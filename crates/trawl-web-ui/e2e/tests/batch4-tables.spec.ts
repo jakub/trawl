@@ -87,7 +87,7 @@ test('Nets renders distinct actual statuses at the same timestamp and keeps nati
   await page.route('**/api/v1/saved', route => route.fulfill({ json: { queries: statuses.map((status, i) => ({
     ...original, id: i + 1, name: `net ${i}`, schedule: {
       id: i + 1, saved_query_id: i + 1, interval: '5m', interval_secs: 300,
-      enabled: true, created_at: time, updated_at: time, total_runs: 1, next_fire_at: time,
+      enabled: true, created_at: time, updated_at: time, total_runs: 1, exhausted: false, next_fire_at: time,
       last_run: { id: i + 1, query: original.query, status, started_at: time },
     },
   })) } }));

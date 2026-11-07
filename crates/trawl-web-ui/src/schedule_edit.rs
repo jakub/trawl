@@ -492,6 +492,7 @@ mod tests {
             updated_at: "2026-03-14T02:00:00Z".to_owned(),
             last_run: None,
             total_runs: 0,
+            exhausted: false,
             window: window.map(str::to_owned),
             lag: lag.map(|(text, _)| text.to_owned()),
             lag_secs: lag.map(|(_, secs)| secs),

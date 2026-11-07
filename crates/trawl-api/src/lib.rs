@@ -1741,8 +1741,16 @@ pub struct ScheduleResponse {
     /// Most recent report run summary (if any).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<ReportRunSummary>,
-    /// Total number of runs executed.
+    /// Runs the schedule has claimed over its life, manual and scheduled,
+    /// including runs retention has since deleted. It is the count
+    /// `max_runs` caps; editing the schedule keeps it, and only deleting
+    /// and recreating the schedule starts it again at 0.
     pub total_runs: u64,
+    /// Whether the run budget is spent: `max_runs` is set and `total_runs`
+    /// has reached it. An exhausted schedule claims no run, manual or
+    /// scheduled, until `max_runs` is raised. `max_runs = 0` is exhausted
+    /// from the start.
+    pub exhausted: bool,
     /// The report window this schedule covers, normalized: the literal
     /// `"since_last"` or a duration such as `"2h"`. Absent means query
     /// mode, where the saved DSL runs verbatim (ADR-0018 ruling 6).
@@ -1878,7 +1886,8 @@ pub struct ReportRunSummary {
 pub struct ListReportRunsResponse {
     /// Report run summaries (most recent first).
     pub runs: Vec<ReportRunSummary>,
-    /// Total number of runs for this schedule.
+    /// Number of runs kept for this schedule. Retention deletes runs, so
+    /// this can be lower than the schedule's `total_runs`.
     pub total: usize,
 }
 
@@ -1917,14 +1926,15 @@ pub struct GlobalRunSummary {
 pub struct ListAllRunsResponse {
     /// Runs (most recent first).
     pub runs: Vec<GlobalRunSummary>,
-    /// Total number of runs for this user.
+    /// Number of runs kept for this user, across saved queries.
     pub total: usize,
 }
 
 /// Aggregate statistics across all report runs for a user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunsStatsResponse {
-    /// Total number of runs (all statuses).
+    /// Number of runs kept (all statuses). Retention deletes runs, so this
+    /// counts what is kept, not what schedules have claimed.
     pub total_runs: u64,
     /// Number of successful runs.
     pub success_count: u64,

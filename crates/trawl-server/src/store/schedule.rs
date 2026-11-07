@@ -598,10 +598,9 @@ fn row_to_report_run(row: &PgRow) -> Result<ReportRun, sqlx::Error> {
     row_to_report_run_at(row, "")
 }
 
-/// SELECT fragment exposing the latest report run (aliased `r_*`) and the total
-/// run count (`run_count`) resolved by [`LATEST_RUN_JOINS`]. Decode the pair
-/// with [`latest_run_and_count_from_row`]. Requires a schedule aliased `s` and
-/// the lateral joins `lr`/`rc`.
+/// SELECT fragment exposing the latest report run (aliased `r_*`) resolved by
+/// [`LATEST_RUN_JOINS`]. Decode it with [`latest_run_from_row`]. Requires a
+/// schedule aliased `s` and the lateral join `lr`.
 pub(crate) const LATEST_RUN_COLS: &str = "lr.id             AS r_id,
      lr.schedule_id    AS r_schedule_id,
      lr.saved_query_id AS r_saved_query_id,
@@ -617,35 +616,26 @@ pub(crate) const LATEST_RUN_COLS: &str = "lr.id             AS r_id,
      lr.window_start   AS r_window_start,
      lr.window_end     AS r_window_end,
      lr.window_truncated AS r_window_truncated,
-     lr.window_kind    AS r_window_kind,
-     rc.run_count      AS run_count";
+     lr.window_kind    AS r_window_kind";
 
 /// LEFT JOIN LATERAL fragment resolving the single latest run (`lr`, tie-broken
-/// by `started_at DESC, id DESC`) and the total run count (`rc`) for the
-/// schedule aliased `s`. Pairs with [`LATEST_RUN_COLS`].
+/// by `started_at DESC, id DESC`) for the schedule aliased `s`. Pairs with
+/// [`LATEST_RUN_COLS`].
 pub(crate) const LATEST_RUN_JOINS: &str = "LEFT JOIN LATERAL (
          SELECT * FROM report_runs r
          WHERE r.schedule_id = s.id
          ORDER BY r.started_at DESC, r.id DESC
          LIMIT 1
-     ) lr ON TRUE
-     LEFT JOIN LATERAL (
-         SELECT COUNT(*) AS run_count FROM report_runs r2 WHERE r2.schedule_id = s.id
-     ) rc ON TRUE";
+     ) lr ON TRUE";
 
 /// Decode the latest run (`r_` prefix, `None` when the schedule has no runs)
-/// and total run count (`run_count`) columns produced by [`LATEST_RUN_COLS`].
-pub(crate) fn latest_run_and_count_from_row(
-    row: &PgRow,
-) -> Result<(Option<ReportRun>, u64), sqlx::Error> {
-    let latest_run = if row.try_get::<Option<i64>, _>("r_id")?.is_some() {
-        Some(row_to_report_run_at(row, "r_")?)
+/// produced by [`LATEST_RUN_COLS`].
+pub(crate) fn latest_run_from_row(row: &PgRow) -> Result<Option<ReportRun>, sqlx::Error> {
+    if row.try_get::<Option<i64>, _>("r_id")?.is_some() {
+        Ok(Some(row_to_report_run_at(row, "r_")?))
     } else {
-        None
-    };
-    let total_runs =
-        u64::try_from(row.try_get::<Option<i64>, _>("run_count")?.unwrap_or(0)).unwrap_or_default();
-    Ok((latest_run, total_runs))
+        Ok(None)
+    }
 }
 
 const SCHEDULE_COLS: &str = "id, saved_query_id, key_id, interval_secs, max_runs, runs_claimed, \
@@ -978,13 +968,13 @@ impl ScheduleStore {
         Ok(row.as_ref().map(row_to_schedule).transpose()?)
     }
 
-    /// Get a schedule with its latest run and total run count in one
-    /// statement (feeds `ScheduleResponse` without per-item lookups).
+    /// Get a schedule with its latest run in one statement (feeds
+    /// `ScheduleResponse` without per-item lookups).
     pub async fn get_schedule_with_stats(
         &self,
         saved_query_id: i64,
         key_id: i64,
-    ) -> Result<Option<(Schedule, Option<ReportRun>, u64)>, StoreError> {
+    ) -> Result<Option<(Schedule, Option<ReportRun>)>, StoreError> {
         let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {cols},
                     {LATEST_RUN_COLS}
@@ -1000,8 +990,8 @@ impl ScheduleStore {
 
         let Some(row) = row else { return Ok(None) };
         let schedule = row_to_schedule(&row)?;
-        let (latest_run, total_runs) = latest_run_and_count_from_row(&row)?;
-        Ok(Some((schedule, latest_run, total_runs)))
+        let latest_run = latest_run_from_row(&row)?;
+        Ok(Some((schedule, latest_run)))
     }
 
     /// List all enabled schedules with their associated saved queries.

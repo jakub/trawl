@@ -3573,8 +3573,9 @@ async fn trigger_run_rejects_reader() {
     assert_403(reader.trigger_run(1).await);
 }
 
-/// Manual runs count toward `max_runs`, and a reached cap is a conflict
-/// with the schedule's state, not a malformed request: 409.
+/// A manual run spends the schedule's lifetime run budget like a scheduled
+/// one, and a spent budget is a conflict with the schedule's state, not a
+/// malformed request: 409.
 #[tokio::test(flavor = "multi_thread")]
 async fn trigger_run_rejects_when_max_runs_reached() {
     let server = setup().await;
@@ -3601,6 +3602,155 @@ async fn trigger_run_rejects_when_max_runs_reached() {
         .await
         .unwrap();
     assert_eq!(runs.runs.len(), 1, "a refused trigger claims nothing");
+}
+
+/// `total_runs` is the schedule's lifetime claim count, so it keeps counting
+/// runs retention deleted, and `exhausted` reads off that same count. The
+/// run statistics and the per-saved runs list still count the runs kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn schedule_reports_claimed_runs_and_exhausted() {
+    use trawl_server::store::RunStatus;
+    use trawl_server::store::schedule::{RunClaim, ScheduleStore};
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let store = ScheduleStore::new(common::app_pool(&server.app_db_url).await);
+
+    let capped = client
+        .create_saved("budget-capped", "* | head 3")
+        .await
+        .unwrap();
+    let capped_schedule = client
+        .set_schedule(capped.id, "1h", Some(3), true, None, None)
+        .await
+        .unwrap();
+    let unlimited = client
+        .create_saved("budget-unlimited", "* | head 3")
+        .await
+        .unwrap();
+    let unlimited_schedule = client
+        .set_schedule(unlimited.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+    assert!(
+        !capped_schedule.exhausted,
+        "a fresh capped schedule has budget"
+    );
+    assert_eq!(capped_schedule.total_runs, 0);
+
+    let run_once = |schedule_id: i64, saved_id: i64| {
+        let store = store.clone();
+        async move {
+            let claimed = store
+                .claim_run(schedule_id, saved_id, "* | head 3", None)
+                .await
+                .unwrap();
+            let RunClaim::Started(id) = claimed else {
+                panic!("claim must start a run, got {claimed:?}")
+            };
+            store
+                .finish_run(id, RunStatus::Success, 5, Some(0), None, None, None)
+                .await
+                .unwrap();
+        }
+    };
+
+    for _ in 0..2 {
+        run_once(capped_schedule.id, capped.id).await;
+        run_once(unlimited_schedule.id, unlimited.id).await;
+    }
+    let below = client.get_schedule(capped.id).await.unwrap();
+    assert_eq!(below.total_runs, 2);
+    assert!(!below.exhausted, "two of three claimed is below the cap");
+
+    run_once(capped_schedule.id, capped.id).await;
+    run_once(unlimited_schedule.id, unlimited.id).await;
+
+    // Keep one run per schedule: kept (1) falls below claimed (3).
+    store.delete_old_runs(36_500, 1).await.unwrap();
+
+    let capped_now = client.get_schedule(capped.id).await.unwrap();
+    assert_eq!(
+        capped_now.total_runs, 3,
+        "retention never lowers the claim count"
+    );
+    assert!(capped_now.exhausted, "three of three claimed is at the cap");
+    let unlimited_now = client.get_schedule(unlimited.id).await.unwrap();
+    assert_eq!(unlimited_now.total_runs, 3);
+    assert!(
+        !unlimited_now.exhausted,
+        "an unlimited schedule never runs out"
+    );
+
+    let listed = client.list_saved().await.unwrap();
+    let listed_schedule = |id: i64| {
+        listed
+            .queries
+            .iter()
+            .find(|q| q.id == id)
+            .and_then(|q| q.schedule.clone())
+            .expect("listed with its schedule")
+    };
+    let capped_listed = listed_schedule(capped.id);
+    assert_eq!(capped_listed.total_runs, 3);
+    assert!(capped_listed.exhausted);
+    let unlimited_listed = listed_schedule(unlimited.id);
+    assert_eq!(unlimited_listed.total_runs, 3);
+    assert!(!unlimited_listed.exhausted);
+
+    let stats = client.runs_stats().await.unwrap();
+    assert_eq!(stats.total_runs, 2, "run statistics count kept runs");
+    let all = client.list_all_runs(Some(50), None).await.unwrap();
+    assert_eq!(all.total, 2, "the global runs list counts kept runs");
+    let kept = client
+        .list_report_runs(capped.id, Some(50), None)
+        .await
+        .unwrap();
+    assert_eq!(kept.total, 1, "the per-saved runs list counts kept runs");
+    assert_eq!(kept.runs.len(), 1);
+}
+
+/// `max_runs = 0` is a legal cap that is spent from the start: the schedule
+/// saves, reads exhausted, and neither door claims a run.
+#[tokio::test(flavor = "multi_thread")]
+async fn max_runs_zero_is_exhausted_from_the_start() {
+    use trawl_server::store::DueClaim;
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("budget-zero", "* | head 3")
+        .await
+        .unwrap();
+    let put = client
+        .set_schedule(saved.id, "1h", Some(0), true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(put.max_runs, Some(0));
+    assert!(put.exhausted, "the PUT response reads exhausted");
+    assert_eq!(put.total_runs, 0);
+
+    let got = client.get_schedule(saved.id).await.unwrap();
+    assert!(got.exhausted, "a zero budget is spent from the start");
+    assert_eq!(got.total_runs, 0);
+
+    let (status, message) = refusal(client.trigger_run(saved.id).await);
+    assert_eq!(status, 409, "{message}");
+    assert!(message.contains("max runs reached"), "{message}");
+
+    let due = stored_next_fire_at(&server, put.id).await;
+    assert_eq!(tick(&server, put.id, due).await, DueClaim::MaxRunsReached);
+
+    let runs = client
+        .list_report_runs(saved.id, Some(10), None)
+        .await
+        .unwrap();
+    assert_eq!(runs.total, 0, "no run is written");
+    assert!(runs.runs.is_empty());
+    let after = client.get_schedule(saved.id).await.unwrap();
+    assert_eq!(after.total_runs, 0, "a refusal spends nothing");
+    assert!(after.exhausted);
 }
 
 /// A run in flight refuses another with 409, and says so even when the

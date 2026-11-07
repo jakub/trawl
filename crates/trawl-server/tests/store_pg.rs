@@ -635,12 +635,12 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
     let alpha = details[0].schedule.as_ref().expect("alpha has schedule");
     assert_eq!(alpha.schedule.interval_secs, 300);
     assert_eq!(alpha.schedule.max_runs, Some(10));
-    assert_eq!(alpha.total_runs, 2);
+    assert_eq!(alpha.schedule.runs_claimed, 2);
     let latest = alpha.latest_run.as_ref().expect("latest run present");
     assert_eq!(latest.duration_ms, Some(101), "latest run is the newest");
 
     let beta = details[1].schedule.as_ref().expect("beta has schedule");
-    assert_eq!(beta.total_runs, 0);
+    assert_eq!(beta.schedule.runs_claimed, 0);
     assert!(beta.latest_run.is_none());
 
     assert!(details[2].schedule.is_none(), "gamma has no schedule");
