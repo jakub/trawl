@@ -16,4 +16,5 @@ pub mod pipeline;
 pub mod preview;
 pub mod producer;
 pub mod publication_marker;
+pub mod rollup_io;
 pub mod wal;
