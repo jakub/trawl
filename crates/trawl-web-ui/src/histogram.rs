@@ -179,7 +179,12 @@ pub fn clock_ticks(series: &Series, width_px: f64) -> Vec<Tick> {
     }
     let min_ms = (series.min_secs * 1000.0).ceil() as i64;
     let max_ms = (series.max_secs * 1000.0).floor() as i64;
-    let day_steps = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000].map(|d| d * DAY_MS);
+    // 1, 2, 5, 10, 20, 50, ... days, so any span reaches a step with at
+    // most six ticks; the sequence ends where a step would overflow.
+    let day_steps = (0..)
+        .map_while(|k| 10_i64.checked_pow(k))
+        .flat_map(|p| [1, 2, 5].map(move |m| p.checked_mul(m * DAY_MS)))
+        .map_while(|step| step);
     let mut fallback: Option<Vec<Tick>> = None;
     for step in STEPS_MS.into_iter().chain(day_steps) {
         let first = min_ms.div_euclid(step) * step;
@@ -602,6 +607,8 @@ mod tests {
             (DAY0 + 17.0, DAY0 + 3_617.0),
             (DAY0 - 86_400.0 * 3.3, DAY0),
             (DAY0 + 59.9, DAY0 + 60.1),
+            // A sender's epoch-zero timestamp beside today's events.
+            (0.0, DAY0),
         ] {
             for width in [120.0, 450.0, 1100.0] {
                 let ticks = clock_ticks(&span(min, max), width);
