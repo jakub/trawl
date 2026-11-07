@@ -1,6 +1,6 @@
 # The kv batch tail runs its stages in written order
 
-status: accepted (2026-11-06), prep record for the kv batch tail order fix (#346); human rulings of 2026-11-06 recorded below
+status: accepted (2026-11-06), prep record for the kv batch tail order fix (#346); human rulings of 2026-11-06 recorded below; amended (2026-11-06) with what the #346 run shipped, see the Amendment
 
 `extract kv` mints columns that SQL cannot name, so the emitter sends it and every later stage to the kv batch tail (`emitter/mod.rs:490-503`). The tail runs over the rows the SQL prefix returned. On main (`42e05d0f`) it does not run those stages in the order the query wrote them:
 
@@ -47,3 +47,35 @@ Considered and rejected:
 - **Promise one vector of rows for the whole tail.** A barrier needs its input and its output at once, so the claim would be false. The decision promises memory that grows with the rows instead.
 
 Out of scope, and not filed by this prep: the batch SQL lane's `head N | sort x` order. It was traced, not run.
+
+## Amendment (2026-11-06): what the #346 run shipped
+
+The implementation settled three points the decision left open or worded
+narrowly.
+
+1. **Every `dedup` is a barrier, bare `dedup` included.** The decision
+   names only `dedup` with fields. A bare `dedup` follows the same path:
+   it keeps the first of each set of identical rows and never clears its
+   key set. Its answer is the one an exact streaming dedup gives, and one
+   barrier path needs no batch flag in the live compiler. The live lane's
+   `compile_dedup` and its 10,000-key reset do not change.
+
+2. **The `tail` refusal comes before the compile.** The tail scans its
+   stages for `tail` before it compiles anything, so a refused query
+   builds no pattern. That refusal wins over every other refusal in the
+   tail, the one-aggregation rule included. The 400's message is:
+
+   `post-processing: tail is not supported after extract kv; use sort and head instead`
+
+3. **The whole tail is validated by one compile.** The engine removes the
+   barriers and calls `compile_stream_plan_with` once on the stages that
+   remain. That call checks the whole tail, walks the pin scope once,
+   uses the one `last` span and prepares every pattern through the one
+   ledger. `post_process::cut_into_steps` then cuts the compiled plan back
+   into steps at the barriers' positions. The live compiler emits one
+   compiled piece per stage it is given, so the cut pairs each piece with
+   its own stage. The engine asserts that the piece count matches. A
+   mismatch is a broken server invariant and panics, rather than running
+   a stage in another stage's place. trawl-core gains no compiler entry
+   point. It only makes `bind_event_key`, `EvalValue::as_instant` and
+   `stream::dedup_key` public.

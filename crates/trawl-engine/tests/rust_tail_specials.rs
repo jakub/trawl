@@ -136,9 +136,8 @@ fn the_tail_computes_over_the_specials_it_received() {
     assert!(max.is_infinite() && max.is_sign_positive(), "{max}");
 
     // A NaN sorts GREATEST, the way DuckDB orders it — not "wherever
-    // arrival order left it". `v` stays in the projection because the
-    // tail defers every sort to the very end, after `table` has already
-    // chosen the columns.
+    // arrival order left it". The tail runs the sort before `table`, in
+    // the order the query writes them (ADR-0064).
     let sorted = run(
         &exec,
         "* | extract kv from message | let v = if(k == 1, 0.0 / 0, 5.0) | sort v | table k, v",
