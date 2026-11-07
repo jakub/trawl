@@ -14,6 +14,7 @@ use crate::{
     perms,
     service_card_fmt::{format_bytes, format_count, format_exact, format_uptime},
 };
+use fleet_ui::time::format_duration;
 use fleet_ui::{Badge, ConfirmModal, ConfirmState, Tone};
 use leptos::{prelude::*, task::spawn_local};
 use std::sync::{
@@ -134,7 +135,7 @@ pub fn HealthPage() -> impl IntoView {
     view! {
         <div class="health-page">
             <header class="health-heading"><div><h1>"Health"</h1></div>
-                <button class="btn health-refresh" on:click=move |_| refresh.update(|n| *n += 1)>"Refresh"</button>
+                <button class="btn-sec health-refresh" on:click=move |_| refresh.update(|n| *n += 1)>"Refresh"</button>
             </header>
             <div class="health-cards">
             <section class="health-section" aria-labelledby="health-checks-title">
@@ -152,6 +153,7 @@ pub fn HealthPage() -> impl IntoView {
                     Some(Ok(report)) => {
                         let mut checks = report.checks.unwrap_or_default().into_iter().collect::<Vec<_>>();
                         checks.sort_by(|a, b| a.0.cmp(&b.0));
+                        let version_reported = report.version.is_some();
                         view! {
                             <dl class="health-checks">{checks.into_iter().map(|(key, result)| {
                                 // An unknown key IS the name: naming a
@@ -176,8 +178,8 @@ pub fn HealthPage() -> impl IntoView {
                                     </div>
                                 }
                             }).collect_view()}</dl>
-                            <dl class="health-facts"><div><dt>"Overall state"</dt><dd>{match report.status { HealthStatus::Ok => "Healthy", HealthStatus::Degraded => "Degraded", HealthStatus::Unavailable => "Unavailable" }}</dd></div>
-                                <div><dt>"Version"</dt><dd>{report.version.unwrap_or_else(|| "Not reported".into())}</dd></div>
+                            <dl class="health-facts">
+                                <div><dt>"Version"</dt><dd class:health-value=version_reported>{report.version.unwrap_or_else(|| "Not reported".into())}</dd></div>
                             </dl>
                         }.into_any()
                     }
@@ -190,11 +192,11 @@ pub fn HealthPage() -> impl IntoView {
                         None => view! { <p role="status">"Loading capacity..."</p> }.into_any(),
                         Some(Err(error)) => view! { <p role="alert">{error}</p> }.into_any(),
                         Some(Ok(s)) => view! { <dl class="health-facts">
-                            <div><dt>"Uptime"</dt><dd>{format_uptime(s.uptime_secs)}</dd></div>
-                            <div><dt>"Queries since startup"</dt><dd>{format_exact(s.total_queries)}</dd></div>
-                            <div><dt>"Active queries"</dt><dd>{s.active_queries}</dd></div>
-                            <div><dt>"Executors available"</dt><dd>{format!("{} / {}", s.pool_available, s.pool_capacity)}</dd></div>
-                            <div><dt>"Retained work"</dt><dd>{s.pool_retained}</dd></div>
+                            <div><dt>"Uptime"</dt><dd class="health-value">{format_uptime(s.uptime_secs)}</dd></div>
+                            <div><dt>"Queries since startup"</dt><dd class="health-value">{format_exact(s.total_queries)}</dd></div>
+                            <div><dt>"Active queries"</dt><dd class="health-value">{s.active_queries}</dd></div>
+                            <div><dt>"Executors available"</dt><dd class="health-value">{format!("{} / {}", s.pool_available, s.pool_capacity)}</dd></div>
+                            <div><dt>"Retained work"</dt><dd class="health-value">{s.pool_retained}</dd></div>
                         </dl><p class="health-note">"Retained work uses occupied executors; it is included in pool usage."</p> }.into_any(),
                     }}
                 </section>
@@ -203,12 +205,12 @@ pub fn HealthPage() -> impl IntoView {
                     <p class="health-live-state" class:sr-only=move || dashboard.get().phase == DashboardPhase::Live role="status">{move || dashboard.get().phase.label()}</p>
                     {move || dashboard.get().snapshot.map(|s| view! {
                         <dl class="health-facts">
-                            <div><dt>"Host"</dt><dd>{s.hostname}</dd></div>
-                            <div><dt>"HTTP ingest rate"</dt><dd>{format!("{:.1} events/s", s.ingest_rate)}</dd></div>
-                            <div><dt>"Query rate"</dt><dd>{format!("{:.1} queries/s", s.query_rate)}</dd></div>
-                            <div><dt>"Hot buffer events"</dt><dd>{format!("{} / {}", format_count(s.hot_buffer_events as u64), format_count(s.hot_buffer_max_events as u64))}</dd></div>
-                            <div><dt>"Hot buffer memory"</dt><dd>{format!("{} / {}", format_bytes(s.hot_buffer_bytes as u64), format_bytes(s.hot_buffer_max_bytes as u64))}</dd></div>
-                            <div><dt>"Executors occupied"</dt><dd>{format!("{} / {}", s.pool_active, s.pool_capacity)}</dd></div>
+                            <div><dt>"Host"</dt><dd class="health-value">{s.hostname}</dd></div>
+                            <div><dt>"HTTP ingest rate"</dt><dd class="health-value">{format!("{:.1} events/s", s.ingest_rate)}</dd></div>
+                            <div><dt>"Query rate"</dt><dd class="health-value">{format!("{:.1} queries/s", s.query_rate)}</dd></div>
+                            <div><dt>"Hot buffer events"</dt><dd class="health-value">{format!("{} / {}", format_count(s.hot_buffer_events as u64), format_count(s.hot_buffer_max_events as u64))}</dd></div>
+                            <div><dt>"Hot buffer memory"</dt><dd class="health-value">{format!("{} / {}", format_bytes(s.hot_buffer_bytes as u64), format_bytes(s.hot_buffer_max_bytes as u64))}</dd></div>
+                            <div><dt>"Executors occupied"</dt><dd class="health-value">{format!("{} / {}", s.pool_active, s.pool_capacity)}</dd></div>
                         </dl>
                     })}
                 </section>
@@ -220,29 +222,50 @@ pub fn HealthPage() -> impl IntoView {
     }
 }
 
-/// Render the server's sample age unchanged, including when the stream stops.
-fn storage_reading(files: u64, bytes: u64, measurement: StorageMeasurement) -> String {
-    match (measurement.status, measurement.sample_age_secs) {
-        (StorageMeasurementStatus::NotConfigured, _) => "Not configured".into(),
-        (StorageMeasurementStatus::NotSampled, _) => "Awaiting measurement".into(),
+/// One storage source's reading: a state line, plus totals only when the
+/// server reports a measured sample. The sample age is the server's, unchanged,
+/// including when the stream stops.
+#[derive(Clone, Copy)]
+struct StorageReading {
+    state: &'static str,
+    totals: Option<(u64, u64, u64)>,
+}
+
+fn storage_reading(files: u64, bytes: u64, measurement: StorageMeasurement) -> StorageReading {
+    let (state, totals) = match (measurement.status, measurement.sample_age_secs) {
+        (StorageMeasurementStatus::NotConfigured, _) => ("Not configured", None),
+        (StorageMeasurementStatus::NotSampled, _) => ("Awaiting measurement", None),
         (StorageMeasurementStatus::Failed, None) => {
-            "Measurement unavailable; collection failed".into()
+            ("Measurement unavailable; collection failed", None)
         }
-        (status, Some(age)) => {
-            let state = if status == StorageMeasurementStatus::Failed {
-                "Collection failed; last complete totals"
-            } else {
-                "Complete measurement"
-            };
-            format!(
-                "{state}: {} files, {}. Sample age: {age}s at this snapshot.",
-                format_exact(files),
-                format_bytes(bytes)
-            )
+        (StorageMeasurementStatus::Failed, Some(age)) => (
+            "Collection failed; last complete totals",
+            Some((files, bytes, age)),
+        ),
+        (StorageMeasurementStatus::Complete, Some(age)) => {
+            ("Complete measurement", Some((files, bytes, age)))
         }
         // The producer requires an age on complete samples. Do not display
         // numeric placeholders as measured if a malformed response violates it.
-        (StorageMeasurementStatus::Complete, None) => "Measurement unavailable".into(),
+        (StorageMeasurementStatus::Complete, None) => ("Measurement unavailable", None),
+    };
+    StorageReading { state, totals }
+}
+
+/// A storage source's state line, then its measured totals as facts. A
+/// state without a measured sample stays one plain line.
+fn storage_reading_view(reading: StorageReading) -> impl IntoView + use<> {
+    match reading.totals {
+        Some((files, bytes, age)) => view! {
+            <p class="health-storage-state">{reading.state}</p>
+            <dl class="health-facts">
+                <div><dt>"Files"</dt><dd>{format_exact(files)}</dd></div>
+                <div><dt>"Size"</dt><dd>{format_bytes(bytes)}</dd></div>
+                <div><dt>"Sample age"</dt><dd>{format!("{age}s")}</dd></div>
+            </dl>
+        }
+        .into_any(),
+        None => view! { <p>{reading.state}</p> }.into_any(),
     }
 }
 
@@ -343,17 +366,17 @@ fn HealthDiagnostics() -> impl IntoView {
                 {move || dashboard.get().snapshot.map(|s| view! {
                     <p class="health-note">"Counters are since process startup. HTTP counters exclude syslog."</p>
                     <dl class="health-facts">
-                        <div><dt>"HTTP rejected events"</dt><dd>{format_exact(s.ingest_rejected)}</dd></div>
+                        <div><dt>"HTTP rejected events"</dt><dd class="health-value">{format_exact(s.ingest_rejected)}</dd></div>
                         <div><dt>"Syslog configuration"</dt><dd>{if s.syslog_enabled { "Enabled" } else { "Disabled" }}</dd></div>
                     </dl>
                     {s.syslog_enabled.then(|| view! {
                         <dl class="health-facts">
-                            <div><dt>"UDP received"</dt><dd>{format_exact(s.syslog_events_udp)}</dd></div>
-                            <div><dt>"TCP received"</dt><dd>{format_exact(s.syslog_events_tcp)}</dd></div>
-                            <div><dt>"Syslog rate"</dt><dd>{format!("{:.1} events/s", s.syslog_rate)}</dd></div>
-                            <div><dt>"Parse errors"</dt><dd>{format_exact(s.syslog_parse_errors)}</dd></div>
-                            <div><dt>"Backpressure drops"</dt><dd>{format_exact(s.syslog_dropped)}</dd></div>
-                            <div><dt>"Active TCP connections"</dt><dd>{format_exact(s.syslog_tcp_connections)}</dd></div>
+                            <div><dt>"UDP received"</dt><dd class="health-value">{format_exact(s.syslog_events_udp)}</dd></div>
+                            <div><dt>"TCP received"</dt><dd class="health-value">{format_exact(s.syslog_events_tcp)}</dd></div>
+                            <div><dt>"Syslog rate"</dt><dd class="health-value">{format!("{:.1} events/s", s.syslog_rate)}</dd></div>
+                            <div><dt>"Parse errors"</dt><dd class="health-value">{format_exact(s.syslog_parse_errors)}</dd></div>
+                            <div><dt>"Backpressure drops"</dt><dd class="health-value">{format_exact(s.syslog_dropped)}</dd></div>
+                            <div><dt>"Active TCP connections"</dt><dd class="health-value">{format_exact(s.syslog_tcp_connections)}</dd></div>
                         </dl>
                     })}
                     <p class="health-note">"Configured enablement does not test listener health. Received messages do not prove persistence."</p>
@@ -366,18 +389,18 @@ fn HealthDiagnostics() -> impl IntoView {
                 {move || dashboard.get().snapshot.map(|s| view! {
                     <div class="health-storage-source" data-source="wal">
                         <h3>"WAL"</h3>
-                        <p>{storage_reading(s.wal_files, s.wal_bytes, s.wal_measurement)}</p>
+                        {storage_reading_view(storage_reading(s.wal_files, s.wal_bytes, s.wal_measurement))}
                         <p class="health-note">"Includes active WAL files; these are not counts of compaction-eligible files."</p>
                     </div>
                     <div class="health-storage-source" data-source="parquet">
                         <h3>"Ingested Parquet"</h3>
-                        <p>{storage_reading(s.parquet_files, s.parquet_bytes, s.parquet_measurement)}</p>
+                        {storage_reading_view(storage_reading(s.parquet_files, s.parquet_bytes, s.parquet_measurement))}
                         <p class="health-note">"Excludes saved report files. Sample age is relative to this dashboard snapshot, separate from live-update status."</p>
                     </div>
                     <dl class="health-facts">
-                        <div><dt>"Successful compaction cycles"</dt><dd>{format_exact(s.compaction_runs)}</dd></div>
-                        <div><dt>"Compaction error tally"</dt><dd>{format_exact(s.compaction_errors)}</dd></div>
-                        <div><dt>"Last successful cycle"</dt><dd>{s.last_compaction_secs.map_or_else(|| "No successful cycle reported since startup".to_owned(), |age| format!("{age}s ago"))}</dd></div>
+                        <div><dt>"Successful compaction cycles"</dt><dd class="health-value">{format_exact(s.compaction_runs)}</dd></div>
+                        <div><dt>"Compaction error tally"</dt><dd class="health-value">{format_exact(s.compaction_errors)}</dd></div>
+                        <div><dt>"Last successful cycle"</dt><dd class:health-value=s.last_compaction_secs.is_some()>{s.last_compaction_secs.map_or_else(|| "No successful cycle reported since startup".to_owned(), |age| format!("{age}s ago"))}</dd></div>
                     </dl>
                     <p class="health-note">"Compaction counters are since process startup. The error tally includes failed cycles and loss/error tallies; it can accompany successful cycles and exceed their count. A successful cycle can have no eligible work."</p>
                 })}
@@ -412,7 +435,7 @@ fn query_rows(response: QueriesResponse) -> Vec<QueryRow> {
             user: q.user,
             query: q.query,
             state: "running".into(),
-            elapsed: format!("{} ms", format_exact(q.running_ms)),
+            elapsed: format_duration(q.running_ms),
         }
     });
     let recent = response.recent.into_iter().map(|entry| {
@@ -430,7 +453,7 @@ fn query_rows(response: QueriesResponse) -> Vec<QueryRow> {
             user: q.user,
             query: q.query,
             state: state.into(),
-            elapsed: format!("{} ms", format_exact(q.duration_ms)),
+            elapsed: format_duration(q.duration_ms),
         }
     });
     active.chain(recent).collect()

@@ -402,7 +402,6 @@ fn FieldsPane(
                     let svc_name_detail = svc_name.clone();
                     let col_for_detail = c.clone();
 
-                    let is_open_caret = is_open.clone();
                     let is_open_detail = is_open.clone();
                     let is_open_aria = is_open.clone();
                     // Membership in the server-stamped list, never a join
@@ -433,7 +432,7 @@ fn FieldsPane(
                                         on:click=toggle
                                     >
                                         <span class="caret" aria-hidden="true">
-                                            {move || if is_open_caret() { "▾" } else { "▸" }}
+                                            <IconView icon=Icon::Chevron size=10 stroke_width=1.5/>
                                         </span>
                                         <span class="c-name">{c.name.clone()}</span>
                                     </button>

@@ -32,4 +32,4 @@ index 0bedf13f..519dccc2 100644
 +                                        </td>
                                          // The cadence in words, with the enabled/paused
                                          // judgement beside it as a Badge rather than a
-                                         // glyph the row has to explain.
+                                         // glyph the row has to explain, and the next fire

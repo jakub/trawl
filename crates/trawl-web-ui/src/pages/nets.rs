@@ -254,9 +254,12 @@ pub fn NetsPage() -> impl IntoView {
                     <table class="fleet-table nets-table" aria-label="Saved queries">
                         <thead><tr>
                             {table_sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "")}
-                            <th scope="col" class="th">"Schedule"</th>
+                            <th scope="col" class="th net-schedule-col">"Schedule"</th>
                             {table_sort_th(sort, NetSort::LastRun, NetSort::LastRun.default_desc(), "Last run", "width:180px")}
-                            <th scope="col" style="width:120px">"Actions"</th>
+                            // The slack column takes the spare width, so a
+                            // net's last run sits next to its schedule.
+                            <th class="col-slack" aria-hidden="true"></th>
+                            <th scope="col" class="net-actions-col">"Actions"</th>
                         </tr></thead>
                         <tbody>
                             <For each=move || visible_nets.get() key=|net| net.id children=move |initial| {
@@ -277,63 +280,78 @@ pub fn NetsPage() -> impl IntoView {
                                         <td class="mono"><a class="row-stretch" href=href prop:replace=true>{move || net.get().name}</a></td>
                                         // The cadence in words, with the enabled/paused
                                         // judgement beside it as a Badge rather than a
-                                        // glyph the row has to explain.
+                                        // glyph the row has to explain, and the next fire
+                                        // those two qualify on the line beneath.
                                         <td>
                                             <span class="cadence">{move || cadence_sentence(net.get().schedule.as_ref())}</span>
                                             {move || net.get().schedule.map(|s| {
                                                 let (tone, label) = if s.enabled { (Tone::Success, "Enabled") } else { (Tone::Neutral, "Paused") };
                                                 view! { <Badge tone=tone>{label}</Badge> }
                                             })}
+                                            {move || {
+                                                let schedule = net.get().schedule?;
+                                                let run = schedule.last_run?;
+                                                schedule.enabled.then(|| {
+                                                    #[allow(clippy::cast_possible_truncation)]
+                                                    let started_ms = js_sys::Date::parse(&run.started_at) as i64;
+                                                    let label = time_until(started_ms + schedule.interval_secs.cast_signed() * 1000, now_ms.get());
+                                                    // `time_until` says "overdue" once the next fire is in the past.
+                                                    let overdue = label == "overdue";
+                                                    view! { <div class="next-run" class:overdue=overdue>"Next: "{label}</div> }
+                                                })
+                                            }}
                                         </td>
                                         <td>{move || {
                                             let Some(schedule) = net.get().schedule else { return view! { <span style="color:var(--ink-3)">"—"</span> }.into_any(); };
                                             let Some(run) = schedule.last_run else {
                                                 return if schedule.enabled {
-                                                    view! { <span class="mono" style="color:var(--ink-3); font-size:10px">"Pending…"</span> }.into_any()
+                                                    view! { <span class="mono run-pending">"Pending…"</span> }.into_any()
                                                 } else {
                                                     view! { <span style="color:var(--ink-3)">"—"</span> }.into_any()
                                                 };
                                             };
-                                            let next_label = schedule.enabled.then(|| {
-                                                #[allow(clippy::cast_possible_truncation)]
-                                                let started_ms = js_sys::Date::parse(&run.started_at) as i64;
-                                                time_until(started_ms + schedule.interval_secs.cast_signed() * 1000, now_ms.get())
-                                            });
                                             let status = crate::tone_vocab::run_status_label(&run.status).to_owned();
                                             view! {
                                                 <div>
                                                     <span class="run-status" style="margin-inline-start:0">{status}</span> " "
                                                     <span class="mono" style="color:var(--ink-2)">{time_ago(&run.started_at, now_ms.get())}</span>
-                                                    {next_label.map(|label| view! { <div class="next-run" style="font-size:10px; color:var(--ink-3)">"Next: "{label}</div> })}
                                                 </div>
                                             }.into_any()
                                         }}</td>
+                                        <td class="col-slack" aria-hidden="true"></td>
                                         // Keep direct controls above the stretched row link.
+                                        // Each action owns a grid column, so a row without
+                                        // Run now leaves that slot empty instead of sliding
+                                        // Delete into it.
                                         <td class="row-menu net-actions">
-                                            <button type="button" class="btn-icon" aria-label="Open in search" title="Open in search"
-                                                on:click=move |ev| {
-                                                    ev.stop_propagation();
-                                                    run(net.get_untracked().query);
-                                                }><span aria-hidden="true">"⌕"</span></button>
-                                            <Show when=move || run_now_offered(&net.get())>
-                                                <button type="button" class="btn-icon" aria-label=RUN_NOW title=RUN_NOW
-                                                    disabled=move || run_in_flight.get()
+                                            <div class="net-action-slots">
+                                                <button type="button" class="btn-sec btn-xs net-open" title="Open in search"
                                                     on:click=move |ev| {
                                                         ev.stop_propagation();
-                                                        let current = net.get_untracked();
-                                                        // Recheck the saved state on activation: a
-                                                        // schedule removed since render has nothing
-                                                        // left to fire.
-                                                        if run_now_offered(&current) && !run_in_flight.get_untracked() {
-                                                            on_run_now(id, current.name, run_in_flight);
-                                                        }
-                                                    }><span aria-hidden="true">"↻"</span></button>
-                                            </Show>
-                                            <button type="button" class="btn-icon net-delete" aria-label="Delete Net" title="Delete Net"
-                                                on:click=move |ev| {
-                                                    ev.stop_propagation();
-                                                    confirm_delete.update(|c| c.request((id, net.get_untracked().name)));
-                                                }><span aria-hidden="true">"×"</span></button>
+                                                        run(net.get_untracked().query);
+                                                    }>"Open in search"</button>
+                                                <Show when=move || run_now_offered(&net.get())>
+                                                    <button type="button" class="btn-sec btn-xs net-run-now" title=RUN_NOW
+                                                        disabled=move || run_in_flight.get()
+                                                        on:click=move |ev| {
+                                                            ev.stop_propagation();
+                                                            let current = net.get_untracked();
+                                                            // Recheck the saved state on activation: a
+                                                            // schedule removed since render has nothing
+                                                            // left to fire.
+                                                            if run_now_offered(&current) && !run_in_flight.get_untracked() {
+                                                                on_run_now(id, current.name, run_in_flight);
+                                                            }
+                                                        }>{RUN_NOW}</button>
+                                                </Show>
+                                                // The accessible name keeps the object and starts
+                                                // with the visible word (WCAG 2.5.3).
+                                                <button type="button" class="btn-danger btn-xs net-delete" aria-label="Delete Net" title="Delete Net"
+                                                    on:click=move |ev| {
+                                                        ev.stop_propagation();
+                                                        confirm_delete.update(|c| c.request((id, net.get_untracked().name)));
+                                                    }>"Delete"</button>
+                                            </div>
                                         </td>
                                     </tr>
                                 }

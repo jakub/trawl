@@ -19,12 +19,35 @@ use crate::categorical::detect;
 use crate::chart_hint::{Hint, chart_hint, final_stage_is_timechart};
 use crate::fetch_plan::coverage_refusal;
 use crate::interop::uplot::{ChartHandle, ChartKind, Opts, create_chart};
-use crate::series::{CatPoints, Lane, SeriesSet, caption, cat_points};
+use crate::series::{
+    Caption, CaptionPart, CatPoints, Lane, SeriesSet, bucket_sentence, caption, cat_points,
+};
 
 /// Everything that lives in the chart OPTIONS rather than its data: the
-/// y-series labels, the ordinal x labels, and the kind. A data-only
-/// update is safe only while all three hold.
-type MountedOpts = (Vec<String>, Option<Vec<String>>, &'static str);
+/// y-series labels, the ordinal x labels, the value-axis label, and the
+/// kind. A data-only update is safe only while all four hold.
+type MountedOpts = (
+    Vec<String>,
+    Option<Vec<String>>,
+    Option<String>,
+    &'static str,
+);
+
+/// The most characters of a metric name the value axis prints. The
+/// label runs along the plot's 320px height in 11px mono, so a longer
+/// alias would run off the canvas; the legend and Events keep it whole.
+const AXIS_LABEL_MAX: usize = 36;
+
+/// The value-axis label for a metric name, cut to [`AXIS_LABEL_MAX`]
+/// characters with an ellipsis when it would not fit.
+fn axis_label(metric: &str) -> String {
+    if metric.chars().count() <= AXIS_LABEL_MAX {
+        return metric.to_owned();
+    }
+    let mut cut: String = metric.chars().take(AXIS_LABEL_MAX - 1).collect();
+    cut.push('…');
+    cut
+}
 
 /// One of the three shapes the Visualization tab draws. Session state,
 /// never part of the search URL (ADR-0027).
@@ -38,10 +61,38 @@ pub enum ChartType {
 /// The picker's order, and the order of the `fits` array.
 const TYPES: [ChartType; 3] = [ChartType::Line, ChartType::Column, ChartType::Bar];
 
+/// Why a chart type does not fit a result: a sentence around the one
+/// query command it names, which renders in mono so it reads as DSL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reason {
+    before: &'static str,
+    command: &'static str,
+    after: &'static str,
+}
+
+impl Reason {
+    /// The plain sentence, for hover text and the refusal paragraph.
+    fn text(self) -> String {
+        format!("{}{}{}", self.before, self.command, self.after)
+    }
+
+    fn view(self) -> impl IntoView {
+        view! { {self.before}<code class="mono">{self.command}</code>{self.after} }
+    }
+}
+
 /// Why Line does not fit a result.
-const LINE_NEEDS: &str = "Line needs a timechart result.";
+const LINE_NEEDS: Reason = Reason {
+    before: "Line needs a ",
+    command: "timechart",
+    after: " result.",
+};
 /// Why Column and Bar do not fit a result.
-const BARS_NEED: &str = "Column and Bar need a stats … by result with one group and one metric.";
+const BARS_NEED: Reason = Reason {
+    before: "Column and Bar need a ",
+    command: "stats … by",
+    after: " result with one group and one metric.",
+};
 
 impl ChartType {
     /// How the uPlot bridge draws this type.
@@ -89,11 +140,23 @@ impl ChartType {
 fn effective_type(
     selected: Option<ChartType>,
     default: ChartType,
-    fits: &[Option<&'static str>; 3],
+    fits: &[Option<Reason>; 3],
 ) -> ChartType {
     selected
         .filter(|ty| fits[ty.slot()].is_none())
         .unwrap_or(default)
+}
+
+/// Why the disabled types are disabled, one sentence per distinct
+/// reason: Column and Bar share theirs. Empty when every type fits.
+fn disabled_reasons(fits: &[Option<Reason>; 3]) -> Vec<Reason> {
+    let mut reasons: Vec<Reason> = Vec::new();
+    for reason in fits.iter().flatten() {
+        if !reasons.contains(reason) {
+            reasons.push(*reason);
+        }
+    }
+    reasons
 }
 
 /// What the tab shows for the current snapshot.
@@ -198,7 +261,7 @@ static PICKER_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 fn ChartTypePicker(
     selected: RwSignal<Option<ChartType>>,
     #[prop(into)] default: Signal<ChartType>,
-    #[prop(into)] fits: Signal<[Option<&'static str>; 3]>,
+    #[prop(into)] fits: Signal<[Option<Reason>; 3]>,
 ) -> impl IntoView {
     let group = format!(
         "chart-type-{}",
@@ -214,7 +277,7 @@ fn ChartTypePicker(
                 // The checked option is the type the chart DRAWS, which
                 // is the default while the stored choice does not fit.
                 let checked = move || effective_type(selected.get(), default.get(), &fits.get()) == ty;
-                let reason = move || fits.get()[ty.slot()];
+                let reason = move || fits.get()[ty.slot()].map(Reason::text);
                 let id = format!("{group}-{}", ty.as_str());
                 view! {
                     <input
@@ -319,7 +382,7 @@ pub fn Chart(
             return match chart_hint(&query, &result, lane, coverage.as_ref()) {
                 Err(hint) => Outcome::Refused(hint),
                 Ok(_) => Outcome::Refused(Hint {
-                    message: BARS_NEED.to_owned(),
+                    message: BARS_NEED.text(),
                     offers_events: true,
                 }),
             };
@@ -345,17 +408,9 @@ pub fn Chart(
     // result holds. A legend of six over a result of fourteen is a
     // picture that lies by omission without it (ADR-0038).
     let caption_line = Memo::new(move |_| match outcome.get() {
-        Outcome::Lines(set) => {
-            let narrow = (!set.group_fields.is_empty()).then(|| set.group_fields.join(", "));
-            caption(
-                set.series.len(),
-                set.total_series,
-                "series",
-                narrow.as_deref(),
-            )
-        }
+        Outcome::Lines(set) => caption(set.series.len(), &set.omitted, "series", &set.group_fields),
         Outcome::Groups { points, .. } => {
-            caption(points.labels.len(), points.total_groups, "groups", None)
+            caption(points.labels.len(), &points.omitted, "groups", &[])
         }
         Outcome::Note(_) | Outcome::Refused(_) => None,
     });
@@ -388,10 +443,13 @@ pub fn Chart(
         let measured_width = width.get();
         let ty = effective.get();
         let frame = match outcome.get() {
+            // A single metric names the value axis; several share it with
+            // no one quantity to name.
             Outcome::Lines(set) => Some((
                 lines_data(&set),
                 set.series.iter().map(|(label, _)| label.clone()).collect(),
                 None,
+                set.metric.as_deref().map(axis_label),
                 set.xs.len(),
                 set.series.len(),
             )),
@@ -399,12 +457,13 @@ pub fn Chart(
                 groups_data(&points),
                 vec![metric],
                 Some(points.labels.clone()),
+                None,
                 points.labels.len(),
                 1,
             )),
             Outcome::Note(_) | Outcome::Refused(_) => None,
         };
-        let Some((data, labels, x_labels, points, series)) = frame else {
+        let Some((data, labels, x_labels, y_label, points, series)) = frame else {
             handle.update_value(|slot| {
                 if let Some(h) = slot.take() {
                     h.destroy();
@@ -418,7 +477,12 @@ pub fn Chart(
             return;
         }
         let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
-        let opts_key: MountedOpts = (labels.clone(), x_labels.clone(), ty.as_str());
+        let opts_key: MountedOpts = (
+            labels.clone(),
+            x_labels.clone(),
+            y_label.clone(),
+            ty.as_str(),
+        );
 
         handle.update_value(|slot| {
             if mounted.get_value().as_ref() != Some(&opts_key) {
@@ -439,7 +503,7 @@ pub fn Chart(
                     width: measured_width,
                     height: 320.0,
                     series: &labels,
-                    y_label: None,
+                    y_label: y_label.as_deref(),
                     kind: ty.as_kind(),
                     utc: x_labels.is_none(),
                     x_labels: x_labels.as_deref(),
@@ -466,7 +530,22 @@ pub fn Chart(
 
     view! {
         <div class="visualization">
-            <ChartTypePicker selected=chart_type default=default_type fits=fits/>
+            // The picker carries why a type is disabled in plain sight,
+            // not only in hover text. A refusal already says why the
+            // chart is empty, so the line steps aside for it.
+            <div class="chart-types-row">
+                <ChartTypePicker selected=chart_type default=default_type fits=fits/>
+                {move || (!matches!(outcome.get(), Outcome::Refused(_)))
+                    .then(|| disabled_reasons(&fits.get()))
+                    .filter(|reasons| !reasons.is_empty())
+                    .map(|reasons| view! {
+                        <span class="chart-types-why">
+                            {reasons.into_iter().enumerate().map(|(idx, reason)| view! {
+                                {(idx > 0).then_some(" ")}{reason.view()}
+                            }).collect_view()}
+                        </span>
+                    })}
+            </div>
             // A failure is an alert, a waiting-for-data note is a
             // status: the live stream's error must announce itself here
             // the way it does over the raw table.
@@ -494,16 +573,46 @@ pub fn Chart(
                 data-series=move || drawn.get().map(|(_, series, _)| series.to_string())
                 data-chart-type=move || drawn.get().map(|(_, _, kind)| kind)
             ></div>
-            {move || caption_line.get().map(|text| view! {
-                <p class="chart-caption" role="status">{text}</p>
-                <button type="button" class="btn-lnk" on:click=move |_| on_events.run(())>"Open Events"</button>
+            // The caption's field and series names render in mono, apart
+            // from its prose: "Narrow `service`" names a field, not a task.
+            {move || caption_line.get().map(|Caption(parts)| view! {
+                <div class="chart-caption-row">
+                    <p class="chart-caption" role="status">
+                        {parts.into_iter().map(|part| match part {
+                            CaptionPart::Text(text) => text.into_any(),
+                            CaptionPart::Field(name) | CaptionPart::Value(name) => {
+                                view! { <code class="mono">{name}</code> }.into_any()
+                            }
+                        }).collect_view()}
+                    </p>
+                    // A line caption leaves the Events destination to
+                    // this label, so the note below need not repeat it.
+                    <button type="button" class="btn-lnk" on:click=move |_| on_events.run(())>
+                        {move || if matches!(outcome.get(), Outcome::Lines(_)) {
+                            "Open Events for exact times and values"
+                        } else {
+                            "Open Events"
+                        }}
+                    </button>
+                </div>
             })}
             // Every drawn chart carries a note, because a canvas is not
-            // a text representation of itself.
+            // a text representation of itself. A line note leads with the
+            // bucket width, which the axis ticks do not show. Under a
+            // caption, it drops the cap and the Events route the caption
+            // row already states.
             {move || match outcome.get() {
-                Outcome::Lines(_) => Some(
-                    "Metrics over time on a UTC axis, up to six series. Gaps mean no value was returned. Open Events for exact times and values.".to_owned()
-                ),
+                Outcome::Lines(set) => Some(if caption_line.get().is_some() {
+                    format!(
+                        "{} Metrics over time on a UTC axis. Gaps mean no value was returned.",
+                        bucket_sentence(set.span)
+                    )
+                } else {
+                    format!(
+                        "{} Metrics over time on a UTC axis, up to six series. Gaps mean no value was returned. Open Events for exact times and values.",
+                        bucket_sentence(set.span)
+                    )
+                }),
                 Outcome::Groups { points, metric, group } => Some(
                     groups_note(effective.get(), &metric, &group, points.labels.len())
                 ),

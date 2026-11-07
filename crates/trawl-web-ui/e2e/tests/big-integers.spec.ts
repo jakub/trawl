@@ -62,8 +62,10 @@ test('the grid prints every digit and sorts the column as numbers', async ({ pag
 
   // Wire order, every digit.
   expect(await bytesCells(page)).toEqual([U64_MAX, ABOVE_2_53, 'NULL', TWO_63, NEGATIVE, I64_MAX]);
-  // The `_time` column is `timestamp`-typed, so it prints its short form.
-  await expect(page.locator(SEL.resultsRow).first()).toContainText('2026-09-01 10:00:00');
+  // The `_time` column is `timestamp`-typed, so it prints its short form:
+  // every row is on one date, which the header states once.
+  await expect(page.locator(`${SEL.resultsRow} > td:nth-child(2)`).first()).toHaveText('10:00:00.000');
+  await expect(page.locator('.results-table thead th.sortable').first()).toHaveText(/^_time UTC 2026-09-01/);
 
   const sort = page.getByRole('button', { name: nameFrom(COPY.resultsSortName, 'bytes'), exact: true });
   await sort.click();
@@ -147,7 +149,7 @@ test('a timechart of big counts draws a line and keeps its exact table', async (
   const table = page.locator(SEL.exactTable);
   await expect(table.locator('tbody tr')).toHaveCount(4);
   expect(await table.locator('tbody tr > td:nth-child(1)').allTextContents()).toEqual([
-    '2026-09-01 00:00:00', '2026-09-01 01:00:00', '2026-09-01 02:00:00', '2026-09-01 03:00:00',
+    '2026-09-01 00:00:00.000', '2026-09-01 01:00:00.000', '2026-09-01 02:00:00.000', '2026-09-01 03:00:00.000',
   ]);
   expect(await table.locator('tbody tr > td:nth-child(2)').allTextContents())
     .toEqual([ABOVE_2_53, I64_MAX, TWO_63, U64_MAX]);

@@ -135,6 +135,6 @@ test.describe('recovering notice', () => {
 
     await expect(page.locator(SEL.loadHintError)).toHaveText(/Couldn't load results: service unavailable/);
     await expect(notice(page)).toHaveCount(0);
-    await expect(page.locator(SEL.statusLabel)).toHaveText('Error');
+    await expect(page.locator(SEL.statusLabel)).toHaveText('Search failed');
   });
 });

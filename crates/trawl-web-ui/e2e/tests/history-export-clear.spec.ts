@@ -101,7 +101,7 @@ for (const [suffix, offset, count] of [['', 0, 50], ['?hq=match&hpage=2', 100, 2
     await button.evaluate((element: HTMLButtonElement) => { element.click(); element.click(); });
     await expect.poll(async () => (await state(request)).deletes).toBe(1);
     await expect(input(page)).toBeDisabled();
-    await expect(page.getByRole('button', { name: 'Search', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Filter', exact: true })).toBeDisabled();
     await expect(page.getByRole('button', { name: 'Clear filter', exact: true })).toBeDisabled();
     await expect(clearButton(page)).toBeDisabled();
     await expect(exportButton(page)).toBeDisabled();

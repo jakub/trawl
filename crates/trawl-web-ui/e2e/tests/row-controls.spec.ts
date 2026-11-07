@@ -89,7 +89,7 @@ test('nets row: Delete Net opens confirmation without the drawer', async ({ page
   await resetScenario(request, 'corpus');
   await page.goto('/jobs/nets');
 
-  const trigger = page.locator(SEL.netAction).filter({ hasText: '×' });
+  const trigger = page.locator(SEL.netAction).filter({ hasText: 'Delete' });
   await expect(trigger).toHaveCount(1);
   await countClicksOn(page, SEL.tableRow);
 
@@ -327,14 +327,16 @@ test('schema quick actions: Tab reveals and Enter searches', async ({ page, requ
   await expect(search).toHaveAccessibleName(nameFrom(COPY.schemaSearchName, CORPUS.service));
 
   // Hidden at rest, revealed by the row's own :focus-within — which is
-  // what makes Tab able to reach it at all.
-  await expect(row.locator('.row-act')).toHaveCSS('opacity', '0');
+  // what makes Tab able to reach it at all. The buttons fade, not their
+  // cell, so the row's divider still runs under the action column.
+  await expect(search).toHaveCSS('opacity', '0');
+  await expect(row.locator('.row-act')).toHaveCSS('opacity', '1');
   await row.locator(SEL.rowStretch).focus();
   await page.keyboard.press('Tab');
   await expectFocusRing(search);
   // Retried, not read once: the reveal is a 100ms opacity transition, so
   // an immediate read catches it part way there.
-  await expect(row.locator('.row-act')).toHaveCSS('opacity', '1');
+  await expect(search).toHaveCSS('opacity', '1');
 
   await page.keyboard.press('Enter');
   // A command, not a place: it goes through the navigator, which builds

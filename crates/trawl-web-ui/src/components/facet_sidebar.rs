@@ -30,13 +30,30 @@
 //! rail is closed, and the header row (chevron, "Filters", the active
 //! count) when it is open, with "Clear all" beside it once a filter is
 //! set. Below the header sit a filter input and the per-field
-//! collapsible groups, with proportional value bars and include/exclude
+//! collapsible groups, with value bars on one scale and include/exclude
 //! actions the row reveals on hover or focus (opacity, never
 //! `display: none`, so the buttons keep their place in the tab order —
 //! ADR-0029). Pressing `+` / `⊘` on a value adds an include / exclude
 //! `Filter` to the shared filters signal; the parent owns state and
 //! re-runs the query via URL navigation. An open rail with nothing to
 //! count shows one hint in place of the input and the groups.
+//!
+//! Every value bar measures its count against the shown rows, the rows
+//! the counts come from, so equal lengths are equal shares in every
+//! group; the scope caption names that row count. A value too rare to
+//! draw keeps a 2px stub.
+//!
+//! A group lists at most [`FACET_TOP_N`] values, while its heading
+//! counts every distinct value on the page. When any field holds more
+//! values than it lists, a second caption line says where lists stop,
+//! and each group's more control names the values it reveals as listed
+//! ones, so neither reads as access to every distinct value.
+//!
+//! A value label wraps to at most three lines, so long values that share
+//! a prefix stay apart. A `_severity` value shows its name, as the
+//! results table does (`17` reads `error`), and filters by its number.
+//! Its group lists the levels most severe first, and error and warn
+//! names take the table's red and amber as text ink.
 
 use std::collections::HashMap;
 
@@ -49,7 +66,8 @@ use leptos_use::{
 use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 
-use crate::facets::RailPage;
+use crate::facets::{FACET_TOP_N, RailPage};
+use crate::severity_cell::{order_severity_facet, severity_facet_ink, severity_facet_name};
 use crate::state::filter_rail::FilterRailChoice;
 use crate::state::query::{Filter, FilterOp};
 
@@ -58,7 +76,8 @@ use crate::state::query::{Filter, FilterOp};
 pub fn FacetSidebar(
     /// The rows on screen, from whichever source the page's mode makes
     /// active: the snapshot page, or the live ring. Read here for its
-    /// loading and error states only; the groups come from `page`.
+    /// loading and error states and its row count, the bars' scale; the
+    /// groups come from `page`.
     #[prop(into)]
     state: Signal<LoadState<QueryResult>>,
     /// Current filters — read to paint selected/excluded value rows.
@@ -95,7 +114,7 @@ pub fn FacetSidebar(
     let collapsed: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
     // Free-text filter applied across value names within a group.
     let needle = RwSignal::new(String::new());
-    // Per-field expansion (show top 5 vs all matching values).
+    // Per-field expansion (show top 5 vs all matching listed values).
     let expanded: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
 
     // Keep one facet tree mounted across both layouts. Filters themselves
@@ -312,22 +331,72 @@ pub fn FacetSidebar(
                 error=Box::new(|_| view! { <p class="facets-hint">"—"</p> }.into_any())
                 // The groups were counted once, with the page's verdict;
                 // this only applies the value search to them.
-                render=Box::new(move |_: QueryResult| {
+                render=Box::new(move |result: QueryResult| {
                     let Some(RailPage::Countable(facets)) = page.get() else {
                         return ().into_any();
                     };
+                    // One scale for every bar: the rows the counts come
+                    // from, never the capped value list, and taken before
+                    // the value search so typing does not rescale them.
+                    let rows = result.row_count();
+                    let scale = f64::from(u32::try_from(rows).unwrap_or(u32::MAX).max(1));
                     let q = needle.get().to_lowercase();
                     let active = filters.get();
-                    facets.into_iter().map(|(field, values)| {
-                        let max = values.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1);
-                        let total = values.len();
-                        let filtered: Vec<_> = if q.is_empty() {
+                    // Both kinds of count describe the rows on screen,
+                    // not the whole corpus; the caption says so once, with
+                    // the bars' scale.
+                    let scope_text = if rows == 1 {
+                        "Bar = share of 1 shown row".to_owned()
+                    } else {
+                        format!("Bar = share of {rows} shown rows")
+                    };
+                    // Taken before the value search: a search narrows
+                    // what a group shows, not what the page lists.
+                    let capped = facets
+                        .iter()
+                        .any(|(_, values, distinct)| *distinct > values.len());
+                    let scope = view! {
+                        <p class="facets-scope">{scope_text}</p>
+                        {capped.then(|| view! {
+                            <p class="facets-scope">
+                                {format!("Lists show up to {FACET_TOP_N} values per field")}
+                            </p>
+                        })}
+                    };
+                    let groups = facets.into_iter().map(|(field, values, distinct)| {
+                        // A severity field's values show as names, the
+                        // way the results table shows them. Only the
+                        // label changes: the title, the selection match,
+                        // the filter a click builds and the count all
+                        // keep the raw value. The rail counts input
+                        // fields only, so `_severity` is the one field
+                        // that qualifies; no `sev()` output reaches it.
+                        let severity = trawl_core::severity::renders_as_severity(&field, &[]);
+                        let label = move |v: &str| {
+                            severity
+                                .then(|| severity_facet_name(v))
+                                .flatten()
+                                .map_or_else(|| v.to_owned(), str::to_owned)
+                        };
+                        // The value search matches what the row shows as
+                        // well as the raw value, so `error` finds `17`.
+                        let mut filtered: Vec<_> = if q.is_empty() {
                             values
                         } else {
                             values.into_iter()
-                                .filter(|(v, _)| v.to_lowercase().contains(&q))
+                                .filter(|(v, _)| {
+                                    v.to_lowercase().contains(&q)
+                                        || label(v).to_lowercase().contains(&q)
+                                })
                                 .collect()
                         };
+                        // A severity field lists its levels as a scale,
+                        // most severe first, so `error` leads the group
+                        // the way it would lead a triage. The values were
+                        // already counted and capped by count.
+                        if severity {
+                            order_severity_facet(&mut filtered);
+                        }
                         let show_all = expanded.get().get(&field).copied().unwrap_or(false);
                         let visible: Vec<_> = if show_all {
                             filtered.clone()
@@ -338,13 +407,23 @@ pub fn FacetSidebar(
                         let is_collapsed = collapsed.get().get(&field).copied().unwrap_or(false);
                         let field_for_toggle = field.clone();
                         let field_for_more = field.clone();
-                        let more_label = format!("Show {extra} more values for {field}");
+                        let noun = if extra == 1 { "value" } else { "values" };
+                        let more_text = format!("Show {extra} more listed {noun}");
+                        let more_label = format!("Show {extra} more listed {noun} for {field}");
+                        // The heading counts the field's distinct values
+                        // on the page, past the listed top values; a value
+                        // row's count is rows. The words keep them apart.
+                        let count = if distinct == 1 {
+                            "1 value".to_owned()
+                        } else {
+                            format!("{distinct} values")
+                        };
                         // The count is a span INSIDE the button, and a
                         // name is the concatenation of what the button
-                        // contains: `_time` beside `8` read as `_time8`.
-                        // Naming the button explicitly puts the two back
-                        // in words; the visible markup is unchanged.
-                        let group_label = format!("{field}, {total} values");
+                        // contains: `_time` beside `8 values` read as
+                        // `_time8 values`. Naming the button explicitly
+                        // puts a comma between the two.
+                        let group_label = format!("{field}, {count}");
                         let active = active.clone();
                         view! {
                             <div class="g" class:collapsed=move || is_collapsed>
@@ -358,14 +437,19 @@ pub fn FacetSidebar(
                                         c.insert(field_for_toggle.clone(), !cur);
                                     })
                                 >
-                                    <span class="chev" aria-hidden="true"><IconView icon=Icon::Chevron size=10 stroke_width=1.5/></span>
+                                    <span class="chev" aria-hidden="true"><IconView icon=Icon::Chevron size=12 stroke_width=1.75/></span>
                                     <span class="name">{field.clone()}</span>
-                                    <span class="cnt">{total}</span>
+                                    <span class="cnt">{count}</span>
                                 </button>
                                 <div class="vals">
                                     {visible.into_iter().map(|(v, c)| {
-                                        let pct = (f64::from(c) / f64::from(max)) * 100.0;
+                                        let share = (f64::from(c) / scale).min(1.0);
                                         let title = v.clone();
+                                        let shown = label(&v);
+                                        // The table's level hue, as text
+                                        // ink: red for error and fatal,
+                                        // amber for warn, plain otherwise.
+                                        let ink = severity.then(|| severity_facet_ink(&v)).flatten();
                                         let state = match_filter_state(&active, &field, &v);
                                         let field_for_inc = field.clone();
                                         let field_for_exc = field.clone();
@@ -381,9 +465,17 @@ pub fn FacetSidebar(
                                             >
                                                 <div
                                                     class="bar"
-                                                    style=format!("width: {pct:.1}%")
+                                                    // The 2px floor in the
+                                                    // stylesheet keeps a rare
+                                                    // value's bar visible.
+                                                    style=format!("--share: {share:.3}")
                                                 ></div>
-                                                <span class="n" title=title>{v}</span>
+                                                <span
+                                                    class="n"
+                                                    class:lvl-ink-error={ink == Some("error")}
+                                                    class:lvl-ink-warn={ink == Some("warn")}
+                                                    title=title
+                                                >{shown}</span>
                                                 <span class="c">{c}</span>
                                                 <span class="act">
                                                     <button
@@ -433,13 +525,14 @@ pub fn FacetSidebar(
                                                 e.insert(field_for_more.clone(), true);
                                             })
                                         >
-                                            {format!("+ {extra} more")}
+                                            {more_text}
                                         </button>
                                     })}
                                 </div>
                             </div>
                         }
-                    }).collect::<Vec<_>>().into_any()
+                    }).collect::<Vec<_>>();
+                    (scope, groups).into_any()
                 })
             />
             </Show>

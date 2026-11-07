@@ -36,15 +36,15 @@ use crate::context_query::SearchNavigation;
 use crate::context_query::{build_context_query, escape_dq, find_col};
 use crate::result_actions::{Capabilities, compare};
 use crate::results_layout::{
-    MessageFirst, cell_text, inspector_selection, message_first, null_fields_label,
-    partition_detail_fields,
+    MessageFirst, SharedDate, cell_text, inspector_selection, message_first, null_fields_label,
+    partition_detail_fields, shared_date, zone_unit,
 };
 use crate::state::query::{Filter, FilterOp};
 use crate::state::search_session::{ExecutedFailure, ExecutedQuery, ExecutedResponse};
 use fleet_ui::overlay::has_layers;
 use fleet_ui::{
-    Btn, CopyButton, Details, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, Rows,
-    ToastBus, ToastKind, Variant,
+    Btn, CopyButton, Details, Drawer, Icon, IconView, LoadState, Loaded, OffsetPager, PageTotal,
+    PageWindow, Rows, ToastBus, ToastKind, Variant,
 };
 use leptos::prelude::*;
 use leptos::web_sys;
@@ -298,6 +298,7 @@ fn InspectorPanel(
                     // the reading is shortened.
                     let value_text = value_to_string(v);
                     let shown = cell_text(types.get(i), v);
+                    let unit = zone_unit(types.get(i));
                     let copy_text = value_text.clone();
                     let allowed = capabilities.detail_filter(name, v);
                     let inc = Filter {
@@ -315,7 +316,10 @@ fn InspectorPanel(
                     let query_for_inc = executed_query.clone();
                     let query_for_exc = executed_query.clone();
                     view! {
-                        <span class="k">{key}</span>
+                        <span class="k">
+                            {key}
+                            {unit.map(|u| view! { <span class="zone-unit" aria-hidden="true">" "{u}</span> })}
+                        </span>
                         <span class="v">{shown}</span>
                         <span class="kv-act">
                             // The visible word says what the press does;
@@ -435,10 +439,32 @@ fn ResultsTableBody(
     let types: Vec<ColumnType> = resp.result.columns.iter().map(|c| c.ty.clone()).collect();
     let rows_data = resp.result.rows.clone();
     let returned = resp.pagination.returned;
+    // A first page with no rows quotes the exact query the server ran,
+    // range and rail filters included, then gives the next step on its
+    // own line. A later empty page keeps the one-line notice.
     let empty_message = if resp.pagination.offset == 0 {
-        "No events match this query. Check the time range and filters."
+        let ran = executed_query.effective.clone();
+        view! {
+            <span class="results-empty-msg">
+                <span class="results-empty-outcome">
+                    "No events match "<code class="mono">{ran}</code>"."
+                </span>
+                // Keeps the two sentences apart in the cell's text; the
+                // blocks already part them on screen.
+                " "
+                <span class="results-empty-next">
+                    "Widen the time range or remove a filter, then Haul again."
+                </span>
+            </span>
+        }
+        .into_any()
     } else {
-        "No events on this page. Try the previous page or check the time range and filters."
+        view! {
+            <span class="results-empty-msg">
+                "No events on this page. Try the previous page or check the time range and filters."
+            </span>
+        }
+        .into_any()
     };
 
     // Cells render as severity tokens for `_severity` plus the columns the
@@ -461,19 +487,36 @@ fn ResultsTableBody(
         }
     });
 
+    // The compact table states the page's one `_time` date in the header
+    // and prints each cell's clock. Read from this response's rows, so a
+    // page turn recomputes it and a sort leaves it alone.
+    let shared = shared_date(&columns, &types, &rows_data);
+    let compact_date = Memo::new(move |_| layout.get().is_none().then(|| shared.clone()).flatten());
+
     let cols_for_header = columns.clone();
+    let units: Vec<Option<&'static str>> = (0..columns.len())
+        .map(|i| zone_unit(types.get(i)))
+        .collect();
     let cols_for_view = columns.clone();
     // One header cell, by original column index. A closure rather than a
     // pre-built Vec because the message-first layout renders three of
     // these and the compact layout renders all of them, and both need
     // the same `th-sort` markup and the same sort state.
-    let sort_header = move |i: usize, name: String| {
-        // The visible text is the column, so the name says what the
-        // press DOES and keeps that word inside it (WCAG 2.5.3). The
-        // direction stays on the cell's `aria-sort` rather than joining
-        // the name: on a real table it is announced once already, and
-        // repeating it here would read twice.
-        let sort_label = format!("Sort by {name}");
+    let sort_header = move |i: usize,
+                            name: String,
+                            unit: Option<&'static str>,
+                            date: Option<String>| {
+        // The visible text is the column and, for a timestamp, its clock
+        // and any shared date, so the name says what the press DOES and
+        // keeps those words inside it (WCAG 2.5.3). The direction stays on
+        // the cell's `aria-sort` rather than joining the name: on a real
+        // table it is announced once already, and repeating it here would
+        // read twice.
+        let sort_label = std::iter::once(format!("Sort by {name}"))
+            .chain(unit.map(str::to_owned))
+            .chain(date.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
         view! {
             // A real `<table>`, so direction is announced by `aria-sort`
             // on the sorted `<th>` alone (ADR-0029) and the glyph is
@@ -499,6 +542,11 @@ fn ResultsTableBody(
                     })
                 >
                     <span>{name}</span>
+                    // Display only: the column's identity stays the bare
+                    // field name. The space is text, not margin, so the
+                    // visible label reads "_time UTC" as the name does.
+                    {unit.map(|u| view! { <span class="zone-unit">" "{u}</span> })}
+                    {date.map(|d| view! { <span class="th-date">" "{d}</span> })}
                     <span class="sort" aria-hidden="true">{move || {
                         sort.get().filter(|s| s.col == i).map_or("·", |s| if s.asc { "▲" } else { "▼" })
                     }}</span>
@@ -506,17 +554,24 @@ fn ResultsTableBody(
             </th>
         }
     };
-    let header_cells = move || match layout.get() {
-        Some(mf) => mf
-            .header_indices()
-            .into_iter()
-            .map(|i| sort_header(i, cols_for_header[i].clone()))
-            .collect::<Vec<_>>(),
-        None => cols_for_header
-            .iter()
-            .enumerate()
-            .map(|(i, name)| sort_header(i, name.clone()))
-            .collect::<Vec<_>>(),
+    let header_cells = move || {
+        // `None` under message-first, so only the compact header dates.
+        let shared = compact_date.get();
+        let header = |i: usize| {
+            let date = shared
+                .as_ref()
+                .filter(|s| s.col == i)
+                .map(|s| s.date.clone());
+            sort_header(i, cols_for_header[i].clone(), units[i], date)
+        };
+        match layout.get() {
+            Some(mf) => mf
+                .header_indices()
+                .into_iter()
+                .map(header)
+                .collect::<Vec<_>>(),
+            None => (0..cols_for_header.len()).map(header).collect::<Vec<_>>(),
+        }
     };
 
     let has_rows = !rows_data.is_empty();
@@ -551,6 +606,7 @@ fn ResultsTableBody(
         bus,
         details,
         layout,
+        compact_date,
         span,
         selected,
         generation,
@@ -683,6 +739,8 @@ struct RowWiring {
     details: Signal<Details>,
     /// The message-first plan in force, or `None` for the compact table.
     layout: Memo<Option<MessageFirst>>,
+    /// The `_time` date the compact table states in its header, if any.
+    compact_date: Memo<Option<SharedDate>>,
     /// Cells per row including the expander column, for the detail
     /// row's `colspan`.
     span: Memo<usize>,
@@ -711,6 +769,7 @@ fn RowFragment(
         bus,
         details,
         layout,
+        compact_date,
         span,
         selected,
         generation,
@@ -735,9 +794,15 @@ fn RowFragment(
     let cells_row = row.clone();
     let cells_cols = columns.clone();
     let cells_types = types.clone();
+    let detail_severity_cols = severity_cols.clone();
     let cells = move || match layout.get() {
         Some(mf) => message_first_cells(&cells_row, &cells_cols, &cells_types, &mf),
-        None => compact_cells(&cells_row, &cells_types, &severity_cols),
+        None => compact_cells(
+            &cells_row,
+            &cells_types,
+            &severity_cols,
+            compact_date.get().as_ref(),
+        ),
     };
 
     let columns_for_detail = columns.clone();
@@ -784,8 +849,8 @@ fn RowFragment(
                             }
                         }
                     >
-                        <span aria-hidden="true">
-                            {move || if is_open() { "▾" } else { "▸" }}
+                        <span class="row-chev" aria-hidden="true">
+                            <IconView icon=Icon::Chevron size=12 stroke_width=1.75/>
                         </span>
                     </button>
                     // Under 900px the inspector stacks below the table, so
@@ -816,12 +881,19 @@ fn RowFragment(
                             let detail_fields = detail_fields.clone();
                             let executed_query = executed_query.clone();
                             let capabilities = capabilities.clone();
+                            let severity_cols = detail_severity_cols.clone();
                             move || detail_fields.visible(show_nulls.get()).into_iter().map(|i| {
                                 let (name, v) = (&columns_for_detail[i], &row_for_detail[i]);
                                 let key = name.clone();
                                 // The filter keeps the wire text; only the
-                                // reading is shortened.
-                                let value_text = cell_text(types_for_detail.get(i), v);
+                                // reading is shortened, and a severity
+                                // column reads by name, as its row cell does.
+                                let value_text = if severity_cols.contains(&i) {
+                                    severity_display(v)
+                                } else {
+                                    cell_text(types_for_detail.get(i), v)
+                                };
+                                let unit = zone_unit(types_for_detail.get(i));
                                 let field_for_click = name.clone();
                                 let value_for_click = value_to_string(v);
                                 let field_for_label = name.clone();
@@ -829,7 +901,10 @@ fn RowFragment(
                                 let allowed = capabilities.detail_filter(name, v);
                                 let query_for_click = executed_query.clone();
                                 view! {
-                                    <span class="k">{key}</span>
+                                    <span class="k">
+                                        {key}
+                                        {unit.map(|u| view! { <span class="zone-unit" aria-hidden="true">" "{u}</span> })}
+                                    </span>
                                     <span class="v">
                                         {if allowed { view! { <button
                                             type="button"
@@ -937,8 +1012,14 @@ fn FindSimilarButton(
     }
 }
 
-/// The compact layout's cells: one per column, in wire order.
-fn compact_cells(row: &[Value], types: &[ColumnType], severity_cols: &[usize]) -> Vec<AnyView> {
+/// The compact layout's cells: one per column, in wire order. With a
+/// shared date, the `_time` cell prints only its clock.
+fn compact_cells(
+    row: &[Value],
+    types: &[ColumnType],
+    severity_cols: &[usize],
+    shared: Option<&SharedDate>,
+) -> Vec<AnyView> {
     row.iter()
         .enumerate()
         .map(|(ci, v)| {
@@ -949,7 +1030,12 @@ fn compact_cells(row: &[Value], types: &[ColumnType], severity_cols: &[usize]) -
                 let cls = severity_class(v);
                 view! { <td><span class=cls>{s}</span></td> }.into_any()
             } else {
-                view! { <td>{cell_text(types.get(ci), v)}</td> }.into_any()
+                let shown = cell_text(types.get(ci), v);
+                let shown = match shared {
+                    Some(s) if s.col == ci => s.clock(&shown),
+                    _ => shown,
+                };
+                view! { <td>{shown}</td> }.into_any()
             }
         })
         .collect()

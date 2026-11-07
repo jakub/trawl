@@ -3,8 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Writes from the investigation board (ADR-0059, #311): Keep on a row of
-// the evidence viewer, with a reason, and Close or Reopen beside the
-// status. `investigations-writer` signs in a session that holds
+// the evidence viewer, with a reason, and Close or Reopen at the end of
+// the status line. `investigations-writer` signs in a session that holds
 // `investigation_write` beside both read grants; the stub records every
 // write's body and applies it in trawld's order (harness/server.mjs):
 // a closed investigation takes nothing but a reopen, then a PATCH whose
@@ -130,7 +130,7 @@ test('a stale close shows the conflict, reads the board again, and the person cl
 
   // The agent writes while the board still holds sequence 9.
   await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'note', text: 'Pool back to 64 on gw-2.' } }]);
-  await main.getByRole('button', { name: 'Close the investigation' }).click();
+  await main.getByRole('button', { name: 'Close investigation' }).click();
   const note = main.locator('.inv-write-note [role="status"]');
   await expect(note).toHaveText(
     'The investigation changed before your close reached it, so nothing changed. The board has read it again: check its status and act again if you still mean to.',
@@ -148,10 +148,10 @@ test('a stale close shows the conflict, reads the board again, and the person cl
   expect(await writes(request)).toHaveLength(1);
 
   // The person acts again, on the sequence the board now holds.
-  await main.getByRole('button', { name: 'Close the investigation' }).click();
+  await main.getByRole('button', { name: 'Close investigation' }).click();
   await expect(note).toHaveText('You closed the investigation.');
   await expect(status(main)).toHaveText('Closed');
-  await expect(main.getByRole('button', { name: 'Reopen the investigation' })).toBeVisible();
+  await expect(main.getByRole('button', { name: 'Reopen investigation' })).toBeVisible();
   await expect(activity).toHaveCount(8);
   await expect(activity.nth(7)).toContainText('Closed the investigation.');
   await expect(activity.nth(7)).toContainText('jakub');
@@ -165,14 +165,14 @@ test('a close that finds the investigation already closed shows the conflict and
   const main = await openBoard(page);
   // Someone else closed it after the board read.
   await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'status', status: 'closed' } }]);
-  await main.getByRole('button', { name: 'Close the investigation' }).click();
+  await main.getByRole('button', { name: 'Close investigation' }).click();
   await expect(main.locator('.inv-write-note [role="status"]')).toHaveText(
     'The investigation was already closed when your close reached it, so nothing changed. The board has read it again.',
   );
   await expect(status(main)).toHaveText('Closed');
   // The control is now the one that applies.
-  await expect(main.getByRole('button', { name: 'Reopen the investigation' })).toBeVisible();
-  await expect(main.getByRole('button', { name: 'Close the investigation' })).toHaveCount(0);
+  await expect(main.getByRole('button', { name: 'Reopen investigation' })).toBeVisible();
+  await expect(main.getByRole('button', { name: 'Close investigation' })).toHaveCount(0);
   expect(await writes(request)).toEqual([
     { method: 'PATCH', id: ID, body: { expected_seq: 9, status: 'closed' } },
   ]);
@@ -186,7 +186,7 @@ test('a conflict notice says the board is reading the investigation again until 
   await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'status', status: 'closed' } }]);
   // The read after the conflict is held on its way back.
   const letThrough = await holdNextRead(page);
-  await main.getByRole('button', { name: 'Close the investigation' }).click();
+  await main.getByRole('button', { name: 'Close investigation' }).click();
   const note = main.locator('.inv-write-note [role="status"]');
   await expect(note).toHaveText(
     'The investigation was already closed when your close reached it, so nothing changed. The board is reading it again.',
@@ -203,7 +203,7 @@ test('a conflict notice says the board is reading the investigation again until 
     'The investigation was already closed when your close reached it, so nothing changed. The board has read it again.',
   );
   await expect(status(main)).toHaveText('Closed');
-  await expect(main.getByRole('button', { name: 'Reopen the investigation' })).toBeVisible();
+  await expect(main.getByRole('button', { name: 'Reopen investigation' })).toBeVisible();
   expect(await writes(request)).toHaveLength(1);
 });
 
@@ -215,12 +215,12 @@ test('a stale reopen shows the conflict and leaves the board open, as someone el
   await expect(status(main)).toHaveText('Closed');
   await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'status', status: 'open' } }]);
 
-  await main.getByRole('button', { name: 'Reopen the investigation' }).click();
+  await main.getByRole('button', { name: 'Reopen investigation' }).click();
   await expect(main.locator('.inv-write-note [role="status"]')).toHaveText(
     'The investigation changed before your reopen reached it, so nothing changed. The board has read it again: check its status and act again if you still mean to.',
   );
   await expect(status(main)).toHaveText('Open');
-  await expect(main.getByRole('button', { name: 'Close the investigation' })).toBeVisible();
+  await expect(main.getByRole('button', { name: 'Close investigation' })).toBeVisible();
   expect(await writes(request)).toEqual([
     { method: 'PATCH', id: ID, body: { expected_seq: 10, status: 'open' } },
   ]);
@@ -316,7 +316,7 @@ test('a close whose answer is lost reads as unknown and holds the control until 
   await freezeClock(page);
   const main = await openBoard(page);
   expect((await request.post('/__ctl/investigation/drop-write')).ok()).toBe(true);
-  const close = main.getByRole('button', { name: 'Close the investigation' });
+  const close = main.getByRole('button', { name: 'Close investigation' });
   await close.click();
   await expect(main.locator('.inv-write-note [role="status"]')).toHaveText(
     "The answer to your close was lost, so it may or may not have taken effect. Refresh to see the investigation's status before you act again.",
@@ -327,7 +327,7 @@ test('a close whose answer is lost reads as unknown and holds the control until 
 
   await main.getByRole('button', { name: 'Refresh the board' }).click();
   await expect(status(main)).toHaveText('Closed');
-  await expect(main.getByRole('button', { name: 'Reopen the investigation' })).toBeEnabled();
+  await expect(main.getByRole('button', { name: 'Reopen investigation' })).toBeEnabled();
   expect(await writes(request)).toHaveLength(1);
 });
 
@@ -336,7 +336,7 @@ test('a close the server committed and then answered with an internal error read
   await freezeClock(page);
   const main = await openBoard(page);
   expect((await request.post('/__ctl/investigation/drop-write', { data: { status: 500, code: 'internal_error' } })).ok()).toBe(true);
-  const close = main.getByRole('button', { name: 'Close the investigation' });
+  const close = main.getByRole('button', { name: 'Close investigation' });
   await close.click();
   await expect(main.locator('.inv-write-note [role="status"]')).toHaveText(
     "The answer to your close was lost, so it may or may not have taken effect. Refresh to see the investigation's status before you act again.",
@@ -484,7 +484,7 @@ test.describe('a write that lands after its page or viewer is gone ends quietly'
     await freezeClock(page);
     const main = await openBoard(page);
     expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
-    await main.getByRole('button', { name: 'Close the investigation' }).click();
+    await main.getByRole('button', { name: 'Close investigation' }).click();
     await heldWrite(request);
     await main.getByRole('link', { name: 'Investigations' }).click();
     await expect(page.getByRole('heading', { level: 1, name: 'Investigations' })).toBeVisible();
@@ -545,7 +545,7 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     const main = await openBoard(page);
     await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
     expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
-    await main.getByRole('button', { name: 'Close the investigation' }).click();
+    await main.getByRole('button', { name: 'Close investigation' }).click();
     await heldWrite(request);
     await setHidden(page, true);
     await expect(main.locator('.inv-live')).toContainText('Paused');
@@ -562,7 +562,7 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     await expect(activity).toHaveCount(7);
     await expect(activity.nth(6)).toContainText('Closed the investigation.');
     await expect(note).toHaveText('You closed the investigation.');
-    await expect(main.getByRole('button', { name: 'Reopen the investigation' })).toBeEnabled();
+    await expect(main.getByRole('button', { name: 'Reopen investigation' })).toBeEnabled();
     await page.waitForTimeout(300);
     expect(await boardReads(request)).toEqual([0, 9]);
   });
@@ -598,7 +598,7 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     const main = await openBoard(page);
     await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'note', text: 'Pool back to 64 on gw-2.' } }]);
     await setHidden(page, true);
-    await main.getByRole('button', { name: 'Close the investigation' }).click();
+    await main.getByRole('button', { name: 'Close investigation' }).click();
     const note = main.locator('.inv-write-note [role="status"]');
     await expect(note).toHaveText(
       'The investigation changed before your close reached it, so nothing changed. The board reads it again when this tab is shown: check its status and act again if you still mean to.',
@@ -628,7 +628,7 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     const live = main.locator('.inv-live');
     await expect(live).toHaveText('Live checked just now');
     expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
-    await main.getByRole('button', { name: 'Close the investigation' }).click();
+    await main.getByRole('button', { name: 'Close investigation' }).click();
     await heldWrite(request);
     // The next poll answers 429 and asks for thirty seconds.
     await request.post('/__ctl/investigation/fail', { data: { count: 1, status: 429, retryAfter: 30 } });
@@ -682,7 +682,7 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
 
     await setHidden(page, true);
     expect((await request.post('/__ctl/investigation/drop-write')).ok()).toBe(true);
-    const close = main.getByRole('button', { name: 'Close the investigation' });
+    const close = main.getByRole('button', { name: 'Close investigation' });
     await close.click();
     const note = main.locator('.inv-write-note [role="status"]');
     await expect(note).toHaveText(
@@ -701,7 +701,7 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     await setHidden(page, false);
     await expect.poll(() => boardReads(request)).toEqual([0, 9, 9]);
     await expect(status(main)).toHaveText('Closed');
-    await expect(main.getByRole('button', { name: 'Reopen the investigation' })).toBeEnabled();
+    await expect(main.getByRole('button', { name: 'Reopen investigation' })).toBeEnabled();
     await expect(main.getByRole('button', { name: 'Refresh the board' })).toHaveCount(0);
     expect(await writes(request)).toHaveLength(1);
   });
@@ -743,9 +743,9 @@ test.describe('the grant matrix', () => {
     `);
     const viewer = await openViewer(page);
     await expect(viewer.locator('tbody tr').first()).toMatchAriaSnapshot(`
-      - row "0 2026-10-24 09:03:40 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)":
+      - row "0 2026-10-24 09:03:40.000 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)":
         - rowheader "0"
-        - cell "2026-10-24 09:03:40"
+        - cell "2026-10-24 09:03:40.000"
         - cell "gw-2"
         - cell "502"
         - cell "upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)"
@@ -755,7 +755,7 @@ test.describe('the grant matrix', () => {
     expect(await writes(request)).toEqual([]);
   });
 
-  test('a writer has Close beside the status and Keep on a viewer row', async ({ page, request }) => {
+  test('a writer has Close at the end of the status line and Keep on a viewer row', async ({ page, request }) => {
     await as(request, 'investigations-writer');
     await freezeClock(page);
     const main = await openBoard(page);
@@ -765,18 +765,17 @@ test.describe('the grant matrix', () => {
           - /url: /investigations
       - heading "502s on checkout since 09:00" [level=1]
       - paragraph:
-        - text: Open
-        - button "Close the investigation"
-        - text: Opened by claude-agent · updated 2026-10-24 09:41 UTC by claude-agent
+        - text: Open Opened by claude-agent · updated 2026-10-24 09:41 UTC by claude-agent
+        - button "Close investigation"
       - paragraph: Live checked just now
       - status
       - button "Refresh"
     `);
     const viewer = await openViewer(page);
     await expect(viewer.locator('tbody tr').first()).toMatchAriaSnapshot(`
-      - row "0 2026-10-24 09:03:40 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use) Keep row 0":
+      - row "0 2026-10-24 09:03:40.000 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use) Keep row 0":
         - rowheader "0"
-        - cell "2026-10-24 09:03:40"
+        - cell "2026-10-24 09:03:40.000"
         - cell "gw-2"
         - cell "502"
         - cell "upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)"

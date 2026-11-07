@@ -430,7 +430,9 @@ for (const phase of ['login document pending', 'logout response pending'] as con
     });
 
     await page.goto('/jobs/nets?note=explicit-logout#receipt');
-    await expect(page.locator('.nets-table')).toBeVisible();
+    // The table renders before its first read answers. A net row means that
+    // read has finished, so the next 5 s tick is free to poll.
+    await expect(page.locator('.nets-table tbody tr').first()).toBeVisible();
     expire = true;
     await page.clock.fastForward(5001);
     await expect.poll(() => Boolean(releasePoll)).toBe(true);

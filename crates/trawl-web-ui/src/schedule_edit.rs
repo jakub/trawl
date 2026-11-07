@@ -193,8 +193,8 @@ pub fn validate_max_runs(text: &str) -> Result<Option<u64>, ScheduleEditError> {
         .map_err(|_| ScheduleEditError::InvalidMaxRuns)
 }
 
-/// How a net's schedule reads in a list: its cadence and what each run
-/// covers, in one phrase.
+/// How a net's schedule reads in a list: its cadence, then its window
+/// named as one, in one phrase.
 ///
 /// The window half is the wire's own vocabulary said in words — an
 /// absent `window` is query mode, `since_last` is tiling, and anything
@@ -206,9 +206,9 @@ pub fn cadence_sentence(schedule: Option<&ScheduleResponse>) -> String {
         return "No schedule".to_owned();
     };
     let covers = match schedule.window.as_deref() {
-        None => "query text".to_owned(),
+        None => "query window".to_owned(),
         Some("since_last") => "since last run".to_owned(),
-        Some(span) => format!("fixed span {span}"),
+        Some(span) => format!("{span} window"),
     };
     format!("Every {} · {covers}", schedule.interval)
 }
@@ -741,7 +741,7 @@ mod tests {
         assert_eq!(cadence_sentence(None), "No schedule");
         assert_eq!(
             cadence_sentence(Some(&schedule(None, None))),
-            "Every 1h · query text"
+            "Every 1h · query window"
         );
         assert_eq!(
             cadence_sentence(Some(&schedule(Some("since_last"), None))),
@@ -749,7 +749,7 @@ mod tests {
         );
         assert_eq!(
             cadence_sentence(Some(&schedule(Some("15m"), None))),
-            "Every 1h · fixed span 15m"
+            "Every 1h · 15m window"
         );
     }
 

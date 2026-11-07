@@ -141,7 +141,7 @@ test('the viewer pages a captured result by the server page size, from stored ro
   await expect(rows.locator('thead th')).toHaveText(['Row', '_time', 'host', 'status', 'bytes', 'message']);
   expect(await shownRows(rows)).toEqual(expected(0, 3));
   // Typed cells: the timestamp's fraction, the status as an integer.
-  await expect(rows.locator('tbody tr').nth(0).locator('td').nth(0)).toHaveText('2026-01-05 06:59:58.12');
+  await expect(rows.locator('tbody tr').nth(0).locator('td').nth(0)).toHaveText('2026-01-05 06:59:58.120');
   await expect(viewer.locator('.results-summary')).toContainText('1–3 of 7');
   // No row is marked when a step opened the viewer.
   await expect(rows.locator('tr[aria-current]')).toHaveCount(0);

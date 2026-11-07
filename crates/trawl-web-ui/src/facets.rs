@@ -37,10 +37,14 @@ use trawl_api::value::{QueryResult, Value};
 /// Max distinct values surfaced per field.
 pub const FACET_TOP_N: usize = 10;
 
-/// One field's facet: `(column_name, sorted (value, count) list)`.
-pub type FieldFacet = (String, Vec<(String, u32)>);
+/// One field's facet: `(column_name, sorted (value, count) list,
+/// distinct values)`. The list holds at most [`FACET_TOP_N`] values; the
+/// distinct count is taken before that cap, so the rail can say how many
+/// values the page holds, not how many it lists.
+pub type FieldFacet = (String, Vec<(String, u32)>, usize);
 
-/// Compute `(field, [(value, count)])` facets from a query result's rows.
+/// Compute `(field, [(value, count)], distinct)` facets from a query
+/// result's rows.
 ///
 /// Fields with zero non-null discrete values are filtered out, and so are
 /// the columns the module docs name as never a dimension. Output is
@@ -54,8 +58,8 @@ pub fn compute_facets(result: &QueryResult) -> Vec<FieldFacet> {
         if trawl_core::schema::is_non_dimension(&col.name) || is_one_off_time(&result.rows, i) {
             continue;
         }
-        if let Some(top) = facet_column(&result.rows, i) {
-            out.push((col.name.clone(), top));
+        if let Some((top, distinct)) = facet_column(&result.rows, i) {
+            out.push((col.name.clone(), top, distinct));
         }
     }
     out
@@ -143,7 +147,7 @@ pub fn rail_page(query: &str, result: &QueryResult) -> RailPage {
     }
     let groups: Vec<FieldFacet> = compute_facets(result)
         .into_iter()
-        .filter(|(field, _)| provenance.input_field(field))
+        .filter(|(field, _, _)| provenance.input_field(field))
         .collect();
     if groups.is_empty() {
         RailPage::NothingToCount
@@ -175,7 +179,8 @@ fn is_one_off_time(rows: &[Vec<Value>], idx: usize) -> bool {
     seen.len() >= 2
 }
 
-fn facet_column(rows: &[Vec<Value>], idx: usize) -> Option<Vec<(String, u32)>> {
+/// The column's top values, and how many distinct values it has.
+fn facet_column(rows: &[Vec<Value>], idx: usize) -> Option<(Vec<(String, u32)>, usize)> {
     let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for row in rows {
         let Some(cell) = row.get(idx) else { continue };
@@ -196,10 +201,11 @@ fn facet_column(rows: &[Vec<Value>], idx: usize) -> Option<Vec<(String, u32)>> {
         return None;
     }
 
+    let distinct = counts.len();
     let mut sorted: Vec<(String, u32)> = counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     sorted.truncate(FACET_TOP_N);
-    Some(sorted)
+    Some((sorted, distinct))
 }
 
 /// An oversized unsigned is a discrete value, so it keeps its facet.
@@ -334,6 +340,8 @@ mod tests {
         assert_eq!(facets[0].1[0].0, "v0");
         assert_eq!(facets[0].1[0].1, 15);
         assert_eq!(facets[0].1[9].0, "v9");
+        // The distinct count is the page's, taken before the cap.
+        assert_eq!(facets[0].2, 15);
     }
 
     #[test]
@@ -383,9 +391,9 @@ mod tests {
         };
         let facets = compute_facets(&result);
         assert!(
-            facets
-                .iter()
-                .any(|(field, values)| field == "count" && values.contains(&("2".to_string(), 2))),
+            facets.iter().any(
+                |(field, values, _)| field == "count" && values.contains(&("2".to_string(), 2))
+            ),
             "{facets:?}"
         );
     }
@@ -395,7 +403,7 @@ mod tests {
     }
 
     fn fields(facets: &[FieldFacet]) -> Vec<&str> {
-        facets.iter().map(|(f, _)| f.as_str()).collect()
+        facets.iter().map(|(f, _, _)| f.as_str()).collect()
     }
 
     /// An event instant, an ingest instant and the whole original event

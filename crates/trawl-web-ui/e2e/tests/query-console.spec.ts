@@ -29,7 +29,7 @@ async function editBuffer(page: Page, text: string) {
   await page.keyboard.insertText(text);
 }
 
-async function expectFacts(page: Page, duration = '0.125s', started = '2026-09-15 12:34:56 UTC') {
+async function expectFacts(page: Page, duration = '125ms', started = '2026-09-15 12:34:56 UTC') {
   await expect(page.locator(SEL.scopeExecution)).toHaveText(`Execution in ${duration}`);
   await expect(page.locator(SEL.scopeStarted)).toHaveText(`Started ${started}`);
 }
@@ -97,7 +97,7 @@ test('the header states the draft while the strip stays with the executed query'
   await page.locator(SEL.runButton).click();
   await expect(page).toHaveURL(/q=last%3D7d/);
   await expect(draft).toHaveCount(0);
-  await expectFacts(page, '0.250s', '2026-09-15 12:35:00 UTC');
+  await expectFacts(page, '250ms', '2026-09-15 12:35:00 UTC');
 });
 
 test('an unrun search gives both tabs the same guidance and runs the example in Events', async ({ page, request }) => {
@@ -198,11 +198,14 @@ test('never-run has no execution, while zero rows and zero duration are valid', 
   });
   await page.goto('/search');
   await expect(page.locator(SEL.scopeCount)).toHaveText('');
+  // Nothing to report, so the strip is not drawn at all.
+  await expect(page.locator(SEL.scopeStrip)).toBeHidden();
   await noTiming(page);
   expect(requests).toBe(0);
   await editBuffer(page, 'service=empty');
   await page.locator(SEL.runButton).click();
   await expect(page.locator(SEL.scopeCount)).toHaveText('0 rows returned');
+  await expect(page.locator(SEL.scopeStrip)).toBeVisible();
   await expectFacts(page, '0ms');
   expect(requests).toBe(1);
 });
@@ -226,7 +229,7 @@ test('page changes report the execution for that response page', async ({ page, 
   await expect(page.locator(SEL.scopeCount)).toHaveText('50 rows returned');
   await page.locator('.results-footer').getByRole('button', { name: /^Next/ }).click();
   await expect(page).toHaveURL(/page=1/);
-  await expectFacts(page, '0.175s', '2026-09-15 12:35:46 UTC');
+  await expectFacts(page, '175ms', '2026-09-15 12:35:46 UTC');
   // The pagination fixture has 53 rows, so the second page returns three.
   await expect(page.locator(SEL.scopeCount)).toHaveText('3 rows returned');
 });
@@ -285,7 +288,7 @@ for (const intermediate of [false, true]) {
     expect([...held.keys()].some(query => query.includes('middle'))).toBe(false);
     const newer = [...held].find(([query]) => query.includes('newer'))![1];
     await newer.fulfill({ json: queryResponse('2026-09-15T11:00:00Z', 200, [['newer']]) });
-    await expectFacts(page, '0.200s', '2026-09-15 11:00:00 UTC');
+    await expectFacts(page, '200ms', '2026-09-15 11:00:00 UTC');
     await expect(page.locator(SEL.scopeCount)).toHaveText('1 row returned');
     await expect(page.locator(SEL.resultsPane)).toContainText('newer');
     await expect(page.locator(SEL.resultsPane)).not.toContainText('older');
@@ -311,7 +314,7 @@ test('an empty query invalidates pending ownership before the same query runs ag
   await expect(page.locator(SEL.scopeCount)).toHaveText('…');
   await noTiming(page);
   await held[1].fulfill({ json: queryResponse('2026-09-15T11:00:00Z', 200) });
-  await expectFacts(page, '0.200s', '2026-09-15 11:00:00 UTC');
+  await expectFacts(page, '200ms', '2026-09-15 11:00:00 UTC');
 });
 
 test('the editor tools name what they act on', async ({ page }) => {

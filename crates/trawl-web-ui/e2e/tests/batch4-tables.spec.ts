@@ -21,10 +21,16 @@ for (const [path, label, columns] of [
     await expect(table).toBeVisible();
     await expect(table.getByRole('columnheader')).toHaveCount(columns);
     const row = table.locator('tbody > tr').first();
-    await expect(row.locator(':scope > td')).toHaveCount(columns);
+    // A trailing slack column takes the spare width so a row's facts sit
+    // next to its identifier; it stays out of the accessibility tree.
+    for (const slack of await table.locator('.col-slack').all()) {
+      await expect(slack).toHaveAttribute('aria-hidden', 'true');
+      await expect(slack).toBeEmpty();
+    }
+    await expect(row.locator(':scope > td:not(.col-slack)')).toHaveCount(columns);
     const tracks = await table.evaluate(el => {
-      const headers = [...el.querySelectorAll('thead th')];
-      const cells = [...el.querySelectorAll('tbody > tr:first-child > td')];
+      const headers = [...el.querySelectorAll('thead th:not(.col-slack)')];
+      const cells = [...el.querySelectorAll('tbody > tr:first-child > td:not(.col-slack)')];
       return headers.map((header, i) => ({
         header: header.getBoundingClientRect().left,
         cell: cells[i].getBoundingClientRect().left,

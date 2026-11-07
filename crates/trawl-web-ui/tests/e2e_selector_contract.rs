@@ -430,7 +430,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "healthRefresh: '.health-refresh',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
-        hook: "class=\"btn health-refresh\"",
+        hook: "class=\"btn-sec health-refresh\"",
     },
     Contract {
         assignment: "healthQueriesRefresh: '.health-queries-refresh',",
@@ -1797,16 +1797,16 @@ const CONTRACTS: &[Contract] = &[
         hook: "format!(\"Exclude {field} = {v}\")",
     },
     Contract {
-        assignment: "facetMoreName: 'Show {extra} more values for {field}',",
+        assignment: "facetMoreName: 'Show {extra} more listed {noun} for {field}',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
-        hook: "format!(\"Show {extra} more values for {field}\")",
+        hook: "format!(\"Show {extra} more listed {noun} for {field}\")",
     },
     Contract {
         assignment: "facetGroupName: '{field}, {total} values',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
-        hook: "format!(\"{field}, {total} values\")",
+        hook: "format!(\"{distinct} values\")",
     },
     Contract {
         assignment: "chipRemoveName: 'Remove filter {} = {}',",
@@ -2036,7 +2036,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "netRunNow: 'Run now',",
         source_path: "src/pages/nets.rs",
         source: NETS_RS,
-        hook: "aria-label=RUN_NOW",
+        hook: "}>{RUN_NOW}</button>",
     },
     Contract {
         assignment: "netRunNow: 'Run now',",
@@ -2199,6 +2199,12 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/query_error_notice.rs",
         source: QUERY_ERROR_NOTICE_RS,
         hook: "class=\"query-error-caret-pad\"",
+    },
+    Contract {
+        assignment: "queryErrorDiagnostic: '.query-error-diagnostic',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-diagnostic\"",
     },
     Contract {
         assignment: "recoveringNotice: '#search-results .recovering-notice[role=\"alert\"]',",

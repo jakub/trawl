@@ -30,7 +30,7 @@ async function settle(page: Page) {
 }
 async function search(page: Page, text: string) {
   await input(page).fill(text);
-  await page.getByRole('button', { name: 'Search', exact: true }).click();
+  await page.getByRole('button', { name: 'Filter', exact: true }).click();
 }
 
 test.beforeEach(async ({ request }) => { await resetScenario(request, 'history-search'); });
@@ -43,7 +43,7 @@ test('draft submission, paging, reload, and browser history retain the applied v
   await settle(page);
   expect((await state(request)).requests).toHaveLength(1);
   await expect(rows(page)).toHaveCount(50);
-  await expect(page.getByText('Edited. Press Enter or Search to apply.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Edited. Press Enter or Filter to apply.', { exact: true })).toBeVisible();
   await input(page).press('Enter');
   await expect(page).toHaveURL(/\/search\/history\?hq=match$/);
   await expect(summary(page)).toHaveText('1–50 of 120');
@@ -83,7 +83,7 @@ test('draft submission, paging, reload, and browser history retain the applied v
   expect((await state(request)).requests.some((r: { filter: string; offset: number }) => r.filter === 'match' && r.offset === 100)).toBe(true);
 });
 
-test('IME Enter does not submit and keyboard Search applies once', async ({ page, request }) => {
+test('IME Enter does not submit and keyboard Filter applies once', async ({ page, request }) => {
   await page.goto('/search/history');
   await expect(rows(page)).toHaveCount(50);
   await expect(input(page)).toHaveAccessibleName('Search query text');
@@ -94,21 +94,21 @@ test('IME Enter does not submit and keyboard Search applies once', async ({ page
   await settle(page);
   expect((await state(request)).requests).toHaveLength(1);
   await input(page).dispatchEvent('compositionend');
-  await page.getByRole('button', { name: 'Search', exact: true }).focus();
+  await page.getByRole('button', { name: 'Filter', exact: true }).focus();
   await page.keyboard.press('Enter');
   await expect(summary(page)).toHaveText('1–50 of 120');
   expect((await state(request)).requests).toHaveLength(2);
 });
 
-test('explicit Search submits the completed composition by pointer', async ({ page, request }) => {
+test('explicit Filter submits the completed composition by pointer', async ({ page, request }) => {
   await page.goto('/search/history');
   await expect(rows(page)).toHaveCount(50);
   await input(page).dispatchEvent('compositionstart');
   await input(page).fill('match');
   // Model the completed composition before the button's pointer activation.
-  // The composition flag must not suppress this explicit Search submission.
+  // The composition flag must not suppress this explicit Filter submission.
   await input(page).dispatchEvent('compositionend');
-  await page.getByRole('button', { name: 'Search', exact: true }).click();
+  await page.getByRole('button', { name: 'Filter', exact: true }).click();
   await expect(summary(page)).toHaveText('1–50 of 120');
   expect((await state(request)).requests).toHaveLength(2);
   expect((await state(request)).requests[1].filter).toBe('match');
