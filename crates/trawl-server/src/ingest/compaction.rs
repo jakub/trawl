@@ -1125,8 +1125,9 @@ async fn retry_removal_syncs(publication: &Arc<PublicationGate>) -> Result<(), S
     }
     let publication = Arc::clone(publication);
     tokio::task::spawn_blocking(move || {
-        publication
-            .retry_removal_syncs(|day| RollupIo::REAL.sync_dir(Phase::ObligationRetrySync, day));
+        publication.retry_removal_syncs(|day| {
+            sync_removal_day(&RollupIo::REAL, Phase::ObligationRetrySync, day)
+        });
     })
     .await
     .map_err(|e| crate::error::join_failure_text("rollup marker removal sync retry", e))
@@ -1794,12 +1795,26 @@ fn remove_rollup_marker(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("failed to remove rollup marker: {e}")),
     }
-    let sync = |day: &Path| io.sync_dir(Phase::UnlinkDaySync, day);
+    let sync = |day: &Path| sync_removal_day(io, Phase::UnlinkDaySync, day);
     match removal {
         Some(removal) => removal.settle(sync),
         None => sync(day_dir),
     }
     .map_err(|e| format!("failed to fsync the rollup marker's removal: {e}"))
+}
+
+/// fsync the day directory of a rollup marker's removal. A day directory
+/// that is gone, as when retention deleted it, fsyncs its env directory
+/// instead: that makes the day's removal durable, and the marker entry
+/// with it. A missing env directory is still an error.
+fn sync_removal_day(io: &RollupIo, phase: Phase, day: &Path) -> std::io::Result<()> {
+    match io.sync_dir(phase, day) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match day.parent() {
+            Some(env) => io.sync_dir(phase, env),
+            None => Err(e),
+        },
+        synced => synced,
+    }
 }
 
 /// Recover from interrupted rollups in a date directory.
@@ -11254,6 +11269,63 @@ mod tests {
         assert!(!late.exists(), "the rollup ran");
         assert_eq!(read_strings(&daily, "msg"), ["one", "late"]);
         assert!(gate.read().await.is_ok());
+    }
+
+    /// Retention deleting the day of an owed removal does not keep the
+    /// obligation forever: the retry fsyncs the env directory instead, which
+    /// makes the day's removal durable, marker entry and all (ADR-0041).
+    #[tokio::test]
+    async fn rollup_unlink_sync_retry_ends_when_retention_deletes_the_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let hourly =
+            write_hourly_parquet(&env, ROLLUP_DAY, "01", "nginx", &[&nginx_row("01", "one")]);
+        let day = env.join(ROLLUP_DAY);
+        let marker = rollup_marker_path(&day, "nginx");
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        let gate = hot.publication();
+        gate.initialize(&data);
+        let recorder = Recorder::new();
+        recorder.fail(Phase::UnlinkDaySync, 0, std::io::ErrorKind::Other);
+        let (rollup_gate, rollup_day, io) = (Arc::clone(&gate), day.clone(), recorder.io());
+        let outcome = tokio::task::spawn_blocking(move || {
+            rollup_day_coordinated(
+                &rollup_day,
+                "nginx",
+                &[hourly],
+                "2GB",
+                Some(&*rollup_gate),
+                &io,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(outcome.result.is_err());
+        assert!(gate.removal_sync_owed(&marker));
+
+        // Retention deletes the whole day directory.
+        std::fs::remove_dir_all(&day).unwrap();
+
+        let errors = compact_once(
+            &tmp.path().join("no-wal"),
+            &data,
+            Duration::ZERO,
+            true,
+            Some(&hot),
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+        )
+        .await;
+        assert_eq!(errors, Ok(0));
+        assert!(
+            !gate.removal_sync_owed(&marker),
+            "the env fsync settles a removal whose day is gone"
+        );
     }
 
     /// After a restart, rollup recovery runs before a compaction pass
