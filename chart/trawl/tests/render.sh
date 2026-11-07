@@ -637,6 +637,15 @@ assert_retention_renders 18446744073709551615 30 \
   --set-string config.scheduler.maxRunsPerSchedule=18446744073709551615
 assert_retention_renders 9223372036854775808 30 \
   --set config.scheduler.maxRunsPerSchedule=9223372036854775808
+# A values-file number reaches the chart as a float64: 2^53 - 1 is the
+# largest one that is exact, and 2^53 could be 2^53 + 1 rounded.
+exact_runs="$work_dir/exact-runs.yaml"
+printf 'config:\n  scheduler:\n    maxRunsPerSchedule: 9007199254740991\n' >"$exact_runs"
+assert_retention_renders 9007199254740991 30 -f "$exact_runs"
+inexact_runs="$work_dir/inexact-runs.yaml"
+printf 'config:\n  scheduler:\n    maxRunsPerSchedule: 9007199254740992\n' >"$inexact_runs"
+assert_render_fails "maxRunsPerSchedule: 9007199254740992" "config.scheduler.maxRunsPerSchedule" \
+  render_only configmap.yaml -f "$inexact_runs"
 
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
