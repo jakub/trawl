@@ -19,7 +19,8 @@ use crate::api;
 use crate::components::net_drawer::NetDrawer;
 use crate::components::sort_th::table_sort_th;
 use crate::schedule_edit::{
-    RUN_NOT_STARTED, RUN_NOW, VIEW_RUN, cadence_sentence, run_now_offered, run_started_toast,
+    RUN_NOT_STARTED, RUN_NOW, RUN_NOW_SPENT_REASON, VIEW_RUN, cadence_sentence, run_budget_label,
+    run_now_offered, run_now_spent, run_started_toast,
 };
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{time_ago, time_until};
@@ -287,14 +288,20 @@ pub fn NetsPage() -> impl IntoView {
                                         </td>
                                         <td>{move || {
                                             let Some(schedule) = net.get().schedule else { return view! { <span style="color:var(--ink-3)">"—"</span> }.into_any(); };
+                                            // A spent budget fires no more runs, so it
+                                            // replaces the countdown and the pending wording.
+                                            let spent = run_budget_label(&schedule);
+                                            let spent_view = spent.clone().map(|label| view! { <div class="run-spent mono" style="font-size:10px; color:var(--ink-3)">{label}</div> });
                                             let Some(run) = schedule.last_run else {
-                                                return if schedule.enabled {
+                                                return if spent_view.is_some() {
+                                                    spent_view.into_any()
+                                                } else if schedule.enabled {
                                                     view! { <span class="mono" style="color:var(--ink-3); font-size:10px">"Pending…"</span> }.into_any()
                                                 } else {
                                                     view! { <span style="color:var(--ink-3)">"—"</span> }.into_any()
                                                 };
                                             };
-                                            let next_label = schedule.enabled.then(|| {
+                                            let next_label = (schedule.enabled && spent.is_none()).then(|| {
                                                 #[allow(clippy::cast_possible_truncation)]
                                                 let started_ms = js_sys::Date::parse(&run.started_at) as i64;
                                                 time_until(started_ms + schedule.interval_secs.cast_signed() * 1000, now_ms.get())
@@ -305,6 +312,7 @@ pub fn NetsPage() -> impl IntoView {
                                                     <span class="run-status" style="margin-inline-start:0">{status}</span> " "
                                                     <span class="mono" style="color:var(--ink-2)">{time_ago(&run.started_at, now_ms.get())}</span>
                                                     {next_label.map(|label| view! { <div class="next-run" style="font-size:10px; color:var(--ink-3)">"Next: "{label}</div> })}
+                                                    {spent_view}
                                                 </div>
                                             }.into_any()
                                         }}</td>
@@ -316,18 +324,23 @@ pub fn NetsPage() -> impl IntoView {
                                                     run(net.get_untracked().query);
                                                 }><span aria-hidden="true">"⌕"</span></button>
                                             <Show when=move || run_now_offered(&net.get())>
-                                                <button type="button" class="btn-icon" aria-label=RUN_NOW title=RUN_NOW
-                                                    disabled=move || run_in_flight.get()
+                                                <button type="button" class="btn-icon" aria-label=RUN_NOW
+                                                    title=move || if run_now_spent(&net.get()) { RUN_NOW_SPENT_REASON } else { RUN_NOW }
+                                                    aria-describedby=move || run_now_spent(&net.get()).then(|| format!("netRunNowSpent{id}"))
+                                                    disabled=move || run_in_flight.get() || run_now_spent(&net.get())
                                                     on:click=move |ev| {
                                                         ev.stop_propagation();
                                                         let current = net.get_untracked();
                                                         // Recheck the saved state on activation: a
-                                                        // schedule removed since render has nothing
-                                                        // left to fire.
-                                                        if run_now_offered(&current) && !run_in_flight.get_untracked() {
+                                                        // schedule removed or spent since render has
+                                                        // nothing left to fire.
+                                                        if run_now_offered(&current) && !run_now_spent(&current) && !run_in_flight.get_untracked() {
                                                             on_run_now(id, current.name, run_in_flight);
                                                         }
                                                     }><span aria-hidden="true">"↻"</span></button>
+                                                {move || run_now_spent(&net.get()).then(|| view! {
+                                                    <span id=format!("netRunNowSpent{id}") class="sr-only">{RUN_NOW_SPENT_REASON}</span>
+                                                })}
                                             </Show>
                                             <button type="button" class="btn-icon net-delete" aria-label="Delete Net" title="Delete Net"
                                                 on:click=move |ev| {

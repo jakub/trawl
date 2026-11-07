@@ -52,6 +52,7 @@ import {
   corpusAllRunsResponse,
   corpusRunsStatsResponse,
   windowedListSavedResponse,
+  spentListSavedResponse,
   scheduleSavedResponse,
   scheduleConflictResponse,
   scheduleNetRunsResponse,
@@ -110,7 +111,7 @@ const MIME = {
 
 // ---- mutable test-scoped state -------------------------------------------
 
-/** @type {'default'|'unauth'|'query-500'|'stream-chart'|'stream-burst'|'populated'|'corpus'|'schedule'} */
+/** @type {'default'|'unauth'|'query-500'|'stream-chart'|'stream-burst'|'populated'|'corpus'|'schedule'|'schedule-spent'} */
 let scenario = 'default';
 
 function savedScenario() { return scenario === 'saved-success' || scenario === 'saved-retry'; }
@@ -1536,7 +1537,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         200,
         scenario === 'schedule'
           ? windowedListSavedResponse()
-          : hasCorpus() ? populatedListSavedResponse() : listSavedResponse(),
+          : scenario === 'schedule-spent'
+            ? spentListSavedResponse()
+            : hasCorpus() ? populatedListSavedResponse() : listSavedResponse(),
       );
       return;
     }
@@ -1578,6 +1581,14 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     // the server resolved (none in query mode, a trailing span for the
     // fixed net). Ids are the scenario's own nets.
     const runNow = p.match(/^\/api\/v1\/saved\/(\d+)\/run$/);
+    // `schedule-spent`: every net there has a spent budget or is never
+    // fired by its spec, so a POST that arrives is recorded and refused
+    // the way trawld refuses a spent schedule. The spec asserts none came.
+    if (runNow && req.method === 'POST' && scenario === 'schedule-spent') {
+      runRequests.push(Number(runNow[1]));
+      sendJson(res, 409, { error: { code: 'conflict', message: 'max runs reached for this net' } });
+      return;
+    }
     if (runNow && req.method === 'POST' && scenario === 'schedule') {
       const savedId = Number(runNow[1]);
       runRequests.push(savedId);
@@ -1624,7 +1635,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     // and its existing assertions remain stable.
     const netRuns = p.match(/^\/api\/v1\/saved\/\d+\/runs$/);
     const netRun = p.match(/^\/api\/v1\/saved\/\d+\/runs\/\d+$/);
-    if (scenario === 'schedule' && req.method === 'GET' && (netRuns || netRun)) {
+    if ((scenario === 'schedule' || scenario === 'schedule-spent') && req.method === 'GET' && (netRuns || netRun)) {
       if (netRuns) {
         // A run Run now claimed leads its own net's list, as the newest.
         const savedId = Number(p.split('/')[4]);

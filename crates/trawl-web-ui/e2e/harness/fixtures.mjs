@@ -326,6 +326,14 @@ export function windowedListSavedResponse() {
   return wire('saved-queries-windowed');
 }
 
+/** `GET /api/v1/saved` under `schedule-spent`: a capped net under its cap,
+ * a net whose budget is spent past a lowered cap (`spent 5/3`), and a
+ * `max_runs = 0` net that never ran. Pinned by
+ * `tests/e2e_wire_fixture_contract.rs`. */
+export function spentListSavedResponse() {
+  return wire('saved-queries-spent');
+}
+
 /** `PUT /api/v1/saved/{id}/schedule` — what a successful save answers.
  * The body is only decoded, never read for content: the assertion a
  * schedule spec makes is about the REQUEST. */

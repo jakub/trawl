@@ -98,7 +98,7 @@ impl std::fmt::Display for ScheduleEditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::BlankFixedSpan => "Enter a span.",
-            Self::InvalidMaxRuns => "Max runs must be a whole number of 1 or more, or blank.",
+            Self::InvalidMaxRuns => "Max runs must be a whole number, 0 or more, or blank.",
         })
     }
 }
@@ -240,6 +240,27 @@ pub const RUN_NOW_FIXED_LINE: &str =
 #[must_use]
 pub fn run_now_offered(saved: &SavedQueryResponse) -> bool {
     saved.schedule.is_some()
+}
+
+/// Why Run now is disabled on a net whose run budget is spent, said
+/// beside the disabled control.
+pub const RUN_NOW_SPENT_REASON: &str = "Run limit reached. Raise it in the schedule to run again.";
+
+/// Whether an offered Run now is disabled because the net's run budget is
+/// spent: its schedule has claimed `max_runs` runs over its life. The
+/// server refuses a manual run of a spent schedule with a 409, so the
+/// control stays in place, disabled, with [`RUN_NOW_SPENT_REASON`].
+#[must_use]
+pub fn run_now_spent(saved: &SavedQueryResponse) -> bool {
+    saved.schedule.as_ref().is_some_and(|s| s.exhausted)
+}
+
+/// `spent N/M` for a schedule whose run budget is spent, else `None`. N is
+/// the lifetime claim count and can exceed M after the cap is lowered.
+#[must_use]
+pub fn run_budget_label(schedule: &ScheduleResponse) -> Option<String> {
+    let max = schedule.max_runs.filter(|_| schedule.exhausted)?;
+    Some(format!("spent {}/{max}", schedule.total_runs))
 }
 
 /// The line the schedule form shows about Run now for `mode`, or `None`
@@ -545,6 +566,33 @@ mod tests {
         let mut paused = schedule(Some("since_last"), None);
         paused.enabled = false;
         assert!(run_now_offered(&net(Some(paused))));
+    }
+
+    /// Run now stays offered on a spent schedule but is disabled, and the
+    /// label names the spend. Only `exhausted` decides it: a capped
+    /// schedule under its cap runs, and a lowered cap shows N above M.
+    #[test]
+    fn run_now_is_disabled_for_a_spent_schedule() {
+        assert!(!run_now_spent(&net(None)));
+        let mut capped = schedule(Some("since_last"), None);
+        capped.max_runs = Some(3);
+        capped.total_runs = 2;
+        assert!(!run_now_spent(&net(Some(capped.clone()))));
+        assert_eq!(run_budget_label(&capped), None);
+
+        let mut spent = capped;
+        spent.total_runs = 5;
+        spent.exhausted = true;
+        let spent_net = net(Some(spent.clone()));
+        assert!(run_now_offered(&spent_net));
+        assert!(run_now_spent(&spent_net));
+        assert_eq!(run_budget_label(&spent).as_deref(), Some("spent 5/3"));
+
+        let mut zero = schedule(None, None);
+        zero.max_runs = Some(0);
+        zero.exhausted = true;
+        assert!(run_now_spent(&net(Some(zero.clone()))));
+        assert_eq!(run_budget_label(&zero).as_deref(), Some("spent 0/0"));
     }
 
     /// The toast states the bounds the server claimed, in UTC, to the
