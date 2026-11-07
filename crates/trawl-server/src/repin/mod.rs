@@ -13,7 +13,8 @@
 //! per-env swap), `engine` (the job lifecycle), `cancel` (the cooperative
 //! cancel registry and its point-of-no-return latch), `recover` (the boot
 //! decision table), `ceiling` (the numbers a forced job accepted), `jobs`
-//! (the in-process job generation capacity samples read).
+//! (the in-process job generation capacity samples read), and, for tests
+//! only, `holds` (job-scoped holds on the engine).
 
 /// How recently the field must have been observed for a repin's report to
 /// call it live (ADR-0013 ruling 10).
@@ -38,6 +39,8 @@ pub mod ceiling;
 pub mod cutover;
 pub mod engine;
 pub mod gate;
+#[cfg(any(test, feature = "test-support"))]
+pub mod holds;
 pub mod jobs;
 pub mod marker;
 pub mod plan;
@@ -52,6 +55,8 @@ pub use cancel::{
 };
 pub use engine::{BoundedStart, RepinEngine, StartOutcome};
 pub use gate::{RepinCoordinator, RollupPause};
+#[cfg(any(test, feature = "test-support"))]
+pub use holds::{JobHold, JobHolds};
 pub use jobs::{JobGeneration, JobReading};
 pub use marker::{
     RepinMarker, RepinPhase, aside_root, in_flight_evidence, marker_path, shadow_root,

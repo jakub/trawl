@@ -4,10 +4,14 @@
 
 //! Postgres-backed repin job store (ADR-0011).
 //!
-//! One repin at a time, install-wide, enforced by the `repin_jobs_one_running`
-//! partial unique index — never an in-process mutex, so the guarantee holds
-//! across restarts and the claim race is decided by postgres exactly as the
-//! scheduler's run claim is. Dry runs are jobs too: the row is the dry-run
+//! One repin at a time, install-wide. Within one trawld, the repin engine's
+//! in-process permit admits one job's work at a time, from before its claim
+//! to after its last staging deletion (ADR-0011, 2026-11-06 amendment). The
+//! `repin_jobs_one_running` partial unique index is the cross-restart
+//! record: it keeps a second running row out, and postgres decides the
+//! claim exactly as it decides the scheduler's run claim. The index frees
+//! at the terminal row, before the post-swap sweep, so it alone does not
+//! keep a second job out of the staging roots. Dry runs are jobs too: the row is the dry-run
 //! report, and the scan → refusal → execution lifecycle is one code path.
 
 use chrono::{DateTime, Utc};

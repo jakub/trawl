@@ -227,11 +227,11 @@ pub async fn reconcile_store(
         }
         // The marker is the only record that a staging root is trawl's to
         // delete: dropping it over a failed sweep strands the leftover
-        // root forever (retention stays suppressed by its mere existence,
-        // and a later cutover meets an aside beside a live env and refuses
-        // the forward-only swap). The store side is idempotent by
+        // root until an operator removes it (retention stays suppressed by
+        // its mere existence, and repin admission refuses every later
+        // repin while it stands). The store side is idempotent by
         // construction, so keeping the marker just replays this at the
-        // next boot — which is exactly the retry.
+        // next boot, which is exactly the retry.
         if swept {
             remove_marker(data_dir)?;
         } else {
