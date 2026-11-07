@@ -1128,6 +1128,11 @@ async fn scheduler_start_keeps_a_fresh_manual_claim() {
 /// retention at limits that would match the running row, a second claim
 /// refused as already running, then a finish that persists over a result
 /// file that is still there.
+///
+/// The scheduler unlinks exactly the paths retention returns. A finished
+/// run's file is among them (the positive control), and the live run's
+/// file, already on disk the way the executor leaves it before
+/// `finish_run`, is not.
 #[tokio::test]
 async fn retention_during_a_run_keeps_the_schedule_claimed() {
     let h = harness().await;
@@ -1140,20 +1145,54 @@ async fn retention_during_a_run_keeps_the_schedule_claimed() {
         .expect("schedule exists")
         .id;
 
-    let run_id = match h
-        .schedules
-        .claim_run(schedule_id, sq, DSL, None, None)
-        .await
-        .expect("claim")
-    {
-        RunClaim::Started(id) => id,
-        other => panic!("expected a started run, got {other:?}"),
+    let claim = || async {
+        match h
+            .schedules
+            .claim_run(schedule_id, sq, DSL, None, None)
+            .await
+            .expect("claim")
+        {
+            RunClaim::Started(id) => id,
+            other => panic!("expected a started run, got {other:?}"),
+        }
+    };
+    let result_file = |run_id: i64| {
+        let relative = format!("scheduled/run_{run_id}.parquet");
+        let file = h.data_dir.join(&relative);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"result").unwrap();
+        (relative, file)
     };
 
+    let finished_id = claim().await;
+    let (finished_relative, _) = result_file(finished_id);
     h.schedules
+        .finish_run(
+            finished_id,
+            RunStatus::Success,
+            10,
+            Some(1),
+            None,
+            None,
+            Some(&finished_relative),
+        )
+        .await
+        .expect("finish the earlier run");
+
+    let run_id = claim().await;
+    let (relative, file) = result_file(run_id);
+
+    let (deleted, paths) = h
+        .schedules
         .delete_old_runs(0, 0)
         .await
         .expect("retention runs");
+    assert_eq!(deleted, 1, "only the finished run is deleted");
+    assert_eq!(
+        paths,
+        vec![finished_relative],
+        "cleanup gets the finished run's file and never the live one"
+    );
 
     assert_eq!(
         h.schedules
@@ -1163,11 +1202,6 @@ async fn retention_during_a_run_keeps_the_schedule_claimed() {
         RunClaim::AlreadyRunning,
         "retention left the running row, so the schedule stays claimed"
     );
-
-    let relative = format!("scheduled/run_{run_id}.parquet");
-    let file = h.data_dir.join(&relative);
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, b"result").unwrap();
 
     let outcome = h
         .schedules
