@@ -29,7 +29,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::{self, Read as _};
+use std::io::{self, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
@@ -89,9 +89,16 @@ pub struct OutputIdentity {
 /// Hash a file by streaming it. The size is the number of bytes hashed, so
 /// the pair describes one read of the file rather than a stat and a read.
 pub fn identity_of(path: &Path) -> io::Result<OutputIdentity> {
-    let mut file = std::fs::File::open(path)?;
+    identity_of_file(&mut std::fs::File::open(path)?)
+}
+
+/// [`identity_of`] on an open `file`, from its first byte whatever its
+/// offset, so a caller that already read the file (a footer check) hashes
+/// the same descriptor it checked.
+pub fn identity_of_file(file: &mut std::fs::File) -> io::Result<OutputIdentity> {
+    file.seek(io::SeekFrom::Start(0))?;
     let mut hasher = blake3::Hasher::new();
-    let size = io::copy(&mut file, &mut hasher)?;
+    let size = io::copy(file, &mut hasher)?;
     Ok(OutputIdentity {
         size,
         hash: hasher.finalize(),
@@ -1284,6 +1291,19 @@ mod tests {
             identity_of(&tmp.path().join("missing")).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn identity_of_a_file_hashes_from_the_start_whatever_its_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("out");
+        let bytes = vec![3u8; 2 * 65536 + 5];
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        file.seek(io::SeekFrom::Start(70_000)).unwrap();
+        assert_eq!(identity_of_file(&mut file).unwrap(), identity(&bytes));
+        // Read to the end by the first call, and still the whole file.
+        assert_eq!(identity_of_file(&mut file).unwrap(), identity(&bytes));
     }
 
     // ---- confinement ----
