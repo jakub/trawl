@@ -572,6 +572,8 @@ sort -count, status
 
 A leading `-` sorts descending. There is no `+` prefix.
 
+NULL and a missing field sort last, in both directions.
+
 ### limit / head
 
 ```text
@@ -600,6 +602,8 @@ tail 5
 ```
 
 Without an earlier `sort`, `tail` orders by `_time` descending first. With one, it keeps that order and limits.
+
+After `extract kv`, `tail` is refused. Use `sort` and `head` instead.
 
 ### table / fields
 
@@ -758,6 +762,15 @@ dedup host, service
 ```
 
 Bare `dedup` keeps distinct whole rows. With fields, `dedup` keeps the row with the latest `_time` in each key group.
+
+In the kv batch tail behind `extract kv`, `dedup` is exact: it reads every row first and keeps one row per key, however many keys there are.
+
+- A row whose `_time` is missing, NULL, or not readable as a timestamp ranks after every row with a readable `_time`.
+- Of rows with the same `_time`, the first one in the stage's input is kept.
+- The kept rows stay in their input order.
+- Bare `dedup` keeps the first of each set of identical rows.
+
+The live stream keeps the first row it sees for each key. It holds up to 10,000 keys. The next new key clears them, so a key seen before can pass again.
 
 ### timechart
 
@@ -1126,16 +1139,19 @@ Four lanes answer a query: batch SQL, the live stream (SSE), the kv batch tail b
 
 | Stage | Live stream | kv batch tail |
 | --- | --- | --- |
-| `where`, `let`, `table`, `fields`, `drop`, `rename`, `limit`, `head`, `tail`, `dedup`, `extract` | Supported | Supported |
-| `stats`, `top`, `rare` | One aggregation stage per query | Supported |
-| `timechart` | One aggregation stage per query. `on` a column other than `_time` is refused. | Supported, except `on` a column other than `_time` |
-| `sort` | Refused: `contradicts real-time arrival order` | Supported |
+| `where`, `let`, `table`, `fields`, `drop`, `rename`, `limit`, `head`, `extract` | Supported | Supported |
+| `dedup` | Supported. Keeps the first row seen for each key, up to 10,000 keys. | Supported, in written order. Exact, and keeps the row with the latest `_time` for each key. |
+| `tail` | Supported | Refused: `tail is not supported after extract kv; use sort and head instead` |
+| `stats`, `top`, `rare` | One aggregation stage per query | One aggregation stage after `extract kv` |
+| `timechart` | One aggregation stage per query. `on` a column other than `_time` is refused. | One aggregation stage after `extract kv`. `on` a column other than `_time` is refused. |
+| `sort` | Refused: `contradicts real-time arrival order` | Supported, in written order |
 | `pivot` | Refused: `dynamic column structure breaks progressive rendering` | Refused |
 | `sample` | Refused: `statistical sampling requires the full dataset` | Refused |
 | `eventstats` | Refused: `window functions require the full dataset` | Refused |
 | `from saved` | Refused: `saved query sources are not supported in streaming mode` | Refused |
 
-- A live stream admits one aggregation stage. A second one is refused with `only one aggregation stage is supported in streaming mode`.
+- The kv batch tail runs its stages in the order the query writes them. A `sort` or a `dedup` there reads all its input before the next stage sees a row, so `extract kv | sort -bytes | head 2` returns the two largest rows.
+- A live stream admits one aggregation stage, and so do the stages after `extract kv`. A second one is refused with `only one aggregation stage is supported in streaming mode`, even with a `sort` between the two.
 - Where batch SQL raises a per-value error, the streaming lane yields `null` instead. This covers an integer overflow and an unreadable `if()` or `case()` condition. A live tail cannot raise a per-event error without ending the subscription.
 - Embedded `--data` has no field catalog, so every comparison there is literal-driven. `sev()` still declares its own type.
 
