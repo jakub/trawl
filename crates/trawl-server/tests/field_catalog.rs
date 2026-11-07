@@ -655,6 +655,8 @@ fn walkdir_parquet(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 // ---------------------------------------------------------------------------
 
 mod boot {
+    use std::collections::HashSet;
+
     use trawl_server::catalog::{FieldCatalog, conform};
     use trawl_server::store::CatalogStore;
 
@@ -710,10 +712,16 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .expect("boot pass runs");
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect("boot pass runs");
         assert!(summary.ran, "first boot must run the pass");
         assert_eq!(
             summary.rewritten, 1,
@@ -786,10 +794,16 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .expect("boot pass runs");
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect("boot pass runs");
         assert_eq!(summary.rewritten, 1, "only the minority file disagrees");
         assert_eq!(column_type(&minority, "_time"), "TIMESTAMP");
 
@@ -846,9 +860,16 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-            .await
-            .expect("boot pass runs");
+        conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect("boot pass runs");
 
         assert_eq!(
             cache.get("duration"),
@@ -912,10 +933,16 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .expect("boot pass runs");
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect("boot pass runs");
         assert_eq!(
             summary.rewritten, 2,
             "the majority file is renamed, the minority file is cast"
@@ -964,16 +991,29 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-            .await
-            .unwrap();
+        conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         let mtimes = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
         let (m1, m2) = (mtimes(&majority), mtimes(&minority));
 
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .unwrap();
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         assert!(!summary.ran, "second boot skips: marker + catalog agree");
         assert_eq!(summary.rewritten, 0);
         assert_eq!(mtimes(&majority), m1, "no file touched");
@@ -988,17 +1028,30 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-            .await
-            .unwrap();
+        conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
 
         // A restored-from-backup data root (or repointed DATABASE_URL)
         // shows up as an identity mismatch — the pass must re-run.
         std::fs::write(data_dir.join("CATALOG"), "someone-elses-catalog\n").unwrap();
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .unwrap();
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         assert!(summary.ran, "identity mismatch must force a re-run");
         assert_eq!(
             summary.rewritten, 0,
@@ -1041,6 +1094,7 @@ mod boot {
                 &cache,
                 &dir,
                 &dir.join("wal"),
+                HashSet::new(),
                 "2GB",
             ))
         });
@@ -1086,17 +1140,30 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-            .await
-            .unwrap();
+        conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         let mtime = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
         let before = mtime(&file);
 
         std::fs::write(data_dir.join("CATALOG"), "someone-elses-catalog\n").unwrap();
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .unwrap();
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         assert!(summary.ran, "identity mismatch re-arms the pass");
         assert_eq!(
             summary.rewritten, 0,
@@ -1117,19 +1184,32 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-            .await
-            .unwrap();
+        conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
 
         // Simulate the crash window: marker gone, corpus already conformant.
         std::fs::remove_file(data_dir.join("CATALOG")).unwrap();
         let mtimes = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
         let (m1, m2) = (mtimes(&majority), mtimes(&minority));
 
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .unwrap();
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         assert!(summary.ran, "a missing marker must force the pass to run");
         assert_eq!(summary.rewritten, 0, "the conformant corpus is untouched");
         assert_eq!(mtimes(&majority), m1, "no file rewritten on the re-run");
@@ -1170,10 +1250,16 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .expect("boot pass runs");
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect("boot pass runs");
         assert!(summary.observed > 0, "the standing corpus must be observed");
 
         // `?service=` answers for a service that has sent nothing since.
@@ -1236,10 +1322,16 @@ mod boot {
         // (missing marker, restored data root), and a re-run must not
         // re-accumulate the row counts it already recorded.
         std::fs::remove_file(data_dir.join("CATALOG")).unwrap();
-        let rerun =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .unwrap();
+        let rerun = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         assert!(rerun.ran, "a missing marker forces the re-run");
         let again = store
             .field_services("duration", None, 1000)
@@ -1276,10 +1368,16 @@ mod boot {
         .execute(&pool)
         .await
         .unwrap();
-        let error =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .expect_err("the observation failure must fail the boot pass");
+        let error = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect_err("the observation failure must fail the boot pass");
         assert!(
             error.contains("failed to backfill field_services"),
             "{error}"
@@ -1302,10 +1400,16 @@ mod boot {
         .execute(&pool)
         .await
         .unwrap();
-        let retry =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .unwrap();
+        let retry = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         assert!(retry.ran, "an incomplete pass must retry");
         assert!(store.is_conformed().await.unwrap());
         assert_eq!(
@@ -1323,10 +1427,16 @@ mod boot {
         assert_eq!(obs[0].service, "svc-a");
         assert_eq!(obs[0].row_count, 3);
 
-        let settled =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .unwrap();
+        let settled = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         assert!(
             !settled.ran,
             "completion and the matching marker skip the pass"
@@ -1348,9 +1458,16 @@ mod boot {
         );
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-            .await
-            .unwrap();
+        conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         // Live compaction accumulates past the corpus the pass saw.
         store
             .touch_services("svc-a", &["duration".to_owned()], 900)
@@ -1358,9 +1475,16 @@ mod boot {
             .unwrap();
 
         std::fs::remove_file(data_dir.join("CATALOG")).unwrap();
-        conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-            .await
-            .unwrap();
+        conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
 
         let obs = store
             .field_services("duration", None, 1000)
@@ -1392,9 +1516,16 @@ mod boot {
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
         let before = std::fs::metadata(&sched).unwrap().modified().unwrap();
-        conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-            .await
-            .expect("boot pass runs");
+        conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect("boot pass runs");
 
         assert!(
             cache.get("sched_only_field").is_none(),
@@ -1437,10 +1568,16 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .expect("boot pass runs");
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect("boot pass runs");
 
         assert_eq!(summary.skipped, 1, "the foreign file is one skip");
         assert_eq!(summary.scanned, 2, "only trawl's own files are scanned");
@@ -1487,10 +1624,16 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .expect("a bad file must not fail the boot pass");
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect("a bad file must not fail the boot pass");
         assert!(summary.ran);
         assert_eq!(summary.skipped, 2, "both bad files are skipped, not fatal");
         assert_eq!(summary.scanned, 2, "only the readable corpus is scanned");
@@ -1514,10 +1657,16 @@ mod boot {
             !data_dir.join("CATALOG").exists(),
             "an unproven corpus must not publish the conformance identity"
         );
-        let again =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .unwrap();
+        let again = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         assert!(again.ran, "skipped files force a re-run on the next boot");
         assert_eq!(again.skipped, 2);
         assert_eq!(again.rewritten, 0, "the readable corpus already conforms");
@@ -1525,10 +1674,16 @@ mod boot {
         // Operator removes the bad files → the pass completes and publishes.
         std::fs::remove_file(&junk).unwrap();
         std::fs::remove_file(&unreadable).unwrap();
-        let clean =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .unwrap();
+        let clean = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         assert!(clean.ran);
         assert_eq!(clean.skipped, 0);
         let marker = std::fs::read_to_string(data_dir.join("CATALOG")).unwrap();
@@ -1560,10 +1715,16 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        let summary =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .expect("an unreadable directory must not fail the boot pass");
+        let summary = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect("an unreadable directory must not fail the boot pass");
         assert!(summary.ran);
         assert_eq!(summary.skipped, 1, "the unreadable directory is one skip");
         assert_eq!(summary.scanned, 2, "the readable corpus is still scanned");
@@ -1580,10 +1741,16 @@ mod boot {
 
         // Operator fixes the permissions → the pass completes and publishes.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let clean =
-            conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-                .await
-                .unwrap();
+        let clean = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .unwrap();
         assert!(clean.ran, "the skipped directory forced a re-run");
         assert_eq!(clean.skipped, 0);
         assert!(data_dir.join("CATALOG").exists());
@@ -1657,6 +1824,7 @@ mod boot {
             &cache,
             &skipped_data,
             &skipped_data.join("wal"),
+            HashSet::new(),
             "2GB",
         )
         .await
@@ -1681,9 +1849,16 @@ mod boot {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         plant_disagreeing_corpus(&data_dir);
-        conform::ensure_conformance(&store, &cache, &data_dir, &data_dir.join("wal"), "2GB")
-            .await
-            .expect("boot pass runs");
+        conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &data_dir.join("wal"),
+            HashSet::new(),
+            "2GB",
+        )
+        .await
+        .expect("boot pass runs");
         assert_eq!(
             conform::verify_archive_identity(&store, &data_dir)
                 .await
@@ -1735,9 +1910,10 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        let held = conform::ensure_conformance(&store, &cache, &data_dir, &wal_dir, "2GB")
-            .await
-            .expect("a claimed file is skipped, not fatal");
+        let held =
+            conform::ensure_conformance(&store, &cache, &data_dir, &wal_dir, HashSet::new(), "2GB")
+                .await
+                .expect("a claimed file is skipped, not fatal");
         assert!(held.ran);
         assert_eq!(held.rewritten, 0, "the claimed canonical is not rewritten");
         assert_eq!(held.skipped, 1, "the claimed canonical counts as skipped");
@@ -1750,9 +1926,10 @@ mod boot {
 
         remove_marker_durably(&marker.marker_path(&wal_dir)).unwrap();
         std::fs::remove_file(&staged).unwrap();
-        let resolved = conform::ensure_conformance(&store, &cache, &data_dir, &wal_dir, "2GB")
-            .await
-            .unwrap();
+        let resolved =
+            conform::ensure_conformance(&store, &cache, &data_dir, &wal_dir, HashSet::new(), "2GB")
+                .await
+                .unwrap();
         assert!(resolved.ran, "the incomplete pass re-runs");
         assert_eq!((resolved.rewritten, resolved.skipped), (1, 0));
         assert_eq!(column_type(&claimed, "duration"), "BIGINT");
@@ -1763,6 +1940,67 @@ mod boot {
                 .trim(),
             store.catalog_id().await.unwrap()
         );
+    }
+
+    /// A day whose rollup marker unlink still owes its day fsync holds no
+    /// marker file, yet the pass leaves its files alone and withholds
+    /// completion; other days conform. Once the obligation ends, the day
+    /// conforms on the next run.
+    #[sqlx::test]
+    async fn rollup_unlink_sync_retry_keeps_the_pass_off_an_owed_day(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        plant(
+            &data_dir,
+            "prod/2026-08-02/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-02 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             x::BIGINT AS duration FROM (VALUES (410), (420), (430)) t(x)",
+        );
+        let owed = plant(
+            &data_dir,
+            "prod/2026-08-01/svc-b.parquet",
+            "SELECT TIMESTAMP '2026-08-01 11:00:00' AS \"_time\", 'svc-b' AS service, \
+             '1.5s' AS duration",
+        );
+        let free = plant(
+            &data_dir,
+            "prod/2026-08-03/11/svc-b.parquet",
+            "SELECT TIMESTAMP '2026-08-03 11:00:00' AS \"_time\", 'svc-b' AS service, \
+             '2.5s' AS duration",
+        );
+        assert!(!data_dir.join("prod/2026-08-01/.rollup-svc-b").exists());
+        let owed_before = std::fs::read(&owed).unwrap();
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        let wal_dir = tmp.path().join("wal");
+        let held = conform::ensure_conformance(
+            &store,
+            &cache,
+            &data_dir,
+            &wal_dir,
+            HashSet::from([data_dir.join("prod/2026-08-01")]),
+            "2GB",
+        )
+        .await
+        .expect("an owed day is skipped, not fatal");
+        assert!(held.ran);
+        assert_eq!((held.rewritten, held.skipped), (1, 1));
+        assert_eq!(std::fs::read(&owed).unwrap(), owed_before);
+        assert_eq!(column_type(&free, "duration"), "BIGINT");
+        assert!(
+            !store.is_conformed().await.unwrap() && !data_dir.join("CATALOG").exists(),
+            "a deferred day must keep the pass armed"
+        );
+
+        let settled =
+            conform::ensure_conformance(&store, &cache, &data_dir, &wal_dir, HashSet::new(), "2GB")
+                .await
+                .unwrap();
+        assert!(settled.ran, "the incomplete pass re-runs");
+        assert_eq!((settled.rewritten, settled.skipped), (1, 0));
+        assert_eq!(column_type(&owed, "duration"), "BIGINT");
+        assert!(store.is_conformed().await.unwrap());
     }
 
     /// Markers that cannot be read may claim any file, so the pass fails
@@ -1782,9 +2020,10 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        let summary = conform::ensure_conformance(&store, &cache, &data_dir, &wal_dir, "2GB")
-            .await
-            .expect("unreadable markers skip the corpus, they do not fail the boot");
+        let summary =
+            conform::ensure_conformance(&store, &cache, &data_dir, &wal_dir, HashSet::new(), "2GB")
+                .await
+                .expect("unreadable markers skip the corpus, they do not fail the boot");
         assert_eq!(
             (summary.scanned, summary.rewritten, summary.skipped),
             (0, 0, 2)

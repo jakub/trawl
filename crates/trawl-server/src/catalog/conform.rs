@@ -81,7 +81,10 @@
 //! marker still present is one recovery could not resolve, and the
 //! compaction pass that later recovers it may retire or replace any file of
 //! that day. Markers that cannot be read fail closed like the publication
-//! claims: the pass skips every file.
+//! claims: the pass skips every file. A day whose rollup marker is gone but
+//! whose unlink boot recovery could not make durable is deferred too: after
+//! a power loss the marker may come back, and recovery proves its rollup by
+//! the daily file's exact bytes, which a rewrite would change.
 //!
 //! The repin engine reuses this machinery: `layout_path`, `Progress` and
 //! `open_bounded_connection`.
@@ -385,14 +388,18 @@ pub(crate) fn walk_archive(data_dir: &Path) -> ArchiveWalk {
 /// Run the boot conformance pass unless the dual-sided identity says it
 /// already ran for exactly this (catalog, data root) pair.
 ///
-/// `wal_dir` holds the publication markers. Every file a pending marker
-/// claims, and every file in a day directory that holds a rollup marker, is
-/// left untouched and counts as skipped.
-pub async fn ensure_conformance(
+/// `wal_dir` holds the publication markers. `removal_owed_days` are the day
+/// directories whose rollup marker unlink still owes its fsync
+/// ([`crate::publication::PublicationGate::removal_sync_owed_days`]). Every
+/// file a pending marker claims, and every file in a day directory that
+/// holds a rollup marker or is in `removal_owed_days`, is left untouched and
+/// counts as skipped.
+pub async fn ensure_conformance<S: std::hash::BuildHasher + Send + 'static>(
     store: &CatalogStore,
     cache: &FieldCatalog,
     data_dir: &Path,
     wal_dir: &Path,
+    removal_owed_days: HashSet<PathBuf, S>,
     memory_limit: &str,
 ) -> Result<ConformSummary, String> {
     let catalog_id = store
@@ -442,7 +449,7 @@ pub async fn ensure_conformance(
         let pinned = existing.clone();
         tokio::task::spawn_blocking(move || {
             let claims = scan_claims(&wal_dir);
-            let rollups = pending_rollup_days(&data_dir);
+            let rollups = rollup_deferred_days(&data_dir, removal_owed_days);
             scan_corpus(
                 &data_dir,
                 &memory_limit,
@@ -682,7 +689,7 @@ pub(crate) fn open_bounded_connection(
 /// with it.
 ///
 /// `claims` is the publication marker scan and `rollups` the day
-/// directories holding a rollup marker ([`pending_rollup_days`]). An `Err`
+/// directories deferred behind a rollup ([`rollup_deferred_days`]). An `Err`
 /// in either means those markers could not be read, so every file may be
 /// claimed and none is scanned.
 fn scan_corpus(
@@ -789,14 +796,17 @@ fn scan_corpus(
             continue;
         }
         // The rollup that recovers this day's marker may retire or replace
-        // any file of the day, so none of them is rewritten under it.
+        // any file of the day, so none of them is rewritten under it. A day
+        // whose marker unlink is not yet durable may get its marker back
+        // after a power loss, so it waits the same way.
         if rollup_days.iter().any(|day| path.starts_with(day)) {
             skipped += 1;
             skip_file(
                 &path,
                 "rollup",
-                "in a day directory an unresolved rollup marker holds — the \
-                 boot pass conforms it after the rollup recovers",
+                "in a day directory an unresolved rollup marker holds, or \
+                 whose marker removal is not yet durable — the boot pass \
+                 conforms it after the rollup settles",
             );
             progress.tick();
             continue;
@@ -815,6 +825,20 @@ fn scan_corpus(
         progress.tick();
     }
     Ok((out, skipped))
+}
+
+/// The day directories conformance defers: those under `data_dir` that hold
+/// a rollup marker, and `removal_owed`, whose marker is gone but whose
+/// unlink is not yet durable. A marker that comes back after a power loss
+/// is recovered from that day's files, so none is rewritten under it. An
+/// `Err` means the markers could not be read.
+fn rollup_deferred_days(
+    data_dir: &Path,
+    removal_owed: impl IntoIterator<Item = PathBuf>,
+) -> std::io::Result<HashSet<PathBuf>> {
+    let mut days = pending_rollup_days(data_dir)?;
+    days.extend(removal_owed);
+    Ok(days)
 }
 
 /// The day directories under `data_dir` that hold a rollup marker. An `Err`
@@ -1299,7 +1323,7 @@ fn rewrite_file(
 mod tests {
     use super::{FileScan, corpus_observations, count_non_null, most_rows_wins, voting_columns};
     use crate::ingest::compaction::{AGG_CHUNK_COLS, ColInfo, describe_source};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use trawl_core::schema::CanonicalType;
 
@@ -1672,6 +1696,66 @@ mod tests {
         let scanned: Vec<PathBuf> = scanned.into_iter().map(|scan| scan.path).collect();
         assert_eq!(scanned, vec![other]);
         assert_eq!(skipped, 2, "{hourly:?} and {daily:?} are deferred");
+    }
+
+    /// A day whose rollup marker is gone but whose unlink still owes its
+    /// day fsync is deferred whole like a day holding a marker, although no
+    /// marker file is there to find; other days are scanned.
+    #[tokio::test]
+    async fn rollup_unlink_sync_retry_defers_conformance_of_an_owed_day() {
+        use crate::ingest::publication_marker::PublicationClaims;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let owed_hourly = standing_parquet(&data, "prod/2026-01-15/10/api.parquet");
+        let owed_daily = standing_parquet(&data, "prod/2026-01-15/api.parquet");
+        let marker_day_hourly = standing_parquet(&data, "prod/2026-01-16/10/api.parquet");
+        std::fs::write(data.join("prod/2026-01-16/.rollup-api"), b"").unwrap();
+        let other = standing_parquet(&data, "prod/2026-01-17/10/api.parquet");
+
+        let gate = crate::publication::PublicationGate::new();
+        let marker = data.join("prod/2026-01-15/.rollup-api");
+        {
+            let _writer = gate.write().await;
+            let removal = gate.owe_removal_sync(&marker);
+            assert!(
+                removal
+                    .settle(|_| Err(std::io::ErrorKind::StorageFull.into()))
+                    .is_err()
+            );
+        }
+        assert!(!marker.exists());
+        assert_eq!(
+            super::pending_rollup_days(&data).unwrap(),
+            HashSet::from([data.join("prod/2026-01-16")]),
+            "the owed day holds no marker file"
+        );
+
+        let rollups = super::rollup_deferred_days(&data, gate.removal_sync_owed_days());
+        assert_eq!(
+            rollups.as_ref().unwrap(),
+            &HashSet::from([data.join("prod/2026-01-15"), data.join("prod/2026-01-16")])
+        );
+        let (scanned, skipped) = super::scan_corpus(
+            &data,
+            "256MB",
+            &HashMap::new(),
+            Ok(&PublicationClaims::default()),
+            rollups.as_ref(),
+        )
+        .unwrap();
+        let scanned: Vec<PathBuf> = scanned.into_iter().map(|scan| scan.path).collect();
+        assert_eq!(scanned, vec![other]);
+        assert_eq!(
+            skipped, 3,
+            "{owed_hourly:?}, {owed_daily:?} and {marker_day_hourly:?} are deferred"
+        );
+
+        // A successful retry ends the obligation, and the day conforms.
+        assert_eq!(gate.retry_removal_syncs(crate::epoch::fsync_dir), 0);
+        assert_eq!(
+            super::rollup_deferred_days(&data, gate.removal_sync_owed_days()).unwrap(),
+            HashSet::from([data.join("prod/2026-01-16")])
+        );
     }
 
     /// Rollup markers that cannot be read fail closed: any day may hold an
