@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-server/src/ingest/compaction.rs b/crates/trawl-server/src/ingest/compaction.rs
+index c87a963f..4dc9abae 100644
+--- a/crates/trawl-server/src/ingest/compaction.rs
++++ b/crates/trawl-server/src/ingest/compaction.rs
+@@ -1927,7 +1927,6 @@ fn recover_rollup_marker(
+             );
+             // The marker's bytes were synced before its rename, so its
+             // entry and the tmp's need only the directory chain.
+-            sync_rollup_chain(io, Phase::RecoveryChainSync, day_dir)?;
+             io.rename(
+                 Phase::Rename,
+                 &marker.tmp(day_dir),

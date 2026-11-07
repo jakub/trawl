@@ -1,0 +1,15 @@
+diff --git a/crates/trawl-server/src/catalog/conform.rs b/crates/trawl-server/src/catalog/conform.rs
+index e42b5cb3..39bd25e3 100644
+--- a/crates/trawl-server/src/catalog/conform.rs
++++ b/crates/trawl-server/src/catalog/conform.rs
+@@ -836,8 +836,8 @@ fn rollup_deferred_days(
+     data_dir: &Path,
+     removal_owed: impl IntoIterator<Item = PathBuf>,
+ ) -> std::io::Result<HashSet<PathBuf>> {
+-    let mut days = pending_rollup_days(data_dir)?;
+-    days.extend(removal_owed);
++    let days = pending_rollup_days(data_dir)?;
++    let _ = removal_owed;
+     Ok(days)
+ }
+ 

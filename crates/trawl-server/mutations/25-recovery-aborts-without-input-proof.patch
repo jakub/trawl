@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-server/src/ingest/rollup_marker.rs b/crates/trawl-server/src/ingest/rollup_marker.rs
+index a29e1c09..1621fda9 100644
+--- a/crates/trawl-server/src/ingest/rollup_marker.rs
++++ b/crates/trawl-server/src/ingest/rollup_marker.rs
+@@ -539,7 +539,7 @@ pub fn classify(
+         match observe(&marker.input_path(day_dir, input)) {
+             Observation::Identity(identity) if identity == input.identity => {}
+             Observation::Identity(_) => return Decision::Unresolved(Proof::InputMismatch),
+-            Observation::Absent => return Decision::Unresolved(Proof::InputMissing),
++            Observation::Absent => {}
+             Observation::Unreadable => return Decision::Unresolved(Proof::InputUnreadable),
+         }
+     }
