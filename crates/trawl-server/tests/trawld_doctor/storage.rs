@@ -18,7 +18,10 @@ use trawl_api::doctor::{Check, Outcome, Report, reason};
 use trawl_server::ingest::publication_marker::{OutputIdentity, ValidatedMarker};
 
 use crate::common;
-use crate::support::{DoctorConfig, assert_no_values, report, run_doctor, write_doctor_config};
+use crate::support::{
+    DoctorConfig, assert_no_values, pending_rollup, report, run_doctor, write_doctor_config,
+    write_parquet,
+};
 
 /// A catalog id no database here holds, for a data root restored from
 /// somewhere else.
@@ -350,16 +353,35 @@ fn publication_marker(wal: &Path) -> (PathBuf, String) {
     (marker.marker_path(wal), marker.encode())
 }
 
-/// A rollup marker as compaction writes it: the hourly inputs, one path a
-/// line.
+/// A rollup of nginx over hours 07 and 08 that stopped before its rename,
+/// planted as real Parquet, and its marker, unwritten: boot's recovery
+/// finishes it.
 fn rollup_marker(data: &Path) -> (PathBuf, String) {
+    pending_rollup(&data.join("prod/2026-09-23"), "nginx", &["07", "08"])
+}
+
+/// A marker from a release before identity-bearing rollup markers: the
+/// hourly inputs, one path a line. Boot's recovery keeps it.
+fn old_format_rollup_marker(data: &Path) {
     let day = data.join("prod/2026-09-23");
-    let body = format!(
-        "{}\n{}",
-        day.join("07/nginx.parquet").display(),
-        day.join("08/nginx.parquet").display()
+    write(
+        &day.join(".rollup-nginx"),
+        format!(
+            "{}\n{}",
+            day.join("07/nginx.parquet").display(),
+            day.join("08/nginx.parquet").display()
+        )
+        .as_bytes(),
     );
-    (day.join(".rollup-nginx"), body)
+}
+
+/// [`rollup_marker`], written, then a daily file the marker never recorded
+/// put in place: boot's recovery cannot prove the rename did not happen,
+/// and keeps it.
+fn prior_mismatch_rollup_marker(data: &Path) {
+    let (path, body) = rollup_marker(data);
+    write(&path, body.as_bytes());
+    write_parquet(&data.join("prod/2026-09-23/nginx.parquet"), 99);
 }
 
 /// Whether the running user reads a file of mode 000 anyway: root, or a
@@ -391,9 +413,64 @@ fn writes_mode_0500(dir: &Path) -> bool {
     privileged
 }
 
-/// `doctor_recovery_markers`: a malformed publication or rollup marker is
-/// `failed`, an unreadable one is `not_sampled`/`unreadable`, and
-/// well-formed pending ones are `complete`/`pending_at_next_boot`.
+/// The marker states `doctor_recovery_markers` expects to fail the row:
+/// the plant, the reason, and for a rollup marker the proof the row names.
+/// A publication marker that does not parse or names another service's
+/// WAL; a rollup marker in an older release's format, one that is not
+/// text, one that is not a regular file, and one whose daily file is not
+/// the prior it recorded.
+type FailedMarker = (&'static str, fn(&Path), &'static str, Option<&'static str>);
+
+fn failed_markers() -> [FailedMarker; 6] {
+    [
+        (
+            "unparseable publication marker",
+            |data: &Path| write(&data.join("wal/prod/.publish-nginx.json"), b"{ not json"),
+            "a publication marker is malformed",
+            None,
+        ),
+        (
+            "publication marker naming WAL of another service",
+            |data: &Path| {
+                let (_, body) = publication_marker(&data.join("wal"));
+                write(&data.join("wal/prod/.publish-api.json"), body.as_bytes());
+            },
+            "a publication marker is malformed",
+            None,
+        ),
+        (
+            "old-format rollup marker",
+            old_format_rollup_marker,
+            "a rollup marker is unresolved",
+            Some("marker_old_format"),
+        ),
+        (
+            "rollup marker that is not text",
+            |data: &Path| write(&data.join("prod/2026-09-23/.rollup-nginx"), &[0xff, 0xfe]),
+            "a rollup marker is unresolved",
+            Some("marker_old_format"),
+        ),
+        (
+            "rollup marker that is a directory",
+            |data: &Path| {
+                std::fs::create_dir_all(data.join("prod/2026-09-23/.rollup-nginx")).unwrap();
+            },
+            "a rollup marker is unresolved",
+            Some("marker_unreadable"),
+        ),
+        (
+            "rollup marker whose daily file is not its prior",
+            prior_mismatch_rollup_marker,
+            "a rollup marker is unresolved",
+            Some("prior_mismatch"),
+        ),
+    ]
+}
+
+/// `doctor_recovery_markers`: a malformed publication marker, and a rollup
+/// marker boot's recovery would keep, are `failed`; an unreadable one is
+/// `not_sampled`/`unreadable`; and pending ones boot's recovery finishes
+/// are `complete`/`pending_at_next_boot`.
 #[tokio::test]
 async fn doctor_recovery_markers() {
     const CHECK: &str = "server.recovery.publication";
@@ -416,47 +493,27 @@ async fn doctor_recovery_markers() {
         let detail = run.row(CHECK).detail.clone().unwrap();
         assert!(
             detail.contains("1 pending and 0 malformed publication marker(s)")
-                && detail.contains("1 pending and 0 malformed rollup marker(s)"),
+                && detail.contains("1 pending and 0 unresolved rollup marker(s)"),
             "{detail}"
         );
     }
 
-    // Malformed: a publication marker that does not parse, a rollup marker
-    // that is not text, and one that is not a regular file.
-    for (name, plant, why) in [
-        (
-            "unparseable publication marker",
-            (|data: &Path| write(&data.join("wal/prod/.publish-nginx.json"), b"{ not json"))
-                as fn(&Path),
-            "a publication marker is malformed",
-        ),
-        (
-            "publication marker naming WAL of another service",
-            |data: &Path| {
-                let (_, body) = publication_marker(&data.join("wal"));
-                write(&data.join("wal/prod/.publish-api.json"), body.as_bytes());
-            },
-            "a publication marker is malformed",
-        ),
-        (
-            "rollup marker that is not text",
-            |data: &Path| write(&data.join("prod/2026-09-23/.rollup-nginx"), &[0xff, 0xfe]),
-            "a rollup marker is malformed",
-        ),
-        (
-            "rollup marker that is a directory",
-            |data: &Path| {
-                std::fs::create_dir_all(data.join("prod/2026-09-23/.rollup-nginx")).unwrap();
-            },
-            "a rollup marker is malformed",
-        ),
-    ] {
+    // Failed: see [`failed_markers`].
+    for (name, plant, why, proof) in failed_markers() {
         let dir = tempfile::tempdir().unwrap();
         let config = current_ingest_root(dir.path());
         plant(&config.data_path);
         let run = doctor(dir.path(), &config, &dbs).await;
         assert_eq!(run.outcome(CHECK), (Outcome::Failed, Some(why)), "{name}");
         assert_eq!(run.code, 1, "{name}");
+        if let Some(proof) = proof {
+            let detail = run.row(CHECK).detail.clone().unwrap();
+            let named = format!(
+                "0 pending and 1 unresolved rollup marker(s); unresolved: env prod, day \
+                 2026-09-23, service nginx, failed proof {proof}"
+            );
+            assert!(detail.ends_with(&named), "{name}: {detail}");
+        }
     }
 
     // Unreadable: a well-formed marker of mode 000 is not sampled, kept
@@ -499,8 +556,8 @@ fn current_query_only_root(dir: &Path) -> DoctorConfig {
 /// `server.recovery.publication` on a query-only node: its publication
 /// gate registers every rollup marker the boot scan finds and refuses
 /// corpus reads while one remains, so the rollup census runs there too. A
-/// malformed rollup marker is `failed`, an unreadable one is
-/// `not_sampled`/`unreadable`, and a pending one is
+/// rollup marker boot's recovery would keep is `failed`, an unreadable one
+/// is `not_sampled`/`unreadable`, and a pending one is
 /// `complete`/`pending_at_next_boot`. Publication markers stay an ingest
 /// node's: a malformed one in the WAL a query-only node never reads changes
 /// nothing.
@@ -526,7 +583,7 @@ async fn doctor_query_only_rollup_markers() {
         assert_ne!(run.code, 1, "{:?}", run.report.checks());
         let detail = run.row(CHECK).detail.clone().unwrap();
         assert!(
-            detail.contains("1 pending and 0 malformed rollup marker(s)")
+            detail.contains("1 pending and 0 unresolved rollup marker(s)")
                 && !detail.contains("publication marker(s)"),
             "{detail}"
         );
@@ -541,16 +598,20 @@ async fn doctor_query_only_rollup_markers() {
         assert_eq!(run.outcome(CHECK), (Outcome::Complete, None));
     }
 
-    // Malformed: not text, and not a regular file.
+    // Unresolved: an older release's format, not a regular file, and a
+    // daily file the marker did not record.
     for (name, plant) in [
         (
-            "rollup marker that is not text",
-            (|data: &Path| write(&data.join("prod/2026-09-23/.rollup-nginx"), &[0xff, 0xfe]))
-                as fn(&Path),
+            "old-format rollup marker",
+            old_format_rollup_marker as fn(&Path),
         ),
         ("rollup marker that is a directory", |data: &Path| {
             std::fs::create_dir_all(data.join("prod/2026-09-23/.rollup-nginx")).unwrap();
         }),
+        (
+            "rollup marker whose daily file is not its prior",
+            prior_mismatch_rollup_marker,
+        ),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let config = current_query_only_root(dir.path());
@@ -558,7 +619,7 @@ async fn doctor_query_only_rollup_markers() {
         let run = doctor(dir.path(), &config, &dbs).await;
         assert_eq!(
             run.outcome(CHECK),
-            (Outcome::Failed, Some("a rollup marker is malformed")),
+            (Outcome::Failed, Some("a rollup marker is unresolved")),
             "{name}"
         );
         assert_eq!(run.code, 1, "{name}");

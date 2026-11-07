@@ -858,8 +858,10 @@ async fn doctor_against(server: &common::TestServer, dir: &Path) -> Report {
     doctor(&config, planted_env(dir), &planted).await
 }
 
-/// A real trawld whose rollup recovery failed at boot, which it reports as
-/// `corpus` `rollup_pending` (the `boot_corpus` suite's stuck rollup).
+/// A real trawld whose boot rollup recovery kept a marker, which it reports
+/// as `corpus` `rollup_pending`: a marker in an older release's format,
+/// which recovery keeps unresolved, naming an hourly input that is a
+/// non-empty directory, which no recovery could retire either.
 async fn trawld_with_a_pending_rollup(dir: &Path) -> common::TestServer {
     let data = common::seed_data_root(dir);
     let day = Path::new(&data).join("prod/2024-01-15");

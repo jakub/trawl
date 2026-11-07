@@ -1723,27 +1723,6 @@ pub(crate) enum RollupMarkerError {
     Read(std::io::Error),
 }
 
-impl RollupMarkerError {
-    /// Whether nothing is at the path any more.
-    pub(crate) fn is_missing(&self) -> bool {
-        matches!(self, Self::Open(e) if e.kind() == std::io::ErrorKind::NotFound)
-    }
-
-    /// Whether what is at the path can never be a marker recovery uses:
-    /// a symlink, not a regular file, over the bound, or not text. Any
-    /// other failure is one the reader may not have been allowed to look
-    /// past.
-    pub(crate) fn is_malformed(&self) -> bool {
-        match self {
-            Self::Open(e) => {
-                no_follow::is_symlink_refusal(e) || e.kind() == std::io::ErrorKind::InvalidInput
-            }
-            Self::TooLarge => true,
-            Self::Read(e) => e.kind() == std::io::ErrorKind::InvalidData,
-        }
-    }
-}
-
 /// The wording recovery has always failed a day with.
 impl std::fmt::Display for RollupMarkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

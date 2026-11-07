@@ -8,7 +8,8 @@
 //! A row is a [`Row`], and every string in it is built here from parts
 //! that cannot carry a value the report must not show: `&'static str`
 //! literals, integers, a [`SelectedPath`] the operator chose, the running
-//! user's [`UserName`], and a [`HealthKey`]. A health value is never
+//! user's [`UserName`], a [`HealthKey`], and a service name, env name or
+//! date that passed trawl's own validation. A health value is never
 //! shown as trawld sent it. No constructor takes a `String`, a `Display`,
 //! or an error, so the `Display` or `Debug` of a database, OS, TLS or HTTP
 //! error, a database URL, a certificate name, a catalog identifier, or a
@@ -169,6 +170,16 @@ impl HealthKey {
     }
 }
 
+/// Shown by [`Text::service_name`] in place of a name that is not a valid
+/// service name.
+pub const INVALID_SERVICE: &str = "<invalid service>";
+/// Shown by [`Text::env_name`] in place of a name that is not a valid env
+/// name.
+pub const INVALID_ENV: &str = "<invalid env>";
+/// Shown by [`Text::date`] in place of text that is not a `YYYY-MM-DD`
+/// date.
+pub const INVALID_DATE: &str = "<invalid date>";
+
 /// Text for a row's detail, source or next action, built only from parts
 /// the report may show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +224,42 @@ impl Text {
     #[must_use]
     pub fn key(mut self, key: &HealthKey) -> Self {
         self.0.push_str(key.0);
+        self
+    }
+
+    /// Append `name` when it is a valid service name
+    /// ([`trawl_config::is_valid_service_name`]), else [`INVALID_SERVICE`].
+    #[must_use]
+    pub fn service_name(mut self, name: &str) -> Self {
+        self.0
+            .push_str(if trawl_config::is_valid_service_name(name) {
+                name
+            } else {
+                INVALID_SERVICE
+            });
+        self
+    }
+
+    /// Append `name` when it is a valid env name
+    /// ([`trawl_config::is_valid_env_name`]), else [`INVALID_ENV`].
+    #[must_use]
+    pub fn env_name(mut self, name: &str) -> Self {
+        self.0.push_str(if trawl_config::is_valid_env_name(name) {
+            name
+        } else {
+            INVALID_ENV
+        });
+        self
+    }
+
+    /// Append the date `day` spells as `YYYY-MM-DD`, written back from the
+    /// parsed date, else [`INVALID_DATE`].
+    #[must_use]
+    pub fn date(mut self, day: &str) -> Self {
+        match chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+            Ok(date) => self.0.push_str(&date.format("%Y-%m-%d").to_string()),
+            Err(_) => self.0.push_str(INVALID_DATE),
+        }
         self
     }
 
@@ -494,6 +541,37 @@ mod tests {
         }
         for name in ["", "$x", "a b", "evil\u{1b}[2J", &"a".repeat(33), "ünï"] {
             assert!(UserName::new(name).is_none(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn names_and_dates_are_shown_only_once_valid() {
+        let text = Text::new("")
+            .env_name("prod")
+            .lit(" ")
+            .service_name("api.v2")
+            .lit(" ")
+            .date("2026-09-23");
+        assert_eq!(text.as_str(), "prod api.v2 2026-09-23");
+        for env in ["", "Prod", "a/b", "evil\u{1b}[2J", &"a".repeat(33)] {
+            assert_eq!(Text::new("").env_name(env).as_str(), INVALID_ENV, "{env:?}");
+        }
+        for service in ["", ".hidden", "a b", "a/b", "x\u{202e}y", &"s".repeat(129)] {
+            assert_eq!(
+                Text::new("").service_name(service).as_str(),
+                INVALID_SERVICE,
+                "{service:?}"
+            );
+        }
+        for day in [
+            "",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-09-23\u{1b}",
+            "../x",
+            "2026-9-3x",
+        ] {
+            assert_eq!(Text::new("").date(day).as_str(), INVALID_DATE, "{day:?}");
         }
     }
 
