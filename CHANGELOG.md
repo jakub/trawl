@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.4
+
+See the [0.9.4 release notes](docs/releases/v0.9.4.md) for the MCP server,
+captured results, investigations, the new API result format, and what to back
+up before upgrading.
+
 ## 0.9.3
 
 See the [0.9.3 release notes](docs/releases/v0.9.3.md) for the server-wide
