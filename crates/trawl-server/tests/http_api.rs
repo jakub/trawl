@@ -3627,7 +3627,7 @@ async fn trigger_run_rejects_when_already_running() {
     // task the happy-path trigger spawns.
     let store = ScheduleStore::new(common::app_pool(&server.app_db_url).await);
     let seeded = store
-        .claim_run(schedule.id, saved.id, "* | head 3", None, None)
+        .claim_run(schedule.id, saved.id, "* | head 3", None)
         .await
         .unwrap();
     assert!(
@@ -5321,7 +5321,7 @@ async fn run_listing_carries_window_and_truncated_flag() {
         let store = store.clone();
         async move {
             let claimed = store
-                .claim_run(schedule.id, saved.id, "service=x", None, window.as_ref())
+                .claim_run(schedule.id, saved.id, "service=x", window.as_ref())
                 .await
                 .unwrap();
             let RunClaim::Started(id) = claimed else {

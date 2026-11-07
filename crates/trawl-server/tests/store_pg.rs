@@ -659,8 +659,9 @@ async fn seed_saved(pool: &PgPool, key_id: i64, name: &str) -> i64 {
 }
 
 /// Claim a `running` report run and return its id, asserting the claim
-/// started (no `max_runs` cap). Seeds runs for the schedule/run lifecycle
-/// tests without the concurrency guards those tests set up explicitly.
+/// started. It spends one run of the schedule's budget, like every claim.
+/// Seeds runs for the schedule/run lifecycle tests without the concurrency
+/// guards those tests set up explicitly.
 async fn seed_run(
     store: &ScheduleStore,
     schedule_id: i64,
@@ -668,7 +669,7 @@ async fn seed_run(
     query: &str,
 ) -> i64 {
     match store
-        .claim_run(schedule_id, saved_query_id, query, None, None)
+        .claim_run(schedule_id, saved_query_id, query, None)
         .await
         .unwrap()
     {
@@ -695,11 +696,8 @@ async fn claim_run_locks_saved_query_before_schedule(pool: PgPool) {
         .await
         .unwrap();
 
-    let claim = tokio::spawn(async move {
-        store
-            .claim_run(schedule.id, saved_id, "q", None, None)
-            .await
-    });
+    let claim =
+        tokio::spawn(async move { store.claim_run(schedule.id, saved_id, "q", None).await });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let waiting: bool = sqlx::query_scalar(
@@ -1250,7 +1248,7 @@ async fn claimed_run_round_trips_its_window(pool: PgPool) {
         kind: WindowKind::SinceLast,
     };
     let rid = match store
-        .claim_run(sched.id, windowed_sq, "q", None, Some(&window))
+        .claim_run(sched.id, windowed_sq, "q", Some(&window))
         .await
         .unwrap()
     {
@@ -1321,7 +1319,7 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
         kind: WindowKind::SinceLast,
     };
     let run = async |w: &ReportWindow| match store
-        .claim_run(sched.id, sq_id, "q", None, Some(w))
+        .claim_run(sched.id, sq_id, "q", Some(w))
         .await
         .unwrap()
     {
@@ -1416,7 +1414,7 @@ async fn finish_and_window_mode_edit_are_order_independent(pool: PgPool) {
             .unwrap();
         let window = bounds(claimed.kind());
         let rid = match store
-            .claim_run(sched.id, sq_id, "q", None, Some(&window))
+            .claim_run(sched.id, sq_id, "q", Some(&window))
             .await
             .unwrap()
         {
@@ -1508,7 +1506,7 @@ async fn fixed_and_legacy_schedules_keep_no_watermark(pool: PgPool) {
             kind: w.kind(),
         });
         let rid = match store
-            .claim_run(sched.id, sq_id, "q", None, covered.as_ref())
+            .claim_run(sched.id, sq_id, "q", covered.as_ref())
             .await
             .unwrap()
         {
@@ -1629,6 +1627,11 @@ async fn claim_due_run_advances_over_ground_the_watermark_covers(pool: PgPool) {
         reread(&store, sq_id).await.next_fire_at,
         now + chrono::Duration::hours(1),
         "the cursor moves one interval so the tick stops re-asking"
+    );
+    assert_eq!(
+        runs_claimed(&pool, sched.id).await,
+        0,
+        "moving the cursor claims no run, so it spends none"
     );
 }
 
@@ -1876,6 +1879,490 @@ async fn claim_due_run_refuses_a_query_that_owns_its_own_window(pool: PgPool) {
         reread(&store, sq_id).await.next_fire_at,
         now,
         "a refused claim leaves the cursor, so the state is loud every poll"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// run budget: `max_runs` counts the runs a schedule claims over its life
+// (ADR-0018 amended 2026-11-06)
+// ---------------------------------------------------------------------------
+
+/// A schedule's spent run budget, read off the row rather than through the
+/// store's decode, so these tests prove what is stored.
+async fn runs_claimed(pool: &PgPool, schedule_id: i64) -> i64 {
+    sqlx::query_scalar("SELECT runs_claimed FROM schedules WHERE id = $1")
+        .bind(schedule_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The three doors a run comes in by.
+#[derive(Debug, Clone, Copy)]
+enum Claimant {
+    /// The scheduler tick, [`ScheduleStore::claim_due_run`].
+    Due,
+    /// An operator, [`ScheduleStore::claim_manual_run`].
+    Manual,
+    /// The test seeding door, [`ScheduleStore::claim_run`].
+    Seed,
+}
+
+const CLAIMANTS: [Claimant; 3] = [Claimant::Due, Claimant::Manual, Claimant::Seed];
+
+/// What a claim answered, folded across the three claimants' outcome types.
+#[derive(Debug, PartialEq, Eq)]
+enum Claimed {
+    Started(i64),
+    AlreadyRunning,
+    MaxRunsReached,
+    Other(String),
+}
+
+/// Claim a run of the schedule on saved query `sq_id` (key 1) through
+/// `claimant`. A due claim is judged at the schedule's own cursor, so it is
+/// always due. An error comes back as its `Debug` text.
+async fn claim_via(
+    store: &ScheduleStore,
+    claimant: Claimant,
+    sq_id: i64,
+) -> Result<Claimed, String> {
+    let schedule = reread(store, sq_id).await;
+    match claimant {
+        Claimant::Due => match store
+            .claim_due_run(schedule.id, schedule.next_fire_at, CATCHUP)
+            .await
+        {
+            Ok(DueClaim::Started(claimed)) => Ok(Claimed::Started(claimed.run_id)),
+            Ok(DueClaim::AlreadyRunning) => Ok(Claimed::AlreadyRunning),
+            Ok(DueClaim::MaxRunsReached) => Ok(Claimed::MaxRunsReached),
+            Ok(other) => Ok(Claimed::Other(format!("{other:?}"))),
+            Err(e) => Err(format!("{e:?}")),
+        },
+        Claimant::Manual => match store.claim_manual_run(sq_id, 1, CATCHUP).await {
+            Ok(ManualRunClaim::Started(claimed)) => Ok(Claimed::Started(claimed.run_id)),
+            Ok(ManualRunClaim::AlreadyRunning) => Ok(Claimed::AlreadyRunning),
+            Ok(ManualRunClaim::MaxRunsReached) => Ok(Claimed::MaxRunsReached),
+            Ok(other) => Ok(Claimed::Other(format!("{other:?}"))),
+            Err(e) => Err(format!("{e:?}")),
+        },
+        Claimant::Seed => match store
+            .claim_run(schedule.id, sq_id, "_severity=error", None)
+            .await
+        {
+            Ok(RunClaim::Started(run_id)) => Ok(Claimed::Started(run_id)),
+            Ok(RunClaim::AlreadyRunning) => Ok(Claimed::AlreadyRunning),
+            Ok(RunClaim::MaxRunsReached) => Ok(Claimed::MaxRunsReached),
+            Err(e) => Err(format!("{e:?}")),
+        },
+    }
+}
+
+/// Claim through `claimant` and insist that a run started.
+async fn start_via(store: &ScheduleStore, claimant: Claimant, sq_id: i64) -> i64 {
+    match claim_via(store, claimant, sq_id).await {
+        Ok(Claimed::Started(run_id)) => run_id,
+        other => panic!("{claimant:?} must start a run, got {other:?}"),
+    }
+}
+
+/// Finish a run with `status`, as the executor would.
+async fn finish(store: &ScheduleStore, run_id: i64, status: RunStatus) {
+    let message = (status != RunStatus::Success).then_some("planted failure");
+    let outcome = store
+        .finish_run(run_id, status, 5, Some(0), message, None, None)
+        .await
+        .unwrap();
+    assert_eq!(outcome, FinishOutcome::Persisted);
+}
+
+/// Every claimant spends the one budget, one claim at a time, and every
+/// claimant refuses once it is spent. Spending is not an edit: the
+/// schedule's `updated_at` stays where the operator left it.
+#[sqlx::test]
+async fn run_budget_is_spent_by_every_claimant(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "spent by all").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 3600, Some(3), None, 0, now)
+        .await
+        .unwrap();
+
+    for (spent, claimant) in (1..).zip(CLAIMANTS) {
+        let run_id = start_via(&store, claimant, sq_id).await;
+        assert_eq!(
+            runs_claimed(&pool, sched.id).await,
+            spent,
+            "{claimant:?} spends exactly one run"
+        );
+        finish(&store, run_id, RunStatus::Success).await;
+    }
+
+    for claimant in CLAIMANTS {
+        assert_eq!(
+            claim_via(&store, claimant, sq_id).await,
+            Ok(Claimed::MaxRunsReached),
+            "{claimant:?} refuses a spent budget"
+        );
+    }
+    assert_eq!(
+        runs_claimed(&pool, sched.id).await,
+        3,
+        "a refusal spends nothing"
+    );
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 3);
+    assert_eq!(
+        reread(&store, sq_id).await.updated_at,
+        sched.updated_at,
+        "spending the budget is not an edit"
+    );
+}
+
+/// The cap reads the counter, never the runs retention happened to keep.
+/// A spent budget with no runs left refuses every claimant, and a budget
+/// with one run left claims it even while more runs than the cap are kept.
+#[sqlx::test]
+async fn run_budget_reads_the_counter_not_the_rows(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+
+    // Spent, and nothing kept: what an upgraded schedule whose runs
+    // retention deleted looks like.
+    let spent_sq = seed_saved(&pool, 1, "spent, nothing kept").await;
+    let spent = store
+        .create_schedule(spent_sq, 1, 3600, Some(2), None, 0, now)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE schedules SET runs_claimed = 2 WHERE id = $1")
+        .bind(spent.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for claimant in CLAIMANTS {
+        assert_eq!(
+            claim_via(&store, claimant, spent_sq).await,
+            Ok(Claimed::MaxRunsReached),
+            "{claimant:?} refuses with no runs to count"
+        );
+    }
+    assert_eq!(store.count_runs(spent.id).await.unwrap(), 0);
+    assert_eq!(runs_claimed(&pool, spent.id).await, 2);
+    assert_eq!(
+        reread(&store, spent_sq).await.next_fire_at,
+        now,
+        "the refused boundary stays claimable"
+    );
+
+    // One run left, with three runs kept under a cap of two.
+    for claimant in CLAIMANTS {
+        let sq_id = seed_saved(&pool, 1, &format!("one left for {claimant:?}")).await;
+        let sched = store
+            .create_schedule(sq_id, 1, 3600, None, None, 0, now)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let run_id = seed_run(&store, sched.id, sq_id, "q").await;
+            finish(&store, run_id, RunStatus::Success).await;
+        }
+        store
+            .update_schedule(sched.id, 1, 3600, Some(2), true, None, 0, now)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE schedules SET runs_claimed = 1 WHERE id = $1")
+            .bind(sched.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let run_id = start_via(&store, claimant, sq_id).await;
+        assert_eq!(runs_claimed(&pool, sched.id).await, 2, "{claimant:?}");
+        finish(&store, run_id, RunStatus::Success).await;
+        for refused in CLAIMANTS {
+            assert_eq!(
+                claim_via(&store, refused, sq_id).await,
+                Ok(Claimed::MaxRunsReached),
+                "{refused:?} refuses once {claimant:?} spent the last run"
+            );
+        }
+        assert_eq!(store.count_runs(sched.id).await.unwrap(), 4);
+        assert_eq!(runs_claimed(&pool, sched.id).await, 2);
+    }
+}
+
+/// A claim refused or failing after the budget is spent rolls the spend
+/// back with everything else: no run row, and the budget where it was.
+#[sqlx::test]
+async fn refused_claims_spend_no_budget(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+
+    // A run in flight. A manual claim asks before it spends; the other two
+    // learn it from the insert, after the spend.
+    let busy_sq = seed_saved(&pool, 1, "busy").await;
+    let busy = store
+        .create_schedule(busy_sq, 1, 3600, Some(5), None, 0, now)
+        .await
+        .unwrap();
+    seed_run(&store, busy.id, busy_sq, "q").await;
+    for claimant in CLAIMANTS {
+        assert_eq!(
+            claim_via(&store, claimant, busy_sq).await,
+            Ok(Claimed::AlreadyRunning),
+            "{claimant:?}"
+        );
+    }
+    assert_eq!(runs_claimed(&pool, busy.id).await, 1);
+    assert_eq!(store.count_runs(busy.id).await.unwrap(), 1);
+
+    // An empty since_last window: the watermark already covers `t - lag`.
+    let covered_sq = seed_saved(&pool, 1, "covered").await;
+    let covered = store
+        .create_schedule(
+            covered_sq,
+            1,
+            3600,
+            Some(5),
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(now + chrono::Duration::hours(10))
+        .bind(covered.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            store
+                .claim_manual_run(covered_sq, 1, CATCHUP)
+                .await
+                .unwrap(),
+            ManualRunClaim::EmptyWindow { .. }
+        ),
+        "the watermark covers the manual window"
+    );
+    assert_eq!(runs_claimed(&pool, covered.id).await, 0);
+    assert_eq!(store.count_runs(covered.id).await.unwrap(), 0);
+
+    // A window that cannot be put onto the saved text (rulings 7 and 11),
+    // planted past the write-time gate.
+    let conflicted_sq = saved(&pool)
+        .create(1, "conflicted", "service=fx | table _time")
+        .await
+        .unwrap()
+        .id;
+    let conflicted = store
+        .create_schedule(
+            conflicted_sq,
+            1,
+            3600,
+            Some(5),
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE saved_queries SET query = $1 WHERE id = $2")
+        .bind("service=fx last=1h | table _time")
+        .bind(conflicted_sq)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for claimant in [Claimant::Due, Claimant::Manual] {
+        let error = claim_via(&store, claimant, conflicted_sq)
+            .await
+            .expect_err("the window cannot be resolved");
+        assert!(error.starts_with("Policy("), "{claimant:?}: {error}");
+    }
+    assert_eq!(runs_claimed(&pool, conflicted.id).await, 0);
+    assert_eq!(store.count_runs(conflicted.id).await.unwrap(), 0);
+    assert_eq!(reread(&store, conflicted_sq).await.next_fire_at, now);
+
+    // An insert that fails outright, after every check has passed.
+    let failing_sq = seed_saved(&pool, 1, "failing insert").await;
+    let failing = store
+        .create_schedule(failing_sq, 1, 3600, Some(5), None, 0, now)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_report_run() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'injected report run failure'; END $$;
+         CREATE TRIGGER refuse_report_run BEFORE INSERT ON report_runs
+         FOR EACH ROW EXECUTE FUNCTION refuse_report_run();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for claimant in CLAIMANTS {
+        let error = claim_via(&store, claimant, failing_sq)
+            .await
+            .expect_err("the insert fails");
+        assert!(
+            error.contains("injected report run failure"),
+            "{claimant:?}: {error}"
+        );
+    }
+    assert_eq!(runs_claimed(&pool, failing.id).await, 0);
+    assert_eq!(store.count_runs(failing.id).await.unwrap(), 0);
+    assert_eq!(reread(&store, failing_sq).await.next_fire_at, now);
+
+    // The control: the same claim spends once its insert can land.
+    sqlx::raw_sql("DROP TRIGGER refuse_report_run ON report_runs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    start_via(&store, Claimant::Due, failing_sq).await;
+    assert_eq!(runs_claimed(&pool, failing.id).await, 1);
+}
+
+/// A claimed run that fails keeps its claim: an error, a timeout and the
+/// boot's interrupted marking all leave the budget spent. There are no
+/// refunds.
+#[sqlx::test]
+async fn failed_runs_keep_their_claim(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "failing runs").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 3600, Some(3), None, 0, now)
+        .await
+        .unwrap();
+
+    let errored = start_via(&store, Claimant::Due, sq_id).await;
+    finish(&store, errored, RunStatus::Error).await;
+    let timed_out = start_via(&store, Claimant::Manual, sq_id).await;
+    finish(&store, timed_out, RunStatus::Timeout).await;
+    let interrupted = start_via(&store, Claimant::Seed, sq_id).await;
+    assert_eq!(store.cleanup_stale_runs().await.unwrap(), 1);
+
+    let interrupted = store.get_run(interrupted, 1).await.unwrap().unwrap();
+    assert_eq!(interrupted.status, RunStatus::Error);
+    assert_eq!(
+        interrupted.error_message.as_deref(),
+        Some("interrupted by server restart")
+    );
+    for (run_id, status) in [(errored, RunStatus::Error), (timed_out, RunStatus::Timeout)] {
+        assert_eq!(
+            store.get_run(run_id, 1).await.unwrap().unwrap().status,
+            status
+        );
+    }
+
+    assert_eq!(runs_claimed(&pool, sched.id).await, 3);
+    for claimant in CLAIMANTS {
+        assert_eq!(
+            claim_via(&store, claimant, sq_id).await,
+            Ok(Claimed::MaxRunsReached),
+            "{claimant:?}: failed runs were still claims"
+        );
+    }
+    assert_eq!(runs_claimed(&pool, sched.id).await, 3);
+}
+
+/// Write the schedule of `sq_id` through the HTTP door, query mode and
+/// enabled.
+async fn put_schedule(
+    store: &ScheduleStore,
+    sq_id: i64,
+    interval_secs: u64,
+    max_runs: Option<u64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> trawl_server::store::Schedule {
+    store
+        .set_schedule_checked(sq_id, 1, interval_secs, max_runs, true, None, 0, now)
+        .await
+        .unwrap()
+}
+
+/// Editing a schedule keeps what it spent. Raising the cap lets it claim
+/// again; lowering it below what is spent refuses new claims while the run
+/// already going finishes; only deleting the schedule and creating a new
+/// one starts a new budget.
+#[sqlx::test]
+async fn run_budget_survives_edits_and_resets_on_recreate(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "edited").await;
+    let sched = put_schedule(&store, sq_id, 3600, Some(2), now).await;
+    for claimant in [Claimant::Due, Claimant::Seed] {
+        let run_id = start_via(&store, claimant, sq_id).await;
+        finish(&store, run_id, RunStatus::Success).await;
+    }
+    assert_eq!(runs_claimed(&pool, sched.id).await, 2);
+
+    // A cadence edit re-anchors the cursor and keeps the count.
+    let edited = put_schedule(&store, sq_id, 7200, Some(2), now).await;
+    assert_eq!(runs_claimed(&pool, sched.id).await, 2, "an edit keeps it");
+    assert_eq!(
+        (edited.runs_claimed, edited.exhausted()),
+        (2, true),
+        "the edit's answer reads the kept budget"
+    );
+    for claimant in CLAIMANTS {
+        assert_eq!(
+            claim_via(&store, claimant, sq_id).await,
+            Ok(Claimed::MaxRunsReached),
+            "{claimant:?}: an edit is not a new budget"
+        );
+    }
+
+    // Raising the cap above what is spent lets it claim again.
+    let raised = put_schedule(&store, sq_id, 7200, Some(3), now).await;
+    assert!(!raised.exhausted());
+    let running = start_via(&store, Claimant::Manual, sq_id).await;
+    assert_eq!(runs_claimed(&pool, sched.id).await, 3);
+
+    // Lowering it below what is spent refuses new claims, and the run
+    // already going is left to finish.
+    let lowered = put_schedule(&store, sq_id, 7200, Some(1), now).await;
+    assert_eq!(runs_claimed(&pool, sched.id).await, 3);
+    assert_eq!(
+        (lowered.runs_claimed, lowered.max_runs, lowered.exhausted()),
+        (3, Some(1), true),
+        "spent past a lowered cap is still spent"
+    );
+    for claimant in [Claimant::Due, Claimant::Seed] {
+        assert_eq!(
+            claim_via(&store, claimant, sq_id).await,
+            Ok(Claimed::MaxRunsReached),
+            "{claimant:?}"
+        );
+    }
+    assert_eq!(
+        claim_via(&store, Claimant::Manual, sq_id).await,
+        Ok(Claimed::AlreadyRunning),
+        "a run in flight still outranks the cap"
+    );
+    finish(&store, running, RunStatus::Success).await;
+    assert_eq!(
+        store.get_run(running, 1).await.unwrap().unwrap().status,
+        RunStatus::Success
+    );
+    for claimant in CLAIMANTS {
+        assert_eq!(
+            claim_via(&store, claimant, sq_id).await,
+            Ok(Claimed::MaxRunsReached),
+            "{claimant:?}"
+        );
+    }
+    assert_eq!(runs_claimed(&pool, sched.id).await, 3);
+
+    // Only a new schedule starts a new budget.
+    store.delete_schedule(sq_id, 1).await.unwrap();
+    let recreated = put_schedule(&store, sq_id, 7200, Some(1), now).await;
+    assert_ne!(recreated.id, sched.id);
+    assert_eq!(runs_claimed(&pool, recreated.id).await, 0);
+    assert_eq!((recreated.runs_claimed, recreated.exhausted()), (0, false));
+    start_via(&store, Claimant::Seed, sq_id).await;
+    assert_eq!(runs_claimed(&pool, recreated.id).await, 1);
+    assert!(
+        reread(&store, sq_id).await.exhausted(),
+        "a read decodes the spend"
     );
 }
 
@@ -2209,7 +2696,7 @@ async fn sequential_run_prevention(pool: PgPool) {
         .unwrap();
 
     let first = store
-        .claim_run(schedule.id, sq_id, "q", None, None)
+        .claim_run(schedule.id, sq_id, "q", None)
         .await
         .unwrap();
     let RunClaim::Started(first_id) = first else {
@@ -2218,7 +2705,7 @@ async fn sequential_run_prevention(pool: PgPool) {
 
     // Second claim is refused (already running) via the named 23505.
     let second = store
-        .claim_run(schedule.id, sq_id, "q", None, None)
+        .claim_run(schedule.id, sq_id, "q", None)
         .await
         .unwrap();
     assert!(matches!(second, RunClaim::AlreadyRunning), "got {second:?}");
@@ -2229,7 +2716,7 @@ async fn sequential_run_prevention(pool: PgPool) {
         .await
         .unwrap();
     let third = store
-        .claim_run(schedule.id, sq_id, "q", None, None)
+        .claim_run(schedule.id, sq_id, "q", None)
         .await
         .unwrap();
     assert!(matches!(third, RunClaim::Started(_)), "got {third:?}");
@@ -2957,8 +3444,8 @@ async fn concurrent_start_run_yields_exactly_one_claim(pool: PgPool) {
     let s1 = store.clone();
     let s2 = store.clone();
     let (a, b) = tokio::join!(
-        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", None, None).await }),
-        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", None, None).await }),
+        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", None).await }),
+        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", None).await }),
     );
     let a = a.unwrap().unwrap();
     let b = b.unwrap().unwrap();
@@ -2972,8 +3459,8 @@ async fn concurrent_start_run_yields_exactly_one_claim(pool: PgPool) {
     assert_eq!(store.count_runs(sched.id).await.unwrap(), 1);
 }
 
-/// Concurrent manual triggers cannot exceed `max_runs`: the check and the
-/// claim share one transaction serialized by FOR UPDATE on the schedule row.
+/// Concurrent claims cannot exceed `max_runs`: the spend and the insert
+/// share one transaction serialized by FOR UPDATE on the schedule row.
 #[sqlx::test]
 async fn concurrent_claims_respect_max_runs(pool: PgPool) {
     let store = schedules(&pool);
@@ -2993,8 +3480,8 @@ async fn concurrent_claims_respect_max_runs(pool: PgPool) {
     let s1 = store.clone();
     let s2 = store.clone();
     let (a, b) = tokio::join!(
-        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", Some(2), None).await }),
-        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", Some(2), None).await }),
+        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", None).await }),
+        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", None).await }),
     );
     let a = a.unwrap().unwrap();
     let b = b.unwrap().unwrap();
@@ -3008,6 +3495,11 @@ async fn concurrent_claims_respect_max_runs(pool: PgPool) {
         store.count_runs(sched.id).await.unwrap(),
         2,
         "total runs never exceed max_runs"
+    );
+    assert_eq!(
+        runs_claimed(&pool, sched.id).await,
+        2,
+        "nor does the budget"
     );
 }
 
@@ -3216,7 +3708,7 @@ async fn delete_saved_racing_since_last_finish_never_orphans_path(pool: PgPool) 
         kind: WindowKind::SinceLast,
     };
     let rid = match sched_store
-        .claim_run(sched.id, sq.id, "q", None, Some(&window))
+        .claim_run(sched.id, sq.id, "q", Some(&window))
         .await
         .unwrap()
     {

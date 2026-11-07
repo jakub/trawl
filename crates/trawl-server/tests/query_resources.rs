@@ -936,7 +936,7 @@ async fn a_stored_run_read_past_the_budget_logs_no_path() {
         .expect("the schedule the API just attached");
     let store = &server.state.storage.schedule;
     let run = match store
-        .claim_run(schedule, saved, SMALL, None, None)
+        .claim_run(schedule, saved, SMALL, None)
         .await
         .expect("claim a run")
     {

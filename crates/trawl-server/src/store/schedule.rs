@@ -28,9 +28,11 @@
 //!   `report_runs_one_running`; every claim maps the named 23505 to its own
 //!   already-running answer ([`DueClaim::AlreadyRunning`],
 //!   [`ManualRunClaim::AlreadyRunning`], [`RunClaim::AlreadyRunning`]);
-//! - every claim's `max_runs` check joins the run insert in one
-//!   transaction (`FOR UPDATE` on the schedule row), manual runs included
-//!   ([`ScheduleStore::claim_manual_run`]);
+//! - every claim spends one run of the schedule's budget (`runs_claimed`,
+//!   capped by `max_runs`) in the transaction that inserts its run, under
+//!   `FOR UPDATE` on the schedule row, manual runs included
+//!   ([`ScheduleStore::claim_manual_run`]); a refusal or failed insert
+//!   after the spend rolls it back;
 //! - deletions lock the parent row then every `report_runs` row (`FOR
 //!   UPDATE`, no `result_path` filter) before collecting parquet paths, so a
 //!   concurrent `finish_run` either lands its path before the lock or blocks
@@ -84,7 +86,14 @@ pub struct Schedule {
     pub saved_query_id: i64,
     pub key_id: i64,
     pub interval_secs: u64,
+    /// The run budget: how many runs this schedule may claim over its life,
+    /// or `None` for no cap.
     pub max_runs: Option<u64>,
+    /// How many runs this schedule has claimed over its life, scheduled and
+    /// manual, failed ones included. Every claim spends one in the
+    /// transaction that inserts its run; edits and retention never lower it
+    /// (ADR-0018 amended 2026-11-06).
+    pub runs_claimed: u64,
     pub enabled: bool,
     /// The window this schedule covers, or `None` for query-text timing,
     /// where the saved DSL is executed verbatim (ADR-0018 ruling 6).
@@ -100,6 +109,16 @@ pub struct Schedule {
     pub next_fire_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Schedule {
+    /// Whether the run budget is spent: `max_runs` is set and
+    /// `runs_claimed` has reached it. Derived from the two, never stored.
+    /// A cap lowered below what is already spent leaves `runs_claimed`
+    /// above `max_runs`, which is still exhausted.
+    pub fn exhausted(&self) -> bool {
+        self.max_runs.is_some_and(|max| self.runs_claimed >= max)
+    }
 }
 
 /// A single report run (the result blob is fetched separately via
@@ -143,7 +162,7 @@ pub enum RunClaim {
     Started(i64),
     /// A run is already in progress for this schedule.
     AlreadyRunning,
-    /// The schedule has reached its `max_runs` cap.
+    /// The schedule's run budget is spent ([`Schedule::exhausted`]).
     MaxRunsReached,
 }
 
@@ -163,7 +182,7 @@ pub enum ManualRunClaim {
     NoSchedule,
     /// A run is already in progress for this schedule.
     AlreadyRunning,
-    /// The schedule has reached its `max_runs` cap.
+    /// The schedule's run budget is spent ([`Schedule::exhausted`]).
     MaxRunsReached,
     /// A `since_last` window ending now would read nothing the watermark
     /// does not already cover.
@@ -224,8 +243,9 @@ pub enum DueClaim {
     /// the boundary is claimed at the next poll after that run finishes,
     /// and the missed ones coalesce into its window (ruling 9).
     AlreadyRunning,
-    /// The schedule hit its `max_runs` cap. The cursor stays put, so
-    /// raising the cap resumes from the boundary that was refused.
+    /// The schedule's run budget is spent ([`Schedule::exhausted`]).
+    /// Nothing was planned and the cursor stays put, so raising the cap
+    /// resumes from the boundary that was refused.
     MaxRunsReached,
 }
 
@@ -472,6 +492,13 @@ pub fn format_interval(secs: u64) -> String {
 /// Decode a [`Schedule`] from columns named `{prefix}id`, `{prefix}key_id`, …
 pub(crate) fn row_to_schedule_at(row: &PgRow, prefix: &str) -> Result<Schedule, sqlx::Error> {
     let col = |name: &str| format!("{prefix}{name}");
+    // `schedules_runs_claimed_nonneg` makes a negative count impossible to
+    // store. Reading one as 0 would hand a spent schedule a fresh budget, so
+    // a row written past the constraint fails to decode instead.
+    let runs_claimed: i64 = row.try_get(col("runs_claimed").as_str())?;
+    let runs_claimed = u64::try_from(runs_claimed).map_err(|_| {
+        sqlx::Error::Decode(format!("schedule runs_claimed={runs_claimed} is negative").into())
+    })?;
     Ok(Schedule {
         id: row.try_get(col("id").as_str())?,
         saved_query_id: row.try_get(col("saved_query_id").as_str())?,
@@ -481,6 +508,7 @@ pub(crate) fn row_to_schedule_at(row: &PgRow, prefix: &str) -> Result<Schedule, 
         max_runs: row
             .try_get::<Option<i64>, _>(col("max_runs").as_str())?
             .map(|v| u64::try_from(v).unwrap_or_default()),
+        runs_claimed,
         enabled: row.try_get(col("enabled").as_str())?,
         window: decode_window(row, prefix)?,
         lag_secs: u64::try_from(row.try_get::<i64, _>(col("lag_secs").as_str())?)
@@ -620,8 +648,9 @@ pub(crate) fn latest_run_and_count_from_row(
     Ok((latest_run, total_runs))
 }
 
-const SCHEDULE_COLS: &str = "id, saved_query_id, key_id, interval_secs, max_runs, enabled, \
-     window_kind, window_secs, lag_secs, covered_through, next_fire_at, created_at, updated_at";
+const SCHEDULE_COLS: &str = "id, saved_query_id, key_id, interval_secs, max_runs, runs_claimed, \
+     enabled, window_kind, window_secs, lag_secs, covered_through, next_fire_at, created_at, \
+     updated_at";
 
 const RUN_COLS: &str = "id, schedule_id, saved_query_id, query, status, origin, started_at, finished_at, \
      duration_ms, row_count, error_message, result_path, window_start, window_end, \
@@ -1011,16 +1040,16 @@ impl ScheduleStore {
     }
 
     /// Claim a run with a caller-chosen query and window, in one
-    /// transaction. Lock the saved query, then the schedule, enforce
-    /// `max_runs`, and insert the running row. Concurrent claims cannot
-    /// exceed the cap.
+    /// transaction. Lock the saved query, then the schedule, spend one run
+    /// of the schedule's budget, and insert the running row. Concurrent
+    /// claims cannot exceed the cap.
     ///
     /// No production path calls this. It is the seeding door for tests
     /// that need a run row with exact contents: the scheduler claims
     /// through [`Self::claim_due_run`], which plans its window from the
     /// fire cursor, and an operator through [`Self::claim_manual_run`].
-    /// It shares their lock order, their cap check and their insert, so a
-    /// row it writes is shaped like theirs.
+    /// It shares their lock order, their budget spend and their insert, so
+    /// a row it writes is shaped like theirs and counts like theirs.
     ///
     /// `window` is recorded on the row as given. `None` writes all the
     /// window columns NULL, the shape of a query-mode run. The row records
@@ -1031,7 +1060,6 @@ impl ScheduleStore {
         schedule_id: i64,
         saved_query_id: i64,
         query: &str,
-        max_runs: Option<u64>,
         window: Option<&ReportWindow>,
     ) -> Result<RunClaim, StoreError> {
         let mut tx = self.pool.begin().await?;
@@ -1052,7 +1080,7 @@ impl ScheduleStore {
         }
 
         // FOR UPDATE serializes concurrent claims on this schedule; a claim
-        // that lost the race observes the winner's committed run count.
+        // that lost the race observes the winner's committed spend.
         let locked: Option<i64> =
             sqlx::query_scalar("SELECT id FROM schedules WHERE id = $1 FOR UPDATE")
                 .bind(schedule_id)
@@ -1066,18 +1094,13 @@ impl ScheduleStore {
             });
         }
 
-        if let Some(max) = max_runs {
-            let count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM report_runs WHERE schedule_id = $1")
-                    .bind(schedule_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if u64::try_from(count).unwrap_or_default() >= max {
-                tx.rollback().await?;
-                return Ok(RunClaim::MaxRunsReached);
-            }
+        if !spend_run_budget(&mut tx, schedule_id).await? {
+            tx.rollback().await?;
+            return Ok(RunClaim::MaxRunsReached);
         }
 
+        // An insert that fails, the already-running 23505 included, rolls
+        // the spend back with it.
         let inserted = insert_running_run(
             &mut tx,
             schedule_id,
@@ -1131,12 +1154,18 @@ impl ScheduleStore {
     ///    asked explicitly under the schedule lock so it outranks the cap
     ///    and the empty-window test: a run in flight is about to move the
     ///    watermark, which would make an empty-window answer misleading;
-    /// 3. the `max_runs` cap, which manual runs count toward;
+    /// 3. a spent run budget, [`ManualRunClaim::MaxRunsReached`]: a manual
+    ///    run spends the budget like a scheduled one, and this step is where
+    ///    the claim spends it;
     /// 4. an empty `since_last` window, [`ManualRunClaim::EmptyWindow`].
     ///
-    /// None of them writes anything. The schedule's `enabled` flag is not
-    /// asked at all: a disabled schedule can still be run by hand. Neither
-    /// cursor moves here; a success moves them in [`Self::finish_run`].
+    /// None of them leaves anything written. Step 3's spend is the claim's
+    /// first write, and every refusal or failure after it (step 4, a window
+    /// that cannot be resolved, a failed insert) rolls the whole
+    /// transaction back, spend included. The schedule's `enabled` flag is
+    /// not asked at all: a disabled schedule can still be run by hand.
+    /// Neither cursor moves here; a success moves them in
+    /// [`Self::finish_run`].
     ///
     /// A missing saved query is a `NotFound`, not a [`ManualRunClaim`]
     /// variant: the caller has nothing to run and nothing to own the run,
@@ -1203,7 +1232,7 @@ impl ScheduleStore {
 
         let t = truncate_to_micros(Utc::now());
 
-        if let Some(refusal) = manual_capacity_refusal(&mut tx, &schedule).await? {
+        if let Some(refusal) = spend_manual_run_budget(&mut tx, schedule.id).await? {
             tx.rollback().await?;
             return Ok(refusal);
         }
@@ -1319,6 +1348,15 @@ impl ScheduleStore {
     /// boundary refused by the cap is claimed when the cap is raised. An
     /// error leaves it alone for the same reason, and is loud on every poll
     /// until the operator repairs the schedule.
+    ///
+    /// The run budget is asked twice and spent once. A spent budget is
+    /// refused off the locked row before anything is planned, so an
+    /// exhausted schedule plans no window on any poll, and answers
+    /// [`DueClaim::MaxRunsReached`] even when it is not due yet. The spend
+    /// itself runs immediately before the run insert, never before the
+    /// [`DueClaim::Advanced`] commit, which claims no run and so spends
+    /// none. The schedule lock is held between the two, so they cannot
+    /// disagree; an insert that fails rolls the spend back.
     pub async fn claim_due_run(
         &self,
         schedule_id: i64,
@@ -1337,6 +1375,11 @@ impl ScheduleStore {
             dsl,
             schedule,
         } = locked;
+
+        if schedule.exhausted() {
+            tx.rollback().await?;
+            return Ok(DueClaim::MaxRunsReached);
+        }
 
         let plan = match plan_due_run(&plan_input(&schedule, now, max_catchup_intervals)) {
             Ok(Due::NotYet) => {
@@ -1375,16 +1418,9 @@ impl ScheduleStore {
             None => dsl,
         };
 
-        if let Some(max) = schedule.max_runs {
-            let count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM report_runs WHERE schedule_id = $1")
-                    .bind(schedule_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if u64::try_from(count).unwrap_or_default() >= max {
-                tx.rollback().await?;
-                return Ok(DueClaim::MaxRunsReached);
-            }
+        if !spend_run_budget(&mut tx, schedule_id).await? {
+            tx.rollback().await?;
+            return Ok(DueClaim::MaxRunsReached);
         }
 
         // Level 3: the run row. Its start is a clock reading taken now,
@@ -1731,7 +1767,8 @@ impl ScheduleStore {
         Ok(row.flatten())
     }
 
-    /// Count runs for a schedule.
+    /// Count the runs a schedule still has. Retention lowers this; the
+    /// runs it has claimed over its life are [`Schedule::runs_claimed`].
     pub async fn count_runs(&self, schedule_id: i64) -> Result<u64, StoreError> {
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM report_runs WHERE schedule_id = $1")
@@ -2201,6 +2238,10 @@ async fn create_schedule_in(
 ///   comparison reads the current row under `FOR UPDATE`, in the same
 ///   transaction as the write, so a concurrent edit cannot land between the
 ///   read and the decision.
+///
+/// `runs_claimed` is not written at all: an edit keeps the run budget the
+/// schedule has spent, whatever it does to `max_runs` (ADR-0018 amended
+/// 2026-11-06). Only deleting the schedule starts a new one.
 #[allow(clippy::too_many_arguments)]
 async fn update_schedule_in(
     conn: &mut sqlx::PgConnection,
@@ -2341,42 +2382,66 @@ impl ManualCursorMove {
     }
 }
 
-/// Whether a manual claim is refused for capacity: a run in progress
-/// first, then the `max_runs` cap, in the precedence
-/// [`ScheduleStore::claim_manual_run`] documents.
+/// Spend one run of a manual claim's budget, or say why the claim is
+/// refused for capacity: a run in progress first, which spends nothing,
+/// then a spent budget, in the precedence
+/// [`ScheduleStore::claim_manual_run`] documents. `None` means the spend
+/// happened and the caller's transaction now has to insert the run or roll
+/// back.
 ///
 /// The caller holds the schedule lock. Every claimant takes that lock
-/// before inserting a run, so neither answer can change before the
-/// caller's insert. The cap is counted from the LOCKED row's `max_runs`,
-/// not from a value read earlier: concurrent triggers serialize on the
-/// lock, and each one sees the winner's committed run count.
-async fn manual_capacity_refusal(
+/// before spending or inserting, so neither answer can change before the
+/// caller's insert, and concurrent triggers serialize on it: each one sees
+/// the winner's committed spend.
+async fn spend_manual_run_budget(
     conn: &mut sqlx::PgConnection,
-    schedule: &Schedule,
+    schedule_id: i64,
 ) -> Result<Option<ManualRunClaim>, sqlx::Error> {
     let running: bool = sqlx::query_scalar(
         "SELECT EXISTS (
              SELECT 1 FROM report_runs WHERE schedule_id = $1 AND status = 'running'
          )",
     )
-    .bind(schedule.id)
+    .bind(schedule_id)
     .fetch_one(&mut *conn)
     .await?;
     if running {
         return Ok(Some(ManualRunClaim::AlreadyRunning));
     }
 
-    if let Some(max) = schedule.max_runs {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM report_runs WHERE schedule_id = $1")
-                .bind(schedule.id)
-                .fetch_one(&mut *conn)
-                .await?;
-        if u64::try_from(count).unwrap_or_default() >= max {
-            return Ok(Some(ManualRunClaim::MaxRunsReached));
-        }
+    if !spend_run_budget(conn, schedule_id).await? {
+        return Ok(Some(ManualRunClaim::MaxRunsReached));
     }
     Ok(None)
+}
+
+/// Spend one run of a schedule's budget, or report that it is spent.
+///
+/// ONE spelling of the spend for its three claimants, beside the one
+/// spelling of the insert it pays for ([`insert_running_run`]). The
+/// statement is the whole decision: it adds one to `runs_claimed` only
+/// while `max_runs` is absent or not yet reached, and `false` (no row
+/// back) is a spent budget (ADR-0018 amended 2026-11-06). Each caller holds
+/// the schedule's `FOR UPDATE` lock and runs this in the transaction that
+/// inserts the run, so a refusal or a failed insert after it rolls the
+/// spend back, and a committed run is always a committed spend.
+///
+/// `updated_at` is deliberately not touched, for the reason
+/// [`set_next_fire_at`] gives: it records operator edits, and a claim is
+/// not one.
+async fn spend_run_budget(
+    conn: &mut sqlx::PgConnection,
+    schedule_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let spent: Option<i64> = sqlx::query_scalar(
+        "UPDATE schedules SET runs_claimed = runs_claimed + 1
+         WHERE id = $1 AND (max_runs IS NULL OR runs_claimed < max_runs)
+         RETURNING runs_claimed",
+    )
+    .bind(schedule_id)
+    .fetch_optional(conn)
+    .await?;
+    Ok(spent.is_some())
 }
 
 /// What the planner reads off a locked schedule row, for both claims.
@@ -2751,6 +2816,43 @@ mod tests {
         assert!(cols.contains("s.window_kind, s.window_secs"));
         assert!(!cols.contains(" ,"));
         assert_eq!(cols.split(", ").count(), SCHEDULE_COLS.split(',').count());
+    }
+
+    /// Exhausted is the cap and the spend compared, nothing else: no cap is
+    /// never exhausted, a cap of 0 is exhausted from the start, and a cap
+    /// lowered below what is spent stays exhausted.
+    #[test]
+    fn exhausted_compares_the_spend_with_the_cap() {
+        let now = fixed_clock();
+        let schedule = |max_runs, runs_claimed| Schedule {
+            id: 1,
+            saved_query_id: 1,
+            key_id: 1,
+            interval_secs: 3600,
+            max_runs,
+            runs_claimed,
+            enabled: true,
+            window: None,
+            lag_secs: 0,
+            covered_through: None,
+            next_fire_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        for (max_runs, runs_claimed, exhausted) in [
+            (None, 0, false),
+            (None, u64::MAX, false),
+            (Some(0), 0, true),
+            (Some(3), 2, false),
+            (Some(3), 3, true),
+            (Some(3), 5, true),
+        ] {
+            assert_eq!(
+                schedule(max_runs, runs_claimed).exhausted(),
+                exhausted,
+                "max_runs={max_runs:?} runs_claimed={runs_claimed}"
+            );
+        }
     }
 
     /// Every run column reachable through the embedded `last_run` of a

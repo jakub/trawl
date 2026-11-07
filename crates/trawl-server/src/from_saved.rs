@@ -667,7 +667,7 @@ mod pg_tests {
         path: Option<&str>,
     ) -> i64 {
         let rid = match store
-            .claim_run(schedule_id, saved_id, "q", None, None)
+            .claim_run(schedule_id, saved_id, "q", None)
             .await
             .unwrap()
         {
@@ -691,7 +691,7 @@ mod pg_tests {
         result: &trawl_api::value::QueryResult,
     ) -> i64 {
         let rid = match store
-            .claim_run(schedule_id, saved_id, "q", None, None)
+            .claim_run(schedule_id, saved_id, "q", None)
             .await
             .unwrap()
         {
@@ -1210,7 +1210,7 @@ mod pg_tests {
 
         // In flight: claimed, never finished.
         let running = match sched_store
-            .claim_run(sid, saved_id, "q", None, None)
+            .claim_run(sid, saved_id, "q", None)
             .await
             .unwrap()
         {
