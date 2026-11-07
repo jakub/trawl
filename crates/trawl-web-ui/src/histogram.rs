@@ -187,12 +187,23 @@ pub fn clock_ticks(series: &Series, width_px: f64) -> Vec<Tick> {
         .map_while(|step| step);
     let mut fallback: Option<Vec<Tick>> = None;
     for step in STEPS_MS.into_iter().chain(day_steps) {
-        let first = min_ms.div_euclid(step) * step;
-        let first = if first < min_ms { first + step } else { first };
-        if first > max_ms {
+        // A query's `time` column can hold any number, so the extent may
+        // reach either end of i64: the first tick rounds up from the
+        // minimum (a first tick past i64 lies past the maximum too), and
+        // the count is taken in i128.
+        let rem = min_ms.rem_euclid(step);
+        let first = if rem == 0 {
+            Some(min_ms)
+        } else {
+            min_ms.checked_add(step - rem)
+        };
+        let Some(first) = first.filter(|&first| first <= max_ms) else {
             break;
-        }
-        let count = (max_ms - first) / step + 1;
+        };
+        let count = (i128::from(max_ms) - i128::from(first)) / i128::from(step) + 1;
+        let Ok(count) = i64::try_from(count) else {
+            continue;
+        };
         if count > MAX_TICKS {
             continue;
         }
@@ -214,7 +225,9 @@ fn place_ticks(series: &Series, width_px: f64, first: i64, step: i64, count: i64
     let mut prev_day: Option<String> = None;
     (0..count)
         .filter_map(|i| {
-            let ms = first + step * i;
+            // Every tick lies inside the extent, but `step * i` alone can
+            // leave i64 when `first` is far below zero.
+            let ms = i64::try_from(i128::from(first) + i128::from(step) * i128::from(i)).ok()?;
             let dt = chrono::DateTime::from_timestamp_millis(ms)?;
             let day = dt.format("%Y-%m-%d").to_string();
             let clock = if step >= DAY_MS {
@@ -616,6 +629,20 @@ mod tests {
                 assert!(ticks.len() <= 6);
                 assert!(ticks.iter().all(|t| (0.0..=1.0).contains(&t.fraction)));
                 assert!(ticks.windows(2).all(|w| w[0].fraction < w[1].fraction));
+            }
+        }
+    }
+
+    /// A query can put any number in a `time` column. Extents whose
+    /// millisecond difference, or whose rounded-down first tick, leaves
+    /// i64 still get an axis instead of an overflow.
+    #[test]
+    fn clock_ticks_survive_extents_at_the_i64_limit() {
+        for (min, max) in [(-5e15, 5e15), (-1e300, 1e300), (-1e300, 0.0)] {
+            for width in [120.0, 1100.0] {
+                let ticks = clock_ticks(&span(min, max), width);
+                assert!(!ticks.is_empty(), "{min}..{max} at {width}px");
+                assert!(ticks.iter().all(|t| (0.0..=1.0).contains(&t.fraction)));
             }
         }
     }
