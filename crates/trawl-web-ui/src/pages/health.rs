@@ -14,6 +14,7 @@ use crate::{
     perms,
     service_card_fmt::{format_bytes, format_count, format_exact, format_uptime},
 };
+use fleet_ui::time::format_duration;
 use fleet_ui::{Badge, ConfirmModal, ConfirmState, Tone};
 use leptos::{prelude::*, task::spawn_local};
 use std::sync::{
@@ -434,7 +435,7 @@ fn query_rows(response: QueriesResponse) -> Vec<QueryRow> {
             user: q.user,
             query: q.query,
             state: "running".into(),
-            elapsed: format!("{} ms", format_exact(q.running_ms)),
+            elapsed: format_duration(q.running_ms),
         }
     });
     let recent = response.recent.into_iter().map(|entry| {
@@ -452,7 +453,7 @@ fn query_rows(response: QueriesResponse) -> Vec<QueryRow> {
             user: q.user,
             query: q.query,
             state: state.into(),
-            elapsed: format!("{} ms", format_exact(q.duration_ms)),
+            elapsed: format_duration(q.duration_ms),
         }
     });
     active.chain(recent).collect()
