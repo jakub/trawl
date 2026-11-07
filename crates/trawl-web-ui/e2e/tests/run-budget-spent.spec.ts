@@ -49,6 +49,10 @@ test('the nets list disables Run now on a spent net and says why', async ({ page
   expect(await deleteX(SPENT.spentNetName)).toBe(await deleteX(SPENT.cappedNetName));
 
   await expect.poll(() => capturedRunRequests(request)).toEqual([]);
+
+  // Positive control: the recorder sees a Run now POST when one is sent.
+  await capped.getByRole('button', { name: COPY.netRunNow, exact: true }).click();
+  await expect.poll(() => capturedRunRequests(request)).toEqual([SPENT.cappedNetId]);
 });
 
 test('the net drawer disables Run now on a spent net and says why', async ({ page, request }) => {

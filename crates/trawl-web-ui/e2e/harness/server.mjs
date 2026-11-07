@@ -1581,12 +1581,20 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     // the server resolved (none in query mode, a trailing span for the
     // fixed net). Ids are the scenario's own nets.
     const runNow = p.match(/^\/api\/v1\/saved\/(\d+)\/run$/);
-    // `schedule-spent`: every net there has a spent budget or is never
-    // fired by its spec, so a POST that arrives is recorded and refused
-    // the way trawld refuses a spent schedule. The spec asserts none came.
+    // `schedule-spent`: every POST is recorded. A net under its cap starts a
+    // query-mode run; a spent net is refused the way trawld refuses one.
     if (runNow && req.method === 'POST' && scenario === 'schedule-spent') {
-      runRequests.push(Number(runNow[1]));
-      sendJson(res, 409, { error: { code: 'bad_request', message: 'max runs reached for this net' } });
+      const savedId = Number(runNow[1]);
+      runRequests.push(savedId);
+      const net = spentListSavedResponse().queries.find((q) => q.id === savedId);
+      if (!net?.schedule || net.schedule.exhausted) {
+        sendJson(res, 409, { error: { code: 'bad_request', message: 'max runs reached for this net' } });
+      } else {
+        const run = { ...runStartedResponse(), id: 504 + startedRuns.length, query: net.query };
+        for (const key of ['window_start', 'window_end', 'window_truncated', 'window_kind']) delete run[key];
+        startedRuns.unshift({ savedId, run });
+        sendJson(res, 200, run);
+      }
       return;
     }
     if (runNow && req.method === 'POST' && scenario === 'schedule') {
