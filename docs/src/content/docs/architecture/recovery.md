@@ -109,7 +109,7 @@ If the gate's scan for rollup markers fails, the gate cannot know which markers 
 
 ### The removal-sync obligation
 
-A marker unlink is durable only after the fsync of the day directory that follows it. If that fsync fails, the marker path is gone, but the entry can come back after a power loss. So before each unlink, trawld records a removal-sync obligation for that service and day, and only a successful fsync of the day directory ends it. Each compaction pass retries the fsync. Each failed retry logs `rollup_removal_sync_owed` at ERROR with the environment, the service and the day.
+A marker unlink is durable only after the fsync of the day directory that follows it. If that fsync fails, the marker path is gone, but the entry can come back after a power loss. So before each unlink, trawld records a removal-sync obligation for that service and day, and only a successful fsync of the day directory ends it. Each compaction pass retries the fsync. If retention has deleted the day directory, the retry fsyncs the environment directory instead, which makes the whole day's removal durable and ends the obligation. Each failed retry logs `rollup_removal_sync_owed` at ERROR with the environment, the service and the day.
 
 While the obligation holds:
 

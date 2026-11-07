@@ -125,13 +125,14 @@ _Amended 2026-11-06:_ a removed rollup marker stays tracked until its removal is
 
 _Amended 2026-11-06:_ the limits of the rollup guarantee (#357). After an fsync fails with EIO, Linux can clear the error, so a later fsync can succeed while the earlier writes never reached the disk. A retry that succeeds after a failure therefore proves less than a first success. Trawl still ends a removal-sync obligation on that success, because it has no stronger signal, and the alternative is a block that only a restart clears. The order of writes across a power loss is not proven. The tests kill the process, which leaves the page cache intact, and they record what each file-system call returned. No test cuts power. The guarantee assumes a local file system whose fsync is honest. Storage that reports an fsync it did not perform, and an operator who edits the data root while trawld runs, are outside it.
 
-_Amended 2026-11-07:_ the implementation of #357 refines the rollup amendments above in six ways.
+_Amended 2026-11-07:_ the implementation of #357 refines the rollup amendments above in seven ways.
 
 - **Present inputs carry their identity in a and b.** Before either case retires anything, each listed hourly file still at its path must carry its recorded identity. An absent one counts as already retired. A present one that differs, or that cannot be read, sends the marker to case d, because retiring it could delete rows the replacement does not hold.
 - **Case b proves that the rename did not happen.** The tmp must carry the replacement identity. Also, either the canonical daily file is absent and no prior was recorded, or the canonical carries the recorded prior identity. Any other canonical sends the marker to case d.
 - **An empty rollup does not run.** When every hourly input was quarantined as invalid, the rollup returns before it merges, so a marker never lists zero inputs.
 - **The marker bound shrinks.** Inputs are named relative to the day directory as `HH/{service}.parquet`, not by absolute path. The bound is derived from the encoding, at 100 inputs and the longest service name, and comes to 26 KiB, down from about 1.2 MB.
 - **The removal-sync obligation is held in memory.** It does not survive a restart, and no boot step rebuilds it. A marker that comes back after a restart and a power loss is classified again from the files. The identity checks above mean it never retires or deletes a file it cannot prove, so it finishes in case a, b or c, or fails closed in case d.
+- **A removal whose day directory is gone syncs the env directory.** Retention can delete a day directory while its marker's removal still owes the fsync. A retry then finds no day directory to sync. It fsyncs the env directory instead, which makes the day's removal durable, marker entry and all, and that success ends the obligation. A missing env directory is still a failure.
 - **`QuarantineKind::RollupTemporary` is retired.** Its only producer was recovery's quarantine of an invalid tmp. Case c now deletes the tmp, so the `rollup_temporary` label of `trawl_files_quarantined_total` is gone.
 
 ## Considered options
