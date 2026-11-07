@@ -218,9 +218,6 @@
       },
       {
         "kind": "parquet"
-      },
-      {
-        "kind": "rollup_temporary"
       }
     ],
     "annotations": {
