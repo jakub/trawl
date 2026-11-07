@@ -31,8 +31,24 @@
 //! nothing and reads no file: it reports every marker that is not in flight.
 //! [`PublicationGate::pending_rollup_markers`] may run without a guard, so
 //! it neither forgets nor lists a marker in flight.
+//!
+//! # Removal syncs owed
+//!
+//! A marker's unlink is durable only once its day directory is fsynced, so
+//! a missing marker file does not prove that the marker will stay gone
+//! after a crash. A writer records the obligation with
+//! [`PublicationGate::owe_removal_sync`] before it unlinks a marker, and
+//! the obligation ends only when a fsync of the day directory succeeds
+//! after the unlink. The gate keeps these obligations apart from the
+//! markers: nothing that forgets a marker on path absence touches them,
+//! and they never refuse reads, because the files the rollup left are
+//! complete. While one is owed, the writers that would replace the day's
+//! files consult it ([`PublicationGate::removal_sync_owed`],
+//! [`PublicationGate::any_removal_sync_owed`],
+//! [`PublicationGate::removal_sync_owed_days`]). The obligations are held in
+//! memory and do not survive a restart.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -138,6 +154,22 @@ struct CorpusState {
     scan_failed: bool,
     initialized: bool,
     restart: Restart,
+    /// Marker unlinks whose day-directory fsync has not succeeded yet. Only
+    /// [`PublicationGate::owe_removal_sync`], a [`RemovalSync`] and
+    /// [`PublicationGate::retry_removal_syncs`] change it; see the
+    /// [module documentation](self).
+    unsynced_removals: HashMap<PathBuf, Removal>,
+    /// Numbers each obligation, so a retry ends only the one it synced for.
+    removal_generation: u64,
+}
+
+/// One owed removal sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Removal {
+    generation: u64,
+    /// Whether its writer still holds the [`RemovalSync`]. Its unlink may
+    /// not have happened yet, so a retry's fsync proves nothing for it.
+    with_writer: bool,
 }
 
 impl CorpusState {
@@ -170,6 +202,20 @@ impl CorpusState {
                     .iter()
                     .any(|path| !self.in_flight.contains(path)),
             restart_backlog: self.restart != Restart::Settled,
+        }
+    }
+}
+
+impl CorpusState {
+    /// End the obligation of `marker` if it is still the one numbered
+    /// `generation`.
+    fn end_removal(&mut self, marker: &Path, generation: u64) {
+        if self
+            .unsynced_removals
+            .get(marker)
+            .is_some_and(|removal| removal.generation == generation)
+        {
+            self.unsynced_removals.remove(marker);
         }
     }
 }
@@ -434,6 +480,92 @@ impl PublicationGate {
         }
     }
 
+    /// Record that the unlink of `marker` owes a fsync of its day
+    /// directory, before the unlink is attempted. The caller holds the
+    /// publication write guard and keeps the returned [`RemovalSync`]
+    /// until it has unlinked the marker, then
+    /// [`settle`](RemovalSync::settle)s it. The obligation holds from this
+    /// call until a day-directory fsync after the unlink succeeds, whether
+    /// or not the marker file still exists.
+    pub fn owe_removal_sync(&self, marker: &Path) -> RemovalSync<'_> {
+        let mut corpus = self.corpus.lock();
+        corpus.removal_generation += 1;
+        let generation = corpus.removal_generation;
+        corpus.unsynced_removals.insert(
+            marker.to_path_buf(),
+            Removal {
+                generation,
+                with_writer: true,
+            },
+        );
+        RemovalSync {
+            gate: self,
+            marker: marker.to_path_buf(),
+            generation,
+        }
+    }
+
+    /// Whether the unlink of `marker` still owes its day-directory fsync.
+    #[must_use]
+    pub fn removal_sync_owed(&self, marker: &Path) -> bool {
+        self.corpus.lock().unsynced_removals.contains_key(marker)
+    }
+
+    /// Whether any marker unlink still owes its day-directory fsync.
+    #[must_use]
+    pub fn any_removal_sync_owed(&self) -> bool {
+        !self.corpus.lock().unsynced_removals.is_empty()
+    }
+
+    /// The day directories of every marker whose unlink still owes its
+    /// fsync.
+    #[must_use]
+    pub fn removal_sync_owed_days(&self) -> HashSet<PathBuf> {
+        self.corpus
+            .lock()
+            .unsynced_removals
+            .keys()
+            .filter_map(|marker| marker.parent().map(Path::to_path_buf))
+            .collect()
+    }
+
+    /// Retry the day-directory fsync of every owed removal whose writer is
+    /// done, once per day directory, with `sync`. Only a successful sync
+    /// ends an obligation; any error keeps it, `NotFound` included, and
+    /// logs `rollup_removal_sync_owed` naming the env, service and day.
+    /// Returns how many obligations are still owed. Blocking I/O, run
+    /// with no lock of the gate's held.
+    pub fn retry_removal_syncs(&self, mut sync: impl FnMut(&Path) -> std::io::Result<()>) -> usize {
+        let mut by_day: HashMap<PathBuf, Vec<(PathBuf, u64)>> = HashMap::new();
+        for (marker, removal) in &self.corpus.lock().unsynced_removals {
+            if removal.with_writer {
+                continue;
+            }
+            if let Some(day) = marker.parent() {
+                by_day
+                    .entry(day.to_path_buf())
+                    .or_default()
+                    .push((marker.clone(), removal.generation));
+            }
+        }
+        for (day, markers) in by_day {
+            match sync(&day) {
+                Ok(()) => {
+                    let mut corpus = self.corpus.lock();
+                    for (marker, generation) in markers {
+                        corpus.end_removal(&marker, generation);
+                    }
+                }
+                Err(error) => {
+                    for (marker, _) in &markers {
+                        log_removal_sync_owed(marker, &error);
+                    }
+                }
+            }
+        }
+        self.corpus.lock().unsynced_removals.len()
+    }
+
     /// Recovery must finish these days before WAL compaction changes any
     /// hourly input named by a marker.
     ///
@@ -530,6 +662,95 @@ impl Drop for RollupRegistration<'_> {
     }
 }
 
+/// A writer's hold on one owed removal sync, from
+/// [`PublicationGate::owe_removal_sync`] until [`settle`](Self::settle) or
+/// drop. While it lives, a retry leaves the obligation to the writer.
+/// Dropping it unsettled, an early return or a panic included, leaves the
+/// obligation owed for the next retry.
+#[must_use = "a removal sync is settled only by `settle`"]
+#[derive(Debug)]
+pub struct RemovalSync<'a> {
+    gate: &'a PublicationGate,
+    marker: PathBuf,
+    generation: u64,
+}
+
+impl RemovalSync<'_> {
+    /// After the writer's unlink of the marker, fsync its day directory
+    /// with `sync`. Success ends the obligation. An error, `NotFound`
+    /// included, keeps it owed for the next retry, logs
+    /// `rollup_removal_sync_owed`, and is returned.
+    pub fn settle(self, sync: impl FnOnce(&Path) -> std::io::Result<()>) -> std::io::Result<()> {
+        let day = self.marker.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a rollup marker path has no day directory",
+            )
+        });
+        match day.and_then(sync) {
+            Ok(()) => {
+                self.gate
+                    .corpus
+                    .lock()
+                    .end_removal(&self.marker, self.generation);
+                Ok(())
+            }
+            Err(error) => {
+                log_removal_sync_owed(&self.marker, &error);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for RemovalSync<'_> {
+    fn drop(&mut self) {
+        if let Some(removal) = self
+            .gate
+            .corpus
+            .lock()
+            .unsynced_removals
+            .get_mut(&self.marker)
+            .filter(|removal| removal.generation == self.generation)
+        {
+            removal.with_writer = false;
+        }
+    }
+}
+
+/// Log that `marker`'s unlink still owes its day fsync. The env, service
+/// and day are logged only once they pass validation, and no path is.
+fn log_removal_sync_owed(marker: &Path, error: &std::io::Error) {
+    const INVALID: &str = "<invalid>";
+    let day_dir = marker.parent();
+    let service = marker
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(".rollup-"))
+        .filter(|service| trawl_config::is_valid_service_name(service))
+        .unwrap_or(INVALID);
+    let day = day_dir
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|day| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_ok())
+        .unwrap_or(INVALID);
+    let env = day_dir
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|env| trawl_config::is_valid_env_name(env))
+        .unwrap_or(INVALID);
+    tracing::error!(
+        event_type = "rollup_removal_sync_owed",
+        env,
+        service,
+        day,
+        error_kind = ?error.kind(),
+        "a rollup marker was unlinked but its day directory fsync failed; \
+         rollup, repin and conformance wait for that day until a retry succeeds"
+    );
+}
+
 fn is_missing(path: &Path) -> bool {
     matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
@@ -619,6 +840,126 @@ mod tests {
         ));
         std::fs::remove_file(marker).unwrap();
         assert!(gate.read().await.is_ok());
+    }
+
+    /// A day directory holding an unlinked rollup marker whose unlink owes
+    /// its fsync.
+    fn owed_marker(dir: &Path) -> PathBuf {
+        let day = dir.join("prod/2026-11-06");
+        std::fs::create_dir_all(&day).unwrap();
+        day.join(".rollup-api")
+    }
+
+    fn refused() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::StorageFull)
+    }
+
+    #[tokio::test]
+    async fn an_owed_removal_sync_outlives_the_marker_file_and_never_refuses_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = owed_marker(dir.path());
+        std::fs::write(&marker, "").unwrap();
+        let gate = PublicationGate::new();
+        {
+            let _writer = gate.write().await;
+            let registration = gate.mark_rollup(&marker);
+            let removal = gate.owe_removal_sync(&marker);
+            std::fs::remove_file(&marker).unwrap();
+            assert!(removal.settle(|_| Err(refused())).is_err());
+            // Path absence ends the marker, and only the marker.
+            registration.finish();
+        }
+        assert!(!marker.exists());
+        assert!(gate.read().await.is_ok(), "reads answer while owed");
+        assert_eq!(gate.unsettled(), None);
+        assert!(gate.pending_rollup_markers().is_empty());
+        assert!(gate.removal_sync_owed(&marker));
+        assert!(gate.any_removal_sync_owed());
+        assert_eq!(
+            gate.removal_sync_owed_days(),
+            HashSet::from([marker.parent().unwrap().to_path_buf()])
+        );
+        // Every evaluator runs again, and still the obligation holds.
+        let _ = gate.read_rollups_only().await;
+        let _ = gate.unsettled_reasons();
+        assert!(gate.removal_sync_owed(&marker));
+    }
+
+    #[test]
+    fn a_failed_retry_keeps_the_obligation_and_a_successful_one_ends_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = owed_marker(dir.path());
+        let gate = PublicationGate::new();
+        drop(gate.owe_removal_sync(&marker));
+
+        let mut synced = Vec::new();
+        assert_eq!(
+            gate.retry_removal_syncs(|day| {
+                synced.push(day.to_path_buf());
+                Err(refused())
+            }),
+            1
+        );
+        assert!(gate.removal_sync_owed(&marker));
+        // A day directory that is gone is a failed sync, not a success.
+        assert_eq!(
+            gate.retry_removal_syncs(|_| Err(std::io::ErrorKind::NotFound.into())),
+            1
+        );
+        assert!(gate.removal_sync_owed(&marker));
+        assert_eq!(
+            gate.retry_removal_syncs(|day| {
+                synced.push(day.to_path_buf());
+                crate::epoch::fsync_dir(day)
+            }),
+            0
+        );
+        assert!(!gate.removal_sync_owed(&marker));
+        assert!(!gate.any_removal_sync_owed());
+        assert!(gate.removal_sync_owed_days().is_empty());
+        assert_eq!(synced, vec![marker.parent().unwrap().to_path_buf(); 2]);
+    }
+
+    #[test]
+    fn a_settled_removal_sync_ends_the_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = owed_marker(dir.path());
+        let gate = PublicationGate::new();
+        let removal = gate.owe_removal_sync(&marker);
+        assert!(gate.removal_sync_owed(&marker), "owed before the unlink");
+        removal.settle(crate::epoch::fsync_dir).unwrap();
+        assert!(!gate.any_removal_sync_owed());
+    }
+
+    #[test]
+    fn a_retry_leaves_an_obligation_to_its_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = owed_marker(dir.path());
+        let gate = PublicationGate::new();
+        let removal = gate.owe_removal_sync(&marker);
+        // The writer has not unlinked yet, so a sync now proves nothing.
+        assert_eq!(gate.retry_removal_syncs(|_| panic!("not retried")), 1);
+        assert!(removal.settle(|_| Err(refused())).is_err());
+        // Settled unsuccessfully, the writer is done: the next retry runs.
+        assert_eq!(gate.retry_removal_syncs(crate::epoch::fsync_dir), 0);
+    }
+
+    #[test]
+    fn a_retry_never_ends_a_newer_obligation_for_the_same_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = owed_marker(dir.path());
+        let gate = PublicationGate::new();
+        drop(gate.owe_removal_sync(&marker));
+        let mut newer = None;
+        let still_owed = gate.retry_removal_syncs(|_| {
+            // Another writer owes the same marker again while the retry's
+            // sync runs.
+            newer = Some(gate.owe_removal_sync(&marker));
+            Ok(())
+        });
+        assert_eq!(still_owed, 1);
+        drop(newer);
+        assert!(gate.removal_sync_owed(&marker));
     }
 
     #[tokio::test]
