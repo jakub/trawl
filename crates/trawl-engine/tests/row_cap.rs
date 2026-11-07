@@ -32,6 +32,22 @@ fn six_events() -> (tempfile::TempDir, String) {
     (dir, glob)
 }
 
+/// Six events with distinct `k`, 1 to 6 in `n` order, written out of `n`
+/// order. The largest `k` is the last event in `n` order, so the top of
+/// all six and the top of the first three are different rows.
+fn six_keys() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.ndjson");
+    let mut file = std::fs::File::create(&path).unwrap();
+    for n in [3, 0, 5, 1, 4, 2] {
+        let k = n + 1;
+        writeln!(file, r#"{{"message":"k={k}","n":{n}}}"#).unwrap();
+    }
+    file.flush().unwrap();
+    let glob = path.display().to_string();
+    (dir, glob)
+}
+
 fn run(dsl: &str, glob: &str, cap: RowCap) -> Result<QueryResult, EngineError> {
     let exec = Executor::new().unwrap();
     exec.cancellable(&CancelLatch::never())
@@ -114,6 +130,52 @@ fn truncate_cuts_a_kv_tail_answer_but_never_its_input() {
     // Cutting the input would publish a wrong count, so it is refused.
     let refused = run(
         "* | extract kv | stats count() as c",
+        &glob,
+        RowCap::Truncate {
+            rows: 1,
+            tail_input: 5,
+        },
+    );
+    assert!(
+        matches!(refused, Err(EngineError::ResultTooLarge(5))),
+        "six events past a tail input bound of five: {refused:?}"
+    );
+}
+
+/// The tail sorts, then takes its `head`, and only then does the cap cut
+/// its answer, so the one row kept is the top row of all six, not of the
+/// first three. The SQL read under the tail still refuses an input past
+/// `tail_input`.
+#[test]
+fn truncate_cuts_a_sorted_kv_tail_after_the_sort() {
+    let (_dir, glob) = six_keys();
+    let dsl = "* | sort n | extract kv | sort -k | head 3";
+
+    let cut = run(
+        dsl,
+        &glob,
+        RowCap::Truncate {
+            rows: 1,
+            tail_input: 6,
+        },
+    )
+    .expect("six events fit the tail's input bound");
+    let k = cut
+        .columns
+        .iter()
+        .position(|column| column.name == "k")
+        .unwrap_or_else(|| panic!("missing k: {:?}", cut.columns));
+    assert_eq!(
+        cut.rows
+            .iter()
+            .map(|row| row[k].clone())
+            .collect::<Vec<_>>(),
+        [Value::Integer(6)],
+        "the single top row of all six"
+    );
+
+    let refused = run(
+        dsl,
         &glob,
         RowCap::Truncate {
             rows: 1,
