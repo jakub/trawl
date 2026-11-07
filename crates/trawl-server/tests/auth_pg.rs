@@ -12,7 +12,10 @@
 //! - AC5: error envelope per failure class (401 credential, 403 authorization,
 //!   503 pg-down without backend detail)
 //! - AC6: scheduler skips revoked / expired / grant-stripped keys
-//! - AC8: audit poller sees out-of-process key mutations
+//! - AC8: audit poller sees out-of-process key mutations, keeps its
+//!   baseline across a failed poll, retries a failed first snapshot and
+//!   stops on shutdown mid-init (#353). These tests capture a global
+//!   subscriber and need nextest's process per test.
 //! - SSE: revoked-before-connect → 401 (handshake-only auth is accepted
 //!   policy)
 
@@ -25,6 +28,7 @@ use common::{roles, seed_data_root, setup};
 use fleet_auth::{KeyStore, PrincipalKind};
 use parking_lot::Mutex;
 use sqlx::PgPool;
+use trawl_server::audit;
 use trawl_server::config::RateLimitConfig;
 
 /// Raw reqwest client that trusts the self-signed harness cert.
@@ -961,18 +965,119 @@ impl std::io::Write for CaptureWriter {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool) {
+/// Capture this process's tracing output as plain text.
+///
+/// The subscriber is global (`try_init`), so the capture holds one test's
+/// log only because nextest runs each test in its own process. Under
+/// `cargo test` the first test to install it would capture every test's
+/// events, and the others would capture nothing. Run these with nextest.
+fn capture_logs() -> Arc<Mutex<Vec<u8>>> {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let writer = CaptureWriter(Arc::clone(&buf));
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
-        // Plain text: the assertions below match field names literally, and
-        // ANSI styling splits `permissions=` with escape codes.
+        // Plain text: the assertions match field names literally, and ANSI
+        // styling splits `permissions=` with escape codes.
         .with_ansi(false)
         .with_writer(move || writer.clone())
         .try_init();
+    buf
+}
 
+fn log_text(buf: &Mutex<Vec<u8>>) -> String {
+    String::from_utf8(buf.lock().clone()).unwrap()
+}
+
+/// Lines the audit poller emitted for a change it detected. fleet-auth logs
+/// its own `key_created` and `key_revoked` for mutations made in this
+/// process; only the poller's lines carry this suffix.
+fn detected(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|l| l.contains("detected by audit"))
+        .collect()
+}
+
+/// Detected lines of `event_type` that name `needle`.
+fn detected_events<'a>(log: &'a str, event_type: &str, needle: &str) -> Vec<&'a str> {
+    let field = format!("event_type=\"{event_type}\"");
+    detected(log)
+        .into_iter()
+        .filter(|l| l.contains(&field) && l.contains(needle))
+        .collect()
+}
+
+/// Bounds a wait for a step that must happen. It never paces the test:
+/// a pass never waits for it, a hang fails on it.
+const HANG_GUARD: Duration = Duration::from_secs(10);
+
+async fn wait_parked(parked: tokio::sync::oneshot::Receiver<()>, what: &str) {
+    tokio::time::timeout(HANG_GUARD, parked)
+        .await
+        .unwrap_or_else(|_| panic!("audit task never reached {what}"))
+        .expect("audit hooks dropped the hold");
+}
+
+/// Release the task from `held`, let it finish that poll, and hold it again
+/// before the next poll's first read. Parking there proves every event of
+/// the released poll was emitted, because emission has no await.
+async fn next_poll(
+    hooks: &audit::AuditHooks,
+    held: tokio::sync::oneshot::Sender<()>,
+) -> tokio::sync::oneshot::Sender<()> {
+    let next = hooks.hold(audit::Phase::Poll, audit::Point::BeforeListKeys);
+    drop(held);
+    wait_parked(next.parked, "the next poll").await;
+    next.release
+}
+
+/// Spawn the audit task held before its first poll, once its baseline and
+/// `audit_start` are in. Returns the release for that hold.
+async fn spawn_held_audit(
+    key_store: &KeyStore,
+    hooks: &audit::AuditHooks,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let first = hooks.hold(audit::Phase::Poll, audit::Point::BeforeListKeys);
+    let handle = audit::spawn_audit_task_with_hooks(
+        key_store.clone(),
+        Duration::from_millis(20),
+        shutdown,
+        hooks.clone(),
+    );
+    wait_parked(first.parked, "the first poll").await;
+    (handle, first.release)
+}
+
+async fn stop_audit(
+    shutdown: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let _ = shutdown.send(true);
+    tokio::time::timeout(HANG_GUARD, handle)
+        .await
+        .expect("audit task must stop on shutdown")
+        .unwrap();
+}
+
+/// The rfc3339 value of `field` in `line`.
+fn timestamp_field(line: &str, field: &str) -> chrono::DateTime<chrono::Utc> {
+    let start = line
+        .find(&format!("{field}="))
+        .unwrap_or_else(|| panic!("no {field} in: {line}"))
+        + field.len()
+        + 1;
+    let value = line[start..].split_whitespace().next().unwrap();
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap_or_else(|e| panic!("{field}={value} is not rfc3339: {e}"))
+        .with_timezone(&chrono::Utc)
+}
+
+#[sqlx::test(migrations = false)]
+async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool) {
+    let buf = capture_logs();
     let key_store = common::fleet_keystore(&pool).await;
 
     // Baseline key so the initial snapshot is non-trivial.
@@ -986,14 +1091,9 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         .await
         .unwrap();
 
+    let hooks = audit::AuditHooks::default();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let handle = trawl_server::audit::spawn_audit_task(
-        key_store.clone(),
-        Duration::from_millis(200),
-        shutdown_rx,
-    );
-    // Let the initial snapshot land before mutating.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (handle, held) = spawn_held_audit(&key_store, &hooks, shutdown_rx).await;
 
     // Out-of-process mutation: a second connection to the same database
     // (what fleet-admin does).
@@ -1011,7 +1111,7 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         )
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    let held = next_poll(&hooks, held).await;
 
     // Privilege escalation with no key mutation at all: the role the baseline
     // key already holds gains a permission. Plus a role assignment.
@@ -1029,50 +1129,296 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         .assign_role(&baseline.info.prefix, "trawl-admin")
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    let held = next_poll(&hooks, held).await;
+
+    // Created and revoked while the poller is held between two polls: the
+    // next poll first sees the key already inactive.
+    let fleeting = second
+        .create_key(
+            "created-and-revoked",
+            PrincipalKind::Service,
+            &roles(&["trawl-reader"]),
+            None,
+        )
+        .await
+        .unwrap();
+    second.revoke_key(&fleeting.info.prefix).await.unwrap();
+    let held = next_poll(&hooks, held).await;
 
     second.revoke_key(&created.info.prefix).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    let held = next_poll(&hooks, held).await;
 
-    let _ = shutdown_tx.send(true);
-    let _ = handle.await;
+    stop_audit(shutdown_tx, handle).await;
+    drop(held);
     second.pool().close().await;
 
-    let log = String::from_utf8(buf.lock().clone()).unwrap();
-    assert!(
-        log.contains("key_created") && log.contains(&created.info.prefix),
-        "audit must emit key_created for the new key; log:\n{log}"
-    );
-    assert!(
-        log.contains("key_revoked"),
-        "audit must emit key_revoked; log:\n{log}"
+    let log = log_text(&buf);
+    let created_lines = detected_events(&log, "key_created", &created.info.prefix);
+    assert_eq!(
+        created_lines.len(),
+        1,
+        "audit must emit key_created once for the new key; log:\n{log}"
     );
     // The effective capability, not just the mutable role name, is recorded.
-    let created_line = log
-        .lines()
-        .find(|l| l.contains("key_created") && l.contains("detected by audit"))
-        .unwrap_or_default();
     assert!(
-        created_line.contains("permissions=") && created_line.contains("trawl:"),
-        "key_created must record resolved permissions; line:\n{created_line}"
+        created_lines[0].contains("permissions=") && created_lines[0].contains("trawl:"),
+        "key_created must record resolved permissions; line:\n{}",
+        created_lines[0]
+    );
+    assert_eq!(
+        detected_events(&log, "key_revoked", &created.info.prefix).len(),
+        1,
+        "audit must emit key_revoked once for the revoked key; log:\n{log}"
     );
     // Mutating a role escalates every key holding it — that must be audited.
-    let role_line = log
-        .lines()
-        .find(|l| l.contains("role_changed"))
-        .unwrap_or_default();
+    let role_lines = detected_events(&log, "role_changed", "trawl-reader");
     assert!(
-        role_line.contains("trawl-reader") && role_line.contains("trawl:server_manage"),
+        role_lines.len() == 1 && role_lines[0].contains("trawl:server_manage"),
         "audit must emit role_changed naming the added permission; log:\n{log}"
     );
-    let assign_line = log
-        .lines()
-        .find(|l| l.contains("key_roles_changed"))
-        .unwrap_or_default();
+    let assign_lines = detected_events(&log, "key_roles_changed", &baseline.info.prefix);
     assert!(
-        assign_line.contains(&baseline.info.prefix) && assign_line.contains("trawl-admin"),
+        assign_lines.len() == 1 && assign_lines[0].contains("trawl-admin"),
         "audit must emit key_roles_changed for the reassigned key; log:\n{log}"
     );
+    // A key the poller first sees inactive reports both events, in order.
+    let fleeting_lines: Vec<&str> = detected(&log)
+        .into_iter()
+        .filter(|l| l.contains(&fleeting.info.prefix))
+        .collect();
+    assert!(
+        fleeting_lines.len() == 2
+            && fleeting_lines[0].contains("event_type=\"key_created\"")
+            && fleeting_lines[1].contains("event_type=\"key_revoked\"")
+            && fleeting_lines[1].contains("permissions="),
+        "a key created and revoked between polls must report key_created then key_revoked; \
+         log:\n{log}"
+    );
+}
+
+/// AC2: a poll that fails after a real `list_keys` emits nothing and keeps
+/// its baseline, and the next poll reports the change exactly once.
+#[sqlx::test(migrations = false)]
+async fn audit_poll_failure_between_reads_keeps_baseline(pool: PgPool) {
+    let buf = capture_logs();
+    let key_store = common::fleet_keystore(&pool).await;
+    let hooks = audit::AuditHooks::default();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (handle, held) = spawn_held_audit(&key_store, &hooks, shutdown_rx).await;
+
+    let key = key_store
+        .create_key(
+            "between-reads",
+            PrincipalKind::Service,
+            &roles(&["trawl-reader"]),
+            None,
+        )
+        .await
+        .unwrap();
+    hooks.fail(audit::Phase::Poll, audit::Step::ListRoles, 1);
+    // Parking before `list_roles` proves `list_keys` ran for real first.
+    let between = hooks.hold(audit::Phase::Poll, audit::Point::BeforeListRoles);
+    drop(held);
+    wait_parked(between.parked, "the role read").await;
+    let held = next_poll(&hooks, between.release).await;
+
+    let log = log_text(&buf);
+    assert!(
+        detected(&log).is_empty(),
+        "a failed poll must emit no change events; log:\n{log}"
+    );
+    let errors: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("event_type=\"audit_error\""))
+        .collect();
+    assert!(
+        errors.len() == 1
+            && errors[0].contains("phase=\"poll\"")
+            && errors[0].contains("operation=\"list_roles\""),
+        "one sanitized audit_error for the failed role read; log:\n{log}"
+    );
+    assert!(
+        !log.contains(audit::INJECTED_ERROR_TEXT),
+        "raw error text must not reach the log; log:\n{log}"
+    );
+
+    let held = next_poll(&hooks, held).await;
+    let log = log_text(&buf);
+    assert_eq!(
+        detected_events(&log, "key_created", &key.info.prefix).len(),
+        1,
+        "the next poll reports the change once; log:\n{log}"
+    );
+
+    let held = next_poll(&hooks, held).await;
+    let log = log_text(&buf);
+    assert_eq!(
+        detected_events(&log, "key_created", &key.info.prefix).len(),
+        1,
+        "a later poll does not report it again; log:\n{log}"
+    );
+
+    stop_audit(shutdown_tx, handle).await;
+    drop(held);
+}
+
+/// AC3: the first snapshot fails three times, then succeeds. The task logs
+/// one sanitized `audit_error` per failure, then `audit_gap`, then
+/// `audit_start`, and audits a mutation made after it recovered.
+#[sqlx::test(migrations = false)]
+async fn audit_init_recovers_after_failures(pool: PgPool) {
+    let buf = capture_logs();
+    let key_store = common::fleet_keystore(&pool).await;
+    let hooks = audit::AuditHooks::default();
+    // Attempts 1 and 2 fail on keys, attempt 3 on roles, attempt 4 succeeds.
+    hooks.fail(audit::Phase::Init, audit::Step::ListKeys, 2);
+    hooks.fail(audit::Phase::Init, audit::Step::ListRoles, 1);
+    let first_attempt = hooks.hold(audit::Phase::Init, audit::Point::BeforeListKeys);
+
+    let spawned_at = chrono::Utc::now();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = audit::spawn_audit_task_with_hooks(
+        key_store.clone(),
+        Duration::from_millis(20),
+        shutdown_rx,
+        hooks.clone(),
+    );
+    wait_parked(first_attempt.parked, "the first init attempt").await;
+    // The first attempt is under way at this instant.
+    let during_first_attempt = chrono::Utc::now();
+    let held = next_poll(&hooks, first_attempt.release).await;
+
+    let log = log_text(&buf);
+    let errors: Vec<(usize, &str)> = log
+        .match_indices("event_type=\"audit_error\"")
+        .map(|(at, _)| (at, log[at..].lines().next().unwrap()))
+        .collect();
+    assert_eq!(errors.len(), 3, "one audit_error per failure; log:\n{log}");
+    for (_, line) in &errors {
+        assert!(
+            line.contains("phase=\"init\""),
+            "audit_error names the phase: {line}"
+        );
+    }
+    let operations: Vec<bool> = errors
+        .iter()
+        .map(|(_, l)| l.contains("operation=\"list_keys\""))
+        .collect();
+    assert_eq!(operations, [true, true, false], "log:\n{log}");
+    assert!(
+        errors[2].1.contains("operation=\"list_roles\""),
+        "log:\n{log}"
+    );
+    assert!(
+        !log.contains(audit::INJECTED_ERROR_TEXT),
+        "raw error text must not reach the log; log:\n{log}"
+    );
+
+    let gaps: Vec<usize> = log
+        .match_indices("event_type=\"audit_gap\"")
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(gaps.len(), 1, "one audit_gap; log:\n{log}");
+    let gap_line = log[gaps[0]..].lines().next().unwrap();
+    let from = timestamp_field(gap_line, "unaudited_from");
+    let until = timestamp_field(gap_line, "unaudited_until");
+    assert!(
+        spawned_at <= from && from <= during_first_attempt,
+        "unaudited_from {from} must be at or before the first attempt ({during_first_attempt})"
+    );
+    assert!(
+        until > during_first_attempt,
+        "unaudited_until {until} must be after the first attempt ({during_first_attempt})"
+    );
+    assert!(gap_line.contains("attempts=3"), "{gap_line}");
+    assert!(gap_line.contains("reconstruction=\"none\""), "{gap_line}");
+    let start = log
+        .find("action=\"audit_start\"")
+        .expect("audit_start after recovery");
+    assert!(
+        errors[2].0 < gaps[0] && gaps[0] < start,
+        "order must be audit_error x3, audit_gap, audit_start; log:\n{log}"
+    );
+
+    let key = key_store
+        .create_key(
+            "after-recovery",
+            PrincipalKind::Service,
+            &roles(&["trawl-reader"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let held = next_poll(&hooks, held).await;
+    let log = log_text(&buf);
+    assert_eq!(
+        detected_events(&log, "key_created", &key.info.prefix).len(),
+        1,
+        "a mutation after recovery is audited; log:\n{log}"
+    );
+
+    stop_audit(shutdown_tx, handle).await;
+    drop(held);
+}
+
+/// AC4: shutdown ends the task while an init fetch is held between its two
+/// reads. The hold is never released, so only the shutdown race can end it.
+#[sqlx::test(migrations = false)]
+async fn audit_shutdown_while_init_fetch_is_held(pool: PgPool) {
+    let buf = capture_logs();
+    let key_store = common::fleet_keystore(&pool).await;
+    let hooks = audit::AuditHooks::default();
+    let held = hooks.hold(audit::Phase::Init, audit::Point::BeforeListRoles);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = audit::spawn_audit_task_with_hooks(
+        key_store.clone(),
+        Duration::from_millis(20),
+        shutdown_rx,
+        hooks.clone(),
+    );
+    wait_parked(held.parked, "the init role read").await;
+
+    stop_audit(shutdown_tx, handle).await;
+    drop(held.release);
+
+    let log = log_text(&buf);
+    assert!(log.contains("action=\"audit_stop\""), "log:\n{log}");
+    assert!(!log.contains("action=\"audit_start\""), "log:\n{log}");
+}
+
+/// AC4: shutdown ends the task while it sleeps between init attempts. The
+/// interval is an hour, so a sleep outside the shutdown race would trip the
+/// hang guard.
+#[sqlx::test(migrations = false)]
+async fn audit_shutdown_while_waiting_between_init_attempts(pool: PgPool) {
+    let buf = capture_logs();
+    let key_store = common::fleet_keystore(&pool).await;
+    let hooks = audit::AuditHooks::default();
+    hooks.fail(audit::Phase::Init, audit::Step::ListKeys, 1);
+    let before_wait = hooks.hold(audit::Phase::Init, audit::Point::BeforeWait);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = audit::spawn_audit_task_with_hooks(
+        key_store.clone(),
+        Duration::from_secs(3600),
+        shutdown_rx,
+        hooks.clone(),
+    );
+    wait_parked(before_wait.parked, "the wait after a failed init").await;
+    drop(before_wait.release);
+    // The task signals `resumed` from inside the poll that runs on into the
+    // sleep, after that poll's shutdown check, so the shutdown below can
+    // only end a sleep that races it.
+    wait_parked(before_wait.resumed, "the sleep after the released hold").await;
+
+    stop_audit(shutdown_tx, handle).await;
+
+    let log = log_text(&buf);
+    assert!(
+        log.contains("event_type=\"audit_error\"") && log.contains("phase=\"init\""),
+        "log:\n{log}"
+    );
+    assert!(log.contains("action=\"audit_stop\""), "log:\n{log}");
+    assert!(!log.contains("action=\"audit_start\""), "log:\n{log}");
 }
 
 // ---------------------------------------------------------------------------
