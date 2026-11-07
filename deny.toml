@@ -15,15 +15,6 @@ ignore = [
     # compile-time proc-macro with no runtime attack surface, pulled transitively
     # by parquet; there is no replacement until parquet drops it upstream.
     "RUSTSEC-2024-0436",
-    # ctutils 0.4.2, fixed in 0.4.4 (published 2026-10-23). The fix is younger
-    # than the 3-day minimum publish age, so this stays ignored until
-    # 2026-10-26; then run `cargo update -p ctutils` and delete this entry.
-    # ctutils is reached through digest (sqlx-postgres password hashing, on
-    # the trusted database link) and through universal-hash → poly1305 →
-    # chacha20poly1305 in fleet-auth, whose AEAD tag check runs on every
-    # session cookie a client presents. A branch in the mask generation can
-    # leak timing from that comparison, so bump as soon as the fix ages.
-    { id = "RUSTSEC-2026-0385", reason = "constant-time mask branch; bump to 0.4.4 after 2026-10-26" },
 ]
 
 [licenses]
