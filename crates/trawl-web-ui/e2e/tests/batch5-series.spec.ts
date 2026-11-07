@@ -79,7 +79,14 @@ test('a wide grouped result draws the six largest and says what it left out', as
   await expect(page.locator(`${SEL.chartHost} .series-key`))
     .toHaveText(hosts.slice(8));
   await expect(page.locator('.visualization .chart-caption'))
-    .toHaveText('6 of 14 series drawn; the 8 smallest by total are not. Narrow host, or open Events.');
+    .toHaveText('6 of 14 series drawn; the 8 smallest by total are not, among them host-08, host-07 and host-06. Narrow host, or');
+
+  // The control beside the caption completes its sentence and names what
+  // Events holds; the note keeps only the bucket, the axis and the gaps.
+  await expect(page.locator('.visualization button.btn-lnk'))
+    .toHaveText('Open Events for exact times and values');
+  await expect(page.locator('.visualization .chart-note'))
+    .toHaveText('1 minute per bucket. Metrics over time on a UTC axis. Gaps mean no value was returned.');
 
   // And the caption's own way to the rows it is talking about.
   await page.locator('.visualization button.btn-lnk').click();
@@ -107,7 +114,7 @@ test('ingest charts show the containing hour in a bounded tooltip', async ({ pag
     await page.mouse.move(plot.x + plot.width * fraction, plot.y + plot.height / 2);
     await expect(tooltip).toBeVisible();
     await expect(tooltip).toContainText('Events: 1');
-    await expect(tooltip.locator('.ig-tooltip-time')).toHaveText('Sep 1, 01:00 AM – Sep 1, 02:00 AM');
+    await expect(tooltip.locator('.ig-tooltip-time')).toHaveText('Sep 1, 01:00 – Sep 1, 02:00');
   }
   for (const fraction of [0.01, 0.99]) {
     await page.mouse.move(plot.x + plot.width * fraction, plot.y + plot.height / 2);

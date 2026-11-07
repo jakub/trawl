@@ -68,6 +68,19 @@ function searchRows(page: Pg): Loc {
   return page.locator('#search-results table.results-table > tbody > tr:not(:has(td.detail))');
 }
 
+/** Search's rows with each `_time` cell whole again: when every event on
+ * the page shares a date, the header states it once and the cells print
+ * only the clock, while the evidence viewer prints every instant whole. */
+async function searchEvents(page: Pg): Promise<string[][]> {
+  const rows = await tableRows(searchRows(page));
+  const headers = page.locator('#search-results table.results-table > thead th.sortable');
+  const names = await headers.locator('button.th-sort > span:first-child').allTextContents();
+  const time = names.indexOf('_time');
+  const date = (await headers.nth(time).locator('.th-date').allTextContents()).map((d) => d.trim());
+  if (date.length === 0) return rows;
+  return rows.map((cells) => cells.map((cell, i) => (i === time ? `${date[0]} ${cell}` : cell)));
+}
+
 async function openSearch(page: Pg, path: string, rows = ABSOLUTE_ROWS) {
   await page.goto(path);
   await expect(searchRows(page)).toHaveCount(rows);
@@ -103,7 +116,7 @@ async function openDialog(page: Pg) {
 test('a fixed range sends the executed text and its half-open window, and the board pages the same rows', async ({ page, request }) => {
   await as(request, 'investigations-writer');
   await openSearch(page, ABSOLUTE);
-  const shown = await tableRows(searchRows(page));
+  const shown = await searchEvents(page);
   expect(shown).toHaveLength(ABSOLUTE_ROWS);
 
   const dialog = await openDialog(page);
@@ -159,7 +172,10 @@ test('a window that holds none of the events keeps none, whatever the stub holds
   await as(request, 'investigations-writer');
   await page.goto('/search?q=status%3E%3D500&r=2020-01-01T00:00:00Z..2020-01-01T00:01:00Z');
   await expect(trailing(page).getByRole('button', { name: 'Send to investigation' })).toBeVisible();
-  await expect(searchRows(page)).toHaveText(['No events match this query. Check the time range and filters.']);
+  await expect(searchRows(page)).toHaveText([
+    'No events match _time>="2020-01-01T00:00:00Z" _time<="2020-01-01T00:01:00Z" status>=500.'
+    + ' Widen the time range or remove a filter, then Haul again.',
+  ]);
   const dialog = await openDialog(page);
   await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
   await dialog.getByLabel('Purpose (optional)').fill('A minute in 2020');

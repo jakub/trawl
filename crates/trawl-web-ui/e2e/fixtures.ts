@@ -251,7 +251,7 @@ export const CORPUS = {
   columns: ['_time', 'host', 'status', 'message'] as const,
   /** `host`'s distinct values, most frequent first, then alphabetical —
    * the order the facet rail computes. Six of them, one past the five a
-   * group shows, so the group offers "+ 1 more". */
+   * group shows, so the group offers "Show 1 more listed value". */
   hosts: ['web-01', 'cache-01', 'db-01', 'edge-01', 'web-02', 'web-03'] as const,
   /** How many values the `host` facet hides behind its more control. */
   hostsHidden: 1,

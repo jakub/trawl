@@ -5,7 +5,7 @@
 //! `<HistoryPage/>` lives in the Search app shell at `/search/history`.
 //!
 //! `GET /api/v1/history` searches all stored query text for the current key
-//! before pagination. Enter/Search applies the draft; typing leaves the
+//! before pagination. Enter/Filter applies the draft; typing leaves the
 //! applied view in place. Rows can reopen a query in the Search editor or
 //! open Save as Net's modal for `POST /api/v1/saved`.
 //!
@@ -24,8 +24,8 @@ use crate::search_url::{
 };
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::{
-    Btn, ConfirmModal, ConfirmState, OffsetPager, PageTotal, PageWindow, ToastBus, ToastKind,
-    Variant, When,
+    Btn, ConfirmModal, ConfirmState, Icon, IconView, OffsetPager, PageTotal, PageWindow, ToastBus,
+    ToastKind, Variant, When,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -352,11 +352,16 @@ pub fn HistoryPage() -> impl IntoView {
             <div class="page-hd compact">
                 <div><h1>"Search history"</h1><p class="sub">"Click to re-run a previous search, or save as a Net for scheduled runs."</p></div>
                 <div class="actions">
-                    <select class="btn-sec" aria-label="History export format" disabled=move || export_disabled.get()
-                        on:change=move |event| export_format.set(if event_target_value(&event) == "json" { HistoryExportFormat::Json } else { HistoryExportFormat::Csv })>
-                        <option value="csv">"CSV"</option><option value="json">"JSON"</option>
-                    </select>
-                    <Btn variant=Variant::Secondary disabled=export_disabled on_click=on_export>"Export this page"</Btn>
+                    <div class="btn-join" role="group" aria-label="Export history">
+                        <span class="select-wrap">
+                            <select class="btn-sec" aria-label="History export format" disabled=move || export_disabled.get()
+                                on:change=move |event| export_format.set(if event_target_value(&event) == "json" { HistoryExportFormat::Json } else { HistoryExportFormat::Csv })>
+                                <option value="csv">"CSV"</option><option value="json">"JSON"</option>
+                            </select>
+                            <IconView icon=Icon::Chevron size=10 stroke_width=1.5 attr:aria-hidden="true"/>
+                        </span>
+                        <Btn variant=Variant::Secondary disabled=export_disabled on_click=on_export>"Export this page"</Btn>
+                    </div>
                     <Btn variant=Variant::Secondary disabled=clearing on_click=on_clear>"Clear history"</Btn>
                 </div>
             </div>
@@ -367,21 +372,24 @@ pub fn HistoryPage() -> impl IntoView {
                         event.prevent_default();
                         // Ignore implicit IME submits until compositionend.
                         // Once it clears the flag, both pointer and keyboard
-                        // Search activation use the same admitted apply action.
+                        // Filter activation use the same admitted apply action.
                         if !composing.get_untracked() { apply.run((draft.get_untracked(), false)); }
                     }>
-                        <label for="history-filter">"Search query text"</label>
+                        <label for="history-filter" class="sr-only">"Search query text"</label>
                         <div class="actions">
-                            <input id="history-filter" class="inp" placeholder="Filter history…" prop:value=move || draft.get()
+                            <div class="inp-wrap">
+                            <IconView icon=Icon::Search size=12 stroke_width=1.5/>
+                            <input id="history-filter" placeholder="Filter history…" prop:value=move || draft.get()
                                 disabled=move || clearing.get() aria-describedby="history-filter-help history-filter-error"
                                 aria-invalid=move || validation.get().is_some().to_string()
                                 on:input=move |event| { draft.set(event_target_value(&event)); validation.set(None); }
                                 on:compositionstart=move |_| composing.set(true) on:compositionend=move |_| composing.set(false)
                                 on:keydown=move |event| { if event.key() == "Enter" && event.is_composing() { event.prevent_default(); } }/>
-                            <button class="btn" type="submit" disabled=move || clearing.get()>"Search"</button>
+                            </div>
+                            <button class="btn-sec" type="submit" disabled=move || clearing.get()>"Filter"</button>
                             <button class="btn-sec" type="button" disabled=move || clearing.get() on:click=move |_| apply.run((String::new(), true))>"Clear filter"</button>
                         </div>
-                        <p id="history-filter-help" class="sub">{move || if edited.get() { "Edited. Press Enter or Search to apply." } else { "Search all query history for your current key." }}</p>
+                        <p id="history-filter-help" class="sub">{move || if edited.get() { "Edited. Press Enter or Filter to apply." } else { "Search all query history for your current key." }}</p>
                         <div id="history-filter-error" class="error" role="alert">{move || validation.get()}</div>
                     </form>
                 </div>
@@ -418,12 +426,12 @@ pub fn HistoryPage() -> impl IntoView {
                                     // When uses Fleet's shared 30-second clock,
                                     // so relative timestamps do not freeze at load.
                                     <td style="color:var(--ink-3)"><When ts=entry.executed_at/></td>
-                                    <td style="text-align:right">{format_with_commas(entry.row_count as u64)}</td>
+                                    <td class="num">{format_with_commas(entry.row_count as u64)}</td>
                                     <td style="text-align:right"><button type="button" class="link" on:click=move |_| save_target.set(Some(saved_query.clone()))>"Save as Net"</button></td>
                                 </tr> }
                             }).collect::<Vec<_>>();
                             view! { <table class="fleet-table history-table" aria-label="Search history">
-                                <thead><tr><th scope="col">"Executed query"</th><th scope="col" style="width:92px">"When"</th><th scope="col" style="width:80px; text-align:right">"Rows"</th><th scope="col" style="width:100px; text-align:right">"Action"</th></tr></thead>
+                                <thead><tr><th scope="col">"Executed query"</th><th scope="col" style="width:92px">"When"</th><th scope="col" style="width:88px; text-align:right">"Rows"</th><th scope="col" style="width:100px; text-align:right">"Action"</th></tr></thead>
                                 <tbody>{rows}</tbody>
                             </table> }.into_any()
                         }}

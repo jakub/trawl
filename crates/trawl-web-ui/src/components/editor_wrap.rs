@@ -11,6 +11,11 @@
 //! derived, never stored: it compares the editor buffer against the
 //! executed query in the URL and navigates nothing (ADR-0027).
 //!
+//! An empty buffer shows a muted example query and the Haul chord over
+//! the editor's first line. The hint is decoration: hidden from
+//! assistive technology, transparent to the pointer, and gone as soon as
+//! the buffer holds a character.
+//!
 //! The stack order is date range, Haul, then the Save as Net / Copy
 //! search URL / Format tool row. Haul mirrors ⌘⏎ in the editor — both
 //! call the parent's submit callback.
@@ -124,7 +129,7 @@ pub fn EditorWrap(
         </div>
         <div class="editor-wrap" id="search-query" tabindex="-1">
             <div class="editor-row">
-                <DslEditor query=query on_submit=on_submit format_trigger=format_trigger/>
+                <EditorField query=query on_submit=on_submit format_trigger=format_trigger/>
                 <div class="editor-right">
                     <RangeDialog
                         value=Signal::derive(move || match range.get() {
@@ -185,6 +190,50 @@ pub fn EditorWrap(
     }
 }
 
+/// The DSL editor with the empty-buffer hint laid over its first line.
+/// The chord names the key the editor binds: ⌘⏎ where ⌘ is the primary
+/// modifier, Ctrl+Enter elsewhere.
+#[component]
+fn EditorField(
+    query: RwSignal<String>,
+    on_submit: Callback<()>,
+    format_trigger: RwSignal<u64>,
+) -> impl IntoView {
+    let ua = window().navigator().user_agent().unwrap_or_default();
+    let chord = if fleet_ui::kbd::apple_keyboard(&ua) {
+        "⌘⏎"
+    } else {
+        "Ctrl+Enter"
+    };
+    view! {
+        <div class="editor-field">
+            <DslEditor query=query on_submit=on_submit format_trigger=format_trigger/>
+            <Show when=move || query.with(String::is_empty)>
+                <span class="editor-hint" aria-hidden="true">
+                    "Type a query, for example "
+                    <code>"service=api _severity>=warn"</code>
+                    ". "
+                    {chord}
+                    " hauls."
+                </span>
+            </Show>
+        </div>
+    }
+}
+
+/// The first diagnostic with its `Line L:C` location set apart, so the
+/// location carries the error tone and the message reads as detail. A
+/// message without a location renders whole. The text is unchanged.
+fn located(first: String) -> AnyView {
+    match first.split_once(" — ") {
+        Some((at, message)) if at.starts_with("Line ") => {
+            let (at, message) = (at.to_owned(), message.to_owned());
+            view! { <span class="draft-diagnostic-at">{at}</span>" — "{message} }.into_any()
+        }
+        _ => first.into_any(),
+    }
+}
+
 /// The local parser's verdict on the buffer: nothing while it parses,
 /// else the first error in full and the rest behind a disclosure.
 #[component]
@@ -205,7 +254,7 @@ fn DraftDiagnosticLine(query: RwSignal<String>) -> impl IntoView {
         diagnostic.get().map(|DraftDiagnostic { first, rest }| {
             view! {
                 <div class="draft-diagnostic">
-                    <p class="draft-diagnostic-first">{first}</p>
+                    <p class="draft-diagnostic-first">{located(first)}</p>
                     {(!rest.is_empty()).then(|| view! {
                         <details class="draft-diagnostic-more" node_ref=more>
                             <summary>{format!("+{} more", rest.len())}</summary>

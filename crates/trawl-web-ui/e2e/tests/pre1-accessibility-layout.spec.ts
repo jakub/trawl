@@ -66,8 +66,8 @@ for (const theme of ['light', 'dark']) {
           for (const n of ancestors) bg = over(rgba(getComputedStyle(n).backgroundColor), bg);
           // The facet meter is a painted sibling. It only counts as a
           // surface behind the digits when its box actually meets the
-          // count's box (ADR-0032 draws it as a 2px rule along the row's
-          // bottom edge), and it paints at its own opacity.
+          // count's box (ADR-0032 draws it as a thin rule in the row's
+          // bottom padding), and it paints at its own opacity.
           const bar = el.closest('.v')?.querySelector('.bar');
           const meets = (a: DOMRect, b: DOMRect) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
           const barSurface = () => {

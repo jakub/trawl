@@ -45,7 +45,7 @@ test('mounted chart recolors through both themes without losing visibility or da
     await selectTheme(page, theme === 'dark' ? 'Dark' : 'Light');
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
     await expect.poll(async () => page.evaluate(() => {
-      const tokens = ['--accent', '--teal', '--red', '--yellow', '--green', '--ink'];
+      const tokens = ['--accent', '--teal', '--red', '--yellow', '--violet', '--ink'];
       const style = getComputedStyle(document.documentElement);
       return [...document.querySelectorAll('.chart .series-key line')].every((line, i) => line.getAttribute('stroke') === style.getPropertyValue(tokens[i]).trim());
     })).toBe(true);

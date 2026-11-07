@@ -53,8 +53,20 @@ pub fn MetaStrip(
     /// Called with the index of a filter to remove.
     on_remove: Callback<usize>,
 ) -> impl IntoView {
+    // The strip is hidden while it has nothing to report, so a search
+    // that has not run does not end in an empty band. A count of zero is
+    // a fact and keeps the strip: presence counts, not the number.
+    let reports = move || {
+        filters_unreadable.get()
+            || (!blocked.get()
+                && (pending.get()
+                    || count.get().is_some()
+                    || execution.get().is_some()
+                    || live.get()
+                    || !filters.get().is_empty()))
+    };
     view! {
-        <div class="scope" class:blocked=move || blocked.get()>
+        <div class="scope" class:blocked=move || blocked.get() class:empty=move || !reports()>
             <Show when=move || !blocked.get()>
                 <div class="scope-facts">
                     <span class="scope-count">
@@ -90,9 +102,9 @@ pub fn MetaStrip(
                     {move || filters.get().into_iter().enumerate().map(|(i, f)| {
                         let is_excl = f.op == FilterOp::Exclude;
                         let label = format!(
-                            "{}{} = {}",
-                            if is_excl { "⊘ " } else { "◆ " },
+                            "{} {} {}",
                             f.field,
+                            if is_excl { "≠" } else { "=" },
                             f.value,
                         );
                         let remove_label = format!("Remove filter {} = {}", f.field, f.value);
