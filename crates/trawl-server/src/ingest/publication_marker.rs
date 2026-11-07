@@ -340,7 +340,7 @@ fn parse_partition(partition: &str) -> Option<(NaiveDate, u8)> {
     (hour <= 23).then_some((parsed, hour))
 }
 
-fn parse_hex_digest(hex: &str) -> Option<blake3::Hash> {
+pub(crate) fn parse_hex_digest(hex: &str) -> Option<blake3::Hash> {
     if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return None;
     }

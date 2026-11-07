@@ -13,8 +13,8 @@
 //!
 //! [`RollupIo::REAL`] runs the real calls. Outside tests it has no fields,
 //! so each wrapper compiles down to the call it wraps. Under `cfg(test)` or
-//! the `test-support` feature, [`RollupIo::recording`] attaches a
-//! [`Recorder`]. Each call appends one [`Entry`] when it starts and fills in
+//! the `test-support` feature, `RollupIo::recording` attaches a
+//! `Recorder`. Each call appends one `Entry` when it starts and fills in
 //! its result when it returns, so a call made inside another one (the day
 //! fsync inside the marker publish) is listed after it, in the order the
 //! calls started. The recorder can also fault one call, chosen by phase and
@@ -29,6 +29,7 @@ use std::io;
 use std::path::Path;
 
 use super::publication_marker::{self, OutputIdentity};
+use super::rollup_marker::Observation;
 
 /// The step of the rollup or of its recovery that one call belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -81,7 +82,7 @@ pub enum Phase {
     TmpRemove,
 }
 
-/// The kind of call an [`Entry`] records.
+/// The kind of call an `Entry` records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Open a file through the caller's opener.
@@ -208,6 +209,26 @@ impl RollupIo {
                 |dir| self.sync_dir(Phase::MarkerDaySync, dir),
             )
         })
+    }
+
+    /// What is at `path`, for recovery's [`classify`](super::rollup_marker::classify): the
+    /// file `open` opens, hashed. The open and the hash are each a
+    /// [`Phase::RecoveryObserve`] call. A `NotFound` open is
+    /// [`Observation::Absent`]; any other failure is
+    /// [`Observation::Unreadable`].
+    pub fn observe(
+        &self,
+        path: &Path,
+        open: impl FnOnce(&Path) -> io::Result<File>,
+    ) -> Observation {
+        match self.open(Phase::RecoveryObserve, path, open) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Observation::Absent,
+            Err(_) => Observation::Unreadable,
+            Ok(mut file) => match self.hash(Phase::RecoveryObserve, path, &mut file) {
+                Ok(identity) => Observation::Identity(identity),
+                Err(_) => Observation::Unreadable,
+            },
+        }
     }
 
     /// Rename `from` to `to`. The entry records `from`.
@@ -634,6 +655,37 @@ mod tests {
         assert_eq!(
             recorder.entries()[0].result,
             Some(Outcome::Err(io::ErrorKind::InvalidData))
+        );
+    }
+
+    #[test]
+    fn observe_reports_absent_identity_and_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("api.parquet");
+        std::fs::write(&file, b"rows").unwrap();
+        let recorder = Recorder::new();
+        let io = recorder.io();
+        assert_eq!(
+            io.observe(&file, |p| File::open(p)),
+            Observation::Identity(publication_marker::identity_of(&file).unwrap())
+        );
+        assert_eq!(
+            io.observe(&tmp.path().join("03/api.parquet"), |p| File::open(p)),
+            Observation::Absent
+        );
+        assert_eq!(
+            io.observe(&file, |_| Err(io::Error::from(io::ErrorKind::InvalidInput))),
+            Observation::Unreadable
+        );
+        let ops: Vec<_> = recorder.entries().iter().map(|e| (e.op, e.phase)).collect();
+        assert_eq!(
+            ops,
+            [
+                (Op::Open, Phase::RecoveryObserve),
+                (Op::Hash, Phase::RecoveryObserve),
+                (Op::Open, Phase::RecoveryObserve),
+                (Op::Open, Phase::RecoveryObserve),
+            ]
         );
     }
 
