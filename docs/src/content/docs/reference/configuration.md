@@ -834,8 +834,8 @@ Notes:
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable scheduled query execution |
 | `poll_interval_secs` | integer | `10` | How often the scheduler looks for due schedules |
-| `max_runs_per_schedule` | integer | `100` | Completed runs kept per schedule |
-| `report_retention_days` | integer | `30` | Delete report runs older than this many days |
+| `max_runs_per_schedule` | integer | `100` | Finished runs (success, error or timeout) kept per schedule. A running run is never deleted or counted. Must be at least 1; 0 is refused at boot |
+| `report_retention_days` | integer | `30` | Delete finished runs that started more than this many days ago. A running run is never deleted. Must be between 1 and 36500; 0 is refused at boot |
 | `max_catchup_intervals` | integer | `24` | Whole schedule intervals one `since_last` catch-up run may cover. Must be between 1 and 1000000 |
 
 ```toml

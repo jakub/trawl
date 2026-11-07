@@ -288,8 +288,8 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `config.syslog.channelCapacity` | int | `10000` | `[syslog] channel_capacity` |
 | `config.scheduler.enabled` | bool | `true` | `[scheduler] enabled` |
 | `config.scheduler.pollIntervalSecs` | int | `10` | `[scheduler] poll_interval_secs` |
-| `config.scheduler.maxRunsPerSchedule` | int | `100` | `[scheduler] max_runs_per_schedule` |
-| `config.scheduler.reportRetentionDays` | int | `30` | `[scheduler] report_retention_days` |
+| `config.scheduler.maxRunsPerSchedule` | int | `100` | `[scheduler] max_runs_per_schedule`. Finished runs kept per schedule; running runs are never deleted. A whole number from 1 to 18446744073709551615; quote values of 2^53 (9007199254740992) or more as strings, because a YAML number that large is not exact. The chart refuses anything else at render. It checks the number Helm parsed: YAML reads a leading zero as octal (`030` is 24) and rounds a decimal past float precision, so write a plain decimal |
+| `config.scheduler.reportRetentionDays` | int | `30` | `[scheduler] report_retention_days`. Finished runs only; running runs are never deleted. A whole number from 1 to 36500; the chart refuses anything else at render. It checks the number Helm parsed: YAML reads a leading zero as octal (`030` is 24) and rounds a decimal past float precision, so write a plain decimal |
 | `config.scheduler.maxCatchupIntervals` | int | `24` | `[scheduler] max_catchup_intervals` |
 | `tls.mode` | string | `auto` | `auto` lets trawld generate a self-signed certificate. `secret` mounts `tls.secretName`. `certManager` creates a Certificate in the release namespace and mounts its Secret `<fullname>-tls` |
 | `tls.secretName` | string | `""` | TLS Secret name for `tls.mode: secret` |

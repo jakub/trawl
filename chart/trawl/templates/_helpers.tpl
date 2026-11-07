@@ -121,3 +121,32 @@ Where trawld mounts its data volume. The web sidecar's certificate mount in
 tls.mode=auto is a subPath of the same volume, so both derive from this.
 */}}
 {{- define "trawl.dataMountPath" -}}/var/lib/trawl{{- end }}
+
+{{/*
+A whole number from 1 to .max, rendered as its exact decimal digits, or a
+render failure. Values files give float64, --set gives int64, and
+--set-string or a value past int64 gives a string; a cast would round,
+wrap or turn a bool into 1, so normalize to digits and compare those.
+Equal-length digit strings compare in numeric order.
+*/}}
+{{- define "trawl.wholeNumber" -}}
+{{- $v := .value -}}
+{{- $kind := kindOf $v -}}
+{{- $s := "" -}}
+{{- $hint := "" -}}
+{{- if eq $kind "string" -}}
+{{- $s = $v -}}
+{{- else if regexMatch "^u?int" $kind -}}
+{{- $s = toString $v -}}
+{{- else if and (eq $kind "float64") (eq $v (floor $v)) -}}
+{{- if lt $v 9007199254740992.0 -}}
+{{- $s = printf "%.0f" $v -}}
+{{- else -}}
+{{- $hint = "; a value this large is not exact as a YAML number, so write it as a quoted string" -}}
+{{- end -}}
+{{- end -}}
+{{- if not (and (regexMatch "^[1-9][0-9]*$" $s) (or (lt (len $s) (len .max)) (and (eq (len $s) (len .max)) (le $s .max)))) -}}
+{{- fail (printf "%s (%s) must be a whole number from 1 to %s; got %v (%s)%s" .name .key .max $v $kind $hint) -}}
+{{- end -}}
+{{- $s -}}
+{{- end }}

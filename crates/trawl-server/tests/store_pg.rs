@@ -2542,6 +2542,345 @@ async fn delete_old_runs_retention_and_paths(pool: PgPool) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// retention spares running runs (#350, ADR-0018 amendment 2026-11-06)
+// ---------------------------------------------------------------------------
+
+/// Seed one report run for the retention tests and pin its `started_at`.
+/// A `Running` status leaves the claim open; any other status finishes it
+/// first. A schedule holds one running row at a time, so seed a schedule's
+/// running row after its terminal rows.
+async fn seed_retention_run(
+    pool: &PgPool,
+    store: &ScheduleStore,
+    (schedule_id, saved_query_id): (i64, i64),
+    status: RunStatus,
+    result_path: Option<&str>,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> i64 {
+    let id = seed_run(store, schedule_id, saved_query_id, "q").await;
+    if status != RunStatus::Running {
+        let error = (status != RunStatus::Success).then_some("failed");
+        let outcome = store
+            .finish_run(id, status, 10, Some(1), error, None, result_path)
+            .await
+            .unwrap();
+        assert_eq!(outcome, FinishOutcome::Persisted);
+    }
+    sqlx::query("UPDATE report_runs SET started_at = $2 WHERE id = $1")
+        .bind(id)
+        .bind(started_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    id
+}
+
+/// A fresh schedule on its own saved query, as `(schedule_id, saved_query_id)`.
+async fn retention_schedule(pool: &PgPool, store: &ScheduleStore, name: &str) -> (i64, i64) {
+    let sq_id = seed_saved(pool, 1, name).await;
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    (sched.id, sq_id)
+}
+
+/// Every surviving run id, ascending.
+async fn surviving_run_ids(pool: &PgPool) -> Vec<i64> {
+    sqlx::query_scalar("SELECT id FROM report_runs ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+fn sorted(mut paths: Vec<String>) -> Vec<String> {
+    paths.sort();
+    paths
+}
+
+/// The age branch deletes old terminal rows and spares an old running row.
+/// The keep is ample so only the age branch can act.
+#[sqlx::test]
+async fn retention_by_age_spares_running_runs(pool: PgPool) {
+    let store = schedules(&pool);
+    let s = retention_schedule(&pool, &store, "age").await;
+    let now = chrono::Utc::now();
+    let old = now - chrono::Duration::days(40);
+
+    seed_retention_run(&pool, &store, s, RunStatus::Success, Some("age/0"), old).await;
+    seed_retention_run(&pool, &store, s, RunStatus::Error, None, old).await;
+    let young = seed_retention_run(
+        &pool,
+        &store,
+        s,
+        RunStatus::Success,
+        Some("age/2"),
+        now - chrono::Duration::days(1),
+    )
+    .await;
+    let running = seed_retention_run(&pool, &store, s, RunStatus::Running, None, old).await;
+
+    let (deleted, paths) = store.delete_old_runs(30, 1_000).await.unwrap();
+    assert_eq!(deleted, 2);
+    assert_eq!(paths, vec!["age/0".to_string()]);
+    assert_eq!(surviving_run_ids(&pool).await, vec![young, running]);
+}
+
+/// The excess branch neither deletes a running row nor counts it toward
+/// the keep. Schedule A's running row is the newest (counting it would cost
+/// a terminal slot); schedule B's is the oldest (ranking it would delete it).
+/// The age limit is ample so only the excess branch can act.
+#[sqlx::test]
+async fn retention_by_count_spares_running_runs(pool: PgPool) {
+    let store = schedules(&pool);
+    let a = retention_schedule(&pool, &store, "count-a").await;
+    let b = retention_schedule(&pool, &store, "count-b").await;
+    let now = chrono::Utc::now();
+    let hours = |h: i64| now - chrono::Duration::hours(h);
+
+    let mut a_terminal = Vec::new();
+    let mut b_terminal = Vec::new();
+    for h in [5, 4, 3, 2] {
+        a_terminal
+            .push(seed_retention_run(&pool, &store, a, RunStatus::Success, None, hours(h)).await);
+        b_terminal
+            .push(seed_retention_run(&pool, &store, b, RunStatus::Success, None, hours(h)).await);
+    }
+    let a_running = seed_retention_run(&pool, &store, a, RunStatus::Running, None, hours(1)).await;
+    let b_running = seed_retention_run(&pool, &store, b, RunStatus::Running, None, hours(9)).await;
+
+    let (deleted, _) = store.delete_old_runs(36_500, 2).await.unwrap();
+    assert_eq!(deleted, 4);
+    let mut expected = vec![
+        a_terminal[2],
+        a_terminal[3],
+        b_terminal[2],
+        b_terminal[3],
+        a_running,
+        b_running,
+    ];
+    expected.sort_unstable();
+    assert_eq!(surviving_run_ids(&pool).await, expected);
+}
+
+/// `success`, `error` and `timeout` are each deleted by age and by excess,
+/// including terminal rows with no result file.
+#[sqlx::test]
+async fn retention_deletes_every_terminal_status(pool: PgPool) {
+    let store = schedules(&pool);
+    let aged = retention_schedule(&pool, &store, "status-age").await;
+    let excess = retention_schedule(&pool, &store, "status-excess").await;
+    let now = chrono::Utc::now();
+    let old = now - chrono::Duration::days(40);
+    let hours = |h: i64| now - chrono::Duration::hours(h);
+
+    // By age: the keep is ample, so only the age branch acts.
+    seed_retention_run(
+        &pool,
+        &store,
+        aged,
+        RunStatus::Success,
+        Some("st/a-success"),
+        old,
+    )
+    .await;
+    seed_retention_run(&pool, &store, aged, RunStatus::Error, None, old).await;
+    seed_retention_run(
+        &pool,
+        &store,
+        aged,
+        RunStatus::Timeout,
+        Some("st/a-timeout"),
+        old,
+    )
+    .await;
+    let aged_keep =
+        seed_retention_run(&pool, &store, aged, RunStatus::Success, None, hours(1)).await;
+    // By excess: young rows, the newest of which is kept.
+    seed_retention_run(
+        &pool,
+        &store,
+        excess,
+        RunStatus::Success,
+        Some("st/e-success"),
+        hours(4),
+    )
+    .await;
+    seed_retention_run(
+        &pool,
+        &store,
+        excess,
+        RunStatus::Error,
+        Some("st/e-error"),
+        hours(3),
+    )
+    .await;
+    seed_retention_run(&pool, &store, excess, RunStatus::Timeout, None, hours(2)).await;
+    let excess_keep = seed_retention_run(
+        &pool,
+        &store,
+        excess,
+        RunStatus::Success,
+        Some("st/e-keep"),
+        hours(1),
+    )
+    .await;
+
+    let (deleted, paths) = store.delete_old_runs(30, 1_000).await.unwrap();
+    assert_eq!(deleted, 3);
+    assert_eq!(
+        sorted(paths),
+        vec!["st/a-success".to_string(), "st/a-timeout".to_string()]
+    );
+
+    let (deleted, paths) = store.delete_old_runs(36_500, 1).await.unwrap();
+    assert_eq!(deleted, 3);
+    assert_eq!(
+        sorted(paths),
+        vec!["st/e-error".to_string(), "st/e-success".to_string()]
+    );
+    assert_eq!(surviving_run_ids(&pool).await, vec![aged_keep, excess_keep]);
+}
+
+/// Rows with equal `started_at` keep the higher ids.
+#[sqlx::test]
+async fn retention_breaks_started_at_ties_by_id(pool: PgPool) {
+    let store = schedules(&pool);
+    let s = retention_schedule(&pool, &store, "ties").await;
+    let at = chrono::Utc::now() - chrono::Duration::hours(1);
+
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        ids.push(seed_retention_run(&pool, &store, s, RunStatus::Success, None, at).await);
+    }
+
+    let (deleted, _) = store.delete_old_runs(36_500, 2).await.unwrap();
+    assert_eq!(deleted, 2);
+    assert_eq!(surviving_run_ids(&pool).await, vec![ids[2], ids[3]]);
+}
+
+/// The keep counts per schedule: each keeps its own newest terminal rows.
+#[sqlx::test]
+async fn retention_keeps_each_schedule_separately(pool: PgPool) {
+    let store = schedules(&pool);
+    let a = retention_schedule(&pool, &store, "sep-a").await;
+    let b = retention_schedule(&pool, &store, "sep-b").await;
+    let now = chrono::Utc::now();
+    let minutes = |m: i64| now - chrono::Duration::minutes(m);
+
+    // Interleave the two schedules' start times so a global ranking would
+    // keep a different set.
+    let mut a_ids = Vec::new();
+    for m in [50, 30, 10] {
+        a_ids
+            .push(seed_retention_run(&pool, &store, a, RunStatus::Success, None, minutes(m)).await);
+    }
+    let mut b_ids = Vec::new();
+    for m in [60, 45, 35, 25, 5] {
+        b_ids.push(seed_retention_run(&pool, &store, b, RunStatus::Error, None, minutes(m)).await);
+    }
+
+    let (deleted, _) = store.delete_old_runs(36_500, 2).await.unwrap();
+    assert_eq!(deleted, 4);
+    let mut expected = vec![a_ids[1], a_ids[2], b_ids[3], b_ids[4]];
+    expected.sort_unstable();
+    assert_eq!(surviving_run_ids(&pool).await, expected);
+}
+
+/// With a keep of 1 and a running row newer than every terminal row, the
+/// running row and the newest terminal row both remain.
+#[sqlx::test]
+async fn retention_keep_one_beside_a_newer_running_run(pool: PgPool) {
+    let store = schedules(&pool);
+    let s = retention_schedule(&pool, &store, "keep-one").await;
+    let now = chrono::Utc::now();
+    let minutes = |m: i64| now - chrono::Duration::minutes(m);
+
+    let mut terminal = Vec::new();
+    for m in [30, 20, 10] {
+        terminal
+            .push(seed_retention_run(&pool, &store, s, RunStatus::Success, None, minutes(m)).await);
+    }
+    let running = seed_retention_run(&pool, &store, s, RunStatus::Running, None, minutes(1)).await;
+
+    let (deleted, _) = store.delete_old_runs(36_500, 1).await.unwrap();
+    assert_eq!(deleted, 2);
+    assert_eq!(surviving_run_ids(&pool).await, vec![terminal[2], running]);
+}
+
+/// Config refuses 0 for both knobs, but the store called directly with 0
+/// for either argument, or both, still spares running rows.
+#[sqlx::test]
+async fn retention_at_zero_still_spares_running_runs(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = chrono::Utc::now();
+    let minutes = |m: i64| now - chrono::Duration::minutes(m);
+
+    // A keep of zero.
+    let a = retention_schedule(&pool, &store, "zero-a").await;
+    seed_retention_run(
+        &pool,
+        &store,
+        a,
+        RunStatus::Success,
+        Some("zero/a"),
+        minutes(20),
+    )
+    .await;
+    let a_running =
+        seed_retention_run(&pool, &store, a, RunStatus::Running, None, minutes(10)).await;
+    let (deleted, paths) = store.delete_old_runs(36_500, 0).await.unwrap();
+    assert_eq!((deleted, paths), (1, vec!["zero/a".to_string()]));
+    assert_eq!(surviving_run_ids(&pool).await, vec![a_running]);
+
+    // An age of zero.
+    let b = retention_schedule(&pool, &store, "zero-b").await;
+    seed_retention_run(&pool, &store, b, RunStatus::Timeout, None, minutes(20)).await;
+    let b_running =
+        seed_retention_run(&pool, &store, b, RunStatus::Running, None, minutes(10)).await;
+    let (deleted, _) = store.delete_old_runs(0, 1_000).await.unwrap();
+    assert_eq!(deleted, 1);
+    assert_eq!(surviving_run_ids(&pool).await, vec![a_running, b_running]);
+
+    // Both zero.
+    let (deleted, paths) = store.delete_old_runs(0, 0).await.unwrap();
+    assert_eq!((deleted, paths), (0, Vec::<String>::new()));
+    assert_eq!(surviving_run_ids(&pool).await, vec![a_running, b_running]);
+}
+
+/// The largest `report_retention_days` config accepts computes a cutoff,
+/// and a value past what the arithmetic holds is an error, not a panic or
+/// a silent substitute.
+#[sqlx::test]
+async fn retention_cutoff_holds_the_configured_bound(pool: PgPool) {
+    let store = schedules(&pool);
+    let s = retention_schedule(&pool, &store, "bound").await;
+    let run = seed_retention_run(
+        &pool,
+        &store,
+        s,
+        RunStatus::Success,
+        None,
+        chrono::Utc::now() - chrono::Duration::days(400),
+    )
+    .await;
+
+    let (deleted, _) = store
+        .delete_old_runs(trawl_config::MAX_SCHEDULER_REPORT_RETENTION_DAYS, 1)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 0);
+
+    let err = store.delete_old_runs(u64::MAX, 1).await.unwrap_err();
+    assert!(matches!(err, StoreError::Validation(_)), "{err:?}");
+    assert_eq!(
+        surviving_run_ids(&pool).await,
+        vec![run],
+        "a refusal deletes nothing"
+    );
+}
+
 #[sqlx::test]
 async fn successful_run_selectors(pool: PgPool) {
     let store = schedules(&pool);
