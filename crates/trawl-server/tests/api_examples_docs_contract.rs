@@ -68,7 +68,10 @@ use trawl_api::results::{
 };
 use trawl_api::stream::SnapshotFrame;
 use trawl_api::value::{Column, ColumnType, QueryResult, Value as Cell, land_cell};
-use trawl_api::{ErrorCode, ErrorResponse, IngestResponse, QueryResponse, ReportRunResponse};
+use trawl_api::{
+    ErrorCode, ErrorResponse, IngestResponse, ListSavedResponse, QueryResponse, ReportRunResponse,
+    RunsStatsResponse, ScheduleResponse,
+};
 use trawl_server::error::ServerError;
 use trawl_server::ingest::envelope::{RejectReason, RepairCode};
 use trawl_server::investigations::service::{ACTIVITY_LIMIT, READ_DEFAULT_LIMIT, READ_MAX_LIMIT};
@@ -685,6 +688,44 @@ fn the_compare_examples_rank_one_statement_over_both_windows() {
     )
     .expect("the request composes");
     assert_eq!(result.query, composed.text(), "{heading:?} query");
+}
+
+/// The schedule example is the wire type, and its run budget agrees with
+/// itself: `exhausted` is `max_runs` set and `total_runs` at or over it.
+#[test]
+fn the_set_a_schedule_example_is_the_wire_type_with_its_run_budget() {
+    let heading = "Set a schedule";
+    let schedule: ScheduleResponse = decode_exactly(heading, examples(heading, 1)[0]);
+    assert_eq!(
+        schedule.exhausted,
+        schedule
+            .max_runs
+            .is_some_and(|max| schedule.total_runs >= max),
+        "{heading:?} example's exhausted disagrees with its counts"
+    );
+}
+
+/// The saved list embeds the schedule shape, so it carries `exhausted` too.
+#[test]
+fn the_saved_query_list_example_is_the_wire_type() {
+    let heading = "Saved query list";
+    let list: ListSavedResponse = decode_exactly(heading, examples(heading, 1)[0]);
+    assert!(
+        list.queries.iter().any(|q| q.schedule.is_some()),
+        "{heading:?} example shows a saved query with its schedule"
+    );
+}
+
+/// The run statistics count kept runs: the statuses sum to no more than
+/// the total.
+#[test]
+fn the_run_statistics_example_is_the_wire_type() {
+    let heading = "Run statistics";
+    let stats: RunsStatsResponse = decode_exactly(heading, examples(heading, 1)[0]);
+    assert!(
+        stats.success_count + stats.error_count + stats.timeout_count <= stats.total_runs,
+        "{heading:?} example counts more runs by status than in total"
+    );
 }
 
 /// The JSON examples under `heading`, which must number `count`.
