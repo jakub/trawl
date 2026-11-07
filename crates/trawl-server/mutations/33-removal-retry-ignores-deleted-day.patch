@@ -1,0 +1,13 @@
+diff --git i/crates/trawl-server/src/ingest/compaction.rs w/crates/trawl-server/src/ingest/compaction.rs
+index 545e84b2..4aeee300 100644
+--- i/crates/trawl-server/src/ingest/compaction.rs
++++ w/crates/trawl-server/src/ingest/compaction.rs
+@@ -1810,7 +1810,7 @@ fn remove_rollup_marker(
+ fn sync_removal_day(io: &RollupIo, phase: Phase, day: &Path) -> std::io::Result<()> {
+     match io.sync_dir(phase, day) {
+         Err(e) if e.kind() == std::io::ErrorKind::NotFound => match day.parent() {
+-            Some(env) => io.sync_dir(phase, env),
++            Some(_) => Err(e),
+             None => Err(e),
+         },
+         synced => synced,

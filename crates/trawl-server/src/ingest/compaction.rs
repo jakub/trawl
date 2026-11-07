@@ -24,8 +24,10 @@ use crate::hot_buffer::{AdmissionState, HotBuffer};
 use crate::ingest::coverage_proof;
 use crate::ingest::no_follow;
 use crate::ingest::publication_marker::{
-    self, PublicationClaims, RecoveryOutcomeKind, ValidatedMarker,
+    self, OutputIdentity, PublicationClaims, RecoveryOutcomeKind, ValidatedMarker,
 };
+use crate::ingest::rollup_io::{Phase, RollupIo};
+use crate::ingest::rollup_marker::{self, RollupMarker};
 use crate::metrics::{BookkeepingWrite, CompactionOperation, QuarantineKind};
 use crate::publication::PublicationGate;
 use crate::repin::RepinCoordinator;
@@ -734,12 +736,16 @@ async fn compact_pass(
     // Recover before new WAL can merge into an hourly path named by an
     // interrupted rollup. Retiring that path after a new merge would delete
     // fresh rows that the daily file never contained.
+    // Without a hot buffer the gate lives for this pass only, and so does
+    // any removal-sync obligation the pass records. trawld always passes its
+    // buffer: ingest, and with it compaction, never runs without one.
     let publication =
         hot_buffer.map_or_else(|| Arc::new(PublicationGate::new()), |buf| buf.publication());
     publication.initialize(data_dir);
     // A failed marker scan refuses every read until a complete scan
     // replaces it, and compaction is what retries it (ADR-0041 slice 2).
     publication.rescan_if_failed(data_dir);
+    retry_removal_syncs(&publication).await?;
     recover_pending_rollups(&publication, repin).await?;
 
     // Tally of corrupt WAL files quarantined this cycle. Folded into the
@@ -967,12 +973,15 @@ async fn compact_pass(
         // move the hourly file it names.
         match scan_claims_blocking(wal_dir).await {
             Ok(claims) => {
+                // The pass's gate, with or without a hot buffer: the rollup
+                // records its marker removals' owed syncs there, and skips
+                // a service-day that still owes one.
                 match rollup_once(
                     data_dir,
                     &claims,
                     memory_limit,
                     repin,
-                    hot_buffer.map(|buf| buf.publication()),
+                    Some(Arc::clone(&publication)),
                 )
                 .await
                 {
@@ -1106,6 +1115,24 @@ async fn scan_claims_blocking(wal_dir: &Path) -> Result<PublicationClaims, Strin
         .map_err(|e| crate::error::join_failure_text("publication claims scan", e))?
 }
 
+/// Retry the day-directory fsync of every rollup marker unlink that still
+/// owes one, on a blocking thread (ADR-0041). A failed retry keeps its
+/// obligation, which the gate logs; it does not stop the pass, because the
+/// files the rollup left are complete.
+async fn retry_removal_syncs(publication: &Arc<PublicationGate>) -> Result<(), String> {
+    if !publication.any_removal_sync_owed() {
+        return Ok(());
+    }
+    let publication = Arc::clone(publication);
+    tokio::task::spawn_blocking(move || {
+        publication.retry_removal_syncs(|day| {
+            sync_removal_day(&RollupIo::REAL, Phase::ObligationRetrySync, day)
+        });
+    })
+    .await
+    .map_err(|e| crate::error::join_failure_text("rollup marker removal sync retry", e))
+}
+
 async fn recover_pending_rollups(
     publication: &Arc<PublicationGate>,
     repin: Option<&Arc<RepinCoordinator>>,
@@ -1125,7 +1152,7 @@ async fn recover_pending_rollups(
             // release either guard while recovery still relocates files.
             let _corpus_guard = corpus_guard;
             let _publication_guard = publication_guard;
-            relocate_pending_rollups(&publication)
+            relocate_pending_rollups(&publication, &RollupIo::REAL)
         })
         .await
         .map_err(|e| {
@@ -1146,9 +1173,9 @@ async fn recover_pending_rollups(
 
 /// The relocation half of rollup recovery, shared by boot and each
 /// compaction pass: forget the registered markers already confirmed gone,
-/// then recover every day directory that still holds one. The caller holds
-/// the publication write guard.
-fn relocate_pending_rollups(publication: &PublicationGate) -> Result<(), String> {
+/// then recover every day directory that still holds one, through `io`.
+/// The caller holds the publication write guard.
+fn relocate_pending_rollups(publication: &PublicationGate, io: &RollupIo) -> Result<(), String> {
     // A previous cleanup or retention pass may already have removed a
     // marker. Listing the pending markers forgets the confirmed missing
     // ones before the days are selected.
@@ -1158,7 +1185,7 @@ fn relocate_pending_rollups(publication: &PublicationGate) -> Result<(), String>
         .filter_map(|marker| marker.parent().map(Path::to_path_buf))
         .collect();
     for day in days {
-        recover_rollup_markers_coordinated(&day, Some(publication))?;
+        recover_rollup_markers_coordinated(&day, Some(publication), io)?;
     }
     Ok(())
 }
@@ -1169,7 +1196,9 @@ fn relocate_pending_rollups(publication: &PublicationGate) -> Result<(), String>
 /// exists. No repin job can hold the corpus gate yet, so the publication
 /// write guard alone excludes every other relocator.
 ///
-/// Recovery only renames or retires files and reads parquet footers. A
+/// Recovery decides from the identities a marker records: it hashes the
+/// files the marker names, then renames, retires or deletes them, but it
+/// parses no Parquet footer and fsyncs no file, only directories. A
 /// failure does not stop the boot: it logs one `rollup_boot_recovery`
 /// ERROR, naming no path, and leaves the marker pending, so reads refuse
 /// `rollup_pending` until a compaction pass recovers it. A marker scan that
@@ -1181,7 +1210,7 @@ pub(crate) fn recover_rollups_at_boot(publication: &PublicationGate) {
     let _publication_guard = publication.blocking_write();
     // The error names hourly paths, so it is not logged; the failure
     // counter has recorded it.
-    let recovered = relocate_pending_rollups(publication).is_ok();
+    let recovered = relocate_pending_rollups(publication, &RollupIo::REAL).is_ok();
     if publication.marker_scan_failed() {
         tracing::error!(
             event_type = "rollup_boot_recovery",
@@ -1298,6 +1327,39 @@ fn log_rollup_blocked(env: &str, date: &str, service: &str) {
     );
 }
 
+/// Whether the rollup of `service` in `day_dir`, the directory of `date`,
+/// waits this pass, logging why: a publication marker claims one of its
+/// hourly files, or the unlink of its last rollup marker still owes the
+/// day directory's fsync (ADR-0041). Until that fsync succeeds, no rollup
+/// of the service-day runs.
+fn rollup_waits(
+    env: &str,
+    date: &str,
+    day_dir: &Path,
+    service: &str,
+    claims: &PublicationClaims,
+    publication: Option<&PublicationGate>,
+) -> bool {
+    let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok();
+    if day.is_some_and(|day| claims.claims_service_day(env, day, service)) {
+        log_rollup_blocked(env, date, service);
+        return true;
+    }
+    if publication.is_some_and(|gate| gate.removal_sync_owed(&rollup_marker_path(day_dir, service)))
+    {
+        tracing::info!(
+            event_type = "rollup_blocked",
+            env = %env,
+            date = %date,
+            compact_service = %service,
+            "the removal of this service's last rollup marker is not durable yet; \
+             its daily rollup waits until a compaction pass fsyncs the day directory"
+        );
+        return true;
+    }
+    false
+}
+
 /// Read an env's entries, observing scan errors while retaining the existing
 /// root-error and per-entry skip behavior.
 fn read_rollup_env_entries(
@@ -1387,13 +1449,13 @@ async fn rollup_env_once(
             None => None,
         };
         let day = path.clone();
-        let recovery_publication = publication.clone();
+        let gate = publication.clone();
         let recovery = tokio::task::spawn_blocking(move || {
             // Lock acquisition stays async so readers can use the blocking
             // pool to finish. Cancellation cannot release these moved guards.
             let _corpus_guard = corpus_guard;
             let _publication_guard = publication_guard;
-            recover_rollup_markers_coordinated(&day, recovery_publication.as_deref())
+            recover_rollup_markers_coordinated(&day, gate.as_deref(), &RollupIo::REAL)
         })
         .await
         .map_err(|e| {
@@ -1426,10 +1488,15 @@ async fn rollup_env_once(
             continue;
         }
 
-        let date = chrono::NaiveDate::parse_from_str(&dir_name, "%Y-%m-%d").ok();
         for (service, files) in &service_files {
-            if date.is_some_and(|date| claims.claims_service_day(env, date, service)) {
-                log_rollup_blocked(env, &dir_name, service);
+            if rollup_waits(
+                env,
+                &dir_name,
+                &path,
+                service,
+                claims,
+                publication.as_deref(),
+            ) {
                 continue;
             }
             // One merge = one gated unit: it reads the day's hourlies,
@@ -1446,22 +1513,15 @@ async fn rollup_env_once(
                     return Ok(failures + quarantined_total);
                 }
             };
-
-            let day_dir = path.clone();
-            let svc = service.clone();
-            let files = files.clone();
-
-            let mem_limit = memory_limit.to_owned();
-            let publication = publication.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                rollup_day_coordinated(&day_dir, &svc, &files, &mem_limit, publication.as_deref())
-            })
-            .await
-            .map_err(|e| {
-                CompactionOperation::DailyRollupUnit.record_failure();
-                crate::error::join_failure_text("rollup", e)
-            })?;
-            drop(unit_guard);
+            let outcome = rollup_unit_blocking(
+                unit_guard,
+                &path,
+                service,
+                files.clone(),
+                memory_limit,
+                publication.clone(),
+            )
+            .await?;
 
             // Quarantined inputs are data-loss whether or not the merge then
             // succeeded — fold the count in unconditionally so it lands on the
@@ -1493,6 +1553,39 @@ async fn rollup_env_once(
     }
 
     Ok(failures + quarantined_total)
+}
+
+/// One gated merge of [`rollup_env_once`] on a blocking thread. The
+/// closure owns `unit_guard`, as recovery owns its guards, so cancelling
+/// the async caller cannot release the corpus gate while the publish still
+/// moves files.
+async fn rollup_unit_blocking(
+    unit_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    day_dir: &Path,
+    service: &str,
+    files: Vec<PathBuf>,
+    memory_limit: &str,
+    publication: Option<Arc<PublicationGate>>,
+) -> Result<RollupOutcome, String> {
+    let day_dir = day_dir.to_path_buf();
+    let service = service.to_owned();
+    let memory_limit = memory_limit.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let _unit_guard = unit_guard;
+        rollup_day_coordinated(
+            &day_dir,
+            &service,
+            &files,
+            &memory_limit,
+            publication.as_deref(),
+            &RollupIo::REAL,
+        )
+    })
+    .await
+    .map_err(|e| {
+        CompactionOperation::DailyRollupUnit.record_failure();
+        crate::error::join_failure_text("rollup", e)
+    })
 }
 
 /// Check if a directory name looks like a date (YYYY-MM-DD).
@@ -1589,20 +1682,11 @@ fn is_dir_empty(path: &Path) -> bool {
     std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
-/// Path for the rollup marker file that tracks in-progress merges.
-///
-/// The marker lists hourly file paths being merged, enabling crash
-/// recovery without re-reading already-consolidated data.
+/// `day_dir/.rollup-{service}`: the [`rollup_marker`] of a merge in
+/// progress.
 fn rollup_marker_path(day_dir: &Path, service: &str) -> PathBuf {
-    day_dir.join(format!(".rollup-{service}"))
+    day_dir.join(rollup_marker::marker_file_name(service))
 }
-
-/// The most bytes a rollup marker can hold. It lists at most one hourly
-/// file per hour directory, and [`collect_hour_dirs`] takes only two-digit
-/// names, so at most 100 lines. Each line is a path of at most 4095 bytes
-/// (Linux `PATH_MAX` less its terminator) written lossily, which turns each
-/// byte that is not UTF-8 into three, plus its newline.
-pub(crate) const MAX_ROLLUP_MARKER_BYTES: u64 = 100 * (3 * 4095 + 1);
 
 /// Open `path` with [`no_follow::open`], and check with `fstat` on the
 /// descriptor that it is a regular file. The open never waits on a FIFO,
@@ -1624,132 +1708,146 @@ fn open_regular(
     Ok((file, metadata.len()))
 }
 
-/// Why [`read_rollup_marker`] returned no marker. Each keeps the error that
-/// recovery's message has always carried.
-#[derive(Debug)]
-pub(crate) enum RollupMarkerError {
-    /// It could not be opened as a regular file: absent, a symlink, not a
-    /// regular file, or refused.
-    Open(std::io::Error),
-    /// It is over [`MAX_ROLLUP_MARKER_BYTES`].
-    TooLarge,
-    /// Reading it failed, or it is not UTF-8 text.
-    Read(std::io::Error),
+/// Open `path` as [`open_regular`] does with [`no_follow::open`]: the
+/// opener the rollup and its recovery hand to [`RollupIo`].
+fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
+    open_regular(path, no_follow::open).map(|(file, _)| file)
 }
 
-impl RollupMarkerError {
-    /// Whether nothing is at the path any more.
-    pub(crate) fn is_missing(&self) -> bool {
-        matches!(self, Self::Open(e) if e.kind() == std::io::ErrorKind::NotFound)
-    }
-
-    /// Whether what is at the path can never be a marker recovery uses:
-    /// a symlink, not a regular file, over the bound, or not text. Any
-    /// other failure is one the reader may not have been allowed to look
-    /// past.
-    pub(crate) fn is_malformed(&self) -> bool {
-        match self {
-            Self::Open(e) => {
-                no_follow::is_symlink_refusal(e) || e.kind() == std::io::ErrorKind::InvalidInput
-            }
-            Self::TooLarge => true,
-            Self::Read(e) => e.kind() == std::io::ErrorKind::InvalidData,
-        }
-    }
-}
-
-/// The wording recovery has always failed a day with.
-impl std::fmt::Display for RollupMarkerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Open(e) => write!(f, "failed to open rollup marker: {e}"),
-            Self::TooLarge => write!(
-                f,
-                "rollup marker is over the {MAX_ROLLUP_MARKER_BYTES}-byte limit"
-            ),
-            Self::Read(e) => write!(f, "failed to read rollup marker: {e}"),
-        }
-    }
-}
-
-/// Read the rollup marker at `path`, opened with [`open_regular`]. A marker
-/// over [`MAX_ROLLUP_MARKER_BYTES`] is an error: one `fstat` reports is
-/// never read, and one that grows after the `fstat` is read only up to one
-/// byte past the bound. Off Unix no marker is opened, so a present one
-/// cannot be read.
-///
-/// Boot recovery reads with it and `trawld --doctor` with
-/// [`read_rollup_marker_with`]; recovery turns the error into its message.
-pub(crate) fn read_rollup_marker(path: &Path) -> Result<String, RollupMarkerError> {
-    read_rollup_marker_with(path, no_follow::open)
-}
-
-/// [`read_rollup_marker`], opening the marker with `open` in place of
-/// [`no_follow::open`]. `trawld --doctor` passes its own opener, which
-/// never opens anything but a regular file for I/O; whatever `open`
-/// returns is judged by `fstat` as [`open_regular`] judges its own.
-pub(crate) fn read_rollup_marker_with(
+/// Open the regular file at `path` and hash it: one rollup input's
+/// identity.
+fn identify(
+    io: &RollupIo,
+    open: Phase,
+    hash: Phase,
     path: &Path,
-    open: impl FnOnce(&Path) -> std::io::Result<std::fs::File>,
-) -> Result<String, RollupMarkerError> {
-    use std::io::Read as _;
-
-    let (file, len) = open_regular(path, open).map_err(RollupMarkerError::Open)?;
-    if len > MAX_ROLLUP_MARKER_BYTES {
-        return Err(RollupMarkerError::TooLarge);
-    }
-    let mut content = String::new();
-    file.take(MAX_ROLLUP_MARKER_BYTES + 1)
-        .read_to_string(&mut content)
-        .map_err(RollupMarkerError::Read)?;
-    if content.len() as u64 > MAX_ROLLUP_MARKER_BYTES {
-        return Err(RollupMarkerError::TooLarge);
-    }
-    Ok(content)
+) -> Result<OutputIdentity, String> {
+    let mut file = io
+        .open(open, path, open_regular_file)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    io.hash(hash, path, &mut file)
+        .map_err(|e| format!("failed to hash {}: {e}", path.display()))
 }
 
-/// Write a rollup marker listing the hourly files being merged.
-fn write_rollup_marker(
+/// fsync `day_dir`, its env directory and the data root: the entry of each
+/// in its parent, and of the day directory's files in it. Retention can
+/// delete a day directory and a publish recreate it, so every caller syncs
+/// the whole chain, as [`durable_marker_for`] does.
+fn sync_rollup_chain(io: &RollupIo, phase: Phase, day_dir: &Path) -> Result<(), String> {
+    let env_dir = day_dir.parent();
+    for dir in [Some(day_dir), env_dir, env_dir.and_then(Path::parent)]
+        .into_iter()
+        .flatten()
+    {
+        io.sync_dir(phase, dir)
+            .map_err(|e| format!("failed to fsync directory {}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Step 6 of a rollup publish (ADR-0041), shared by the rollup and
+/// recovery cases a and b: retire exactly the hourly inputs `marker` lists,
+/// then fsync each distinct hour directory, whether or not its input was
+/// still there. A retirement that renamed its input aside as `.merged`
+/// changed the hour directory too. An hour directory that is gone has its
+/// parent, the day directory, synced in its place.
+fn retire_rollup_inputs(
+    io: &RollupIo,
     day_dir: &Path,
-    service: &str,
-    hourly_files: &[PathBuf],
+    marker: &RollupMarker,
 ) -> Result<(), String> {
-    let content = hourly_files
+    for input in marker.inputs() {
+        io.retire(&marker.input_path(day_dir, input), retire_merged_input)?;
+    }
+    let hours: std::collections::BTreeSet<&str> = marker
+        .inputs()
         .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("\n");
-    crate::epoch::publish_marker_staged(day_dir, &format!(".rollup-{service}"), &content)
+        .map(rollup_marker::Input::hour)
+        .collect();
+    for hour in hours {
+        let hour_dir = day_dir.join(hour);
+        match io.sync_dir(Phase::HourSync, &hour_dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                io.sync_dir(Phase::HourSync, day_dir)
+            }
+            synced => synced,
+        }
+        .map_err(|e| format!("failed to fsync directory {}: {e}", hour_dir.display()))?;
+    }
+    Ok(())
 }
 
-/// Delete the rollup marker after successful cleanup.
-fn delete_rollup_marker(day_dir: &Path, service: &str) {
-    let marker = rollup_marker_path(day_dir, service);
-    let _ = std::fs::remove_file(marker);
+/// Step 7 of a rollup publish (ADR-0041), shared by the rollup and every
+/// recovery case that clears a marker: record the removal-sync obligation,
+/// unlink the marker, then fsync the day directory. Only that fsync's
+/// success ends the obligation, so an error after the unlink leaves it
+/// owed, for the gate's retry. A marker already gone is unlinked, and its
+/// removal still owes the fsync.
+fn remove_rollup_marker(
+    io: &RollupIo,
+    day_dir: &Path,
+    marker_path: &Path,
+    publication: Option<&PublicationGate>,
+) -> Result<(), String> {
+    let removal = publication.map(|gate| gate.owe_removal_sync(marker_path));
+    match io.remove_file(Phase::MarkerUnlink, marker_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("failed to remove rollup marker: {e}")),
+    }
+    let sync = |day: &Path| sync_removal_day(io, Phase::UnlinkDaySync, day);
+    match removal {
+        Some(removal) => removal.settle(sync),
+        None => sync(day_dir),
+    }
+    .map_err(|e| format!("failed to fsync the rollup marker's removal: {e}"))
 }
 
-/// Recover from interrupted rollup operations in a date directory.
+/// fsync the day directory of a rollup marker's removal. A day directory
+/// that is gone, as when retention deleted it, fsyncs its env directory
+/// instead: that makes the day's removal durable, and the marker entry
+/// with it. A missing env directory is still an error.
+fn sync_removal_day(io: &RollupIo, phase: Phase, day: &Path) -> std::io::Result<()> {
+    match io.sync_dir(phase, day) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match day.parent() {
+            Some(env) => io.sync_dir(phase, env),
+            None => Err(e),
+        },
+        synced => synced,
+    }
+}
+
+/// Recover from interrupted rollups in a date directory.
 ///
-/// Checks for `.rollup-{service}` marker files and completes the
-/// interrupted operation:
-/// - If a complete `.parquet.tmp` exists, promote it before retiring hourlies.
-///   The existing canonical may belong to an earlier merge.
-/// - If the tmp is corrupt, quarantine it and retain hourly inputs.
-/// - If only the canonical exists, retire the marker's hourly inputs.
-/// - If neither exists: stale marker, just remove it.
+/// Reads each `.rollup-{service}` marker and applies the first case of
+/// ADR-0041 that the identities it records prove, as
+/// [`rollup_marker::classify`] decides from what is at each path now:
 ///
-/// A marker or a `.parquet.tmp` that is not a regular file, and a marker
-/// over [`MAX_ROLLUP_MARKER_BYTES`], fail the recovery of the day with the
-/// marker left in place. Neither is opened in a way that can block.
+/// - **a.** The canonical file is the replacement, so the rename happened:
+///   fsync the day directory, remove a leftover tmp, then retire the
+///   inputs and remove the marker.
+/// - **b.** The tmp is the replacement and the rename did not happen:
+///   fsync the directory chain, rename, fsync the day directory, then as a.
+/// - **c.** Nothing was retired: delete the tmp and remove the marker. The
+///   next rollup merges again.
+/// - **d.** Nothing is proven: keep every file and the marker, log
+///   `rollup_recovery_unresolved`, and fail the day.
+///
+/// Recovery hashes the files a marker names but parses no Parquet footer,
+/// and fsyncs directories, never a file. Nothing it opens can block: a
+/// marker, tmp or input that is not a regular file reads as unreadable.
 #[cfg(test)]
 fn recover_rollup_markers(day_dir: &Path) -> Result<(), String> {
-    recover_rollup_markers_coordinated(day_dir, None)
+    recover_rollup_markers_coordinated(day_dir, None, &RollupIo::REAL)
 }
 
-/// The caller holds the publication write guard through recovery.
+/// [`recover_rollup_markers`] under `publication`, making every file
+/// operation through `io`. The caller holds the publication write guard
+/// through recovery.
 fn recover_rollup_markers_coordinated(
     day_dir: &Path,
     publication: Option<&PublicationGate>,
+    io: &RollupIo,
 ) -> Result<(), String> {
     // Classify the actual read error before converting it to the existing
     // string result. A stat-before-read check would race retention again.
@@ -1761,16 +1859,22 @@ fn recover_rollup_markers_coordinated(
     })?;
     // Returned errors are owned here, including errors from nested file
     // operations. Async callers separately own only their JoinError branch.
-    recover_rollup_markers_inner(day_dir, publication, entries).inspect_err(|_| {
+    recover_rollup_markers_inner(day_dir, publication, entries, io).inspect_err(|_| {
         CompactionOperation::PendingRollupRecovery.record_failure();
     })
 }
 
+/// Recover every marker in `entries`. An unresolved marker does not stop
+/// the others: the day fails with the first one's error once all are
+/// tried. A failed file operation fails the day at once, and the next
+/// pass retries it.
 fn recover_rollup_markers_inner(
     day_dir: &Path,
     publication: Option<&PublicationGate>,
     entries: std::fs::ReadDir,
+    io: &RollupIo,
 ) -> Result<(), String> {
+    let mut unresolved = None;
     for entry in entries {
         let path = entry
             .map_err(|e| format!("failed to read rollup entry: {e}"))?
@@ -1778,7 +1882,7 @@ fn recover_rollup_markers_inner(
         let Some(service) = path
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(|name| name.strip_prefix(".rollup-"))
+            .and_then(|name| name.strip_prefix(rollup_marker::MARKER_PREFIX))
         else {
             continue;
         };
@@ -1789,100 +1893,134 @@ fn recover_rollup_markers_inner(
         if let Some(gate) = publication {
             gate.hold_after_publish_for_test();
         }
-        let canonical = day_dir.join(format!("{service}.parquet"));
-        let tmp = day_dir.join(format!("{service}.parquet.tmp"));
-        let marker_content = read_rollup_marker(&path).map_err(|e| e.to_string())?;
-        let hourly_files: Vec<PathBuf> = marker_content
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(PathBuf::from)
-            .collect();
-
-        // An existing daily file may precede this merge. A complete tmp
-        // contains both that daily file and the new hourly inputs.
-        // A tmp that is not a regular file is no output of this merge, and
-        // is neither promoted nor quarantined.
-        let staged = match open_regular(&tmp, no_follow::open) {
-            Ok(staged) => Some(staged),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("failed to open rollup tmp: {e}")),
-        };
-        if let Some((staged, staged_len)) = staged {
-            if is_valid_parquet_file(staged, staged_len) {
-                tracing::info!(
-                    event_type = "rollup_recovery",
-                    compact_service = %service,
-                    "recovering rollup: renaming tmp to canonical"
-                );
-                std::fs::rename(&tmp, &canonical)
-                    .map_err(|e| format!("rollup recovery rename failed: {e}"))?;
-                for file in &hourly_files {
-                    retire_merged_input(file)?;
-                }
-            } else {
-                // Keep the old daily and hourly sources for a fresh merge.
-                // Remove the marker durably before removing the invalid tmp.
-                // Otherwise a crash after quarantine would make recovery
-                // mistake the old daily for this merge's published output.
-                tracing::warn!(
-                    event_type = "rollup_recovery",
-                    compact_service = %service,
-                    "discarding truncated rollup tmp; retaining hourly files for retry"
-                );
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(format!("failed to remove rollup marker: {e}")),
-                }
-                std::fs::File::open(day_dir)
-                    .and_then(|dir| dir.sync_all())
-                    .map_err(|e| format!("failed to sync rollup marker removal: {e}"))?;
-                if let Some(registration) = registration {
-                    registration.finish();
-                }
-                quarantine_file(
-                    &tmp,
-                    service,
-                    "rollup_quarantine",
-                    QuarantineKind::RollupTemporary,
-                )?;
-                continue;
-            }
-        } else {
-            let canonical_exists = match std::fs::symlink_metadata(&canonical) {
-                Ok(_) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                Err(e) => return Err(format!("failed to inspect rollup canonical: {e}")),
-            };
-            if canonical_exists {
-                tracing::info!(
-                    event_type = "rollup_recovery",
-                    compact_service = %service,
-                    "recovering rollup: canonical exists, deleting hourly files"
-                );
-                for file in &hourly_files {
-                    retire_merged_input(file)?;
-                }
-            } else {
-                tracing::warn!(
-                    event_type = "rollup_recovery",
-                    compact_service = %service,
-                    "removing stale rollup marker (no tmp or canonical file)"
-                );
-            }
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("failed to remove rollup marker: {e}")),
-        }
+        let recovered = recover_rollup_marker(day_dir, &path, publication, io);
+        // Forgets the marker only when its file is gone: an unlink whose
+        // day fsync failed leaves reads answering, under its obligation.
         if let Some(registration) = registration {
             registration.finish();
         }
+        if let Some(proof) = recovered? {
+            let error = log_rollup_unresolved(day_dir, service, proof);
+            unresolved.get_or_insert(error);
+        }
     }
-    Ok(())
+    unresolved.map_or(Ok(()), Err)
 }
 
+/// Apply the case that holds for the marker at `marker_path`. Returns the
+/// proof that failed when none of a, b or c holds (case d), with every
+/// file left as it was.
+fn recover_rollup_marker(
+    day_dir: &Path,
+    marker_path: &Path,
+    publication: Option<&PublicationGate>,
+    io: &RollupIo,
+) -> Result<Option<rollup_marker::Proof>, String> {
+    use rollup_marker::Decision;
+
+    let marker = match rollup_marker::read(marker_path) {
+        Ok(marker) => marker,
+        Err(rollup_marker::ReadError::Missing) => return Ok(None),
+        Err(e) => return Ok(e.proof()),
+    };
+    let decision =
+        rollup_marker::classify(&marker, day_dir, |path| io.observe(path, open_regular_file));
+    let service = marker.service();
+    match decision {
+        Decision::Published => {
+            tracing::info!(
+                event_type = "rollup_recovery",
+                compact_service = %service,
+                "recovering rollup: the daily file is the merge's output; retiring its inputs"
+            );
+            io.sync_dir(Phase::RenameDaySync, day_dir)
+                .map_err(|e| format!("failed to fsync directory {}: {e}", day_dir.display()))?;
+            remove_leftover_tmp(io, &marker.tmp(day_dir))?;
+        }
+        Decision::Promote => {
+            tracing::info!(
+                event_type = "rollup_recovery",
+                compact_service = %service,
+                "recovering rollup: renaming the merge's output into place"
+            );
+            // The marker's bytes were synced before its rename, so its
+            // entry and the tmp's need only the directory chain.
+            sync_rollup_chain(io, Phase::RecoveryChainSync, day_dir)?;
+            io.rename(
+                Phase::Rename,
+                &marker.tmp(day_dir),
+                &marker.canonical(day_dir),
+            )
+            .map_err(|e| format!("rollup recovery rename failed: {e}"))?;
+            io.sync_dir(Phase::RenameDaySync, day_dir)
+                .map_err(|e| format!("failed to fsync directory {}: {e}", day_dir.display()))?;
+        }
+        Decision::Abort => {
+            remove_leftover_tmp(io, &marker.tmp(day_dir))?;
+            remove_rollup_marker(io, day_dir, marker_path, publication)?;
+            tracing::warn!(
+                event_type = "rollup_recovery",
+                compact_service = %service,
+                "abandoned an interrupted rollup that retired nothing; \
+                 its hourly files are kept for the next rollup"
+            );
+            return Ok(None);
+        }
+        Decision::Unresolved(proof) => return Ok(Some(proof)),
+    }
+    retire_rollup_inputs(io, day_dir, &marker)?;
+    remove_rollup_marker(io, day_dir, marker_path, publication)?;
+    Ok(None)
+}
+
+/// Remove the rollup tmp at `tmp` if it is a regular file. Anything else
+/// there is no output of the merge, so it is left in place, and leaving it
+/// does not stop recovery.
+fn remove_leftover_tmp(io: &RollupIo, tmp: &Path) -> Result<(), String> {
+    if !std::fs::symlink_metadata(tmp).is_ok_and(|meta| meta.file_type().is_file()) {
+        return Ok(());
+    }
+    match io.remove_file(Phase::TmpRemove, tmp) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove rollup tmp: {e}")),
+    }
+}
+
+/// Log that the rollup marker of `service` in `day_dir` stays unresolved
+/// (case d), and return the day's path-free error. The env, day and
+/// service are named only once they pass validation, and no path is.
+fn log_rollup_unresolved(day_dir: &Path, service: &str, proof: rollup_marker::Proof) -> String {
+    const INVALID: &str = "<invalid>";
+    let service = Some(service)
+        .filter(|service| trawl_config::is_valid_service_name(service))
+        .unwrap_or(INVALID);
+    let date = day_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok())
+        .unwrap_or(INVALID);
+    let env = day_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|env| trawl_config::is_valid_env_name(env))
+        .unwrap_or(INVALID);
+    tracing::error!(
+        event_type = "rollup_recovery_unresolved",
+        env,
+        date,
+        compact_service = service,
+        proof = proof.label(),
+        "rollup recovery cannot prove what an interrupted rollup did; every \
+         file and the marker are kept, and reads refuse rollup_pending until \
+         an operator resolves it"
+    );
+    format!(
+        "the rollup marker of service {service} on {date} in env {env} is unresolved \
+         ({proof}); every file is kept until an operator resolves it"
+    )
+}
 /// Parquet magic bytes, written at both the start and end of every valid
 /// parquet file.
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -2142,11 +2280,11 @@ struct RollupOutcome {
 ///
 /// Opens an in-memory `DuckDB` connection, reads all hourly files via
 /// `read_parquet([list], union_by_name=true)`, sorts by timestamp for
-/// optimal row group statistics, writes to `.tmp`, then atomic-renames.
-///
-/// Uses a `.rollup-{service}` marker file for crash safety: the marker
-/// lists which hourly files are being merged, enabling recovery without
-/// re-reading already-consolidated data.
+/// optimal row group statistics, and writes `{service}.parquet.tmp`. It
+/// then publishes the tmp in the durable order of ADR-0041, under a
+/// `.rollup-{service}` [`rollup_marker`] that records the identity of the
+/// replacement, of each hourly input and of the prior daily file, so
+/// recovery can finish or abandon the merge from identities alone.
 ///
 /// Thin wrapper over [`rollup_day_inner`] that pairs the accumulated quarantine
 /// count with the merge result, so the count is reported even when the merge
@@ -2158,15 +2296,25 @@ fn rollup_day_blocking(
     hourly_files: &[PathBuf],
     memory_limit: &str,
 ) -> RollupOutcome {
-    rollup_day_coordinated(day_dir, service, hourly_files, memory_limit, None)
+    rollup_day_coordinated(
+        day_dir,
+        service,
+        hourly_files,
+        memory_limit,
+        None,
+        &RollupIo::REAL,
+    )
 }
 
+/// [`rollup_day_blocking`] under `publication`, making every file
+/// operation of the publish through `io`.
 fn rollup_day_coordinated(
     day_dir: &Path,
     service: &str,
     hourly_files: &[PathBuf],
     memory_limit: &str,
     publication: Option<&PublicationGate>,
+    io: &RollupIo,
 ) -> RollupOutcome {
     let mut quarantined: u64 = 0;
     let result = rollup_day_inner(
@@ -2176,6 +2324,7 @@ fn rollup_day_coordinated(
         memory_limit,
         &mut quarantined,
         publication,
+        io,
     );
     RollupOutcome {
         quarantined,
@@ -2194,6 +2343,7 @@ fn rollup_day_inner(
     memory_limit: &str,
     quarantined: &mut u64,
     publication: Option<&PublicationGate>,
+    io: &RollupIo,
 ) -> Result<(), String> {
     let rollup_start = std::time::Instant::now();
     let conn =
@@ -2240,9 +2390,11 @@ fn rollup_day_inner(
             *quarantined += 1;
         }
     }
+    let mut prior_merged = false;
     if canonical_path.exists() {
         if is_valid_parquet(&canonical_path) {
             all_files.push(canonical_path.clone());
+            prior_merged = true;
         } else {
             let _publication_guard = publication.map(PublicationGate::blocking_write);
             quarantine_file(
@@ -2255,13 +2407,15 @@ fn rollup_day_inner(
         }
     }
 
-    // Every input was corrupt and has been quarantined — nothing readable
-    // to merge, and nothing left to retry. This is data loss: a whole
-    // service/day produced no daily file. Surface it distinctly at error
-    // level (the partial-corrupt path only logs a cheerful rollup_complete)
-    // and report the quarantine count so it lands on the dashboard counter.
-    if all_files.is_empty() {
-        if *quarantined > 0 {
+    // No hourly input is left to merge. Every input was corrupt and has
+    // been quarantined, and with no daily file either there is nothing
+    // readable to retry. That is data loss: a whole service/day produced
+    // no daily file. Surface it distinctly at error level (the
+    // partial-corrupt path only logs a cheerful rollup_complete) and report
+    // the quarantine count so it lands on the dashboard counter. A daily
+    // file that remains is left as it is, and no marker lists no input.
+    if merged_hourly.is_empty() {
+        if all_files.is_empty() && *quarantined > 0 {
             tracing::error!(
                 event_type = "rollup_data_loss",
                 compact_service = %service,
@@ -2271,6 +2425,43 @@ fn rollup_day_inner(
         }
         return Ok(());
     }
+
+    // The identity of each file the merge reads, taken before it reads
+    // them: recovery retires an input only while it still carries the
+    // identity recorded here. A file that changed after this read is
+    // recorded as it was, so recovery fails closed on it rather than
+    // retiring rows the replacement never held.
+    merged_hourly.sort();
+    let mut inputs = Vec::with_capacity(merged_hourly.len());
+    for path in &merged_hourly {
+        let name = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|hour| hour.to_str())
+            .map(|hour| format!("{hour}/{service}.parquet"))
+            .filter(|name| day_dir.join(name) == *path)
+            .ok_or_else(|| {
+                format!(
+                    "rollup input {} is not an hour file of {}",
+                    path.display(),
+                    day_dir.display()
+                )
+            })?;
+        inputs.push((
+            name,
+            identify(io, Phase::InputOpen, Phase::InputHash, path)?,
+        ));
+    }
+    let prior = if prior_merged {
+        Some(identify(
+            io,
+            Phase::PriorOpen,
+            Phase::PriorHash,
+            &canonical_path,
+        )?)
+    } else {
+        None
+    };
 
     // Path provenance: ingest validates every service name against
     // [A-Za-z0-9._-] (no quote, no space, no leading dot) and data_dir is
@@ -2317,39 +2508,65 @@ fn rollup_day_inner(
         return Err(failure.into());
     }
 
-    // Keep marker publication, daily publication, and hourly retirement
-    // invisible to readers until the complete generation is ready.
+    // 2. On one descriptor, the bytes whose footer parses are the bytes
+    //    synced and the bytes the marker names. A footer that does not
+    //    parse fails the rollup here, before any marker exists, with every
+    //    input as it was.
+    let replacement = {
+        let mut tmp = io
+            .open(Phase::TmpOpen, &tmp_path, open_regular_file)
+            .map_err(|e| format!("failed to open {}: {e}", tmp_path.display()))?;
+        io.check_footer(Phase::TmpFooter, &tmp_path, &tmp)
+            .map_err(|e| format!("rollup output {} is unusable: {e}", tmp_path.display()))?;
+        io.sync_file(Phase::TmpSync, &tmp_path, &tmp)
+            .map_err(|e| format!("failed to fsync {}: {e}", tmp_path.display()))?;
+        io.hash(Phase::TmpHash, &tmp_path, &mut tmp)
+            .map_err(|e| format!("failed to hash {}: {e}", tmp_path.display()))?
+    };
+    let marker = RollupMarker::new(service, replacement, prior, inputs)
+        .map_err(|e| format!("cannot record rollup marker: {e}"))?;
+
+    // 3. The tmp's entry, and the chain of directories above it.
+    sync_rollup_chain(io, Phase::ChainSync, day_dir)?;
+
+    // 4. Keep marker publication, daily publication, and hourly retirement
+    //    invisible to readers until the complete generation is ready.
     let publication_guard = publication.map(PublicationGate::blocking_write);
-    let marker = rollup_marker_path(day_dir, service);
+    let marker_path = marker.marker_path(day_dir);
     // Declared after the guard, so an early return drops it first: a
     // failure leaves the marker registered, and no longer in flight, before
     // the next writer can take the lock.
-    let registration = publication.map(|gate| gate.mark_rollup(&marker));
-    write_rollup_marker(day_dir, service, &merged_hourly)?;
+    let registration = publication.map(|gate| gate.mark_rollup(&marker_path));
+    io.publish_marker(
+        day_dir,
+        &rollup_marker::marker_file_name(service),
+        &marker.encode(),
+    )
+    .map_err(|e| format!("failed to publish rollup marker: {e}"))?;
 
-    // Atomic rename.
-    std::fs::rename(&tmp_path, &canonical_path)
+    // 5. From here a failure leaves the marker, and recovery finishes or
+    //    abandons the merge from what it records.
+    io.rename(Phase::Rename, &tmp_path, &canonical_path)
         .map_err(|e| format!("rollup rename failed: {e}"))?;
+    io.sync_dir(Phase::RenameDaySync, day_dir)
+        .map_err(|e| format!("failed to fsync directory {}: {e}", day_dir.display()))?;
     #[cfg(any(test, feature = "test-support"))]
     if let Some(gate) = publication {
         gate.hold_after_publish_for_test();
     }
 
-    // Delete the hourly source files that were merged. If a delete fails,
-    // rename the file aside (`.merged`) so it can never be re-merged into a
-    // later rollup — the merge path has no dedup, so a surviving hourly would
-    // silently duplicate every one of its rows on the next tick. A failed
-    // rename-aside is a hard error: the file still matches `*.parquet`.
-    for f in &merged_hourly {
-        retire_merged_input(f)?;
-    }
-
-    // Remove marker — rollup fully complete.
-    delete_rollup_marker(day_dir, service);
+    // 6 and 7. A merged hourly that survived would be merged again by a
+    // later rollup and duplicate every one of its rows, since the merge
+    // has no dedup; retirement renames aside one it cannot delete.
+    let finished = retire_rollup_inputs(io, day_dir, &marker)
+        .and_then(|()| remove_rollup_marker(io, day_dir, &marker_path, publication));
+    // 8. Forgets the marker only once its file is gone, so a failure that
+    //    left it on disk keeps refusing reads.
     if let Some(registration) = registration {
         registration.finish();
     }
     drop(publication_guard);
+    finished?;
 
     let output_bytes = std::fs::metadata(&canonical_path).map_or(0, |m| m.len());
 
@@ -5199,6 +5416,7 @@ pub(crate) mod oom_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingest::rollup_io::{Op, Outcome, Recorder};
     use crate::test_timing::HANG_GUARD;
     use std::time::Instant;
 
@@ -5390,7 +5608,7 @@ mod tests {
         assert!(rollup_env_unclaimed(&removed).await.is_err());
         assert!(collect_hour_dirs(&removed).is_empty());
         assert!(collect_service_files(std::slice::from_ref(&removed)).is_empty());
-        let recovery = recover_rollup_markers_coordinated(&removed, None);
+        let recovery = recover_rollup_markers_coordinated(&removed, None, &RollupIo::REAL);
         assert!(
             recovery
                 .unwrap_err()
@@ -5410,7 +5628,7 @@ mod tests {
         assert!(rollup_env_unclaimed(&removed).await.is_err());
         assert!(collect_hour_dirs(&removed).is_empty());
         assert!(collect_service_files(std::slice::from_ref(&removed)).is_empty());
-        assert!(recover_rollup_markers_coordinated(&removed, None).is_err());
+        assert!(recover_rollup_markers_coordinated(&removed, None, &RollupIo::REAL).is_err());
         assert_eq!(
             operation_count(&handle, CompactionOperation::DailyRollupScan),
             3
@@ -5730,81 +5948,72 @@ mod tests {
         assert!(!day.join("svc.parquet").exists());
     }
 
+    /// An abandoned rollup (case c) deletes its tmp and quarantines nothing,
+    /// and is no recovery failure. An unresolved marker (case d) fails
+    /// recovery once and quarantines nothing either.
     #[tokio::test]
-    async fn operational_recovery_failure_and_temporary_quarantine_are_separate_facts() {
+    async fn operational_rollup_abort_and_unresolved_recovery_are_separate_facts() {
         let handle = operational_metrics();
         let recovery_before = operation_count(&handle, CompactionOperation::PendingRollupRecovery);
-        let quarantine_before = quarantine_count(&handle, QuarantineKind::RollupTemporary);
+        let quarantined = |handle: &metrics_exporter_prometheus::PrometheusHandle| {
+            QuarantineKind::ALL.map(|kind| quarantine_count(handle, kind))
+        };
+        let quarantine_before = quarantined(&handle);
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
-        let env = data.join("prod");
-        let hourly = write_hourly_parquet(&env, "2026-01-15", "00", "svc", &[OPERATIONAL_ROW]);
-        let hourly_bytes = std::fs::read(&hourly).unwrap();
-        let day = env.join("2026-01-15");
-        let temporary = day.join("svc.parquet.tmp");
-        std::fs::write(&temporary, b"truncated output").unwrap();
-        write_rollup_marker(&day, "svc", std::slice::from_ref(&hourly)).unwrap();
-        assert!(
+        let state = interrupted_rollup(&data, false, Phase::Rename);
+        std::fs::write(&state.tmp, b"truncated output").unwrap();
+        let hourly_bytes: Vec<Vec<u8>> = state
+            .hourlies
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        let no_wal = tmp.path().join("no-wal");
+        let pass = || {
             compact_once(
-                &tmp.path().join("no-wal"),
+                &no_wal,
                 &data,
                 Duration::ZERO,
                 false,
                 None,
                 500,
                 "2GB",
-                None
+                None,
             )
-            .await
-            .is_ok()
-        );
-        assert_eq!(
-            quarantine_count(&handle, QuarantineKind::RollupTemporary) - quarantine_before,
-            1
-        );
+        };
+        assert!(pass().await.is_ok());
         assert_eq!(
             operation_count(&handle, CompactionOperation::PendingRollupRecovery) - recovery_before,
             0
         );
-        assert_eq!(std::fs::read(&hourly).unwrap(), hourly_bytes);
-        assert_eq!(
-            std::fs::read(day.join("svc.parquet.tmp.corrupt")).unwrap(),
-            b"truncated output"
-        );
-        assert!(!day.join("svc.parquet").exists());
+        assert_eq!(quarantined(&handle), quarantine_before);
+        for (path, bytes) in state.hourlies.iter().zip(&hourly_bytes) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+        assert!(!state.tmp.exists(), "the abandoned tmp is deleted");
+        assert!(!state.day.join("nginx.parquet.tmp.corrupt").exists());
+        assert!(!state.canonical.exists());
+        assert!(!state.marker.exists());
 
-        // A directory at the staged output is not a regular file. Recovery
-        // fails once, keeps the source and quarantines nothing.
-        std::fs::create_dir(&temporary).unwrap();
-        write_rollup_marker(&day, "svc", std::slice::from_ref(&hourly)).unwrap();
-        assert!(
-            compact_once(
-                &tmp.path().join("no-wal"),
-                &data,
-                Duration::ZERO,
-                false,
-                None,
-                500,
-                "2GB",
-                None
-            )
-            .await
-            .is_err()
+        // A listed input is gone and nothing was published: recovery fails
+        // once, keeps the marker and the other input, and quarantines
+        // nothing.
+        let marker = write_marker(
+            &state.day,
+            "nginx",
+            unwritten_identity(),
+            None,
+            &state.hourlies,
         );
+        std::fs::remove_file(&state.hourlies[1]).unwrap();
+        assert!(pass().await.is_err());
         assert_eq!(
             operation_count(&handle, CompactionOperation::PendingRollupRecovery) - recovery_before,
             1
         );
-        assert_eq!(
-            quarantine_count(&handle, QuarantineKind::RollupTemporary) - quarantine_before,
-            1
-        );
-        assert_eq!(std::fs::read(&hourly).unwrap(), hourly_bytes);
-        assert!(temporary.is_dir());
-        assert!(
-            !day.join("svc.parquet.tmp.corrupt.1").exists(),
-            "nothing is reserved for a quarantine"
-        );
+        assert_eq!(quarantined(&handle), quarantine_before);
+        assert_eq!(std::fs::read(&state.hourlies[0]).unwrap(), hourly_bytes[0]);
+        assert!(marker.exists());
     }
 
     #[cfg(unix)]
@@ -5885,8 +6094,13 @@ mod tests {
             .unwrap(),
             0
         );
-        let marker = day.join(".rollup-svc");
-        std::fs::write(&marker, input.to_string_lossy().as_bytes()).unwrap();
+        let marker = write_marker(
+            &day,
+            "svc",
+            unwritten_identity(),
+            None,
+            std::slice::from_ref(&input),
+        );
         drop(hot.publication().mark_rollup(&marker));
         assert!(
             compact_once_coordinated(
@@ -6061,7 +6275,13 @@ mod tests {
         let input = write_hourly_parquet(&env, "2026-01-15", "00", "svc", &[OPERATIONAL_ROW]);
         let day = env.join("2026-01-15");
         let original = std::fs::read(&input).unwrap();
-        write_rollup_marker(&day, "svc", std::slice::from_ref(&input)).unwrap();
+        write_marker(
+            &day,
+            "svc",
+            unwritten_identity(),
+            None,
+            std::slice::from_ref(&input),
+        );
         let gate = Arc::new(PublicationGate::new());
         gate.initialize(&data);
         gate.panic_next_publication_for_test();
@@ -6093,10 +6313,9 @@ mod tests {
             operation_count(&handle, CompactionOperation::DailyRollupUnit),
             0
         );
-        assert_eq!(
-            quarantine_count(&handle, QuarantineKind::RollupTemporary),
-            0
-        );
+        for kind in QuarantineKind::ALL {
+            assert_eq!(quarantine_count(&handle, kind), 0);
+        }
     }
 
     // ---- publication markers (ADR-0041, #252) -----------------------------
@@ -7086,8 +7305,14 @@ mod tests {
             let day = env.join("2026-01-15");
             let daily = day.join("nginx.parquet");
             std::fs::copy(&hourly, &daily).unwrap();
-            write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
-            let marker = rollup_marker_path(&day, "nginx");
+            // The rollup renamed its output into place and retired nothing.
+            let marker = write_marker(
+                &day,
+                "nginx",
+                identity(&daily),
+                None,
+                std::slice::from_ref(&hourly),
+            );
             let gate = Arc::new(PublicationGate::new());
             gate.initialize(&root);
             let coordinator = Arc::new(RepinCoordinator::new());
@@ -7186,13 +7411,31 @@ mod tests {
         let second = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[new]);
         let combined = write_hourly_parquet(&env, "2026-01-15", "02", "nginx", &[old, new]);
         let day = env.join("2026-01-15");
-        std::fs::rename(combined, day.join("nginx.parquet")).unwrap();
-        write_rollup_marker(&day, "nginx", &[first.clone(), second.clone()]).unwrap();
-        let marker = rollup_marker_path(&day, "nginx");
+        let daily = day.join("nginx.parquet");
+        std::fs::rename(combined, &daily).unwrap();
+        let marker = write_marker(
+            &day,
+            "nginx",
+            identity(&daily),
+            None,
+            &[first.clone(), second.clone()],
+        );
         let complete = std::fs::read(&marker).unwrap();
         let stage = day.join(format!("..rollup-nginx.next.{}", std::process::id()));
         std::fs::create_dir(&stage).unwrap();
-        assert!(write_rollup_marker(&day, "nginx", std::slice::from_ref(&first)).is_err());
+        // A publish whose staged name is taken fails before its rename.
+        let partial = RollupMarker::new(
+            "nginx",
+            identity(&daily),
+            None,
+            vec![(input_name(&first), identity(&first))],
+        )
+        .unwrap();
+        assert!(
+            RollupIo::REAL
+                .publish_marker(&day, ".rollup-nginx", &partial.encode())
+                .is_err()
+        );
         assert_eq!(std::fs::read(&marker).unwrap(), complete);
         std::fs::remove_dir(&stage).unwrap();
         std::fs::write(&stage, b"partial staged list").unwrap();
@@ -7201,7 +7444,7 @@ mod tests {
         assert_eq!(gate.pending_rollup_markers(), vec![marker]);
         {
             let _writer = gate.write().await;
-            recover_rollup_markers_coordinated(&day, Some(&gate)).unwrap();
+            recover_rollup_markers_coordinated(&day, Some(&gate), &RollupIo::REAL).unwrap();
         }
         assert!(!first.exists());
         assert!(!second.exists());
@@ -7213,8 +7456,11 @@ mod tests {
         );
     }
 
+    /// An abandoned rollup (case c) whose tmp removal fails keeps its
+    /// marker, and the retry abandons it again: the prior daily file and
+    /// the unpublished hourly are both kept.
     #[tokio::test]
-    async fn failed_invalid_tmp_quarantine_cannot_retire_unpublished_rows_on_retry() {
+    async fn failed_rollup_abort_cannot_retire_unpublished_rows_on_retry() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("data");
         let env = root.join("prod");
@@ -7227,25 +7473,26 @@ mod tests {
         std::fs::rename(first, &canonical).unwrap();
         let invalid_tmp = day.join("nginx.parquet.tmp");
         std::fs::write(&invalid_tmp, b"truncated").unwrap();
-        // Every quarantine name is taken, so the quarantine fails after
-        // recovery has removed the marker.
-        for n in 0..MAX_QUARANTINE_ATTEMPTS {
-            let name = match n {
-                0 => "nginx.parquet.tmp.corrupt".to_owned(),
-                n => format!("nginx.parquet.tmp.corrupt.{n}"),
-            };
-            std::fs::write(day.join(name), b"").unwrap();
-        }
-        write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
+        let marker = write_marker(
+            &day,
+            "nginx",
+            unwritten_identity(),
+            Some(identity(&canonical)),
+            std::slice::from_ref(&hourly),
+        );
         let gate = PublicationGate::new();
         gate.initialize(&root);
+        let recorder = Recorder::new();
+        recorder.fail(Phase::TmpRemove, 0, std::io::ErrorKind::PermissionDenied);
         {
             let _writer = gate.write().await;
-            assert!(recover_rollup_markers_coordinated(&day, Some(&gate)).is_err());
-            assert!(!rollup_marker_path(&day, "nginx").exists());
+            assert!(recover_rollup_markers_coordinated(&day, Some(&gate), &recorder.io()).is_err());
+            assert!(marker.exists(), "the marker stays until the abort finishes");
             assert!(invalid_tmp.is_file());
-            recover_rollup_markers_coordinated(&day, Some(&gate)).unwrap();
+            recover_rollup_markers_coordinated(&day, Some(&gate), &recorder.io()).unwrap();
         }
+        assert!(!marker.exists());
+        assert!(!invalid_tmp.exists());
         assert_eq!(read_strings(&canonical, "msg"), vec!["old"]);
         assert_eq!(read_strings(&hourly, "msg"), vec!["new"]);
         assert!(gate.read().await.is_ok());
@@ -7269,7 +7516,13 @@ mod tests {
             let day = env.join(&partition_day);
             let daily = day.join("nginx.parquet");
             std::fs::copy(&hourly, &daily).unwrap();
-            write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
+            write_marker(
+                &day,
+                "nginx",
+                identity(&daily),
+                None,
+                std::slice::from_ref(&hourly),
+            );
             let fresh_wal = write_wal_file(&env_wal, "nginx", &[fresh]);
             let hot = with_hot.then(|| {
                 Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
@@ -7414,6 +7667,7 @@ mod tests {
                 &[writer_hourly],
                 "2GB",
                 Some(&writer_gate),
+                &RollupIo::REAL,
             )
             .result
             .unwrap();
@@ -7465,7 +7719,13 @@ mod tests {
         let staged = day.join("nginx.parquet.tmp");
         std::fs::rename(previous, &canonical).unwrap();
         std::fs::rename(combined, &staged).unwrap();
-        write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
+        write_marker(
+            &day,
+            "nginx",
+            identity(&staged),
+            Some(identity(&canonical)),
+            std::slice::from_ref(&hourly),
+        );
         remove_stale_tmp(&staged, Duration::ZERO);
         assert!(
             staged.exists(),
@@ -7477,41 +7737,40 @@ mod tests {
         assert!(!staged.exists());
     }
 
+    /// A rollup that stopped before its rename, whose tmp is not its
+    /// output, is abandoned (case c): the old daily file and the hourly
+    /// inputs are kept, and the tmp is deleted.
     #[test]
     fn corrupt_tmp_preserves_old_daily_and_hourlies() {
         let tmp = tempfile::tempdir().unwrap();
-        let day = tmp.path();
-        let canonical = day.join("nginx.parquet");
-        let hourly = day.join("hourly.parquet");
-        std::fs::write(&canonical, b"old daily").unwrap();
-        std::fs::write(&hourly, b"hourly input").unwrap();
-        std::fs::write(day.join("nginx.parquet.tmp"), b"truncated").unwrap();
-        write_rollup_marker(day, "nginx", std::slice::from_ref(&hourly)).unwrap();
-        recover_rollup_markers(day).unwrap();
-        assert_eq!(std::fs::read(canonical).unwrap(), b"old daily");
-        assert!(hourly.exists());
+        let state = interrupted_rollup(tmp.path(), true, Phase::Rename);
+        std::fs::write(&state.tmp, b"truncated").unwrap();
+        let daily = std::fs::read(&state.canonical).unwrap();
+        let hourly = std::fs::read(&state.hourlies[0]).unwrap();
+        recover_rollup_markers(&state.day).unwrap();
+        assert_eq!(std::fs::read(&state.canonical).unwrap(), daily);
+        assert_eq!(std::fs::read(&state.hourlies[0]).unwrap(), hourly);
+        assert!(state.hourlies[1].exists());
+        assert!(!state.tmp.exists());
+        assert!(!state.marker.exists());
     }
 
+    /// A marker recovery cannot resolve keeps readers closed and stays:
+    /// here the daily file is neither the prior the marker records nor its
+    /// replacement.
     #[tokio::test]
     async fn failed_rollup_recovery_keeps_readers_closed() {
         let tmp = tempfile::tempdir().unwrap();
-        let day = tmp.path();
-        let hourly = day.join("hourly.parquet");
-        std::fs::create_dir(&hourly).unwrap();
-        std::fs::write(hourly.join("child"), b"occupied").unwrap();
-        let aside = day.join("hourly.parquet.merged");
-        std::fs::create_dir(&aside).unwrap();
-        std::fs::write(aside.join("child"), b"occupied").unwrap();
-        std::fs::write(day.join("nginx.parquet"), b"daily").unwrap();
-        write_rollup_marker(day, "nginx", &[hourly]).unwrap();
+        let state = interrupted_rollup(tmp.path(), true, Phase::Rename);
+        replace_with_other_parquet(tmp.path(), &state.canonical);
         let gate = Arc::new(PublicationGate::new());
         {
             let _writer = gate.write().await;
-            drop(gate.mark_rollup(&rollup_marker_path(day, "nginx")));
+            drop(gate.mark_rollup(&state.marker));
         }
         assert!(recover_pending_rollups(&gate, None).await.is_err());
         assert!(gate.read().await.is_err());
-        assert!(rollup_marker_path(day, "nginx").exists());
+        assert!(state.marker.exists());
     }
 
     /// Rollup recovery admits compaction on rollup state alone: the restart
@@ -7608,8 +7867,13 @@ mod tests {
         let day = env.join("2026-01-15");
         let daily = day.join("nginx.parquet");
         std::fs::rename(merged, &daily).unwrap();
-        write_rollup_marker(&day, "nginx", &[first.clone(), second.clone()]).unwrap();
-        let marker = rollup_marker_path(&day, "nginx");
+        let marker = write_marker(
+            &day,
+            "nginx",
+            identity(&daily),
+            None,
+            &[first.clone(), second.clone()],
+        );
         let gate = PublicationGate::starting();
         gate.initialize(&data);
         assert_eq!(gate.pending_rollup_markers(), vec![marker.clone()]);
@@ -7679,16 +7943,11 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
-        let day = data.join("prod/2026-01-15");
-        // The hourly input can be neither removed nor set aside.
-        let hourly = day.join("01/nginx.parquet");
-        for dir in [hourly.clone(), day.join("01/nginx.parquet.merged")] {
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("child"), b"occupied").unwrap();
-        }
-        std::fs::write(day.join("nginx.parquet"), b"daily").unwrap();
-        write_rollup_marker(&day, "nginx", &[hourly]).unwrap();
-        let marker = rollup_marker_path(&day, "nginx");
+        // The daily file is neither the prior the marker records nor its
+        // replacement, so recovery cannot prove what the rollup did.
+        let state = interrupted_rollup(&data, true, Phase::Rename);
+        replace_with_other_parquet(tmp.path(), &state.canonical);
+        let marker = state.marker.clone();
         let gate = PublicationGate::starting();
         gate.initialize(&data);
 
@@ -7713,6 +7972,10 @@ mod tests {
             .collect();
         assert_eq!(failures.len(), 1, "{log}");
         assert!(failures[0].contains("ERROR"), "{log}");
+        assert!(
+            log.contains("event_type=\"rollup_recovery_unresolved\""),
+            "{log}"
+        );
         assert!(
             !log.contains(&*tmp.path().to_string_lossy()),
             "no path is logged: {log}"
@@ -7765,70 +8028,83 @@ mod tests {
     }
 
     /// A FIFO at the staged rollup output does not block boot recovery
-    /// either, and is not taken for a truncated output: nothing is
-    /// quarantined or retired, and the marker stays pending.
+    /// either, and is never taken for the merge's output: it is no regular
+    /// file, so recovery leaves it in place. With every input present and
+    /// nothing published, recovery abandons the rollup and keeps the hourly
+    /// inputs (case c). With the output already renamed into place, it
+    /// finishes the rollup (case a).
     #[cfg(target_os = "linux")]
     #[test]
-    fn rollup_boot_recovery_leaves_a_fifo_staged_output_pending_without_blocking() {
+    fn rollup_boot_recovery_steps_past_a_fifo_staged_output_without_blocking() {
         use std::os::unix::fs::FileTypeExt as _;
 
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let env = data.join("prod");
-        let row = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
-        let hourly = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[row]);
-        let day = env.join("2026-01-15");
-        let staged = day.join("nginx.parquet.tmp");
-        crate::ingest::no_follow::test_support::make_fifo(&staged);
-        write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
-        let marker = rollup_marker_path(&day, "nginx");
+        for published in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            let stop = if published {
+                Phase::Retire
+            } else {
+                Phase::Rename
+            };
+            let state = interrupted_rollup(&data, false, stop);
+            if state.tmp.exists() {
+                std::fs::remove_file(&state.tmp).unwrap();
+            }
+            crate::ingest::no_follow::test_support::make_fifo(&state.tmp);
+            let hourly = std::fs::read(&state.hourlies[0]).unwrap();
 
-        let gate = recover_at_boot_promptly(&data);
+            let gate = recover_at_boot_promptly(&data);
 
-        assert!(
-            std::fs::symlink_metadata(&staged)
-                .unwrap()
-                .file_type()
-                .is_fifo(),
-            "the FIFO is neither promoted nor quarantined"
-        );
-        assert!(hourly.exists(), "the hourly input is kept");
-        assert!(marker.exists(), "the marker stays for a compaction pass");
-        assert_eq!(gate.pending_rollup_markers(), vec![marker]);
-        assert_eq!(
-            gate.unsettled(),
-            Some(crate::publication::CorpusUnsettled::RollupPending)
-        );
+            assert!(
+                std::fs::symlink_metadata(&state.tmp)
+                    .unwrap()
+                    .file_type()
+                    .is_fifo(),
+                "published={published}: the FIFO stays in place"
+            );
+            assert!(!state.marker.exists(), "published={published}");
+            assert!(gate.pending_rollup_markers().is_empty());
+            assert!(
+                !gate
+                    .unsettled_reasons()
+                    .contains(crate::publication::CorpusUnsettled::RollupPending)
+            );
+            if published {
+                assert!(state.hourlies.iter().all(|path| !path.exists()));
+                assert_eq!(read_strings(&state.canonical, "msg"), ["one", "two"]);
+            } else {
+                assert_eq!(std::fs::read(&state.hourlies[0]).unwrap(), hourly);
+                assert!(state.hourlies[1].exists());
+                assert!(!state.canonical.exists());
+            }
+        }
     }
 
-    /// A rollup marker over [`MAX_ROLLUP_MARKER_BYTES`] is not read, so no
-    /// path it lists is retired, and it stays pending. One at the bound is
-    /// read and recovered.
+    /// A rollup marker over [`rollup_marker::MAX_ROLLUP_MARKER_BYTES`] is
+    /// not read, so no file it names is retired, and it stays pending. One
+    /// at the bound is read and recovered.
     #[cfg(unix)]
     #[test]
     fn rollup_boot_recovery_reads_no_marker_over_the_bound() {
         for (len, recovered) in [
-            (MAX_ROLLUP_MARKER_BYTES, true),
-            (MAX_ROLLUP_MARKER_BYTES + 1, false),
+            (rollup_marker::MAX_ROLLUP_MARKER_BYTES, true),
+            (rollup_marker::MAX_ROLLUP_MARKER_BYTES + 1, false),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let data = tmp.path().join("data");
-            let env = data.join("prod");
-            let row = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
-            let hourly = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[row]);
-            let day = env.join("2026-01-15");
-            std::fs::write(day.join("nginx.parquet"), b"daily").unwrap();
-            // The listed hourly, padded with the empty lines a marker read
-            // skips.
-            let mut body = hourly.to_string_lossy().into_owned().into_bytes();
-            body.resize(usize::try_from(len).unwrap(), b'\n');
-            let marker = rollup_marker_path(&day, "nginx");
-            std::fs::write(&marker, body).unwrap();
+            let state = interrupted_rollup(&data, false, Phase::Retire);
+            // The marker the rollup wrote, padded with the trailing
+            // whitespace a JSON read skips.
+            let mut body = std::fs::read(&state.marker).unwrap();
+            body.resize(usize::try_from(len).unwrap(), b' ');
+            std::fs::write(&state.marker, body).unwrap();
 
             let gate = recover_at_boot_promptly(&data);
 
-            assert_eq!(!hourly.exists(), recovered, "{len}-byte marker");
-            assert_eq!(!marker.exists(), recovered, "{len}-byte marker");
+            for hourly in &state.hourlies {
+                assert_eq!(!hourly.exists(), recovered, "{len}-byte marker");
+            }
+            assert_eq!(!state.marker.exists(), recovered, "{len}-byte marker");
             assert_eq!(
                 gate.pending_rollup_markers().is_empty(),
                 recovered,
@@ -10160,6 +10436,1013 @@ mod tests {
         out
     }
 
+    // ---- rollup publish and recovery fixtures (ADR-0041, #357) ----------
+
+    /// The historical day the rollup fixtures roll up.
+    const ROLLUP_DAY: &str = "2026-01-15";
+
+    /// One `nginx` event at `hour`:00 of [`ROLLUP_DAY`], whose `msg` is
+    /// `msg`.
+    fn nginx_row(hour: &str, msg: &str) -> String {
+        format!(
+            r#"{{"_time":"{ROLLUP_DAY}T{hour}:00:00Z","_ingested":"{ROLLUP_DAY}T{hour}:00:00Z","service":"nginx","msg":"{msg}"}}"#
+        )
+    }
+
+    fn identity(path: &Path) -> OutputIdentity {
+        publication_marker::identity_of(path).unwrap()
+    }
+
+    /// An identity no fixture file has.
+    fn unwritten_identity() -> OutputIdentity {
+        OutputIdentity {
+            size: 7,
+            hash: blake3::hash(b"never written"),
+        }
+    }
+
+    /// The `HH/{service}.parquet` name of the hourly file `path`.
+    fn input_name(path: &Path) -> String {
+        let hour = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let file = path.file_name().unwrap().to_str().unwrap();
+        format!("{hour}/{file}")
+    }
+
+    /// Publish into `day` the rollup marker a rollup of `service` writes
+    /// when it merged `inputs`, with these identities, and the prior daily
+    /// file `prior` into the replacement `replacement`. Returns its path.
+    fn write_marker_with(
+        day: &Path,
+        service: &str,
+        replacement: OutputIdentity,
+        prior: Option<OutputIdentity>,
+        inputs: Vec<(String, OutputIdentity)>,
+    ) -> PathBuf {
+        let marker = RollupMarker::new(service, replacement, prior, inputs).unwrap();
+        crate::epoch::publish_marker_durable(
+            day,
+            &rollup_marker::marker_file_name(service),
+            &marker.encode(),
+        )
+        .unwrap();
+        marker.marker_path(day)
+    }
+
+    /// [`write_marker_with`], recording each input in `inputs` with the
+    /// identity it has now.
+    fn write_marker(
+        day: &Path,
+        service: &str,
+        replacement: OutputIdentity,
+        prior: Option<OutputIdentity>,
+        inputs: &[PathBuf],
+    ) -> PathBuf {
+        let inputs = inputs
+            .iter()
+            .map(|path| (input_name(path), identity(path)))
+            .collect();
+        write_marker_with(day, service, replacement, prior, inputs)
+    }
+
+    /// Every entry under `root`, by its path relative to `root`: a regular
+    /// file with its bytes, anything else with none.
+    fn rollup_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+                if kind.is_dir() {
+                    stack.push(path);
+                } else if kind.is_file() {
+                    out.insert(rel, Some(std::fs::read(&path).unwrap()));
+                } else {
+                    out.insert(rel, None);
+                }
+            }
+        }
+        out
+    }
+
+    /// Copy the directories and regular files under `from` to `to`.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// Whether `gate` admits a corpus read now.
+    fn reads_answer(gate: &PublicationGate) -> bool {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(gate.read())
+            .is_ok()
+    }
+
+    /// The paths of one service-day an interrupted rollup left.
+    struct Interrupted {
+        day: PathBuf,
+        hourlies: Vec<PathBuf>,
+        canonical: PathBuf,
+        tmp: PathBuf,
+        marker: PathBuf,
+    }
+
+    /// A rollup of `nginx`'s hourly files for hours 01 and 02 of
+    /// [`ROLLUP_DAY`] under `root/prod`, merging a prior daily file when
+    /// `prior`, whose first call of `phase` failed. That failure is a crash
+    /// right there: every file stays as the rollup left it.
+    fn interrupted_rollup(root: &Path, prior: bool, phase: Phase) -> Interrupted {
+        let env = root.join("prod");
+        let hourlies = vec![
+            write_hourly_parquet(&env, ROLLUP_DAY, "01", "nginx", &[&nginx_row("01", "one")]),
+            write_hourly_parquet(&env, ROLLUP_DAY, "02", "nginx", &[&nginx_row("02", "two")]),
+        ];
+        let day = env.join(ROLLUP_DAY);
+        let canonical = day.join("nginx.parquet");
+        if prior {
+            let staging = root.join("staging");
+            let daily = write_hourly_parquet(
+                &staging,
+                ROLLUP_DAY,
+                "00",
+                "nginx",
+                &[&nginx_row("00", "prior")],
+            );
+            std::fs::rename(daily, &canonical).unwrap();
+            std::fs::remove_dir_all(staging).unwrap();
+        }
+        let recorder = Recorder::new();
+        recorder.fail(phase, 0, std::io::ErrorKind::Other);
+        let outcome = rollup_day_coordinated(&day, "nginx", &hourlies, "2GB", None, &recorder.io());
+        assert!(outcome.result.is_err(), "the rollup stops at {phase:?}");
+        Interrupted {
+            tmp: day.join("nginx.parquet.tmp"),
+            marker: rollup_marker_path(&day, "nginx"),
+            day,
+            hourlies,
+            canonical,
+        }
+    }
+
+    /// Put a real Parquet file at `path` that no rollup fixture merged,
+    /// staged under `root/other`.
+    fn replace_with_other_parquet(root: &Path, path: &Path) {
+        let staging = root.join("other");
+        let other = write_hourly_parquet(
+            &staging,
+            ROLLUP_DAY,
+            "05",
+            "nginx",
+            &[&nginx_row("05", "other")],
+        );
+        std::fs::rename(other, path).unwrap();
+        std::fs::remove_dir_all(staging).unwrap();
+    }
+
+    /// The rollup's durable order (ADR-0041): every call it makes, in the
+    /// order it made them, each with the result the real call returned.
+    /// Its inputs sit in three hour directories beside a prior daily file,
+    /// and the second retirement finds a directory where its input was, so
+    /// it renames the input aside as `.merged`. That hour directory is
+    /// synced like the others.
+    #[test]
+    fn rollup_publish_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let env = root.join("prod");
+        let hours = ["01", "02", "03"];
+        let hourlies: Vec<PathBuf> = hours
+            .iter()
+            .map(|hour| {
+                write_hourly_parquet(&env, ROLLUP_DAY, hour, "nginx", &[&nginx_row(hour, hour)])
+            })
+            .collect();
+        let day = env.join(ROLLUP_DAY);
+        let canonical = day.join("nginx.parquet");
+        let staging = tmp.path().join("staging");
+        let prior = write_hourly_parquet(
+            &staging,
+            ROLLUP_DAY,
+            "00",
+            "nginx",
+            &[&nginx_row("00", "prior")],
+        );
+        std::fs::rename(prior, &canonical).unwrap();
+        let tmp_path = day.join("nginx.parquet.tmp");
+        let marker = rollup_marker_path(&day, "nginx");
+        let staged = day.join(format!("..rollup-nginx.next.{}", std::process::id()));
+        let recorder = Recorder::new();
+        recorder.before(Phase::Retire, 1, |path| {
+            std::fs::remove_file(path).unwrap();
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("occupied"), b"").unwrap();
+        });
+        let gate = PublicationGate::new();
+
+        rollup_day_coordinated(&day, "nginx", &hourlies, "2GB", Some(&gate), &recorder.io())
+            .result
+            .unwrap();
+
+        let mut expected = Vec::new();
+        for hourly in &hourlies {
+            expected.push((Op::Open, Phase::InputOpen, hourly.clone()));
+            expected.push((Op::Hash, Phase::InputHash, hourly.clone()));
+        }
+        expected.extend([
+            (Op::Open, Phase::PriorOpen, canonical.clone()),
+            (Op::Hash, Phase::PriorHash, canonical.clone()),
+            (Op::Open, Phase::TmpOpen, tmp_path.clone()),
+            (Op::Footer, Phase::TmpFooter, tmp_path.clone()),
+            (Op::SyncFile, Phase::TmpSync, tmp_path.clone()),
+            (Op::Hash, Phase::TmpHash, tmp_path.clone()),
+            (Op::SyncDir, Phase::ChainSync, day.clone()),
+            (Op::SyncDir, Phase::ChainSync, env.clone()),
+            (Op::SyncDir, Phase::ChainSync, root.clone()),
+            (Op::PublishMarker, Phase::MarkerPublish, marker.clone()),
+            (Op::SyncFile, Phase::MarkerStagedSync, staged),
+            (Op::SyncDir, Phase::MarkerDaySync, day.clone()),
+            (Op::Rename, Phase::Rename, tmp_path.clone()),
+            (Op::SyncDir, Phase::RenameDaySync, day.clone()),
+        ]);
+        for hourly in &hourlies {
+            expected.push((Op::Retire, Phase::Retire, hourly.clone()));
+        }
+        for hour in hours {
+            expected.push((Op::SyncDir, Phase::HourSync, day.join(hour)));
+        }
+        expected.extend([
+            (Op::RemoveFile, Phase::MarkerUnlink, marker.clone()),
+            (Op::SyncDir, Phase::UnlinkDaySync, day.clone()),
+        ]);
+        let entries = recorder.entries();
+        let calls: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.op, entry.phase, entry.path.clone()))
+            .collect();
+        assert_eq!(calls, expected);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.result == Some(Outcome::Ok)),
+            "{entries:#?}"
+        );
+        let chain: Vec<usize> = entries
+            .iter()
+            .filter(|entry| entry.phase == Phase::ChainSync)
+            .map(|entry| entry.occurrence)
+            .collect();
+        assert_eq!(chain, [0, 1, 2], "occurrences count per phase");
+
+        assert!(
+            day.join("02/nginx.parquet.merged").is_dir(),
+            "the fallback ran"
+        );
+        assert!(!hourlies[0].exists() && !hourlies[2].exists());
+        assert!(!tmp_path.exists() && !marker.exists());
+        assert!(!gate.removal_sync_owed(&marker));
+        assert!(reads_answer(&gate));
+        assert_eq!(read_strings(&canonical, "msg"), ["prior", "01", "02", "03"]);
+    }
+
+    /// Each sync and marker operation of the rollup fails in turn, chosen
+    /// by phase and occurrence (ADR-0041). No failure retires an input
+    /// before the rename's day fsync succeeds, and none completes the
+    /// rollup. Before the marker exists, reads answer and every input is as
+    /// it was. While the marker is on disk, reads refuse. After the
+    /// unlink's fsync fails, reads answer and the removal-sync obligation
+    /// holds. A tmp whose footer does not parse fails the rollup before any
+    /// marker exists, with every input unchanged.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table of faults, one set of checks
+    fn rollup_sync_failure_matrix() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum After {
+            NoMarker,
+            MarkerPending,
+            RemovalOwed,
+        }
+        #[derive(Debug, Clone, Copy)]
+        enum Fault {
+            Fail(Phase, usize),
+            /// Overwrite the tmp with bytes whose footer cannot parse, just
+            /// before its footer check.
+            BadFooter,
+        }
+        let cases = [
+            (Fault::BadFooter, After::NoMarker),
+            (Fault::Fail(Phase::TmpFooter, 0), After::NoMarker),
+            (Fault::Fail(Phase::TmpSync, 0), After::NoMarker),
+            (Fault::Fail(Phase::ChainSync, 0), After::NoMarker),
+            (Fault::Fail(Phase::ChainSync, 1), After::NoMarker),
+            (Fault::Fail(Phase::ChainSync, 2), After::NoMarker),
+            (Fault::Fail(Phase::MarkerPublish, 0), After::NoMarker),
+            (Fault::Fail(Phase::MarkerStagedSync, 0), After::NoMarker),
+            (Fault::Fail(Phase::MarkerDaySync, 0), After::MarkerPending),
+            (Fault::Fail(Phase::Rename, 0), After::MarkerPending),
+            (Fault::Fail(Phase::RenameDaySync, 0), After::MarkerPending),
+            (Fault::Fail(Phase::HourSync, 0), After::MarkerPending),
+            (Fault::Fail(Phase::HourSync, 1), After::MarkerPending),
+            (Fault::Fail(Phase::MarkerUnlink, 0), After::MarkerPending),
+            (Fault::Fail(Phase::UnlinkDaySync, 0), After::RemovalOwed),
+        ];
+        for (fault, after) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("data");
+            let env = root.join("prod");
+            let hourlies = [
+                write_hourly_parquet(&env, ROLLUP_DAY, "01", "nginx", &[&nginx_row("01", "one")]),
+                write_hourly_parquet(&env, ROLLUP_DAY, "02", "nginx", &[&nginx_row("02", "two")]),
+            ];
+            let inputs: Vec<Vec<u8>> = hourlies
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            let day = env.join(ROLLUP_DAY);
+            let marker = rollup_marker_path(&day, "nginx");
+            let gate = PublicationGate::new();
+            gate.initialize(&root);
+            let recorder = Recorder::new();
+            match fault {
+                Fault::Fail(phase, occurrence) => {
+                    recorder.fail(phase, occurrence, std::io::ErrorKind::Other);
+                }
+                Fault::BadFooter => recorder.before(Phase::TmpFooter, 0, |path| {
+                    std::fs::write(path, b"PAR1 no footer at all PAR1").unwrap();
+                }),
+            }
+
+            let outcome = rollup_day_coordinated(
+                &day,
+                "nginx",
+                &hourlies,
+                "2GB",
+                Some(&gate),
+                &recorder.io(),
+            );
+
+            assert!(
+                outcome.result.is_err(),
+                "{fault:?}: the rollup does not complete"
+            );
+            let entries = recorder.entries();
+            let durable_rename = entries.iter().position(|entry| {
+                entry.phase == Phase::RenameDaySync && entry.result == Some(Outcome::Ok)
+            });
+            let first_retire = entries
+                .iter()
+                .position(|entry| entry.phase == Phase::Retire);
+            if let Some(retire) = first_retire {
+                assert!(
+                    durable_rename.is_some_and(|rename| rename < retire),
+                    "{fault:?}: an input retired before the rename's day fsync succeeded"
+                );
+            }
+            if durable_rename.is_none() {
+                for (path, bytes) in hourlies.iter().zip(&inputs) {
+                    assert_eq!(&std::fs::read(path).unwrap(), bytes, "{fault:?}");
+                }
+            }
+            match after {
+                After::NoMarker => {
+                    assert!(!marker.exists(), "{fault:?}");
+                    assert!(reads_answer(&gate), "{fault:?}: reads answer");
+                    assert!(!day.join("nginx.parquet").exists(), "{fault:?}");
+                    assert!(first_retire.is_none(), "{fault:?}");
+                }
+                After::MarkerPending => {
+                    assert!(marker.exists(), "{fault:?}");
+                    assert!(!reads_answer(&gate), "{fault:?}: reads refuse");
+                    assert_eq!(
+                        gate.unsettled(),
+                        Some(crate::publication::CorpusUnsettled::RollupPending),
+                        "{fault:?}"
+                    );
+                }
+                After::RemovalOwed => {
+                    assert!(!marker.exists(), "{fault:?}");
+                    assert!(reads_answer(&gate), "{fault:?}: reads answer");
+                    assert!(gate.removal_sync_owed(&marker), "{fault:?}: still owed");
+                    assert!(hourlies.iter().all(|path| !path.exists()), "{fault:?}");
+                }
+            }
+            if matches!(fault, Fault::BadFooter) {
+                let footer = entries
+                    .iter()
+                    .find(|entry| entry.phase == Phase::TmpFooter)
+                    .unwrap();
+                assert_eq!(
+                    footer.result,
+                    Some(Outcome::Err(std::io::ErrorKind::InvalidData))
+                );
+                assert!(
+                    !entries
+                        .iter()
+                        .any(|entry| entry.phase == Phase::MarkerPublish),
+                    "no marker is written after a bad footer"
+                );
+            }
+        }
+    }
+
+    /// What recovery must do with one state of [`rollup_recovery_matrix`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Recovers {
+        /// Case a: the daily file is the output; the inputs are retired.
+        Published,
+        /// Case b: the tmp is renamed into place; the inputs are retired.
+        Promoted,
+        /// Case c: the tmp is deleted; the inputs and daily file stay.
+        Abandoned,
+        /// Case d: nothing changes, and this proof is named.
+        Unresolved(rollup_marker::Proof),
+    }
+
+    /// Rollup recovery over real Parquet files, from each state a crash or
+    /// a later change can leave (ADR-0041). Each state is the files a
+    /// rollup leaves when one of its calls fails, then changed as named.
+    /// Recovery takes a with the tmp absent, matching and not matching,
+    /// records no rename in a, takes b, and takes c with no prior and with
+    /// a matching prior. It fails closed (d) on a prior mismatch, a missing
+    /// input, an input set aside as `.merged`, an old-format marker and a
+    /// present input that changed under a: every file stays byte-identical,
+    /// and `rollup_recovery_unresolved` names the service and day and no
+    /// path. It never parses a footer or fsyncs a file, and observes the
+    /// canonical first. Running it twice gives the files running it once
+    /// does, as does a run that fails midway followed by one that does not.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table of states, one set of checks
+    fn rollup_recovery_matrix() {
+        use rollup_marker::Proof;
+
+        fn other(
+            state: Interrupted,
+            root: &Path,
+            path: impl Fn(&Interrupted) -> PathBuf,
+        ) -> Interrupted {
+            replace_with_other_parquet(root, &path(&state));
+            state
+        }
+        fn garbage_tmp(state: Interrupted) -> Interrupted {
+            std::fs::write(&state.tmp, b"PAR1 not the merge's output PAR1").unwrap();
+            state
+        }
+        fn without_tmp(state: Interrupted) -> Interrupted {
+            std::fs::remove_file(&state.tmp).unwrap();
+            state
+        }
+        /// A name, the state, what recovery does, and a fault to inject
+        /// before a clean rerun.
+        type Case = (
+            &'static str,
+            fn(&Path) -> Interrupted,
+            Recovers,
+            Option<(Phase, usize)>,
+        );
+        let cases: [Case; 12] = [
+            (
+                "a, tmp absent",
+                |root| interrupted_rollup(root, false, Phase::Retire),
+                Recovers::Published,
+                Some((Phase::Retire, 1)),
+            ),
+            (
+                "a, tmp matching",
+                |root| {
+                    let state = interrupted_rollup(root, false, Phase::Retire);
+                    std::fs::copy(&state.canonical, &state.tmp).unwrap();
+                    state
+                },
+                Recovers::Published,
+                Some((Phase::HourSync, 0)),
+            ),
+            (
+                "a, tmp not matching",
+                |root| garbage_tmp(interrupted_rollup(root, false, Phase::Retire)),
+                Recovers::Published,
+                Some((Phase::TmpRemove, 0)),
+            ),
+            (
+                "b",
+                |root| interrupted_rollup(root, false, Phase::Rename),
+                Recovers::Promoted,
+                Some((Phase::Rename, 0)),
+            ),
+            (
+                "b, prior",
+                |root| interrupted_rollup(root, true, Phase::Rename),
+                Recovers::Promoted,
+                Some((Phase::RenameDaySync, 0)),
+            ),
+            (
+                "c, no prior",
+                |root| garbage_tmp(interrupted_rollup(root, false, Phase::Rename)),
+                Recovers::Abandoned,
+                Some((Phase::MarkerUnlink, 0)),
+            ),
+            (
+                "c, matching prior",
+                |root| garbage_tmp(interrupted_rollup(root, true, Phase::Rename)),
+                Recovers::Abandoned,
+                Some((Phase::UnlinkDaySync, 0)),
+            ),
+            (
+                "d, prior mismatch",
+                |root| {
+                    other(interrupted_rollup(root, true, Phase::Rename), root, |s| {
+                        s.canonical.clone()
+                    })
+                },
+                Recovers::Unresolved(Proof::PriorMismatch),
+                None,
+            ),
+            (
+                "d, missing input",
+                |root| {
+                    let state = without_tmp(interrupted_rollup(root, false, Phase::Rename));
+                    std::fs::remove_file(&state.hourlies[1]).unwrap();
+                    state
+                },
+                Recovers::Unresolved(Proof::InputMissing),
+                None,
+            ),
+            (
+                "d, .merged input",
+                |root| {
+                    let state = without_tmp(interrupted_rollup(root, false, Phase::Rename));
+                    let mut aside = state.hourlies[1].clone().into_os_string();
+                    aside.push(".merged");
+                    std::fs::rename(&state.hourlies[1], aside).unwrap();
+                    state
+                },
+                Recovers::Unresolved(Proof::InputMissing),
+                None,
+            ),
+            (
+                "d, old format",
+                |root| {
+                    let state = interrupted_rollup(root, false, Phase::Retire);
+                    let paths: Vec<String> = state
+                        .hourlies
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect();
+                    std::fs::write(&state.marker, paths.join("\n")).unwrap();
+                    state
+                },
+                Recovers::Unresolved(Proof::MarkerOldFormat),
+                None,
+            ),
+            (
+                "d, present input mismatch under a",
+                |root| {
+                    other(interrupted_rollup(root, false, Phase::Retire), root, |s| {
+                        s.hourlies[1].clone()
+                    })
+                },
+                Recovers::Unresolved(Proof::InputMismatch),
+                None,
+            ),
+        ];
+
+        let logs = captured_logs();
+        for (name, build, recovers, fault) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let original = tmp.path().join("original");
+            let state = build(&original);
+            let rel = |path: &Path| path.strip_prefix(&original).unwrap().to_path_buf();
+            let (canonical, staged, marker) =
+                (rel(&state.canonical), rel(&state.tmp), rel(&state.marker));
+            let hourlies: Vec<PathBuf> = state.hourlies.iter().map(|path| rel(path)).collect();
+            let initial = rollup_tree(&original);
+            let day_in = |root: &Path| root.join(rel(&state.day));
+
+            let once = tmp.path().join("once");
+            copy_tree(&original, &once);
+            let recorder = Recorder::new();
+            let log_start = logged(&logs).len();
+            let first = recover_rollup_markers_coordinated(&day_in(&once), None, &recorder.io());
+            let log = logged(&logs)[log_start..].to_owned();
+            let after = rollup_tree(&once);
+            let entries = recorder.entries();
+
+            assert!(
+                !entries
+                    .iter()
+                    .any(|e| matches!(e.op, Op::Footer | Op::SyncFile)),
+                "{name}: recovery parses no footer and fsyncs no file: {entries:#?}"
+            );
+            // A marker that does not decode leaves nothing to observe.
+            if recovers == Recovers::Unresolved(Proof::MarkerOldFormat) {
+                assert!(entries.is_empty(), "{name}: {entries:#?}");
+            } else {
+                assert_eq!(
+                    entries.first().map(|e| (e.phase, e.path.clone())),
+                    Some((Phase::RecoveryObserve, once.join(&canonical))),
+                    "{name}: the canonical is observed first"
+                );
+            }
+            let renamed = entries.iter().any(|e| e.op == Op::Rename);
+            match recovers {
+                Recovers::Published | Recovers::Promoted => {
+                    first.unwrap_or_else(|e| panic!("{name}: {e}"));
+                    let output = if recovers == Recovers::Published {
+                        &canonical
+                    } else {
+                        &staged
+                    };
+                    assert_eq!(after.get(&canonical), initial.get(output), "{name}");
+                    assert!(!after.contains_key(&staged), "{name}: the tmp is gone");
+                    assert!(!after.contains_key(&marker), "{name}");
+                    for hourly in &hourlies {
+                        assert!(!after.contains_key(hourly), "{name}: {hourly:?} is retired");
+                    }
+                    assert_eq!(renamed, recovers == Recovers::Promoted, "{name}");
+                    // The crashed rollup may never have synced its rename, so
+                    // recovery makes the canonical's entry durable before it
+                    // retires any input.
+                    let durable_rename = entries.iter().position(|e| {
+                        e.phase == Phase::RenameDaySync && e.result == Some(Outcome::Ok)
+                    });
+                    if let Some(retire) = entries.iter().position(|e| e.phase == Phase::Retire) {
+                        assert!(
+                            durable_rename.is_some_and(|sync| sync < retire),
+                            "{name}: the day is synced before the first retirement"
+                        );
+                    }
+                    // Retirement is durable before the marker goes, and the
+                    // marker's unlink is synced after it.
+                    let at = |phase: Phase| entries.iter().rposition(|e| e.phase == phase);
+                    let unlink = at(Phase::MarkerUnlink).expect(name);
+                    assert!(
+                        at(Phase::HourSync).is_some_and(|sync| sync < unlink),
+                        "{name}: every hour directory is synced before the marker unlink"
+                    );
+                    assert!(
+                        at(Phase::UnlinkDaySync).is_some_and(|sync| sync > unlink),
+                        "{name}: the day is synced after the marker unlink"
+                    );
+                    if renamed {
+                        let phases: Vec<Phase> = entries.iter().map(|e| e.phase).collect();
+                        let rename = phases.iter().position(|p| *p == Phase::Rename).unwrap();
+                        let chain = phases
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, p)| **p == Phase::RecoveryChainSync)
+                            .map(|(i, _)| i)
+                            .collect::<Vec<_>>();
+                        assert_eq!(chain.len(), 3, "{name}: the day, env and root are synced");
+                        assert!(
+                            chain.iter().all(|i| *i < rename),
+                            "{name}: before the rename"
+                        );
+                    }
+                }
+                Recovers::Abandoned => {
+                    first.unwrap_or_else(|e| panic!("{name}: {e}"));
+                    assert_eq!(after.get(&canonical), initial.get(&canonical), "{name}");
+                    assert!(!after.contains_key(&staged), "{name}: the tmp is deleted");
+                    assert!(!after.contains_key(&marker), "{name}");
+                    for hourly in &hourlies {
+                        assert_eq!(after.get(hourly), initial.get(hourly), "{name}");
+                    }
+                    assert!(!renamed, "{name}");
+                    assert!(log.contains("WARN"), "{name}: {log}");
+                }
+                Recovers::Unresolved(proof) => {
+                    let error = first.expect_err(name);
+                    assert_eq!(after, initial, "{name}: every file is byte-identical");
+                    assert!(
+                        entries.iter().all(|e| e.phase == Phase::RecoveryObserve),
+                        "{name}: {entries:#?}"
+                    );
+                    let path = tmp.path().to_string_lossy();
+                    assert!(!error.contains(&*path), "{name}: {error}");
+                    assert!(!log.contains(&*path), "{name}: no path is logged: {log}");
+                    let lines: Vec<&str> = log
+                        .lines()
+                        .filter(|line| line.contains("event_type=\"rollup_recovery_unresolved\""))
+                        .collect();
+                    assert_eq!(lines.len(), 1, "{name}: {log}");
+                    for field in [
+                        "ERROR".to_owned(),
+                        "compact_service=\"nginx\"".to_owned(),
+                        format!("date=\"{ROLLUP_DAY}\""),
+                        "env=\"prod\"".to_owned(),
+                        format!("proof=\"{}\"", proof.label()),
+                    ] {
+                        assert!(lines[0].contains(&field), "{name}: {field} in {}", lines[0]);
+                    }
+                }
+            }
+
+            // Twice is once.
+            let again = recover_rollup_markers_coordinated(&day_in(&once), None, &RollupIo::REAL);
+            assert_eq!(
+                again.is_ok(),
+                !matches!(recovers, Recovers::Unresolved(_)),
+                "{name}"
+            );
+            assert_eq!(
+                rollup_tree(&once),
+                after,
+                "{name}: a second run changes nothing"
+            );
+
+            // A run that fails midway, then one that does not, ends where
+            // one run does.
+            if let Some((phase, occurrence)) = fault {
+                let interrupted = tmp.path().join("interrupted");
+                copy_tree(&original, &interrupted);
+                let recorder = Recorder::new();
+                recorder.fail(phase, occurrence, std::io::ErrorKind::Other);
+                assert!(
+                    recover_rollup_markers_coordinated(&day_in(&interrupted), None, &recorder.io())
+                        .is_err(),
+                    "{name}: the fault at {phase:?} fails recovery"
+                );
+                recover_rollup_markers_coordinated(&day_in(&interrupted), None, &RollupIo::REAL)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(
+                    rollup_tree(&interrupted),
+                    after,
+                    "{name}: interrupted at {phase:?}, then recovered"
+                );
+            }
+        }
+    }
+
+    /// A rollup whose unlink fsync fails leaves its service-day owed while
+    /// the marker path is gone (ADR-0041). While it is owed, reads answer
+    /// and no rollup of that service-day runs. The next compaction pass
+    /// retries the fsync for real, which ends the obligation, and the
+    /// rollup runs again.
+    #[tokio::test]
+    async fn rollup_unlink_sync_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let hourly =
+            write_hourly_parquet(&env, ROLLUP_DAY, "01", "nginx", &[&nginx_row("01", "one")]);
+        let day = env.join(ROLLUP_DAY);
+        let daily = day.join("nginx.parquet");
+        let marker = rollup_marker_path(&day, "nginx");
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        let gate = hot.publication();
+        gate.initialize(&data);
+        let recorder = Recorder::new();
+        recorder.fail(Phase::UnlinkDaySync, 0, std::io::ErrorKind::Other);
+        let (rollup_gate, rollup_day, io) = (Arc::clone(&gate), day.clone(), recorder.io());
+        let outcome = tokio::task::spawn_blocking(move || {
+            rollup_day_coordinated(
+                &rollup_day,
+                "nginx",
+                &[hourly],
+                "2GB",
+                Some(&*rollup_gate),
+                &io,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(outcome.result.is_err());
+        assert!(!marker.exists(), "the marker is unlinked");
+        assert!(
+            gate.removal_sync_owed(&marker),
+            "its unlink still owes the fsync"
+        );
+        assert!(gate.read().await.is_ok(), "reads answer");
+        let published = std::fs::read(&daily).unwrap();
+
+        // While it is owed, the rollup skips the service-day.
+        let late =
+            write_hourly_parquet(&env, ROLLUP_DAY, "05", "nginx", &[&nginx_row("05", "late")]);
+        rollup_env_once(
+            "prod",
+            &env,
+            &PublicationClaims::default(),
+            "2GB",
+            None,
+            Some(Arc::clone(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(late.exists(), "no rollup of an owed service-day runs");
+        assert_eq!(std::fs::read(&daily).unwrap(), published);
+        assert!(!marker.exists());
+        assert!(gate.removal_sync_owed(&marker));
+        assert!(gate.read().await.is_ok());
+
+        // The next pass's real fsync ends it, and that pass rolls up again.
+        let errors = compact_once(
+            &tmp.path().join("no-wal"),
+            &data,
+            Duration::ZERO,
+            true,
+            Some(&hot),
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+        )
+        .await;
+        assert_eq!(errors, Ok(0));
+        assert!(!gate.removal_sync_owed(&marker));
+        assert!(!late.exists(), "the rollup ran");
+        assert_eq!(read_strings(&daily, "msg"), ["one", "late"]);
+        assert!(gate.read().await.is_ok());
+    }
+
+    /// Retention deleting the day of an owed removal does not keep the
+    /// obligation forever: the retry fsyncs the env directory instead, which
+    /// makes the day's removal durable, marker entry and all (ADR-0041).
+    #[tokio::test]
+    async fn rollup_unlink_sync_retry_ends_when_retention_deletes_the_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let hourly =
+            write_hourly_parquet(&env, ROLLUP_DAY, "01", "nginx", &[&nginx_row("01", "one")]);
+        let day = env.join(ROLLUP_DAY);
+        let marker = rollup_marker_path(&day, "nginx");
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        let gate = hot.publication();
+        gate.initialize(&data);
+        let recorder = Recorder::new();
+        recorder.fail(Phase::UnlinkDaySync, 0, std::io::ErrorKind::Other);
+        let (rollup_gate, rollup_day, io) = (Arc::clone(&gate), day.clone(), recorder.io());
+        let outcome = tokio::task::spawn_blocking(move || {
+            rollup_day_coordinated(
+                &rollup_day,
+                "nginx",
+                &[hourly],
+                "2GB",
+                Some(&*rollup_gate),
+                &io,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(outcome.result.is_err());
+        assert!(gate.removal_sync_owed(&marker));
+
+        // Retention deletes the whole day directory.
+        std::fs::remove_dir_all(&day).unwrap();
+
+        let errors = compact_once(
+            &tmp.path().join("no-wal"),
+            &data,
+            Duration::ZERO,
+            true,
+            Some(&hot),
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+        )
+        .await;
+        assert_eq!(errors, Ok(0));
+        assert!(
+            !gate.removal_sync_owed(&marker),
+            "the env fsync settles a removal whose day is gone"
+        );
+    }
+
+    /// After a restart, rollup recovery runs before a compaction pass
+    /// compacts new WAL, and reads refuse `rollup_pending` while a marker
+    /// is unresolved (ADR-0041).
+    #[tokio::test]
+    async fn rollup_restart_visibility() {
+        fn pass_buffer() -> Arc<HotBuffer> {
+            Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+                max_events: 100,
+                max_bytes: 100_000,
+            }))
+        }
+        async fn refuses_rollup_pending(gate: &PublicationGate) -> bool {
+            matches!(
+                gate.read().await,
+                Err(crate::error::ServerError::CorpusRecovering(
+                    crate::publication::CorpusUnsettled::RollupPending
+                ))
+            )
+        }
+        let old = r#"{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"nginx","msg":"old"}"#;
+        let fresh = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"fresh"}"#;
+
+        // A rollup of this hour stopped after its rename. The WAL written
+        // since would merge into the hourly file its marker lists, so
+        // recovery must retire that file before the WAL phase merges.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = tmp.path().join("wal");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        let now = chrono::Utc::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        let hourly = write_hourly_parquet(
+            &data.join("prod"),
+            &today,
+            &now.format("%H").to_string(),
+            "nginx",
+            &[old],
+        );
+        let day = data.join("prod").join(&today);
+        let marker = rollup_marker_path(&day, "nginx");
+        let recorder = Recorder::new();
+        recorder.fail(Phase::Retire, 0, std::io::ErrorKind::Other);
+        let (rollup_day, io) = (day.clone(), recorder.io());
+        let outcome = tokio::task::spawn_blocking(move || {
+            rollup_day_coordinated(&rollup_day, "nginx", &[hourly], "2GB", None, &io)
+        })
+        .await
+        .unwrap();
+        assert!(outcome.result.is_err() && marker.exists());
+        let fresh_wal = write_wal_file(&wal.join("prod"), "nginx", &[fresh]);
+
+        let hot = pass_buffer();
+        let gate = hot.publication();
+        gate.initialize(&data);
+        assert!(
+            refuses_rollup_pending(&gate).await,
+            "the boot scan found the marker"
+        );
+        let pass = compact_once(
+            &wal,
+            &data,
+            Duration::ZERO,
+            false,
+            Some(&hot),
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+        );
+        assert_eq!(pass.await, Ok(0));
+        assert!(!marker.exists(), "recovery finished the rollup");
+        assert!(!fresh_wal.exists(), "the pass compacted the new WAL");
+        assert_eq!(read_strings(&day.join("nginx.parquet"), "msg"), ["old"]);
+        let mut rows: Vec<String> = find_files_by_ext(&data, "parquet")
+            .iter()
+            .flat_map(|file| read_strings(file, "msg"))
+            .collect();
+        rows.sort();
+        assert_eq!(rows, ["fresh", "old"], "no row lost or doubled");
+        assert!(gate.read().await.is_ok());
+
+        // A marker recovery cannot resolve: the daily file is neither the
+        // prior nor the replacement it records. No pass compacts WAL, and
+        // reads keep refusing.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = tmp.path().join("wal");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        let state = interrupted_rollup(&data, true, Phase::Rename);
+        replace_with_other_parquet(tmp.path(), &state.canonical);
+        let waiting = write_wal_file(&wal.join("prod"), "nginx", &[fresh]);
+        let hot = pass_buffer();
+        let gate = hot.publication();
+        gate.initialize(&data);
+        assert!(refuses_rollup_pending(&gate).await);
+        for _ in 0..2 {
+            let pass = compact_once(
+                &wal,
+                &data,
+                Duration::ZERO,
+                false,
+                Some(&hot),
+                DEFAULT_CHUNK_SIZE,
+                "2GB",
+                None,
+            );
+            assert!(pass.await.is_err());
+            assert!(
+                waiting.exists(),
+                "no WAL compacts while a marker is unresolved"
+            );
+            assert!(state.marker.exists());
+            assert!(refuses_rollup_pending(&gate).await);
+        }
+    }
+
     #[test]
     fn rollup_day_blocking_merges_hourly_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10646,31 +11929,39 @@ mod tests {
 
     #[test]
     fn rollup_recovery_after_rename_crash() {
-        // Simulate crash after rename but before hourly deletion:
-        // canonical exists, marker exists, hourly files still present.
+        // A crash after the rename and before any retirement: the daily
+        // file is the merge's output, so recovery retires the hourly files
+        // the marker lists (case a).
         let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let date = "2026-01-15";
+        let state = interrupted_rollup(tmp.path(), false, Phase::Retire);
+        assert!(state.marker.exists());
+        assert!(state.hourlies.iter().all(|path| path.exists()));
+        recover_rollup_markers(&state.day).unwrap();
+        assert_eq!(read_strings(&state.canonical, "msg"), ["one", "two"]);
+        assert!(
+            state.hourlies.iter().all(|path| !path.exists()),
+            "hourly files are retired"
+        );
+        assert!(
+            !state.marker.exists(),
+            "marker should be removed after recovery"
+        );
 
-        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
-        let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
-
-        let day_dir = data_dir.join(date);
-        let canonical = day_dir.join("nginx.parquet");
-        let marker = day_dir.join(".rollup-nginx");
-
-        // Simulate: canonical was written (via rename), marker exists, hourly survives.
-        std::fs::write(&canonical, b"consolidated data").unwrap();
-        write_rollup_marker(&day_dir, "nginx", std::slice::from_ref(&f1)).unwrap();
-        assert!(marker.exists());
-        assert!(f1.exists());
-
-        // Recovery should delete hourlies and marker without touching canonical.
-        recover_rollup_markers(&day_dir).unwrap();
-
-        assert!(canonical.exists(), "canonical should survive recovery");
-        assert!(!f1.exists(), "hourly file should be deleted by recovery");
-        assert!(!marker.exists(), "marker should be removed after recovery");
+        // The same crash, then a daily file the merge never wrote in its
+        // place: recovery retires nothing and keeps the marker (case d).
+        let tmp = tempfile::tempdir().unwrap();
+        let state = interrupted_rollup(tmp.path(), false, Phase::Retire);
+        replace_with_other_parquet(tmp.path(), &state.canonical);
+        let hourly = std::fs::read(&state.hourlies[0]).unwrap();
+        assert!(recover_rollup_markers(&state.day).is_err());
+        assert_eq!(
+            std::fs::read(&state.hourlies[0]).unwrap(),
+            hourly,
+            "a valid hourly is kept under a daily file that does not match"
+        );
+        assert!(state.hourlies[1].exists());
+        assert!(state.marker.exists());
+        assert_eq!(read_strings(&state.canonical, "msg"), ["other"]);
     }
 
     #[test]
@@ -10689,12 +11980,18 @@ mod tests {
         let tmp_file = day_dir.join("nginx.parquet.tmp");
         let marker = day_dir.join(".rollup-nginx");
 
-        // Simulate: a COMPLETE .tmp was written, marker exists, no canonical
-        // yet. A real interrupted-after-write tmp is a valid parquet, so use
-        // f1's bytes (recovery validates before promoting — see
-        // `recovery_discards_truncated_tmp` for the truncated case).
+        // Simulate: the merge's output was written as the tmp, the marker
+        // records its identity, no canonical yet. Recovery promotes only a
+        // tmp with that identity (see `recovery_discards_truncated_tmp` for
+        // one without it).
         std::fs::copy(&f1, &tmp_file).unwrap();
-        write_rollup_marker(&day_dir, "nginx", std::slice::from_ref(&f1)).unwrap();
+        write_marker(
+            &day_dir,
+            "nginx",
+            identity(&tmp_file),
+            None,
+            std::slice::from_ref(&f1),
+        );
         assert!(!canonical.exists());
         assert!(tmp_file.exists());
 
@@ -10709,16 +12006,29 @@ mod tests {
 
     #[test]
     fn rollup_recovery_stale_marker() {
-        // Stale marker: neither canonical nor .tmp exists.
+        // A marker whose daily file, tmp and listed hourly are all gone
+        // proves nothing: recovery keeps it, and the day fails with text
+        // that names no path.
         let tmp = tempfile::tempdir().unwrap();
-        let day_dir = tmp.path().join("2026-01-15");
+        let day_dir = tmp.path().join("data/prod/2026-01-15");
         std::fs::create_dir_all(&day_dir).unwrap();
+        let marker = write_marker_with(
+            &day_dir,
+            "nginx",
+            unwritten_identity(),
+            None,
+            vec![("01/nginx.parquet".to_owned(), unwritten_identity())],
+        );
+        let body = std::fs::read(&marker).unwrap();
 
-        let marker = day_dir.join(".rollup-nginx");
-        std::fs::write(&marker, "/nonexistent/path.parquet").unwrap();
+        let error = recover_rollup_markers(&day_dir).unwrap_err();
 
-        recover_rollup_markers(&day_dir).unwrap();
-        assert!(!marker.exists(), "stale marker should be removed");
+        assert!(!error.contains(&*tmp.path().to_string_lossy()), "{error}");
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            body,
+            "the stale marker is kept"
+        );
     }
 
     #[test]
@@ -11113,8 +12423,10 @@ mod tests {
 
     #[test]
     fn recovery_discards_truncated_tmp() {
-        // Crash mid-COPY: a truncated .tmp must not be promoted to canonical,
-        // and the hourly files must be retained for a fresh rollup.
+        // A tmp that is not the merge's output must not be promoted to
+        // canonical. Nothing was published and every input is present, so
+        // recovery abandons the rollup: the tmp is deleted and the hourly
+        // files are retained for a fresh rollup.
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
@@ -11127,7 +12439,13 @@ mod tests {
         let tmp_file = day_dir.join("nginx.parquet.tmp");
 
         std::fs::write(&tmp_file, b"PAR1trunc").unwrap();
-        write_rollup_marker(&day_dir, "nginx", std::slice::from_ref(&f1)).unwrap();
+        write_marker(
+            &day_dir,
+            "nginx",
+            unwritten_identity(),
+            None,
+            std::slice::from_ref(&f1),
+        );
 
         recover_rollup_markers(&day_dir).unwrap();
 
@@ -11135,7 +12453,11 @@ mod tests {
             !canonical.exists(),
             "must NOT promote a truncated tmp to canonical"
         );
-        assert!(!tmp_file.exists(), "truncated tmp should be moved aside");
+        assert!(!tmp_file.exists(), "the tmp is deleted");
+        assert!(
+            !day_dir.join("nginx.parquet.tmp.corrupt").exists(),
+            "nothing is quarantined"
+        );
         assert!(f1.exists(), "hourly file retained for re-rollup");
         assert!(
             !day_dir.join(".rollup-nginx").exists(),
@@ -11309,39 +12631,29 @@ mod tests {
 
     #[test]
     fn recovery_keeps_marker_when_hourly_retire_fails() {
-        // Canonical present, marker lists an hourly that can be neither
-        // deleted nor renamed aside. recover_rollup_markers must return Err
-        // and leave the marker in place so the next pass retries.
+        // The daily file is the merge's output, and the retirement of a
+        // listed hourly fails. Recovery must return Err and leave the
+        // marker in place so the next pass retries, and that retry
+        // finishes the rollup.
         let tmp = tempfile::tempdir().unwrap();
-        let day_dir = tmp.path().join("2026-01-15");
-        std::fs::create_dir_all(&day_dir).unwrap();
+        let state = interrupted_rollup(tmp.path(), false, Phase::Retire);
+        let recorder = Recorder::new();
+        recorder.fail(Phase::Retire, 1, std::io::ErrorKind::PermissionDenied);
 
-        let canonical = day_dir.join("nginx.parquet");
-        std::fs::write(&canonical, b"consolidated").unwrap();
+        let result = recover_rollup_markers_coordinated(&state.day, None, &recorder.io());
 
-        // The "hourly" is a non-empty directory: remove_file fails (EISDIR),
-        // and rename-aside fails too because a non-empty `.merged` directory
-        // already occupies the target (ENOTEMPTY).
-        let hourly = day_dir.join("01").join("nginx.parquet");
-        std::fs::create_dir_all(&hourly).unwrap();
-        std::fs::write(hourly.join("blocker"), b"x").unwrap();
-        let aside = day_dir.join("01").join("nginx.parquet.merged");
-        std::fs::create_dir_all(&aside).unwrap();
-        std::fs::write(aside.join("blocker"), b"x").unwrap();
-
-        let marker = day_dir.join(".rollup-nginx");
-        write_rollup_marker(&day_dir, "nginx", std::slice::from_ref(&hourly)).unwrap();
-        assert!(marker.exists());
-
-        let result = recover_rollup_markers(&day_dir);
         assert!(
             result.is_err(),
-            "recovery should fail when an hourly can be neither removed nor retired"
+            "recovery should fail when an hourly cannot be retired"
         );
         assert!(
-            marker.exists(),
+            state.marker.exists(),
             "marker must survive so the next recovery pass retries"
         );
+        assert!(!state.hourlies[0].exists() && state.hourlies[1].exists());
+        recover_rollup_markers(&state.day).unwrap();
+        assert!(!state.marker.exists());
+        assert!(state.hourlies.iter().all(|path| !path.exists()));
     }
 
     #[test]
@@ -11369,38 +12681,19 @@ mod tests {
         // marker, which lists all of them. The next recovery pass replays the
         // marker verbatim, so retiring an already-gone hourly must be a no-op
         // success: an Err on the first phantom short-circuits before the
-        // marker delete and wedges recovery permanently.
+        // marker delete and wedges recovery permanently. The daily file is
+        // the merge's output, so an absent input was retired (case a).
         let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let date = "2026-01-15";
-
-        // Two hourlies were originally merged; the canonical already exists.
-        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
-        let r2 = r#"{"_time":"2026-01-15T02:00:00Z","_ingested":"2026-01-15T02:00:00Z","service":"nginx","msg":"b"}"#;
-        let already_deleted = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
-        let still_present = write_hourly_parquet(&data_dir, date, "02", "nginx", &[r2]);
-
-        let day_dir = data_dir.join(date);
-        let canonical = day_dir.join("nginx.parquet");
-        std::fs::write(&canonical, b"consolidated").unwrap();
-
-        // Marker lists both (written before the cleanup loop ran).
-        write_rollup_marker(
-            &day_dir,
-            "nginx",
-            &[already_deleted.clone(), still_present.clone()],
-        )
-        .unwrap();
-        let marker = day_dir.join(".rollup-nginx");
-        assert!(marker.exists());
+        let state = interrupted_rollup(tmp.path(), false, Phase::Retire);
+        let (already_deleted, still_present) = (&state.hourlies[0], &state.hourlies[1]);
 
         // Simulate the partial cleanup: the first hourly was deleted before the
         // crash, the second was not.
-        std::fs::remove_file(&already_deleted).unwrap();
-        assert!(!already_deleted.exists());
+        std::fs::remove_file(already_deleted).unwrap();
         assert!(still_present.exists());
 
-        recover_rollup_markers(&day_dir).expect("recovery must tolerate a phantom-missing hourly");
+        recover_rollup_markers(&state.day)
+            .expect("recovery must tolerate a phantom-missing hourly");
 
         // The surviving hourly is retired (deleted, or renamed aside as .merged).
         let mut aside = still_present.clone().into_os_string();
@@ -11411,7 +12704,7 @@ mod tests {
         );
         // The marker must be removed so later compaction ticks don't replay it.
         assert!(
-            !marker.exists(),
+            !state.marker.exists(),
             "marker must be removed after recovery completes"
         );
     }

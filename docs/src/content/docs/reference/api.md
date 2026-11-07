@@ -2998,8 +2998,16 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | 409 | none | The body is a job with status `refused_needs_force`: the scan found values the new type cannot read, or ambiguous numerals under the `otel` reading, and `force` was not set, or the finished rewrite exceeded an accepted ceiling. `requires_force_reason` names which. |
 | 409 | `bad_request` | The previous repin is still running or cleaning up its staging, or staging from an earlier repin remains. No job is claimed. For leftover staging, the message names the remedy: a restart for a marker or a shadow root, manual removal for an aside root |
 | 400 | `bad_request` | `field` is an envelope field or not pinned, `to` is not a catalog type, `to` equals the current pin without `force`, `dialect` is unknown or given with a target other than `SEVERITY`, a ceiling is given without `force`, the pin changed between lookup and claim, the staging directory is on a different filesystem from the data root, or free disk is below the affected bytes plus the retention floor |
-| 503 | `service_unavailable` | This node has ingest disabled and does not own the data root, the repin staging state could not be read, the job could not claim the corpus before its scan and ended `blocked`, or no job was claimed within `[server] timeout_secs`. In the last case nothing runs from the request, and it can be retried. |
+| 503 | `service_unavailable` | This node has ingest disabled and does not own the data root, the repin staging state could not be read, the job could not claim the corpus before its scan and ended `blocked`, a finished rollup's marker removal is not yet durable, or no job was claimed within `[server] timeout_secs`. In the last case nothing runs from the request, and it can be retried. |
 | 503 | `corpus_recovering` | The corpus is unsettled. The job ends `blocked`, and its `error` names the reason. See [corpus recovering](#corpus-recovering). |
+
+A daily rollup ends by unlinking its marker and fsyncing the day directory. Until that fsync succeeds, the unlink is not durable, and repin admission refuses with 503 `service_unavailable`. The job ends `blocked`. The response message and the job's `error` are both:
+
+```text
+repin is blocked while a finished rollup's marker removal is not yet durable; retry after the next compaction pass
+```
+
+Reads still answer while this holds. Each compaction pass retries the fsync. See [the removal-sync obligation](/architecture/recovery/#the-removal-sync-obligation).
 
 ### Repin status
 
@@ -4336,7 +4344,7 @@ Prometheus scrape-target labels are separate and remain on every alert.
 | `TrawlTelemetryWalWriteFailure` | `trawl_telemetry_wal_write_failures_total` | Failed telemetry write attempts, including retained retries and crashed tasks; no metric labels |
 | `TrawlWalDurabilityDegraded` | `trawl_wal_durability_failures_total{operation="parent_directory_sync"}` | Failed WAL directory sync operations, each of which rejected its write; counted by the WAL writer |
 | `TrawlCompactionOperationFailure` | `trawl_compaction_operation_failures_total{operation}` | Explicit failed attempts, using the eight closed operations below |
-| `TrawlFileQuarantine` | `trawl_files_quarantined_total{kind}` | Files successfully renamed into quarantine; `kind` is `wal`, `parquet`, or `rollup_temporary` |
+| `TrawlFileQuarantine` | `trawl_files_quarantined_total{kind}` | Files successfully renamed into quarantine; `kind` is `wal` or `parquet` |
 | `TrawlPublicationRecoveryBlocked` | `trawl_publication_recovery_total{outcome=~"contradictory\|failed"}` | Publication markers that recovery left blocking their service, counted once per marker per recovery pass |
 | `TrawlIngestAdmissionRefusing` | `trawl_hot_buffer_admission_refusals_total{kind="full"}`, summed over `producer` | Reservations refused for lack of space; `oversized` refusals are excluded |
 | `TrawlHotBufferDrainStalled` | `trawl_hot_buffer_oldest_batch_age_seconds` compared with `trawl_compaction_interval_seconds` | Gauges, not counters: seconds since the oldest resident batch was inserted, against ten compaction intervals with a 60-second floor |

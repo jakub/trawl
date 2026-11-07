@@ -93,14 +93,15 @@ pub async fn prepare_corpus(state: &AppState, config: &Config) -> Result<(), Str
     // enumerate, is skipped and counted inside the pass, so one bad path
     // cannot keep the daemon down. So is every file a publication marker
     // still claims after boot recovery, and every file in a day an
-    // unresolved rollup marker holds: the pass leaves it untouched and
-    // withholds completion, so the next boot conforms it once the marker
-    // resolves.
+    // unresolved rollup marker holds or whose marker unlink boot recovery
+    // could not make durable: the pass leaves it untouched and withholds
+    // completion, so the next boot conforms it once the marker resolves.
     let summary = conform::ensure_conformance(
         &state.storage.catalog,
         &state.query.field_catalog,
         &config.data.base_dir(),
         &config.wal_dir(),
+        gate.removal_sync_owed_days(),
         &config.ingest.compaction_memory_limit,
     )
     .await?;

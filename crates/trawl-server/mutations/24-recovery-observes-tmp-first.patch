@@ -1,0 +1,15 @@
+diff --git a/crates/trawl-server/src/ingest/rollup_marker.rs b/crates/trawl-server/src/ingest/rollup_marker.rs
+index a29e1c09..63c8066f 100644
+--- a/crates/trawl-server/src/ingest/rollup_marker.rs
++++ b/crates/trawl-server/src/ingest/rollup_marker.rs
+@@ -512,6 +512,10 @@ pub fn classify(
+     day_dir: &Path,
+     mut observe: impl FnMut(&Path) -> Observation,
+ ) -> Decision {
++    if observe(&marker.tmp(day_dir)).is(marker.replacement) {
++        return present_inputs_match(marker, day_dir, &mut observe)
++            .map_or(Decision::Promote, Decision::Unresolved);
++    }
+     let canonical = observe(&marker.canonical(day_dir));
+     if canonical.is(marker.replacement) {
+         return present_inputs_match(marker, day_dir, &mut observe)

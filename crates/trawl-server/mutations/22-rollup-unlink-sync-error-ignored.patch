@@ -1,0 +1,13 @@
+diff --git i/crates/trawl-server/src/ingest/compaction.rs w/crates/trawl-server/src/ingest/compaction.rs
+index 545e84b2..2850c6cd 100644
+--- i/crates/trawl-server/src/ingest/compaction.rs
++++ w/crates/trawl-server/src/ingest/compaction.rs
+@@ -1800,7 +1800,7 @@ fn remove_rollup_marker(
+         Some(removal) => removal.settle(sync),
+         None => sync(day_dir),
+     }
+-    .map_err(|e| format!("failed to fsync the rollup marker's removal: {e}"))
++    .or_else(|_| Ok(()))
+ }
+ 
+ /// fsync the day directory of a rollup marker's removal. A day directory

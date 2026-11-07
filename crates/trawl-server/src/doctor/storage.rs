@@ -10,15 +10,18 @@
 //! [`conform::judge_archive_identity`], conformance through
 //! [`conform::conformance_recorded`], the repin marker through
 //! [`marker::parse_marker`] and [`marker::RepinPhase::query_only_refuses`],
-//! and the publication and rollup markers through the decoders boot's
-//! recovery reads them with. Where boot reads a small file its own way, the
+//! the publication and rollup markers through the decoders boot's recovery
+//! reads them with, and each rollup marker's fate through recovery's own
+//! [`rollup_marker::classify`]. Where boot reads a small file its own way, the
 //! doctor injects [`super::fsread`] instead, so a FIFO, a symlink or an
 //! oversized file under the data root costs a row, never the run.
 //!
 //! Nothing under the data root is created, renamed, or removed. The group
 //! reads [`Ctx::app`], which the database group filled, and no row names
 //! the data root, the WAL directory, a marker's content or a catalog
-//! identifier: rows say what boot will do, in fixed sentences.
+//! identifier: rows say what boot will do, in fixed sentences. The one
+//! exception is an unresolved rollup marker, which the row names by the
+//! env, day and service its path spells, each shown only once valid.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,7 +33,7 @@ use super::output::{Row, Text};
 use super::{Ctx, Runner, ServerCheck};
 use crate::catalog::conform::{self, IdentityJudgement};
 use crate::epoch::{self, DataRootState, RootFault, RootReader};
-use crate::ingest::{compaction, publication_marker};
+use crate::ingest::{publication_marker, rollup_marker};
 #[cfg(unix)]
 use crate::owner_only::{self, Prediction, Refusal, RootKind};
 use crate::repin::marker;
@@ -1351,24 +1354,139 @@ enum Publications {
 }
 
 /// What `server.recovery.publication` counted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MarkersSeen {
     /// The publication markers under the WAL root.
     publication: Publications,
     /// Whether the data root's day directories could all be listed.
     rollup_listed: bool,
-    /// Rollup markers that read.
+    /// Rollup markers boot's recovery finishes: cases a, b and c.
     rollup_pending: usize,
-    /// Rollup markers boot's recovery can never use.
-    rollup_malformed: usize,
-    /// Rollup markers that could not be read.
+    /// Rollup markers boot's recovery keeps, with every file they name, until
+    /// an operator acts: case d, an old-format marker among them. Sorted.
+    rollup_unresolved: Vec<UnresolvedRollup>,
+    /// Rollup markers the doctor could not look at, or whose classification
+    /// depends on a file it could not look at.
     rollup_unreadable: usize,
+}
+
+/// One rollup marker boot's recovery cannot finish, as the row names it:
+/// where it is, from the marker's path, and the proof that failed. The
+/// names are shown only once [`Text`] validates them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnresolvedRollup {
+    env: String,
+    day: String,
+    service: String,
+    proof: rollup_marker::Proof,
+}
+
+impl UnresolvedRollup {
+    fn at(marker: &Path, proof: rollup_marker::Proof) -> Self {
+        let name = |path: Option<&Path>| {
+            path.and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let day_dir = marker.parent();
+        let file = name(Some(marker));
+        Self {
+            env: name(day_dir.and_then(Path::parent)),
+            day: name(day_dir),
+            service: file
+                .strip_prefix(rollup_marker::MARKER_PREFIX)
+                .unwrap_or_default()
+                .to_owned(),
+            proof,
+        }
+    }
+}
+
+/// What the doctor saw of one rollup marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollupSeen {
+    /// It went away before it was read.
+    Gone,
+    /// Boot's recovery finishes it.
+    Pending,
+    /// Boot's recovery keeps it, because this proof failed.
+    Unresolved(rollup_marker::Proof),
+    /// The doctor could not look at it, or at a file its classification
+    /// depends on.
+    NotLooked,
+}
+
+/// Whether `error` is the doctor's own inability to look, as when it does
+/// not run as the service user or `/proc` is not mounted, rather than a
+/// state trawld's recovery would meet too.
+fn doctor_could_not_look(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+    )
+}
+
+/// What is at `path`, for [`rollup_marker::classify`], seen the way boot's
+/// recovery sees it: never following a symlink, nothing but a regular file
+/// read, and a regular file hashed. Opened by [`fsread::open_for_decoder`],
+/// so nothing that is not a regular file is opened for I/O. Sets `blind`
+/// when the doctor could not look.
+fn observe_rollup_path(path: &Path, blind: &mut bool) -> rollup_marker::Observation {
+    use rollup_marker::Observation;
+    let mut file = match fsread::open_for_decoder(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Observation::Absent,
+        Err(e) => {
+            *blind |= doctor_could_not_look(&e);
+            return Observation::Unreadable;
+        }
+    };
+    match file.metadata() {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Observation::Unreadable,
+        Err(_) => {
+            *blind = true;
+            return Observation::Unreadable;
+        }
+    }
+    publication_marker::identity_of_file(&mut file)
+        .map_or(Observation::Unreadable, Observation::Identity)
+}
+
+/// Read the rollup marker at `path` with the decoder boot's recovery reads
+/// it with, then classify it with recovery's own [`rollup_marker::classify`],
+/// read-only. The hashing counts against the look's deadline: a look that
+/// runs out reports the row not sampled, never a mismatch.
+fn see_rollup(path: &Path) -> RollupSeen {
+    let marker = match rollup_marker::read_with(path, fsread::open_for_decoder) {
+        Ok(marker) => marker,
+        Err(rollup_marker::ReadError::Unreadable(e)) if doctor_could_not_look(&e) => {
+            return RollupSeen::NotLooked;
+        }
+        Err(e) => return e.proof().map_or(RollupSeen::Gone, RollupSeen::Unresolved),
+    };
+    let Some(day_dir) = path.parent() else {
+        return RollupSeen::NotLooked;
+    };
+    let mut blind = false;
+    match rollup_marker::classify(&marker, day_dir, |path| {
+        observe_rollup_path(path, &mut blind)
+    }) {
+        // An unreadable observation never proves a case, so a, b or c
+        // holds whatever the doctor could not see.
+        rollup_marker::Decision::Published
+        | rollup_marker::Decision::Promote
+        | rollup_marker::Decision::Abort => RollupSeen::Pending,
+        rollup_marker::Decision::Unresolved(_) if blind => RollupSeen::NotLooked,
+        rollup_marker::Decision::Unresolved(proof) => RollupSeen::Unresolved(proof),
+    }
 }
 
 /// Count the rollup markers in the data root's day directories and, on an
 /// ingest node, the publication markers under the WAL root, each by the
 /// decoder boot recovers it with, opened by the doctor's
-/// [`fsread::open_for_decoder`].
+/// [`fsread::open_for_decoder`]. Each rollup marker is classified the way
+/// boot's recovery classifies it ([`see_rollup`]).
 ///
 /// The rollup census runs on every node type: the publication gate's boot
 /// scan registers every rollup marker on a query-only node too, and its
@@ -1385,43 +1503,78 @@ fn count_markers(data_root: &Path, wal_dir: &Path, ingest: bool) -> MarkersSeen 
         publication,
         rollup_listed: false,
         rollup_pending: 0,
-        rollup_malformed: 0,
+        rollup_unresolved: Vec::new(),
         rollup_unreadable: 0,
     };
     let mut rollups = std::collections::HashSet::new();
     seen.rollup_listed = crate::publication::scan_markers(data_root, &mut rollups).is_ok();
+    let mut rollups: Vec<PathBuf> = rollups.into_iter().collect();
+    rollups.sort();
     for path in rollups {
-        match compaction::read_rollup_marker_with(&path, fsread::open_for_decoder) {
-            Ok(_) => seen.rollup_pending += 1,
-            Err(e) if e.is_missing() => {}
-            Err(e) if e.is_malformed() => seen.rollup_malformed += 1,
-            Err(_) => seen.rollup_unreadable += 1,
+        match see_rollup(&path) {
+            RollupSeen::Gone => {}
+            RollupSeen::Pending => seen.rollup_pending += 1,
+            RollupSeen::Unresolved(proof) => seen
+                .rollup_unresolved
+                .push(UnresolvedRollup::at(&path, proof)),
+            RollupSeen::NotLooked => seen.rollup_unreadable += 1,
         }
     }
     seen
 }
 
 /// `server.recovery.publication`: the rollup markers and, on an ingest
-/// node, the publication markers are readable and well formed. A pending
-/// one is boot's to finish.
+/// node, the publication markers are readable and well formed, and boot's
+/// recovery can finish every rollup marker. A pending one is boot's to
+/// finish.
 async fn check_markers(data_root: PathBuf, wal_dir: PathBuf, ingest: bool) -> Row {
     let check = ServerCheck::RecoveryPublication;
     match look(move || count_markers(&data_root, &wal_dir, ingest)).await {
-        Ok(seen) => markers_row(seen),
+        Ok(seen) => markers_row(&seen),
         Err(why) => missed(check, why),
     }
 }
 
+/// The most unresolved rollup markers one row names.
+const UNRESOLVED_LISTED: usize = 10;
+
+/// `text`, then each unresolved rollup marker's env, day, service and
+/// failed proof, up to [`UNRESOLVED_LISTED`] of them.
+fn list_unresolved(mut text: Text, unresolved: &[UnresolvedRollup]) -> Text {
+    text = text.lit("; unresolved: ");
+    for (i, marker) in unresolved.iter().take(UNRESOLVED_LISTED).enumerate() {
+        if i > 0 {
+            text = text.lit("; ");
+        }
+        text = text
+            .lit("env ")
+            .env_name(&marker.env)
+            .lit(", day ")
+            .date(&marker.day)
+            .lit(", service ")
+            .service_name(&marker.service)
+            .lit(", failed proof ")
+            .lit(marker.proof.label());
+    }
+    if unresolved.len() > UNRESOLVED_LISTED {
+        text = text
+            .lit("; and ")
+            .int((unresolved.len() - UNRESOLVED_LISTED) as u64)
+            .lit(" more");
+    }
+    text
+}
+
 /// The `server.recovery.publication` row for what was counted. A malformed
-/// marker outweighs one that could not be read, which outweighs pending
-/// ones.
-fn markers_row(seen: MarkersSeen) -> Row {
+/// publication marker outweighs an unresolved rollup marker, which
+/// outweighs one that could not be read, which outweighs pending ones.
+fn markers_row(seen: &MarkersSeen) -> Row {
     let check = ServerCheck::RecoveryPublication;
     let rollups = |text: Text| {
         text.int(seen.rollup_pending as u64)
             .lit(" pending and ")
-            .int(seen.rollup_malformed as u64)
-            .lit(" malformed rollup marker(s)")
+            .int(seen.rollup_unresolved.len() as u64)
+            .lit(" unresolved rollup marker(s)")
     };
     // `None` on a query-only node, which counts no publication marker.
     let census = match seen.publication {
@@ -1439,24 +1592,28 @@ fn markers_row(seen: MarkersSeen) -> Row {
                 .lit(" malformed publication marker(s); ")
         },
     ));
-    let inspect = Text::new(if census.is_some() {
-        "trawld leaves a malformed marker in place and keeps what it claims blocked; \
-         inspect the markers in the WAL directory's environments and the data root's \
-         day directories"
-    } else {
-        "this query-only node refuses corpus reads while a rollup marker remains, and the \
-         ingest node's recovery leaves a malformed one in place; inspect the markers in \
-         the data root's day directories"
-    });
     if census.is_some_and(|census| census.invalid > 0) {
         return Row::failed(check, "a publication marker is malformed")
             .detail(counts)
-            .next(inspect);
+            .next(Text::new(
+                "trawld leaves a malformed marker in place and keeps what it claims blocked; \
+                 inspect the markers in the WAL directory's environments and the data root's \
+                 day directories",
+            ));
     }
-    if seen.rollup_malformed > 0 {
-        return Row::failed(check, "a rollup marker is malformed")
-            .detail(counts)
-            .next(inspect);
+    if !seen.rollup_unresolved.is_empty() {
+        return Row::failed(check, "a rollup marker is unresolved")
+            .detail(list_unresolved(counts, &seen.rollup_unresolved))
+            .next(Text::new(if census.is_some() {
+                "trawld keeps an unresolved rollup marker and every file it names, and \
+                 refuses corpus reads, until an operator acts: stop trawld, back up the data \
+                 root, then move the candidate file aside or remove the marker as the \
+                 recovery guide describes, and start trawld"
+            } else {
+                "this query-only node refuses corpus reads while a rollup marker remains, and \
+                 the ingest node that writes this data root keeps an unresolved one until an \
+                 operator acts as the recovery guide describes"
+            }));
     }
     let publication_unread = match seen.publication {
         Publications::NotCounted => false,
@@ -1468,7 +1625,8 @@ fn markers_row(seen: MarkersSeen) -> Row {
     if publication_unread || !seen.rollup_listed || seen.rollup_unreadable > 0 {
         return Row::not_sampled(check, reason::UNREADABLE)
             .detail(Text::new(
-                "a marker, or a directory that may hold one, could not be read",
+                "a marker, a file a rollup marker names, or a directory that may hold one, \
+                 could not be read",
             ))
             .next(Text::new("rerun as the service user"));
     }
@@ -1889,15 +2047,28 @@ mod tests {
             unreadable,
             ..Default::default()
         };
-        let seen = |publication, rollup_pending, rollup_malformed, rollup_unreadable| MarkersSeen {
-            publication: Publications::Counted(publication),
-            rollup_listed: true,
-            rollup_pending,
-            rollup_malformed,
-            rollup_unreadable,
+        let unresolved = |n| {
+            vec![
+                UnresolvedRollup {
+                    env: "prod".to_owned(),
+                    day: "2026-09-23".to_owned(),
+                    service: "api".to_owned(),
+                    proof: rollup_marker::Proof::PriorMismatch,
+                };
+                n
+            ]
         };
-        let row = |seen| {
-            let row = markers_row(seen);
+        let seen = |publication, rollup_pending, rollup_unresolved: usize, rollup_unreadable| {
+            MarkersSeen {
+                publication: Publications::Counted(publication),
+                rollup_listed: true,
+                rollup_pending,
+                rollup_unresolved: unresolved(rollup_unresolved),
+                rollup_unreadable,
+            }
+        };
+        let row = |seen: MarkersSeen| {
+            let row = markers_row(&seen);
             (row.outcome(), row.reason())
         };
         assert_eq!(
@@ -1909,12 +2080,16 @@ mod tests {
             (Outcome::Complete, Some(reason::PENDING_AT_NEXT_BOOT))
         );
         assert_eq!(
-            row(seen(census(1, 1, 1), 0, 0, 1)),
+            row(seen(census(1, 1, 1), 0, 1, 1)),
             (Outcome::Failed, Some("a publication marker is malformed"))
         );
         assert_eq!(
             row(seen(census(1, 0, 1), 0, 1, 0)),
-            (Outcome::Failed, Some("a rollup marker is malformed"))
+            (Outcome::Failed, Some("a rollup marker is unresolved"))
+        );
+        assert_eq!(
+            row(seen(census(0, 0, 0), 1, 1, 1)),
+            (Outcome::Failed, Some("a rollup marker is unresolved"))
         );
         assert_eq!(
             row(seen(census(1, 0, 1), 0, 0, 0)),
@@ -1945,6 +2120,204 @@ mod tests {
             row(incomplete),
             (Outcome::NotSampled, Some(reason::UNREADABLE))
         );
+
+        // The listing stops at a bound and counts the rest.
+        let many = MarkersSeen {
+            rollup_unresolved: unresolved(UNRESOLVED_LISTED + 3),
+            ..seen(census(0, 0, 0), 0, 0, 0)
+        };
+        let detail = markers_row(&many).into_check().detail.unwrap();
+        assert_eq!(
+            detail.matches("failed proof prior_mismatch").count(),
+            UNRESOLVED_LISTED,
+            "{detail}"
+        );
+        assert!(detail.ends_with("; and 3 more"), "{detail}");
+    }
+
+    /// A one-row Parquet file at `path` holding `value`, so each call with a
+    /// new value has a new identity.
+    fn parquet(path: &Path, value: i64) -> publication_marker::OutputIdentity {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        duckdb::Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT TIMESTAMP '2026-09-23 07:00:00' AS _time, {value}::BIGINT AS n) \
+                 TO '{}' (FORMAT PARQUET)",
+                path.to_string_lossy().replace('\'', "''")
+            ))
+            .unwrap();
+        publication_marker::identity_of(path).unwrap()
+    }
+
+    /// Where a rollup of `service` in `day` stops, and so which recovery
+    /// case its marker leaves.
+    #[derive(Clone, Copy)]
+    enum Crash {
+        /// After the rename: the canonical is the replacement and the hourly
+        /// input is retired. Case a.
+        AfterRename,
+        /// Before the rename: the tmp is the replacement and the hourly
+        /// input is in place. Case b.
+        BeforeRename,
+        /// After the rename, over a prior daily file the marker records,
+        /// then the canonical was replaced by something else. Case d,
+        /// `prior_mismatch`.
+        PriorReplaced,
+    }
+
+    /// Plant a rollup of `service` in `day` that stopped at `crash`, with
+    /// real Parquet and this release's marker. Returns the marker's path.
+    fn plant_rollup(day: &Path, service: &str, crash: Crash) -> PathBuf {
+        let hourly = day.join(format!("07/{service}.parquet"));
+        let canonical = day.join(format!("{service}.parquet"));
+        let tmp = day.join(format!("{service}.parquet.tmp"));
+        let input = parquet(&hourly, 1);
+        let replacement = parquet(&tmp, 2);
+        let prior = match crash {
+            Crash::PriorReplaced => Some(parquet(&canonical, 3)),
+            Crash::AfterRename | Crash::BeforeRename => None,
+        };
+        let marker = rollup_marker::RollupMarker::new(
+            service,
+            replacement,
+            prior,
+            vec![(format!("07/{service}.parquet"), input)],
+        )
+        .unwrap();
+        let path = day.join(rollup_marker::marker_file_name(service));
+        write(&path, marker.encode().as_bytes());
+        match crash {
+            Crash::BeforeRename => {}
+            Crash::AfterRename => {
+                std::fs::rename(&tmp, &canonical).unwrap();
+                std::fs::remove_file(&hourly).unwrap();
+            }
+            Crash::PriorReplaced => {
+                std::fs::remove_file(&tmp).unwrap();
+                parquet(&canonical, 4);
+            }
+        }
+        path
+    }
+
+    /// `server.recovery.publication` runs recovery's classification over
+    /// each rollup marker, read-only. One recovery can finish is pending;
+    /// one it would keep, an old-format marker included, fails the row,
+    /// which names its env, day, service and the proof that failed, and no
+    /// path.
+    #[test]
+    fn unresolved_rollup_markers_name_service_day_and_proof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = data.join("wal");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        let mismatch = plant_rollup(&data.join("prod/2026-09-23"), "api", Crash::PriorReplaced);
+        let old_format = data.join("lab/2026-09-24/.rollup-nginx");
+        write(
+            &old_format,
+            format!(
+                "{}\n",
+                data.join("lab/2026-09-24/07/nginx.parquet").display()
+            )
+            .as_bytes(),
+        );
+        plant_rollup(&data.join("prod/2026-09-25"), "web", Crash::AfterRename);
+        let before = |paths: &[&Path]| -> Vec<Vec<u8>> {
+            paths.iter().map(|p| std::fs::read(p).unwrap()).collect()
+        };
+        let watched = [
+            mismatch.as_path(),
+            &data.join("prod/2026-09-23/api.parquet"),
+            &data.join("prod/2026-09-23/07/api.parquet"),
+            &old_format,
+        ];
+        let bytes = before(&watched);
+
+        for ingest in [true, false] {
+            let seen = count_markers(&data, &wal, ingest);
+            assert_eq!(seen.rollup_pending, 1, "the case-a marker is pending");
+            assert_eq!(seen.rollup_unreadable, 0);
+            assert_eq!(
+                seen.rollup_unresolved,
+                vec![
+                    UnresolvedRollup {
+                        env: "lab".to_owned(),
+                        day: "2026-09-24".to_owned(),
+                        service: "nginx".to_owned(),
+                        proof: rollup_marker::Proof::MarkerOldFormat,
+                    },
+                    UnresolvedRollup {
+                        env: "prod".to_owned(),
+                        day: "2026-09-23".to_owned(),
+                        service: "api".to_owned(),
+                        proof: rollup_marker::Proof::PriorMismatch,
+                    },
+                ]
+            );
+            let row = markers_row(&seen);
+            assert_eq!(
+                (row.outcome(), row.reason()),
+                (Outcome::Failed, Some("a rollup marker is unresolved"))
+            );
+            let check = row.into_check();
+            let detail = check.detail.unwrap();
+            assert!(
+                detail.contains("1 pending and 2 unresolved rollup marker(s); unresolved: ")
+                    && detail.contains(
+                        "env lab, day 2026-09-24, service nginx, failed proof marker_old_format; \
+                         env prod, day 2026-09-23, service api, failed proof prior_mismatch"
+                    ),
+                "{detail}"
+            );
+            let shown = format!("{detail} {:?}", check.next_action);
+            assert!(!shown.contains(&*tmp.path().to_string_lossy()), "{shown}");
+            assert!(!shown.contains(".parquet"), "{shown}");
+            assert!(check.next_action.unwrap().contains("recovery guide"));
+        }
+        assert_eq!(before(&watched), bytes, "the doctor changed a file");
+
+        // Without the unresolved ones, the recoverable marker is pending.
+        std::fs::remove_file(&mismatch).unwrap();
+        std::fs::remove_file(&old_format).unwrap();
+        let row = markers_row(&count_markers(&data, &wal, true));
+        assert_eq!(
+            (row.outcome(), row.reason()),
+            (Outcome::Complete, Some(reason::PENDING_AT_NEXT_BOOT))
+        );
+    }
+
+    /// A marker whose classification depends on a file the doctor may not
+    /// read is not sampled, never unresolved: the service user's recovery
+    /// may read it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rollup_input_the_doctor_may_not_read_is_not_sampled() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if rustix::process::geteuid().is_root() {
+            return; // root reads a mode-000 file
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let day = data.join("prod/2026-09-23");
+        plant_rollup(&day, "api", Crash::BeforeRename);
+        let hourly = day.join("07/api.parquet");
+        std::fs::set_permissions(&hourly, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let seen = count_markers(&data, &data.join("wal"), false);
+        std::fs::set_permissions(&hourly, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            (
+                seen.rollup_pending,
+                seen.rollup_unresolved.len(),
+                seen.rollup_unreadable
+            ),
+            (0, 0, 1)
+        );
+        let row = markers_row(&seen);
+        assert_eq!(
+            (row.outcome(), row.reason()),
+            (Outcome::NotSampled, Some(reason::UNREADABLE))
+        );
     }
 
     /// The rollup and publication census read what is on disk with the
@@ -1956,22 +2329,25 @@ mod tests {
         let wal = data.join("wal");
         std::fs::create_dir_all(wal.join("prod")).unwrap();
         let day = data.join("prod/2026-09-23");
-        write(
-            &day.join(".rollup-nginx"),
-            b"/data/prod/2026-09-23/07/nginx.parquet\n",
-        );
+        plant_rollup(&day, "nginx", Crash::BeforeRename);
         write(&day.join(".rollup-api"), &[0xff, 0xfe]);
         write(&wal.join("prod/.publish-nginx.json"), b"{ not json");
         let seen = count_markers(&data, &wal, true);
         assert_eq!(seen.rollup_pending, 1);
-        assert_eq!(seen.rollup_malformed, 1);
+        assert_eq!(
+            seen.rollup_unresolved
+                .iter()
+                .map(|marker| (marker.service.as_str(), marker.proof))
+                .collect::<Vec<_>>(),
+            vec![("api", rollup_marker::Proof::MarkerOldFormat)]
+        );
         assert_eq!(seen.rollup_unreadable, 0);
         assert!(seen.rollup_listed);
         let Publications::Counted(publication) = seen.publication else {
             panic!("{seen:?}");
         };
         assert_eq!((publication.pending, publication.invalid), (0, 1));
-        assert_eq!(markers_row(seen).outcome(), Outcome::Failed);
+        assert_eq!(markers_row(&seen).outcome(), Outcome::Failed);
     }
 
     /// A query-only node's publication gate registers every rollup marker
@@ -1984,49 +2360,46 @@ mod tests {
         let data = tmp.path().join("data");
         let wal = data.join("wal");
         let day = data.join("prod/2026-09-23");
-        write(
-            &day.join(".rollup-nginx"),
-            b"/data/prod/2026-09-23/07/nginx.parquet\n",
-        );
+        plant_rollup(&day, "nginx", Crash::BeforeRename);
         write(&wal.join("prod/.publish-nginx.json"), b"{ not json");
         let seen = count_markers(&data, &wal, false);
         assert_eq!(seen.publication, Publications::NotCounted);
-        assert_eq!((seen.rollup_pending, seen.rollup_malformed), (1, 0));
-        let row = markers_row(seen);
+        assert_eq!((seen.rollup_pending, seen.rollup_unresolved.len()), (1, 0));
+        let row = markers_row(&seen);
         assert_eq!(
             (row.outcome(), row.reason()),
             (Outcome::Complete, Some(reason::PENDING_AT_NEXT_BOOT))
         );
         let detail = row.into_check().detail.unwrap();
         assert!(
-            detail.contains("1 pending and 0 malformed rollup marker(s)")
+            detail.contains("1 pending and 0 unresolved rollup marker(s)")
                 && !detail.contains("publication marker(s)"),
             "{detail}"
         );
 
         write(&day.join(".rollup-api"), &[0xff, 0xfe]);
-        let row = markers_row(count_markers(&data, &wal, false));
+        let row = markers_row(&count_markers(&data, &wal, false));
         assert_eq!(
             (row.outcome(), row.reason()),
-            (Outcome::Failed, Some("a rollup marker is malformed"))
+            (Outcome::Failed, Some("a rollup marker is unresolved"))
         );
 
         let query_only = |rollup_listed, rollup_unreadable| MarkersSeen {
             publication: Publications::NotCounted,
             rollup_listed,
             rollup_pending: 0,
-            rollup_malformed: 0,
+            rollup_unresolved: Vec::new(),
             rollup_unreadable,
         };
         for unread in [query_only(false, 0), query_only(true, 1)] {
-            let row = markers_row(unread);
+            let row = markers_row(&unread);
             assert_eq!(
                 (row.outcome(), row.reason()),
                 (Outcome::NotSampled, Some(reason::UNREADABLE)),
                 "{unread:?}"
             );
         }
-        let row = markers_row(query_only(true, 0));
+        let row = markers_row(&query_only(true, 0));
         assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
     }
 

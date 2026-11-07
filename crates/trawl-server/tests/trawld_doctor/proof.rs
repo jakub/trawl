@@ -211,7 +211,7 @@ fn the_leak_check_refuses_every_forbidden_shape() {
         "trawld 0.9.0; uid 1000 (jakub); HTTP 503",
         "--config /tmp/.tmpAbC123/trawld.toml",
         "2026-09-28 10:00:00",
-        "1 pending and 0 malformed rollup marker(s)",
+        "1 pending and 0 unresolved rollup marker(s)",
         "[server] http_addr in /etc/trawl/trawld.toml",
         "deadbeef",
     ] {
@@ -1020,12 +1020,9 @@ async fn populated_installation() -> Installation {
     )
     .expect("a valid publication marker");
     std::fs::write(marker.marker_path(&wal), marker.encode()).unwrap();
-    let day = data.join("prod/2024-01-15");
-    std::fs::write(
-        day.join(".rollup-nginx"),
-        day.join("10/nginx.parquet").display().to_string(),
-    )
-    .unwrap();
+    let (rollup, body) =
+        crate::support::pending_rollup(&data.join("prod/2024-01-15"), "nginx", &["10"]);
+    std::fs::write(rollup, body).unwrap();
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     trawl_server::tls::build_server_config(None, None, dir.path())

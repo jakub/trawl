@@ -664,6 +664,50 @@ pub async fn migrated_app() -> String {
     url
 }
 
+/// A one-row Parquet file at `path`, holding `value`.
+pub fn write_parquet(path: &Path, value: i64) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    duckdb::Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT TIMESTAMP '2026-09-23 07:00:00' AS _time, {value}::BIGINT AS n) \
+             TO '{}' (FORMAT PARQUET)",
+            path.to_string_lossy().replace('\'', "''")
+        ))
+        .unwrap();
+}
+
+/// A rollup of `service` in `day` that stopped before its rename, which
+/// boot's recovery finishes: each hour's `HH/{service}.parquet` in place
+/// (written as Parquet when absent), the replacement Parquet in
+/// `{service}.parquet.tmp`, and a canonical daily file, when one is there,
+/// recorded as the prior. Returns the marker's path and this release's
+/// body for it, unwritten.
+pub fn pending_rollup(day: &Path, service: &str, hours: &[&str]) -> (PathBuf, String) {
+    use trawl_server::ingest::publication_marker::identity_of;
+    use trawl_server::ingest::rollup_marker::{RollupMarker, marker_file_name};
+
+    let inputs = hours
+        .iter()
+        .zip(1..)
+        .map(|(hour, value)| {
+            let name = format!("{hour}/{service}.parquet");
+            let path = day.join(&name);
+            if !path.exists() {
+                write_parquet(&path, value);
+            }
+            (name, identity_of(&path).unwrap())
+        })
+        .collect();
+    let tmp = day.join(format!("{service}.parquet.tmp"));
+    write_parquet(&tmp, -1);
+    let canonical = day.join(format!("{service}.parquet"));
+    let prior = canonical.exists().then(|| identity_of(&canonical).unwrap());
+    let marker = RollupMarker::new(service, identity_of(&tmp).unwrap(), prior, inputs)
+        .expect("a valid rollup marker");
+    (day.join(marker_file_name(service)), marker.encode())
+}
+
 pub fn row<'a>(report: &'a Report, id: &str) -> &'a Check {
     report
         .checks()

@@ -99,6 +99,12 @@ const fn repin_blocked(reason: CorpusUnsettled) -> &'static str {
     }
 }
 
+/// Why repin admission stops while a finished rollup's marker unlink still
+/// owes its day-directory fsync. Reads still answer, so this is not a
+/// `corpus_recovering` refusal; the compaction pass retries the fsync.
+const REMOVAL_SYNC_OWED: &str = "repin is blocked while a finished rollup's marker removal is not yet \
+     durable; retry after the next compaction pass";
+
 /// Why [`claim_rollup_pause`] admitted no job.
 #[derive(Debug)]
 enum AdmissionStop {
@@ -141,6 +147,12 @@ async fn claim_rollup_pause(
             },
             other => PassStop::Failed(other.safe_message()).into(),
         })?;
+        if publication.any_removal_sync_owed() {
+            return Err(AdmissionStop::Blocked {
+                row: REMOVAL_SYNC_OWED.to_owned(),
+                refusal: ServerError::ServiceUnavailable(REMOVAL_SYNC_OWED.to_owned()),
+            });
+        }
         cancel.check(STAGE_SCAN)?;
         Ok::<_, AdmissionStop>(coordinator.pause_rollup())
     };
@@ -2962,6 +2974,55 @@ mod tests {
             }
             assert_eq!(admit(gate).await, rollup, "starting: {starting}");
         }
+    }
+
+    /// A finished rollup whose marker unlink still owes its day fsync
+    /// blocks repin admission with a fixed, path-free refusal that is not
+    /// `corpus_recovering`, and claims no pause. A successful retry of the
+    /// fsync admits the next request.
+    #[tokio::test]
+    async fn rollup_unlink_sync_retry_refuses_repin_admission() {
+        let coordinator = Arc::new(RepinCoordinator::new());
+        let publication = crate::publication::PublicationGate::new();
+        let registry = Arc::new(CancelRegistry::default());
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("prod/2026-11-06");
+        std::fs::create_dir_all(&day).unwrap();
+        let marker = day.join(".rollup-api");
+        {
+            let _writer = publication.write().await;
+            let removal = publication.owe_removal_sync(&marker);
+            assert!(!marker.exists(), "the marker path is already gone");
+            assert!(
+                removal
+                    .settle(|_| Err(std::io::ErrorKind::StorageFull.into()))
+                    .is_err()
+            );
+        }
+        assert!(publication.read().await.is_ok(), "reads answer while owed");
+
+        let cancel = registry.arm(1);
+        match claim_rollup_pause(&coordinator, &publication, &cancel).await {
+            Err(AdmissionStop::Blocked {
+                row,
+                refusal: ServerError::ServiceUnavailable(text),
+            }) => {
+                assert_eq!(row, REMOVAL_SYNC_OWED);
+                assert_eq!(text, REMOVAL_SYNC_OWED);
+                assert!(!text.contains(dir.path().to_str().unwrap()));
+            }
+            Err(other) => panic!("expected the removal-sync refusal, got {other:?}"),
+            Ok(_) => panic!("an owed removal sync admitted a repin"),
+        }
+        assert!(!coordinator.rollup_paused(), "no pause was claimed");
+        assert!(coordinator.rollup_unit_guard().await.is_some());
+
+        assert_eq!(publication.retry_removal_syncs(crate::epoch::fsync_dir), 0);
+        let pause = claim_rollup_pause(&coordinator, &publication, &cancel)
+            .await
+            .expect("a settled obligation admits the repin");
+        assert!(coordinator.rollup_paused());
+        drop(pause);
     }
 
     #[tokio::test]

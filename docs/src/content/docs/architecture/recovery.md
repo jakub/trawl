@@ -62,11 +62,88 @@ A query-only node can hold stale pins until you restart it. Repin is a single-da
 
 ## Daily rollup
 
-Rollup writes a durable marker listing its complete input set before replacing hourly files with the daily output, and holds the publication write guard through input retirement. An unfinished marker refuses corpus reads with 503 `corpus_recovering` and cause kind `rollup_pending` until recovery completes, including across a restart. That is what stops a query counting the hourly and daily copies of one event.
+A daily rollup merges one service's hourly files in a day directory, and the daily file if one exists, into one daily file, `{service}.parquet`. Then it retires the hourly files. Before it replaces anything, it writes a rollup marker, `data/{env}/{date}/.rollup-{service}`. The marker records an identity, a size and a BLAKE3 digest, for each of these files:
 
-An ingest boot recovers rollup markers before boot conformance, so a marker that recovery can finish never reaches a client. Recovery renames or retires files and reads Parquet footers. It never merges again. It opens a rollup marker and the staged `.parquet.tmp` output as regular files only: it never follows a symlink, and a FIFO does not make it wait. A marker over its size bound is never read. Recovery of such a marker fails, and the marker stays pending. `rollup_boot_recovery` logs the marker count at INFO. A failure does not stop the boot. `rollup_boot_recovery` then logs at ERROR with the count still pending, reads stay refused as `rollup_pending`, and each compaction pass retries. Boot conformance leaves a day directory alone while a rollup marker in it is unresolved, and logs `catalog_conform_skip` with `phase="rollup"` for each file it skips. If conformance cannot read the rollup markers at all, it skips every file and logs `catalog_conform_rollups_unreadable`.
+- the replacement daily file;
+- each hourly input, named relative to the day directory as `HH/{service}.parquet`;
+- the daily file that the merge folds in, if one existed. This is the prior daily file.
+
+While a marker exists, corpus reads answer 503 `corpus_recovering` with cause kind `rollup_pending`, across a restart too. That stops a query counting the hourly and daily copies of one event.
+
+### Rollup publish order
+
+A rollup publishes in this order:
+
+1. Merge the inputs into `{service}.parquet.tmp`.
+2. Open the tmp as a regular file, without following a symlink. On that one descriptor, parse the Parquet footer, fsync the file, then hash it. A footer that does not parse fails the rollup before any marker exists, and every input stays as it was.
+3. Fsync the day directory, its environment directory, and the data root. Retention can delete a day directory and a later write can create it again, so the rollup does not trust an earlier sync.
+4. Take the publication write guard. Write the marker durably: fsync the marker file before it is renamed into place, then fsync the day directory.
+5. Rename the tmp onto `{service}.parquet`, then fsync the day directory.
+6. Retire exactly the hourly files that the marker lists. Retirement deletes each file, or renames it to `.merged` if the delete fails. Then fsync each hour directory that held an input, also when the input was already gone. If an hour directory is gone, fsync the day directory in its place.
+7. Unlink the marker, then fsync the day directory, under the [removal-sync obligation](#the-removal-sync-obligation).
+
+Every fsync is fatal: a failure stops the rollup at that step. A failure before step 4 leaves the inputs and the daily file as they were. From step 4 until the unlink, the marker stays, and recovery finishes or abandons the rollup from what the marker records. A failed fsync after the unlink leaves the rollup's files complete, and the obligation holds. If every hourly input was invalid and quarantined, no rollup runs, so a marker never lists zero inputs.
+
+### How rollup recovery decides
+
+Recovery runs under the publication write guard. It runs at boot, before boot conformance, and at the start of each compaction pass, before the pass compacts any WAL. So a marker that recovery can finish never reaches a client.
+
+Recovery opens the marker, the tmp, the daily file and each hourly file as regular files only. It never follows a symlink, and a FIFO does not make it wait. It reads a marker only up to its size bound, which holds 100 inputs, and it refuses a name outside the `HH/{service}.parquet` form. It hashes the files and compares each size and digest with the marker. It does not parse Parquet footers, it fsyncs directories but never a file, and it never merges again.
+
+Recovery applies the first case that holds:
+
+- **a. The daily file carries the replacement identity.** The rename happened, whatever the tmp holds. Recovery fsyncs the day directory, removes a leftover tmp if it is a regular file, then runs steps 6 and 7.
+- **b. The tmp carries the replacement identity, and the rename did not happen.** The rename did not happen if the daily file is absent and the marker records no prior, or if the daily file carries the recorded prior identity. Recovery fsyncs the day directory, its environment directory and the data root, renames the tmp, and fsyncs the day directory. Then it runs steps 6 and 7.
+- **c. Provable abort.** The rename did not happen, as in b, and every listed hourly file is at its path with its recorded identity. A `.merged` copy does not count. Nothing was retired. Recovery deletes the tmp if it is a regular file, then runs step 7, and logs `rollup_recovery` at WARN. The next rollup merges again.
+- **d. Fail closed.** In every other state, recovery keeps the hourly files, the marker, the daily file and the tmp. It logs `rollup_recovery_unresolved` at ERROR with the environment, the day, the service and the proof that failed, and no path.
+
+In cases a and b, each listed hourly file that is still at its path must carry its recorded identity. An absent one was already retired. A present one that differs, or that cannot be read, sends the marker to case d, because retiring it could delete rows that the daily file does not hold. A marker that an older release wrote records no identities, so it always reaches case d.
+
+Each step can be interrupted and run again. A second recovery over the files that the first one left reaches the same end state.
+
+Case d is a standing fault. The marker stays, so reads keep refusing as `rollup_pending`. Each compaction pass stops at rollup recovery, so no WAL file is compacted, and ingest is refused once the hot buffer is full. `TrawlCorpusUnsettled` fires after 10 minutes. Follow [resolve an unresolved rollup marker](#resolve-an-unresolved-rollup-marker).
+
+`rollup_boot_recovery` logs the marker count at INFO. A failure does not stop the boot. `rollup_boot_recovery` then logs at ERROR with the count still pending, reads stay refused as `rollup_pending`, and each compaction pass retries. Boot conformance leaves a day directory alone while a rollup marker in it is unresolved, and logs `catalog_conform_skip` with `phase="rollup"` for each file it skips. If conformance cannot read the rollup markers at all, it skips every file and logs `catalog_conform_rollups_unreadable`.
 
 If the gate's scan for rollup markers fails, the gate cannot know which markers exist, so reads refuse as `rollup_pending`. An ingest boot then logs `rollup_boot_recovery` at ERROR to say that the marker scan failed, not the INFO line of a finished recovery. Only a later complete scan clears that. On an ingest node, each compaction pass scans again, and `publication_scan_recovered` logs the scan that clears it. A query-only node has no compaction, so its failed scan stays until you restart it.
+
+### The removal-sync obligation
+
+A marker unlink is durable only after the fsync of the day directory that follows it. If that fsync fails, the marker path is gone, but the entry can come back after a power loss. So before each unlink, trawld records a removal-sync obligation for that service and day, and only a successful fsync of the day directory ends it. Each compaction pass retries the fsync. If retention has deleted the day directory, the retry fsyncs the environment directory instead, which makes the whole day's removal durable and ends the obligation. Each failed retry logs `rollup_removal_sync_owed` at ERROR with the environment, the service and the day.
+
+While the obligation holds:
+
+- the daily rollup of that service and day waits, and logs `rollup_blocked`;
+- repin admission refuses, and the job ends `blocked`. See [repin a field](/reference/api/#repin-a-field);
+- boot conformance does not rewrite the files in that day directory.
+
+Reads still answer. The files on disk are consistent, and only the durability of the unlink is unproven.
+
+The obligation is held in memory and does not survive a restart. A marker that comes back after a power loss is recovered from its recorded identities like any other. Recovery never retires or deletes a file it cannot prove, so such a marker finishes in case a, b or c, or fails closed in case d.
+
+### Resolve an unresolved rollup marker
+
+When recovery cannot prove what an interrupted rollup did, it waits for you. Health reports `checks.corpus` as `rollup_pending`, and `TrawlCorpusUnsettled` fires once reads have refused for 10 minutes. Trawl does not repair this state itself, because a wrong repair loses or duplicates rows. Decide from the files:
+
+1. Stop trawld.
+2. Back up the data root. Recovery left every file as it was, so the backup keeps the evidence.
+3. Run `trawld --doctor` as the service user. The `server.recovery.publication` row fails with `a rollup marker is unresolved`. Its detail names the environment, day, service and failed proof of each unresolved marker, up to 10. The row counts a marker that recovery can finish as pending and does not fail for it.
+4. Inspect `data/{env}/{date}/`. In this release the marker `.rollup-{service}` is JSON. Compare each recorded `size` and `blake3` digest with the daily file `{service}.parquet`, the tmp `{service}.parquet.tmp`, and each hourly file `HH/{service}.parquet`. `b3sum` prints a BLAKE3 digest. A marker from an older release is a list of absolute hourly paths, with no identities. The failed proof says what did not match:
+   - `prior_mismatch`: the daily file carries neither the replacement nor the recorded prior identity. The daily file can also be present while the marker records no prior, or absent while the marker records one.
+   - `canonical_unreadable`: the daily file could not be read.
+   - `input_missing`: a listed hourly file is gone, and neither the daily file nor the tmp is the replacement.
+   - `input_mismatch` or `input_unreadable`: a listed hourly file that is still there has a different identity, or could not be read.
+   - `marker_old_format`, `marker_unsupported_version`, `marker_malformed`, `marker_oversized` or `marker_unreadable`: recovery cannot use the marker itself.
+5. Take one of these actions. Afterwards, each row of that service and day must be in exactly one place: the daily file or one hourly file.
+   - **Move the candidate file aside.** The candidate is the file that the failed proof names. Move it out of the data root, for example next to your backup, and keep the marker. At the next start, recovery decides again from the files that remain. It finishes or abandons the rollup if it can now prove the state. Moving a file aside takes its rows out of search, so do it only when another file holds those rows, or when you accept losing them.
+   - **Remove the marker.** The next rollup then merges the hourly files and the daily file that remain. This is right only when no row is in both the daily file and an hourly file. If the daily file already holds an hourly file's rows, move that hourly file aside first, or the next rollup duplicates its rows. You can leave the tmp: stale temporary-file cleanup removes it. A `marker_*` proof leaves only this action, because recovery cannot read the marker.
+6. Start trawld. Check that `rollup_recovery_unresolved` is not logged again, and that `checks.corpus` in `/api/v1/health` reads `ok`.
+
+For `marker_old_format`, you can instead start the release that wrote the marker, let its recovery finish, stop it, and then start this release again.
+
+### What the rollup guarantee does not cover
+
+The order of writes across a power loss is not proven. The tests kill the process, which keeps the page cache, and they record what each file-system call returned. No test cuts power. A successful fsync after a failed one proves less than a first success, as the [limits](#limits) below explain, but trawld still ends a removal-sync obligation on it. The guarantee assumes a local file system whose fsync is honest. Storage that reports an fsync it did not do, and an operator who edits the data root while trawld runs, are outside it.
 
 ## Publication markers
 
@@ -146,4 +223,4 @@ The data root and the WAL directory are trusted storage, owned by the user that 
 
 ## Recovery is not backup
 
-Markers make an interrupted owned operation restartable. They do not replace a backup of the corpus, the Trawl database, the Fleet keystore, and the session material. Restore those together and test the result. Removing a marker to make a failed startup look clean destroys the evidence that would finish the job.
+Markers make an interrupted owned operation restartable. They do not replace a backup of the corpus, the Trawl database, the Fleet keystore, and the session material. Restore those together and test the result. Removing a marker to make a failed startup look clean destroys the evidence that would finish the job. Remove a rollup marker only after a backup, as [resolve an unresolved rollup marker](#resolve-an-unresolved-rollup-marker) describes.

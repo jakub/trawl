@@ -108,6 +108,50 @@ filter_for() {
       FILTER=(--lib first_seen_inactive_key_reports_created_then_revoked
         roles_change_and_revoke_in_one_poll_report_both)
       ;;
+    # The durable rollup publish of #357. A skipped step drops out of the
+    # recorded call order, and the fault the matrix injects at it no
+    # longer stops the rollup.
+    17-rollup-tmp-sync-skipped.patch | 18-rollup-ancestor-chain-sync-skipped.patch | \
+      19-rollup-marker-best-effort.patch | 20-rollup-rename-day-sync-skipped.patch | \
+      21-rollup-hour-sync-skipped.patch | 27-rollup-footer-check-skipped.patch)
+      FILTER=(--lib rollup_publish_order rollup_sync_failure_matrix)
+      ;;
+    # An unlink whose day fsync failed reports success: the matrix
+    # requires that rollup to fail.
+    22-rollup-unlink-sync-error-ignored.patch)
+      FILTER=(--lib rollup_sync_failure_matrix)
+      ;;
+    # An owed removal sync that a read forgets once the marker path is
+    # gone: the rollup, repin and conformance retry tests each read past
+    # the unlink and still require the obligation.
+    23-removal-obligation-ends-on-absence.patch)
+      FILTER=(--lib rollup_unlink_sync_retry)
+      ;;
+    # Recovery of #357: a tmp trusted before the canonical is observed, an
+    # abort with an input missing, and a skipped directory fsync. The
+    # matrix checks the observation order, the case each state takes, and
+    # the calls each case makes.
+    24-recovery-observes-tmp-first.patch | 25-recovery-aborts-without-input-proof.patch | \
+      28-recovery-promote-chain-sync-skipped.patch | 29-recovery-promote-day-sync-skipped.patch | \
+      30-recovery-published-day-sync-skipped.patch)
+      FILTER=(--lib rollup_recovery_matrix)
+      ;;
+    # The consumers of an owed removal sync: repin admission, the next
+    # rollup of that service-day, and boot conformance each wait for it.
+    26-repin-admission-ignores-removal-obligation.patch)
+      FILTER=(--lib rollup_unlink_sync_retry_refuses_repin_admission)
+      ;;
+    31-rollup-ignores-removal-obligation.patch)
+      FILTER=(--lib ingest::compaction::tests::rollup_unlink_sync_retry)
+      ;;
+    32-conformance-ignores-removal-obligation.patch)
+      FILTER=(--lib rollup_unlink_sync_retry_defers_conformance_of_an_owed_day)
+      ;;
+    # A removal retry whose day directory retention deleted fsyncs the env
+    # directory, so the obligation can end.
+    33-removal-retry-ignores-deleted-day.patch)
+      FILTER=(--lib rollup_unlink_sync_retry_ends_when_retention_deletes_the_day)
+      ;;
     *) return 1 ;;
   esac
 }

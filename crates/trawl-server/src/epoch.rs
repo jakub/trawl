@@ -532,22 +532,56 @@ pub(crate) fn publish_marker_staged(dir: &Path, name: &str, body: &str) -> Resul
 /// handle. A symlink planted between the removal and the create makes the
 /// create fail instead of redirecting the write.
 pub(crate) fn publish_marker_durable(dir: &Path, name: &str, body: &str) -> Result<(), String> {
+    publish_marker_durable_with(dir, name, body, |_, file| file.sync_all(), fsync_dir)
+        .map_err(|e| e.to_string())
+}
+
+/// [`publish_marker_durable`] with the staged file's sync and the directory
+/// fsync done by `sync_staged` (given the staged path and its open file)
+/// and `sync_dir`, so a caller can observe each or fail it. Either one failing fails the publish, as in
+/// [`publish_marker_durable`]. The error keeps the kind of the I/O error
+/// behind it, and its text is [`publish_marker_durable`]'s.
+pub(crate) fn publish_marker_durable_with(
+    dir: &Path,
+    name: &str,
+    body: &str,
+    sync_staged: impl FnOnce(&Path, &std::fs::File) -> std::io::Result<()>,
+    sync_dir: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let context = |e: std::io::Error, what: std::fmt::Arguments<'_>| {
+        std::io::Error::new(e.kind(), format!("{what}: {e}"))
+    };
     let staged = staged_path(dir, name);
     match std::fs::remove_file(&staged) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("failed to remove stale {}: {e}", staged.display())),
+        Err(e) => {
+            return Err(context(
+                e,
+                format_args!("failed to remove stale {}", staged.display()),
+            ));
+        }
     }
     let mut file = std::fs::File::create_new(&staged)
-        .map_err(|e| format!("failed to create {}: {e}", staged.display()))?;
+        .map_err(|e| context(e, format_args!("failed to create {}", staged.display())))?;
     file.write_all(body.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("failed to write and fsync {}: {e}", staged.display()))?;
+        .and_then(|()| sync_staged(&staged, &file))
+        .map_err(|e| {
+            context(
+                e,
+                format_args!("failed to write and fsync {}", staged.display()),
+            )
+        })?;
     drop(file);
     let marker = dir.join(name);
     std::fs::rename(&staged, &marker)
-        .map_err(|e| format!("failed to publish {}: {e}", marker.display()))?;
-    fsync_dir(dir).map_err(|e| format!("failed to fsync directory {}: {e}", dir.display()))
+        .map_err(|e| context(e, format_args!("failed to publish {}", marker.display())))?;
+    sync_dir(dir).map_err(|e| {
+        context(
+            e,
+            format_args!("failed to fsync directory {}", dir.display()),
+        )
+    })
 }
 
 /// The PID-unique staged name a marker is written under before its rename.
@@ -1335,6 +1369,72 @@ mod tests {
         // or under a seccomp profile that blocks statx; the walk then falls
         // back to `/`. Where the attribute is known, `/` must be a mount root.
         assert_ne!(mount_root(Path::new("/")).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn durable_marker_writer_with_hooks_syncs_the_staged_file_then_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let order = std::cell::RefCell::new(Vec::new());
+        publish_marker_durable_with(
+            dir,
+            ".marker",
+            "body",
+            |staged, file| {
+                assert_eq!(staged, staged_path(dir, ".marker"));
+                // The staged file holds the whole body before its sync, and
+                // the marker name is not published yet.
+                assert_eq!(file.metadata().unwrap().len(), 4);
+                assert!(!dir.join(".marker").exists());
+                order.borrow_mut().push("staged");
+                file.sync_all()
+            },
+            |synced| {
+                assert_eq!(synced, dir);
+                assert!(dir.join(".marker").exists());
+                order.borrow_mut().push("dir");
+                fsync_dir(synced)
+            },
+        )
+        .unwrap();
+        assert_eq!(*order.borrow(), ["staged", "dir"]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".marker")).unwrap(),
+            "body"
+        );
+    }
+
+    #[test]
+    fn durable_marker_writer_with_hooks_fails_on_either_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let refused = || std::io::Error::from(std::io::ErrorKind::StorageFull);
+
+        let err =
+            publish_marker_durable_with(dir, ".staged", "body", |_, _| Err(refused()), fsync_dir)
+                .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert!(
+            err.to_string().starts_with("failed to write and fsync"),
+            "{err}"
+        );
+        assert!(!dir.join(".staged").exists(), "never renamed into place");
+
+        let err = publish_marker_durable_with(
+            dir,
+            ".dir",
+            "body",
+            |_, file| file.sync_all(),
+            |_| Err(refused()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert!(
+            err.to_string().starts_with("failed to fsync directory"),
+            "{err}"
+        );
+        // The rename happened; only its durability is unknown.
+        assert_eq!(std::fs::read_to_string(dir.join(".dir")).unwrap(), "body");
     }
 
     #[test]

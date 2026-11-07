@@ -270,17 +270,15 @@ impl CompactionOperation {
 pub enum QuarantineKind {
     Wal,
     Parquet,
-    RollupTemporary,
 }
 
 impl QuarantineKind {
-    pub const ALL: [Self; 3] = [Self::Wal, Self::Parquet, Self::RollupTemporary];
+    pub const ALL: [Self; 2] = [Self::Wal, Self::Parquet];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Wal => "wal",
             Self::Parquet => "parquet",
-            Self::RollupTemporary => "rollup_temporary",
         }
     }
 }
@@ -656,7 +654,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         FILES_QUARANTINED_TOTAL,
-        "Files successfully renamed out of normal processing with bytes retained, labelled by kind; temporary rollup sources may remain intact, not an event-loss count"
+        "Files successfully renamed out of normal processing with bytes retained, labelled by kind; not an event-loss count"
     );
     describe_gauge!(
         SYSLOG_TCP_CONNECTIONS,
@@ -2765,7 +2763,6 @@ mod tests {
                 "trawl_maintenance_resource_exhausted_total",
                 "trawl_files_quarantined_total{kind=\"wal\"}",
                 "trawl_files_quarantined_total{kind=\"parquet\"}",
-                "trawl_files_quarantined_total{kind=\"rollup_temporary\"}",
                 "trawl_publication_recovery_total{outcome=\"contradictory\"}",
                 "trawl_publication_recovery_total{outcome=\"failed\"}",
                 "trawl_retention_deletions_total{trigger=\"age\"}",

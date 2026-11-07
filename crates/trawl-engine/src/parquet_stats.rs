@@ -20,6 +20,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use parquet::basic::{ConvertedType, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
+use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::ColumnDescriptor;
@@ -449,6 +450,22 @@ fn merge(acc: &mut Option<StatVal>, candidate: Option<StatVal>, is_min: bool) ->
         },
     }
     true
+}
+
+/// Parse the footer of the open `file`, and nothing else: the trailing
+/// magic, the metadata length and the metadata thrift. The rollup checks a
+/// file it is about to publish on the descriptor it then syncs and hashes,
+/// so no path lookup can swap the file in between.
+///
+/// The reader works on duplicates of `file`'s descriptor, which share its
+/// offset: the caller seeks before reading `file` again.
+///
+/// # Errors
+/// The parquet error when the footer cannot be read or parsed.
+pub fn check_footer(file: &File) -> Result<(), parquet::errors::ParquetError> {
+    ParquetMetaDataReader::new()
+        .parse_and_finish(file)
+        .map(drop)
 }
 
 /// Read a single parquet file's footer statistics. Pure Rust — never invokes
@@ -883,6 +900,24 @@ mod tests {
         let path = dir.path().join("garbage.parquet");
         std::fs::write(&path, b"this is definitely not a parquet file").unwrap();
         assert!(read_file_stats(&path).is_err());
+    }
+
+    #[test]
+    fn check_footer_passes_real_parquet_and_refuses_a_bad_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let real = dir.path().join("real.parquet");
+        write_parquet(&conn, &real, "SELECT 1 AS n, 'x' AS msg");
+        check_footer(&File::open(&real).unwrap()).unwrap();
+
+        // Both magics in place, so a magic-only check would accept it.
+        let mut bytes = b"PAR1".to_vec();
+        bytes.extend_from_slice(b"not a thrift footer at all");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(b"PAR1");
+        let fake = dir.path().join("fake.parquet");
+        std::fs::write(&fake, &bytes).unwrap();
+        assert!(check_footer(&File::open(&fake).unwrap()).is_err());
     }
 
     #[test]

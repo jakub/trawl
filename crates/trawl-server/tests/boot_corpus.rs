@@ -23,6 +23,8 @@ use common::captured::{self, Restartable, Unserved};
 use common::{HotBufferKnobs, TestServer, seed_data_root, setup_observing_boot};
 use trawl_server::bus::{EventBus as _, EventSubscriber as _, LocalSubscriber};
 use trawl_server::config::{CaptureConfig, RateLimitConfig};
+use trawl_server::ingest::publication_marker::{OutputIdentity, identity_of};
+use trawl_server::ingest::rollup_marker::{RollupMarker, marker_file_name};
 use trawl_server::publication::CorpusUnsettled;
 use trawl_server::report_window::ScheduleWindow;
 use trawl_server::state::AppState;
@@ -231,25 +233,41 @@ async fn boot_hydration_above_the_caps_leaves_overhang() {
     );
 }
 
-/// The seed's nginx hourly file, its day, and a daily file holding the
-/// same rows, as an interrupted rollup leaves them.
+/// The seed's nginx hourly file, its day, a daily file holding the same
+/// rows, and the path of nginx's rollup marker in that day, unwritten.
 fn plant_rollup(data: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let day = data.join("prod/2024-01-15");
     let hourly = day.join("10/nginx.parquet");
     std::fs::copy(&hourly, day.join("nginx.parquet")).unwrap();
-    let marker = day.join(".rollup-nginx");
-    std::fs::write(&marker, hourly.to_string_lossy().as_bytes()).unwrap();
+    let marker = day.join(marker_file_name("nginx"));
     (day, hourly, marker)
 }
 
+/// A marker body for nginx in `day` that lists `10/nginx.parquet` at its
+/// identity, with no prior daily file recorded.
+fn nginx_marker(day: &Path, replacement: OutputIdentity) -> String {
+    let input = identity_of(&day.join("10/nginx.parquet")).unwrap();
+    RollupMarker::new(
+        "nginx",
+        replacement,
+        None,
+        vec![("10/nginx.parquet".to_owned(), input)],
+    )
+    .unwrap()
+    .encode()
+}
+
 /// A pending rollup marker is recovered by the boot, before the listener:
-/// the hourly input the daily file already holds is retired, and each row
+/// the daily file carries the replacement identity the marker recorded
+/// (case a), so the hourly input it already holds is retired, and each row
 /// is counted once.
 #[tokio::test(flavor = "multi_thread")]
 async fn rollup_boot_recovery_recovers_a_pending_marker_before_serving() {
     let dir = tempfile::tempdir().unwrap();
     let data = seed_data_root(dir.path());
     let (day, hourly, marker) = plant_rollup(Path::new(&data));
+    let replacement = identity_of(&day.join("nginx.parquet")).unwrap();
+    std::fs::write(&marker, nginx_marker(&day, replacement)).unwrap();
 
     let server = setup_observing_boot(dir.path(), data, None, &mut |state| {
         assert!(
@@ -271,25 +289,39 @@ async fn rollup_boot_recovery_recovers_a_pending_marker_before_serving() {
     assert_eq!(health(&server).await, ("ok".to_owned(), "ok".to_owned()));
 }
 
-/// A rollup recovery that fails does not stop the boot. The marker stays,
-/// reads refuse `rollup_pending`, and health names it.
+/// A rollup recovery that cannot prove the state does not stop the boot.
+/// Here the daily file is present, carries neither the replacement
+/// identity nor a recorded prior (the marker records none), and no
+/// temporary file exists: case d, a prior mismatch. Every file and the
+/// marker stay as they were, reads refuse `rollup_pending`, and health
+/// names it.
 #[tokio::test(flavor = "multi_thread")]
 async fn rollup_boot_recovery_failure_refuses_reads_as_rollup_pending() {
     let dir = tempfile::tempdir().unwrap();
     let data = seed_data_root(dir.path());
-    let day = Path::new(&data).join("prod/2024-01-15");
-    // An hourly input that can be neither removed nor set aside.
-    let stuck = day.join("10/stuck.parquet");
-    for path in [stuck.clone(), day.join("10/stuck.parquet.merged")] {
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(path.join("child"), b"occupied").unwrap();
-    }
-    std::fs::copy(day.join("10/nginx.parquet"), day.join("stuck.parquet")).unwrap();
-    let marker = day.join(".rollup-stuck");
-    std::fs::write(&marker, stuck.to_string_lossy().as_bytes()).unwrap();
+    let (day, hourly, marker) = plant_rollup(Path::new(&data));
+    // A replacement that no file on disk carries.
+    let replacement = OutputIdentity {
+        size: 1,
+        hash: blake3::hash(b"a replacement that was never written"),
+    };
+    std::fs::write(&marker, nginx_marker(&day, replacement)).unwrap();
+    let canonical = day.join("nginx.parquet");
+    let originals: Vec<_> = [&hourly, &canonical, &marker]
+        .into_iter()
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect();
 
     let server = setup_observing_boot(dir.path(), data, None, &mut |_| {}).await;
-    assert!(marker.exists(), "the marker waits for a compaction pass");
+    for (path, bytes) in &originals {
+        assert_eq!(
+            &std::fs::read(path).unwrap(),
+            bytes,
+            "{} changed",
+            path.display()
+        );
+    }
+    assert!(!day.join("nginx.parquet.tmp").exists());
     assert_eq!(
         unsettled(&server.state),
         Some(CorpusUnsettled::RollupPending)
