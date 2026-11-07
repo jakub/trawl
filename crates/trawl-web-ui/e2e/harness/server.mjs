@@ -1586,7 +1586,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     // the way trawld refuses a spent schedule. The spec asserts none came.
     if (runNow && req.method === 'POST' && scenario === 'schedule-spent') {
       runRequests.push(Number(runNow[1]));
-      sendJson(res, 409, { error: { code: 'conflict', message: 'max runs reached for this net' } });
+      sendJson(res, 409, { error: { code: 'bad_request', message: 'max runs reached for this net' } });
       return;
     }
     if (runNow && req.method === 'POST' && scenario === 'schedule') {
