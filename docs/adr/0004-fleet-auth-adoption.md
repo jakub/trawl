@@ -1,6 +1,6 @@
 # trawl adopts the fleet-auth postgres keystore; sqlite trawl-auth retires
 
-status: accepted (2026-07-11)
+status: accepted (2026-07-11); amended (2026-11-06): the key audit reports observed changes and survives a failed first snapshot, prep record for #353, see the Amendment
 
 Completes the auth half of ADR-0030 step 4 (canonical text in the coastwatch repo;
 the UI half landed via #27/PR #29). trawld takes a **hard postgres dependency**:
@@ -259,3 +259,59 @@ transitional file along with the crate.
 - fleet-admin ships in the runtime docker image and the .deb (it is the
   migration/provisioning tool the helm init container and operators invoke;
   as of this ADR the Dockerfile does not install it).
+
+## Amendment: the key audit reports observed changes and survives a failed first snapshot, 2026-11-06
+
+Prep record for #353. The audit poller kept its promise only for changes
+that one poll saw happen. A key created and revoked between two polls logged
+`key_created` and never `key_revoked`, because a new key took only the
+creation branch and the snapshot then stored it as inactive. A failed first
+snapshot logged "audit task disabled" and ended the task, so nothing was
+audited until trawld restarted.
+
+**What the trail promises.** The poller reports the changes it observes
+between two snapshots. It does not reconstruct history. Role assignments
+have no timestamps, so a change that a later change undoes before the next
+poll leaves no trace. A key row that is deleted produces no event. No code
+deletes one today.
+
+**Emission order is reporting order.** Within one poll, every role-catalog
+event comes first. Then, for each key, in this order: `key_created` when the
+key is new, `key_roles_changed` when an earlier snapshot holds the key with
+other roles, and `key_revoked` when the key is newly inactive. One key can
+produce more than one event in one poll. A key that first appears inactive
+produces `key_created` and then `key_revoked`, and no `key_roles_changed`.
+This order says how the poller reports a poll. It does not say the
+mutations happened in that order: `fleet-admin roles delete --force` can
+strip a role from a key that is already revoked.
+
+**Timestamps.** `key_created` carries the key's `created_at`. `key_revoked`
+carries its `revoked_at`, or `unknown` when the row has none. The poll time
+is never used as a mutation time.
+
+**`key_revoked` carries roles and permissions.** Like the other key events,
+it now carries the key's roles and the permissions they resolve to in the
+role catalog of the same poll. That is the catalog state the poller
+observed, not proof of what the key could do at the moment of its revoke.
+
+**A snapshot replaces the last one only when it is whole.** The poller
+replaces its snapshot only after both the key read and the role read
+succeed. A failed or cancelled poll emits nothing and keeps the last good
+snapshot. The next successful poll reports the change once.
+
+**A failed first snapshot is retried.** The task starts uninitialized and
+retries the first snapshot at the configured `audit_interval_secs`, with no
+limit on attempts. Each attempt and each wait races shutdown. Each failure
+logs `audit_error` with the phase and the operation that failed, and no raw
+database text. When a snapshot finally succeeds after one or more failures,
+the task logs `audit_gap` at warn before `audit_start`. The event carries
+`unaudited_from`, the time the first attempt began, before its first read;
+`unaudited_until`, the time the baseline was taken; the number of failed
+attempts; and a statement that the baseline was established without
+reconstruction. Changes made inside that window are not backfilled.
+Backfill from `created_at` and `revoked_at` would cover keys but not role
+assignments, so it would be a partial trail that reads as a complete one.
+
+Not covered: `retype` and expiry are not audited, and `list_keys` reads
+each key's roles in a separate query, so one snapshot can mix two moments.
+Coastwatch runs no such poller, so fleet-auth is unchanged.

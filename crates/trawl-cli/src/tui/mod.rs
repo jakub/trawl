@@ -82,6 +82,10 @@ pub(super) struct QueryResult {
     /// The caps a live aggregate snapshot reported as having dropped input
     /// (ADR-0001). Empty for every other result.
     pub(super) capped: Vec<trawl_api::stream::SnapshotCap>,
+    /// The run that sent this result, fixed when the run was spawned.
+    pub(super) generation: state::RunGeneration,
+    /// Whether a batch query or a live stream sent this result.
+    pub(super) source: state::RunSource,
 }
 
 /// Result of a mutation operation (save/delete saved query).
@@ -101,15 +105,19 @@ pub(super) enum MutationResult {
     ScheduleSet { saved_query_id: i64 },
     /// Dashboard snapshot received from server (Err on failure — preserves cached data).
     DashboardUpdate(Result<Box<trawl_client::DashboardSnapshot>, String>),
-    /// Report runs loaded for a saved query.
+    /// Answer to the runs request `token` for a saved query: the runs and
+    /// the server's total, or the error to show.
     RunsLoaded {
+        token: state::RequestToken,
         saved_id: i64,
-        runs: Vec<trawl_client::ReportRunSummary>,
-        total: usize,
+        outcome: Result<(Vec<trawl_client::ReportRunSummary>, usize), String>,
     },
-    /// A specific run's result data loaded.
+    /// Answer to the run-result request `token`: the result, or the error to show.
     RunResultLoaded {
-        result: trawl_api::value::QueryResult,
+        token: state::RequestToken,
+        saved_id: i64,
+        run_id: i64,
+        outcome: Result<trawl_api::value::QueryResult, String>,
     },
     /// Mutation failed.
     Error { message: String },
@@ -147,8 +155,6 @@ pub struct App {
     pub results_search: Option<ResultsSearch>,
     /// Maximum events to retain in live streaming buffer.
     max_live_events: usize,
-    /// Handle to the live streaming task (if active).
-    live_task: Option<tokio::task::JoinHandle<()>>,
     /// Channel for receiving query results from background tasks.
     query_rx: mpsc::UnboundedReceiver<QueryResult>,
     /// Sender for spawning queries.
@@ -164,9 +170,6 @@ pub struct App {
     driver_rx: Option<mpsc::UnboundedReceiver<DriverCommand>>,
     /// Path to the driver socket (for cleanup on exit).
     driver_socket_path: Option<PathBuf>,
-    /// Pending execute waiter: the socket task blocks on this until
-    /// the matching tab's query completes.
-    driver_execute_waiter: Option<ExecuteWaiter>,
     /// Server version string (fetched from health endpoint at startup).
     pub server_version: Option<String>,
     /// Admin dashboard state (permissions, polling, cache).
@@ -201,7 +204,6 @@ impl App {
             timezone: "local".to_owned(),
             results_search: None,
             max_live_events: 1000,
-            live_task: None,
             query_rx,
             query_tx,
             mutation_rx,
@@ -209,7 +211,6 @@ impl App {
             sample_values_cache: std::collections::HashMap::new(),
             driver_rx: None,
             driver_socket_path: None,
-            driver_execute_waiter: None,
             server_version: None,
             dashboard: DashboardState::new(),
             theme: theme::dark(),
@@ -230,31 +231,51 @@ impl App {
 
     /// Execute a query in the background.
     pub fn execute_query(&mut self) {
-        // Stop live streaming if active (user is running a new/edited query).
-        if self.live_mode {
-            self.stop_live_stream();
+        self.start_batch(None);
+    }
+
+    /// End the tab's run, if any: abort its task, and answer a driver
+    /// execute waiting on a batch with `reason` as its error. The run is
+    /// taken before the answer goes out, so a client that already left
+    /// still releases the tab.
+    fn end_run(&mut self, reason: &str) {
+        match std::mem::take(&mut self.tab.execution) {
+            state::Execution::Idle => {}
+            state::Execution::Batch { handle, reply, .. } => {
+                handle.abort();
+                if let Some(reply) = reply {
+                    reply.answer(DriverResponse::err(reason));
+                }
+            }
+            state::Execution::Live { handle, .. } => {
+                handle.abort();
+                self.live_mode = false;
+            }
         }
+    }
+
+    /// Start a batch query that answers `reply` when it ends.
+    ///
+    /// Empty input starts nothing and ends nothing; the earlier run, batch
+    /// or live, keeps going. Otherwise the earlier run ends as "replaced"
+    /// before the new one takes `reply`.
+    fn start_batch(&mut self, reply: Option<ExecuteWaiter>) {
+        if self.active_tab().editor.text().trim().is_empty() {
+            if let Some(reply) = reply {
+                reply.answer(DriverResponse::err("empty query"));
+            }
+            return;
+        }
+
+        self.end_run("replaced");
 
         // Auto-format the editor before executing (best-effort: a parse
         // failure or a format refusal leaves the text to run as typed).
         // Uses the same path as Ctrl+F.
         self.format_editor_query();
 
-        let tab = self.active_tab_mut();
-        let query = tab.editor.text().trim().to_owned();
-
-        if query.is_empty() {
-            return;
-        }
-
-        // Abort any previously running query on this tab.
-        if let Some(handle) = tab.query_task.take() {
-            handle.abort();
-        }
-
-        tab.status = TabStatus::Running {
-            start: Instant::now(),
-        };
+        let query = self.active_tab().editor.text().trim().to_owned();
+        let generation = self.tab.next_generation();
 
         let client = self.client.clone();
         let tx = self.query_tx.clone();
@@ -281,11 +302,20 @@ impl App {
                 result,
                 duration,
                 capped: Vec::new(),
+                generation,
+                source: state::RunSource::Batch,
             });
         });
 
-        // Store handle for cancellation.
-        self.active_tab_mut().query_task = Some(handle);
+        let tab = self.active_tab_mut();
+        tab.execution = state::Execution::Batch {
+            generation,
+            handle,
+            reply,
+        };
+        tab.status = TabStatus::Running {
+            start: Instant::now(),
+        };
     }
 
     /// Format the editor query in-place using the checked DSL formatter.
@@ -321,17 +351,25 @@ impl App {
         }
     }
 
-    /// Cancel the currently running query on the active tab (if any).
+    /// Cancel the running batch query on the active tab (if any). A live
+    /// stream is not a query to cancel; F9 stops it.
     pub(super) fn cancel_query(&mut self) {
-        let tab = self.active_tab_mut();
-        if let Some(handle) = tab.query_task.take() {
-            handle.abort();
-            tab.status = TabStatus::Error {
-                message: "cancelled".to_owned(),
-                details: Vec::new(),
-            };
-            tracing::info!("query cancelled by user");
+        if !self.active_tab().execution.is_batch() {
+            return;
         }
+        self.end_run("cancelled");
+        self.active_tab_mut().status = TabStatus::Error {
+            message: "cancelled".to_owned(),
+            details: Vec::new(),
+        };
+        tracing::info!("query cancelled by user");
+    }
+
+    /// Clear the query tab (Ctrl+L, the palette): end its run, batch or
+    /// live, then reset the editor and results.
+    pub(super) fn clear_tab(&mut self) {
+        self.end_run("cleared");
+        self.active_tab_mut().clear();
     }
 
     /// Refresh the saved queries cache from the server.
@@ -359,56 +397,118 @@ impl App {
     }
 
     /// Fetch report runs for a saved query (async, results arrive via mutation channel).
-    fn fetch_runs(&self, saved_id: i64) {
+    fn fetch_runs(&self, saved_id: i64, token: state::RequestToken) {
         let client = self.client.clone();
         let mutation_tx = self.mutation_tx.clone();
         tokio::spawn(async move {
-            let result = match client.list_report_runs(saved_id, Some(50), None).await {
-                Ok(resp) => MutationResult::RunsLoaded {
-                    saved_id,
-                    runs: resp.runs,
-                    total: resp.total,
-                },
+            let outcome = match client.list_report_runs(saved_id, Some(50), None).await {
+                Ok(resp) => Ok((resp.runs, resp.total)),
                 Err(e) => {
                     tracing::error!("failed to fetch runs for saved query {saved_id}: {e}");
-                    MutationResult::Error {
-                        message: format!("Failed to fetch runs: {e}"),
-                    }
+                    Err(format!("Failed to fetch runs: {e}"))
                 }
             };
-            let _ = mutation_tx.send(result);
+            let _ = mutation_tx.send(MutationResult::RunsLoaded {
+                token,
+                saved_id,
+                outcome,
+            });
         });
     }
 
     /// Fetch a specific run's result data (async, results arrive via mutation channel).
-    fn fetch_run_result(&self, saved_id: i64, run_id: i64) {
+    fn fetch_run_result(&self, saved_id: i64, run_id: i64, token: state::RequestToken) {
         let client = self.client.clone();
         let mutation_tx = self.mutation_tx.clone();
         tokio::spawn(async move {
-            let result = match client.get_report_run(saved_id, run_id).await {
+            let outcome = match client.get_report_run(saved_id, run_id).await {
                 Ok(resp) => {
                     if let Some(qr) = resp.result {
-                        MutationResult::RunResultLoaded { result: qr }
+                        Ok(qr)
                     } else if resp.summary.row_count == Some(0) {
                         // Successful run with 0 rows — show empty result, not an error.
-                        MutationResult::RunResultLoaded {
-                            result: trawl_api::value::QueryResult::empty(),
-                        }
+                        Ok(trawl_api::value::QueryResult::empty())
                     } else {
-                        MutationResult::Error {
-                            message: "Run has no result data".to_owned(),
-                        }
+                        Err("Run has no result data".to_owned())
                     }
                 }
                 Err(e) => {
                     tracing::error!("failed to fetch run result: {e}");
-                    MutationResult::Error {
-                        message: run_result_error_message(&e),
-                    }
+                    Err(run_result_error_message(&e))
                 }
             };
-            let _ = mutation_tx.send(result);
+            let _ = mutation_tx.send(MutationResult::RunResultLoaded {
+                token,
+                saved_id,
+                run_id,
+                outcome,
+            });
         });
+    }
+
+    /// The Saved detail, if it is for `saved_id` and waits on `token`.
+    fn pending_saved_detail(
+        &mut self,
+        token: state::RequestToken,
+        saved_id: i64,
+    ) -> Option<&mut state::SavedDetailState> {
+        self.panel
+            .saved_detail
+            .as_mut()
+            .filter(|d| d.pending == Some(token) && d.saved_id == saved_id)
+    }
+
+    /// Apply a runs response if the detail still waits on it; ignore it otherwise.
+    fn apply_runs_loaded(
+        &mut self,
+        token: state::RequestToken,
+        saved_id: i64,
+        outcome: Result<(Vec<trawl_client::ReportRunSummary>, usize), String>,
+    ) {
+        let Some(detail) = self.pending_saved_detail(token, saved_id) else {
+            tracing::debug!("ignoring stale runs response for saved query {saved_id}");
+            return;
+        };
+        match outcome {
+            Ok((runs, total)) => {
+                tracing::debug!("loaded {} runs for saved query {saved_id}", runs.len());
+                detail.runs = runs;
+                detail.total_runs = total;
+                detail.pending = None;
+                self.panel.saved_focus = state::SavedFocus::Detail;
+            }
+            // An empty run list would read as "no runs yet", so the failed
+            // detail closes instead.
+            Err(message) => {
+                self.panel.saved_detail = None;
+                self.panel.saved_focus = state::SavedFocus::List;
+                self.popup = Some(Popup::Error { message });
+            }
+        }
+    }
+
+    /// Apply a run-result response if the detail still waits on it; ignore it otherwise.
+    fn apply_run_result_loaded(
+        &mut self,
+        token: state::RequestToken,
+        saved_id: i64,
+        run_id: i64,
+        outcome: Result<trawl_api::value::QueryResult, String>,
+    ) {
+        let Some(detail) = self.pending_saved_detail(token, saved_id) else {
+            tracing::debug!("ignoring stale result response for run {run_id}");
+            return;
+        };
+        detail.pending = None;
+        match outcome {
+            Ok(result) => {
+                tracing::debug!("loaded result data for run {run_id}");
+                detail.result = Some(state::LoadedRun { run_id, result });
+                detail.result_scroll = 0;
+                self.panel.saved_focus = state::SavedFocus::RunResults;
+            }
+            Err(message) => self.popup = Some(Popup::Error { message }),
+        }
     }
 
     /// Poll for mutation results and refresh caches.
@@ -433,22 +533,22 @@ impl App {
                         saved.queries.len()
                     );
 
-                    // If we should select a specific query, find its index
-                    if let Some(name) = select_name
-                        && let Some(idx) = saved.queries.iter().position(|q| q.name == name)
-                    {
-                        self.panel.saved_selected = idx;
-                    }
-
+                    // Select the named query, else keep the previous one by
+                    // id across a reorder, else keep the index.
+                    let prior_id = self
+                        .saved_cache
+                        .as_ref()
+                        .and_then(|c| c.queries.get(self.panel.saved_selected))
+                        .map(|q| q.id);
+                    let index = select_name
+                        .and_then(|name| saved.queries.iter().position(|q| q.name == name))
+                        .or_else(|| {
+                            let id = prior_id?;
+                            saved.queries.iter().position(|q| q.id == id)
+                        })
+                        .unwrap_or(self.panel.saved_selected);
                     self.saved_cache = Some(saved);
-
-                    // Reset selection if it's now out of bounds
-                    if let Some(cache) = &self.saved_cache {
-                        let selected = self.panel.saved_selected;
-                        if selected >= cache.queries.len() && !cache.queries.is_empty() {
-                            self.panel.saved_selected = cache.queries.len().saturating_sub(1);
-                        }
-                    }
+                    self.select_saved(index);
                 }
                 MutationResult::ScheduleSet { saved_query_id } => {
                     tracing::info!("schedule set for saved query {saved_query_id}");
@@ -467,31 +567,16 @@ impl App {
                     self.dashboard.clear_inflight();
                 }
                 MutationResult::RunsLoaded {
+                    token,
                     saved_id,
-                    runs,
-                    total,
-                } => {
-                    tracing::debug!("loaded {} runs for saved query {saved_id}", runs.len());
-                    self.panel.saved_detail = Some(state::SavedDetailState {
-                        saved_id,
-                        runs,
-                        total_runs: total,
-                        run_selected: 0,
-                        run_scroll: 0,
-                        result: None,
-                        result_scroll: 0,
-                        loading: false,
-                    });
-                    self.panel.saved_focus = state::SavedFocus::Detail;
-                }
-                MutationResult::RunResultLoaded { result } => {
-                    tracing::debug!("loaded run result data");
-                    if let Some(ref mut detail) = self.panel.saved_detail {
-                        detail.result = Some(result);
-                        detail.result_scroll = 0;
-                    }
-                    self.panel.saved_focus = state::SavedFocus::RunResults;
-                }
+                    outcome,
+                } => self.apply_runs_loaded(token, saved_id, outcome),
+                MutationResult::RunResultLoaded {
+                    token,
+                    saved_id,
+                    run_id,
+                    outcome,
+                } => self.apply_run_result_loaded(token, saved_id, run_id, outcome),
                 MutationResult::Error { message } => {
                     tracing::error!("mutation error: {message}");
                     self.popup = Some(Popup::Error { message });
@@ -531,53 +616,67 @@ impl App {
     }
 
     /// Poll for query results and update the tab.
+    ///
+    /// Only the current run's results apply. One from an ended or replaced
+    /// run changes nothing. A batch result ends its run and answers its
+    /// driver execute; a live snapshot leaves the stream running.
     pub fn poll_query_results(&mut self) {
         while let Ok(query_result) = self.query_rx.try_recv() {
+            let event = (query_result.generation, query_result.source);
+            if self.tab.execution.current() != Some(event) {
+                tracing::debug!("ignoring obsolete query event");
+                continue;
+            }
             tracing::info!("received query result");
 
-            let tab = &mut self.tab;
-            tab.query_task = None;
+            let reply = match event.1 {
+                state::RunSource::Batch => match std::mem::take(&mut self.tab.execution) {
+                    state::Execution::Batch { reply, .. } => reply,
+                    _ => unreachable!("current() matched a batch"),
+                },
+                state::RunSource::Live => None,
+            };
 
-            match query_result.result {
-                Ok(response) => {
-                    // Auto-switch to line chart view for timechart queries.
-                    let is_timechart = response.result.columns.iter().any(|c| c.name == "_time");
-                    if is_timechart && tab.chart_view == ChartView::Table {
-                        tab.chart_view = ChartView::LineChart;
-                    }
+            self.show_query_result(query_result, reply);
+        }
+    }
 
-                    tab.result = Some(response);
-                    tab.live_capped = query_result.capped;
-                    #[allow(clippy::cast_possible_truncation)] // Query duration < u64::MAX ms
-                    let duration_ms = query_result.duration.as_millis() as u64;
-                    tab.status = TabStatus::Success { duration_ms };
-                    tab.scroll_offset = 0;
-                    tab.horizontal_scroll_offset = 0;
-                    tab.selected_row = None;
-                    tab.column_config = Some(ColumnConfig::init(
-                        &tab.result.as_ref().unwrap().result.columns,
-                    ));
-                    tab.validation_errors.clear();
-
-                    // Notify driver execute waiter.
-                    if self.driver_execute_waiter.is_some() {
-                        let waiter = self.driver_execute_waiter.take().unwrap();
-                        let mut data = query_response_to_data(self.tab.result.as_ref().unwrap());
-                        data.duration_ms = Some(duration_ms);
-                        let _ = waiter.reply.send(DriverResponse::ok_with(data));
-                    }
+    /// Draw a current run's result on the tab, then answer `reply` with it.
+    fn show_query_result(&mut self, query_result: QueryResult, reply: Option<ExecuteWaiter>) {
+        let tab = &mut self.tab;
+        match query_result.result {
+            Ok(response) => {
+                // Auto-switch to line chart view for timechart queries.
+                let is_timechart = response.result.columns.iter().any(|c| c.name == "_time");
+                if is_timechart && tab.chart_view == ChartView::Table {
+                    tab.chart_view = ChartView::LineChart;
                 }
-                Err(ref err) => {
-                    // Notify driver execute waiter of failure.
-                    if self.driver_execute_waiter.is_some() {
-                        let waiter = self.driver_execute_waiter.take().unwrap();
-                        let _ = waiter.reply.send(DriverResponse::err(&err.message));
-                    }
-                    tab.status = TabStatus::Error {
-                        message: err.message.clone(),
-                        details: err.details.clone(),
-                    };
+
+                tab.column_config = Some(ColumnConfig::init(&response.result.columns));
+                tab.result = Some(response);
+                tab.live_capped = query_result.capped;
+                #[allow(clippy::cast_possible_truncation)] // Query duration < u64::MAX ms
+                let duration_ms = query_result.duration.as_millis() as u64;
+                tab.status = TabStatus::Success { duration_ms };
+                tab.scroll_offset = 0;
+                tab.horizontal_scroll_offset = 0;
+                tab.selected_row = None;
+                tab.validation_errors.clear();
+
+                if let (Some(reply), Some(result)) = (reply, tab.result.as_ref()) {
+                    let mut data = query_response_to_data(result);
+                    data.duration_ms = Some(duration_ms);
+                    reply.answer(DriverResponse::ok_with(data));
                 }
+            }
+            Err(err) => {
+                if let Some(reply) = reply {
+                    reply.answer(DriverResponse::err(&err.message));
+                }
+                tab.status = TabStatus::Error {
+                    message: err.message,
+                    details: err.details,
+                };
             }
         }
     }
@@ -688,9 +787,9 @@ impl App {
                 self.switch_to_main_tab(MainTab::Query);
                 return;
             }
-            // Keyed on the task, not the status: a refused Ctrl+F replaces
+            // Keyed on the run, not the status: a refused Ctrl+F replaces
             // the Running status while the request is still in flight.
-            (KeyModifiers::NONE, KeyCode::Esc) if self.active_tab().query_task.is_some() => {
+            (KeyModifiers::NONE, KeyCode::Esc) if self.active_tab().execution.is_batch() => {
                 self.cancel_query();
                 return;
             }
@@ -1607,25 +1706,72 @@ mod tests {
 
     // --- Channel injection tests (poll_query_results / poll_mutations) ---
 
-    #[test]
-    fn poll_query_result_updates_tab() {
+    /// A query event from the run `run` names.
+    fn event(
+        run: (state::RunGeneration, state::RunSource),
+        result: Result<QueryResponse, QueryError>,
+    ) -> QueryResult {
+        QueryResult {
+            result,
+            duration: Duration::from_millis(1),
+            capped: Vec::new(),
+            generation: run.0,
+            source: run.1,
+        }
+    }
+
+    /// A query event from the tab's current run.
+    fn tagged(app: &App, result: Result<QueryResponse, QueryError>) -> QueryResult {
+        event(
+            app.tab.execution.current().expect("a run is current"),
+            result,
+        )
+    }
+
+    /// Type a query when the editor is empty, so a run has one to start.
+    fn ensure_query(app: &mut App) {
+        if app.tab.editor.text().trim().is_empty() {
+            app.tab.editor.insert_text("* | stats count() by host");
+        }
+    }
+
+    /// Start a batch query on the editor's query. Its own answer is never
+    /// polled in these tests, so it stays in flight.
+    fn run_batch(app: &mut App) {
+        ensure_query(app);
+        app.execute_query();
+        assert!(app.tab.execution.is_batch(), "{:?}", app.tab.execution);
+    }
+
+    /// Start a live stream on the editor's query with F9.
+    fn run_live(app: &mut App) {
+        ensure_query(app);
+        app.handle_key(key(KeyCode::F(9)));
+        assert!(
+            matches!(app.tab.execution, state::Execution::Live { .. }),
+            "{:?}",
+            app.tab.execution
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_query_result_updates_tab() {
         let mut app = test_app();
+        run_batch(&mut app);
         let response = make_query_response(
             vec!["host", "count"],
             vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
         );
-        app.query_tx
-            .send(QueryResult {
-                result: Ok(response),
-                duration: Duration::from_millis(50),
-                capped: Vec::new(),
-            })
-            .unwrap();
+        app.query_tx.send(tagged(&app, Ok(response))).unwrap();
 
         app.poll_query_results();
 
         assert!(app.tab.result.is_some());
         assert!(matches!(app.tab.status, TabStatus::Success { .. }));
+        assert!(
+            matches!(app.tab.execution, state::Execution::Idle),
+            "the result ends its batch"
+        );
     }
 
     /// A live aggregate that dropped input is still a result, not an error:
@@ -1633,8 +1779,8 @@ mod tests {
     /// theme's warning colour, ahead of the row counts so a narrow pane
     /// keeps it. The latest snapshot decides, so one with nothing dropped
     /// clears the mark.
-    #[test]
-    fn live_capped_snapshot_marks_results_title() {
+    #[tokio::test]
+    async fn live_capped_snapshot_marks_results_title() {
         use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 
         const MARK: &str = " partial: groups > 10000 ";
@@ -1642,13 +1788,15 @@ mod tests {
             cap: SnapshotCapKind::Groups,
             limit: 10_000,
         }];
-        let snapshot = |capped: Vec<SnapshotCap>| QueryResult {
-            result: Ok(make_query_response(
-                vec!["host", "count"],
-                vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
-            )),
-            duration: Duration::from_secs(0),
+        let snapshot = |app: &App, capped: Vec<SnapshotCap>| QueryResult {
             capped,
+            ..tagged(
+                app,
+                Ok(make_query_response(
+                    vec!["host", "count"],
+                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                )),
+            )
         };
         let title_row = |app: &mut App, width: u16| {
             let backend = ratatui::backend::TestBackend::new(width, 24);
@@ -1667,7 +1815,8 @@ mod tests {
 
         for width in [100_u16, 40] {
             let mut app = test_app();
-            app.query_tx.send(snapshot(capped.clone())).unwrap();
+            run_live(&mut app);
+            app.query_tx.send(snapshot(&app, capped.clone())).unwrap();
             app.poll_query_results();
             assert!(
                 matches!(app.tab.status, TabStatus::Success { .. }),
@@ -1692,7 +1841,7 @@ mod tests {
                 "width {width}: rows render\n{screen}"
             );
 
-            app.query_tx.send(snapshot(Vec::new())).unwrap();
+            app.query_tx.send(snapshot(&app, Vec::new())).unwrap();
             app.poll_query_results();
             let (cells, _) = title_row(&mut app, width);
             let text: String = cells.iter().map(ratatui::buffer::Cell::symbol).collect();
@@ -1713,8 +1862,8 @@ mod tests {
     /// chart views draw the placeholder, and that is where the drop changed
     /// the answer. A capped result whose columns are all hidden draws a
     /// placeholder of its own.
-    #[test]
-    fn live_capped_snapshot_marks_every_placeholder_title() {
+    #[tokio::test]
+    async fn live_capped_snapshot_marks_every_placeholder_title() {
         use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 
         const MARK: &str = " partial: groups > 10000 ";
@@ -1756,11 +1905,14 @@ mod tests {
 
         for view in [ChartView::LineChart, ChartView::Sparkline] {
             let mut app = test_app();
+            run_live(&mut app);
             app.query_tx
                 .send(QueryResult {
-                    result: Ok(make_query_response(vec!["_time", "host", "count"], vec![])),
-                    duration: Duration::from_secs(0),
                     capped: capped(),
+                    ..tagged(
+                        &app,
+                        Ok(make_query_response(vec!["_time", "host", "count"], vec![])),
+                    )
                 })
                 .unwrap();
             app.poll_query_results();
@@ -1774,14 +1926,17 @@ mod tests {
         }
 
         let mut app = test_app();
+        run_live(&mut app);
         app.query_tx
             .send(QueryResult {
-                result: Ok(make_query_response(
-                    vec!["host", "count"],
-                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
-                )),
-                duration: Duration::from_secs(0),
                 capped: capped(),
+                ..tagged(
+                    &app,
+                    Ok(make_query_response(
+                        vec!["host", "count"],
+                        vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                    )),
+                )
             })
             .unwrap();
         app.poll_query_results();
@@ -1802,22 +1957,24 @@ mod tests {
 
         const MARK: &str = " partial: groups > 10000 ";
         let mut app = test_app();
+        run_live(&mut app);
         app.query_tx
             .send(QueryResult {
-                result: Ok(make_query_response(
-                    vec!["host", "count"],
-                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
-                )),
-                duration: Duration::from_secs(0),
                 capped: vec![SnapshotCap {
                     cap: SnapshotCapKind::Groups,
                     limit: 10_000,
                 }],
+                ..tagged(
+                    &app,
+                    Ok(make_query_response(
+                        vec!["host", "count"],
+                        vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                    )),
+                )
             })
             .unwrap();
         app.poll_query_results();
-        app.live_mode = true;
-        app.tab.editor.insert_text("* | stats count() by host");
+        assert!(app.live_mode);
 
         // The answer is never polled, so the query stays pending.
         app.execute_query();
@@ -1871,24 +2028,26 @@ mod tests {
 
         const MARK: &str = " partial: groups > 10000 ";
         let mut app = test_app();
+        // Start the stream that sends the capped snapshot.
+        run_live(&mut app);
         app.query_tx
             .send(QueryResult {
-                result: Ok(make_query_response(
-                    vec!["host", "count"],
-                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
-                )),
-                duration: Duration::from_secs(0),
                 capped: vec![SnapshotCap {
                     cap: SnapshotCapKind::Groups,
                     limit: 10_000,
                 }],
+                ..tagged(
+                    &app,
+                    Ok(make_query_response(
+                        vec!["host", "count"],
+                        vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                    )),
+                )
             })
             .unwrap();
         app.poll_query_results();
-        app.tab.editor.insert_text("* | stats count() by host");
 
-        // Start, stop, restart; no replacement snapshot is ever polled.
-        app.handle_key(key(KeyCode::F(9)));
+        // Stop, restart; no replacement snapshot is ever polled.
         app.handle_key(key(KeyCode::F(9)));
         app.handle_key(key(KeyCode::F(9)));
         assert!(app.live_mode, "the second F9 restarted the stream");
@@ -1915,18 +2074,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn poll_query_result_sets_error_status() {
+    #[tokio::test]
+    async fn poll_query_result_sets_error_status() {
         let mut app = test_app();
+        run_batch(&mut app);
         app.query_tx
-            .send(QueryResult {
-                result: Err(QueryError {
+            .send(tagged(
+                &app,
+                Err(QueryError {
                     message: "something broke".to_owned(),
                     details: Vec::new(),
                 }),
-                duration: Duration::from_millis(10),
-                capped: Vec::new(),
-            })
+            ))
             .unwrap();
 
         app.poll_query_results();
@@ -1937,20 +2096,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn poll_query_result_resets_scroll() {
+    #[tokio::test]
+    async fn poll_query_result_resets_scroll() {
         let mut app = test_app();
+        run_batch(&mut app);
         app.tab.scroll_offset = 42;
         app.tab.horizontal_scroll_offset = 7;
 
         let response = make_query_response(vec!["x"], vec![vec![Value::Integer(1)]]);
-        app.query_tx
-            .send(QueryResult {
-                result: Ok(response),
-                duration: Duration::from_millis(1),
-                capped: Vec::new(),
-            })
-            .unwrap();
+        app.query_tx.send(tagged(&app, Ok(response))).unwrap();
 
         app.poll_query_results();
 
@@ -1958,9 +2112,10 @@ mod tests {
         assert_eq!(app.tab.horizontal_scroll_offset, 0);
     }
 
-    #[test]
-    fn poll_query_result_timechart_auto_switches_view() {
+    #[tokio::test]
+    async fn poll_query_result_timechart_auto_switches_view() {
         let mut app = test_app();
+        run_batch(&mut app);
         assert_eq!(app.tab.chart_view, ChartView::Table);
 
         let response = make_query_response(
@@ -1970,13 +2125,7 @@ mod tests {
                 Value::Integer(10),
             ]],
         );
-        app.query_tx
-            .send(QueryResult {
-                result: Ok(response),
-                duration: Duration::from_millis(1),
-                capped: Vec::new(),
-            })
-            .unwrap();
+        app.query_tx.send(tagged(&app, Ok(response))).unwrap();
 
         app.poll_query_results();
 
@@ -2107,21 +2256,18 @@ mod tests {
         assert!(matches!(app.popup, Some(Popup::Error { .. })));
     }
 
-    #[test]
-    fn multiple_results_last_wins() {
+    /// A live stream sends many snapshots, and the last one polled is the
+    /// one on screen. (A batch ends on its first result.)
+    #[tokio::test]
+    async fn multiple_results_last_wins() {
         let mut app = test_app();
+        run_live(&mut app);
 
-        // Send two results — the last one should be the final state.
+        // Send two snapshots — the last one should be the final state.
         for i in 0..2 {
             let response =
                 make_query_response(vec!["idx"], vec![vec![Value::Integer(i64::from(i))]]);
-            app.query_tx
-                .send(QueryResult {
-                    result: Ok(response),
-                    duration: Duration::from_millis(1),
-                    capped: Vec::new(),
-                })
-                .unwrap();
+            app.query_tx.send(tagged(&app, Ok(response))).unwrap();
         }
 
         app.poll_query_results();
@@ -2130,6 +2276,45 @@ mod tests {
         // Last result (idx=1) should be the one stored.
         let rows = &app.tab.result.as_ref().unwrap().result.rows;
         assert_eq!(rows[0][0], Value::Integer(1));
+    }
+
+    /// Swap a run's task for one that never ends on its own, and return its
+    /// abort handle. The real task's request to the dummy server fails and
+    /// finishes by itself, which would pass for an abort.
+    fn hold_pending(handle: &mut tokio::task::JoinHandle<()>) -> tokio::task::AbortHandle {
+        let held = tokio::spawn(std::future::pending::<()>());
+        let abort = held.abort_handle();
+        std::mem::replace(handle, held).abort();
+        abort
+    }
+
+    /// The abort handle of the tab's running batch, held pending so only an
+    /// abort finishes it, or fail loudly.
+    fn batch_abort_handle(app: &mut App) -> tokio::task::AbortHandle {
+        match &mut app.tab.execution {
+            state::Execution::Batch { handle, .. } => hold_pending(handle),
+            other => panic!("expected a batch run, got {other:?}"),
+        }
+    }
+
+    /// The abort handle of the tab's live stream, held pending so only an
+    /// abort finishes it, or fail loudly.
+    fn live_abort_handle(app: &mut App) -> tokio::task::AbortHandle {
+        match &mut app.tab.execution {
+            state::Execution::Live { handle, .. } => hold_pending(handle),
+            other => panic!("expected a live run, got {other:?}"),
+        }
+    }
+
+    /// Wait, within a bound, for an aborted task to finish.
+    async fn assert_finishes(task: &tokio::task::AbortHandle) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the aborted task finishes");
     }
 
     /// A query whose formatted text would be over the query limit: 40 000
@@ -2226,7 +2411,7 @@ mod tests {
         app.tab.editor.insert_text("service=web");
         // The answer is never polled, so the query stays in flight.
         app.execute_query();
-        assert!(app.tab.query_task.is_some());
+        assert!(app.tab.execution.is_batch());
 
         app.tab.editor.clear();
         app.tab.editor.insert_text(&too_long_to_format());
@@ -2237,15 +2422,1088 @@ mod tests {
             app.tab.status
         );
 
-        let in_flight = app.tab.query_task.as_ref().unwrap().abort_handle();
+        let in_flight = batch_abort_handle(&mut app);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.tab.query_task.is_none(), "Esc drops the task handle");
-        tokio::task::yield_now().await;
-        assert!(in_flight.is_finished(), "Esc aborts the request in flight");
+        assert!(
+            matches!(app.tab.execution, state::Execution::Idle),
+            "Esc ends the run"
+        );
+        assert_finishes(&in_flight).await;
         assert!(
             matches!(&app.tab.status, TabStatus::Error { message, .. } if message == "cancelled"),
             "{:?}",
             app.tab.status
         );
+    }
+
+    /// A driver client that reaches the app through its real admission path,
+    /// `poll_driver_commands`.
+    struct Driver {
+        tx: mpsc::UnboundedSender<DriverCommand>,
+        terminal: Terminal<ratatui::backend::TestBackend>,
+    }
+
+    impl Driver {
+        /// Become `app`'s driver channel.
+        fn attach(app: &mut App) -> Self {
+            let (tx, rx) = mpsc::unbounded_channel();
+            app.driver_rx = Some(rx);
+            let terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            Self { tx, terminal }
+        }
+
+        /// Send an execute that `reply` answers, and let the app admit it.
+        fn send_execute(
+            &mut self,
+            app: &mut App,
+            reply: tokio::sync::oneshot::Sender<DriverResponse>,
+        ) {
+            self.tx
+                .send(DriverCommand {
+                    request: driver::DriverRequest::Execute { timeout_ms: 10_000 },
+                    reply,
+                })
+                .unwrap();
+            app.poll_driver_commands(&mut self.terminal);
+        }
+
+        /// Send an execute and return the client's end of its reply.
+        fn execute(&mut self, app: &mut App) -> tokio::sync::oneshot::Receiver<DriverResponse> {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            self.send_execute(app, reply);
+            answer
+        }
+    }
+
+    /// The driver client has had no answer yet.
+    fn assert_unanswered(answer: &mut tokio::sync::oneshot::Receiver<DriverResponse>, case: &str) {
+        match answer.try_recv() {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Ok(response) => panic!("{case}: answered early with {response:?}"),
+            Err(closed) => panic!("{case}: reply dropped unanswered: {closed:?}"),
+        }
+    }
+
+    /// The driver client got the error `expected`.
+    fn assert_answered_err(
+        answer: &mut tokio::sync::oneshot::Receiver<DriverResponse>,
+        expected: &str,
+        case: &str,
+    ) {
+        match answer.try_recv() {
+            Ok(response) => {
+                assert!(!response.ok, "{case}: {response:?}");
+                assert_eq!(response.error.as_deref(), Some(expected), "{case}");
+            }
+            Err(e) => panic!("{case}: expected {expected:?}, got {e:?}"),
+        }
+    }
+
+    /// The tab runs a batch that answers a driver client still waiting.
+    fn assert_admitted(app: &App, case: &str) {
+        assert!(
+            app.tab.execution.reply_pending(),
+            "{case}: the execute was admitted: {:?}",
+            app.tab.execution
+        );
+    }
+
+    /// The generation of the tab's current run, or fail loudly.
+    fn current_generation(app: &App) -> state::RunGeneration {
+        app.tab.execution.current().expect("a run is current").0
+    }
+
+    /// Clear the editor through the command palette, as a person would.
+    fn palette_clear(app: &mut App) {
+        app.handle_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        for ch in "Clear Editor".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        let Some(Popup::CommandPalette {
+            ref filtered,
+            ref items,
+            selected,
+            ..
+        }) = app.popup
+        else {
+            panic!("the palette is open");
+        };
+        let action = &items[filtered[selected].item_index].action;
+        assert!(
+            matches!(
+                action,
+                palette::PaletteAction::RunAction(palette::ActionKind::ClearEditor)
+            ),
+            "the palette selects Clear Editor: {action:?}"
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.popup.is_none());
+    }
+
+    /// Every way a query ends answers the driver execute waiting on it, through
+    /// the real key and palette handlers, and the next execute is admitted.
+    #[tokio::test]
+    async fn driver_execute_terminal_transitions() {
+        type Transition = fn(&mut App);
+        let cases: [(&str, &str, Transition); 9] = [
+            ("Esc", "cancelled", |app| app.handle_key(key(KeyCode::Esc))),
+            ("editor Ctrl+C", "cancelled", |app| {
+                app.focus = Focus::Editor;
+                app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            }),
+            ("results Ctrl+C", "cancelled", |app| {
+                app.focus = Focus::Results;
+                app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            }),
+            ("results Ctrl+C while typing a search", "cancelled", |app| {
+                app.focus = Focus::Results;
+                let mut search = state::ResultsSearch::new();
+                search.input_active = true;
+                app.results_search = Some(search);
+                app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            }),
+            ("results Ctrl+C in column mode", "cancelled", |app| {
+                app.focus = Focus::Results;
+                let mut columns = state::ColumnConfig::init(&[]);
+                columns.selected = Some(0);
+                app.tab.column_config = Some(columns);
+                app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            }),
+            ("Ctrl+L", "cleared", |app| {
+                app.handle_key(key_mod(KeyCode::Char('l'), KeyModifiers::CONTROL));
+            }),
+            ("palette clear", "cleared", palette_clear),
+            ("F5", "replaced", |app| app.handle_key(key(KeyCode::F(5)))),
+            ("F9", "replaced by live stream", |app| {
+                app.handle_key(key(KeyCode::F(9)));
+            }),
+        ];
+
+        for (case, expected, transition) in cases {
+            let mut app = test_app();
+            let mut driver = Driver::attach(&mut app);
+            ensure_query(&mut app);
+            let mut answer = driver.execute(&mut app);
+            assert_unanswered(&mut answer, case);
+            assert_admitted(&app, case);
+
+            transition(&mut app);
+            assert_answered_err(&mut answer, expected, case);
+            assert!(!app.tab.execution.reply_pending(), "{case}");
+
+            app.focus = Focus::Editor;
+            ensure_query(&mut app);
+            let mut next = driver.execute(&mut app);
+            assert_unanswered(&mut next, case);
+            assert_admitted(&app, &format!("{case}, then"));
+        }
+
+        // Ctrl+C over a selection copies it, and the query keeps running.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let mut answer = driver.execute(&mut app);
+        app.tab.editor.selection_anchor = Some((0, 0));
+        assert!(app.tab.editor.selected_text().is_some());
+        app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_unanswered(&mut answer, "Ctrl+C over a selection");
+        assert_admitted(&app, "Ctrl+C over a selection");
+    }
+
+    /// A result queued before a cancel, a clear or a replacement is polled
+    /// after the next execute was admitted, and changes nothing.
+    #[tokio::test]
+    async fn query_generation_rejects_queued_results() {
+        type Transition = fn(&mut App);
+        let cases: [(&str, &str, Transition); 3] = [
+            ("Esc", "cancelled", |app| app.handle_key(key(KeyCode::Esc))),
+            ("Ctrl+L", "cleared", |app| {
+                app.handle_key(key_mod(KeyCode::Char('l'), KeyModifiers::CONTROL));
+            }),
+            ("F5", "replaced", |app| app.handle_key(key(KeyCode::F(5)))),
+        ];
+
+        for (case, expected, transition) in cases {
+            let mut app = test_app();
+            let mut driver = Driver::attach(&mut app);
+            ensure_query(&mut app);
+            let mut first = driver.execute(&mut app);
+            let first_run = app.tab.execution.current().unwrap();
+            app.query_tx
+                .send(event(
+                    first_run,
+                    Ok(make_query_response(
+                        vec!["x"],
+                        vec![vec![Value::Integer(1)]],
+                    )),
+                ))
+                .unwrap();
+
+            transition(&mut app);
+            ensure_query(&mut app);
+            let mut second = driver.execute(&mut app);
+            let second_generation = current_generation(&app);
+            assert_ne!(second_generation, first_run.0, "{case}");
+
+            app.poll_query_results();
+
+            assert_answered_err(&mut first, expected, case);
+            assert_unanswered(&mut second, case);
+            assert_admitted(&app, case);
+            assert_eq!(current_generation(&app), second_generation, "{case}");
+            assert!(
+                matches!(app.tab.status, TabStatus::Running { .. }),
+                "{case}: {:?}",
+                app.tab.status
+            );
+            assert!(
+                app.tab.result.is_none(),
+                "{case}: the old rows are not drawn"
+            );
+        }
+    }
+
+    /// A batch's own result answers the driver execute waiting on it: its
+    /// rows on success, its error text on failure. Either way the tab is
+    /// free for the next execute.
+    #[tokio::test]
+    async fn driver_execute_answers_with_its_own_result() {
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let mut answer = driver.execute(&mut app);
+        app.query_tx
+            .send(tagged(
+                &app,
+                Ok(make_query_response(
+                    vec!["host"],
+                    vec![
+                        vec![Value::String("a".to_owned())],
+                        vec![Value::String("b".to_owned())],
+                    ],
+                )),
+            ))
+            .unwrap();
+        app.poll_query_results();
+        let response = answer.try_recv().expect("the result answers the execute");
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.data.row_count, Some(2));
+        assert_eq!(response.data.columns, Some(vec!["host".to_owned()]));
+        assert_eq!(
+            response.data.rows,
+            Some(vec![
+                vec![serde_json::json!("a")],
+                vec![serde_json::json!("b")]
+            ])
+        );
+        assert_eq!(response.data.duration_ms, Some(1));
+        assert!(matches!(app.tab.execution, state::Execution::Idle));
+
+        let mut answer = driver.execute(&mut app);
+        assert_admitted(&app, "after a success");
+        app.query_tx
+            .send(tagged(
+                &app,
+                Err(QueryError {
+                    message: "something broke".to_owned(),
+                    details: Vec::new(),
+                }),
+            ))
+            .unwrap();
+        app.poll_query_results();
+        assert_answered_err(&mut answer, "something broke", "a failed batch");
+        assert!(matches!(app.tab.execution, state::Execution::Idle));
+    }
+
+    /// A live snapshot never touches a batch, and a live start ends one.
+    #[tokio::test]
+    async fn live_and_batch_ownership() {
+        // A snapshot queued before a batch replaced the stream is dropped:
+        // the batch stays running, cancellable and unanswered.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        run_live(&mut app);
+        let snapshot = tagged(
+            &app,
+            Ok(make_query_response(
+                vec!["x"],
+                vec![vec![Value::Integer(1)]],
+            )),
+        );
+        app.query_tx.send(snapshot).unwrap();
+        let mut answer = driver.execute(&mut app);
+        assert!(!app.live_mode, "the batch stops the stream");
+        app.poll_query_results();
+        assert!(
+            matches!(app.tab.status, TabStatus::Running { .. }),
+            "{:?}",
+            app.tab.status
+        );
+        assert!(app.tab.result.is_none(), "the snapshot is not drawn");
+        assert_unanswered(&mut answer, "after a stale snapshot");
+        assert_admitted(&app, "after a stale snapshot");
+        app.handle_key(key(KeyCode::Esc));
+        assert_answered_err(&mut answer, "cancelled", "Esc after a stale snapshot");
+
+        // The current stream's snapshot still draws, and the stream goes on.
+        let mut app = test_app();
+        run_live(&mut app);
+        let generation = current_generation(&app);
+        let snapshot = tagged(
+            &app,
+            Ok(make_query_response(
+                vec!["x"],
+                vec![vec![Value::Integer(1)]],
+            )),
+        );
+        app.query_tx.send(snapshot).unwrap();
+        app.poll_query_results();
+        assert!(app.tab.result.is_some(), "the current snapshot is drawn");
+        assert!(matches!(app.tab.status, TabStatus::Success { .. }));
+        assert!(
+            matches!(app.tab.execution, state::Execution::Live { generation: g, .. } if g == generation),
+            "{:?}",
+            app.tab.execution
+        );
+
+        // A live start answers the batch, aborts it, and its late result
+        // is dropped.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let mut answer = driver.execute(&mut app);
+        let batch_run = app.tab.execution.current().unwrap();
+        let batch = batch_abort_handle(&mut app);
+        app.handle_key(key(KeyCode::F(9)));
+        assert_answered_err(&mut answer, "replaced by live stream", "F9");
+        assert!(
+            matches!(app.tab.execution, state::Execution::Live { .. }),
+            "{:?}",
+            app.tab.execution
+        );
+        assert!(
+            matches!(app.tab.status, TabStatus::Idle),
+            "nothing is left running: {:?}",
+            app.tab.status
+        );
+        assert_finishes(&batch).await;
+        app.query_tx
+            .send(event(
+                batch_run,
+                Ok(make_query_response(
+                    vec!["x"],
+                    vec![vec![Value::Integer(1)]],
+                )),
+            ))
+            .unwrap();
+        app.poll_query_results();
+        assert!(
+            app.tab.result.is_none(),
+            "the batch's late rows are dropped"
+        );
+        assert!(
+            matches!(app.tab.execution, state::Execution::Live { .. }),
+            "{:?}",
+            app.tab.execution
+        );
+    }
+
+    /// A reply whose client left stops holding the tab.
+    #[tokio::test]
+    async fn driver_timeout_releases_ownership() {
+        // Busy stays busy while the client waits, and frees once it leaves.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let mut first = driver.execute(&mut app);
+        let first_generation = current_generation(&app);
+        let mut refused = driver.execute(&mut app);
+        assert_answered_err(
+            &mut refused,
+            "another execute is already pending",
+            "a second execute",
+        );
+        assert_unanswered(&mut first, "the first execute");
+        assert_eq!(current_generation(&app), first_generation);
+        drop(first);
+        let mut next = driver.execute(&mut app);
+        assert_unanswered(&mut next, "after the first client left");
+        assert_admitted(&app, "after the first client left");
+        assert_ne!(current_generation(&app), first_generation);
+
+        // An execute whose client left before admission runs nothing.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        drop(answer);
+        driver.send_execute(&mut app, reply);
+        assert!(
+            matches!(app.tab.execution, state::Execution::Idle),
+            "{:?}",
+            app.tab.execution
+        );
+        assert!(matches!(app.tab.status, TabStatus::Idle));
+
+        // A cancel whose answer has nowhere to go still ends the run.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        drop(driver.execute(&mut app));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(
+            matches!(app.tab.execution, state::Execution::Idle),
+            "{:?}",
+            app.tab.execution
+        );
+        let mut next = driver.execute(&mut app);
+        assert_unanswered(&mut next, "after the cancel");
+        assert_admitted(&app, "after the cancel");
+
+        // So does a result whose answer has nowhere to go, and it draws.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        drop(driver.execute(&mut app));
+        let result = tagged(
+            &app,
+            Ok(make_query_response(
+                vec!["x"],
+                vec![vec![Value::Integer(1)]],
+            )),
+        );
+        app.query_tx.send(result).unwrap();
+        app.poll_query_results();
+        assert!(
+            matches!(app.tab.execution, state::Execution::Idle),
+            "{:?}",
+            app.tab.execution
+        );
+        assert!(app.tab.result.is_some(), "the result is drawn");
+        let mut next = driver.execute(&mut app);
+        assert_unanswered(&mut next, "after the result");
+        assert_admitted(&app, "after the result");
+    }
+
+    /// Ctrl+C cancels a running query after a refused Ctrl+F replaced its
+    /// Running status, from the editor and from the results pane.
+    #[tokio::test]
+    async fn ctrl_c_cancels_after_format_refusal() {
+        for focus in [Focus::Editor, Focus::Results] {
+            let mut app = test_app();
+            app.tab.editor.insert_text("service=web");
+            app.handle_key(key(KeyCode::F(5)));
+            let in_flight = batch_abort_handle(&mut app);
+
+            app.tab.editor.clear();
+            app.tab.editor.insert_text(&too_long_to_format());
+            app.handle_key(key_mod(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            assert!(
+                matches!(&app.tab.status, TabStatus::Error { message, .. } if message.starts_with("not formatted: ")),
+                "{focus:?}: {:?}",
+                app.tab.status
+            );
+
+            app.focus = focus;
+            app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(
+                matches!(app.tab.execution, state::Execution::Idle),
+                "{focus:?}: {:?}",
+                app.tab.execution
+            );
+            assert_finishes(&in_flight).await;
+            assert!(
+                matches!(&app.tab.status, TabStatus::Error { message, .. } if message == "cancelled"),
+                "{focus:?}: {:?}",
+                app.tab.status
+            );
+        }
+    }
+
+    /// Ctrl+L and the palette's clear stop a live stream.
+    #[tokio::test]
+    async fn ctrl_l_stops_live() {
+        type Clear = fn(&mut App);
+        let cases: [(&str, Clear); 2] = [
+            ("Ctrl+L", |app| {
+                app.handle_key(key_mod(KeyCode::Char('l'), KeyModifiers::CONTROL));
+            }),
+            ("palette clear", palette_clear),
+        ];
+        for (case, clear) in cases {
+            let mut app = test_app();
+            run_live(&mut app);
+            let stream = live_abort_handle(&mut app);
+            clear(&mut app);
+            assert!(!app.live_mode, "{case}");
+            assert!(
+                matches!(app.tab.execution, state::Execution::Idle),
+                "{case}: {:?}",
+                app.tab.execution
+            );
+            assert_finishes(&stream).await;
+        }
+    }
+
+    /// Running an empty editor stops nothing and replaces nothing.
+    #[tokio::test]
+    async fn empty_run_replaces_nothing() {
+        // A live stream keeps going.
+        let mut app = test_app();
+        run_live(&mut app);
+        let generation = current_generation(&app);
+        app.tab.editor.clear();
+        app.handle_key(key(KeyCode::F(5)));
+        assert!(app.live_mode);
+        assert!(
+            matches!(app.tab.execution, state::Execution::Live { generation: g, .. } if g == generation),
+            "{:?}",
+            app.tab.execution
+        );
+
+        // A batch keeps going and keeps its driver client waiting.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let mut answer = driver.execute(&mut app);
+        let generation = current_generation(&app);
+        app.tab.editor.clear();
+        app.handle_key(key(KeyCode::F(5)));
+        assert_eq!(current_generation(&app), generation);
+        assert_unanswered(&mut answer, "after an empty F5");
+        assert_admitted(&app, "after an empty F5");
+
+        // An empty driver execute is refused and leaves the batch alone.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        app.handle_key(key(KeyCode::F(5)));
+        let generation = current_generation(&app);
+        app.tab.editor.clear();
+        let mut answer = driver.execute(&mut app);
+        assert_answered_err(&mut answer, "empty query", "an empty driver execute");
+        assert!(app.tab.execution.is_batch());
+        assert_eq!(current_generation(&app), generation);
+    }
+
+    /// Through a real driver socket, an execute that timed out does not
+    /// block the next one: the next is admitted, and answered when it ends.
+    #[tokio::test]
+    async fn driver_socket_timeout_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.sock");
+        let mut app = test_app();
+        app.driver_rx = Some(driver::spawn_listener(&path).unwrap());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        ensure_query(&mut app);
+        // The batch's own answer is never polled: only the driver ends it.
+        let execute = |timeout_ms| {
+            let path = path.clone();
+            tokio::spawn(async move {
+                driver::send_command(&path, &driver::DriverRequest::Execute { timeout_ms })
+                    .await
+                    .unwrap()
+            })
+        };
+        let bound = Duration::from_secs(10);
+
+        let first = execute(200);
+        tokio::time::timeout(bound, async {
+            while !first.is_finished() {
+                app.poll_driver_commands(&mut terminal);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first execute times out");
+        let response = first.await.unwrap();
+        assert!(!response.ok, "{response:?}");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("timeout waiting for response")
+        );
+        assert!(
+            app.tab.execution.is_batch(),
+            "the batch outlives its client"
+        );
+        let detached = current_generation(&app);
+
+        let second = execute(10_000);
+        tokio::time::timeout(bound, async {
+            while current_generation(&app) == detached && !second.is_finished() {
+                app.poll_driver_commands(&mut terminal);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the second execute reaches the app");
+        assert!(
+            !second.is_finished(),
+            "the second execute was admitted, not answered: {:?}",
+            second.await
+        );
+        assert!(app.tab.execution.reply_pending());
+        app.handle_key(key(KeyCode::Esc));
+        let response = tokio::time::timeout(bound, second)
+            .await
+            .expect("the cancel answers the second execute")
+            .unwrap();
+        assert!(!response.ok, "{response:?}");
+        assert_eq!(response.error.as_deref(), Some("cancelled"));
+    }
+
+    /// A saved query entry for the Saved-tab request tests.
+    fn saved_entry(id: i64, name: &str) -> SavedQueryResponse {
+        SavedQueryResponse {
+            id,
+            name: name.to_owned(),
+            query: format!("service={name}"),
+            created_at: String::new(),
+            updated_at: String::new(),
+            schedule: None,
+        }
+    }
+
+    /// A finished report run with the given id.
+    fn run_summary(id: i64) -> trawl_client::ReportRunSummary {
+        trawl_client::ReportRunSummary {
+            id,
+            query: "service=web".to_owned(),
+            status: "success".to_owned(),
+            started_at: "2026-03-14T03:00:00Z".to_owned(),
+            finished_at: None,
+            duration_ms: Some(5),
+            row_count: Some(1),
+            error_message: None,
+            result_path: None,
+            window_start: None,
+            window_end: None,
+            window_truncated: None,
+            window_kind: None,
+            origin: None,
+        }
+    }
+
+    /// An app on the Saved tab's list, holding saved queries X (id 1) and
+    /// Y (id 2) with X selected.
+    fn saved_xy_app() -> App {
+        let mut app = test_app();
+        app.saved_cache = Some(ListSavedResponse {
+            queries: vec![saved_entry(1, "X"), saved_entry(2, "Y")],
+        });
+        app.switch_to_main_tab(MainTab::Saved);
+        app
+    }
+
+    /// The token of the request the Saved detail waits on.
+    fn pending_token(app: &App) -> state::RequestToken {
+        app.panel
+            .saved_detail
+            .as_ref()
+            .and_then(|d| d.pending)
+            .expect("a Saved request is pending")
+    }
+
+    fn send_runs(app: &mut App, token: state::RequestToken, saved_id: i64, run_ids: &[i64]) {
+        app.mutation_tx
+            .send(MutationResult::RunsLoaded {
+                token,
+                saved_id,
+                outcome: Ok((
+                    run_ids.iter().copied().map(run_summary).collect(),
+                    run_ids.len(),
+                )),
+            })
+            .unwrap();
+        app.poll_mutations();
+    }
+
+    fn loaded_run_ids(app: &App) -> Vec<i64> {
+        app.panel
+            .saved_detail
+            .as_ref()
+            .map(|d| d.runs.iter().map(|r| r.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// A runs response completes only the request that is pending. These
+    /// tests never await, so the spawned fetches never run on the
+    /// current-thread runtime and only the injected responses arrive.
+    #[tokio::test]
+    async fn saved_detail_response_order() {
+        // X then Y, X's response first: X's is stale, Y's applies.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x = pending_token(&app);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let y = pending_token(&app);
+        assert_ne!(x, y);
+        send_runs(&mut app, x, 1, &[101]);
+        assert_eq!(pending_token(&app), y);
+        assert!(loaded_run_ids(&app).is_empty());
+        send_runs(&mut app, y, 2, &[201]);
+        let detail = app.panel.saved_detail.as_ref().unwrap();
+        assert_eq!((detail.saved_id, detail.pending), (2, None));
+        assert_eq!(loaded_run_ids(&app), [201]);
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
+
+        // X then Y, Y's response first: Y's applies, X's late one changes nothing.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x = pending_token(&app);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let y = pending_token(&app);
+        send_runs(&mut app, y, 2, &[201]);
+        let before = app.panel.saved_detail.clone();
+        send_runs(&mut app, x, 1, &[101]);
+        assert_eq!(app.panel.saved_detail, before);
+        assert_eq!(loaded_run_ids(&app), [201]);
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
+
+        // X, Y, X: the first X response names the same saved query as the
+        // third request, but it answers an older request. Arriving last,
+        // after the third request completed, it changes nothing.
+        let (mut app, x1, y, x3) = saved_xyx_app();
+        send_runs(&mut app, y, 2, &[201]);
+        send_runs(&mut app, x3, 1, &[103]);
+        let before = app.panel.saved_detail.clone();
+        send_runs(&mut app, x1, 1, &[101]);
+        assert_eq!(app.panel.saved_detail, before);
+        assert_eq!(loaded_run_ids(&app), [103]);
+        assert_eq!(pending_token_or_none(&app), None);
+
+        // X, Y, X again, with the first X response (here a failure) arriving
+        // while the third request is pending: it neither completes that
+        // request nor opens a popup.
+        let (mut app, x1, y, x3) = saved_xyx_app();
+        send_runs(&mut app, y, 2, &[201]);
+        app.mutation_tx
+            .send(MutationResult::RunsLoaded {
+                token: x1,
+                saved_id: 1,
+                outcome: Err("Failed to fetch runs: boom".to_owned()),
+            })
+            .unwrap();
+        app.poll_mutations();
+        assert!(app.popup.is_none(), "a stale runs failure opens no popup");
+        let detail = app.panel.saved_detail.as_ref().unwrap();
+        assert_eq!((detail.saved_id, detail.pending), (1, Some(x3)));
+        assert!(detail.runs.is_empty());
+        send_runs(&mut app, x3, 1, &[103]);
+        assert_eq!(loaded_run_ids(&app), [103]);
+        assert_eq!(pending_token_or_none(&app), None);
+
+        // A matching runs failure shows the error and closes the detail, so
+        // the pane never shows "no runs yet" for a list it could not load.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x = pending_token(&app);
+        app.mutation_tx
+            .send(MutationResult::RunsLoaded {
+                token: x,
+                saved_id: 1,
+                outcome: Err("Failed to fetch runs: boom".to_owned()),
+            })
+            .unwrap();
+        app.poll_mutations();
+        assert!(matches!(app.popup, Some(Popup::Error { .. })));
+        assert!(app.panel.saved_detail.is_none());
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::List);
+    }
+
+    /// Enter on X, Left, Down, Enter on Y, Left, Up, Enter on X: returns the
+    /// app with the third request pending and the three tokens in order.
+    fn saved_xyx_app() -> (
+        App,
+        state::RequestToken,
+        state::RequestToken,
+        state::RequestToken,
+    ) {
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x1 = pending_token(&app);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let y = pending_token(&app);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
+        let x3 = pending_token(&app);
+        assert_ne!(x1, x3);
+        (app, x1, y, x3)
+    }
+
+    fn pending_token_or_none(app: &App) -> Option<state::RequestToken> {
+        app.panel.saved_detail.as_ref().and_then(|d| d.pending)
+    }
+
+    fn send_result(
+        app: &mut App,
+        token: state::RequestToken,
+        saved_id: i64,
+        run_id: i64,
+        outcome: Result<trawl_api::value::QueryResult, String>,
+    ) {
+        app.mutation_tx
+            .send(MutationResult::RunResultLoaded {
+                token,
+                saved_id,
+                run_id,
+                outcome,
+            })
+            .unwrap();
+        app.poll_mutations();
+    }
+
+    /// One row of data, so a stale result that leaked in would be visible.
+    fn one_row_result() -> trawl_api::value::QueryResult {
+        make_query_response(vec!["count"], vec![vec![Value::Integer(7)]]).result
+    }
+
+    /// A run result applies only for the pending request. A stale success,
+    /// a stale zero-row success and a stale failure change nothing.
+    #[tokio::test]
+    async fn saved_run_result_response_order() {
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let runs = pending_token(&app);
+        send_runs(&mut app, runs, 1, &[101, 102]);
+
+        // Enter on run 101, then Down and Enter on run 102: 101's request is stale.
+        app.handle_key(key(KeyCode::Enter));
+        let first = pending_token(&app);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let second = pending_token(&app);
+        assert_ne!(first, second);
+
+        let before = app.panel.saved_detail.clone();
+        for stale in [
+            Ok(one_row_result()),
+            Ok(trawl_api::value::QueryResult::empty()),
+            Err("Failed to fetch run result: boom".to_owned()),
+        ] {
+            send_result(&mut app, first, 1, 101, stale);
+            assert_eq!(app.panel.saved_detail, before);
+            assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
+            assert!(app.popup.is_none(), "a stale response opens no popup");
+        }
+
+        // The matching failure shows the error and leaves nothing pending.
+        send_result(
+            &mut app,
+            second,
+            1,
+            102,
+            Err("Failed to fetch run result: boom".to_owned()),
+        );
+        assert!(matches!(app.popup, Some(Popup::Error { .. })));
+        assert_eq!(pending_token_or_none(&app), None);
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
+        app.popup = None;
+
+        // A fresh request for the same run applies and opens the result.
+        app.handle_key(key(KeyCode::Enter));
+        let third = pending_token(&app);
+        send_result(&mut app, third, 1, 102, Ok(one_row_result()));
+        let detail = app.panel.saved_detail.as_ref().unwrap();
+        assert_eq!(detail.pending, None);
+        assert_eq!(
+            detail.result,
+            Some(state::LoadedRun {
+                run_id: 102,
+                result: one_row_result(),
+            })
+        );
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::RunResults);
+    }
+
+    fn refresh_cache(app: &mut App, entries: Vec<SavedQueryResponse>) {
+        app.mutation_tx
+            .send(MutationResult::CacheRefreshed {
+                saved: ListSavedResponse { queries: entries },
+                select_name: None,
+            })
+            .unwrap();
+        app.poll_mutations();
+    }
+
+    fn mouse_at(kind: event::MouseEventKind, row: u16) -> event::MouseEvent {
+        event::MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Each way the Saved selection moves keeps the detail while it still
+    /// names the selected saved query and drops it otherwise. A dropped
+    /// detail ignores the response to its request; a kept one still applies it.
+    #[tokio::test]
+    async fn saved_navigation_invalidates_requests() {
+        use event::{MouseButton, MouseEventKind};
+        use state::SavedFocus;
+        /// Moves the Saved selection; gets the row of a list index.
+        type Action = fn(&mut App, &dyn Fn(u16) -> u16);
+
+        // The list's first row sits one line below the panel's top border.
+        let panel = ratatui::layout::Rect::new(0, 3, 80, 20);
+        let row_of = |index: u16| panel.y + 1 + index;
+
+        let dropped: [(&str, Action); 7] = [
+            ("Left", |app, _| app.handle_key(key(KeyCode::Left))),
+            ("Esc", |app, _| app.handle_key(key(KeyCode::Esc))),
+            ("click on Y", |app, row_of| {
+                app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), row_of(1)));
+            }),
+            ("wheel down", |app, row_of| {
+                app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, row_of(0)));
+            }),
+            ("delete of X", |app, _| {
+                refresh_cache(app, vec![saved_entry(2, "Y")]);
+            }),
+            ("empty cache", |app, _| refresh_cache(app, Vec::new())),
+            ("refresh that replaces X's id", |app, _| {
+                refresh_cache(app, vec![saved_entry(3, "X"), saved_entry(2, "Y")]);
+            }),
+        ];
+        for (name, action) in dropped {
+            let mut app = saved_xy_app();
+            app.layout.panel = Some(panel);
+            app.handle_key(key(KeyCode::Enter));
+            let x = pending_token(&app);
+            action(&mut app, &row_of);
+            assert!(app.panel.saved_detail.is_none(), "{name} drops the detail");
+            assert_eq!(app.panel.saved_focus, SavedFocus::List, "{name}");
+            let selected = app.panel.saved_selected;
+            send_runs(&mut app, x, 1, &[101]);
+            assert!(
+                app.panel.saved_detail.is_none(),
+                "{name}: late runs apply nothing"
+            );
+            assert_eq!(app.panel.saved_focus, SavedFocus::List, "{name}");
+            assert_eq!(app.panel.saved_selected, selected, "{name}");
+            assert!(app.popup.is_none(), "{name}");
+        }
+
+        let kept: [(&str, Action); 3] = [
+            ("tab switch", |app, _| app.handle_key(key(KeyCode::Tab))),
+            ("click on X", |app, row_of| {
+                app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), row_of(0)));
+            }),
+            ("cache reorder", |app, _| {
+                refresh_cache(app, vec![saved_entry(2, "Y"), saved_entry(1, "X")]);
+            }),
+        ];
+        for (name, action) in kept {
+            let mut app = saved_xy_app();
+            app.layout.panel = Some(panel);
+            app.handle_key(key(KeyCode::Enter));
+            let x = pending_token(&app);
+            action(&mut app, &row_of);
+            assert_eq!(
+                pending_token_or_none(&app),
+                Some(x),
+                "{name} keeps the detail"
+            );
+            let selected = &app.saved_cache.as_ref().unwrap().queries[app.panel.saved_selected];
+            assert_eq!(selected.id, 1, "{name} keeps X selected");
+            send_runs(&mut app, x, 1, &[101]);
+            assert_eq!(
+                loaded_run_ids(&app),
+                [101],
+                "{name}: the matching response applies"
+            );
+            assert_eq!(app.panel.saved_focus, SavedFocus::Detail, "{name}");
+        }
+
+        // A refresh that selects a new query by name moves off X and drops its detail.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        app.mutation_tx
+            .send(MutationResult::CacheRefreshed {
+                saved: ListSavedResponse {
+                    queries: vec![saved_entry(1, "X"), saved_entry(2, "Y")],
+                },
+                select_name: Some("Y".to_owned()),
+            })
+            .unwrap();
+        app.poll_mutations();
+        assert_eq!(app.panel.saved_selected, 1);
+        assert!(app.panel.saved_detail.is_none());
+    }
+
+    /// Render the app and return the screen text.
+    fn screen(app: &mut App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| ui::render(app, f)).unwrap();
+        terminal.backend().to_string()
+    }
+
+    /// A fresh app showing the same Saved tab state as `app`.
+    fn saved_view_copy(app: &App) -> App {
+        let mut copy = test_app();
+        copy.saved_cache.clone_from(&app.saved_cache);
+        copy.main_tab = app.main_tab;
+        copy.focus = app.focus;
+        copy.panel = app.panel.clone();
+        copy
+    }
+
+    /// Press `q` on a copy of the app and return the editor text it builds.
+    fn q_prefill(app: &App) -> String {
+        let mut probe = saved_view_copy(app);
+        probe.handle_key(key(KeyCode::Char('q')));
+        probe.tab.editor.text()
+    }
+
+    /// The header, the run-result title and `q` all name the saved query and
+    /// run the detail shows, not whatever row the list index now points at.
+    #[tokio::test]
+    async fn saved_header_and_q_share_identity() {
+        use handlers::saved_run_query;
+
+        // Detail view: X's runs, then a refresh that puts Y at X's old index.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x = pending_token(&app);
+        send_runs(&mut app, x, 1, &[101, 102]);
+        refresh_cache(&mut app, vec![saved_entry(2, "Y"), saved_entry(1, "X")]);
+        // A stale response for an older request changes nothing either.
+        send_runs(&mut app, x, 1, &[999]);
+        let text = screen(&mut app);
+        assert!(text.contains("query  service=X"), "{text}");
+        assert!(!text.contains("query  service=Y"), "{text}");
+        assert_eq!(q_prefill(&app), saved_run_query("X", Some(101)));
+
+        // `select_saved` keeps the list index on X, so point it at Y by hand:
+        // the header and `q` must not read the list index at all.
+        let mut probe = saved_view_copy(&app);
+        probe.panel.saved_selected = 0;
+        let text = screen(&mut probe);
+        assert!(text.contains("query  service=X"), "{text}");
+        assert_eq!(q_prefill(&probe), saved_run_query("X", Some(101)));
+
+        // Run-result view: Enter on run 101, Down to 102 before 101's result
+        // lands. The displayed run is 101, so the title and `q` say 101.
+        app.handle_key(key(KeyCode::Enter));
+        let first = pending_token(&app);
+        app.handle_key(key(KeyCode::Down));
+        send_result(&mut app, first, 1, 101, Ok(one_row_result()));
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::RunResults);
+        assert_eq!(app.panel.saved_detail.as_ref().unwrap().run_selected, 1);
+        refresh_cache(&mut app, vec![saved_entry(1, "X"), saved_entry(2, "Y")]);
+        send_result(&mut app, first, 1, 102, Ok(one_row_result()));
+        let text = screen(&mut app);
+        assert!(text.contains("Run #101"), "{text}");
+        assert!(!text.contains("Run #102"), "{text}");
+        assert_eq!(q_prefill(&app), saved_run_query("X", Some(101)));
     }
 }

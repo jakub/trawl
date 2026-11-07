@@ -1,5 +1,8 @@
-{{- if and .Values.crashDump.enabled (not .Values.persistence.enabled) -}}
-{{- fail "crashDump.enabled=true requires persistence.enabled=true so crash dumps and trawld data survive pod replacement; enable persistence.enabled or disable crashDump.enabled" -}}
+{{- /* ADR-0056 (amendment 2026-11-06): the data volume is the claim template
+     below, and trawld mounts it unconditionally. Without it the pod names
+     a volume nothing provides, so the chart refuses before anything else. */ -}}
+{{- if not .Values.persistence.enabled -}}
+{{- fail "persistence.enabled=false is unsupported: trawl requires its data PVC for persistent storage; set persistence.enabled=true" -}}
 {{- end }}
 {{- /* ADR-0016: the CSRF guard compares a browser's Origin against origins
      the operator states. There is no default worth having, so the chart
@@ -398,9 +401,7 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-  {{- if or .Values.persistence.enabled .Values.crashDump.enabled }}
   volumeClaimTemplates:
-    {{- if .Values.persistence.enabled }}
     - metadata:
         name: data
         labels:
@@ -414,7 +415,6 @@ spec:
         resources:
           requests:
             storage: {{ .Values.persistence.size }}
-    {{- end }}
     {{- if .Values.crashDump.enabled }}
     - metadata:
         name: cores
@@ -430,4 +430,3 @@ spec:
           requests:
             storage: {{ .Values.crashDump.size }}
     {{- end }}
-  {{- end }}

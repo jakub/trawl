@@ -147,6 +147,18 @@ pub struct ExecuteWaiter {
     pub reply: oneshot::Sender<DriverResponse>,
 }
 
+impl ExecuteWaiter {
+    /// The driver client stopped waiting (its request timed out).
+    pub fn is_closed(&self) -> bool {
+        self.reply.is_closed()
+    }
+
+    /// Answer the driver client. A client that already left is ignored.
+    pub fn answer(self, response: DriverResponse) {
+        let _ = self.reply.send(response);
+    }
+}
+
 impl std::fmt::Debug for ExecuteWaiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecuteWaiter").finish_non_exhaustive()
@@ -531,7 +543,14 @@ impl App {
     }
 
     fn handle_driver_execute(&mut self, reply: tokio::sync::oneshot::Sender<DriverResponse>) {
-        if self.driver_execute_waiter.is_some() {
+        // The client gave up before admission: run nothing.
+        if reply.is_closed() {
+            return;
+        }
+
+        // A batch whose client timed out holds a closed reply, which is not
+        // pending: this execute replaces that batch.
+        if self.active_tab().execution.reply_pending() {
             let _ = reply.send(DriverResponse::err("another execute is already pending"));
             return;
         }
@@ -541,10 +560,8 @@ impl App {
             return;
         }
 
-        self.driver_execute_waiter = Some(ExecuteWaiter { reply });
-
-        // Trigger query execution (same as F5 / ctrl+enter).
-        self.execute_query();
+        // Same run as F5 / ctrl+enter, answering this reply when it ends.
+        self.start_batch(Some(ExecuteWaiter { reply }));
     }
 
     fn handle_driver_capture<B: ratatui::backend::Backend>(

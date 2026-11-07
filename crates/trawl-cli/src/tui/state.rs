@@ -11,6 +11,8 @@ use ratatui::layout::Rect;
 use trawl_client::{PaginationMeta, QueryResponse};
 use trawl_engine::value::{Column, ColumnType, QueryResult, TypeFold, Value};
 
+use super::driver::ExecuteWaiter;
+
 /// Cached layout areas from the last render frame, used for mouse hit-testing.
 ///
 /// Rewritten by every draw, so a resize cannot leave hit-testing on a stale layout.
@@ -566,8 +568,22 @@ pub enum SavedFocus {
     RunResults,
 }
 
+/// Names one Saved-tab request, so its response completes only that request.
+///
+/// Two requests for the same saved query get different tokens: run history
+/// changes between them, so an older answer must not finish a newer request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestToken(u64);
+
+/// A run's result together with the run it belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedRun {
+    pub run_id: i64,
+    pub result: trawl_api::value::QueryResult,
+}
+
 /// State for the saved tab detail pane (right side).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SavedDetailState {
     /// ID of the saved query whose runs are loaded.
     pub saved_id: i64,
@@ -580,12 +596,13 @@ pub struct SavedDetailState {
     /// Scroll offset for the run list.
     #[allow(dead_code)] // The run list renderer centers on `run_selected` instead
     pub run_scroll: usize,
-    /// Loaded result data for viewing a specific run.
-    pub result: Option<trawl_api::value::QueryResult>,
+    /// The run result on display, tagged with its run.
+    pub result: Option<LoadedRun>,
     /// Scroll offset for result rows.
     pub result_scroll: usize,
-    /// Whether runs are currently being fetched.
-    pub loading: bool,
+    /// The runs or run-result request this detail waits on. Only a response
+    /// carrying this token applies.
+    pub pending: Option<RequestToken>,
 }
 
 /// Panel state for non-Query tabs (schema, history, saved).
@@ -601,6 +618,8 @@ pub struct PanelState {
     pub saved_focus: SavedFocus,
     /// Detail pane state for the selected saved query (runs + result).
     pub saved_detail: Option<SavedDetailState>,
+    /// Source of the next Saved-tab [`RequestToken`].
+    next_request: u64,
 }
 
 impl PanelState {
@@ -611,7 +630,14 @@ impl PanelState {
             saved_selected: 0,
             saved_focus: SavedFocus::default(),
             saved_detail: None,
+            next_request: 0,
         }
+    }
+
+    /// Mint a token no earlier Saved-tab request holds.
+    pub fn next_token(&mut self) -> RequestToken {
+        self.next_request += 1;
+        RequestToken(self.next_request)
     }
 }
 
@@ -1978,6 +2004,60 @@ impl LiveBuffer {
     }
 }
 
+/// Names one run on the query tab. Only the current run's events reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunGeneration(u64);
+
+/// Which kind of run sent a query event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunSource {
+    /// A one-shot query.
+    Batch,
+    /// A live tail stream.
+    Live,
+}
+
+/// The query tab's run, separate from the displayed [`TabStatus`]: a refused
+/// format replaces the status while the run is still in flight.
+#[derive(Debug, Default)]
+pub enum Execution {
+    /// Nothing runs.
+    #[default]
+    Idle,
+    /// A one-shot query, with the driver execute it answers (if any).
+    Batch {
+        generation: RunGeneration,
+        handle: tokio::task::JoinHandle<()>,
+        reply: Option<ExecuteWaiter>,
+    },
+    /// A live tail stream.
+    Live {
+        generation: RunGeneration,
+        handle: tokio::task::JoinHandle<()>,
+    },
+}
+
+impl Execution {
+    /// A one-shot query is running.
+    pub fn is_batch(&self) -> bool {
+        matches!(self, Self::Batch { .. })
+    }
+
+    /// The current run's generation and source, `None` when idle.
+    pub fn current(&self) -> Option<(RunGeneration, RunSource)> {
+        match self {
+            Self::Idle => None,
+            Self::Batch { generation, .. } => Some((*generation, RunSource::Batch)),
+            Self::Live { generation, .. } => Some((*generation, RunSource::Live)),
+        }
+    }
+
+    /// A batch holds a driver reply whose client still waits for it.
+    pub fn reply_pending(&self) -> bool {
+        matches!(self, Self::Batch { reply: Some(reply), .. } if !reply.is_closed())
+    }
+}
+
 /// The query tab state (editor + results).
 #[derive(Debug)]
 pub struct Tab {
@@ -1999,8 +2079,11 @@ pub struct Tab {
     pub last_visible_rows: usize,
     /// Column configuration (visibility, pinning, width overrides). Reset on new result.
     pub column_config: Option<ColumnConfig>,
-    /// Handle to the running query task (for cancellation).
-    pub query_task: Option<tokio::task::JoinHandle<()>>,
+    /// The tab's one run, batch or live. Only `App` starts and ends it.
+    pub execution: Execution,
+    /// Source of the next [`RunGeneration`]. [`Tab::clear`] keeps it, so a
+    /// generation never repeats on the tab.
+    next_run: u64,
     /// Real-time validation errors from local parsing (separate from execution errors).
     pub validation_errors: Vec<trawl_core::parser::ParseError>,
     /// Whether the editor has been modified since last validation.
@@ -2028,7 +2111,8 @@ impl Tab {
             selected_row: None,
             last_visible_rows: 15,
             column_config: None,
-            query_task: None,
+            execution: Execution::Idle,
+            next_run: 0,
             validation_errors: Vec::new(),
             validation_dirty: false,
             last_edit_time: None,
@@ -2037,7 +2121,8 @@ impl Tab {
         }
     }
 
-    /// Clear the editor and reset state.
+    /// Clear the editor and reset the display. The run is `App::clear_tab`'s
+    /// to end, so this leaves `execution` alone.
     pub fn clear(&mut self) {
         self.editor.clear();
         self.result = None;
@@ -2053,10 +2138,12 @@ impl Tab {
         self.last_edit_time = None;
         self.ghost = None;
         self.live_capped.clear();
-        // Abort any running query task.
-        if let Some(handle) = self.query_task.take() {
-            handle.abort();
-        }
+    }
+
+    /// Mint a generation no earlier run on this tab holds.
+    pub fn next_generation(&mut self) -> RunGeneration {
+        self.next_run += 1;
+        RunGeneration(self.next_run)
     }
 
     /// Mark the editor content as modified, triggering validation after debounce.

@@ -46,8 +46,7 @@ replaces anything at that path that is not a directory on the next boot.
 
 ### Enable capture on Helm
 
-1. Set `crashDump.enabled` on the release. `persistence.enabled` must already
-   be `true`, or the chart refuses to render. Set `TRAWL_IMAGE_TAG` to an
+1. Set `crashDump.enabled` on the release. Set `TRAWL_IMAGE_TAG` to an
    image built from the same revision as your chart checkout. Pass that tag
    explicitly when enabling or disabling capture.
 

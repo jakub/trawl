@@ -1,6 +1,6 @@
 # Retention and report windows: age is per-env policy, pressure is survival, the schedule owns its window
 
-status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class; amended (2026-10-23): the capture sweep without the scheduler
+status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class; amended (2026-10-23): the capture sweep without the scheduler; amended (2026-11-06): stale runs at boot, retention of terminal runs only, and a lifetime run budget
 
 Two parked halves of PR #58, one subject: who owns time. Retention is one
 install-wide `max_age_days`, so keeping `prod` a year forces keeping the
@@ -124,3 +124,23 @@ Two stores join retention with their own clocks, neither under the per-env age p
 ## Amendment: the capture sweep without the scheduler, 2026-10-23
 
 The hourly retention tick that sweeps captured results belongs to the scheduler, so an installation with `[scheduler] enabled = false` has none. There trawld runs the same sweep on a task of its own, every `[capture] ttl_secs` clamped to between one second and one hour. With the scheduler on, the retention tick sweeps and no second task runs. Either way, a read that finds a temporary capture past its deadline marks it expired and removes its file at once, the binding quota pass expires due captures before it counts usage, and boot expires the captures that came due while trawld was down.
+
+## Amendment: stale report runs are marked at boot, 2026-11-06
+
+A run that was `running` when trawld stopped never finishes. Until now only the scheduler task marked such runs, so with `[scheduler] enabled = false` the row stayed `running` and every manual run on that schedule was refused as "already in progress" (#349). Boot now marks them, whatever `[scheduler] enabled` says: `boot::prepare_corpus` sets every `running` report run to `error` with the message `interrupted by server restart`, beside the investigation steps it already interrupts, on ingest and query-only nodes alike. The advisory lock is held by then, so no live sibling owns those rows.
+
+Boot is the only place that marks stale runs. The scheduler loop no longer does it: its cleanup ran on a spawned task after the listener could already accept a manual run, and it could mark that fresh run `error` and free the schedule for a second claim while the first still executed. A failure to mark them stops the boot, like a failure to interrupt the steps. A daemon that cannot prove its schedules are free must not accept claims on them. Marking leaves the watermark and the fire cursor where they are, as any failed run does (ruling 9).
+
+## Amendment: retention deletes only finished runs, 2026-11-06
+
+Report-run retention deletes only terminal runs: `success`, `error` and `timeout`. A `running` row is never deleted by age and never counted or deleted as excess, so retention cannot free a schedule's one running slot while its run executes (#350). The per-schedule ranking orders terminal runs by `started_at DESC, id DESC`, so `max_runs_per_schedule` keeps that many terminal runs and a running row beside them costs nothing.
+
+Both knobs must be at least 1. `report_retention_days = 0` and `max_runs_per_schedule = 0` stop the boot with a configuration error naming the key, rather than meaning "keep none". `report_retention_days` is at most 36500, about 100 years: the cutoff is a date the scheduler must compute, and a larger value used to clamp silently to 365 days or panic the scheduler task. `max_runs_per_schedule` has no upper bound, because a count needs no date arithmetic.
+
+## Amendment: `max_runs` is a lifetime budget, 2026-11-06
+
+`max_runs` counts the runs a schedule has claimed over its life, not the runs retention has kept (#351). Counting retained rows let retention refill the budget: a daily schedule with `max_runs = 60` under the 30-day default never stopped. The schedule now stores `runs_claimed`, and every claim, scheduled or manual, increments it in the same transaction that inserts the run, only while `max_runs` is absent or `runs_claimed < max_runs`. A claim that fails to insert rolls the increment back. A claimed run that later fails, times out or is interrupted keeps its claim. There are no refunds.
+
+Editing a schedule keeps `runs_claimed`. Raising `max_runs` lets the schedule claim again; lowering it below `runs_claimed` refuses new claims and leaves a running run to finish. Only deleting the schedule and creating a new one starts a new budget. A schedule is exhausted when `max_runs` is set and `runs_claimed >= max_runs`. Exhausted is derived from those two values and is never stored. `max_runs = 0` stays legal and makes a schedule exhausted from the start. The API reports `runs_claimed` as the schedule's `total_runs` and adds `exhausted`. Counts that describe kept runs, such as the run statistics and the run list's total, stay retained counts and say so.
+
+The upgrade seeds `runs_claimed` from the runs each schedule still has. That is a lower bound: a schedule whose older runs retention already deleted may claim up to its cap again before it stops. History that retention deleted cannot be counted. Seeding every capped schedule as spent would also stop schedules that never reached their cap, so the seed is only what the kept rows prove.

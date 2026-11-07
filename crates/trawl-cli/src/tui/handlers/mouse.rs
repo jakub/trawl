@@ -259,7 +259,7 @@ impl App {
                 }
                 let relative = (row - content_start_y) as usize;
                 if relative < item_count {
-                    self.panel.saved_selected = relative;
+                    self.select_saved(relative);
                 }
             }
             // Dashboard and Query don't have clickable panel lists.
@@ -350,8 +350,7 @@ impl App {
                     .saved_cache
                     .as_ref()
                     .map_or(0, |s| s.queries.len().saturating_sub(1));
-                self.panel.saved_selected =
-                    apply_scroll_delta(self.panel.saved_selected, delta, max);
+                self.select_saved(apply_scroll_delta(self.panel.saved_selected, delta, max));
             }
             _ => {}
         }

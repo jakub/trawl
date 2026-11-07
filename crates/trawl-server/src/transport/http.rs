@@ -60,7 +60,7 @@ use crate::investigations::routes as investigations;
 use crate::policy::{normalize_auth_errors, require_trawl_grant};
 use crate::rate_limit::{RateLimitState, rate_limit_middleware};
 use crate::results::routes;
-use crate::shutdown::{ShutdownRx, shutdown_observed, shutdown_signal};
+use crate::shutdown::{ACCEPT_ERROR_BACKOFF, ShutdownRx, shutdown_observed, shutdown_signal};
 use crate::state::{AppState, HttpConfig};
 use crate::tls;
 
@@ -759,12 +759,6 @@ fn adopt_listener(
     tracing::info!(event_type = "lifecycle", addr = %local_addr, "HTTPS server listening");
     Ok(listener)
 }
-
-/// How long the accept loop waits after a failed `accept()` before it
-/// accepts again. Long enough that a process out of file descriptors does
-/// not spin on the error; short enough that it serves again soon after
-/// descriptors free up.
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The listener the accept loop reads.
 ///

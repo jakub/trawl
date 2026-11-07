@@ -651,3 +651,75 @@ three UI forks:
    button is hidden and the footer shows the equivalent
    `trawl schema repin … --dry-run` command line, matching the CLI
    rendering. No disabled affordances.
+
+## Amendment (2026-11-06): one repin lifecycle at a time, held in process (#345)
+
+The `repin_jobs_one_running` index frees its slot when the row turns
+terminal. On the success path that happens inside `finish_cutover`, before
+the job's task sweeps its staging roots, drops its rollup pause and disarms
+the cancel registry. A second job could claim in that window. Both jobs
+use the same fixed staging paths, so the first job's sweep could delete
+the second job's shadow and marker. `swap_envs` reads an absent shadow as
+a finished swap, so the second job could then flip the pin over a corpus
+it never rewrote. These rulings close the window.
+
+1. **One repin permit per engine.** The engine owns one exclusive,
+   in-process repin permit. Every repin request, dry runs included, tries
+   to take it before `claim_job`, on both entry paths (`start` and
+   `start_within`). A request that cannot take it is refused at once. It
+   does not wait.
+
+2. **The permit lasts as long as the job's work.** The spawned task that
+   owns the job holds the permit, not the handler future. It covers the
+   scan, the panic settlement and disarm in `run_request`, `run_job`, the
+   post-swap sweep, the rollup pause drop and the end of the `JobGuard`.
+   Release is the last act, and a guard performs it so that an unwind
+   releases it too. Blocking work keeps the permit until the blocking
+   closure returns. A `spawn_blocking` task outlives a cancelled waiter,
+   so a staging step must not sit behind a timeout that releases the
+   permit while the closure still runs.
+
+3. **In-process is sound here.** The overlap is between two jobs in one
+   process: the second claim can land only while the first job's task is
+   alive. trawld builds one `RepinEngine`, and boot recovery finishes
+   before the engine exists, so after a restart no earlier job's task can
+   be running. The database index still decides one-running across
+   restarts and remains the record. The permit covers the part of the
+   lifecycle the row cannot see. Two trawld processes on one data root
+   stay out of scope, as they are for the corpus gate and the publication
+   gate (ADR-0026).
+
+4. **Admission is three checks, in order.** First the permit. Then, under
+   the permit, no leftover staging evidence: `in_flight_evidence` must
+   read `None` (no marker, no shadow root, no aside root). Then the
+   database claim. A refusal at any check writes nothing: no job row, no
+   rollup pause, no cancel arm, no marker.
+
+5. **The refusals.** Each is a fixed message with no paths.
+   - Permit held: 409, the previous repin is still running or still
+     cleaning up its staging. Retry when it finishes.
+   - A marker remains: 409 naming the marker's job id and phase. Remedy:
+     fix the cause the logs report (`repin_sweep_failed`,
+     `repin_marker_error`), then restart trawld. Boot replays the
+     marker's cleanup. `trawld --doctor` shows the marker under
+     `server.recovery.repin`.
+   - A staging root remains with no marker: 409 naming the root. Boot
+     sweeps a marker-less shadow, so a restart clears it. Boot never
+     deletes a marker-less aside, so the operator removes it by hand.
+   - `in_flight_evidence` fails: 503 with a fixed message. Unreadable
+     evidence is evidence, as pin gc already rules.
+
+6. **A live job no longer inherits leftovers.** Before this amendment a
+   job adopted an earlier job's failed sweep: `sweep_pre_swap_staging`
+   called the standing marker "the last license" to delete a leftover
+   aside, and `free_aside_slot` parked the new outgoing generation beside
+   one. Ruling 4 means a live job starts only on clean staging, so both
+   behaviours now serve the boot marker replay alone. The human chose this
+   gate over inheritance. A cleanup that keeps failing therefore blocks
+   repins until a restart replays it, but retention is already stalled by
+   the same leftover, so the gate adds no new kind of stall.
+
+Rejected: keeping the database slot through the sweep, because the row
+would need a non-terminal state after the pin flip, which ADR-0022 rulings
+1 and 4 forbid. Rejected: per-job staging paths, because every recovery
+path, `in_flight_evidence`, retention and pin gc assume the fixed ones.

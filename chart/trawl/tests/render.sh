@@ -200,14 +200,41 @@ assert_name_count 2 data "$enabled"
 assert_name_count 2 cores "$enabled"
 assert_claim_template cores test-cores 3Gi "$enabled"
 
-invalid_stdout="$work_dir/invalid.yaml"
-invalid_stderr="$work_dir/invalid.err"
-if render --set persistence.enabled=false --set crashDump.enabled=true \
-  >"$invalid_stdout" 2>"$invalid_stderr"; then
-  echo "expected crashDump.enabled=true with persistence.enabled=false to fail" >&2
-  exit 1
-fi
-grep -Fq 'crashDump.enabled=true requires persistence.enabled=true' "$invalid_stderr"
+data_claim="$work_dir/data-claim.yaml"
+render --set persistence.enabled=true --set persistence.storageClass=test-data \
+  --set persistence.size=7Gi >"$data_claim"
+assert_name_count 2 data "$data_claim"
+assert_claim_template data test-data 7Gi "$data_claim"
+
+# persistence.enabled is required (ADR-0056, amendment 2026-11-06): the data
+# claim template is unconditional, so `false` and a removed key (`null`) are
+# refused before any other check. Every cell of web x crashDump x tls.mode
+# refuses, and every accepted cell wires each `data` mount to the one claim.
+for web_cell in off on; do
+  for crash_cell in off on; do
+    for tls_cell in auto secret certManager; do
+      cell=(--set "crashDump.enabled=$([[ $crash_cell == on ]] && echo true || echo false)")
+      [[ $web_cell == on ]] && cell+=("${web_enabled[@]}")
+      case $tls_cell in
+        secret) cell+=(--set tls.mode=secret --set tls.secretName=matrix-tls \
+          --set tls.upstreamServerName=api.example.com --set tls.upstreamCa=secret) ;;
+        certManager) cell+=(--set tls.mode=certManager --set tls.certManager.issuerRef.name=matrix-ca \
+          --set 'tls.certManager.dnsNames[0]=api.example.com' --set tls.upstreamCa=secret) ;;
+      esac
+      for refused in false null; do
+        label="persistence.enabled=${refused} (web ${web_cell}, crashDump ${crash_cell}, tls ${tls_cell})"
+        assert_render_fails "$label" 'persistence.enabled=false is unsupported' \
+          render --set "persistence.enabled=${refused}" "${cell[@]}"
+        if grep -Fq 'crashDump.enabled=true requires persistence.enabled=true' "$work_dir/fail.err"; then
+          echo "expected ${label} not to name the old crashDump message, got:" >&2
+          cat "$work_dir/fail.err" >&2
+          exit 1
+        fi
+      done
+      python3 "$chart/tests/data_wiring.py" --set persistence.enabled=true "${cell[@]}"
+    done
+  done
+done
 
 disabled="$work_dir/disabled.yaml"
 render --set persistence.enabled=true --set crashDump.enabled=false >"$disabled"
@@ -571,6 +598,7 @@ python3 "$chart/tests/tls.py"
 python3 "$chart/tests/pod_security.py"
 python3 "$chart/tests/query_scratch.py"
 python3 "$chart/tests/results_dir.py"
+python3 "$chart/tests/wal_dir.py"
 python3 "$chart/tests/link_origin.py"
 python3 "$chart/tests/operational-alerts.py"
 

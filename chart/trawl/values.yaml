@@ -74,6 +74,8 @@ httpRoute:
 # -- Persistent storage
 # Single PVC for parquet data, WAL, the transitional app-state store, and
 # auto-generated TLS certs.
+# Must be true. The render fails when it is false or removed, because trawld
+# mounts this volume unconditionally.
 persistence:
   enabled: true
   storageClass: ""
@@ -109,8 +111,6 @@ persistence:
 # The dump PVC is separate from the data PVC, so dumps stay out of data backups
 # and survive container restarts, pod reschedules, and node reboots. Off by
 # default.
-# Requires persistence.enabled=true; rendering fails instead of silently using
-# pod-local storage when crash dumps are enabled without persistent data.
 #
 # trawld reads the contract below from the environment:
 #   TRAWL_CRASH_DUMP_DIR    <- mountPath
@@ -214,6 +214,9 @@ config:
       ingestRpm: 1000
 
   data:
+    # Must be /var/lib/trawl or a path below it, with no .. component, so the
+    # Parquet files land on the data volume. With crashDump.enabled it must
+    # not be at or below crashDump.mountPath. Any other value fails the render.
     path: "/var/lib/trawl/data"
 
   auth:
@@ -222,7 +225,13 @@ config:
   ingest:
     enabled: true
     maxBodyBytes: "16M"
-    # Defaults to {data.path}/wal when empty.
+    # Defaults to {data.path}/wal when empty. A value must be an absolute
+    # path below /var/lib/trawl with no .. component, and renders cleaned.
+    # The render fails when the WAL would sit off the data volume, or at,
+    # under or above the query scratch directory, the results root or an
+    # enabled crashDump.mountPath, or at or under the repin roots
+    # <data.path>.repin-next and <data.path>.repin-aside, which repin
+    # deletes. These checks hold with ingest off.
     walDir: ""
     compactionIntervalSecs: 10
     # DuckDB memory_limit of each compaction, rollup, conform and repin

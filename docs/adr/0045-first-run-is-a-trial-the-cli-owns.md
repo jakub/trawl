@@ -1,6 +1,6 @@
 # First run is a trial the CLI owns; an installation starts fresh
 
-status: accepted (2026-09-25), prep record for #203; amended (2026-09-25, 2026-09-27) during the #203 run, and by ADR-0048 (2026-09-28), see the Amendments
+status: accepted (2026-09-25), prep record for #203; amended (2026-09-25, 2026-09-27) during the #203 run, by ADR-0048 (2026-09-28), and (2026-11-06) by the prep record for #354, see the Amendments
 
 Before a first query, an evaluator needs five executables, PostgreSQL with two databases, two roles, two keys, a certificate, and a hand-written config. No install channel creates a key. A fresh `apt install` starts `trawld` against placeholder database URLs, and systemd restarts it every five seconds. This record adds a **trial**: a disposable installation that the `trawl` CLI creates, runs, and deletes on one Linux machine. It also makes the Debian package install without starting anything.
 
@@ -9,6 +9,7 @@ Before a first query, an evaluator needs five executables, PostgreSQL with two d
 **The CLI owns the trial.** `trawl trial` has five verbs: `up`, `status`, `key`, `stop`, and `down`. `up` renders a Compose project into the trial directory and runs it with the published image `ghcr.io/jakub/trawl:<CLI version>` and `postgres:18`. It creates the databases, applies the Fleet schema, mints the keys, starts `trawld` and `trawl-web`, loads sample data, and prints the browser and API addresses. A Compose bundle alone cannot mint a key or hand it to the user. fleet-dev (ADR-0010) is a development controller that needs a source checkout. The CLI already ships everywhere a client runs.
 
 **One trial per Docker engine, and the trial acts only on what it labels.** The Compose project is `trawl-trial`. Every container, network, and volume carries the trial's random id. The trial refuses to act on a resource with a different id, refuses a remote Docker context, and never adopts a listener that already holds its port. `up` resumes an existing trial without new keys or new samples, and refuses to resume on an image digest other than the one it recorded. `down` lists what it will delete and asks for confirmation, or takes `--yes`. It then deletes the containers, volumes, network, and trial directory. Nothing restarts at boot.
+*Amended 2026-11-06 ([an unfinished teardown blocks `up`](#amendment-an-unfinished-teardown-blocks-up-2026-11-06)): `down` writes a teardown marker before its first deletion and removes it last. `up` refuses while the marker exists, and refuses to resume a trial whose volumes are gone.*
 
 **Loopback only.** The API listens on `127.0.0.1:15514` and the browser UI on `127.0.0.1:18090`. PostgreSQL has no published port, and syslog is off. The browser origins are `http://localhost:18090` and `http://127.0.0.1:18090`. Insecure cookies are allowed because the browser leg is plain HTTP on loopback. Other local processes can reach both ports, and the host's root and Docker administrators can read every secret. The trial does not protect against them.
 
@@ -66,3 +67,23 @@ The Decision names the image `ghcr.io/jakub/trawl:<CLI version>`. The release wo
 ## Amendment: the loopback switch is removed, 2026-09-28
 
 [ADR-0048](0048-trawl-web-always-verifies-trawld.md) removes `TRAWL_WEB_INSECURE_UPSTREAM`. The Helm chart pins trawld's certificate in every TLS mode, so no channel skips verification. `trawl-web` now starts before the pinned certificate exists and loads it when trawld writes it, so the Debian unit no longer restarts every 5 seconds before trawld's first start.
+
+## Amendment: an unfinished teardown blocks `up`, 2026-11-06
+
+The Decision says `down` deletes the containers, volumes, network, and trial directory. It deletes them one step at a time and records no progress. When `down` is interrupted or fails after `volume rm`, `state.json` still records every phase as done. The next `up` trusts the database phase and starts PostgreSQL over a new, empty volume that holds no superuser password file. PostgreSQL exits, and every rerun of `up` fails the same way with a plain Docker error (#354). The prep for #354 decided the rulings below. No human fork arose.
+
+1. **`down` writes a teardown marker.** The marker is `$XDG_STATE_HOME/trawl/trial.teardown`, beside the trial directory and `trial.lock`, outside the directory that `down` deletes. `down` writes it under the lifecycle lock, after the approval, the engine check, and the ownership scan, and before the first Docker deletion. The write is atomic and durable, at mode `0600`. The marker holds the trial id, and the engine id when the state records one. If the write fails, `down` deletes nothing. A declined approval writes no marker.
+2. **`down` removes the marker last.** It removes the marker only after the Docker deletions and the directory removal succeed, and after the directory removal is synced to disk. An interruption at any earlier point leaves the marker.
+3. **`up` refuses an unfinished teardown.** `up` checks for the marker before it reads the state, and while the marker exists it refuses and changes nothing. The message tells the user to run `trawl trial down` to finish the deletion, then `trawl trial up` to create a new trial. `status` reports the marker. `stop` ignores it.
+4. **`up` refuses to resume over missing volumes.** After it settles one-off containers, `up` checks the labelled inventory. When the state records the database phase or any later step, the three volumes `postgres`, `trawld`, and `web` must each exist with this trial's id. A state that records no step may have missing volumes. If the inventory or a probe fails, `up` reports an error and never reads the failure as a missing volume.
+5. **Refusal, not repair.** `up` never resets a phase, mints a key again, or posts the samples again to work around missing storage. The remedy is `down`, then `up`. A trial is disposable, so a fresh one loses nothing that the user needs to keep.
+6. **`down` always finishes.** `down` keeps the permissive `DownView` reader and deletes by the trial id that the state records. It uses the marker's trial id only when `state.json` is gone. It never refuses because the marker and the state name different ids: that refusal would block the only command that recovers the trial, and the trial id label already keeps another trial's resources safe. The engine check stays. When the marker exists and the trial directory does not, `down` says that it is finishing an interrupted teardown and removes the marker, where it used to report that there is no trial.
+7. **Limits.** Volume presence is the only storage check. A volume that an earlier failing `up` already recreated empty passes it, and the user runs `down` once by hand. A volume replaced under the same name, or a corrupt one, is out of scope. The lifecycle lock serializes `trawl trial` commands only, not other Docker administration on the engine.
+8. **An older CLI ignores the marker.** To downgrade the CLI, run `trawl trial down` to completion first. Trial data needs no backup.
+
+Considered and rejected:
+
+- **Reset the phases and repair on `up`.** A repair has to mint the keys again and post the samples again over a recorded intent, and `up` has neither path today. `down`, then `up`, reaches the same fresh trial through code that exists.
+- **A teardown phase inside `state.json`.** `TrialState` denies unknown fields, so an older CLI would refuse the whole file. The directory removal also deletes the file before the teardown ends.
+- **A marker inside the trial directory.** The directory removal deletes it before the removal finishes, so it cannot be the last thing removed.
+- **Refuse `down` when the marker and the state disagree.** It leaves the user with no command that recovers the trial.

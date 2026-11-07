@@ -5,10 +5,12 @@
 //! Scheduler-owned report windows, end to end (ADR-0018 rulings 6-14).
 //!
 //! Real postgres, real `DuckDB`, real fleet keystore, and an injected clock:
-//! every test drives `poll_and_execute` with explicit instants instead of
-//! waiting for them. Coverage is a claim about hours, so a wall-clock test
-//! could only prove the parts that fit inside a few seconds — which is
-//! none of the interesting ones.
+//! every window test drives `poll_and_execute` with explicit instants
+//! instead of waiting for them. Coverage is a claim about hours, so a
+//! wall-clock test could only prove the parts that fit inside a few
+//! seconds — which is none of the interesting ones. One test spawns the
+//! real loop instead, over the shared server fixture, to prove its start
+//! leaves a fresh manual claim alone.
 //!
 //! The fixture is one service (`fx`) whose events sit on and around the
 //! window boundaries: the instant T0 itself, one microsecond either side
@@ -968,4 +970,151 @@ async fn readable_name_rename_preserves_legacy_and_new_run_paths() {
         assert!(!h.run_rows(run).is_empty());
     }
     assert!(runs.iter().skip(1).any(|run| run.result_path.is_some()));
+}
+
+// ---------------------------------------------------------------------------
+// the real loop's start
+// ---------------------------------------------------------------------------
+
+/// Wait under the hang guard until `ready` holds, polling every 20 ms.
+async fn until<F, Fut>(what: &str, mut ready: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + trawl_server::test_timing::HANG_GUARD;
+    while !ready().await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: not within the hang guard"
+        );
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+    }
+}
+
+/// Every run of `saved_id` as `(id, status, finished_at set, error_message)`.
+async fn runs_of(db: &PgPool, saved_id: i64) -> Vec<(i64, String, bool, Option<String>)> {
+    sqlx::query_as(
+        "SELECT id, status, finished_at IS NOT NULL, error_message
+         FROM report_runs WHERE saved_query_id = $1 ORDER BY id",
+    )
+    .bind(saved_id)
+    .fetch_all(db)
+    .await
+    .unwrap()
+}
+
+/// Starting the scheduler cannot interrupt a fresh claim: a manual run
+/// claimed after boot, whose work is parked at `Seam::Started`, stays
+/// `running` through the loop's first complete iteration, and then
+/// finishes `success`.
+///
+/// The real loop runs, over the shared fixture that boots through
+/// `boot::prepare_corpus`. The target net A fires a day out, so the loop
+/// never claims it. The sentinel net B is created after A and is due, and
+/// `list_enabled_schedules` orders by id, so B getting its run shows the
+/// iteration's claim pass reached past A. Stopping and joining the loop is
+/// the barrier that the iteration finished. The default poll interval
+/// keeps report-run retention out of the first iteration.
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduler_start_keeps_a_fresh_manual_claim() {
+    let server = common::setup().await;
+    let key_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let storage = &server.state.storage;
+    let now = Utc::now();
+    let target = storage
+        .saved
+        .create(
+            key_id,
+            "fresh_manual_target",
+            "service=nginx | stats count()",
+        )
+        .await
+        .unwrap();
+    storage
+        .schedule
+        .create_schedule(
+            target.id,
+            key_id,
+            3600,
+            None,
+            None,
+            0,
+            now + Duration::days(1),
+        )
+        .await
+        .unwrap();
+    let sentinel = storage
+        .saved
+        .create(key_id, "due_sentinel", "service=nginx | stats count()")
+        .await
+        .unwrap();
+    storage
+        .schedule
+        .create_schedule(sentinel.id, key_id, 3600, None, None, 0, now)
+        .await
+        .unwrap();
+    let db = common::fixture_pool(&server.app_db_url, 1).await;
+
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(trawl_server::pool::seam::Seam::Started);
+    let manual = trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token)
+        .unwrap()
+        .trigger_run(target.id)
+        .await
+        .expect("the manual run is accepted");
+    until("the manual run's work started", || async {
+        started.arrivals() >= 1
+    })
+    .await;
+    assert_eq!(
+        runs_of(&db, target.id).await,
+        [(manual.id, "running".to_owned(), false, None)]
+    );
+
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let scheduler = trawl_server::scheduler::spawn_scheduler(
+        storage.schedule.clone(),
+        KeyStore::from_pool(server.fleet_pool.clone()),
+        server.state.query.pool.clone(),
+        std::sync::Arc::clone(&server.state.results),
+        SchedulerConfig::default(),
+        common::DEFAULT_TEST_TIMEOUT_SECS,
+        stopped,
+    );
+    until("the loop claimed the due sentinel", || async {
+        !runs_of(&db, sentinel.id).await.is_empty()
+    })
+    .await;
+    stop.send(true).unwrap();
+    tokio::time::timeout(trawl_server::test_timing::HANG_GUARD, scheduler)
+        .await
+        .expect("the scheduler loop stops")
+        .expect("the scheduler loop did not panic");
+
+    assert_eq!(
+        runs_of(&db, target.id).await,
+        [(manual.id, "running".to_owned(), false, None)],
+        "the loop's first iteration left the fresh claim alone"
+    );
+
+    started.release();
+    until("the manual run finished", || async {
+        runs_of(&db, target.id).await[0].1 != "running"
+    })
+    .await;
+    assert_eq!(
+        runs_of(&db, target.id).await,
+        [(manual.id, "success".to_owned(), true, None)]
+    );
+    until("the sentinel's run finished", || async {
+        runs_of(&db, sentinel.id)
+            .await
+            .iter()
+            .all(|run| run.1 != "running")
+    })
+    .await;
+    let sentinel_runs = runs_of(&db, sentinel.id).await;
+    assert_eq!(sentinel_runs.len(), 1, "{sentinel_runs:?}");
+    assert_eq!(sentinel_runs[0].1, "success", "{sentinel_runs:?}");
 }

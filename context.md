@@ -28,6 +28,10 @@ _Avoid_: instance, deployment, server (when the whole is meant)
 A disposable installation that one person's CLI creates, owns, and deletes on one machine, reachable only through loopback. A trial is never promoted. A durable installation always starts fresh.
 _Avoid_: demo, sandbox, quickstart, dev stack (that is fleet-dev's)
 
+**Teardown marker**:
+The file `trial.teardown` that `trawl trial down` writes beside the trial directory before its first deletion and removes after everything else. While it exists, the trial's teardown is unfinished: `up` refuses, and `down` finishes the teardown.
+_Avoid_: tombstone, lock (that is `trial.lock`), phase (phases live in `state.json`)
+
 **Doctor**:
 A read-only diagnosis run from one vantage: the server host, the web proxy's host, or a client holding a key. It reports each named check as proven, disproven, not configured, or not sampled, and it never repairs, initializes, or writes what it inspects. Distinct from `fleet-dev doctor`, which checks a developer's machine.
 _Avoid_: health check (that is the endpoint), preflight, self-test
@@ -95,6 +99,10 @@ _Avoid_: lockfile, flag file
 **Publication marker**:
 The durable record of one compaction publishing its WAL batches into a parquet file: which WAL files it consumes and which output it installs. While it exists, recovery decides from it whether the publish happened, and nothing else may compact, hydrate, retire or delete the files it names.
 _Avoid_: lock, journal entry
+
+**Rollup marker**:
+The durable record of one daily rollup replacing a service's hourly files in one day directory with its daily file. It records the identity of the replacement, of each input hourly file, and of the daily file the merge folds in, if any. While it exists, reads refuse as `rollup_pending`, and recovery decides from those identities whether to finish the rollup, abort it, or stop for an operator. Distinct from a publication marker, which brackets one compaction publish from the WAL into an hourly file.
+_Avoid_: rollup lock, journal entry, publication marker (that is compaction's)
 
 **Batch identity**:
 The name of one ingest batch: its environment and its WAL file name without the extension. The WAL, the hot buffer, publication markers and compaction all refer to the batch by it.
@@ -170,6 +178,10 @@ _Avoid_: migration, retype (as a noun)
 The repin rewrite's recovery of shelved values: re-extracting the original from `_raw` under the same lossless guard, so data a bad pin shelved returns under the new type.
 _Avoid_: backfill, recovery (too generic)
 
+**Repin permit**:
+The in-process right to run one repin job, from before its claim to after its last staging deletion. trawld has one. A repin request that cannot take it is refused, not queued. The job row says whether a job is running; the permit says whether its work has ended.
+_Avoid_: lock, mutex, tenure, slot (that is the job row's one-running index), permit alone (that is the executor pool)
+
 ### Query
 
 **Pin snapshot**:
@@ -177,7 +189,7 @@ The full catalog pin set, taken once and used consistently for one query — or 
 _Avoid_: snapshot (unqualified)
 
 **Lane**:
-One of the four evaluators that can answer a query: batch SQL, the live stream (SSE), the kv batch tail, and embedded `--data`. "All four lanes" means literally all four; when embedded is excluded (it has no catalog), say "the three pinned lanes".
+One of the four evaluators that can answer a query: batch SQL, the live stream (SSE), the kv batch tail, and embedded `--data`. "All four lanes" means literally all four; when embedded is excluded (it has no catalog), say "the three pinned lanes". The kv batch tail runs stages in the order the query writes them. A `sort` or a `dedup` with fields there is a barrier: it reads its whole input before the next stage sees a row (ADR-0064).
 _Avoid_: path, mode
 
 **Corpus read**:
@@ -309,6 +321,10 @@ _Avoid_: delay, grace period, offset
 **Manual run**:
 A run a person starts on a scheduled net outside its cadence: the schedule's next window, fired early. Its success moves coverage and stands in for any scheduled run already overdue; its failure changes nothing.
 _Avoid_: trigger run, ad-hoc run (that is a search), side run
+
+**Run budget**:
+The number of runs a schedule may claim over its life, set by `max_runs` and spent one claim at a time, scheduled or manual, failures included. Editing the schedule keeps what was spent; only a new schedule starts a new budget. A schedule with no runs left is spent, which the API reports as `exhausted`, and claims nothing until its cap is raised.
+_Avoid_: retained runs (that is what retention keeps), quota, run limit, exhausted flag (nothing is stored)
 
 ### Tables and analyses
 

@@ -7,13 +7,22 @@
 use crossterm::event::{self, KeyCode, KeyModifiers};
 
 use super::super::App;
-use super::super::state::{Focus, Popup, ResultsSearch, TabStatus};
+use super::super::state::{Focus, Popup, ResultsSearch};
 use super::super::ui;
 
 impl App {
     /// Handle key events when results are focused.
     #[allow(clippy::too_many_lines)] // Key dispatch with search + column modes requires many arms
     pub(crate) fn handle_results_key(&mut self, key: event::KeyEvent) {
+        // Ctrl+C cancels a running query from every results mode, so the
+        // search bar and column mode cannot swallow it.
+        if (key.modifiers, key.code) == (KeyModifiers::CONTROL, KeyCode::Char('c'))
+            && self.active_tab().execution.is_batch()
+        {
+            self.cancel_query();
+            return;
+        }
+
         // If search input is active, route keys to the search bar first.
         if self.results_search.as_ref().is_some_and(|s| s.input_active) {
             self.handle_search_input_key(key);
@@ -145,12 +154,6 @@ impl App {
                     if tab.selected_row.is_some() {
                         tab.selected_row = None;
                     }
-                }
-            }
-            // Ctrl+C: cancel running query (from results focus)
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                if matches!(self.active_tab().status, TabStatus::Running { .. }) {
-                    self.cancel_query();
                 }
             }
             // Horizontal scrolling

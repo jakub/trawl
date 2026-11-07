@@ -182,7 +182,10 @@ database, restore the `trawl` dump only and reconcile keys by hand.
    It also prunes the kept evidence of every investigation whose
    `retain_until` has passed; the findings that cite it remain. Then it marks
    every investigation step that never recorded an outcome as `interrupted`
-   and logs the count as `investigations_boot`.
+   and logs the count as `investigations_boot`. It also marks every report
+   run left `running` as `error` with the message
+   `interrupted by server restart`, and logs `stale_runs_cleaned` with the
+   count when it marks any.
 
 ## Verify the restore
 

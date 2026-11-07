@@ -94,6 +94,14 @@ filter_for() {
     13-refusal-does-not-wake-the-loop.patch)
       FILTER=(--lib refusals_against_in_flight_charge_wait_for_an_insert)
       ;;
+    # A listener that ends on its first accept or receive error: the
+    # recover test sees it end before the line arrives (#352).
+    14-tcp-accept-error-ends-listener.patch)
+      FILTER=(--lib tcp_accept_recovers)
+      ;;
+    15-udp-recv-error-ends-listener.patch)
+      FILTER=(--lib udp_receive_recovers)
+      ;;
     *) return 1 ;;
   esac
 }
