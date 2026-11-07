@@ -51,9 +51,12 @@ stream.
 Both clients keep a bounded buffer. The TUI keeps `tail.max_events`
 rows, 1000 by default, and drops the oldest first. A slow client falls behind
 the server's event bus, and the status bar shows **Lagged** with a count.
-Treat a lag or **Search failed** as a gap in what you saw, even if events resume. Live
-tail carries no degraded-pin notice, so open **Schema** and run a bounded
-query when you investigate a conflict or missing values.
+Treat a lag or a failed stream as a gap in what you saw, even if events
+resume. The browser's status bar shows **Search failed**. The TUI shows
+**Error** in the results pane when a stream cannot start, and only logs an
+error after the stream has started. Live tail carries no degraded-pin
+notice, so open **Schema** and run a bounded query when you investigate a
+conflict or missing values.
 
 The status bar counts the stream. **Received** is the number of events the
 browser buffer accepted since the stream opened, not the number of messages
