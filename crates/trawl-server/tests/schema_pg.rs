@@ -124,13 +124,114 @@ ALTER TABLE captured_results
     ADD COLUMN correlation TEXT,
     ADD COLUMN metadata_bytes BIGINT NOT NULL DEFAULT 0
         CONSTRAINT captured_results_metadata_bytes CHECK (metadata_bytes >= 0);
+ALTER TABLE schedules
+    ADD COLUMN runs_claimed BIGINT NOT NULL DEFAULT 0
+        CONSTRAINT schedules_runs_claimed_nonneg CHECK (runs_claimed >= 0);
 ";
+/// The migration that adds `schedules.runs_claimed` and seeds it.
+const RUNS_CLAIMED_MIGRATION: &str = "20261106000001_schedule_runs_claimed.sql";
 async fn seed_old(pool: &PgPool) {
     sqlx::query("INSERT INTO saved_queries(key_id,name,query,created_at,updated_at) VALUES (1,'retained query','service=test',now(),now())")
         .execute(pool).await.unwrap();
 }
 #[path = "../../../scripts/schema-baseline/cases.rs"]
 mod cases;
+
+/// The upgrade seeds each schedule's run budget from the runs it still has,
+/// whatever their status (ADR-0018 amended 2026-11-06). The database stands
+/// one migration behind, as an installation upgrading in place does, and
+/// boot's own runner applies the rest.
+#[sqlx::test(migrations = false)]
+async fn runs_claimed_backfill_counts_retained_runs(pool: PgPool) {
+    let previous = tempfile::tempdir().unwrap();
+    let mut copied = 0;
+    for entry in std::fs::read_dir(NEW_DIR).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap();
+        if name == RUNS_CLAIMED_MIGRATION {
+            continue;
+        }
+        std::fs::copy(&path, previous.path().join(name)).unwrap();
+        copied += 1;
+    }
+    assert_eq!(
+        copied + 1,
+        std::fs::read_dir(NEW_DIR).unwrap().count(),
+        "{RUNS_CLAIMED_MIGRATION} is one of the embedded migrations"
+    );
+    sqlx::migrate::Migrator::new(previous.path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let mut schedules = Vec::new();
+    for (name, kept) in [("none kept", 0), ("two kept", 2), ("five kept", 5)] {
+        let saved_query: i64 = sqlx::query_scalar(
+            "INSERT INTO saved_queries (key_id, name, query, created_at, updated_at)
+             VALUES (1, $1, 'service=test', now(), now()) RETURNING id",
+        )
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let schedule: i64 = sqlx::query_scalar(
+            "INSERT INTO schedules
+                 (saved_query_id, key_id, interval_secs, max_runs, created_at, updated_at,
+                  next_fire_at)
+             VALUES ($1, 1, 3600, 3, now(), now(), now()) RETURNING id",
+        )
+        .bind(saved_query)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        for run in 0..kept {
+            // The newest run is still going; the rest finished one way or
+            // another. Every one of them was claimed.
+            let status = match (kept - 1 - run, run % 3) {
+                (0, _) => "running",
+                (_, 0) => "success",
+                (_, 1) => "error",
+                _ => "timeout",
+            };
+            sqlx::query(
+                "INSERT INTO report_runs
+                     (schedule_id, saved_query_id, query, status, started_at, finished_at)
+                 VALUES ($1, $2, 'service=test', $3, now() - make_interval(hours => $4),
+                         CASE WHEN $3 = 'running' THEN NULL ELSE now() END)",
+            )
+            .bind(schedule)
+            .bind(saved_query)
+            .bind(status)
+            .bind(kept - run)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        schedules.push((schedule, i64::from(kept)));
+    }
+    let running: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM report_runs WHERE status = 'running'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        running, 2,
+        "the seeded schedules with runs each have one running"
+    );
+
+    migrate(&pool).await.unwrap();
+
+    for (schedule, kept) in schedules {
+        let runs_claimed: i64 =
+            sqlx::query_scalar("SELECT runs_claimed FROM schedules WHERE id = $1")
+                .bind(schedule)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(runs_claimed, kept, "schedule {schedule}");
+    }
+}
 
 #[sqlx::test(migrations = false)]
 async fn failed_boot_retains_old_data_and_releases_the_sole_writer_lock(pool: PgPool) {

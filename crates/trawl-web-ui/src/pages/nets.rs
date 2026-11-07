@@ -19,7 +19,8 @@ use crate::api;
 use crate::components::net_drawer::NetDrawer;
 use crate::components::sort_th::table_sort_th;
 use crate::schedule_edit::{
-    RUN_NOT_STARTED, RUN_NOW, VIEW_RUN, cadence_sentence, run_now_offered, run_started_toast,
+    RUN_NOT_STARTED, RUN_NOW, RUN_NOW_SPENT_REASON, VIEW_RUN, cadence_sentence, run_budget_label,
+    run_now_offered, run_now_spent, run_started_toast,
 };
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{time_ago, time_until};
@@ -291,7 +292,8 @@ pub fn NetsPage() -> impl IntoView {
                                             {move || {
                                                 let schedule = net.get().schedule?;
                                                 let run = schedule.last_run?;
-                                                schedule.enabled.then(|| {
+                                                // A spent budget fires no more runs, so it has no next fire.
+                                                (schedule.enabled && !schedule.exhausted).then(|| {
                                                     #[allow(clippy::cast_possible_truncation)]
                                                     let started_ms = js_sys::Date::parse(&run.started_at) as i64;
                                                     let label = time_until(started_ms + schedule.interval_secs.cast_signed() * 1000, now_ms.get());
@@ -303,8 +305,14 @@ pub fn NetsPage() -> impl IntoView {
                                         </td>
                                         <td>{move || {
                                             let Some(schedule) = net.get().schedule else { return view! { <span style="color:var(--ink-3)">"—"</span> }.into_any(); };
+                                            // A spent budget fires no more runs, so it
+                                            // replaces the pending wording.
+                                            let spent = run_budget_label(&schedule);
+                                            let spent_view = spent.map(|label| view! { <div class="run-spent mono" style="font-size:10px; color:var(--ink-3)">{label}</div> });
                                             let Some(run) = schedule.last_run else {
-                                                return if schedule.enabled {
+                                                return if spent_view.is_some() {
+                                                    spent_view.into_any()
+                                                } else if schedule.enabled {
                                                     view! { <span class="mono run-pending">"Pending…"</span> }.into_any()
                                                 } else {
                                                     view! { <span style="color:var(--ink-3)">"—"</span> }.into_any()
@@ -315,6 +323,7 @@ pub fn NetsPage() -> impl IntoView {
                                                 <div>
                                                     <span class="run-status" style="margin-inline-start:0">{status}</span> " "
                                                     <span class="mono" style="color:var(--ink-2)">{time_ago(&run.started_at, now_ms.get())}</span>
+                                                    {spent_view}
                                                 </div>
                                             }.into_any()
                                         }}</td>
@@ -331,18 +340,24 @@ pub fn NetsPage() -> impl IntoView {
                                                         run(net.get_untracked().query);
                                                     }>"Open in search"</button>
                                                 <Show when=move || run_now_offered(&net.get())>
-                                                    <button type="button" class="btn-sec btn-xs net-run-now" title=RUN_NOW
-                                                        disabled=move || run_in_flight.get()
+                                                    <button type="button" class="btn-sec btn-xs net-run-now"
+                                                        title=move || if run_now_spent(&net.get()) { RUN_NOW_SPENT_REASON } else { RUN_NOW }
+                                                        aria-describedby=move || run_now_spent(&net.get()).then(|| format!("netRunNowSpent{id}"))
+                                                        disabled=move || run_in_flight.get() || run_now_spent(&net.get())
                                                         on:click=move |ev| {
                                                             ev.stop_propagation();
                                                             let current = net.get_untracked();
                                                             // Recheck the saved state on activation: a
-                                                            // schedule removed since render has nothing
-                                                            // left to fire.
-                                                            if run_now_offered(&current) && !run_in_flight.get_untracked() {
+                                                            // schedule removed or spent since render has
+                                                            // nothing left to fire.
+                                                            if run_now_offered(&current) && !run_now_spent(&current) && !run_in_flight.get_untracked() {
                                                                 on_run_now(id, current.name, run_in_flight);
                                                             }
                                                         }>{RUN_NOW}</button>
+                                                    // Absolutely positioned (sr-only), so it takes no grid slot.
+                                                    {move || run_now_spent(&net.get()).then(|| view! {
+                                                        <span id=format!("netRunNowSpent{id}") class="sr-only">{RUN_NOW_SPENT_REASON}</span>
+                                                    })}
                                                 </Show>
                                                 // The accessible name keeps the object and starts
                                                 // with the visible word (WCAG 2.5.3).

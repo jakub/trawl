@@ -777,6 +777,9 @@ export const COPY = {
   /// for firing a schedule by hand, in the nets row and the net drawer
   /// header alike. Offered exactly when the SAVED net has a schedule.
   netRunNow: 'Run now',
+  /// crates/trawl-web-ui/src/schedule_edit.rs `RUN_NOW_SPENT_REASON` —
+  /// why Run now is disabled on a net whose run budget is spent.
+  netRunNowSpentReason: 'Run limit reached. Raise it in the schedule to run again.',
   /// The Run now success toast: the window the server claimed, as
   /// `run_started_toast` formats it. `{from}` and `{to}` are the bounds.
   runStartedToast: 'Run started · covers {from}–{to} UTC',

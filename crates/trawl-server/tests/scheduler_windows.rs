@@ -1148,7 +1148,7 @@ async fn retention_during_a_run_keeps_the_schedule_claimed() {
     let claim = || async {
         match h
             .schedules
-            .claim_run(schedule_id, sq, DSL, None, None)
+            .claim_run(schedule_id, sq, DSL, None)
             .await
             .expect("claim")
         {
@@ -1196,7 +1196,7 @@ async fn retention_during_a_run_keeps_the_schedule_claimed() {
 
     assert_eq!(
         h.schedules
-            .claim_run(schedule_id, sq, DSL, None, None)
+            .claim_run(schedule_id, sq, DSL, None)
             .await
             .expect("second claim"),
         RunClaim::AlreadyRunning,
@@ -1223,6 +1223,64 @@ async fn retention_during_a_run_keeps_the_schedule_claimed() {
     assert_eq!(runs[0].id, run_id);
     assert_eq!(runs[0].status, RunStatus::Success);
     assert!(file.exists(), "the run's result file is kept");
+}
+
+/// Retention below the cap no longer refills it (ADR-0018 amended
+/// 2026-11-06). Under a keep of one, a schedule capped at three runs claims
+/// exactly three across the retention passes, then refuses every later
+/// boundary. Its cursor stays on the first boundary it refused, so raising
+/// the cap would resume there.
+#[tokio::test]
+async fn retention_below_the_cap_stops_at_the_cap() {
+    let h = harness().await;
+    let saved = h
+        .saved
+        .create(h.key_id, "capped", DSL)
+        .await
+        .expect("create saved query");
+    let sq = saved.id;
+    h.schedules
+        .create_schedule(sq, h.key_id, 3600, Some(3), None, 0, t0())
+        .await
+        .expect("create schedule");
+
+    let mut claimed = std::collections::BTreeSet::new();
+    for boundary in 0..5 {
+        h.tick(at(hours(boundary) + Duration::seconds(3))).await;
+        let runs = h.runs(sq).await;
+        assert!(
+            runs.iter().all(|run| run.status == RunStatus::Success),
+            "{runs:?}"
+        );
+        claimed.extend(runs.iter().map(|run| run.id));
+        h.schedules
+            .delete_old_runs(365, 1)
+            .await
+            .expect("retention runs");
+        assert_eq!(h.runs(sq).await.len(), 1, "retention keeps one run");
+    }
+
+    assert_eq!(
+        claimed.len(),
+        3,
+        "exactly the cap, across retention passes: {claimed:?}"
+    );
+    let schedule = h
+        .schedules
+        .get_schedule_for_saved_query(sq, h.key_id)
+        .await
+        .expect("read schedule")
+        .expect("schedule exists");
+    assert_eq!(
+        schedule.next_fire_at,
+        at(hours(3)),
+        "the first refused boundary stays claimable"
+    );
+    assert_eq!(
+        (schedule.runs_claimed, schedule.exhausted()),
+        (3, true),
+        "retention never changes the budget"
+    );
 }
 
 /// The same transition on the real scheduled path: a due 60 s schedule's
@@ -1266,7 +1324,7 @@ async fn retention_during_a_scheduled_run_keeps_its_result() {
         .expect("retention runs");
     assert_eq!(
         h.schedules
-            .claim_run(schedule_id, sq, DSL, None, None)
+            .claim_run(schedule_id, sq, DSL, None)
             .await
             .expect("second claim"),
         RunClaim::AlreadyRunning,

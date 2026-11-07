@@ -455,7 +455,7 @@ mod unavailable_run_result {
 
         let store = &server.state.storage.schedule;
         let run_id = match store
-            .claim_run(schedule_id, saved_id, query, None, None)
+            .claim_run(schedule_id, saved_id, query, None)
             .await
             .expect("claim a run")
         {

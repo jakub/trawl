@@ -2044,6 +2044,26 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "{RUN_NOW}",
     },
+    // Why Run now is disabled on a spent run budget: one reason, defined
+    // once and said by both places that disable it.
+    Contract {
+        assignment: "netRunNowSpentReason: 'Run limit reached. Raise it in the schedule to run again.',",
+        source_path: "src/schedule_edit.rs",
+        source: SCHEDULE_EDIT_RS,
+        hook: "pub const RUN_NOW_SPENT_REASON: &str = \"Run limit reached. Raise it in the schedule to run again.\";",
+    },
+    Contract {
+        assignment: "netRunNowSpentReason: 'Run limit reached. Raise it in the schedule to run again.',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "class=\"sr-only\">{RUN_NOW_SPENT_REASON}</span>",
+    },
+    Contract {
+        assignment: "netRunNowSpentReason: 'Run limit reached. Raise it in the schedule to run again.',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "<span id=\"netRunNowSpent\">{RUN_NOW_SPENT_REASON}</span>",
+    },
     Contract {
         assignment: "runStartedToast: 'Run started · covers {from}–{to} UTC',",
         source_path: "src/schedule_edit.rs",

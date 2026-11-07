@@ -24,8 +24,9 @@ use fleet_ui::{
 };
 
 use crate::schedule_edit::{
-    RUN_NOT_STARTED, RUN_NOW, VIEW_RUN, WindowDraft, WindowMode, preview_cap, run_now_form_line,
-    run_now_offered, run_started_toast, schedule_sentence, validate_max_runs,
+    RUN_NOT_STARTED, RUN_NOW, RUN_NOW_SPENT_REASON, VIEW_RUN, WindowDraft, WindowMode, preview_cap,
+    run_budget_label, run_now_form_line, run_now_offered, run_now_spent, run_started_toast,
+    schedule_sentence, validate_max_runs,
 };
 
 use crate::api::RUNS_PAGE_SIZE;
@@ -77,6 +78,15 @@ pub fn NetDrawer(
     // offer follows the SAVED state, never an unsaved draft of it: what
     // fires is the schedule the server holds.
     let run_now_allowed = move || saved.get().is_some_and(|n| run_now_offered(&n));
+    // A spent run budget keeps Run now on screen, disabled, with the
+    // spend and the reason beside it: the server would refuse the run.
+    let run_now_spent_label = Signal::derive(move || {
+        saved
+            .get()
+            .and_then(|n| n.schedule)
+            .and_then(|s| run_budget_label(&s))
+    });
+    let spent = Signal::derive(move || saved.get().is_some_and(|n| run_now_spent(&n)));
     let run_in_flight = RwSignal::new(false);
 
     // -- inline rename --
@@ -196,7 +206,10 @@ pub fn NetDrawer(
         if missing.get_untracked() || run_in_flight.get_untracked() {
             return;
         }
-        let Some(current) = saved.get_untracked().filter(run_now_offered) else {
+        let Some(current) = saved
+            .get_untracked()
+            .filter(|n| run_now_offered(n) && !run_now_spent(n))
+        else {
             return;
         };
         let id = net_id_for_run_now;
@@ -309,11 +322,17 @@ pub fn NetDrawer(
                     <Btn
                         variant=Variant::Secondary
                         on_click=on_run_now_click
-                        disabled=Signal::derive(move || run_in_flight.get())
-                        attr:title="Run the schedule's next window now"
+                        disabled=Signal::derive(move || run_in_flight.get() || spent.get())
+                        attr:title=move || if spent.get() { RUN_NOW_SPENT_REASON } else { "Run the schedule's next window now" }
+                        attr:aria-describedby=move || spent.get().then_some("netRunNowSpent")
                     >
                         {RUN_NOW}
                     </Btn>
+                    {move || run_now_spent_label.get().map(|label| view! {
+                        <span class="run-spent" style="font-size:11px; color:var(--ink-3)">
+                            <span class="mono">{label}</span>" · "<span id="netRunNowSpent">{RUN_NOW_SPENT_REASON}</span>
+                        </span>
+                    })}
                 })}
             }.into_any())
         >
