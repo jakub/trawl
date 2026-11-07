@@ -318,6 +318,20 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
     .await
     .unwrap();
 
+    // The rollup stopped before its rename (case b): the tmp carries the
+    // replacement, the daily file the prior merged into it, and the hourly
+    // input is still in place, each at its recorded identity.
+    let identity = |path: &std::path::Path| {
+        trawl_server::ingest::publication_marker::identity_of(path).unwrap()
+    };
+    let body = trawl_server::ingest::rollup_marker::RollupMarker::new(
+        "late",
+        identity(&tmp),
+        Some(identity(&canonical)),
+        vec![("01/late.parquet".to_owned(), identity(&hourly))],
+    )
+    .unwrap()
+    .encode();
     let marker = day.join(".rollup-late");
     let publication = h
         .server
@@ -329,7 +343,7 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
         .publication();
     {
         let _writer = publication.write().await;
-        std::fs::write(&marker, format!("{}\n", hourly.display())).unwrap();
+        std::fs::write(&marker, &body).unwrap();
         drop(publication.mark_rollup(&marker));
     }
     let originals: Vec<_> = [&canonical, &hourly, &tmp, &marker]
