@@ -161,7 +161,7 @@ test('show more reveals the hidden values', async ({ page, request }) => {
   const more = group.locator(SEL.facetMore);
   await expect(more).toHaveJSProperty('tagName', 'BUTTON');
   await expect(more).toHaveAccessibleName(
-    nameFrom(COPY.facetMoreName, String(CORPUS.hostsHidden), FIELD),
+    nameFrom(COPY.facetMoreName, String(CORPUS.hostsHidden), CORPUS.hostsHidden === 1 ? 'value' : 'values', FIELD),
   );
 
   // It follows the last value's controls in the tab order.
@@ -178,6 +178,37 @@ test('show more reveals the hidden values', async ({ page, request }) => {
   // Nothing left to reveal, so the control goes rather than sitting
   // there doing nothing.
   await expect(more).toHaveCount(0);
+});
+
+// The rail lists up to 10 values per field (`FACET_TOP_N`). A second
+// scope line says so, but only while some field holds more than that.
+const LIST_CAP_LINE = 'Lists show up to 10 values per field';
+
+test('the scope names the list cap only while a field holds more values than it lists', async ({ page, request }) => {
+  // No corpus field reaches 10 distinct values, so the line stays away.
+  await openCorpusSearch(page, request);
+  await expect(page.locator('.facets-scope').first()).toBeVisible();
+  await expect(page.getByText(LIST_CAP_LINE, { exact: true })).toHaveCount(0);
+
+  // Twelve rows with twelve hosts: the heading counts 12, the group
+  // lists 10 once expanded, and the line appears once, in the scope.
+  const hostAt = presentation.columns.findIndex((c: { name: string }) => c.name === 'host');
+  const rows = Array.from({ length: 12 }, (_, i) => {
+    const row = [...presentation.rows[i % presentation.rows.length]];
+    row[hostAt] = `host-${String(i + 1).padStart(2, '0')}`;
+    return row;
+  });
+  await page.route('**/api/v1/query', (route) => route.fulfill({ json: { ...presentation, rows } }));
+  await page.goto(PRESENTATION_URL);
+  const line = page.getByText(LIST_CAP_LINE, { exact: true });
+  await expect(line).toHaveCount(1);
+  await expect(line).toHaveClass('facets-scope');
+
+  const group = page.locator(SEL.facetGroup).filter({
+    has: page.getByRole('button', { name: nameFrom(COPY.facetGroupName, 'host', '12') }),
+  });
+  await group.locator(SEL.facetMore).click();
+  await expect(group.locator(SEL.facetValue)).toHaveCount(10);
 });
 
 test('long value keeps clear of the actions', async ({ page, request }) => {
@@ -458,7 +489,7 @@ test('filters on a field the rail no longer counts stay visible and removable', 
   const chips = page.locator(SEL.filterChip);
   await expect(chips).toHaveCount(2);
   await expect(chips.filter({ hasText: `timestamp = ${first}` })).not.toHaveClass(/excl/);
-  await expect(chips.filter({ hasText: `timestamp = ${second}` })).toHaveClass(/excl/);
+  await expect(chips.filter({ hasText: `timestamp ≠ ${second}` })).toHaveClass(/excl/);
   await expect(
     page.getByRole('button', { name: nameFrom(COPY.facetGroupName, 'level', '3') }),
   ).toBeVisible();

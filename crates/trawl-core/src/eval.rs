@@ -123,7 +123,11 @@ impl EvalValue {
     /// the one probe-pinned owner of that syntax (ADR-0017 §1). A second
     /// parser here would drift: it would have to reject a malformed
     /// offset (`+ab:cd`) and read the infinities on its own.
-    pub(crate) fn as_instant(&self) -> Option<compare::Instant> {
+    ///
+    /// Public for the kv batch tail's `dedup` in trawl-engine, which ranks
+    /// each row by its `_time` read this way, as batch SQL's
+    /// `TRY_CAST(_time AS TIMESTAMP)` ranks it.
+    pub fn as_instant(&self) -> Option<compare::Instant> {
         match self {
             Self::Timestamp(instant) => Some(*instant),
             Self::Str(s) => compare::literal_timestamp(s),
@@ -454,7 +458,10 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
 /// `DuckDB` answer to mirror — it errors — so this picks the
 /// lexicographically-first variant: deterministic regardless of map
 /// order, and the same tie-break ingest's own fold-collision rule uses.
-pub(crate) fn bind_event_key<'e>(event: &'e Row, name: &str) -> Option<&'e str> {
+///
+/// Public for the kv batch tail's `sort` and `dedup` in trawl-engine, so
+/// they bind a name as every other stage of the tail does.
+pub fn bind_event_key<'e>(event: &'e Row, name: &str) -> Option<&'e str> {
     if let Some((key, _)) = event.get_key_value(name) {
         return Some(key.as_str());
     }

@@ -1327,6 +1327,47 @@ fn the_schedule_scenario_carries_every_schedule_mode_and_an_unscheduled_net() {
 /// (ADR-0018 as amended on 2026-09-23). Its text carries the spliced
 /// bounds, as the run row stores them. The refusal is a 409's envelope
 /// whose message the toast quotes, so the message is the contract.
+const SAVED_QUERIES_SPENT: &str = include_str!("../e2e/harness/wire/saved-queries-spent.json");
+
+/// The `schedule-spent` scenario's saved list, which `e2e/fixtures.ts`
+/// `SPENT` names: a capped net under its cap (Run now enabled), a net
+/// spent past a lowered cap (`spent 5/3`), and a `max_runs = 0` net that
+/// never ran (`spent 0/0`, no pending wording). `exhausted` agrees with
+/// `total_runs >= max_runs` on every net, as the server derives it.
+#[test]
+fn the_spent_scenario_carries_a_capped_net_and_two_spent_ones() {
+    let saved: ListSavedResponse = decode("saved-queries-spent.json", SAVED_QUERIES_SPENT);
+    let shape: Vec<_> = saved
+        .queries
+        .iter()
+        .map(|q| {
+            let s = q.schedule.as_ref().expect("every net here has a schedule");
+            assert_eq!(
+                s.exhausted,
+                s.max_runs.is_some_and(|max| s.total_runs >= max),
+                "net {} reports an exhausted flag its counts contradict",
+                q.id
+            );
+            (
+                q.id,
+                q.name.as_str(),
+                s.max_runs,
+                s.total_runs,
+                s.exhausted,
+                s.last_run.is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (1, "capped error digest", Some(5), 2, false, true),
+            (2, "spent error digest", Some(3), 5, true, true),
+            (3, "zero-run sweep", Some(0), 0, true, false),
+        ]
+    );
+}
+
 #[test]
 fn the_run_now_fixtures_carry_a_manual_window_and_a_refusal() {
     let saved: ListSavedResponse = decode("saved-queries-windowed.json", SAVED_QUERIES_WINDOWED);

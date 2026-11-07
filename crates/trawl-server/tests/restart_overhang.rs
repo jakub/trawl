@@ -507,7 +507,7 @@ async fn record_report(server: &TestServer, data: &str, name: &str) {
     let (saved_id, schedule_id) = scheduled_saved_query(server, name).await;
     let store = &server.state.storage.schedule;
     let RunClaim::Started(run_id) = store
-        .claim_run(schedule_id, saved_id, "service=nginx", None, None)
+        .claim_run(schedule_id, saved_id, "service=nginx", None)
         .await
         .unwrap()
     else {

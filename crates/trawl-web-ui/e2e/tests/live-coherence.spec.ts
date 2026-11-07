@@ -226,7 +226,7 @@ test('the burst footer counts what the ring accepted, survives a drop, and resta
   // the failure never reaches the footer.
   blocked = true;
   expect((await request.post('/__ctl/stream/drop')).ok()).toBe(true);
-  await expect(page.locator(SEL.statusLabel)).toHaveText('Error');
+  await expect(page.locator(SEL.statusLabel)).toHaveText('Search failed');
   // Wait for the REFUSED reconnect, not just the drop: an HTTP error
   // closes the EventSource for good, so from here only the Retry button
   // can open a stream, and the retry assertion below cannot be answered
@@ -259,7 +259,7 @@ test('live aggregation counts frames and reads a malformed one as an error', asy
   await expect(page.locator(SEL.workspaceTab).first()).toContainText('3');
 
   expect((await request.post('/__ctl/stream/frame', { data: { data: 'not a frame' } })).ok()).toBe(true);
-  await expect(page.locator(SEL.statusLabel)).toHaveText('Error');
+  await expect(page.locator(SEL.statusLabel)).toHaveText('Search failed');
   expect(await frame(rows(1))).toBe(true);
   await expect(page.locator(SEL.statusLabel)).toHaveText('Live');
 });
@@ -387,13 +387,13 @@ test('the histogram and execution timing are absent in live and return with a sn
   await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   await page.locator(SEL.stopLive).click();
   await expect(page.locator(SEL.histoStrip)).toHaveCount(1);
-  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 0.125s');
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 125ms');
   await expect(page.locator(SEL.scopeStarted)).toHaveText('Started 2026-09-15 12:34:56 UTC');
 
   // An explicit DSL window still reports response timing in the strip.
   await resetScenario(request, 'corpus');
   await page.goto('/search?q=last%3D24h&r=15m');
-  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 0.125s');
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 125ms');
   await expect(page.locator(SEL.scopeStarted)).toHaveText('Started 2026-09-15 12:34:56 UTC');
 });
 
@@ -431,7 +431,7 @@ test('a snapshot finishing after Live cannot restore timing or complete a later 
   await expect(page.locator(SEL.scopeExecution)).toHaveCount(0);
   await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   await held[1].fulfill({ json: responseBody('2026-09-15T11:00:00Z', 200) });
-  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 0.200s');
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 200ms');
   await expect(page.locator(SEL.scopeStarted)).toHaveText('Started 2026-09-15 11:00:00 UTC');
   await expect(page.locator(SEL.scopeCount)).toHaveText('1 row returned');
 });

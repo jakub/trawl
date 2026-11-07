@@ -2,8 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Histogram/>` — 78px strip rendering a stacked ok/err bar chart
+//! `<Histogram/>` — 80px strip rendering a stacked ok/err bar chart
 //! over the current page's results.
+//!
+//! A drawn chart carries a one-line key above the bars: what they count
+//! (this page's events), how long one bucket is (the `Series` width,
+//! never the query range), that the axis labels are UTC, and what the
+//! two colours mean. Its copy restates `build_series` and the error test
+//! below, so it changes when they do.
 //!
 //! Time bucketing leans on `crate::histogram::bucketize_series`, which
 //! also carries the bounds the bars were laid out over: the axis
@@ -11,13 +17,20 @@
 //! from that one `Series`, so none of them can disagree about where a
 //! bucket starts. Timestamps come from a `_time` / `time` / `timestamp`
 //! / `@timestamp` column; with none of them there is nothing to bucket
-//! and the strip says so.
+//! and the strip says so. A settled page with no rows at all collapses
+//! the strip instead: the results table below already says the page is
+//! empty, and a blank band above it would only push that notice down.
 //!
 //! "is error" is `_severity >= 17` (the `OTel` error band and above,
 //! ADR-0013 §9); a page carrying no `_severity` column draws every bar
 //! as ok.
 //!
-//! The x axis reads real timestamps off the data.
+//! The x axis reads real timestamps off the data: round UTC clock times
+//! inside the bucketed extent, each placed at its own position
+//! (`crate::histogram::clock_ticks`). The tick step depends on how wide
+//! the axis is, so the axis width is measured after the bars render and
+//! whenever the strip resizes, and only the axis re-renders when it
+//! changes.
 //!
 //! A bar's tooltip is centred on it, then measured against the strip and
 //! shifted sideways (`--tip-shift`) so an edge bar's tip never runs past
@@ -36,7 +49,9 @@ use trawl_api::value::Value;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
 
-use crate::histogram::{Series, axis_labels, bucket_time, bucketize_series, tip_shift};
+use crate::histogram::{
+    Series, TickAlign, bucket_time, bucket_width_label, bucketize_series, clock_ticks, tip_shift,
+};
 
 const N_BUCKETS: usize = 48;
 
@@ -57,41 +72,56 @@ pub fn Histogram(
     >,
 ) -> impl IntoView {
     let strip = NodeRef::<leptos::html::Div>::new();
+    // The x axis's measured width in pixels; `None` until it is laid out.
+    let axis_width = RwSignal::new(None::<f64>);
     // Every bar moves when the strip changes width, including the one
     // whose tip is on screen. The observer disconnects with the
     // component through leptos-use.
     let _ = leptos_use::use_resize_observer(strip, move |_, _| {
         if let Some(strip) = strip.get_untracked() {
             place_all_tips(&strip);
+            measure_axis(&strip, axis_width);
         }
     });
     view! {
-        <div class="histo" node_ref=strip>
+        <div
+            class="histo"
+            // Only a settled, row-less response collapses the strip; a
+            // pending, failed or never-run search keeps its band.
+            class:histo-empty=move || {
+                rows.with(|r| matches!(r, Some(Ok(resp)) if resp.result.rows.is_empty()))
+            }
+            node_ref=strip
+        >
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
                 // Deliberate quiet-error override: the results table
                 // already reports the query failure.
                 error=Box::new(|_| view! { <div class="histo-hint">"—"</div> }.into_any())
                 render=Box::new(move |resp: crate::state::search_session::ExecutedResponse| {
+                    // A page with no rows draws nothing: the strip is
+                    // collapsed and the table carries the empty notice.
+                    if resp.result.rows.is_empty() {
+                        return ().into_any();
+                    }
                     let Some(series) = build_series(&resp) else {
-                        // Two different absences, two different sentences: a
-                        // page with no rows at all, and a page whose rows
-                        // carry no timestamp anyone can read.
-                        let hint = if resp.result.rows.is_empty() {
-                            "No events on this page."
-                        } else {
-                            "No usable timestamps in shown events."
-                        };
-                        return view! { <div class="histo-hint">{hint}</div> }.into_any();
+                        return view! {
+                            <div class="histo-hint">"No usable timestamps in shown events."</div>
+                        }.into_any();
                     };
                     let max = series.buckets.iter().map(|b| b.ok + b.err).max().unwrap_or(1).max(1);
-                    let half = max / 2;
-                    let (x_start, x_mid, x_end) = axis_labels(&series);
+                    let top = scale_top(max);
+                    let axis_series = series.clone();
                     let width = series.bucket_width();
                     let min = series.min_secs;
+                    let scope = format!(
+                        "Events on this page · {} per bucket · UTC",
+                        bucket_width_label(width)
+                    );
                     // New buckets or labels replace every bar, and the
                     // strip keeps its size, so the observer stays quiet.
-                    // Place the new tips once they are laid out. Nothing
+                    // Place the new tips and measure the new axis once
+                    // they are laid out. Nothing
                     // cancels the frame, and switching tab or leaving the
                     // page can dispose the strip before it runs; a
                     // disposed ref reads as `None` and the frame does
@@ -99,19 +129,31 @@ pub fn Histogram(
                     request_animation_frame(move || {
                         if let Some(strip) = strip.try_get_untracked().flatten() {
                             place_all_tips(&strip);
+                            measure_axis(&strip, axis_width);
                         }
                     });
                     view! {
+                        <div class="histo-key">
+                            <span class="histo-scope">{scope}</span>
+                            <span class="histo-swatch">
+                                <span class="ok" aria-hidden="true"></span>
+                                "Other"
+                            </span>
+                            <span class="histo-swatch">
+                                <span class="err" aria-hidden="true"></span>
+                                "Error or fatal"
+                            </span>
+                        </div>
                         <div class="yax">
-                            <span>{max}</span>
-                            <span>{half}</span>
-                            <span>"0"</span>
+                            <span class="y-top">{top}</span>
+                            {(top >= 2).then(|| view! { <span class="y-mid">{top / 2}</span> })}
+                            <span class="y-zero">"0"</span>
                         </div>
                         <div class="bars">
                             {series.buckets.into_iter().enumerate().map(|(i, b)| {
                                 let total = b.ok + b.err;
-                                let ok_h = pct(b.ok, max);
-                                let err_h = pct(b.err, max);
+                                let ok_h = pct(b.ok, top);
+                                let err_h = pct(b.err, top);
                                 let start = bucket_start(min, width, i);
                                 let tip = format!(
                                     "{} – {} · {total} events{}",
@@ -136,9 +178,7 @@ pub fn Histogram(
                             }).collect::<Vec<_>>()}
                         </div>
                         <div class="xax">
-                            <span>{x_start}</span>
-                            <span>{x_mid}</span>
-                            <span>{x_end}</span>
+                            {move || axis_width.get().map(|width| axis_ticks(&axis_series, width))}
                         </div>
                     }.into_any()
                 })
@@ -180,6 +220,36 @@ fn place_all_tips(strip: &web_sys::Element) {
         if let Ok(bar) = bar.dyn_into::<HtmlElement>() {
             place_bar_tip(&bar, strip);
         }
+    }
+}
+
+/// The x axis's tick labels for an axis `width` pixels wide, each at its
+/// tick's position.
+fn axis_ticks(series: &Series, width: f64) -> impl IntoView + use<> {
+    clock_ticks(series, width)
+        .into_iter()
+        .map(|tick| {
+            let class = match tick.align {
+                TickAlign::Center => "tick",
+                TickAlign::Start => "tick tick-start",
+                TickAlign::End => "tick tick-end",
+            };
+            let left = format!("left:{:.4}%", tick.fraction * 100.0);
+            view! { <span class=class style=left>{tick.label}</span> }
+        })
+        .collect_view()
+}
+
+/// Read the x axis's width into `axis_width`, when it is laid out and
+/// differs from the last reading. A disposed strip has no signal left to
+/// set, and the write is skipped.
+fn measure_axis(strip: &web_sys::Element, axis_width: RwSignal<Option<f64>>) {
+    let Some(axis) = strip.query_selector(".xax").ok().flatten() else {
+        return;
+    };
+    let width = f64::from(axis.client_width());
+    if width > 0.0 && axis_width.try_get_untracked() != Some(Some(width)) {
+        let _ = axis_width.try_set(Some(width));
     }
 }
 
@@ -276,6 +346,12 @@ fn value_to_seconds(v: &Value) -> Option<f64> {
         }
         _ => None,
     }
+}
+
+/// The y scale's top: the tallest bar rounded up to an even count, so
+/// the label on the midpoint gridline is a whole number of events.
+fn scale_top(max: u32) -> u32 {
+    if max <= 1 { 1 } else { max + max % 2 }
 }
 
 fn pct(n: u32, max: u32) -> f64 {

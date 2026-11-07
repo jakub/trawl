@@ -251,7 +251,7 @@ export const CORPUS = {
   columns: ['_time', 'host', 'status', 'message'] as const,
   /** `host`'s distinct values, most frequent first, then alphabetical —
    * the order the facet rail computes. Six of them, one past the five a
-   * group shows, so the group offers "+ 1 more". */
+   * group shows, so the group offers "Show 1 more listed value". */
   hosts: ['web-01', 'cache-01', 'db-01', 'edge-01', 'web-02', 'web-03'] as const,
   /** How many values the `host` facet hides behind its more control. */
   hostsHidden: 1,
@@ -332,6 +332,24 @@ export const SCHEDULE = {
    * them into (`PREVIEW_PAGE_SIZE` in `src/components/net_drawer.rs`). */
   pagedRunRows: 45,
   previewPageSize: 20,
+} as const;
+
+/**
+ * The `schedule-spent` scenario (issue #351): `harness/wire/saved-queries-spent.json`,
+ * pinned by `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs`.
+ */
+export const SPENT = {
+  /** A capped net under its cap: Run now stays enabled. */
+  cappedNetId: 1,
+  cappedNetName: 'capped error digest',
+  /** A net spent past a lowered cap. */
+  spentNetId: 2,
+  spentNetName: 'spent error digest',
+  spentLabel: 'spent 5/3',
+  /** A `max_runs = 0` net that never ran. */
+  zeroNetId: 3,
+  zeroNetName: 'zero-run sweep',
+  zeroLabel: 'spent 0/0',
 } as const;
 
 /** Re-point the stub server at a non-default scenario for this test. Call

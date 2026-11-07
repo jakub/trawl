@@ -68,10 +68,10 @@ pub fn time_ago(iso: &str, now_ms: i64) -> String {
     format!("{} {}", month_abbrev(d.month()), d.day())
 }
 
-/// Compact duration: `"0.482s"` for >=10ms, `"3ms"` for sub-10ms.
+/// Compact duration: `"482ms"` below one second, `"1.005s"` from one second up.
 #[must_use]
 pub fn format_duration(ms: u64) -> String {
-    if ms < 10 {
+    if ms < 1000 {
         return format!("{ms}ms");
     }
     let s = ms / 1000;
@@ -242,12 +242,16 @@ mod tests {
 
     #[test]
     fn format_duration_contract() {
-        // sub-10ms passthrough
+        // sub-second values print integer milliseconds
+        assert_eq!(format_duration(0), "0ms");
         assert_eq!(format_duration(9), "9ms");
-        // boundary: first second-formatted value, zero-padded frac
-        assert_eq!(format_duration(10), "0.010s");
+        assert_eq!(format_duration(10), "10ms");
+        assert_eq!(format_duration(482), "482ms");
+        // boundary: 999ms is the last millisecond value, 1000ms the first seconds value
+        assert_eq!(format_duration(999), "999ms");
+        assert_eq!(format_duration(1000), "1.000s");
         // frac zero-pad above the seconds place
         assert_eq!(format_duration(1005), "1.005s");
-        assert_eq!(format_duration(482), "0.482s");
+        assert_eq!(format_duration(1240), "1.240s");
     }
 }

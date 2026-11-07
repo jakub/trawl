@@ -10,8 +10,8 @@ use sqlx::{AssertSqlSafe, PgPool, Row as _};
 
 use super::error::{PgViolation, StoreError, WindowWriteError, classify_violation};
 use super::schedule::{
-    LATEST_RUN_COLS, LATEST_RUN_JOINS, ReportRun, Schedule, decode_window,
-    latest_run_and_count_from_row, row_to_schedule_at, schedule_cols_as,
+    LATEST_RUN_COLS, LATEST_RUN_JOINS, ReportRun, Schedule, decode_window, latest_run_from_row,
+    row_to_schedule_at, schedule_cols_as,
 };
 use crate::report_window::check_window_compatibility;
 
@@ -33,7 +33,7 @@ pub struct SavedQuery {
     pub updated_at: DateTime<Utc>,
 }
 
-/// A saved query enriched with its schedule and run stats — the bulk-join
+/// A saved query enriched with its schedule and latest run — the bulk-join
 /// shape backing `GET /api/v1/saved` (one query, independent of item count).
 #[derive(Debug, Clone)]
 pub struct SavedQueryDetails {
@@ -41,12 +41,12 @@ pub struct SavedQueryDetails {
     pub schedule: Option<ScheduleWithStats>,
 }
 
-/// A schedule enriched with its latest run and total run count.
+/// A schedule enriched with its latest run. The lifetime run count rides
+/// the schedule itself ([`Schedule::runs_claimed`]).
 #[derive(Debug, Clone)]
 pub struct ScheduleWithStats {
     pub schedule: Schedule,
     pub latest_run: Option<ReportRun>,
-    pub total_runs: u64,
 }
 
 /// Decode a [`SavedQuery`] from columns named `{prefix}id`, `{prefix}name`, …
@@ -98,8 +98,8 @@ impl SavedQueryStore {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// List saved queries with schedule + latest-run + run-count details in
-    /// a single statement: the lateral joins keep it one round trip whatever
+    /// List saved queries with schedule + latest-run details in a single
+    /// statement: the lateral join keeps it one round trip whatever
     /// the item count, instead of three follow-up lookups per saved query.
     pub async fn list_with_details(
         &self,
@@ -125,11 +125,10 @@ impl SavedQueryStore {
             let saved = row_to_saved_query(row)?;
             let schedule = if row.try_get::<Option<i64>, _>("s_id")?.is_some() {
                 let schedule = row_to_schedule_at(row, "s_")?;
-                let (latest_run, total_runs) = latest_run_and_count_from_row(row)?;
+                let latest_run = latest_run_from_row(row)?;
                 Some(ScheduleWithStats {
                     schedule,
                     latest_run,
-                    total_runs,
                 })
             } else {
                 None

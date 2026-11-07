@@ -129,6 +129,7 @@ export const SEL = {
   queryErrorText: 'pre.query-error-text',
   queryErrorCaret: '.query-error-caret',
   queryErrorCaretPad: '.query-error-caret .query-error-caret-pad',
+  queryErrorDiagnostic: '.query-error-diagnostic',
   /// crates/trawl-web-ui/src/components/recovering_notice.rs — the
   /// recovering notice, which search.rs mounts in the results region in
   /// place of the table or chart when a snapshot is refused as
@@ -720,8 +721,9 @@ export const COPY = {
   /// value controls.
   facetIncludeName: 'Include {field} = {v}',
   facetExcludeName: 'Exclude {field} = {v}',
-  /// Its "+ N more" control, whose visible text stays `+ N more`.
-  facetMoreName: 'Show {extra} more values for {field}',
+  /// Its more control, which reads `Show N more listed values` and adds
+  /// the field to its name. `{noun}` is `value` for one, else `values`.
+  facetMoreName: 'Show {extra} more listed {noun} for {field}',
   /// The group header. Its count lives in a span inside the button, so
   /// an unnamed header read as `_time8`; this names the two in words.
   facetGroupName: '{field}, {total} values',
@@ -775,6 +777,9 @@ export const COPY = {
   /// for firing a schedule by hand, in the nets row and the net drawer
   /// header alike. Offered exactly when the SAVED net has a schedule.
   netRunNow: 'Run now',
+  /// crates/trawl-web-ui/src/schedule_edit.rs `RUN_NOW_SPENT_REASON` —
+  /// why Run now is disabled on a net whose run budget is spent.
+  netRunNowSpentReason: 'Run limit reached. Raise it in the schedule to run again.',
   /// The Run now success toast: the window the server claimed, as
   /// `run_started_toast` formats it. `{from}` and `{to}` are the bounds.
   runStartedToast: 'Run started · covers {from}–{to} UTC',

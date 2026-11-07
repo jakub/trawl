@@ -206,6 +206,10 @@
   --green:      #3a6a33;
   --green-wash: rgba(58,106,51,.10);
   --blue:       #2a5c8a;
+  /* --violet is a chart series colour, held near --teal's lightness in
+   * each theme so no series outweighs another; its hue sits apart from
+   * the blue accent and the teal series beside it. */
+  --violet:     #7241a0;
 
   /* Elevation ramp (ADR-0032): a well inset plus three raised steps, each
    * a tight contact layer under a soft ambient one, tinted toward the
@@ -299,6 +303,7 @@
   --green:      #7bbd6a;
   --green-wash: rgba(123,189,106,.12);
   --blue:       #5a9fd4;
+  --violet:     #c09aeb;
 
   --edge-hi:     rgb(255 255 255 / .09);
   --inset:       inset 0 1px 3px rgb(0 0 0 / .38);
@@ -409,6 +414,16 @@ body {
   text-rendering: optimizeLegibility;
 }
 button { font: inherit; }
+/* A link with no class of its own reads as product text in accent ink,
+ * visited or not, instead of the browser's blue and purple (any author
+ * colour beats the UA's :visited one). `:where` keeps the rule at zero
+ * specificity, so any classed link, and any rule that styles links
+ * inside a component, still wins. */
+:where(a:not([class])) {
+  color: var(--accent-ink);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
 ::selection { background: var(--selection); }
 
 /* Focus ring — a 2px outline offset from the control, so it never
@@ -1631,7 +1646,7 @@ select:focus-visible,
 .load-more .load-more-end {
   font-size: var(--fs-small);
   color: var(--ink-3);
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -1746,6 +1761,9 @@ select:focus-visible,
   padding: 12px;
   animation: fadeIn 120ms;
 }
+/* Dark shadows barely read, so the popover steps up to --panel-2 to
+ * part from the --panel console it overlaps. */
+[data-theme="dark"] .dr-pop { background: var(--panel-2); }
 /* .dr-pop .tabs reskin retired (issue #31): the popover's mode strip
  * renders fleet_ui::Segmented; the layout margin stays with the dialog. */
 .dr-pop .seg { margin-bottom: 10px; }
@@ -1780,6 +1798,15 @@ select:focus-visible,
   border-color: var(--line);
   box-shadow: var(--elev-1);
   font-weight: 600;
+}
+/* On the dark --panel-2 popover a --panel chip sinks below its --fill
+ * siblings, so the chosen preset takes the open trigger's wash and a
+ * half-strength accent border instead: still quieter than the full
+ * --accent border a hovered preset shows. */
+[data-theme="dark"] .dr-pop .opt.on {
+  background: var(--accent-wash);
+  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+  box-shadow: none;
 }
 /* From/To stack vertically — a full ISO timestamp at mono --table-fs
  * needs ~154px and two-abreast cells in the 320px popover can't hold

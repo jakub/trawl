@@ -409,11 +409,18 @@ pub fn SchemaPage() -> impl IntoView {
                                     [day] => {
                                         let unit = if day.count == 1 { "event" } else { "events" };
                                         let label = format!("{} {unit} on {}. One day recorded.", day.count, day.date);
+                                        // The words name what the point is: history,
+                                        // not health. The point already carries the
+                                        // full description, so they stay out of the
+                                        // accessibility tree.
                                         view! {
-                                            <svg class="sc-spark" width="96" height="16" viewBox="0 0 96 16" role="img" aria-label=label.clone()>
-                                                <title>{label.clone()}</title>
-                                                <circle cx="48" cy="8" r="3" fill=spark_color/>
-                                            </svg>
+                                            <span class="activity-single">
+                                                <svg class="sc-spark" width="8" height="16" viewBox="0 0 8 16" role="img" aria-label=label.clone()>
+                                                    <title>{label.clone()}</title>
+                                                    <circle cx="4" cy="8" r="3" fill=spark_color/>
+                                                </svg>
+                                                <span aria-hidden="true">"1 day recorded"</span>
+                                            </span>
                                         }.into_any()
                                     },
                                     _ => view! {
@@ -480,6 +487,7 @@ pub fn SchemaPage() -> impl IntoView {
                                             <td class="num">{events_label}</td>
                                             <td class="num">{storage_label}</td>
                                             <td class="num">{field_count}</td>
+                                            <td class="col-slack" aria-hidden="true"></td>
                                             <td class="row-act">
                                             // Commands, not places: both go
                                             // through the navigator, which
@@ -514,6 +522,9 @@ pub fn SchemaPage() -> impl IntoView {
                                             {table_sort_th(sort, SvcSort::Events, SvcSort::Events.default_desc(), "Events", "width:84px; text-align:right")}
                                             {table_sort_th(sort, SvcSort::Storage, SvcSort::Storage.default_desc(), "Storage", "width:100px; text-align:right")}
                                             {table_sort_th(sort, SvcSort::Fields, SvcSort::Fields.default_desc(), "Fields", "width:76px; text-align:right")}
+                                            // The slack column takes the spare width, so a
+                                            // service's facts sit next to its name.
+                                            <th class="col-slack" aria-hidden="true"></th>
                                             <th scope="col" style="width:84px"><span class="sr-only">Actions</span></th>
                                         </tr></thead>
                                         <tbody>{rows}</tbody></table>

@@ -301,7 +301,7 @@ test.describe('on a phone', () => {
                       - rowgroup:
                         - row "_time host status message"
                       - rowgroup:
-                        - row "2026-10-24 09:03:40 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)"
+                        - row "2026-10-24 09:03:40.000 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)"
                   - button "Open Row 0 of result fedcba98 among its rows"
                 - listitem:
                   - paragraph: Row 2 of result fedcba98
@@ -310,7 +310,7 @@ test.describe('on a phone', () => {
                       - rowgroup:
                         - row "_time host status message"
                       - rowgroup:
-                        - row "2026-10-24 09:01:12 gw-2 502 upstream connect timeout to payments:8443 after 3000ms"
+                        - row "2026-10-24 09:01:12.000 gw-2 502 upstream connect timeout to payments:8443 after 3000ms"
                   - button "Open Row 2 of result fedcba98 among its rows"
           - listitem:
             - article:
@@ -326,7 +326,7 @@ test.describe('on a phone', () => {
         - list "Steps":
           - listitem:
             - group:
-              - text: Step Succeeded 3 rows · 0.182s Find the first 502 and what the gateway logged beside it
+              - text: Step Succeeded 3 rows · 182ms Find the first 502 and what the gateway logged beside it
               - code: service=shop-api status>=500 earliest="2026-10-24T08:00:00.000000Z" latest="2026-10-24T10:00:00.000000Z" | sort -_time, -_ingested
               - paragraph: Bounds 2026-10-24T08:00:00.000000Z → 2026-10-24T10:00:00.000000Z
               - paragraph: claude-agent · 2026-10-24 09:13 UTC

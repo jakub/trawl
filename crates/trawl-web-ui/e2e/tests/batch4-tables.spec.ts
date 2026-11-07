@@ -21,10 +21,16 @@ for (const [path, label, columns] of [
     await expect(table).toBeVisible();
     await expect(table.getByRole('columnheader')).toHaveCount(columns);
     const row = table.locator('tbody > tr').first();
-    await expect(row.locator(':scope > td')).toHaveCount(columns);
+    // A trailing slack column takes the spare width so a row's facts sit
+    // next to its identifier; it stays out of the accessibility tree.
+    for (const slack of await table.locator('.col-slack').all()) {
+      await expect(slack).toHaveAttribute('aria-hidden', 'true');
+      await expect(slack).toBeEmpty();
+    }
+    await expect(row.locator(':scope > td:not(.col-slack)')).toHaveCount(columns);
     const tracks = await table.evaluate(el => {
-      const headers = [...el.querySelectorAll('thead th')];
-      const cells = [...el.querySelectorAll('tbody > tr:first-child > td')];
+      const headers = [...el.querySelectorAll('thead th:not(.col-slack)')];
+      const cells = [...el.querySelectorAll('tbody > tr:first-child > td:not(.col-slack)')];
       return headers.map((header, i) => ({
         header: header.getBoundingClientRect().left,
         cell: cells[i].getBoundingClientRect().left,
@@ -87,7 +93,7 @@ test('Nets renders distinct actual statuses at the same timestamp and keeps nati
   await page.route('**/api/v1/saved', route => route.fulfill({ json: { queries: statuses.map((status, i) => ({
     ...original, id: i + 1, name: `net ${i}`, schedule: {
       id: i + 1, saved_query_id: i + 1, interval: '5m', interval_secs: 300,
-      enabled: true, created_at: time, updated_at: time, total_runs: 1, next_fire_at: time,
+      enabled: true, created_at: time, updated_at: time, total_runs: 1, exhausted: false, next_fire_at: time,
       last_run: { id: i + 1, query: original.query, status, started_at: time },
     },
   })) } }));

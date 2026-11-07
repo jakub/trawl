@@ -165,7 +165,7 @@ has no **Retry**: sending the same text again gets the same answer.
 When the server refuses a snapshot as `corpus_recovering`, both results tabs
 show a recovering notice instead of the table or chart. Its title reads
 **Search is recovering**, the server's sentence follows, and **Retry** sends
-the same request again. The status bar reads **Recovering**, not **Error**, and
+the same request again. The status bar reads **Recovering**, not **Search failed**, and
 **Hauling** while the Retry runs. The server is still loading data from before a
 restart, or finishing an interrupted storage rollup, so an empty table would be
 wrong. Live mode reads only the event stream, which this refusal does not
@@ -301,7 +301,7 @@ all retained history for your key before paging. Matching is a literal
 substring using the database's lowercase rules; whitespace, `%`, and `_` remain
 significant. **Save as Net** stores a row as a saved query.
 
-Typing edits a draft. **Search** or Enter outside IME composition applies it.
+Typing edits a draft. **Filter** or Enter outside IME composition applies it.
 A changed filter starts at page one and adds a browser history entry.
 Submitting unchanged text refreshes the current page. **Clear filter** applies
 an empty filter at page one. Paging keeps the applied filter, discards an unsubmitted
@@ -329,7 +329,7 @@ not change the export.
 
 **Clear history** asks for confirmation, then deletes every history row for
 your key, including unmatched rows and other pages. Saved queries remain.
-While deletion is pending, filter input, Search, Clear filter, paging, export,
+While deletion is pending, filter input, Filter, Clear filter, paging, export,
 and duplicate Clear are disabled. Success resets the filter and page, replaces
 the URL with `/search/history`, and refreshes without restoring old rows if
 that refresh fails. A failed or unknown deletion outcome preserves the view
@@ -615,7 +615,7 @@ stream; those buttons do not trigger a storage scan or open another stream.
 
 | Section | Permission | Contents |
 |---------|------------|----------|
-| Server health | any signed-in key | Overall state, version, and each named check. A `duckdb` check that reads `slow` shows as a warning, not a failure |
+| Server health | any signed-in key | State in the card title, version, and each named check. A `duckdb` check that reads `slow` shows as a warning, not a failure |
 | Capacity | `server_manage` | Uptime, queries since startup, active queries, executors available, and retained work |
 | Live operations | `server_manage` | Host, HTTP ingest rate, query rate, hot buffer events and memory, and executors occupied |
 | Ingestion | `server_manage` | HTTP rejected events, syslog configuration, transport receive counts, syslog rate, parse errors, backpressure drops, and active TCP connections |

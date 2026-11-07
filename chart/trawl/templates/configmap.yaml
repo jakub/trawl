@@ -240,8 +240,9 @@ data:
     [scheduler]
     enabled = {{ .Values.config.scheduler.enabled }}
     poll_interval_secs = {{ .Values.config.scheduler.pollIntervalSecs | int }}
-    max_runs_per_schedule = {{ .Values.config.scheduler.maxRunsPerSchedule | int }}
-    report_retention_days = {{ .Values.config.scheduler.reportRetentionDays | int }}
+    {{- /* trawld refuses these out of range at boot; fail the render first. */}}
+    max_runs_per_schedule = {{ include "trawl.wholeNumber" (dict "value" .Values.config.scheduler.maxRunsPerSchedule "max" "18446744073709551615" "name" "config.scheduler.maxRunsPerSchedule" "key" "[scheduler] max_runs_per_schedule") }}
+    report_retention_days = {{ include "trawl.wholeNumber" (dict "value" .Values.config.scheduler.reportRetentionDays "max" "36500" "name" "config.scheduler.reportRetentionDays" "key" "[scheduler] report_retention_days") }}
     max_catchup_intervals = {{ .Values.config.scheduler.maxCatchupIntervals | int }}
     {{- if .Values.web.enabled }}
 

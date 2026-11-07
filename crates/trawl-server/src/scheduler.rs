@@ -891,7 +891,7 @@ mod pg_tests {
             .await
             .unwrap();
         let rid = match sched_store
-            .claim_run(sched.id, saved.id, "q", None, None)
+            .claim_run(sched.id, saved.id, "q", None)
             .await
             .unwrap()
         {

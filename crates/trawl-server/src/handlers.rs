@@ -2366,12 +2366,10 @@ fn saved_query_response(saved: SavedQuery) -> SavedQueryResponse {
     }
 }
 
-/// Build a [`ScheduleResponse`] from a schedule with pre-fetched run stats.
-fn build_schedule_response(
-    schedule: &Schedule,
-    latest_run: Option<ReportRun>,
-    total_runs: u64,
-) -> ScheduleResponse {
+/// Build a [`ScheduleResponse`] from a schedule and its pre-fetched latest
+/// run. The run count and `exhausted` both read off this one `schedule`, so
+/// they can never pair a count with some other read's cap.
+fn build_schedule_response(schedule: &Schedule, latest_run: Option<ReportRun>) -> ScheduleResponse {
     ScheduleResponse {
         id: schedule.id,
         saved_query_id: schedule.saved_query_id,
@@ -2382,7 +2380,8 @@ fn build_schedule_response(
         created_at: schedule.created_at.to_rfc3339(),
         updated_at: schedule.updated_at.to_rfc3339(),
         last_run: latest_run.map(report_run_summary),
-        total_runs,
+        total_runs: schedule.runs_claimed,
+        exhausted: schedule.exhausted(),
         window: schedule.window.map(|w| w.to_string()),
         // The lag pair rides the window, not the stored number: query mode
         // stores a zero that changes no answer, and reporting "0s" there
@@ -2408,7 +2407,7 @@ fn build_schedule_response(
 
 /// Build a [`ScheduleResponse`] from a bulk-join [`ScheduleWithStats`] row.
 fn schedule_response_from_stats(stats: ScheduleWithStats) -> ScheduleResponse {
-    build_schedule_response(&stats.schedule, stats.latest_run, stats.total_runs)
+    build_schedule_response(&stats.schedule, stats.latest_run)
 }
 
 /// Convert a [`ReportRun`] into a [`ReportRunSummary`].
@@ -2899,18 +2898,19 @@ pub async fn set_schedule(
         )
         .await?;
 
-    // Freshly created/updated schedules can already have runs (updates);
-    // fetch the stats the response carries.
-    let (_, latest_run, total_runs) = state
+    // An updated schedule can already have runs; fetch the latest one the
+    // response carries. The response reads that same row whole, never the
+    // write's cap beside the re-read's count: a claim between the two
+    // statements would pair them into a state no row held. A schedule gone
+    // by then answers with what was written.
+    let (schedule, latest_run) = state
         .storage
         .schedule
         .get_schedule_with_stats(saved_id, key_id)
         .await?
-        .map_or((None, None, 0), |(s, lr, tr)| (Some(s), lr, tr));
+        .unwrap_or((schedule, None));
 
-    Ok(Json(build_schedule_response(
-        &schedule, latest_run, total_runs,
-    )))
+    Ok(Json(build_schedule_response(&schedule, latest_run)))
 }
 
 /// `GET /api/v1/saved/{id}/schedule` — get schedule for a saved query.
@@ -2926,16 +2926,14 @@ pub async fn get_schedule(
 
     let key_id = verified.id;
 
-    let (schedule, latest_run, total_runs) = state
+    let (schedule, latest_run) = state
         .storage
         .schedule
         .get_schedule_with_stats(saved_id, key_id)
         .await?
         .ok_or_else(|| ServerError::NotFound("no schedule for this saved query".into()))?;
 
-    Ok(Json(build_schedule_response(
-        &schedule, latest_run, total_runs,
-    )))
+    Ok(Json(build_schedule_response(&schedule, latest_run)))
 }
 
 /// `DELETE /api/v1/saved/{id}/schedule` — delete a schedule.

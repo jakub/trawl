@@ -73,7 +73,7 @@ pub mod error_banner;
 #[cfg(target_arch = "wasm32")]
 pub mod field;
 pub mod icon;
-#[cfg(target_arch = "wasm32")]
+// The ⌘-or-Ctrl rule is native-tested; the `Kbd` renderer is wasm32-only.
 pub mod kbd;
 // The shared menu contract is crate-internal: both menus are the public
 // surface, the panel is not. Compiled on native test builds too, so its

@@ -859,7 +859,7 @@ mod tests {
             shape
                 .group_label(&timestamps, &timestamps.rows[0])
                 .as_deref(),
-            Some("2026-10-22 12:34:56.12")
+            Some("2026-10-22 12:34:56.120")
         );
         assert_eq!(
             shape.group_label(&timestamps, &timestamps.rows[0]),

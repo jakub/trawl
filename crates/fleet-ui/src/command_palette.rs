@@ -149,8 +149,8 @@ pub(crate) fn platform_kbd_hint(ua: &str) -> PlatformKbdHint {
     let ios = ["ipad", "iphone", "ipod"]
         .iter()
         .any(|name| ua.contains(name));
-    let is_macos = !ios && (ua.contains("macintosh") || ua.contains("mac os x"));
-    let apple = ios || is_macos;
+    let apple = crate::kbd::apple_keyboard(&ua);
+    let is_macos = apple && !ios;
     PlatformKbdHint {
         label: if apple { "⌘K" } else { "Ctrl+K" },
         aria_keyshortcuts: if apple { "Meta+K" } else { "Control+K" },

@@ -31,7 +31,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use trawl_api::display::value_to_string;
 use trawl_api::value::{QueryResult, Value};
-use trawl_core::ast::{PipeStage, TimechartStage};
+use trawl_core::ast::{PipeStage, TimeUnit, TimechartStage, TrawlDuration};
 use trawl_core::schema::{TIME, catalog_key};
 use trawl_core::timechart::{query_span, resolve_span};
 
@@ -60,9 +60,39 @@ pub struct SeriesSet {
     pub series: Vec<(String, Vec<Option<f64>>)>,
     /// How many series the result held before [`SERIES_CAP`] applied.
     pub total_series: usize,
+    /// The labels of the series [`SERIES_CAP`] left out, largest total
+    /// first, so the caption can name them.
+    pub omitted: Vec<String>,
     /// The `by` fields in query order, for the caption; empty when the
     /// timechart is ungrouped.
     pub group_fields: Vec<String>,
+    /// The result's name for the metric column when there is exactly
+    /// one, as the response carries it after every alias and `rename`;
+    /// the value axis's label. `None` when several metrics share the
+    /// axis, which then has no single quantity to name.
+    pub metric: Option<String>,
+    /// The bucket width the grid was laid on: the one the lane's
+    /// executor cut the result with (see [`Lane`]).
+    pub span: TrawlDuration,
+}
+
+/// The sentence that names a line chart's aggregation period, such as
+/// `10 minutes per bucket.`, in the histogram caption's per-bucket
+/// wording, so the reader need not find `span=` in the query or mistake
+/// the axis's tick spacing for it. It names the bucket and not the
+/// metric, because a bucket may hold an average or a sum as well as a
+/// count.
+#[must_use]
+pub fn bucket_sentence(span: TrawlDuration) -> String {
+    let unit = match span.unit {
+        TimeUnit::Seconds => "second",
+        TimeUnit::Minutes => "minute",
+        TimeUnit::Hours => "hour",
+        TimeUnit::Days => "day",
+        TimeUnit::Weeks => "week",
+    };
+    let plural = if span.quantity == 1 { "" } else { "s" };
+    format!("{} {unit}{plural} per bucket.", span.quantity)
 }
 
 /// Why a result is not drawn as lines. Every variant names the fix or
@@ -389,17 +419,23 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
     if !group_cols.is_empty() && metric_cols.len() > 1 {
         return Err(Refusal::GroupedTwoMetrics);
     }
+    let metric = match metric_cols.as_slice() {
+        [ci] => Some(result.columns[*ci].name.clone()),
+        _ => None,
+    };
     if result.rows.is_empty() {
         return Err(Refusal::Empty);
     }
 
     // The width the lane's executor cut the buckets with (see `Lane`).
-    let span = match lane {
-        Lane::Snapshot => query_span(&ast).map_or(60, |d| d.to_seconds()),
-        Lane::Live => resolve_span(tc.span, None).to_seconds(),
-    }
-    .max(1);
-    let span = i64::try_from(span).unwrap_or(i64::MAX);
+    let bucket = match lane {
+        Lane::Snapshot => query_span(&ast).unwrap_or(TrawlDuration {
+            quantity: 1,
+            unit: TimeUnit::Minutes,
+        }),
+        Lane::Live => resolve_span(tc.span, None),
+    };
+    let span = i64::try_from(bucket.to_seconds().max(1)).unwrap_or(i64::MAX);
 
     // Pass 1: every `_time` cell, so that an unreadable one refuses
     // before any series is built.
@@ -486,6 +522,11 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
             .total_cmp(&a.total)
             .then_with(|| a.label.cmp(&b.label))
     });
+    let omitted = series
+        .iter()
+        .skip(SERIES_CAP)
+        .map(|s| s.label.clone())
+        .collect();
     series.truncate(SERIES_CAP);
     series.sort_by(|a, b| a.label.cmp(&b.label));
     let series = series
@@ -500,7 +541,10 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
         xs,
         series,
         total_series,
+        omitted,
         group_fields,
+        metric,
+        span: bucket,
     })
 }
 
@@ -629,6 +673,8 @@ pub struct CatPoints {
     pub values: Vec<Option<f64>>,
     /// How many groups the result held before [`GROUP_CAP`] applied.
     pub total_groups: usize,
+    /// The labels of the groups [`GROUP_CAP`] left out, largest first.
+    pub omitted: Vec<String>,
 }
 
 /// The points a Column or Bar chart draws for a shape
@@ -656,40 +702,117 @@ pub fn cat_points(shape: &CatShape, result: &QueryResult) -> CatPoints {
         (None, None) => la.cmp(lb),
     });
     let total_groups = points.len();
+    let omitted = points
+        .iter()
+        .skip(GROUP_CAP)
+        .map(|(label, _)| label.clone())
+        .collect();
     points.truncate(GROUP_CAP);
     let (labels, values) = points.into_iter().unzip();
     CatPoints {
         labels,
         values,
         total_groups,
+        omitted,
+    }
+}
+
+/// One run of a caption: prose, or a name the query or the result
+/// supplied. The names render in mono, so a `by` field or a series
+/// value does not read as an English word.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptionPart {
+    Text(String),
+    /// A `by` field the caption suggests narrowing.
+    Field(String),
+    /// A series or group label left out of the chart.
+    Value(String),
+}
+
+/// A caption as its parts; `to_string` is the plain sentence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caption(pub Vec<CaptionPart>);
+
+impl std::fmt::Display for Caption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for part in &self.0 {
+            let (CaptionPart::Text(text) | CaptionPart::Field(text) | CaptionPart::Value(text)) =
+                part;
+            f.write_str(text)?;
+        }
+        Ok(())
     }
 }
 
 /// The line under a chart that drew fewer series or groups than the
 /// result holds; `None` when nothing was left out.
 ///
-/// `noun` is `"series"` for Line and `"groups"` for Column and Bar.
-/// `narrow` is the `by` fields joined with `", "`, when there are any to
-/// suggest narrowing. The copy is asserted by the e2e suite.
+/// `omitted` is the labels left out, largest first. The caption names
+/// up to three of them, so every series in the result is either in the
+/// key or in this line (ADR-0038). `noun` is `"series"` for Line and
+/// `"groups"` for Column and Bar. `narrow` is the `by` fields, when
+/// there are any to suggest narrowing. That sentence ends on "or": the
+/// Open Events control beside the caption completes it, so the caption
+/// never names Events itself. The copy is asserted by the e2e suite.
 #[must_use]
-pub fn caption(drawn: usize, total: usize, noun: &str, narrow: Option<&str>) -> Option<String> {
-    if drawn >= total {
-        return None;
-    }
-    let omitted = total - drawn;
-    // One omission reads as a singular; the plural keeps the count.
-    let line = match (noun == "series", omitted) {
-        (true, 1) => format!("{drawn} of {total} series drawn; the smallest by total is not."),
-        (true, _) => {
-            format!("{drawn} of {total} series drawn; the {omitted} smallest by total are not.")
-        }
-        (false, 1) => format!("{drawn} of {total} {noun} drawn; the smallest is not."),
-        (false, _) => format!("{drawn} of {total} {noun} drawn; the {omitted} smallest are not."),
+pub fn caption(drawn: usize, omitted: &[String], noun: &str, narrow: &[String]) -> Option<Caption> {
+    use CaptionPart::{Field, Text};
+    let count = omitted.len();
+    let total = drawn + count;
+    let smallest = if noun == "series" {
+        "smallest by total"
+    } else {
+        "smallest"
     };
-    Some(match narrow {
-        Some(fields) => format!("{line} Narrow {fields}, or open Events."),
-        None => line,
-    })
+    let head = format!("{drawn} of {total} {noun} drawn;");
+    // An empty group value prints as `""`, so the sentence keeps its subject.
+    let value = |name: &String| {
+        CaptionPart::Value(if name.is_empty() {
+            "\"\"".to_owned()
+        } else {
+            name.clone()
+        })
+    };
+    let text = |t: String| Text(t);
+    let mut parts = match omitted {
+        [] => return None,
+        [name] => vec![
+            text(format!("{head} ")),
+            value(name),
+            text(format!(", the {smallest}, is not.")),
+        ],
+        [a, b] => vec![
+            text(format!("{head} the 2 {smallest} are not: ")),
+            value(a),
+            text(" and ".to_owned()),
+            value(b),
+            text(".".to_owned()),
+        ],
+        [a, b, c, rest @ ..] => vec![
+            text(if rest.is_empty() {
+                format!("{head} the 3 {smallest} are not: ")
+            } else {
+                format!("{head} the {count} {smallest} are not, among them ")
+            }),
+            value(a),
+            text(", ".to_owned()),
+            value(b),
+            text(" and ".to_owned()),
+            value(c),
+            text(".".to_owned()),
+        ],
+    };
+    if !narrow.is_empty() {
+        parts.push(text(" Narrow ".to_owned()));
+        for (idx, field) in narrow.iter().enumerate() {
+            if idx > 0 {
+                parts.push(text(", ".to_owned()));
+            }
+            parts.push(Field(field.clone()));
+        }
+        parts.push(text(", or".to_owned()));
+    }
+    Some(Caption(parts))
 }
 
 #[cfg(test)]
@@ -846,6 +969,7 @@ mod align_series_tests {
         assert_eq!(series(&set, "b"), &[None, Some(3.0), None]);
         assert_eq!(set.total_series, 2);
         assert_eq!(set.group_fields, vec!["host".to_owned()]);
+        assert_eq!(set.metric.as_deref(), Some("count"));
     }
 
     #[test]
@@ -999,9 +1123,25 @@ mod align_series_tests {
         assert_eq!(set.series.len(), SERIES_CAP);
         let labels: Vec<&str> = set.series.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(labels, vec!["g08", "g09", "g10", "g11", "g12", "g13"]);
+        let omitted: Vec<&str> = set.omitted.iter().map(String::as_str).collect();
         assert_eq!(
-            caption(set.series.len(), set.total_series, "series", Some("host")),
-            Some("6 of 14 series drawn; the 8 smallest by total are not. Narrow host, or open Events.".into())
+            omitted,
+            vec!["g07", "g06", "g05", "g04", "g03", "g02", "g01", "g00"],
+            "the left-out labels, largest first"
+        );
+        assert_eq!(
+            caption(
+                set.series.len(),
+                &set.omitted,
+                "series",
+                &["host".to_owned()]
+            )
+            .map(|c| c.to_string())
+            .as_deref(),
+            Some(
+                "6 of 14 series drawn; the 8 smallest by total are not, among them g07, g06 and g05. \
+                 Narrow host, or"
+            )
         );
     }
 
@@ -1036,6 +1176,8 @@ mod align_series_tests {
         .unwrap();
         assert_eq!(set.total_series, 3);
         assert!(set.group_fields.is_empty());
+        // Three quantities share the axis: none of them names it.
+        assert_eq!(set.metric, None);
         assert_eq!(series(&set, "count"), &[Some(3.0), Some(4.0)]);
         assert_eq!(series(&set, "mean"), &[Some(1.5), None]);
         let max = series(&set, "max_bytes");
@@ -1047,6 +1189,8 @@ mod align_series_tests {
         let rows = vec![vec![at(0), Value::Integer(3)]];
         let set = align(renamed, &result(&["_time", "n"], rows)).unwrap();
         assert_eq!(set.series[0].0, "n");
+        // The axis takes the name the result carries, not the declared one.
+        assert_eq!(set.metric.as_deref(), Some("n"));
     }
 
     #[test]
@@ -1185,6 +1329,33 @@ mod align_series_tests {
         )
         .unwrap();
         assert_eq!(set.xs.len(), 2);
+        assert_eq!(bucket_sentence(set.span), "1 hour per bucket.");
+    }
+
+    #[test]
+    fn the_bucket_sentence_names_the_span_as_written() {
+        let rows = vec![vec![at(0), Value::Integer(1)]];
+        let sentence = |query: &str| {
+            let set = align(query, &result(&["_time", "count"], rows.clone())).unwrap();
+            bucket_sentence(set.span)
+        };
+        assert_eq!(
+            sentence("* | timechart span=10m count()"),
+            "10 minutes per bucket."
+        );
+        assert_eq!(
+            sentence("* | timechart span=90s count()"),
+            "90 seconds per bucket."
+        );
+        assert_eq!(sentence("* | timechart count()"), "1 minute per bucket.");
+        assert_eq!(
+            sentence("last=30d | timechart count()"),
+            "6 hours per bucket."
+        );
+        assert_eq!(
+            sentence("* | timechart span=1d avg(bytes) as mean"),
+            "1 day per bucket."
+        );
     }
 
     #[test]
@@ -1205,6 +1376,10 @@ mod align_series_tests {
         assert_eq!(points.labels[0], "s24");
         assert_eq!(points.values[0], Some(24.0));
         assert_eq!(points.labels[19], "s05");
+        assert_eq!(
+            points.omitted,
+            vec!["s04", "s03", "s02", "s01", "s00", "nul"]
+        );
         assert!(
             !points.labels.contains(&"nul".to_owned()),
             "nulls rank last"
@@ -1224,29 +1399,77 @@ mod align_series_tests {
         assert_eq!(points.labels, vec!["a", "b", "n"]);
         assert_eq!(points.values, vec![Some(1.0), Some(1.0), None]);
         assert_eq!(points.total_groups, 3);
+        assert!(points.omitted.is_empty());
     }
 
     #[test]
     fn caption_text_matches_the_contract() {
-        assert_eq!(caption(6, 6, "series", Some("host")), None);
-        assert_eq!(caption(3, 3, "groups", None), None);
+        let names = |n: usize| -> Vec<String> { (1..=n).map(|i| format!("h{i}")).collect() };
+        let caption = |drawn, omitted: &[String], noun, narrow: &[&str]| {
+            let narrow: Vec<String> = narrow.iter().map(|f| (*f).to_owned()).collect();
+            caption(drawn, omitted, noun, &narrow).map(|c| c.to_string())
+        };
+        assert_eq!(caption(6, &[], "series", &["host"]), None);
+        assert_eq!(caption(3, &[], "groups", &[]), None);
         assert_eq!(
-            caption(6, 14, "series", Some("host, service")).as_deref(),
+            caption(6, &names(1), "series", &[]).as_deref(),
+            Some("6 of 7 series drawn; h1, the smallest by total, is not.")
+        );
+        assert_eq!(
+            caption(6, &names(2), "series", &["host"]).as_deref(),
             Some(
-                "6 of 14 series drawn; the 8 smallest by total are not. Narrow host, service, or open Events."
+                "6 of 8 series drawn; the 2 smallest by total are not: h1 and h2. \
+                 Narrow host, or"
             )
         );
         assert_eq!(
-            caption(6, 7, "series", None).as_deref(),
-            Some("6 of 7 series drawn; the smallest by total is not.")
+            caption(6, &names(3), "series", &[]).as_deref(),
+            Some("6 of 9 series drawn; the 3 smallest by total are not: h1, h2 and h3.")
         );
         assert_eq!(
-            caption(20, 26, "groups", None).as_deref(),
-            Some("20 of 26 groups drawn; the 6 smallest are not.")
+            caption(6, &names(8), "series", &["host", "service"]).as_deref(),
+            Some(
+                "6 of 14 series drawn; the 8 smallest by total are not, among them h1, h2 and h3. \
+                 Narrow host, service, or"
+            )
         );
         assert_eq!(
-            caption(20, 21, "groups", None).as_deref(),
-            Some("20 of 21 groups drawn; the smallest is not.")
+            caption(20, &names(6), "groups", &[]).as_deref(),
+            Some("20 of 26 groups drawn; the 6 smallest are not, among them h1, h2 and h3.")
+        );
+        assert_eq!(
+            caption(20, &names(1), "groups", &[]).as_deref(),
+            Some("20 of 21 groups drawn; h1, the smallest, is not.")
+        );
+        assert_eq!(
+            caption(6, &[String::new()], "series", &[]).as_deref(),
+            Some("6 of 7 series drawn; \"\", the smallest by total, is not.")
+        );
+    }
+
+    #[test]
+    fn caption_parts_mark_fields_and_values() {
+        use CaptionPart::{Field, Text, Value};
+        let parts = caption(
+            6,
+            &["trawld".to_owned()],
+            "series",
+            &["host".to_owned(), "service".to_owned()],
+        )
+        .unwrap()
+        .0;
+        assert_eq!(
+            parts,
+            vec![
+                Text("6 of 7 series drawn; ".to_owned()),
+                Value("trawld".to_owned()),
+                Text(", the smallest by total, is not.".to_owned()),
+                Text(" Narrow ".to_owned()),
+                Field("host".to_owned()),
+                Text(", ".to_owned()),
+                Field("service".to_owned()),
+                Text(", or".to_owned()),
+            ]
         );
     }
 
@@ -1324,6 +1547,9 @@ mod align_series_tests {
         let snap = align(query, &result(&["_time", "count"], rows)).unwrap();
         assert_eq!(snap.xs.len(), 2);
         assert_eq!(snap.series[0].1, vec![Some(1.0), Some(1.0)]);
+        // The note names the width each lane was cut with.
+        assert_eq!(bucket_sentence(live.span), "1 minute per bucket.");
+        assert_eq!(bucket_sentence(snap.span), "5 minutes per bucket.");
     }
 
     #[test]
@@ -1430,6 +1656,8 @@ mod align_series_tests {
         assert_eq!(series(&set, "500"), &[Some(1.0)]);
         // The caption hint names the field as the reader wrote it.
         assert_eq!(set.group_fields, vec!["status"]);
+        // The renamed group is not mistaken for the metric.
+        assert_eq!(set.metric.as_deref(), Some("count"));
 
         // A chain of renames follows the name through every stage, and
         // the renames inside one stage are parallel.

@@ -3333,7 +3333,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/saved"
 {
   "queries": [
     { "id": 7, "name": "errors-by-service", "query": "_severity>=error | stats count() by service", "created_at": "2026-09-01T09:00:00+00:00", "updated_at": "2026-09-01T09:00:00+00:00",
-      "schedule": { "id": 3, "saved_query_id": 7, "interval": "1h", "interval_secs": 3600, "enabled": true, "total_runs": 2, "next_fire_at": "2026-09-11T09:00:00.000000Z" } }
+      "schedule": { "id": 3, "saved_query_id": 7, "interval": "1h", "interval_secs": 3600, "enabled": true, "total_runs": 2, "exhausted": false, "next_fire_at": "2026-09-11T09:00:00.000000Z", "created_at": "2026-09-01T09:00:00+00:00", "updated_at": "2026-09-01T09:00:00+00:00" } }
   ]
 }
 ```
@@ -3474,7 +3474,7 @@ Creates or replaces the schedule on a saved query. On an update, `next_fire_at` 
 | `interval` | body | string | yes | The period. At least `60s`. |
 | `window` | body | string | no | What each run covers. `"since_last"` tiles from the previous run's window end. A duration such as `"2h"` is a fixed trailing span, at least `60s`. Absent is query mode: the saved DSL runs verbatim. |
 | `lag` | body | string | no | Late-arrival allowance. Shifts both window bounds back. Default `"0s"`. Requires `window`. |
-| `max_runs` | body | integer | no | Stop after this many runs. Absent means unlimited. |
+| `max_runs` | body | integer | no | Stop after this many claimed runs over the schedule's life, scheduled and manual. Retention does not give runs back. `0` means the schedule is exhausted from the start. An edit keeps the count; only deleting the schedule and creating it again starts it at 0. Absent means unlimited. |
 | `enabled` | body | boolean | no | Default `true`, on create and on update |
 
 **Request**
@@ -3492,7 +3492,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X PUT -H "Content-Type: app
   "id": 3, "saved_query_id": 7, "interval": "1h", "interval_secs": 3600, "enabled": true,
   "window": "since_last", "lag": "5m", "lag_secs": 300,
   "covered_through": "2026-09-11T07:55:00.000000Z", "next_fire_at": "2026-09-11T09:00:00.000000Z",
-  "total_runs": 2,
+  "total_runs": 2, "exhausted": false,
   "last_run": { "id": 42, "query": "earliest=\"2026-09-11T06:55:00.000000Z\" latest=\"2026-09-11T07:55:00.000000Z\" _severity>=error | stats count() by service", "status": "success", "started_at": "2026-09-11T08:00:00+00:00", "finished_at": "2026-09-11T08:00:01+00:00", "duration_ms": 900, "row_count": 4, "result_path": "scheduled/errors-by-service/run_42.parquet", "window_start": "2026-09-11T06:55:00.000000Z", "window_end": "2026-09-11T07:55:00.000000Z", "window_truncated": false, "window_kind": "since_last" },
   "created_at": "2026-09-01T09:00:00+00:00", "updated_at": "2026-09-11T08:00:00+00:00"
 }
@@ -3502,6 +3502,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X PUT -H "Content-Type: app
 |-------|------|-------------|
 | `interval` | string | Normalized: the largest unit that divides the period, for example `"90m"` for 5400 seconds |
 | `max_runs` | integer | Absent when unlimited |
+| `total_runs` | integer | Runs the schedule has claimed over its life, scheduled and manual, including runs retention has since deleted. This is the count `max_runs` caps. |
+| `exhausted` | boolean | `true` when `max_runs` is set and `total_runs` has reached it. An exhausted schedule claims no run, scheduled or manual, until `max_runs` is raised. |
 | `window` | string | `"since_last"` or a normalized duration. Absent in query mode. |
 | `lag`, `lag_secs` | string, integer | Present exactly when `window` is. A windowed schedule with no lag reports `"0s"` and `0`. |
 | `covered_through` | string | The `since_last` watermark, where the next window starts. Seeded at `next_fire_at - interval - lag` before the first run. Absent for a fixed window and in query mode. |
@@ -3585,7 +3587,7 @@ Runs the schedule's next window now, as if its next fire came early. Any schedul
 - A fixed window covers the span ending at `t - lag`.
 - Query mode runs the saved text as written.
 
-The run counts against `max_runs` and records `origin: "manual"`. A successful run advances `covered_through` like a scheduled `since_last` run. It also moves an overdue `next_fire_at` to the first fire after `t`, so the overdue scheduled run does not follow with an older window. A `next_fire_at` already after `t` stays where it is. A failed, timed-out, or interrupted run moves neither. The response returns at once with status `running`, and the run continues in the background.
+The run spends one run of the schedule's `max_runs` budget, and a run that fails, times out, or is interrupted still counts. It records `origin: "manual"`. A successful run advances `covered_through` like a scheduled `since_last` run. It also moves an overdue `next_fire_at` to the first fire after `t`, so the overdue scheduled run does not follow with an older window. A `next_fire_at` already after `t` stays where it is. A failed, timed-out, or interrupted run moves neither. The response returns at once with status `running`, and the run continues in the background.
 
 **Request**
 
@@ -3607,7 +3609,9 @@ The shape is the [report run](#report-runs) summary. `started_at` is `t`, and th
 |--------|------|------|
 | 400 | `bad_request` | The saved query has no schedule |
 | 404 | `not_found` | No saved query with this id belongs to the key |
-| 409 | `bad_request` | A run is already in progress, `max_runs` is reached, or a `since_last` window would be empty: `nothing new to read: coverage already reaches 2026-09-11T08:25:00.000000Z, and a run now would end at 2026-09-11T08:24:10.000000Z`. Nothing is recorded. |
+| 409 | `bad_request` | A run is already in progress for this net. Nothing is recorded. |
+| 409 | `bad_request` | The run budget is spent: `max runs reached for this net`. Raise `max_runs`, or delete the schedule and create it again. Nothing is recorded. |
+| 409 | `bad_request` | A `since_last` window would be empty: `nothing new to read: coverage already reaches 2026-09-11T08:25:00.000000Z, and a run now would end at 2026-09-11T08:24:10.000000Z`. Nothing is recorded. |
 | 503 | `corpus_recovering` | The corpus is unsettled. No run is created and the schedule does not move. See [corpus recovering](#corpus-recovering). |
 
 ## Report runs
@@ -3657,6 +3661,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/saved/7/r
 ```json
 { "runs": [{ "id": 42, "query": "...", "status": "success", "started_at": "2026-09-11T08:00:00+00:00", "finished_at": "2026-09-11T08:00:01+00:00", "duration_ms": 900, "row_count": 4, "result_path": "scheduled/errors-by-service/run_42.parquet" }], "total": 2 }
 ```
+
+`total` counts the schedule's kept runs. It can be lower than the schedule's `total_runs`, because retention deletes runs.
 
 **Errors**
 
@@ -3750,6 +3756,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/runs"
 | Field | Type | Description |
 |-------|------|-------------|
 | `runs[].net_id`, `runs[].net_name` | integer, string | The owning saved query's id and name. The remaining fields are the run summary. |
+| `total` | integer | The key's kept runs across saved queries |
 
 **Errors**
 
@@ -3767,7 +3774,7 @@ Parameter errors use the normal JSON error envelope. Invalid tokens return `inva
 
 Permission: `saved_query`
 
-Aggregates the key's runs.
+Aggregates the key's kept runs. Retention deletes runs, so `total_runs` here counts the runs kept, not the runs schedules have claimed. A schedule's own `total_runs` counts those.
 
 **Request**
 
