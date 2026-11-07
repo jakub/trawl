@@ -567,10 +567,9 @@ that failed work completed or that a latched refusal cleared.
 ## File quarantine
 
 `TrawlFileQuarantine` observes `trawl_files_quarantined_total{kind}`, in files,
-only after a successful quarantine rename. The closed kinds are `wal`,
-`parquet`, and `rollup_temporary`. Bytes are retained outside normal processing.
-Temporary rollup files can be quarantined while their hourly sources remain
-intact. A failed reservation or rename is not a successful quarantine.
+only after a successful quarantine rename. The closed kinds are `wal` and
+`parquet`. Bytes are retained outside normal processing. A failed reservation
+or rename is not a successful quarantine.
 
 1. Read `compaction_quarantine` or `rollup_quarantine` to find the original and
    quarantine paths. Compare any separate compaction-operation alert.
@@ -807,9 +806,19 @@ The `reason` label is one of two values:
    query-only node clears a failed scan only when you restart it.
    [Daily rollup](/architecture/recovery/#daily-rollup) describes the
    recovery.
+6. If `rollup_recovery_unresolved` is logged at ERROR, recovery cannot prove
+   what an interrupted rollup did, and it keeps every file and the marker.
+   No retry clears that, and compaction publishes no WAL until it is
+   resolved. Follow
+   [resolve an unresolved rollup marker](/architecture/recovery/#resolve-an-unresolved-rollup-marker):
+   stop trawld, back up the data root, and read
+   `server.recovery.publication` in `trawld --doctor`.
 
 Do not remove WAL files or markers to clear the state. A removed WAL file
-loses its events, and a removed marker can duplicate rows.
+loses its events, and a removed marker can duplicate rows. The one exception
+is a rollup marker that `trawld --doctor` reports as unresolved. Remove it
+only as the resolution steps describe, after a backup, and with trawld
+stopped.
 
 Resolution means the gauge read 0 for both reasons. Searches answer again
 from the moment the state clears, and the next scheduler poll claims the
