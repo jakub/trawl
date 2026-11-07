@@ -736,6 +736,9 @@ async fn compact_pass(
     // Recover before new WAL can merge into an hourly path named by an
     // interrupted rollup. Retiring that path after a new merge would delete
     // fresh rows that the daily file never contained.
+    // Without a hot buffer the gate lives for this pass only, and so does
+    // any removal-sync obligation the pass records. trawld always passes its
+    // buffer: ingest, and with it compaction, never runs without one.
     let publication =
         hot_buffer.map_or_else(|| Arc::new(PublicationGate::new()), |buf| buf.publication());
     publication.initialize(data_dir);
