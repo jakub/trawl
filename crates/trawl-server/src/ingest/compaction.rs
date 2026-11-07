@@ -11068,6 +11068,18 @@ mod tests {
                             "{name}: the day is synced before the first retirement"
                         );
                     }
+                    // Retirement is durable before the marker goes, and the
+                    // marker's unlink is synced after it.
+                    let at = |phase: Phase| entries.iter().rposition(|e| e.phase == phase);
+                    let unlink = at(Phase::MarkerUnlink).expect(name);
+                    assert!(
+                        at(Phase::HourSync).is_some_and(|sync| sync < unlink),
+                        "{name}: every hour directory is synced before the marker unlink"
+                    );
+                    assert!(
+                        at(Phase::UnlinkDaySync).is_some_and(|sync| sync > unlink),
+                        "{name}: the day is synced after the marker unlink"
+                    );
                     if renamed {
                         let phases: Vec<Phase> = entries.iter().map(|e| e.phase).collect();
                         let rename = phases.iter().position(|p| *p == Phase::Rename).unwrap();
