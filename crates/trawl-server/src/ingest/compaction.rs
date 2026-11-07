@@ -11056,6 +11056,18 @@ mod tests {
                         assert!(!after.contains_key(hourly), "{name}: {hourly:?} is retired");
                     }
                     assert_eq!(renamed, recovers == Recovers::Promoted, "{name}");
+                    // The crashed rollup may never have synced its rename, so
+                    // recovery makes the canonical's entry durable before it
+                    // retires any input.
+                    let durable_rename = entries.iter().position(|e| {
+                        e.phase == Phase::RenameDaySync && e.result == Some(Outcome::Ok)
+                    });
+                    if let Some(retire) = entries.iter().position(|e| e.phase == Phase::Retire) {
+                        assert!(
+                            durable_rename.is_some_and(|sync| sync < retire),
+                            "{name}: the day is synced before the first retirement"
+                        );
+                    }
                     if renamed {
                         let phases: Vec<Phase> = entries.iter().map(|e| e.phase).collect();
                         let rename = phases.iter().position(|p| *p == Phase::Rename).unwrap();
