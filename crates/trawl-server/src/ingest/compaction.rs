@@ -1684,13 +1684,6 @@ fn rollup_marker_path(day_dir: &Path, service: &str) -> PathBuf {
     day_dir.join(rollup_marker::marker_file_name(service))
 }
 
-/// The most bytes a rollup marker can hold. It lists at most one hourly
-/// file per hour directory, and [`collect_hour_dirs`] takes only two-digit
-/// names, so at most 100 lines. Each line is a path of at most 4095 bytes
-/// (Linux `PATH_MAX` less its terminator) written lossily, which turns each
-/// byte that is not UTF-8 into three, plus its newline.
-pub(crate) const MAX_ROLLUP_MARKER_BYTES: u64 = 100 * (3 * 4095 + 1);
-
 /// Open `path` with [`no_follow::open`], and check with `fstat` on the
 /// descriptor that it is a regular file. The open never waits on a FIFO,
 /// and a symlink at the last component is refused, never followed. Boot
@@ -1709,61 +1702,6 @@ fn open_regular(
         ));
     }
     Ok((file, metadata.len()))
-}
-
-/// Why [`read_rollup_marker_with`] returned no marker.
-#[derive(Debug)]
-pub(crate) enum RollupMarkerError {
-    /// It could not be opened as a regular file: absent, a symlink, not a
-    /// regular file, or refused.
-    Open(std::io::Error),
-    /// It is over [`MAX_ROLLUP_MARKER_BYTES`].
-    TooLarge,
-    /// Reading it failed, or it is not UTF-8 text.
-    Read(std::io::Error),
-}
-
-/// The wording recovery has always failed a day with.
-impl std::fmt::Display for RollupMarkerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Open(e) => write!(f, "failed to open rollup marker: {e}"),
-            Self::TooLarge => write!(
-                f,
-                "rollup marker is over the {MAX_ROLLUP_MARKER_BYTES}-byte limit"
-            ),
-            Self::Read(e) => write!(f, "failed to read rollup marker: {e}"),
-        }
-    }
-}
-
-/// Read the rollup marker at `path` as text, opened with `open` and judged
-/// by `fstat` as [`open_regular`] judges its own. A marker over
-/// [`MAX_ROLLUP_MARKER_BYTES`] is an error: one `fstat` reports is never
-/// read, and one that grows after the `fstat` is read only up to one byte
-/// past the bound.
-///
-/// Recovery reads markers with [`rollup_marker::read`]. Only
-/// `trawld --doctor` still reads with this, passing its own opener, which
-/// never opens anything but a regular file for I/O.
-pub(crate) fn read_rollup_marker_with(
-    path: &Path,
-    open: impl FnOnce(&Path) -> std::io::Result<std::fs::File>,
-) -> Result<String, RollupMarkerError> {
-    use std::io::Read as _;
-
-    let (file, len) = open_regular(path, open).map_err(RollupMarkerError::Open)?;
-    if len > MAX_ROLLUP_MARKER_BYTES {
-        return Err(RollupMarkerError::TooLarge);
-    }
-    let mut content = String::new();
-    file.take(MAX_ROLLUP_MARKER_BYTES + 1)
-        .read_to_string(&mut content)
-        .map_err(RollupMarkerError::Read)?;
-    if content.len() as u64 > MAX_ROLLUP_MARKER_BYTES {
-        return Err(RollupMarkerError::TooLarge);
-    }
-    Ok(content)
 }
 
 /// Open `path` as [`open_regular`] does with [`no_follow::open`]: the
