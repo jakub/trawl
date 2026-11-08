@@ -1,0 +1,1382 @@
+<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-g5ptsecz"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>MCP server | trawl</title><link rel="canonical" href="https://trawl.sh/reference/mcp/"/><link rel="sitemap" href="/sitemap-index.xml"/><link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.4.4"/><meta name="generator" content="Starlight v0.42.7"/><meta property="og:title" content="MCP server"/><meta property="og:type" content="article"/><meta property="og:url" content="https://trawl.sh/reference/mcp/"/><meta property="og:locale" content="en"/><meta property="og:description" content="The tools, resources, text contract, limits, refusals, and command line of the trawl MCP server."/><meta property="og:site_name" content="trawl"/><meta name="twitter:card" content="summary_large_image"/><meta name="description" content="The tools, resources, text contract, limits, refusals, and command line of the trawl MCP server."/><script>
+	window.StarlightThemeProvider = (() => {
+		const storedTheme =
+			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
+		const theme =
+			storedTheme ||
+			(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+		document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+		return {
+			updatePickers(theme = storedTheme || 'auto') {
+				document.querySelectorAll('starlight-theme-select').forEach((picker) => {
+					const select = picker.querySelector('select');
+					if (select) select.value = theme;
+					/** @type {HTMLTemplateElement | null} */
+					const tmpl = document.querySelector(`#theme-icons`);
+					const newIcon = tmpl && tmpl.content.querySelector('.' + theme);
+					if (newIcon) {
+						const oldIcon = picker.querySelector('svg.label-icon');
+						if (oldIcon) {
+							oldIcon.replaceChildren(...newIcon.cloneNode(true).childNodes);
+						}
+					}
+				});
+			},
+		};
+	})();
+</script><template id="theme-icons"><svg aria-hidden="true" class="light astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M5 12a1 1 0 0 0-1-1H3a1 1 0 0 0 0 2h1a1 1 0 0 0 1-1Zm.64 5-.71.71a1 1 0 0 0 0 1.41 1 1 0 0 0 1.41 0l.71-.71A1 1 0 0 0 5.64 17ZM12 5a1 1 0 0 0 1-1V3a1 1 0 0 0-2 0v1a1 1 0 0 0 1 1Zm5.66 2.34a1 1 0 0 0 .7-.29l.71-.71a1 1 0 1 0-1.41-1.41l-.66.71a1 1 0 0 0 0 1.41 1 1 0 0 0 .66.29Zm-12-.29a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.71-.71a1.004 1.004 0 1 0-1.43 1.41l.73.71ZM21 11h-1a1 1 0 0 0 0 2h1a1 1 0 0 0 0-2Zm-2.64 6A1 1 0 0 0 17 18.36l.71.71a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.76-.66ZM12 6.5a5.5 5.5 0 1 0 5.5 5.5A5.51 5.51 0 0 0 12 6.5Zm0 9a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm0 3.5a1 1 0 0 0-1 1v1a1 1 0 0 0 2 0v-1a1 1 0 0 0-1-1Z"/></svg><svg aria-hidden="true" class="dark astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.64 13a1 1 0 0 0-1.05-.14 8.049 8.049 0 0 1-3.37.73 8.15 8.15 0 0 1-8.14-8.1 8.59 8.59 0 0 1 .25-2A1 1 0 0 0 8 2.36a10.14 10.14 0 1 0 14 11.69 1 1 0 0 0-.36-1.05Zm-9.5 6.69A8.14 8.14 0 0 1 7.08 5.22v.27a10.15 10.15 0 0 0 10.14 10.14 9.784 9.784 0 0 0 2.1-.22 8.11 8.11 0 0 1-7.18 4.32v-.04Z"/></svg><svg aria-hidden="true" class="auto astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg></template><link rel="stylesheet" href="/_astro/print.ehPL0gv-.css" media="print"><link rel="stylesheet" href="/_astro/common.D0LovfKS.css"><script type="module" src="/_astro/page.cNngjUgL.js"></script></head><body class="astro-g5ptsecz"><a class="sl-skip-link astro-qb7clj6f" href="#_top">Skip to content</a><div class="page sl-flex astro-yntsjkba"><header class="header astro-yntsjkba"><div class="header astro-by6fddyj"><div class="title-wrapper sl-flex astro-by6fddyj"><a href="/" class="site-title sl-flex astro-6rvad3va"><img class="astro-6rvad3va" alt src="/_astro/trawl.NZOzpwx_.png" width="458" height="350"><span class="astro-6rvad3va" translate="no">trawl</span></a></div><div class="sl-flex print:hidden astro-by6fddyj"><site-search class="astro-by6fddyj astro-b5kgnn7o" data-translations="{&quot;placeholder&quot;:&quot;Search&quot;}"><button data-open-modal disabled aria-label="Search" aria-keyshortcuts="Control+K" class="astro-b5kgnn7o"><svg aria-hidden="true" class="astro-b5kgnn7o astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.71 20.29 18 16.61A9 9 0 1 0 16.61 18l3.68 3.68a.999.999 0 0 0 1.42 0 1 1 0 0 0 0-1.39ZM11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z"/></svg><span class="sl-hidden md:sl-block astro-b5kgnn7o" aria-hidden="true">Search</span><kbd class="sl-hidden md:sl-flex astro-b5kgnn7o" style="display: none;"><kbd class="astro-b5kgnn7o">Ctrl</kbd><kbd class="astro-b5kgnn7o">K</kbd></kbd></button><dialog style="padding:0" aria-label="Search" class="astro-b5kgnn7o"><div class="dialog-frame sl-flex astro-b5kgnn7o"><button data-close-modal class="sl-flex md:sl-hidden astro-b5kgnn7o">Cancel</button><div class="search-container astro-b5kgnn7o"><div id="starlight__search" class="astro-b5kgnn7o"></div></div></div></dialog></site-search><script>
+	(() => {
+		const openBtn = document.querySelector('button[data-open-modal]');
+		const shortcut = openBtn?.querySelector('kbd');
+		if (!openBtn || !(shortcut instanceof HTMLElement)) return;
+		const platformKey = shortcut.querySelector('kbd');
+		if (platformKey && /(Mac|iPhone|iPod|iPad)/i.test(navigator.platform)) {
+			platformKey.textContent = '⌘';
+			openBtn.setAttribute('aria-keyshortcuts', 'Meta+K');
+		}
+		shortcut.style.display = '';
+	})();
+</script><script type="module" src="/_astro/Search.astro_astro_type_script_index_0_lang.Djc9ZKGJ.js"></script></div><div class="sl-hidden md:sl-flex print:hidden right-group astro-by6fddyj"><div class="sl-flex social-icons astro-by6fddyj"><a href="https://github.com/jakub/trawl" rel="me" class="sl-flex astro-n2mnl6yq"><span class="sr-only astro-n2mnl6yq">GitHub</span><svg aria-hidden="true" class="astro-n2mnl6yq astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><starlight-theme-select><label style="--sl-select-width: 6.25em" class="astro-2z5xp7gb"><span class="sr-only astro-2z5xp7gb">Select theme</span><svg aria-hidden="true" class="icon label-icon astro-2z5xp7gb astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg><select autocomplete="off" class="astro-2z5xp7gb"><option value="dark" class="astro-2z5xp7gb">Dark</option><option value="light" class="astro-2z5xp7gb">Light</option><option value="auto" selected class="astro-2z5xp7gb">Auto</option></select><svg aria-hidden="true" class="icon caret astro-2z5xp7gb astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 9.17a1 1 0 0 0-1.41 0L12 12.71 8.46 9.17a1 1 0 1 0-1.41 1.42l4.24 4.24a1.002 1.002 0 0 0 1.42 0L17 10.59a1.002 1.002 0 0 0 0-1.42Z"/></svg></label></starlight-theme-select><script>
+	StarlightThemeProvider.updatePickers();
+</script><script type="module">var e=`starlight-theme`,t=e=>e===`auto`||e===`dark`||e===`light`?e:`auto`,n=()=>t(typeof localStorage<`u`&&localStorage.getItem(e));function r(t){typeof localStorage<`u`&&localStorage.setItem(e,t===`light`||t===`dark`?t:``)}var i=()=>matchMedia(`(prefers-color-scheme: light)`).matches?`light`:`dark`;function a(e){StarlightThemeProvider.updatePickers(e),document.documentElement.dataset.theme=e===`auto`?i():e,r(e)}matchMedia(`(prefers-color-scheme: light)`).addEventListener(`change`,()=>{n()===`auto`&&a(`auto`)});var o=class extends HTMLElement{constructor(){super(),a(n()),this.querySelector(`select`)?.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&a(t(e.currentTarget.value))})}};customElements.define(`starlight-theme-select`,o);</script><script type="module">var e=class extends HTMLElement{constructor(){super();let e=this.querySelector(`select`);e&&(e.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&(window.location.pathname=e.currentTarget.value)}),window.addEventListener(`pageshow`,t=>{if(!t.persisted)return;let n=e.querySelector(`option[selected]`)?.index;n!==e.selectedIndex&&(e.selectedIndex=n??0)}))}};customElements.define(`starlight-lang-select`,e);</script></div></div></header><nav class="sidebar print:hidden astro-yntsjkba" aria-label="Main"><button popovertarget="starlight__sidebar" class="sl-menu-button sl-flex md:sl-hidden print:hidden astro-r2osgdlg"><svg aria-hidden="true" class="open-menu astro-r2osgdlg astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M3 8h18a1 1 0 1 0 0-2H3a1 1 0 0 0 0 2Zm18 8H3a1 1 0 0 0 0 2h18a1 1 0 0 0 0-2Zm0-5H3a1 1 0 0 0 0 2h18a1 1 0 0 0 0-2Z"/></svg><svg aria-hidden="true" class="close-menu astro-r2osgdlg astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="m13.41 12 6.3-6.29a1.004 1.004 0 1 0-1.42-1.42L12 10.59l-6.29-6.3a1.004 1.004 0 0 0-1.42 1.42l6.3 6.29-6.3 6.29a1 1 0 0 0 0 1.42.998.998 0 0 0 1.42 0l6.29-6.3 6.29 6.3a.999.999 0 0 0 1.42 0 1 1 0 0 0 0-1.42L13.41 12Z"/></svg><span class="sr-only astro-r2osgdlg">Menu</span></button><script type="module">var e=class extends HTMLElement{constructor(){super();let e=matchMedia(`(min-width: 50em)`),t=()=>{this.popover=e.matches?null:`auto`};t(),e.addEventListener(`change`,()=>t()),this.addEventListener(`toggle`,({newState:e})=>this.trapFocus(e===`open`))}trapFocus(e){document.querySelectorAll(`.main-frame, .sl-skip-link`).forEach(t=>{t.toggleAttribute(`inert`,e)})}};customElements.define(`sl-sidebar-pane`,e);</script><sl-sidebar-pane popover id="starlight__sidebar" class="sidebar-pane astro-yntsjkba"><div class="sidebar-content sl-flex astro-yntsjkba"><sl-sidebar-state-persist data-hash="07dehtw" class="astro-ipdry5cl"><script aria-hidden="true">
+		(() => {
+			try {
+				if (!matchMedia('(min-width: 50em)').matches) return;
+				/** @type {HTMLElement | null} */
+				const target = document.querySelector('sl-sidebar-state-persist');
+				const state = JSON.parse(sessionStorage.getItem('sl-sidebar-state') || '0');
+				if (!target || !state || target.dataset.hash !== state.hash) return;
+				window._starlightScrollRestore = state.scroll;
+				customElements.define(
+					'sl-sidebar-restore',
+					class SidebarRestore extends HTMLElement {
+						connectedCallback() {
+							try {
+								const idx = parseInt(this.dataset.index || '');
+								const details = this.closest('details');
+								if (details && typeof state.open[idx] === 'boolean') details.open = state.open[idx];
+							} catch {}
+						}
+					}
+				);
+			} catch {}
+		})();
+	</script><ul class="top-level astro-rmhv4bp6"><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Start here</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="0"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/start/overview/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Requirements and components</span></a></li><li class="astro-rmhv4bp6"><a href="/start/connect/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Connect to a server</span></a></li><li class="astro-rmhv4bp6"><a href="/start/local-parquet/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Query local Parquet</span></a></li><li class="astro-rmhv4bp6"><a href="/getting-started/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Installation</span></a></li><li class="astro-rmhv4bp6"><a href="/getting-started/first-query/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Your first query</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Use Trawl</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="1"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/reference/web-ui/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Search in the browser</span></a></li><li class="astro-rmhv4bp6"><a href="/use/query-tutorial/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Build a query</span></a></li><li class="astro-rmhv4bp6"><a href="/use/cli-tui/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">CLI and TUI workflows</span></a></li><li class="astro-rmhv4bp6"><a href="/use/live-tail/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Watch live events</span></a></li><li class="astro-rmhv4bp6"><a href="/use/saved-reports/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Saved queries and reports</span></a></li><li class="astro-rmhv4bp6"><a href="/use/sharing-export/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Share searches and export results</span></a></li><li class="astro-rmhv4bp6"><a href="/use/agents/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Ask Trawl from Claude</span></a></li><li class="astro-rmhv4bp6"><a href="/use/investigations/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Work an investigation from the browser</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Operate Trawl</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="2"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/operate/deployment/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Deploy Trawl</span></a></li><li class="astro-rmhv4bp6"><a href="/operate/ingestion/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Connect log senders</span></a></li><li class="astro-rmhv4bp6"><a href="/getting-started/vector-integration/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Ship logs with Vector</span></a></li><li class="astro-rmhv4bp6"><a href="/operate/access/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Manage access</span></a></li><li class="astro-rmhv4bp6"><a href="/operate/health/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Check health and stalled work</span></a></li><li class="astro-rmhv4bp6"><a href="/operate/operational-alerts/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Respond to operational alerts</span></a></li><li class="astro-rmhv4bp6"><a href="/operate/catalog/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Repair catalog conflicts</span></a></li><li class="astro-rmhv4bp6"><a href="/operate/retention/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Manage retention</span></a></li><li class="astro-rmhv4bp6"><a href="/operate/backup-restore/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Back up and restore</span></a></li><li class="astro-rmhv4bp6"><a href="/reference/crash-dumps/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Crash dumps</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details open class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Reference</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="3"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/reference/dsl/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Query Language (DSL)</span></a></li><li class="astro-rmhv4bp6"><a href="/reference/cli/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">CLI &amp; TUI</span></a></li><li class="astro-rmhv4bp6"><a href="/reference/api/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">HTTP API</span></a></li><li class="astro-rmhv4bp6"><a href="/reference/mcp/" aria-current="page" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">MCP server</span></a></li><li class="astro-rmhv4bp6"><a href="/reference/configuration/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Configuration</span></a></li><li class="astro-rmhv4bp6"><a href="/reference/events/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Event contract</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Architecture</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="4"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/architecture/overview/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Architecture overview</span></a></li><li class="astro-rmhv4bp6"><a href="/architecture/data-flow/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Ingest and publication</span></a></li><li class="astro-rmhv4bp6"><a href="/architecture/catalog/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Catalog and conformance</span></a></li><li class="astro-rmhv4bp6"><a href="/architecture/query-execution/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Query execution</span></a></li><li class="astro-rmhv4bp6"><a href="/architecture/recovery/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Recovery and cutover</span></a></li><li class="astro-rmhv4bp6"><a href="/architecture/reports-telemetry/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Reports and telemetry</span></a></li></ul></details></li><li class="astro-rmhv4bp6"><details class="astro-rmhv4bp6"><summary class="astro-rmhv4bp6"><span class="group-label astro-rmhv4bp6"><span class="large astro-rmhv4bp6">Contribute</span></span><svg aria-hidden="true" class="caret astro-rmhv4bp6 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="5"></sl-sidebar-restore><ul class="astro-rmhv4bp6"><li class="astro-rmhv4bp6"><a href="/getting-started/development/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Local development</span></a></li><li class="astro-rmhv4bp6"><a href="/contribute/source-map/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Source map</span></a></li><li class="astro-rmhv4bp6"><a href="/contribute/testing/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Test a change</span></a></li><li class="astro-rmhv4bp6"><a href="/contribute/experiments/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Run a full-app experiment</span></a></li><li class="astro-rmhv4bp6"><a href="/contribute/documentation/" class="astro-rmhv4bp6"><span class="astro-rmhv4bp6">Maintain the documentation</span></a></li></ul></details></li></ul><script aria-hidden="true">
+		(() => {
+			const scroller = document.getElementById('starlight__sidebar');
+			if (!window._starlightScrollRestore || !scroller) return;
+			scroller.scrollTop = window._starlightScrollRestore;
+			delete window._starlightScrollRestore;
+		})();
+	</script></sl-sidebar-state-persist><div class="md:sl-hidden"><div class="mobile-preferences sl-flex astro-p4azlveh"><div class="social-icons astro-p4azlveh"><a href="https://github.com/jakub/trawl" rel="me" class="sl-flex astro-n2mnl6yq"><span class="sr-only astro-n2mnl6yq">GitHub</span><svg aria-hidden="true" class="astro-n2mnl6yq astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><starlight-theme-select><label style="--sl-select-width: 6.25em" class="astro-2z5xp7gb"><span class="sr-only astro-2z5xp7gb">Select theme</span><svg aria-hidden="true" class="icon label-icon astro-2z5xp7gb astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg><select autocomplete="off" class="astro-2z5xp7gb"><option value="dark" class="astro-2z5xp7gb">Dark</option><option value="light" class="astro-2z5xp7gb">Light</option><option value="auto" selected class="astro-2z5xp7gb">Auto</option></select><svg aria-hidden="true" class="icon caret astro-2z5xp7gb astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 9.17a1 1 0 0 0-1.41 0L12 12.71 8.46 9.17a1 1 0 1 0-1.41 1.42l4.24 4.24a1.002 1.002 0 0 0 1.42 0L17 10.59a1.002 1.002 0 0 0 0-1.42Z"/></svg></label></starlight-theme-select><script>
+	StarlightThemeProvider.updatePickers();
+</script></div></div></div></sl-sidebar-pane></nav><div class="main-frame astro-yntsjkba"><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()});</script><div class="lg:sl-flex astro-lrzkfocr"><aside class="right-sidebar-container print:hidden astro-lrzkfocr"><div class="right-sidebar astro-lrzkfocr"><div class="lg:sl-hidden astro-qok35upx"><mobile-starlight-toc data-min-h="2" data-max-h="3" class="astro-66cqc7ze"><nav aria-labelledby="starlight__on-this-page--mobile" class="astro-66cqc7ze"><details id="starlight__mobile-toc" class="astro-66cqc7ze"><summary id="starlight__on-this-page--mobile" class="sl-flex astro-66cqc7ze"><span class="toggle sl-flex astro-66cqc7ze">On this page<svg aria-hidden="true" class="caret astro-66cqc7ze astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></span><span class="display-current astro-66cqc7ze"></span></summary><div class="dropdown astro-66cqc7ze"><ul class="isMobile astro-jugkfwgx" style="--depth: 0;"><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#_top" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Overview</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#command" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Command</span></a><ul class="isMobile astro-jugkfwgx" style="--depth: 1;"><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#exit-codes" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Exit codes</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#refusals" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Refusals</span></a></li></ul></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#tools" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Tools</span></a><ul class="isMobile astro-jugkfwgx" style="--depth: 1;"><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#orient" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">orient</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#search" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">search</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#read" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">read</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#correlation-tools" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Correlation tools</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#context" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">context</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#sightings" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">sightings</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#compare" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">compare</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#fields" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">fields</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#investigation" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">investigation</span></a></li></ul></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#resources" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Resources</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#text-contract" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Text contract</span></a><ul class="isMobile astro-jugkfwgx" style="--depth: 1;"><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#layout-of-a-search-or-read-result" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Layout of a search or read result</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#truncation-facts" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Truncation facts</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#facets" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Facets</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#next-actions" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Next actions</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#the-search-url" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">The search URL</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#activity" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Activity</span></a></li></ul></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#limits" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Limits</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#refused-calls" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Refused calls</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#hints" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Hints</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#out-of-scope-in-10" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Out of scope in 1.0</span></a></li></ul></div></details></nav></mobile-starlight-toc><script type="module" src="/_astro/MobileTableOfContents.astro_astro_type_script_index_0_lang.C3fM4Kra.js"></script></div><div class="right-sidebar-panel sl-hidden lg:sl-block astro-qok35upx"><div class="sl-container astro-qok35upx"><starlight-toc data-min-h="2" data-max-h="3"><nav aria-labelledby="starlight__on-this-page"><h2 id="starlight__on-this-page">On this page</h2><ul class="astro-jugkfwgx" style="--depth: 0;"><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#_top" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Overview</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#command" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Command</span></a><ul class="astro-jugkfwgx" style="--depth: 1;"><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#exit-codes" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Exit codes</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#refusals" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Refusals</span></a></li></ul></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#tools" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Tools</span></a><ul class="astro-jugkfwgx" style="--depth: 1;"><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#orient" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">orient</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#search" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">search</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#read" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">read</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#correlation-tools" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Correlation tools</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#context" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">context</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#sightings" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">sightings</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#compare" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">compare</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#fields" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">fields</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#investigation" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">investigation</span></a></li></ul></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#resources" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Resources</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#text-contract" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Text contract</span></a><ul class="astro-jugkfwgx" style="--depth: 1;"><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#layout-of-a-search-or-read-result" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Layout of a search or read result</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#truncation-facts" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Truncation facts</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#facets" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Facets</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#next-actions" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Next actions</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#the-search-url" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">The search URL</span></a></li><li style="--depth: 1;" class="astro-jugkfwgx"><a href="#activity" style="--depth: 1;" class="astro-jugkfwgx"><span style="--depth: 1;" class="astro-jugkfwgx">Activity</span></a></li></ul></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#limits" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Limits</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#refused-calls" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Refused calls</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#hints" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Hints</span></a></li><li style="--depth: 0;" class="astro-jugkfwgx"><a href="#out-of-scope-in-10" style="--depth: 0;" class="astro-jugkfwgx"><span style="--depth: 0;" class="astro-jugkfwgx">Out of scope in 1.0</span></a></li></ul></nav></starlight-toc><script type="module" src="/_astro/TableOfContents.astro_astro_type_script_index_0_lang.BpJaGz7G.js"></script></div></div></div></aside><div class="main-pane astro-lrzkfocr"><main data-pagefind-body class="astro-g5ptsecz" lang="en" dir="ltr"><aside class="preview-banner astro-yp67euhd">Manual for <a href="https://github.com/jakub/trawl/releases/tag/v0.9.4" class="astro-yp67euhd">Trawl v0.9.4</a>. <a href="/release.json" class="astro-yp67euhd">Build identity</a>.</aside><div class="content-panel astro-a7po4psb"><div class="sl-container astro-a7po4psb"><h1 id="_top" class="astro-bebwqqxs">MCP server</h1></div></div><div class="content-panel astro-a7po4psb"><div class="sl-container astro-a7po4psb"><div class="sl-markdown-content"><p>The MCP server lets an MCP client, such as Claude Code or Claude Desktop, ask
+questions of a Trawl server. It is a client of trawld: it holds one API key,
+sends every request over the <a href="/reference/api/">HTTP API</a>, and so is subject to
+every permission, quota, and rate limit that applies to that key. It contains
+no model and builds no SQL. To set it up, see
+<a href="/use/agents/">Ask Trawl from Claude</a>.</p>
+<p>The 1.0 server speaks over the stdio transport only. It negotiates the
+2025-11-25 protocol revision by <code dir="auto">initialize</code> and the 2026-07-28 revision by
+<code dir="auto">server/discover</code>.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="command">Command</h2><a class="sl-anchor-link" href="#command"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Command”</span></a></div>
+<div class="expressive-code"><link rel="stylesheet" href="/_astro/ec.v4551.css"><script type="module" src="/_astro/ec.0vx5m.js"></script><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="text"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">trawl mcp --profile NAME [--token-file PATH]</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">trawl -p NAME mcp [--token-file PATH]</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl mcp --profile NAME [--token-file PATH]trawl -p NAME mcp [--token-file PATH]"><div></div></button></div></figure></div>
+<p><code dir="auto">trawl mcp</code> reads MCP messages on stdin and writes them on stdout. Stdout
+carries protocol frames only. Logs go to stderr after a successful start, at
+the level <code dir="auto">RUST_LOG</code> names (default <code dir="auto">warn</code>). No terminal UI starts.</p>
+<p>The command takes its target, key, and trust only from the named profile and
+<code dir="auto">--token-file</code>. The profile binds the server URL and the TLS trust. The key
+comes from the profile’s own <code dir="auto">token</code>, or from the file that <code dir="auto">--token-file</code>
+names, with surrounding whitespace removed. <code dir="auto">[server].token</code> is never read. See
+<a href="/reference/configuration/#client-configuration">client configuration</a> for the
+profile keys, and <a href="/reference/cli/#the-reserved--p-trial-profile">the <code dir="auto">trial</code> profile</a>
+for the reserved profile.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Value</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">-p, --profile</code></td>
+<td><code dir="auto">&lt;NAME&gt;</code></td>
+<td>The profile to use. Required. This is the global option</td>
+</tr>
+<tr>
+<td><code dir="auto">--token-file</code></td>
+<td><code dir="auto">&lt;PATH&gt;</code></td>
+<td>Read the API key from this file, for a profile that holds no <code dir="auto">token</code></td>
+</tr>
+</tbody>
+</table>
+<p>The command does not contact the server at startup. The first tool call does,
+so a server that is down gives that call a refusal, not the process an exit.
+The display zone of <code dir="auto">orient</code> is the <code dir="auto">ui.timezone</code> setting of the CLI config on
+the machine that runs <code dir="auto">trawl mcp</code>: <code dir="auto">local</code> (the default), <code dir="auto">UTC</code>, or a fixed
+offset such as <code dir="auto">+05:30</code>.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="exit-codes">Exit codes</h3><a class="sl-anchor-link" href="#exit-codes"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Exit codes”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">0</code></td>
+<td>The client closed the session after it started</td>
+</tr>
+<tr>
+<td><code dir="auto">1</code></td>
+<td>The session did not start, or the transport failed. This includes a client that closes stdin before <code dir="auto">initialize</code></td>
+</tr>
+<tr>
+<td><code dir="auto">2</code></td>
+<td><code dir="auto">trawl mcp</code> refused the command line or the profile, and printed one <code dir="auto">trawl: ...</code> line to stderr</td>
+</tr>
+</tbody>
+</table>
+<p>A profile with insecure trust also prints the usual insecure-connection
+warning on stderr before the server starts.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="refusals">Refusals</h3><a class="sl-anchor-link" href="#refusals"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Refusals”</span></a></div>
+<p><code dir="auto">trawl mcp</code> exits <code dir="auto">2</code> for each of these cases. No message contains a value of
+a variable, a flag, or a key.</p>
+<ul>
+<li>Any of <code dir="auto">TRAWL_URL</code>, <code dir="auto">TRAWL_TOKEN</code>, <code dir="auto">TRAWL_PROFILE</code>, or <code dir="auto">TRAWL_INSECURE</code> is
+set, even empty. The message names every variable that is present.</li>
+<li><code dir="auto">--url</code>, <code dir="auto">--token</code>, or <code dir="auto">--insecure</code> is given.</li>
+<li>No profile is named.</li>
+<li>Two key sources are given: a profile that holds a <code dir="auto">token</code> together with
+<code dir="auto">--token-file</code>, or <code dir="auto">-p trial</code> with <code dir="auto">--token-file</code>, because the trial profile
+always carries its operator key.</li>
+<li>No key source is given. The message names <code dir="auto">[profiles.NAME]</code> and
+<code dir="auto">--token-file</code>.</li>
+<li>The profile does not resolve: the config file is missing or invalid, the
+profile does not exist, its URL is not valid, no trial exists for <code dir="auto">-p trial</code>,
+or its <code dir="auto">ca_cert</code> file holds no certificate.</li>
+<li><code dir="auto">ui.timezone</code> is not <code dir="auto">local</code>, <code dir="auto">UTC</code>, or a fixed offset.</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="tools">Tools</h2><a class="sl-anchor-link" href="#tools"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Tools”</span></a></div>
+<p>The server lists eight tools, always in this order: <code dir="auto">orient</code>, <code dir="auto">search</code>,
+<code dir="auto">read</code>, <code dir="auto">context</code>, <code dir="auto">sightings</code>, <code dir="auto">compare</code>, <code dir="auto">fields</code>, <code dir="auto">investigation</code>. Every
+input is a flat object. An enum field (<code dir="auto">mode</code>, <code dir="auto">action</code>, or <code dir="auto">source</code>) picks the
+variant, and a property that only one variant reads is optional. No input schema has a root <code dir="auto">anyOf</code> or <code dir="auto">oneOf</code>, and every
+property name stays within <code dir="auto">[A-Za-z0-9_.-]</code>. Every tool has an <code dir="auto">outputSchema</code>
+for its success result.</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th><code dir="auto">readOnlyHint</code></th>
+<th><code dir="auto">destructiveHint</code></th>
+<th><code dir="auto">idempotentHint</code></th>
+<th><code dir="auto">openWorldHint</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">orient</code></td>
+<td><code dir="auto">true</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">true</code></td>
+<td><code dir="auto">true</code></td>
+</tr>
+<tr>
+<td><code dir="auto">search</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">true</code></td>
+</tr>
+<tr>
+<td><code dir="auto">read</code></td>
+<td><code dir="auto">true</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">true</code></td>
+<td><code dir="auto">true</code></td>
+</tr>
+<tr>
+<td><code dir="auto">context</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">true</code></td>
+</tr>
+<tr>
+<td><code dir="auto">sightings</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">true</code></td>
+</tr>
+<tr>
+<td><code dir="auto">compare</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">true</code></td>
+</tr>
+<tr>
+<td><code dir="auto">fields</code></td>
+<td><code dir="auto">true</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">true</code></td>
+<td><code dir="auto">true</code></td>
+</tr>
+<tr>
+<td><code dir="auto">investigation</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">false</code></td>
+<td><code dir="auto">true</code></td>
+</tr>
+</tbody>
+</table>
+<p><code dir="auto">search</code> is not read-only because <code dir="auto">mode=execute</code> records a new
+<a href="/reference/api/#captured-results">captured result</a> on each call. <code dir="auto">context</code>,
+<code dir="auto">sightings</code>, and <code dir="auto">compare</code> record one on every call, for the same reason.
+<code dir="auto">investigation</code> is not read-only or idempotent because its writes append
+entries. None of its actions deletes anything. A call with
+arguments that do not decode into the tool’s input is an <code dir="auto">isError</code> result that
+names the problem. A call to a tool name that is not listed is a protocol error.</p>
+<p><code dir="auto">tools/list</code> and <code dir="auto">resources/list</code> carry a private cache scope and a time to
+live of 60 seconds.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="orient">orient</h3><a class="sl-anchor-link" href="#orient"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “orient”</span></a></div>
+<p><code dir="auto">orient</code> takes no arguments. It describes the installation in one call:</p>
+<ul>
+<li>the trawld version, the time now in UTC and in the display zone, the key’s
+name, prefix, and permissions, and the health status with its problems;</li>
+<li>the inventory: every environment, service, and host that sent events in the
+last 24 hours, with the event count and the newest <code dir="auto">_time</code>, busiest first;</li>
+<li>the retention reach of each environment;</li>
+<li>the open investigations;</li>
+<li>the degraded fields, the limits that apply, and the installed DSL stages and
+functions;</li>
+<li>the <code dir="auto">trawl://dsl/</code> resources and a short block of DSL essentials, for a client
+that reads no resources;</li>
+<li>at most two proposed next calls.</li>
+</ul>
+<p><code dir="auto">orient</code> reads <code dir="auto">whoami</code>, <code dir="auto">capabilities</code>, <code dir="auto">health</code>, and the schema services.
+Three parts depend on the key. The inventory runs one query over <code dir="auto">last=24h</code>
+grouped by environment, service, and host, so it needs <code dir="auto">query</code>, and <code dir="auto">orient</code>
+asks for at most 200 groups. Without <code dir="auto">query</code>, or when trawld refuses the
+query, one line says why and the rest of the answer stands. Retention reach
+comes from the dashboard, so it needs <code dir="auto">server_manage</code>. Without it the line
+reads <code dir="auto">retention reach: not readable with this key</code>. The open investigations
+come from the investigation list, so they need <code dir="auto">query</code> and
+<code dir="auto">investigation_read</code>. <code dir="auto">orient</code> prints at most 5, most recently changed first,
+one line each. A last line says how many more are open, or <code dir="auto">none</code> when no
+investigation is open. When trawld refuses the list, one line names its code
+and the rest of the answer stands. Without those permissions, <code dir="auto">orient</code> prints
+no investigation line.</p>
+<p>When <code dir="auto">whoami</code> or <code dir="auto">capabilities</code> is refused, <code dir="auto">orient</code> is refused with trawld’s
+code.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="search">search</h3><a class="sl-anchor-link" href="#search"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “search”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">mode</code></td>
+<td><code dir="auto">validate</code> or <code dir="auto">execute</code></td>
+<td>Required. <code dir="auto">validate</code> checks the query without running it. <code dir="auto">execute</code> runs it and keeps the rows as a captured result</td>
+</tr>
+<tr>
+<td><code dir="auto">query</code></td>
+<td>string</td>
+<td>Required. The DSL query. Put the time bounds in the text, such as <code dir="auto">last=1h</code></td>
+</tr>
+<tr>
+<td><code dir="auto">rows</code></td>
+<td>integer, 1 to 200</td>
+<td>For <code dir="auto">execute</code>. Rows to print. Default 50</td>
+</tr>
+<tr>
+<td><code dir="auto">max_bytes</code></td>
+<td>integer, 4096 to 32768</td>
+<td>For <code dir="auto">execute</code>. The response budget. Default 16384</td>
+</tr>
+<tr>
+<td><code dir="auto">investigation</code></td>
+<td>string</td>
+<td>For <code dir="auto">execute</code>. The id of the investigation to attach the search to</td>
+</tr>
+<tr>
+<td><code dir="auto">purpose</code></td>
+<td>string, at most 1024 bytes</td>
+<td>For <code dir="auto">execute</code> with <code dir="auto">investigation</code>. Why the search runs, recorded on its step</td>
+</tr>
+</tbody>
+</table>
+<p><code dir="auto">validate</code> calls <a href="/reference/api/"><code dir="auto">POST /api/v1/validate</code></a> and needs the
+<code dir="auto">validate</code> permission. A query that does not validate is a successful call:
+the outcome line says <code dir="auto">The query did not validate: N errors.</code>, and each error
+follows with a caret excerpt. A valid query answers <code dir="auto">The query is valid.</code> with
+the formatted query and one proposed call to run it.</p>
+<p><code dir="auto">execute</code> captures the query with <a href="/reference/api/#capture-a-result"><code dir="auto">POST /api/v1/results</code></a>,
+which needs <code dir="auto">query</code>, then reads the first page of the capture. It never runs
+the query twice. The answer follows the <a href="#text-contract">text contract</a> and
+carries the result id and the time until it expires. To read more rows, call
+<code dir="auto">read</code>.</p>
+<p><code dir="auto">execute</code> computes these <a href="#hints">hints</a> from the capture: dominance, lag, a
+field not in the catalog, and, for a capture with no rows, the nearest bounds.</p>
+<p>With <code dir="auto">investigation</code>, <code dir="auto">execute</code> attaches the capture to that investigation.
+trawld records the search as a step of the investigation and keeps the whole
+result as its evidence. The attached search needs <code dir="auto">query</code>,
+<code dir="auto">investigation_read</code>, and <code dir="auto">investigation_write</code>. The answer prints an
+<code dir="auto">investigation:</code> line with the id and the kept result’s id, then the
+<a href="#activity">activity</a> since this session last saw the investigation. The
+server checks the id’s shape and the length of <code dir="auto">purpose</code> before it sends a
+request, and refuses <code dir="auto">purpose</code> without <code dir="auto">investigation</code>. <code dir="auto">validate</code> runs
+nothing, so it ignores both inputs and names the ones the call gave: beside
+the investigation id when the call names one, else on the outcome line.</p>
+<p>A refused attached search is an <code dir="auto">isError</code> result with trawld’s code. For
+<code dir="auto">investigation_closed</code>, the text names the <code dir="auto">status</code> call that reopens the
+investigation. For <code dir="auto">evidence_budget_exceeded</code>, it prints trawld’s message with
+the bytes used and the limit, and says that evidence frees only when it ages
+out or an operator deletes an investigation.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="read">read</h3><a class="sl-anchor-link" href="#read"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “read”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">action</code></td>
+<td><code dir="auto">page</code>, <code dir="auto">cell</code>, or <code dir="auto">investigation</code></td>
+<td>Required. <code dir="auto">page</code> prints rows. <code dir="auto">cell</code> prints the text of one cell. <code dir="auto">investigation</code> prints an investigation’s entries</td>
+</tr>
+<tr>
+<td><code dir="auto">result_id</code></td>
+<td>string</td>
+<td>For <code dir="auto">page</code> and <code dir="auto">cell</code>. The id that <code dir="auto">search</code> returned</td>
+</tr>
+<tr>
+<td><code dir="auto">investigation_id</code></td>
+<td>string</td>
+<td>For <code dir="auto">investigation</code>. The investigation’s id</td>
+</tr>
+<tr>
+<td><code dir="auto">since</code></td>
+<td>integer</td>
+<td>For <code dir="auto">investigation</code>. Print the entries changed after this sequence. Default 0, from the start</td>
+</tr>
+<tr>
+<td><code dir="auto">offset</code></td>
+<td>integer</td>
+<td>For <code dir="auto">page</code>. The first captured row to print, counted from 0. Default 0</td>
+</tr>
+<tr>
+<td><code dir="auto">rows</code></td>
+<td>integer, 1 to 200</td>
+<td>For <code dir="auto">page</code>. Rows to print. Default 50</td>
+</tr>
+<tr>
+<td><code dir="auto">row</code></td>
+<td>integer</td>
+<td>For <code dir="auto">cell</code>. The captured row, counted from 0</td>
+</tr>
+<tr>
+<td><code dir="auto">column</code></td>
+<td>integer</td>
+<td>For <code dir="auto">cell</code>. The column position, counted from 0</td>
+</tr>
+<tr>
+<td><code dir="auto">byte_offset</code></td>
+<td>integer</td>
+<td>For <code dir="auto">cell</code>. The byte of the cell’s text to continue from. Default 0</td>
+</tr>
+<tr>
+<td><code dir="auto">max_bytes</code></td>
+<td>integer, 4096 to 32768</td>
+<td>The response budget. Default 16384</td>
+</tr>
+</tbody>
+</table>
+<p><code dir="auto">read</code> runs nothing again. It needs <code dir="auto">query</code>. A key reads its own captures,
+and, with <code dir="auto">investigation_read</code>, the results that investigations keep as
+evidence. A page prints no search URL: the reason line says the search that
+captured the result printed it. A <code dir="auto">cell</code> call prints the whole cell, or as many
+bytes as the budget holds. The reply names the <code dir="auto">byte_offset</code> where the rest
+starts, and proposes the call that reads it.</p>
+<p>A page of a result that <code dir="auto">context</code>, <code dir="auto">sightings</code>, or <code dir="auto">compare</code> captured prints
+that tool’s <a href="#correlation-tools">block</a> on every page, between the truncation
+facts and the next calls. The denominators and the warnings therefore travel
+with every page.</p>
+<p>A result past its deadline answers trawld’s <code dir="auto">result_gone</code>, and an unknown id
+answers <code dir="auto">not_found</code>. Both are refusals, never an empty page.</p>
+<p><code dir="auto">action=investigation</code> prints the same board as <code dir="auto">investigation action=read</code>,
+with the same renderer, and its continuation is a <code dir="auto">read</code> call. It needs
+<code dir="auto">query</code> and <code dir="auto">investigation_read</code>.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="correlation-tools">Correlation tools</h3><a class="sl-anchor-link" href="#correlation-tools"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Correlation tools”</span></a></div>
+<p><code dir="auto">context</code>, <code dir="auto">sightings</code>, and <code dir="auto">compare</code> each send one correlation read to
+trawld, which builds the DSL and keeps the answer as a new captured result.
+Each tool reads trawld’s capabilities first, then reads the first page of the
+new result, at most 50 rows and never more than trawld’s
+<code dir="auto">bounds.page_max_rows</code>, and answers in the
+<a href="#layout-of-a-search-or-read-result">layout of a result</a>. Between the
+truncation facts and the next calls, each prints its block: what the read
+established. The block is never dropped to fit the budget. To read more rows,
+call <code dir="auto">read</code> with the result id. A reply that the budget cut proposes the call
+that continues it, as <a href="#limits">Limits</a> describes. Each tool needs <code dir="auto">query</code>.</p>
+<p>Each tool takes <code dir="auto">investigation</code> and <code dir="auto">purpose</code> as <code dir="auto">search</code> does. With
+<code dir="auto">investigation</code>, the read is attached to that investigation: trawld records it
+as a step and keeps its whole result as evidence. The attached read needs
+<code dir="auto">query</code>, <code dir="auto">investigation_read</code>, and <code dir="auto">investigation_write</code>. The answer prints the
+<code dir="auto">investigation:</code> line and the <a href="#activity">activity</a> as an attached search
+does. The server checks the id’s shape and the length of <code dir="auto">purpose</code> before it
+sends a request, and refuses <code dir="auto">purpose</code> without <code dir="auto">investigation</code>. A refused
+attached read is an <code dir="auto">isError</code> result with trawld’s code, as for an attached
+<a href="#search">search</a>.</p>
+<p>A refused read is an <code dir="auto">isError</code> result with trawld’s code, as described in
+<a href="#refused-calls">Refused calls</a>. The tools add these 400 codes:</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">focus_incomplete</code></td>
+<td>The focus row has no <code dir="auto">_time</code>, or no value for a key that the scope names</td>
+</tr>
+<tr>
+<td><code dir="auto">focus_ambiguous</code></td>
+<td>The focus row has two columns of the same name for a focus key</td>
+</tr>
+<tr>
+<td><code dir="auto">windows_overlap</code></td>
+<td>The compare windows overlap</td>
+</tr>
+<tr>
+<td><code dir="auto">correlation_invalid</code></td>
+<td>A compare input cannot be built into a query: a filter that does not parse or has a pipe stage or a time clause, or a group field that the statement assigns, such as <code dir="auto">compare_status</code></td>
+</tr>
+</tbody>
+</table>
+<p>A value over its cap, or a name that the read refuses, such as a reserved
+<code dir="auto">fields</code> name, is <code dir="auto">bad_request</code>. A read that finds more than 5000 groups is
+<code dir="auto">result_too_large</code>, and the message says what to narrow. The
+<a href="/reference/api/#correlation-reads">HTTP API</a> lists every case.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="context">context</h3><a class="sl-anchor-link" href="#context"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “context”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">result_id</code></td>
+<td>string</td>
+<td>Required. The captured result that holds the focus row</td>
+</tr>
+<tr>
+<td><code dir="auto">row</code></td>
+<td>integer</td>
+<td>Required. The focus row, counted from 0</td>
+</tr>
+<tr>
+<td><code dir="auto">scope</code></td>
+<td><code dir="auto">env_and_host</code>, <code dir="auto">env</code>, or <code dir="auto">host</code></td>
+<td>The focus row’s keys that hold the read. Default <code dir="auto">env_and_host</code></td>
+</tr>
+<tr>
+<td><code dir="auto">seconds</code></td>
+<td>integer, at least 1</td>
+<td>Seconds on each side of the focus row’s <code dir="auto">_time</code>. Default 30</td>
+</tr>
+<tr>
+<td><code dir="auto">before</code></td>
+<td>integer, 0 to 50</td>
+<td>Rows strictly earlier than the focus row. Default 10</td>
+</tr>
+<tr>
+<td><code dir="auto">after</code></td>
+<td>integer, 0 to 50</td>
+<td>Rows strictly later than the focus row. Default 10</td>
+</tr>
+<tr>
+<td><code dir="auto">investigation</code></td>
+<td>string</td>
+<td>The id of the investigation to attach the read to</td>
+</tr>
+<tr>
+<td><code dir="auto">purpose</code></td>
+<td>string, at most 1024 bytes</td>
+<td>With <code dir="auto">investigation</code>. Why the read runs, recorded on its step</td>
+</tr>
+<tr>
+<td><code dir="auto">max_bytes</code></td>
+<td>integer, 4096 to 32768</td>
+<td>The response budget. Default 16384</td>
+</tr>
+</tbody>
+</table>
+<p><code dir="auto">context</code> reads the events around one captured row, with the <code dir="auto">env</code> and <code dir="auto">host</code>
+values of that row. It never widens the read: a focus row without <code dir="auto">_time</code>, or
+without a key that the scope names, is refused with <code dir="auto">focus_incomplete</code>.</p>
+<p>The block holds these lines:</p>
+<ul>
+<li><code dir="auto">scope used:</code> with the <code dir="auto">env</code> and <code dir="auto">host</code> that held the read, or <code dir="auto">any</code>, and the
+seconds on each side.</li>
+<li><code dir="auto">focus:</code> with the result id, the row, its <code dir="auto">_time</code>, <code dir="auto">env</code>, and <code dir="auto">host</code>.</li>
+<li><code dir="auto">earlier:</code>, <code dir="auto">same _time:</code>, and <code dir="auto">later:</code>, each with its range of captured rows
+and its row count. At most 20 rows share the focus row’s <code dir="auto">_time</code>.</li>
+<li>The sentence <code dir="auto">this is a new read; equal timestamps establish no order</code>.</li>
+</ul>
+<p>The rows are a new read, so the focus event is one of the rows at its <code dir="auto">_time</code>
+and is not marked. Two events with equal cells print as two rows.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="sightings">sightings</h3><a class="sl-anchor-link" href="#sightings"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “sightings”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">literal</code></td>
+<td>string, 1 to 1024 bytes</td>
+<td>Required. The text to find, such as an IP address</td>
+</tr>
+<tr>
+<td><code dir="auto">earliest</code></td>
+<td>RFC 3339 instant</td>
+<td>The start of the bounds, inclusive</td>
+</tr>
+<tr>
+<td><code dir="auto">latest</code></td>
+<td>RFC 3339 instant</td>
+<td>The end of the bounds, exclusive. Default now</td>
+</tr>
+<tr>
+<td><code dir="auto">last</code></td>
+<td>DSL duration</td>
+<td>A duration that ends now, such as <code dir="auto">24h</code>, instead of <code dir="auto">earliest</code> and <code dir="auto">latest</code></td>
+</tr>
+<tr>
+<td><code dir="auto">fields</code></td>
+<td>list of up to 16 field names</td>
+<td>Restricts which fields the literal is attributed to. Not <code dir="auto">_raw</code>, <code dir="auto">sighting_count</code>, <code dir="auto">sighting_first</code>, or <code dir="auto">sighting_last</code>, in any letter case</td>
+</tr>
+<tr>
+<td><code dir="auto">investigation</code></td>
+<td>string</td>
+<td>The id of the investigation to attach the read to</td>
+</tr>
+<tr>
+<td><code dir="auto">purpose</code></td>
+<td>string, at most 1024 bytes</td>
+<td>With <code dir="auto">investigation</code>. Why the read runs, recorded on its step</td>
+</tr>
+<tr>
+<td><code dir="auto">max_bytes</code></td>
+<td>integer, 4096 to 32768</td>
+<td>The response budget. Default 16384</td>
+</tr>
+</tbody>
+</table>
+<p><code dir="auto">sightings</code> finds where one literal occurs. trawld runs the bare-term text
+search once, over <code dir="auto">message</code> and <code dir="auto">_raw</code>. The bounds default to the last 24
+hours and span at most 7 days. trawld counts every match by <code dir="auto">env</code> and
+<code dir="auto">service</code>, with the first and last <code dir="auto">_time</code> seen, and captures the 5000 most
+recent matches.</p>
+<p>The block holds these lines:</p>
+<ul>
+<li><code dir="auto">sightings of</code> with the literal, then the denominator sentence:
+<code dir="auto">field counts are over the N captured matches; service counts are over all M</code>.</li>
+<li><code dir="auto">attribution restricted to fields</code> with the names, when the call gave
+<code dir="auto">fields</code>. The capture stores the list, so every later <code dir="auto">read</code> page of the
+result prints the same line; a requested field with no match still appears
+in it. Without the line, every field was attributed.</li>
+<li>The groups, one JSON array per line: env, service, matches, first seen, last
+seen, most matches first.</li>
+<li><code dir="auto">matches per service:</code> and <code dir="auto">matches per env:</code>, which the server sums from the
+groups.</li>
+<li><code dir="auto">fields holding the literal</code>, with the captured matches for each field.
+trawld lists at most 256; <code dir="auto">and N more fields held the literal; pass fields to attribute them</code> counts the rest.</li>
+<li><code dir="auto">_raw only:</code>, the captured matches in which no field but <code dir="auto">_raw</code> holds the
+literal, counted over every field whatever <code dir="auto">fields</code> says. <code dir="auto">_raw</code> can match
+field names and syntax, so these are counted apart.</li>
+</ul>
+<p><code dir="auto">fields</code> changes only the list of fields holding the literal. The matches, the
+totals, the captured matches, and the <code dir="auto">_raw only:</code> count stay the same with or
+without it. The next calls propose trawld’s follow-up queries as <code dir="auto">search</code> calls
+over the same bounds: the literal on its busiest service, and its volume by
+service over time. When the <code dir="auto">sightings</code> call was attached, each proposed
+<code dir="auto">search</code> carries the same <code dir="auto">investigation</code>, and no <code dir="auto">purpose</code>.</p>
+<p>A field holds the literal when its text contains it in any letter case. A
+number or a boolean is read as its text: <code dir="auto">true</code>, <code dir="auto">false</code>, the digits of an
+integer, and the shortest decimal form of a float, such as <code dir="auto">3</code> for 3.0. So the
+literal <code dir="auto">3.0</code>, copied from the JSON of a float cell, does not match that cell.
+Each captured match carries the <code dir="auto">sighting_count</code>, <code dir="auto">sighting_first</code>, and
+<code dir="auto">sighting_last</code> of its group, in place of any event field of those names.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="compare">compare</h3><a class="sl-anchor-link" href="#compare"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “compare”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">filter</code></td>
+<td>string</td>
+<td>Required. DSL search terms, such as <code dir="auto">service=auth "failed password"</code>. No pipe stage, and no time clause at any depth, under <code dir="auto">NOT</code> or in parentheses included</td>
+</tr>
+<tr>
+<td><code dir="auto">foreground_earliest</code></td>
+<td>RFC 3339 instant</td>
+<td>Required. The start of the window under question, inclusive</td>
+</tr>
+<tr>
+<td><code dir="auto">foreground_latest</code></td>
+<td>RFC 3339 instant</td>
+<td>Required. Its end, exclusive</td>
+</tr>
+<tr>
+<td><code dir="auto">baseline_earliest</code></td>
+<td>RFC 3339 instant</td>
+<td>The start of the baseline window, inclusive</td>
+</tr>
+<tr>
+<td><code dir="auto">baseline_latest</code></td>
+<td>RFC 3339 instant</td>
+<td>Its end, exclusive</td>
+</tr>
+<tr>
+<td><code dir="auto">group_by</code></td>
+<td>list of up to 2 field names</td>
+<td>The fields to group the counts by. Not a column that the statement assigns: those all start with <code dir="auto">compare_</code>, such as <code dir="auto">compare_status</code>. A user field such as <code dir="auto">status</code> groups</td>
+</tr>
+<tr>
+<td><code dir="auto">min_count</code></td>
+<td>integer, at least 1</td>
+<td>A group is listed when either window counts at least this many events for it. Default 1</td>
+</tr>
+<tr>
+<td><code dir="auto">investigation</code></td>
+<td>string</td>
+<td>The id of the investigation to attach the read to</td>
+</tr>
+<tr>
+<td><code dir="auto">purpose</code></td>
+<td>string, at most 1024 bytes</td>
+<td>With <code dir="auto">investigation</code>. Why the read runs, recorded on its step</td>
+</tr>
+<tr>
+<td><code dir="auto">max_bytes</code></td>
+<td>integer, 4096 to 32768</td>
+<td>The response budget. Default 16384</td>
+</tr>
+</tbody>
+</table>
+<p><code dir="auto">compare</code> counts one filter in two windows. Without a baseline bound, the
+baseline is the window of equal duration just before the foreground. The
+windows can touch but not overlap. One statement scans both windows, so both
+counts come from the same data. Each row of the result is one group, with both
+counts, both rates, and the absolute and relative change where they are
+defined. A group with no events in the baseline is <code dir="auto">new_in_foreground</code>, never
+an infinite change.</p>
+<p>The block holds these lines:</p>
+<ul>
+<li><code dir="auto">foreground:</code> and <code dir="auto">baseline:</code>, each with its start, end, and duration.</li>
+<li><code dir="auto">grouped by:</code> with the group fields.</li>
+<li>The number of groups listed, the minimum count, and the ranking: absolute
+rate change descending, then count, then group key.</li>
+<li>The rate unit: events per minute of each window.</li>
+<li>One <code dir="auto">warning</code> line for each warning, with trawld’s text. A warning says that
+a window starts before the oldest data that retention kept, or that a group
+field has a degraded pin. With no warnings, the line <code dir="auto">warnings: none raised</code>.</li>
+</ul>
+<p>trawld raises at most one retention warning per window, which names up to
+eight environments and counts the rest, and at most one degraded-pin warning
+per group field. So a compare has at most four warnings.</p>
+<p>The server prints every warning in full and never drops one to fit the budget.
+A warning means the counts can be incomplete. No warning is a claim that they
+are complete.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="fields">fields</h3><a class="sl-anchor-link" href="#fields"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “fields”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">source</code></td>
+<td><code dir="auto">service</code> or <code dir="auto">result</code></td>
+<td>Required. <code dir="auto">service</code> lists the fields of one service. <code dir="auto">result</code> lists the columns of a captured result</td>
+</tr>
+<tr>
+<td><code dir="auto">service</code></td>
+<td>string</td>
+<td>With <code dir="auto">service</code>. The service name</td>
+</tr>
+<tr>
+<td><code dir="auto">result_id</code></td>
+<td>string</td>
+<td>With <code dir="auto">result</code>. The id that <code dir="auto">search</code> returned</td>
+</tr>
+</tbody>
+</table>
+<p>Give <code dir="auto">service</code> only with <code dir="auto">source=service</code>, and <code dir="auto">result_id</code> only with
+<code dir="auto">source=result</code>. Any other combination is an <code dir="auto">isError</code> result that says which
+input is missing or unexpected.</p>
+<p>Each field has a provenance, which says where its facts come from:</p>
+<table>
+<thead>
+<tr>
+<th>Provenance</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">catalog_observation</code></td>
+<td>The field catalog: the pinned type, whether the pin is degraded, the rows that carried the field, and when the catalog last saw it</td>
+</tr>
+<tr>
+<td><code dir="auto">parquet_footer</code></td>
+<td>The footers of the stored Parquet files: the stored type, the row count, and the null count</td>
+</tr>
+<tr>
+<td><code dir="auto">cached_sample</code></td>
+<td>The daemon’s cached sample of recent values. The output schema lists it, and no 1.0 tool prints it</td>
+</tr>
+<tr>
+<td><code dir="auto">capture</code></td>
+<td>The captured result itself: the type, the row and null counts, and the distinct count and listed values from its column facts</td>
+</tr>
+</tbody>
+</table>
+<p><code dir="auto">source=service</code> needs <code dir="auto">schema_read</code>. It reads the catalog and the stored
+schema as two records, which count different things, and prints a field that
+both know twice, catalog first. When one record is refused, the other answers
+and the outcome line names what failed. <code dir="auto">source=result</code> reads a zero-row page of
+the capture, so it needs <code dir="auto">query</code>, and nothing runs again.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="investigation">investigation</h3><a class="sl-anchor-link" href="#investigation"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “investigation”</span></a></div>
+<p>An investigation is a shared, append-only log of the work on one question:
+the searches that ran for it, the rows kept as evidence, findings, and notes.
+Every key with <code dir="auto">query</code> and <code dir="auto">investigation_read</code> reads every investigation, so
+an agent and a person work in the same one. The
+<a href="/reference/api/">investigations API</a> stores it. Each entry has a sequence
+number, <code dir="auto">seq</code>, and the sequence of its last change, <code dir="auto">updated_seq</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">action</code></td>
+<td><code dir="auto">create</code>, <code dir="auto">read</code>, <code dir="auto">list</code>, <code dir="auto">note</code>, <code dir="auto">finding</code>, <code dir="auto">keep</code>, <code dir="auto">finding_status</code>, or <code dir="auto">status</code></td>
+<td>Required. The call to make</td>
+</tr>
+<tr>
+<td><code dir="auto">id</code></td>
+<td>string, 32 lowercase hex digits</td>
+<td>For every action except <code dir="auto">list</code>. The investigation’s id. Optional for <code dir="auto">create</code></td>
+</tr>
+<tr>
+<td><code dir="auto">title</code></td>
+<td>string, at most 200 bytes</td>
+<td>For <code dir="auto">create</code>. Required</td>
+</tr>
+<tr>
+<td><code dir="auto">question</code></td>
+<td>string, at most 2048 bytes</td>
+<td>For <code dir="auto">create</code>. Required. The question the investigation answers</td>
+</tr>
+<tr>
+<td><code dir="auto">scope</code></td>
+<td>string, at most 2048 bytes</td>
+<td>For <code dir="auto">create</code>. What the investigation covers</td>
+</tr>
+<tr>
+<td><code dir="auto">text</code></td>
+<td>string, at most 4096 bytes</td>
+<td>For <code dir="auto">note</code>. Required</td>
+</tr>
+<tr>
+<td><code dir="auto">statement</code></td>
+<td>string, at most 4096 bytes</td>
+<td>For <code dir="auto">finding</code>. Required</td>
+</tr>
+<tr>
+<td><code dir="auto">status</code></td>
+<td><code dir="auto">hypothesis</code>, <code dir="auto">supported</code>, <code dir="auto">refuted</code>, <code dir="auto">unresolved</code>, <code dir="auto">open</code>, or <code dir="auto">closed</code></td>
+<td>For <code dir="auto">finding</code> and <code dir="auto">finding_status</code>, one of the first four. For <code dir="auto">status</code>, <code dir="auto">open</code> or <code dir="auto">closed</code>. Required by all three</td>
+</tr>
+<tr>
+<td><code dir="auto">references</code></td>
+<td>array of <code dir="auto">{result_id, row}</code>, at most 32</td>
+<td>For <code dir="auto">finding</code>. The rows that support it</td>
+</tr>
+<tr>
+<td><code dir="auto">counterevidence</code></td>
+<td>array of <code dir="auto">{result_id, row}</code>, at most 32</td>
+<td>For <code dir="auto">finding</code>. The rows that count against it</td>
+</tr>
+<tr>
+<td><code dir="auto">remaining_question</code></td>
+<td>string, at most 1024 bytes</td>
+<td>For <code dir="auto">finding</code>. What the evidence leaves open</td>
+</tr>
+<tr>
+<td><code dir="auto">result_id</code></td>
+<td>string</td>
+<td>For <code dir="auto">keep</code>. Required. The captured result whose rows to keep</td>
+</tr>
+<tr>
+<td><code dir="auto">rows</code></td>
+<td>array of integers, at most 200</td>
+<td>For <code dir="auto">keep</code>. Required. The row numbers, counted from 0</td>
+</tr>
+<tr>
+<td><code dir="auto">reason</code></td>
+<td>string, at most 1024 bytes</td>
+<td>For <code dir="auto">keep</code>. Required</td>
+</tr>
+<tr>
+<td><code dir="auto">finding_seq</code></td>
+<td>integer</td>
+<td>For <code dir="auto">finding_status</code>. Required. The <code dir="auto">seq</code> of the finding</td>
+</tr>
+<tr>
+<td><code dir="auto">expected_seq</code></td>
+<td>integer</td>
+<td>For <code dir="auto">finding_status</code> and <code dir="auto">status</code>. Required. The investigation’s <code dir="auto">seq</code> that the call saw last</td>
+</tr>
+<tr>
+<td><code dir="auto">since</code></td>
+<td>integer</td>
+<td>For <code dir="auto">read</code>. Print the entries changed after this sequence. Default 0</td>
+</tr>
+<tr>
+<td><code dir="auto">max_bytes</code></td>
+<td>integer, 4096 to 32768</td>
+<td>The response budget. Default 16384</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>trawld route</th>
+<th>Permissions</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">create</code></td>
+<td><code dir="auto">PUT /api/v1/investigations/{id}</code></td>
+<td><code dir="auto">query</code>, <code dir="auto">investigation_read</code>, <code dir="auto">investigation_write</code></td>
+</tr>
+<tr>
+<td><code dir="auto">read</code></td>
+<td><code dir="auto">GET /api/v1/investigations/{id}?since=</code></td>
+<td><code dir="auto">query</code>, <code dir="auto">investigation_read</code></td>
+</tr>
+<tr>
+<td><code dir="auto">list</code></td>
+<td><code dir="auto">GET /api/v1/investigations</code></td>
+<td><code dir="auto">query</code>, <code dir="auto">investigation_read</code></td>
+</tr>
+<tr>
+<td><code dir="auto">note</code>, <code dir="auto">finding</code>, <code dir="auto">keep</code></td>
+<td><code dir="auto">POST /api/v1/investigations/{id}/entries</code></td>
+<td><code dir="auto">query</code>, <code dir="auto">investigation_read</code>, <code dir="auto">investigation_write</code></td>
+</tr>
+<tr>
+<td><code dir="auto">finding_status</code></td>
+<td><code dir="auto">PUT /api/v1/investigations/{id}/findings/{seq}/status</code></td>
+<td><code dir="auto">query</code>, <code dir="auto">investigation_read</code>, <code dir="auto">investigation_write</code></td>
+</tr>
+<tr>
+<td><code dir="auto">status</code></td>
+<td><code dir="auto">PATCH /api/v1/investigations/{id}</code></td>
+<td><code dir="auto">query</code>, <code dir="auto">investigation_read</code>, <code dir="auto">investigation_write</code></td>
+</tr>
+</tbody>
+</table>
+<p>A key that works in investigations through this server therefore holds
+<code dir="auto">query</code>, <code dir="auto">schema_read</code>, <code dir="auto">validate</code>, <code dir="auto">investigation_read</code>, and
+<code dir="auto">investigation_write</code>.</p>
+<p>The server refuses a call before it sends a request when the call gives a
+field that its action does not take, lacks a field that the action needs,
+gives a malformed <code dir="auto">id</code>, or gives a value past its bound. The text names the
+field and lists the fields the action takes.</p>
+<p><code dir="auto">create</code> without an <code dir="auto">id</code> mints one: 16 random bytes as 32 lowercase hex
+digits. The model never chooses the id. The answer prints the id first. A
+<code dir="auto">create</code> with the same <code dir="auto">id</code> and the same fields returns the existing
+investigation, so to recover a <code dir="auto">create</code> whose answer was lost, send it again
+with the printed id. A failed <code dir="auto">create</code> prints the id it sent for this reason.</p>
+<p><code dir="auto">read</code> prints the investigation and its board: every entry changed after
+<code dir="auto">since</code>, in change order, one line each. It asks trawld for at most 50 entries
+a call. <code dir="auto">keep</code> keeps the named rows, and when they are rows of the key’s own
+temporary result, it keeps the whole result as evidence. <code dir="auto">finding_status</code> and
+<code dir="auto">status</code> overwrite, so they carry <code dir="auto">expected_seq</code>. <code dir="auto">status</code> sends the status
+alone, one field a request. When the investigation changed after
+<code dir="auto">expected_seq</code>, trawld answers <code dir="auto">sequence_conflict</code>, and the text prints the sequence the call
+expected, the current one, and the <code dir="auto">read</code> call that prints what changed.</p>
+<p>These are not actions: changing the title or the question, deleting an
+investigation, and keeping its evidence past the retention ceiling. Deleting
+and extending need <code dir="auto">server_manage</code>, an operator’s permission, through the
+<a href="/reference/api/">investigations API</a>.</p>
+<p>A refused call is an <code dir="auto">isError</code> result with trawld’s code. Nothing retries it.</p>
+<table>
+<thead>
+<tr>
+<th>Refusal</th>
+<th>What the text adds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTTP 403</td>
+<td>The permissions the action needs. <code dir="auto">orient</code> lists the key’s permissions</td>
+</tr>
+<tr>
+<td>HTTP 404</td>
+<td>No investigation has that id. <code dir="auto">investigation action=list</code> lists them</td>
+</tr>
+<tr>
+<td><code dir="auto">sequence_conflict</code></td>
+<td>The expected and current sequence, and <code dir="auto">investigation action=read id=ID since=EXPECTED</code></td>
+</tr>
+<tr>
+<td><code dir="auto">investigation_exists</code></td>
+<td>An investigation with that id has another creator or other fields. Read it, or create without an id</td>
+</tr>
+<tr>
+<td><code dir="auto">investigation_closed</code></td>
+<td><code dir="auto">investigation action=status id=ID status=open</code> reopens it</td>
+</tr>
+<tr>
+<td><code dir="auto">evidence_budget_exceeded</code></td>
+<td>Evidence frees only when it ages out or an operator deletes an investigation</td>
+</tr>
+</tbody>
+</table>
+<div class="sl-heading-wrapper level-h2"><h2 id="resources">Resources</h2><a class="sl-anchor-link" href="#resources"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Resources”</span></a></div>
+<p>The DSL reference is served as MCP resources. The text is the published
+<a href="/reference/dsl/">DSL reference</a>, compiled into the binary, so it matches the
+<code dir="auto">trawl</code> version and changes only with it. Each resource has the MIME type
+<code dir="auto">text/markdown</code>. A resource holds at most 32 KiB of text.</p>
+<table>
+<thead>
+<tr>
+<th>URI</th>
+<th>Content</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">trawl://dsl/overview</code></td>
+<td>The page text before its first <code dir="auto">##</code> heading</td>
+</tr>
+<tr>
+<td><code dir="auto">trawl://dsl/&lt;slug&gt;</code></td>
+<td>One <code dir="auto">##</code> section of the page, such as <code dir="auto">trawl://dsl/search-stage</code></td>
+</tr>
+<tr>
+<td><code dir="auto">trawl://dsl/&lt;slug&gt;/&lt;sub-slug&gt;</code></td>
+<td>One <code dir="auto">###</code> section of a <code dir="auto">##</code> section that is larger than 32 KiB</td>
+</tr>
+</tbody>
+</table>
+<p>A slug is the heading in lowercase with hyphens. <code dir="auto">resources/list</code> returns the
+URIs in page order. <code dir="auto">orient</code> lists them in its text. A URI that is not listed is
+a resource-not-found error.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="text-contract">Text contract</h2><a class="sl-anchor-link" href="#text-contract"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Text contract”</span></a></div>
+<p>Every tool result has one text block that stands alone, and a
+<code dir="auto">structuredContent</code> object that mirrors it under the tool’s <code dir="auto">outputSchema</code>. A
+client that renders only the text loses nothing.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="layout-of-a-search-or-read-result">Layout of a search or read result</h3><a class="sl-anchor-link" href="#layout-of-a-search-or-read-result"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Layout of a search or read result”</span></a></div>
+<p>The text block holds these parts from top to bottom. A part that is empty is
+left out.</p>
+<ol>
+<li>The outcome line, then <code dir="auto">result:</code> with the result id and the time the result
+is readable until.</li>
+<li><code dir="auto">bounds:</code> with the earliest bound (inclusive) and the latest bound
+(exclusive), and <code dir="auto">executed query:</code> with the text trawld ran.</li>
+<li>Four sentences of truncation facts, described <a href="#truncation-facts">below</a>.</li>
+<li>One <code dir="auto">facet</code> line per facet, then one <code dir="auto">hint:</code> line per hint. A result of
+<code dir="auto">context</code>, <code dir="auto">sightings</code>, or <code dir="auto">compare</code> prints its block here instead.</li>
+<li>At most two <code dir="auto">next:</code> lines: a tool name and its arguments as a JSON object,
+then the reason.</li>
+<li><code dir="auto">search URL:</code> with the link, or <code dir="auto">no search URL:</code> with the reason.</li>
+<li>One columns line.</li>
+<li><code dir="auto">rows from captured row N:</code> and the rows, one JSON array per line.</li>
+</ol>
+<p>Bounds and the expiry time are RFC 3339 in UTC with microseconds.</p>
+<p>Every value that came from stored events prints as JSON: each cell, each facet
+value, each column name, and the executed query. Event text is therefore always
+a JSON string inside a JSON array, whatever it holds. The server also escapes
+DEL, the C1 control characters, the bidirectional controls, the zero-width
+characters and joiners, the byte order mark, the soft hyphen, and U+2028 and
+U+2029 as <code dir="auto">\uXXXX</code>, on top of the escapes JSON requires. These characters can
+reorder or hide the text around them. The free text that the server writes, and
+trawld’s messages, print on one line with line breaks and the same characters
+escaped.</p>
+<p><code dir="auto">structuredContent</code> carries the same escaped text. In every string and key of
+the mirror, each control character and each of these characters is the escape
+text the text block prints for it inside a row: <code dir="auto">\n</code> for a line feed, <code dir="auto">\t</code> for
+a tab, <code dir="auto">\u001b</code> for an escape, <code dir="auto">\u00ad</code> for a soft hyphen. A client can show
+the model the mirror instead of the text block, and Claude Code does. A client
+can also decode the mirror and render its strings. Either way, no string holds
+a character that reorders, hides or rewrites the text around it, and a string
+with line breaks, such as a note or a query, is one line, as it is in the text
+block’s rows. A mirror string that holds one of these escapes does not decode
+to the stored text. To get the stored bytes, read the row or the entry through
+the <a href="/reference/api/">HTTP API</a>. A proposed next call whose arguments hold a
+control character or one of these characters is left out of the mirror, so
+that a call taken from the mirror never runs changed arguments; its <code dir="auto">next:</code>
+line in the text block stays, and the JSON escapes there decode to the
+original arguments.</p>
+<p>A cell is its wire JSON value, as the <a href="/reference/api/">API</a> returns it. A
+cell whose wire text is longer than 512 bytes prints as a JSON string of its
+first 512 bytes, cut on a character boundary. The string ends with a marker
+that names the omitted bytes and the call that reads the cell:
+<code dir="auto">…[+N bytes: read action=cell row=R column=C]</code>. The mirror lists each
+abbreviated cell as its row, column, and total bytes. <code dir="auto">read action=cell</code>
+returns the whole value.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="truncation-facts">Truncation facts</h3><a class="sl-anchor-link" href="#truncation-facts"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Truncation facts”</span></a></div>
+<p>Four sentences tell the reader what the rows are not. They use fixed wording.</p>
+<ol>
+<li><code dir="auto">The execution produced N rows.</code> The rows the query returned.</li>
+<li><code dir="auto">The capture kept all N rows.</code> or <code dir="auto">The capture kept N of the M rows and truncated the result.</code> The rows the capture stored, which is at most the
+capture bound <code dir="auto">max_rows</code>.</li>
+<li><code dir="auto">The DSL did not sample, limit or deduplicate the rows.</code> Or the sentence
+names the stages that did: <code dir="auto">sample</code>, <code dir="auto">limit</code> or <code dir="auto">tail</code>, and <code dir="auto">dedup</code>. The
+server reads these from the executed query’s pipe stages.</li>
+<li><code dir="auto">This response prints N rows from captured row R, abbreviates N cells and omits N columns; N captured rows follow.</code> When the budget dropped anything,
+a last clause lists what: rows, the facets, the hints, the proposed next
+calls.</li>
+</ol>
+<div class="sl-heading-wrapper level-h3"><h3 id="facets">Facets</h3><a class="sl-anchor-link" href="#facets"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Facets”</span></a></div>
+<p>A facet counts the values of one column over the captured rows. A result prints
+at most 3 facets of at most 5 values each, most frequent first. Only a column
+whose facts list every distinct value is a facet. Time columns, trailing
+metadata such as <code dir="auto">_raw</code> and <code dir="auto">_ingested</code>, and columns with a value longer than
+512 bytes are not.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="next-actions">Next actions</h3><a class="sl-anchor-link" href="#next-actions"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Next actions”</span></a></div>
+<p>A result proposes at most 2 next calls. After a page they are the next page
+and, when a cell was abbreviated, the call that reads the first such cell.
+After <code dir="auto">sightings</code>, its follow-up queries come after the next page. After
+a valid <code dir="auto">validate</code> it is the call that runs the query. Each call’s arguments
+are valid under that tool’s input schema.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="the-search-url">The search URL</h3><a class="sl-anchor-link" href="#the-search-url"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “The search URL”</span></a></div>
+<p>The search URL opens <a href="/reference/web-ui/">Search</a> with the executed query and
+its bounds. The server builds it with the same codec as Search, so the page
+that opens shows what the tool ran. The <code dir="auto">q</code> parameter carries the executed
+text, including the exact <code dir="auto">earliest=</code> and <code dir="auto">latest=</code> of the capture, and <code dir="auto">r</code>
+carries those bounds widened to whole seconds. The origin is the trawld setting
+<a href="/reference/configuration/#server"><code dir="auto">[server] link_origin</code></a>. A request never
+chooses it.</p>
+<p>A result has no search URL, and its <code dir="auto">no search URL:</code> line says why, when:</p>
+<ul>
+<li>trawld has no <code dir="auto">link_origin</code>;</li>
+<li>the result has no bounds, because it was read from <code dir="auto">from saved</code> report rows;</li>
+<li>the bounds do not parse as instants;</li>
+<li>Search would refuse the link, because its query string is over 32 KiB or 64
+parameters;</li>
+<li>the whole link, origin included, is longer than 32 KiB;</li>
+<li>the link did not fit the response budget;</li>
+<li>trawld’s capabilities could not be read, so the origin is unknown. The reason
+names the code trawld answered.</li>
+</ul>
+<div class="sl-heading-wrapper level-h3"><h3 id="activity">Activity</h3><a class="sl-anchor-link" href="#activity"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Activity”</span></a></div>
+<p>Activity is what other keys changed in an investigation since this session
+last saw it. One <code dir="auto">trawl mcp</code> process is one session. For each investigation,
+the session remembers the last sequence it printed, and it prints each entry
+that another key changed once, at most, in that session.</p>
+<ul>
+<li><code dir="auto">note</code>, <code dir="auto">finding</code>, <code dir="auto">keep</code>, and every attached call, a <code dir="auto">search</code>, <code dir="auto">context</code>,
+<code dir="auto">sightings</code>, or <code dir="auto">compare</code> that names an investigation, send the session’s
+sequence to trawld as <code dir="auto">seen_seq</code>. So every attached call carries activity.
+trawld answers with the entries that other keys changed after it, at most 50,
+and says when more follow. The answer prints them under
+<code dir="auto">activity by other keys since #N, in change order</code>.</li>
+<li>The first call that touches an investigation in a session sends no
+<code dir="auto">seen_seq</code>, and its answer prints no activity. Its <code dir="auto">activity:</code> line says that
+the session starts to follow the investigation there, and names the <code dir="auto">read</code>
+call that prints the board. After a <code dir="auto">create</code>, a write, or a status change,
+the session starts at that sequence. trawld’s answer to an attached call
+names the sequence of the step it appended, <code dir="auto">step_seq</code>, and the session
+starts at that step once the answer fits its budget.</li>
+<li><code dir="auto">finding_status</code> and <code dir="auto">status</code> answer with no activity. The next <code dir="auto">note</code>,
+<code dir="auto">finding</code>, <code dir="auto">keep</code>, or attached call prints it.</li>
+<li>A board that <code dir="auto">read</code> prints counts as seen, unless its <code dir="auto">since</code> is past the
+session’s sequence. Such a board leaves a gap, so the session keeps its
+sequence. A board that prints every entry trawld sent, with none to follow,
+counts as seen through the sequence trawld read to, its <code dir="auto">through_seq</code>. So an
+empty board counts as seen too.</li>
+<li>The session’s sequence moves only to the <code dir="auto">updated_seq</code> of the last entry the
+answer printed, or to the <code dir="auto">through_seq</code> of a board printed whole, and only
+after the answer fits its budget. A refused or
+failed call moves nothing, and neither does an answer that does not fit.
+This holds for the first attached call too: when its page fails or its
+answer does not fit, the session does not start at its step, and the next
+attached call sends no <code dir="auto">seen_seq</code>.</li>
+<li>After trawld accepted an attached call, the call is a step of the
+investigation and its result is kept for it. An error after that point, such
+as a page that fails or an answer that does not fit, opens with a line that
+names the investigation and the kept result.</li>
+<li>The server checks trawld’s capture answer before it prints anything from it.
+A result id that is not 32 lowercase hex digits names no result that a read
+can page. An attached call also needs the answer to say that the result
+is kept for the investigation that the call named. When the answer fails a
+check, the call is an <code dir="auto">isError</code> result that names no result and moves no
+sequence. For an attached call, the text says that the call may be a
+step of the investigation, and it names the <code dir="auto">investigation action=read</code> call,
+from the session’s sequence, whose step entry names the kept result.</li>
+</ul>
+<p>Each entry prints as one line:
+<code dir="auto">#SEQ [(changed at #UPDATED_SEQ)] KIND by PREFIX "NAME" at TIME: BODY</code>. The
+key’s prefix and name are the ones it had when it wrote the entry. Stored text
+prints as JSON strings with the same characters escaped as above, so a title,
+note, or name another key wrote cannot reorder or hide the text around it. In
+an activity block, an entry whose line is longer than 1024 bytes prints its
+header and a marker instead of its body:
+<code dir="auto">…[+N bytes: investigation action=read id=ID since=S]</code>, where the call prints
+the entry on the board. A board prints each entry whole, limited only by the
+response budget. When the budget does not hold the first
+entry of a board, that entry prints its header and a marker. The marker names
+the same read with <code dir="auto">max_bytes=32768</code> when that budget holds the entry. Else it
+names the investigation’s page in the web UI.</p>
+<p>An entry’s header, its sequence, kind, and attribution, is never shortened.
+When the budget does not hold even the header of a board’s first entry, for
+example a key name of 40000 bytes, the read is an error, never an answer that
+prints no entry. The error names the investigation, the entry’s sequence, and
+the read past it, with <code dir="auto">since</code> set to the entry’s <code dir="auto">updated_seq</code>. It names a
+larger <code dir="auto">max_bytes</code> when 32768 holds the entry, and the investigation’s page in
+the web UI.</p>
+<p>When the budget cuts activity or a board, it drops whole entries from the end,
+never from the middle, and the block says how many it dropped. The answer
+then proposes <code dir="auto">investigation {"action":"read","id":ID,"since":S}</code>, where <code dir="auto">S</code>
+is the <code dir="auto">updated_seq</code> of the last entry printed. It proposes the same call when
+trawld said more entries follow. On a <code dir="auto">read action=investigation</code> board the
+proposed call is the matching <code dir="auto">read</code> call. The continuation lives in the
+activity block, so it stays when the budget drops the other next calls.</p>
+<p>A write that trawld accepted is acknowledged at every <code dir="auto">max_bytes</code>, from 4096
+to 32768. The outcome line of every <code dir="auto">create</code>, <code dir="auto">note</code>, <code dir="auto">finding</code>, <code dir="auto">keep</code>,
+<code dir="auto">finding_status</code>, and <code dir="auto">status</code> answer names the investigation id, and every
+answer but <code dir="auto">create</code>’s names the sequence written. A <code dir="auto">create</code>’s outcome line
+names only the id. The header line that follows it prints the sequence: <code dir="auto">seq 0</code>
+for a new investigation, or the current sequence when the <code dir="auto">create</code> replays one
+that exists. If the answer is still over its budget without its entries and
+next calls, the server shortens the answer, not the acknowledgement:</p>
+<ol>
+<li>The entry written prints its header and the marker
+<code dir="auto">…[+N bytes: investigation action=read id=ID since=S]</code>.</li>
+<li>The title, question, and scope print as prefixes cut on a character
+boundary. Each prefix ends with <code dir="auto">…[+N bytes: WHERE]</code>. <code dir="auto">WHERE</code> is
+<code dir="auto">investigation action=read</code> with <code dir="auto">max_bytes=32768</code> when that budget holds
+the whole header, else the investigation’s page in the web UI.</li>
+</ol>
+<p><code dir="auto">N</code> counts the bytes of escaped text left out. <code dir="auto">structuredContent</code> carries the
+same prefixes, escaped as the text block prints them, and lists each shortened
+text under <code dir="auto">investigation.abbreviated</code>.
+The id, status, sequence, retention, and attribution are never shortened. A
+board read shortens its header the same way.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="limits">Limits</h2><a class="sl-anchor-link" href="#limits"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Limits”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Response size, <code dir="auto">text</code> plus <code dir="auto">structuredContent</code></td>
+<td>16384 bytes by default; the call’s <code dir="auto">max_bytes</code> sets it, from 4096 to 32768</td>
+</tr>
+<tr>
+<td>Rows per response</td>
+<td>50 by default; the call’s <code dir="auto">rows</code> sets it, from 1 to 200</td>
+</tr>
+<tr>
+<td>Rows per page request to trawld</td>
+<td>the call’s <code dir="auto">rows</code>, held to trawld’s <code dir="auto">[capture] page_max_rows</code> (<code dir="auto">bounds.page_max_rows</code> in capabilities); a created continuation stays inside it</td>
+</tr>
+<tr>
+<td>Cell bytes per request to trawld</td>
+<td>the call’s <code dir="auto">max_bytes</code>, held to trawld’s <code dir="auto">[capture] max_wire_bytes</code> (<code dir="auto">bounds.max_wire_bytes</code>); the rest follows through continuations</td>
+</tr>
+<tr>
+<td>Cell</td>
+<td>512 bytes of wire JSON; a longer cell is abbreviated</td>
+</tr>
+<tr>
+<td>Facets per result</td>
+<td>3, of 5 values each</td>
+</tr>
+<tr>
+<td>Next actions per reply</td>
+<td>2</td>
+</tr>
+<tr>
+<td>Activity entry line</td>
+<td>1024 bytes; a longer activity entry prints its header and a marker. A board prints entries whole, within the response budget</td>
+</tr>
+<tr>
+<td>Activity entries per answer</td>
+<td>50, trawld’s limit, then a continuation</td>
+</tr>
+<tr>
+<td>Board entries per read request to trawld</td>
+<td>50</td>
+</tr>
+<tr>
+<td>Open investigations in <code dir="auto">orient</code></td>
+<td>5</td>
+</tr>
+<tr>
+<td>Error text</td>
+<td>8192 bytes, cut on a character boundary with a marker</td>
+</tr>
+<tr>
+<td>DSL resource</td>
+<td>32768 bytes</td>
+</tr>
+</tbody>
+</table>
+<p>The hard budget of 32 KiB stays under the 50,000 characters at which Claude
+Code spills a result to a file, even if a client counts the text and the
+mirror together. The server counts both against <code dir="auto">max_bytes</code>.</p>
+<p>When a reply is over its budget, the server fits it in this order. It drops
+whole rows from the end of the page, never cutting a row or a cell, and says
+how many. The outcome line of a <code dir="auto">read</code> page names the rows the response
+prints, not the rows it read; when it prints none, the line says that the row
+at the offset does not fit. If no rows fit, it also drops the facets, then the next calls, then
+the search URL (and <code dir="auto">no search URL:</code> says so), then the hints, and prints the
+most rows that fit. A correlation block is never dropped. Only when a
+<code dir="auto">sightings</code> reply still does not fit does the server leave entries off the
+ends of its groups, totals, and fields lists, and a line names how many. The
+denominator sentence stays. A page cut this way always proposes the rest: the
+continuation call moves to the end of the rows printed, or is created when the
+server page was the last one. When not even one row fits, the rows block says
+<code dir="auto">no row fits max_bytes N; see next actions</code>, and the proposed call reads that
+row alone at the hard cap, or, when no budget prints the row, reads its cells
+one at a time. A cell range cut the same way proposes the rest from the byte
+where printing stopped; a range with no room for a single byte is an <code dir="auto">isError</code>
+result that names the smallest <code dir="auto">max_bytes</code> that prints one.
+If the reply does not fit with all of those gone, the call is an <code dir="auto">isError</code>
+result that names the result id and <code dir="auto">max_bytes</code>. The result is kept, so a
+<code dir="auto">read</code> with a larger <code dir="auto">max_bytes</code> returns it. <code dir="auto">orient</code> and <code dir="auto">fields</code> fit their
+replies the same way, dropping inventory rows or fields from the end before
+their other parts.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="refused-calls">Refused calls</h2><a class="sl-anchor-link" href="#refused-calls"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Refused calls”</span></a></div>
+<p>A call that trawld refuses, or that fails on the way, is an <code dir="auto">isError</code> result
+with one text block and no <code dir="auto">structuredContent</code>. The text holds these parts:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="text"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">search was refused: parse_error (HTTP 400).</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">trawld says: unknown command 'stat'</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">error: unknown command 'stat'</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">  </span></span><span style="--0:#d6deeb;--1:#403f53">service=nginx | stat count()</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">                  </span></span><span style="--0:#d6deeb;--1:#403f53">^^^^</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">  </span></span><span style="--0:#d6deeb;--1:#403f53">hint: did you mean 'stats'?</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">retry after: 3 seconds</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">request id: 7c1e0f52</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="search was refused: parse_error (HTTP 400).trawld says: unknown command &#x27;stat&#x27;error: unknown command &#x27;stat&#x27;  service=nginx | stat count()                  ^^^^  hint: did you mean &#x27;stats&#x27;?retry after: 3 secondsrequest id: 7c1e0f52"><div></div></button></div></figure></div>
+<ul>
+<li>The tool, the error code, and the HTTP status.</li>
+<li><code dir="auto">trawld says:</code> and trawld’s message, on one line.</li>
+<li>One <code dir="auto">error:</code> line for each diagnostic, up to 8, then a count of the rest. A
+diagnostic with a span carries a caret excerpt cut from the text that was
+sent, and its hint when trawld gave one. The excerpt keeps 60 bytes of the
+line on each side of the span. A multi-line text names the line number. The
+excerpt prints each control character, bidirectional control, zero-width
+character, joiner, byte order mark, soft hyphen, and line or paragraph
+separator as U+FFFD, and keeps tabs. The server drops an excerpt whose span
+is reversed, past the end of the text, or off a character boundary, and keeps
+the message.</li>
+<li><code dir="auto">retry after: N seconds</code> when trawld sent a <code dir="auto">Retry-After</code> header, or <code dir="auto">retry after: trawld named no wait</code> for a 429 without one.</li>
+<li><code dir="auto">request id:</code>, which an operator can search for in the trawld logs, when
+the response carried an id of 1 to 64 visible ASCII characters.</li>
+</ul>
+<p>When the text is over 8192 bytes, the head is cut, and the <code dir="auto">retry after</code> and
+<code dir="auto">request id</code> lines stay. A refusal after trawld accepted an attached call,
+such as a refused first page, opens with the line that names the investigation
+and the kept result. The line that names the captured result and the <code dir="auto">read</code>
+call for it comes just before <code dir="auto">retry after</code>. The server caps that text once,
+and it cuts only trawld’s message and the diagnostics.</p>
+<p>A failure in transport, or a response that does not parse, prints a sentence
+that names its class only, such as <code dir="auto">no connection to trawld opened</code>. It holds
+no library message, address, or path.</p>
+<p>A failed validation is not a refusal. <code dir="auto">search mode=validate</code> on a query that
+does not parse is a successful call.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="hints">Hints</h2><a class="sl-anchor-link" href="#hints"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Hints”</span></a></div>
+<p>A hint is computed from facts that trawld answered, never generated. Each hint
+names the rows or the range it was computed over. A hint that needs a call to
+trawld stays silent when trawld refuses the call, so a hint never turns a
+search into an error. <code dir="auto">search</code> prints these four.</p>
+<table>
+<thead>
+<tr>
+<th>Hint</th>
+<th>When it prints</th>
+<th>Threshold</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dominance</td>
+<td>One <code dir="auto">service</code> or one <code dir="auto">host</code> value holds a large share of the captured rows</td>
+<td>At least 80% of the captured rows (<code dir="auto">DOMINANCE_PERCENT</code>), among at least 2 distinct values (<code dir="auto">DOMINANCE_MIN_DISTINCT</code>). A column with more than 5 distinct values is not judged</td>
+</tr>
+<tr>
+<td>Lag</td>
+<td>A sender’s <code dir="auto">_ingested</code> is far ahead of its <code dir="auto">_time</code></td>
+<td>More than 300 seconds (<code dir="auto">LAG_THRESHOLD_SECS</code>) on a row of the page this response read. The hint names the service and host with the largest gap and counts the other senders over the threshold</td>
+</tr>
+<tr>
+<td>Not in the catalog</td>
+<td>The catalog has no pin for a field that the search stage names, or, when the query names one <code dir="auto">service=</code>, no observation of it in that service</td>
+<td>The hint states what the catalog holds now. The catalog evicts pins and observations, so stored events can still carry the field. The check covers at most 4 fields (<code dir="auto">MAX_FIELD_CHECKS</code>), none that begin with <code dir="auto">_</code> and none of the well-known log fields, and reads at most 3 catalog pages of 100 observations (<code dir="auto">CATALOG_MAX_PAGES</code>, <code dir="auto">CATALOG_PAGE_ROWS</code>). A check that does not finish gives no hint. It needs <code dir="auto">schema_read</code></td>
+</tr>
+<tr>
+<td>Nearest bounds</td>
+<td>The capture has no rows</td>
+<td>The query is a plain search stage with no pipe stages. One aggregate widens the bounds by 7 days (<code dir="auto">NEAREST_REACH_DAYS</code>) before the earliest bound and after the latest bound, clipped at now, and reports the last event before the bounds and the first after. Any other shape prints <code dir="auto">nearest bounds: not computed for this shape</code></td>
+</tr>
+</tbody>
+</table>
+<p>The constants are in <code dir="auto">crates/trawl-mcp/src/hints.rs</code>.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="out-of-scope-in-10">Out of scope in 1.0</h2><a class="sl-anchor-link" href="#out-of-scope-in-10"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Out of scope in 1.0”</span></a></div>
+<p>These are not in the 1.0 server:</p>
+<ul>
+<li>the streamable HTTP transport, and so a client that connects from a cloud
+service to a tailnet address;</li>
+<li>the <code dir="auto">watch</code> and <code dir="auto">operations</code> tools;</li>
+<li>OAuth.</li>
+</ul>
+<p>The reasons and the planned order are in
+<a href="https://github.com/jakub/trawl/blob/main/docs/adr/0058-the-mcp-server-is-a-thin-client-that-answers-in-text-first.md">ADR-0058</a>.
+Investigations are
+<a href="https://github.com/jakub/trawl/blob/main/docs/adr/0059-an-investigation-is-grant-visible-and-its-evidence-outlives-the-corpus.md">ADR-0059</a>.
+The captured results it reads are
+<a href="https://github.com/jakub/trawl/blob/main/docs/adr/0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md">ADR-0057</a>.</p>
+</div><footer class="sl-flex astro-ddtxxk7k"><div class="meta sl-flex astro-ddtxxk7k"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/mcp.md" class="sl-flex print:hidden astro-qlekgd3o"><svg aria-hidden="true" class="astro-qlekgd3o astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a></div><div class="pagination-links print:hidden astro-b5raizh3" dir="ltr"><a href="/reference/api/" rel="prev" class="astro-b5raizh3"><svg aria-hidden="true" class="astro-b5raizh3 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-b5raizh3">Previous<br class="astro-b5raizh3"><span class="link-title astro-b5raizh3">HTTP API</span></span></a><a href="/reference/configuration/" rel="next" class="astro-b5raizh3"><svg aria-hidden="true" class="astro-b5raizh3 astro-hkc32dio" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-b5raizh3">Next<br class="astro-b5raizh3"><span class="link-title astro-b5raizh3">Configuration</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
