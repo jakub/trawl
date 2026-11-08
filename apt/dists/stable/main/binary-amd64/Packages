@@ -1,45 +1,45 @@
 Package: trawl-cli
-Version: 0.9.3-1
+Version: 0.9.4-1
 Architecture: amd64
 Maintainer: Jakub Burgis <mail@jakub.me>
-Installed-Size: 15864
-Depends: libc6 (>= 2.34), trawl-runtime (= 0.9.3-1)
-Filename: pool/trawl-cli_0.9.3-1_amd64.deb
-Size: 4331564
-MD5sum: 75db07090035acf93f08c3b38c42f03f
-SHA1: c72c67f5186ecdcf89a7fe311a6381938206622e
-SHA256: f88ad8e0315b38c4ad8bd8e52c37e7298c7de51fda456dd0c858b3804c00be25
+Installed-Size: 21246
+Depends: libc6 (>= 2.34), trawl-runtime (= 0.9.4-1)
+Filename: pool/trawl-cli_0.9.4-1_amd64.deb
+Size: 5678376
+MD5sum: bb1bbd5d351c6ba59f0fd94befe08734
+SHA1: 5e8a2adb8408de4d7976b9fd17e5f1404098cfae
+SHA256: cfedef859202be5d09bd61846833a0c4d46647781d82149ccd02c3b9935f4287
 Section: utils
 Priority: optional
 Description: CLI tool for querying logs via trawl
 
 Package: trawl-runtime
-Version: 0.9.3-1
+Version: 0.9.4-1
 Architecture: amd64
 Maintainer: Jakub Burgis <mail@jakub.me>
-Installed-Size: 68877
+Installed-Size: 68894
 Depends: libc6 (>= 2.34), libgcc-s1 (>= 3.4), libstdc++6 (>= 6)
-Filename: pool/trawl-runtime_0.9.3-1_amd64.deb
-Size: 18270726
-MD5sum: c6390d81791697dfda79322c73bdce57
-SHA1: cb92801edfc8524bdfe31538d95bb67a0f834a62
-SHA256: acc9464242745b2e376838fd393af0b5db0a28a4b9aa664bd63d7e8a0a6c6706
+Filename: pool/trawl-runtime_0.9.4-1_amd64.deb
+Size: 18283732
+MD5sum: dd914db6da3cd15fd76872fca2834b70
+SHA1: 523717daffceafd0f44a53ef7765269247b2c3eb
+SHA256: 62ac03a6cf1c211e031a6d714ac4a4640b00efa8b98dbc278ab7803ba5182b21
 Section: libs
 Priority: optional
 Description: Trawl's verified DuckDB runtime
  Official DuckDB with built-in ICU, JSON, and Parquet support.
 
 Package: trawl-server
-Version: 0.9.3-1
+Version: 0.9.4-1
 Architecture: amd64
 Maintainer: Jakub Burgis <mail@jakub.me>
-Installed-Size: 52627
-Depends: libc6 (>= 2.34), trawl-runtime (= 0.9.3-1)
-Filename: pool/trawl-server_0.9.3-1_amd64.deb
-Size: 16149920
-MD5sum: 91330562473edcc5d63b5ec2f488021c
-SHA1: 17cded49eec9f06bbc8e7c78a8935a6ba54914bb
-SHA256: 2f82bddbc8cd75ac3c43e73878ae7e04986083ee787c023f26b8919470b2bc63
+Installed-Size: 57889
+Depends: libc6 (>= 2.34), trawl-runtime (= 0.9.4-1)
+Filename: pool/trawl-server_0.9.4-1_amd64.deb
+Size: 18142200
+MD5sum: 106d4bb3222eae500bae7fc81b190cbe
+SHA1: 0f6bd1e430497616f7aec33d6a5aeaf31b4ffd03
+SHA256: bb14c86fc1725da3bc234a1ccf037a3f373142154046a52d6ab7cf981d8977c5
 Section: net
 Priority: optional
 Description: The trawld daemon — HTTP, Unix socket, and TCP+TLS listeners
