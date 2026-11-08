@@ -1788,7 +1788,7 @@ fn EvidenceItem(
                 let opened = Opened { result_id: reference.result_id.clone(), row: Some(reference.row) };
                 view! {
                     <EvidenceTable row=row label=row_label.clone()/>
-                    <Btn variant=Variant::Secondary size=Size::Xs attr:class="inv-open-rows"
+                    <Btn variant=Variant::Secondary size=Size::Xs class:inv-open-rows=true
                         attr:aria-label=format!("Open {row_label} among its rows")
                         on_click=Callback::new(move |()| open.run(opened.clone()))>"Open result"</Btn>
                 }.into_any()
@@ -1905,7 +1905,7 @@ fn StepItem(seq: u64, entry: Memo<Option<LogEntry>>, open: Callback<Opened>) -> 
                                 let label = format!("View the rows of result {}", short_result_id(&result_id));
                                 let opened = Opened { result_id, row: None };
                                 view! {
-                                    <Btn variant=Variant::Secondary size=Size::Xs attr:class="inv-open-rows" attr:aria-label=label
+                                    <Btn variant=Variant::Secondary size=Size::Xs class:inv-open-rows=true attr:aria-label=label
                                         on_click=Callback::new(move |()| open.run(opened.clone()))>"View rows"</Btn>
                                 }
                             })}

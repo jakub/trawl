@@ -237,6 +237,8 @@ test.describe('on a phone', () => {
     // viewer on a readable cited row or a step's captured result, and
     // nothing offers a write the session cannot make.
     await expect(main.getByRole('button')).toHaveText(['Refresh', 'Open result', 'Open result', 'View rows', 'View rows']);
+    // The openers keep the design system's button classes beside their own.
+    await expect(main.locator('button.inv-open-rows.btn-sec.btn-xs')).toHaveCount(4);
 
     await expect(main).toMatchAriaSnapshot(`
       - paragraph:
