@@ -235,7 +235,7 @@ A glob, a regex, or a `like` or `ilike` pattern in a query. A pattern is always 
 _Avoid_: computed pattern (refused), matcher, expression (that is the larger tree a pattern sits in)
 
 **Row-scalar position**:
-An expression evaluated once per row: `where`, `let`, `sort`, and a scalar call's argument. An aggregate call there is refused in both lanes.
+An expression evaluated once per row: a `where` condition or a `let` assignment, at any depth. An aggregate call there is refused in both lanes. A scalar call's argument takes the position of the call: in a row-scalar position it is row-scalar, and in an aggregation slot it is part of the slot. So `stats coalesce(sum(x), 0)` is legal, and `where lower(count(x)) == "a"` is refused.
 
 **Aggregation slot**:
 The head of a `stats`, `timechart`, `eventstats` or `pivot` aggregation. It names an aggregate; batch also takes a scalar head there, and the live lane refuses one.

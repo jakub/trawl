@@ -11,7 +11,7 @@ use chumsky::prelude::*;
 
 use crate::ast::{
     FieldFilter, FilterOp, FilterValue, QuotedSearch, Scalar, SearchStage, SearchToken, Spanned,
-    TextSearch, TimeClause, TimeFilter,
+    TextSearch, TimeBound, TimeClause, TimeFilter,
 };
 use crate::parser::comment::{self, Spaced};
 use crate::parser::primitives::{
@@ -63,6 +63,15 @@ pub(crate) const MSG_QUOTE_AFTER_REGEX: &str =
 /// (ADR-0061 ruling 2).
 pub(crate) const MSG_NESTED_TIME_CLAUSE: &str =
     "a time clause cannot sit inside parentheses or under NOT";
+
+/// The message an `earliest=` or `latest=` clause carries when
+/// [`TimeBound::read`] has no instant for it (ADR-0017's amendment of
+/// 2026-11-08).
+pub(crate) const MSG_UNREADABLE_BOUND: &str = "cannot read this time bound as a timestamp";
+
+/// The message `last=` beside an absolute bound carries (ADR-0061's
+/// amendment of 2026-11-08).
+pub(crate) const MSG_LAST_WITH_BOUND: &str = "cannot combine 'last=' with 'earliest='/'latest='";
 
 /// The message a group of only `OR` separators carries (ADR-0061
 /// ruling 4).
@@ -530,38 +539,93 @@ enum TokenOrSep<T> {
     Or,
 }
 
-/// Take the time clauses out of one top-level token list into the stage's
-/// slots, the last of each kind winning.
+/// The search stage's time clauses, taken out of its groups in text
+/// order, the last of each kind winning its slot.
 ///
 /// Only the top level holds a clause: a clause inside parentheses or
 /// under `NOT` is a parse error (ADR-0061 ruling 2, [`search_token`]).
-/// Every clause taken is also recorded in `hoisted` with its span, since
+/// Every clause taken is also recorded in `clauses` with its span, since
 /// the three slots keep only the last of each kind.
-fn hoist_time_filters(
-    tokens: &mut Vec<Spanned<SearchToken>>,
-    time_filter: &mut Option<Spanned<TimeFilter>>,
-    earliest: &mut Option<Spanned<String>>,
-    latest: &mut Option<Spanned<String>>,
-    hoisted: &mut Vec<Spanned<TimeClause>>,
-) {
-    tokens.retain(|t| match &t.node {
-        SearchToken::TimeFilter(tf) => {
-            *time_filter = Some(Spanned::new(tf.clone(), t.span.clone()));
-            hoisted.push(Spanned::new(TimeClause::Last, t.span.clone()));
+///
+/// Each clause is checked as it is taken, because a later clause of its
+/// kind overwrites the slot and `clauses` keeps no value: an unreadable
+/// bound is refused over its own span, and the first clause that puts
+/// `last=` beside an absolute bound is refused over its span. A refused
+/// bound leaves its slot as it was, and the parse fails.
+#[derive(Default)]
+struct Hoist {
+    time_filter: Option<Spanned<TimeFilter>>,
+    earliest: Option<Spanned<TimeBound>>,
+    latest: Option<Spanned<TimeBound>>,
+    clauses: Vec<Spanned<TimeClause>>,
+    /// Whether a `last=` and an absolute clause have each been taken, and
+    /// whether the pair has been refused, which happens once.
+    seen_last: bool,
+    seen_absolute: bool,
+    paired: bool,
+}
+
+impl Hoist {
+    /// Take the time clauses out of one top-level token list.
+    fn take(
+        &mut self,
+        tokens: &mut Vec<Spanned<SearchToken>>,
+        emitter: &mut chumsky::input::Emitter<Rich<'_, char>>,
+    ) {
+        tokens.retain(|t| {
+            let span = t.span.clone();
+            let clause = match &t.node {
+                SearchToken::TimeFilter(tf) => {
+                    self.time_filter = Some(Spanned::new(tf.clone(), span.clone()));
+                    TimeClause::Last
+                }
+                SearchToken::EarliestFilter(text) => {
+                    if let Some(bound) = read_bound(text, &span, emitter) {
+                        self.earliest = Some(bound);
+                    }
+                    TimeClause::Earliest
+                }
+                SearchToken::LatestFilter(text) => {
+                    if let Some(bound) = read_bound(text, &span, emitter) {
+                        self.latest = Some(bound);
+                    }
+                    TimeClause::Latest
+                }
+                _ => return true,
+            };
+            if clause == TimeClause::Last {
+                self.seen_last = true;
+            } else {
+                self.seen_absolute = true;
+            }
+            if self.seen_last && self.seen_absolute && !self.paired {
+                self.paired = true;
+                emitter.emit(Rich::custom(
+                    (span.start..span.end).into(),
+                    MSG_LAST_WITH_BOUND,
+                ));
+            }
+            self.clauses.push(Spanned::new(clause, span));
             false
-        }
-        SearchToken::EarliestFilter(ts) => {
-            *earliest = Some(Spanned::new(ts.clone(), t.span.clone()));
-            hoisted.push(Spanned::new(TimeClause::Earliest, t.span.clone()));
-            false
-        }
-        SearchToken::LatestFilter(ts) => {
-            *latest = Some(Spanned::new(ts.clone(), t.span.clone()));
-            hoisted.push(Spanned::new(TimeClause::Latest, t.span.clone()));
-            false
-        }
-        _ => true,
-    });
+        });
+    }
+}
+
+/// The bound an `earliest=` or `latest=` clause spells, or `None` after
+/// refusing the clause over its span.
+fn read_bound(
+    text: &str,
+    span: &std::ops::Range<usize>,
+    emitter: &mut chumsky::input::Emitter<Rich<'_, char>>,
+) -> Option<Spanned<TimeBound>> {
+    let bound = TimeBound::read(text);
+    if bound.is_none() {
+        emitter.emit(Rich::custom(
+            (span.start..span.end).into(),
+            MSG_UNREADABLE_BOUND,
+        ));
+    }
+    bound.map(|bound| Spanned::new(bound, span.clone()))
 }
 
 /// Parse the full search stage: OR-separated groups of AND-joined tokens.
@@ -582,7 +646,7 @@ pub(crate) fn search_stage<'src>()
         .spaced()
         .repeated()
         .collect::<Vec<_>>()
-        .map(|items| {
+        .validate(|items, _, emitter| {
             let mut groups: Vec<Vec<_>> = vec![vec![]];
             for item in items {
                 match item {
@@ -598,28 +662,19 @@ pub(crate) fn search_stage<'src>()
             // Hoist time clauses out of the OR groups — they apply
             // globally. If multiple clauses of the same kind appear, the
             // last one wins, in text order across the groups.
-            let mut time_filter = None;
-            let mut earliest = None;
-            let mut latest = None;
-            let mut hoisted = Vec::new();
+            let mut hoist = Hoist::default();
             for group in &mut groups {
-                hoist_time_filters(
-                    group,
-                    &mut time_filter,
-                    &mut earliest,
-                    &mut latest,
-                    &mut hoisted,
-                );
+                hoist.take(group, emitter);
             }
             // Remove groups that became empty after hoisting.
             groups.retain(|g| !g.is_empty());
 
             SearchStage {
                 groups,
-                time_filter,
-                earliest,
-                latest,
-                hoisted,
+                time_filter: hoist.time_filter,
+                earliest: hoist.earliest,
+                latest: hoist.latest,
+                hoisted: hoist.clauses,
             }
         })
         .labelled("search stage")
@@ -1323,27 +1378,190 @@ mod tests {
     /// groups: only the top level holds a clause (ADR-0061 ruling 2).
     #[test]
     fn every_hoisted_clause_is_recorded_with_its_span() {
-        let input = r#"last=1h (a OR b) earliest="x" OR b latest="y" last=3h"#;
-        let result = search_stage().parse(input).into_result().unwrap();
-        let hoisted: Vec<(TimeClause, &str)> = result
-            .hoisted
-            .iter()
-            .map(|c| (c.node, &input[c.span.clone()]))
-            .collect();
+        let hoisted = |input: &'static str| -> (SearchStage, Vec<(TimeClause, &'static str)>) {
+            let result = search_stage().parse(input).into_result().unwrap();
+            let clauses = result
+                .hoisted
+                .iter()
+                .map(|c| (c.node, &input[c.span.clone()]))
+                .collect();
+            (result, clauses)
+        };
+
+        let input =
+            r#"earliest="2026-03-14" (a OR b) latest="2026-03-16" OR b earliest="2026-03-15""#;
+        let (result, clauses) = hoisted(input);
         assert_eq!(
-            hoisted,
+            clauses,
             [
-                (TimeClause::Last, "last=1h"),
-                (TimeClause::Earliest, r#"earliest="x""#),
-                (TimeClause::Latest, r#"latest="y""#),
-                (TimeClause::Last, "last=3h"),
+                (TimeClause::Earliest, r#"earliest="2026-03-14""#),
+                (TimeClause::Latest, r#"latest="2026-03-16""#),
+                (TimeClause::Earliest, r#"earliest="2026-03-15""#),
             ]
+        );
+        let earliest = result.earliest.expect("earliest should be hoisted");
+        assert_eq!(
+            &input[earliest.span], r#"earliest="2026-03-15""#,
+            "the last `earliest=` is the slot's"
+        );
+
+        let input = "last=1h (a OR b) OR b last=3h";
+        let (result, clauses) = hoisted(input);
+        assert_eq!(
+            clauses,
+            [(TimeClause::Last, "last=1h"), (TimeClause::Last, "last=3h")]
         );
         let tf = result.time_filter.expect("time_filter should be hoisted");
         assert_eq!(&input[tf.span], "last=3h", "the last `last=` is the slot's");
 
         let plain = search_stage().parse("a b").into_result().unwrap();
         assert!(plain.hoisted.is_empty());
+    }
+
+    /// Every `earliest=` and `latest=` clause reads through
+    /// `compare::bound_instant`, and `last=` never sits beside one
+    /// (ADR-0017 and ADR-0061, amendments of 2026-11-08). Each refusal
+    /// is a parse error over exactly the clause to change: an unreadable
+    /// clause over itself, even when a later clause of its kind
+    /// overrides it, and a `last=` pair over the clause that completes it.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn absolute_bounds_are_checked_and_spanned() {
+        use crate::compare::literal_timestamp;
+        use comment::{HINT_LAST_WITH_BOUND, HINT_UNREADABLE_BOUND};
+
+        let refused = |input: &str| -> Vec<(std::ops::Range<usize>, String, Option<String>)> {
+            crate::parser::parse(input)
+                .expect_err(input)
+                .into_iter()
+                .map(|e| (e.span, e.message, e.hint))
+                .collect()
+        };
+        let unreadable = |span: std::ops::Range<usize>| {
+            (
+                span,
+                MSG_UNREADABLE_BOUND.to_string(),
+                Some(HINT_UNREADABLE_BOUND.to_string()),
+            )
+        };
+        let with_last = |span: std::ops::Range<usize>| {
+            (
+                span,
+                MSG_LAST_WITH_BOUND.to_string(),
+                Some(HINT_LAST_WITH_BOUND.to_string()),
+            )
+        };
+
+        let cases: [(&str, Vec<_>); 14] = [
+            // A word DuckDB has no reading for.
+            (r#"earliest="yesterday""#, vec![unreadable(0..20)]),
+            // Read, but its cast text is `+10000-…`, NULL to DuckDB.
+            (
+                r#"service=api latest="10000-01-01""#,
+                vec![unreadable(12..32)],
+            ),
+            // Outside both calendars.
+            (r#"latest="300000-01-01""#, vec![unreadable(0..21)]),
+            // An overridden clause is still checked.
+            (
+                r#"earliest="bad" earliest="2026-03-14""#,
+                vec![unreadable(0..14)],
+            ),
+            // …and so is the clause that overrides a good one.
+            (
+                r#"earliest="2026-03-14" latest="soon""#,
+                vec![unreadable(22..35)],
+            ),
+            // Each unreadable clause carries its own error.
+            (
+                r#"earliest="bad" latest="worse""#,
+                vec![unreadable(0..14), unreadable(15..29)],
+            ),
+            // Spans are bytes: a multibyte prefix moves them by its length.
+            (r#""é" earliest="yesterday""#, vec![unreadable(5..25)]),
+            // A clause beside an OR is still top level, and still checked.
+            (r#"a OR earliest="nope""#, vec![unreadable(5..20)]),
+            // `last=` with an absolute bound: over the later clause.
+            (r#"last=1h earliest="2026-03-14""#, vec![with_last(8..29)]),
+            (r#"last=1h latest="2026-03-14""#, vec![with_last(8..27)]),
+            (r#"earliest="2026-03-14" last=1h"#, vec![with_last(22..29)]),
+            // The first clause that completes a pair, and only it.
+            (
+                r#"last=1h earliest="2026-03-14" latest="2026-03-15""#,
+                vec![with_last(8..29)],
+            ),
+            (
+                r#"last=1h a OR b last=2h latest="2026-03-14""#,
+                vec![with_last(23..42)],
+            ),
+            // The two checks are independent: an unreadable clause that
+            // completes a pair carries both errors.
+            (
+                r#"last=1h earliest="bad""#,
+                vec![unreadable(8..22), with_last(8..22)],
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(refused(input), want, "{input:?}");
+        }
+
+        let parsed = |input: &str| {
+            crate::parser::parse(input)
+                .unwrap_or_else(|e| panic!("{input:?} must parse: {e:?}"))
+                .search
+        };
+        let at = |text: &str| literal_timestamp(text).expect("a timestamp");
+
+        // Every spelling the cast reads is a bound, its text kept as
+        // written beside the instant that executes.
+        for (text, instant) in [
+            ("2026-03-14", "2026-03-14 00:00:00"),
+            ("2026-03-14T09:00:00", "2026-03-14 09:00:00"),
+            ("2026-03-14 09:00:00", "2026-03-14 09:00:00"),
+            ("2026-03-14T09:00:00.000001", "2026-03-14 09:00:00.000001"),
+            ("2026-03-14T09:00:00Z", "2026-03-14 09:00:00"),
+            // The offset is read, then discarded: the wall clock stays.
+            ("2026-03-14T09:00:00+05:30", "2026-03-14 09:00:00"),
+            ("epoch", "1970-01-01 00:00:00"),
+            ("infinity", "infinity"),
+            ("-infinity", "-infinity"),
+        ] {
+            let search = parsed(&format!(r#"earliest="{text}" latest="{text}""#));
+            for bound in [search.earliest, search.latest] {
+                let bound = bound.expect("the bound").node;
+                assert_eq!(bound.text(), text);
+                assert_eq!(bound.instant().cast_text(), instant, "{text:?}");
+            }
+        }
+
+        // The last valid clause of a kind still wins.
+        let search = parsed(r#"earliest="2026-03-14" earliest="2026-03-15""#);
+        let earliest = search.earliest.expect("the bound").node;
+        assert_eq!(earliest.text(), "2026-03-15");
+        assert_eq!(earliest.instant(), at("2026-03-15"));
+        assert_eq!(search.hoisted.len(), 2);
+
+        // Unquoted, the keyword is a field filter (ADR-0062), so its
+        // value is never read as a bound.
+        for input in ["earliest=2026-03-14", "earliest=yesterday"] {
+            let search = parsed(input);
+            assert!(search.earliest.is_none(), "{input:?}");
+            assert!(search.hoisted.is_empty(), "{input:?}");
+            assert!(
+                matches!(
+                    &search.groups[0][0].node,
+                    SearchToken::FieldFilter(f) if f.field == "earliest"
+                ),
+                "{input:?}"
+            );
+        }
+
+        // An inverted interval parses; it answers empty in both lanes.
+        let search = parsed(r#"earliest="2026-03-15" latest="2026-03-14""#);
+        assert!(
+            search.earliest.expect("earliest").node.instant()
+                > search.latest.expect("latest").node.instant()
+        );
     }
 
     /// A clause beside an `OR` is still top level, and keeps its slot:

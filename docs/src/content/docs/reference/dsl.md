@@ -457,7 +457,10 @@ latest="2026-03-14T03:15:00Z"
 
 The three keywords are read before any field filter and apply to the whole search. They belong at the top level of the search stage, beside other tokens and `OR`, and bound every `OR` group: `error last=1h OR warn` finds either term in the last hour. Inside parentheses or under `NOT` a keyword is a parse error, `a time clause cannot sit inside parentheses or under NOT`, with the hint `time clauses apply to the whole search; write it outside the group`. So `(error last=1h)` and `NOT last=1h` are refused. Fields of those names are reachable with backticks, as in `` `last`=5 ``.
 
-- `last=` with `earliest=` or `latest=` is refused: `cannot combine 'last=' with 'earliest='/'latest='`
+- A bound is a date such as `"2026-03-14"`, a time such as `"2026-03-14T09:00:00"`, `"2026-03-14 09:00:00"`, `"2026-03-14T09:00:00.123457"` or `"2026-03-14T09:00:00Z"`, or one of `"epoch"`, `"infinity"` and `"-infinity"`.
+- A bound reads as wall clock. A written offset is discarded, so `earliest="2026-03-14T09:00:00+05:30"` starts at 09:00. Live tail and batch read a bound the same way.
+- Every `earliest=` and `latest=` clause is checked, even one that a later clause of the same kind overrides. A bound that cannot be read, or that names an instant the query engine cannot hold, is a parse error over that clause: `cannot read this time bound as a timestamp`. So `earliest="yesterday"` and `latest="10000-01-01"` are refused. Years run up to 9999.
+- `last=` with `earliest=` or `latest=` is a parse error, `cannot combine 'last=' with 'earliest='/'latest='`, with the hint `use last= alone, or earliest= and latest= without it`. The error covers the clause that completes the pair: in `last=1h earliest="2026-03-14"` it covers `earliest="2026-03-14"`.
 - A repeated keyword takes its last spelling in the text.
 - A zero duration returns `duration must be greater than zero`, and an overflowing one returns `duration too large`.
 - The pair is half-open, `[earliest, latest)`, so an event at `2026-03-14T03:00:00Z` matches `earliest="2026-03-14T03:00:00Z"` and does not match `latest="2026-03-14T03:00:00Z"`. Consecutive windows tile.
@@ -978,6 +981,15 @@ Expressions may nest 16 levels deep. A nesting level is a parenthesised sub-expr
 | `first(field)`, `last(field)` | First, last value. |
 | `values(field)`, `list(field)` | List of distinct values. |
 
+An aggregation function runs only in an aggregation slot: the aggregate list of `stats`, `timechart`, `eventstats` or `pivot`. Both lanes check this before the query runs, and both return the same sentence.
+
+- In `where` or `let`, at any depth, an aggregate is refused. `| where count(x) > 1` returns `count() is an aggregation; use it in stats, timechart, eventstats or pivot`.
+- An aggregate inside another aggregate is refused. `| stats sum(count(x))` returns `count() cannot be nested inside sum()`.
+- A scalar function around an aggregate in a slot is legal in batch, so `| stats coalesce(sum(x), 0)` runs. In `where` or `let`, a scalar call around an aggregate is still refused, as in `| where lower(count(x)) == "a"`.
+- A field named `count` is not a call. `| where count == 1` reads the field.
+
+A scalar head in an aggregation slot, such as `| stats lower(x)` or `| stats coalesce(sum(x), 0)`, runs only in batch SQL. Live tail and the kv batch tail refuse it; see [Batch and streaming differences](#batch-and-streaming-differences).
+
 ## Scalar functions
 
 Scalar functions are available in `let`, `eval` and `where` expressions.
@@ -1152,6 +1164,7 @@ Four lanes answer a query: batch SQL, the live stream (SSE), the kv batch tail b
 
 - The kv batch tail runs its stages in the order the query writes them. A `sort` or a `dedup` there reads all its input before the next stage sees a row, so `extract kv | sort -bytes | head 2` returns the two largest rows.
 - A live stream admits one aggregation stage, and so do the stages after `extract kv`. A second one is refused with `only one aggregation stage is supported in streaming mode`, even with a `sort` between the two.
+- A live stream and the kv batch tail run only aggregates in an aggregation slot. A scalar head, such as `stats lower(x)`, is refused with `lower() is not an aggregate; a scalar head in an aggregation slot runs only in SQL`. A scalar around an aggregate is a scalar head too, so `stats coalesce(sum(x), 0)` is refused there and runs in batch SQL.
 - Where batch SQL raises a per-value error, the streaming lane yields `null` instead. This covers an integer overflow and an unreadable `if()` or `case()` condition. A live tail cannot raise a per-event error without ending the subscription.
 - Embedded `--data` has no field catalog, so every comparison there is literal-driven. `sev()` still declares its own type.
 

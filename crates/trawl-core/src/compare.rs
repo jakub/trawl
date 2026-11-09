@@ -422,6 +422,22 @@ pub fn literal_timestamp(text: &str) -> Option<Instant> {
     parse_instant(text, ZoneRule::Ignore)
 }
 
+/// The instant a search stage's `earliest=` or `latest=` clause bounds
+/// events by, or `None` when the clause has no bound both lanes can hold
+/// (ADR-0017's amendment of 2026-11-08).
+///
+/// The text reads as a [`literal_timestamp`], and the SQL lane receives
+/// the instant as its [`Instant::cast_text`]. That text must read back as
+/// the same instant. A finite year above 9999 does not: chrono's `%Y`
+/// writes `+10000`, which `TRY_CAST(… AS TIMESTAMP)` reads as NULL, so
+/// such a bound is refused rather than bound to a NULL. Probed in
+/// `a_bound_instant_reads_back_through_duckdb`.
+#[must_use]
+pub fn bound_instant(text: &str) -> Option<Instant> {
+    literal_timestamp(text)
+        .filter(|instant| literal_timestamp(&instant.cast_text()) == Some(*instant))
+}
+
 /// Render a live event's value in the TIMESTAMP pin's canonical pattern
 /// text — the in-memory mirror of
 /// `strftime(col, TIMESTAMP_PATTERN_SQL_FORMAT)` over the conformed
@@ -2612,6 +2628,40 @@ mod tests {
             "294247-01-01 00:00:00",
         ] {
             assert_eq!(canonical_timestamp_text(input), None, "{input:?}");
+        }
+    }
+
+    /// A search bound is what [`literal_timestamp`] reads AND what its
+    /// [`Instant::cast_text`] reads back as. Chrono's `%Y` writes a finite
+    /// year above 9999 with a leading `+`, which neither the mirror nor
+    /// `DuckDB` reads, so such a year cannot reach the SQL lane and is
+    /// refused. A year `DuckDB` prints as BC keeps its reading. The
+    /// engine side of both claims is `a_bound_instant_reads_back_through_duckdb`.
+    #[test]
+    fn bound_instant_refuses_unprintable_years() {
+        let at = |text: &str| literal_timestamp(text).expect("the mirror reads the text");
+        for text in [
+            "2026-03-14",
+            "2026-03-14T09:00:00+05:30",
+            "9999-12-31 23:59:59.999999",
+            "0000-01-01 00:00:00",
+            "-0001-01-01 00:00:00",
+            "epoch",
+            "infinity",
+            "-infinity",
+        ] {
+            assert_eq!(bound_instant(text), Some(at(text)), "{text:?}");
+        }
+        // Read by the mirror, but its cast text is `+10000-…`.
+        assert_eq!(at("10000-01-01").cast_text(), "+10000-01-01 00:00:00");
+        for text in [
+            "10000-01-01",
+            "262142-12-31 23:59:59",
+            "300000-01-01",
+            "yesterday",
+            "",
+        ] {
+            assert_eq!(bound_instant(text), None, "{text:?}");
         }
     }
 

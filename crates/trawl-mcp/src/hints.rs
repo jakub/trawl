@@ -38,7 +38,7 @@ use trawl_api::value::{
     QueryResult, TRAILING_LOG_FIELDS, Value, WELL_KNOWN_LOG_FIELDS, wire_cell_text,
 };
 use trawl_client::{CapturedResult, ErrorCode};
-use trawl_core::ast::{FilterOp, FilterValue, Query, Scalar, SearchToken, Spanned};
+use trawl_core::ast::{FilterOp, FilterValue, Query, Scalar, SearchToken, Spanned, TimeBound};
 use trawl_core::field_refs::referenced_fields;
 use trawl_core::format::checked_format_query;
 use trawl_core::parser::parse_unbuilt;
@@ -418,8 +418,11 @@ impl NearestPlan {
         let search = &mut query.search;
         search.time_filter = None;
         search.hoisted.clear();
-        search.earliest = Some(Spanned::new(from.clone(), 0..0));
-        search.latest = Some(Spanned::new(to.clone(), 0..0));
+        // A widened bound no query can hold builds no plan, so the hint
+        // says it was not computed: the search never runs with that side
+        // unbounded.
+        search.earliest = Some(Spanned::new(TimeBound::read(&from)?, 0..0));
+        search.latest = Some(Spanned::new(TimeBound::read(&to)?, 0..0));
         // The aggregate is built from text that holds only the bounds this
         // function formatted, and joins the caller's search as AST: the
         // caller's text reaches the DSL only through the formatter.
@@ -435,8 +438,8 @@ impl NearestPlan {
         // the widened bounds, the one aggregate.
         let reparsed = parse_unbuilt(&dsl).ok()?;
         let bounds = (
-            reparsed.search.earliest.as_ref().map(|b| b.node.as_str()),
-            reparsed.search.latest.as_ref().map(|b| b.node.as_str()),
+            reparsed.search.earliest.as_ref().map(|b| b.node.text()),
+            reparsed.search.latest.as_ref().map(|b| b.node.text()),
         );
         if reparsed.search.time_filter.is_some()
             || bounds != (Some(from.as_str()), Some(to.as_str()))

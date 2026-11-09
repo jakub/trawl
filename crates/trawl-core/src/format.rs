@@ -448,10 +448,13 @@ impl<'q> Renderer<'q> {
             clauses.push(format!("last={}", tf.node.duration));
         }
         if let Some(ref earliest) = search.earliest {
-            clauses.push(format!("earliest=\"{}\"", escape_quoted(&earliest.node)));
+            clauses.push(format!(
+                "earliest=\"{}\"",
+                escape_quoted(earliest.node.text())
+            ));
         }
         if let Some(ref latest) = search.latest {
-            clauses.push(format!("latest=\"{}\"", escape_quoted(&latest.node)));
+            clauses.push(format!("latest=\"{}\"", escape_quoted(latest.node.text())));
         }
         self.out.push_str(&clauses.join(" "));
 
@@ -1050,8 +1053,8 @@ mod tests {
             LetStage, LimitStage, LiteralValue, PipeStage, PivotStage, Query, QuotedSearch,
             RareStage, RenameStage, SampleMode, SampleStage, SavedRunSelector, Scalar, SearchStage,
             SearchToken, SortDirection, SortField, SortStage, Spanned, StatsStage, TableStage,
-            TailStage, TextSearch, TimeFilter, TimeUnit, TimechartStage, TopStage, TrawlDuration,
-            UnaryOp, WhereStage,
+            TailStage, TextSearch, TimeBound, TimeFilter, TimeUnit, TimechartStage, TopStage,
+            TrawlDuration, UnaryOp, WhereStage,
         };
         use crate::canonical_form::same_query;
         use crate::parser::suggest::{
@@ -1338,12 +1341,38 @@ mod tests {
                 .prop_map(|(quantity, unit)| TrawlDuration { quantity, unit })
         }
 
-        fn bound() -> impl Strategy<Value = Option<Spanned<String>>> + Clone {
+        /// A bound in one of the spellings the cast reads: the parser
+        /// refuses any other (ADR-0017's amendment of 2026-11-08).
+        fn bound() -> impl Strategy<Value = Option<Spanned<TimeBound>>> + Clone {
+            let dated = (
+                0u32..=9999,
+                1u32..=12,
+                1u32..=28,
+                0u32..24,
+                0u32..60,
+                0usize..6,
+            )
+                .prop_map(|(year, month, day, hour, minute, form)| {
+                    let date = format!("{year:04}-{month:02}-{day:02}");
+                    let time = format!("{hour:02}:{minute:02}:00");
+                    match form {
+                        0 => date,
+                        1 => format!("{date}T{time}"),
+                        2 => format!("{date} {time}"),
+                        3 => format!("{date}T{time}.123456"),
+                        4 => format!("{date}T{time}Z"),
+                        _ => format!("{date}T{time}+05:30"),
+                    }
+                });
+            let text = prop_oneof![
+                4 => dated,
+                1 => prop::sample::select(vec!["epoch", "infinity", "-infinity"])
+                    .prop_map(str::to_owned),
+            ];
             prop::option::weighted(
                 0.2,
-                exact().prop_map(|scalar| match scalar {
-                    Scalar::Exact(text) => spanned(text),
-                    _ => unreachable!("exact() makes exact scalars"),
+                text.prop_map(|text| {
+                    spanned(TimeBound::read(&text).expect("the generator spells bounds"))
                 }),
             )
         }
@@ -1362,12 +1391,20 @@ mod tests {
                     "not_token negates a bare NOT's next token",
                     |(groups, ..)| !not_word_meets_a_token(groups, false),
                 )
-                .prop_map(|(groups, time_filter, earliest, latest)| SearchStage {
-                    groups,
-                    time_filter,
-                    earliest,
-                    latest,
-                    hoisted: Vec::new(),
+                .prop_map(|(groups, time_filter, earliest, latest)| {
+                    // `last=` never sits beside an absolute bound.
+                    let (earliest, latest) = if time_filter.is_some() {
+                        (None, None)
+                    } else {
+                        (earliest, latest)
+                    };
+                    SearchStage {
+                        groups,
+                        time_filter,
+                        earliest,
+                        latest,
+                        hoisted: Vec::new(),
+                    }
                 })
         }
 
@@ -1882,10 +1919,10 @@ mod tests {
             "last=30s",
             "last=2w",
             r#"earliest="2026-01-01""#,
-            r#"latest="now""#,
-            r#"earliest="a\"b""#,
-            r#"latest="-1h""#,
-            r#"earliest="""#,
+            r#"latest="2026-03-14T09:00:00""#,
+            r#"earliest="2026-03-14 09:00:00.5""#,
+            r#"latest="-infinity""#,
+            r#"earliest="2026-03-14T09:00:00+05:30""#,
         ];
 
         /// What sits between two search tokens: spaces, an `OR`, a line
@@ -2750,7 +2787,10 @@ mod tests {
         for (dsl, want) in [
             (r#""a\nb\tc\rd""#, r#""a\nb\tc\rd""#),
             (r#"host="a\nb""#, r#"host="a\nb""#),
-            (r#"earliest="a\tb""#, r#"earliest="a\tb""#),
+            (
+                r#"earliest="2026-03-14\t09:00:00""#,
+                r#"earliest="2026-03-14\t09:00:00""#,
+            ),
             (r#"* | where m == "a\r\nb""#, "*\n| where m == \"a\\r\\nb\""),
             (r#"| from saved "a\nb""#, r#"| from saved "a\nb""#),
         ] {
@@ -2834,19 +2874,33 @@ mod tests {
     }
 
     /// The absolute bounds are quoted strings too, so they print escaped
-    /// the same way and keep the text they were written with.
+    /// the same way and keep the text they were written with. The cast
+    /// reads a tab or a line break as the date/time separator, but no
+    /// timestamp holds a quote or a backslash, so a bound spelling one is
+    /// refused before anything formats it (ADR-0017's amendment of
+    /// 2026-11-08).
     #[test]
     fn quoted_time_bounds_round_trip() {
-        let original =
-            crate::parser::parse(r#"error earliest="a\" OR x" latest="b\\""#).expect("parses");
+        let original = crate::parser::parse(
+            r#"error earliest="2026-03-14\t09:00:00" latest="2026-03-14\n10:00:00""#,
+        )
+        .expect("parses");
         let printed = format_query(&original);
         let reparsed = crate::parser::parse(&printed)
             .unwrap_or_else(|e| panic!("printed as {printed:?} must parse: {e:?}"));
         let bounds = |query: &Query| {
             (
                 query.search.groups.len(),
-                query.search.earliest.as_ref().map(|b| b.node.clone()),
-                query.search.latest.as_ref().map(|b| b.node.clone()),
+                query
+                    .search
+                    .earliest
+                    .as_ref()
+                    .map(|b| b.node.text().to_owned()),
+                query
+                    .search
+                    .latest
+                    .as_ref()
+                    .map(|b| b.node.text().to_owned()),
             )
         };
         assert_eq!(
@@ -2854,6 +2908,20 @@ mod tests {
             bounds(&original),
             "printed as {printed:?}"
         );
+        assert_eq!(
+            bounds(&original).1.as_deref(),
+            Some("2026-03-14\t09:00:00"),
+            "the escape decodes to a tab"
+        );
+
+        for dsl in [r#"error earliest="a\" OR x""#, r#"error latest="b\\""#] {
+            let errors = crate::parser::parse(dsl).expect_err(dsl);
+            assert_eq!(
+                errors[0].message,
+                crate::parser::search::MSG_UNREADABLE_BOUND,
+                "{dsl}"
+            );
+        }
     }
 
     #[test]

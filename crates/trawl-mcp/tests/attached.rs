@@ -1854,11 +1854,11 @@ async fn an_attached_sightings_follow_up_carries_the_investigation_not_the_purpo
         let query = arguments["query"].as_str().unwrap();
         let parsed = trawl_core::parser::parse(query).expect("a follow-up parses");
         assert_eq!(
-            parsed.search.earliest.as_ref().map(|b| b.node.as_str()),
+            parsed.search.earliest.as_ref().map(|b| b.node.text()),
             Some("2026-03-14T03:00:00.250000Z")
         );
         assert_eq!(
-            parsed.search.latest.as_ref().map(|b| b.node.as_str()),
+            parsed.search.latest.as_ref().map(|b| b.node.text()),
             Some("2026-03-14T04:00:00.750000Z")
         );
     }

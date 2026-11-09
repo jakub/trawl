@@ -107,9 +107,9 @@ pub struct SearchStage {
     /// If multiple `last=` tokens appear, last one wins.
     pub time_filter: Option<Spanned<TimeFilter>>,
     /// Absolute lower time bound (`earliest="..."`), hoisted from groups.
-    pub earliest: Option<Spanned<String>>,
+    pub earliest: Option<Spanned<TimeBound>>,
     /// Absolute upper time bound (`latest="..."`), hoisted from groups.
-    pub latest: Option<Spanned<String>>,
+    pub latest: Option<Spanned<TimeBound>>,
     /// Every time clause hoisted from groups, with the span of the clause
     /// token itself.
     ///
@@ -148,8 +148,8 @@ impl SearchStage {
     /// window that a per-group reading of the text would miss.
     ///
     /// Which of the three is reported matters only for the message a
-    /// refusal prints. A query carrying two clauses is already the
-    /// emitter's error (`last=` beside an absolute bound).
+    /// refusal prints. A parsed query never carries `last=` beside an
+    /// absolute bound: the parser refuses the pair.
     #[must_use]
     pub fn time_clause(&self) -> Option<TimeClause> {
         if self.time_filter.is_some() {
@@ -189,6 +189,43 @@ impl TimeClause {
             Self::Earliest => "earliest",
             Self::Latest => "latest",
         }
+    }
+}
+
+/// An `earliest=` or `latest=` bound: the text as written, and the instant
+/// it reads as (ADR-0017's amendment of 2026-11-08).
+///
+/// The formatter and the canonical form read the text, so a query keeps
+/// its source identity. Both lanes execute the instant. [`Self::read`] is
+/// the only constructor, so the two cannot disagree, and clearing the
+/// slot that holds a bound drops both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimeBound {
+    text: String,
+    instant: crate::compare::Instant,
+}
+
+impl TimeBound {
+    /// The bound `text` spells, or `None` when
+    /// [`crate::compare::bound_instant`] has no instant for it.
+    #[must_use]
+    pub fn read(text: &str) -> Option<Self> {
+        crate::compare::bound_instant(text).map(|instant| Self {
+            text: text.to_owned(),
+            instant,
+        })
+    }
+
+    /// The bound as the query wrote it.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The instant events are compared with.
+    #[must_use]
+    pub fn instant(&self) -> crate::compare::Instant {
+        self.instant
     }
 }
 
