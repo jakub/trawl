@@ -1,0 +1,25 @@
+---
+source: crates/trawl-cli/src/tui/ui/panels.rs
+assertion_line: 1616
+expression: frames
+---
+width 13:
+"????  serv…  "
+"????  serv…  "
+"????  serv…  "
+"????  serv…  "
+"????  serv…  "
+
+width 17:
+"????  service=…  "
+"????  service=…  "
+"????  service=…  "
+"????  service=…  "
+"????  service=…  "
+
+width 24:
+"????  service="résumé…  "
+"????  service="日本語…  " Hidden by multi-width symbols: [(16, " "), (18, " "), (20, " ")]
+"????  service="ééé_fi…  "
+"????  service="❤️❤️_l…  " Hidden by multi-width symbols: [(16, " "), (18, " ")]
+"????  service="a�b�c_…  "

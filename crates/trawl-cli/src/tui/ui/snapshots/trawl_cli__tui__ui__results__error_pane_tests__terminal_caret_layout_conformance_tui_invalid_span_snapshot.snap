@@ -1,0 +1,16 @@
+---
+source: crates/trawl-cli/src/tui/ui/results.rs
+expression: "snapshot_rows(\"end inside a character\")"
+---
+┌ Error ───────────────────────────────────────────────────┐
+│ error: parse error: the error                            │
+│                                                          │
+│   the message                                            │
+│   hint: the hint                                         │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘

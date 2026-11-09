@@ -20,6 +20,8 @@ use trawl_api::display::{
 };
 use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 use trawl_api::value::ColumnType;
+use trawl_core::sanitize::sanitize_display_text;
+use trawl_core::text_layout::{caret_layout, cells, fit_cells, locate_span};
 use trawl_engine::value::Value;
 
 use crate::tui::App;
@@ -91,9 +93,18 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     if let TabStatus::Error {
         ref message,
         ref details,
+        ref query,
     } = tab.status
     {
-        render_error_display(app, frame, results_area, tab, message, details);
+        render_error_display(
+            app,
+            frame,
+            results_area,
+            tab,
+            message,
+            details,
+            query.as_deref(),
+        );
     } else if let Some(response) = &tab.result {
         let result = &response.result;
         let is_timechart = is_timechart_result(result);
@@ -264,7 +275,7 @@ fn render_table(
     let header_cells: Vec<Cell<'_>> = display_cols
         .iter()
         .map(|&col_idx| {
-            let cell = Cell::from(result.columns[col_idx].name.as_str());
+            let cell = Cell::from(sanitize_display_text(&result.columns[col_idx].name));
             if col_cursor == Some(col_idx) {
                 cell.style(
                     Style::default()
@@ -317,8 +328,7 @@ fn render_table(
                     } else {
                         cell_text(&result.columns[col_idx].ty, value)
                     };
-                    let truncated = truncate_with_ellipsis(&text, width);
-                    let cell = Cell::from(truncated);
+                    let cell = Cell::from(fit_cells(&text, width));
                     if current_match_cell == Some((abs_row, col_idx)) {
                         cell.style(
                             Style::default()
@@ -605,8 +615,17 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
 /// Render error details with span highlighting in the results pane.
 ///
-/// Shows the error message in red, then the query text with the error
-/// span underlined and a caret line below it.
+/// Shows the error message in red, then each detail: the line of `query`
+/// its span starts on, the span underlined and a caret line below it,
+/// then the detail's message and hint. `query` is the text the failed run
+/// sent, which the spans index, never the editor's current draft.
+///
+/// Spans are UTF-8 byte offsets; [`locate_span`] resolves them and
+/// [`caret_layout`] places the carets by display cells. A span that cannot
+/// index `query` (reversed, past the end, or inside a character), or an
+/// error with no sent query, shows the message and hint without an
+/// excerpt; a span is never clamped. Every piece of text drawn here is
+/// sanitized: it can hold anything the user typed or the server said.
 #[allow(clippy::too_many_arguments)]
 fn render_error_display(
     app: &App,
@@ -615,6 +634,7 @@ fn render_error_display(
     tab: &crate::tui::state::Tab,
     message: &str,
     details: &[trawl_client::ErrorDetail],
+    query: Option<&str>,
 ) {
     let theme = &app.theme;
     let border_style = if app.focus == Focus::Results {
@@ -632,11 +652,11 @@ fn render_error_display(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let query_text = tab.editor.text();
+    let muted = Style::default().fg(theme.text_muted);
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     lines.push(Line::from(Span::styled(
-        format!("error: {message}"),
+        format!("error: {}", sanitize_display_text(message)),
         Style::default()
             .fg(theme.status_error)
             .add_modifier(Modifier::BOLD),
@@ -645,85 +665,57 @@ fn render_error_display(
 
     // A validation error's one detail has no span and repeats the message
     // above, so a list with no span renders the message alone.
-    if !details.iter().any(|d| d.span.is_some()) || query_text.is_empty() {
-        // No span info — just show the message.
+    if !details.iter().any(|d| d.span.is_some()) {
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, inner);
         return;
     }
 
-    // Render each detail with span highlighting.
     for detail in details {
-        if let Some(ref span) = detail.span {
-            let start = span.start.min(query_text.len());
-            let end = span.end.min(query_text.len()).max(start);
-
-            // Find the line containing the span.
-            let mut line_start = 0;
-            let mut line_end = query_text.len();
-            for (i, ch) in query_text.char_indices() {
-                if ch == '\n' {
-                    if i < start {
-                        line_start = i + 1;
-                    }
-                    if i >= end && line_end == query_text.len() {
-                        line_end = i;
-                    }
-                }
-            }
-
-            let query_line = &query_text[line_start..line_end];
-            let col_start = start - line_start;
-            let col_end = (end - line_start).min(query_line.len());
-            let underline_len = (col_end - col_start).max(1);
-
-            // Query text with error span highlighted.
-            let before = &query_line[..col_start];
-            let error_region = &query_line[col_start..col_end];
-            let after = &query_line[col_end..];
-
+        let located = query.and_then(|query| {
+            let span = detail.span.as_ref()?;
+            let at = locate_span(query, span.start, span.end)?;
+            Some(caret_layout(query, &at))
+        });
+        if let Some(layout) = located {
             lines.push(Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::styled(before.to_owned(), Style::default().fg(theme.text_primary)),
+                Span::raw("  "),
+                Span::styled(layout.before, Style::default().fg(theme.text_primary)),
                 Span::styled(
-                    error_region.to_owned(),
+                    layout.covered,
                     Style::default()
                         .fg(theme.status_error)
                         .add_modifier(Modifier::UNDERLINED),
                 ),
-                Span::styled(after.to_owned(), Style::default().fg(theme.text_primary)),
+                Span::styled(layout.after, Style::default().fg(theme.text_primary)),
             ]));
-
             lines.push(Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::raw(" ".repeat(col_start)),
+                Span::raw("  "),
+                Span::raw(" ".repeat(layout.pad)),
                 Span::styled(
-                    "^".repeat(underline_len),
+                    "^".repeat(layout.carets),
                     Style::default().fg(theme.status_error),
                 ),
             ]));
-
-            lines.push(Line::from(Span::styled(
-                format!("  {}", detail.message),
-                Style::default().fg(theme.text_muted),
-            )));
-
-            if let Some(ref label) = detail.label {
-                lines.push(Line::from(Span::styled(
-                    format!("  while parsing: {label}"),
-                    Style::default().fg(theme.text_muted),
-                )));
-            }
-
-            lines.push(Line::from(""));
-        } else {
-            // No span — just the message.
-            lines.push(Line::from(Span::styled(
-                format!("  {}", detail.message),
-                Style::default().fg(theme.text_muted),
-            )));
-            lines.push(Line::from(""));
         }
+
+        lines.push(Line::from(Span::styled(
+            format!("  {}", sanitize_display_text(&detail.message)),
+            muted,
+        )));
+        if let Some(label) = &detail.label {
+            lines.push(Line::from(Span::styled(
+                format!("  while parsing: {}", sanitize_display_text(label)),
+                muted,
+            )));
+        }
+        if let Some(hint) = &detail.hint {
+            lines.push(Line::from(Span::styled(
+                format!("  hint: {}", sanitize_display_text(hint)),
+                muted,
+            )));
+        }
+        lines.push(Line::from(""));
     }
 
     let paragraph = Paragraph::new(lines);
@@ -751,6 +743,18 @@ pub fn is_bar_chartable(result: &trawl_engine::value::QueryResult) -> bool {
     has_string && has_numeric
 }
 
+/// [`extract_series`] with each series label sanitized. A label is a
+/// metric column's name or a grouped value, so a sender can pick it, and
+/// it reaches titles, legends and axis labels.
+fn chart_series(result: &trawl_engine::value::QueryResult) -> (Vec<(String, Vec<u64>)>, usize) {
+    let (series, total) = extract_series(result);
+    let series = series
+        .into_iter()
+        .map(|(label, values)| (sanitize_display_text(&label), values))
+        .collect();
+    (series, total)
+}
+
 /// Render braille line chart for timechart results using `Chart` widget.
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn render_line_chart(
@@ -766,7 +770,7 @@ fn render_line_chart(
         Style::default().fg(theme.border_unfocused)
     };
 
-    let (series, total_series) = extract_series(result);
+    let (series, total_series) = chart_series(result);
 
     if series.is_empty() {
         render_placeholder(app, frame, area);
@@ -980,8 +984,8 @@ fn render_bar_chart(
         .position(|v| matches!(v, Value::Integer(_) | Value::UInt(_) | Value::Float(_)))
         .unwrap_or(1);
 
-    let metric_name = &result.columns[value_col].name;
-    let label_name = &result.columns[label_col].name;
+    let metric_name = sanitize_display_text(&result.columns[value_col].name);
+    let label_name = sanitize_display_text(&result.columns[label_col].name);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1004,7 +1008,8 @@ fn render_bar_chart(
         .take(max_bars)
         .enumerate()
         .map(|(idx, row)| {
-            let label = cell_text(&result.columns[label_col].ty, &row[label_col]);
+            let label =
+                sanitize_display_text(&cell_text(&result.columns[label_col].ty, &row[label_col]));
             // A bar's height is a `u64`, which is `Value::UInt`'s own
             // width, so an oversized unsigned draws at its real
             // magnitude. A negative or a NaN clamps to the bottom of the
@@ -1074,7 +1079,7 @@ fn render_sparkline(
         Style::default().fg(theme.border_unfocused)
     };
 
-    let (series, total_series) = extract_series(result);
+    let (series, total_series) = chart_series(result);
 
     if series.is_empty() {
         // Fallback to placeholder if extraction failed
@@ -1197,11 +1202,7 @@ fn render_series_label(
     series_color: ratatui::style::Color,
 ) {
     let w = area.width as usize;
-    let display_label = if label.len() > w {
-        format!("{}…", &label[..w - 1])
-    } else {
-        label.to_owned()
-    };
+    let display_label = fit_cells(label, w);
 
     if area.height >= 3 {
         frame.render_widget(
@@ -1219,7 +1220,9 @@ fn render_series_label(
         );
 
         frame.render_widget(
-            Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(series_color)),
+            Paragraph::new(display_label)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(series_color)),
             Rect {
                 y: area.y + area.height / 2,
                 height: 1,
@@ -1229,7 +1232,9 @@ fn render_series_label(
     } else {
         // Too short for y-axis labels — just show the series name
         frame.render_widget(
-            Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(series_color)),
+            Paragraph::new(display_label)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(series_color)),
             area,
         );
     }
@@ -1369,6 +1374,9 @@ fn render_stacked_sparklines(
 /// Samples up to `SAMPLE_ROWS` visible rows starting from `v_scroll`, taking
 /// the max display width per column, clamped to `MIN_COL` and to each
 /// column's equal share of `available_width` (itself capped at `MAX_COL`).
+/// Widths are display cells of the text as the grid draws it: each value
+/// is cut to the column's cap with [`fit_cells`] before it is measured, so
+/// a value of any length costs no more than the cap to size.
 /// Respects `width_override` from `ColumnConfig`; hidden columns get width 0.
 fn compute_column_widths(
     result: &trawl_engine::value::QueryResult,
@@ -1401,14 +1409,12 @@ fn compute_column_widths(
                 }
             }
 
-            let mut max_width = col.name.len();
+            let width_of = |text: &str| cells(&fit_cells(text, max_col));
+            let mut max_width = width_of(&col.name);
 
             for row in result.rows.iter().skip(v_scroll).take(SAMPLE_ROWS) {
                 if let Some(value) = row.get(col_idx) {
-                    let display_len = cell_text(&col.ty, value).len();
-                    if display_len > max_width {
-                        max_width = display_len;
-                    }
+                    max_width = max_width.max(width_of(&cell_text(&col.ty, value)));
                 }
             }
 
@@ -1417,16 +1423,6 @@ fn compute_column_widths(
             width
         })
         .collect()
-}
-
-/// Truncate a string to max width, appending `…` if truncated.
-fn truncate_with_ellipsis(value: &str, max_width: usize) -> String {
-    if value.chars().count() <= max_width {
-        value.to_owned()
-    } else {
-        let truncated: String = value.chars().take(max_width.saturating_sub(1)).collect();
-        format!("{truncated}\u{2026}")
-    }
 }
 
 /// Extract time metadata from timechart result.
@@ -1466,14 +1462,16 @@ fn extract_time_metadata(
         "N/A".to_owned()
     };
 
-    // Format times (truncate if too long)
+    // Format times (truncate if too long), sanitized: a `_time` cell is
+    // whatever the result holds.
     let format_time = |s: String| {
-        if s.len() > 19 {
+        let s = if s.len() > 19 {
             // Keep just date and time, drop subseconds/timezone
             s.chars().take(19).collect()
         } else {
             s
-        }
+        };
+        sanitize_display_text(&s)
     };
 
     Some((format_time(first_time), format_time(last_time), span))
@@ -1765,5 +1763,559 @@ mod placeholder_tests {
                 .draw(|f| crate::tui::ui::render(&mut app, f))
                 .unwrap_or_else(|e| panic!("{width}x{height} must render: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod error_pane_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_core::text_layout::{SPAN_CASES, SpanCase, cells as cells_of};
+
+    use crate::tui::state::TabStatus;
+    use crate::tui::tests::test_app;
+
+    /// Wide enough for every row of the span table: the pane clips a line
+    /// past its width rather than wrapping it.
+    const WIDTH: u16 = 60;
+    const HEIGHT: u16 = 12;
+
+    /// The error pane alone, drawn for one error whose one detail has
+    /// `span` over `query`, as rows of text.
+    fn pane(query: Option<&str>, span: Option<(usize, usize)>) -> Vec<String> {
+        let mut app = test_app();
+        app.tab.status = TabStatus::Error {
+            message: "parse error: the error".to_owned(),
+            details: vec![trawl_client::ErrorDetail {
+                message: "the message".to_owned(),
+                span: span.map(|(start, end)| trawl_client::ErrorSpan { start, end }),
+                label: None,
+                hint: Some("the hint".to_owned()),
+            }],
+            query: query.map(str::to_owned),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("terminal");
+        terminal
+            .draw(|f| super::render(&app, f, f.area()))
+            .expect("render");
+        rows_of(terminal.backend().buffer())
+    }
+
+    /// `buffer` as rows of text. A cell hidden behind a double-width
+    /// character is skipped, so each row reads as the terminal shows it.
+    pub(super) fn rows_of(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        buffer
+            .content
+            .chunks(usize::from(buffer.area.width))
+            .map(|cells| {
+                let mut row = String::new();
+                let mut hidden: usize = 0;
+                for cell in cells {
+                    if hidden == 0 {
+                        row.push_str(cell.symbol());
+                    }
+                    hidden = hidden.max(cells_of(cell.symbol())).saturating_sub(1);
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// The pane's inner rows: inside the border and its one-cell padding,
+    /// trailing blanks dropped.
+    fn inner(rows: &[String]) -> Vec<String> {
+        rows[1..rows.len() - 1]
+            .iter()
+            .map(|row| {
+                let inside = row
+                    .strip_prefix("│ ")
+                    .and_then(|r| r.strip_suffix(" │"))
+                    .unwrap_or_else(|| panic!("a bordered row: {row:?}"));
+                inside.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    /// What the pane shows for a detail with no excerpt.
+    fn no_excerpt() -> Vec<String> {
+        let mut rows: Vec<String> = [
+            "error: parse error: the error",
+            "",
+            "  the message",
+            "  hint: the hint",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        rows.resize(usize::from(HEIGHT) - 2, String::new());
+        rows
+    }
+
+    fn case(name: &str) -> &'static SpanCase {
+        SPAN_CASES
+            .iter()
+            .find(|case| case.name == name)
+            .unwrap_or_else(|| panic!("no span case {name:?}"))
+    }
+
+    /// Every row of the shared span table, drawn through the real error
+    /// pane: a row that locates shows its excerpt line and a caret line at
+    /// the row's display cells; one that cannot index its text shows the
+    /// message and hint with no excerpt and no caret.
+    #[test]
+    fn terminal_caret_layout_conformance_tui() {
+        for case in SPAN_CASES {
+            let rows = pane(Some(case.text), Some((case.start, case.end)));
+            assert!(
+                rows.iter().all(|row| !row.contains('\r')),
+                "{}: {rows:#?}",
+                case.name
+            );
+            let got = inner(&rows);
+            let want = match case.expect {
+                Some(expect) => {
+                    let mut want: Vec<String> = vec![
+                        "error: parse error: the error".to_owned(),
+                        String::new(),
+                        format!("  {}", expect.excerpt).trim_end().to_owned(),
+                        format!("  {}{}", " ".repeat(expect.pad), "^".repeat(expect.carets)),
+                        "  the message".to_owned(),
+                        "  hint: the hint".to_owned(),
+                    ];
+                    want.resize(usize::from(HEIGHT) - 2, String::new());
+                    want
+                }
+                None => no_excerpt(),
+            };
+            assert_eq!(got, want, "{}", case.name);
+        }
+    }
+
+    /// An error raised before anything was sent has no query to quote: a
+    /// span shows the message and hint alone.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_without_a_query() {
+        assert_eq!(inner(&pane(None, Some((0, 0)))), no_excerpt());
+    }
+
+    /// An empty sent query still gets its one caret for a valid `0..0`.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_empty_query() {
+        let rows = inner(&pane(Some(""), Some((0, 0))));
+        assert_eq!(rows[2], "");
+        assert_eq!(rows[3], "  ^");
+        assert_eq!(rows[4], "  the message");
+    }
+
+    /// The message, label and hint can hold anything the server said, and
+    /// a control or bidi character in them cannot rewrite the line.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_sanitizes_messages() {
+        let mut app = test_app();
+        app.tab.status = TabStatus::Error {
+            message: "bad\u{1b}[2J".to_owned(),
+            details: vec![trawl_client::ErrorDetail {
+                message: "a\u{202E}b".to_owned(),
+                span: Some(trawl_client::ErrorSpan { start: 0, end: 1 }),
+                label: Some("l\u{7}".to_owned()),
+                hint: Some("try\r\nthis".to_owned()),
+            }],
+            query: Some("q".to_owned()),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("terminal");
+        terminal
+            .draw(|f| super::render(&app, f, f.area()))
+            .expect("render");
+        let screen = terminal.backend().to_string();
+        for drawn in [
+            "error: bad\u{FFFD}[2J",
+            "  a\u{FFFD}b",
+            "  while parsing: l\u{FFFD}",
+            "  hint: try\u{FFFD}\u{FFFD}this",
+        ] {
+            assert!(screen.contains(drawn), "{drawn:?} in:\n{screen}");
+        }
+    }
+
+    /// Snapshots of representative rows, drawn whole with their border.
+    fn snapshot_rows(name: &str) -> String {
+        let case = case(name);
+        pane(Some(case.text), Some((case.start, case.end))).join("\n")
+    }
+
+    /// The issue's query: the caret sits under the `(`, after two
+    /// double-width characters.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_cjk_snapshot() {
+        insta::assert_snapshot!(snapshot_rows("cjk before the span"));
+    }
+
+    /// A CRLF query draws no `\r` and quotes the span's own line.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_crlf_snapshot() {
+        insta::assert_snapshot!(snapshot_rows("crlf query"));
+    }
+
+    /// A span running onto later lines marks only its start line.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_multi_line_snapshot() {
+        insta::assert_snapshot!(snapshot_rows("multi-line span clips to its start line"));
+    }
+
+    /// A span ending inside a character draws no excerpt and no caret.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_invalid_span_snapshot() {
+        insta::assert_snapshot!(snapshot_rows("end inside a character"));
+    }
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_core::text_layout::{MARKER, cells};
+    use trawl_engine::value::{Column, ColumnType, QueryResult, Value};
+
+    use super::compute_column_widths;
+    use super::error_pane_tests::rows_of;
+    use crate::tui::state::TabStatus;
+    use crate::tui::tests::test_app;
+
+    fn result(rows: Vec<Vec<Value>>, columns: &[&str]) -> QueryResult {
+        QueryResult {
+            columns: columns
+                .iter()
+                .map(|name| Column::new(*name, ColumnType::String))
+                .collect(),
+            rows,
+        }
+    }
+
+    /// A column is as wide as its widest value's display cells: six CJK
+    /// characters take 12 cells and 18 bytes, ten accented letters built
+    /// from combining marks take 10 cells and 30 bytes.
+    #[test]
+    fn grid_column_widths_measure_display_cells() {
+        let result = result(
+            vec![vec![
+                Value::String("日本語日本語".into()),
+                Value::String("e\u{301}".repeat(10)),
+            ]],
+            &["s", "t"],
+        );
+        assert_eq!(compute_column_widths(&result, 0, 200, None), [12, 10]);
+    }
+
+    /// A value far past the column's cap, CJK or a run of combining marks,
+    /// is sized by its cut at the cap: 29 CJK characters and the marker
+    /// fill 59 of the 60 cells, and one more character would not fit.
+    #[test]
+    fn grid_column_widths_stop_at_the_cap() {
+        let result = result(
+            vec![vec![
+                Value::String("日".repeat(10_000)),
+                Value::String(format!("x{}", "\u{301}".repeat(100_000))),
+            ]],
+            &["s", "t"],
+        );
+        let widths = compute_column_widths(&result, 0, 200, None);
+        assert_eq!(widths[0], 59);
+        assert_eq!(widths[1], 8);
+    }
+
+    /// A CJK value wider than its column is cut by display cells and
+    /// marked as cut, and the column after it starts in the same place on
+    /// every row.
+    #[test]
+    fn grid_cuts_wide_values_by_display_cells() {
+        let mut app = test_app();
+        let rows = vec![
+            vec![
+                Value::String("日".repeat(50)),
+                Value::String("first".into()),
+            ],
+            vec![Value::String("web".into()), Value::String("second".into())],
+        ];
+        app.tab.result = Some(trawl_client::QueryResponse {
+            execution: None,
+            result: result(rows, &["service", "message"]),
+            pagination: trawl_client::PaginationMeta {
+                limit: 10_000,
+                offset: 0,
+                returned: 2,
+                total: 2,
+            },
+            degraded_fields: Vec::new(),
+            severity_columns: Vec::new(),
+        });
+        app.tab.status = TabStatus::Success { duration_ms: 1 };
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("terminal");
+        terminal
+            .draw(|f| crate::tui::ui::render(&mut app, f))
+            .expect("render");
+        let rows = rows_of(terminal.backend().buffer());
+        let screen = rows.join("\n");
+
+        let wide = rows
+            .iter()
+            .find(|row| row.contains('日'))
+            .unwrap_or_else(|| panic!("a row with the CJK value:\n{screen}"));
+        let narrow = rows
+            .iter()
+            .find(|row| row.contains("web"))
+            .unwrap_or_else(|| panic!("a row with the short value:\n{screen}"));
+        assert!(
+            wide.contains(&format!("日{MARKER}")),
+            "the cut is marked:\n{screen}"
+        );
+        assert!(
+            wide.contains("first") && narrow.contains("second"),
+            "{screen}"
+        );
+
+        // The cell where `message` starts, in display cells from the left.
+        let column_of = |row: &str, value: &str| cells(&row[..row.find(value).expect("value")]);
+        assert_eq!(
+            column_of(wide, "first"),
+            column_of(narrow, "second"),
+            "the message column lines up:\n{screen}"
+        );
+        assert!(
+            rows.iter().all(|row| cells(row) == 80),
+            "every row fills the terminal exactly:\n{screen}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod series_label_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
+    use trawl_core::text_layout::{MARKER, cells};
+
+    use super::error_pane_tests::rows_of;
+    use super::render_series_label;
+    use crate::tui::tests::test_app;
+
+    /// A grouped value reaches the sparkline label from `extract_series`,
+    /// so a sender picks it. Whether it fits or is cut, by a multibyte
+    /// character past the label's last byte or into a zero-width area, it
+    /// draws right-aligned within the area instead of panicking.
+    #[test]
+    fn series_labels_fit_by_display_cells() {
+        let theme = test_app().theme;
+        for (label, width, expect) in [
+            ("aaaaaaaaaaaaaaaaéz", 18, "aaaaaaaaaaaaaaaaéz"),
+            ("aaaaaaaaaaaaaaaaaéz", 18, "aaaaaaaaaaaaaaaaa…"),
+            ("日本語日本語日", 18, "日本語日本語日"),
+            ("日本語日本語日本語日", 18, "日本語日本語日本…"),
+            ("日本語日本語日", 0, ""),
+        ] {
+            for height in [1, 3] {
+                let mut terminal = Terminal::new(TestBackend::new(20, 3)).expect("terminal");
+                terminal
+                    .draw(|f| {
+                        let area = Rect::new(0, 0, width, height);
+                        render_series_label(f, &theme, area, label, 0, 9, Color::Reset);
+                    })
+                    .expect("render");
+                let rows = rows_of(terminal.backend().buffer());
+                let screen = rows.join("\n");
+                let row = &rows[usize::from(height / 2)];
+                assert_eq!(
+                    cells(row.trim_end()),
+                    usize::from(width),
+                    "{label:?} at {width}x{height} ends on the area's edge:\n{screen}"
+                );
+                assert_eq!(
+                    row.trim(),
+                    expect,
+                    "{label:?} at {width}x{height}:\n{screen}"
+                );
+                assert!(
+                    expect == label || expect.is_empty() || expect.ends_with(MARKER),
+                    "a cut is marked"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sender_text_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_engine::value::{Column, ColumnType, QueryResult, Value};
+
+    use crate::tui::App;
+    use crate::tui::state::{ChartView, TabStatus};
+    use crate::tui::tests::test_app;
+
+    /// A bidi override a sender can put in a field name or a grouped value.
+    const BIDI: &str = "a\u{202E}b";
+
+    fn with_result(result: QueryResult, view: ChartView) -> App {
+        let mut app = test_app();
+        let returned = result.rows.len();
+        app.tab.result = Some(trawl_client::QueryResponse {
+            execution: None,
+            result,
+            pagination: trawl_client::PaginationMeta {
+                limit: 10_000,
+                offset: 0,
+                returned,
+                total: returned,
+            },
+            degraded_fields: Vec::new(),
+            severity_columns: Vec::new(),
+        });
+        app.tab.status = TabStatus::Success { duration_ms: 1 };
+        app.tab.chart_view = view;
+        app
+    }
+
+    /// The results pane drawn alone, as the terminal's text.
+    fn pane(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("terminal");
+        terminal
+            .draw(|f| super::render(app, f, f.area()))
+            .expect("render");
+        terminal.backend().to_string()
+    }
+
+    fn assert_sanitized(surface: &str, screen: &str) {
+        assert!(
+            !screen.contains('\u{202E}'),
+            "{surface} draws the override:\n{screen}"
+        );
+        assert!(
+            screen.contains('\u{FFFD}'),
+            "{surface} draws no replacement:\n{screen}"
+        );
+    }
+
+    fn time(i: i64) -> Value {
+        Value::String(format!("2026-01-01 00:0{i}:00"))
+    }
+
+    /// `timechart count by host`: the hosts are the series labels.
+    fn grouped_timechart() -> QueryResult {
+        let rows = (0..3_i64)
+            .flat_map(|i| {
+                [BIDI, "web"]
+                    .map(|host| vec![time(i), Value::String(host.into()), Value::Integer(i)])
+            })
+            .collect();
+        QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("host", ColumnType::String),
+                Column::new("count", ColumnType::Integer),
+            ],
+            rows,
+        }
+    }
+
+    /// One series, named for its metric column: the label is in the title.
+    fn single_timechart() -> QueryResult {
+        QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new(BIDI, ColumnType::Integer),
+            ],
+            rows: (0..3_i64)
+                .map(|i| vec![time(i), Value::Integer(i)])
+                .collect(),
+        }
+    }
+
+    /// The line chart's legend.
+    #[test]
+    fn sender_text_is_sanitized_in_the_line_chart_legend() {
+        let screen = pane(&with_result(grouped_timechart(), ChartView::LineChart));
+        assert_sanitized("line chart legend", &screen);
+    }
+
+    #[test]
+    fn sender_text_is_sanitized_in_the_line_chart_title() {
+        let screen = pane(&with_result(single_timechart(), ChartView::LineChart));
+        assert_sanitized("line chart title", &screen);
+    }
+
+    /// The stacked sparklines' labels.
+    #[test]
+    fn sender_text_is_sanitized_in_sparkline_labels() {
+        let screen = pane(&with_result(grouped_timechart(), ChartView::Sparkline));
+        assert_sanitized("sparkline labels", &screen);
+    }
+
+    #[test]
+    fn sender_text_is_sanitized_in_the_sparkline_title() {
+        let screen = pane(&with_result(single_timechart(), ChartView::Sparkline));
+        assert_sanitized("sparkline title", &screen);
+    }
+
+    /// The time axis and the title quote the first and last `_time`.
+    #[test]
+    fn sender_text_is_sanitized_in_chart_time_labels() {
+        let mut result = grouped_timechart();
+        for row in &mut result.rows {
+            row[0] = Value::String(BIDI.into());
+        }
+        for view in [ChartView::LineChart, ChartView::Sparkline] {
+            let screen = pane(&with_result(result.clone(), view));
+            assert_sanitized(&format!("{view:?} time labels"), &screen);
+        }
+    }
+
+    #[test]
+    fn sender_text_is_sanitized_in_the_bar_chart() {
+        let result = QueryResult {
+            columns: vec![
+                Column::new("host", ColumnType::String),
+                Column::new(BIDI, ColumnType::Integer),
+            ],
+            rows: vec![
+                vec![Value::String(BIDI.into()), Value::Integer(3)],
+                vec![Value::String("web".into()), Value::Integer(5)],
+            ],
+        };
+        let screen = pane(&with_result(result, ChartView::BarChart));
+        assert_sanitized("bar chart", &screen);
+        assert_eq!(
+            screen.matches('\u{FFFD}').count(),
+            2,
+            "the title and the label:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn sender_text_is_sanitized_in_result_headers() {
+        let result = QueryResult {
+            columns: vec![Column::new(BIDI, ColumnType::String)],
+            rows: vec![vec![Value::String("web".into())]],
+        };
+        let screen = pane(&with_result(result, ChartView::Table));
+        assert_sanitized("result header", &screen);
+    }
+
+    #[test]
+    fn sender_text_is_sanitized_in_the_status_bar() {
+        let mut app = test_app();
+        app.main_tab = crate::tui::state::MainTab::History;
+        app.tab.status = TabStatus::Error {
+            message: format!("unknown field {BIDI}"),
+            details: Vec::new(),
+            query: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).expect("terminal");
+        terminal
+            .draw(|f| super::super::status::render(&app, f, f.area()))
+            .expect("render");
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("error: unknown field"), "{screen}");
+        assert_sanitized("status bar", &screen);
     }
 }
