@@ -67,10 +67,11 @@ The first command queries `lab` and the second opens the TUI against it.
 `TRAWL_PROFILE` selects a profile too. `--config /path/to/client.toml` reads a
 different file. Name the server every time you change something.
 
-A token goes only to the URL it was saved for. A profile with its own `url`
-needs its own `token`. Without one, `trawl` does not send the `[server]` token
-to that URL. The same holds for `--url` and `TRAWL_URL`, so this command fails
-before it sends anything, even with `TRAWL_TOKEN` set:
+A token goes only to the URL it was saved for. A profile whose `url` names
+another server needs its own `token`: `trawl` does not send the `[server]`
+token there. The same holds for `--url` and `TRAWL_URL`. With the usual
+server's key in `[server]` or exported in `TRAWL_TOKEN`, this command fails
+before it sends anything:
 
 ```bash
 trawl --url https://lab-logs.example.com:5514 query 'last=15m | head 20'
