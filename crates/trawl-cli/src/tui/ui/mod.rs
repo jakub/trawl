@@ -693,6 +693,39 @@ mod tests {
         assert!(screen.contains("2026-01-15 10:00:00 +05:30"), "{screen}");
     }
 
+    /// An instant's text varies in length (the fraction drops its trailing
+    /// zeros), so a longer reading below the first 50 rows still fits its
+    /// column with its offset when the pane shows more than 50 rows.
+    #[test]
+    fn a_long_instant_below_fifty_visible_rows_keeps_its_offset() {
+        let mut app = test_app();
+        app.display_zone = "-04:00".parse().unwrap();
+        let mut rows: Vec<Vec<Value>> = (0..55)
+            .map(|i| {
+                vec![
+                    Value::String("2026-11-01T05:30:00.000000Z".into()),
+                    Value::String(format!("row {i}")),
+                ]
+            })
+            .collect();
+        rows.push(vec![
+            Value::String("2026-11-01T05:30:00.123456Z".into()),
+            Value::String("row 55".into()),
+        ]);
+        let mut response = make_query_response(vec!["_time", "message"], rows);
+        response.result.columns[0].ty = trawl_engine::value::ColumnType::Timestamp;
+        app.tab.result = Some(response);
+        app.tab.status = TabStatus::Success { duration_ms: 3 };
+        let mut terminal = Terminal::new(TestBackend::new(120, 200)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("row 55"), "row 55 is on screen:\n{screen}");
+        assert!(
+            screen.contains("2026-11-01 01:30:00.123456 -04:00"),
+            "the longer reading keeps its offset:\n{screen}"
+        );
+    }
+
     /// Set only in the child process: the display-zone timechart draws
     /// there, under the `TZ` the parent chose.
     const BERLIN_CHILD: &str = "TRAWL_TUI_BERLIN_CHILD";

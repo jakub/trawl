@@ -200,8 +200,14 @@ fn render_table(
     let available_width = area.width.saturating_sub(4) as usize; // borders + padding
 
     // Widths for every column, not just the displayed ones.
-    let all_widths =
-        compute_column_widths(result, v_scroll, available_width, config, app.display_zone);
+    let all_widths = compute_column_widths(
+        result,
+        v_scroll,
+        max_visible_rows,
+        available_width,
+        config,
+        app.display_zone,
+    );
     let total_cols = result.columns.len();
 
     let pinned = config.map_or_else(Vec::new, ColumnConfig::pinned_indices);
@@ -1371,12 +1377,16 @@ fn render_stacked_sparklines(
 
 /// Compute adaptive column widths based on header + first N rows of data.
 ///
-/// Samples up to `SAMPLE_ROWS` visible rows starting from `v_scroll`, taking
-/// the max display width per column, clamped to `MIN_COL` and to each
+/// Samples the rows from `v_scroll` on, every row the grid draws
+/// (`visible_rows`) and at least `SAMPLE_ROWS`, taking the max display
+/// width per column, clamped to `MIN_COL` and to each
 /// column's equal share of `available_width` (itself capped at `MAX_COL`).
 /// A column of instants may take the whole `available_width` instead: its
 /// offset is often the only difference between two rows (a fall-back
-/// night's two 01:30s), so cutting it would show one reading twice.
+/// night's two 01:30s), so cutting it would show one reading twice. An
+/// instant's text varies in length (its fraction drops trailing zeros), so
+/// a row the sample missed could be wider than its column: every drawn row
+/// is sampled.
 /// Widths are display cells of the text as the grid draws it: each value
 /// is cut to its column's cap with [`fit_cells`] before it is measured, so
 /// a value of any length costs no more than the cap to size.
@@ -1384,6 +1394,7 @@ fn render_stacked_sparklines(
 fn compute_column_widths(
     result: &trawl_engine::value::QueryResult,
     v_scroll: usize,
+    visible_rows: usize,
     available_width: usize,
     config: Option<&ColumnConfig>,
     zone: DisplayZone,
@@ -1421,7 +1432,12 @@ fn compute_column_widths(
             let mut max_width = width_of(&col.name, max_col);
             let mut cap = max_col;
 
-            for row in result.rows.iter().skip(v_scroll).take(SAMPLE_ROWS) {
+            for row in result
+                .rows
+                .iter()
+                .skip(v_scroll)
+                .take(SAMPLE_ROWS.max(visible_rows))
+            {
                 if let Some(value) = row.get(col_idx) {
                     let width = match present_cell(&col.ty, value, zone) {
                         Some(shown) => {
@@ -2144,7 +2160,7 @@ mod grid_tests {
             &["s", "t"],
         );
         assert_eq!(
-            compute_column_widths(&result, 0, 200, None, DisplayZone::Utc),
+            compute_column_widths(&result, 0, 1, 200, None, DisplayZone::Utc),
             [12, 10]
         );
     }
@@ -2161,7 +2177,7 @@ mod grid_tests {
             ]],
             &["s", "t"],
         );
-        let widths = compute_column_widths(&result, 0, 200, None, DisplayZone::Utc);
+        let widths = compute_column_widths(&result, 0, 1, 200, None, DisplayZone::Utc);
         assert_eq!(widths[0], 59);
         assert_eq!(widths[1], 8);
     }
