@@ -183,6 +183,9 @@ struct Handles {
     previewed: RwSignal<bool>,
     busy_field: RwSignal<Option<String>>,
     slot_note: RwSignal<Option<String>>,
+    /// The request generation: every initiating click bumps it. A probe
+    /// carries the generation it was made for.
+    generation: RwSignal<u32>,
     /// False once this dialog is disposed. Every signal above then
     /// panics on `get_untracked` (a write is a silent no-op), and any
     /// state a dead dialog computes is state nobody can see.
@@ -196,6 +199,26 @@ impl Handles {
     fn is_alive(self) -> bool {
         self.alive.try_get_value() == Some(true)
     }
+
+    /// Whether a probe made for generation `turn` failed with a 401 that
+    /// sent the page to sign-in. Asked only of a mounted dialog whose
+    /// generation is still `turn`, so a stale or disposed probe never
+    /// navigates. A declined 401 is an ordinary failed read.
+    fn leaves_for_sign_in(self, turn: u32, failure: Option<&ApiError>) -> bool {
+        self.is_alive()
+            && self.generation.try_get_untracked() == Some(turn)
+            && failure.and_then(crate::auth_return::sign_in_if_unauthorized) == Some(true)
+    }
+}
+
+/// One status read, as the dialog's decisions take it: the reduction,
+/// the row for a caller that may adopt it, and the failure itself, which
+/// the caller hands to the sign-in handler once it knows the read is
+/// still its own.
+struct Probed {
+    probe: StatusProbe,
+    job: Option<RepinJobResponse>,
+    failure: Option<ApiError>,
 }
 
 /// The repin dialog. `on_close` carries `Some(job)` only for a real
@@ -279,6 +302,7 @@ pub fn RepinModal(
         previewed,
         busy_field,
         slot_note,
+        generation,
         alive,
     };
 
@@ -337,7 +361,7 @@ pub fn RepinModal(
                     return;
                 }
                 Ok(RepinOutcome::Started(job)) => {
-                    let Some(followed) = follow_plan(job, handles).await else {
+                    let Some(followed) = follow_plan(job, seq, handles).await else {
                         return;
                     };
                     match followed {
@@ -409,6 +433,13 @@ pub fn RepinModal(
                     probe_slot(false, handles);
                 }
                 Err(e) => {
+                    // Past both checks above, so the answer is this
+                    // dialog's own: a 401 sends the page to sign-in. A
+                    // declined one is a pre-claim refusal below, shown as
+                    // the session-ended sentence.
+                    if crate::auth_return::sign_in_if_unauthorized(&e) == Some(true) {
+                        return;
+                    }
                     // A dry run mutates nothing, and a real run answered
                     // a definitive 4xx was decided before the claim: a
                     // 400's validation, a 403 from a permission that
@@ -852,27 +883,42 @@ fn plan_block(job: &RepinJobResponse, refused: bool) -> AnyView {
     .into_any()
 }
 
-/// One `/schema/repin/status` read: the decision's reduction of it, and
-/// the row itself for the caller that may adopt it.
-async fn status_probe() -> (StatusProbe, Option<RepinJobResponse>) {
+impl Probed {
+    fn job(job: Option<RepinJobResponse>) -> Self {
+        Self {
+            probe: job.as_ref().map_or(StatusProbe::NoJob, |job| {
+                StatusProbe::Job(ProbedJob::from(job))
+            }),
+            job,
+            failure: None,
+        }
+    }
+
+    /// The read said nothing. It must never be read as "no job".
+    fn failed(failure: ApiError) -> Self {
+        Self {
+            probe: StatusProbe::Failed,
+            job: None,
+            failure: Some(failure),
+        }
+    }
+}
+
+/// One `/schema/repin/status` read.
+async fn status_probe() -> Probed {
     match api::repin_status().await {
-        Ok(resp) => match resp.job {
-            Some(job) => (StatusProbe::Job(ProbedJob::from(&job)), Some(job)),
-            None => (StatusProbe::NoJob, None),
-        },
-        // The read said nothing. It must never be read as "no job".
-        Err(_) => (StatusProbe::Failed, None),
+        Ok(resp) => Probed::job(resp.job),
+        Err(e) => Probed::failed(e),
     }
 }
 
 /// One `/schema/repin/status?id=` read of job `id`, reduced the way
 /// [`status_probe`] reduces the install-wide one. The route's 404 is
 /// [`StatusProbe::NoJob`]: it holds no such job.
-async fn job_probe(id: i64) -> (StatusProbe, Option<RepinJobResponse>) {
+async fn job_probe(id: i64) -> Probed {
     match api::repin_job_status(id).await {
-        Ok(Some(job)) => (StatusProbe::Job(ProbedJob::from(&job)), Some(job)),
-        Ok(None) => (StatusProbe::NoJob, None),
-        Err(_) => (StatusProbe::Failed, None),
+        Ok(job) => Probed::job(job),
+        Err(e) => Probed::failed(e),
     }
 }
 
@@ -883,8 +929,13 @@ async fn job_probe(id: i64) -> (StatusProbe, Option<RepinJobResponse>) {
 /// a terminal one is classified at once, and only a running one is read
 /// again, by its id, once per [`REPIN_POLL_MS`]. By id, so another job in
 /// the one-running slot can never stand in for this one. `None` once the
-/// dialog is gone, which stops the reads.
-async fn follow_plan(started: RepinJobResponse, handles: Handles) -> Option<FollowedPlan> {
+/// dialog is gone, or once a read of request `seq` sent the page to
+/// sign-in, which stops the reads.
+async fn follow_plan(
+    started: RepinJobResponse,
+    seq: u32,
+    handles: Handles,
+) -> Option<FollowedPlan> {
     let job_id = started.id;
     let mut probe = StatusProbe::Job(ProbedJob::from(&started));
     let mut found = Some(started);
@@ -904,10 +955,11 @@ async fn follow_plan(started: RepinJobResponse, handles: Handles) -> Option<Foll
         if !handles.is_alive() {
             return None;
         }
-        (probe, found) = job_probe(job_id).await;
-        if !handles.is_alive() {
+        let read = job_probe(job_id).await;
+        if !handles.is_alive() || handles.leaves_for_sign_in(seq, read.failure.as_ref()) {
             return None;
         }
+        (probe, found) = (read.probe, read.job);
         errors = if matches!(probe, StatusProbe::Failed) {
             errors + 1
         } else {
@@ -929,8 +981,13 @@ fn probe_recovery(
     on_close: Callback<Option<RepinJobResponse>>,
 ) {
     handles.probing.set(true);
+    let turn = handles.generation.get_untracked();
     spawn_local(async move {
-        let (probe, found) = status_probe().await;
+        let Probed {
+            probe,
+            job: found,
+            failure,
+        } = status_probe().await;
         let verdict = recovery_verdict(&run, &probe);
         // Running or terminal, a proven job is the one this modal asked
         // for: hand it to the case file, which owns progress and
@@ -948,6 +1005,9 @@ fn probe_recovery(
             return;
         }
         handles.probing.set(false);
+        if handles.leaves_for_sign_in(turn, failure.as_ref()) {
+            return;
+        }
         match verdict {
             // `Adopt` is only ever returned for a `Job` probe, so the row
             // is in hand here — and the non-refused half returned above.
@@ -978,15 +1038,19 @@ fn probe_recovery(
 /// holds it.
 fn probe_slot(adopt_free: bool, handles: Handles) {
     handles.probing.set(true);
+    let turn = handles.generation.get_untracked();
     spawn_local(async move {
-        let (probe, _) = status_probe().await;
+        let read = status_probe().await;
         // Nothing this read can decide matters to a dialog that is gone,
         // and it mutates nothing server-side either way.
         if !handles.is_alive() {
             return;
         }
         handles.probing.set(false);
-        match slot_check(&probe) {
+        if handles.leaves_for_sign_in(turn, read.failure.as_ref()) {
+            return;
+        }
+        match slot_check(&read.probe) {
             SlotCheck::Held(field) => {
                 handles.slot_note.set(None);
                 handles.busy_field.set(Some(sanitize_display_text(&field)));
