@@ -431,7 +431,7 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
         EvalValue::Timestamp(instant) => crate::value::Value::String(match instant {
             Instant::NegInfinity => "-infinity".to_owned(),
             Instant::At(at) => {
-                crate::executor::wire_timestamp(at.and_utc().timestamp_micros(), Utc.fix())
+                trawl_api::zone::wire_timestamp(at.and_utc().timestamp_micros(), Utc.fix())
             }
             Instant::Infinity => "infinity".to_owned(),
         }),

@@ -495,7 +495,7 @@ impl Corpus {
         pins: &FieldTypes,
     ) -> Result<QueryResult, EngineError> {
         match &self.hot {
-            None => exec.run_query(dsl, &self.cold, pins, usize::MAX, 0),
+            None => exec.run_query(dsl, &self.cold, pins, usize::MAX),
             Some(hot) => exec.run_query_with_hot(
                 dsl,
                 &self.cold,
@@ -504,7 +504,6 @@ impl Corpus {
                 &self.hot_pins(pins),
                 pins,
                 usize::MAX,
-                0,
             ),
         }
     }
@@ -2007,7 +2006,7 @@ mod absent_equals_explicit_null {
                     };
                     let label = format!("`{dsl}`");
                     let run = |source: &str| {
-                        exec.run_query(&dsl, source, &FieldTypes::new(), usize::MAX, 0)
+                        exec.run_query(&dsl, source, &FieldTypes::new(), usize::MAX)
                             .map_err(|error| error.to_string())
                             .and_then(|result| y_cells(&result))
                     };
@@ -2140,7 +2139,7 @@ mod absent_equals_explicit_null {
                       TIMESTAMP '2024-01-15 10:00:00' AS _ingested, \
                       'web1' AS host, 'svc' AS service)";
         let run = |dsl: &str| {
-            exec.run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+            exec.run_query(dsl, source, &FieldTypes::new(), usize::MAX)
                 .map(|result| result.rows.iter().map(|row| Cell::from(&row[0])).collect())
                 .map_err(|error| error.to_string())
         };
@@ -2768,7 +2767,6 @@ mod alias_capture {
                         out.to_str().expect("utf-8 path"),
                         &pins,
                         usize::MAX,
-                        0,
                     )
                     .map_err(|e| e.to_string())
                     .and_then(|result| {
@@ -2947,7 +2945,6 @@ mod alias_capture {
                                     out.to_str().expect("utf-8 path"),
                                     &FieldTypes::new(),
                                     usize::MAX,
-                                    0,
                                 )
                                 .map_err(|e| e.to_string())
                                 .and_then(|result| {
@@ -3470,7 +3467,7 @@ mod every_lane {
         let corpus = Corpus::build(Variant::Absent, Split::ColdOnly);
         let mut matrix = Matrix::default();
         through("glob", &mut matrix, |dsl| {
-            exec.run_query(dsl, &corpus.glob(), &FieldTypes::new(), usize::MAX, 0)
+            exec.run_query(dsl, &corpus.glob(), &FieldTypes::new(), usize::MAX)
         });
         matrix.assert("embedded --data over a parquet glob");
     }
@@ -3490,7 +3487,7 @@ mod every_lane {
         let source = path.to_str().expect("utf-8 path");
         let mut matrix = Matrix::default();
         through("ndjson", &mut matrix, |dsl| {
-            exec.run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+            exec.run_query(dsl, source, &FieldTypes::new(), usize::MAX)
         });
         matrix.assert("embedded --data over ndjson");
     }
@@ -3678,7 +3675,7 @@ mod every_lane {
                 format!("{label} `{dsl}`"),
                 judge_batch(
                     &Answer::Rows(answer),
-                    exec.run_query(dsl, source, &pins, usize::MAX, 0),
+                    exec.run_query(dsl, source, &pins, usize::MAX),
                 ),
             );
         }
@@ -3710,7 +3707,7 @@ mod every_lane {
                 format!("`{dsl}`"),
                 judge_batch(
                     &Answer::Rows(answer),
-                    exec.run_query(dsl, source, &pins, usize::MAX, 0),
+                    exec.run_query(dsl, source, &pins, usize::MAX),
                 ),
             );
         }

@@ -226,7 +226,7 @@ fn display_zone(config: Option<&str>) -> Result<String, Refusal> {
         ))
     })?;
     let zone = cfg.ui.timezone;
-    trawl_engine::timezone::resolve_utc_offset(&zone).map_err(|_| {
+    zone.parse::<trawl_api::zone::DisplayZone>().map_err(|_| {
         Refusal(format!(
             "ui.timezone in {path} is not \"local\", \"UTC\", or a fixed offset such as \
              \"+05:30\"; fix it, or remove it for \"local\""

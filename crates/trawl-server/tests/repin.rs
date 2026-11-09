@@ -1300,7 +1300,6 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         "status=418 last=1h | stats count() by status",
         Deadline::after(HANG_GUARD),
         false,
-        0,
         WorkContext::system(WorkKind::Query),
     );
     let mut across = std::pin::pin!(across);

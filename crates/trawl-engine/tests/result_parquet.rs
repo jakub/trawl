@@ -256,13 +256,12 @@ fn a_timestamp_list_through_a_rust_tail_is_stored_as_timestamps() {
             &source.display().to_string(),
             &trawl_core::schema::FieldTypes::new(),
             100,
-            19_800,
         )
         .expect("the kv tail runs");
     assert_eq!(
         written.rows,
         vec![vec![Value::Array(vec![text(
-            "2026-01-15T14:30:00.123456+05:30"
+            "2026-01-15T09:00:00.123456Z"
         )])]]
     );
 

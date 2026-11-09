@@ -779,7 +779,6 @@ async fn health_ignores_a_full_pool() {
                 "*",
                 Deadline::after(std::time::Duration::from_secs(2)),
                 false,
-                0,
                 WorkContext::key(WorkKind::Query, 1),
             )
             .await

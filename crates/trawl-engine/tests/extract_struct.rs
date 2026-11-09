@@ -203,7 +203,7 @@ fn fixture(dir: &std::path::Path, messages: &[&str]) -> String {
 fn batch_rows(dsl: &str, source: &str, names: &[String]) -> Vec<(i64, Vec<Option<String>>)> {
     let result = Executor::new()
         .expect("an executor")
-        .run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+        .run_query(dsl, source, &FieldTypes::new(), usize::MAX)
         .unwrap_or_else(|e| panic!("{dsl}: {e}"));
     let column = |name: &str| {
         result
@@ -447,7 +447,6 @@ fn an_extract_feeds_a_pivot() {
             &source,
             &FieldTypes::new(),
             usize::MAX,
-            0,
         )
         .expect("the pivot runs");
     let column = |name: &str| {

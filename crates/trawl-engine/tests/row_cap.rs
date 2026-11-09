@@ -51,7 +51,7 @@ fn six_keys() -> (tempfile::TempDir, String) {
 fn run(dsl: &str, glob: &str, cap: RowCap) -> Result<QueryResult, EngineError> {
     let exec = Executor::new().unwrap();
     exec.cancellable(&CancelLatch::never())
-        .run_query(dsl, glob, &FieldTypes::new(), cap, 0)
+        .run_query(dsl, glob, &FieldTypes::new(), cap)
 }
 
 #[test]

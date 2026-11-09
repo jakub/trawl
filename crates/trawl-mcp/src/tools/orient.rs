@@ -195,12 +195,7 @@ async fn gated_reads<B: Backend>(
             if may_query {
                 Some(
                     backend
-                        .query_paginated_tz(
-                            INVENTORY_QUERY,
-                            Some(INVENTORY_MAX_ROWS),
-                            None,
-                            Some("UTC".to_owned()),
-                        )
+                        .query_paginated(INVENTORY_QUERY, Some(INVENTORY_MAX_ROWS), None)
                         .await,
                 )
             } else {

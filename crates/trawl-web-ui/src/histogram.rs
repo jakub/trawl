@@ -351,10 +351,9 @@ pub struct Slot {
 /// later of them. The zero slots are what make idle time read as idle.
 ///
 /// Anchoring on the newest row rather than wall-clock now is
-/// deliberate: `_time` arrives pre-shifted into trawld's configured
-/// display timezone, which the browser doesn't know. Anchoring on the
-/// data keeps every comparison inside one timezone, at the cost of the
-/// grid ending at the last observed bucket instead of the current one.
+/// deliberate: it keeps every comparison on the rows' own clock rather
+/// than the browser's, at the cost of the grid ending at the last
+/// observed bucket instead of the current one.
 ///
 /// Rows falling outside the window are dropped; rows sharing a slot are
 /// summed, so unaligned input still lands somewhere sensible.
@@ -400,7 +399,7 @@ pub fn align_buckets(rows: &[(i64, u64)], slot_ms: i64, n: usize) -> Vec<Slot> {
 }
 
 /// Parse a trawl timestamp into epoch milliseconds, treating it as
-/// naive wall-clock (no timezone shift applied).
+/// naive wall-clock (the wire is UTC, so no shift is needed).
 ///
 /// Accepts the result wire's RFC 3339 `T`-separated form and the
 /// space-separated `YYYY-MM-DD HH:MM:SS[.fff]` cast text; any trailing

@@ -279,13 +279,12 @@ impl App {
 
         let client = self.client.clone();
         let tx = self.query_tx.clone();
-        let timezone = self.timezone.clone();
 
         let handle = tokio::spawn(async move {
             tracing::info!("background task started for query: {}", query);
             let start = Instant::now();
             let result = client
-                .query_paginated_tz(&query, None, None, Some(timezone))
+                .query_paginated(&query, None, None)
                 .await
                 .map_err(|e| QueryError {
                     message: e.to_string(),

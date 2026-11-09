@@ -435,7 +435,7 @@ async fn a_zero_row_search_reports_the_nearest_events_for_the_same_search() {
     assert_eq!(
         backend.calls(),
         [
-            "query Some(3) None Some(\"UTC\") earliest=\"2026-03-07T03:00:00.250000Z\" \
+            "query Some(3) None earliest=\"2026-03-07T03:00:00.250000Z\" \
              latest=\"2026-03-14T10:00:00.000000Z\" service=api status>=500\n\
              | let side = case(_time < \"2026-03-14T03:00:00.250000Z\", \"before\", _time >= \
              \"2026-03-14T04:00:00.750000Z\", \"after\", \"inside\")\n\
@@ -507,7 +507,7 @@ fn submitted_query(backend: &Fake) -> trawl_core::ast::Query {
     let calls = backend.calls();
     assert_eq!(calls.len(), 1, "{calls:?}");
     let dsl = calls[0]
-        .strip_prefix("query Some(3) None Some(\"UTC\") ")
+        .strip_prefix("query Some(3) None ")
         .unwrap_or_else(|| panic!("{calls:?}"));
     trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl:?}: {e:?}"))
 }

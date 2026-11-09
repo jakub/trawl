@@ -115,7 +115,7 @@ const FIXTURES: &[(&str, usize)] = &[
 
 fn run(executor: &Executor, dsl: &str, source: &str) -> QueryResult {
     executor
-        .run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+        .run_query(dsl, source, &FieldTypes::new(), usize::MAX)
         .unwrap_or_else(|error| panic!("{dsl:?} runs: {error}"))
 }
 

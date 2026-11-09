@@ -400,7 +400,6 @@ pub async fn query(q: &str, plan: FetchPlan) -> Result<QueryResponse, ApiError> 
         query: q.to_owned(),
         limit: Some(limit),
         offset: Some(offset),
-        timezone: None,
     };
     let resp = Request::post("/api/v1/query")
         .header("content-type", "application/json")

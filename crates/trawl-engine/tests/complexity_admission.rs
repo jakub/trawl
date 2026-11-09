@@ -85,7 +85,7 @@ fn the_batch_lane_refuses_over_budget_dsl_without_binding() {
     for (case, dsl) in refused_queries() {
         let before = prepare_probe::count();
         let outcome = exec
-            .run_query(&dsl, &glob, &FieldTypes::new(), 100, 0)
+            .run_query(&dsl, &glob, &FieldTypes::new(), 100)
             .map(|_| ());
         assert_refused_without_binding(case, before, &outcome);
     }
@@ -112,7 +112,6 @@ fn the_hot_lanes_refuse_over_budget_dsl_without_binding() {
                     &FieldTypes::new(),
                     &FieldTypes::new(),
                     100,
-                    0,
                 )
                 .map(|_| ());
             assert_refused_without_binding(case, before, &outcome);
@@ -161,7 +160,7 @@ fn the_bind_counter_counts_an_admitted_query() {
     let exec = Executor::new().expect("executor");
     let glob = common::fixture_glob();
     let before = prepare_probe::count();
-    exec.run_query("* | head 1", &glob, &FieldTypes::new(), 100, 0)
+    exec.run_query("* | head 1", &glob, &FieldTypes::new(), 100)
         .expect("an in-budget query runs");
     assert!(
         prepare_probe::count() > before,

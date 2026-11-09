@@ -838,7 +838,6 @@ async fn a_windowed_run_query_reexecutes_standalone_with_identical_bounds() {
             &run.query,
             Deadline::after(StdDuration::from_secs(TIMEOUT_SECS)),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;

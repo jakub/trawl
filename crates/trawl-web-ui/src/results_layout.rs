@@ -21,11 +21,10 @@ use trawl_api::value::{ColumnType, Value};
 /// A result cell as the grids print it.
 ///
 /// A `timestamp` cell (or a list of them) shows as
-/// `2024-01-15 10:00:00.120`: the wall clock in the offset the server
-/// rendered it in, without the `T` or the offset. The CLI and the TUI
-/// drop the fraction's trailing zeros ([`timestamp_cell_text`]); the
-/// browser pads the fraction to at least milliseconds instead, so the
-/// digits line up down a column. Finer precision the wire carries stays.
+/// `2024-01-15 10:00:00.120`: the UTC wall clock the server sent, without
+/// the `T` or the `Z`. The CLI and the TUI drop the fraction's trailing
+/// zeros ([`timestamp_cell_text`]); the browser pads the fraction to at
+/// least milliseconds instead, so the digits line up down a column. Finer precision the wire carries stays.
 /// Whether a cell is a timestamp is the column's type, never the cell's
 /// spelling, so a `string` column holding RFC 3339 text shows as sent.
 /// A column the grid has no type for (a short `types` list) shows like

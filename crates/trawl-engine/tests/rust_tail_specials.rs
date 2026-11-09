@@ -32,7 +32,7 @@ fn source(rows: &[&str]) -> (tempfile::TempDir, String) {
 }
 
 fn run(exec: &Executor, dsl: &str, glob: &str) -> QueryResult {
-    exec.run_query(dsl, glob, &FieldTypes::new(), usize::MAX, 0)
+    exec.run_query(dsl, glob, &FieldTypes::new(), usize::MAX)
         .unwrap_or_else(|error| panic!("{dsl:?} must run: {error}"))
 }
 
@@ -150,72 +150,63 @@ fn the_tail_computes_over_the_specials_it_received() {
     );
 }
 
-/// (c) The silent-regression guard: a TIMESTAMP column still renders in
-/// the display offset after a tail runs.
+/// (c) The silent-regression guard: a TIMESTAMP column still renders as
+/// the wire's UTC text after a tail runs.
 ///
 /// The tail reads `DuckDB`'s cast text in UTC and the render after it
 /// re-parses that TEXT (`render_tracked_timestamps`), so a bridge that
 /// retyped timestamp cells would break it without any test noticing: the
 /// value would simply stay UTC cast text.
 #[test]
-fn a_timestamp_column_still_shifts_after_the_tail() {
+fn a_timestamp_column_still_renders_as_wire_text_after_the_tail() {
     let (_dir, glob) = source(&[
         r#"{"message":"k=v","service":"nginx","_time":"2026-01-15T09:00:00Z","_ingested":"2026-01-15T09:00:00Z"}"#,
     ]);
     let exec = Executor::new().unwrap();
     let dsl = "* | extract kv from message | table _time, k";
-    let offset = 5 * 3600 + 1800; // +05:30
 
-    let shifted = exec
-        .run_query(dsl, &glob, &FieldTypes::new(), usize::MAX, offset)
-        .unwrap();
-    let utc = exec
-        .run_query(dsl, &glob, &FieldTypes::new(), usize::MAX, 0)
+    let result = exec
+        .run_query(dsl, &glob, &FieldTypes::new(), usize::MAX)
         .unwrap();
 
-    let Value::String(shifted_time) = cell(&shifted, 0, "_time") else {
+    let Value::String(time) = cell(&result, 0, "_time") else {
         panic!("_time must stay a string through the tail");
     };
-    let Value::String(utc_time) = cell(&utc, 0, "_time") else {
-        panic!("_time must stay a string through the tail");
-    };
-    assert_eq!(utc_time, "2026-01-15T09:00:00.000000Z");
     assert_eq!(
-        shifted_time, "2026-01-15T14:30:00.000000+05:30",
-        "the display offset must still reach a cell that crossed the tail"
+        time, "2026-01-15T09:00:00.000000Z",
+        "the wire text must still reach a cell that crossed the tail"
     );
 }
 
-/// A timestamp the TAIL computes — an infinity included — survives a
-/// display-shifted run.
+/// A timestamp the TAIL computes, an infinity included, survives the
+/// render after the tail.
 ///
 /// The render after the tail only touches the columns its lineage tracks;
 /// a computed infinity is the tail's own value, so it passes through as
-/// the word while a real `_time` beside it still renders in the display
-/// offset. Both halves are asserted, because "nothing moved" is also what
-/// a broken render looks like.
+/// the word while a real `_time` beside it still renders as wire text.
+/// Both halves are asserted, because "nothing moved" is also what a broken
+/// render looks like.
 #[test]
-fn a_tail_computed_infinity_survives_a_shifted_run() {
+fn a_tail_computed_infinity_survives_the_wire_render() {
     let (_dir, glob) = source(&[
         r#"{"message":"k=v","service":"nginx","_time":"2026-01-15T09:00:00Z","_ingested":"2026-01-15T09:00:00Z"}"#,
     ]);
     let exec = Executor::new().unwrap();
     let dsl =
         r#"* | extract kv from message | let t = date_trunc("day", "infinity") | table _time, t"#;
-    let offset = 5 * 3600 + 1800; // +05:30
 
-    let shifted = exec
-        .run_query(dsl, &glob, &FieldTypes::new(), usize::MAX, offset)
+    let result = exec
+        .run_query(dsl, &glob, &FieldTypes::new(), usize::MAX)
         .unwrap();
     assert_eq!(
-        cell(&shifted, 0, "t"),
+        cell(&result, 0, "t"),
         &Value::String("infinity".into()),
-        "a computed infinity must cross the bridge and the shift unchanged"
+        "a computed infinity must cross the bridge and the render unchanged"
     );
     assert_eq!(
-        cell(&shifted, 0, "_time"),
-        &Value::String("2026-01-15T14:30:00.000000+05:30".into()),
-        "…while the real timestamp column beside it still shifts"
+        cell(&result, 0, "_time"),
+        &Value::String("2026-01-15T09:00:00.000000Z".into()),
+        "…while the real timestamp column beside it still renders"
     );
 }
 
@@ -246,13 +237,7 @@ fn a_double_pinned_infinity_compares_in_the_tail() {
     pins.insert("d", CanonicalType::Double);
 
     let batch = exec
-        .run_query(
-            "* | where d > 1 | table service",
-            &glob,
-            &pins,
-            usize::MAX,
-            0,
-        )
+        .run_query("* | where d > 1 | table service", &glob, &pins, usize::MAX)
         .unwrap();
     assert_eq!(
         batch.row_count(),
@@ -266,7 +251,6 @@ fn a_double_pinned_infinity_compares_in_the_tail() {
             &glob,
             &pins,
             usize::MAX,
-            0,
         )
         .unwrap();
     assert_eq!(
@@ -355,7 +339,6 @@ fn the_cold_start_fallback_keeps_the_statements_anchor() {
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,
-            0,
         )
         .expect("the cold-start fallback must answer");
 

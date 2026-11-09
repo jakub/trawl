@@ -58,7 +58,6 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
             "*",
             Deadline::after(HANG_GUARD),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -97,7 +96,6 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
             "*",
             Deadline::after(Duration::from_millis(30)),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -149,7 +147,6 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
             "*",
             Deadline::after(HANG_GUARD),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -191,7 +188,6 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
             "*",
             Deadline::after(Duration::from_secs(1)),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -254,7 +250,6 @@ async fn query_timeout_keeps_publication_guard_until_duckdb_task_finishes() {
             "*",
             Deadline::after(Duration::from_millis(30)),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -296,7 +291,6 @@ async fn aborting_request_keeps_running_reader_protected() {
                 "*",
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 WorkContext::system(WorkKind::Query),
             )
             .await

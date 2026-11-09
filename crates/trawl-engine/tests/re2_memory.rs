@@ -709,8 +709,8 @@ fn run_lanes(spec: &Spec, lanes: Vec<Executor>) -> (Vec<Executor>, Vec<String>) 
             thread::spawn(move || {
                 barrier.wait();
                 let run = match &written {
-                    Some(query) => lane.execute_emitted(query, usize::MAX, 0),
-                    None => lane.run_query(&dsl, &glob, &FieldTypes::new(), usize::MAX, 0),
+                    Some(query) => lane.execute_emitted(query, usize::MAX),
+                    None => lane.run_query(&dsl, &glob, &FieldTypes::new(), usize::MAX),
                 };
                 let outcome = match run {
                     Ok(result) if result.rows.is_empty() || dsl.starts_with('*') => "ok".to_owned(),
@@ -745,13 +745,7 @@ fn measure(spec: &Spec) -> Seen {
     // the baseline already holds the parquet reader's state.
     for lane in &lanes {
         let warm = lane
-            .run_query(
-                "message=/zzzz/",
-                &spec.glob,
-                &FieldTypes::new(),
-                usize::MAX,
-                0,
-            )
+            .run_query("message=/zzzz/", &spec.glob, &FieldTypes::new(), usize::MAX)
             .expect("the warm-up runs");
         assert!(warm.rows.is_empty(), "the warm-up matches nothing");
     }
@@ -3664,7 +3658,7 @@ fn union_branches_shapes_plan_and_run() {
             .map(trawl_core::emitter::SqlValue::String)
             .collect();
         let result = executor
-            .execute_emitted(&query, usize::MAX, 0)
+            .execute_emitted(&query, usize::MAX)
             .unwrap_or_else(|e| panic!("{}: {e}", query.sql));
         assert_eq!(result.rows.len(), 1, "{}", query.sql);
         format!("{:?}", result.rows[0])
@@ -3707,7 +3701,7 @@ fn extract_struct_forms_plan_and_run() {
             .map(trawl_core::emitter::SqlValue::String)
             .collect();
         let result = executor
-            .execute_emitted(&query, usize::MAX, 0)
+            .execute_emitted(&query, usize::MAX)
             .unwrap_or_else(|e| panic!("{form:?}: {e}"));
         assert_eq!(result.columns.len(), STRUCT_GROUPS, "{form:?}");
         assert_eq!(result.rows.len(), FILES, "{form:?}");
@@ -3799,7 +3793,7 @@ fn fixed_sites_shapes_plan_and_run() {
         query.sql = sql;
         query.params = Vec::new();
         executor
-            .execute_emitted(&query, usize::MAX, 0)
+            .execute_emitted(&query, usize::MAX)
             .unwrap_or_else(|e| panic!("{}: {e}", query.sql))
     };
     let rows = FILES * FIXED_ROWS_PER_FILE;

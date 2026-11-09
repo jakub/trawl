@@ -170,10 +170,7 @@ async fn orient_answers_the_installation_with_inventory_and_retention() {
         ]
     );
     assert!(
-        backend.calls()[4].ends_with(&format!(
-            "Some(200) None Some(\"UTC\") {}",
-            orient::INVENTORY_QUERY
-        )),
+        backend.calls()[4].ends_with(&format!("Some(200) None {}", orient::INVENTORY_QUERY)),
         "{:?}",
         backend.calls()
     );

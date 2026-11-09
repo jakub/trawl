@@ -628,15 +628,7 @@ async fn run_configured(args: Cli, command: Option<Command>) -> Result<u8, CliEr
                 Some(connection(&cfg, args.token.as_deref())?)
             };
 
-            cli::run_query(
-                &query,
-                data.as_deref(),
-                format,
-                output.as_deref(),
-                conn,
-                &cfg.ui.timezone,
-            )
-            .await?;
+            cli::run_query(&query, data.as_deref(), format, output.as_deref(), conn).await?;
         }
         Some(Command::Validate { query }) => {
             // Validate supports both daemon and local-only mode: no token

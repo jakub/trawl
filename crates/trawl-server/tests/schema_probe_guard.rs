@@ -270,7 +270,6 @@ async fn parked_probe_keeps_its_permit() {
                 "service=nginx",
                 deadline,
                 false,
-                0,
                 WorkContext::system(WorkKind::Query),
             )
             .await
@@ -368,7 +367,6 @@ async fn probe_respects_the_publication_guard() {
                 DSL,
                 Deadline::after(HANG_GUARD),
                 false,
-                0,
                 WorkContext::system(WorkKind::Query),
             )
             .await
@@ -437,7 +435,6 @@ async fn probe_respects_the_publication_guard() {
             DSL,
             Deadline::after(HANG_GUARD),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await

@@ -81,7 +81,6 @@ pub async fn run_query(
     format: Option<OutputFormat>,
     output: Option<&Path>,
     conn: Option<ConnectionParams>,
-    timezone: &str,
 ) -> Result<(), CliError> {
     let format = format.unwrap_or_else(|| {
         if io::stdout().is_terminal() {
@@ -116,7 +115,7 @@ pub async fn run_query(
     }
 
     let (result, degraded, severity_columns) = if let Some(data) = data {
-        match run_embedded_mode(data, query, timezone) {
+        match run_embedded_mode(data, query) {
             // Embedded mode has no catalog, so no degraded notice to
             // carry; `sev()` declares its own pin, so its columns still
             // render as tokens without one.
@@ -128,7 +127,7 @@ pub async fn run_query(
             Err(e) => return Err(e),
         }
     } else if let Some(conn) = conn {
-        match run_daemon_mode(&conn, query, timezone).await {
+        match run_daemon_mode(&conn, query).await {
             Ok(r) => r,
             Err(CliError::Client(ref client_err)) => {
                 render_client_error(query, client_err);
@@ -321,12 +320,9 @@ async fn run_parquet_export(
 async fn run_daemon_mode(
     conn: &ConnectionParams,
     query: &str,
-    timezone: &str,
 ) -> Result<(QueryResult, Vec<String>, Vec<String>), CliError> {
     let client = conn.client()?;
-    let response = client
-        .query_paginated_tz(query, None, None, Some(timezone.to_owned()))
-        .await?;
+    let response = client.query_paginated(query, None, None).await?;
     Ok(daemon_outcome(response))
 }
 
@@ -344,9 +340,7 @@ fn daemon_outcome(
 }
 
 /// Execute the query locally with an embedded `DuckDB` engine.
-fn run_embedded_mode(data: &str, query: &str, timezone: &str) -> Result<QueryResult, CliError> {
-    let utc_offset_secs =
-        trawl_engine::timezone::resolve_utc_offset(timezone).map_err(CliError::Usage)?;
+fn run_embedded_mode(data: &str, query: &str) -> Result<QueryResult, CliError> {
     let executor = trawl_engine::executor::Executor::new()?;
     // CLI has no server-side row limit, hence usize::MAX. Embedded mode is
     // pin-blind by design (no catalog, ADR-0011): the explicit empty set
@@ -356,7 +350,6 @@ fn run_embedded_mode(data: &str, query: &str, timezone: &str) -> Result<QueryRes
         data,
         &trawl_core::schema::FieldTypes::new(),
         usize::MAX,
-        utc_offset_secs,
     )?)
 }
 
@@ -1111,7 +1104,6 @@ mod tests {
             Some(OutputFormat::Parquet),
             None,
             None,
-            "UTC",
         )
         .await;
         let err = result.unwrap_err();
@@ -1138,7 +1130,7 @@ mod tests {
                 .unwrap();
         }
         let glob = dir.path().join("*.parquet");
-        let result = run_embedded_mode(glob.to_str().unwrap(), "*", "UTC").unwrap();
+        let result = run_embedded_mode(glob.to_str().unwrap(), "*").unwrap();
         assert_eq!(result.columns, source.columns);
         assert_eq!(
             result.rows,
@@ -1176,7 +1168,6 @@ mod tests {
             Some(OutputFormat::Parquet),
             Some(&output),
             None,
-            "UTC",
         )
         .await
         .unwrap();
@@ -1187,7 +1178,6 @@ mod tests {
                 output.to_str().unwrap(),
                 &trawl_core::schema::FieldTypes::new(),
                 usize::MAX,
-                0,
             )
             .unwrap();
         assert_eq!(roundtrip, source);

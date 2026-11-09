@@ -22,7 +22,7 @@ trait RunQueryUnlimited {
 
 impl RunQueryUnlimited for Executor {
     fn run_query_max(&self, dsl: &str, source: &str) -> Result<QueryResult, EngineError> {
-        self.run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+        self.run_query(dsl, source, &FieldTypes::new(), usize::MAX)
     }
 }
 
@@ -908,7 +908,7 @@ fn setup_kv() -> (Executor, String) {
 fn extract_kv_basic_pipeline() {
     let (exec, src) = setup_kv();
     let result = exec
-        .run_query("* | extract kv | head 5", &src, &FieldTypes::new(), 1000, 0)
+        .run_query("* | extract kv | head 5", &src, &FieldTypes::new(), 1000)
         .unwrap();
     // Should have original columns + extracted kv columns.
     let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
@@ -931,7 +931,6 @@ fn extract_kv_with_where() {
             &src,
             &FieldTypes::new(),
             1000,
-            0,
         )
         .unwrap();
     // status >= 400: 500 and 404 → 2 rows.
@@ -947,7 +946,6 @@ fn extract_kv_with_stats() {
             &src,
             &FieldTypes::new(),
             1000,
-            0,
         )
         .unwrap();
     // GET: 3, POST: 1, PUT: 1 → 3 groups.
@@ -966,7 +964,6 @@ fn extract_kv_with_search_prefix() {
             &src,
             &FieldTypes::new(),
             1000,
-            0,
         )
         .unwrap();
     // web01 has 3 rows.
@@ -1200,7 +1197,6 @@ fn hot_pin_conflict_nulls_hot_value_keeps_both_rows() {
             &duration_bigint_pins(),
             &FieldTypes::new(),
             usize::MAX,
-            0,
         )
         .expect("a pinned hot conflict must resolve in one execution");
 
@@ -1244,7 +1240,6 @@ fn hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
             &duration_bigint_pins(),
             &FieldTypes::new(),
             usize::MAX,
-            0,
         )
         .expect("a pinned hot conflict behind a pruned list source must resolve");
 
@@ -1367,7 +1362,6 @@ fn foreign_nonconformant_corpus_errors_loudly() {
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,
-            0,
         )
         .expect_err("a nonconformant corpus with cold files present must error, not 200");
     assert!(
@@ -1405,7 +1399,6 @@ fn foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_source() {
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,
-            0,
         )
         .expect_err("a nonconformant corpus behind a pruned list must error, not 200");
     assert!(
@@ -1527,7 +1520,6 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
             &pins,
             &FieldTypes::new(),
             usize::MAX,
-            0,
         )
         .expect("hot+cold query must not error on a malformed hot timestamp");
 
@@ -1594,7 +1586,6 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
-                0,
             )
             .expect("hot query must succeed");
 
@@ -1652,12 +1643,12 @@ fn pinned_comparison_applies_on_cold_only_run_query() {
     let pins = status_varchar_pins();
 
     let eq = exec
-        .run_query("status=200", &source, &pins, usize::MAX, 0)
+        .run_query("status=200", &source, &pins, usize::MAX)
         .expect("text equality must not error on the VARCHAR column");
     assert_eq!(eq.row_count(), 1);
 
     let ordered = exec
-        .run_query("status>=400", &source, &pins, usize::MAX, 0)
+        .run_query("status>=400", &source, &pins, usize::MAX)
         .expect("ordered numeric comparison must not error over 'accepted'");
     assert_eq!(ordered.row_count(), 1, "only '404' is >= 400");
 }
@@ -1697,7 +1688,6 @@ fn pinned_comparison_survives_pruned_list_source() {
             &pins,
             &pins,
             usize::MAX,
-            0,
         )
         .expect("the pruned retry must keep the comparison pins");
     // cold '404' + hot '500'; cold 'accepted'/'200' excluded, no error.
@@ -1734,7 +1724,6 @@ fn pinned_comparison_survives_hot_only_fallback() {
             &pins,
             &pins,
             usize::MAX,
-            0,
         )
         .expect("the hot-only fallback must keep the comparison pins");
     assert_eq!(result.row_count(), 1, "only '404' matches, no error");
@@ -1827,7 +1816,6 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
             &pins,
             &pins,
             usize::MAX,
-            0,
         )
         .expect("text equality must not error on the hot-only lane");
     assert_eq!(exact.row_count(), 1, "the text '200' must match");
@@ -1858,7 +1846,6 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
             &pins,
             &pins,
             usize::MAX,
-            0,
         )
         .expect("text equality must not error on the hot-only lane");
     assert_eq!(
@@ -1878,7 +1865,6 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
             &pins,
             &pins,
             usize::MAX,
-            0,
         )
         .expect("a non-numeric literal must not throw on the hot-only lane");
     assert_eq!(word.row_count(), 1, "'200' is not the text 'accepted'");
@@ -1961,10 +1947,10 @@ fn setup_pinned_kv() -> (Executor, String, FieldTypes, tempfile::TempDir) {
 fn extract_kv_tail_where_is_pin_aware() {
     let (exec, src, ft, _dir) = setup_pinned_kv();
     let with_kv = exec
-        .run_query("* | extract kv | where status > 400", &src, &ft, 1000, 0)
+        .run_query("* | extract kv | where status > 400", &src, &ft, 1000)
         .unwrap();
     let without_kv = exec
-        .run_query("* | where status > 400", &src, &ft, 1000, 0)
+        .run_query("* | where status > 400", &src, &ft, 1000)
         .unwrap();
     // '404' and '500' compare in the DECIMAL space; 'accepted' and '1.5'
     // vs 400 are UNKNOWN/false; '200' is below.
@@ -1977,7 +1963,7 @@ fn extract_kv_tail_where_is_pin_aware() {
 
     // The equality rung too: '200' matches == 200 as text.
     let eq_kv = exec
-        .run_query("* | extract kv | where status == 200", &src, &ft, 1000, 0)
+        .run_query("* | extract kv | where status == 200", &src, &ft, 1000)
         .unwrap();
     assert_eq!(eq_kv.row_count(), 1);
 }
@@ -1993,7 +1979,6 @@ fn extract_kv_tail_after_rename_carries_the_remapped_pin() {
             &src,
             &ft,
             1000,
-            0,
         )
         .unwrap();
     assert_eq!(result.row_count(), 2, "the pin travels under the new name");
@@ -2011,7 +1996,6 @@ fn extract_kv_tail_without_pins_stays_literal_driven() {
             &src,
             &FieldTypes::new(),
             1000,
-            0,
         )
         .unwrap();
     assert_eq!(result.row_count(), 0, "embedded mode keeps today's answer");
@@ -2037,50 +2021,32 @@ fn setup_pinned_time() -> (Executor, String, FieldTypes, tempfile::TempDir) {
     (exec, format!("{}", path.display()), ft, dir)
 }
 
-/// The tail's pin-aware TIMESTAMP comparison reads the STORED instant, not
-/// the caller's display offset: `utc_offset_secs` is a rendering knob, so
-/// the same query must answer the same rows in every display zone — and
-/// exactly what the split-free query answers.
+/// The tail's pin-aware TIMESTAMP comparison reads the STORED instant, and
+/// the surviving column is still that TIMESTAMP, typed and rendered as one.
 #[test]
-fn extract_kv_tail_timestamp_compare_ignores_the_display_offset() {
+fn extract_kv_tail_timestamp_compare_reads_the_stored_instant() {
     let (exec, src, ft, _dir) = setup_pinned_time();
     let dsl = "* | extract kv | where _time > \"2026-01-01T05:00:00Z\"";
-    for (offset, rendered) in [
-        (0, "2026-01-01T05:30:00.000000Z"),
-        (-18_000, "2026-01-01T00:30:00.000000-05:00"),
-        (19_800, "2026-01-01T11:00:00.000000+05:30"),
-    ] {
-        let result = exec.run_query(dsl, &src, &ft, 1000, offset).unwrap();
-        assert_eq!(
-            result.row_count(),
-            1,
-            "05:30Z is after 05:00Z whatever zone the client displays in (offset {offset})"
-        );
-        // The tail compared the stored instant; the column it passed
-        // through is still that TIMESTAMP, typed and rendered as one.
-        let idx = result
-            .columns
-            .iter()
-            .position(|c| c.name == "_time")
-            .expect("_time column");
-        assert_eq!(result.columns[idx].ty, ColumnType::Timestamp, "{offset}");
-        assert_eq!(
-            result.rows[0][idx],
-            Value::String(rendered.into()),
-            "{offset}"
-        );
-    }
-    // The threshold that genuinely excludes the row excludes it everywhere.
+    let result = exec.run_query(dsl, &src, &ft, 1000).unwrap();
+    assert_eq!(result.row_count(), 1, "05:30Z is after 05:00Z");
+    // The tail compared the stored instant; the column it passed
+    // through is still that TIMESTAMP, typed and rendered as one.
+    let idx = result
+        .columns
+        .iter()
+        .position(|c| c.name == "_time")
+        .expect("_time column");
+    assert_eq!(result.columns[idx].ty, ColumnType::Timestamp);
+    assert_eq!(
+        result.rows[0][idx],
+        Value::String("2026-01-01T05:30:00.000000Z".into())
+    );
+    // The threshold that genuinely excludes the row excludes it.
     let after = "* | extract kv | where _time > \"2026-01-01T06:00:00Z\"";
-    for offset in [0, -18_000, 19_800] {
-        assert_eq!(
-            exec.run_query(after, &src, &ft, 1000, offset)
-                .unwrap()
-                .row_count(),
-            0,
-            "offset {offset}"
-        );
-    }
+    assert_eq!(
+        exec.run_query(after, &src, &ft, 1000).unwrap().row_count(),
+        0
+    );
     // And it agrees with the same predicate without the kv split.
     assert_eq!(
         exec.run_query(
@@ -2088,7 +2054,6 @@ fn extract_kv_tail_timestamp_compare_ignores_the_display_offset() {
             &src,
             &ft,
             1000,
-            -18_000,
         )
         .unwrap()
         .row_count(),
@@ -2096,18 +2061,16 @@ fn extract_kv_tail_timestamp_compare_ignores_the_display_offset() {
     );
 }
 
-/// Running the tail over UTC does not cost the caller its display zone:
-/// the surviving TIMESTAMP columns are rendered in it afterwards, so the
-/// cell is the same one the split-free query prints.
+/// Running the tail over cast text does not cost the cell its wire
+/// rendering: the surviving TIMESTAMP columns are rendered afterwards, so
+/// the cell is the same one the split-free query prints.
 #[test]
-fn extract_kv_tail_still_renders_timestamps_in_the_display_zone() {
+fn extract_kv_tail_still_renders_timestamps_as_wire_text() {
     let (exec, src, ft, _dir) = setup_pinned_time();
     let with_kv = exec
-        .run_query("* | extract kv | head 5", &src, &ft, 1000, -18_000)
+        .run_query("* | extract kv | head 5", &src, &ft, 1000)
         .unwrap();
-    let without_kv = exec
-        .run_query("* | head 5", &src, &ft, 1000, -18_000)
-        .unwrap();
+    let without_kv = exec.run_query("* | head 5", &src, &ft, 1000).unwrap();
     let cell = |result: &QueryResult| {
         let idx = result
             .columns
@@ -2118,16 +2081,16 @@ fn extract_kv_tail_still_renders_timestamps_in_the_display_zone() {
     };
     assert_eq!(
         cell(&with_kv),
-        Value::String("2026-01-01T00:30:00.000000-05:00".into())
+        Value::String("2026-01-01T05:30:00.000000Z".into())
     );
     assert_eq!(cell(&with_kv), cell(&without_kv));
 }
 
-/// The display offset follows the tail's own lineage: a timestamp column
-/// renamed INSIDE the tail still renders in the caller's zone under its
-/// new name — the value is untransformed, only the label moved.
+/// The wire rendering follows the tail's own lineage: a timestamp column
+/// renamed INSIDE the tail still renders as wire text under its new name,
+/// the value untransformed and only the label moved.
 #[test]
-fn extract_kv_tail_rename_keeps_the_display_zone() {
+fn extract_kv_tail_rename_keeps_the_wire_rendering() {
     let (exec, src, ft, _dir) = setup_pinned_time();
     let result = exec
         .run_query(
@@ -2135,15 +2098,14 @@ fn extract_kv_tail_rename_keeps_the_display_zone() {
             &src,
             &ft,
             1000,
-            -18_000,
         )
         .unwrap();
     assert_eq!(result.columns.len(), 1);
     assert_eq!(result.columns[0].name, "t");
     assert_eq!(
         result.rows[0][0],
-        Value::String("2026-01-01T00:30:00.000000-05:00".into()),
-        "the renamed column is still the stored instant and shifts with it"
+        Value::String("2026-01-01T05:30:00.000000Z".into()),
+        "the renamed column is still the stored instant"
     );
 }
 
@@ -2155,7 +2117,7 @@ fn extract_kv_tail_rename_keeps_the_display_zone() {
 fn extract_kv_tail_keeps_the_projected_column_order() {
     let (exec, src, ft, _dir) = setup_pinned_time();
     let names = |dsl: &str| -> Vec<String> {
-        exec.run_query(dsl, &src, &ft, 1000, 0)
+        exec.run_query(dsl, &src, &ft, 1000)
             .unwrap()
             .columns
             .into_iter()
@@ -2180,10 +2142,9 @@ fn extract_kv_tail_keeps_the_projected_column_order() {
 }
 
 /// `let t2 = _time` copies the value verbatim, so both columns must show
-/// the same rendering in the caller's zone, never one local and one UTC
-/// side by side.
+/// the same rendering, never one wire text and one cast text side by side.
 #[test]
-fn extract_kv_tail_alias_copy_keeps_the_display_zone() {
+fn extract_kv_tail_alias_copy_keeps_the_wire_rendering() {
     let (exec, src, ft, _dir) = setup_pinned_time();
     let result = exec
         .run_query(
@@ -2191,7 +2152,6 @@ fn extract_kv_tail_alias_copy_keeps_the_display_zone() {
             &src,
             &ft,
             1000,
-            -18_000,
         )
         .unwrap();
     let cell = |name: &str| {
@@ -2204,19 +2164,18 @@ fn extract_kv_tail_alias_copy_keeps_the_display_zone() {
     };
     assert_eq!(
         cell("_time"),
-        Value::String("2026-01-01T00:30:00.000000-05:00".into())
+        Value::String("2026-01-01T05:30:00.000000Z".into())
     );
     assert_eq!(
         cell("t2"),
         cell("_time"),
-        "an alias copy is the same instant and must display in the same zone"
+        "an alias copy is the same instant and must render the same"
     );
 }
 
 /// A COMPUTED value is the tail's own, not the stored rendering: the
 /// lineage kills it and it stays exactly as the tail produced it (UTC
-/// text here) — the honest reading for a transformed value, never a
-/// re-shifted guess.
+/// text here) — the honest reading for a transformed value.
 #[test]
 fn extract_kv_tail_computed_value_stays_as_rendered() {
     let (exec, src, ft, _dir) = setup_pinned_time();
@@ -2226,7 +2185,6 @@ fn extract_kv_tail_computed_value_stays_as_rendered() {
             &src,
             &ft,
             1000,
-            -18_000,
         )
         .unwrap();
     let cell = |name: &str| {
@@ -2239,7 +2197,7 @@ fn extract_kv_tail_computed_value_stays_as_rendered() {
     };
     assert_eq!(
         cell("_time"),
-        Value::String("2026-01-01T00:30:00.000000-05:00".into())
+        Value::String("2026-01-01T05:30:00.000000Z".into())
     );
     assert_eq!(
         cell("t3"),
@@ -2295,7 +2253,7 @@ fn run_at_anchor(exec: &Executor, dsl: &str, source: &str) -> Result<QueryResult
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let emitted =
         trawl_core::emitter::emit(&query, source, fixed_anchor()).expect("emit should succeed");
-    exec.execute_emitted(&emitted, usize::MAX, 0)
+    exec.execute_emitted(&emitted, usize::MAX)
 }
 
 /// [`run_at_anchor`], with the emitter told what `source` carries, as the
@@ -2332,7 +2290,7 @@ fn run_at_anchor_described(
         fixed_anchor(),
     )
     .expect("emit should succeed");
-    exec.execute_emitted(&emitted, usize::MAX, 0)
+    exec.execute_emitted(&emitted, usize::MAX)
 }
 
 fn integer_at(result: &QueryResult, row: usize, name: &str) -> i64 {

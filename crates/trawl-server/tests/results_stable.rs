@@ -104,7 +104,6 @@ async fn query_rows(server: &TestServer, dsl: &str) -> usize {
             query: dsl.to_owned(),
             limit: Some(10_000),
             offset: None,
-            timezone: None,
         })
         .send()
         .await
