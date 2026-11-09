@@ -23,7 +23,7 @@ case "${4:-}" in
   --cli-only)
     "${command[@]}" --locked --release --target "$build_target" --no-default-features --features trawl-cli/clipboard -p trawl-cli --bin trawl ;;
   --image-only)
-    "${command[@]}" --locked --release --target "$build_target" --no-default-features -p trawl-server -p trawl-admin -p fleet-admin -p trawl-web --bins ;;
+    "${command[@]}" --locked --release --target "$build_target" --no-default-features -p trawl-server -p fleet-admin -p trawl-web --bins ;;
   "")
     "${command[@]}" --locked --release --target "$build_target" --no-default-features --features trawl-cli/clipboard --workspace --exclude trawl-web-ui ;;
   *) echo 'unsupported distribution build option' >&2; exit 1 ;;

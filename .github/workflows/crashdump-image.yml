@@ -98,7 +98,7 @@ jobs:
       - name: Precompress SPA + enforce wire-size budgets
         run: cargo xtask compress-web
 
-      # Exactly the four binaries the Dockerfile COPYs, in the release profile
+      # Exactly the three binaries the Dockerfile COPYs, in the release profile
       # with the shipped glibc floor. Named individually rather than
       # --workspace: the CLI and TUI are not in the image and this job is
       # already the most expensive one in the repo.
