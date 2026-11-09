@@ -2508,8 +2508,9 @@ struct StoreFault<'a> {
 }
 
 /// Log a store fault on a repin path: `error_class` and `cause_kind` at
-/// `level`, and the error's text at DEBUG only (ADR-0040, amended
-/// 2026-11-08), as the scheduler's `log_store_fault` does.
+/// `level`, and the error's text and the field name at DEBUG only
+/// (ADR-0040, amended 2026-11-08), as the scheduler's `log_store_fault`
+/// does. A pinned field's name can come from an ingest sender.
 fn log_store_fault(level: Loudness, at: StoreFault<'_>, err: StoreError, what: &'static str) {
     let StoreFault {
         event_type,
@@ -2525,7 +2526,6 @@ fn log_store_fault(level: Loudness, at: StoreFault<'_>, err: StoreError, what: &
             event_type,
             job_id,
             attempt,
-            field,
             error_class,
             cause_kind,
             "{what}"
@@ -2534,7 +2534,6 @@ fn log_store_fault(level: Loudness, at: StoreFault<'_>, err: StoreError, what: &
             event_type,
             job_id,
             attempt,
-            field,
             error_class,
             cause_kind,
             "{what}"
@@ -3641,6 +3640,9 @@ mod tests {
         use tracing::Level;
 
         const MARKER: &str = "/var/lib/trawl/data/MARKER-repin-store";
+        // A pinned field's name can come from an ingest sender, so it is
+        // content: DEBUG only, like the driver text.
+        const FIELD: &str = "zz_field_marker";
         const SOURCE: &str = include_str!("engine.rs");
         let planted = || StoreError::Unavailable(sqlx::Error::Protocol(MARKER.into()));
         let expected = ServerError::from(planted());
@@ -3652,7 +3654,7 @@ mod tests {
                 Level::WARN,
                 StoreFault {
                     event_type: "catalog_bookkeeping_error",
-                    field: Some("latency"),
+                    field: Some(FIELD),
                     ..StoreFault::default()
                 },
             ),
@@ -3676,7 +3678,7 @@ mod tests {
                 },
             ),
         ] {
-            let event_type = at.event_type;
+            let (event_type, at_field) = (at.event_type, at.field.is_some());
             let events = events_of(|| log_store_fault(loudness, at, planted(), "a repin fault"));
             let loud: Vec<_> = events.iter().filter(|e| e.is_default_level()).collect();
             assert_eq!(loud.len(), 1, "{event_type}: {events:?}");
@@ -3699,12 +3701,17 @@ mod tests {
             );
             assert!(!event.fields.contains_key("error"), "{event:?}");
             assert!(!event.text().contains("MARKER"), "{event:?}");
+            assert!(!event.fields.contains_key("field"), "{event:?}");
+            assert!(!event.text().contains(FIELD), "{event:?}");
 
             let debug = events
                 .iter()
                 .find(|e| e.level == Level::DEBUG)
                 .unwrap_or_else(|| panic!("{event_type}: no DEBUG event: {events:?}"));
             assert!(debug.text().contains(MARKER), "{debug:?}");
+            if at_field {
+                assert!(debug.text().contains(FIELD), "{debug:?}");
+            }
         }
 
         for (from, to) in [
