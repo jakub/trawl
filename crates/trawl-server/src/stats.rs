@@ -154,17 +154,13 @@ fn emit_stats(
     );
 }
 
+/// Event capture for the loop tests below.
 #[cfg(test)]
-mod tests {
+mod support {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
-    use tokio::sync::{mpsc, watch};
-    use tracing_subscriber::prelude::*;
-
-    type Events = Arc<Mutex<Vec<HashMap<String, String>>>>;
+    pub(super) type Events = Arc<Mutex<Vec<HashMap<String, String>>>>;
 
     struct Fields<'a>(&'a mut HashMap<String, String>);
 
@@ -177,7 +173,7 @@ mod tests {
         }
     }
 
-    struct Capture(Events);
+    pub(super) struct Capture(pub(super) Events);
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
         fn on_event(
@@ -190,99 +186,113 @@ mod tests {
             self.0.lock().unwrap().push(fields);
         }
     }
+}
 
-    /// The first collection panics with a payload that names a path; the
-    /// next tick collects again, the failure event quotes neither, and
-    /// shutdown still ends the loop. The panic's default stderr report is
-    /// expected test output.
-    #[tokio::test(start_paused = true)]
-    async fn a_failed_collection_does_not_end_the_loop() {
-        // The run future is polled on this thread, so its events land here.
-        let events = Events::default();
-        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
-        let _capturing = tracing::subscriber::set_default(subscriber);
+/// The first collection panics with a payload that names a path; the
+/// next tick collects again, the failure event quotes neither, and
+/// shutdown still ends the loop. The panic's default stderr report is
+/// expected test output.
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn a_failed_collection_does_not_end_the_loop() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (collected_tx, mut collected_rx) = mpsc::unbounded_channel();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let on_tick = {
-            let calls = Arc::clone(&calls);
+    use tokio::sync::mpsc;
+    use tracing_subscriber::prelude::*;
+
+    use support::{Capture, Events};
+
+    // The run future is polled on this thread, so its events land here.
+    let events = Events::default();
+    let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+    let _capturing = tracing::subscriber::set_default(subscriber);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (collected_tx, mut collected_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let on_tick = {
+        let calls = Arc::clone(&calls);
+        move || {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            let collected_tx = collected_tx.clone();
             move || {
-                let call = calls.fetch_add(1, Ordering::SeqCst);
-                let collected_tx = collected_tx.clone();
-                move || {
-                    if call == 0 {
-                        std::panic::panic_any("PRIVATE-PAYLOAD /secret/path");
-                    }
-                    collected_tx.send(call).unwrap();
+                if call == 0 {
+                    std::panic::panic_any("PRIVATE-PAYLOAD /secret/path");
                 }
+                collected_tx.send(call).unwrap();
             }
-        };
-        let run = tokio::spawn(super::run(Duration::from_secs(60), shutdown_rx, on_tick));
-
-        // Paused time advances to each tick on its own once nothing else
-        // can run; the second tick follows the panicked first.
-        assert_eq!(collected_rx.recv().await, Some(1));
-
-        shutdown_tx.send(true).unwrap();
-        run.await.expect("the stats loop returns after shutdown");
-
-        let events = events.lock().unwrap();
-        let failures: Vec<_> = events
-            .iter()
-            .filter(|e| e.get("event_type").map(String::as_str) == Some("stats_collection_failed"))
-            .collect();
-        assert_eq!(failures.len(), 1, "one failure event: {events:?}");
-        for value in failures[0].values() {
-            assert!(
-                !value.contains("PRIVATE") && !value.contains("/secret"),
-                "the failure event quotes the panic payload: {value}"
-            );
         }
-        assert_eq!(
-            failures[0].get("error").map(String::as_str),
-            Some("stats gauge collection task panicked")
+    };
+    let handle = tokio::spawn(run(Duration::from_secs(60), shutdown_rx, on_tick));
+
+    // Paused time advances to each tick on its own once nothing else
+    // can run; the second tick follows the panicked first.
+    assert_eq!(collected_rx.recv().await, Some(1));
+
+    shutdown_tx.send(true).unwrap();
+    handle.await.expect("the stats loop returns after shutdown");
+
+    let events = events.lock().unwrap();
+    let failures: Vec<_> = events
+        .iter()
+        .filter(|e| e.get("event_type").map(String::as_str) == Some("stats_collection_failed"))
+        .collect();
+    assert_eq!(failures.len(), 1, "one failure event: {events:?}");
+    for value in failures[0].values() {
+        assert!(
+            !value.contains("PRIVATE") && !value.contains("/secret"),
+            "the failure event quotes the panic payload: {value}"
         );
     }
+    assert_eq!(
+        failures[0].get("error").map(String::as_str),
+        Some("stats gauge collection task panicked")
+    );
+}
 
-    /// Shutdown sent while a collection runs waits for that collection.
-    #[tokio::test(start_paused = true)]
-    async fn shutdown_waits_for_the_collection_in_flight() {
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
-        let finished = Arc::new(AtomicUsize::new(0));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let on_tick = {
+/// Shutdown sent while a collection runs waits for that collection.
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_the_collection_in_flight() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::mpsc;
+
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let on_tick = {
+        let finished = Arc::clone(&finished);
+        move || {
+            // Only the first collection holds; any later one is a no-op.
+            let gate = release_rx.lock().unwrap().take();
+            let started_tx = started_tx.clone();
             let finished = Arc::clone(&finished);
             move || {
-                // Only the first collection holds; any later one is a no-op.
-                let gate = release_rx.lock().unwrap().take();
-                let started_tx = started_tx.clone();
-                let finished = Arc::clone(&finished);
-                move || {
-                    if let Some(gate) = gate {
-                        started_tx.send(()).unwrap();
-                        gate.recv().unwrap();
-                        finished.fetch_add(1, Ordering::SeqCst);
-                    }
+                if let Some(gate) = gate {
+                    started_tx.send(()).unwrap();
+                    gate.recv().unwrap();
+                    finished.fetch_add(1, Ordering::SeqCst);
                 }
             }
-        };
-        let run = tokio::spawn(super::run(Duration::from_secs(60), shutdown_rx, on_tick));
-
-        started_rx.recv().await.unwrap();
-        shutdown_tx.send(true).unwrap();
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
         }
-        assert!(
-            !run.is_finished(),
-            "the loop left before its collection finished"
-        );
+    };
+    let handle = tokio::spawn(run(Duration::from_secs(60), shutdown_rx, on_tick));
 
-        release_tx.send(()).unwrap();
-        run.await.expect("the stats loop returns after shutdown");
-        assert_eq!(finished.load(Ordering::SeqCst), 1);
+    started_rx.recv().await.unwrap();
+    shutdown_tx.send(true).unwrap();
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
     }
+    assert!(
+        !handle.is_finished(),
+        "the loop left before its collection finished"
+    );
+
+    release_tx.send(()).unwrap();
+    handle.await.expect("the stats loop returns after shutdown");
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
 }
