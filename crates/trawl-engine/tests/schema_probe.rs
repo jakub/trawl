@@ -312,6 +312,7 @@ fn present_field_sql_is_unchanged() {
     let export = lane_statements(&fixture, "export", export_queries(), |dsl| {
         prepared("export", dsl, || {
             exec.export_parquet(dsl, &fixture.cold, &pins, &out, usize::MAX)
+                .map(drop)
         })
     });
     insta::assert_snapshot!("export", export);
@@ -328,6 +329,7 @@ fn present_field_sql_is_unchanged() {
                 &out,
                 usize::MAX,
             )
+            .map(drop)
         })
     });
     insta::assert_snapshot!("export_hot_and_cold", export_hot);
@@ -455,23 +457,27 @@ impl<'a> Request<'a> {
                     0,
                 )
                 .map(drop),
-            Lane::Export => lanes.export_parquet(
-                dsl,
-                source,
-                self.pins,
-                out.as_deref().expect("an export path"),
-                usize::MAX,
-            ),
-            Lane::ExportHotAndCold => lanes.export_parquet_with_hot(
-                dsl,
-                source,
-                hot,
-                &hot_columns,
-                self.hot_pins,
-                self.pins,
-                out.as_deref().expect("an export path"),
-                usize::MAX,
-            ),
+            Lane::Export => lanes
+                .export_parquet(
+                    dsl,
+                    source,
+                    self.pins,
+                    out.as_deref().expect("an export path"),
+                    usize::MAX,
+                )
+                .map(drop),
+            Lane::ExportHotAndCold => lanes
+                .export_parquet_with_hot(
+                    dsl,
+                    source,
+                    hot,
+                    &hot_columns,
+                    self.hot_pins,
+                    self.pins,
+                    out.as_deref().expect("an export path"),
+                    usize::MAX,
+                )
+                .map(drop),
         };
         (outcome, out)
     }
@@ -760,7 +766,9 @@ fn envelope_timestamp_absent_is_loud() {
 
     let both_lanes = |dsl: &str| {
         let queried = exec.run_query(dsl, &source, &pins, usize::MAX, 0).map(drop);
-        let exported = exec.export_parquet(dsl, &source, &pins, &out, usize::MAX);
+        let exported = exec
+            .export_parquet(dsl, &source, &pins, &out, usize::MAX)
+            .map(drop);
         assert!(!out.exists(), "`{dsl}`: a refused export writes nothing");
         [("query", queried), ("export", exported)]
     };

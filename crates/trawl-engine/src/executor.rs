@@ -455,7 +455,7 @@ impl Cancellable<'_> {
         pins: &FieldTypes,
         output_path: &Path,
         max_rows: usize,
-    ) -> Result<(), EngineError> {
+    ) -> Result<usize, EngineError> {
         self.executor.export_parquet_latched(
             dsl,
             source,
@@ -481,7 +481,7 @@ impl Cancellable<'_> {
         pins: &FieldTypes,
         output_path: &Path,
         max_rows: usize,
-    ) -> Result<(), EngineError> {
+    ) -> Result<usize, EngineError> {
         self.executor.export_parquet_with_hot_latched(
             dsl,
             source,
@@ -1577,7 +1577,8 @@ impl Executor {
     /// Export query results directly to a Parquet file via `DuckDB` `COPY TO`.
     ///
     /// Uses a temp table to stage the query results, then writes them to
-    /// the output path as Snappy-compressed Parquet.
+    /// the output path as Snappy-compressed Parquet, and returns the number
+    /// of rows written.
     ///
     /// Returns an error if the pipeline contains Rust post-processing stages
     /// (e.g. `extract kv`) since those can't be expressed as pure SQL.
@@ -1595,7 +1596,7 @@ impl Executor {
         pins: &FieldTypes,
         output_path: &Path,
         max_rows: usize,
-    ) -> Result<(), EngineError> {
+    ) -> Result<usize, EngineError> {
         self.export_parquet_latched(
             dsl,
             source,
@@ -1621,7 +1622,7 @@ impl Executor {
         cancel: &CancelLatch,
         clock: &PhaseClock,
         re2: Option<NonZeroU32>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<usize, EngineError> {
         // The export's one ledger: its statement's RE2 allowance, held
         // until the lane returns.
         let mut ledger = Preparer::new().with_stop(cancel.stop());
@@ -1671,7 +1672,8 @@ impl Executor {
         }
     }
 
-    /// Export with hot buffer union, falling back to hot-only on cold start.
+    /// Export with hot buffer union, falling back to hot-only on cold start,
+    /// and return the number of rows written.
     ///
     /// Routes through the same resolution and the same outcome gate as
     /// [`Self::run_query_with_hot`]: the hot branch is pin-conformed by the
@@ -1698,7 +1700,7 @@ impl Executor {
         pins: &FieldTypes,
         output_path: &Path,
         max_rows: usize,
-    ) -> Result<(), EngineError> {
+    ) -> Result<usize, EngineError> {
         self.export_parquet_with_hot_latched(
             dsl,
             source,
@@ -1731,7 +1733,7 @@ impl Executor {
         cancel: &CancelLatch,
         clock: &PhaseClock,
         re2: Option<NonZeroU32>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<usize, EngineError> {
         // The export's one ledger, as on the cold lane.
         let mut ledger = Preparer::new().with_stop(cancel.stop());
         let ast = clock
@@ -1819,7 +1821,7 @@ impl Executor {
         clock: &PhaseClock,
         re2: Option<NonZeroU32>,
         ledger: &mut Preparer,
-    ) -> Result<(), EngineError> {
+    ) -> Result<usize, EngineError> {
         // Same rule as the query lane: no second bind starts once the
         // caller has asked for this work to stop.
         cancel.check()?;
@@ -1871,7 +1873,7 @@ impl Executor {
         let prepared = clock.time(QueryPhase::Bind, || {
             prepare_statement(&self.conn, &create_sql)
         });
-        match prepared {
+        let rows = match prepared {
             Ok(mut stmt) => {
                 // The export's bind-to-execute boundary: the staging
                 // SELECT is the whole query, so this is the same bind the
@@ -1880,19 +1882,30 @@ impl Executor {
                     cleanup(&self.conn);
                     return Err(EngineError::Cancelled);
                 }
-                // Staging is the export's `execute` (ADR-0046).
-                let staged =
-                    clock.time(QueryPhase::Execute, || stmt.execute(param_refs.as_slice()));
-                if let Err(e) = staged {
-                    cleanup(&self.conn);
-                    return Err(staging_failure(e));
+                // Staging is the export's `execute` (ADR-0046). The
+                // staged table holds exactly the rows the COPY writes, so
+                // its count is the export's row count; a prepared CTAS
+                // reports no changed rows to count instead.
+                let staged = clock.time(QueryPhase::Execute, || {
+                    stmt.execute(param_refs.as_slice())?;
+                    self.conn
+                        .query_row("SELECT count(*) FROM __trawl_export", [], |row| {
+                            row.get::<_, usize>(0)
+                        })
+                });
+                match staged {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        cleanup(&self.conn);
+                        return Err(staging_failure(e));
+                    }
                 }
             }
             Err(e) => {
                 cleanup(&self.conn);
                 return Err(staging_failure(e));
             }
-        }
+        };
 
         // Staging and COPY are separate statements. A cancellation that
         // arrived during staging must stop here, even if staging succeeded.
@@ -1915,7 +1928,7 @@ impl Executor {
                 return Err(e.into());
             }
             cleanup(&self.conn);
-            Ok(())
+            Ok(rows)
         })
     }
 
@@ -2493,7 +2506,16 @@ fn write_capture_ndjson(
             };
             record.insert(format!("c{position}"), cell);
         }
-        serde_json::to_writer(&mut out, &record).map_err(|e| unencodable(&e))?;
+        // A failed write inside the encoder is the staging file's fault,
+        // not the result's: it answers as the I/O error it is, whose public
+        // message is fixed, rather than as an encoding refusal quoting it.
+        serde_json::to_writer(&mut out, &record).map_err(|e| {
+            if e.is_io() {
+                EngineError::Io(e.into())
+            } else {
+                unencodable(&e)
+            }
+        })?;
         out.write_all(b"\n")?;
     }
     out.flush()?;
@@ -2550,7 +2572,13 @@ fn write_wire_ndjson(result: &QueryResult, path: &Path) -> Result<(), EngineErro
             .enumerate()
             .map(|(index, cell)| (format!("c{index}"), cell))
             .collect::<serde_json::Map<_, _>>();
-        serde_json::to_writer(&mut file, &record).map_err(|e| unencodable(&e))?;
+        serde_json::to_writer(&mut file, &record).map_err(|e| {
+            if e.is_io() {
+                EngineError::Io(e.into())
+            } else {
+                unencodable(&e)
+            }
+        })?;
         file.write_all(b"\n")?;
     }
     file.flush()?;
@@ -3020,9 +3048,9 @@ fn classify_query_outcome(outcome: Result<&QueryResult, &EngineError>) -> HotCol
 /// remapped at staging as on the query path ([`staging_failure`]), so it
 /// arrives as `Emit`, beside the emitter's own refusals (a `rust_stages`
 /// pipeline, a non-UTF-8 path).
-fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome {
+fn classify_export_outcome(outcome: &Result<usize, EngineError>) -> HotColdOutcome {
     match outcome {
-        Ok(()) => HotColdOutcome::Columns,
+        Ok(_) => HotColdOutcome::Columns,
         Err(EngineError::Database(e)) if is_no_files_error(e) => HotColdOutcome::NoColumns,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
         // As on the query lane: an emitter refusal, a `Refused`, an
@@ -4995,6 +5023,55 @@ mod tests {
     use crate::cancel::CancelLatch;
     use crate::timing::{Fallback, PhaseClock, PhaseTotals, QueryPhase, Transition};
 
+    /// A staging write that fails inside the encoder is the filesystem's
+    /// fault, not the query's: it answers as [`EngineError::Io`], whose
+    /// public message is fixed, and never as an emit refusal quoting the
+    /// I/O error. The cell is larger than the writer's buffer, so the
+    /// failure surfaces from `serde_json::to_writer` itself.
+    #[test]
+    fn a_capture_staging_write_failure_is_an_io_error() {
+        use crate::value::{Column, ColumnType, QueryResult, Value};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stage.ndjson");
+        std::fs::write(&path, b"").unwrap();
+        // Opened read-only, so every write fails with EBADF.
+        let file = std::fs::File::open(&path).unwrap();
+        let result = QueryResult {
+            columns: vec![Column::new("big", ColumnType::String)],
+            rows: vec![vec![Value::String("x".repeat(64 * 1024))]],
+        };
+
+        let err = super::write_capture_ndjson(&result, &[super::StoredAs::Native], &file)
+            .expect_err("a write to a read-only handle must fail");
+        assert!(
+            matches!(err, EngineError::Io(_)),
+            "a staging write failure must be an I/O error, got {err:?}"
+        );
+    }
+
+    /// A scheduled result's ndjson staging write that fails inside the
+    /// encoder answers as [`EngineError::Io`], as the capture staging write
+    /// does. `/dev/full` opens fine and fails every write with ENOSPC, and
+    /// the cell is larger than the writer's buffer, so the failure surfaces
+    /// from `serde_json::to_writer` rather than from `File::create`.
+    #[test]
+    fn a_scheduled_result_write_failure_is_an_io_error() {
+        use crate::value::{Column, ColumnType, QueryResult, Value};
+
+        let result = QueryResult {
+            columns: vec![Column::new("big", ColumnType::String)],
+            rows: vec![vec![Value::String("x".repeat(64 * 1024))]],
+        };
+
+        let err = super::write_wire_ndjson(&result, std::path::Path::new("/dev/full"))
+            .expect_err("a write to /dev/full must fail");
+        assert!(
+            matches!(err, EngineError::Io(_)),
+            "a scheduled result write failure must be an I/O error, got {err:?}"
+        );
+    }
+
     /// A connection with `DuckDB`'s structured diagnostics on, as every
     /// executor's is, for provoking the errors the classifiers read.
     fn json_errors_conn() -> Connection {
@@ -6367,17 +6444,21 @@ mod tests {
                         0,
                     )
                     .map(|_| ()),
-                lanes.export_parquet(broken, &cold, &none, &out, 10),
-                lanes.export_parquet_with_hot(
-                    broken,
-                    &cold,
-                    hot_path,
-                    &hot_columns_of(&hot),
-                    &none,
-                    &none,
-                    &out,
-                    10,
-                ),
+                lanes
+                    .export_parquet(broken, &cold, &none, &out, 10)
+                    .map(drop),
+                lanes
+                    .export_parquet_with_hot(
+                        broken,
+                        &cold,
+                        hot_path,
+                        &hot_columns_of(&hot),
+                        &none,
+                        &none,
+                        &out,
+                        10,
+                    )
+                    .map(drop),
             ]
         };
         let names = ["query", "hot query", "export", "hot export"];
@@ -6917,7 +6998,7 @@ mod structured_error_classification {
                 &out,
                 usize::MAX,
             )
-            .map(|()| out)
+            .map(|_| out)
         };
 
         let typed = "* | stats sum(column_name)";
@@ -7035,5 +7116,196 @@ mod structured_error_classification {
                 }
             }
         }
+    }
+}
+
+/// An export returns the number of rows it wrote, and that number is the
+/// written file's row count on every lane: a filter that matches nothing,
+/// a LIMIT below the result size, and an unbounded export.
+#[cfg(test)]
+mod export_row_count {
+    use std::path::Path;
+
+    use duckdb::Connection;
+
+    use super::{Executor, FieldTypes, hot_columns_of};
+
+    const COLD_ROWS: usize = 5;
+    const HOT_ROWS: usize = 3;
+
+    /// (DSL, `max_rows`) for the three shapes the count must hold under.
+    const SHAPES: [(&str, usize); 3] = [("service=nope", usize::MAX), ("*", 2), ("*", usize::MAX)];
+
+    fn write_cold(path: &Path) {
+        Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT TIMESTAMP '2024-01-15 10:00:00' + to_seconds(i) AS \"_time\", \
+                              'svc' AS service, 'm' || i AS message \
+                       FROM range({COLD_ROWS}) t(i)) \
+                 TO '{}' (FORMAT PARQUET)",
+                path.display()
+            ))
+            .unwrap();
+    }
+
+    fn write_hot(path: &Path) {
+        use std::fmt::Write as _;
+
+        let mut lines = String::new();
+        for i in 0..HOT_ROWS {
+            writeln!(
+                lines,
+                "{{\"_time\":\"2024-01-15T11:00:0{i}Z\",\"_ingested\":\"2024-01-15T11:00:0{i}Z\",\"service\":\"svc\",\"message\":\"h{i}\"}}"
+            )
+            .unwrap();
+        }
+        std::fs::write(path, lines).unwrap();
+    }
+
+    fn file_rows(path: &Path) -> usize {
+        let rows: i64 = Connection::open_in_memory()
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    path.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        usize::try_from(rows).unwrap()
+    }
+
+    fn expected(dsl: &str, max_rows: usize, available: usize) -> usize {
+        if dsl == "*" {
+            available.min(max_rows)
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn cold_export_returns_the_written_row_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let hour = dir.path().join("10");
+        std::fs::create_dir_all(&hour).unwrap();
+        write_cold(&hour.join("svc.parquet"));
+        let source = format!("['{}/*.parquet']", hour.display());
+        let exec = Executor::new().unwrap();
+        for (i, (dsl, max_rows)) in SHAPES.into_iter().enumerate() {
+            let out = dir.path().join(format!("cold-{i}.parquet"));
+            let rows = exec
+                .export_parquet(dsl, &source, &FieldTypes::new(), &out, max_rows)
+                .unwrap();
+            assert_eq!(rows, file_rows(&out), "{dsl} / {max_rows}");
+            assert_eq!(
+                rows,
+                expected(dsl, max_rows, COLD_ROWS),
+                "{dsl} / {max_rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn hot_only_export_returns_the_written_row_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let hour = dir.path().join("10");
+        std::fs::create_dir_all(&hour).unwrap();
+        let hot = dir.path().join("hot.ndjson");
+        write_hot(&hot);
+        let source = format!("['{}/*.parquet']", hour.display());
+        let exec = Executor::new().unwrap();
+        for (i, (dsl, max_rows)) in SHAPES.into_iter().enumerate() {
+            let out = dir.path().join(format!("hot-{i}.parquet"));
+            let rows = exec
+                .export_parquet_with_hot(
+                    dsl,
+                    &source,
+                    hot.to_str().unwrap(),
+                    &hot_columns_of(&hot),
+                    &FieldTypes::new(),
+                    &FieldTypes::new(),
+                    &out,
+                    max_rows,
+                )
+                .unwrap();
+            assert_eq!(rows, file_rows(&out), "{dsl} / {max_rows}");
+            assert_eq!(
+                rows,
+                expected(dsl, max_rows, HOT_ROWS),
+                "{dsl} / {max_rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn hot_and_cold_export_returns_the_written_row_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let hour = dir.path().join("10");
+        std::fs::create_dir_all(&hour).unwrap();
+        write_cold(&hour.join("svc.parquet"));
+        let hot = dir.path().join("hot.ndjson");
+        write_hot(&hot);
+        let source = format!("['{}/*.parquet']", hour.display());
+        let exec = Executor::new().unwrap();
+        for (i, (dsl, max_rows)) in SHAPES.into_iter().enumerate() {
+            let out = dir.path().join(format!("union-{i}.parquet"));
+            let rows = exec
+                .export_parquet_with_hot(
+                    dsl,
+                    &source,
+                    hot.to_str().unwrap(),
+                    &hot_columns_of(&hot),
+                    &FieldTypes::new(),
+                    &FieldTypes::new(),
+                    &out,
+                    max_rows,
+                )
+                .unwrap();
+            assert_eq!(rows, file_rows(&out), "{dsl} / {max_rows}");
+            assert_eq!(
+                rows,
+                expected(dsl, max_rows, COLD_ROWS + HOT_ROWS),
+                "{dsl} / {max_rows}"
+            );
+        }
+    }
+
+    /// The cancellable lanes return the same count as the plain ones.
+    #[test]
+    fn cancellable_exports_return_the_written_row_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let hour = dir.path().join("10");
+        std::fs::create_dir_all(&hour).unwrap();
+        write_cold(&hour.join("svc.parquet"));
+        let hot = dir.path().join("hot.ndjson");
+        write_hot(&hot);
+        let source = format!("['{}/*.parquet']", hour.display());
+        let exec = Executor::new().unwrap();
+        let latch = crate::cancel::CancelLatch::never();
+        let lanes = exec.cancellable(&latch);
+        let cold_out = dir.path().join("cold.parquet");
+        let rows = lanes
+            .export_parquet("*", &source, &FieldTypes::new(), &cold_out, usize::MAX)
+            .unwrap();
+        assert_eq!(rows, file_rows(&cold_out));
+        assert_eq!(rows, COLD_ROWS);
+        let union_out = dir.path().join("union.parquet");
+        let rows = lanes
+            .export_parquet_with_hot(
+                "*",
+                &source,
+                hot.to_str().unwrap(),
+                &hot_columns_of(&hot),
+                &FieldTypes::new(),
+                &FieldTypes::new(),
+                &union_out,
+                usize::MAX,
+            )
+            .unwrap();
+        assert_eq!(rows, file_rows(&union_out));
+        assert_eq!(rows, COLD_ROWS + HOT_ROWS);
     }
 }

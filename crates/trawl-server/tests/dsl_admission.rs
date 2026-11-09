@@ -169,6 +169,117 @@ async fn every_entry_point_refuses_the_same_over_budget_dsl() {
     );
 }
 
+/// A time clause neither lane can hold is a parse error over that clause
+/// (ADR-0017 and ADR-0061, amendments of 2026-11-08), and every door says
+/// so the same way: `/query` and stream setup answer 400 with one body,
+/// and `/validate`, whose refusal is its own 200 answer, carries that
+/// body's detail as its error. Before the parser owned these refusals the
+/// stream opened a live tail on `last=1h earliest="…"`, which `/query`
+/// refused, and dropped a bound it could not read.
+#[tokio::test(flavor = "multi_thread")]
+async fn time_clause_refusals_match_across_doors() {
+    let server = common::setup().await;
+    let http = raw_client();
+    let token = &server.analyst_token;
+
+    let unreadable = "cannot read this time bound as a timestamp";
+    let with_last = "cannot combine 'last=' with 'earliest='/'latest='";
+    // (query, the clause the refusal covers, its sentence)
+    let cases = [
+        (
+            r#"earliest="yesterday" service=api"#,
+            r#"earliest="yesterday""#,
+            unreadable,
+        ),
+        (
+            r#"service=api latest="10000-01-01""#,
+            r#"latest="10000-01-01""#,
+            unreadable,
+        ),
+        (
+            r#"service=api latest="300000-01-01""#,
+            r#"latest="300000-01-01""#,
+            unreadable,
+        ),
+        (
+            r#"earliest="bad" earliest="2026-03-14""#,
+            r#"earliest="bad""#,
+            unreadable,
+        ),
+        (
+            r#"last=1h earliest="2026-03-14""#,
+            r#"earliest="2026-03-14""#,
+            with_last,
+        ),
+        (
+            r#"last=1h latest="2026-03-14" | stats count()"#,
+            r#"latest="2026-03-14""#,
+            with_last,
+        ),
+    ];
+
+    let answer = |response: reqwest::Response| async move {
+        let status = response.status();
+        let body = response.text().await.expect("response body");
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("body is not JSON ({e}): {body}"));
+        (status, value)
+    };
+    for (dsl, clause, sentence) in cases {
+        let at = dsl.find(clause).expect("the clause is in the text");
+        let span = serde_json::json!({ "start": at, "end": at + clause.len() });
+
+        let (query_status, query) = answer(
+            http.post(format!("{}/api/v1/query", server.url))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "query": dsl }))
+                .send()
+                .await
+                .expect("query request"),
+        )
+        .await;
+        let (stream_status, stream) = answer(
+            http.get(format!("{}/api/v1/stream", server.url))
+                .query(&[("query", dsl)])
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("stream request"),
+        )
+        .await;
+        let (validate_status, validation) = answer(
+            http.post(format!("{}/api/v1/validate", server.url))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "query": dsl }))
+                .send()
+                .await
+                .expect("validate request"),
+        )
+        .await;
+
+        assert_eq!(query_status, 400, "{dsl}: /query refuses: {query}");
+        assert_eq!(stream_status, 400, "{dsl}: stream setup refuses: {stream}");
+        assert_eq!(stream, query, "{dsl}: /query and stream answer one body");
+        let error = &query["error"];
+        assert_eq!(error["code"], "parse_error", "{dsl}: {query}");
+        assert_eq!(error["message"], sentence, "{dsl}: {query}");
+        let details = error["details"].as_array().expect("the envelope's details");
+        assert_eq!(details.len(), 1, "{dsl}: one refusal: {query}");
+        let detail = &details[0];
+        assert_eq!(detail["message"], sentence, "{dsl}");
+        assert_eq!(detail["span"], span, "{dsl}: the span covers {clause}");
+        assert!(detail["hint"].is_string(), "{dsl}: a hint names the fix");
+
+        assert_eq!(validate_status, 200, "{dsl}: {validation}");
+        assert_eq!(validation["valid"], false, "{dsl}: {validation}");
+        assert_eq!(
+            validation["errors"],
+            serde_json::json!([detail]),
+            "{dsl}: /validate reports the same detail"
+        );
+    }
+}
+
 /// A refused write is not a partial write: the create leaves no row and
 /// the update leaves the stored text alone.
 #[tokio::test(flavor = "multi_thread")]

@@ -178,7 +178,7 @@ fn run(lane: Lane, corpus: &Corpus, source: &str, hot: &Path) -> Result<usize, E
             .map(|r| r.row_count()),
         Lane::Export => exec
             .export_parquet("*", source, &pins, &out, 1000)
-            .map(|()| corpus.count_exported(&out)),
+            .map(|_| corpus.count_exported(&out)),
         Lane::ExportHot => exec
             .export_parquet_with_hot(
                 "*",
@@ -190,7 +190,7 @@ fn run(lane: Lane, corpus: &Corpus, source: &str, hot: &Path) -> Result<usize, E
                 &out,
                 1000,
             )
-            .map(|()| corpus.count_exported(&out)),
+            .map(|_| corpus.count_exported(&out)),
     }
 }
 

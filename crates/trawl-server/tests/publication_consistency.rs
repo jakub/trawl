@@ -106,7 +106,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
     // (ADR-0024).
     assert!(matches!(
         blocked.result,
-        Err(ServerError::ServiceUnavailable(_))
+        Err(ServerError::CapacityNotStarted)
     ));
     let blocked_export = pool
         .export_parquet(
@@ -119,7 +119,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         .await;
     assert!(matches!(
         blocked_export,
-        Err(ServerError::ServiceUnavailable(_))
+        Err(ServerError::CapacityNotStarted)
     ));
     assert_eq!(
         pool.available_permits(),
@@ -154,7 +154,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         )
         .await;
     assert_eq!(after.result.unwrap().rows.len(), 3);
-    let export = pool
+    let (export, rows) = pool
         .export_parquet(
             pool.allocate_query_id(),
             "*",
@@ -175,6 +175,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         )
         .unwrap();
     assert_eq!(count, 3, "export preserves accepted identical events");
+    assert_eq!(rows, 3, "the returned count is the file's");
 }
 
 #[tokio::test]

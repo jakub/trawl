@@ -32,7 +32,10 @@
 //! because retiring it would delete rows the replacement may not hold.
 //!
 //! [`classify`] reads only through the observer its caller passes, and
-//! never changes a file, so recovery and `trawld --doctor` share it.
+//! never changes a file, so recovery and `trawld --doctor` share it. Both
+//! classify a marker only in a directory named as a canonical date
+//! ([`crate::env_dirs::parse_date`]). A marker found anywhere else is case
+//! d with [`Proof::DayNotCanonical`], decided before the marker is read.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -44,8 +47,9 @@ use serde::{Deserialize, Serialize};
 use super::no_follow;
 use super::publication_marker::{OutputIdentity, parse_hex_digest};
 
-/// Marker file name prefix inside a day directory.
-pub const MARKER_PREFIX: &str = ".rollup-";
+/// Marker file name prefix inside a day directory. Built by
+/// [`marker_file_name`] and stripped by [`marker_service`] only.
+const MARKER_PREFIX: &str = ".rollup-";
 
 /// The value of the record's `format` field.
 const FORMAT: &str = "trawl-rollup-marker";
@@ -54,11 +58,11 @@ const FORMAT: &str = "trawl-rollup-marker";
 const VERSION: u64 = 1;
 
 /// Most inputs one marker lists. A rollup merges at most one hourly file
-/// per hour directory, and the rollup scan takes only two-digit hour
-/// directory names, `00` to `99`.
-pub const MAX_INPUTS: usize = 100;
+/// per hour directory, and an hour directory is named `00` to `23`
+/// ([`crate::env_dirs::parse_hour`]).
+pub const MAX_INPUTS: usize = 24;
 
-/// Largest marker the reader reads: 26 KiB.
+/// Largest marker the reader reads: 7168 bytes, 7 KiB.
 ///
 /// [`RollupMarker::encode`] writes compact JSON, and validation bounds each
 /// part of it:
@@ -237,7 +241,7 @@ impl RollupMarker {
 
     /// `day_dir/{service}.parquet`.
     pub fn canonical(&self, day_dir: &Path) -> PathBuf {
-        day_dir.join(format!("{}.parquet", self.service))
+        crate::env_dirs::daily_file(day_dir, &self.service)
     }
 
     /// `day_dir/{service}.parquet.tmp`.
@@ -283,6 +287,14 @@ pub fn marker_file_name(service: &str) -> String {
     format!("{MARKER_PREFIX}{service}")
 }
 
+/// What follows `.rollup-` in `file_name`, unvalidated, or `None` when
+/// `file_name` is not a rollup marker's. Discovery takes any such name, an
+/// empty or invalid service included, so a marker recovery cannot use
+/// still refuses reads; [`read`] validates the service.
+pub(crate) fn marker_service(file_name: &str) -> Option<&str> {
+    file_name.strip_prefix(MARKER_PREFIX)
+}
+
 fn validate_service(service: &str) -> Result<(), String> {
     if trawl_config::is_valid_service_name(service) {
         Ok(())
@@ -291,13 +303,14 @@ fn validate_service(service: &str) -> Result<(), String> {
     }
 }
 
-/// The hour of `HH/{service}.parquet`, in exactly that spelling. Anything
-/// else, an absolute path or one with `..` included, is `None`.
+/// The hour of `HH/{service}.parquet`, in exactly that spelling, with `HH`
+/// an hour directory name ([`crate::env_dirs::parse_hour`]). Anything else,
+/// an absolute path or one with `..` included, is `None`.
 fn parse_input_name(service: &str, name: &str) -> Option<[u8; 2]> {
     let (hour, file) = name.split_once('/')?;
+    crate::env_dirs::parse_hour(hour)?;
     let hour: [u8; 2] = hour.as_bytes().try_into().ok()?;
-    (hour.iter().all(u8::is_ascii_digit) && file.strip_suffix(".parquet")? == service)
-        .then_some(hour)
+    (file.strip_suffix(".parquet")? == service).then_some(hour)
 }
 
 /// Why [`read`] returned no marker.
@@ -373,7 +386,7 @@ pub fn read_with(
     let service = path
         .file_name()
         .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix(MARKER_PREFIX))
+        .and_then(marker_service)
         .ok_or_else(|| ReadError::Malformed("the file name is not a rollup marker's".to_owned()))?;
     validate_service(service).map_err(ReadError::Malformed)?;
     let file = open(path).map_err(|e| match e.kind() {
@@ -442,6 +455,10 @@ impl Observation {
 /// fixed label that logs and the doctor report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Proof {
+    /// The marker's directory is not named as a canonical date
+    /// ([`crate::env_dirs::parse_date`]), so the paths it names are not the
+    /// layout's. Recovery checks this first, and reads nothing there.
+    DayNotCanonical,
     /// The marker could not be opened or read, or is not a regular file.
     MarkerUnreadable,
     /// The marker is over its size bound.
@@ -469,6 +486,7 @@ impl Proof {
     /// The fixed `snake_case` label.
     pub const fn label(self) -> &'static str {
         match self {
+            Self::DayNotCanonical => "day_not_canonical",
             Self::MarkerUnreadable => "marker_unreadable",
             Self::MarkerOversized => "marker_oversized",
             Self::MarkerOldFormat => "marker_old_format",
@@ -723,18 +741,54 @@ mod tests {
         assert_malformed(decode_raw(&raw), "listed twice");
     }
 
+    /// A rollup merges at most one input per hour, `00` to `23`: a marker
+    /// listing every hour is read, and one entry more is refused by its
+    /// count before any name is looked at.
     #[test]
     fn validation_bounds_the_input_count() {
+        assert_eq!(MAX_INPUTS, 24, "one input per hour, 00 to 23");
         let raw = RawMarker::new(id(1), None, Vec::new());
         assert_malformed(decode_raw(&raw), "empty");
-        let hundred: Vec<_> = (0..100).map(|h| input(&format!("{h:02}"), 2)).collect();
-        assert!(decode_raw(&RawMarker::new(id(1), None, hundred.clone())).is_ok());
-        let mut hundred_and_one = hundred;
-        hundred_and_one.push(input("00", 3));
+        let every_hour: Vec<_> = (0..MAX_INPUTS)
+            .map(|h| input(&format!("{h:02}"), 2))
+            .collect();
+        assert!(decode_raw(&RawMarker::new(id(1), None, every_hour.clone())).is_ok());
+        let mut one_more = every_hour;
+        one_more.push(input("00", 3));
         assert_malformed(
-            decode_raw(&RawMarker::new(id(1), None, hundred_and_one)),
-            "over the 100-entry limit",
+            decode_raw(&RawMarker::new(id(1), None, one_more)),
+            &format!("over the {MAX_INPUTS}-entry limit"),
         );
+    }
+
+    /// Marker hours share the partition grammar: an input under an hour
+    /// directory past `23` makes the whole marker malformed, alone or
+    /// beside a valid hour.
+    #[test]
+    fn rejects_hours_past_23() {
+        let last = RawMarker::new(id(1), None, vec![("23/svc.parquet".to_owned(), id(2))]);
+        assert!(decode("svc", last.encode().as_bytes()).is_ok());
+        for inputs in [
+            vec!["24/svc.parquet"],
+            vec!["99/svc.parquet"],
+            vec!["00/svc.parquet", "24/svc.parquet"],
+            vec!["99/svc.parquet", "07/svc.parquet"],
+        ] {
+            let raw = RawMarker::new(
+                id(1),
+                None,
+                inputs
+                    .iter()
+                    .map(|name| ((*name).to_owned(), id(2)))
+                    .collect(),
+            );
+            match decode("svc", raw.encode().as_bytes()) {
+                Err(ReadError::Malformed(reason)) => {
+                    assert!(reason.contains("is not HH/svc.parquet"), "{reason:?}");
+                }
+                other => panic!("{inputs:?}: expected a malformed marker, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1226,6 +1280,7 @@ mod tests {
     #[test]
     fn proof_labels_are_stable() {
         let labels: Vec<_> = [
+            Proof::DayNotCanonical,
             Proof::MarkerUnreadable,
             Proof::MarkerOversized,
             Proof::MarkerOldFormat,
@@ -1243,6 +1298,7 @@ mod tests {
         assert_eq!(
             labels,
             [
+                "day_not_canonical",
                 "marker_unreadable",
                 "marker_oversized",
                 "marker_old_format",

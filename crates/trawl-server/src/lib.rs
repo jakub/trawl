@@ -29,6 +29,8 @@ mod history_params;
 pub mod hot_buffer;
 pub mod ingest;
 pub mod investigations;
+#[cfg(test)]
+mod layout_guard;
 pub mod live;
 pub mod metrics;
 pub mod monitor;
@@ -56,6 +58,8 @@ pub mod stats;
 pub mod store;
 pub mod syslog;
 pub mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_events;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_timing;
 pub mod tls;

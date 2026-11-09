@@ -346,10 +346,11 @@ async fn refused_bounds_take_nothing() {
             json!({ "query": service, "window": { "earliest": "yesterday" } }),
             "bad_request",
         ),
+        // The parser refuses the clause, as it does at `/query`.
         (
             "an unparseable earliest=",
             json!({ "query": format!(r#"{service} earliest="yesterday""#) }),
-            "bad_request",
+            "parse_error",
         ),
     ];
     for (what, body, expected) in cases {

@@ -4778,6 +4778,81 @@ fn a_timestamp_casts_to_the_text_duckdb_prints() {
     }
 }
 
+/// A search bound executes as [`trawl_core::compare::bound_instant`]'s
+/// instant, and the SQL lane binds that instant's `cast_text` in place of
+/// the written text (ADR-0017's amendment of 2026-11-08). So every
+/// instant `bound_instant` accepts must read back through
+/// `TRY_CAST(? AS TIMESTAMP)` as that same instant, and as the same
+/// value the written text reads as.
+///
+/// The refused years are the other half of the premise: a finite year
+/// above 9999 reads, but its cast text (`+10000-…`) is NULL to the
+/// engine, so binding it would bound nothing.
+#[test]
+fn a_bound_instant_reads_back_through_duckdb() {
+    use trawl_core::compare::{bound_instant, literal_timestamp};
+
+    let conn = conn();
+    let fmt = trawl_core::compare::TIMESTAMP_PATTERN_SQL_FORMAT;
+    let engine = |text: &str| -> Option<String> {
+        conn.query_row(
+            "SELECT strftime(TRY_CAST(? AS TIMESTAMP), ?)",
+            [text, fmt],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    // The spellings ADR-0017's amendment names, each of which must be a
+    // bound, on top of every matrix row the mirror reads.
+    let named = [
+        "2026-03-14",
+        "2026-03-14T09:00:00",
+        "2026-03-14 09:00:00",
+        "2026-03-14T09:00:00.123456",
+        "2026-03-14T09:00:00Z",
+        "2026-03-14T09:00:00+05:30",
+        "-0001-01-01 00:00:00",
+        "epoch",
+        "infinity",
+        "-infinity",
+    ];
+    for text in named {
+        assert!(bound_instant(text).is_some(), "{text:?} must be a bound");
+    }
+    let mut accepted = 0;
+    for text in TIMESTAMP_TEXT_MATRIX.iter().copied().chain(named) {
+        let Some(instant) = bound_instant(text) else {
+            continue;
+        };
+        accepted += 1;
+        let bound = instant.cast_text();
+        assert_eq!(
+            engine(&bound),
+            Some(instant.pattern_text()),
+            "{text:?} binds as {bound:?}, which the engine reads as another instant"
+        );
+        assert_eq!(
+            engine(&bound),
+            engine(text),
+            "{text:?} and its bound text {bound:?} read differently"
+        );
+    }
+    assert!(accepted > 50, "only {accepted} matrix rows were bounds");
+
+    // Read by the mirror and by the engine, but not as cast text.
+    for text in ["10000-01-01", "262142-12-31 23:59:59"] {
+        let instant = literal_timestamp(text).expect("the mirror reads the text");
+        assert!(engine(text).is_some(), "the engine reads {text:?}");
+        assert!(instant.cast_text().starts_with('+'), "{text:?}");
+        assert_eq!(engine(&instant.cast_text()), None, "{text:?}");
+        assert_eq!(bound_instant(text), None, "{text:?}");
+    }
+    // Outside both calendars.
+    assert_eq!(literal_timestamp("300000-01-01"), None);
+    assert_eq!(engine("300000-01-01"), None);
+    assert_eq!(bound_instant("300000-01-01"), None);
+}
+
 /// What each date scalar answers for `infinity` and `-infinity`.
 ///
 /// Measured, not reasoned: the three families do three DIFFERENT things,

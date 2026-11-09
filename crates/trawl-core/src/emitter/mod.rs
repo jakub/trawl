@@ -1721,11 +1721,6 @@ mod tests {
         assert_snapshot!(emit_dsl_err("* | eventstats dc(host) as hosts by service"));
     }
 
-    #[test]
-    fn error_last_with_earliest() {
-        assert_snapshot!(emit_dsl_err(r#"last=1h earliest="2026-03-14T00:00:00Z""#));
-    }
-
     // -----------------------------------------------------------------------
     // composite hot source
     // -----------------------------------------------------------------------

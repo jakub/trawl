@@ -37,10 +37,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use trawl_core::ast::{
-    PipeStage, Query, SearchStage, SortDirection, SortField, SortStage, TimeClause,
+    PipeStage, Query, SearchStage, SortDirection, SortField, SortStage, TimeBound, TimeClause,
 };
 use trawl_core::canonical_form::same_query;
-use trawl_core::compare::{Instant, literal_timestamp};
+use trawl_core::compare::Instant;
 use trawl_core::complexity::MAX_PIPELINE_STAGES;
 use trawl_core::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
 use trawl_core::schema::{INGESTED, TIME, catalog_key};
@@ -287,7 +287,7 @@ pub enum BoundsError {
 /// - neither: `[T − default_window, T)`.
 ///
 /// A query's `earliest=`/`latest=` value is read the way `DuckDB` reads the
-/// literal (`compare::literal_timestamp`, which drops a spelled offset), so
+/// literal (the parsed [`TimeBound`], which drops a spelled offset), so
 /// the bound is the one `/query` would apply. A window's values are RFC
 /// 3339 instants, offsets applied. A window and a query clause together are
 /// refused, as are an empty window and one longer than `max_span`. An
@@ -572,7 +572,7 @@ fn requested_by_window(window: &WindowInput) -> Result<Requested, BoundsError> {
 fn requested_by_query(search: &SearchStage) -> Result<Requested, BoundsError> {
     let last = search.time_filter.as_ref().map(|tf| tf.node.duration);
     match (last, &search.earliest, &search.latest) {
-        // The emitter refuses the same pair, so `/query` would too.
+        // The parser refuses the same pair, so a parsed query never has it.
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(BoundsError::MixedClauses),
         (Some(last), None, None) => Ok(Requested::Last(Duration::from_secs(last.to_seconds()))),
         (None, Some(earliest), latest) => Ok(Requested::Absolute {
@@ -587,18 +587,19 @@ fn requested_by_query(search: &SearchStage) -> Result<Requested, BoundsError> {
     }
 }
 
-/// The instant a query's `earliest=`/`latest=` literal names, read as
-/// `DuckDB` reads it against a TIMESTAMP column.
-fn clause_instant(clause: TimeClause, value: &str) -> Result<DateTime<Utc>, BoundsError> {
+/// The instant a query's `earliest=`/`latest=` clause executes as. A
+/// capture window holds finite instants only.
+fn clause_instant(clause: TimeClause, bound: &TimeBound) -> Result<DateTime<Utc>, BoundsError> {
+    let value = bound.text();
     if value.len() > MAX_TIME_VALUE_BYTES {
         return Err(BoundsError::ClauseTooLong {
             clause,
             bytes: value.len(),
         });
     }
-    match literal_timestamp(value) {
-        Some(Instant::At(at)) => Ok(at.and_utc()),
-        Some(Instant::Infinity | Instant::NegInfinity) | None => Err(BoundsError::InvalidClause {
+    match bound.instant() {
+        Instant::At(at) => Ok(at.and_utc()),
+        Instant::Infinity | Instant::NegInfinity => Err(BoundsError::InvalidClause {
             clause,
             value: value.to_owned(),
         }),
@@ -1139,14 +1140,19 @@ mod tests {
 
     #[test]
     fn last_beside_an_absolute_bound_is_refused() {
-        assert_eq!(
-            resolve_dsl(r#"last=1h earliest="2026-10-23T10:00:00Z""#),
-            Err(BoundsError::MixedClauses)
-        );
-        assert_eq!(
-            resolve_dsl(r#"latest="2026-10-23T10:00:00Z" last=1h"#),
-            Err(BoundsError::MixedClauses)
-        );
+        // In a query the pair does not parse.
+        for dsl in [
+            r#"last=1h earliest="2026-10-23T10:00:00Z""#,
+            r#"latest="2026-10-23T10:00:00Z" last=1h"#,
+        ] {
+            assert_eq!(
+                resolve_dsl(dsl),
+                Err(BoundsError::Unparseable {
+                    message: r#""cannot combine 'last=' with 'earliest='/'latest='""#.to_owned()
+                }),
+                "{dsl}"
+            );
+        }
         let window = WindowInput {
             earliest: Some("2026-10-23T10:00:00Z".to_owned()),
             latest: None,
@@ -1178,8 +1184,15 @@ mod tests {
 
     #[test]
     fn an_unreadable_query_instant_is_refused() {
+        // A clause with no timestamp reading does not parse.
+        assert_eq!(
+            resolve_dsl(r#"earliest="yesterday""#),
+            Err(BoundsError::Unparseable {
+                message: r#""cannot read this time bound as a timestamp""#.to_owned()
+            })
+        );
+        // An infinity parses, but a capture window holds finite instants.
         for (dsl, clause, value) in [
-            (r#"earliest="yesterday""#, TimeClause::Earliest, "yesterday"),
             (
                 r#"earliest="-infinity" latest="2026-10-23T10:00:00Z""#,
                 TimeClause::Earliest,
@@ -1250,6 +1263,12 @@ mod tests {
             resolve_window("*", &last(&"1".repeat(MAX_TIME_VALUE_BYTES))),
             Err(BoundsError::InvalidWindow { field: "last", .. })
         ));
+        // A clause reads as a timestamp before its length is measured,
+        // and a fraction of any length is one.
+        let long = format!(
+            "2026-10-23T10:00:00.{}",
+            "1".repeat(MAX_TIME_VALUE_BYTES + 1 - "2026-10-23T10:00:00.".len())
+        );
         assert_eq!(
             resolve_dsl(&format!("earliest=\"{long}\"")),
             Err(BoundsError::ClauseTooLong {
@@ -1781,7 +1800,13 @@ mod tests {
                 trawl_core::context::EvalContext::capture(),
             )
             .unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
-            let (start, end) = window_of(&resolved);
+            // A bound binds as its instant's cast text (ADR-0017's
+            // amendment of 2026-11-08).
+            let Source::Live { earliest, latest } = &resolved.source else {
+                unreachable!("a stored source was skipped")
+            };
+            let bound = |at: &DateTime<Utc>| Instant::At(at.naive_utc()).cast_text();
+            let (start, end) = (bound(earliest), bound(latest));
             let params = format!("{:?}", emitted.params);
             assert!(
                 params.contains(&start) && params.contains(&end),
@@ -1799,7 +1824,11 @@ mod tests {
             &format!("{}service=x  | stats count()", prefix(T, T)),
         )
         .unwrap();
-        prove_unchanged("last=1h a OR b", r#"earliest="x" latest="y"  a OR b"#).unwrap();
+        prove_unchanged(
+            "last=1h a OR b",
+            r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T10:00:00Z"  a OR b"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1807,19 +1836,19 @@ mod tests {
         let original = "service=x error last=1h | stats count() by host";
         for corrupted in [
             // A value changed.
-            r#"earliest="a" latest="b" service=y error  | stats count() by host"#,
+            r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T10:00:00Z" service=y error  | stats count() by host"#,
             // A token lost.
-            r#"earliest="a" latest="b" service=x  | stats count() by host"#,
+            r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T10:00:00Z" service=x  | stats count() by host"#,
             // A negation gained.
-            r#"earliest="a" latest="b" service=x NOT error  | stats count() by host"#,
+            r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T10:00:00Z" service=x NOT error  | stats count() by host"#,
             // The OR structure changed.
-            r#"earliest="a" latest="b" service=x OR error  | stats count() by host"#,
+            r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T10:00:00Z" service=x OR error  | stats count() by host"#,
             // A stage changed.
-            r#"earliest="a" latest="b" service=x error  | stats count() by service"#,
+            r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T10:00:00Z" service=x error  | stats count() by service"#,
             // A stage gained.
-            r#"earliest="a" latest="b" service=x error  | stats count() by host | head 1"#,
+            r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T10:00:00Z" service=x error  | stats count() by host | head 1"#,
             // Text that no longer parses.
-            r#"earliest="a" latest="b" service=x error  | stats count( by host"#,
+            r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T10:00:00Z" service=x error  | stats count( by host"#,
         ] {
             assert_eq!(
                 prove_unchanged(original, corrupted),
@@ -1835,7 +1864,7 @@ mod tests {
     /// order; layout and comments are no change.
     #[test]
     fn bounds_proof_detects_body_changes() {
-        let bounds = r#"earliest="a" latest="b""#;
+        let bounds = r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T10:00:00Z""#;
         for original in [r#"`OR.a`="" b last=1h"#, r#"last=1h `OR.a`="" b"#] {
             for same in [
                 format!(r#"{bounds} `OR.a`="" b"#),
@@ -1868,7 +1897,7 @@ mod tests {
             format!(r#"{bounds} `OR.b`="" b | where x == 1"#),
             format!(r#"{bounds} `OR.a`="" b | where x == 2"#),
             format!(r#"{bounds} `OR.a`="" b | where x == 1.0"#),
-            r#"earliest="a" latest="c" `OR.a`="" b | where x == 1"#.to_owned(),
+            r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T11:00:00Z" `OR.a`="" b | where x == 1"#.to_owned(),
             format!(r#"{bounds} `OR.a`="" b"#),
         ] {
             assert_eq!(
@@ -1881,7 +1910,7 @@ mod tests {
 
     #[test]
     fn the_order_proof_accepts_only_the_imposed_stage() {
-        let spliced = r#"earliest="a" latest="b" error"#;
+        let spliced = r#"earliest="2026-10-23T09:00:00Z" latest="2026-10-23T10:00:00Z" error"#;
         prove_order_appended(spliced, &format!("{spliced}\n{IMPOSED_ORDER}")).unwrap();
         for wrong in [
             format!("{spliced}\n| sort _time, _ingested"),

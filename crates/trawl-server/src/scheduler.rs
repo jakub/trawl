@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use fleet_auth::KeyStore;
 
 use crate::config::SchedulerConfig;
+use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
 use crate::publication::CorpusUnsettled;
@@ -471,16 +472,11 @@ pub(crate) async fn execute_scheduled_query(
             );
         }
         Err(e) => {
-            let (status, error_msg) = if matches!(e, crate::error::ServerError::Timeout) {
-                (RunStatus::Timeout, format!("{e}"))
-            } else {
-                (RunStatus::Error, format!("{e}"))
-            };
-
-            finish_failed_run(&schedule_store, run_id, status, duration_ms, &error_msg).await;
+            let status = record_failed_run(&schedule_store, run_id, duration_ms, &e).await;
 
             // The class only: the error's text can quote the saved query
-            // (ADR-0040). The run record keeps the text for its owner.
+            // (ADR-0040). The run row stores the error's public message,
+            // the one the wire sends (ADR-0046, amended 2026-11-08).
             tracing::warn!(
                 event_type = "scheduled_query_failed",
                 run_id,
@@ -492,6 +488,31 @@ pub(crate) async fn execute_scheduled_query(
             );
         }
     }
+}
+
+/// Record a run whose query failed: a timeout as `timeout`, anything else
+/// as `error`, with the error's public message as the run's text. Returns
+/// the status it recorded.
+async fn record_failed_run(
+    schedule_store: &ScheduleStore,
+    run_id: i64,
+    duration_ms: u64,
+    error: &ServerError,
+) -> RunStatus {
+    let status = if matches!(error, ServerError::Timeout) {
+        RunStatus::Timeout
+    } else {
+        RunStatus::Error
+    };
+    finish_failed_run(
+        schedule_store,
+        run_id,
+        status,
+        duration_ms,
+        &error.safe_message(),
+    )
+    .await;
+    status
 }
 
 /// Fail a run whose result has neither a file nor a blob. A success here
@@ -523,8 +544,9 @@ async fn fail_unpersisted_run(
     );
 }
 
-/// Record a run as failed with `error_msg`, its owner's to read. A store
-/// error is logged; the run then stays `running` until boot-time cleanup.
+/// Record a run as failed with `error_msg`, which every reader of the run
+/// sees. A store error is logged; the run then stays `running` until
+/// boot-time cleanup.
 async fn finish_failed_run(
     schedule_store: &ScheduleStore,
     run_id: i64,
@@ -544,13 +566,23 @@ async fn finish_failed_run(
         )
         .await
     {
-        tracing::error!(
-            event_type = "scheduler_error",
-            run_id,
-            error = %e,
-            "failed to finish run"
-        );
+        log_store_fault(run_id, e, "failed to finish run");
     }
+}
+
+/// Log a store failure the scheduler swallows: the class and the cause
+/// kind at ERROR, and the driver's text, which can quote paths and
+/// diagnostics, at DEBUG only (ADR-0040, amended 2026-11-08).
+fn log_store_fault(run_id: i64, err: crate::store::StoreError, what: &'static str) {
+    tracing::debug!(event_type = "scheduler_error", run_id, error = %err, "{what}");
+    let fault = ServerError::from(err);
+    tracing::error!(
+        event_type = "scheduler_error",
+        run_id,
+        error_class = fault.error_class(),
+        cause_kind = fault.cause_kind().as_str(),
+        "{what}"
+    );
 }
 
 /// Persist a successful run's result, then reconcile the parquet file on disk
@@ -608,28 +640,27 @@ pub(crate) async fn finish_run_or_recover(
             // Err even though the row was written to status='success' with
             // result_path set. So the parquet must not be deleted here —
             // recovery flips the row only while it is still 'running'.
-            tracing::error!(
-                event_type = "scheduler_error",
-                run_id,
-                error = %e,
-                result_path = result_path.unwrap_or("(blob)"),
-                "failed to finish run (ambiguous commit); recovering via guarded flip"
-            );
             recover_ambiguous_finish(
                 schedule_store,
                 base_dir,
                 run_id,
                 duration_ms,
                 result_path,
-                &e,
+                e,
             )
             .await;
         }
     }
 }
 
+/// The text a run row stores when its result could not be persisted. The
+/// store's error is not part of it: its text is the driver's, which the run's
+/// readers never see (ADR-0046, amended 2026-11-08).
+const RESULT_PERSISTENCE_FAILED: &str = "result persistence failed";
+
 /// Recover from an ambiguous `finish_run` commit and reconcile the parquet on
-/// disk, without ever destroying a success that actually committed.
+/// disk, without ever destroying a success that actually committed. `err` is
+/// the ambiguous commit's failure, which is logged and never stored.
 ///
 /// Guarded state transition: flip the row to `error` only while it is still
 /// `running`. If the success commit actually landed (status is already
@@ -652,14 +683,25 @@ pub(crate) async fn recover_ambiguous_finish(
     run_id: i64,
     duration_ms: u64,
     result_path: Option<&str>,
-    err: &crate::store::StoreError,
+    err: crate::store::StoreError,
 ) {
+    tracing::debug!(
+        event_type = "scheduler_error",
+        run_id,
+        error = %err,
+        "failed to finish run (ambiguous commit); recovering via guarded flip"
+    );
+    let fault = ServerError::from(err);
+    tracing::error!(
+        event_type = "scheduler_error",
+        run_id,
+        error_class = fault.error_class(),
+        cause_kind = fault.cause_kind().as_str(),
+        result_path = result_path.unwrap_or("(blob)"),
+        "failed to finish run (ambiguous commit); recovering via guarded flip"
+    );
     match schedule_store
-        .fail_run_if_running(
-            run_id,
-            duration_ms,
-            &format!("result persistence failed: {err}"),
-        )
+        .fail_run_if_running(run_id, duration_ms, RESULT_PERSISTENCE_FAILED)
         .await
     {
         Ok(FlipOutcome::FlippedToError) => {
@@ -675,14 +717,11 @@ pub(crate) async fn recover_ambiguous_finish(
             }
         }
         Ok(FlipOutcome::NotRunning) => {}
-        Err(e2) => {
-            tracing::error!(
-                event_type = "scheduler_error",
-                run_id,
-                error = %e2,
-                "failed to flip wedged run to error; run stays stuck until restart"
-            );
-        }
+        Err(e2) => log_store_fault(
+            run_id,
+            e2,
+            "failed to flip wedged run to error; run stays stuck until restart",
+        ),
     }
 }
 
@@ -702,19 +741,34 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
     let full = format!("{}/{relative}", base_dir.trim_end_matches('/'));
     match std::fs::remove_file(&full) {
         Ok(()) => true,
+        // The default-level events name the file relative to the data root;
+        // the absolute path and the error text go to DEBUG (ADR-0040,
+        // amended 2026-11-08).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(
+            tracing::debug!(
                 event_type = "result_file_already_absent",
                 path = %full,
+                error = %e,
+                "no parquet result file to delete: it is already gone"
+            );
+            tracing::info!(
+                event_type = "result_file_already_absent",
+                path = %relative,
                 "no parquet result file to delete: it is already gone"
             );
             false
         }
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "result_file_cleanup_error",
                 path = %full,
                 error = %e,
+                "failed to delete parquet result file"
+            );
+            tracing::warn!(
+                event_type = "result_file_cleanup_error",
+                path = %relative,
+                error_kind = %e.kind(),
                 "failed to delete parquet result file"
             );
             false
@@ -753,15 +807,25 @@ fn write_result_parquet(
     result: &trawl_api::value::QueryResult,
 ) -> Result<(Option<String>, Option<Vec<u8>>), String> {
     let base = pool.base_dir().trim_end_matches('/');
-    let relative = format!("scheduled/run_{run_id}.parquet");
+    let relative = result_relative_path(run_id);
     let full_path = format!("{base}/{relative}");
     let temp_path = format!("{full_path}.tmp");
 
-    if let Err(e) = std::fs::create_dir_all(format!("{base}/scheduled")) {
-        tracing::warn!(
+    // The fallback events name the error's kind, never its text, which
+    // can carry host paths and engine diagnostics; the text goes to DEBUG
+    // (ADR-0040, amended 2026-11-08).
+    if let Err(e) = std::fs::create_dir_all(format!("{base}/{}", trawl_config::SCHEDULED_DIR_NAME))
+    {
+        tracing::debug!(
             event_type = "scheduler_parquet_error",
             run_id,
             error = %e,
+            "failed to create scheduled result directory, falling back to blob"
+        );
+        tracing::warn!(
+            event_type = "scheduler_parquet_error",
+            run_id,
+            error_kind = %e.kind(),
             "failed to create scheduled result directory, falling back to blob"
         );
         return zstd_fallback(result);
@@ -772,11 +836,10 @@ fn write_result_parquet(
     let executor = match pool.detached_executor() {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(
-                event_type = "scheduler_parquet_error",
+            log_parquet_engine_fault(
                 run_id,
-                error = %e,
-                "failed to create executor for parquet write, falling back to blob"
+                e,
+                "failed to create executor for parquet write, falling back to blob",
             );
             return zstd_fallback(result);
         }
@@ -788,22 +851,27 @@ fn write_result_parquet(
     match executor.write_query_result_to_parquet(result, temp) {
         Ok(_) => {}
         // Not a failure: the result's shape has no exact parquet form, and
-        // the blob is its representation.
+        // the blob is its representation. The reason names a column, which
+        // is query or sender content, so it stays at DEBUG.
         Err(e @ trawl_engine::error::EngineError::NotParquetStorable { .. }) => {
-            tracing::info!(
+            tracing::debug!(
                 event_type = "scheduler_result_blob",
                 run_id,
                 reason = %e,
+                "the run's result has no exact parquet form"
+            );
+            tracing::info!(
+                event_type = "scheduler_result_blob",
+                run_id,
                 "storing the run's result as a blob"
             );
             return zstd_fallback(result);
         }
         Err(e) => {
-            tracing::warn!(
-                event_type = "scheduler_parquet_error",
+            log_parquet_engine_fault(
                 run_id,
-                error = %e,
-                "failed to write parquet result, falling back to blob"
+                e,
+                "failed to write parquet result, falling back to blob",
             );
             let _ = std::fs::remove_file(temp);
             return zstd_fallback(result);
@@ -811,10 +879,16 @@ fn write_result_parquet(
     }
 
     if let Err(e) = std::fs::rename(temp, final_path) {
-        tracing::warn!(
+        tracing::debug!(
             event_type = "scheduler_parquet_error",
             run_id,
             error = %e,
+            "failed to rename parquet temp file, falling back to blob"
+        );
+        tracing::warn!(
+            event_type = "scheduler_parquet_error",
+            run_id,
+            error_kind = %e.kind(),
             "failed to rename parquet temp file, falling back to blob"
         );
         let _ = std::fs::remove_file(temp);
@@ -822,6 +896,27 @@ fn write_result_parquet(
     }
 
     Ok((Some(relative), None))
+}
+
+/// Where run `run_id`'s result parquet lives, relative to the data root:
+/// in the reserved scheduled-results directory.
+fn result_relative_path(run_id: i64) -> String {
+    format!("{}/run_{run_id}.parquet", trawl_config::SCHEDULED_DIR_NAME)
+}
+
+/// Log an engine failure that sends a run's result to the blob: its class
+/// and cause kind at WARN, its text, which can quote `DuckDB` diagnostics or
+/// an `io::Error`, at DEBUG.
+fn log_parquet_engine_fault(run_id: i64, err: trawl_engine::error::EngineError, what: &str) {
+    tracing::debug!(event_type = "scheduler_parquet_error", run_id, error = %err, "{what}");
+    let fault = ServerError::from(err);
+    tracing::warn!(
+        event_type = "scheduler_parquet_error",
+        run_id,
+        error_class = fault.error_class(),
+        cause_kind = fault.cause_kind().as_str(),
+        "{what}"
+    );
 }
 
 /// Compress a `QueryResult` as a zstd blob of its typed wire JSON, the
@@ -872,12 +967,16 @@ pub(crate) fn decode_result_blob(blob: Option<Vec<u8>>) -> Option<trawl_api::val
 /// tested in `tests/store_pg.rs`; these tests pin the file-cleanup decision the
 /// store outcome alone doesn't prove (swapping the arms would leak files or
 /// destroy committed results with the store tests still green). The Err/Err
-/// double-fault arm needs fault injection and stays uncovered.
+/// double-fault arm is driven through a closed pool, for its events only.
 #[cfg(test)]
 mod pg_tests {
     use sqlx::PgPool;
 
-    use super::{finish_run_or_recover, recover_ambiguous_finish};
+    use super::{
+        RESULT_PERSISTENCE_FAILED, finish_run_or_recover, record_failed_run,
+        recover_ambiguous_finish,
+    };
+    use crate::error::ServerError;
     use crate::store::{RunClaim, RunStatus, SavedQueryStore, ScheduleStore, StoreError};
 
     /// Seed a saved query + schedule + started (`running`) run, returning the
@@ -963,7 +1062,7 @@ mod pg_tests {
         touch(base, rel);
 
         let err = StoreError::Validation("boom".to_owned());
-        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), &err).await;
+        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), err).await;
 
         assert!(
             !exists(base, rel),
@@ -992,7 +1091,7 @@ mod pg_tests {
             .unwrap();
 
         let err = StoreError::Validation("boom".to_owned());
-        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), &err).await;
+        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), err).await;
 
         assert!(
             exists(base, rel),
@@ -1006,6 +1105,243 @@ mod pg_tests {
         );
         assert_eq!(run.result_path.as_deref(), Some(rel));
         assert_eq!(run.row_count, Some(7));
+    }
+
+    const MARKER: &str = "/var/lib/trawl/data/MARKER-sched/prod/x.parquet";
+
+    /// The run as both runs reads serve it: the run itself, and the saved
+    /// query's run list.
+    async fn read_back(
+        store: &ScheduleStore,
+        saved_id: i64,
+        rid: i64,
+    ) -> Vec<crate::store::ReportRun> {
+        let one = store.get_run(rid, 1).await.unwrap().unwrap();
+        let listed = store
+            .list_runs(saved_id, 1, 50, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == rid)
+            .expect("the run is listed");
+        vec![one, listed]
+    }
+
+    /// A run that fails in `DuckDB` stores the public message the wire
+    /// sends, not the driver's or the `io::Error`'s text (ADR-0046,
+    /// amended 2026-11-08).
+    #[sqlx::test]
+    async fn scheduled_execution_errors_store_the_public_message(pool: PgPool) {
+        use trawl_engine::error::EngineError;
+
+        let failures = [
+            (
+                "database",
+                ServerError::Engine(EngineError::Database(duckdb::Error::InvalidColumnName(
+                    MARKER.into(),
+                ))),
+            ),
+            (
+                "io",
+                ServerError::Engine(EngineError::Io(std::io::Error::other(MARKER))),
+            ),
+        ];
+        for (name, failure) in failures {
+            let (store, saved_id, rid) = seed_run(&pool, name).await;
+            let status = record_failed_run(&store, rid, 9, &failure).await;
+            assert_eq!(status, RunStatus::Error, "{name}");
+            for run in read_back(&store, saved_id, rid).await {
+                assert_eq!(run.status, RunStatus::Error, "{name}: {run:?}");
+                assert_eq!(
+                    run.error_message.as_deref(),
+                    Some("query execution failed"),
+                    "{name}: {run:?}"
+                );
+                assert_eq!(
+                    run.error_message,
+                    Some(failure.safe_message()),
+                    "{name}: the row and the wire carry one message"
+                );
+                assert!(!format!("{run:?}").contains("MARKER"), "{name}: {run:?}");
+            }
+        }
+    }
+
+    /// A run whose result persistence failed stores a fixed summary, never
+    /// the store driver's text.
+    #[sqlx::test]
+    async fn scheduled_persistence_recovery_stores_a_fixed_summary(pool: PgPool) {
+        let (store, saved_id, rid) = seed_run(&pool, "persistence").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let rel = "scheduled/persistence/run.parquet";
+        touch(base, rel);
+
+        let err = StoreError::Unavailable(sqlx::Error::Protocol(MARKER.into()));
+        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), err).await;
+
+        assert!(!exists(base, rel), "the flipped run's file is removed");
+        for run in read_back(&store, saved_id, rid).await {
+            assert_eq!(run.status, RunStatus::Error, "{run:?}");
+            assert_eq!(
+                run.error_message.as_deref(),
+                Some(RESULT_PERSISTENCE_FAILED),
+                "{run:?}"
+            );
+            assert!(!format!("{run:?}").contains("MARKER"), "{run:?}");
+        }
+    }
+
+    #[derive(Debug)]
+    struct LoggedEvent {
+        level: tracing::Level,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    struct EventFields<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for EventFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct EventLog(std::sync::Arc<std::sync::Mutex<Vec<LoggedEvent>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLog {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::HashMap::new();
+            event.record(&mut EventFields(&mut fields));
+            self.0.lock().unwrap().push(LoggedEvent {
+                level: *event.metadata().level(),
+                fields,
+            });
+        }
+    }
+
+    /// Every event `work` emits on this thread, at every level.
+    async fn events_of(work: impl std::future::Future<Output = ()>) -> Vec<LoggedEvent> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let log = EventLog::default();
+        let capturing =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        work.await;
+        drop(capturing);
+        std::mem::take(&mut *log.0.lock().unwrap())
+    }
+
+    /// The scheduler's store-fault events say which failure it was and
+    /// what it came from, at ERROR, and keep the driver's text at DEBUG
+    /// only (ADR-0040, amended 2026-11-08). The ambiguous commit is driven
+    /// with a planted marker; a failed finish and a failed flip run
+    /// against a closed pool, whose own text must stay at DEBUG too.
+    #[sqlx::test]
+    async fn scheduler_fault_events_carry_no_error_text(pool: PgPool) {
+        use tracing::Level;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap().to_owned();
+        let planted = || StoreError::Unavailable(sqlx::Error::Protocol(MARKER.into()));
+        let fields_of = |e: StoreError| {
+            let fault = ServerError::from(e);
+            (fault.error_class(), fault.cause_kind().as_str())
+        };
+        let ambiguous = fields_of(planted());
+        let closed_pool = fields_of(StoreError::Unavailable(sqlx::Error::PoolClosed));
+
+        let (store, _, ambiguous_run) = seed_run(&pool, "ambiguous").await;
+        let (_, _, finish_run) = seed_run(&pool, "finish").await;
+        let (_, _, flip_run) = seed_run(&pool, "flip").await;
+
+        let ambiguous_events = events_of(recover_ambiguous_finish(
+            &store,
+            &base,
+            ambiguous_run,
+            5,
+            None,
+            planted(),
+        ))
+        .await;
+        // The rest run against the store with its pool closed, so its
+        // writes fail with a real driver error.
+        pool.close().await;
+        let closed = store;
+
+        let cases = [
+            ("ambiguous commit", vec![ambiguous], ambiguous_events),
+            (
+                "failed finish",
+                vec![closed_pool],
+                events_of(async {
+                    let failure = ServerError::Engine(trawl_engine::error::EngineError::Io(
+                        std::io::Error::other(MARKER),
+                    ));
+                    record_failed_run(&closed, finish_run, 5, &failure).await;
+                })
+                .await,
+            ),
+            (
+                "failed flip",
+                vec![ambiguous, closed_pool],
+                events_of(recover_ambiguous_finish(
+                    &closed,
+                    &base,
+                    flip_run,
+                    5,
+                    None,
+                    planted(),
+                ))
+                .await,
+            ),
+        ];
+
+        for (label, expected, events) in cases {
+            let faults: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    e.level == Level::ERROR
+                        && e.fields.get("event_type").map(String::as_str) == Some("scheduler_error")
+                })
+                .map(|e| {
+                    (
+                        e.fields.get("error_class").map_or("", String::as_str),
+                        e.fields.get("cause_kind").map_or("", String::as_str),
+                    )
+                })
+                .collect();
+            assert_eq!(faults, expected, "{label}: {events:?}");
+            for event in events
+                .iter()
+                .filter(|e| [Level::INFO, Level::WARN, Level::ERROR].contains(&e.level))
+            {
+                assert!(!event.fields.contains_key("error"), "{label}: {event:?}");
+                for (field, value) in &event.fields {
+                    assert!(
+                        !value.contains("MARKER"),
+                        "{label}: {field} carries the error's text at {}: {value}",
+                        event.level
+                    );
+                }
+            }
+            let texts = events
+                .iter()
+                .filter(|e| e.level == Level::DEBUG && e.fields.contains_key("error"))
+                .count();
+            assert_eq!(
+                texts,
+                expected.len(),
+                "{label}: each fault's text is kept at DEBUG: {events:?}"
+            );
+        }
     }
 }
 
@@ -1156,8 +1492,24 @@ mod off_reactor_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{CorpusWatch, decode_result_blob, remove_result_file, zstd_fallback};
+    use super::{
+        CorpusWatch, decode_result_blob, remove_result_file, result_relative_path, zstd_fallback,
+    };
     use crate::publication::CorpusUnsettled::{RestartBacklog, RollupPending};
+
+    /// Scheduled results land in the reserved `scheduled/` root entry,
+    /// which the env listing skips.
+    #[test]
+    fn reserved_root_entries_agree_across_consumers() {
+        let relative = result_relative_path(42);
+        let path = std::path::Path::new(&relative);
+        assert_eq!(
+            path.parent(),
+            Some(std::path::Path::new(trawl_config::SCHEDULED_DIR_NAME))
+        );
+        assert_eq!(relative, "scheduled/run_42.parquet");
+        assert!(trawl_config::RESERVED_ROOT_DIRS.contains(&trawl_config::SCHEDULED_DIR_NAME));
+    }
 
     /// The loop logs a change of corpus state once, never a poll that
     /// finds the same state: a settled start is silent, a reason switch is
@@ -1210,10 +1562,69 @@ mod tests {
         );
     }
 
+    /// Both cleanup events name the result by its data-root-relative path
+    /// and never carry the absolute host path or the `io::Error` text,
+    /// which go to a DEBUG event (ADR-0040, amended 2026-11-08). The
+    /// failure is a directory where the file should be, so `remove_file`
+    /// fails with something other than `NotFound`.
+    #[test]
+    fn result_file_cleanup_events_carry_no_host_path_or_io_text() {
+        use crate::test_events::events_of;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap().to_owned();
+        let abs = tmp.path().display().to_string();
+        let blocked = "scheduled/foo/run_dir.parquet";
+        std::fs::create_dir_all(tmp.path().join(blocked)).unwrap();
+        let io_text = std::fs::remove_file(tmp.path().join(blocked))
+            .expect_err("a directory cannot be unlinked as a file")
+            .to_string();
+        let missing = "scheduled/foo/does_not_exist.parquet";
+
+        for (rel, event_type, removal_error) in [
+            (missing, "result_file_already_absent", false),
+            (blocked, "result_file_cleanup_error", true),
+        ] {
+            let events = events_of(|| assert!(!remove_result_file(&base, rel)));
+            let loud: Vec<_> = events.iter().filter(|e| e.is_default_level()).collect();
+            assert_eq!(loud.len(), 1, "{rel}: {events:?}");
+            let event = loud[0];
+            assert_eq!(
+                event.fields.get("event_type").map(String::as_str),
+                Some(event_type),
+                "{event:?}"
+            );
+            assert_eq!(
+                event.fields.get("path").map(String::as_str),
+                Some(rel),
+                "{event:?}"
+            );
+            assert!(!event.text().contains(&abs), "{event:?}");
+            assert!(!event.text().contains("os error"), "{event:?}");
+            if removal_error {
+                assert_eq!(event.level, tracing::Level::WARN, "{event:?}");
+                assert!(event.fields.contains_key("error_kind"), "{event:?}");
+                assert!(!event.text().contains(&io_text), "{event:?}");
+            } else {
+                assert_eq!(event.level, tracing::Level::INFO, "{event:?}");
+            }
+
+            let debug = events
+                .iter()
+                .find(|e| e.level == tracing::Level::DEBUG)
+                .unwrap_or_else(|| panic!("{rel}: no DEBUG event: {events:?}"));
+            assert!(debug.text().contains(&abs), "{debug:?}");
+            if removal_error {
+                assert!(debug.text().contains(&io_text), "{debug:?}");
+            }
+        }
+    }
+
     /// A scheduled run times itself: one `query_timing` of kind
     /// `scheduled` per run, keyed by its `query_id` and `run_id`, whose
     /// id the lifecycle events carry too. A failed run's event says its
-    /// class and never its text, which only the run record keeps.
+    /// class and never its text. The run row stores the error's public
+    /// message, which for an emit error names the caller's function.
     #[sqlx::test]
     async fn scheduled_run_emits_query_timing_and_no_error_text(pool: sqlx::PgPool) {
         use std::collections::HashMap;
@@ -1341,7 +1752,7 @@ mod tests {
             run.error_message
                 .as_deref()
                 .is_some_and(|m| m.contains("zz_sched_needle")),
-            "the run record keeps the text: {run:?}"
+            "the run row stores the public message, which names the emit error's function: {run:?}"
         );
     }
 
@@ -1376,5 +1787,142 @@ mod tests {
             reason.contains("encoding failed") && reason.contains("\"n\""),
             "{reason}"
         );
+    }
+
+    /// A run whose result has no exact parquet form stores a blob, and
+    /// the default-level event says so without the refusal's reason: the
+    /// reason names the column, which is query or sender content (a
+    /// renamed field, an `extract kv` key). The reason goes to DEBUG.
+    #[test]
+    fn result_blob_event_carries_no_column_name() {
+        use crate::test_events::events_of;
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+
+        // A mixed column has no exact parquet form, so the run stores a
+        // blob. Its name is query or sender content (a renamed field, an
+        // `extract kv` key), so the default-level event must not carry the
+        // refusal that quotes it.
+        const MARKER: &str = "zz_content_marker";
+        let result = QueryResult {
+            columns: vec![Column::new(MARKER, ColumnType::Mixed)],
+            rows: vec![
+                vec![Value::Integer(1)],
+                vec![Value::String("word".to_owned())],
+            ],
+        };
+        let data = tempfile::tempdir().unwrap();
+        let executors = crate::pool::ExecutorPool::for_test(
+            data.path().display().to_string(),
+            1,
+            100_000,
+            None,
+        )
+        .unwrap();
+
+        let mut stored = None;
+        let events = events_of(|| {
+            stored = Some(super::write_result_parquet(&executors, 1, &result));
+        });
+        let (path, blob) = stored.unwrap().expect("the blob encodes");
+        assert!(
+            path.is_none() && blob.is_some(),
+            "a mixed column stores a blob"
+        );
+
+        let blob_event = events
+            .iter()
+            .find(|e| {
+                e.is_default_level()
+                    && e.fields.get("event_type").map(String::as_str)
+                        == Some("scheduler_result_blob")
+            })
+            .unwrap_or_else(|| panic!("no default-level blob event: {events:?}"));
+        assert!(!blob_event.text().contains(MARKER), "{blob_event:?}");
+        for event in events.iter().filter(|e| e.is_default_level()) {
+            assert!(!event.text().contains(MARKER), "{event:?}");
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| e.level == tracing::Level::DEBUG && e.text().contains(MARKER)),
+            "the refusal keeps its reason at DEBUG: {events:?}"
+        );
+    }
+
+    /// Each parquet fallback the test can provoke falls back to the blob
+    /// with a WARN that names the error's kind and class but carries
+    /// neither its text nor the data root, which go to a DEBUG event
+    /// beside it (ADR-0040, amended 2026-11-08). The arms: the result
+    /// directory blocked by a file, the engine's ndjson staging path
+    /// blocked by a directory (an [`EngineError::Io`]), and the final path
+    /// blocked by a non-empty directory, so the rename fails. The detached
+    /// executor arm takes the same engine path and is not provoked here.
+    ///
+    /// [`EngineError::Io`]: trawl_engine::error::EngineError::Io
+    #[test]
+    fn parquet_fallback_events_carry_no_error_text() {
+        use crate::test_events::events_of;
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+
+        type Block = fn(&std::path::Path);
+
+        let result = QueryResult {
+            columns: vec![Column::new("n", ColumnType::Integer)],
+            rows: vec![vec![Value::Integer(7)]],
+        };
+        let block_dir = |base: &std::path::Path| {
+            std::fs::write(base.join("scheduled"), b"").unwrap();
+        };
+        let block_write = |base: &std::path::Path| {
+            std::fs::create_dir_all(base.join("scheduled/run_1.parquet.tmp.ndjson.tmp")).unwrap();
+        };
+        let block_rename = |base: &std::path::Path| {
+            std::fs::create_dir_all(base.join("scheduled/run_1.parquet/inner")).unwrap();
+        };
+        let cases: [(&str, Block, &[&str]); 3] = [
+            ("directory", block_dir, &["error_kind"]),
+            ("engine write", block_write, &["error_class", "cause_kind"]),
+            ("rename", block_rename, &["error_kind"]),
+        ];
+        for (arm, block, carried) in cases {
+            let data = tempfile::tempdir().unwrap();
+            let abs = data.path().display().to_string();
+            block(data.path());
+            let executors =
+                crate::pool::ExecutorPool::for_test(abs.clone(), 1, 100_000, None).unwrap();
+
+            let mut stored = None;
+            let events = events_of(|| {
+                stored = Some(super::write_result_parquet(&executors, 1, &result));
+            });
+            let (path, blob) = stored.unwrap().expect("the blob fallback encodes");
+            assert!(path.is_none() && blob.is_some(), "{arm}: no blob fallback");
+
+            for event in events.iter().filter(|e| e.is_default_level()) {
+                assert!(!event.text().contains(&abs), "{arm}: {event:?}");
+                assert!(!event.text().contains("os error"), "{arm}: {event:?}");
+                assert!(!event.fields.contains_key("error"), "{arm}: {event:?}");
+            }
+            let warn = events
+                .iter()
+                .find(|e| {
+                    e.level == tracing::Level::WARN
+                        && e.fields.get("event_type").map(String::as_str)
+                            == Some("scheduler_parquet_error")
+                })
+                .unwrap_or_else(|| panic!("{arm}: no WARN: {events:?}"));
+            for field in carried {
+                assert!(warn.fields.contains_key(*field), "{arm}: {warn:?}");
+            }
+            let debug = events
+                .iter()
+                .find(|e| {
+                    e.level == tracing::Level::DEBUG
+                        && e.fields.get("event_type").map(String::as_str)
+                            == Some("scheduler_parquet_error")
+                })
+                .unwrap_or_else(|| panic!("{arm}: no DEBUG: {events:?}"));
+            assert!(debug.text().contains("os error"), "{arm}: {debug:?}");
+        }
     }
 }

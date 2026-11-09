@@ -14,6 +14,9 @@ pub mod ast;
 /// DSL parser — transforms query strings into AST.
 pub mod parser;
 
+/// The closed set of aggregate functions both lanes implement.
+pub mod aggregate;
+
 /// The stop cancellable work reads between its steps (ADR-0063).
 pub mod cancel;
 

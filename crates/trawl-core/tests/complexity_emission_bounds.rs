@@ -259,11 +259,10 @@ fn pins(entries: &[(usize, CanonicalType)]) -> FieldTypes {
     map
 }
 
-/// Emit `dsl` and return the one expression fragment it projects or
-/// filters on.
-fn fragment(dsl: &str, pin_map: &FieldTypes) -> String {
+/// Emit `dsl` and return its SQL.
+fn emitted_sql(dsl: &str, pin_map: &FieldTypes) -> String {
     let query = parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
-    let sql = trawl_core::emitter::emit_with_pins(
+    trawl_core::emitter::emit_with_pins(
         &query,
         "src",
         pin_map,
@@ -271,7 +270,13 @@ fn fragment(dsl: &str, pin_map: &FieldTypes) -> String {
         anchor(),
     )
     .unwrap_or_else(|e| panic!("{dsl}: {e}"))
-    .sql;
+    .sql
+}
+
+/// Emit `dsl` and return the one expression fragment it projects or
+/// filters on.
+fn fragment(dsl: &str, pin_map: &FieldTypes) -> String {
+    let sql = emitted_sql(dsl, pin_map);
     if let Some((_, tail)) = sql.split_once("NOT IN ('z')), ") {
         let (expr, _) = tail
             .rsplit_once(" AS \"z\"")
@@ -282,6 +287,19 @@ fn fragment(dsl: &str, pin_map: &FieldTypes) -> String {
         .split_once("WHERE ")
         .unwrap_or_else(|| panic!("{dsl}: neither a projection nor a filter: {sql}"));
     tail.trim().to_string()
+}
+
+/// Emit `dsl`, a `stats` stage whose one output is `z`, and return that
+/// output's expression.
+fn slot_fragment(dsl: &str, pin_map: &FieldTypes) -> String {
+    let sql = emitted_sql(dsl, pin_map);
+    let (_, tail) = sql
+        .split_once("SELECT ")
+        .unwrap_or_else(|| panic!("{dsl}: no projection in {sql}"));
+    let (expr, _) = tail
+        .split_once(" AS \"z\"")
+        .unwrap_or_else(|| panic!("{dsl}: no output alias in {sql}"));
+    expr.trim().to_string()
 }
 
 /// How the emitted TEXT's copy count relates to the declared one.
@@ -710,7 +728,14 @@ fn every_known_function_has_an_emission_fixture() {
 
     let none = FieldTypes::new();
     for (name, args, markers) in fixtures {
-        let sql = fragment(&format!("* | let z = {name}({args})"), &none);
+        // An aggregate stands only in an aggregation slot (ADR-0001,
+        // Amendment 2026-11-08), so its fixture is a `stats` output and
+        // every other function's a `let` projection.
+        let sql = if trawl_core::emitter::is_aggregate_function(name) {
+            slot_fragment(&format!("* | stats {name}({args}) as z"), &none)
+        } else {
+            fragment(&format!("* | let z = {name}({args})"), &none)
+        };
         let rendering = shape_of(name, args);
         check(name, &rendering, &sql, *markers, Copies::Exact);
     }
@@ -782,13 +807,14 @@ fn arity_dependent_shapes_match_their_emission() {
         &none,
         3,
     );
-    // `count(x)` is not `count()`.
-    check_let(
+    // `count(x)` is not `count()`. An aggregate stands only in an
+    // aggregation slot, so this one is a `stats` output.
+    check(
         "count/1",
         &Rendering::Function(FunctionShape::Plain(1)),
-        "count(`__c0__`)",
-        &none,
+        &slot_fragment("* | stats count(`__c0__`) as z", &none),
         1,
+        Copies::Exact,
     );
     // `round`'s precision argument is inlined, never an operand.
     check_let(

@@ -22,6 +22,7 @@ use std::path::Path;
 use trawl_api::doctor::{Check, Outcome, Report, Verdict};
 
 use super::ServerCheck;
+use crate::env_dirs;
 use crate::handlers::HEALTH_CHECK_NAMES;
 
 /// Output format for the report, named as `trawl doctor` names them.
@@ -252,13 +253,13 @@ impl Text {
         self
     }
 
-    /// Append the date `day` spells as `YYYY-MM-DD`, written back from the
-    /// parsed date, else [`INVALID_DATE`].
+    /// Append `day` when it is a date directory name, written back from
+    /// the parsed date, else [`INVALID_DATE`].
     #[must_use]
     pub fn date(mut self, day: &str) -> Self {
-        match chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
-            Ok(date) => self.0.push_str(&date.format("%Y-%m-%d").to_string()),
-            Err(_) => self.0.push_str(INVALID_DATE),
+        match env_dirs::parse_date(day) {
+            Some(date) => self.0.push_str(&env_dirs::date_name(date)),
+            None => self.0.push_str(INVALID_DATE),
         }
         self
     }

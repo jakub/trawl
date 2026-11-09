@@ -55,8 +55,7 @@ async fn capacity_metrics_endpoint_exposes_query_scratch_and_role_series_only() 
     )
     .await;
     let scratch_dir = server.state.query.pool.scratch().path().to_path_buf();
-    let glob = server.state.query.pool.fallback_glob().to_string();
-    let data_root = std::path::PathBuf::from(&glob[..glob.find('*').expect("a glob")])
+    let data_root = std::path::Path::new(server.state.query.pool.base_dir())
         .components()
         .collect::<std::path::PathBuf>();
     let wal_dir = server

@@ -409,7 +409,10 @@ impl InvestigationStore {
         new: &NewInvestigation,
     ) -> Result<CreateOutcome, StoreError> {
         let creation = serde_json::to_string(&new.creation).map_err(|e| {
-            StoreError::Validation(format!("the create request does not encode: {e}"))
+            // A public message names no serde_json text (ADR-0040,
+            // amendment of 2026-11-08).
+            tracing::debug!(error = %e, "an investigation create request did not encode");
+            StoreError::Validation("the create request does not encode".to_owned())
         })?;
         for _ in 0..CREATE_ATTEMPTS {
             let inserted = sqlx::query(concat!(
@@ -1796,8 +1799,10 @@ async fn advance(
 }
 
 fn encode_payload(payload: &EntryPayload) -> Result<String, StoreError> {
-    serde_json::to_string(payload)
-        .map_err(|e| StoreError::Validation(format!("the entry does not encode: {e}")))
+    serde_json::to_string(payload).map_err(|e| {
+        tracing::debug!(error = %e, "an investigation entry did not encode");
+        StoreError::Validation("the entry does not encode".to_owned())
+    })
 }
 
 /// The table's spelling of an entry kind, as `investigation_log_kind_check`

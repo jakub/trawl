@@ -52,13 +52,14 @@ use trawl_engine::timing::{PhaseClock, QueryPhase};
 use trawl_engine::value::QueryResult;
 
 use crate::deadline::Deadline;
-use crate::error::{CAPACITY_NOT_STARTED, ServerError};
+use crate::error::ServerError;
 use crate::hot_buffer::{HotBuffer, HotSnapshot};
 use crate::query_timing::{Outcome, PhysicalOutcome, QueryTiming, Reclaim, emit_reclaimed};
 use crate::source::{compute_source, select, selection_bytes};
 
-/// Test-only delay injected into the blocking query task so timeout and
-/// cancellation tests can reliably win the `select!`/cancel race. Zero means
+/// Test-only delay injected into the blocking query and Parquet export
+/// tasks so timeout and cancellation tests can reliably win the
+/// `select!`/cancel race. Zero means
 /// no delay. Compiled for unit tests and, via the `test-support` feature,
 /// for this crate's own integration tests — no production consumer enables
 /// that feature, so release builds never carry it.
@@ -731,7 +732,7 @@ impl RefusalOnce {
                 "query work refused before it started"
             );
         }
-        ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned())
+        ServerError::CapacityNotStarted
     }
 
     fn refuse_outcome(&self, id: u64, kind: WorkKind, refusal: StartRefusal) -> ExecuteOutcome {
@@ -2461,10 +2462,6 @@ impl ExecutorPool {
         &self.base_dir
     }
 
-    pub fn fallback_glob(&self) -> &Arc<str> {
-        &self.fallback_glob
-    }
-
     /// Sample distinct values of one field for autocomplete.
     ///
     /// A parquet-reading lane like any other, so it funnels through the
@@ -2513,6 +2510,7 @@ impl ExecutorPool {
         let mut slot = self.begin_slot(id, work, None, permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
         let fallback_glob = Arc::clone(&self.fallback_glob);
+        let base_dir = Arc::clone(&self.base_dir);
         let field = field.to_owned();
         let service = service.map(ToOwned::to_owned);
 
@@ -2531,11 +2529,7 @@ impl ExecutorPool {
                     }
                     worker_seam!(seams, Started);
                     let glob = match service {
-                        Some(svc) => {
-                            let base = fallback_glob.as_ref();
-                            let base_prefix = base.find('*').map_or(base, |pos| &base[..pos]);
-                            format!("{base_prefix}**/{svc}.parquet")
-                        }
+                        Some(svc) => service_glob(&base_dir, &svc),
                         None => fallback_glob.to_string(),
                     };
                     let result = slot
@@ -2578,7 +2572,8 @@ impl ExecutorPool {
     /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id).
     ///
     /// Acquires a pool executor, writes to a temp file, and returns the
-    /// raw bytes. Respects the hot buffer for fresh event visibility.
+    /// raw bytes with the number of rows written. Respects the hot buffer
+    /// for fresh event visibility.
     ///
     /// The same lifecycle as [`execute`](Self::execute): the budget covers
     /// every wait up to bytes in hand, and an export that outlives its
@@ -2591,7 +2586,7 @@ impl ExecutorPool {
         max_rows: usize,
         deadline: Deadline,
         work: WorkContext,
-    ) -> Result<Vec<u8>, ServerError> {
+    ) -> Result<(Vec<u8>, usize), ServerError> {
         let kind = work.kind;
         let timing = work.timing.clone();
         let clock = timing
@@ -2650,6 +2645,16 @@ impl ExecutorPool {
                     slot.started_timing();
                     worker_seam!(seams, Started);
 
+                    // Test-only: sleep before the export so tests can hold
+                    // it running.
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
+                        if delay > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                        }
+                    }
+
                     let clock = slot.clock();
                     let cancel = slot.cancel_latch();
                     let source = clock.time(QueryPhase::Source, || {
@@ -2694,9 +2699,10 @@ impl ExecutorPool {
                     .map_err(ServerError::from);
 
                     // Reading the written file back is this format's render.
-                    let bytes = written.and_then(|()| {
+                    let exported = written.and_then(|rows| {
                         clock
                             .time(QueryPhase::Render, || std::fs::read(&tmp_path))
+                            .map(|bytes| (bytes, rows))
                             .map_err(|e| {
                                 ServerError::Internal(format!(
                                     "failed to read parquet temp file: {e}"
@@ -2704,7 +2710,7 @@ impl ExecutorPool {
                             })
                     });
                     worker_seam!(seams, Finished);
-                    bytes
+                    exported
                 }));
                 let result =
                     outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("export")));
@@ -2961,6 +2967,12 @@ impl ExecutorPool {
             }
         }
     }
+}
+
+/// The glob over one service's files under the data root `base_dir`,
+/// joined with exactly one separator.
+fn service_glob(base_dir: &str, service: &str) -> String {
+    format!("{}/**/{service}.parquet", base_dir.trim_end_matches('/'))
 }
 
 #[cfg(test)]
@@ -3670,24 +3682,20 @@ mod tests {
                 TEST_WORK,
             )
         };
-        assert_eq!(
-            parquet_rows(&export().await.expect("the export answers")),
-            2,
-            "one cold row and one hot row"
-        );
+        let (bytes, rows) = export().await.expect("the export answers");
+        assert_eq!(parquet_rows(&bytes), 2, "one cold row and one hot row");
+        assert_eq!(rows, 2, "the returned count is the file's");
 
         hot.fail_next_snapshot_for_test();
         let error = export()
             .await
-            .map(|bytes| parquet_rows(&bytes))
+            .map(|(bytes, _)| parquet_rows(&bytes))
             .expect_err("the export refuses instead of answering cold-only");
         assert_snapshot_refusal(error, crate::error::CauseKind::IoStorageFull).await;
 
-        assert_eq!(
-            parquet_rows(&export().await.expect("the export answers")),
-            2,
-            "the fault latched nothing"
-        );
+        let (bytes, rows) = export().await.expect("the export answers");
+        assert_eq!(parquet_rows(&bytes), 2, "the fault latched nothing");
+        assert_eq!(rows, 2, "the returned count is the file's");
     }
 
     /// A snapshot whose path is not UTF-8 cannot be opened by `DuckDB`, so
@@ -3752,7 +3760,7 @@ mod tests {
         /// One round's gate and its parked exports.
         type Round = (
             Arc<seam::Gate>,
-            Vec<tokio::task::JoinHandle<Result<Vec<u8>, ServerError>>>,
+            Vec<tokio::task::JoinHandle<Result<(Vec<u8>, usize), ServerError>>>,
         );
         const PERMITS: usize = 3;
         const ROUNDS: usize = 3;
@@ -4008,6 +4016,19 @@ mod tests {
         assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
     }
 
+    /// The service-scoped sampling glob is built from the configured root,
+    /// with one separator whatever the root's spelling.
+    #[test]
+    fn configured_data_root_is_passed_directly() {
+        for base in ["/var/lib/trawl/data", "/var/lib/trawl/data/"] {
+            assert_eq!(
+                service_glob(base, "nginx"),
+                "/var/lib/trawl/data/**/nginx.parquet"
+            );
+        }
+        assert_eq!(service_glob("/", "nginx"), "/**/nginx.parquet");
+    }
+
     #[test]
     fn fallback_glob_strips_trailing_slash() {
         let pool = ExecutorPool::for_test("/var/lib/trawl/data/".into(), 1, 100_000, None).unwrap();
@@ -4049,7 +4070,7 @@ mod tests {
         let waited = start.elapsed();
 
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "a query that never left the queue is refused, not timed out: {:?}",
             outcome.result
         );
@@ -4086,7 +4107,7 @@ mod tests {
         let waited = start.elapsed();
 
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "a query that never passed the gate is refused, not timed out: {:?}",
             outcome.result
         );
@@ -4268,7 +4289,7 @@ mod tests {
         .expect("publication wait must return before the writer releases its guard");
 
         assert!(
-            matches!(&result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&result, Err(ServerError::CapacityNotStarted)),
             "a sample that never started is a capacity refusal, got {result:?}"
         );
         assert_eq!(
@@ -4369,7 +4390,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         let outcome = request.await.expect("the request joins");
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "expected a capacity refusal, got {:?}",
             outcome.result
         );
@@ -4636,7 +4657,7 @@ mod tests {
         entry.release();
         let outcome = request.await.expect("the request joins");
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "expected a refusal, got {:?}",
             outcome.result
         );
@@ -4771,7 +4792,7 @@ mod tests {
         until("cleanup", || pool.retained() == 0).await;
 
         assert!(
-            matches!(&expiry_first, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&expiry_first, Err(ServerError::CapacityNotStarted)),
             "expiry before the start is a capacity refusal, got {expiry_first:?}"
         );
         assert!(
@@ -5201,7 +5222,7 @@ mod tests {
             .expect("the sample task joins")
             .expect_err("a full pool cannot be sampled");
         assert!(
-            matches!(&refused, ServerError::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED),
+            matches!(&refused, ServerError::CapacityNotStarted),
             "expected the safe capacity refusal, got {refused:?}"
         );
 
@@ -5221,9 +5242,12 @@ mod tests {
         settle().await;
         tokio::time::advance(Duration::from_millis(301)).await;
         settle().await;
-        assert!(short.await.expect("the sample task joins").is_err_and(
-            |e| matches!(&e, ServerError::ServiceUnavailable(m) if m == CAPACITY_NOT_STARTED)
-        ),);
+        assert!(
+            short
+                .await
+                .expect("the sample task joins")
+                .is_err_and(|e| matches!(&e, ServerError::CapacityNotStarted)),
+        );
 
         // Nothing a refused helper touched is still held: it never got a
         // permit, so it never registered.
@@ -5420,7 +5444,7 @@ mod tests {
             if !export.as_ref().is_err_and(exhausted) {
                 wrong.push(format!(
                     "export, {label}: {:?}",
-                    export.map(|bytes| parquet_rows(&bytes))
+                    export.map(|(bytes, _)| parquet_rows(&bytes))
                 ));
             }
         }
@@ -5788,7 +5812,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "{:?}",
             outcome.result
         );
@@ -5813,7 +5837,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "{:?}",
             outcome.result
         );
@@ -6567,7 +6591,7 @@ mod tests {
             .await
             .expect_err("a window waits for the guard the writer holds");
         assert!(
-            matches!(&refused, ServerError::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED),
+            matches!(&refused, ServerError::CapacityNotStarted),
             "{refused:?}"
         );
         drop(writer);

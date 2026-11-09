@@ -336,6 +336,28 @@ fn source_path_errors_carry_no_path() {
     }
 }
 
+/// A refused source list never travels in the refusal either. The list is
+/// server-minted from the data root, and a root whose path holds a comma
+/// splits into fragments that fail the quoting check, each one an
+/// absolute path.
+#[cfg(test)]
+#[test]
+fn source_list_errors_carry_no_path() {
+    for source in [
+        "['/srv/secret/data,backup/prod/2026-01-01/a.parquet']",
+        "[/srv/secret/data/prod/2026-01-01/a.parquet]",
+    ] {
+        let message = match validate_source_list(source) {
+            Err(super::EmitError::UnsupportedOperation { message }) => message,
+            other => panic!("expected a refusal for {source}, got {other:?}"),
+        };
+        assert!(
+            !message.contains('/'),
+            "the refusal must not carry the path: {message}"
+        );
+    }
+}
+
 /// Validate a list-format source for `read_parquet()`.
 ///
 /// Expected format: `['path1', 'path2', ...]`. Each individual path
@@ -353,8 +375,11 @@ fn validate_source_list(source: &str) -> Result<(), super::EmitError> {
         let path = trimmed
             .strip_prefix('\'')
             .and_then(|s| s.strip_suffix('\''))
-            .ok_or_else(|| super::EmitError::UnsupportedOperation {
-                message: format!("invalid source list element: {trimmed}"),
+            .ok_or_else(|| {
+                tracing::debug!(element = trimmed, "invalid source list element");
+                super::EmitError::UnsupportedOperation {
+                    message: "invalid source list element".to_string(),
+                }
             })?;
         validate_source_path(path)?;
     }
