@@ -42,7 +42,7 @@ trawl query 'last=15m | head 20'
 Expect up to 20 events and a footer with the number of rows returned, such
 as `3 row(s)`, or `no results` when nothing matched. Use the API URL, not the
 browser URL. Keep `--token` off the command line, because shell history keeps
-it. `TRAWL_TOKEN` in the environment overrides the file.
+it. `TRAWL_TOKEN` in the environment overrides the file for the same server.
 
 ## Keep more than one server in profiles
 
@@ -66,6 +66,25 @@ trawl --profile lab
 The first command queries `lab` and the second opens the TUI against it.
 `TRAWL_PROFILE` selects a profile too. `--config /path/to/client.toml` reads a
 different file. Name the server every time you change something.
+
+A token goes only to the URL it was saved for. A profile with its own `url`
+needs its own `token`. Without one, `trawl` does not send the `[server]` token
+to that URL. The same holds for `--url` and `TRAWL_URL`, so this command fails
+before it sends anything, even with `TRAWL_TOKEN` set:
+
+```bash
+trawl --url https://lab-logs.example.com:5514 query 'last=15m | head 20'
+```
+
+The message names `--token` and `--token-file`. Save the lab key in a file
+private to your account and name it:
+
+```bash
+trawl --url https://lab-logs.example.com:5514 \
+  --token-file ~/.config/trawl/lab.key query 'last=15m | head 20'
+```
+
+The [CLI reference](/reference/cli/#where-a-token-goes) has the full rules.
 
 ## Fix a connection problem
 

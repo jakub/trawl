@@ -1088,8 +1088,14 @@ cookie_secret_path = "/var/lib/trawl/web.cookie"
 ## Client configuration
 
 The `trawl` CLI and TUI read `~/.config/trawl/config.toml`. A flag beats an
-environment variable, which beats the config file. See the
-[CLI reference](/reference/cli/#global-options) for the flags.
+environment variable, which beats the config file, except that a saved token
+goes only to the URL it was saved for. See the
+[CLI reference](/reference/cli/#global-options) for the flags and
+[where a token goes](/reference/cli/#where-a-token-goes) for the token rules.
+
+Every `url` must be an `http` or `https` URL with a host. A URL with
+credentials (`user@` before the host), a query, or a fragment is refused, and
+so is a `%3F` or `%23` in its path.
 
 ### `[server]`
 
@@ -1098,19 +1104,20 @@ The default connection, used when no `--profile` is selected.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `url` | string | `"https://localhost:5514"` | Server URL |
-| `token` | string | *(none)* | API token |
+| `token` | string | *(none)* | API token. `trawl` sends it only to `url` |
 | `insecure` | bool | `false` | Accept self-signed TLS certificates. `trawl` then prints a warning to stderr |
 | `ca_cert` | path | *(none)* | PEM file of the CA certificates to trust for this server. `trawl` trusts only these CAs and still checks the hostname. The path must be absolute or start with `~`. Setting it together with `insecure` is an error |
 
 ### `[profiles.<name>]`
 
-One table per named server. Each key overrides the matching `[server]` key.
+One table per named server. Each key overrides the matching `[server]` key,
+but a token stays with the URL it was saved for.
 Select a profile with `-p dev`, `--profile dev`, or `TRAWL_PROFILE=dev`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `url` | string | *(inherits `[server]`)* | Server URL |
-| `token` | string | *(inherits `[server]`)* | API token |
+| `token` | string | *(`[server]` token, for an equal URL only)* | API token. `trawl` sends it only to the profile's URL |
 | `insecure` | bool | *(inherits `[server]`)* | Accept self-signed TLS certificates |
 | `ca_cert` | path | *(inherits `[server]`)* | PEM file of the CA certificates to trust. `""` clears an inherited `ca_cert` |
 
@@ -1123,7 +1130,23 @@ token = "flt_prod_token"
 url = "https://localhost:5514"
 token = "flt_dev_token"
 ca_cert = "~/.config/trawl/dev-ca.pem"
+
+[profiles.quicktest]
+insecure = true
 ```
+
+A profile's own `token` is bound to the profile's URL: its own `url`, or
+`[server].url` when it sets none. A profile without `token` can use
+`[server].token` only when the selected URL equals `[server].url`. In the
+example, `[profiles.quicktest]` sets no `url`, so `-p quicktest` sends
+`flt_prod_token` to `[server].url`. A profile whose `url` names another server and that sets no
+`token` does not carry `[server].token` there: `trawl` refuses and sends
+nothing. Add `token` to the profile, or give `--token` or `--token-file`.
+
+URLs are equal when the scheme, host, port, and path prefix are equal. Case in
+the scheme and host, a default port, and one trailing `/` do not matter. A
+different path prefix, another port, `localhost` against `127.0.0.1`, or a
+trailing dot on the host makes a different URL.
 
 ### `[ui]`
 
