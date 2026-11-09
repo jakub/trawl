@@ -251,8 +251,8 @@ pub enum ServerError {
 
     /// The auth backend could not answer a keystore call (503). The
     /// driver's typed kind rides along for [`ServerError::cause_kind`]; the
-    /// postgres detail itself is logged where the error is converted and
-    /// never reaches the wire.
+    /// postgres detail itself is logged at DEBUG where the error is
+    /// converted, and never reaches the wire or a default-level event.
     #[error("service unavailable: auth backend unavailable")]
     AuthBackend(CauseKind),
 
@@ -1064,20 +1064,18 @@ impl From<fleet_auth::AuthError> for ServerError {
         use fleet_auth::AuthError as E;
         match err {
             E::Database(e) => {
-                tracing::error!(target: "auth.backend", error = %e, "fleet auth backend error");
-                Self::AuthBackend(CauseKind::of_sqlx(&e))
+                Self::auth_backend_fault(CauseKind::of_sqlx(&e), "fleet auth backend error", &e)
             }
             E::Migration(e) => {
-                tracing::error!(target: "auth.backend", error = %e, "fleet auth migration error");
-                Self::AuthBackend(CauseKind::PgMigrate)
+                Self::auth_backend_fault(CauseKind::PgMigrate, "fleet auth migration error", &e)
             }
-            E::Schema(e) => {
-                tracing::error!(target: "auth.backend", error = %e, "fleet auth schema error");
-                Self::AuthBackend(CauseKind::of_auth_schema(&e))
-            }
+            E::Schema(e) => Self::auth_backend_fault(
+                CauseKind::of_auth_schema(&e),
+                "fleet auth schema error",
+                &e,
+            ),
             E::Hash(e) | E::TokenGeneration(e) => {
-                tracing::error!(target: "auth.backend", error = %e, "fleet auth worker error");
-                Self::AuthBackend(CauseKind::AuthWorker)
+                Self::auth_backend_fault(CauseKind::AuthWorker, "fleet auth worker error", &e)
             }
             E::InvalidKey(_) | E::MalformedToken(_) => {
                 Self::Unauthorized("authentication failed".into())
@@ -1568,23 +1566,65 @@ impl ServerError {
         }
     }
 
-    /// Log the detail of a server-side fault, which its response redacts:
-    /// a store's diagnostics, a report window's failure, an internal error.
+    /// Log a server-side fault, which its response redacts: a store's
+    /// diagnostics, a report window's failure, an internal error.
+    ///
+    /// The ERROR event carries the class and the cause kind, never the
+    /// error's text, which can quote the saved query, paths and driver
+    /// diagnostics. The text goes to a DEBUG event beside it, which the
+    /// default filter drops (ADR-0040, amended 2026-11-08).
     fn log_fault(&self) {
+        let error_class = self.error_class();
+        let cause_kind = self.cause_kind().as_str();
         match self {
             Self::Store(StoreError::Unavailable(source)) => {
-                tracing::error!(target: "storage.backend", error = %source, "app-state store error");
+                tracing::error!(
+                    target: "storage.backend",
+                    error_class,
+                    cause_kind,
+                    "app-state store error"
+                );
+                tracing::debug!(
+                    target: "storage.backend",
+                    error = %source,
+                    "app-state store error"
+                );
             }
             Self::Store(StoreError::Migration(source)) => {
-                tracing::error!(target: "storage.backend", error = %source, "app-state store migration error");
+                tracing::error!(
+                    target: "storage.backend",
+                    error_class,
+                    cause_kind,
+                    "app-state store migration error"
+                );
+                tracing::debug!(
+                    target: "storage.backend",
+                    error = %source,
+                    "app-state store migration error"
+                );
             }
             Self::WindowPlan(_) | Self::WindowMaterialize(_) => {
-                tracing::error!(event_type = "report_window_error", error = %self, "report window could not be resolved");
+                tracing::error!(
+                    event_type = "report_window_error",
+                    error_class,
+                    cause_kind,
+                    "report window could not be resolved"
+                );
+                tracing::debug!(
+                    event_type = "report_window_error",
+                    error = %self,
+                    "report window could not be resolved"
+                );
             }
             Self::Engine(EngineError::MissingPreparedPattern) => {
                 tracing::error!(
                     event_type = "missing_prepared_pattern",
-                    error_class = self.error_class(),
+                    error_class,
+                    cause_kind,
+                    "internal server error: a query's tail had no prepared pattern"
+                );
+                tracing::debug!(
+                    event_type = "missing_prepared_pattern",
                     error = %self,
                     "internal server error: a query's tail had no prepared pattern"
                 );
@@ -1592,13 +1632,38 @@ impl ServerError {
             Self::Internal(_) | Self::Panicked(_) => {
                 tracing::error!(
                     event_type = "internal_error",
-                    error_class = self.error_class(),
+                    error_class,
+                    cause_kind,
+                    "internal server error"
+                );
+                tracing::debug!(
+                    event_type = "internal_error",
                     error = %self,
                     "internal server error"
                 );
             }
             _ => {}
         }
+    }
+
+    /// The auth backend's 503, logged where a keystore failure converts:
+    /// the class and the driver's kind at ERROR, and the driver's text,
+    /// which the wire never carries, at DEBUG only (ADR-0040, amended
+    /// 2026-11-08).
+    fn auth_backend_fault(
+        kind: CauseKind,
+        what: &'static str,
+        source: &dyn std::fmt::Display,
+    ) -> Self {
+        let error = Self::AuthBackend(kind);
+        tracing::error!(
+            target: "auth.backend",
+            error_class = error.error_class(),
+            cause_kind = kind.as_str(),
+            "{what}"
+        );
+        tracing::debug!(target: "auth.backend", error = %source, "{what}");
+        error
     }
 }
 
@@ -3806,6 +3871,160 @@ mod tests {
                 headers.get(axum::http::header::CACHE_CONTROL).is_some(),
                 fact.no_store,
                 "{label}"
+            );
+        }
+    }
+
+    /// One event a fault logged: its level and every field, the message
+    /// among them.
+    #[derive(Debug)]
+    struct LoggedEvent {
+        level: tracing::Level,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    struct EventFields<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for EventFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct EventLog(std::sync::Arc<std::sync::Mutex<Vec<LoggedEvent>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLog {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::HashMap::new();
+            event.record(&mut EventFields(&mut fields));
+            self.0.lock().unwrap().push(LoggedEvent {
+                level: *event.metadata().level(),
+                fields,
+            });
+        }
+    }
+
+    /// Every event `work` emits, at every level.
+    fn events_of(work: impl FnOnce()) -> Vec<LoggedEvent> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let log = EventLog::default();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(log.clone()), work);
+        std::mem::take(&mut *log.0.lock().unwrap())
+    }
+
+    /// A fault's default-level events say which failure it was and what
+    /// it came from, and never its text: the planted marker reaches DEBUG
+    /// only (ADR-0040, amended 2026-11-08). `log_fault` runs where the
+    /// response is built, and the auth backend logs where its error
+    /// converts, so each is driven through that path.
+    #[test]
+    fn default_fault_events_carry_no_error_text() {
+        use crate::store::migrations::SchemaError;
+        use tracing::Level;
+
+        const PATH: &str = "/var/lib/trawl/data/MARKER-fault/prod/x.parquet";
+        const PANIC: &str = "MARKER-panic-label";
+
+        // The response path, for every fault `log_fault` logs. A unit
+        // fault's own sentence is the text that stays at DEBUG.
+        let faults: Vec<(ServerError, String)> = vec![
+            (
+                ServerError::Store(StoreError::Unavailable(sqlx::Error::Protocol(PATH.into()))),
+                PATH.into(),
+            ),
+            (
+                ServerError::Store(StoreError::Migration(SchemaError::Database(
+                    sqlx::Error::Protocol(PATH.into()),
+                ))),
+                PATH.into(),
+            ),
+            (
+                ServerError::WindowMaterialize(MaterializeError::SourceUnparseable {
+                    message: PATH.into(),
+                }),
+                PATH.into(),
+            ),
+            (
+                ServerError::WindowPlan(PlanError::Arithmetic),
+                PlanError::Arithmetic.to_string(),
+            ),
+            (
+                ServerError::Engine(EngineError::MissingPreparedPattern),
+                EngineError::MissingPreparedPattern.to_string(),
+            ),
+            (
+                ServerError::Internal(format!("failed to read parquet temp file {PATH}")),
+                PATH.into(),
+            ),
+            (ServerError::Panicked(PANIC), PANIC.into()),
+        ];
+        let mut cases: Vec<(String, &'static str, &'static str, String, Vec<LoggedEvent>)> =
+            Vec::new();
+        for (fault, marker) in faults {
+            let label = format!("{fault:?}");
+            let (class, cause) = (fault.error_class(), fault.cause_kind().as_str());
+            let events = events_of(|| drop(fault.into_response()));
+            cases.push((label, class, cause, marker, events));
+        }
+        // The conversion path, for every keystore failure that logs.
+        for (failure, marker) in [
+            (
+                fleet_auth::AuthError::Database(sqlx::Error::Protocol(PATH.into())),
+                PATH,
+            ),
+            (fleet_auth::AuthError::Hash(PATH.into()), PATH),
+            (fleet_auth::AuthError::TokenGeneration(PATH.into()), PATH),
+        ] {
+            let label = format!("{failure:?}");
+            let mut converted = None;
+            let events = events_of(|| converted = Some(ServerError::from(failure)));
+            let converted = converted.expect("the failure converts");
+            let (class, cause) = (converted.error_class(), converted.cause_kind().as_str());
+            cases.push((label, class, cause, marker.to_owned(), events));
+        }
+
+        for (label, class, cause, marker, events) in cases {
+            let loud: Vec<_> = events
+                .iter()
+                .filter(|e| [Level::INFO, Level::WARN, Level::ERROR].contains(&e.level))
+                .collect();
+            assert!(
+                loud.iter().any(|e| e.level == Level::ERROR),
+                "{label} logs its fault at ERROR: {events:?}"
+            );
+            for event in &loud {
+                assert_eq!(
+                    event.fields.get("error_class").map(String::as_str),
+                    Some(class),
+                    "{label}: {event:?}"
+                );
+                assert_eq!(
+                    event.fields.get("cause_kind").map(String::as_str),
+                    Some(cause),
+                    "{label}: {event:?}"
+                );
+                assert!(!event.fields.contains_key("error"), "{label}: {event:?}");
+                for (field, value) in &event.fields {
+                    assert!(
+                        !value.contains(&marker) && !value.contains("MARKER"),
+                        "{label}: {field} carries the error's text at {}: {value}",
+                        event.level
+                    );
+                }
+            }
+            assert!(
+                events.iter().any(|e| e.level == Level::DEBUG
+                    && e.fields.get("error").is_some_and(|v| v.contains(&marker))),
+                "{label}: the error's text is kept at DEBUG: {events:?}"
             );
         }
     }
