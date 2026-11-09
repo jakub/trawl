@@ -25,10 +25,25 @@ use trawl_engine::parquet_stats::{
     ParquetStatsError, StatVal, TimestampUnit, read_row_group_bounds,
 };
 
-/// Time filter padding (seconds) to account for WAL compaction delay.
-/// Events ingested at time T may land in the hourly partition for T + ~20s,
-/// so we widen the file selection window by one hour.
+use crate::ingest::envelope::MAX_TIME_LEAD;
+
+/// How far before `now - N` a `last=N` walk over hour directories starts,
+/// in seconds: room for the `_time` lead ingest allows.
+///
+/// Compaction files a row in the hour directory of its own clock, at or
+/// after the row's arrival, and ingest replaces a `_time` more than
+/// [`MAX_TIME_LEAD`] after arrival (ADR-0008 and ADR-0013, amendments of
+/// 2026-11-08). So a row in hour directory H has a `_time` at most
+/// `MAX_TIME_LEAD` past the end of H, and a row the query matches sits in a
+/// directory no older than the hour of `now - N - MAX_TIME_LEAD`. A delayed
+/// compaction only moves a row into a later directory, which the walk to
+/// `now` covers. One hour is more than the bound needs: it keeps rows
+/// stored before the bound, with a lead under an hour, visible.
 const TIME_FILTER_PADDING_SECS: u64 = 3600;
+const _: () = {
+    assert!(MAX_TIME_LEAD.subsec_nanos() == 0);
+    assert!(MAX_TIME_LEAD.num_seconds() <= TIME_FILTER_PADDING_SECS.cast_signed());
+};
 
 /// The file pattern that selects every service's file in a directory.
 const ANY_SERVICE: &str = "*.parquet";
@@ -119,12 +134,14 @@ pub(crate) fn select(
     let Narrowing { file_pattern, envs } = narrowing(&base, &ast);
     let time_filter = ast.search.time_filter.as_ref().map(|tf| tf.node.duration);
 
+    // One clock read for every env, so all of them walk the same hours.
+    let now = Utc::now();
     let mut elements: Vec<Element> = Vec::new();
     for env in &envs {
         let env_base = format!("{base}/{env}");
         match time_filter {
             Some(duration) => {
-                let scoped = time_scoped_dirs(&env_base, duration, &file_pattern);
+                let scoped = time_scoped_dirs(&env_base, duration, &file_pattern, now);
                 if scoped.is_empty() {
                     elements.extend(date_scoped_dirs(&env_base));
                 } else {
@@ -518,9 +535,10 @@ fn micros(sample: &StatVal, ceil: bool) -> Option<i128> {
     })
 }
 
-/// Time-scoped directories for one env root: hour-level for today,
-/// day-level and/or hour-level for historical dates, existence-filtered.
-/// Returns an empty vec when nothing on disk matches the window.
+/// Time-scoped directories for one env root at `now`: hour-level for
+/// today, day-level and/or hour-level for historical dates,
+/// existence-filtered. Returns an empty vec when nothing on disk matches
+/// the window.
 ///
 /// A historical start day is selected whole, every hour of it: the walk
 /// starts at that day's midnight rather than at the padded start's hour.
@@ -528,12 +546,12 @@ fn time_scoped_dirs(
     base: &str,
     duration: trawl_core::ast::TrawlDuration,
     file_pattern: &str,
+    now: DateTime<Utc>,
 ) -> Vec<Element> {
     let total_secs = duration
         .to_seconds()
         .saturating_add(TIME_FILTER_PADDING_SECS);
 
-    let now = chrono::Utc::now();
     let start = now - chrono::Duration::seconds(i64::try_from(total_secs).unwrap_or(i64::MAX));
     let from = if start.date_naive() == now.date_naive() {
         start.naive_utc()
@@ -1869,5 +1887,155 @@ mod tests {
                 "one unreadable byte per file, so the counts must agree for {dsl:?}"
             );
         }
+    }
+
+    /// A row compacted at C, with a `_time` lead L ≤ [`MAX_TIME_LEAD`] over
+    /// it, sits in C's hour directory, or in C's day directory once that day
+    /// rolled up. A `last=N` query at Q ≥ C matches it when C + L ≥ Q − N,
+    /// so the walk must select that directory for every C ≥ Q − N −
+    /// `MAX_TIME_LEAD`, the worst lead. Each fixture keeps Q's own hour
+    /// directory, so the empty-selection fallback cannot answer for the
+    /// walk, and no file may be selected twice.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn last_window_reaches_every_row_within_the_lead() {
+        use std::collections::HashSet;
+        use trawl_core::ast::{TimeUnit, TrawlDuration};
+
+        #[derive(Debug, Clone, Copy)]
+        enum Layout {
+            /// Every hour holds an hourly file.
+            Hourly,
+            /// Historical days hold only their rolled-up day file; today is
+            /// hourly.
+            Rolled,
+            /// Every day, today included, holds a day file for one service
+            /// and hourly files for another (a partial rollup).
+            Mixed,
+        }
+
+        let hour = chrono::Duration::hours(1);
+        let floor_hour = |t: DateTime<Utc>| {
+            t.date_naive()
+                .and_hms_opt(t.hour(), 0, 0)
+                .unwrap()
+                .and_utc()
+        };
+        // Q at 00:10 makes N = 1h cross midnight.
+        for q in [at("2026-11-08T00:10:00Z"), at("2026-11-08T13:37:00Z")] {
+            let today = q.date_naive();
+            for unit in [TimeUnit::Minutes, TimeUnit::Hours, TimeUnit::Days] {
+                let n = TrawlDuration { quantity: 1, unit };
+                let window = chrono::Duration::seconds(n.to_seconds().cast_signed());
+                let earliest = q - window - MAX_TIME_LEAD;
+
+                // Every minute from the earliest matching C to Q, both ends
+                // included, and each hour boundary in between ±1µs.
+                let mut compactions = Vec::new();
+                let mut c = earliest;
+                while c <= q {
+                    compactions.push(c);
+                    c += chrono::Duration::minutes(1);
+                }
+                compactions.push(q);
+                let mut boundary = floor_hour(earliest) + hour;
+                while boundary <= q {
+                    for micros in [-1, 0, 1] {
+                        let c = boundary + chrono::Duration::microseconds(micros);
+                        if (earliest..=q).contains(&c) {
+                            compactions.push(c);
+                        }
+                    }
+                    boundary += hour;
+                }
+
+                for layout in [Layout::Hourly, Layout::Rolled, Layout::Mixed] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let root = tmp.path();
+                    // Directories from three hours before the walk's start,
+                    // so the walk has older ones to leave out.
+                    let mut h = floor_hour(q - window - chrono::Duration::hours(3));
+                    while h <= q {
+                        let day = h.format("%Y-%m-%d");
+                        let hh = h.format("%H");
+                        let historical = h.date_naive() != today;
+                        match layout {
+                            Layout::Rolled if historical => {
+                                write_len(root, &format!("prod/{day}/svc.parquet"), 1);
+                            }
+                            Layout::Hourly | Layout::Rolled => {
+                                write_len(root, &format!("prod/{day}/{hh}/svc.parquet"), 1);
+                            }
+                            Layout::Mixed => {
+                                write_len(root, &format!("prod/{day}/svc.parquet"), 1);
+                                write_len(root, &format!("prod/{day}/{hh}/other.parquet"), 1);
+                            }
+                        }
+                        h += hour;
+                    }
+                    let base = format!("{}/prod", root.display());
+
+                    for pattern in [ANY_SERVICE, "svc.parquet"] {
+                        let label = format!("Q={q} N={n:?} {layout:?} {pattern}");
+                        let selected = time_scoped_dirs(&base, n, pattern, q);
+                        assert!(selected.iter().all(|e| !e.recursive), "{label}");
+                        let dirs: HashSet<&str> = selected.iter().map(|e| e.dir.as_str()).collect();
+                        assert_eq!(dirs.len(), selected.len(), "{label}: a directory twice");
+                        let recent = format!("{base}/{}", q.format("%Y-%m-%d/%H"));
+                        assert!(dirs.contains(recent.as_str()), "{label}: {dirs:?}");
+
+                        for c in &compactions {
+                            let day_dir = format!("{base}/{}", c.format("%Y-%m-%d"));
+                            let hour_dir = format!("{base}/{}", c.format("%Y-%m-%d/%H"));
+                            let historical = c.date_naive() != today;
+                            let holders = match layout {
+                                Layout::Rolled if historical => vec![day_dir],
+                                Layout::Hourly | Layout::Rolled => vec![hour_dir],
+                                Layout::Mixed => vec![day_dir, hour_dir],
+                            };
+                            for dir in holders {
+                                assert!(
+                                    dirs.contains(dir.as_str()),
+                                    "{label}: a row compacted at {c} is in {dir}, \
+                                     which the walk left out: {dirs:?}"
+                                );
+                            }
+                        }
+
+                        let matched: Vec<String> = selected
+                            .iter()
+                            .flat_map(|e| glob_matches(&format!("{}/{pattern}", e.dir)))
+                            .collect();
+                        let distinct: HashSet<&String> = matched.iter().collect();
+                        assert!(!matched.is_empty(), "{label}");
+                        assert_eq!(distinct.len(), matched.len(), "{label}: a file twice");
+                    }
+                }
+            }
+        }
+
+        // The walk still prunes: at 13:37, `last=1m` starts at 12:36, so the
+        // 11:00 directory is left out.
+        let tmp = tempfile::tempdir().unwrap();
+        for hh in ["11", "12", "13"] {
+            write_len(tmp.path(), &format!("prod/2026-11-08/{hh}/svc.parquet"), 1);
+        }
+        let base = format!("{}/prod", tmp.path().display());
+        let minute = TrawlDuration {
+            quantity: 1,
+            unit: TimeUnit::Minutes,
+        };
+        let dirs: Vec<String> =
+            time_scoped_dirs(&base, minute, ANY_SERVICE, at("2026-11-08T13:37:00Z"))
+                .into_iter()
+                .map(|e| e.dir)
+                .collect();
+        assert_eq!(
+            dirs,
+            [
+                format!("{base}/2026-11-08/12"),
+                format!("{base}/2026-11-08/13")
+            ]
+        );
     }
 }

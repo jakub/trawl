@@ -148,12 +148,18 @@ pub enum TimeLineage {
         field: String,
     },
     /// The arrival time filled `_time`: `time.from_ingest` when no source
-    /// was present, `time.unparseable` when `unparseable` names one.
+    /// was present, `time.unparseable` when `unparseable` names one, and
+    /// `time.ahead_of_arrival` when `ahead_of_arrival` names one. At most
+    /// one of the two is set.
     Arrival {
         /// The first present source when it failed to parse; absent when no
         /// source was present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unparseable: Option<String>,
+        /// The first present source when it parsed to more than 15 minutes
+        /// after arrival.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ahead_of_arrival: Option<String>,
     },
 }
 
@@ -231,7 +237,10 @@ mod tests {
                 .clone(),
             repairs: vec!["env.defaulted".into(), "field.name_case_folded".into()],
             lineage: PreviewLineage {
-                time: TimeLineage::Arrival { unparseable: None },
+                time: TimeLineage::Arrival {
+                    unparseable: None,
+                    ahead_of_arrival: None,
+                },
                 severity: SeverityLineage::Field {
                     field: "level".into(),
                     skipped_unmappable: vec!["severity".into()],
@@ -324,8 +333,16 @@ mod tests {
             },
             TimeLineage::Arrival {
                 unparseable: Some("ts".into()),
+                ahead_of_arrival: None,
             },
-            TimeLineage::Arrival { unparseable: None },
+            TimeLineage::Arrival {
+                unparseable: None,
+                ahead_of_arrival: Some("timestamp".into()),
+            },
+            TimeLineage::Arrival {
+                unparseable: None,
+                ahead_of_arrival: None,
+            },
         ] {
             assert_eq!(round_trip(&time), time);
         }
@@ -335,6 +352,14 @@ mod tests {
             })
             .unwrap(),
             json!({"from": "field", "field": "timestamp"})
+        );
+        assert_eq!(
+            serde_json::to_value(TimeLineage::Arrival {
+                unparseable: None,
+                ahead_of_arrival: Some("timestamp".into()),
+            })
+            .unwrap(),
+            json!({"from": "arrival", "ahead_of_arrival": "timestamp"})
         );
         for severity in [
             SeverityLineage::Missing,
@@ -368,7 +393,10 @@ mod tests {
             event: numbers.as_object().unwrap().clone(),
             repairs: Vec::new(),
             lineage: PreviewLineage {
-                time: TimeLineage::Arrival { unparseable: None },
+                time: TimeLineage::Arrival {
+                    unparseable: None,
+                    ahead_of_arrival: None,
+                },
                 severity: SeverityLineage::Missing,
                 fields: Vec::new(),
             },
