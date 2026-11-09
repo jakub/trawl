@@ -1119,7 +1119,7 @@ async fn check_identity(
     let seen = look(move || {
         let marker = read_catalog_marker(&data_root);
         let linked = marker.is_err()
-            && std::fs::symlink_metadata(data_root.join("CATALOG"))
+            && std::fs::symlink_metadata(data_root.join(trawl_config::CATALOG_MARKER))
                 .is_ok_and(|meta| meta.file_type().is_symlink());
         let mut walked = None;
         let judgement = marker.as_ref().ok().map(|marker| {
@@ -1393,8 +1393,7 @@ impl UnresolvedRollup {
         Self {
             env: name(day_dir.and_then(Path::parent)),
             day: name(day_dir),
-            service: file
-                .strip_prefix(rollup_marker::MARKER_PREFIX)
+            service: rollup_marker::marker_service(&file)
                 .unwrap_or_default()
                 .to_owned(),
             proof,
@@ -1457,7 +1456,19 @@ fn observe_rollup_path(path: &Path, blind: &mut bool) -> rollup_marker::Observat
 /// it with, then classify it with recovery's own [`rollup_marker::classify`],
 /// read-only. The hashing counts against the look's deadline: a look that
 /// runs out reports the row not sampled, never a mismatch.
+///
+/// Like recovery, it first refuses a marker whose directory is not named
+/// as a canonical date, without reading it.
 fn see_rollup(path: &Path) -> RollupSeen {
+    let canonical_day = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .and_then(crate::env_dirs::parse_date)
+        .is_some();
+    if !canonical_day {
+        return RollupSeen::Unresolved(rollup_marker::Proof::DayNotCanonical);
+    }
     let marker = match rollup_marker::read_with(path, fsread::open_for_decoder) {
         Ok(marker) => marker,
         Err(rollup_marker::ReadError::Unreadable(e)) if doctor_could_not_look(&e) => {
@@ -2285,6 +2296,50 @@ mod tests {
             (row.outcome(), row.reason()),
             (Outcome::Complete, Some(reason::PENDING_AT_NEXT_BOOT))
         );
+    }
+
+    /// Boot's recovery refuses a rollup marker under an env child that is
+    /// not a canonical date before it reads the marker, so the doctor
+    /// reports it unresolved with `day_not_canonical`, never pending, and
+    /// shows the day as invalid. Under a canonical date, the same files
+    /// would be case b.
+    #[test]
+    fn a_rollup_marker_under_a_noncanonical_day_is_unresolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = data.join("wal");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        let marker = plant_rollup(&data.join("prod/2026-13-45"), "api", Crash::BeforeRename);
+        assert_eq!(
+            see_rollup(&marker),
+            RollupSeen::Unresolved(rollup_marker::Proof::DayNotCanonical)
+        );
+        for ingest in [true, false] {
+            let seen = count_markers(&data, &wal, ingest);
+            assert_eq!((seen.rollup_pending, seen.rollup_unreadable), (0, 0));
+            assert_eq!(
+                seen.rollup_unresolved,
+                vec![UnresolvedRollup {
+                    env: "prod".to_owned(),
+                    day: "2026-13-45".to_owned(),
+                    service: "api".to_owned(),
+                    proof: rollup_marker::Proof::DayNotCanonical,
+                }]
+            );
+            let row = markers_row(&seen);
+            assert_eq!(
+                (row.outcome(), row.reason()),
+                (Outcome::Failed, Some("a rollup marker is unresolved"))
+            );
+            let detail = row.into_check().detail.unwrap();
+            assert!(
+                detail.contains(&format!(
+                    "env prod, day {}, service api, failed proof day_not_canonical",
+                    super::super::output::INVALID_DATE
+                )),
+                "{detail}"
+            );
+        }
     }
 
     /// A marker whose classification depends on a file the doctor may not

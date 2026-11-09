@@ -57,7 +57,9 @@ use tokio::sync::{
     OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 
+use crate::env_dirs;
 use crate::error::ServerError;
+use crate::ingest::rollup_marker;
 
 /// Why the corpus is not settled, so reads refuse with 503
 /// `corpus_recovering` (ADR-0041). When both hold, `RollupPending` is the
@@ -263,7 +265,8 @@ impl PublicationGate {
         }
     }
 
-    /// Register root/env/date/.rollup-* markers before admitting readers.
+    /// Register every rollup marker [`scan_markers`] finds, in any directory
+    /// child of an env, before admitting readers.
     /// Literal directory traversal keeps glob metacharacters in root names
     /// literal. A failed scan refuses reads until a later complete scan
     /// clears it ([`rescan_if_failed`](Self::rescan_if_failed)). Only
@@ -726,13 +729,13 @@ fn log_removal_sync_owed(marker: &Path, error: &std::io::Error) {
     let service = marker
         .file_name()
         .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix(".rollup-"))
+        .and_then(rollup_marker::marker_service)
         .filter(|service| trawl_config::is_valid_service_name(service))
         .unwrap_or(INVALID);
     let day = day_dir
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
-        .filter(|day| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_ok())
+        .filter(|day| env_dirs::parse_date(day).is_some())
         .unwrap_or(INVALID);
     let env = day_dir
         .and_then(Path::parent)
@@ -763,9 +766,11 @@ fn directory_exists(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// Collect every `root/{env}/{date}/.rollup-*` marker into `markers`. A
-/// missing root holds none; any other listing error is an `Err`, because an
-/// unknown marker may exist.
+/// Collect every `root/{env}/{child}/.rollup-*` marker into `markers`,
+/// whatever the child directory's name: a marker under a child that is not
+/// a canonical date still refuses reads, and recovery keeps it with every
+/// file (ADR-0041). A missing root holds none; any other listing error is
+/// an `Err`, because an unknown marker may exist.
 pub(crate) fn scan_markers(root: &Path, markers: &mut HashSet<PathBuf>) -> std::io::Result<()> {
     let envs = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -784,19 +789,14 @@ pub(crate) fn scan_markers(root: &Path, markers: &mut HashSet<PathBuf>) -> std::
         if !directory_exists(&env.path())? {
             continue;
         }
-        for date in std::fs::read_dir(env.path())? {
-            let date = date?;
-            if chrono::NaiveDate::parse_from_str(&date.file_name().to_string_lossy(), "%Y-%m-%d")
-                .is_err()
-            {
+        for child in std::fs::read_dir(env.path())? {
+            let child = child?;
+            if !directory_exists(&child.path())? {
                 continue;
             }
-            if !directory_exists(&date.path())? {
-                continue;
-            }
-            for entry in std::fs::read_dir(date.path())? {
+            for entry in std::fs::read_dir(child.path())? {
                 let entry = entry?;
-                if entry.file_name().to_string_lossy().starts_with(".rollup-") {
+                if rollup_marker::marker_service(&entry.file_name().to_string_lossy()).is_some() {
                     markers.insert(entry.path());
                 }
             }
@@ -1594,6 +1594,107 @@ mod tests {
             gate.read().await.is_ok(),
             "the failed scan no longer refuses"
         );
+    }
+
+    /// Every entry under `root` by path: a regular file with its bytes,
+    /// anything else with none.
+    fn tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+                if kind.is_dir() {
+                    stack.push(path.clone());
+                }
+                let bytes = kind.is_file().then(|| std::fs::read(&path).unwrap());
+                out.insert(path, bytes);
+            }
+        }
+        out
+    }
+
+    /// A rollup marker under an env child that is not a canonical date is
+    /// found, refuses corpus reads with a 503 `corpus_recovering` whose
+    /// cause is `rollup_pending`, and outlives boot recovery with every
+    /// file beside it byte-identical (ADR-0041, amendment of 2026-11-08).
+    /// Under a canonical date, its identities would promote the tmp and
+    /// retire the input.
+    #[test]
+    fn marker_under_noncanonical_parent_keeps_reads_refused() {
+        use axum::response::IntoResponse as _;
+
+        use crate::ingest::publication_marker::identity_of;
+        use crate::ingest::rollup_marker::RollupMarker;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let day = root.join("prod/2026-13-45");
+        std::fs::create_dir_all(day.join("07")).unwrap();
+        let input = day.join("07/svc.parquet");
+        let merged = day.join("svc.parquet.tmp");
+        std::fs::write(&input, b"hourly rows").unwrap();
+        std::fs::write(&merged, b"merged rows").unwrap();
+        let marker = RollupMarker::new(
+            "svc",
+            identity_of(&merged).unwrap(),
+            None,
+            vec![("07/svc.parquet".to_owned(), identity_of(&input).unwrap())],
+        )
+        .unwrap();
+        let marker_path = marker.marker_path(&day);
+        std::fs::write(&marker_path, marker.encode()).unwrap();
+        let before = tree(&root);
+
+        let mut found = HashSet::new();
+        scan_markers(&root, &mut found).unwrap();
+        assert_eq!(found, HashSet::from([marker_path.clone()]));
+
+        let gate = PublicationGate::new();
+        gate.initialize(&root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let refused = |gate: &PublicationGate| match runtime.block_on(gate.read()) {
+            Ok(_) => panic!("corpus reads answered"),
+            Err(refusal) => refusal,
+        };
+        let refusal = refused(&gate);
+        assert!(matches!(
+            refusal,
+            ServerError::CorpusRecovering(CorpusUnsettled::RollupPending)
+        ));
+        assert_eq!(refusal.cause_kind().as_str(), "rollup_pending");
+        let response = refusal.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = runtime
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "corpus_recovering");
+
+        capturing(|capture| {
+            crate::ingest::compaction::recover_rollups_at_boot(&gate);
+            let boot: Vec<tracing::Level> = capture
+                .0
+                .lock()
+                .iter()
+                .filter(|(_, event)| event.as_deref() == Some("rollup_boot_recovery"))
+                .map(|(level, _)| *level)
+                .collect();
+            assert_eq!(boot, [tracing::Level::ERROR], "boot finished no recovery");
+            assert_eq!(capture.count("rollup_recovery_unresolved"), 1);
+        });
+        assert_eq!(tree(&root), before, "recovery changed the data root");
+        assert_eq!(gate.pending_rollup_markers(), vec![marker_path]);
+        assert!(matches!(
+            refused(&gate),
+            ServerError::CorpusRecovering(CorpusUnsettled::RollupPending)
+        ));
     }
 
     /// A gate whose scan did not fail never rescans: a marker that appears

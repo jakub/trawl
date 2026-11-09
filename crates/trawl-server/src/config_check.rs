@@ -18,6 +18,8 @@
 
 use std::path::{Path, PathBuf};
 
+use trawl_config::STORAGE_MARKERS;
+
 use crate::config::{Config, ConfigError};
 
 /// Validate local configuration only. Database URLs are required, but no
@@ -160,8 +162,6 @@ impl std::fmt::Debug for MarkerOverlap {
 }
 
 impl std::error::Error for MarkerOverlap {}
-
-const STORAGE_MARKERS: [&str; 3] = ["EPOCH", "CATALOG", "REPIN"];
 
 /// Refuse a `server.log_file` that aliases a reserved storage marker, when
 /// the file logger is the one in use (internal telemetry off).

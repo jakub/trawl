@@ -129,20 +129,24 @@ fn the_export_lanes_refuse_over_budget_dsl_without_binding() {
     let path = out.path().join("export.parquet");
     for (case, dsl) in refused_queries() {
         let before = prepare_probe::count();
-        let cold = exec.export_parquet(&dsl, &glob, &FieldTypes::new(), &path, 100);
+        let cold = exec
+            .export_parquet(&dsl, &glob, &FieldTypes::new(), &path, 100)
+            .map(drop);
         assert_refused_without_binding(case, before, &cold);
 
         let before = prepare_probe::count();
-        let union = exec.export_parquet_with_hot(
-            &dsl,
-            &glob,
-            &hot,
-            &hot_columns_of(&hot),
-            &FieldTypes::new(),
-            &FieldTypes::new(),
-            &path,
-            100,
-        );
+        let union = exec
+            .export_parquet_with_hot(
+                &dsl,
+                &glob,
+                &hot,
+                &hot_columns_of(&hot),
+                &FieldTypes::new(),
+                &FieldTypes::new(),
+                &path,
+                100,
+            )
+            .map(drop);
         assert_refused_without_binding(case, before, &union);
     }
     assert!(

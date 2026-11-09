@@ -806,14 +806,15 @@ fn write_result_parquet(
     result: &trawl_api::value::QueryResult,
 ) -> Result<(Option<String>, Option<Vec<u8>>), String> {
     let base = pool.base_dir().trim_end_matches('/');
-    let relative = format!("scheduled/run_{run_id}.parquet");
+    let relative = result_relative_path(run_id);
     let full_path = format!("{base}/{relative}");
     let temp_path = format!("{full_path}.tmp");
 
     // The fallback events name the error's kind, never its text, which
     // can carry host paths and engine diagnostics; the text goes to DEBUG
     // (ADR-0040, amended 2026-11-08).
-    if let Err(e) = std::fs::create_dir_all(format!("{base}/scheduled")) {
+    if let Err(e) = std::fs::create_dir_all(format!("{base}/{}", trawl_config::SCHEDULED_DIR_NAME))
+    {
         tracing::debug!(
             event_type = "scheduler_parquet_error",
             run_id,
@@ -894,6 +895,12 @@ fn write_result_parquet(
     }
 
     Ok((Some(relative), None))
+}
+
+/// Where run `run_id`'s result parquet lives, relative to the data root:
+/// in the reserved scheduled-results directory.
+fn result_relative_path(run_id: i64) -> String {
+    format!("{}/run_{run_id}.parquet", trawl_config::SCHEDULED_DIR_NAME)
 }
 
 /// Log an engine failure that sends a run's result to the blob: its class
@@ -1484,8 +1491,24 @@ mod off_reactor_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{CorpusWatch, decode_result_blob, remove_result_file, zstd_fallback};
+    use super::{
+        CorpusWatch, decode_result_blob, remove_result_file, result_relative_path, zstd_fallback,
+    };
     use crate::publication::CorpusUnsettled::{RestartBacklog, RollupPending};
+
+    /// Scheduled results land in the reserved `scheduled/` root entry,
+    /// which the env listing skips.
+    #[test]
+    fn reserved_root_entries_agree_across_consumers() {
+        let relative = result_relative_path(42);
+        let path = std::path::Path::new(&relative);
+        assert_eq!(
+            path.parent(),
+            Some(std::path::Path::new(trawl_config::SCHEDULED_DIR_NAME))
+        );
+        assert_eq!(relative, "scheduled/run_42.parquet");
+        assert!(trawl_config::RESERVED_ROOT_DIRS.contains(&trawl_config::SCHEDULED_DIR_NAME));
+    }
 
     /// The loop logs a change of corpus state once, never a poll that
     /// finds the same state: a settled start is silent, a reason switch is

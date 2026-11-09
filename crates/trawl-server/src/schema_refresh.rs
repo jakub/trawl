@@ -65,12 +65,12 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
         loop {
             interval.tick().await;
 
-            let fallback_glob = state.query.pool.fallback_glob().to_owned();
+            let data_root = PathBuf::from(state.query.pool.base_dir());
             let warned = Arc::clone(&warned);
             let warned_unpinned = Arc::clone(&warned_unpinned);
             let catalog = Arc::clone(&catalog);
             let result = tokio::task::spawn_blocking(move || {
-                refresh_service_schema(&fallback_glob, &warned, &warned_unpinned, &catalog)
+                refresh_service_schema(&data_root, &warned, &warned_unpinned, &catalog)
             })
             .await;
 
@@ -173,22 +173,18 @@ struct FileInfo {
 
 /// Perform the full service schema refresh.
 ///
-/// Walks parquet files, groups by service, then for each service reads parquet
-/// footers for column stats and row counts; column types come from `catalog`
-/// (the in-process pin cache — no `DuckDB`, no postgres). `warned` carries the
+/// Walks the parquet files under the data root `base`, groups them by
+/// service, then for each service reads parquet footers for column stats
+/// and row counts; column types come from `catalog` (the in-process pin
+/// cache — no `DuckDB`, no postgres). `warned` carries the
 /// set of files that failed to read on the previous pass so each break is
 /// logged once; `warned_unpinned` does the same for columns with no pin.
 fn refresh_service_schema(
-    fallback_glob: &str,
+    base: &Path,
     warned: &Mutex<HashSet<PathBuf>>,
     warned_unpinned: &Mutex<HashSet<String>>,
     catalog: &FieldCatalog,
 ) -> Result<Vec<ServiceSchema>, Box<dyn std::error::Error + Send + Sync>> {
-    let base = fallback_glob
-        .find('*')
-        .map_or(fallback_glob, |pos| &fallback_glob[..pos]);
-    let base = Path::new(base.trim_end_matches('/'));
-
     if !base.is_dir() {
         return Ok(Vec::new());
     }
@@ -379,22 +375,12 @@ fn build_service_schema(
 fn find_date_ancestor(path: &Path) -> Option<String> {
     for ancestor in path.ancestors().skip(1) {
         if let Some(name) = ancestor.file_name().and_then(|n| n.to_str())
-            && is_date_dir(name)
+            && crate::env_dirs::parse_date(name).is_some()
         {
             return Some(name.to_owned());
         }
     }
     None
-}
-
-/// Check if a directory name looks like YYYY-MM-DD.
-fn is_date_dir(name: &str) -> bool {
-    name.len() == 10
-        && name.as_bytes()[4] == b'-'
-        && name.as_bytes()[7] == b'-'
-        && name[..4].bytes().all(|b| b.is_ascii_digit())
-        && name[5..7].bytes().all(|b| b.is_ascii_digit())
-        && name[8..10].bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -419,6 +405,31 @@ mod tests {
         crate::catalog::FieldCatalog::new()
     }
 
+    /// The refresh reads the configured root as a path. A root whose name
+    /// holds `*` would be cut short by any glob-based recovery and read
+    /// nothing.
+    #[test]
+    fn configured_data_root_is_passed_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data[1]*");
+        write_service_parquet(
+            &root.join("prod"),
+            "2026-06-20/00",
+            "nginx",
+            "SELECT * FROM (VALUES (200)) t(status)",
+        );
+
+        let warned = Mutex::new(HashSet::new());
+        let warned_unpinned = Mutex::new(HashSet::new());
+        // With and without a trailing separator.
+        for root in [root.clone(), root.join("")] {
+            let services =
+                refresh_service_schema(&root, &warned, &warned_unpinned, &empty_catalog()).unwrap();
+            let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, ["nginx"], "{}", root.display());
+        }
+    }
+
     #[test]
     fn catalog_pin_wins_over_footer_type_while_stats_stay_footer_true() {
         // A catalog pin that disagrees with the file's physical type —
@@ -440,10 +451,9 @@ mod tests {
             trawl_core::schema::CanonicalType::BigInt,
         )]);
 
-        let glob = format!("{}/**/*.parquet", base.display());
         let warned = Mutex::new(HashSet::new());
         let warned_unpinned = Mutex::new(HashSet::new());
-        let services = refresh_service_schema(&glob, &warned, &warned_unpinned, &catalog).unwrap();
+        let services = refresh_service_schema(base, &warned, &warned_unpinned, &catalog).unwrap();
 
         let nginx = services.iter().find(|s| s.name == "nginx").unwrap();
         let status = nginx.columns.iter().find(|c| c.name == "status").unwrap();
@@ -478,10 +488,9 @@ mod tests {
             trawl_core::schema::CanonicalType::Severity,
         )]);
 
-        let glob = format!("{}/**/*.parquet", base.display());
         let warned = Mutex::new(HashSet::new());
         let warned_unpinned = Mutex::new(HashSet::new());
-        let services = refresh_service_schema(&glob, &warned, &warned_unpinned, &catalog).unwrap();
+        let services = refresh_service_schema(base, &warned, &warned_unpinned, &catalog).unwrap();
 
         let nginx = services.iter().find(|s| s.name == "nginx").unwrap();
         let severity = nginx
@@ -511,11 +520,10 @@ mod tests {
             "SELECT * FROM (VALUES (200)) t(status)",
         );
 
-        let glob = format!("{}/**/*.parquet", base.display());
         let warned = Mutex::new(HashSet::new());
         let warned_unpinned = Mutex::new(HashSet::new());
         let services =
-            refresh_service_schema(&glob, &warned, &warned_unpinned, &empty_catalog()).unwrap();
+            refresh_service_schema(base, &warned, &warned_unpinned, &empty_catalog()).unwrap();
 
         let nginx = services.iter().find(|s| s.name == "nginx").unwrap();
         let status = nginx.columns.iter().find(|c| c.name == "status").unwrap();
@@ -541,11 +549,10 @@ mod tests {
              t(zz_custom, _time, alpha)",
         );
 
-        let glob = format!("{}/**/*.parquet", base.display());
         let warned = Mutex::new(HashSet::new());
         let warned_unpinned = Mutex::new(HashSet::new());
         let services =
-            refresh_service_schema(&glob, &warned, &warned_unpinned, &empty_catalog()).unwrap();
+            refresh_service_schema(base, &warned, &warned_unpinned, &empty_catalog()).unwrap();
 
         let names: Vec<&str> = services[0]
             .columns
@@ -572,11 +579,10 @@ mod tests {
             "SELECT * FROM (VALUES (500), (502), (200)) t(status)",
         );
 
-        let glob = format!("{}/**/*.parquet", base.display());
         let warned = Mutex::new(HashSet::new());
         let warned_unpinned = Mutex::new(HashSet::new());
         let services =
-            refresh_service_schema(&glob, &warned, &warned_unpinned, &empty_catalog()).unwrap();
+            refresh_service_schema(base, &warned, &warned_unpinned, &empty_catalog()).unwrap();
 
         let nginx = services.iter().find(|s| s.name == "nginx").unwrap();
         assert_eq!(nginx.file_count, 2);
@@ -616,11 +622,10 @@ mod tests {
         std::fs::write(&bad, b"not parquet at all").unwrap();
 
         // Refresh succeeds despite the bad file...
-        let glob = format!("{}/**/*.parquet", base.display());
         let warned = Mutex::new(HashSet::new());
         let warned_unpinned = Mutex::new(HashSet::new());
         let services =
-            refresh_service_schema(&glob, &warned, &warned_unpinned, &empty_catalog()).unwrap();
+            refresh_service_schema(base, &warned, &warned_unpinned, &empty_catalog()).unwrap();
         assert!(services.iter().any(|s| s.name == "good"));
 
         // ...the bad file's service has zero events (it was skipped)...
@@ -645,13 +650,12 @@ mod tests {
         std::fs::create_dir_all(svc.parent().unwrap()).unwrap();
         std::fs::write(&svc, b"garbage, not parquet yet").unwrap();
 
-        let glob = format!("{}/**/*.parquet", base.display());
         let warned = Mutex::new(HashSet::new());
         let warned_unpinned = Mutex::new(HashSet::new());
         let catalog = empty_catalog();
 
         // Pass 1: file is garbage → skipped, zero events, recorded in warned.
-        let pass1 = refresh_service_schema(&glob, &warned, &warned_unpinned, &catalog).unwrap();
+        let pass1 = refresh_service_schema(base, &warned, &warned_unpinned, &catalog).unwrap();
         let svc1 = pass1.iter().find(|s| s.name == "svc").unwrap();
         assert_eq!(svc1.total_events, 0);
         assert!(warned.lock().contains(&svc));
@@ -665,7 +669,7 @@ mod tests {
         .unwrap();
 
         // Pass 2: it reads cleanly and its rows are counted; warned set clears.
-        let pass2 = refresh_service_schema(&glob, &warned, &warned_unpinned, &catalog).unwrap();
+        let pass2 = refresh_service_schema(base, &warned, &warned_unpinned, &catalog).unwrap();
         let svc2 = pass2.iter().find(|s| s.name == "svc").unwrap();
         assert_eq!(svc2.total_events, 2);
         assert!(!warned.lock().contains(&svc));
