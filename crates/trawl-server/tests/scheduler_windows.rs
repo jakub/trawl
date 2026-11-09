@@ -822,12 +822,12 @@ async fn a_windowed_run_query_reexecutes_standalone_with_identical_bounds() {
     let run = h.runs(sq).await.remove(1);
     let parsed = trawl_core::parser::parse(&run.query).expect("the stored text parses");
     assert_eq!(
-        parsed.search.earliest.map(|b| b.node),
+        parsed.search.earliest.map(|b| b.node.text().to_owned()),
         run.window_start.map(format_window_bound),
         "the pasted query's lower bound IS the run's"
     );
     assert_eq!(
-        parsed.search.latest.map(|b| b.node),
+        parsed.search.latest.map(|b| b.node.text().to_owned()),
         run.window_end.map(format_window_bound)
     );
 

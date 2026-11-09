@@ -210,13 +210,13 @@ impl CompiledFilter {
         });
 
         let earliest = search.earliest.as_ref().and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s.node)
+            chrono::DateTime::parse_from_rfc3339(s.node.text())
                 .ok()
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
 
         let latest = search.latest.as_ref().and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s.node)
+            chrono::DateTime::parse_from_rfc3339(s.node.text())
                 .ok()
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });

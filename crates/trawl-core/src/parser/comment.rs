@@ -336,6 +336,8 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
         crate::parser::primitives::MSG_REGEX_LINE_BREAK => Some(HINT_REGEX_LINE_BREAK.to_string()),
         crate::parser::primitives::MSG_REGEX_PIPE_STAGE => Some(HINT_REGEX_PIPE_STAGE.to_string()),
         crate::parser::search::MSG_NESTED_TIME_CLAUSE => Some(HINT_NESTED_TIME_CLAUSE.to_string()),
+        crate::parser::search::MSG_UNREADABLE_BOUND => Some(HINT_UNREADABLE_BOUND.to_string()),
+        crate::parser::search::MSG_LAST_WITH_BOUND => Some(HINT_LAST_WITH_BOUND.to_string()),
         crate::parser::primitives::MSG_QUOTE_OPENS_BARE_VALUE => {
             Some(HINT_QUOTE_OPENS_BARE_VALUE.to_string())
         }
@@ -395,6 +397,15 @@ pub(crate) const HINT_REGEX_PIPE_STAGE: &str = "drop the spaces or write \\s";
 /// The hint for a time clause inside parentheses or under `NOT`.
 pub(crate) const HINT_NESTED_TIME_CLAUSE: &str =
     "time clauses apply to the whole search; write it outside the group";
+
+/// The hint for an `earliest=` or `latest=` bound that is not a
+/// timestamp both lanes can hold.
+pub(crate) const HINT_UNREADABLE_BOUND: &str = "write a date such as \"2026-03-14\", a time such \
+     as \"2026-03-14T09:00:00\", or epoch, infinity or -infinity; years run up to 9999";
+
+/// The hint for `last=` beside `earliest=` or `latest=`.
+pub(crate) const HINT_LAST_WITH_BOUND: &str =
+    "use last= alone, or earliest= and latest= without it";
 
 /// The hint for a bare value that opens with `"`.
 pub(crate) const HINT_QUOTE_OPENS_BARE_VALUE: &str = "close the quote";

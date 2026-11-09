@@ -740,11 +740,11 @@ async fn sightings_proposes_its_follow_ups_over_the_same_bounds() {
     let query = actions[1]["arguments"]["query"].as_str().unwrap();
     let parsed = trawl_core::parser::parse(query).expect("a follow-up parses");
     assert_eq!(
-        parsed.search.earliest.as_ref().map(|b| b.node.as_str()),
+        parsed.search.earliest.as_ref().map(|b| b.node.text()),
         Some(EARLIEST)
     );
     assert_eq!(
-        parsed.search.latest.as_ref().map(|b| b.node.as_str()),
+        parsed.search.latest.as_ref().map(|b| b.node.text()),
         Some(LATEST)
     );
     assert!(query.contains("service=nginx"), "{query}");
