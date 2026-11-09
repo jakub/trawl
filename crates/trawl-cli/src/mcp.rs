@@ -30,7 +30,7 @@
 //! stderr, naming the error's kind and never a byte of the stream.
 
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use trawl_client::{HttpClient, TlsTrust};
 use trawl_core::sanitize::sanitize_display_text;
@@ -50,23 +50,15 @@ const REFUSED: u8 = 2;
 /// The exit status when the transport fails.
 const TRANSPORT_FAILED: u8 = 1;
 
-/// `trawl mcp` arguments. The profile is the global `-p/--profile`.
-#[derive(Debug, clap::Args)]
-pub(crate) struct McpArgs {
-    /// Read the API key from the file PATH, for a profile that holds no
-    /// token.
-    #[arg(long, value_name = "PATH")]
-    token_file: Option<PathBuf>,
-}
-
 /// Why `trawl mcp` will not start: one line, naming variables, flags and
 /// files, never a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Refusal(String);
 
-/// Run `trawl mcp` and return its exit status.
-pub(crate) async fn run(globals: Globals, args: McpArgs) -> u8 {
-    let started = match start(&globals, &args) {
+/// Run `trawl mcp` and return its exit status. Its profile is the global
+/// `-p/--profile`, and its key file the global `--token-file`.
+pub(crate) async fn run(globals: Globals) -> u8 {
+    let started = match start(&globals) {
         Ok(started) => started,
         Err(Refusal(message)) => {
             report(&message);
@@ -93,7 +85,7 @@ struct Started {
 }
 
 /// Select, resolve and build the server, with no network call.
-fn start(globals: &Globals, args: &McpArgs) -> Result<Started, Refusal> {
+fn start(globals: &Globals) -> Result<Started, Refusal> {
     let selection = select(globals, &env_bound_names(NAME), |name| {
         std::env::var_os(name).is_some()
     })?;
@@ -107,7 +99,7 @@ fn start(globals: &Globals, args: &McpArgs) -> Result<Started, Refusal> {
             check.next_action.unwrap_or_default(),
         )));
     };
-    let key = choose_key(&selection, connection.key, args.token_file.as_deref())?;
+    let key = choose_key(&selection, connection.key, globals.token_file.as_deref())?;
     let display_zone = display_zone(globals.config.as_deref())?;
     let client = HttpClient::with_trust(connection.url.base(), key.secret(), &connection.trust)
         .map_err(|_| {
@@ -302,6 +294,7 @@ mod tests {
         Globals {
             url: None,
             token: false,
+            token_file: None,
             insecure: false,
             profile: profile.map(str::to_owned),
             config: None,

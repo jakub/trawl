@@ -266,6 +266,59 @@ impl ApiBase {
     }
 }
 
+/// Where clap took a value that a flag and its environment variable share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// Typed on the command line: `--url`, `--token`.
+    CommandLine,
+    /// Exported: `TRAWL_URL`, `TRAWL_TOKEN`.
+    Environment,
+}
+
+/// Where the merged `--url` and `--token` values came from.
+///
+/// clap folds `--url` into `TRAWL_URL` and `--token` into `TRAWL_TOKEN`,
+/// so the parsed value cannot say which one the user gave. clap's own
+/// record of the source can.
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the ordinary policy reads it next")
+)]
+pub(crate) struct Sources {
+    /// `None` when neither `--url` nor `TRAWL_URL` gave a value.
+    pub(crate) url: Option<Origin>,
+    /// `None` when neither `--token` nor `TRAWL_TOKEN` gave a value.
+    pub(crate) token: Option<Origin>,
+}
+
+impl Sources {
+    /// Read the sources from the top-level matches.
+    ///
+    /// `--url` and `--token` are global, and clap copies a global's value
+    /// between a command and its subcommands keeping the higher source, so
+    /// the top level reports a flag typed after the subcommand as typed.
+    ///
+    /// An unknown source fails closed in each direction. A token counts as
+    /// typed only when clap says so: a typed token goes to any target, an
+    /// exported one only to its binding. A URL counts as exported only when
+    /// clap says so: an exported URL can bind an exported token, a typed
+    /// one never does.
+    pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Self {
+        use clap::parser::ValueSource;
+        Self {
+            url: matches.value_source("url").map(|source| match source {
+                ValueSource::EnvVariable => Origin::Environment,
+                _ => Origin::CommandLine,
+            }),
+            token: matches.value_source("token").map(|source| match source {
+                ValueSource::CommandLine => Origin::CommandLine,
+                _ => Origin::Environment,
+            }),
+        }
+    }
+}
+
 /// An API key, read once, with the name of where it came from.
 pub struct Key {
     secret: Zeroizing<String>,

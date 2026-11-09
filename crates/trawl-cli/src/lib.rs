@@ -44,6 +44,15 @@ struct Cli {
     #[arg(long, env = "TRAWL_TOKEN", hide_env_values = true, global = true)]
     token: Option<String>,
 
+    /// Read the API key from the file PATH, a regular file of at most 4 KiB.
+    /// The key goes to the server this command selects: use it, or --token,
+    /// to reach a server other than the one a saved key belongs to. Not with
+    /// --token.
+    // No environment variable: a file named in the environment would follow
+    // every command the way an exported key does.
+    #[arg(long, value_name = "PATH", global = true)]
+    token_file: Option<PathBuf>,
+
     /// Accept self-signed TLS certificates.
     #[arg(long, env = "TRAWL_INSECURE", hide_env_values = true, global = true)]
     insecure: bool,
@@ -136,7 +145,7 @@ enum Command {
     /// --url, --token and --insecure are refused. stdout carries protocol
     /// messages only and logs go to stderr. Exits 0 when the client closes
     /// the session, 1 on a transport error, 2 on a refusal.
-    Mcp(mcp::McpArgs),
+    Mcp,
 
     /// Run a disposable trial installation in Docker on this machine:
     /// loopback only, with sample data. `-p trial` connects to it.
@@ -438,9 +447,9 @@ pub enum CliError {
 /// The binary's entry point: parse argv, run, and map errors to an exit code.
 #[tokio::main]
 pub async fn main() {
-    let args = parse_cli();
+    let (args, sources) = parse_cli();
 
-    match run(args).await {
+    match run(args, sources).await {
         // Only `trawl doctor`, `trawl mcp` and `trawl preview-ingest` return
         // a status other than 0.
         Ok(0) => {}
@@ -468,7 +477,11 @@ const ENVLESS: [&str; 2] = [doctor::NAME, mcp::NAME];
 /// pass that fails is reported as it stands when argv names one of
 /// [`ENVLESS`]; help and version output come from the normal command, which
 /// never prints an environment value.
-fn parse_cli() -> Cli {
+///
+/// The matches are kept long enough to read where `--url` and `--token`
+/// came from: the parsed values cannot tell a typed flag from an exported
+/// variable.
+fn parse_cli() -> (Cli, connection::Sources) {
     use clap::error::ErrorKind;
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     match envless_command().try_get_matches_from(&args) {
@@ -477,7 +490,11 @@ fn parse_cli() -> Cli {
                 .subcommand_name()
                 .is_some_and(|name| ENVLESS.contains(&name)) =>
         {
-            return Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+            let sources = connection::Sources::from_matches(&matches);
+            return (
+                Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit()),
+                sources,
+            );
         }
         Err(e)
             if !matches!(
@@ -494,7 +511,13 @@ fn parse_cli() -> Cli {
         }
         Ok(_) | Err(_) => {}
     }
-    Cli::parse_from(args)
+    // What `Cli::parse_from` does, keeping the matches.
+    let matches = Cli::command().get_matches_from(args);
+    let sources = connection::Sources::from_matches(&matches);
+    let cli = Cli::from_arg_matches(&matches)
+        .map_err(|e| e.format(&mut Cli::command()))
+        .unwrap_or_else(|e| e.exit());
+    (cli, sources)
 }
 
 /// The command with no argument bound to an environment variable.
@@ -529,7 +552,7 @@ fn exit_on_error(e: &CliError) -> ! {
 
 /// Run the command and return its exit status. Every command but `doctor`,
 /// `mcp` and `preview-ingest` returns 0 on success and an error otherwise.
-async fn run(mut args: Cli) -> Result<u8, CliError> {
+async fn run(mut args: Cli, sources: connection::Sources) -> Result<u8, CliError> {
     // Trial verbs run before config.toml is read: a broken client config
     // must not block `trawl trial up` or `down`. `doctor` and `mcp` select
     // their own target and key, and never read config.toml the way other
@@ -537,24 +560,28 @@ async fn run(mut args: Cli) -> Result<u8, CliError> {
     let command = match args.command.take() {
         Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd).await.map(|()| 0)?),
         Some(Command::Doctor(doctor_args)) => return doctor::run(args.into(), doctor_args).await,
-        Some(Command::Mcp(mcp_args)) => return Ok(mcp::run(args.into(), mcp_args).await),
+        Some(Command::Mcp) => return Ok(mcp::run(args.into()).await),
         command => command,
     };
     // The preview's own contract: any failure, the config included, is
     // exit 2 (no complete report), never `CliError`'s generic 1.
     if matches!(command, Some(Command::PreviewIngest(_))) {
-        let result = run_configured(args, command).await;
+        let result = run_configured(args, sources, command).await;
         return Ok(preview_ingest::exit_status(
             result,
             &mut io::stderr().lock(),
         ));
     }
-    run_configured(args, command).await
+    run_configured(args, sources, command).await
 }
 
 /// Load the client config, resolve the connection, and run a command that
 /// reads it: everything but `trial` and `doctor`.
-async fn run_configured(args: Cli, command: Option<Command>) -> Result<u8, CliError> {
+async fn run_configured(
+    args: Cli,
+    _sources: connection::Sources,
+    command: Option<Command>,
+) -> Result<u8, CliError> {
     // The driver sends to whatever TUI holds the socket and never uses the
     // resolved connection, so under -p trial it could drive a TUI that is
     // connected elsewhere. Refused before the socket is touched.
@@ -666,7 +693,7 @@ async fn run_configured(args: Cli, command: Option<Command>) -> Result<u8, CliEr
             return preview_ingest::run(&mut stdout.lock(), &conn, body, &preview).await;
         }
 
-        Some(Command::Trial { .. } | Command::Doctor(_) | Command::Mcp(_)) => {
+        Some(Command::Trial { .. } | Command::Doctor(_) | Command::Mcp) => {
             unreachable!("trial, doctor and mcp return before the config loads")
         }
     }
@@ -679,6 +706,7 @@ impl From<Cli> for doctor::Globals {
         Self {
             url: args.url,
             token: args.token.is_some(),
+            token_file: args.token_file,
             insecure: args.insecure,
             profile: args.profile,
             config: args.config,
@@ -1043,6 +1071,112 @@ mod arg_tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    /// `--token-file` is one global flag with no environment variable.
+    /// Given before or after any subcommand, it fills the same field. A
+    /// subcommand that declared its own would shadow the global without a
+    /// word, so every copy clap propagates must be the global one.
+    #[test]
+    fn token_file_is_one_global_flag() {
+        fn token_file_args(command: &clap::Command, path: &str, seen: &mut usize) {
+            for arg in command.get_arguments() {
+                if arg.get_id() == "token_file" {
+                    *seen += 1;
+                    assert!(arg.is_global_set(), "{path} declares its own --token-file");
+                    assert!(arg.get_env().is_none(), "{path}: --token-file reads no env");
+                }
+            }
+            for sub in command.get_subcommands() {
+                token_file_args(sub, &format!("{path} {}", sub.get_name()), seen);
+            }
+        }
+        let mut command = Cli::command();
+        command.build();
+        let mut seen = 0;
+        token_file_args(&command, "trawl", &mut seen);
+        assert!(seen > 1, "the global reaches the subcommands");
+
+        for argv in [
+            &["trawl", "--token-file", "/k", "query", "q"][..],
+            &["trawl", "query", "q", "--token-file", "/k"],
+            &["trawl", "schema", "fields", "--token-file", "/k"],
+            &["trawl", "--token-file", "/k"],
+            &[
+                "trawl",
+                "doctor",
+                "--url",
+                "https://h:1",
+                "--token-file",
+                "/k",
+            ],
+            &[
+                "trawl",
+                "--token-file",
+                "/k",
+                "doctor",
+                "--url",
+                "https://h:1",
+            ],
+            &["trawl", "mcp", "-p", "home", "--token-file", "/k"],
+            &["trawl", "--token-file", "/k", "mcp", "-p", "home"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert_eq!(cli.token_file, Some(PathBuf::from("/k")), "{argv:?}");
+        }
+    }
+
+    /// Where `--url` and `--token` came from, read off the top-level
+    /// matches. A flag typed after the subcommand counts as typed, even
+    /// when its variable is set too.
+    #[test]
+    fn sources_follow_the_command_line_over_globals() {
+        use connection::Origin::{CommandLine, Environment};
+        // Tests cannot set the environment, so a variable every cargo test
+        // run sets stands in for TRAWL_URL and TRAWL_TOKEN.
+        const SET: &str = "CARGO_MANIFEST_DIR";
+        assert!(std::env::var_os(SET).is_some(), "{SET} is set under cargo");
+        let sources = |exported: bool, argv: &[&str]| {
+            let mut command = Cli::command();
+            if exported {
+                command = command
+                    .mut_arg("url", |arg| arg.env(SET))
+                    .mut_arg("token", |arg| arg.env(SET));
+            }
+            let matches = command
+                .try_get_matches_from(argv)
+                .unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let sources = connection::Sources::from_matches(&matches);
+            (sources.url, sources.token)
+        };
+
+        assert_eq!(sources(false, &["trawl", "query", "q"]), (None, None));
+        assert_eq!(
+            sources(true, &["trawl", "query", "q"]),
+            (Some(Environment), Some(Environment))
+        );
+        for argv in [
+            &["trawl", "--url", "u", "--token", "t", "query", "q"][..],
+            &["trawl", "query", "q", "--url", "u", "--token", "t"],
+            &["trawl", "schema", "fields", "--url", "u", "--token", "t"],
+            &["trawl", "--url", "u", "--token", "t"],
+        ] {
+            for exported in [false, true] {
+                assert_eq!(
+                    sources(exported, argv),
+                    (Some(CommandLine), Some(CommandLine)),
+                    "{argv:?}, exported: {exported}"
+                );
+            }
+        }
+        assert_eq!(
+            sources(true, &["trawl", "query", "q", "--url", "u"]),
+            (Some(CommandLine), Some(Environment))
+        );
+        assert_eq!(
+            sources(true, &["trawl", "schema", "fields", "--token", "t"]),
+            (Some(Environment), Some(CommandLine))
+        );
     }
 
     /// The repin ceilings parse as numbers and default to absent. Absent is
