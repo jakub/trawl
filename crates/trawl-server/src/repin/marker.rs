@@ -221,24 +221,58 @@ pub fn in_flight_evidence(data_dir: &Path) -> Result<Option<&'static str>, std::
 /// directory that contains a mount point is `EBUSY`, not `EXDEV`. One
 /// stat walk up front turns all of that into a refusal that changes
 /// nothing.
+///
+/// The refusal reaches the request and the repin job row, so it names the
+/// data root by its setting, offenders relative to the data root, the
+/// staging roots by their sibling names and I/O failures by their
+/// [`std::io::ErrorKind`] (ADR-0040, amendment of 2026-11-08). The
+/// absolute paths and the error text go to a DEBUG event only.
 pub fn check_staging_filesystem(data_dir: &Path) -> Result<(), String> {
     let parent = data_dir.parent().filter(|p| !p.as_os_str().is_empty());
     let parent = parent.unwrap_or_else(|| Path::new("."));
-    let root_dev = device_of(data_dir)?;
-    if root_dev != device_of(parent)? {
-        return Err(format!(
-            "the data root {} is a mount point, so the repin staging roots \
-             ({}, {}) would sit on the parent filesystem — the hardlinks and \
-             the atomic per-env swap a repin is built from cannot cross \
-             filesystems (EXDEV). Mount the volume one level up and put the \
-             data root inside it (the packaged layout: volume at \
-             /var/lib/trawl, [data] path = \"/var/lib/trawl/data\")",
-            data_dir.display(),
-            shadow_root(data_dir).display(),
-            aside_root(data_dir).display()
-        ));
+    let root_dev = device_of(data_dir, "the data root")?;
+    if root_dev != device_of(parent, "the data root's parent directory")? {
+        return Err(mount_point_message(data_dir));
     }
     check_env_subtree_devices(data_dir, root_dev, &|meta| device_of_meta(meta))
+}
+
+/// The refusal for a data root that is itself a mount point.
+fn mount_point_message(data_dir: &Path) -> String {
+    format!(
+        "the data root ([data] path) is a mount point, so the repin staging \
+         roots beside it ({}, {}) would sit on the parent filesystem — the \
+         hardlinks and the atomic per-env swap a repin is built from cannot \
+         cross filesystems (EXDEV). Mount the volume one level up and put \
+         the data root inside it (the packaged layout: volume at \
+         /var/lib/trawl, [data] path = \"/var/lib/trawl/data\")",
+        sibling_name(&shadow_root(data_dir)),
+        sibling_name(&aside_root(data_dir))
+    )
+}
+
+/// A staging root named by its final component: a sibling of the data
+/// root, never its absolute path.
+fn sibling_name(root: &Path) -> String {
+    root.file_name().map_or_else(
+        || "a sibling of the data root".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// A pre-flight I/O failure, named by `what` and the error's kind. The
+/// path and the error text go to DEBUG.
+fn io_refusal(what: &str, path: &Path, e: &std::io::Error) -> String {
+    tracing::debug!(
+        event_type = "repin_staging_preflight_io",
+        path = %path.display(),
+        error = %e,
+        "the repin staging pre-flight could not read a path"
+    );
+    format!(
+        "the repin staging pre-flight failed to {what} ({})",
+        e.kind()
+    )
 }
 
 /// Walk the env directories the swap moves and the shadow build
@@ -252,7 +286,7 @@ where
     F: Fn(&std::fs::Metadata) -> u64,
 {
     for (_env, env_dir) in crate::env_dirs::try_list_env_dirs(data_dir)
-        .map_err(|e| format!("failed to list env dirs under {}: {e}", data_dir.display()))?
+        .map_err(|e| io_refusal("list the env dirs under the data root", data_dir, &e))?
     {
         walk_devices(&env_dir, data_dir, root_dev, dev_of)?;
     }
@@ -263,15 +297,28 @@ fn walk_devices<F>(dir: &Path, data_dir: &Path, root_dev: u64, dev_of: &F) -> Re
 where
     F: Fn(&std::fs::Metadata) -> u64,
 {
+    let rel = |path: &Path| crate::catalog::gc::root_relative(data_dir, path);
     let meta = std::fs::symlink_metadata(dir)
-        .map_err(|e| format!("failed to stat {}: {e}", dir.display()))?;
+        .map_err(|e| io_refusal(&format!("stat {}", rel(dir)), dir, &e))?;
+    // Only an env directory can be a link here: the listing follows one,
+    // and the walk below never descends into a link. Reading on would
+    // walk the link's target outside the data root and name its children
+    // as entries of this env.
+    if meta.is_symlink() {
+        return Err(format!(
+            "the env directory {} is a symlink: the repin shadow cannot carry \
+             symlinked entries under the data root — replace it with the real \
+             directory and retry",
+            rel(dir)
+        ));
+    }
     if dev_of(&meta) != root_dev {
         return Err(nested_mount_message(data_dir, dir));
     }
     let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+        std::fs::read_dir(dir).map_err(|e| io_refusal(&format!("read {}", rel(dir)), dir, &e))?;
     for entry in entries {
-        let entry = entry.map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+        let entry = entry.map_err(|e| io_refusal(&format!("read {}", rel(dir)), dir, &e))?;
         let path = entry.path();
         // `DirEntry::metadata` is an `lstat`, so a symlink reports the
         // device of the directory holding it rather than of its target —
@@ -280,7 +327,7 @@ where
         // target is never hardlinked or renamed by this engine.
         let meta = entry
             .metadata()
-            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+            .map_err(|e| io_refusal(&format!("stat {}", rel(&path)), &path, &e))?;
         if dev_of(&meta) != root_dev {
             return Err(nested_mount_message(data_dir, &path));
         }
@@ -293,7 +340,7 @@ where
 
 fn nested_mount_message(data_dir: &Path, offender: &Path) -> String {
     format!(
-        "{} is on a different filesystem than the data root {} (a volume \
+        "{} is on a different filesystem than the data root (a volume \
          mounted at a subdirectory of the corpus), which a repin cannot \
          stage: the shadow build hardlinks every unaffected file into {} \
          (EXDEV across filesystems) and the cutover renames each env \
@@ -303,17 +350,16 @@ fn nested_mount_message(data_dir: &Path, offender: &Path) -> String {
          volume out of the data root (one filesystem for the whole corpus; \
          the packaged layout: volume at /var/lib/trawl, [data] path = \
          \"/var/lib/trawl/data\") and retry",
-        offender.display(),
-        data_dir.display(),
-        shadow_root(data_dir).display()
+        crate::catalog::gc::root_relative(data_dir, offender),
+        sibling_name(&shadow_root(data_dir))
     )
 }
 
 /// The filesystem a path lives on. Non-unix has no device identity to
 /// compare, so the check is a no-op there (trawld ships for Linux).
-fn device_of(path: &Path) -> Result<u64, String> {
+fn device_of(path: &Path, what: &str) -> Result<u64, String> {
     let meta =
-        std::fs::metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+        std::fs::metadata(path).map_err(|e| io_refusal(&format!("stat {what}"), path, &e))?;
     Ok(device_of_meta(&meta))
 }
 
@@ -516,9 +562,42 @@ mod tests {
         };
         let err = check_env_subtree_devices(&data, 0, &dev_of)
             .expect_err("a nested mount must be refused before anything is built");
-        assert!(err.contains(&tiered.display().to_string()), "{err}");
+        assert!(err.starts_with("prod/2026-01-01/10 is on"), "{err}");
+        assert!(err.contains("into data.repin-next"), "{err}");
+        assert!(!err.contains(&tmp.path().display().to_string()), "{err}");
         assert!(err.contains("EXDEV"), "{err}");
         assert!(err.contains("EBUSY"), "{err}");
+    }
+
+    /// The pre-flight's refusals reach the request and the job row, so
+    /// they carry neither the error's text nor an absolute host path.
+    #[test]
+    fn staging_refusals_carry_no_host_path_or_io_text() {
+        const MARKER: &str = "zz_io_marker_/srv/secret";
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let abs = tmp.path().display().to_string();
+
+        let injected = std::io::Error::other(MARKER);
+        let msg = io_refusal("stat prod/sub", &data.join("prod/sub"), &injected);
+        assert_eq!(
+            msg,
+            "the repin staging pre-flight failed to stat prod/sub (other error)"
+        );
+
+        let msg = mount_point_message(&data);
+        assert!(!msg.contains(&abs), "{msg}");
+        assert!(msg.contains("(data.repin-next, data.repin-aside)"), "{msg}");
+        assert!(msg.contains("Mount the volume one level up"), "{msg}");
+
+        // A data root that is not there: the real stat failure.
+        let err = check_staging_filesystem(&data).expect_err("nothing to stat");
+        assert!(!err.contains(&abs), "{err}");
+        assert!(!err.contains("os error"), "{err}");
+        assert_eq!(
+            err,
+            "the repin staging pre-flight failed to stat the data root (entity not found)"
+        );
     }
 
     /// A bind-mounted file is the same defect one level down: the shadow
@@ -541,7 +620,53 @@ mod tests {
             }
         };
         let err = check_env_subtree_devices(&data, 0, &dev_of).expect_err("EXDEV in waiting");
-        assert!(err.contains(&file.display().to_string()), "{err}");
+        assert!(
+            err.starts_with("prod/2026-01-01/10/svc.parquet is on"),
+            "{err}"
+        );
+        assert!(!err.contains(&tmp.path().display().to_string()), "{err}");
+    }
+
+    /// A symlinked env directory is refused before the walk reads it. The
+    /// listing follows the link, so reading on would name the link
+    /// target's children as `prod/...` entries of the data root, and a
+    /// refusal about one of them would carry a name from outside the data
+    /// root. The refusal names the env relative to the data root only.
+    #[cfg(unix)]
+    #[test]
+    fn staging_preflight_refuses_a_symlinked_env_dir() {
+        const MARKER: &str = "MARKER-outside-file";
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let planted = outside.path().join(MARKER);
+        std::fs::write(&planted, b"rows").unwrap();
+        std::os::unix::fs::symlink(outside.path(), data.join("prod")).unwrap();
+        let outside_abs = outside.path().display().to_string();
+        let expected = "the env directory prod is a symlink: the repin shadow cannot \
+                        carry symlinked entries under the data root — replace it with \
+                        the real directory and retry";
+
+        // The real device lookup: both tempdirs share a filesystem, so
+        // only the link itself can refuse.
+        let err = check_staging_filesystem(&data).expect_err("a symlinked env must refuse");
+        assert_eq!(err, expected);
+
+        // A link target's child on another device must not be named.
+        let foreign_ino = inode(&planted);
+        let dev_of = |meta: &std::fs::Metadata| {
+            if inode_of(meta) == foreign_ino {
+                7777
+            } else {
+                0
+            }
+        };
+        let err =
+            check_env_subtree_devices(&data, 0, &dev_of).expect_err("a symlinked env must refuse");
+        assert!(!err.contains(MARKER), "{err}");
+        assert!(!err.contains(&outside_abs), "{err}");
+        assert_eq!(err, expected);
     }
 
     /// Only what the engine moves is in scope: `wal/` and `scheduled/`
@@ -589,11 +714,14 @@ mod tests {
     #[test]
     fn a_data_root_on_its_own_mount_is_refused() {
         let mount = Path::new("/proc");
-        if !mount.exists() || device_of(mount).unwrap() == device_of(Path::new("/")).unwrap() {
+        if !mount.exists()
+            || device_of(mount, "/proc").unwrap() == device_of(Path::new("/"), "/").unwrap()
+        {
             return; // no /proc to lean on; nothing to prove here
         }
         let err = check_staging_filesystem(mount).expect_err("a mount point must be refused");
-        assert!(err.contains("/proc.repin-next"), "{err}");
+        assert!(err.contains("(proc.repin-next, proc.repin-aside)"), "{err}");
+        assert!(!err.contains("/proc"), "{err}");
         assert!(err.contains("EXDEV"), "{err}");
     }
 
