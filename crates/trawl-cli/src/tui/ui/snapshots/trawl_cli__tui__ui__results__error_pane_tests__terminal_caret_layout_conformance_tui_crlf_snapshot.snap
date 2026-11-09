@@ -1,0 +1,16 @@
+---
+source: crates/trawl-cli/src/tui/ui/results.rs
+expression: "snapshot_rows(\"crlf query\")"
+---
+┌ Error ───────────────────────────────────────────────────┐
+│ error: parse error: the error                            │
+│                                                          │
+│   | stats count( by host                                 │
+│                     ^^^^                                 │
+│   the message                                            │
+│   hint: the hint                                         │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘

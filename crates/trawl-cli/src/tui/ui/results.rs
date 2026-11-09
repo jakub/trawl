@@ -20,6 +20,8 @@ use trawl_api::display::{
 };
 use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 use trawl_api::value::ColumnType;
+use trawl_core::sanitize::sanitize_display_text;
+use trawl_core::text_layout::{caret_layout, locate_span};
 use trawl_engine::value::Value;
 
 use crate::tui::App;
@@ -614,9 +616,17 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
 /// Render error details with span highlighting in the results pane.
 ///
-/// Shows the error message in red, then the query text with the error
-/// span underlined and a caret line below it. The spans index `query`,
-/// the text the failed run sent, never the editor's current draft.
+/// Shows the error message in red, then each detail: the line of `query`
+/// its span starts on, the span underlined and a caret line below it,
+/// then the detail's message and hint. `query` is the text the failed run
+/// sent, which the spans index, never the editor's current draft.
+///
+/// Spans are UTF-8 byte offsets; [`locate_span`] resolves them and
+/// [`caret_layout`] places the carets by display cells. A span that cannot
+/// index `query` (reversed, past the end, or inside a character), or an
+/// error with no sent query, shows the message and hint without an
+/// excerpt; a span is never clamped. Every piece of text drawn here is
+/// sanitized: it can hold anything the user typed or the server said.
 #[allow(clippy::too_many_arguments)]
 fn render_error_display(
     app: &App,
@@ -643,11 +653,11 @@ fn render_error_display(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let query_text = query.unwrap_or_default();
+    let muted = Style::default().fg(theme.text_muted);
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     lines.push(Line::from(Span::styled(
-        format!("error: {message}"),
+        format!("error: {}", sanitize_display_text(message)),
         Style::default()
             .fg(theme.status_error)
             .add_modifier(Modifier::BOLD),
@@ -656,85 +666,57 @@ fn render_error_display(
 
     // A validation error's one detail has no span and repeats the message
     // above, so a list with no span renders the message alone.
-    if !details.iter().any(|d| d.span.is_some()) || query_text.is_empty() {
-        // No span info — just show the message.
+    if !details.iter().any(|d| d.span.is_some()) {
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, inner);
         return;
     }
 
-    // Render each detail with span highlighting.
     for detail in details {
-        if let Some(ref span) = detail.span {
-            let start = span.start.min(query_text.len());
-            let end = span.end.min(query_text.len()).max(start);
-
-            // Find the line containing the span.
-            let mut line_start = 0;
-            let mut line_end = query_text.len();
-            for (i, ch) in query_text.char_indices() {
-                if ch == '\n' {
-                    if i < start {
-                        line_start = i + 1;
-                    }
-                    if i >= end && line_end == query_text.len() {
-                        line_end = i;
-                    }
-                }
-            }
-
-            let query_line = &query_text[line_start..line_end];
-            let col_start = start - line_start;
-            let col_end = (end - line_start).min(query_line.len());
-            let underline_len = (col_end - col_start).max(1);
-
-            // Query text with error span highlighted.
-            let before = &query_line[..col_start];
-            let error_region = &query_line[col_start..col_end];
-            let after = &query_line[col_end..];
-
+        let located = query.and_then(|query| {
+            let span = detail.span.as_ref()?;
+            let at = locate_span(query, span.start, span.end)?;
+            Some(caret_layout(query, &at))
+        });
+        if let Some(layout) = located {
             lines.push(Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::styled(before.to_owned(), Style::default().fg(theme.text_primary)),
+                Span::raw("  "),
+                Span::styled(layout.before, Style::default().fg(theme.text_primary)),
                 Span::styled(
-                    error_region.to_owned(),
+                    layout.covered,
                     Style::default()
                         .fg(theme.status_error)
                         .add_modifier(Modifier::UNDERLINED),
                 ),
-                Span::styled(after.to_owned(), Style::default().fg(theme.text_primary)),
+                Span::styled(layout.after, Style::default().fg(theme.text_primary)),
             ]));
-
             lines.push(Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::raw(" ".repeat(col_start)),
+                Span::raw("  "),
+                Span::raw(" ".repeat(layout.pad)),
                 Span::styled(
-                    "^".repeat(underline_len),
+                    "^".repeat(layout.carets),
                     Style::default().fg(theme.status_error),
                 ),
             ]));
-
-            lines.push(Line::from(Span::styled(
-                format!("  {}", detail.message),
-                Style::default().fg(theme.text_muted),
-            )));
-
-            if let Some(ref label) = detail.label {
-                lines.push(Line::from(Span::styled(
-                    format!("  while parsing: {label}"),
-                    Style::default().fg(theme.text_muted),
-                )));
-            }
-
-            lines.push(Line::from(""));
-        } else {
-            // No span — just the message.
-            lines.push(Line::from(Span::styled(
-                format!("  {}", detail.message),
-                Style::default().fg(theme.text_muted),
-            )));
-            lines.push(Line::from(""));
         }
+
+        lines.push(Line::from(Span::styled(
+            format!("  {}", sanitize_display_text(&detail.message)),
+            muted,
+        )));
+        if let Some(label) = &detail.label {
+            lines.push(Line::from(Span::styled(
+                format!("  while parsing: {}", sanitize_display_text(label)),
+                muted,
+            )));
+        }
+        if let Some(hint) = &detail.hint {
+            lines.push(Line::from(Span::styled(
+                format!("  hint: {}", sanitize_display_text(hint)),
+                muted,
+            )));
+        }
+        lines.push(Line::from(""));
     }
 
     let paragraph = Paragraph::new(lines);
@@ -1776,5 +1758,204 @@ mod placeholder_tests {
                 .draw(|f| crate::tui::ui::render(&mut app, f))
                 .unwrap_or_else(|e| panic!("{width}x{height} must render: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod error_pane_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_core::text_layout::{SPAN_CASES, SpanCase, cells as cells_of};
+
+    use crate::tui::state::TabStatus;
+    use crate::tui::tests::test_app;
+
+    /// Wide enough for every row of the span table: the pane clips a line
+    /// past its width rather than wrapping it.
+    const WIDTH: u16 = 60;
+    const HEIGHT: u16 = 12;
+
+    /// The error pane alone, drawn for one error whose one detail has
+    /// `span` over `query`, as rows of text. A cell hidden behind a
+    /// double-width character is skipped, so each row reads as the
+    /// terminal shows it.
+    fn pane(query: Option<&str>, span: Option<(usize, usize)>) -> Vec<String> {
+        let mut app = test_app();
+        app.tab.status = TabStatus::Error {
+            message: "parse error: the error".to_owned(),
+            details: vec![trawl_client::ErrorDetail {
+                message: "the message".to_owned(),
+                span: span.map(|(start, end)| trawl_client::ErrorSpan { start, end }),
+                label: None,
+                hint: Some("the hint".to_owned()),
+            }],
+            query: query.map(str::to_owned),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("terminal");
+        terminal
+            .draw(|f| super::render(&app, f, f.area()))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .chunks(usize::from(WIDTH))
+            .map(|cells| {
+                let mut row = String::new();
+                let mut hidden: usize = 0;
+                for cell in cells {
+                    if hidden == 0 {
+                        row.push_str(cell.symbol());
+                    }
+                    hidden = hidden.max(cells_of(cell.symbol())).saturating_sub(1);
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// The pane's inner rows: inside the border and its one-cell padding,
+    /// trailing blanks dropped.
+    fn inner(rows: &[String]) -> Vec<String> {
+        rows[1..rows.len() - 1]
+            .iter()
+            .map(|row| {
+                let inside = row
+                    .strip_prefix("│ ")
+                    .and_then(|r| r.strip_suffix(" │"))
+                    .unwrap_or_else(|| panic!("a bordered row: {row:?}"));
+                inside.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    /// What the pane shows for a detail with no excerpt.
+    fn no_excerpt() -> Vec<String> {
+        let mut rows: Vec<String> = [
+            "error: parse error: the error",
+            "",
+            "  the message",
+            "  hint: the hint",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        rows.resize(usize::from(HEIGHT) - 2, String::new());
+        rows
+    }
+
+    fn case(name: &str) -> &'static SpanCase {
+        SPAN_CASES
+            .iter()
+            .find(|case| case.name == name)
+            .unwrap_or_else(|| panic!("no span case {name:?}"))
+    }
+
+    /// Every row of the shared span table, drawn through the real error
+    /// pane: a row that locates shows its excerpt line and a caret line at
+    /// the row's display cells; one that cannot index its text shows the
+    /// message and hint with no excerpt and no caret.
+    #[test]
+    fn terminal_caret_layout_conformance_tui() {
+        for case in SPAN_CASES {
+            let rows = pane(Some(case.text), Some((case.start, case.end)));
+            assert!(
+                rows.iter().all(|row| !row.contains('\r')),
+                "{}: {rows:#?}",
+                case.name
+            );
+            let got = inner(&rows);
+            let want = match case.expect {
+                Some(expect) => {
+                    let mut want: Vec<String> = vec![
+                        "error: parse error: the error".to_owned(),
+                        String::new(),
+                        format!("  {}", expect.excerpt).trim_end().to_owned(),
+                        format!("  {}{}", " ".repeat(expect.pad), "^".repeat(expect.carets)),
+                        "  the message".to_owned(),
+                        "  hint: the hint".to_owned(),
+                    ];
+                    want.resize(usize::from(HEIGHT) - 2, String::new());
+                    want
+                }
+                None => no_excerpt(),
+            };
+            assert_eq!(got, want, "{}", case.name);
+        }
+    }
+
+    /// An error raised before anything was sent has no query to quote: a
+    /// span shows the message and hint alone.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_without_a_query() {
+        assert_eq!(inner(&pane(None, Some((0, 0)))), no_excerpt());
+    }
+
+    /// An empty sent query still gets its one caret for a valid `0..0`.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_empty_query() {
+        let rows = inner(&pane(Some(""), Some((0, 0))));
+        assert_eq!(rows[2], "");
+        assert_eq!(rows[3], "  ^");
+        assert_eq!(rows[4], "  the message");
+    }
+
+    /// The message, label and hint can hold anything the server said, and
+    /// a control or bidi character in them cannot rewrite the line.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_sanitizes_messages() {
+        let mut app = test_app();
+        app.tab.status = TabStatus::Error {
+            message: "bad\u{1b}[2J".to_owned(),
+            details: vec![trawl_client::ErrorDetail {
+                message: "a\u{202E}b".to_owned(),
+                span: Some(trawl_client::ErrorSpan { start: 0, end: 1 }),
+                label: Some("l\u{7}".to_owned()),
+                hint: Some("try\r\nthis".to_owned()),
+            }],
+            query: Some("q".to_owned()),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("terminal");
+        terminal
+            .draw(|f| super::render(&app, f, f.area()))
+            .expect("render");
+        let screen = terminal.backend().to_string();
+        for drawn in [
+            "error: bad\u{FFFD}[2J",
+            "  a\u{FFFD}b",
+            "  while parsing: l\u{FFFD}",
+            "  hint: try\u{FFFD}\u{FFFD}this",
+        ] {
+            assert!(screen.contains(drawn), "{drawn:?} in:\n{screen}");
+        }
+    }
+
+    /// Snapshots of representative rows, drawn whole with their border.
+    fn snapshot_rows(name: &str) -> String {
+        let case = case(name);
+        pane(Some(case.text), Some((case.start, case.end))).join("\n")
+    }
+
+    /// The issue's query: the caret sits under the `(`, after two
+    /// double-width characters.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_cjk_snapshot() {
+        insta::assert_snapshot!(snapshot_rows("cjk before the span"));
+    }
+
+    /// A CRLF query draws no `\r` and quotes the span's own line.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_crlf_snapshot() {
+        insta::assert_snapshot!(snapshot_rows("crlf query"));
+    }
+
+    /// A span running onto later lines marks only its start line.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_multi_line_snapshot() {
+        insta::assert_snapshot!(snapshot_rows("multi-line span clips to its start line"));
+    }
+
+    /// A span ending inside a character draws no excerpt and no caret.
+    #[test]
+    fn terminal_caret_layout_conformance_tui_invalid_span_snapshot() {
+        insta::assert_snapshot!(snapshot_rows("end inside a character"));
     }
 }

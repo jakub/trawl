@@ -1,0 +1,16 @@
+---
+source: crates/trawl-cli/src/tui/ui/results.rs
+expression: "snapshot_rows(\"cjk before the span\")"
+---
+┌ Error ───────────────────────────────────────────────────┐
+│ error: parse error: the error                            │
+│                                                          │
+│   service="日本" | where x ~ /(/                         │
+│                               ^                          │
+│   the message                                            │
+│   hint: the hint                                         │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
