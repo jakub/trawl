@@ -37,6 +37,11 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
             message: refusal.to_string(),
         }
     })?;
+    // Then an aggregate written where neither lane can run it (ADR-0001,
+    // Amendment 2026-11-08). The stream compiler runs it at the same
+    // point, so a query with several defects gets one first sentence from
+    // both lanes.
+    crate::aggregate::check_positions(stages)?;
 
     for (i, stage) in stages.iter().enumerate() {
         match &stage.node {
@@ -47,6 +52,11 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
             }
             PipeStage::Timechart(tc) => {
                 for agg in &tc.aggregations {
+                    validate_function(agg)?;
+                }
+            }
+            PipeStage::EventStats(es) => {
+                for agg in &es.aggregations {
                     validate_function(agg)?;
                 }
             }
@@ -98,9 +108,9 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
             // The pipeline may not mint a reserved name (ADR-0013 §5):
             // ingest strips the `_` prefix off an incoming key, so a
             // capture group that wrote one would be a column the DSL can
-            // create and ingest can never carry. The SSE lane never runs
-            // `validate_pipeline`, so it mirrors this refusal where it
-            // compiles the regex (`stream::compile_extract`), the same
+            // create and ingest can never carry. The stream compiler does
+            // not call `validate_pipeline`, so it mirrors this refusal where
+            // it compiles the regex (`stream::compile_extract`), the same
             // way the kv arm seals its keys in both lanes.
             for capture in &captures {
                 if crate::schema::is_reserved_name(&capture.name) {
@@ -169,7 +179,7 @@ pub(crate) fn reserved_name_error(what: &str, name: &str) -> EmitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{PivotStage, StatsStage, TimechartStage};
+    use crate::ast::{EventStatsStage, PivotStage, StatsStage, TimechartStage};
 
     fn agg(alias: &str) -> AggExpr {
         AggExpr {
@@ -204,6 +214,10 @@ mod tests {
                 on_field: "status".to_string(),
                 by: vec![],
             })),
+            stage(PipeStage::EventStats(EventStatsStage {
+                aggregations: vec![agg("_level")],
+                group_by: vec![],
+            })),
         ];
         for s in stages {
             let err = validate_pipeline(std::slice::from_ref(&s))
@@ -212,6 +226,23 @@ mod tests {
                 err.to_string().contains("reserved namespace"),
                 "{err} ({s:?})"
             );
+        }
+    }
+
+    /// An `eventstats` slot gets the name and arity check every other
+    /// aggregation slot gets.
+    #[test]
+    fn eventstats_slots_are_checked() {
+        for (dsl, sentence) in [
+            ("* | eventstats bogus(x) as y", "unknown function: bogus"),
+            (
+                "* | eventstats avg() as y",
+                "invalid aggregation: avg() requires exactly one argument",
+            ),
+        ] {
+            let query = crate::parser::parse(dsl).expect("dsl parses");
+            let err = validate_pipeline(&query.pipeline).expect_err("refused");
+            assert_eq!(err.message(), sentence, "{dsl}");
         }
     }
 

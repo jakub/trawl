@@ -850,6 +850,85 @@ fn scalar_around_aggregate_output_runs_in_duckdb() {
     );
 }
 
+/// An aggregate written where neither lane can run it is refused before
+/// either lane compiles, with one sentence both doors return: in a
+/// per-row expression at any depth, or inside another aggregate's
+/// operand (ADR-0001, Amendment 2026-11-08).
+///
+/// The issue's examples spell equality `=`, but the expression grammar's
+/// equality is `==`; with `=` these texts would be parse errors and prove
+/// nothing about the new refusal.
+#[test]
+fn aggregate_position_refusals_match() {
+    let row = "is an aggregation; use it in stats, timechart, eventstats or pivot";
+    for (dsl, sentence) in [
+        (
+            "| where count(x) > 1",
+            format!("invalid aggregation: count() {row}"),
+        ),
+        (
+            "| let y = avg(x)",
+            format!("invalid aggregation: avg() {row}"),
+        ),
+        (
+            r#"| where lower(count(x)) == "a""#,
+            format!("invalid aggregation: count() {row}"),
+        ),
+        (
+            "| stats sum(count(x))",
+            "invalid aggregation: count() cannot be nested inside sum()".to_owned(),
+        ),
+        // A scalar between the two aggregates is no way around it.
+        (
+            "| stats sum(coalesce(count(x), 0))",
+            "invalid aggregation: count() cannot be nested inside sum()".to_owned(),
+        ),
+    ] {
+        let query = trawl_core::parser::parse(dsl).expect("dsl parses");
+        let batch = emitter::emit(
+            &query,
+            "/data/**/*.parquet",
+            trawl_core::context::EvalContext::capture(),
+        )
+        .expect_err("batch refuses the aggregate's position")
+        .to_string();
+        // `compile_stream_plan_with` over a fresh ledger.
+        let live = compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None)
+            .expect_err("live refuses the aggregate's position")
+            .to_string();
+        assert_eq!(batch, live, "{dsl}: the two doors disagree");
+        assert_eq!(batch, sentence, "{dsl}");
+    }
+
+    // A field named `count` is a field, and ordinary scalar calls, a
+    // scalar around an aggregate's output in a slot, and an aggregate
+    // over a scalar's value stay legal.
+    for dsl in [
+        "| where count == 1",
+        r#"| where lower(service) == "nginx" | let y = coalesce(n, 0)"#,
+        "| stats coalesce(sum(x), 0)",
+        "| stats sum(coalesce(x, 0)) as total",
+    ] {
+        let query = trawl_core::parser::parse(dsl).expect("dsl parses");
+        emitter::emit(
+            &query,
+            "/data/**/*.parquet",
+            trawl_core::context::EvalContext::capture(),
+        )
+        .unwrap_or_else(|error| panic!("{dsl}: batch must accept it: {error}"));
+    }
+    // Live, where nothing scalar heads the slot: the scalar head is the
+    // live lane's own refusal (`live_scalar_heads_are_refused`).
+    for dsl in [
+        "| where count == 1",
+        r#"| where lower(service) == "nginx" | let y = coalesce(n, 0)"#,
+    ] {
+        let query = trawl_core::parser::parse(dsl).expect("dsl parses");
+        compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None)
+            .unwrap_or_else(|error| panic!("{dsl}: live must accept it: {error}"));
+    }
+}
+
 /// The round trip through the row doors (`from_json` then `to_json`)
 /// changes neither key order nor cell rendering of an event map, so the
 /// expectation is computed as `serde_json::to_string` of the map rather

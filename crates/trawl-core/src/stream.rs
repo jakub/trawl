@@ -72,9 +72,12 @@ pub enum StreamPlanError {
     /// A `strftime`/`strptime` format string literal contains an invalid code.
     InvalidFormat(String),
     /// A function call the emitter's own tables refuse — an unknown name
-    /// or the wrong argument count. This lane never runs
-    /// `validate_pipeline`, so it mirrors the check itself: otherwise
-    /// `let s = sev()` opens a live-looking stream that can only ever
+    /// or the wrong argument count — or an aggregate written where
+    /// neither lane can run it ([`crate::aggregate::check_positions`]).
+    /// This compiler does not call `validate_pipeline` (`/api/v1/stream`
+    /// runs it in admission, before the compile), so it runs the checks
+    /// itself: otherwise a plan compiled without admission would turn
+    /// `let s = sev()` into a live-looking stream that can only ever
     /// evaluate to NULL while `/api/v1/query` 400s on the same text.
     InvalidFunction(String),
     /// A pinned comparison the shared rule table refuses — an unknown
@@ -86,7 +89,7 @@ pub enum StreamPlanError {
     /// A pipeline write position naming trawl's `_` namespace — an
     /// `extract` capture group, the one such name that is not already a
     /// parse error (ADR-0013 §5). The SQL lane refuses it in
-    /// `emitter::validate_pipeline`, which this lane never runs.
+    /// `emitter::validate_pipeline`, which this compiler does not call.
     ReservedName(String),
     /// A projecting stage that would mint two columns of one name
     /// (ADR-0013 ruling 8). Same reason as `ReservedName`: the sentence
@@ -205,6 +208,12 @@ pub fn compile_stream_plan_with(
     // being unstreamable.
     crate::complexity::check_pipeline_complexity(pipeline)
         .map_err(|refusal| StreamPlanError::TooComplex(refusal.to_string()))?;
+
+    // Then an aggregate written where neither lane can run it, at the
+    // point `validate_pipeline` checks it too (ADR-0001, Amendment
+    // 2026-11-08): eval would answer NULL for `where count(x) > 1`.
+    crate::aggregate::check_positions(pipeline)
+        .map_err(|e| StreamPlanError::InvalidFunction(e.to_string()))?;
 
     // The shared projection-name check runs next, over every stage —
     // before the unsupported-stage and multi-aggregation refusals — so a
@@ -1333,12 +1342,13 @@ fn compile_extract(
                 .map(|capture| capture.name)
                 .collect();
             // The `_` namespace is sealed at both pipeline write positions
-            // (ADR-0013 §5), and this lane is a door of its own: SSE parses
-            // and compiles straight to a stream plan, never through
-            // `emitter::validate_pipeline`. Without this mirror of
-            // `validate_extract`'s check, `extract "(?P<_severity>…)"` would
-            // 400 in batch and stream happily live, letting a message body
-            // overwrite trawl's own derived verdict slot.
+            // (ADR-0013 §5), and this compiler is a door of its own: it
+            // does not call `emitter::validate_pipeline`, which
+            // `/api/v1/stream` runs only in admission. Without this mirror
+            // of `validate_extract`'s check, a plan compiled without
+            // admission would stream `extract "(?P<_severity>…)"` live
+            // while batch 400s, letting a message body overwrite trawl's
+            // own derived verdict slot.
             for name in &captures {
                 if crate::schema::is_reserved_name(name) {
                     return Err(StreamPlanError::ReservedName(
@@ -3689,8 +3699,8 @@ mod tests {
 
     /// The pipeline may not mint a reserved name — the same predicate
     /// ingest strips by (ADR-0013 §5) — and both doors refuse it: the
-    /// SQL lane through `validate_pipeline`, the SSE lane (which never
-    /// runs it) through its own plan compilation. Otherwise a capture
+    /// SQL lane through `validate_pipeline`, the stream compiler (which
+    /// does not call it) through its own plan compilation. Otherwise a capture
     /// group named `_severity` would 400 in batch and stream live,
     /// letting log content overwrite trawl's derived verdict.
     #[test]
@@ -3769,7 +3779,7 @@ mod tests {
     }
 
     /// `sev()`'s dialect is a closed vocabulary in the stream lane too:
-    /// this lane never runs `validate_pipeline`, and eval has no error
+    /// the compiler does not call `validate_pipeline`, and eval has no error
     /// channel, so a dialect it cannot honour has to be refused where the
     /// plan is compiled — the same sentence the emitter gives.
     #[test]
@@ -3809,11 +3819,11 @@ mod tests {
         }
     }
 
-    /// Arity is the emitter's table in both lanes, word for word: this
-    /// lane never runs `validate_pipeline`, so without the mirror
-    /// `/stream` accepts `sev()` and `sev(a, b, c)` — opening a
-    /// live-looking stream that can only evaluate to NULL — while
-    /// `/api/v1/query` 400s on the same text.
+    /// Arity is the emitter's table in both lanes, word for word: the
+    /// compiler does not call `validate_pipeline`, so without the mirror
+    /// a plan compiled without admission accepts `sev()` and
+    /// `sev(a, b, c)` — a live-looking stream that can only evaluate to
+    /// NULL — while `/api/v1/query` 400s on the same text.
     #[test]
     fn rejects_a_wrong_arity_call_with_the_emitters_own_sentence() {
         let scope = PinScope::unpinned();
