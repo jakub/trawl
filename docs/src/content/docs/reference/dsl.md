@@ -290,7 +290,7 @@ Which pin applies follows the pipeline, not a flat name lookup.
 
 Inside one `let`, a reference to a sibling target resolves the way the SQL does: an existing column of that name wins, so `let a = 1, b = a` gives `b` the original `a`, and only a name the row does not carry reads the sibling's fresh value, so `let ms = 1000, total = ms * 2` gives `total = 2000`. Pins stay pre-stage, so `let a = status, b = a` gives `b` no pin.
 
-Timestamps in the kv batch tail compare as stored instants. The result carries them in UTC, and the client shows every `timestamp` column in your display zone. `rename _time as t` and the bare alias `let t2 = _time` stay `timestamp` columns, so they show in your zone. A value the tail computes from a timestamp, such as `let t = coalesce(_time, x)`, is a `string` column holding UTC text with no offset, such as `2026-01-01 05:30:00`, and the client shows it unchanged.
+Timestamps in the kv batch tail compare as stored instants. The result carries them in UTC, and the client shows every `timestamp` column in your display zone. `rename _time as t`, the bare alias `let t2 = _time`, and a function that returns a timestamp, such as `let d = date_trunc("day", _time)`, give `timestamp` columns, so they show in your zone. The tail reads a timestamp as UTC text with no offset, such as `2026-01-01 05:30:00`. An expression that passes that value through, such as `let t = coalesce(_time, x)`, gives a `string` column, and the client shows that text unchanged.
 
 ### The two namespaces
 
