@@ -7,5 +7,5 @@ FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 WHERE TRY_CAST("_time" AS TIMESTAMP) >= CAST(? AS TIMESTAMP) AND "_severity" = ?
 ---
 params:
-  0: '2026-03-14T00:00:00Z'
+  0: '2026-03-14 00:00:00'
   1: 'error'

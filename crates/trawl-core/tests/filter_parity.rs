@@ -1102,6 +1102,205 @@ fn time_filter_parity_on_time_column() {
     }
 }
 
+/// One event per id, its `_time` in the wire form ingest writes, at the
+/// instants the bounds below sit on and one microsecond to either side.
+const BOUND_EVENTS: &[(&str, Option<&str>)] = &[
+    ("pre-epoch", Some("1969-12-31T23:59:59.999999Z")),
+    ("epoch", Some("1970-01-01T00:00:00.000000Z")),
+    ("eve", Some("2026-03-13T23:59:59.999999Z")),
+    ("midnight", Some("2026-03-14T00:00:00.000000Z")),
+    ("midnight+1us", Some("2026-03-14T00:00:00.000001Z")),
+    ("nine-1us", Some("2026-03-14T08:59:59.999999Z")),
+    ("nine", Some("2026-03-14T09:00:00.000000Z")),
+    ("nine+1us", Some("2026-03-14T09:00:00.000001Z")),
+    ("frac", Some("2026-03-14T09:00:00.123456Z")),
+    ("frac+1us", Some("2026-03-14T09:00:00.123457Z")),
+    ("next-day", Some("2026-03-15T00:00:00.000000Z")),
+    ("no-time", None),
+];
+
+/// `earliest=` and `latest=` select the same events in both lanes, in
+/// every spelling `CAST(… AS TIMESTAMP)` reads (ADR-0017's amendment of
+/// 2026-11-08): `earliest` inclusive, `latest` exclusive, an offset read
+/// and dropped, so `+05:30` selects from 09:00 wall clock. The expected ids
+/// are written out by hand from [`BOUND_EVENTS`], never computed by
+/// either lane. An event with no `_time` is outside every bound.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn search_time_bound_parity() {
+    const FROM_MIDNIGHT: &[&str] = &[
+        "midnight",
+        "midnight+1us",
+        "nine-1us",
+        "nine",
+        "nine+1us",
+        "frac",
+        "frac+1us",
+        "next-day",
+    ];
+    const BEFORE_MIDNIGHT: &[&str] = &["pre-epoch", "epoch", "eve"];
+    const FROM_NINE: &[&str] = &["nine", "nine+1us", "frac", "frac+1us", "next-day"];
+    const BEFORE_NINE: &[&str] = &[
+        "pre-epoch",
+        "epoch",
+        "eve",
+        "midnight",
+        "midnight+1us",
+        "nine-1us",
+    ];
+    const ALL_TIMED: &[&str] = &[
+        "pre-epoch",
+        "epoch",
+        "eve",
+        "midnight",
+        "midnight+1us",
+        "nine-1us",
+        "nine",
+        "nine+1us",
+        "frac",
+        "frac+1us",
+        "next-day",
+    ];
+    let cases: &[(&str, &[&str])] = &[
+        // date-only: midnight
+        (r#"earliest="2026-03-14""#, FROM_MIDNIGHT),
+        (r#"latest="2026-03-14""#, BEFORE_MIDNIGHT),
+        // `T`-separated and space-separated
+        (r#"earliest="2026-03-14T09:00:00""#, FROM_NINE),
+        (r#"latest="2026-03-14 09:00:00""#, BEFORE_NINE),
+        // fractional, to the microsecond
+        (
+            r#"earliest="2026-03-14T09:00:00.123457""#,
+            &["frac+1us", "next-day"],
+        ),
+        (
+            r#"latest="2026-03-14T09:00:00.123457""#,
+            &[
+                "pre-epoch",
+                "epoch",
+                "eve",
+                "midnight",
+                "midnight+1us",
+                "nine-1us",
+                "nine",
+                "nine+1us",
+                "frac",
+            ],
+        ),
+        // `Z`, and an offset either way: the wall clock stays 09:00
+        (r#"earliest="2026-03-14T09:00:00Z""#, FROM_NINE),
+        (r#"earliest="2026-03-14T09:00:00+05:30""#, FROM_NINE),
+        (r#"latest="2026-03-14T09:00:00-08:00""#, BEFORE_NINE),
+        // the keywords
+        (
+            r#"earliest="epoch""#,
+            &[
+                "epoch",
+                "eve",
+                "midnight",
+                "midnight+1us",
+                "nine-1us",
+                "nine",
+                "nine+1us",
+                "frac",
+                "frac+1us",
+                "next-day",
+            ],
+        ),
+        (r#"latest="epoch""#, &["pre-epoch"]),
+        (r#"latest="infinity""#, ALL_TIMED),
+        (r#"earliest="infinity""#, &[]),
+        (r#"earliest="-infinity""#, ALL_TIMED),
+        (r#"latest="-infinity""#, &[]),
+        // adjacent microseconds: earliest inclusive, latest exclusive
+        (
+            r#"earliest="2026-03-14T00:00:00.000001" latest="2026-03-14T09:00:00.000001""#,
+            &["midnight+1us", "nine-1us", "nine"],
+        ),
+        (
+            r#"earliest="2026-03-14" latest="2026-03-15""#,
+            &[
+                "midnight",
+                "midnight+1us",
+                "nine-1us",
+                "nine",
+                "nine+1us",
+                "frac",
+                "frac+1us",
+            ],
+        ),
+        // an inverted interval is empty
+        (r#"earliest="2026-03-15" latest="2026-03-14""#, &[]),
+        // the last clause of a kind wins
+        (
+            r#"earliest="2026-03-15" earliest="2026-03-14T09:00:00""#,
+            FROM_NINE,
+        ),
+    ];
+
+    let events: Vec<(&str, Map<String, Value>)> = BOUND_EVENTS
+        .iter()
+        .map(|(id, time)| {
+            let mut event = Map::new();
+            event.insert("id".into(), Value::String((*id).to_owned()));
+            if let Some(time) = time {
+                event.insert("_time".into(), Value::String((*time).to_owned()));
+            }
+            (*id, event)
+        })
+        .collect();
+    let mut file = tempfile::Builder::new()
+        .suffix(".ndjson")
+        .tempfile()
+        .unwrap();
+    for (_, event) in &events {
+        writeln!(file, "{}", Value::Object(event.clone())).unwrap();
+    }
+    file.flush().unwrap();
+    let path = file.path().to_str().unwrap();
+
+    // The session zone every engine connection pins, so a zoned `_time`
+    // column reads as UTC whatever this machine's zone is.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .unwrap();
+    let anchor = trawl_core::context::EvalContext::capture();
+    for (dsl, want) in cases {
+        let query = parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl} parses: {e:?}"));
+
+        let filter =
+            CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
+        let live: Vec<&str> = events
+            .iter()
+            .filter(|(_, event)| {
+                filter
+                    .matches_at(event, &anchor)
+                    .expect("a never stop never cancels")
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        let emitted = emitter::emit(&query, path, anchor).expect("emit succeeds");
+        let sql = format!("SELECT \"id\" FROM ({}) AS _sub", emitted.sql);
+        let params = bind_params(&emitted.params);
+        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows: Vec<String> = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let batch: Vec<&str> = events
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| rows.iter().any(|row| row == id))
+            .collect();
+
+        assert_eq!(live, *want, "live lane, {dsl}");
+        assert_eq!(batch, *want, "batch lane, {dsl}\nsql: {}", emitted.sql);
+    }
+}
+
 // ── Pinned parity (ADR-0011 slice A) ──────────────────────────────────
 
 /// Execute emitted SQL strictly: any `DuckDB` error fails the test. An

@@ -34,16 +34,19 @@ pub(crate) fn emit_search(
         state.time_filter = Some(tf.node.duration);
     }
 
+    // A bound binds as the instant the parser read, in the text `DuckDB`
+    // prints for it, so both lanes compare one value (ADR-0017's
+    // amendment of 2026-11-08).
     if let Some(earliest) = &search.earliest {
         let time = state.read_field(crate::schema::TIME, Use::Operand)?;
-        let p = state.push_param(SqlValue::String(earliest.node.text().to_owned()));
+        let p = state.push_param(SqlValue::String(earliest.node.instant().cast_text()));
         state.push_where(format!(
             "TRY_CAST({time} AS TIMESTAMP) >= CAST({p} AS TIMESTAMP)"
         ));
     }
     if let Some(latest) = &search.latest {
         let time = state.read_field(crate::schema::TIME, Use::Operand)?;
-        let p = state.push_param(SqlValue::String(latest.node.text().to_owned()));
+        let p = state.push_param(SqlValue::String(latest.node.instant().cast_text()));
         state.push_where(format!(
             "TRY_CAST({time} AS TIMESTAMP) < CAST({p} AS TIMESTAMP)"
         ));

@@ -51,10 +51,10 @@ pub struct CompiledFilter {
     groups: Vec<Vec<TokenMatcher>>,
     /// Global time filter (hoisted from groups during parsing).
     time_filter: Option<TimeMatcher>,
-    /// Absolute lower bound (`earliest=`).
-    earliest: Option<chrono::DateTime<chrono::Utc>>,
-    /// Absolute upper bound (`latest=`).
-    latest: Option<chrono::DateTime<chrono::Utc>>,
+    /// Absolute lower bound (`earliest=`), inclusive.
+    earliest: Option<compare::Instant>,
+    /// Absolute upper bound (`latest=`), exclusive.
+    latest: Option<compare::Instant>,
 }
 
 impl std::fmt::Debug for CompiledFilter {
@@ -209,17 +209,10 @@ impl CompiledFilter {
             duration_secs: tf.node.duration.to_seconds(),
         });
 
-        let earliest = search.earliest.as_ref().and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(s.node.text())
-                .ok()
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-        });
-
-        let latest = search.latest.as_ref().and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(s.node.text())
-                .ok()
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-        });
+        // The instants the parser read, which the SQL lane binds too
+        // (ADR-0017's amendment of 2026-11-08).
+        let earliest = search.earliest.as_ref().map(|b| b.node.instant());
+        let latest = search.latest.as_ref().map(|b| b.node.instant());
 
         let groups = compile_groups(&search.groups, pins, preparer)?;
 
@@ -260,16 +253,18 @@ impl CompiledFilter {
             return Ok(false);
         }
 
-        // Check absolute time bounds.
+        // Check absolute time bounds. `Instant`'s order puts both
+        // infinities where the SQL comparison does.
         if self.earliest.is_some() || self.latest.is_some() {
             if let Some(ts) = extract_event_timestamp(event) {
-                if let Some(earliest) = &self.earliest
-                    && ts < *earliest
+                let ts = compare::Instant::At(ts.naive_utc());
+                if let Some(earliest) = self.earliest
+                    && ts < earliest
                 {
                     return Ok(false);
                 }
-                if let Some(latest) = &self.latest
-                    && ts >= *latest
+                if let Some(latest) = self.latest
+                    && ts >= latest
                 {
                     return Ok(false);
                 }
