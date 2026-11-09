@@ -5,11 +5,16 @@
 //! Generated secrets, and the one way a secret reaches a container.
 //!
 //! Every secret the CLI generates comes from the OS RNG into a buffer that
-//! is zeroed on drop, and has a `Debug` that shows no byte of it. It leaves
-//! the process only on the stdin of a sealed docker call: [`put_file`]
-//! writes it to a 0400 file in a service's volume, owned by the user that
-//! reads it. No secret is ever an argument, an environment entry, a label,
-//! or a host file.
+//! is zeroed on drop, and has a `Debug` that shows no byte of it. The trial
+//! certificate's key is held the same way once it is encoded, but rcgen's
+//! own copies are not zeroed ([`super::certificate`]). A secret leaves the
+//! process only on the stdin of a sealed docker call: [`put_file`] writes
+//! it to a 0400 file in a service's volume, owned by the user that reads
+//! it. No secret is ever an argument, an environment entry, a label, or a
+//! host file.
+//!
+//! [`read_file`] reads a public file back from a volume, as the same user,
+//! and tells a missing file from a read that failed.
 
 use std::fmt;
 use std::time::Duration;
@@ -23,9 +28,9 @@ use super::docker::{Args, Docker, DockerError, Sensitivity};
 /// Random bytes behind each generated password.
 const SECRET_BYTES: usize = 32;
 
-/// A `compose run` that writes one file creates the network and volumes
-/// on first use, so it gets longer than a probe.
-const PUT_FILE_TIMEOUT: Duration = Duration::from_secs(120);
+/// A `compose run` that reads or writes one file creates the network and
+/// volumes on first use, so it gets longer than a probe.
+const FILE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// `n` random bytes from the OS RNG, as lowercase hex.
 pub fn random_hex(n: usize) -> Zeroizing<String> {
@@ -153,15 +158,69 @@ head -c "$n" > "$t"
 if [ "$(wc -c < "$t")" -ne "$n" ]; then rm -f -- "$t"; exit 66; fi
 mv -f -- "$t" "$1""#;
 
-/// The `compose run` arguments that write `path` in `target`'s volume.
-fn put_file_args(target: Target, path: &str) -> Args {
+/// The in-container reader. Its only argument is the path.
+///
+/// It prints one status line, then for a regular file the file's first
+/// [`READ_LIMIT`] + 1 bytes, so a longer file reads as too long without
+/// being read whole:
+///
+/// - `present`: a regular file, followed by its bytes.
+/// - `not-a-file`: something else is at the path, such as a directory or a
+///   link, dangling or not. It is not read.
+/// - `absent`: nothing is at the path, and the nearest ancestor that exists
+///   is a directory the reader can search, so nothing is hidden from it.
+///
+/// Anything else, such as an ancestor the reader cannot search, exits
+/// non-zero. A failed read never reads as `absent`.
+const READ: &str = r#"set -eu
+case "$1" in /*) ;; *) exit 64 ;; esac
+if [ -L "$1" ]; then echo not-a-file; exit 0; fi
+if [ -f "$1" ]; then echo present; exec head -c 65537 -- "$1"; fi
+if [ -e "$1" ]; then echo not-a-file; exit 0; fi
+d="${1%/*}"
+while [ -n "$d" ] && [ ! -e "$d" ] && [ ! -L "$d" ]; do d="${d%/*}"; done
+d="${d:-/}"
+if [ -L "$d" ] || [ ! -d "$d" ] || [ ! -x "$d" ]; then
+  echo "cannot search $d" >&2
+  exit 65
+fi
+echo absent"#;
+
+/// The most bytes [`read_file`] returns of a file it reads whole.
+pub const READ_LIMIT: u64 = 64 * 1024;
+
+/// What [`read_file`] found at a path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VolumeFile {
+    /// A regular file: its bytes, or its first [`READ_LIMIT`] + 1 bytes
+    /// when it is longer than [`READ_LIMIT`].
+    Present(Vec<u8>),
+    /// Something other than a regular file, which was not read.
+    NotAFile,
+    /// Nothing is at the path.
+    Absent,
+}
+
+/// The `compose run` arguments that run `script` with `path` as its only
+/// argument in `target`'s volume, as the volume's reading user.
+fn script_args(target: Target, script: &str, path: &str) -> Args {
     let mut args = Args::new().args(["run", "--rm", "--no-deps", "-T"]);
     if let Some(user) = target.user() {
         args = args.args(["--user", user]);
     }
     args.args(["--entrypoint", "/bin/sh"])
         .arg(target.service().name())
-        .args(["-c", WRITE, "sh", path])
+        .args(["-c", script, "sh", path])
+}
+
+/// The `compose run` arguments that write `path` in `target`'s volume.
+fn put_file_args(target: Target, path: &str) -> Args {
+    script_args(target, WRITE, path)
+}
+
+/// The `compose run` arguments that read `path` in `target`'s volume.
+fn read_file_args(target: Target, path: &str) -> Args {
+    script_args(target, READ, path)
 }
 
 /// Whether `path` is one the writer may take: absolute, and nothing but
@@ -201,13 +260,50 @@ pub async fn put_file(
     stdin.extend_from_slice(bytes);
     let args = docker.compose(put_file_args(target, path));
     docker
-        .capture(&args, Some(&stdin), Sensitivity::Sealed, PUT_FILE_TIMEOUT)
+        .capture(&args, Some(&stdin), Sensitivity::Sealed, FILE_TIMEOUT)
         .await
         .map(drop)
 }
 
+/// Read `path` inside `target`'s volume, as the user [`put_file`] writes
+/// it as. For a public file only: the call quotes the reader's stderr in
+/// its error.
+///
+/// [`VolumeFile::Absent`] comes only from the reader's own `absent` line,
+/// never from empty output. A reader that fails, or prints no status line
+/// this function knows, is an error.
+///
+/// # Panics
+/// When `path` is not a plain absolute path. Every caller passes one of
+/// the constants in [`super::compose`].
+pub async fn read_file(
+    docker: &Docker,
+    target: Target,
+    path: &'static str,
+) -> Result<VolumeFile, DockerError> {
+    assert!(is_plain_absolute(path), "not a plain absolute path: {path}");
+    let args = docker.compose(read_file_args(target, path));
+    let out = docker
+        .capture(&args, None, Sensitivity::Diagnose, FILE_TIMEOUT)
+        .await?;
+    let (status, rest) = match out.stdout.iter().position(|&b| b == b'\n') {
+        Some(end) => (&out.stdout[..end], &out.stdout[end + 1..]),
+        None => (&out.stdout[..], &[][..]),
+    };
+    match (status, rest.is_empty()) {
+        (b"present", _) => Ok(VolumeFile::Present(rest.to_vec())),
+        (b"not-a-file", true) => Ok(VolumeFile::NotAFile),
+        (b"absent", true) => Ok(VolumeFile::Absent),
+        _ => Err(DockerError::Failed {
+            command: args.display(),
+            status: "exit status 0".to_owned(),
+            detail: Some("its output does not start with a status line trawl knows".to_owned()),
+        }),
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     use super::*;
@@ -249,6 +345,8 @@ mod tests {
             compose::WEB_TOML,
             compose::WEB_COOKIE,
             compose::WEB_CA,
+            compose::TLS_KEY,
+            compose::TLS_CERT,
         ] {
             assert!(is_plain_absolute(path), "{path}");
         }
@@ -291,15 +389,139 @@ mod tests {
         assert_eq!(words.last().unwrap(), compose::WEB_COOKIE);
     }
 
-    /// A stub docker that runs the real writer script locally, with the
-    /// path moved under the test's temp dir.
-    fn local_writer(root: &std::path::Path) -> (tempfile::TempDir, Docker) {
+    /// A stub docker that runs the real writer or reader script locally,
+    /// with the path moved under `root`.
+    ///
+    /// It logs every call, in order, to `calls` in the stub's own temp dir,
+    /// outside `root`: `put <path>` for the writer, `read <path>` for the
+    /// reader, and `other` for anything that runs neither, which then
+    /// fails.
+    pub(crate) fn local_writer(root: &std::path::Path) -> (tempfile::TempDir, Docker) {
         stub(&format!(
-            r#"while [ "$1" != "-c" ]; do shift; done
+            r#"log="${{0%/*}}/calls"
+run=
+for a; do if [ "$a" = "-c" ]; then run=1; break; fi; done
+if [ -z "$run" ]; then echo other >> "$log"; exit 1; fi
+while [ "$1" != "-c" ]; do shift; done
 script="$2"; path="$4"
+case "$script" in *'mv -f'*) op=put ;; *) op=read ;; esac
+echo "$op $path" >> "$log"
 exec /bin/sh -c "$script" sh "{root}$path""#,
             root = root.display()
         ))
+    }
+
+    /// The calls [`local_writer`] logged, one per line.
+    pub(crate) fn calls(stub: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(stub.path().join("calls")).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_reader_runs_as_the_writer_with_the_path_as_its_only_argument() {
+        let read = read_file_args(Target::Trawld, compose::TLS_CERT)
+            .argv()
+            .to_vec();
+        let put = put_file_args(Target::Trawld, compose::TLS_CERT)
+            .argv()
+            .to_vec();
+        assert_eq!(read.len(), put.len());
+        let script = read.iter().position(|a| a == "-c").unwrap() + 1;
+        for (i, (r, p)) in read.iter().zip(&put).enumerate() {
+            if i != script {
+                assert_eq!(r, p, "argument {i}");
+            }
+        }
+        assert_eq!(read[script], READ);
+        assert!(!READ.contains("mv -f"), "the stub tells a read by this");
+        // The cap the reader applies is READ_LIMIT + 1.
+        assert!(READ.contains(&format!("head -c {} --", READ_LIMIT + 1)));
+    }
+
+    #[tokio::test]
+    async fn read_file_tells_present_absent_and_not_a_file_apart() {
+        let root = tempfile::tempdir().unwrap();
+        let (stub, docker) = local_writer(root.path());
+        let at = |path: &str| root.path().join(path.trim_start_matches('/'));
+
+        // A fresh volume: no `tls/` either.
+        let read = || read_file(&docker, Target::Trawld, compose::TLS_CERT);
+        assert_eq!(read().await.unwrap(), VolumeFile::Absent);
+        std::fs::create_dir_all(at(compose::TLS_CERT).parent().unwrap()).unwrap();
+        assert_eq!(read().await.unwrap(), VolumeFile::Absent);
+
+        // Bytes come back exactly, the empty file included.
+        for bytes in [&b""[..], b"\n", b"-----BEGIN CERTIFICATE-----\nabc\n"] {
+            std::fs::write(at(compose::TLS_CERT), bytes).unwrap();
+            assert_eq!(read().await.unwrap(), VolumeFile::Present(bytes.to_vec()));
+        }
+
+        // A longer file comes back one byte past the limit.
+        let limit = usize::try_from(READ_LIMIT).unwrap();
+        std::fs::write(at(compose::TLS_CERT), vec![b'x'; limit * 2]).unwrap();
+        assert_eq!(
+            read().await.unwrap(),
+            VolumeFile::Present(vec![b'x'; limit + 1])
+        );
+
+        // A directory, a link to a real file, and a dangling link are
+        // none of them read.
+        std::fs::remove_file(at(compose::TLS_CERT)).unwrap();
+        std::fs::create_dir(at(compose::TLS_CERT)).unwrap();
+        assert_eq!(read().await.unwrap(), VolumeFile::NotAFile);
+        std::fs::remove_dir(at(compose::TLS_CERT)).unwrap();
+        std::fs::write(at(compose::TLS_KEY), b"key").unwrap();
+        std::os::unix::fs::symlink(at(compose::TLS_KEY), at(compose::TLS_CERT)).unwrap();
+        assert_eq!(read().await.unwrap(), VolumeFile::NotAFile);
+        std::fs::remove_file(at(compose::TLS_KEY)).unwrap();
+        assert_eq!(read().await.unwrap(), VolumeFile::NotAFile);
+
+        let logged = calls(&stub);
+        assert!(
+            logged
+                .lines()
+                .all(|line| line == format!("read {}", compose::TLS_CERT)),
+            "{logged}"
+        );
+        assert_eq!(logged.lines().count(), 9, "{logged}");
+    }
+
+    /// Only the reader's own `absent` line reads as absent: a parent it
+    /// cannot search, a failed run, an empty reply, and a reply without a
+    /// status line are errors.
+    #[tokio::test]
+    async fn a_read_that_cannot_tell_is_an_error_never_absent() {
+        // The ancestor walk, run as a user who cannot search `tls/`. Root
+        // searches every directory, so it runs only for another user.
+        if !nix::unistd::geteuid().is_root() {
+            let root = tempfile::tempdir().unwrap();
+            let (_stub, docker) = local_writer(root.path());
+            let tls = root
+                .path()
+                .join(compose::TLS_CERT.trim_start_matches('/'))
+                .parent()
+                .unwrap()
+                .to_owned();
+            std::fs::create_dir_all(&tls).unwrap();
+            std::fs::set_permissions(&tls, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let result = read_file(&docker, Target::Trawld, compose::TLS_CERT).await;
+            std::fs::set_permissions(&tls, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("exit status 65"), "{err}");
+            assert!(err.to_string().contains("cannot search"), "{err}");
+        }
+
+        for body in [
+            "echo 'Error response from daemon: no such volume' >&2; exit 1",
+            "exit 0",
+            "printf ''",
+            "echo absent-ish",
+            "printf 'absent\\nmore'",
+            "echo PRESENT",
+        ] {
+            let (_stub, docker) = stub(body);
+            let result = read_file(&docker, Target::Trawld, compose::TLS_CERT).await;
+            assert!(result.is_err(), "{body}: {result:?}");
+        }
     }
 
     #[tokio::test]
@@ -347,12 +569,7 @@ exec /bin/sh -c "$script" sh "{root}$path""#,
         // Claim 10 bytes, send 3.
         let args = docker.compose(put_file_args(Target::Trawld, compose::PGPASS));
         let err = docker
-            .capture(
-                &args,
-                Some(b"10\nnew"),
-                Sensitivity::Sealed,
-                PUT_FILE_TIMEOUT,
-            )
+            .capture(&args, Some(b"10\nnew"), Sensitivity::Sealed, FILE_TIMEOUT)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exit status 66"), "{err}");
