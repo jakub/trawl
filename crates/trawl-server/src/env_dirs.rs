@@ -104,13 +104,10 @@ pub(crate) fn hourly_file(env_root: &Path, date: NaiveDate, hour: u8, service: &
     hour_dir(env_root, date, hour).join(format!("{service}{PARQUET_EXTENSION}"))
 }
 
-/// The daily rollup of `service` for `date` under `env_root`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the walkers adopt the builders next")
-)]
-pub(crate) fn daily_file(env_root: &Path, date: NaiveDate, service: &str) -> PathBuf {
-    day_dir(env_root, date).join(format!("{service}{PARQUET_EXTENSION}"))
+/// The daily rollup of `service` in the day directory `day_dir` (see
+/// [`day_dir`]).
+pub(crate) fn daily_file(day_dir: &Path, service: &str) -> PathBuf {
+    day_dir.join(format!("{service}{PARQUET_EXTENSION}"))
 }
 
 /// Where one standing file sits in trawl's own storage layout.
@@ -535,7 +532,7 @@ mod tests {
                 Some(hour_dir(&env_root, date, hour).as_path())
             );
         }
-        let path = daily_file(&env_root, date, "svc-a");
+        let path = daily_file(&day_dir(&env_root, date), "svc-a");
         assert_eq!(path, root.join("prod/2026-08-01/svc-a.parquet"));
         assert_eq!(path.parent(), Some(day_dir(&env_root, date).as_path()));
         let layout = layout_path(&root, &path).unwrap();

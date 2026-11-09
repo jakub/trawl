@@ -20,7 +20,7 @@ use trawl_core::severity::Dialect;
 
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{
-    date_name, hour_dir, hourly_file, list_env_dirs, parse_date, parse_hour,
+    daily_file, date_name, hour_dir, hourly_file, list_env_dirs, parse_date, parse_hour,
     try_list_env_dirs_observed,
 };
 use crate::hot_buffer::{AdmissionState, HotBuffer};
@@ -1839,11 +1839,25 @@ fn recover_rollup_markers(day_dir: &Path) -> Result<(), String> {
 /// [`recover_rollup_markers`] under `publication`, making every file
 /// operation through `io`. The caller holds the publication write guard
 /// through recovery.
+///
+/// Every recovery entry comes through here, so a `day_dir` whose name is
+/// not a canonical date is refused first: its markers name paths outside
+/// the layout, so recovery reads, moves and removes nothing there and
+/// leaves each marker registered, refusing reads (ADR-0041).
 fn recover_rollup_markers_coordinated(
     day_dir: &Path,
     publication: Option<&PublicationGate>,
     io: &RollupIo,
 ) -> Result<(), String> {
+    let canonical_day = day_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(parse_date)
+        .is_some();
+    if !canonical_day {
+        CompactionOperation::PendingRollupRecovery.record_failure();
+        return Err(log_rollup_day_not_canonical(day_dir));
+    }
     // Classify the actual read error before converting it to the existing
     // string result. A stat-before-read check would race retention again.
     let entries = std::fs::read_dir(day_dir).map_err(|e| {
@@ -1877,7 +1891,7 @@ fn recover_rollup_markers_inner(
         let Some(service) = path
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(|name| name.strip_prefix(rollup_marker::MARKER_PREFIX))
+            .and_then(rollup_marker::marker_service)
         else {
             continue;
         };
@@ -1986,21 +2000,15 @@ fn remove_leftover_tmp(io: &RollupIo, tmp: &Path) -> Result<(), String> {
 /// (case d), and return the day's path-free error. The env, day and
 /// service are named only once they pass validation, and no path is.
 fn log_rollup_unresolved(day_dir: &Path, service: &str, proof: rollup_marker::Proof) -> String {
-    const INVALID: &str = "<invalid>";
     let service = Some(service)
         .filter(|service| trawl_config::is_valid_service_name(service))
-        .unwrap_or(INVALID);
+        .unwrap_or(LOGGED_INVALID);
     let date = day_dir
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|date| parse_date(date).is_some())
-        .unwrap_or(INVALID);
-    let env = day_dir
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .filter(|env| trawl_config::is_valid_env_name(env))
-        .unwrap_or(INVALID);
+        .unwrap_or(LOGGED_INVALID);
+    let env = logged_rollup_env(day_dir);
     tracing::error!(
         event_type = "rollup_recovery_unresolved",
         env,
@@ -2016,6 +2024,43 @@ fn log_rollup_unresolved(day_dir: &Path, service: &str, proof: rollup_marker::Pr
          ({proof}); every file is kept until an operator resolves it"
     )
 }
+
+/// Log that the rollup markers in `day_dir`, a directory not named as a
+/// canonical date, stay unresolved, and return the day's path-free error.
+/// The env is named only once it passes validation, and the directory's
+/// own name, like any path, never is.
+fn log_rollup_day_not_canonical(day_dir: &Path) -> String {
+    let env = logged_rollup_env(day_dir);
+    let proof = rollup_marker::Proof::DayNotCanonical;
+    tracing::error!(
+        event_type = "rollup_recovery_unresolved",
+        env,
+        date = LOGGED_INVALID,
+        proof = proof.label(),
+        "rollup recovery keeps a rollup marker in a directory that is not a \
+         date; every file and the marker are kept, and reads refuse \
+         rollup_pending until an operator resolves it"
+    );
+    format!(
+        "a rollup marker in env {env} is in a directory that is not a date \
+         ({proof}); every file is kept until an operator resolves it"
+    )
+}
+
+/// What the rollup recovery logs show for a name that fails validation.
+const LOGGED_INVALID: &str = "<invalid>";
+
+/// The env of `day_dir` as the rollup recovery logs show it: the name of
+/// its parent once that passes validation.
+fn logged_rollup_env(day_dir: &Path) -> &str {
+    day_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|env| trawl_config::is_valid_env_name(env))
+        .unwrap_or(LOGGED_INVALID)
+}
+
 /// Parquet magic bytes, written at both the start and end of every valid
 /// parquet file.
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -2370,7 +2415,7 @@ fn rollup_day_inner(
     // so one bad file (e.g. a crash mid-COPY) doesn't wedge the rollup
     // forever. `merged_hourly` tracks the valid hourlies we will delete on
     // success — quarantined files are already renamed away.
-    let canonical_path = day_dir.join(format!("{service}.parquet"));
+    let canonical_path = daily_file(day_dir, service);
     let mut all_files: Vec<PathBuf> = Vec::with_capacity(hourly_files.len() + 1);
     let mut merged_hourly: Vec<PathBuf> = Vec::with_capacity(hourly_files.len());
     for f in hourly_files {
@@ -5595,7 +5640,9 @@ mod tests {
         // Retention can remove a discovered env/day/hour before its scan or
         // recovery starts. Preserve the original control flow, including the
         // recovery Err, without manufacturing failed-operation evidence.
-        let removed = tmp.path().join("removed-by-retention");
+        // Retention removes only days named as dates, and recovery refuses
+        // any other name before it lists the day, so the path is one.
+        let removed = tmp.path().join("2026-01-15");
         std::fs::create_dir(&removed).unwrap();
         std::fs::remove_dir(&removed).unwrap();
         assert!(rollup_env_unclaimed(&removed).await.is_err());
@@ -7972,6 +8019,126 @@ mod tests {
         assert!(
             !log.contains(&*tmp.path().to_string_lossy()),
             "no path is logged: {log}"
+        );
+    }
+
+    /// A rollup marker under an env child that is not a canonical date is
+    /// not in the layout, so recovery refuses its day before listing it:
+    /// no file is observed, moved or removed, the marker stays registered,
+    /// and reads refuse `rollup_pending` (ADR-0041, amendment of
+    /// 2026-11-08). Each refusal is a counted recovery failure, logged with
+    /// the proof `day_not_canonical` and no path, and boot reports no
+    /// finished recovery. Under a canonical date, the marker's identities
+    /// would promote the tmp and retire the input.
+    #[test]
+    fn rollup_recovery_refuses_a_noncanonical_day() {
+        let handle = operational_metrics();
+        let logs = captured_logs();
+        let failures_before = operation_count(&handle, CompactionOperation::PendingRollupRecovery);
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let day = data.join("prod/2026-13-45");
+        std::fs::create_dir_all(day.join("07")).unwrap();
+        let input = day.join("07/nginx.parquet");
+        let merged = day.join("nginx.parquet.tmp");
+        std::fs::write(&input, b"hourly rows").unwrap();
+        std::fs::write(&merged, b"merged rows").unwrap();
+        let marker = write_marker(
+            &day,
+            "nginx",
+            identity(&merged),
+            None,
+            std::slice::from_ref(&input),
+        );
+        let before = rollup_tree(&data);
+        let gate = PublicationGate::new();
+        gate.initialize(&data);
+        assert_eq!(gate.pending_rollup_markers(), vec![marker.clone()]);
+
+        let recorder = Recorder::new();
+        let error = {
+            let _writer = gate.blocking_write();
+            recover_rollup_markers_coordinated(&day, Some(&gate), &recorder.io()).unwrap_err()
+        };
+        assert!(error.contains("day_not_canonical"), "{error}");
+        assert!(!error.contains(&*tmp.path().to_string_lossy()), "{error}");
+        assert!(recorder.entries().is_empty(), "{:?}", recorder.entries());
+        assert!(recover_rollup_markers(&day).is_err());
+        recover_rollups_at_boot(&gate);
+
+        assert_eq!(rollup_tree(&data), before, "recovery changed a file");
+        assert_eq!(gate.pending_rollup_markers(), vec![marker]);
+        assert!(!reads_answer(&gate));
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::PendingRollupRecovery) - failures_before,
+            3
+        );
+        let log = logged(&logs);
+        let events = |event_type: &str| -> Vec<&str> {
+            log.lines()
+                .filter(|line| line.contains(&format!("event_type=\"{event_type}\"")))
+                .collect()
+        };
+        let unresolved = events("rollup_recovery_unresolved");
+        assert_eq!(unresolved.len(), 3, "{log}");
+        for line in unresolved {
+            assert!(
+                line.contains("env=\"prod\"")
+                    && line.contains("date=\"<invalid>\"")
+                    && line.contains("proof=\"day_not_canonical\""),
+                "{line}"
+            );
+        }
+        let boot = events("rollup_boot_recovery");
+        assert_eq!(boot.len(), 1, "{log}");
+        assert!(boot[0].contains("ERROR"), "{log}");
+        assert!(!log.contains(&*tmp.path().to_string_lossy()), "{log}");
+    }
+
+    /// A marker listing an input under hour `24` or `99` fails validation
+    /// (case d, `marker_malformed`): boot recovery keeps it and every file,
+    /// and reads refuse `rollup_pending`. Were those hours valid, its
+    /// identities would promote the tmp and retire the input.
+    #[test]
+    fn rollup_recovery_keeps_a_marker_listing_an_hour_past_23() {
+        let logs = captured_logs();
+        for hour in ["24", "99"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            let day = data.join("prod").join(ROLLUP_DAY);
+            std::fs::create_dir_all(day.join(hour)).unwrap();
+            let input = day.join(hour).join("nginx.parquet");
+            let merged = day.join("nginx.parquet.tmp");
+            std::fs::write(&input, b"hourly rows").unwrap();
+            std::fs::write(&merged, b"merged rows").unwrap();
+            let raw = rollup_marker::RawMarker::new(
+                identity(&merged),
+                None,
+                vec![(input_name(&input), identity(&input))],
+            );
+            let marker = rollup_marker_path(&day, "nginx");
+            std::fs::write(&marker, raw.encode()).unwrap();
+            let before = rollup_tree(&data);
+            let gate = PublicationGate::new();
+            gate.initialize(&data);
+
+            recover_rollups_at_boot(&gate);
+
+            assert_eq!(rollup_tree(&data), before, "hour {hour}");
+            assert_eq!(gate.pending_rollup_markers(), vec![marker], "hour {hour}");
+            assert!(!reads_answer(&gate), "hour {hour}");
+        }
+        let log = logged(&logs);
+        let unresolved: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("event_type=\"rollup_recovery_unresolved\""))
+            .collect();
+        assert_eq!(unresolved.len(), 2, "{log}");
+        assert!(
+            unresolved
+                .iter()
+                .all(|line| line.contains("proof=\"marker_malformed\"")),
+            "{log}"
         );
     }
 
