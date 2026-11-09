@@ -435,6 +435,10 @@ Permission: `export`
 
 Runs a query and returns the rows as a file. Timestamps are UTC. The row cap is `[server] max_export_rows` (`1000000`) instead of `max_result_rows`. Rows past the cap are dropped; the export is not refused.
 
+An export is tracked like a query. While it runs, [`GET /api/v1/queries`](#active-recent-and-retained-work) lists it, and the key that submitted it or a `server_manage` key can [cancel it](#cancel-a-running-query). Each export adds one to `total_queries` in [server stats](#server-stats). A request refused for its `format` or a malformed body is not counted. Each export that answers adds one to `trawl_queries_total` under its `status`: `success`, `error`, or `timeout`.
+
+A successful export writes one [query history](#query-history) row for its key. The row count in that row and in the export's `recent` entry is the number of data rows in the file, after `limit` and the row cap. A CSV header is not a row. The history write never fails an export. If the history store fails or does not answer before the export's deadline, the export still answers with its file, and the row can be missing.
+
 **Parameters**
 
 | Name | In | Type | Required | Description |
@@ -3150,6 +3154,8 @@ Permission: `query`
 
 Lists active, recently completed, and retained work from every key, with `own` marking the reader's. See [inspect capacity](/operate/health/#inspect-capacity).
 
+[Exports](#export-query-results) are listed like queries, so every key with `query` sees the DSL of every running and recent export. The `export` permission alone does not allow this request.
+
 **Request**
 
 ```bash
@@ -3170,6 +3176,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/queries"
 |-------|------|-------------|
 | `active[].role` | string | The key's role names, sorted and comma-joined. `none` when the key holds no roles. |
 | `recent` | array | Most recent first. At most `[server] max_query_history` (`1000`) entries are kept. |
+| `recent[].rows` | integer or null | Rows the work produced, before any page was cut from them. For an export, the data rows in its file. `null` when the work did not succeed. |
 | `recent[].error` | string or null | Why the query failed. A query whose request ended before it recorded an outcome, because the client disconnected, says `abandoned: the request ended before the query recorded an outcome`. |
 | `retained` | array | Work that still holds a pool permit after its request answered. Disjoint from `active`. |
 | `retained[].kind` | string | `query`, `from_saved`, `export`, `scheduled`, `sample`, or `capture` |
@@ -3189,6 +3196,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/queries"
 Permission: `query_cancel` for the key's own work, `server_manage` for any work
 
 Asks the pool to interrupt the work with this id, including retained work. Ownership is the submitting key's id, not its name. The response acknowledges the request and does not prove the worker stopped. Repeating the request is safe.
+
+An export is cancelled the same way, by its id from `/api/v1/queries`. A key that holds only `export` cannot cancel an export, its own included. A cancel has no effect before the pool registers the work. It also has no effect while a `csv` or `json` export renders its file, because the pool work has already ended. The same holds for a query.
 
 **Parameters**
 
@@ -3227,6 +3236,10 @@ Permission: `query`
 Lists the key's own completed queries, ordered by execution time descending,
 then history ID descending for tied timestamps. An optional filter searches
 the stored query text across the key's complete retained history before paging.
+
+A successful [export](#export-query-results) writes a row, like a query. Its
+`row_count` is the number of data rows in the file. A failed export writes no
+row.
 
 **Parameters**
 
