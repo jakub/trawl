@@ -19,6 +19,7 @@ use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
 pub mod cli;
 mod config;
+mod connection;
 pub mod doctor;
 mod mcp;
 pub mod preview_ingest;

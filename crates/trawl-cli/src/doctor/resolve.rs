@@ -38,10 +38,6 @@
 //! `[server].token`, and nothing renders the `Display` of a `ConfigError` or
 //! `TrialError`: every reason is written here, from names alone.
 
-use std::fmt;
-use std::io::Read as _;
-use std::net::{Ipv4Addr, Ipv6Addr};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
 use clap::error::ErrorKind;
@@ -52,11 +48,11 @@ use zeroize::Zeroizing;
 use crate::config::{self, Config, ConfigError, ProfileConfig};
 use crate::trial;
 
+pub use crate::connection::{CheckedUrl, Key, Scheme, UrlProblem, check_url};
+pub(crate) use crate::connection::{Failure, key_from_file, key_from_text};
+
 /// Id of the check this module produces.
 pub const CONNECTION_CONFIG: &str = "connection.config";
-
-/// A key file holds one key and a newline; anything larger is not a key.
-const MAX_KEY_BYTES: u64 = 4096;
 
 /// The command line as `trawl doctor` sees it, before selection.
 ///
@@ -145,163 +141,6 @@ pub enum KeySource {
     Env(String),
     /// `--token-file PATH`.
     File(PathBuf),
-}
-
-/// `http` or `https`; nothing else is accepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scheme {
-    Http,
-    Https,
-}
-
-impl Scheme {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Http => "http",
-            Self::Https => "https",
-        }
-    }
-}
-
-/// A URL that passed the doctor's shape rules: `http` or `https`, a host,
-/// an optional port, an optional path prefix, and no userinfo, query, or
-/// fragment.
-#[derive(Clone, PartialEq, Eq)]
-pub struct CheckedUrl {
-    scheme: Scheme,
-    host: String,
-    /// `scheme://host[:port]`, lowercased.
-    origin: String,
-    /// The origin plus any path, without a trailing `/`.
-    base: String,
-    /// Whether anything followed the authority besides a lone `/`.
-    has_path: bool,
-}
-
-impl fmt::Debug for CheckedUrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CheckedUrl")
-            .field("origin", &self.origin)
-            .finish_non_exhaustive()
-    }
-}
-
-impl CheckedUrl {
-    /// `scheme://host[:port]`.
-    #[must_use]
-    pub fn origin(&self) -> &str {
-        &self.origin
-    }
-
-    /// The URL requests are built on: the origin plus any path prefix.
-    #[must_use]
-    pub fn base(&self) -> &str {
-        &self.base
-    }
-
-    #[must_use]
-    pub const fn scheme(&self) -> Scheme {
-        self.scheme
-    }
-
-    /// Whether the host is `localhost` or a loopback address literal.
-    #[must_use]
-    pub fn is_loopback(&self) -> bool {
-        let host = self.host.as_str();
-        if host.eq_ignore_ascii_case("localhost") {
-            return true;
-        }
-        if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-            return v6.parse::<Ipv6Addr>().is_ok_and(|ip| ip.is_loopback());
-        }
-        host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
-    }
-}
-
-/// Why a URL was not accepted. Neither variant carries any of the URL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UrlProblem {
-    /// Not `http(s)://host[:port][/path]`.
-    Malformed,
-    /// It carries userinfo (`user@` or `user:password@`).
-    Credentials,
-    /// It has a query or a fragment (`?` or `#`, empty or not, or either
-    /// percent-encoded in the path).
-    QueryOrFragment,
-}
-
-/// Check a URL's shape.
-///
-/// The authority ends where the WHATWG parser ends it, at the first `/`,
-/// `\`, `?` or `#`, and any `@` inside it is userinfo. That check comes
-/// first, so a URL with credentials is always reported as such.
-///
-/// Request paths are appended to what remains, so anything after it but a
-/// path prefix is refused: a `?` or `#` would carry every request path into
-/// a query or a fragment. `%3F` and `%23` are refused as well, because a
-/// proxy that decodes the path would read them as the same delimiters.
-pub fn check_url(raw: &str) -> Result<CheckedUrl, UrlProblem> {
-    let (scheme, rest) = raw.split_once("://").ok_or(UrlProblem::Malformed)?;
-    let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    if authority.contains('@') {
-        return Err(UrlProblem::Credentials);
-    }
-    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) || tail.contains('\\') {
-        return Err(UrlProblem::Malformed);
-    }
-    let encoded = tail.to_ascii_lowercase();
-    if tail.contains(['?', '#']) || encoded.contains("%3f") || encoded.contains("%23") {
-        return Err(UrlProblem::QueryOrFragment);
-    }
-    let scheme = match scheme.to_ascii_lowercase().as_str() {
-        "https" => Scheme::Https,
-        "http" => Scheme::Http,
-        _ => return Err(UrlProblem::Malformed),
-    };
-    let host = host_of(authority).ok_or(UrlProblem::Malformed)?;
-    let origin = format!("{}://{}", scheme.as_str(), authority.to_ascii_lowercase());
-    let path = tail.trim_end_matches('/');
-    Ok(CheckedUrl {
-        scheme,
-        host: host.to_ascii_lowercase(),
-        base: format!("{origin}{path}"),
-        origin,
-        has_path: !path.is_empty(),
-    })
-}
-
-/// The host of `host[:port]` or `[v6][:port]`, if the authority is one.
-fn host_of(authority: &str) -> Option<&str> {
-    let (host, port) = if authority.starts_with('[') {
-        let close = authority.find(']')?;
-        let (host, after) = authority.split_at(close + 1);
-        match after {
-            "" => (host, None),
-            _ => (host, Some(after.strip_prefix(':')?)),
-        }
-    } else {
-        match authority.rsplit_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
-        }
-    };
-    if let Some(port) = port
-        && (port.is_empty()
-            || !port.bytes().all(|b| b.is_ascii_digit())
-            || port.parse::<u16>().is_err())
-    {
-        return None;
-    }
-    let valid = if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        v6.parse::<Ipv6Addr>().is_ok()
-    } else {
-        !host.is_empty()
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
-    };
-    valid.then_some(host)
 }
 
 /// Turn the command line into a [`Selection`], or refuse it.
@@ -430,47 +269,19 @@ fn check_web_url(raw: &str) -> Result<CheckedUrl, Refusal> {
             "--web-url must be an http or https origin with a host, such as https://HOST:PORT",
         ),
     })?;
-    if url.has_path {
+    if url.has_path() {
         return Err(Refusal::invalid(
             "--web-url must be an origin: a scheme, a host, and a port, with no path, query, \
              or fragment",
         ));
     }
-    if url.scheme == Scheme::Http && !url.is_loopback() {
+    if url.scheme() == Scheme::Http && !url.is_loopback() {
         return Err(Refusal::invalid(
             "--web-url must use https unless its host is loopback (localhost, 127.0.0.1, or \
              [::1])",
         ));
     }
     Ok(url)
-}
-
-/// An API key the selection named, read once.
-pub struct Key {
-    secret: Zeroizing<String>,
-    source: String,
-}
-
-impl fmt::Debug for Key {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Key")
-            .field("source", &self.source)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Key {
-    /// The key itself. It goes only into the request that proves identity.
-    #[must_use]
-    pub fn secret(&self) -> &str {
-        &self.secret
-    }
-
-    /// Where the key came from, named without its value.
-    #[must_use]
-    pub fn source(&self) -> &str {
-        &self.source
-    }
 }
 
 /// A connection that resolved: everything the API checks need.
@@ -495,28 +306,6 @@ pub struct Resolution {
     pub connection: Option<Connection>,
 }
 
-/// Why `connection.config` failed, all of it written here. `trawl mcp`
-/// reports the same three parts when its key file does not resolve.
-#[derive(Debug)]
-pub(crate) struct Failure {
-    /// What was being read, named without its value.
-    pub(crate) source: String,
-    /// What is wrong with it.
-    pub(crate) reason: String,
-    /// What the user does next.
-    pub(crate) next_action: String,
-}
-
-impl Failure {
-    fn new(source: impl Into<String>, reason: impl Into<String>, next: impl Into<String>) -> Self {
-        Self {
-            source: source.into(),
-            reason: reason.into(),
-            next_action: next.into(),
-        }
-    }
-}
-
 /// Read what the selection names and build the `connection.config` check.
 pub fn resolve(selection: &TargetSelection) -> Resolution {
     let (source, resolved) = match selection {
@@ -537,10 +326,7 @@ pub fn resolve(selection: &TargetSelection) -> Resolution {
     };
     match resolved {
         Ok((connection, trust_detail)) => {
-            let key = connection
-                .key
-                .as_ref()
-                .map_or("none selected", |key| key.source.as_str());
+            let key = connection.key.as_ref().map_or("none selected", Key::source);
             let check = Check {
                 id: CONNECTION_CONFIG.to_owned(),
                 outcome: Outcome::Complete,
@@ -552,7 +338,7 @@ pub fn resolve(selection: &TargetSelection) -> Resolution {
             };
             Resolution {
                 target: Target {
-                    origin: Some(connection.url.origin.clone()),
+                    origin: Some(connection.url.origin().to_owned()),
                     source,
                 },
                 check,
@@ -626,63 +412,6 @@ fn key_from_env(name: &str) -> Result<Key, Failure> {
         Err(std::env::VarError::NotUnicode(_)) => return Err(fail("is not valid UTF-8")),
     };
     key_from_text(&value, SOURCE).ok_or_else(|| fail("is empty"))
-}
-
-/// Read the key from the file `--token-file` names: a regular file of at
-/// most [`MAX_KEY_BYTES`], UTF-8, trimmed, not empty. `trawl mcp` reads its
-/// key file through here too.
-pub(crate) fn key_from_file(path: &std::path::Path) -> Result<Key, Failure> {
-    // The path is not echoed, for the same reason as the variable's name.
-    const SOURCE: &str = "key from --token-file";
-    let fail = |what: &str| {
-        Failure::new(
-            SOURCE,
-            format!("the file --token-file names {what}"),
-            "write the key to that file, or name another with --token-file",
-        )
-    };
-    // Non-blocking, so a FIFO cannot stall the open; the regular-file check
-    // on the opened handle then refuses it.
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(fail("does not exist"));
-        }
-        Err(_) => return Err(fail("cannot be read")),
-    };
-    match file.metadata() {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => return Err(fail("is not a regular file")),
-        Err(_) => return Err(fail("cannot be read")),
-    }
-    let mut bytes = Zeroizing::new(Vec::new());
-    if file
-        .take(MAX_KEY_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return Err(fail("cannot be read"));
-    }
-    if bytes.len() as u64 > MAX_KEY_BYTES {
-        return Err(fail("is larger than an API key"));
-    }
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return Err(fail("is not valid UTF-8"));
-    };
-    key_from_text(text, SOURCE).ok_or_else(|| fail("is empty"))
-}
-
-/// A trimmed, non-empty key.
-fn key_from_text(text: &str, source: &str) -> Option<Key> {
-    let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| Key {
-        secret: Zeroizing::new(trimmed.to_owned()),
-        source: source.to_owned(),
-    })
 }
 
 /// The `connection.config` failure for a config file that did not load.

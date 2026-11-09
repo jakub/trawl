@@ -6737,6 +6737,7 @@ dependencies = [
  "trawl-server",
  "trawl-web",
  "unicode-width",
+ "url",
  "zeroize",
 ]
 
