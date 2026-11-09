@@ -27,7 +27,7 @@ use crate::ast::{
     AggExpr, DedupStage, DropStage, EventStatsStage, Expr, ExtractStage, FieldFilter,
     FromSavedStage, LetStage, LimitStage, LiteralValue, PipeStage, PivotStage, Query, QuotedSearch,
     RareStage, RenameStage, SampleStage, SearchStage, SearchToken, SortField, SortStage, Spanned,
-    StatsStage, TableStage, TailStage, TextSearch, TimeFilter, TimechartStage, TopStage,
+    StatsStage, TableStage, TailStage, TextSearch, TimeBound, TimeFilter, TimechartStage, TopStage,
     WhereStage,
 };
 
@@ -75,6 +75,12 @@ fn same_time_filter(a: &TimeFilter, b: &TimeFilter) -> bool {
     let TimeFilter { duration: da } = a;
     let TimeFilter { duration: db } = b;
     da == db
+}
+
+/// A bound is its written text (ADR-0061): the instant it reads as
+/// follows from the text, and two spellings of one instant still differ.
+fn same_bound(a: &TimeBound, b: &TimeBound) -> bool {
+    a.text() == b.text()
 }
 
 fn same_field_filter(a: &FieldFilter, b: &FieldFilter) -> bool {
@@ -151,8 +157,8 @@ impl<'q> Walk<'q> {
             hoisted: _,
         } = b;
         same_optional(ta.as_ref(), tb.as_ref(), same_time_filter)
-            && same_optional(ea.as_ref(), eb.as_ref(), String::eq)
-            && same_optional(la.as_ref(), lb.as_ref(), String::eq)
+            && same_optional(ea.as_ref(), eb.as_ref(), same_bound)
+            && same_optional(la.as_ref(), lb.as_ref(), same_bound)
             && self.groups(ga, gb)
     }
 
@@ -626,6 +632,42 @@ mod tests {
         assert_differ(r#"x latest="2026-01-01T00:00:00Z""#, "x");
         // a time clause against a field named like its keyword
         assert_differ("last=1h", "`last`=1h");
+    }
+
+    /// A bound's identity is its written text, not the instant it reads
+    /// as (ADR-0061): two spellings of one instant are two queries, and
+    /// the same spelling twice is one.
+    #[test]
+    fn resolved_bounds_do_not_change_source_identity() {
+        for (a, b) in [
+            (
+                r#"earliest="2026-03-14""#,
+                r#"earliest="2026-03-14T00:00:00""#,
+            ),
+            (
+                r#"latest="2026-03-14T09:00:00Z""#,
+                r#"latest="2026-03-14 09:00:00""#,
+            ),
+            (
+                r#"latest="2026-03-14T09:00:00+05:30""#,
+                r#"latest="2026-03-14T09:00:00""#,
+            ),
+            (r#"earliest="inf""#, r#"earliest="infinity""#),
+        ] {
+            let (qa, qb) = (parsed(a), parsed(b));
+            let instant = |q: &Query| {
+                let bound = q.search.earliest.as_ref().or(q.search.latest.as_ref());
+                bound.expect("a bound").node.instant()
+            };
+            assert_eq!(
+                instant(&qa),
+                instant(&qb),
+                "{a:?} and {b:?} read as one instant"
+            );
+            assert_differ(a, b);
+        }
+        // Where the clause sits is not identity either.
+        assert_same(r#"x earliest="2026-03-14""#, r#"earliest="2026-03-14" x"#);
     }
 
     #[test]

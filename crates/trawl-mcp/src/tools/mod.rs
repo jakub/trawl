@@ -40,7 +40,7 @@ use trawl_client::{
     Attach, CapturedResult, ClientError, Correlation, CorrelationResponse, InvestigationId,
     ResultColumn, ResultPage, ValueCount,
 };
-use trawl_core::ast::{PipeStage, Spanned};
+use trawl_core::ast::{PipeStage, Spanned, TimeBound};
 
 use attach::{Attachment, Caller, Held};
 
@@ -455,8 +455,10 @@ fn follow_up_searches(
             if search.time_filter.is_some() || !search.hoisted.is_empty() {
                 return None;
             }
-            search.earliest = Some(Spanned::new(earliest.to_owned(), 0..0));
-            search.latest = Some(Spanned::new(latest.to_owned(), 0..0));
+            // A bound no query can hold omits the follow-up rather than
+            // run it with that side unbounded.
+            search.earliest = Some(Spanned::new(TimeBound::read(earliest)?, 0..0));
+            search.latest = Some(Spanned::new(TimeBound::read(latest)?, 0..0));
             let reason = if query.pipeline.is_empty() {
                 "the literal on its busiest service, over the same bounds"
             } else {

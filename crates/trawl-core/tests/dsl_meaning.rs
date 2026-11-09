@@ -124,11 +124,11 @@ fn meaning(query: &Query) -> String {
         search
             .earliest
             .as_ref()
-            .map(|t| format!("@earliest({:?})", t.node)),
+            .map(|t| format!("@earliest({:?})", t.node.text())),
         search
             .latest
             .as_ref()
-            .map(|t| format!("@latest({:?})", t.node)),
+            .map(|t| format!("@latest({:?})", t.node.text())),
     ];
     for slot in slots.into_iter().flatten() {
         if !out.is_empty() {

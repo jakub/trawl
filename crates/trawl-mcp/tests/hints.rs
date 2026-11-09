@@ -79,11 +79,11 @@ fn the_search_url_round_trips_to_exactly_the_captured_bounds() {
     let effective = effective_query(q, &[], &range);
     let parsed = trawl_core::parser::parse(&effective).expect("the effective query parses");
     assert_eq!(
-        parsed.search.earliest.as_ref().map(|b| b.node.as_str()),
+        parsed.search.earliest.as_ref().map(|b| b.node.text()),
         Some(EARLIEST)
     );
     assert_eq!(
-        parsed.search.latest.as_ref().map(|b| b.node.as_str()),
+        parsed.search.latest.as_ref().map(|b| b.node.text()),
         Some(LATEST)
     );
     // Every `_time` filter, whatever its value kind, so a stray pattern or
