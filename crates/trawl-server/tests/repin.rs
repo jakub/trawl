@@ -397,8 +397,8 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
         assert_eq!(job.status, RepinJobStatus::Blocked);
         assert_eq!(
             job.error.as_deref(),
-            Some("repin is blocked while rollup publication is incomplete; retry after recovery"),
-            "the job row keeps the reason-specific text"
+            Some("Search is unavailable while the server finishes an interrupted storage rollup."),
+            "the job row carries the refusal's public message"
         );
         assert!(
             job.planned_at.is_none(),

@@ -387,11 +387,11 @@ async fn refused_repin(server: &TestServer) -> Answer {
         (
             trawl_server::store::RepinJobStatus::Blocked,
             Some(
-                "repin is blocked while the server finishes loading data from before its \
-                 restart; retry once it settles"
+                "Search is unavailable while the server finishes loading data from before its \
+                 restart."
             )
         ),
-        "the job row keeps the reason-specific text"
+        "the job row carries the refusal's public message"
     );
     answer
 }

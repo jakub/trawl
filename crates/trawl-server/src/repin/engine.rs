@@ -43,7 +43,6 @@ use crate::deadline::Deadline;
 use crate::error::ServerError;
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
-use crate::publication::CorpusUnsettled;
 use crate::repin::cancel::{
     CancelActor, CancelHandle, CancelRegistry, CancelVerdict, Commit, PassStop, STAGE_BUILD,
     STAGE_FINAL_GATE, STAGE_SCAN, Settlement, audit_cancel_refused, audit_cancel_requested,
@@ -84,21 +83,6 @@ const FLIP_ATTEMPTS: u32 = 3;
 /// in [`RepinEngine::finish`] are exhausted (a real store outage).
 const FINISH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Why repin admission stops while the corpus is unsettled (ADR-0041).
-/// Fixed text per reason: the job row carries it, so it names no path,
-/// marker or count.
-const fn repin_blocked(reason: CorpusUnsettled) -> &'static str {
-    match reason {
-        CorpusUnsettled::RollupPending => {
-            "repin is blocked while rollup publication is incomplete; retry after recovery"
-        }
-        CorpusUnsettled::RestartBacklog => {
-            "repin is blocked while the server finishes loading data from before its restart; \
-             retry once it settles"
-        }
-    }
-}
-
 /// Why repin admission stops while a finished rollup's marker unlink still
 /// owes its day-directory fsync. Reads still answer, so this is not a
 /// `corpus_recovering` refusal; the compaction pass retries the fsync.
@@ -111,9 +95,10 @@ enum AdmissionStop {
     /// A boundary observed a cancel request.
     Cancelled { stage: &'static str },
     /// The job ends `blocked`. `row` is the text its job row carries, and
-    /// `refusal` is what the request answers. An unsettled corpus keeps its
-    /// typed refusal, so the request answers 503 `corpus_recovering` as
-    /// every other corpus read does (ADR-0041).
+    /// `refusal` is what the request answers; the row is the refusal's
+    /// public message (ADR-0040, amendment of 2026-11-08). An unsettled
+    /// corpus keeps its typed refusal, so the request answers 503
+    /// `corpus_recovering` as every other corpus read does (ADR-0041).
     Blocked { row: String, refusal: ServerError },
 }
 
@@ -141,9 +126,9 @@ async fn claim_rollup_pause(
     let admission = async {
         let _corpus = coordinator.cutover_guard().await;
         let _publication = publication.read().await.map_err(|error| match error {
-            ServerError::CorpusRecovering(reason) => AdmissionStop::Blocked {
-                row: repin_blocked(reason).to_owned(),
-                refusal: ServerError::CorpusRecovering(reason),
+            refusal @ ServerError::CorpusRecovering(_) => AdmissionStop::Blocked {
+                row: refusal.safe_message(),
+                refusal,
             },
             other => PassStop::Failed(other.safe_message()).into(),
         })?;
@@ -2900,7 +2885,9 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(AdmissionStop::Blocked {
-                    refusal: ServerError::CorpusRecovering(CorpusUnsettled::RollupPending),
+                    refusal: ServerError::CorpusRecovering(
+                        crate::publication::CorpusUnsettled::RollupPending
+                    ),
                     ..
                 })
             ));
@@ -2924,8 +2911,9 @@ mod tests {
     }
 
     /// An unsettled corpus refuses repin admission with the typed
-    /// `corpus_recovering` refusal, and the job row's fixed message names
-    /// the reason, the pending rollup first (ADR-0041).
+    /// `corpus_recovering` refusal, and the job row carries the refusal's
+    /// public message, which names the reason, the pending rollup first
+    /// (ADR-0041).
     #[tokio::test]
     async fn repin_admission_names_why_the_corpus_is_unsettled() {
         let admit = |publication: crate::publication::PublicationGate| async move {
@@ -2937,19 +2925,19 @@ mod tests {
             match result {
                 Err(AdmissionStop::Blocked {
                     row,
-                    refusal: ServerError::CorpusRecovering(reason),
+                    refusal: refusal @ ServerError::CorpusRecovering(_),
                 }) => {
-                    assert_eq!(row, repin_blocked(reason));
+                    assert_eq!(row, refusal.safe_message(), "row == wire");
                     row
                 }
                 Err(other) => panic!("expected the corpus refusal, got {other:?}"),
                 Ok(_) => panic!("an unsettled corpus admitted a repin"),
             }
         };
-        let restart = "repin is blocked while the server finishes loading data from before its \
-                       restart; retry once it settles";
+        let restart =
+            "Search is unavailable while the server finishes loading data from before its restart.";
         let rollup =
-            "repin is blocked while rollup publication is incomplete; retry after recovery";
+            "Search is unavailable while the server finishes an interrupted storage rollup.";
 
         assert_eq!(
             admit(crate::publication::PublicationGate::starting()).await,
