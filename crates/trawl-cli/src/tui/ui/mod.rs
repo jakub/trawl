@@ -670,6 +670,29 @@ mod tests {
         assert!(text.contains("2026-01-15T04:30:01.250000Z"), "{text}");
     }
 
+    /// A pivot names its columns from data, so a timestamp column can be
+    /// called `_severity`. The grid reads it by its type, in the display
+    /// zone, not as a severity number.
+    #[test]
+    fn a_timestamp_column_named_like_severity_draws_in_the_display_zone() {
+        let mut app = test_app();
+        app.display_zone = "+05:30".parse().unwrap();
+        let mut response = make_query_response(
+            vec!["_severity", "message"],
+            vec![vec![
+                Value::String("2026-01-15T04:30:00.000000Z".into()),
+                Value::String("request ok".into()),
+            ]],
+        );
+        response.result.columns[0].ty = trawl_engine::value::ColumnType::Timestamp;
+        app.tab.result = Some(response);
+        app.tab.status = TabStatus::Success { duration_ms: 3 };
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("2026-01-15 10:00:00 +05:30"), "{screen}");
+    }
+
     /// Set only in the child process: the display-zone timechart draws
     /// there, under the `TZ` the parent chose.
     const BERLIN_CHILD: &str = "TRAWL_TUI_BERLIN_CHILD";

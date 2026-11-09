@@ -310,16 +310,21 @@ fn render_table(
                 .map(|&col_idx| {
                     let value = &row_data[col_idx];
                     let width = all_widths[col_idx] as usize;
-                    let text = if trawl_core::severity::renders_as_severity(
-                        &result.columns[col_idx].name,
-                        &response.severity_columns,
-                    ) {
-                        // A severity cell shows its OTel token, so `17` reads
-                        // `error`, the same vocabulary that filters it
-                        // (ADR-0013 §6).
-                        severity_cell_text(value)
-                    } else {
-                        cell_text(&result.columns[col_idx].ty, value, app.display_zone)
+                    let ty = &result.columns[col_idx].ty;
+                    // A timestamp reads by its type in the display zone,
+                    // whatever its column is called. Otherwise a severity
+                    // cell shows its OTel token, so `17` reads `error`, the
+                    // same vocabulary that filters it (ADR-0013 §6).
+                    let text = match trawl_api::zone::present_cell(ty, value, app.display_zone) {
+                        Some(text) => text,
+                        None if trawl_core::severity::renders_as_severity(
+                            &result.columns[col_idx].name,
+                            &response.severity_columns,
+                        ) =>
+                        {
+                            severity_cell_text(value)
+                        }
+                        None => cell_text(ty, value, app.display_zone),
                     };
                     let truncated = truncate_with_ellipsis(&text, width);
                     let cell = Cell::from(truncated);

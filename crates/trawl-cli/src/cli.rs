@@ -428,16 +428,18 @@ fn render_table(
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                if severity_cells.get(i).copied().unwrap_or(false) {
-                    severity_cell_text(v)
-                } else {
-                    // A timestamp shows its wall clock in the display zone
-                    // with that instant's own offset.
-                    result
-                        .columns
-                        .get(i)
-                        .and_then(|c| trawl_api::zone::present_cell(&c.ty, v, zone))
-                        .unwrap_or_else(|| v.to_string())
+                // A timestamp shows its wall clock in the display zone with
+                // that instant's own offset, whatever its column is called.
+                let presented = result
+                    .columns
+                    .get(i)
+                    .and_then(|c| trawl_api::zone::present_cell(&c.ty, v, zone));
+                match presented {
+                    Some(text) => text,
+                    None if severity_cells.get(i).copied().unwrap_or(false) => {
+                        severity_cell_text(v)
+                    }
+                    None => v.to_string(),
                 }
             })
             .collect();
@@ -961,6 +963,22 @@ mod tests {
         assert!(!table.contains(" 17 "));
         assert!(render(render_ndjson).contains("17"));
         assert!(render(render_csv).contains("17"));
+    }
+
+    /// A pivot names its columns from data, so a timestamp column can be
+    /// called `_severity`. Its type decides how it reads, not its name.
+    #[test]
+    fn a_timestamp_column_named_like_severity_still_shows_in_the_display_zone() {
+        use trawl_engine::value::{Column, ColumnType};
+        let mut result = QueryResult {
+            columns: vec![Column::new("_severity", ColumnType::Timestamp)],
+            rows: vec![vec![Value::String("2026-10-25T00:30:00.000000Z".into())]],
+        };
+        let zone = "+02:00".parse::<DisplayZone>().unwrap();
+        let mut buf = Vec::new();
+        render_results(&mut result, OutputFormat::Table, zone, &[], &mut buf).unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert!(table.contains("2026-10-25 02:30:00 +02:00"), "{table}");
     }
 
     /// The table shows each instant in the display zone with its own
