@@ -345,7 +345,8 @@ async fn accepted_event_carries_canonical_event_repairs_and_lineage() {
     assert_eq!(
         lineage.time,
         TimeLineage::Arrival {
-            unparseable: Some("timestamp".into())
+            unparseable: Some("timestamp".into()),
+            ahead_of_arrival: None,
         }
     );
     assert_eq!(
@@ -931,9 +932,12 @@ const UNREACHABLE_REJECTS: [&str; 3] = ["wal_failure", "hot_buffer_full", "inges
 /// carries a unique `id`, the only key the WAL is matched on.
 ///
 /// Times sit far from the plausibility window's edges: an hour ago for a
-/// plausible time, 2001 for an implausible one.
+/// plausible time, 2001 for an implausible one, and a day ahead for one
+/// that arrival time replaces.
 fn plain_differential_body() -> String {
     let recent = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let ahead = (chrono::Utc::now() + chrono::Duration::days(1))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let long_name = "k".repeat(300);
     let lines = [
@@ -941,6 +945,7 @@ fn plain_differential_body() -> String {
                "_time": recent, "severity": "info", "message": "clean"}),
         json!({"id": "filled", "service": "diff", "message": "host, env and time filled"}),
         json!({"id": "old", "service": "diff", "host": "h1", "_time": "2001-02-03T04:05:06Z"}),
+        json!({"id": "ahead", "service": "diff", "host": "h1", "timestamp": ahead}),
         json!({"id": "bad-time", "service": "diff", "host": "h1", "timestamp": "not a time",
                "level": "gold"}),
         json!({"id": "raw", "service": "diff", "host": "h1", "_raw": "r".repeat(70_000)}),
