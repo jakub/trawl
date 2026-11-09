@@ -285,6 +285,20 @@ pub fn redirect_to_login() -> bool {
     true
 }
 
+/// The one sign-in handler for a failed request (ADR-0066). `None` when
+/// `error` is not [`ApiError::Unauthorized`](crate::api_error::ApiError);
+/// for an unauthorized one, [`redirect_to_login`] runs, and `Some` says
+/// whether navigation started. It declines a second redirect and one
+/// while an explicit logout is pending.
+///
+/// Call it only after the caller's own owner-lifetime and
+/// request-generation checks, so a stale or disposed answer never
+/// navigates.
+#[cfg(target_arch = "wasm32")]
+pub fn sign_in_if_unauthorized(error: &crate::api_error::ApiError) -> Option<bool> {
+    error.is_unauthorized().then(redirect_to_login)
+}
+
 /// Read the current sign-in query after authentication succeeds. Failures do
 /// not consume the URL, and a copied or reloaded sign-in link needs no storage.
 #[cfg(target_arch = "wasm32")]

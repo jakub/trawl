@@ -153,6 +153,12 @@ impl ApiError {
         self.envelope().map(|envelope| &envelope.code)
     }
 
+    /// Whether the session failed: every 401, and nothing else.
+    #[must_use]
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(self, Self::Unauthorized { .. })
+    }
+
     /// The server's envelope when this failure is a query error, else
     /// `None`.
     #[must_use]
@@ -518,6 +524,32 @@ mod tests {
         );
         assert_kept_whole(&err, &sent);
         assert_eq!(err.resource_exhausted(), Some("out of room"));
+    }
+
+    /// The sign-in handler's question: every 401, with or without an
+    /// envelope, and nothing else, a 403 and an `auth_error` code on
+    /// another status included.
+    #[test]
+    fn is_unauthorized_is_every_401_and_nothing_else() {
+        let auth = body_of(&ErrorEnvelope::simple(ErrorCode::AuthError, "expired"));
+        assert!(http_failure(401, Some(&auth)).is_unauthorized());
+        assert!(http_failure(401, None).is_unauthorized());
+        for err in [
+            http_failure(403, Some(&auth)),
+            http_failure(
+                403,
+                Some(&body_of(&ErrorEnvelope::simple(
+                    ErrorCode::Forbidden,
+                    "forbidden",
+                ))),
+            ),
+            http_failure(500, None),
+            ApiError::Network("offline".to_owned()),
+            ApiError::Decode("bad".to_owned()),
+            ApiError::Refused("no"),
+        ] {
+            assert!(!err.is_unauthorized(), "{err:?}");
+        }
     }
 
     /// The server's fixed `query_resource_exhausted` sentence is kept as its
