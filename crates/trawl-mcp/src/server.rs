@@ -19,6 +19,8 @@ use rmcp::model::{
 use rmcp::service::{MaybeSendFuture, RequestContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
+use trawl_api::zone::DisplayZone;
+
 use crate::backend::Backend;
 use crate::session::Seen;
 use crate::{dsl, tools};
@@ -39,16 +41,12 @@ pub const TOOLS_TTL_MS: u64 = 60_000;
 /// compiled in, so they change only with the binary, like the tool table.
 pub const RESOURCES_TTL_MS: u64 = TOOLS_TTL_MS;
 
-/// The display zone a server uses until [`TrawlServer::with_display_zone`]
-/// names another.
-pub const DEFAULT_DISPLAY_ZONE: &str = "UTC";
-
 /// The MCP server over one [`Backend`]: one session, since one stdio
 /// session is one process.
 #[derive(Debug)]
 pub struct TrawlServer<B> {
     backend: B,
-    display_zone: String,
+    display_zone: DisplayZone,
     /// The `seen_seq` of each investigation this session touched
     /// (ADR-0059, [`crate::session`]).
     seen: Seen,
@@ -56,25 +54,15 @@ pub struct TrawlServer<B> {
 
 impl<B: Backend> TrawlServer<B> {
     /// A server whose every tool call goes to `backend`, displaying times
-    /// in [`DEFAULT_DISPLAY_ZONE`].
-    pub fn new(backend: B) -> Self {
+    /// in `display_zone`: the `ui.timezone` of the CLI config on the
+    /// machine that runs `trawl mcp`, parsed before the server starts,
+    /// which `orient` labels as that machine's setting next to UTC.
+    pub fn new(backend: B, display_zone: DisplayZone) -> Self {
         Self {
             backend,
-            display_zone: DEFAULT_DISPLAY_ZONE.to_owned(),
+            display_zone,
             seen: Seen::default(),
         }
-    }
-
-    /// The same server, displaying times in `zone`: the `ui.timezone` of
-    /// the CLI config on the machine that runs `trawl mcp`, which `orient`
-    /// labels as that machine's setting next to UTC. It is one of the
-    /// spellings the CLI accepts: `"local"` (that machine's offset at the
-    /// moment of display), `"UTC"`, or a fixed offset such as `"+05:30"`.
-    /// The CLI refuses any other spelling before the server starts.
-    #[must_use]
-    pub fn with_display_zone(mut self, zone: impl Into<String>) -> Self {
-        self.display_zone = zone.into();
-        self
     }
 
     /// The backend the tools call.
@@ -82,9 +70,9 @@ impl<B: Backend> TrawlServer<B> {
         &self.backend
     }
 
-    /// The display zone, as [`Self::with_display_zone`] set it.
-    pub fn display_zone(&self) -> &str {
-        &self.display_zone
+    /// The display zone the server was built with.
+    pub fn display_zone(&self) -> DisplayZone {
+        self.display_zone
     }
 
     /// What this session has seen of each investigation.
@@ -137,7 +125,7 @@ impl<B: Backend + 'static> ServerHandler for TrawlServer<B> {
                 &request.name,
                 request.arguments,
                 &self.backend,
-                &self.display_zone,
+                self.display_zone,
                 &self.seen,
             ) => {
                 result.map(CallToolResponse::from)

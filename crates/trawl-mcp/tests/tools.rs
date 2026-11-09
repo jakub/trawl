@@ -13,6 +13,7 @@ use rmcp::model::CallToolResult;
 use serde_json::{Value as Json, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use trawl_api::value::{Column, ColumnType, Value};
+use trawl_api::zone::DisplayZone;
 use trawl_api::{EnvironmentCapacity, Reach, ReachEnd};
 use trawl_client::ErrorCode;
 use trawl_mcp::TrawlServer;
@@ -42,6 +43,45 @@ fn now() -> DateTime<Utc> {
 }
 
 // -- orient -------------------------------------------------------------------
+
+/// The fixed display zone `+05:30`.
+fn india() -> DisplayZone {
+    DisplayZone::Fixed(chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap())
+}
+
+/// `orient` reports its captured now in the validated display zone through
+/// trawl-api's presenter: the same spelling the presenter gives that instant
+/// at the zone's offset, with a fraction the wire carries, and no fallback
+/// note.
+#[tokio::test]
+async fn orient_uses_shared_display_zone() {
+    let now = DateTime::parse_from_rfc3339("2026-03-14T04:05:06.789012Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let backend = orient_backend(&[]);
+    let result = orient::run(&backend, india(), now).await;
+    assert_ne!(result.is_error, Some(true));
+
+    let micros = now.timestamp_micros();
+    let presented = trawl_api::zone::wire_timestamp(micros, india().offset_at(now));
+    assert_eq!(presented, "2026-03-14T09:35:06.789012+05:30");
+    let utc = trawl_api::zone::wire_timestamp(micros, DisplayZone::Utc.offset_at(now));
+    let mirror = result.structured_content.as_ref().unwrap();
+    assert_eq!(mirror["now_display"], json!(presented));
+    assert_eq!(mirror["now_utc"], json!(utc));
+    assert_eq!(
+        mirror["display_zone"],
+        json!("+05:30, the mcp host's setting")
+    );
+    assert!(mirror.get("display_zone_note").is_none(), "{mirror}");
+    let text = text_of(&result);
+    assert!(
+        text.contains(&format!(
+            "\nnow: {utc} (UTC); {presented} (display zone: +05:30, the mcp host's setting)\n"
+        )),
+        "{text}"
+    );
+}
 
 fn inventory() -> trawl_client::QueryResponse {
     query_response(
@@ -103,15 +143,15 @@ async fn orient_answers_the_installation_with_inventory_and_retention() {
     let mut backend = orient_backend(&["query", "schema_read", "server_manage"]);
     backend.query = ok(inventory());
     backend.dashboard = ok(dashboard(vec![prod_capacity()]));
-    let result = orient::run(&backend, "+05:30", now()).await;
+    let result = orient::run(&backend, india(), now()).await;
     assert_ne!(result.is_error, Some(true));
     let text = text_of(&result);
     let golden = [
         "trawld 0.9.3 answers: health ok, 2 environment, service and host groups with events in \
          the last 24 hours.",
         "version: trawld 0.9.3",
-        "now: 2026-03-14T04:05:06Z (UTC); 2026-03-14T09:35:06+05:30 (display zone: +05:30, the \
-         mcp host's setting)",
+        "now: 2026-03-14T04:05:06.000000Z (UTC); 2026-03-14T09:35:06.000000+05:30 (display \
+         zone: +05:30, the mcp host's setting)",
         r#"key: "agent", prefix "abcd1234"; permissions: query, schema_read, server_manage"#,
         "health: ok (HTTP 200)",
         "inventory, last 24 hours, busiest first: [env, service, host, events, last_seen]",
@@ -179,7 +219,7 @@ async fn orient_answers_the_installation_with_inventory_and_retention() {
 #[tokio::test]
 async fn orient_without_query_or_server_manage_says_what_it_cannot_read() {
     let backend = orient_backend(&["schema_read"]);
-    let result = orient::run(&backend, "UTC", now()).await;
+    let result = orient::run(&backend, DisplayZone::Utc, now()).await;
     assert_ne!(result.is_error, Some(true));
     let text = text_of(&result);
     assert!(
@@ -202,7 +242,7 @@ async fn orient_without_query_or_server_manage_says_what_it_cannot_read() {
 async fn orient_names_a_recovering_corpus_and_still_answers() {
     let mut backend = orient_backend(&["query"]);
     backend.query = refuse(503, ErrorCode::CorpusRecovering, "recovering");
-    let result = orient::run(&backend, "UTC", now()).await;
+    let result = orient::run(&backend, DisplayZone::Utc, now()).await;
     assert_ne!(result.is_error, Some(true));
     let text = text_of(&result);
     assert!(
@@ -220,7 +260,7 @@ async fn orient_names_a_recovering_corpus_and_still_answers() {
 async fn orient_with_server_manage_but_no_dashboard_says_why() {
     let mut backend = orient_backend(&["server_manage"]);
     backend.dashboard = refuse(500, ErrorCode::InternalError, "boom");
-    let text = text_of(&orient::run(&backend, "local", now()).await).to_owned();
+    let text = text_of(&orient::run(&backend, DisplayZone::Local, now()).await).to_owned();
     assert!(
         text.contains(
             "retention reach: the dashboard could not be read: internal_error (HTTP 500)"
@@ -239,7 +279,7 @@ async fn orient_refused_by_whoami_is_a_tool_error() {
         schema_services: refuse(401, ErrorCode::AuthError, "bad key"),
         ..Fake::default()
     };
-    let result = orient::run(&backend, "UTC", now()).await;
+    let result = orient::run(&backend, DisplayZone::Utc, now()).await;
     assert_eq!(result.is_error, Some(true));
     let text = text_of(&result);
     assert!(
@@ -268,7 +308,7 @@ async fn orient_drops_inventory_rows_to_fit_and_says_so() {
     response.result.rows = rows;
     response.pagination.total = 200;
     backend.query = ok(response);
-    let result = orient::run(&backend, "UTC", now()).await;
+    let result = orient::run(&backend, DisplayZone::Utc, now()).await;
     assert_ne!(result.is_error, Some(true));
     assert!(used_bytes(&result) <= 16 * 1024, "{}", used_bytes(&result));
     let text = text_of(&result);
@@ -1098,7 +1138,7 @@ async fn follow(action: &Json, backend: &Fake) -> CallToolResult {
         action["tool"].as_str().unwrap(),
         action["arguments"].as_object().cloned(),
         backend,
-        "UTC",
+        DisplayZone::Utc,
         &trawl_mcp::session::Seen::default(),
     )
     .await
@@ -1994,7 +2034,7 @@ async fn an_oversized_argument_is_capped_error_text_on_the_tools_call_path() {
     let (client, server) = tokio::io::duplex(1 << 22);
     let (read, write) = tokio::io::split(server);
     tokio::spawn(async move {
-        let running = TrawlServer::new(Fake::default())
+        let running = TrawlServer::new(Fake::default(), DisplayZone::Utc)
             .serve((read, write))
             .await
             .unwrap();
@@ -2062,7 +2102,7 @@ impl Stdio {
         let (client, server) = tokio::io::duplex(1 << 22);
         let (read, write) = tokio::io::split(server);
         tokio::spawn(async move {
-            let running = TrawlServer::new(backend)
+            let running = TrawlServer::new(backend, DisplayZone::Utc)
                 .serve((read, write))
                 .await
                 .unwrap();
@@ -2422,7 +2462,7 @@ async fn an_unparseable_result_timestamp_prints_as_one_escaped_line() {
             trawl_mcp::tools::schema::READ,
             arguments.as_object().cloned(),
             &backend,
-            "UTC",
+            DisplayZone::Utc,
             &trawl_mcp::session::Seen::default(),
         )
         .await
@@ -2487,7 +2527,7 @@ async fn a_proposed_call_in_the_mirror_runs_what_the_text_proposes_or_is_left_ou
             "search",
             arguments.as_object().cloned(),
             &backend,
-            "UTC",
+            DisplayZone::Utc,
             &trawl_mcp::session::Seen::default(),
         )
         .await
@@ -2549,7 +2589,7 @@ async fn a_proposed_call_in_the_mirror_runs_what_the_text_proposes_or_is_left_ou
         "orient",
         None,
         &backend,
-        "UTC",
+        DisplayZone::Utc,
         &trawl_mcp::session::Seen::default(),
     )
     .await

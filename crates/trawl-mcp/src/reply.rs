@@ -342,16 +342,12 @@ pub struct OrientReply {
     /// trawld's version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_version: Option<String>,
-    /// Now, in UTC, RFC 3339.
+    /// Now, in UTC, in the wire's RFC 3339 spelling.
     pub now_utc: String,
     /// The display zone's label, the MCP host's setting.
     pub display_zone: String,
-    /// Now, in the display zone, RFC 3339.
+    /// Now, in the display zone, in the wire's RFC 3339 spelling.
     pub now_display: String,
-    /// Why the display zone is not the one configured, when the setting
-    /// did not parse and UTC stands in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_zone_note: Option<String>,
     /// The key that answers: its name, prefix and effective permissions.
     pub key: KeyView,
     /// Health as trawld reports it.

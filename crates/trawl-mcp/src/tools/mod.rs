@@ -35,6 +35,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use trawl_api::CapabilitiesResponse;
 use trawl_api::value::wire_cell_text;
+use trawl_api::zone::DisplayZone;
 use trawl_client::{
     Attach, CapturedResult, ClientError, Correlation, CorrelationResponse, InvestigationId,
     ResultColumn, ResultPage, ValueCount,
@@ -70,7 +71,7 @@ pub async fn dispatch<B: Backend>(
     name: &str,
     arguments: Option<JsonObject>,
     backend: &B,
-    display_zone: &str,
+    display_zone: DisplayZone,
     seen: &Seen,
 ) -> Result<CallToolResult, ErrorData> {
     match name {

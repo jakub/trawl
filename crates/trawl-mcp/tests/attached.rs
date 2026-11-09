@@ -26,6 +26,7 @@ use trawl_api::investigations::{
     InvestigationSummary, LogEntry,
 };
 use trawl_api::value::{ColumnType, Value};
+use trawl_api::zone::DisplayZone;
 use trawl_client::{
     CaptureKind, CaptureResponse, CapturedResult, CompareFacts, CompareWarning, CompareWarningCode,
     CompareWindow, ContextFacts, ContextGroups, Correlation, CorrelationResponse, ErrorCode,
@@ -973,7 +974,7 @@ async fn orient_lists_the_five_most_recently_changed_open_investigations() {
         &["query", "investigation_read"],
         ok(InvestigationList { investigations }),
     );
-    let result = orient::run(&backend, "UTC", now()).await;
+    let result = orient::run(&backend, DisplayZone::Utc, now()).await;
     assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
     let text = text_of(&result);
     let listed: Vec<&str> = text
@@ -1030,7 +1031,7 @@ async fn orient_lists_the_five_most_recently_changed_open_investigations() {
 #[tokio::test]
 async fn orient_lists_nothing_for_a_key_that_cannot_read_investigations() {
     let backend = orient_backend(&["query"], None);
-    let result = orient::run(&backend, "UTC", now()).await;
+    let result = orient::run(&backend, DisplayZone::Utc, now()).await;
     assert_ne!(result.is_error, Some(true));
     assert!(
         !text_of(&result).contains("open investigations"),
@@ -1059,7 +1060,7 @@ async fn orient_says_in_one_line_when_there_is_no_open_investigation_or_no_list(
         ),
     ] {
         let backend = orient_backend(&["query", "investigation_read"], list);
-        let result = orient::run(&backend, "UTC", now()).await;
+        let result = orient::run(&backend, DisplayZone::Utc, now()).await;
         assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
         assert!(text_of(&result).contains(expected), "{}", text_of(&result));
     }
@@ -1115,7 +1116,7 @@ async fn call(tool: &str, backend: &Fake, seen: &Seen, arguments: Json) -> CallT
     let Json::Object(arguments) = arguments else {
         panic!("arguments are an object");
     };
-    trawl_mcp::tools::dispatch(tool, Some(arguments), backend, "UTC", seen)
+    trawl_mcp::tools::dispatch(tool, Some(arguments), backend, DisplayZone::Utc, seen)
         .await
         .expect("a known tool")
 }

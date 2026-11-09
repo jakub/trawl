@@ -26,10 +26,11 @@
 //! - Times print in UTC and in the display zone, the `ui.timezone` of the
 //!   machine that runs `trawl mcp`, labelled as that machine's setting.
 
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, Offset, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value as Json, json};
 use trawl_api::value::Value;
+use trawl_api::zone::{DisplayZone, wire_timestamp};
 use trawl_api::{CapabilitiesResponse, HealthStatus, Reach, ReachEnd, WithheldReason};
 use trawl_client::types::ServiceSchemaResponse;
 use trawl_client::{
@@ -86,7 +87,7 @@ const FIRST_SEARCH: &str = "_severity>=error last=1h | stats count() by service 
 /// display setting and `now` the instant it reports as now.
 pub async fn run<B: Backend>(
     backend: &B,
-    display_zone: &str,
+    display_zone: DisplayZone,
     now: DateTime<Utc>,
 ) -> CallToolResult {
     let (whoami, capabilities, health, services) = tokio::join!(
@@ -129,7 +130,6 @@ pub async fn run<B: Backend>(
         |(status, health)| health_view(status, &health),
     );
 
-    let (offset, display_zone_label, display_zone_note) = display_offset(display_zone, now);
     let next_actions = next_actions(
         may_query,
         permitted(SCHEMA_READ_PERMISSION),
@@ -142,12 +142,9 @@ pub async fn run<B: Backend>(
             may_query.then_some(inventory.len()),
         ),
         server_version: Some(capabilities.version.clone()),
-        now_utc: now.to_rfc3339_opts(SecondsFormat::Secs, true),
-        display_zone: display_zone_label,
-        now_display: now
-            .with_timezone(&offset)
-            .to_rfc3339_opts(SecondsFormat::Secs, true),
-        display_zone_note,
+        now_utc: now_text(now, DisplayZone::Utc.offset_at(now)),
+        display_zone: display_zone_label(display_zone, now),
+        now_display: now_text(now, display_zone.offset_at(now)),
         key: KeyView {
             name: whoami.name.clone(),
             prefix: whoami.prefix.clone(),
@@ -351,36 +348,20 @@ fn degraded_part(
     }
 }
 
-/// The display zone's offset at `now`, its label, and a note when the
-/// setting did not parse and UTC stands in.
-///
-/// `zone` is the CLI's `ui.timezone`: `local` (the offset of the machine
-/// that runs `trawl mcp`, at `now`), `UTC`, or a fixed offset such as
-/// `+05:30`. The CLI refuses any other spelling, so the note is a guard,
-/// never a panic.
-#[must_use]
-pub fn display_offset(zone: &str, now: DateTime<Utc>) -> (FixedOffset, String, Option<String>) {
+/// The display zone's label in `orient`: its canonical spelling, with the
+/// offset at `now` for `local`, named as the setting of the machine that
+/// runs `trawl mcp`.
+fn display_zone_label(zone: DisplayZone, now: DateTime<Utc>) -> String {
     const SETTING: &str = "the mcp host's setting";
-    let utc = FixedOffset::east_opt(0).unwrap_or_else(|| Utc.fix());
-    let trimmed = zone.trim();
-    if trimmed.eq_ignore_ascii_case("local") {
-        let offset = Local.offset_from_utc_datetime(&now.naive_utc()).fix();
-        return (offset, format!("local, {offset}, {SETTING}"), None);
+    match zone {
+        DisplayZone::Local => format!("local, {}, {SETTING}", zone.offset_at(now)),
+        DisplayZone::Utc | DisplayZone::Fixed(_) => format!("{zone}, {SETTING}"),
     }
-    if trimmed.eq_ignore_ascii_case("utc") {
-        return (utc, format!("UTC, {SETTING}"), None);
-    }
-    match trimmed.parse::<FixedOffset>() {
-        Ok(offset) => (offset, format!("{offset}, {SETTING}"), None),
-        Err(_) => (
-            utc,
-            format!("UTC, standing in for {SETTING}"),
-            Some(format!(
-                "the setting {} did not parse, so UTC stands in",
-                crate::render::rows::json_text(zone)
-            )),
-        ),
-    }
+}
+
+/// `now` in the wire's spelling at `offset`, through trawl-api's presenter.
+fn now_text(now: DateTime<Utc>, offset: FixedOffset) -> String {
+    wire_timestamp(now.timestamp_micros(), offset)
 }
 
 /// The inventory rows and their note from the inventory query's answer.
@@ -629,56 +610,11 @@ pub(crate) fn object(value: Json) -> Map<String, Json> {
 mod tests {
     use super::*;
 
-    fn at(text: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(text)
-            .unwrap()
-            .with_timezone(&Utc)
-    }
-
     #[test]
     fn the_inventory_query_parses() {
         let query = trawl_core::parser::parse(INVENTORY_QUERY).expect("the inventory parses");
         assert!(query.has_aggregation());
         trawl_core::parser::parse(FIRST_SEARCH).expect("the first search parses");
-    }
-
-    #[test]
-    fn utc_is_utc() {
-        let (offset, label, note) = display_offset("UTC", at("2026-03-14T03:00:00Z"));
-        assert_eq!(offset.local_minus_utc(), 0);
-        assert_eq!(label, "UTC, the mcp host's setting");
-        assert!(note.is_none());
-    }
-
-    #[test]
-    fn a_fixed_offset_is_that_offset() {
-        let (offset, label, note) = display_offset("+05:30", at("2026-03-14T03:00:00Z"));
-        assert_eq!(offset.local_minus_utc(), 5 * 3600 + 30 * 60);
-        assert_eq!(label, "+05:30, the mcp host's setting");
-        assert!(note.is_none());
-        let (offset, _, _) = display_offset("-07:00", at("2026-03-14T03:00:00Z"));
-        assert_eq!(offset.local_minus_utc(), -7 * 3600);
-    }
-
-    #[test]
-    fn local_is_the_machines_offset_at_that_instant() {
-        let now = at("2026-07-01T12:00:00Z");
-        let (offset, label, note) = display_offset("local", now);
-        let expected = Local.offset_from_utc_datetime(&now.naive_utc()).fix();
-        assert_eq!(offset, expected);
-        assert!(label.starts_with("local, "), "{label}");
-        assert!(label.ends_with("the mcp host's setting"), "{label}");
-        assert!(note.is_none());
-    }
-
-    #[test]
-    fn an_unparsable_zone_falls_back_to_utc_and_says_so() {
-        let (offset, label, note) = display_offset("Mars/Olympus\n", at("2026-03-14T03:00:00Z"));
-        assert_eq!(offset.local_minus_utc(), 0);
-        assert!(label.starts_with("UTC"), "{label}");
-        let note = note.expect("a note");
-        assert!(note.contains(r#""Mars/Olympus\n""#), "{note}");
-        assert!(note.contains("UTC stands in"), "{note}");
     }
 
     #[test]

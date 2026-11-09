@@ -12,9 +12,10 @@ use std::collections::HashMap;
 
 use crate::value::{ColumnType, QueryResult, Value};
 
-/// A cell of a `timestamp` column, or of a list of them, as the CLI table
-/// and the TUI show it: each timestamp through [`timestamp_text`], a list
-/// the way `Value`'s `Display` writes one.
+/// A cell of a `timestamp` column, or of a list of them, as the browser's
+/// results grid shows it: each timestamp through [`timestamp_text`], a list
+/// the way `Value`'s `Display` writes one. The CLI table and the TUI use
+/// [`crate::zone::present_cell`].
 ///
 /// `None` for any other cell, which each surface renders its own way.
 #[must_use]
