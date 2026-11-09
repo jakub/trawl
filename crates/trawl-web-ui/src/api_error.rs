@@ -17,6 +17,10 @@
 
 use trawl_api::{ErrorCode, ErrorEnvelope, ErrorResponse};
 
+/// What an [`ApiError::Unauthorized`] says: the session ended, and the
+/// way back is to sign in. Never the envelope's message.
+pub const SESSION_ENDED: &str = "Your session has ended. Sign in again.";
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ApiError {
     #[error("network: {0}")]
@@ -24,8 +28,11 @@ pub enum ApiError {
 
     /// Any 401: the session failed, not the request. The envelope that
     /// came with it, when there was a valid one, is kept, but it never
-    /// changes the classification and never becomes the display.
-    #[error("unauthorized")]
+    /// changes the classification and never becomes the display. The
+    /// display is [`SESSION_ENDED`], which a write that toasts the error
+    /// shows as it stands; a read sends the page to sign-in instead
+    /// (`auth_return::sign_in_if_unauthorized`).
+    #[error("{}", SESSION_ENDED)]
     Unauthorized {
         /// The server's envelope, unabridged. Boxed so every result that
         /// can carry this error stays small.
@@ -333,7 +340,8 @@ pub fn saved_name_refusal(error: &ApiError) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiError, DUPLICATE_NAME, INVALID_NAME, Kept, http_failure, kept_as, saved_name_refusal,
+        ApiError, DUPLICATE_NAME, INVALID_NAME, Kept, SESSION_ENDED, http_failure, kept_as,
+        saved_name_refusal,
     };
     use trawl_api::investigations::SequenceConflict;
     use trawl_api::{ErrorCode, ErrorDetail, ErrorEnvelope, ErrorResponse, ErrorSpan};
@@ -439,7 +447,7 @@ mod tests {
         assert!(matches!(err, ApiError::Unauthorized { .. }), "{err:?}");
         assert_kept_whole(&err, &auth);
         assert_eq!(err.http_status(), Some(401));
-        assert_eq!(err.to_string(), "unauthorized");
+        assert_eq!(err.to_string(), SESSION_ENDED);
         // Even a code that would otherwise be a query error.
         let parse = full_envelope(ErrorCode::ParseError, "bad");
         assert!(matches!(
@@ -778,7 +786,7 @@ mod tests {
         }
 
         let session = refusal(401, ErrorCode::AuthError, hostile);
-        assert_eq!(saved_name_refusal(&session), "unauthorized");
+        assert_eq!(saved_name_refusal(&session), SESSION_ENDED);
         for (err, gone) in [
             (ApiError::Network(hostile.to_owned()), hostile),
             (ApiError::Decode(hostile.to_owned()), hostile),

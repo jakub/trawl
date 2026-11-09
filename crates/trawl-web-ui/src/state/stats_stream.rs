@@ -67,9 +67,11 @@ pub fn start_stats_stream(stats: SharedDashboard) -> Option<StatsLifecycle> {
     source.set_onerror(Some(on_error.as_ref().unchecked_ref()));
     let bootstrap_alive = alive.clone();
     leptos::task::spawn_local(async move {
-        let result = crate::api::dashboard().await.map_err(|e| e.http_status());
-        if bootstrap_alive.load(Ordering::SeqCst) {
-            stats.update(|s| s.bootstrap(result));
+        let result = crate::api::dashboard().await;
+        if bootstrap_alive.load(Ordering::SeqCst)
+            && !crate::auth_return::leaves_for_sign_in(&result)
+        {
+            stats.update(|s| s.bootstrap(result.map_err(|e| e.http_status())));
         }
     });
     Some(StatsLifecycle {

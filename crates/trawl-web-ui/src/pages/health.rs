@@ -83,13 +83,43 @@ fn health_title(report: Option<&Result<HealthResponse, String>>) -> &'static str
     }
 }
 
+/// The sentence for a report read that failed and did not send the page
+/// to sign-in: a permission refusal has its own, a refusal the server
+/// explained is its message, and a bare status or a lost answer is
+/// generic. A 401 reaches here only when the sign-in handler declined,
+/// and reads as the session-ended sentence.
 fn read_error(error: &api::ApiError) -> String {
+    if error.is_unauthorized() {
+        return error.to_string();
+    }
+    if error.http_status() == Some(403) {
+        return "You do not have permission to read this report.".into();
+    }
+    if let Some(envelope) = error.envelope() {
+        return format!("Report unavailable: {}", envelope.message);
+    }
     match error.http_status() {
-        Some(401 | 403) => "You do not have permission to read this report.".into(),
         Some(status) => {
             format!("Report unavailable, server returned {status}. Refresh to try again.")
         }
         None => "Could not read this report. Refresh to try again.".into(),
+    }
+}
+
+/// The sentence for a cancellation that failed. The request is a
+/// DELETE, so a lost answer or a 5xx (which a proxy can return after the
+/// daemon acted) leaves the outcome unknown. A 401 never reached the
+/// daemon: it says the session ended, and this write does not navigate.
+/// Any other enveloped refusal is the server's message.
+fn cancel_error(error: &api::ApiError) -> String {
+    const UNKNOWN: &str = "Cancellation outcome unknown. Refresh queries before trying again.";
+    if error.is_unauthorized() {
+        return error.to_string();
+    }
+    match (error.http_status(), error.envelope()) {
+        (None | Some(500..=599), _) => UNKNOWN.into(),
+        (Some(_), Some(envelope)) => format!("Cancellation failed: {}", envelope.message),
+        (Some(status), None) => format!("Cancellation failed, server returned {status}."),
     }
 }
 
@@ -117,18 +147,24 @@ pub fn HealthPage() -> impl IntoView {
         };
         let health_generation = generation.clone();
         spawn_local(async move {
-            let result = api::health().await.map_err(|e| read_error(&e));
-            if health_generation.load(Ordering::SeqCst) == epoch {
-                health.set(Some(result));
+            let result = api::health().await;
+            if health_generation.load(Ordering::SeqCst) != epoch
+                || crate::auth_return::leaves_for_sign_in(&result)
+            {
+                return;
             }
+            health.set(Some(result.map_err(|e| read_error(&e))));
         });
         if perms::is_trawl_admin(&identity.permissions) {
             let stats_generation = generation.clone();
             spawn_local(async move {
-                let result = api::stats().await.map_err(|e| read_error(&e));
-                if stats_generation.load(Ordering::SeqCst) == epoch {
-                    capacity.set(Some(result));
+                let result = api::stats().await;
+                if stats_generation.load(Ordering::SeqCst) != epoch
+                    || crate::auth_return::leaves_for_sign_in(&result)
+                {
+                    return;
                 }
+                capacity.set(Some(result.map_err(|e| read_error(&e))));
             });
         }
     });
@@ -489,13 +525,13 @@ fn HealthQueries() -> impl IntoView {
         }
         let guard = read_generation.clone();
         spawn_local(async move {
-            let result = api::queries()
-                .await
-                .map(query_rows)
-                .map_err(|e| read_error(&e));
-            if guard.load(Ordering::SeqCst) == epoch {
-                rows.set(Some(result));
+            let result = api::queries().await;
+            if guard.load(Ordering::SeqCst) != epoch
+                || crate::auth_return::leaves_for_sign_in(&result)
+            {
+                return;
             }
+            rows.set(Some(result.map(query_rows).map_err(|e| read_error(&e))));
         });
     });
     Effect::new(move |_| {
@@ -531,15 +567,7 @@ fn HealthQueries() -> impl IntoView {
                 }
                 Ok(answer) if answer.cancelled => "Cancellation requested".into(),
                 Ok(_) => "No work was cancelled".into(),
-                // A proxy 5xx can follow a DELETE that reached the daemon.
-                // It does not prove whether cancellation took effect.
-                Err(error) if matches!(error.http_status(), None | Some(500..=599)) => {
-                    "Cancellation outcome unknown. Refresh queries before trying again.".into()
-                }
-                Err(error) => format!(
-                    "Cancellation failed, server returned {}.",
-                    error.http_status().unwrap_or_default()
-                ),
+                Err(error) => cancel_error(&error),
             }));
             refresh.update(|n| *n += 1);
         });

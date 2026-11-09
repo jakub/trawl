@@ -299,6 +299,16 @@ pub fn sign_in_if_unauthorized(error: &crate::api_error::ApiError) -> Option<boo
     error.is_unauthorized().then(redirect_to_login)
 }
 
+/// [`sign_in_if_unauthorized`] over a whole answer: whether it sent the
+/// page to sign-in. `false` for a success, for any other failure, and
+/// for a 401 the handler declined; the caller then settles the page on
+/// the failure, whose display for a 401 is the session-ended sentence.
+/// The same call-order rule holds: only after the caller's own checks.
+#[cfg(target_arch = "wasm32")]
+pub fn leaves_for_sign_in<T>(answer: &Result<T, crate::api_error::ApiError>) -> bool {
+    answer.as_ref().err().and_then(sign_in_if_unauthorized) == Some(true)
+}
+
 /// Read the current sign-in query after authentication succeeds. Failures do
 /// not consume the URL, and a copied or reloaded sign-in link needs no storage.
 #[cfg(target_arch = "wasm32")]

@@ -5,8 +5,8 @@
 //! `<AuthShell/>` — authenticated layout wrapping all non-login routes.
 //!
 //! A thin app-specific wrapper over [`fleet_ui::Shell`]: keeps the
-//! `/me` fetch, the Unauthorized redirect to sign-in carrying the requested
-//! URL, and the
+//! `/me` fetch, its Unauthorized answer sent to sign-in carrying the
+//! requested URL through the shared handler, and the
 //! `ShellStatus` + `me` context provision; maps trawl's `AppMode` /
 //! `section` state onto fleet-ui's `SidebarGroup` / `RailItem` props.
 //! The toast bus and `<Toasts/>` host are owned by `fleet_ui::Shell`
@@ -40,25 +40,33 @@ pub struct ShellStatus {
 #[allow(clippy::too_many_lines)] // shell chrome is one cohesive view tree
 pub fn AuthShell() -> impl IntoView {
     let me = RwSignal::new(None::<api::MeResponse>);
-    let redirect_to_login = RwSignal::new(false);
     let auth_error = RwSignal::new(None::<&'static str>);
     let checking_session = RwSignal::new(false);
     let session_attempt = RwSignal::new(0u64);
 
     Effect::new(move |_| {
-        let _ = session_attempt.get();
+        let attempt = session_attempt.get();
         checking_session.set(true);
         auth_error.set(None);
         spawn_local(async move {
-            match api::me().await {
+            let answer = api::me().await;
+            // Only the newest check of a shell that is still mounted acts
+            // on its answer; a disposed shell reads as `None`.
+            if session_attempt.try_get_untracked() != Some(attempt)
+                || crate::auth_return::leaves_for_sign_in(&answer)
+            {
+                return;
+            }
+            match answer {
                 Ok(resp) => {
                     me.try_set(Some(resp));
                 }
-                Err(api::ApiError::Unauthorized { .. }) => {
-                    redirect_to_login.try_set(true);
-                }
                 Err(err) => {
-                    auth_error.try_set(Some(if err.http_status() == Some(403) {
+                    auth_error.try_set(Some(if err.is_unauthorized() {
+                        // Sign-in was declined: an explicit logout is
+                        // under way, or another redirect started first.
+                        crate::api_error::SESSION_ENDED
+                    } else if err.http_status() == Some(403) {
                         "This account does not have access to Trawl."
                     } else {
                         "Unable to check your session. Try again when the service is available."
@@ -73,12 +81,6 @@ pub fn AuthShell() -> impl IntoView {
             session_attempt.update(|attempt| *attempt += 1);
         }
     };
-
-    Effect::new(move |_| {
-        if redirect_to_login.get() {
-            crate::auth_return::redirect_to_login();
-        }
-    });
 
     let current_app = app_mode::from_url();
     let current_section = section::from_url(current_app);

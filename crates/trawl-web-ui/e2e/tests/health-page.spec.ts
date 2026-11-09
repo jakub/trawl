@@ -443,8 +443,10 @@ for (const status of [500, 502, 504, 403]) {
     await rows(page);
     const dialog = await confirm(page);
     await dialog.getByRole('button', { name: 'Cancel query', exact: true }).click();
+    // A refusal the server explained is its message; a 5xx can follow a
+    // DELETE that reached the daemon, so its outcome stays unknown.
     const message = status === 403
-      ? 'Cancellation failed, server returned 403.'
+      ? 'Cancellation failed: insufficient permissions'
       : 'Cancellation outcome unknown. Refresh queries before trying again.';
     await expect(page.locator(SEL.healthQueries)).toContainText(message);
     await expect(page.locator(SEL.healthQueries)).not.toContainText('Cancellation requested');
