@@ -108,6 +108,13 @@ fn ingest_batch_too_large_message(requested: Option<Charge>, ceiling: Charge) ->
 }
 
 /// Server errors, mapped to HTTP responses via [`IntoResponse`].
+///
+/// Each error has one public message ([`ServerError::safe_message`]),
+/// which the wire and every record of the failure carry. The free-text
+/// variants (`Unauthorized`, `Forbidden`, `BadRequest`, `NotFound`,
+/// `Conflict`, `Ingest` and `ServiceUnavailable`) disclose their text as
+/// written, so their constructors never interpolate an error's `Display`
+/// or an absolute host path (ADR-0040, amended 2026-11-08).
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     /// Query engine failure (parse, emit, or `DuckDB` execution).
@@ -144,7 +151,7 @@ pub enum ServerError {
     /// when a repin owns the data root, when the corpus cannot be read
     /// well enough to prove a pin dead, and when the purge's outcome is
     /// unknown. The message is the operator's instruction, so unlike a
-    /// store error it reaches the wire intact.
+    /// store error it reaches the wire and the records intact.
     #[error("conflict: {0}")]
     Conflict(String),
 
@@ -766,71 +773,42 @@ impl CauseKind {
 }
 
 impl ServerError {
-    /// Return a sanitized error message safe for logs and tracker history.
+    /// The public message: the one string a client reads as the
+    /// envelope's `message` and every record of the failure stores, which
+    /// are the query tracker's recent entries, report run rows, repin job
+    /// rows and the capture tracker's outcome (ADR-0040, amended
+    /// 2026-11-08).
     ///
-    /// Database internals and internal error details are redacted to prevent
-    /// information disclosure. Parse, emit and refusal messages (client
-    /// mistakes, every one of them trawl-authored or quoting the caller's own
-    /// tokens) are preserved by the catch-all below: a redacted refusal would
-    /// leave the tracker, the scheduler's run rows and the client response
-    /// unable to say what was refused.
+    /// It is the message `rendered()` sends, so the wire and the records
+    /// cannot disagree. `rendered()` decides it per variant, with no
+    /// wildcard arm at the `ServerError`, `EngineError` or `StoreError`
+    /// level, so a new variant does not compile until its disclosure is
+    /// written. Provenance decides what it may hold: text trawl wrote,
+    /// values the request carried, and permitted domain facts such as
+    /// configured limits, counts, sequence numbers and names relative to
+    /// the data root. Never the `Display` text of `DuckDB`, an `io::Error`
+    /// or the store driver, an absolute host path, generated SQL or a
+    /// panic payload: a variant that carries those answers a fixed
+    /// sentence. Structured details from the request, such as parse spans,
+    /// emit hints and the `conflict` member, stay on the wire.
+    ///
+    /// Not for default-level telemetry: parse and emit text quotes the
+    /// caller's own tokens. Events carry [`Self::error_class`] and
+    /// [`Self::cause_kind`] instead.
     pub fn safe_message(&self) -> String {
-        match self {
-            Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
-                "query execution failed".to_owned()
-            }
-            Self::Engine(EngineError::ResourceExhausted | EngineError::RegexResources(_))
-            | Self::RegexResources(_) => QUERY_RESOURCE_EXHAUSTED.to_owned(),
-            Self::Store(StoreError::Unavailable(_) | StoreError::Migration(_)) => {
-                "app-state store unavailable".to_owned()
-            }
-            Self::Internal(_) | Self::Panicked(_) => "internal error".to_owned(),
-            // The two 500-class window errors can quote the saved DSL and
-            // the parser's message; the policy refusal below them is the
-            // operator's own input and keeps its text.
-            Self::WindowPlan(_) | Self::WindowMaterialize(_) => {
-                "report window could not be resolved".to_owned()
-            }
-            Self::Ingest(_) => "ingest error".to_owned(),
-            Self::BadRequest(_) => "bad request".to_owned(),
-            Self::NotFound(_) => "not found".to_owned(),
-            Self::Forbidden(_) => "forbidden".to_owned(),
-            Self::RateLimited { .. } => "rate limit exceeded".to_owned(),
-            Self::TooManyStreams => "too many concurrent streams".to_owned(),
-            // [`CAPACITY_NOT_STARTED`] is a fixed server-capacity sentence
-            // with nothing to redact, and it is the whole answer a
-            // pre-start refusal gives: erasing it to "service unavailable"
-            // would leave the scheduler's run row and the query tracker
-            // unable to tell a capacity refusal from any other 503.
-            Self::CapacityNotStarted => CAPACITY_NOT_STARTED.to_owned(),
-            Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
-            // `IngestBodyTooLarge`, `RequestTooLarge`, `HotBufferFull`,
-            // `IngestBatchTooLarge`, `PreviewTooLarge`,
-            // `CaptureSourceTooLarge`, `CaptureTooLarge`, `CaptureBusy`,
-            // `CaptureQuotaExceeded`, `ResultGone`, `ResultUnavailable`,
-            // `ResultCorrupt`, `SequenceConflict`, `InvestigationExists`,
-            // `InvestigationClosed`, `EvidenceBudgetExceeded`,
-            // `UnsupportedEncoding`, `CorpusRecovering`, `HotSnapshot`,
-            // `EnvListing`, `EngineSampleFailed`, `RequestLimitReached` and
-            // `PreparationUnavailable` render fixed text and counts, with
-            // nothing to redact.
-            // `CaptureBounds` quotes only the caller's own window values,
-            // as a parse error quotes their tokens, and so do
-            // `FocusIncomplete`, `FocusAmbiguous`, `WindowsOverlap` and
-            // `CorrelationInvalid` with the read's input.
-            other => other.to_string(),
-        }
+        self.rendered().1.message
     }
 
     /// Return a stable, content-free classification of this error.
     ///
     /// SECURITY: default-filter telemetry logs this instead of any message.
-    /// [`safe_message`](Self::safe_message) is safe to hand a *client* but not
-    /// safe to persist: it deliberately preserves parse/emit text, and
-    /// parser/emitter messages quote the user's own tokens and format strings
-    /// (`Self::Engine(EngineError::Database)`'s raw form likewise embeds the
-    /// generated SQL and the values it choked on). The class comes from a
-    /// closed set of literals, so it is safe to store in the retained
+    /// The public message ([`safe_message`](Self::safe_message)) goes to
+    /// the client and to the failure's own records, which only key holders
+    /// read, but not into telemetry: it keeps parse/emit text, which
+    /// quotes the user's own tokens and format strings, and an error's raw
+    /// `Display` is worse (`Self::Engine(EngineError::Database)`'s embeds
+    /// the generated SQL and the values it choked on). The class comes from
+    /// a closed set of literals, so it is safe to store in the retained
     /// `service=trawld` corpus and stable enough to alarm on.
     pub fn error_class(&self) -> &'static str {
         match self {
@@ -1130,10 +1108,17 @@ impl ServerError {
         self.rendered().1.code
     }
 
-    /// The status and the envelope this error answers with. Pure: the
+    /// The status and the envelope this error answers with, and the
+    /// disclosure projection: the envelope's `message` is the public
+    /// message every record stores ([`Self::safe_message`]). Pure: the
     /// server-side log of a fault is [`Self::log_fault`]'s, written once
     /// per response.
+    ///
+    /// No arm is a wildcard, here or in the nested `Store` match, and the
+    /// lint below keeps it so: a new variant is a compile error until its
+    /// disclosure is decided.
     #[allow(clippy::too_many_lines)] // exhaustive error table is cohesive
+    #[deny(clippy::wildcard_enum_match_arm)]
     fn rendered(&self) -> (StatusCode, trawl_api::ErrorEnvelope) {
         use trawl_api::{ErrorCode, ErrorEnvelope};
 
@@ -1713,10 +1698,9 @@ mod tests {
         let err = ServerError::Engine(EngineError::MissingPreparedPattern);
         assert_eq!(err.error_class(), "missing_prepared_pattern");
         assert_eq!(err.cause_kind(), CauseKind::None);
-        assert_eq!(
-            err.safe_message(),
-            ServerError::Engine(EngineError::MissingPreparedPattern).to_string()
-        );
+        // The tracker stores the sentence the client reads, not the
+        // engine's own wording of the invariant it broke.
+        assert_eq!(err.safe_message(), MISSING_PREPARED_PATTERN);
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = axum::body::to_bytes(response.into_body(), 4096)
@@ -1728,17 +1712,21 @@ mod tests {
         assert!(body["error"].get("details").is_none(), "{body}");
     }
 
-    /// Parse and emit a query the emitter refuses, and read the envelope
-    /// the server answers with.
-    async fn emit_refusal(query: &str) -> (StatusCode, serde_json::Value) {
+    /// Parse and emit a query the emitter refuses, and return its refusal.
+    fn emit_error(query: &str) -> trawl_core::emitter::EmitError {
         let parsed = trawl_core::parser::parse(query).expect("the query parses");
-        let err = trawl_core::emitter::emit(
+        trawl_core::emitter::emit(
             &parsed,
             "/data/**/*.parquet",
             trawl_core::context::EvalContext::capture(),
         )
-        .expect_err("the emitter refuses the query");
-        let response = ServerError::Engine(EngineError::Emit(err)).into_response();
+        .expect_err("the emitter refuses the query")
+    }
+
+    /// Parse and emit a query the emitter refuses, and read the envelope
+    /// the server answers with.
+    async fn emit_refusal(query: &str) -> (StatusCode, serde_json::Value) {
+        let response = ServerError::Engine(EngineError::Emit(emit_error(query))).into_response();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -2105,12 +2093,13 @@ mod tests {
     }
 
     /// The auth backend's 503 keeps the answer it always gave while the
-    /// driver's kind rides along for the failure record.
+    /// driver's kind rides along for the failure record, and the record
+    /// stores the sentence the client reads.
     #[tokio::test]
     async fn an_auth_backend_failure_answers_the_same_redacted_503() {
         let err = ServerError::from(fleet_auth::AuthError::Database(sqlx::Error::PoolTimedOut));
         assert_eq!(err.error_class(), "service_unavailable");
-        assert_eq!(err.safe_message(), "service unavailable");
+        assert_eq!(err.safe_message(), "auth backend unavailable");
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = body_string(response).await;
@@ -2124,7 +2113,7 @@ mod tests {
     async fn a_panic_is_a_redacted_500_with_its_own_class() {
         let err = ServerError::Panicked("query worker");
         assert_eq!(err.error_class(), "panic");
-        assert_eq!(err.safe_message(), "internal error");
+        assert_eq!(err.safe_message(), "internal server error");
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_string(response).await;
@@ -2170,18 +2159,43 @@ mod tests {
         assert!(err.safe_message().contains("bad syntax"));
     }
 
-    /// The pre-start capacity refusal is a fixed sentence about the
-    /// server, so it survives redaction and reaches the query tracker and
-    /// the run row intact. Every other 503 still generalizes: an auth or
-    /// store backend's own words are not for a client.
-    #[test]
-    fn safe_message_keeps_the_capacity_refusal_and_generalizes_the_rest() {
-        let refused = ServerError::CapacityNotStarted;
-        assert_eq!(refused.safe_message(), CAPACITY_NOT_STARTED);
-        assert_eq!(refused.error_class(), "service_unavailable");
+    /// A free-text 503 discloses its text as written, on the wire and in
+    /// the records alike, so a query refused one says why. Provenance
+    /// decides disclosure, not the characters (ADR-0040, amended
+    /// 2026-11-08): the projection passes the text whole, whatever it
+    /// holds, and keeping a backend's own words out is its constructors'
+    /// rule. Backend outages have variants of their own, with fixed
+    /// sentences.
+    #[tokio::test]
+    async fn a_free_text_503_discloses_what_its_constructor_wrote() {
+        let sentence = "dashboard data not yet available";
+        let err = ServerError::ServiceUnavailable(sentence.into());
+        assert_eq!(err.safe_message(), sentence);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_string(err.into_response()).await).unwrap();
+        assert_eq!(body["error"]["message"], sentence);
 
-        let backend = ServerError::ServiceUnavailable("pg://user:pw@host down".into());
-        assert_eq!(backend.safe_message(), "service unavailable");
+        // Nothing filters it: a constructor that passed a DSN would
+        // disclose the DSN, which is why none may.
+        let unfiltered = ServerError::ServiceUnavailable("pg://user:pw@host down".into());
+        assert_eq!(unfiltered.safe_message(), "pg://user:pw@host down");
+
+        for (outage, sentence) in [
+            (
+                ServerError::Store(StoreError::Unavailable(sqlx::Error::Protocol(
+                    "pg://user:pw@host down".into(),
+                ))),
+                "app-state store unavailable",
+            ),
+            (
+                ServerError::from(fleet_auth::AuthError::Database(sqlx::Error::Protocol(
+                    "pg://user:pw@host down".into(),
+                ))),
+                "auth backend unavailable",
+            ),
+        ] {
+            assert_eq!(outage.safe_message(), sentence);
+        }
     }
 
     /// The pre-start capacity refusal is a typed variant (ADR-0040,
@@ -2237,7 +2251,7 @@ mod tests {
     #[test]
     fn safe_message_redacts_internal_errors() {
         let err = ServerError::Internal("db connection string leaked".into());
-        assert_eq!(err.safe_message(), "internal error");
+        assert_eq!(err.safe_message(), "internal server error");
     }
 
     /// A conflict is the state, not the request: 409 with the message
@@ -3148,5 +3162,651 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_string(response).await;
         assert!(!body.contains("zz_secret_token"), "got: {body}");
+    }
+
+    // -- One public message (ADR-0040, amended 2026-11-08) ────────────────
+
+    /// The status, headers and decoded body an error answers with.
+    async fn answer(error: ServerError) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = serde_json::from_str(&body_string(response).await).unwrap();
+        (status, headers, body)
+    }
+
+    /// Writes the disclosure witness and its sample table from one list of
+    /// rows, a pattern and a sample per variant. The witness matches with
+    /// no wildcard at the `ServerError`, `EngineError` or `StoreError`
+    /// level, so a new variant fails to compile until its row exists, and
+    /// the row is what puts its sample in the table.
+    macro_rules! disclosure_rows {
+        (
+            server { $($pat:pat => $sample:expr,)+ }
+            engine { $($engine_pat:pat => $engine_sample:expr,)+ }
+            store { $($store_pat:pat => $store_sample:expr,)+ }
+        ) => {
+            /// The row `error` belongs to, through `Engine` and `Store`.
+            #[deny(clippy::wildcard_enum_match_arm)]
+            fn variant_name(error: &ServerError) -> &'static str {
+                match error {
+                    ServerError::Engine(engine) => match engine {
+                        $($engine_pat => stringify!($engine_pat),)+
+                    },
+                    ServerError::Store(store) => match store {
+                        $($store_pat => stringify!($store_pat),)+
+                    },
+                    $($pat => stringify!($pat),)+
+                }
+            }
+
+            /// One sample of every variant, with the row it was written in.
+            fn every_variant() -> Vec<(&'static str, ServerError)> {
+                vec![
+                    $((stringify!($pat), $sample),)+
+                    $((stringify!($engine_pat), ServerError::Engine($engine_sample)),)+
+                    $((stringify!($store_pat), ServerError::Store($store_sample)),)+
+                ]
+            }
+        };
+    }
+
+    disclosure_rows! {
+        server {
+            ServerError::Unauthorized(_) => {
+                ServerError::Unauthorized("authentication failed".into())
+            },
+            ServerError::Forbidden(_) => {
+                ServerError::Forbidden("no trawl grant for this key".into())
+            },
+            ServerError::BadRequest(_) => {
+                ServerError::BadRequest("invalid service name: a/b".into())
+            },
+            ServerError::NotFound(_) => ServerError::NotFound("field not pinned: status".into()),
+            ServerError::Conflict(_) => ServerError::Conflict("a repin owns the data root".into()),
+            ServerError::WindowPolicy(_) => {
+                ServerError::WindowPolicy(WindowPolicyError::TimeClause {
+                    window: crate::report_window::ScheduleWindow::SinceLast,
+                    clause: trawl_core::ast::TimeClause::Last,
+                })
+            },
+            ServerError::WindowPlan(_) => ServerError::WindowPlan(PlanError::InvalidConfig),
+            ServerError::WindowMaterialize(_) => {
+                ServerError::WindowMaterialize(MaterializeError::BodyChanged)
+            },
+            ServerError::Timeout => ServerError::Timeout,
+            ServerError::RegexResources(_) => {
+                ServerError::RegexResources(trawl_core::pattern::RegexRefusal::Budget)
+            },
+            ServerError::PreparationUnavailable => ServerError::PreparationUnavailable,
+            ServerError::Ingest(_) => ServerError::Ingest("line 3: missing _time".into()),
+            ServerError::IngestBodyTooLarge { .. } => {
+                ServerError::IngestBodyTooLarge { limit: 1_048_576 }
+            },
+            ServerError::RequestTooLarge { .. } => ServerError::RequestTooLarge {
+                setting: "[server] max_request_body_bytes",
+                limit: 131_072,
+            },
+            ServerError::RateLimited { .. } => ServerError::RateLimited { retry_after_secs: 2 },
+            ServerError::TooManyStreams => ServerError::TooManyStreams,
+            ServerError::ServiceUnavailable(_) => {
+                ServerError::ServiceUnavailable("service schema not yet available".into())
+            },
+            ServerError::CapacityNotStarted => ServerError::CapacityNotStarted,
+            ServerError::AuthBackend(_) => ServerError::AuthBackend(CauseKind::PgIo),
+            ServerError::HotBufferFull { .. } => ServerError::HotBufferFull { retry_after_secs: 5 },
+            ServerError::IngestBatchTooLarge { .. } => ServerError::IngestBatchTooLarge {
+                requested: None,
+                ceiling: Charge::ZERO,
+            },
+            ServerError::PreviewTooLarge { .. } => ServerError::PreviewTooLarge { limit: 500 },
+            ServerError::CaptureSourceTooLarge { .. } => ServerError::CaptureSourceTooLarge {
+                selected_bytes: 20,
+                max_bytes: 10,
+            },
+            ServerError::CaptureBounds(_) => ServerError::CaptureBounds(BoundsError::LatestAlone),
+            ServerError::CaptureTooLarge(_) => ServerError::CaptureTooLarge(CaptureOverflow::Rows {
+                rows: 6000,
+                max_rows: 5000,
+            }),
+            ServerError::CaptureBusy { .. } => ServerError::CaptureBusy { retry_after_secs: 7 },
+            ServerError::CaptureQuotaExceeded { .. } => {
+                ServerError::CaptureQuotaExceeded { retry_after_secs: 900 }
+            },
+            ServerError::ResultGone { .. } => ServerError::ResultGone {
+                reason: GoneReason::Expired,
+            },
+            ServerError::ResultUnavailable => ServerError::ResultUnavailable,
+            ServerError::ResultCorrupt => ServerError::ResultCorrupt,
+            ServerError::FocusIncomplete(_) => {
+                ServerError::FocusIncomplete("the focus row has no `host`".into())
+            },
+            ServerError::FocusAmbiguous(_) => {
+                ServerError::FocusAmbiguous("the focus row has two `env` columns".into())
+            },
+            ServerError::WindowsOverlap(_) => {
+                ServerError::WindowsOverlap("the foreground and baseline windows overlap".into())
+            },
+            ServerError::CorrelationInvalid(_) => {
+                ServerError::CorrelationInvalid("the literal is empty".into())
+            },
+            ServerError::SequenceConflict { .. } => ServerError::SequenceConflict {
+                expected: 4,
+                current: 6,
+            },
+            ServerError::InvestigationExists => ServerError::InvestigationExists,
+            ServerError::InvestigationClosed => ServerError::InvestigationClosed,
+            ServerError::EvidenceBudgetExceeded { .. } => {
+                ServerError::EvidenceBudgetExceeded { used: 10, limit: 20 }
+            },
+            ServerError::UnsupportedEncoding => ServerError::UnsupportedEncoding,
+            ServerError::CorpusRecovering(_) => {
+                ServerError::CorpusRecovering(CorpusUnsettled::RollupPending)
+            },
+            ServerError::HotSnapshot(_) => {
+                ServerError::HotSnapshot(std::io::Error::other("snapshot"))
+            },
+            ServerError::EnvListing(_) => ServerError::EnvListing(std::io::Error::other("listing")),
+            ServerError::EngineSampleFailed => ServerError::EngineSampleFailed,
+            ServerError::RequestLimitReached(_) => {
+                ServerError::RequestLimitReached(Allowance::Probe)
+            },
+            ServerError::Internal(_) => ServerError::Internal("task was cancelled".into()),
+            ServerError::Panicked(_) => ServerError::Panicked("query worker"),
+        }
+        engine {
+            EngineError::Parse(_) => EngineError::Parse(vec![trawl_core::parser::ParseError {
+                message: "unexpected token".into(),
+                span: 0..3,
+                label: None,
+                hint: None,
+            }]),
+            EngineError::Emit(_) => {
+                EngineError::Emit(emit_error("* | stats nosuchfunc(x) by host"))
+            },
+            EngineError::Database(_) => {
+                EngineError::Database(duckdb::Error::InvalidColumnName("column".into()))
+            },
+            EngineError::ResourceExhausted => EngineError::ResourceExhausted,
+            EngineError::RegexResources(_) => {
+                EngineError::RegexResources(trawl_core::pattern::RegexRefusal::Reservation)
+            },
+            EngineError::ResultTooLarge(_) => EngineError::ResultTooLarge(5000),
+            EngineError::AggregationCapped(_) => {
+                EngineError::AggregationCapped(trawl_core::stream::AggregationCap::Groups)
+            },
+            EngineError::ColdDataUnread => EngineError::ColdDataUnread,
+            EngineError::Refused { .. } => EngineError::Refused {
+                message: "timechart on 'host' is not a timestamp: VARCHAR".into(),
+            },
+            EngineError::IntegerOutOfRange { .. } => EngineError::IntegerOutOfRange {
+                column: "total".into(),
+            },
+            EngineError::NotParquetStorable { .. } => EngineError::NotParquetStorable {
+                reason: "a mixed column".into(),
+            },
+            EngineError::BudgetNotApplied { .. } => EngineError::BudgetNotApplied {
+                setting: "memory_limit",
+                configured: "1GiB".into(),
+                applied: "2GiB".into(),
+            },
+            EngineError::MissingPreparedPattern => EngineError::MissingPreparedPattern,
+            EngineError::Io(_) => EngineError::Io(std::io::Error::other("io")),
+            EngineError::Cancelled => EngineError::Cancelled,
+        }
+        store {
+            StoreError::Unavailable(_) => StoreError::Unavailable(sqlx::Error::PoolTimedOut),
+            StoreError::Migration(_) => {
+                StoreError::Migration(crate::store::migrations::SchemaError::UntrackedSchema)
+            },
+            StoreError::LockHeld => StoreError::LockHeld,
+            StoreError::DuplicateName { .. } => StoreError::DuplicateName { name: "x".into() },
+            StoreError::ScheduleExists { .. } => StoreError::ScheduleExists { saved_query_id: 1 },
+            StoreError::InvestigationNotFound => StoreError::InvestigationNotFound,
+            StoreError::SequenceConflict { .. } => StoreError::SequenceConflict {
+                expected: 1,
+                current: 2,
+            },
+            StoreError::InvestigationClosed => StoreError::InvestigationClosed,
+            StoreError::NotFound { .. } => StoreError::NotFound {
+                id: 9,
+                resource: "saved query",
+            },
+            StoreError::Validation(_) => StoreError::Validation("expires_at is in the past".into()),
+            StoreError::InvalidInterval { .. } => {
+                StoreError::InvalidInterval { input: "5x".into() }
+            },
+            StoreError::IntervalTooShort { .. } => StoreError::IntervalTooShort { secs: 3 },
+            StoreError::DurationTooLong { .. } => StoreError::DurationTooLong { secs: u64::MAX },
+            StoreError::LagWithoutWindow { .. } => StoreError::LagWithoutWindow { lag_secs: 60 },
+            StoreError::InvalidName { .. } => StoreError::InvalidName { name: "a\tb".into() },
+            StoreError::RepinAlreadyRunning => StoreError::RepinAlreadyRunning,
+            StoreError::PurgeCommitUnknown => StoreError::PurgeCommitUnknown,
+            StoreError::PurgePrepareTimeout => StoreError::PurgePrepareTimeout,
+            StoreError::WaitExpired => StoreError::WaitExpired,
+            StoreError::RepinPinVanished { .. } => StoreError::RepinPinVanished {
+                field: "status".into(),
+                expected: "BIGINT",
+                found: None,
+            },
+        }
+    }
+
+    /// Every variant's disclosure is decided at compile time: the witness
+    /// above names each one with no wildcard at any level, and each sample
+    /// is the variant its row names, so no sample stands in for another
+    /// and every row's sample reaches the projection tests below.
+    #[test]
+    fn every_variant_has_a_decided_disclosure() {
+        let mut names = std::collections::HashSet::new();
+        for (row, error) in every_variant() {
+            assert_eq!(variant_name(&error), row, "the sample in row {row}");
+            assert!(names.insert(row), "{row} has two rows");
+            assert!(!error.safe_message().is_empty(), "{row} discloses nothing");
+        }
+    }
+
+    /// The decoded wire `message` is the public message every record
+    /// stores, for every variant: one projection, not two policies.
+    #[tokio::test]
+    async fn wire_and_stored_messages_are_one_projection() {
+        for (row, error) in every_variant() {
+            let stored = error.safe_message();
+            let code = serde_json::to_value(error.code()).unwrap();
+            let (status, _, body) = answer(error).await;
+            assert_eq!(body["error"]["message"], stored, "{row}");
+            assert_eq!(body["error"]["code"], code, "{row}");
+            assert!(
+                status.is_client_error() || status.is_server_error(),
+                "{row} answers {status}"
+            );
+        }
+    }
+
+    /// Errors that carry internals answer their fixed sentence, wherever
+    /// the planted path, SQL, driver text or panic label sat inside them.
+    #[tokio::test]
+    async fn internal_markers_do_not_cross_the_disclosure_boundary() {
+        use crate::store::migrations::SchemaError;
+
+        const PATH: &str = "/var/lib/trawl/data/MARKER-path/prod/x.parquet";
+        const SQL: &str = "SELECT MARKER_sql FROM read_parquet('/var/lib/trawl/data/**')";
+        const DRIVER: &str = "MARKER-driver: password authentication failed for user trawl";
+        const PANIC: &str = "MARKER-panic-label";
+        // A plan error has no field to plant in. Its own sentence is the
+        // detail that stays in the log, so it is the marker.
+        let plan_detail = PlanError::Arithmetic.to_string();
+
+        let cases: Vec<(ServerError, String)> = vec![
+            (
+                ServerError::Engine(EngineError::Database(duckdb::Error::DuckDBFailure(
+                    duckdb::ffi::Error::new(1),
+                    Some(SQL.into()),
+                ))),
+                SQL.into(),
+            ),
+            (
+                ServerError::Engine(EngineError::Database(duckdb::Error::InvalidColumnName(
+                    PATH.into(),
+                ))),
+                PATH.into(),
+            ),
+            (
+                ServerError::Engine(EngineError::Io(std::io::Error::other(PATH))),
+                PATH.into(),
+            ),
+            (
+                ServerError::Engine(EngineError::BudgetNotApplied {
+                    setting: "temp_directory",
+                    configured: PATH.into(),
+                    applied: SQL.into(),
+                }),
+                "MARKER".into(),
+            ),
+            (
+                ServerError::Engine(EngineError::NotParquetStorable {
+                    reason: PATH.into(),
+                }),
+                PATH.into(),
+            ),
+            (
+                ServerError::Store(StoreError::Unavailable(sqlx::Error::Protocol(
+                    DRIVER.into(),
+                ))),
+                DRIVER.into(),
+            ),
+            (
+                ServerError::Store(StoreError::Migration(SchemaError::Database(
+                    sqlx::Error::Protocol(DRIVER.into()),
+                ))),
+                DRIVER.into(),
+            ),
+            (
+                ServerError::HotSnapshot(std::io::Error::other(PATH)),
+                PATH.into(),
+            ),
+            (
+                ServerError::EnvListing(std::io::Error::other(PATH)),
+                PATH.into(),
+            ),
+            (
+                ServerError::Internal(format!("{DRIVER} at {PATH} running {SQL}")),
+                "MARKER".into(),
+            ),
+            (ServerError::Panicked(PANIC), PANIC.into()),
+            (ServerError::WindowPlan(PlanError::Arithmetic), plan_detail),
+            (
+                ServerError::WindowMaterialize(MaterializeError::SourceUnparseable {
+                    message: SQL.into(),
+                }),
+                SQL.into(),
+            ),
+            (
+                ServerError::WindowMaterialize(MaterializeError::OutputUnparseable {
+                    message: PATH.into(),
+                }),
+                PATH.into(),
+            ),
+            (
+                ServerError::WindowMaterialize(MaterializeError::BoundsNotReadBack {
+                    start: PATH.into(),
+                    end: SQL.into(),
+                }),
+                "MARKER".into(),
+            ),
+        ];
+        for (error, marker) in cases {
+            let label = format!("{error:?}");
+            // The marker is in the error, so its absence below is the
+            // projection's doing.
+            assert!(
+                error.to_string().contains(&marker) || label.contains(&marker),
+                "the marker was planted in {label}"
+            );
+            let stored = error.safe_message();
+            let (_, headers, body) = answer(error).await;
+            let wire = body["error"]["message"].as_str().unwrap().to_owned();
+            for (place, text) in [
+                ("public message", stored),
+                ("wire message", wire),
+                ("body", body.to_string()),
+            ] {
+                assert!(!text.contains(&marker), "{place} of {label}: {text}");
+                assert!(!text.contains("/var/lib"), "{place} of {label}: {text}");
+            }
+            for value in headers.values() {
+                assert!(!value.to_str().unwrap().contains("MARKER"), "{label}");
+            }
+        }
+    }
+
+    /// What a caller needs to act on survives the projection whole: parse
+    /// spans and emit hints, configured limits, counts, sequence numbers
+    /// and the specialized 409 codes, each with its status, code, details,
+    /// `conflict` member and headers, and with the same text in the record.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one flat table of facts, one row per answer
+    async fn approved_domain_facts_remain_actionable() {
+        use serde_json::json;
+
+        struct Fact {
+            error: ServerError,
+            status: StatusCode,
+            code: &'static str,
+            message: &'static str,
+            details: Option<serde_json::Value>,
+            conflict: Option<serde_json::Value>,
+            retry_after: Option<&'static str>,
+            no_store: bool,
+        }
+        let fact = |error, status, code, message| Fact {
+            error,
+            status,
+            code,
+            message,
+            details: None,
+            conflict: None,
+            retry_after: None,
+            no_store: false,
+        };
+
+        let facts = vec![
+            Fact {
+                details: Some(json!([
+                    {
+                        "message": "unexpected token 'zz_tok'",
+                        "span": {"start": 4, "end": 10},
+                        "label": "pipeline",
+                        "hint": "did you mean 'stats'?",
+                    },
+                    {"message": "unclosed string", "span": {"start": 12, "end": 14}},
+                ])),
+                ..fact(
+                    ServerError::Engine(EngineError::Parse(vec![
+                        trawl_core::parser::ParseError {
+                            message: "unexpected token 'zz_tok'".into(),
+                            span: 4..10,
+                            label: Some("pipeline".into()),
+                            hint: Some("did you mean 'stats'?".into()),
+                        },
+                        trawl_core::parser::ParseError {
+                            message: "unclosed string".into(),
+                            span: 12..14,
+                            label: None,
+                            hint: None,
+                        },
+                    ])),
+                    StatusCode::BAD_REQUEST,
+                    "parse_error",
+                    "unexpected token 'zz_tok'",
+                )
+            },
+            Fact {
+                details: Some(json!([
+                    {"message": "unknown function: countt", "hint": "did you mean 'count'?"},
+                ])),
+                ..fact(
+                    ServerError::Engine(EngineError::Emit(emit_error(
+                        "* | stats countt(x) by host",
+                    ))),
+                    StatusCode::BAD_REQUEST,
+                    "validation_error",
+                    "unknown function: countt (did you mean 'count'?)",
+                )
+            },
+            fact(
+                ServerError::RequestTooLarge {
+                    setting: "[server] max_request_body_bytes",
+                    limit: 131_072,
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "request body exceeds [server] max_request_body_bytes (131072 bytes)",
+            ),
+            fact(
+                ServerError::IngestBodyTooLarge { limit: 1_048_576 },
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "ingest_error",
+                "gzip body decompresses past the 1048576 byte limit ([ingest] max_body_bytes); \
+                 send smaller batches",
+            ),
+            fact(
+                ServerError::IngestBatchTooLarge {
+                    requested: Some(Charge {
+                        events: 61,
+                        bytes: 700,
+                    }),
+                    ceiling: Charge {
+                        events: 60,
+                        bytes: 960,
+                    },
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "ingest_batch_too_large",
+                "ingest batch too large: 61 events and 700 serialized bytes exceed the limit of \
+                 60 events or 960 serialized bytes per request; split the batch",
+            ),
+            fact(
+                ServerError::Engine(EngineError::ResultTooLarge(5000)),
+                StatusCode::BAD_REQUEST,
+                "result_too_large",
+                "result exceeded 5000 row limit",
+            ),
+            fact(
+                ServerError::CaptureSourceTooLarge {
+                    selected_bytes: 20,
+                    max_bytes: 10,
+                },
+                StatusCode::BAD_REQUEST,
+                "capture_source_too_large",
+                "the window selects 20 bytes of stored data, above the capture limit of 10 \
+                 bytes; narrow the window",
+            ),
+            fact(
+                ServerError::EvidenceBudgetExceeded {
+                    used: 10,
+                    limit: 20,
+                },
+                StatusCode::CONFLICT,
+                "evidence_budget_exceeded",
+                "keeping this result would exceed the evidence budget: 10 of 20 bytes are \
+                 already kept; evidence frees as it ages out, or when an operator with \
+                 server_manage deletes an investigation",
+            ),
+            Fact {
+                conflict: Some(json!({"expected": 4, "current": 6})),
+                ..fact(
+                    ServerError::SequenceConflict {
+                        expected: 4,
+                        current: 6,
+                    },
+                    StatusCode::CONFLICT,
+                    "sequence_conflict",
+                    "the investigation changed: the request expected sequence 4 and it is now \
+                     6; read it again and retry",
+                )
+            },
+            Fact {
+                conflict: Some(json!({"expected": 1, "current": 2})),
+                ..fact(
+                    ServerError::Store(StoreError::SequenceConflict {
+                        expected: 1,
+                        current: 2,
+                    }),
+                    StatusCode::CONFLICT,
+                    "sequence_conflict",
+                    "the investigation is at sequence 2, not the expected 1",
+                )
+            },
+            fact(
+                ServerError::InvestigationExists,
+                StatusCode::CONFLICT,
+                "investigation_exists",
+                "an investigation with this id already exists with a different creator or \
+                 different fields; create it under a new id",
+            ),
+            fact(
+                ServerError::InvestigationClosed,
+                StatusCode::CONFLICT,
+                "investigation_closed",
+                "the investigation is closed; reopen it before adding work, keeps, findings or \
+                 notes",
+            ),
+            fact(
+                ServerError::ResultUnavailable,
+                StatusCode::CONFLICT,
+                "result_unavailable",
+                "the captured result's file is missing; its rows cannot be read",
+            ),
+            // A generic 409 keeps `bad_request`, with its remedy as written.
+            fact(
+                ServerError::Conflict("a repin owns the data root; retry after it finishes".into()),
+                StatusCode::CONFLICT,
+                "bad_request",
+                "a repin owns the data root; retry after it finishes",
+            ),
+            fact(
+                ServerError::Store(StoreError::RepinAlreadyRunning),
+                StatusCode::CONFLICT,
+                "bad_request",
+                "a repin job is already running (one at a time, install-wide)",
+            ),
+            fact(
+                ServerError::BadRequest("offset + limit exceeds max_result_rows (1000)".into()),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "offset + limit exceeds max_result_rows (1000)",
+            ),
+            fact(
+                ServerError::Store(StoreError::IntervalTooShort { secs: 3 }),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "schedule interval 3s is below minimum of 60s",
+            ),
+            fact(
+                ServerError::Store(StoreError::NotFound {
+                    id: 9,
+                    resource: "saved query",
+                }),
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "saved query not found or unauthorized",
+            ),
+            fact(
+                ServerError::WindowPolicy(WindowPolicyError::TimeClause {
+                    window: crate::report_window::ScheduleWindow::SinceLast,
+                    clause: trawl_core::ast::TimeClause::Last,
+                }),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "schedule window \"since_last\" conflicts with the saved query's last= time \
+                 clause; remove one side",
+            ),
+            Fact {
+                retry_after: Some("37"),
+                ..fact(
+                    ServerError::HotBufferFull {
+                        retry_after_secs: 37,
+                    },
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "hot_buffer_full",
+                    "hot buffer full: nothing from this request was written; retry it after \
+                     compaction drains",
+                )
+            },
+            Fact {
+                no_store: true,
+                ..fact(
+                    ServerError::RequestLimitReached(Allowance::Regular),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "request_limit_reached",
+                    REQUEST_LIMIT_REACHED,
+                )
+            },
+        ];
+
+        for fact in facts {
+            let label = format!("{:?}", fact.error);
+            assert_eq!(fact.error.safe_message(), fact.message, "{label}");
+            let (status, headers, body) = answer(fact.error).await;
+            assert_eq!(status, fact.status, "{label}");
+            let error = &body["error"];
+            assert_eq!(error["code"], fact.code, "{label}");
+            assert_eq!(error["message"], fact.message, "{label}");
+            assert_eq!(error.get("details"), fact.details.as_ref(), "{label}");
+            assert_eq!(error.get("conflict"), fact.conflict.as_ref(), "{label}");
+            assert_eq!(
+                headers
+                    .get(axum::http::header::RETRY_AFTER)
+                    .map(|v| v.to_str().unwrap()),
+                fact.retry_after,
+                "{label}"
+            );
+            assert_eq!(
+                headers.get(axum::http::header::CACHE_CONTROL).is_some(),
+                fact.no_store,
+                "{label}"
+            );
+        }
     }
 }
