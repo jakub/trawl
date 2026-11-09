@@ -270,8 +270,8 @@ path = "~/.trawl/data"
 
 # How often server stats (pool utilization, SSE connections, hot buffer
 # metrics) are emitted as telemetry events (seconds). Lower values give
-# more granular observability at the cost of telemetry volume.
-# 0 = disabled.
+# more granular observability at the cost of telemetry volume. Must be
+# greater than 0.
 # stats_interval_secs = 60
 
 # How often buffered tracing events are flushed to WAL (seconds).
