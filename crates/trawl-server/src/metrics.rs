@@ -1133,7 +1133,13 @@ impl<T: Clone> StorageCache<T> {
         scan: impl FnOnce() -> std::io::Result<T>,
         mut publish: impl FnMut(T),
     ) {
-        let _owner = self.attempt.lock().expect("storage attempt poisoned");
+        // A scan that panics poisons this lock while it holds it. The lock
+        // guards `()` and `state` is never held across a scan, so taking it
+        // back recovers nothing half-written, and the next attempt can run.
+        let _owner = self
+            .attempt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Recheck after ownership: another emitter or scrape may have finished
         // while this caller waited. Never publish gauges outside this owner.
         let due = {
@@ -1807,6 +1813,57 @@ mod tests {
             || start + Duration::from_secs(109),
             || panic!("completion controls TTL"),
             |_| {},
+        );
+    }
+
+    #[test]
+    fn a_panicked_scan_does_not_stop_later_collections() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::time::Duration;
+        let cache = StorageCache::default();
+        let start = Instant::now();
+        let before = StorageTotals {
+            files: 2,
+            bytes: 17,
+        };
+        let after = StorageTotals {
+            files: 3,
+            bytes: 40,
+        };
+        cache.collect(|| start, || Ok(before), |_| {});
+
+        let due = start + STORAGE_CACHE_TTL;
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            cache.collect(|| due, || panic!("injected scan panic"), |_| {});
+        }));
+        assert!(panicked.is_err(), "the scan panic reaches the caller");
+
+        // The sample completed before the panic stays readable.
+        let snapshot = cache.snapshot(true, due);
+        assert_eq!(
+            (snapshot.files, snapshot.bytes),
+            (before.files, before.bytes)
+        );
+        assert_eq!(
+            snapshot.measurement.sample_age_secs,
+            Some(STORAGE_CACHE_TTL.as_secs())
+        );
+
+        // The panicked attempt never finished, so the next one is due.
+        let recovered = due + Duration::from_secs(1);
+        let mut published = None;
+        cache.collect(
+            || recovered,
+            || Ok(after),
+            |sample| published = Some(sample),
+        );
+        assert_eq!(published, Some(after));
+        assert_storage(
+            &cache,
+            recovered,
+            trawl_api::StorageMeasurementStatus::Complete,
+            after,
+            Some(0),
         );
     }
 
