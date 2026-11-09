@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 /// The current storage epoch, written to `data/EPOCH`.
 pub const CURRENT_EPOCH: &str = "3";
 /// Marker filename inside the data root.
-pub const EPOCH_FILE: &str = "EPOCH";
+pub const EPOCH_FILE: &str = trawl_config::EPOCH_MARKER;
 /// Suffix for staged marker files shared with catalog, repin, and rollup.
 const NEXT_SUFFIX: &str = ".next";
 
@@ -320,9 +320,8 @@ pub fn classify_data_root<R: RootReader>(
         })?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        owned |= matches!(name.as_ref(), "wal" | "CATALOG" | "REPIN" | "scheduled")
-            || name.starts_with("EPOCH.next.")
-            || (meta.is_dir() && is_date_partition(&name));
+        owned |= trawl_config::is_reserved_root_entry(&name)
+            || (meta.is_dir() && crate::env_dirs::is_owned_residue_dir_name(&name));
         // A PID name alone is not authority to discard an entry. An initial
         // publication can leave only a regular file containing a prefix of
         // the current marker, including zero bytes before its first write.
@@ -330,7 +329,7 @@ pub fn classify_data_root<R: RootReader>(
             staged_epochs.push(entry.path());
         } else {
             empty = false;
-            if name.starts_with("EPOCH.next.") {
+            if name.starts_with(trawl_config::EPOCH_STAGING_PREFIX) {
                 refused_staging = Some(entry.path());
             }
         }
@@ -395,7 +394,7 @@ fn is_staged_epoch<R: RootReader>(
     let name = entry.file_name();
     let Some(pid) = name
         .to_str()
-        .and_then(|name| name.strip_prefix("EPOCH.next."))
+        .and_then(|name| name.strip_prefix(trawl_config::EPOCH_STAGING_PREFIX))
     else {
         return Ok(false);
     };
@@ -471,20 +470,12 @@ fn validate_wal<E>(wal_dir: &Path) -> Result<(), RootFault<E>> {
     Ok(())
 }
 
-/// A top-level date partition is an owned storage layout, not a generic archive.
-fn is_date_partition(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
-}
-
 fn publish_epoch(data_root: &Path) -> Result<(), String> {
-    let staged = data_root.join(format!("EPOCH.next.{}", std::process::id()));
+    let staged = data_root.join(format!(
+        "{}{}",
+        trawl_config::EPOCH_STAGING_PREFIX,
+        std::process::id()
+    ));
     // Admission removed only proven initial-publication remnants. Exclusive
     // creation refuses any replacement entry, including a symlink, instead
     // of truncating or following it. Keep the same handle through fsync.
@@ -1115,6 +1106,72 @@ mod tests {
             assert!(err.contains("nonempty but has no EPOCH"), "{err}");
             assert_eq!(snapshot(tmp.path()), before);
         }
+    }
+
+    /// Owned-residue detection is looser than partition validity: a
+    /// date-shaped directory that is no calendar date still marks the root
+    /// as trawl's, so a query-only node refuses it and changes nothing.
+    #[test]
+    fn refuses_impossible_date_as_owned_residue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("2026-13-45")).unwrap();
+        let before = snapshot(tmp.path());
+        let err = ensure_current_epoch(&data, &data.join("wal"), false).unwrap_err();
+        assert!(err.contains("nonempty but has no EPOCH"), "{err}");
+        assert_eq!(snapshot(tmp.path()), before);
+        assert!(crate::env_dirs::is_owned_residue_dir_name("2026-13-45"));
+        assert_eq!(crate::env_dirs::parse_date("2026-13-45"), None);
+    }
+
+    /// Every consumer of the reserved root entries reads the one
+    /// definition in `trawl-config`: the env exclusions, this gate's owned
+    /// check and the `server.log_file` marker guard.
+    #[test]
+    fn reserved_root_entries_agree_across_consumers() {
+        for dir in trawl_config::RESERVED_ROOT_DIRS {
+            assert!(!crate::env_dirs::is_env_dir_name(dir), "{dir}");
+        }
+        let staged = format!("{}123", trawl_config::EPOCH_STAGING_PREFIX);
+        // EPOCH is the marker this gate reads before it lists the root.
+        let owned = trawl_config::RESERVED_ROOT_DIRS
+            .into_iter()
+            .chain(
+                trawl_config::STORAGE_MARKERS
+                    .into_iter()
+                    .filter(|name| *name != trawl_config::EPOCH_MARKER),
+            )
+            .chain([staged.as_str()]);
+        for name in owned {
+            assert!(trawl_config::is_reserved_root_entry(name), "{name}");
+            for as_dir in [true, false] {
+                let tmp = tempfile::tempdir().unwrap();
+                let data = tmp.path().join("data");
+                std::fs::create_dir(&data).unwrap();
+                if as_dir {
+                    std::fs::create_dir(data.join(name)).unwrap();
+                } else {
+                    std::fs::write(data.join(name), b"").unwrap();
+                }
+                let before = snapshot(tmp.path());
+                let err = ensure_current_epoch(&data, &data.join("wal"), false).unwrap_err();
+                assert!(err.contains("nonempty but has no EPOCH"), "{name}: {err}");
+                assert_eq!(snapshot(tmp.path()), before, "{name}");
+            }
+        }
+        for name in ["export", "prod", "EPOCH.next", "2026-01-01"] {
+            assert!(!trawl_config::is_reserved_root_entry(name), "{name}");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        for marker in trawl_config::STORAGE_MARKERS {
+            let err = crate::config_check::validate_log_destination(&data.join(marker), &data)
+                .unwrap_err();
+            assert!(err.to_string().contains("reserved storage marker"), "{err}");
+        }
+        crate::config_check::validate_log_destination(&data.join("server.log"), &data).unwrap();
     }
 
     #[test]

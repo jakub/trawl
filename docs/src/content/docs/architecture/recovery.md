@@ -88,7 +88,7 @@ Every fsync is fatal: a failure stops the rollup at that step. A failure before 
 
 Recovery runs under the publication write guard. It runs at boot, before boot conformance, and at the start of each compaction pass, before the pass compacts any WAL. So a marker that recovery can finish never reaches a client.
 
-Recovery opens the marker, the tmp, the daily file and each hourly file as regular files only. It never follows a symlink, and a FIFO does not make it wait. It reads a marker only up to its size bound, which holds 100 inputs, and it refuses a name outside the `HH/{service}.parquet` form. It hashes the files and compares each size and digest with the marker. It does not parse Parquet footers, it fsyncs directories but never a file, and it never merges again.
+Recovery opens the marker, the tmp, the daily file and each hourly file as regular files only. It never follows a symlink, and a FIFO does not make it wait. It reads a marker only up to its size bound, which holds 24 inputs. It refuses a name outside the `HH/{service}.parquet` form, where `HH` is `00` to `23`. It hashes the files and compares each size and digest with the marker. It does not parse Parquet footers, it fsyncs directories but never a file, and it never merges again.
 
 Recovery applies the first case that holds:
 
@@ -134,6 +134,7 @@ When recovery cannot prove what an interrupted rollup did, it waits for you. Hea
    - `input_missing`: a listed hourly file is gone, and neither the daily file nor the tmp is the replacement.
    - `input_mismatch` or `input_unreadable`: a listed hourly file that is still there has a different identity, or could not be read.
    - `marker_old_format`, `marker_unsupported_version`, `marker_malformed`, `marker_oversized` or `marker_unreadable`: recovery cannot use the marker itself.
+   - `day_not_canonical`: the marker is in a directory whose name is not a calendar date written as `YYYY-MM-DD`, so recovery reads and changes nothing in it. Move that directory out of the data root.
 5. Take one of these actions. Afterwards, each row of that service and day must be in exactly one place: the daily file or one hourly file.
    - **Move the candidate file aside.** The candidate is the file that the failed proof names. Move it out of the data root, for example next to your backup, and keep the marker. At the next start, recovery decides again from the files that remain. It finishes or abandons the rollup if it can now prove the state. Moving a file aside takes its rows out of search, so do it only when another file holds those rows, or when you accept losing them.
    - **Remove the marker.** The next rollup then merges the hourly files and the daily file that remain. This is right only when no row is in both the daily file and an hourly file. If the daily file already holds an hourly file's rows, move that hourly file aside first, or the next rollup duplicates its rows. You can leave the tmp: stale temporary-file cleanup removes it. A `marker_*` proof leaves only this action, because recovery cannot read the marker.

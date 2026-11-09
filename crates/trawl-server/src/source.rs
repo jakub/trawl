@@ -25,6 +25,7 @@ use trawl_engine::parquet_stats::{
     ParquetStatsError, StatVal, TimestampUnit, read_row_group_bounds,
 };
 
+use crate::env_dirs::{date_name, hour_name, parse_date, parse_hour};
 use crate::ingest::envelope::MAX_TIME_LEAD;
 
 /// How far before `now - N` a `last=N` walk over hour directories starts,
@@ -592,7 +593,7 @@ fn partition_dirs(
         .expect("valid hour from Timelike::hour()");
 
     while cursor <= now {
-        let day = cursor.format("%Y-%m-%d").to_string();
+        let day = date_name(cursor.date());
 
         if cursor.date() == today {
             // Today may have day-level consolidated files from a
@@ -602,7 +603,7 @@ fn partition_dirs(
                 dirs.push(format!("{base}/{day}"));
             }
             while cursor <= now {
-                let hour = cursor.format("%H");
+                let hour = hour_name(cursor_hour(cursor));
                 dirs.push(format!("{base}/{day}/{hour}"));
                 cursor += chrono::Duration::hours(1);
             }
@@ -614,8 +615,8 @@ fn partition_dirs(
                 dirs.push(format!("{base}/{day}"));
             }
             if has_hours || !has_day {
-                for h in cursor.hour()..24 {
-                    dirs.push(format!("{base}/{day}/{h:02}"));
+                for h in cursor_hour(cursor)..24 {
+                    dirs.push(format!("{base}/{day}/{}", hour_name(h)));
                 }
             }
 
@@ -630,10 +631,15 @@ fn partition_dirs(
     dirs
 }
 
+/// The hour of `cursor`, as an hour directory counts it.
+fn cursor_hour(cursor: NaiveDateTime) -> u8 {
+    u8::try_from(cursor.hour()).expect("Timelike::hour() is below 24")
+}
+
 /// Date-scoped directories for one env root, for queries without a
 /// `last=` filter.
 ///
-/// Enumerates directories matching `YYYY-MM-DD` in the env base, each read
+/// Enumerates the date directories ([`parse_date`]) in the env base, each read
 /// through `**`. Returns an empty vec when the env base holds no date dirs.
 fn date_scoped_dirs(base: &str) -> Vec<Element> {
     let Ok(entries) = std::fs::read_dir(base) else {
@@ -646,7 +652,7 @@ fn date_scoped_dirs(base: &str) -> Vec<Element> {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if is_date_dir_name(name_str) && entry.path().is_dir() {
+        if parse_date(name_str).is_some() && entry.path().is_dir() {
             dirs.push(format!("{base}/{name_str}"));
         }
     }
@@ -655,19 +661,6 @@ fn date_scoped_dirs(base: &str) -> Vec<Element> {
     // source list is stable across calls.
     dirs.sort();
     dirs.into_iter().map(Element::date).collect()
-}
-
-/// Check if a directory name looks like `YYYY-MM-DD`.
-fn is_date_dir_name(name: &str) -> bool {
-    if name.len() != 10 {
-        return false;
-    }
-    let bytes = name.as_bytes();
-    bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[..4].iter().all(u8::is_ascii_digit)
-        && bytes[5..7].iter().all(u8::is_ascii_digit)
-        && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
 /// Check if a date directory has day-level parquet files (consolidated).
@@ -708,7 +701,7 @@ fn has_hour_dirs(base: &str, day: &str) -> bool {
         }
         p.file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.len() == 2 && n.bytes().all(|b| b.is_ascii_digit()))
+            .is_some_and(|n| parse_hour(n).is_some())
     })
 }
 
@@ -728,6 +721,25 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect()
+    }
+
+    /// A date-shaped directory that names no calendar date is not a date
+    /// partition: a query without `last=` does not read it.
+    #[test]
+    fn date_scoped_dirs_skips_noncalendar_dates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("prod");
+        for day in ["2026-01-15", "2026-13-45"] {
+            let hour = base.join(day).join("07");
+            std::fs::create_dir_all(&hour).unwrap();
+            std::fs::write(hour.join("svc.parquet"), b"").unwrap();
+        }
+        let base = base.to_str().unwrap();
+
+        assert_eq!(
+            date_scoped_dirs(base),
+            [Element::date(format!("{base}/2026-01-15"))]
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use trawl_core::schema::CanonicalType;
 
-use crate::catalog::conform::layout_path;
+use crate::env_dirs::{LayoutPath, layout_path};
 use crate::ingest::compaction::{
     ColInfo, ConformPlan, ConformPolicy, RepinReading, bounded_misfit_samples_sql,
     decode_misfit_samples, describe_source, is_valid_parquet, quote_ident, repin_count_exprs,
@@ -210,7 +210,7 @@ pub(crate) fn affected_schema(
     data_dir: &Path,
     src: &Path,
     field: &str,
-) -> Result<Option<(Vec<ColInfo>, crate::catalog::conform::LayoutPath)>, String> {
+) -> Result<Option<(Vec<ColInfo>, LayoutPath)>, String> {
     if src.extension().is_none_or(|e| e != "parquet") {
         return Ok(None);
     }
@@ -237,7 +237,7 @@ fn rewrite_affected(
     src: &Path,
     dst: &Path,
     schema: &[ColInfo],
-    layout: crate::catalog::conform::LayoutPath,
+    layout: LayoutPath,
     field: &str,
     reading: RepinReading,
     flipped_pins: &HashMap<String, CanonicalType>,

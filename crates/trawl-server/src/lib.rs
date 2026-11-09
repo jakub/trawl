@@ -29,6 +29,8 @@ mod history_params;
 pub mod hot_buffer;
 pub mod ingest;
 pub mod investigations;
+#[cfg(test)]
+mod layout_guard;
 pub mod live;
 pub mod metrics;
 pub mod monitor;

@@ -33,7 +33,7 @@ pub fn spawn_stats_emitter(
     let pool = state.query.pool.clone();
     let sse_semaphore = Arc::clone(&state.query.sse_semaphore);
     let hot_buffer = state.query.hot_buffer.clone();
-    let fallback_glob = pool.fallback_glob().to_string();
+    let data_root = std::path::PathBuf::from(pool.base_dir());
     let wal_dir = state
         .ingest
         .wal_writer
@@ -53,7 +53,7 @@ pub fn spawn_stats_emitter(
         );
         let hot_buffer = hot_buffer.clone();
         let publication = pool.publication();
-        let fallback_glob = fallback_glob.clone();
+        let data_root = data_root.clone();
         let wal_dir = wal_dir.clone();
         let repin_jobs = Arc::clone(&repin_jobs);
         let scratch_dir = scratch_dir.clone();
@@ -62,7 +62,7 @@ pub fn spawn_stats_emitter(
             crate::metrics::collect_gauges(
                 hot_buffer.as_ref(),
                 &publication,
-                &fallback_glob,
+                &data_root,
                 wal_dir.as_deref(),
                 &scratch_dir,
                 query,

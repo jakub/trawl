@@ -36,6 +36,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use super::no_follow;
+use crate::env_dirs::{date_name, hour_dir, hour_name, hourly_file, parse_date, parse_hour};
 
 /// Marker file name prefix inside `wal_dir/{env}`.
 const MARKER_PREFIX: &str = ".publish-";
@@ -188,21 +189,22 @@ impl ValidatedMarker {
 
     /// `YYYY-MM-DD/HH`, the marker's partition field.
     pub fn partition(&self) -> String {
-        format!("{}/{:02}", self.date.format("%Y-%m-%d"), self.hour)
+        format!("{}/{}", date_name(self.date), hour_name(self.hour))
     }
 
     /// `data_dir/{env}/{date}/{HH}`.
     pub fn output_dir(&self, data_dir: &Path) -> PathBuf {
-        data_dir
-            .join(&self.env)
-            .join(self.date.format("%Y-%m-%d").to_string())
-            .join(format!("{:02}", self.hour))
+        hour_dir(&data_dir.join(&self.env), self.date, self.hour)
     }
 
     /// The published output path.
     pub fn canonical(&self, data_dir: &Path) -> PathBuf {
-        self.output_dir(data_dir)
-            .join(format!("{}.parquet", self.service))
+        hourly_file(
+            &data_dir.join(&self.env),
+            self.date,
+            self.hour,
+            &self.service,
+        )
     }
 
     /// The staged output path the publish renames from.
@@ -329,15 +331,7 @@ fn validate_wal_names(service: &str, wal: &[String]) -> Result<(), String> {
 /// Parse `YYYY-MM-DD/HH` in exactly the spelling compaction writes.
 fn parse_partition(partition: &str) -> Option<(NaiveDate, u8)> {
     let (date, hour) = partition.split_once('/')?;
-    if hour.len() != 2 || !hour.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let parsed = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
-    if parsed.format("%Y-%m-%d").to_string() != date {
-        return None;
-    }
-    let hour: u8 = hour.parse().ok()?;
-    (hour <= 23).then_some((parsed, hour))
+    Some((parse_date(date)?, parse_hour(hour)?))
 }
 
 pub(crate) fn parse_hex_digest(hex: &str) -> Option<blake3::Hash> {

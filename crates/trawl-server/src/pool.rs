@@ -2462,10 +2462,6 @@ impl ExecutorPool {
         &self.base_dir
     }
 
-    pub fn fallback_glob(&self) -> &Arc<str> {
-        &self.fallback_glob
-    }
-
     /// Sample distinct values of one field for autocomplete.
     ///
     /// A parquet-reading lane like any other, so it funnels through the
@@ -2514,6 +2510,7 @@ impl ExecutorPool {
         let mut slot = self.begin_slot(id, work, None, permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
         let fallback_glob = Arc::clone(&self.fallback_glob);
+        let base_dir = Arc::clone(&self.base_dir);
         let field = field.to_owned();
         let service = service.map(ToOwned::to_owned);
 
@@ -2532,11 +2529,7 @@ impl ExecutorPool {
                     }
                     worker_seam!(seams, Started);
                     let glob = match service {
-                        Some(svc) => {
-                            let base = fallback_glob.as_ref();
-                            let base_prefix = base.find('*').map_or(base, |pos| &base[..pos]);
-                            format!("{base_prefix}**/{svc}.parquet")
-                        }
+                        Some(svc) => service_glob(&base_dir, &svc),
                         None => fallback_glob.to_string(),
                     };
                     let result = slot
@@ -2974,6 +2967,12 @@ impl ExecutorPool {
             }
         }
     }
+}
+
+/// The glob over one service's files under the data root `base_dir`,
+/// joined with exactly one separator.
+fn service_glob(base_dir: &str, service: &str) -> String {
+    format!("{}/**/{service}.parquet", base_dir.trim_end_matches('/'))
 }
 
 #[cfg(test)]
@@ -4015,6 +4014,19 @@ mod tests {
     fn fallback_glob_derived_from_base_dir() {
         let pool = ExecutorPool::for_test("/var/lib/trawl/data".into(), 1, 100_000, None).unwrap();
         assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
+    }
+
+    /// The service-scoped sampling glob is built from the configured root,
+    /// with one separator whatever the root's spelling.
+    #[test]
+    fn configured_data_root_is_passed_directly() {
+        for base in ["/var/lib/trawl/data", "/var/lib/trawl/data/"] {
+            assert_eq!(
+                service_glob(base, "nginx"),
+                "/var/lib/trawl/data/**/nginx.parquet"
+            );
+        }
+        assert_eq!(service_glob("/", "nginx"), "/**/nginx.parquet");
     }
 
     #[test]

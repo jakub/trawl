@@ -1182,6 +1182,22 @@ mod tests {
         assert!(dirs[0].path.starts_with(tmp.path().join("prod")));
     }
 
+    /// Retention deletes only canonical calendar dates. An impossible date
+    /// and a padded spelling of a real one are left alone, whatever epoch's
+    /// owned-residue check says about them.
+    #[test]
+    fn noncalendar_date_dir_is_never_a_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod/2026-01-02")).unwrap();
+        for name in ["2026-13-45", "2026-01- 1"] {
+            std::fs::create_dir_all(tmp.path().join("prod").join(name)).unwrap();
+        }
+
+        let dirs = enumerate_date_dirs(tmp.path(), fixed_today()).unwrap();
+        let paths: Vec<_> = dirs.iter().map(|dir| dir.path.clone()).collect();
+        assert_eq!(paths, [tmp.path().join("prod/2026-01-02")]);
+    }
+
     #[test]
     fn enumerate_merges_candidates_across_envs() {
         let tmp = tempfile::tempdir().unwrap();

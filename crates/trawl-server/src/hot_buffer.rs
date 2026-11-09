@@ -3086,7 +3086,7 @@ mod hydrate {
             crate::metrics::collect_gauges(
                 Some(&buf),
                 &buf.publication(),
-                "/nonexistent/*.parquet",
+                std::path::Path::new("/nonexistent"),
                 None,
                 std::path::Path::new("/nonexistent/scratch"),
                 crate::metrics::QueryGauges::default(),
