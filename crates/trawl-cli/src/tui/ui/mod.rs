@@ -634,17 +634,17 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// A `timestamp` column draws exactly as the engine's old zoneless
-    /// text drew, widths included: the grid shows the wall clock the
-    /// server rendered in the reader's offset, not the wire's `T` and
-    /// offset.
+    /// A `timestamp` column draws each UTC instant in the display zone
+    /// with its own offset, widths included; a string column holding the
+    /// same text draws as sent.
     #[test]
-    fn wire_timestamps_draw_as_the_old_wall_clock_text() {
-        let draw = |time_ty: trawl_engine::value::ColumnType, times: [&str; 2]| {
+    fn wire_timestamps_draw_in_the_display_zone() {
+        let draw = |time_ty: trawl_engine::value::ColumnType, zone: &str| {
             let mut app = test_app();
+            app.display_zone = zone.parse().unwrap();
             let mut response = make_query_response(
                 vec!["_time", "message"],
-                times
+                ["2026-01-15T04:30:00.000000Z", "2026-01-15T04:30:01.250000Z"]
                     .iter()
                     .map(|t| {
                         vec![
@@ -661,19 +661,90 @@ mod tests {
             terminal.draw(|f| super::render(&mut app, f)).unwrap();
             terminal.backend().to_string()
         };
-        let wire = draw(
-            trawl_engine::value::ColumnType::Timestamp,
-            [
-                "2026-01-15T10:00:00.000000+05:30",
-                "2026-01-15T10:00:01.250000+05:30",
+        let india = draw(trawl_engine::value::ColumnType::Timestamp, "+05:30");
+        assert!(india.contains("2026-01-15 10:00:00 +05:30"), "{india}");
+        assert!(india.contains("2026-01-15 10:00:01.25 +05:30"), "{india}");
+        let utc = draw(trawl_engine::value::ColumnType::Timestamp, "UTC");
+        assert!(utc.contains("2026-01-15 04:30:01.25 +00:00"), "{utc}");
+        let text = draw(trawl_engine::value::ColumnType::String, "+05:30");
+        assert!(text.contains("2026-01-15T04:30:01.250000Z"), "{text}");
+    }
+
+    /// Set only in the child process: the display-zone timechart draws
+    /// there, under the `TZ` the parent chose.
+    const BERLIN_CHILD: &str = "TRAWL_TUI_BERLIN_CHILD";
+
+    /// The TUI under `TZ=Europe/Berlin` with the display zone `local`, over
+    /// a timechart whose two buckets are the fall-back night's two 02:30s.
+    /// The machine zone is per process, so the drawing happens in a CHILD
+    /// PROCESS: this test binary re-runs itself with the ignored
+    /// [`utc_timechart_child_under_berlin`] selected and `TZ` set, and the
+    /// child snapshots the chart. The parent fails if the child fails or
+    /// never ran.
+    #[test]
+    fn utc_timechart_arithmetic_survives_local_display() {
+        const CHILD: &str = "tui::ui::tests::utc_timechart_child_under_berlin";
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("locate this test binary"))
+                .args([
+                    CHILD,
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("TZ", "Europe/Berlin")
+                .env(BERLIN_CHILD, "1")
+                .output()
+                .expect("run the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the Berlin child failed or did not run; status {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status,
+        );
+    }
+
+    /// The subprocess entry point. Without [`BERLIN_CHILD`] it does nothing,
+    /// so a run with `--run-ignored` passes it untouched.
+    #[test]
+    #[ignore = "entry point for the Berlin child process; the test above runs it"]
+    fn utc_timechart_child_under_berlin() {
+        if std::env::var_os(BERLIN_CHILD).is_none() {
+            return;
+        }
+
+        let mut app = test_app();
+        app.display_zone = trawl_api::zone::DisplayZone::Local;
+        let mut response = make_query_response(
+            vec!["_time", "count"],
+            vec![
+                vec![
+                    Value::String("2026-10-25T00:30:00.000000Z".into()),
+                    Value::Integer(3),
+                ],
+                vec![
+                    Value::String("2026-10-25T01:30:00.000000Z".into()),
+                    Value::Integer(5),
+                ],
             ],
         );
-        let before = draw(
-            trawl_engine::value::ColumnType::String,
-            ["2026-01-15 10:00:00", "2026-01-15 10:00:01.25"],
-        );
-        assert_eq!(wire, before);
-        assert!(wire.contains("2026-01-15 10:00:01.25"), "{wire}");
+        response.result.columns[0].ty = trawl_engine::value::ColumnType::Timestamp;
+        app.tab.result = Some(response);
+        app.tab.status = TabStatus::Success { duration_ms: 4 };
+        app.tab.chart_view = crate::tui::state::ChartView::LineChart;
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        // Without a zone database both readings would be UTC: say so
+        // before the snapshot does.
+        for reading in ["2026-10-25 02:30:00 +02:00", "2026-10-25 02:30:00 +01:00"] {
+            assert!(screen.contains(reading), "{reading} missing:\n{screen}");
+        }
+        assert!(screen.contains("span: 1h"), "{screen}");
+        insta::assert_snapshot!("utc_timechart_arithmetic_survives_local_display", screen);
     }
 
     #[test]

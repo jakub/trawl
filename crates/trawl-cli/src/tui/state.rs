@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use ratatui::layout::Rect;
+use trawl_api::zone::DisplayZone;
 use trawl_client::{PaginationMeta, QueryResponse};
 use trawl_engine::value::{Column, ColumnType, QueryResult, TypeFold, Value};
 
@@ -62,8 +63,13 @@ impl ResultsSearch {
     /// Recompute matches against the given result data.
     ///
     /// If a `ColumnConfig` is provided, hidden columns are skipped — searching
-    /// invisible data is confusing.
-    pub fn update_matches(&mut self, result: &QueryResult, config: Option<&ColumnConfig>) {
+    /// invisible data is confusing. An instant matches as it shows in `zone`.
+    pub fn update_matches(
+        &mut self,
+        result: &QueryResult,
+        config: Option<&ColumnConfig>,
+        zone: DisplayZone,
+    ) {
         self.matches.clear();
         if self.query.is_empty() {
             return;
@@ -81,7 +87,7 @@ impl ResultsSearch {
                 let Some(column) = result.columns.get(col_idx) else {
                     continue;
                 };
-                let display = crate::tui::ui::results::cell_text(&column.ty, value);
+                let display = crate::tui::ui::results::cell_text(&column.ty, value, zone);
                 if display.to_lowercase().contains(&needle) {
                     self.matches.push((row_idx, col_idx));
                 }
@@ -3285,19 +3291,22 @@ mod tests {
                 Column::new("note", ColumnType::String),
             ],
             rows: vec![vec![
-                Value::String("2026-01-15T10:00:01.250000+05:30".into()),
+                Value::String("2026-01-15T04:30:01.250000Z".into()),
                 Value::String("T10".into()),
             ]],
         };
+        let india = "+05:30".parse::<DisplayZone>().unwrap();
         let mut search = ResultsSearch::new();
-        search.query = "10:00:01.25".to_owned();
-        search.update_matches(&result, None);
+        search.query = "10:00:01.25 +05:30".to_owned();
+        search.update_matches(&result, None, india);
         assert_eq!(search.matches, vec![(0, 0)]);
         search.query = "t10".to_owned();
-        search.update_matches(&result, None);
+        search.update_matches(&result, None, india);
         assert_eq!(search.matches, vec![(0, 1)], "only the cell that shows it");
-        search.query = "+05:30".to_owned();
-        search.update_matches(&result, None);
-        assert!(search.matches.is_empty());
+        search.query = "04:30".to_owned();
+        search.update_matches(&result, None, india);
+        assert!(search.matches.is_empty(), "the UTC wire text is not shown");
+        search.update_matches(&result, None, DisplayZone::Utc);
+        assert_eq!(search.matches, vec![(0, 0)]);
     }
 }

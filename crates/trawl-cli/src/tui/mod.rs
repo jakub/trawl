@@ -28,6 +28,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
+use trawl_api::zone::DisplayZone;
 use trawl_client::{
     ClientError, HistoryResponse, HttpClient, ListSavedResponse, QueryResponse, SchemaResponse,
     WhoAmIResponse,
@@ -149,8 +150,9 @@ pub struct App {
     pub should_quit: bool,
     /// Whether live tail mode is active.
     pub live_mode: bool,
-    /// Timezone configuration string for timestamp display.
-    pub timezone: String,
+    /// The zone every instant shows in, parsed from `ui.timezone` before
+    /// the TUI takes the terminal. Results stay UTC; only drawing converts.
+    pub display_zone: DisplayZone,
     /// Active results search (vim-style `/`).
     pub results_search: Option<ResultsSearch>,
     /// Maximum events to retain in live streaming buffer.
@@ -183,8 +185,9 @@ pub struct App {
 }
 
 impl App {
-    /// Create a new app with the given client.
-    pub fn new(client: HttpClient) -> Self {
+    /// Create a new app with the given client, showing instants in
+    /// `display_zone`.
+    pub fn new(client: HttpClient, display_zone: DisplayZone) -> Self {
         let (query_tx, query_rx) = mpsc::unbounded_channel();
         let (mutation_tx, mutation_rx) = mpsc::unbounded_channel();
 
@@ -201,7 +204,7 @@ impl App {
             saved_cache: None,
             should_quit: false,
             live_mode: false,
-            timezone: "local".to_owned(),
+            display_zone,
             results_search: None,
             max_live_events: 1000,
             query_rx,
@@ -862,6 +865,9 @@ pub async fn run(
     direct_token: Option<&str>,
     driver_path: Option<&Path>,
 ) -> Result<(), CliError> {
+    // Before any request and before raw mode or the alternate screen: an
+    // invalid zone leaves the terminal as it was.
+    let display_zone = crate::cli::display_zone(&config.ui.timezone)?;
     let client = crate::connection(config, direct_token)?.client()?;
 
     // Set up terminal.
@@ -965,10 +971,9 @@ pub async fn run(
     };
 
     // Create app with schema, history, and saved queries.
-    let mut app = App::new(client);
+    let mut app = App::new(client, display_zone);
     app.mouse_enabled = config.ui.enable_mouse;
     app.max_live_events = config.tail.max_events;
-    app.timezone = config.ui.timezone.clone();
     app.theme = theme::resolve(&config.ui.theme);
     app.schema_cache = schema;
     app.history_cache = history;
@@ -1170,7 +1175,7 @@ mod tests {
     /// No network calls will be made — only channel injection.
     pub(crate) fn test_app() -> App {
         let client = HttpClient::new_insecure("https://localhost:0", "flt_test_not_real").unwrap();
-        App::new(client)
+        App::new(client, DisplayZone::Utc)
     }
 
     /// Build a synthetic `KeyEvent` with no modifiers.

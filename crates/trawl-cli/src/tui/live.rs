@@ -49,13 +49,6 @@ impl App {
         // Extract field order from the DSL so the live buffer preserves it.
         let field_order = extract_field_order(&query);
 
-        // The stream sends UTC; the display zone is applied to its frames
-        // here.
-        let zone = self
-            .timezone
-            .parse::<trawl_api::zone::DisplayZone>()
-            .unwrap_or(trawl_api::zone::DisplayZone::Utc);
-
         let client = self.client.clone();
         let tx = self.query_tx.clone();
         let max_events = self.max_live_events;
@@ -89,14 +82,12 @@ impl App {
 
             while let Some(event) = stream.next().await {
                 match event {
-                    Ok(StreamEvent::Event(mut frame)) => {
-                        trawl_api::zone::apply_zone(&mut frame, zone);
+                    Ok(StreamEvent::Event(frame)) => {
                         buffer.push_frame(&frame);
                         event_count += 1;
                         tracing::debug!("received stream event, total: {event_count}");
                     }
-                    Ok(StreamEvent::Snapshot { mut result, capped }) => {
-                        trawl_api::zone::apply_zone(&mut result, zone);
+                    Ok(StreamEvent::Snapshot { result, capped }) => {
                         buffer.replace_with_snapshot(&result, &capped);
                         // Each snapshot replaces the whole result — send immediately.
                         let response = buffer.to_query_response();

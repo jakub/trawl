@@ -15,11 +15,12 @@ use ratatui::widgets::{
     Table,
 };
 use std::collections::HashSet;
-use trawl_api::display::{
-    downsample, extract_series, is_timechart_result, timestamp_cell_text, value_to_string,
-};
+use trawl_api::display::{downsample, extract_series, is_timechart_result, value_to_string};
 use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 use trawl_api::value::ColumnType;
+use trawl_api::zone::{
+    DisplayZone, TIMESTAMP_INFINITY, TIMESTAMP_NEG_INFINITY, present_cell, wire_micros,
+};
 use trawl_engine::value::Value;
 
 use crate::tui::App;
@@ -186,7 +187,8 @@ fn render_table(
     let available_width = area.width.saturating_sub(4) as usize; // borders + padding
 
     // Widths for every column, not just the displayed ones.
-    let all_widths = compute_column_widths(result, v_scroll, available_width, config);
+    let all_widths =
+        compute_column_widths(result, v_scroll, available_width, config, app.display_zone);
     let total_cols = result.columns.len();
 
     let pinned = config.map_or_else(Vec::new, ColumnConfig::pinned_indices);
@@ -315,7 +317,7 @@ fn render_table(
                         // (ADR-0013 §6).
                         severity_cell_text(value)
                     } else {
-                        cell_text(&result.columns[col_idx].ty, value)
+                        cell_text(&result.columns[col_idx].ty, value, app.display_zone)
                     };
                     let truncated = truncate_with_ellipsis(&text, width);
                     let cell = Cell::from(truncated);
@@ -773,7 +775,7 @@ fn render_line_chart(
         return;
     }
 
-    let time_info = extract_time_metadata(result);
+    let time_info = extract_time_metadata(result, app.display_zone);
 
     let title = if series.len() == 1 {
         let label = &series[0].0;
@@ -1004,7 +1006,11 @@ fn render_bar_chart(
         .take(max_bars)
         .enumerate()
         .map(|(idx, row)| {
-            let label = cell_text(&result.columns[label_col].ty, &row[label_col]);
+            let label = cell_text(
+                &result.columns[label_col].ty,
+                &row[label_col],
+                app.display_zone,
+            );
             // A bar's height is a `u64`, which is `Value::UInt`'s own
             // width, so an oversized unsigned draws at its real
             // magnitude. A negative or a NaN clamps to the bottom of the
@@ -1083,7 +1089,7 @@ fn render_sparkline(
     }
 
     // Extract time metadata for title
-    let time_info = extract_time_metadata(result);
+    let time_info = extract_time_metadata(result, app.display_zone);
 
     // Single series: render one large sparkline
     if series.len() == 1 {
@@ -1375,6 +1381,7 @@ fn compute_column_widths(
     v_scroll: usize,
     available_width: usize,
     config: Option<&ColumnConfig>,
+    zone: DisplayZone,
 ) -> Vec<u16> {
     const MIN_COL: usize = 8;
     const MAX_COL: usize = 60;
@@ -1405,7 +1412,7 @@ fn compute_column_widths(
 
             for row in result.rows.iter().skip(v_scroll).take(SAMPLE_ROWS) {
                 if let Some(value) = row.get(col_idx) {
-                    let display_len = cell_text(&col.ty, value).len();
+                    let display_len = cell_text(&col.ty, value, zone).len();
                     if display_len > max_width {
                         max_width = display_len;
                     }
@@ -1431,9 +1438,14 @@ fn truncate_with_ellipsis(value: &str, max_width: usize) -> String {
 
 /// Extract time metadata from timechart result.
 ///
-/// Returns (`start_time`, `end_time`, `span_interval`) as formatted strings.
+/// Returns (`start_time`, `end_time`, `span_interval`) as formatted strings:
+/// the earliest and latest instants shown in `zone`, offset included, and
+/// the smallest gap between distinct instants. Both read the UTC instants
+/// the rows carry, never display text, so a fall-back night's two 02:30s
+/// stay an hour apart in any zone. Row order is left alone.
 fn extract_time_metadata(
     result: &trawl_engine::value::QueryResult,
+    zone: DisplayZone,
 ) -> Option<(String, String, String)> {
     if result.rows.is_empty() {
         return None;
@@ -1441,67 +1453,46 @@ fn extract_time_metadata(
 
     // Find the _time column by name (UNION ALL BY NAME can reorder columns)
     let time_col = result.columns.iter().position(|c| c.name == "_time")?;
-
     let time_ty = &result.columns[time_col].ty;
-    let first_time = cell_text(time_ty, &result.rows[0][time_col]);
-    let last_time = cell_text(time_ty, &result.rows[result.rows.len() - 1][time_col]);
 
-    // Derive span from the minimum non-zero delta between consecutive time buckets.
-    // Using min rather than just the first pair handles sparse data (empty buckets
-    // aren't emitted by time_bucket) and group-by rows sharing the same _time.
-    let span = if result.rows.len() >= 2 {
-        let mut min_delta: Option<u64> = None;
-        for pair in result.rows.windows(2) {
-            let t1 = cell_text(time_ty, &pair[0][time_col]);
-            let t2 = cell_text(time_ty, &pair[1][time_col]);
-            if let (Some(s1), Some(s2)) = (parse_timestamp_secs(&t1), parse_timestamp_secs(&t2)) {
-                let delta = s2.saturating_sub(s1);
-                if delta > 0 {
-                    min_delta = Some(min_delta.map_or(delta, |prev| prev.min(delta)));
-                }
+    let mut instants: Vec<(i64, &Value)> = result
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let cell = row.get(time_col)?;
+            match cell {
+                Value::String(wire) => wire_micros(wire).map(|micros| (micros, cell)),
+                _ => None,
             }
-        }
-        min_delta.map_or("?".to_owned(), format_duration)
+        })
+        .collect();
+    instants.sort_by_key(|(micros, _)| *micros);
+    instants.dedup_by_key(|(micros, _)| *micros);
+    let (first, last) = (instants.first()?, instants.last()?);
+    let shown = |cell: &Value| cell_text(time_ty, cell, zone);
+
+    // Derive span from the minimum gap between distinct instants. Using the
+    // minimum handles sparse data (empty buckets aren't emitted by
+    // time_bucket) and group-by rows sharing the same _time. An infinity is
+    // no bucket, so it bounds no gap.
+    let span = if instants.len() >= 2 {
+        let finite: Vec<i64> = instants
+            .iter()
+            .map(|(micros, _)| *micros)
+            .filter(|micros| !matches!(*micros, TIMESTAMP_INFINITY | TIMESTAMP_NEG_INFINITY))
+            .collect();
+        finite
+            .windows(2)
+            .filter_map(|pair| u64::try_from(i128::from(pair[1]) - i128::from(pair[0])).ok())
+            .map(|micros| micros / 1_000_000)
+            .filter(|&secs| secs > 0)
+            .min()
+            .map_or("?".to_owned(), format_duration)
     } else {
         "N/A".to_owned()
     };
 
-    // Format times (truncate if too long)
-    let format_time = |s: String| {
-        if s.len() > 19 {
-            // Keep just date and time, drop subseconds/timezone
-            s.chars().take(19).collect()
-        } else {
-            s
-        }
-    };
-
-    Some((format_time(first_time), format_time(last_time), span))
-}
-
-/// Parse "YYYY-MM-DD HH:MM:SS" into total seconds (for diffing, not epoch).
-fn parse_timestamp_secs(s: &str) -> Option<u64> {
-    // Expect at minimum "YYYY-MM-DD HH:MM:SS" (19 chars)
-    if s.len() < 19 {
-        return None;
-    }
-    let bytes = s.as_bytes();
-
-    let year: u64 = s[0..4].parse().ok()?;
-    let month: u64 = s[5..7].parse().ok()?;
-    let day: u64 = s[8..10].parse().ok()?;
-
-    // Delimiter between date and time can be ' ' or 'T'
-    if bytes[10] != b' ' && bytes[10] != b'T' {
-        return None;
-    }
-
-    let hour: u64 = s[11..13].parse().ok()?;
-    let min: u64 = s[14..16].parse().ok()?;
-    let sec: u64 = s[17..19].parse().ok()?;
-
-    // Rough total seconds (not calendar-accurate, but fine for diffs within days)
-    Some(year * 365 * 86400 + month * 30 * 86400 + day * 86400 + hour * 3600 + min * 60 + sec)
+    Some((shown(first.1), shown(last.1), span))
 }
 
 /// Format a duration in seconds as a human-readable string.
@@ -1517,18 +1508,47 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-/// A result cell as the TUI shows it: a timestamp as the wall clock the
-/// server rendered in the reader's offset ([`timestamp_cell_text`]), any
-/// other cell through [`value_to_string`]. The grid, its column widths,
-/// the detail popup and the search all read this one text.
-pub fn cell_text(ty: &ColumnType, value: &Value) -> String {
-    timestamp_cell_text(ty, value).unwrap_or_else(|| value_to_string(value))
+/// A result cell as the TUI shows it: an instant in `zone` with its own
+/// offset ([`present_cell`]), any other cell through [`value_to_string`].
+/// The grid, its column widths, the detail popup and the search all read
+/// this one text.
+pub fn cell_text(ty: &ColumnType, value: &Value, zone: DisplayZone) -> String {
+    present_cell(ty, value, zone).unwrap_or_else(|| value_to_string(value))
 }
 
 /// A `_severity` cell as the TUI shows it: the shared `OTel` token, or the
 /// grid's ordinary rendering where the ladder has no reading for the value.
 fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
     crate::cli::severity_token(value).map_or_else(|| value_to_string(value), str::to_owned)
+}
+
+/// The timechart's bounds and span come from the UTC instants: rows out of
+/// order and a repeated bucket still give the earliest and latest instants,
+/// and an infinity bounds no gap.
+#[cfg(test)]
+#[test]
+fn timechart_metadata_reads_utc_instants() {
+    use trawl_engine::value::{Column, QueryResult};
+
+    let s = |t: &str| vec![Value::String(t.into()), Value::Integer(1)];
+    let result = QueryResult {
+        columns: vec![
+            Column::new("_time", ColumnType::Timestamp),
+            Column::new("count", ColumnType::Integer),
+        ],
+        rows: vec![
+            s("2026-10-25T01:30:00.000000Z"),
+            s("2026-10-25T00:30:00.000000Z"),
+            s("2026-10-25T00:30:00.000000Z"),
+            s("2026-10-25T03:30:00.000000Z"),
+            s("infinity"),
+        ],
+    };
+    let zone = "+02:00".parse::<DisplayZone>().unwrap();
+    let (start, end, span) = extract_time_metadata(&result, zone).unwrap();
+    assert_eq!(start, "2026-10-25 02:30:00 +02:00");
+    assert_eq!(end, "infinity");
+    assert_eq!(span, "1h");
 }
 
 /// Both timechart views survive metrics at the top of the `u64` range.
