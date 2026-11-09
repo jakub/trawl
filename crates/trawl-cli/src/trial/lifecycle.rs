@@ -3363,6 +3363,36 @@ fi"#,
         assert!(pair_loads(&cert_bytes, &key_bytes));
     }
 
+    /// A key path the writer cannot replace stops the new pair at the key:
+    /// no certificate is written beside it, nothing is pinned, and the
+    /// state is unchanged.
+    #[tokio::test]
+    async fn a_key_path_that_is_a_directory_stops_generation_at_the_key() {
+        let trial = CertTrial::new();
+        let key = trial.at(compose::TLS_KEY);
+        std::fs::create_dir_all(&key).unwrap();
+        let mut state = trial.state(false, None);
+        let saved = std::fs::read(trial.paths.state_file()).unwrap();
+        let in_memory = state.clone();
+
+        let err = certificate(&trial.docker, &trial.paths, &mut state)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrialError::Docker(_)), "{err:?}");
+        assert_eq!(
+            trial.take_calls(),
+            format!("read {}\nput {}\n", compose::TLS_CERT, compose::TLS_KEY)
+        );
+        assert!(!trial.at(compose::TLS_CERT).exists());
+        assert!(!trial.at(compose::WEB_CA).exists());
+        assert!(!trial.paths.ca_file().exists());
+        assert_eq!(std::fs::read(trial.paths.state_file()).unwrap(), saved);
+        assert_eq!(state, in_memory);
+        // The directory is untouched and the temporary file is gone.
+        assert!(trial.volume().is_empty(), "{:?}", trial.volume());
+        assert!(key.is_dir());
+    }
+
     /// What a refusal case puts at the certificate's path.
     enum Volume<'a> {
         Empty,

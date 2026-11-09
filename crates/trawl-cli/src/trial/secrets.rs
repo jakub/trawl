@@ -143,8 +143,10 @@ impl Target {
 /// It creates the parent directory owner-only, clears temporary files a
 /// killed run left, writes the bytes to a temporary file created 0400
 /// (umask 377), refuses a short write (the CLI was killed mid-pipe), and
-/// renames the file into place. The file is owned by the user the
-/// container runs as, which is the user that reads it.
+/// renames the file into place. A directory at the path fails the rename
+/// (GNU `mv -T`; both images are Debian), and the temporary file is
+/// removed. The file is owned by the user the container runs as, which is
+/// the user that reads it.
 const WRITE: &str = r#"set -eu
 case "$1" in /*) ;; *) exit 64 ;; esac
 umask 077
@@ -156,7 +158,7 @@ umask 377
 t="$1.tmp.$$"
 head -c "$n" > "$t"
 if [ "$(wc -c < "$t")" -ne "$n" ]; then rm -f -- "$t"; exit 66; fi
-mv -f -- "$t" "$1""#;
+mv -fT -- "$t" "$1" || { rm -f -- "$t"; exit 67; }"#;
 
 /// The in-container reader. Its only argument is the path.
 ///
@@ -579,6 +581,36 @@ exec /bin/sh -c "$script" sh "{root}$path""#,
             std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
             1
         );
+    }
+
+    /// A directory at the path is never written into: the write fails,
+    /// sealed, and leaves no temporary file beside or inside it.
+    #[tokio::test]
+    async fn put_file_to_a_directory_fails_and_leaves_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let (_stub, docker) = local_writer(root.path());
+        let file = root.path().join(compose::TLS_KEY.trim_start_matches('/'));
+        std::fs::create_dir_all(&file).unwrap();
+        let secret = HexSecret::generate();
+        let err = put_file(
+            &docker,
+            Target::Trawld,
+            compose::TLS_KEY,
+            secret.expose().as_bytes(),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err} {err:?}");
+        assert!(!text.contains(secret.expose()), "{text}");
+        assert!(text.contains("exit status 67"), "{text}");
+        assert!(!text.contains("cannot overwrite"), "sealed: {text}");
+        assert!(file.is_dir());
+        assert_eq!(std::fs::read_dir(&file).unwrap().count(), 0);
+        let beside: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(beside, [file.file_name().unwrap().to_owned()]);
     }
 
     #[tokio::test]
