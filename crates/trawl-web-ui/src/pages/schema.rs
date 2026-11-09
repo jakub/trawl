@@ -41,6 +41,7 @@ use crate::api;
 // the query notice's case-file links so both encode a name identically.
 use crate::components::enc_uri as enc;
 use crate::components::field_case_drawer::FieldCaseDrawer;
+use crate::components::read_turn::ReadTurn;
 use crate::components::service_card_fmt::{
     degraded_count, format_bytes, format_count, is_healthy, today_yesterday_utc,
 };
@@ -132,7 +133,17 @@ pub fn SchemaPage() -> impl IntoView {
     let filter = RwSignal::new(String::new());
     let sort = RwSignal::new((SvcSort::Name, false));
 
-    let services = LocalResource::new(|| async move { api::schema_services().await });
+    // Only the newest read of a page still mounted may send it to
+    // sign-in; Retry retires the read it replaces.
+    let services_turn = ReadTurn::new();
+    let services = LocalResource::new(move || {
+        let turn = services_turn.begin();
+        async move {
+            let answer = api::schema_services().await;
+            services_turn.leaves_for_sign_in(turn, &answer);
+            answer
+        }
+    });
 
     // Past this width the service panel docks in the second column
     // instead of sliding over a scrim; the field case file stays an
@@ -347,7 +358,7 @@ pub fn SchemaPage() -> impl IntoView {
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(services.get()))
                         label="schema"
-                        retry=Callback::new(move |()| { services.set(None); services.refetch(); })
+                        retry=Callback::new(move |()| { services_turn.supersede(); services.set(None); services.refetch(); })
                         render=Box::new(move |resp: trawl_api::ServiceSchemaResponse| {
                             let needle = filter.get().to_lowercase();
                             let mut visible: Vec<ServiceSchema> = resp.services.iter()
