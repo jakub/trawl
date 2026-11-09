@@ -433,7 +433,12 @@ each HTTP ingest request that stored at least one event with an actionable
 repair. An actionable repair means you should inspect the sender. It does not
 mean the sender is at fault or hostile, and it does not mean data was lost.
 For example, `time.unparseable` stored the event at its arrival time, and
-`time.out_of_range` kept the value it flagged. Routine repairs, such as
+`time.out_of_range` kept the value it flagged. `time.ahead_of_arrival` also
+stored the event at its arrival time, because the sender's time was more than
+15 minutes ahead. A sender whose clock or zone is wrong earns it, such as a
+host that sends local time with no zone from east of UTC. The sender's value
+stays in its `timestamp` or `@timestamp` column, or in `_raw` when trawld
+built it. Routine repairs, such as
 `env.defaulted` and `host.from_peer`, write no warning. The
 [repair codes table](/reference/events/#repair-codes) gives the class of each
 code. The warning counts only events that trawld acknowledged. A group whose

@@ -1,6 +1,6 @@
 # Routine repairs share ingest completion; actionable repairs warn
 
-status: accepted (2026-10-14), prep record for #302
+status: accepted (2026-10-14), prep record for #302; amended (2026-11-08): `time.ahead_of_arrival` is actionable, see the Amendment
 
 trawld logged one WARN, `ingest_repairs`, for every HTTP ingest request in which any event was repaired. Most repairs are the contract working as designed. `env.defaulted` is the zero-config path of ADR-0009, and `host.from_peer` fills a host from an honest peer. A sender that relied on `default_env` therefore produced a WARN on every batch for as long as it ran. On the homelab (v0.9.3, 2026-10-11) one Vector DaemonSet produced about 18 WARN lines a minute, with no rejections. trawld persists its own tracing as `service=trawld` events, so each WARN was also stored.
 
@@ -13,7 +13,7 @@ The same WARN was the only record that tied a repair to an ingest key. `trawl_in
 | class | codes |
 |---|---|
 | routine | `env.defaulted`, `host.from_peer`, `host.omitted`, `time.from_ingest`, `field.name_case_folded`, `field.reserved_prefix` |
-| actionable | `time.unparseable`, `time.out_of_range`, `field.truncated`, `field.name_too_long`, `field.name_empty`, `field.name_case_collision`, `field.reserved_prefix_collision`, `field.stamp_claimed`, `field.producer_asserted`, `service.from_profile` |
+| actionable | `time.unparseable`, `time.out_of_range`, `time.ahead_of_arrival`, `field.truncated`, `field.name_too_long`, `field.name_empty`, `field.name_case_collision`, `field.reserved_prefix_collision`, `field.stamp_claimed`, `field.producer_asserted`, `service.from_profile` |
 
 Three codes are new, because one old code covered both a routine and an actionable case. ADR-0013's amendment of 2026-10-14 defines them:
 
@@ -54,3 +54,7 @@ Both lines take `request_id` and the peer from the request span. Counts are occu
 ## Amendment: `field.truncated` covers every string value, 2026-11-02
 
 [ADR-0063](0063-a-querys-regex-work-is-bounded-before-it-runs.md) applies the `_raw` length cap, `MAX_RAW_CHARS`, to every string value the canonicalizer stores, so that one regex call over one stored value has a bounded cost. A cut value records `field.truncated`, which stays actionable: a value the sender sent was cut. Events stored before the change keep their long values, and nothing migrates them.
+
+## Amendment: `time.ahead_of_arrival` is actionable, 2026-11-08
+
+[ADR-0013](0013-namespace-contract-and-alias-deletion.md)'s amendment of 2026-11-08 adds `time.ahead_of_arrival`: a parseable `_time` more than 15 minutes after arrival was replaced by arrival time. It is actionable, because a value the sender sent was replaced. The actionable row of the table above lists it. `time.out_of_range` now flags only a time more than ten years in the past.

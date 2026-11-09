@@ -36,6 +36,7 @@ use trawl_api::results::{ResultList, ResultPage, ResultShape, ResultSource, Valu
 use trawl_api::value::Value;
 use trawl_config::CaptureConfig;
 use trawl_server::config::{IngestConfig, RateLimitConfig};
+use trawl_server::ingest::envelope::MAX_TIME_LEAD;
 use trawl_server::ingest::producer::Derivation;
 use trawl_server::pool::seam::Seam;
 use trawl_server::publication::CorpusUnsettled;
@@ -781,19 +782,21 @@ async fn captured_and_live(
 
 /// A capture reads what `/query` reads for the text it recorded, whatever
 /// partition holds the event. Compaction names a partition by when it
-/// wrote it, and ingest keeps the `_time` a sender says, so an event's
-/// partition does not bound its `_time` (ADR-0057):
+/// wrote it, and ingest keeps a `_time` up to [`MAX_TIME_LEAD`] ahead of
+/// arrival, so an event's partition does not pin its `_time` (ADR-0057):
 ///
-/// - a sender stamping six hours ahead: its event is compacted now, into
-///   this hour's partition, and drained from the hot buffer, and the
-///   capture covers the hour around its `_time`;
+/// - a sender stamping the full allowed lead ahead: its event is compacted
+///   now, into this hour's partition, and drained from the hot buffer, and
+///   the capture covers the hour around its `_time`;
 /// - a sender whose clock ran two days ahead: its partition was written
 ///   two days ago, and its `_time` is ten minutes ago, inside a capture of
 ///   the last half hour.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_reads_what_query_reads_whatever_partition_holds_the_event() {
     let now = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap();
-    let ahead = now + TimeDelta::hours(6);
+    // `now` is truncated to the second before arrival, so this lead is
+    // inside the bound and ingest keeps it.
+    let ahead = now + MAX_TIME_LEAD;
     let skewed = now - TimeDelta::minutes(10);
     let written = (now - TimeDelta::days(2))
         .format("prod/%Y-%m-%d/%H")
@@ -822,7 +825,7 @@ async fn a_capture_reads_what_query_reads_whatever_partition_holds_the_event() {
             "_time": rfc3339(ahead),
             "service": "ahead",
             "host": "web09",
-            "message": "six hours ahead",
+            "message": "at the allowed lead",
         })],
     )
     .await;
@@ -846,7 +849,7 @@ async fn a_capture_reads_what_query_reads_whatever_partition_holds_the_event() {
                 "earliest": rfc3339(ahead - TimeDelta::minutes(30)),
                 "latest": rfc3339(ahead + TimeDelta::minutes(30)),
             }),
-            "six hours ahead",
+            "at the allowed lead",
         ),
         (
             "service=skewed",

@@ -12886,8 +12886,10 @@ mod tests {
             json!("2026-09-27T14:00:00.123456+02:00"),
             json!("2026-09-27 12:00:00.123456Z"),
             json!("2026-09-27t12:00:00.123456z"),
-            // Instants the canonicalizer writes as they are, but the
-            // repair changes.
+            // Instants the repair changes. The canonicalizer writes the leap
+            // second as it is. It replaces the two far-future ones with
+            // arrival (`time.ahead_of_arrival`), but WAL written before that
+            // rule may still hold them.
             json!("2026-06-30T23:59:60.000000Z"),
             json!("+10000-01-01T00:00:00.000000Z"),
             micros(chrono::DateTime::<chrono::Utc>::MAX_UTC),
