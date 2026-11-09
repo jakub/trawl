@@ -268,7 +268,7 @@ fn present_field_sql_is_unchanged() {
 
     let cold_only = lane_statements(&fixture, "cold-only", QUERIES.iter().copied(), |dsl| {
         prepared("cold-only", dsl, || {
-            exec.run_query(dsl, &fixture.cold, &pins, usize::MAX, 0)
+            exec.run_query(dsl, &fixture.cold, &pins, usize::MAX)
                 .map(drop)
         })
     });
@@ -284,7 +284,6 @@ fn present_field_sql_is_unchanged() {
                 &hot_pins,
                 &pins,
                 usize::MAX,
-                0,
             )
             .map(drop)
         })
@@ -301,7 +300,6 @@ fn present_field_sql_is_unchanged() {
                 &hot_pins,
                 &pins,
                 usize::MAX,
-                0,
             )
             .map(drop)
         })
@@ -444,7 +442,7 @@ impl<'a> Request<'a> {
         });
         let cap = RowCap::Refuse(usize::MAX);
         let outcome = match lane {
-            Lane::Cold => lanes.run_query(dsl, source, self.pins, cap, 0).map(drop),
+            Lane::Cold => lanes.run_query(dsl, source, self.pins, cap).map(drop),
             Lane::HotAndCold | Lane::ColdStart => lanes
                 .run_query_with_hot(
                     dsl,
@@ -454,7 +452,6 @@ impl<'a> Request<'a> {
                     self.hot_pins,
                     self.pins,
                     cap,
-                    0,
                 )
                 .map(drop),
             Lane::Export => lanes
@@ -765,7 +762,7 @@ fn envelope_timestamp_absent_is_loud() {
     let out = dir.path().join("export.parquet");
 
     let both_lanes = |dsl: &str| {
-        let queried = exec.run_query(dsl, &source, &pins, usize::MAX, 0).map(drop);
+        let queried = exec.run_query(dsl, &source, &pins, usize::MAX).map(drop);
         let exported = exec
             .export_parquet(dsl, &source, &pins, &out, usize::MAX)
             .map(drop);
@@ -911,7 +908,7 @@ fn host_and_f(
     let out = fixture.dir.path().join(format!("{lane:?}.parquet"));
     let _ = std::fs::remove_file(&out);
     let result = match lane {
-        Lane::Cold => exec.run_query(DSL, &fixture.cold, pins, usize::MAX, 0)?,
+        Lane::Cold => exec.run_query(DSL, &fixture.cold, pins, usize::MAX)?,
         Lane::HotAndCold => exec.run_query_with_hot(
             DSL,
             &fixture.cold,
@@ -920,7 +917,6 @@ fn host_and_f(
             pins,
             pins,
             usize::MAX,
-            0,
         )?,
         Lane::Export | Lane::ExportHotAndCold => {
             if lane == Lane::Export {

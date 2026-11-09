@@ -185,7 +185,10 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
             if matches!(value, Value::Null) {
                 return None;
             }
-            Some((col.name.as_str(), super::results::cell_text(&col.ty, value)))
+            Some((
+                col.name.as_str(),
+                super::results::cell_text(&col.ty, value, app.display_zone),
+            ))
         })
         .collect();
     let visible_fields = fields.len();

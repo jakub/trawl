@@ -211,14 +211,13 @@ impl Backend for Fake {
         self.answer("field_values", self.field_values.as_ref())
     }
 
-    async fn query_paginated_tz(
+    async fn query_paginated(
         &self,
         dsl: &str,
         limit: Option<usize>,
         offset: Option<usize>,
-        timezone: Option<String>,
     ) -> Result<QueryResponse, ClientError> {
-        self.record(format!("query {limit:?} {offset:?} {timezone:?} {dsl}"));
+        self.record(format!("query {limit:?} {offset:?} {dsl}"));
         self.answer("query", self.query.as_ref())
     }
 

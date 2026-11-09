@@ -370,11 +370,11 @@ mod tests {
         let executor = trawl_engine::executor::Executor::new().unwrap();
         let pins = trawl_core::schema::FieldTypes::new();
         let counted = executor
-            .run_query("* | stats count()", ZERO_COLUMN_SOURCE, &pins, 100, 0)
+            .run_query("* | stats count()", ZERO_COLUMN_SOURCE, &pins, 100)
             .unwrap();
         assert_eq!(counted.rows[0][0].to_string(), "0");
         let table = executor
-            .run_query("* | table n", ZERO_COLUMN_SOURCE, &pins, 100, 0)
+            .run_query("* | table n", ZERO_COLUMN_SOURCE, &pins, 100)
             .expect("a field the run never recorded reads as NULL");
         assert!(table.rows.is_empty(), "the run has no rows: {table:?}");
         let columns: Vec<(&str, &trawl_engine::value::ColumnType)> = table
@@ -445,7 +445,6 @@ mod tests {
                 &source,
                 &trawl_core::schema::FieldTypes::new(),
                 100,
-                0,
             )
             .expect("the emitter accepts the subquery and DuckDB reads the file");
         assert_eq!(counted.rows[0][0].to_string(), "1");
@@ -888,11 +887,11 @@ mod pg_tests {
         let executor = trawl_engine::executor::Executor::new().unwrap();
         let pins = trawl_core::schema::FieldTypes::new();
         let counted = executor
-            .run_query("* | stats count()", &source, &pins, 100, 0)
+            .run_query("* | stats count()", &source, &pins, 100)
             .unwrap();
         assert_eq!(counted.rows[0][0].to_string(), "0");
         let listed = executor
-            .run_query("* | table n", &source, &pins, 100, 0)
+            .run_query("* | table n", &source, &pins, 100)
             .unwrap();
         assert!(listed.rows.is_empty());
         assert_eq!(
@@ -1051,7 +1050,6 @@ mod pg_tests {
                 &source,
                 &trawl_core::schema::FieldTypes::new(),
                 100,
-                0,
             )
             .unwrap();
         assert_eq!(result.rows.len(), 1, "one row, from the run that has one");
@@ -1161,7 +1159,6 @@ mod pg_tests {
                 &source,
                 &trawl_core::schema::FieldTypes::new(),
                 100,
-                0,
             )
             .unwrap();
         assert_eq!(counted.rows[0][0].to_string(), "0");

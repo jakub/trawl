@@ -1308,7 +1308,6 @@ fn run_query_blocking(
     input: ReadInput<'_>,
     pins: &trawl_core::schema::FieldTypes,
     cap: RowCap,
-    utc_offset_secs: i32,
     capture_debug: bool,
     snapshotted: impl FnOnce(),
 ) -> (Result<QueryResult, ServerError>, Option<PoolDebugInfo>) {
@@ -1361,16 +1360,13 @@ fn run_query_blocking(
                     &hot.field_types,
                     pins,
                     cap,
-                    utc_offset_secs,
                 )
                 .map_err(ServerError::from)
         } else {
             let executor = executor.cancellable(cancel).timed(clock);
             match input {
-                ReadInput::Corpus(_) => executor.run_query(dsl, source, pins, cap, utc_offset_secs),
-                ReadInput::Recorded => {
-                    executor.run_recorded_query(dsl, source, pins, cap, utc_offset_secs)
-                }
+                ReadInput::Corpus(_) => executor.run_query(dsl, source, pins, cap),
+                ReadInput::Recorded => executor.run_recorded_query(dsl, source, pins, cap),
             }
             .map_err(ServerError::from)
         }
@@ -1895,7 +1891,7 @@ impl ExecutorPool {
     /// When `capture_debug` is true, captures source selection, hot buffer
     /// state, and generated SQL for the query debug log.
     ///
-    /// `utc_offset_secs` is applied to all timestamp values in the result.
+    /// Timestamps in the result are UTC.
     ///
     /// A result past `max_result_rows` is refused. A lane with a cap of its
     /// own goes through [`execute_capped`](Self::execute_capped).
@@ -1905,7 +1901,6 @@ impl ExecutorPool {
         dsl: &str,
         deadline: Deadline,
         capture_debug: bool,
-        utc_offset_secs: i32,
         work: WorkContext,
     ) -> ExecuteOutcome {
         self.execute_capped(
@@ -1914,7 +1909,6 @@ impl ExecutorPool {
             RowCap::Refuse(self.max_result_rows),
             deadline,
             capture_debug,
-            utc_offset_secs,
             work,
         )
         .await
@@ -1931,7 +1925,6 @@ impl ExecutorPool {
         cap: RowCap,
         deadline: Deadline,
         capture_debug: bool,
-        utc_offset_secs: i32,
         work: WorkContext,
     ) -> ExecuteOutcome {
         let kind = work.kind;
@@ -2087,7 +2080,6 @@ impl ExecutorPool {
                                 ReadInput::Corpus(hot_buffer.as_ref().map(|hb| (hb, &scratch))),
                                 &pins,
                                 cap,
-                                utc_offset_secs,
                                 capture_debug,
                                 || {},
                             );
@@ -2173,7 +2165,6 @@ impl ExecutorPool {
         source: &str,
         deadline: Deadline,
         capture_debug: bool,
-        utc_offset_secs: i32,
         work: WorkContext,
     ) -> ExecuteOutcome {
         let kind = work.kind;
@@ -2280,7 +2271,6 @@ impl ExecutorPool {
                         ReadInput::Recorded,
                         &pins,
                         cap,
-                        utc_offset_secs,
                         capture_debug,
                         || {},
                     );
@@ -2778,7 +2768,6 @@ impl ExecutorPool {
         source: CaptureSource,
         cap: RowCap,
         deadline: Deadline,
-        utc_offset_secs: i32,
         work: WorkContext,
         finish: CaptureFinish<T>,
     ) -> Result<T, ServerError> {
@@ -2911,7 +2900,6 @@ impl ExecutorPool {
                         input,
                         &pins,
                         cap,
-                        utc_offset_secs,
                         false,
                         || {
                             worker_seam!(seams, Snapshotted);
@@ -3397,7 +3385,6 @@ mod tests {
                 "* | table lvl",
                 Deadline::after(Duration::from_secs(30)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -3417,7 +3404,6 @@ mod tests {
                 "* | table lvl",
                 Deadline::after(Duration::from_secs(30)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -3468,7 +3454,6 @@ mod tests {
                 "* | let t = null | timechart on t count()",
                 Deadline::after(Duration::from_secs(30)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -3563,7 +3548,6 @@ mod tests {
                     dsl,
                     Deadline::after(Duration::from_secs(30)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -3651,7 +3635,6 @@ mod tests {
                 "* | head 100",
                 Deadline::after(Duration::from_secs(30)),
                 false,
-                0,
                 TEST_WORK,
             )
         };
@@ -3895,7 +3878,6 @@ mod tests {
                 "| | |",
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -3925,7 +3907,6 @@ mod tests {
                     "* | table lvl",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -3952,7 +3933,6 @@ mod tests {
                 "| | invalid",
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -3969,7 +3949,6 @@ mod tests {
                 "service:test",
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -3988,7 +3967,6 @@ mod tests {
                 "service:test",
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -3998,7 +3976,6 @@ mod tests {
                 "service:test",
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -4063,7 +4040,6 @@ mod tests {
                 "*",
                 Deadline::after(Duration::from_secs(5)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -4100,7 +4076,6 @@ mod tests {
                 "*",
                 Deadline::after(Duration::from_secs(5)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -4142,7 +4117,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4173,7 +4147,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4218,7 +4191,6 @@ mod tests {
                 "service:test",
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await
@@ -4328,7 +4300,6 @@ mod tests {
                 "service:test",
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await
@@ -4371,7 +4342,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4447,7 +4417,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4519,7 +4488,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4559,7 +4527,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(60)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4584,7 +4551,6 @@ mod tests {
                 "*",
                 Deadline::after(Duration::from_secs(60)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -4606,7 +4572,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(60)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4640,7 +4605,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(60)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4702,7 +4666,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(60)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4757,7 +4720,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4780,7 +4742,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4820,7 +4781,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(600)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -4868,7 +4828,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(60)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await;
@@ -4923,7 +4882,6 @@ mod tests {
                 "*",
                 Deadline::after(Duration::from_secs(60)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await
@@ -4985,7 +4943,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -5041,7 +4998,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     WorkContext::system(WorkKind::Scheduled),
                 )
                 .await
@@ -5056,7 +5012,6 @@ mod tests {
                     window(),
                     RowCap::Refuse(100),
                     Deadline::after(Duration::from_secs(5)),
-                    0,
                     WorkContext::key(WorkKind::Capture, 13),
                     rows_of(),
                 )
@@ -5120,7 +5075,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(60)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await;
@@ -5151,7 +5105,6 @@ mod tests {
                 window(),
                 RowCap::Refuse(100),
                 Deadline::after(Duration::from_secs(60)),
-                0,
                 WorkContext::key(WorkKind::Capture, 7),
                 rows_of(),
             )
@@ -5187,7 +5140,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(600)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -5425,14 +5377,7 @@ mod tests {
             let deadline = || Deadline::after(Duration::from_secs(120));
 
             let query = pool
-                .execute(
-                    pool.allocate_query_id(),
-                    DSL,
-                    deadline(),
-                    false,
-                    0,
-                    TEST_WORK,
-                )
+                .execute(pool.allocate_query_id(), DSL, deadline(), false, TEST_WORK)
                 .await
                 .result;
             if !query.as_ref().is_err_and(exhausted) {
@@ -5506,7 +5451,6 @@ mod tests {
                     "read_parquet('/nonexistent/run.parquet')",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -5614,7 +5558,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     TEST_WORK,
                 )
                 .await
@@ -5807,7 +5750,6 @@ mod tests {
                 "*",
                 Deadline::after(Duration::from_secs(5)),
                 false,
-                0,
                 TEST_WORK.with_timing(timing),
             )
             .await;
@@ -5832,7 +5774,6 @@ mod tests {
                 "*",
                 Deadline::after(Duration::from_secs(5)),
                 false,
-                0,
                 TEST_WORK.with_timing(timing),
             )
             .await;
@@ -5899,7 +5840,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     work,
                 )
                 .await
@@ -5993,7 +5933,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     work,
                 )
                 .await
@@ -6027,7 +5966,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(5)),
                     false,
-                    0,
                     work,
                 )
                 .await
@@ -6079,7 +6017,6 @@ mod tests {
                     "*",
                     Deadline::after(Duration::from_secs(600)),
                     false,
-                    0,
                     work,
                 )
                 .await
@@ -6129,7 +6066,6 @@ mod tests {
                 "*",
                 Deadline::after(Duration::from_secs(30)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -6141,7 +6077,6 @@ mod tests {
                 "'/nonexistent/saved.parquet'",
                 Deadline::after(Duration::from_secs(30)),
                 false,
-                0,
                 TEST_WORK,
             )
             .await;
@@ -6278,7 +6213,6 @@ mod tests {
                 window(),
                 RowCap::Refuse(100),
                 Deadline::after(Duration::from_secs(60)),
-                0,
                 work,
                 finish,
             )
@@ -6337,7 +6271,6 @@ mod tests {
                         window(),
                         RowCap::Refuse(100),
                         Deadline::after(Duration::from_secs(600)),
-                        0,
                         work,
                         Box::new(move |_: CaptureInput<'_>| {
                             finished.store(true, Ordering::SeqCst);
@@ -6413,7 +6346,6 @@ mod tests {
                         window(),
                         RowCap::Refuse(100),
                         Deadline::after(Duration::from_secs(5)),
-                        0,
                         work,
                         Box::new(move |_: CaptureInput<'_>| {
                             entered.store(true, Ordering::SeqCst);
@@ -6485,7 +6417,6 @@ mod tests {
                 window_under(1),
                 RowCap::Refuse(100),
                 Deadline::after(Duration::from_secs(60)),
-                0,
                 work,
                 Box::new({
                     let finished = Arc::clone(&finished);
@@ -6562,7 +6493,6 @@ mod tests {
                 },
                 RowCap::Refuse(100),
                 Deadline::after(Duration::from_secs(30)),
-                0,
                 work,
                 Box::new(|input: CaptureInput<'_>| {
                     Ok((input.result.rows.len(), input.source_bytes))
@@ -6584,7 +6514,6 @@ mod tests {
                 window(),
                 RowCap::Refuse(100),
                 Deadline::after(Duration::from_millis(200)),
-                0,
                 WorkContext::key(WorkKind::Capture, 7),
                 rows_of(),
             )
@@ -6613,7 +6542,6 @@ mod tests {
                 window(),
                 RowCap::Refuse(100),
                 Deadline::after(Duration::from_secs(30)),
-                0,
                 work,
                 Box::new(|_: CaptureInput<'_>| -> Result<(), ServerError> {
                     panic!("{}", seam::INJECTED_PANIC_PAYLOAD)
@@ -6636,7 +6564,6 @@ mod tests {
                 window(),
                 RowCap::Refuse(100),
                 Deadline::after(Duration::from_secs(30)),
-                0,
                 work,
                 Box::new({
                     let finished = Arc::clone(&finished);

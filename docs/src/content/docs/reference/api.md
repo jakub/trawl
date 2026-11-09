@@ -201,7 +201,7 @@ Each cell is encoded under its column's type. A null cell is JSON `null` under e
 
 An integer cell is a string so that a JavaScript client keeps every digit past 2^53. The spelling is canonical: `-?(0|[1-9][0-9]*)`. A decimal string has no plus sign, no leading zero, no `-0`, and no whitespace. The value is in the signed or the unsigned 64-bit range, from `-9223372036854775808` to `18446744073709551615`. A decoder refuses any other spelling and any value outside that range. It also refuses a JSON number under `integer`, and a string under `float` other than the three spellings in the table. A query whose result has an integer outside the range, for example a `sum` past `18446744073709551615`, is refused with 400 `execution_error`. The message names the column. Cast the column with `tonumber()` or `tostring()`.
 
-A timestamp cell uses `Z` at offset zero and `+HH:MM` or `-HH:MM` otherwise. A query response writes timestamps in the request's `timezone`. Report runs and stream frames write them in UTC. A year outside 0000 to 9999 uses the ISO 8601 expanded form, a sign and at least four digits, for example `+10000-01-01T00:00:00.000000Z`. `infinity` and `-infinity` are DuckDB's infinite timestamps.
+A timestamp cell is in UTC, with a `Z` suffix, in query responses, report runs, and stream frames alike. A client that shows instants in another zone converts the cells of `timestamp` columns itself. A year outside 0000 to 9999 uses the ISO 8601 expanded form, a sign and at least four digits, for example `+10000-01-01T00:00:00.000000Z`. `infinity` and `-infinity` are DuckDB's infinite timestamps.
 
 A `mixed` column holds cells of more than one type. Only a column that an `extract kv` stage computes, or a merge of live frames, can be `mixed`. Each non-null cell carries its own `type` and `value`, and a `list` tag also carries `items`. A decoder reads the cell from its tag, never from its spelling.
 
@@ -210,7 +210,6 @@ A column with no evidence of its type is `string`. That is an all-null column th
 These limits apply:
 
 - DuckDB `DECIMAL`, `INTERVAL`, `STRUCT`, `MAP`, and `UNION` values arrive as null cells in a `string` column.
-- A timestamp that a stage after `extract kv` computes is written in UTC, not in the request's `timezone`.
 - A `date` or `time` column that passes through a stage after `extract kv` is `string`.
 - A `mixed` column tags a timestamp that a stage after `extract kv` computes as `string`, on its own or as a `list` item. A column whose every cell is such a timestamp is `timestamp`.
 
@@ -308,7 +307,8 @@ Runs a DSL query and returns one page of rows. A query whose first stage is `fro
 | `query` | body | string | yes | The DSL query |
 | `limit` | body | integer | no | Rows per page. Default and cap: `[server] max_result_rows` (`100000`). |
 | `offset` | body | integer | no | Rows to skip. Default `0`. `offset + limit` may not exceed `max_result_rows`. |
-| `timezone` | body | string | no | Timestamp display zone: `"UTC"`, `"local"`, or a fixed offset such as `"+05:30"`. Default `"UTC"`. |
+
+trawld ignores a body field it does not know. A request that still carries a `timezone` field gets UTC timestamps, as every request does.
 
 **Request**
 
@@ -342,7 +342,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | `pagination` | object | `limit`, `offset`, `returned`, and `total` for this page |
 | `pagination.total` | integer | Rows this execution produced, before the response window was cut from them. Compare it with `returned` to tell a whole result from a page of one. |
 | `execution` | object | Optional execution metadata. Present on successful server query responses, including zero-row results. Absent on synthetic client results. |
-| `execution.started_at` | string | Server start instant in RFC 3339 UTC, with a `Z` suffix. Independent of the request's `timezone`. |
+| `execution.started_at` | string | Server start instant in RFC 3339 UTC, with a `Z` suffix. |
 | `execution.duration_ms` | integer | Server-measured duration in milliseconds. Zero is valid. |
 | `degraded_fields` | array | Fields the query bound whose pin is degraded, including fields filtered on and then projected away. Absent when empty. Stale by at most `schema_cache_ttl_secs`. |
 | `severity_columns` | array | Result columns that hold OTel severity numbers other than `_severity`. Absent when empty. |
@@ -355,7 +355,7 @@ The server captures `execution.started_at` beside its monotonic timer. The durat
 |--------|------|------|
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
-| 400 | `bad_request` | `timezone` is not `UTC`, `local`, or a fixed offset, or `offset + limit` exceeds `max_result_rows` |
+| 400 | `bad_request` | `offset + limit` exceeds `max_result_rows` |
 | 400 | `result_too_large` | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at its group, distinct-value or exact-value cap. The message names the cap and its limit. |
 | 400 | `execution_error` | A result cell is an integer outside the signed and unsigned 64-bit range. The message names the column. |
 | 404 | `not_found` | A `from saved` stage names a saved query the key does not own, or one with no successful run |

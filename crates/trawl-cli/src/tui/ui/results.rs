@@ -16,10 +16,13 @@ use ratatui::widgets::{
 };
 use std::collections::HashSet;
 use trawl_api::display::{
-    downsample, extract_series, is_timechart_result, timestamp_cell_text, value_to_string,
+    downsample, extract_series_labelled, is_timechart_result, value_to_string,
 };
 use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 use trawl_api::value::ColumnType;
+use trawl_api::zone::{
+    DisplayZone, TIMESTAMP_INFINITY, TIMESTAMP_NEG_INFINITY, present_cell, wire_micros,
+};
 use trawl_core::sanitize::sanitize_display_text;
 use trawl_core::text_layout::{caret_layout, cells, fit_cells, locate_span};
 use trawl_engine::value::Value;
@@ -197,7 +200,14 @@ fn render_table(
     let available_width = area.width.saturating_sub(4) as usize; // borders + padding
 
     // Widths for every column, not just the displayed ones.
-    let all_widths = compute_column_widths(result, v_scroll, available_width, config);
+    let all_widths = compute_column_widths(
+        result,
+        v_scroll,
+        max_visible_rows,
+        available_width,
+        config,
+        app.display_zone,
+    );
     let total_cols = result.columns.len();
 
     let pinned = config.map_or_else(Vec::new, ColumnConfig::pinned_indices);
@@ -317,16 +327,21 @@ fn render_table(
                 .map(|&col_idx| {
                     let value = &row_data[col_idx];
                     let width = all_widths[col_idx] as usize;
-                    let text = if trawl_core::severity::renders_as_severity(
-                        &result.columns[col_idx].name,
-                        &response.severity_columns,
-                    ) {
-                        // A severity cell shows its OTel token, so `17` reads
-                        // `error`, the same vocabulary that filters it
-                        // (ADR-0013 §6).
-                        severity_cell_text(value)
-                    } else {
-                        cell_text(&result.columns[col_idx].ty, value)
+                    let ty = &result.columns[col_idx].ty;
+                    // A timestamp reads by its type in the display zone,
+                    // whatever its column is called. Otherwise a severity
+                    // cell shows its OTel token, so `17` reads `error`, the
+                    // same vocabulary that filters it (ADR-0013 §6).
+                    let text = match trawl_api::zone::present_cell(ty, value, app.display_zone) {
+                        Some(text) => text,
+                        None if trawl_core::severity::renders_as_severity(
+                            &result.columns[col_idx].name,
+                            &response.severity_columns,
+                        ) =>
+                        {
+                            severity_cell_text(value)
+                        }
+                        None => cell_text(ty, value, app.display_zone),
                     };
                     let cell = Cell::from(fit_cells(&text, width));
                     if current_match_cell == Some((abs_row, col_idx)) {
@@ -743,18 +758,6 @@ pub fn is_bar_chartable(result: &trawl_engine::value::QueryResult) -> bool {
     has_string && has_numeric
 }
 
-/// [`extract_series`] with each series label sanitized. A label is a
-/// metric column's name or a grouped value, so a sender can pick it, and
-/// it reaches titles, legends and axis labels.
-fn chart_series(result: &trawl_engine::value::QueryResult) -> (Vec<(String, Vec<u64>)>, usize) {
-    let (series, total) = extract_series(result);
-    let series = series
-        .into_iter()
-        .map(|(label, values)| (sanitize_display_text(&label), values))
-        .collect();
-    (series, total)
-}
-
 /// Render braille line chart for timechart results using `Chart` widget.
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn render_line_chart(
@@ -770,14 +773,14 @@ fn render_line_chart(
         Style::default().fg(theme.border_unfocused)
     };
 
-    let (series, total_series) = chart_series(result);
+    let (series, total_series) = chart_series(result, app.display_zone);
 
     if series.is_empty() {
         render_placeholder(app, frame, area);
         return;
     }
 
-    let time_info = extract_time_metadata(result);
+    let time_info = extract_time_metadata(result, app.display_zone);
 
     let title = if series.len() == 1 {
         let label = &series[0].0;
@@ -1008,8 +1011,11 @@ fn render_bar_chart(
         .take(max_bars)
         .enumerate()
         .map(|(idx, row)| {
-            let label =
-                sanitize_display_text(&cell_text(&result.columns[label_col].ty, &row[label_col]));
+            let label = sanitize_display_text(&cell_text(
+                &result.columns[label_col].ty,
+                &row[label_col],
+                app.display_zone,
+            ));
             // A bar's height is a `u64`, which is `Value::UInt`'s own
             // width, so an oversized unsigned draws at its real
             // magnitude. A negative or a NaN clamps to the bottom of the
@@ -1079,7 +1085,7 @@ fn render_sparkline(
         Style::default().fg(theme.border_unfocused)
     };
 
-    let (series, total_series) = chart_series(result);
+    let (series, total_series) = chart_series(result, app.display_zone);
 
     if series.is_empty() {
         // Fallback to placeholder if extraction failed
@@ -1088,7 +1094,7 @@ fn render_sparkline(
     }
 
     // Extract time metadata for title
-    let time_info = extract_time_metadata(result);
+    let time_info = extract_time_metadata(result, app.display_zone);
 
     // Single series: render one large sparkline
     if series.len() == 1 {
@@ -1371,18 +1377,27 @@ fn render_stacked_sparklines(
 
 /// Compute adaptive column widths based on header + first N rows of data.
 ///
-/// Samples up to `SAMPLE_ROWS` visible rows starting from `v_scroll`, taking
-/// the max display width per column, clamped to `MIN_COL` and to each
+/// Samples the rows from `v_scroll` on, every row the grid draws
+/// (`visible_rows`) and at least `SAMPLE_ROWS`, taking the max display
+/// width per column, clamped to `MIN_COL` and to each
 /// column's equal share of `available_width` (itself capped at `MAX_COL`).
+/// A column of instants may take the whole `available_width` instead: its
+/// offset is often the only difference between two rows (a fall-back
+/// night's two 01:30s), so cutting it would show one reading twice. An
+/// instant's text varies in length (its fraction drops trailing zeros), so
+/// a row the sample missed could be wider than its column: every drawn row
+/// is sampled.
 /// Widths are display cells of the text as the grid draws it: each value
-/// is cut to the column's cap with [`fit_cells`] before it is measured, so
+/// is cut to its column's cap with [`fit_cells`] before it is measured, so
 /// a value of any length costs no more than the cap to size.
 /// Respects `width_override` from `ColumnConfig`; hidden columns get width 0.
 fn compute_column_widths(
     result: &trawl_engine::value::QueryResult,
     v_scroll: usize,
+    visible_rows: usize,
     available_width: usize,
     config: Option<&ColumnConfig>,
+    zone: DisplayZone,
 ) -> Vec<u16> {
     const MIN_COL: usize = 8;
     const MAX_COL: usize = 60;
@@ -1394,6 +1409,10 @@ fn compute_column_widths(
         .max(1);
     let per_col_budget = (available_width / visible_count).saturating_sub(CELL_PADDING);
     let max_col = per_col_budget.clamp(MIN_COL, MAX_COL);
+    let instant_col = available_width
+        .saturating_sub(CELL_PADDING)
+        .clamp(MIN_COL, MAX_COL)
+        .max(max_col);
 
     result
         .columns
@@ -1409,17 +1428,30 @@ fn compute_column_widths(
                 }
             }
 
-            let width_of = |text: &str| cells(&fit_cells(text, max_col));
-            let mut max_width = width_of(&col.name);
+            let width_of = |text: &str, cap: usize| cells(&fit_cells(text, cap));
+            let mut max_width = width_of(&col.name, max_col);
+            let mut cap = max_col;
 
-            for row in result.rows.iter().skip(v_scroll).take(SAMPLE_ROWS) {
+            for row in result
+                .rows
+                .iter()
+                .skip(v_scroll)
+                .take(SAMPLE_ROWS.max(visible_rows))
+            {
                 if let Some(value) = row.get(col_idx) {
-                    max_width = max_width.max(width_of(&cell_text(&col.ty, value)));
+                    let width = match present_cell(&col.ty, value, zone) {
+                        Some(shown) => {
+                            cap = instant_col;
+                            width_of(&shown, instant_col)
+                        }
+                        None => width_of(&value_to_string(value), max_col),
+                    };
+                    max_width = max_width.max(width);
                 }
             }
 
             #[allow(clippy::cast_possible_truncation)]
-            let width = max_width.clamp(MIN_COL, max_col) as u16;
+            let width = max_width.clamp(MIN_COL, cap) as u16;
             width
         })
         .collect()
@@ -1427,9 +1459,15 @@ fn compute_column_widths(
 
 /// Extract time metadata from timechart result.
 ///
-/// Returns (`start_time`, `end_time`, `span_interval`) as formatted strings.
+/// Returns (`start_time`, `end_time`, `span_interval`) as formatted strings:
+/// the first and last rows' instants shown in `zone`, offset included, and
+/// the smallest gap between distinct instants. The chart plots rows in
+/// response order, so the endpoint labels follow it too. The span reads
+/// the UTC instants the rows carry, never display text, so a fall-back
+/// night's two 02:30s stay an hour apart in any zone.
 fn extract_time_metadata(
     result: &trawl_engine::value::QueryResult,
+    zone: DisplayZone,
 ) -> Option<(String, String, String)> {
     if result.rows.is_empty() {
         return None;
@@ -1437,69 +1475,66 @@ fn extract_time_metadata(
 
     // Find the _time column by name (UNION ALL BY NAME can reorder columns)
     let time_col = result.columns.iter().position(|c| c.name == "_time")?;
-
     let time_ty = &result.columns[time_col].ty;
-    let first_time = cell_text(time_ty, &result.rows[0][time_col]);
-    let last_time = cell_text(time_ty, &result.rows[result.rows.len() - 1][time_col]);
 
-    // Derive span from the minimum non-zero delta between consecutive time buckets.
-    // Using min rather than just the first pair handles sparse data (empty buckets
-    // aren't emitted by time_bucket) and group-by rows sharing the same _time.
-    let span = if result.rows.len() >= 2 {
-        let mut min_delta: Option<u64> = None;
-        for pair in result.rows.windows(2) {
-            let t1 = cell_text(time_ty, &pair[0][time_col]);
-            let t2 = cell_text(time_ty, &pair[1][time_col]);
-            if let (Some(s1), Some(s2)) = (parse_timestamp_secs(&t1), parse_timestamp_secs(&t2)) {
-                let delta = s2.saturating_sub(s1);
-                if delta > 0 {
-                    min_delta = Some(min_delta.map_or(delta, |prev| prev.min(delta)));
-                }
-            }
-        }
-        min_delta.map_or("?".to_owned(), format_duration)
+    let mut instants: Vec<i64> = result
+        .rows
+        .iter()
+        .filter_map(|row| match row.get(time_col)? {
+            Value::String(wire) => wire_micros(wire),
+            _ => None,
+        })
+        .collect();
+    instants.sort_unstable();
+    instants.dedup();
+    let shown = |row: &[Value]| row.get(time_col).map(|cell| cell_text(time_ty, cell, zone));
+    let (first, last) = (shown(result.rows.first()?)?, shown(result.rows.last()?)?);
+
+    // Derive span from the minimum gap between distinct instants. Using the
+    // minimum handles sparse data (empty buckets aren't emitted by
+    // time_bucket) and group-by rows sharing the same _time. An infinity is
+    // no bucket, so it bounds no gap.
+    let span = if instants.len() >= 2 {
+        let finite: Vec<i64> = instants
+            .iter()
+            .copied()
+            .filter(|micros| !matches!(*micros, TIMESTAMP_INFINITY | TIMESTAMP_NEG_INFINITY))
+            .collect();
+        finite
+            .windows(2)
+            .filter_map(|pair| u64::try_from(i128::from(pair[1]) - i128::from(pair[0])).ok())
+            .map(|micros| micros / 1_000_000)
+            .filter(|&secs| secs > 0)
+            .min()
+            .map_or("?".to_owned(), format_duration)
     } else {
         "N/A".to_owned()
     };
 
-    // Format times (truncate if too long), sanitized: a `_time` cell is
-    // whatever the result holds.
-    let format_time = |s: String| {
-        let s = if s.len() > 19 {
-            // Keep just date and time, drop subseconds/timezone
-            s.chars().take(19).collect()
-        } else {
-            s
-        };
-        sanitize_display_text(&s)
-    };
-
-    Some((format_time(first_time), format_time(last_time), span))
+    // Sanitized: a `_time` cell that is not a timestamp is whatever the
+    // result holds. An instant keeps its whole text, offset included.
+    Some((
+        sanitize_display_text(&first),
+        sanitize_display_text(&last),
+        span,
+    ))
 }
 
-/// Parse "YYYY-MM-DD HH:MM:SS" into total seconds (for diffing, not epoch).
-fn parse_timestamp_secs(s: &str) -> Option<u64> {
-    // Expect at minimum "YYYY-MM-DD HH:MM:SS" (19 chars)
-    if s.len() < 19 {
-        return None;
-    }
-    let bytes = s.as_bytes();
-
-    let year: u64 = s[0..4].parse().ok()?;
-    let month: u64 = s[5..7].parse().ok()?;
-    let day: u64 = s[8..10].parse().ok()?;
-
-    // Delimiter between date and time can be ' ' or 'T'
-    if bytes[10] != b' ' && bytes[10] != b'T' {
-        return None;
-    }
-
-    let hour: u64 = s[11..13].parse().ok()?;
-    let min: u64 = s[14..16].parse().ok()?;
-    let sec: u64 = s[17..19].parse().ok()?;
-
-    // Rough total seconds (not calendar-accurate, but fine for diffs within days)
-    Some(year * 365 * 86400 + month * 30 * 86400 + day * 86400 + hour * 3600 + min * 60 + sec)
+/// A timechart's series as the TUI draws them: a `timestamp` group label
+/// in `zone` through [`cell_text`], as the grid shows that column, and
+/// every label sanitized. A label is a metric column's name or a grouped
+/// value, so a sender can pick it, and it reaches titles, legends and axis
+/// labels.
+fn chart_series(
+    result: &trawl_engine::value::QueryResult,
+    zone: DisplayZone,
+) -> (Vec<(String, Vec<u64>)>, usize) {
+    let (series, total) = extract_series_labelled(result, |ty, value| cell_text(ty, value, zone));
+    let series = series
+        .into_iter()
+        .map(|(label, values)| (sanitize_display_text(&label), values))
+        .collect();
+    (series, total)
 }
 
 /// Format a duration in seconds as a human-readable string.
@@ -1515,18 +1550,140 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-/// A result cell as the TUI shows it: a timestamp as the wall clock the
-/// server rendered in the reader's offset ([`timestamp_cell_text`]), any
-/// other cell through [`value_to_string`]. The grid, its column widths,
-/// the detail popup and the search all read this one text.
-pub fn cell_text(ty: &ColumnType, value: &Value) -> String {
-    timestamp_cell_text(ty, value).unwrap_or_else(|| value_to_string(value))
+/// A result cell as the TUI shows it: an instant in `zone` with its own
+/// offset ([`present_cell`]), any other cell through [`value_to_string`].
+/// The grid, its column widths, the detail popup and the search all read
+/// this one text.
+pub fn cell_text(ty: &ColumnType, value: &Value, zone: DisplayZone) -> String {
+    present_cell(ty, value, zone).unwrap_or_else(|| value_to_string(value))
 }
 
 /// A `_severity` cell as the TUI shows it: the shared `OTel` token, or the
 /// grid's ordinary rendering where the ladder has no reading for the value.
 fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
     crate::cli::severity_token(value).map_or_else(|| value_to_string(value), str::to_owned)
+}
+
+/// The timechart's span comes from the UTC instants: rows out of order and
+/// a repeated bucket still give the smallest gap, and an infinity bounds no
+/// gap. The endpoint labels are the first and last rows.
+#[cfg(test)]
+#[test]
+fn timechart_metadata_reads_utc_instants() {
+    use trawl_engine::value::{Column, QueryResult};
+
+    let s = |t: &str| vec![Value::String(t.into()), Value::Integer(1)];
+    let result = QueryResult {
+        columns: vec![
+            Column::new("_time", ColumnType::Timestamp),
+            Column::new("count", ColumnType::Integer),
+        ],
+        rows: vec![
+            s("2026-10-25T01:30:00.000000Z"),
+            s("2026-10-25T00:30:00.000000Z"),
+            s("2026-10-25T00:30:00.000000Z"),
+            s("2026-10-25T03:30:00.000000Z"),
+            s("infinity"),
+        ],
+    };
+    let zone = "+02:00".parse::<DisplayZone>().unwrap();
+    let (start, end, span) = extract_time_metadata(&result, zone).unwrap();
+    assert_eq!(start, "2026-10-25 03:30:00 +02:00");
+    assert_eq!(end, "infinity");
+    assert_eq!(span, "1h");
+}
+
+/// The chart plots rows in response order, so its endpoint labels do too:
+/// under `| sort -_time` the left label names the latest bucket, which is
+/// the left-most point.
+#[cfg(test)]
+#[test]
+fn timechart_labels_follow_response_order() {
+    use trawl_engine::value::{Column, QueryResult};
+
+    let s = |t: &str| vec![Value::String(t.into()), Value::Integer(1)];
+    let result = QueryResult {
+        columns: vec![
+            Column::new("_time", ColumnType::Timestamp),
+            Column::new("count", ColumnType::Integer),
+        ],
+        rows: vec![
+            s("2026-10-25T01:30:00.000000Z"),
+            s("2026-10-25T00:30:00.000000Z"),
+        ],
+    };
+    let zone = "+02:00".parse::<DisplayZone>().unwrap();
+    let (start, end, span) = extract_time_metadata(&result, zone).unwrap();
+    assert_eq!(start, "2026-10-25 03:30:00 +02:00");
+    assert_eq!(end, "2026-10-25 02:30:00 +02:00");
+    assert_eq!(span, "1h");
+}
+
+/// A timechart grouped by a `timestamp` column names each series by its
+/// instant in the display zone, as the grid shows that column, not by the
+/// UTC wire text.
+#[cfg(test)]
+#[test]
+fn timechart_timestamp_group_labels_use_the_display_zone() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_engine::value::{Column, QueryResult};
+
+    let row = |time: &str, ingested: &str| {
+        vec![
+            Value::String(time.into()),
+            Value::String(ingested.into()),
+            Value::Integer(2),
+        ]
+    };
+    let result = QueryResult {
+        columns: vec![
+            Column::new("_time", ColumnType::Timestamp),
+            Column::new("_ingested", ColumnType::Timestamp),
+            Column::new("count", ColumnType::Integer),
+        ],
+        rows: vec![
+            row("2026-01-15T00:00:00.000000Z", "2026-01-15T04:30:00.000000Z"),
+            row("2026-01-15T00:00:00.000000Z", "2026-01-15T05:30:00.000000Z"),
+            row("2026-01-15T01:00:00.000000Z", "2026-01-15T04:30:00.000000Z"),
+            row("2026-01-15T01:00:00.000000Z", "2026-01-15T05:30:00.000000Z"),
+        ],
+    };
+
+    for view in [ChartView::LineChart, ChartView::Sparkline] {
+        let mut app = crate::tui::tests::test_app();
+        app.display_zone = "+05:30".parse().unwrap();
+        let returned = result.rows.len();
+        app.tab.result = Some(trawl_client::QueryResponse {
+            execution: None,
+            result: result.clone(),
+            pagination: trawl_client::PaginationMeta {
+                limit: 10_000,
+                offset: 0,
+                returned,
+                total: returned,
+            },
+            degraded_fields: Vec::new(),
+            severity_columns: Vec::new(),
+        });
+        app.tab.chart_view = view;
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).expect("terminal");
+        terminal
+            .draw(|f| crate::tui::ui::render(&mut app, f))
+            .expect("render");
+        let screen = terminal.backend().to_string();
+
+        assert!(!screen.contains("15T0"), "{view:?} wire label:\n{screen}");
+        if view == ChartView::LineChart {
+            for label in ["2026-01-15 10:00:00 +05:30", "2026-01-15 11:00:00 +05:30"] {
+                assert!(
+                    screen.contains(label),
+                    "{view:?} {label} missing:\n{screen}"
+                );
+            }
+        }
+    }
 }
 
 /// Both timechart views survive metrics at the top of the `u64` range.
@@ -1567,7 +1724,7 @@ fn timechart_sparklines_survive_unsigned_magnitudes() {
     // or zeroed the unsigned cells would still leave non-empty series
     // (the fixture carries integers too), and both draws below would
     // succeed over zeros.
-    let (series, _) = extract_series(&result);
+    let (series, _) = trawl_api::display::extract_series(&result);
     assert!(
         series.contains(&("m0".to_owned(), vec![0, u64::MAX]))
             && series.contains(&("m1".to_owned(), vec![u64::MAX, 0])),
@@ -1975,8 +2132,8 @@ mod grid_tests {
     use trawl_core::text_layout::{MARKER, cells};
     use trawl_engine::value::{Column, ColumnType, QueryResult, Value};
 
-    use super::compute_column_widths;
     use super::error_pane_tests::rows_of;
+    use super::{DisplayZone, compute_column_widths};
     use crate::tui::state::TabStatus;
     use crate::tui::tests::test_app;
 
@@ -2002,7 +2159,10 @@ mod grid_tests {
             ]],
             &["s", "t"],
         );
-        assert_eq!(compute_column_widths(&result, 0, 200, None), [12, 10]);
+        assert_eq!(
+            compute_column_widths(&result, 0, 1, 200, None, DisplayZone::Utc),
+            [12, 10]
+        );
     }
 
     /// A value far past the column's cap, CJK or a run of combining marks,
@@ -2017,7 +2177,7 @@ mod grid_tests {
             ]],
             &["s", "t"],
         );
-        let widths = compute_column_widths(&result, 0, 200, None);
+        let widths = compute_column_widths(&result, 0, 1, 200, None, DisplayZone::Utc);
         assert_eq!(widths[0], 59);
         assert_eq!(widths[1], 8);
     }

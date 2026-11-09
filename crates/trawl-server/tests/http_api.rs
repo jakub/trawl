@@ -1460,32 +1460,46 @@ async fn a_failed_from_saved_resolution_finishes_its_tracking() {
     assert!(seen.retained.is_empty(), "no permit was ever taken");
 }
 
-/// An unparseable timezone is request validation, refused with a 400 before
-/// the tracker opens an entry. It used to be resolved after `tracker.start`
-/// and returned by `?`, which left the id active for the life of the
-/// process because nothing sweeps abandoned entries.
+/// trawld answers in UTC only: a body from an older client that still
+/// carries a `timezone`, valid or not, is answered, and every timestamp in
+/// the answer is UTC. The field is ignored, never validated.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_invalid_timezone_leaves_no_active_entry() {
-    const DSL: &str = "service=tz-refusal last=1h | head 1";
+async fn a_stale_timezone_field_is_ignored_and_the_answer_is_utc() {
+    const DSL: &str = "service=tz-stale last=1h | table _time";
 
     let server = setup().await;
-    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
-
-    let resp = raw_client()
-        .post(format!("{}/api/v1/query", server.url))
-        .header("authorization", format!("Bearer {}", server.analyst_token))
-        .json(&serde_json::json!({ "query": DSL, "timezone": "Mars/Olympus_Mons" }))
-        .send()
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let resp = ingest
+        .ingest(&[serde_json::json!({
+            "service": "tz-stale", "host": "web01", "timestamp": now, "message": "hello",
+        })])
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "an unresolvable timezone is a 400");
+    assert_eq!(resp.accepted, 1);
 
-    let seen = admin.queries().await.unwrap();
-    assert!(
-        !seen.active.iter().any(|q| q.snapshot.query == DSL),
-        "a refused timezone leaves nothing running"
-    );
-    assert!(seen.retained.is_empty(), "no permit was ever taken");
+    for stale in ["+05:30", "Mars/Olympus_Mons"] {
+        let resp = raw_client()
+            .post(format!("{}/api/v1/query", server.url))
+            .header("authorization", format!("Bearer {}", server.analyst_token))
+            .json(&serde_json::json!({ "query": DSL, "timezone": stale }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "a stale timezone {stale:?} is ignored");
+        let answer: trawl_api::QueryResponse = resp.json().await.unwrap();
+        assert_eq!(answer.result.row_count(), 1, "{stale:?}");
+        let trawl_api::value::Value::String(time) = &answer.result.rows[0][0] else {
+            panic!(
+                "_time is a timestamp string, got {:?}",
+                answer.result.rows[0][0]
+            );
+        };
+        assert!(
+            time.ends_with('Z'),
+            "the answer is UTC whatever the stale field says ({stale:?}): {time}"
+        );
+    }
 }
 
 /// Poll `cond` until it holds, failing after a generous bound.

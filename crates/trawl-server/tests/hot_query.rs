@@ -98,7 +98,6 @@ async fn hot_buffer_makes_events_immediately_queryable() {
             "* | head 100",
             Deadline::after(Duration::from_secs(10)),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -145,7 +144,6 @@ async fn hot_buffer_makes_events_immediately_queryable() {
             "* | head 100",
             Deadline::after(Duration::from_secs(10)),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -238,7 +236,6 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
             "* | head 100",
             Deadline::after(Duration::from_secs(10)),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -335,7 +332,6 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
             "* | head 100",
             Deadline::after(Duration::from_secs(10)),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -527,7 +523,6 @@ async fn query_works_without_hot_buffer() {
             "* | head 100",
             Deadline::after(Duration::from_secs(10)),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -606,7 +601,6 @@ async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours(
             "service=nginx last=6h",
             Deadline::after(Duration::from_secs(10)),
             false,
-            0,
             WorkContext::system(WorkKind::Query),
         )
         .await;
@@ -695,7 +689,6 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
                 dsl,
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 WorkContext::system(WorkKind::Query),
             )
             .await
@@ -865,7 +858,6 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
                 dsl,
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 WorkContext::system(WorkKind::Query),
             )
             .await
@@ -1021,7 +1013,6 @@ async fn hot_null_only_key_reads_as_typed_null() {
                 dsl,
                 Deadline::after(Duration::from_secs(10)),
                 false,
-                0,
                 WorkContext::system(WorkKind::Query),
             )
             .await

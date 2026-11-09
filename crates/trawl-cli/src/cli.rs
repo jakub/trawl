@@ -8,6 +8,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
 use clap::ValueEnum;
+use trawl_api::zone::DisplayZone;
 use trawl_core::sanitize::sanitize_display_text;
 use trawl_core::text_layout::{caret_layout, locate_span};
 use trawl_engine::value::{QueryResult, Value};
@@ -76,14 +77,46 @@ impl std::fmt::Debug for ConnectionParams {
     }
 }
 
-/// Execute a query and print the results.
+/// The display zone a command that prints instants reads from
+/// `ui.timezone`, parsed once before it sends anything. An invalid value is
+/// a usage error naming it; no path falls back to UTC.
+pub fn display_zone(value: &str) -> Result<DisplayZone, CliError> {
+    value
+        .parse()
+        .map_err(|refusal: trawl_api::zone::ZoneRefusal| CliError::Usage(refusal.to_string()))
+}
+
+/// Export a query's results as Parquet to `output`.
+///
+/// Parquet carries UTC instants and prints none, so this path never reads
+/// the display zone.
+pub async fn run_parquet_query(
+    query: &str,
+    data: Option<&str>,
+    output: Option<&Path>,
+    conn: Option<ConnectionParams>,
+) -> Result<(), CliError> {
+    // Parquet output requires -o flag (binary format can't go to stdout).
+    let Some(output_path) = output else {
+        return Err(CliError::Usage(
+            "parquet output requires -o/--output flag".into(),
+        ));
+    };
+    // Use DuckDB's native COPY TO directly.
+    run_parquet_export(query, data, conn.as_ref(), output_path).await
+}
+
+/// Execute a query and print the results, each instant in `zone`.
+///
+/// A Parquet `format` goes to [`run_parquet_query`], which never reads
+/// `zone`.
 pub async fn run_query(
     query: &str,
     data: Option<&str>,
     format: Option<OutputFormat>,
     output: Option<&Path>,
+    zone: DisplayZone,
     conn: Option<ConnectionParams>,
-    timezone: &str,
 ) -> Result<(), CliError> {
     let format = format.unwrap_or_else(|| {
         if io::stdout().is_terminal() {
@@ -92,18 +125,8 @@ pub async fn run_query(
             OutputFormat::Json
         }
     });
-
-    // Parquet output requires -o flag (binary format can't go to stdout).
-    if format == OutputFormat::Parquet && output.is_none() {
-        return Err(CliError::Usage(
-            "parquet output requires -o/--output flag".into(),
-        ));
-    }
-
-    // Parquet export: use DuckDB's native COPY TO directly.
     if format == OutputFormat::Parquet {
-        let output_path = output.expect("validated above");
-        return run_parquet_export(query, data, conn.as_ref(), output_path).await;
+        return run_parquet_query(query, data, output, conn).await;
     }
 
     // Block `from saved` in embedded mode: resolving a saved query's name
@@ -117,8 +140,8 @@ pub async fn run_query(
         ));
     }
 
-    let (result, degraded, severity_columns) = if let Some(data) = data {
-        match run_embedded_mode(data, query, timezone) {
+    let (mut result, degraded, severity_columns) = if let Some(data) = data {
+        match run_embedded_mode(data, query) {
             // Embedded mode has no catalog, so no degraded notice to
             // carry; `sev()` declares its own pin, so its columns still
             // render as tokens without one.
@@ -130,7 +153,7 @@ pub async fn run_query(
             Err(e) => return Err(e),
         }
     } else if let Some(conn) = conn {
-        match run_daemon_mode(&conn, query, timezone).await {
+        match run_daemon_mode(&conn, query).await {
             Ok(r) => r,
             Err(CliError::Client(ref client_err)) => {
                 render_client_error(query, client_err);
@@ -146,9 +169,10 @@ pub async fn run_query(
 
     let stdout = io::stdout();
     emit_results(
-        &result,
+        &mut result,
         format,
         output,
+        zone,
         &degraded,
         &severity_columns,
         &mut stdout.lock(),
@@ -179,10 +203,12 @@ fn embedded_severity_columns(query: &str) -> Vec<String> {
 /// The stream split is the contract: with `-o`, the file is the
 /// deliverable and the footer goes to `err` so it can never
 /// contaminate it; without it, results and footer share `out`.
+#[allow(clippy::too_many_arguments)]
 fn emit_results(
-    result: &QueryResult,
+    result: &mut QueryResult,
     format: OutputFormat,
     output: Option<&Path>,
+    zone: DisplayZone,
     degraded: &[String],
     severity_columns: &[String],
     out: &mut impl Write,
@@ -190,28 +216,38 @@ fn emit_results(
 ) -> Result<(), CliError> {
     if let Some(output_path) = output {
         let mut file = std::fs::File::create(output_path)?;
-        render_results(result, format, severity_columns, &mut file)?;
+        render_results(result, format, zone, severity_columns, &mut file)?;
         // The file is the deliverable; the notice belongs on the terminal.
         write_degraded_footer(err, format, degraded)?;
     } else {
-        render_results(result, format, severity_columns, out)?;
+        render_results(result, format, zone, severity_columns, out)?;
         write_degraded_footer(out, format, degraded)?;
     }
 
     Ok(())
 }
 
-/// Render the result rows in the requested format.
+/// Render the result rows in the requested format, each instant in `zone`.
+///
+/// The table presents each instant with its own offset; json and csv carry
+/// the wire spelling re-written in `zone`, so `result` leaves converted.
 fn render_results(
-    result: &QueryResult,
+    result: &mut QueryResult,
     format: OutputFormat,
+    zone: DisplayZone,
     severity_columns: &[String],
     out: &mut impl Write,
 ) -> io::Result<()> {
     match format {
-        OutputFormat::Table => render_table(result, severity_columns, out),
-        OutputFormat::Json => render_ndjson(result, out),
-        OutputFormat::Csv => render_csv(result, out),
+        OutputFormat::Table => render_table(result, zone, severity_columns, out),
+        OutputFormat::Json => {
+            trawl_api::zone::apply_zone(result, zone);
+            render_ndjson(result, out)
+        }
+        OutputFormat::Csv => {
+            trawl_api::zone::apply_zone(result, zone);
+            render_csv(result, out)
+        }
         OutputFormat::Parquet => unreachable!("handled above"),
     }
 }
@@ -323,12 +359,9 @@ async fn run_parquet_export(
 async fn run_daemon_mode(
     conn: &ConnectionParams,
     query: &str,
-    timezone: &str,
 ) -> Result<(QueryResult, Vec<String>, Vec<String>), CliError> {
     let client = conn.client()?;
-    let response = client
-        .query_paginated_tz(query, None, None, Some(timezone.to_owned()))
-        .await?;
+    let response = client.query_paginated(query, None, None).await?;
     Ok(daemon_outcome(response))
 }
 
@@ -346,9 +379,7 @@ fn daemon_outcome(
 }
 
 /// Execute the query locally with an embedded `DuckDB` engine.
-fn run_embedded_mode(data: &str, query: &str, timezone: &str) -> Result<QueryResult, CliError> {
-    let utc_offset_secs =
-        trawl_engine::timezone::resolve_utc_offset(timezone).map_err(CliError::Usage)?;
+fn run_embedded_mode(data: &str, query: &str) -> Result<QueryResult, CliError> {
     let executor = trawl_engine::executor::Executor::new()?;
     // CLI has no server-side row limit, hence usize::MAX. Embedded mode is
     // pin-blind by design (no catalog, ADR-0011): the explicit empty set
@@ -358,7 +389,6 @@ fn run_embedded_mode(data: &str, query: &str, timezone: &str) -> Result<QueryRes
         data,
         &trawl_core::schema::FieldTypes::new(),
         usize::MAX,
-        utc_offset_secs,
     )?)
 }
 
@@ -366,6 +396,7 @@ fn run_embedded_mode(data: &str, query: &str, timezone: &str) -> Result<QueryRes
 
 fn render_table(
     result: &QueryResult,
+    zone: DisplayZone,
     severity_columns: &[String],
     out: &mut impl Write,
 ) -> io::Result<()> {
@@ -399,17 +430,18 @@ fn render_table(
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                if severity_cells.get(i).copied().unwrap_or(false) {
-                    severity_cell_text(v)
-                } else {
-                    // A timestamp shows the wall clock the server rendered
-                    // in the reader's offset, without the wire's `T` and
-                    // offset.
-                    result
-                        .columns
-                        .get(i)
-                        .and_then(|c| trawl_api::display::timestamp_cell_text(&c.ty, v))
-                        .unwrap_or_else(|| v.to_string())
+                // A timestamp shows its wall clock in the display zone with
+                // that instant's own offset, whatever its column is called.
+                let presented = result
+                    .columns
+                    .get(i)
+                    .and_then(|c| trawl_api::zone::present_cell(&c.ty, v, zone));
+                match presented {
+                    Some(text) => text,
+                    None if severity_cells.get(i).copied().unwrap_or(false) => {
+                        severity_cell_text(v)
+                    }
+                    None => v.to_string(),
                 }
             })
             .collect();
@@ -818,7 +850,7 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        render_table(&result, &severity, &mut out).unwrap();
+        render_table(&result, DisplayZone::Utc, &severity, &mut out).unwrap();
         let table = String::from_utf8(out).unwrap();
         for digits in [
             "9007199254740993",
@@ -867,7 +899,14 @@ mod tests {
         let emit = |format, output: Option<&Path>| {
             let (mut out, mut err) = (Vec::new(), Vec::new());
             emit_results(
-                &result, format, output, &degraded, &severity, &mut out, &mut err,
+                &mut result.clone(),
+                format,
+                output,
+                DisplayZone::Utc,
+                &degraded,
+                &severity,
+                &mut out,
+                &mut err,
             )
             .unwrap();
             (
@@ -928,7 +967,7 @@ mod tests {
         };
         let table = {
             let mut buf = Vec::new();
-            render_table(&result, &[], &mut buf).unwrap();
+            render_table(&result, DisplayZone::Utc, &[], &mut buf).unwrap();
             String::from_utf8(buf).unwrap()
         };
         assert!(table.contains("error"));
@@ -937,64 +976,90 @@ mod tests {
         assert!(render(render_csv).contains("17"));
     }
 
-    /// A `timestamp` column shows in the table exactly as the engine's old
-    /// zoneless text did (the wall clock the server rendered in the
-    /// reader's offset), while json and csv carry the wire's RFC 3339.
+    /// A pivot names its columns from data, so a timestamp column can be
+    /// called `_severity`. Its type decides how it reads, not its name.
     #[test]
-    fn the_table_shows_wire_timestamps_as_the_wall_clock() {
+    fn a_timestamp_column_named_like_severity_still_shows_in_the_display_zone() {
         use trawl_engine::value::{Column, ColumnType};
-        let table = |result: &QueryResult| {
-            let mut buf = Vec::new();
-            render_table(result, &[], &mut buf).unwrap();
-            String::from_utf8(buf).unwrap()
+        let mut result = QueryResult {
+            columns: vec![Column::new("_severity", ColumnType::Timestamp)],
+            rows: vec![vec![Value::String("2026-10-25T00:30:00.000000Z".into())]],
         };
-        let wire = [
-            "2026-01-15T10:00:00.000000+05:30",
-            "2026-01-15T10:00:00.120000+05:30",
-            "infinity",
-        ];
-        let shown = ["2026-01-15 10:00:00", "2026-01-15 10:00:00.12", "infinity"];
-        let typed = QueryResult {
+        let zone = "+02:00".parse::<DisplayZone>().unwrap();
+        let mut buf = Vec::new();
+        render_results(&mut result, OutputFormat::Table, zone, &[], &mut buf).unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert!(table.contains("2026-10-25 02:30:00 +02:00"), "{table}");
+    }
+
+    /// The table shows each instant in the display zone with its own
+    /// offset, so the two 02:30s of a fall-back night differ; json and csv
+    /// carry the wire spelling re-written in the zone. A string column
+    /// holding time-shaped text stays as sent everywhere.
+    #[test]
+    fn query_output_presents_each_instant_in_the_display_zone() {
+        use trawl_engine::value::{Column, ColumnType};
+        let s = |t: &str| Value::String(t.into());
+        let berlin_summer = "+02:00".parse::<DisplayZone>().unwrap();
+        let result = QueryResult {
             columns: vec![
                 Column::new("_time", ColumnType::Timestamp),
                 Column::new("seen", ColumnType::list(ColumnType::Timestamp)),
+                Column::new("text", ColumnType::String),
             ],
-            rows: wire
-                .iter()
-                .map(|t| {
-                    vec![
-                        Value::String((*t).into()),
-                        Value::Array(vec![Value::String((*t).into())]),
-                    ]
-                })
-                .collect(),
-        };
-        let before = QueryResult {
-            columns: vec![
-                Column::new("_time", ColumnType::String),
-                Column::new("seen", ColumnType::list(ColumnType::String)),
+            rows: vec![
+                vec![
+                    s("2026-10-25T00:30:00.000000Z"),
+                    Value::Array(vec![s("2026-10-25T00:30:00.120000Z"), s("infinity")]),
+                    s("2026-10-25T00:30:00.000000Z"),
+                ],
+                vec![s("-infinity"), Value::Array(vec![]), s("x")],
             ],
-            rows: shown
-                .iter()
-                .map(|t| {
-                    vec![
-                        Value::String((*t).into()),
-                        Value::Array(vec![Value::String((*t).into())]),
-                    ]
-                })
-                .collect(),
         };
-        assert_eq!(table(&typed), table(&before));
-
-        for f in [
-            render_ndjson as fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>,
-            render_csv,
-        ] {
+        let render = |format, zone| {
             let mut buf = Vec::new();
-            f(&typed, &mut buf).unwrap();
-            let text = String::from_utf8(buf).unwrap();
-            assert!(text.contains(wire[1]), "{text}");
+            render_results(&mut result.clone(), format, zone, &[], &mut buf).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+
+        let table = render(OutputFormat::Table, berlin_summer);
+        for shown in [
+            "2026-10-25 02:30:00 +02:00",
+            "[2026-10-25 02:30:00.12 +02:00, infinity]",
+            "2026-10-25T00:30:00.000000Z",
+            "-infinity",
+        ] {
+            assert!(table.contains(shown), "{shown:?} missing from\n{table}");
         }
+        let utc = render(OutputFormat::Table, DisplayZone::Utc);
+        assert!(utc.contains("2026-10-25 00:30:00 +00:00"), "{utc}");
+
+        let json = render(OutputFormat::Json, berlin_summer);
+        let first: serde_json::Value = serde_json::from_str(json.lines().next().unwrap()).unwrap();
+        assert_eq!(first["_time"], "2026-10-25T02:30:00.000000+02:00");
+        assert_eq!(
+            first["seen"],
+            serde_json::json!(["2026-10-25T02:30:00.120000+02:00", "infinity"])
+        );
+        assert_eq!(first["text"], "2026-10-25T00:30:00.000000Z");
+
+        let csv = render(OutputFormat::Csv, berlin_summer);
+        let row = csv.lines().nth(1).unwrap();
+        assert!(
+            row.starts_with("2026-10-25T02:30:00.000000+02:00,"),
+            "{row}"
+        );
+        assert!(row.ends_with(",2026-10-25T00:30:00.000000Z"), "{row}");
+    }
+
+    /// The zone a query reads comes from the one trawl-api grammar, and a
+    /// refusal is a usage error naming the value.
+    #[test]
+    fn an_invalid_display_zone_is_a_usage_error_naming_it() {
+        assert_eq!(display_zone(" local ").unwrap(), DisplayZone::Local);
+        let err = display_zone("Mars/Olympus").unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)), "{err:?}");
+        assert!(err.to_string().contains("\"Mars/Olympus\""), "{err}");
     }
 
     /// A declared severity column (`sev()`'s output under its own alias)
@@ -1012,7 +1077,7 @@ mod tests {
         let declared = vec!["s".to_owned()];
 
         let mut buf = Vec::new();
-        render_table(&result, &declared, &mut buf).unwrap();
+        render_table(&result, DisplayZone::Utc, &declared, &mut buf).unwrap();
         let table = String::from_utf8(buf).unwrap();
         assert!(table.contains("error2"), "{table}");
         assert!(
@@ -1022,7 +1087,7 @@ mod tests {
 
         // Undeclared: no list, no tokens.
         let mut buf = Vec::new();
-        render_table(&result, &[], &mut buf).unwrap();
+        render_table(&result, DisplayZone::Utc, &[], &mut buf).unwrap();
         let plain = String::from_utf8(buf).unwrap();
         assert!(!plain.contains("error2"), "{plain}");
 
@@ -1037,7 +1102,7 @@ mod tests {
             rows: vec![vec![Value::Integer(18)]],
         };
         let mut buf = Vec::new();
-        render_table(&mixed, &declared, &mut buf).unwrap();
+        render_table(&mixed, DisplayZone::Utc, &declared, &mut buf).unwrap();
         let table = String::from_utf8(buf).unwrap();
         assert!(table.contains("error2"), "mixed-case alias: {table}");
 
@@ -1116,15 +1181,7 @@ mod tests {
 
     #[tokio::test]
     async fn parquet_format_without_output_flag_errors() {
-        let result = run_query(
-            "*",
-            Some("dummy.parquet"),
-            Some(OutputFormat::Parquet),
-            None,
-            None,
-            "UTC",
-        )
-        .await;
+        let result = run_parquet_query("*", Some("dummy.parquet"), None, None).await;
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("parquet output requires -o"),
@@ -1149,7 +1206,7 @@ mod tests {
                 .unwrap();
         }
         let glob = dir.path().join("*.parquet");
-        let result = run_embedded_mode(glob.to_str().unwrap(), "*", "UTC").unwrap();
+        let result = run_embedded_mode(glob.to_str().unwrap(), "*").unwrap();
         assert_eq!(result.columns, source.columns);
         assert_eq!(
             result.rows,
@@ -1181,16 +1238,9 @@ mod tests {
             .write_query_result_to_parquet(&source, &input)
             .unwrap();
 
-        run_query(
-            "*",
-            input.to_str(),
-            Some(OutputFormat::Parquet),
-            Some(&output),
-            None,
-            "UTC",
-        )
-        .await
-        .unwrap();
+        run_parquet_query("*", input.to_str(), Some(&output), None)
+            .await
+            .unwrap();
 
         let roundtrip = executor
             .run_query(
@@ -1198,7 +1248,6 @@ mod tests {
                 output.to_str().unwrap(),
                 &trawl_core::schema::FieldTypes::new(),
                 usize::MAX,
-                0,
             )
             .unwrap();
         assert_eq!(roundtrip, source);

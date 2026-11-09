@@ -195,8 +195,8 @@ impl Refusal {
 ///   with no zone.
 /// - `YYYY-MM-DDTHH:MM:SS[.fff]Z` or `…+00:00`: RFC 3339 with a zero
 ///   offset. The result wire writes a `timestamp` cell this way
-///   (`…T00:00:00.000000Z`), batch and live alike, because the web UI
-///   sends `timezone: None` and the server defaults the offset to zero.
+///   (`…T00:00:00.000000Z`), batch and live alike, because trawld answers
+///   in UTC only.
 ///
 /// A non-zero offset, a `T` form with no zone, a space form with one, an
 /// impossible date (`2026-02-30`), or any other text is `None`. The

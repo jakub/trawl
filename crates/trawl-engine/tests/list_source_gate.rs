@@ -162,7 +162,7 @@ fn run(lane: Lane, corpus: &Corpus, source: &str, hot: &Path) -> Result<usize, E
     let out = corpus.export_path(lane);
     match lane {
         Lane::Query => exec
-            .run_query("*", source, &pins, usize::MAX, 0)
+            .run_query("*", source, &pins, usize::MAX)
             .map(|r| r.row_count()),
         Lane::QueryHot => exec
             .run_query_with_hot(
@@ -173,7 +173,6 @@ fn run(lane: Lane, corpus: &Corpus, source: &str, hot: &Path) -> Result<usize, E
                 &pins,
                 &pins,
                 usize::MAX,
-                0,
             )
             .map(|r| r.row_count()),
         Lane::Export => exec

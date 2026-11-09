@@ -49,10 +49,6 @@ impl App {
         // Extract field order from the DSL so the live buffer preserves it.
         let field_order = extract_field_order(&query);
 
-        // Resolve timezone offset for timestamp display in streaming events.
-        let utc_offset_secs =
-            trawl_engine::timezone::resolve_utc_offset(&self.timezone).unwrap_or(0);
-
         let client = self.client.clone();
         let tx = self.query_tx.clone();
         let max_events = self.max_live_events;
@@ -87,14 +83,12 @@ impl App {
 
             while let Some(event) = stream.next().await {
                 match event {
-                    Ok(StreamEvent::Event(mut frame)) => {
-                        apply_tz_to_frame(&mut frame, utc_offset_secs);
+                    Ok(StreamEvent::Event(frame)) => {
                         buffer.push_frame(&frame);
                         event_count += 1;
                         tracing::debug!("received stream event, total: {event_count}");
                     }
-                    Ok(StreamEvent::Snapshot { mut result, capped }) => {
-                        apply_tz_to_frame(&mut result, utc_offset_secs);
+                    Ok(StreamEvent::Snapshot { result, capped }) => {
                         buffer.replace_with_snapshot(&result, &capped);
                         // Each snapshot replaces the whole result — send immediately.
                         let response = buffer.to_query_response();
@@ -194,98 +188,9 @@ fn extract_field_order(query: &str) -> Vec<String> {
     Vec::new()
 }
 
-/// Apply the display offset to a live frame's timestamp cells.
-///
-/// The stream sends UTC, where a batch query asks the server for the
-/// configured offset, so the TUI applies it here, to every column the
-/// frame types `timestamp` (a list of timestamps included) and to nothing
-/// else: a sender's text that merely looks like a time stays as sent. A
-/// cell chrono cannot read, such as an infinity, stays as sent too.
-fn apply_tz_to_frame(frame: &mut trawl_engine::value::QueryResult, utc_offset_secs: i32) {
-    if utc_offset_secs == 0 {
-        return;
-    }
-    let trawl_engine::value::QueryResult { columns, rows } = frame;
-    for row in rows {
-        for (column, cell) in columns.iter().zip(row.iter_mut()) {
-            shift_timestamps(&column.ty, cell, utc_offset_secs);
-        }
-    }
-}
-
-/// [`apply_tz_to_frame`] for one cell of a column typed `ty`.
-fn shift_timestamps(
-    ty: &trawl_engine::value::ColumnType,
-    cell: &mut trawl_engine::value::Value,
-    utc_offset_secs: i32,
-) {
-    use trawl_engine::value::{ColumnType, Value};
-    match (ty, cell) {
-        (ColumnType::Timestamp, Value::String(text)) => {
-            if let Some(shifted) = trawl_engine::timezone::rfc3339_at_offset(text, utc_offset_secs)
-            {
-                *text = shifted;
-            }
-        }
-        (ColumnType::List { items }, Value::Array(elements)) => {
-            for element in elements {
-                shift_timestamps(items, element, utc_offset_secs);
-            }
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{apply_tz_to_frame, extract_field_order};
-    use trawl_engine::value::{Column, ColumnType, QueryResult, Value};
-
-    /// The display offset moves every `timestamp` cell, a list's elements
-    /// included, and leaves a `string` that looks like a time, an
-    /// infinity, and a null alone. At offset zero nothing changes.
-    #[test]
-    fn the_display_offset_shifts_timestamp_columns_only() {
-        let text = |s: &str| Value::String(s.to_owned());
-        let frame = QueryResult {
-            columns: vec![
-                Column::new("_time", ColumnType::Timestamp),
-                Column::new("seen", ColumnType::list(ColumnType::Timestamp)),
-                Column::new("timestamp", ColumnType::String),
-                Column::new("ends", ColumnType::Timestamp),
-                Column::new("_ingested", ColumnType::Timestamp),
-            ],
-            rows: vec![vec![
-                text("2026-01-15T09:00:00.000000Z"),
-                Value::Array(vec![text("2026-01-15T23:30:00.500000Z")]),
-                text("2026-01-15T09:00:00Z"),
-                text("infinity"),
-                Value::Null,
-            ]],
-        };
-
-        let mut utc = frame.clone();
-        apply_tz_to_frame(&mut utc, 0);
-        assert_eq!(utc, frame);
-
-        let mut shifted = frame;
-        apply_tz_to_frame(&mut shifted, 19_800);
-        assert_eq!(
-            shifted.rows,
-            vec![vec![
-                text("2026-01-15T14:30:00.000000+05:30"),
-                Value::Array(vec![text("2026-01-16T05:00:00.500000+05:30")]),
-                text("2026-01-15T09:00:00Z"),
-                text("infinity"),
-                Value::Null,
-            ]]
-        );
-        // The grid then shows the wall clock at that offset.
-        assert_eq!(
-            crate::tui::ui::results::cell_text(&ColumnType::Timestamp, &shifted.rows[0][0]),
-            "2026-01-15 14:30:00"
-        );
-    }
+    use super::extract_field_order;
 
     /// Zero-alias contract (ADR-0013): the live column order carries the user's
     /// own spellings verbatim. An alias mapping here would make `table

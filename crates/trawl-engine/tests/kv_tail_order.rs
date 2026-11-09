@@ -36,7 +36,7 @@ fn source(rows: &[String]) -> (tempfile::TempDir, String) {
 fn try_run(dsl: &str, glob: &str) -> Result<QueryResult, EngineError> {
     Executor::new()
         .unwrap()
-        .run_query(dsl, glob, &FieldTypes::new(), usize::MAX, 0)
+        .run_query(dsl, glob, &FieldTypes::new(), usize::MAX)
 }
 
 fn run(dsl: &str, glob: &str) -> QueryResult {

@@ -32,6 +32,7 @@
 use std::io::{self, Write as _};
 use std::path::Path;
 
+use trawl_api::zone::DisplayZone;
 use trawl_client::{HttpClient, TlsTrust};
 use trawl_core::sanitize::sanitize_display_text;
 use trawl_mcp::TrawlServer;
@@ -97,7 +98,7 @@ fn start(globals: &Globals) -> Result<Started, Refusal> {
         globals.config.as_deref(),
     )?;
     Ok(Started {
-        server: TrawlServer::new(built.client).with_display_zone(built.display_zone),
+        server: TrawlServer::new(built.client, built.display_zone),
         insecure: built.insecure,
     })
 }
@@ -105,7 +106,7 @@ fn start(globals: &Globals) -> Result<Started, Refusal> {
 /// What [`build`] makes from a resolution.
 struct Built {
     client: HttpClient,
-    display_zone: String,
+    display_zone: DisplayZone,
     insecure: bool,
 }
 
@@ -244,17 +245,14 @@ fn choose_key(
     }
 }
 
-/// The CLI config's `ui.timezone`, checked, for `orient` to display times
-/// in. `cfg` is the config the resolution read; `path` names it.
-fn display_zone(cfg: &Config, path: &str) -> Result<String, Refusal> {
-    let zone = cfg.ui.timezone.clone();
-    trawl_engine::timezone::resolve_utc_offset(&zone).map_err(|_| {
-        Refusal(format!(
-            "ui.timezone in {path} is not \"local\", \"UTC\", or a fixed offset such as \
-             \"+05:30\"; fix it, or remove it for \"local\""
-        ))
-    })?;
-    Ok(zone)
+/// The CLI config's `ui.timezone`, parsed once before the server starts,
+/// for `orient` to display times in. `cfg` is the config the resolution
+/// read; `path` names it. An invalid value is a refusal naming it.
+fn display_zone(cfg: &Config, path: &str) -> Result<DisplayZone, Refusal> {
+    cfg.ui
+        .timezone
+        .parse::<DisplayZone>()
+        .map_err(|refusal| Refusal(format!("ui.timezone in {path}: {refusal}")))
 }
 
 /// Send every log line to stderr, at the level `RUST_LOG` names (default
@@ -318,6 +316,29 @@ mod tests {
 
     fn env_names() -> Vec<String> {
         ENV.iter().map(|&n| n.to_owned()).collect()
+    }
+
+    /// The zone is parsed into the type `orient` uses; a refused value is
+    /// named, escaped, in the one refusal line.
+    #[test]
+    fn the_display_zone_is_parsed_once_and_a_refusal_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // `toml` is a TOML basic string, escapes included.
+        let zone_in = |toml: &str| {
+            std::fs::write(&path, format!("[ui]\ntimezone = \"{toml}\"\n")).unwrap();
+            let cfg = Config::load(path.to_str()).unwrap();
+            display_zone(&cfg, path.to_str().unwrap())
+        };
+        assert_eq!(zone_in(" Local ").unwrap(), DisplayZone::Local);
+        let Err(Refusal(message)) = zone_in(r"Mars/Olympus\u001B[2J") else {
+            panic!("an invalid zone must be refused");
+        };
+        assert!(
+            message.contains(r#""Mars/Olympus\u{1b}[2J" is not a display zone"#),
+            "{message}"
+        );
+        assert!(!message.contains('\u{1b}'), "{message}");
     }
 
     fn globals(profile: Option<&str>) -> Globals {
@@ -413,9 +434,10 @@ mod tests {
         };
 
         std::fs::write(&file, toml("bogus")).unwrap();
-        assert_eq!(zone(first), Ok("+05:30".to_owned()), "rewritten");
+        let offset = "+05:30".parse::<DisplayZone>().unwrap();
+        assert_eq!(zone(first), Ok(offset), "rewritten");
         std::fs::remove_file(&file).unwrap();
-        assert_eq!(zone(second), Ok("+05:30".to_owned()), "deleted");
+        assert_eq!(zone(second), Ok(offset), "deleted");
 
         // The same check still refuses a bad zone in the snapshot.
         let mut bogus = Config::default();

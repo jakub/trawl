@@ -70,6 +70,9 @@ insta = { workspace = true }
 # schema tests do.
 jsonschema = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+# `tests/client_zone.rs` runs the TUI on a PTY: crossterm needs a real
+# terminal. `openpty` is behind nix's `term` feature.
+nix = { workspace = true, features = ["term"] }
 rustls = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }

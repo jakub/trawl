@@ -293,7 +293,11 @@ impl App {
         if let Some(ref mut search) = self.results_search
             && let Some(ref response) = self.tab.result
         {
-            search.update_matches(&response.result, self.tab.column_config.as_ref());
+            search.update_matches(
+                &response.result,
+                self.tab.column_config.as_ref(),
+                self.display_zone,
+            );
         }
     }
 

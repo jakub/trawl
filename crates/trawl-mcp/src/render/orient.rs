@@ -80,9 +80,6 @@ fn installation_lines(reply: &OrientReply, lines: &mut Vec<String>) {
         reply.now_display,
         one_line(&reply.display_zone)
     ));
-    if let Some(note) = &reply.display_zone_note {
-        lines.push(format!("display zone: {}", one_line(note)));
-    }
     let permissions = if reply.key.permissions.is_empty() {
         "none".to_owned()
     } else {

@@ -371,10 +371,7 @@ async fn nearest_from<B: Backend>(backend: &B, plan: Option<NearestPlan>) -> Str
     let Some(plan) = plan else {
         return NEAREST_NOT_COMPUTED.to_owned();
     };
-    match backend
-        .query_paginated_tz(&plan.dsl, Some(3), None, Some("UTC".to_owned()))
-        .await
-    {
+    match backend.query_paginated(&plan.dsl, Some(3), None).await {
         Ok(response) => plan.describe(&response.result),
         Err(error) => format!(
             "nearest bounds: not computed; the widened query failed: {}",

@@ -59,13 +59,7 @@ fn cancelled_during_probe_never_binds_main() {
 
     let before = prepare_probe::count();
     exec.cancellable(&latch)
-        .run_query(
-            dsl,
-            &source,
-            &FieldTypes::new(),
-            RowCap::Refuse(usize::MAX),
-            0,
-        )
+        .run_query(dsl, &source, &FieldTypes::new(), RowCap::Refuse(usize::MAX))
         .expect("a TIMESTAMP bucket source runs");
     assert!(
         prepare_probe::count() >= before + 2,
@@ -79,7 +73,6 @@ fn cancelled_during_probe_never_binds_main() {
         &source,
         &FieldTypes::new(),
         RowCap::Refuse(usize::MAX),
-        0,
     );
     assert!(
         matches!(outcome, Err(EngineError::Cancelled)),

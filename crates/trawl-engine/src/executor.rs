@@ -12,7 +12,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::path::Path;
 use std::sync::Arc;
 
-use chrono::{Datelike as _, FixedOffset};
+use chrono::{Offset as _, Utc};
 use duckdb::Connection;
 use duckdb::core::LogicalTypeId;
 use duckdb::types::{TimeUnit, ValueRef};
@@ -376,7 +376,6 @@ impl Cancellable<'_> {
         source: &str,
         pins: &FieldTypes,
         cap: RowCap,
-        utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         self.executor.run_query_latched(
             dsl,
@@ -384,7 +383,6 @@ impl Cancellable<'_> {
             pins,
             SourceOrigin::Corpus,
             cap,
-            utc_offset_secs,
             self.cancel,
             &self.clock,
             self.executor.re2_threads,
@@ -402,7 +400,6 @@ impl Cancellable<'_> {
         source: &str,
         pins: &FieldTypes,
         cap: RowCap,
-        utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         self.executor.run_query_latched(
             dsl,
@@ -410,7 +407,6 @@ impl Cancellable<'_> {
             pins,
             SourceOrigin::Recorded,
             cap,
-            utc_offset_secs,
             self.cancel,
             &self.clock,
             self.executor.re2_threads,
@@ -429,7 +425,6 @@ impl Cancellable<'_> {
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
         cap: RowCap,
-        utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         self.executor.run_query_with_hot_latched(
             dsl,
@@ -439,7 +434,6 @@ impl Cancellable<'_> {
             hot_pins,
             pins,
             cap,
-            utc_offset_secs,
             self.cancel,
             &self.clock,
             self.executor.re2_threads,
@@ -939,16 +933,13 @@ impl Executor {
     /// A result past `max_rows` is refused ([`RowCap::Refuse`]); a lane
     /// that cuts instead goes through [`Cancellable::run_query`].
     ///
-    /// Timestamps render in the wire's RFC 3339 at the display offset
-    /// `utc_offset_secs`; pass `0` for UTC. An offset of a day or more is
-    /// refused.
+    /// Timestamps render in the wire's RFC 3339, in UTC.
     pub fn run_query(
         &self,
         dsl: &str,
         source: &str,
         pins: &FieldTypes,
         max_rows: usize,
-        utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         self.run_query_latched(
             dsl,
@@ -956,7 +947,6 @@ impl Executor {
             pins,
             SourceOrigin::Corpus,
             RowCap::Refuse(max_rows),
-            utc_offset_secs,
             &CancelLatch::never(),
             &PhaseClock::off(),
             None,
@@ -973,7 +963,6 @@ impl Executor {
         pins: &FieldTypes,
         origin: SourceOrigin,
         cap: RowCap,
-        utc_offset_secs: i32,
         cancel: &CancelLatch,
         clock: &PhaseClock,
         re2: Option<NonZeroU32>,
@@ -989,7 +978,6 @@ impl Executor {
         cancel.check()?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
         cancel.check()?;
-        let display = display_offset(utc_offset_secs)?;
         // With no hot buffer to fall back to, the outcome policy returns
         // every failure the probe can have (see [`cold_action`]), so a
         // failed probe is the lane's answer as it stands.
@@ -999,7 +987,7 @@ impl Executor {
             resolved.emit_cold(&ast, &pins, &columns, EvalContext::capture())
         })?;
         cancel.check()?;
-        let outcome = self.read_emitted(emitted, cap, display, cancel, clock, re2, &mut ledger);
+        let outcome = self.read_emitted(emitted, cap, cancel, clock, re2, &mut ledger);
         // Same gate as the hot lanes, one column over: with no hot buffer to
         // fall back to, `HotOnly` is unreachable (see [`cold_action`]) — but a
         // "no files" answer over a source that still reaches files is the
@@ -1014,7 +1002,7 @@ impl Executor {
             ColdAction::ReturnOutcome | ColdAction::HotOnly => outcome?,
         };
         clock.time(QueryPhase::Post, || {
-            read.finish(&ast, cap, display, &mut ledger, cancel)
+            read.finish(&ast, cap, &mut ledger, cancel)
         })
     }
 
@@ -1044,7 +1032,6 @@ impl Executor {
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
         max_rows: usize,
-        utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         self.run_query_with_hot_latched(
             dsl,
@@ -1054,7 +1041,6 @@ impl Executor {
             hot_pins,
             pins,
             RowCap::Refuse(max_rows),
-            utc_offset_secs,
             &CancelLatch::never(),
             &PhaseClock::off(),
             None,
@@ -1074,7 +1060,6 @@ impl Executor {
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
         cap: RowCap,
-        utc_offset_secs: i32,
         cancel: &CancelLatch,
         clock: &PhaseClock,
         re2: Option<NonZeroU32>,
@@ -1091,7 +1076,6 @@ impl Executor {
         cancel.check()?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
         cancel.check()?;
-        let display = display_offset(utc_offset_secs)?;
         let probed = self.input_columns(
             &ast,
             &resolved,
@@ -1112,8 +1096,7 @@ impl Executor {
                     resolved.emit_union(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
                 cancel.check()?;
-                let outcome =
-                    self.read_emitted(emitted, cap, display, cancel, clock, re2, &mut ledger);
+                let outcome = self.read_emitted(emitted, cap, cancel, clock, re2, &mut ledger);
                 (Some(columns), outcome)
             }
             Err(e) => (None, Err(e)),
@@ -1150,13 +1133,13 @@ impl Executor {
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
                 cancel.check()?;
-                self.read_emitted(hot_emitted, cap, display, cancel, clock, re2, &mut ledger)?
+                self.read_emitted(hot_emitted, cap, cancel, clock, re2, &mut ledger)?
             }
             ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome => outcome?,
         };
         clock.time(QueryPhase::Post, || {
-            read.finish(&ast, cap, display, &mut ledger, cancel)
+            read.finish(&ast, cap, &mut ledger, cancel)
         })
     }
 
@@ -1168,14 +1151,13 @@ impl Executor {
         &self,
         emitted: EmittedQuery,
         cap: RowCap,
-        display: FixedOffset,
         cancel: &CancelLatch,
         clock: &PhaseClock,
         re2: Option<NonZeroU32>,
         ledger: &mut Preparer,
     ) -> Result<SqlRead, EngineError> {
         hold_re2(&emitted, re2, ledger)?;
-        let sql_text = sql_timestamp_text(&emitted, display);
+        let sql_text = sql_timestamp_text(&emitted);
         let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
         let (result, timestamp_columns) =
             self.execute_emitted_tracked(&emitted, sql_cap, sql_text, cancel, clock)?;
@@ -1191,17 +1173,16 @@ impl Executor {
     /// `max_rows` caps the number of result rows to prevent unbounded memory
     /// allocation. Returns [`EngineError::ResultTooLarge`] if exceeded.
     ///
-    /// Timestamps render in the wire's RFC 3339 at `utc_offset_secs`.
+    /// Timestamps render in the wire's RFC 3339, in UTC.
     pub fn execute_emitted(
         &self,
         query: &EmittedQuery,
         max_rows: usize,
-        utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         self.execute_emitted_tracked(
             query,
             RowCap::Refuse(max_rows),
-            TimestampText::Wire(display_offset(utc_offset_secs)?),
+            TimestampText::Wire,
             &CancelLatch::never(),
             &PhaseClock::off(),
         )
@@ -2060,7 +2041,7 @@ impl Executor {
         while let Some(row) = result_rows.next()? {
             let mut cells = Vec::with_capacity(columns.len());
             for (i, column) in columns.iter().enumerate() {
-                cells.push(extract_value(row, i, &column.name, TimestampText::UTC)?);
+                cells.push(extract_value(row, i, &column.name, TimestampText::Wire)?);
             }
             rows.push(cells);
         }
@@ -2346,7 +2327,7 @@ impl Executor {
             let mut cells = Vec::with_capacity(selected.len());
             for (index, (column, name)) in selected.iter().zip(&names).enumerate() {
                 cells.push(match column.stored_as {
-                    StoredAs::Native => extract_value(row, index, name, TimestampText::UTC)?,
+                    StoredAs::Native => extract_value(row, index, name, TimestampText::Wire)?,
                     StoredAs::WireText => Value::Null,
                 });
             }
@@ -2627,7 +2608,6 @@ impl SqlRead {
         self,
         ast: &Query,
         cap: RowCap,
-        display: FixedOffset,
         ledger: &mut Preparer,
         cancel: &CancelLatch,
     ) -> Result<QueryResult, EngineError> {
@@ -2647,7 +2627,7 @@ impl SqlRead {
                 cancel,
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
-            render_tracked_timestamps(&mut result, &tracked, display, cancel)?;
+            render_tracked_timestamps(&mut result, &tracked, cancel)?;
         }
         cap.trim(&mut result);
         if emitted.needs_column_reorder {
@@ -3388,9 +3368,9 @@ fn typed_columns(stmt: &duckdb::Statement<'_>) -> Vec<Column> {
 ///
 /// Uses `ValueRef` for type-safe dispatch. Temporal values render through
 /// this module's own formatters ([`format_timestamp`], [`format_date`],
-/// [`format_time`]) rather than `DuckDB`'s, because the display offset has
-/// to be applied while the value is still an integer count. `timestamps`
-/// picks the wire's RFC 3339 or `DuckDB`'s cast text ([`TimestampText`]).
+/// [`format_time`]) rather than `DuckDB`'s, because the wire spells a
+/// timestamp its own way while the value is still an integer count.
+/// `timestamps` picks the wire's RFC 3339 or `DuckDB`'s cast text ([`TimestampText`]).
 ///
 /// The cell has to agree with the type [`crate::column_type::column_type`]
 /// gives its column, or the wire encoder refuses it; a `HUGEINT` or
@@ -3520,7 +3500,7 @@ fn list_ubigint_renders_digits() {
         .expect("prepare");
     let mut rows = stmt.query([]).expect("query");
     let row = rows.next().expect("step").expect("one row");
-    let cell = extract_value(row, 0, "ids", TimestampText::UTC)
+    let cell = extract_value(row, 0, "ids", TimestampText::Wire)
         .expect("every element fits an integer cell");
 
     assert_eq!(
@@ -3629,7 +3609,7 @@ fn every_duckdb_type_agrees_with_its_cells() {
     let mut landed = 0;
     while let Some(row) = rows.next().expect("step") {
         for (i, column) in columns.iter().enumerate() {
-            let cell = match extract_value(row, i, &column.name, TimestampText::UTC) {
+            let cell = match extract_value(row, i, &column.name, TimestampText::Wire) {
                 Ok(cell) => cell,
                 Err(EngineError::IntegerOutOfRange { column }) => {
                     refused.push(column);
@@ -3709,34 +3689,16 @@ const TIMESTAMP_NEG_INFINITY: i64 = -i64::MAX;
 /// How a result renders its `TIMESTAMP` cells.
 #[derive(Debug, Clone, Copy)]
 enum TimestampText {
-    /// The result wire's RFC 3339 ([`wire_timestamp`]) in a display
-    /// offset.
-    Wire(FixedOffset),
+    /// The result wire's RFC 3339 in UTC
+    /// ([`trawl_api::zone::wire_timestamp`]).
+    Wire,
     /// `DuckDB`'s own `CAST(ts AS VARCHAR)` text, in UTC: what a Rust tail
     /// reads ([`sql_timestamp_text`]).
     Cast,
 }
 
-impl TimestampText {
-    /// The wire's text in UTC, for a result no reader's offset applies to.
-    const UTC: Self = Self::Wire(match FixedOffset::east_opt(0) {
-        Some(utc) => utc,
-        None => unreachable!(),
-    });
-}
-
-/// The display offset as a zone the wire can spell.
-///
-/// An RFC 3339 offset is under a day, so a larger one is refused rather
-/// than rendered. `timezone::resolve_utc_offset` only resolves offsets
-/// under a day from the forms it documents.
-fn display_offset(utc_offset_secs: i32) -> Result<FixedOffset, EngineError> {
-    FixedOffset::east_opt(utc_offset_secs).ok_or_else(|| EngineError::Refused {
-        message: format!("a display offset of {utc_offset_secs} seconds is not under a day"),
-    })
-}
-
 fn format_timestamp(unit: TimeUnit, val: i64, text: TimestampText) -> String {
+    // The sentinels come first: `to_micros` would overflow on them.
     match val {
         TIMESTAMP_INFINITY => return "infinity".to_owned(),
         TIMESTAMP_NEG_INFINITY => return "-infinity".to_owned(),
@@ -3744,48 +3706,9 @@ fn format_timestamp(unit: TimeUnit, val: i64, text: TimestampText) -> String {
     }
     let micros = to_micros(unit, val);
     match text {
-        TimestampText::Wire(offset) => wire_timestamp(micros, offset),
+        TimestampText::Wire => trawl_api::zone::wire_timestamp(micros, Utc.fix()),
         TimestampText::Cast => cast_timestamp(micros),
     }
-}
-
-/// 40,000 Gregorian years in microseconds: 100 cycles of 400 years, each
-/// exactly 146,097 days.
-const FORTY_MILLENNIA_MICROS: i64 = 100 * 146_097 * 86_400 * 1_000_000;
-
-/// An instant in the result wire's spelling: chrono's
-/// `to_rfc3339_opts(SecondsFormat::Micros, true)` in `offset`, so RFC 3339
-/// with six fraction digits, `Z` at offset zero and `+HH:MM` otherwise.
-///
-/// RFC 3339 spells four-digit years only, and chrono writes any other year
-/// in ISO 8601's expanded form, a sign and at least four digits
-/// (`+10000-01-01T00:00:00.000000Z`). chrono's calendar ends at ±262,143
-/// years, short of `DuckDB`'s 294,247; the Gregorian calendar repeats every
-/// 400 years to the day, so an instant past chrono's end is written
-/// 40,000 years nearer and its year moved back.
-pub(crate) fn wire_timestamp(micros: i64, offset: FixedOffset) -> String {
-    if let Some(at) = chrono::DateTime::from_timestamp_micros(micros) {
-        return at
-            .with_timezone(&offset)
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-    }
-    let (nearer, years) = if micros > 0 {
-        (micros - FORTY_MILLENNIA_MICROS, 40_000)
-    } else {
-        (micros + FORTY_MILLENNIA_MICROS, -40_000)
-    };
-    let local = chrono::DateTime::from_timestamp_micros(nearer)
-        .expect("40,000 years nearer is inside chrono's calendar")
-        .with_timezone(&offset);
-    let text = local.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-    // The nearer year is still past 0000-9999, so chrono wrote a sign and
-    // digits up to the first `-` after it.
-    let month_on = 1 + text[1..].find('-').expect("chrono writes a dated year");
-    format!(
-        "{:+05}{}",
-        i64::from(local.year()) + years,
-        &text[month_on..]
-    )
 }
 
 /// An instant as `DuckDB`'s `CAST(ts AS VARCHAR)` writes it, in UTC:
@@ -3847,7 +3770,7 @@ fn parse_cast_timestamp(text: &str) -> Option<i64> {
 
 /// How the SQL result renders its TIMESTAMP cells.
 ///
-/// The wire's RFC 3339 in the display offset, unless a Rust tail follows,
+/// The wire's RFC 3339 in UTC, unless a Rust tail follows,
 /// because that tail is a second evaluator, not a printer. Its `| where`
 /// and `| let` are pin-aware (ADR-0011) and read a TIMESTAMP cell's text
 /// as the stored instant through `compare::conformed_timestamp`, and its
@@ -3856,9 +3779,9 @@ fn parse_cast_timestamp(text: &str) -> Option<i64> {
 /// the text the SQL lane compares and prints, and
 /// [`render_tracked_timestamps`] renders the wire's text afterwards: the
 /// all-SQL path's order too, compare the stored instant and render last.
-fn sql_timestamp_text(emitted: &EmittedQuery, display: FixedOffset) -> TimestampText {
+fn sql_timestamp_text(emitted: &EmittedQuery) -> TimestampText {
     if emitted.rust_stages.is_empty() {
-        TimestampText::Wire(display)
+        TimestampText::Wire
     } else {
         TimestampText::Cast
     }
@@ -3909,22 +3832,22 @@ fn rendered_timestamp_type(ty: &ColumnType) -> Option<ColumnType> {
     }
 }
 
-/// One tracked cell in the wire's text at `display`: cast text as RFC 3339,
+/// One tracked cell in the wire's text: cast text as RFC 3339,
 /// a list element by element, and NULL as NULL. `None` when any text in
 /// it is not cast text.
-fn render_tracked_cell(cell: &Value, display: FixedOffset) -> Option<Value> {
+fn render_tracked_cell(cell: &Value) -> Option<Value> {
     match cell {
         Value::Null => Some(Value::Null),
         Value::String(text) => parse_cast_timestamp(text).map(|micros| {
             Value::String(format_timestamp(
                 TimeUnit::Microsecond,
                 micros,
-                TimestampText::Wire(display),
+                TimestampText::Wire,
             ))
         }),
         Value::Array(elements) => elements
             .iter()
-            .map(|element| render_tracked_cell(element, display))
+            .map(render_tracked_cell)
             .collect::<Option<Vec<_>>>()
             .map(Value::Array),
         _ => None,
@@ -3933,7 +3856,7 @@ fn render_tracked_cell(cell: &Value, display: FixedOffset) -> Option<Value> {
 
 /// Render the columns the Rust tail's lineage ([`tail_timestamp_scope`])
 /// still calls a stored TIMESTAMP, or a stored list of them, in the wire's
-/// text and display offset, and type them `timestamp` (or the list of it).
+/// text, and type them `timestamp` (or the list of it).
 ///
 /// The tail ran over `DuckDB`'s cast text ([`sql_timestamp_text`]), where a
 /// stored TIMESTAMP is a string, list items included, so
@@ -3950,7 +3873,6 @@ fn render_tracked_cell(cell: &Value, display: FixedOffset) -> Option<Value> {
 fn render_tracked_timestamps(
     result: &mut QueryResult,
     tracked: &PinScope,
-    display: FixedOffset,
     cancel: &CancelLatch,
 ) -> Result<(), EngineError> {
     if tracked.is_empty() {
@@ -3971,8 +3893,7 @@ fn render_tracked_timestamps(
             if at.is_multiple_of(crate::post_process::TAIL_CANCEL_STRIDE) {
                 cancel.check()?;
             }
-            let Some(cell) = render_tracked_cell(row.get(idx).unwrap_or(&Value::Null), display)
-            else {
+            let Some(cell) = render_tracked_cell(row.get(idx).unwrap_or(&Value::Null)) else {
                 break;
             };
             rendered.push(cell);
@@ -4003,25 +3924,15 @@ fn a_tracked_render_observes_cancellation() {
     let untouched = result.clone();
     let tracked = tail_timestamp_scope(&["seen".into()], &[]);
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let outcome = render_tracked_timestamps(
-        &mut result,
-        &tracked,
-        FixedOffset::east_opt(0).unwrap(),
-        &CancelLatch::new(flag),
-    );
+    let outcome = render_tracked_timestamps(&mut result, &tracked, &CancelLatch::new(flag));
     assert!(
         matches!(outcome, Err(EngineError::Cancelled)),
         "{outcome:?}"
     );
     assert_eq!(result, untouched);
 
-    render_tracked_timestamps(
-        &mut result,
-        &tracked,
-        FixedOffset::east_opt(0).unwrap(),
-        &CancelLatch::never(),
-    )
-    .expect("a latch that never stops");
+    render_tracked_timestamps(&mut result, &tracked, &CancelLatch::never())
+        .expect("a latch that never stops");
     assert_eq!(
         result.columns[0].ty,
         ColumnType::Timestamp,
@@ -4067,13 +3978,8 @@ fn tracked_lists_render_element_by_element() {
         &["seen".into(), "deep".into(), "bad".into(), "key".into()],
         &[],
     );
-    render_tracked_timestamps(
-        &mut result,
-        &tracked,
-        FixedOffset::east_opt(19_800).unwrap(),
-        &CancelLatch::never(),
-    )
-    .expect("a latch that never stops");
+    render_tracked_timestamps(&mut result, &tracked, &CancelLatch::never())
+        .expect("a latch that never stops");
 
     let timestamps = ColumnType::list(ColumnType::Timestamp);
     assert_eq!(
@@ -4087,7 +3993,7 @@ fn tracked_lists_render_element_by_element() {
     );
     assert_eq!(
         result.rows[0][0],
-        list(vec![text("2026-01-15T14:30:00.123456+05:30"), Value::Null])
+        list(vec![text("2026-01-15T09:00:00.123456Z"), Value::Null])
     );
     assert_eq!(result.rows[1][0], Value::Null);
     assert_eq!(
@@ -4096,7 +4002,7 @@ fn tracked_lists_render_element_by_element() {
     );
     assert_eq!(
         result.rows[1][1],
-        list(vec![list(vec![text("1970-01-01T05:29:59.500000+05:30")])])
+        list(vec![list(vec![text("1969-12-31T23:59:59.500000Z")])])
     );
     for row in 0..2 {
         assert_eq!(result.rows[row][2..], untouched.rows[row][2..]);
@@ -4150,13 +4056,12 @@ fn days_to_ymd(days: i32) -> (i32, u32, u32) {
     (y as i32, m, d)
 }
 
-/// The wire's timestamp text: RFC 3339 with six fraction digits, `Z` at
-/// offset zero and the offset otherwise, before the epoch and after it,
-/// and `DuckDB`'s words for its infinities in every unit.
+/// The wire's timestamp text: RFC 3339 with six fraction digits and `Z`,
+/// before the epoch and after it, and `DuckDB`'s words for its infinities
+/// in every unit.
 #[cfg(test)]
 #[test]
-fn timestamps_render_as_rfc3339_with_micros_and_an_offset() {
-    let wire = |secs: i32| TimestampText::Wire(FixedOffset::east_opt(secs).unwrap());
+fn timestamps_render_as_rfc3339_with_micros() {
     // 2024-01-15T10:00:00Z and 1969-12-31T23:59:59.5Z.
     let at = 1_705_312_800_000_000;
     let pre_epoch = -500_000;
@@ -4164,50 +4069,37 @@ fn timestamps_render_as_rfc3339_with_micros_and_an_offset() {
         (
             TimeUnit::Microsecond,
             at,
-            wire(0),
+            TimestampText::Wire,
             "2024-01-15T10:00:00.000000Z",
         ),
         (
             TimeUnit::Microsecond,
-            at,
-            wire(19_800),
-            "2024-01-15T15:30:00.000000+05:30",
-        ),
-        (
-            TimeUnit::Microsecond,
-            at,
-            wire(-18_000),
-            "2024-01-15T05:00:00.000000-05:00",
-        ),
-        (
-            TimeUnit::Microsecond,
             at + 120_450,
-            wire(0),
+            TimestampText::Wire,
             "2024-01-15T10:00:00.120450Z",
         ),
         (
             TimeUnit::Microsecond,
             pre_epoch,
-            wire(0),
+            TimestampText::Wire,
             "1969-12-31T23:59:59.500000Z",
         ),
         (
-            TimeUnit::Microsecond,
-            pre_epoch,
-            wire(3_600),
-            "1970-01-01T00:59:59.500000+01:00",
+            TimeUnit::Second,
+            0,
+            TimestampText::Wire,
+            "1970-01-01T00:00:00.000000Z",
         ),
-        (TimeUnit::Second, 0, wire(0), "1970-01-01T00:00:00.000000Z"),
         (
             TimeUnit::Millisecond,
             1_705_312_800_123,
-            wire(0),
+            TimestampText::Wire,
             "2024-01-15T10:00:00.123000Z",
         ),
         (
             TimeUnit::Nanosecond,
             1_705_312_800_123_456_789,
-            wire(0),
+            TimestampText::Wire,
             "2024-01-15T10:00:00.123456Z",
         ),
         (
@@ -4235,62 +4127,25 @@ fn timestamps_render_as_rfc3339_with_micros_and_an_offset() {
         TimeUnit::Microsecond,
         TimeUnit::Nanosecond,
     ] {
-        for text in [wire(0), wire(19_800), TimestampText::Cast] {
+        for text in [TimestampText::Wire, TimestampText::Cast] {
             assert_eq!(format_timestamp(unit, i64::MAX, text), "infinity");
             assert_eq!(format_timestamp(unit, -i64::MAX, text), "-infinity");
         }
     }
 }
 
-/// Past chrono's calendar the wire still writes the instant exactly, in
-/// chrono's own expanded-year form: the 40,000-year step lands on the
-/// same calendar day, checked against chrono where both can write it and
-/// against `DuckDB`'s own extremes where only the step can.
+/// Past chrono's calendar the wire still writes `DuckDB`'s own finite
+/// extremes, `test_all_types()`'s, on the same civil date as the cast text.
 #[cfg(test)]
 #[test]
 fn timestamps_past_chronos_calendar_keep_their_civil_date() {
-    let utc = FixedOffset::east_opt(0).unwrap();
-    // Inside chrono's calendar, the step's arithmetic agrees with chrono.
-    for micros in [
-        253_402_300_800_000_000_i64, // +10000-01-01T00:00:00Z
-        -62_167_219_200_000_001,     // -0001-12-31T23:59:59.999999Z
-        5_000_000_000_000_000_000,
-        -5_000_000_000_000_000_000,
-    ] {
-        let direct = wire_timestamp(micros, utc);
-        let (nearer, years) = if micros > 0 {
-            (micros - FORTY_MILLENNIA_MICROS, 40_000)
-        } else {
-            (micros + FORTY_MILLENNIA_MICROS, -40_000)
-        };
-        let stepped = wire_timestamp(nearer, utc);
-        let year = |text: &str| -> i64 {
-            let end = 1 + text[1..].find('-').unwrap();
-            text[..end].parse().unwrap()
-        };
-        assert_eq!(year(&direct), year(&stepped) + years, "{direct}");
-        assert_eq!(
-            direct[direct[1..].find('-').unwrap() + 1..],
-            stepped[stepped[1..].find('-').unwrap() + 1..],
-            "{direct}"
-        );
-    }
-    assert_eq!(
-        wire_timestamp(253_402_300_800_000_000, utc),
-        "+10000-01-01T00:00:00.000000Z"
-    );
-    // `DuckDB`'s own finite extremes, from `test_all_types()`, which only the
-    // step can write; the cast text agrees on the civil date.
     let min = -9_223_372_022_400_000_000;
     let max = 9_223_372_036_854_775_806;
-    assert_eq!(wire_timestamp(min, utc), "-290308-12-22T00:00:00.000000Z");
+    let wire = |micros| format_timestamp(TimeUnit::Microsecond, micros, TimestampText::Wire);
+    assert_eq!(wire(min), "-290308-12-22T00:00:00.000000Z");
     assert_eq!(cast_timestamp(min), "-290308-12-22 00:00:00");
-    assert_eq!(wire_timestamp(max, utc), "+294247-01-10T04:00:54.775806Z");
+    assert_eq!(wire(max), "+294247-01-10T04:00:54.775806Z");
     assert_eq!(cast_timestamp(max), "294247-01-10 04:00:54.775806");
-    assert_eq!(
-        wire_timestamp(max, FixedOffset::east_opt(-3_600).unwrap()),
-        "+294247-01-10T03:00:54.775806-01:00"
-    );
 }
 
 /// A time keeps its fraction, in `DuckDB`'s cast spelling.
@@ -4310,20 +4165,6 @@ fn times_keep_their_fraction() {
         format_time(TimeUnit::Microsecond, 86_400_000_000),
         "24:00:00"
     );
-}
-
-/// An offset RFC 3339 cannot spell is refused, never rendered.
-#[cfg(test)]
-#[test]
-fn a_display_offset_of_a_day_is_refused() {
-    assert!(display_offset(86_399).is_ok());
-    assert!(display_offset(-86_399).is_ok());
-    for secs in [86_400, -86_400, i32::MAX] {
-        assert!(
-            matches!(display_offset(secs), Err(EngineError::Refused { .. })),
-            "{secs}"
-        );
-    }
 }
 
 /// One parquet fixture for the `timechart on` lane, two rows, one
@@ -4471,7 +4312,7 @@ fn timechart_refusal(source: &str, dsl: &str) -> String {
 fn timechart_outcome(source: &str, dsl: &str) -> Result<QueryResult, EngineError> {
     Executor::new()
         .expect("executor")
-        .run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+        .run_query(dsl, source, &FieldTypes::new(), usize::MAX)
 }
 
 /// Every bucket source that is not a timestamp is refused, naming the
@@ -4524,7 +4365,6 @@ fn timechart_input_refuses_each_non_timestamp() {
                 &source,
                 &FieldTypes::new(),
                 usize::MAX,
-                0,
             )
             .unwrap_or_else(|e| panic!("{column} is a bucket source: {e:?}"));
         assert_eq!(result.rows.len(), 2, "one bucket per day, on {column}");
@@ -4636,7 +4476,6 @@ fn pivot_made_time_column_is_not_the_bucket() {
             &source,
             &FieldTypes::new(),
             usize::MAX,
-            0,
         )
         .expect("a pivot-made _time column is not this query's bucket");
     assert!(
@@ -4732,7 +4571,6 @@ fn empty_glob_probe_stays_silent() {
             &empty,
             &FieldTypes::new(),
             usize::MAX,
-            0,
         )
         .expect("an empty window is an empty result, probe or no probe");
     assert!(result.rows.is_empty(), "{:?}", result.rows);
@@ -4769,7 +4607,6 @@ fn type_refusal_survives_hot_fallback() {
         &FieldTypes::new(),
         &FieldTypes::new(),
         usize::MAX,
-        0,
     );
     match outcome {
         Err(EngineError::Refused { message }) => assert_eq!(
@@ -4834,7 +4671,6 @@ fn missing_column_still_benign_with_hot() {
             &FieldTypes::new(),
             &FieldTypes::new(),
             RowCap::Refuse(usize::MAX),
-            0,
         )
         .expect("an absent column reads NULL with a hot buffer too");
     assert!(result.rows.is_empty(), "{:?}", result.rows);
@@ -4918,7 +4754,6 @@ fn refusal_survives_hot_only_retry() {
         &FieldTypes::new(),
         &FieldTypes::new(),
         usize::MAX,
-        0,
     );
     match outcome {
         Err(EngineError::Refused { message }) => assert_eq!(
@@ -5302,7 +5137,7 @@ mod tests {
             meta.data_type
         );
 
-        let result = exec.run_query("* | fields meta", &glob, &FieldTypes::new(), usize::MAX, 0);
+        let result = exec.run_query("* | fields meta", &glob, &FieldTypes::new(), usize::MAX);
         assert!(
             matches!(result, Err(EngineError::Database(ref e)) if is_conversion_error(e)),
             "a query over the irreconcilable mix must error loudly (the \
@@ -5344,7 +5179,7 @@ mod tests {
         // Prove describe matches read time: a SELECT over the same glob must
         // succeed, returning both rows the union merges.
         let result = exec
-            .run_query("* | fields meta", &glob, &FieldTypes::new(), usize::MAX, 0)
+            .run_query("* | fields meta", &glob, &FieldTypes::new(), usize::MAX)
             .expect("SELECT meta over the merged-STRUCT glob must succeed");
         assert_eq!(
             result.row_count(),
@@ -5378,7 +5213,6 @@ mod tests {
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
-                0,
             )
             .expect("cold-start query must return hot rows, not error");
         assert_eq!(
@@ -5628,7 +5462,6 @@ mod tests {
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,
-            0,
         );
         assert!(
             result.is_err(),
@@ -5668,7 +5501,6 @@ mod tests {
                     &FieldTypes::new(),
                     &FieldTypes::new(),
                     RowCap::Refuse(usize::MAX),
-                    0,
                 )
                 .unwrap_or_else(|e| panic!("{dsl}: an absent field reads NULL, not {e:?}"));
             let totals = close(&clock);
@@ -5968,7 +5800,6 @@ mod tests {
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
-                0,
             )
             .expect("a partial list-source miss must not fail the query");
         assert_eq!(
@@ -6001,7 +5832,7 @@ mod tests {
             empty_hour.display()
         );
         let result = exec
-            .run_query("*", &source, &FieldTypes::new(), usize::MAX, 0)
+            .run_query("*", &source, &FieldTypes::new(), usize::MAX)
             .expect("a partial list-source miss must not fail the query");
         assert_eq!(
             result.row_count(),
@@ -6060,7 +5891,7 @@ mod tests {
         let exec = Executor::new().unwrap();
         let source = format!("['{}/*.parquet']", hour.display());
         let result = exec
-            .run_query("*", &source, &FieldTypes::new(), usize::MAX, 0)
+            .run_query("*", &source, &FieldTypes::new(), usize::MAX)
             .expect("an empty window must be an empty success, not an error");
         assert_eq!(result.row_count(), 0, "an empty window has no rows");
     }
@@ -6095,7 +5926,7 @@ mod tests {
                 ] {
                     let before = super::schema_probe::count_on_this_thread();
                     let result = exec
-                        .run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+                        .run_query(dsl, source, &FieldTypes::new(), usize::MAX)
                         .unwrap_or_else(|e| panic!("{dsl} over {source}: {e:?}"));
                     assert_eq!(
                         super::schema_probe::count_on_this_thread() - before,
@@ -6157,7 +5988,6 @@ mod tests {
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,
-            0,
         );
         assert!(
             matches!(result, Err(crate::error::EngineError::ColdDataUnread)),
@@ -6430,7 +6260,7 @@ mod tests {
             let lanes = exec.cancellable(latch);
             [
                 lanes
-                    .run_query(broken, &cold, &none, RowCap::Refuse(10), 0)
+                    .run_query(broken, &cold, &none, RowCap::Refuse(10))
                     .map(|_| ()),
                 lanes
                     .run_query_with_hot(
@@ -6441,7 +6271,6 @@ mod tests {
                         &none,
                         &none,
                         RowCap::Refuse(10),
-                        0,
                     )
                     .map(|_| ()),
                 lanes
@@ -6509,7 +6338,6 @@ mod tests {
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 RowCap::Refuse(usize::MAX),
-                0,
             )
             .expect("cold start answers from the hot buffer");
         assert_eq!(result.rows.len(), 1);
@@ -6563,13 +6391,7 @@ mod tests {
             .expect("executor")
             .cancellable(&CancelLatch::never())
             .timed(&clock)
-            .run_query(
-                dsl,
-                &source,
-                &FieldTypes::new(),
-                RowCap::Refuse(usize::MAX),
-                0,
-            )
+            .run_query(dsl, &source, &FieldTypes::new(), RowCap::Refuse(usize::MAX))
             .expect("a TIMESTAMP bucket source charts");
 
         let totals = close(&clock);
@@ -6909,7 +6731,7 @@ mod structured_error_classification {
         let _defects = ["nope", "no_column"]
             .map(|column| super::schema_probe::claim_present(&marker, column, "BIGINT"));
         let (_scratch, exec) = query_database(64 * MIB, 64 * MIB);
-        let run = |dsl: &str| exec.run_query(dsl, &source, &FieldTypes::new(), usize::MAX, 0);
+        let run = |dsl: &str| exec.run_query(dsl, &source, &FieldTypes::new(), usize::MAX);
         for (dsl, field) in [
             ("* | stats sum(nope)", "nope"),
             ("* | stats sum(nope) by hostname", "nope"),
@@ -6983,7 +6805,6 @@ mod structured_error_classification {
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
-                0,
             )
         };
         let export = |dsl: &str, name: &str| {
@@ -7075,7 +6896,6 @@ mod structured_error_classification {
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
-                0,
             );
             let Err(EngineError::Database(duckdb::Error::DuckDBFailure(_, Some(message)))) =
                 &outcome

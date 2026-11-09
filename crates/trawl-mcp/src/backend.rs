@@ -84,14 +84,12 @@ pub trait Backend: Send + Sync {
         service: Option<&str>,
     ) -> impl Future<Output = Result<FieldValuesResponse, ClientError>> + Send;
 
-    /// Execute a DSL query with pagination and an explicit display zone
-    /// (`POST /api/v1/query`).
-    fn query_paginated_tz(
+    /// Execute a DSL query with pagination (`POST /api/v1/query`).
+    fn query_paginated(
         &self,
         dsl: &str,
         limit: Option<usize>,
         offset: Option<usize>,
-        timezone: Option<String>,
     ) -> impl Future<Output = Result<QueryResponse, ClientError>> + Send;
 
     /// Validate a DSL query without executing it (`POST /api/v1/validate`).
@@ -268,14 +266,13 @@ impl Backend for HttpClient {
         HttpClient::field_values(self, field, limit, service).await
     }
 
-    async fn query_paginated_tz(
+    async fn query_paginated(
         &self,
         dsl: &str,
         limit: Option<usize>,
         offset: Option<usize>,
-        timezone: Option<String>,
     ) -> Result<QueryResponse, ClientError> {
-        HttpClient::query_paginated_tz(self, dsl, limit, offset, timezone).await
+        HttpClient::query_paginated(self, dsl, limit, offset).await
     }
 
     async fn validate(&self, dsl: &str) -> Result<ValidationResponse, ClientError> {

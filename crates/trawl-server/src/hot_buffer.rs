@@ -1665,7 +1665,6 @@ mod tests {
                     &trawl_core::schema::FieldTypes::new(),
                     &trawl_core::schema::FieldTypes::new(),
                     usize::MAX,
-                    0,
                 )
                 .expect("hot query must succeed");
 

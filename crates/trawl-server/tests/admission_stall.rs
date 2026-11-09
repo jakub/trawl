@@ -136,7 +136,6 @@ async fn search(server: &TestServer, dsl: &str) -> Vec<BTreeMap<String, trawl_ap
             query: dsl.to_owned(),
             limit: Some(10_000),
             offset: None,
-            timezone: None,
         })
         .send()
         .await

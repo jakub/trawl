@@ -152,9 +152,10 @@ pub struct UiConfig {
     #[serde(default = "default_tab_width")]
     pub tab_width: usize,
 
-    /// Timezone for timestamp display.
+    /// Display zone for timestamps, parsed by `trawl_api::zone::DisplayZone`
+    /// when a command that prints instants starts.
     ///
-    /// - `"local"` (default) — system timezone via `chrono::Local`
+    /// - `"local"` (default) — this machine's zone, offset per instant
     /// - `"UTC"` — no conversion
     /// - `"+HH:MM"` / `"-HH:MM"` — fixed offset
     #[serde(default = "default_timezone")]

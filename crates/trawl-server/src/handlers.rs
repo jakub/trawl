@@ -113,20 +113,6 @@ pub async fn query(
         )));
     }
 
-    // Resolve the timezone from the request (default to UTC when absent)
-    // BEFORE anything opens a tracker entry. This is request validation
-    // like the offset check above, and its `?` return has no outcome path
-    // to finish tracking through: opening the entry first would record an
-    // invalid timezone as an abandoned query rather than refuse it before
-    // any query exists.
-    let utc_offset_secs = req
-        .timezone
-        .as_deref()
-        .map(trawl_engine::timezone::resolve_utc_offset)
-        .transpose()
-        .map_err(ServerError::BadRequest)?
-        .unwrap_or(0);
-
     // One id from the pool's counter keys both the tracker entry and the
     // pool's interrupt map, so cancel-by-id interrupts the query the client
     // sees. Allocated before query_start so every lifecycle event correlates
@@ -283,7 +269,6 @@ pub async fn query(
                             &resolved.source,
                             deadline,
                             capture_debug,
-                            utc_offset_secs,
                             crate::pool::WorkContext::key(
                                 crate::pool::WorkKind::FromSaved,
                                 verified.id,
@@ -307,7 +292,6 @@ pub async fn query(
                         &req.query,
                         deadline,
                         capture_debug,
-                        utc_offset_secs,
                         crate::pool::WorkContext::key(crate::pool::WorkKind::Query, verified.id)
                             .with_user(&verified.name)
                             .with_timing(timing.timing().clone()),
@@ -3505,8 +3489,6 @@ pub async fn export(
         rows: limit,
         tail_input: max_export_rows,
     };
-    // Exports use UTC — timezone conversion is a display concern for
-    // interactive queries, not bulk data exports.
     let outcome = state
         .query
         .pool
@@ -3516,7 +3498,6 @@ pub async fn export(
             cap,
             deadline,
             capture_debug,
-            0,
             crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id)
                 .with_user(&verified.name)
                 .with_timing(timing.timing().clone()),

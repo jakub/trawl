@@ -46,7 +46,7 @@ pub struct Opts<'a> {
     pub y_label: Option<&'a str>,
     pub kind: ChartKind,
     /// Format the time axis as UTC. Set when x values were derived from
-    /// trawld's already-timezone-shifted `_time` strings.
+    /// trawld's `_time` strings, which are UTC.
     pub utc: bool,
     /// `Some` switches the x scale to ordinal: one label per category and
     /// xs are `0..n-1`. `None` keeps a time x scale.

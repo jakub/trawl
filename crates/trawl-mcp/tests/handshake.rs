@@ -11,6 +11,7 @@
 use rmcp::ServiceExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
+use trawl_api::zone::DisplayZone;
 use trawl_client::HttpClient;
 use trawl_mcp::TrawlServer;
 
@@ -51,7 +52,7 @@ async fn start() -> Client {
     let backend = HttpClient::new("http://127.0.0.1:9", "unused").unwrap();
     let (read, write) = tokio::io::split(server);
     tokio::spawn(async move {
-        let running = TrawlServer::new(backend)
+        let running = TrawlServer::new(backend, DisplayZone::Utc)
             .serve((read, write))
             .await
             .unwrap();

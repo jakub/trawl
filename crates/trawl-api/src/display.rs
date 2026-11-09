@@ -12,9 +12,10 @@ use std::collections::HashMap;
 
 use crate::value::{ColumnType, QueryResult, Value};
 
-/// A cell of a `timestamp` column, or of a list of them, as the CLI table
-/// and the TUI show it: each timestamp through [`timestamp_text`], a list
-/// the way `Value`'s `Display` writes one.
+/// A cell of a `timestamp` column, or of a list of them, as the browser's
+/// results grid shows it: each timestamp through [`timestamp_text`], a list
+/// the way `Value`'s `Display` writes one. The CLI table and the TUI use
+/// [`crate::zone::present_cell`].
 ///
 /// `None` for any other cell, which each surface renders its own way.
 #[must_use]
@@ -53,9 +54,12 @@ fn element_text(ty: &ColumnType, value: &Value) -> String {
 /// without the `T`, the offset or the fraction's trailing zeros, so
 /// `2024-01-15T10:00:00.120000+02:00` shows as `2024-01-15 10:00:00.12`.
 ///
-/// The server renders a result in the reader's offset, so the wall clock
-/// is the reading the reader asked for. Text that is not a wire timestamp
-/// (`infinity`, or anything else) shows as it stands.
+/// The wall clock is read at whatever offset the text carries, and the
+/// offset is dropped, so the reading is UTC for a result as trawld answers
+/// it. Show this only where the zone is labelled elsewhere, as the browser
+/// labels its timestamp columns; [`crate::zone::present_human`] keeps each
+/// instant's offset. Text that is not a wire timestamp (`infinity`, or
+/// anything else) shows as it stands.
 #[must_use]
 pub fn timestamp_text(text: &str) -> String {
     if !text.is_ascii() {
@@ -200,6 +204,18 @@ fn series_total(values: &[u64]) -> u128 {
 /// distinct series before any truncation.
 #[must_use]
 pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) {
+    extract_series_labelled(result, |_, value| value_to_string(value))
+}
+
+/// [`extract_series`] with each group-by label written by `label` from the
+/// group column's type and a cell of the group, so a surface can show a
+/// `timestamp` group in its display zone. Series still group, rank and
+/// sort by [`value_to_string`] of the cell.
+#[must_use]
+pub fn extract_series_labelled(
+    result: &QueryResult,
+    label: impl Fn(&ColumnType, &Value) -> String,
+) -> (Vec<(String, Vec<u64>)>, usize) {
     const MAX_SERIES: usize = 6;
 
     let Some(time_col) = result.columns.iter().position(|c| c.name == "_time") else {
@@ -239,20 +255,29 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
             let group_idx = string_cols[0];
             let metric_idx = numeric_cols[0];
 
-            let mut series_map: HashMap<String, Vec<u64>> = HashMap::new();
+            let mut series_map: HashMap<String, (&Value, Vec<u64>)> = HashMap::new();
             for row in &result.rows {
-                let label = value_to_string(&row[group_idx]);
+                let group = &row[group_idx];
                 let value = value_to_u64(&row[metric_idx]);
-                series_map.entry(label).or_default().push(value);
+                series_map
+                    .entry(value_to_string(group))
+                    .or_insert_with(|| (group, Vec::new()))
+                    .1
+                    .push(value);
             }
 
-            let mut series: Vec<(String, Vec<u64>)> = series_map.into_iter().collect();
+            let mut series: Vec<(String, (&Value, Vec<u64>))> = series_map.into_iter().collect();
             let total = series.len();
             if series.len() > MAX_SERIES {
-                series.sort_by_key(|s| std::cmp::Reverse(series_total(&s.1)));
+                series.sort_by_key(|s| std::cmp::Reverse(series_total(&s.1.1)));
                 series.truncate(MAX_SERIES);
             }
             series.sort_by(|a, b| a.0.cmp(&b.0));
+            let group_ty = &result.columns[group_idx].ty;
+            let series = series
+                .into_iter()
+                .map(|(_, (group, values))| (label(group_ty, group), values))
+                .collect();
             (series, total)
         } else if string_cols.is_empty() {
             let mut series: Vec<(String, Vec<u64>)> = numeric_cols

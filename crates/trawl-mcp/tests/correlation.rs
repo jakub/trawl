@@ -14,6 +14,7 @@ use rmcp::model::CallToolResult;
 use serde_json::{Value as Json, json};
 use trawl_api::investigations::InvestigationId;
 use trawl_api::value::{ColumnType, Value};
+use trawl_api::zone::DisplayZone;
 use trawl_client::{
     CaptureKind, CompareFacts, CompareWarning, CompareWarningCode, CompareWindow, ContextFacts,
     ContextGroups, Correlation, CorrelationResponse, ErrorCode, ErrorEnvelope, FieldSightings,
@@ -1431,7 +1432,7 @@ async fn a_correlation_row_the_budget_cannot_print_is_proposed_alone_at_the_hard
         "read",
         action["arguments"].as_object().cloned(),
         &backend,
-        "UTC",
+        DisplayZone::Utc,
         &Seen::default(),
     )
     .await
@@ -1457,15 +1458,21 @@ async fn the_correlation_tools_dispatch_by_name() {
             .as_object()
             .cloned(),
         &backend,
-        "UTC",
+        DisplayZone::Utc,
         &Seen::default(),
     )
     .await
     .unwrap();
     assert_ne!(answer.is_error, Some(true), "{}", text_of(&answer));
-    let unknown = trawl_mcp::tools::dispatch("correlate", None, &backend, "UTC", &Seen::default())
-        .await
-        .unwrap_err();
+    let unknown = trawl_mcp::tools::dispatch(
+        "correlate",
+        None,
+        &backend,
+        DisplayZone::Utc,
+        &Seen::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(
         unknown.message.contains("context, sightings, compare"),
         "{}",
@@ -1475,7 +1482,7 @@ async fn the_correlation_tools_dispatch_by_name() {
         "sightings",
         json!({"literal": "x", "window": "1h"}).as_object().cloned(),
         &backend,
-        "UTC",
+        DisplayZone::Utc,
         &Seen::default(),
     )
     .await

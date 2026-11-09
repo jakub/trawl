@@ -741,7 +741,6 @@ pub(crate) async fn run(
             plan.lane_source,
             RowCap::Refuse(pool.max_result_rows()),
             deadline,
-            0,
             work,
             finish,
         )
@@ -3581,7 +3580,6 @@ mod pg_tests {
             },
             RowCap::Refuse(100),
             Deadline::after(Duration::from_secs(60)),
-            0,
             work,
             Box::new(move |input: CaptureInput<'_>| keep.run(input)),
         )

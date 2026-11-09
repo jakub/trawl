@@ -42,7 +42,10 @@ The command does not contact the server at startup. The first tool call does,
 so a server that is down gives that call a refusal, not the process an exit.
 The display zone of `orient` is the `ui.timezone` setting of the CLI config on
 the machine that runs `trawl mcp`: `local` (the default), `UTC`, or a fixed
-offset such as `+05:30`.
+offset such as `+05:30`. `local` is the zone of that machine, not the zone of
+the trawld host. [Client configuration](/reference/configuration/#ui) gives
+the grammar. Only `orient`'s time now uses the display zone. Captured rows,
+bounds, and every other instant stay in UTC.
 
 ### Exit codes
 
@@ -57,8 +60,9 @@ warning on stderr before the server starts.
 
 ### Refusals
 
-`trawl mcp` exits `2` for each of these cases. No message contains a value of
-a variable, a flag, or a key.
+`trawl mcp` exits `2` for each of these cases. No message contains the value
+of a variable or a key. A message about the config file names its path, and
+the `ui.timezone` refusal also names the value, which is not secret.
 
 - Any of `TRAWL_URL`, `TRAWL_TOKEN`, `TRAWL_PROFILE`, or `TRAWL_INSECURE` is
   set, even empty. The message names every variable that is present.
@@ -72,7 +76,8 @@ a variable, a flag, or a key.
 - The profile does not resolve: the config file is missing or invalid, the
   profile does not exist, its URL is not valid, no trial exists for `-p trial`,
   or its `ca_cert` file holds no certificate.
-- `ui.timezone` is not `local`, `UTC`, or a fixed offset.
+- `ui.timezone` is not `local`, `UTC`, or a fixed offset `±HH:MM`. The
+  message names the value.
 
 ## Tools
 

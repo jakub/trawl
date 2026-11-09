@@ -45,15 +45,9 @@ fn ndjson(rows: &[&str]) -> (tempfile::TempDir, String) {
 }
 
 fn run(dsl: &str, source: &str) -> Result<QueryResult, EngineError> {
-    run_at(dsl, source, 0)
-}
-
-/// [`run`] with timestamps rendered at a display offset of
-/// `utc_offset_secs`.
-fn run_at(dsl: &str, source: &str, utc_offset_secs: i32) -> Result<QueryResult, EngineError> {
     Executor::new()
         .unwrap()
-        .run_query(dsl, source, &FieldTypes::new(), usize::MAX, utc_offset_secs)
+        .run_query(dsl, source, &FieldTypes::new(), usize::MAX)
 }
 
 fn types(result: &QueryResult) -> Vec<(String, ColumnType)> {
@@ -299,11 +293,11 @@ fn a_rust_tail_that_removes_every_row_keeps_the_projected_schema() {
 /// timestamps: typed `list` of `timestamp`, each item in the display
 /// offset, exactly as the same query answers without the tail.
 #[test]
-fn a_timestamp_list_keeps_its_type_and_display_offset_through_a_rust_tail() {
+fn a_timestamp_list_keeps_its_type_and_wire_text_through_a_rust_tail() {
     let (_dir, source) =
         parquet("SELECT 'k=v' AS message, [TIMESTAMP '2026-01-15 09:00:00.123456'] AS seen");
-    let baseline = run_at("* | table seen", &source, 19800).expect("the SQL lane runs");
-    let tail = run_at("* | extract kv | table seen", &source, 19800).expect("the kv tail runs");
+    let baseline = run("* | table seen", &source).expect("the SQL lane runs");
+    let tail = run("* | extract kv | table seen", &source).expect("the kv tail runs");
     assert_eq!(
         baseline.columns[0].ty,
         ColumnType::list(ColumnType::Timestamp),
@@ -348,10 +342,9 @@ fn a_listed_aggregate_keeps_its_timestamp_items_through_kv() {
     let (_dir, source) =
         parquet("SELECT 'k=v' AS message, TIMESTAMP '2026-01-15 09:00:00.123456' AS _time");
     let base = "* | stats list(_time) as seen, max(message) as message";
-    let baseline =
-        run_at(&format!("{base} | table seen"), &source, 19800).expect("the SQL lane runs");
-    let tail = run_at(&format!("{base} | extract kv | table seen"), &source, 19800)
-        .expect("the kv tail runs");
+    let baseline = run(&format!("{base} | table seen"), &source).expect("the SQL lane runs");
+    let tail =
+        run(&format!("{base} | extract kv | table seen"), &source).expect("the kv tail runs");
     assert_eq!(tail, baseline);
 }
 
@@ -362,12 +355,8 @@ fn a_listed_aggregate_keeps_its_timestamp_items_through_kv() {
 fn a_timestamp_list_with_no_row_left_is_still_typed() {
     let (_dir, source) =
         parquet("SELECT 'k=v' AS message, [TIMESTAMP '2026-01-15 09:00:00.123456'] AS seen");
-    let result = run_at(
-        "* | extract kv | where k == \"nope\" | table seen",
-        &source,
-        19800,
-    )
-    .expect("the kv tail runs");
+    let result = run("* | extract kv | where k == \"nope\" | table seen", &source)
+        .expect("the kv tail runs");
     assert!(result.rows.is_empty(), "{result:?}");
     assert_eq!(
         types(&result),

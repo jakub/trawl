@@ -407,7 +407,6 @@ pub(crate) async fn execute_scheduled_query(
                 query,
                 deadline,
                 false,
-                0,
                 crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled)
                     .with_timing(timing.timing().clone()),
             )
