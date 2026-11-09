@@ -53,9 +53,12 @@ fn element_text(ty: &ColumnType, value: &Value) -> String {
 /// without the `T`, the offset or the fraction's trailing zeros, so
 /// `2024-01-15T10:00:00.120000+02:00` shows as `2024-01-15 10:00:00.12`.
 ///
-/// The server renders a result in the reader's offset, so the wall clock
-/// is the reading the reader asked for. Text that is not a wire timestamp
-/// (`infinity`, or anything else) shows as it stands.
+/// The wall clock is read at whatever offset the text carries, and the
+/// offset is dropped, so the reading is UTC for a result as trawld answers
+/// it. Show this only where the zone is labelled elsewhere, as the browser
+/// labels its timestamp columns; [`crate::zone::present_human`] keeps each
+/// instant's offset. Text that is not a wire timestamp (`infinity`, or
+/// anything else) shows as it stands.
 #[must_use]
 pub fn timestamp_text(text: &str) -> String {
     if !text.is_ascii() {

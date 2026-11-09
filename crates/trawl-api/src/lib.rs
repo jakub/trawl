@@ -22,6 +22,7 @@ pub mod investigations;
 pub mod results;
 pub mod stream;
 pub mod value;
+pub mod zone;
 
 pub use crate::capabilities::{
     CapabilitiesResponse, CapabilityBounds, CaptureAdmission, CaptureQuotas, DslCapabilities,
