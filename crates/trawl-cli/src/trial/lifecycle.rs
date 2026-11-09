@@ -1012,7 +1012,7 @@ enum CertificatePlan {
 ///   published and `up` cannot tell which pins it reached.
 ///
 /// Damaged means not a regular file, empty, longer than ca.pem may be, or
-/// not exactly one PEM certificate.
+/// not exactly one PEM certificate ([`is_one_certificate`]).
 fn judge_certificate(state: &TrialState, found: VolumeFile) -> Result<CertificatePlan, TrialError> {
     let refuse = |problem| Err(TrialError::CertificateDamaged { problem });
     let recorded = state.phases.tls || state.tls.is_some();
@@ -1028,6 +1028,9 @@ fn judge_certificate(state: &TrialState, found: VolumeFile) -> Result<Certificat
     if u64::try_from(pem.len()).map_or(true, |len| len > MAX_CA_BYTES) {
         return refuse("is too large to be one certificate");
     }
+    if !is_one_certificate(&pem) {
+        return refuse("is not one PEM certificate");
+    }
     let Ok(found) = fingerprint(&pem) else {
         return refuse("is not one PEM certificate");
     };
@@ -1036,6 +1039,36 @@ fn judge_certificate(state: &TrialState, found: VolumeFile) -> Result<Certificat
         return refuse("is not the one the trial recorded");
     }
     Ok(CertificatePlan::Reuse(pem))
+}
+
+/// Whether `pem` is one PEM `CERTIFICATE` section with nothing but
+/// whitespace around it, whose DER is one well-formed X.509 certificate
+/// with no bytes after it. The pins are these bytes as they are, so
+/// anything else in them, a private key included, would be published.
+///
+/// The text check runs first, so a payload holding any other section is
+/// refused before a byte of it is decoded.
+fn is_one_certificate(pem: &[u8]) -> bool {
+    use rustls_pki_types::pem::{PemObject as _, SectionKind};
+
+    const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    const END: &[u8] = b"-----END CERTIFICATE-----";
+    let Some(body) = pem
+        .trim_ascii()
+        .strip_prefix(BEGIN)
+        .and_then(|rest| rest.strip_suffix(END))
+    else {
+        return false;
+    };
+    if body.windows(5).any(|w| w == b"-----") {
+        return false;
+    }
+    let mut sections = <(SectionKind, Vec<u8>)>::pem_slice_iter(pem);
+    let (Some(Ok((SectionKind::Certificate, der))), None) = (sections.next(), sections.next())
+    else {
+        return false;
+    };
+    matches!(x509_parser::parse_x509_certificate(&der), Ok((rest, _)) if rest.is_empty())
 }
 
 /// The SHA-256 fingerprint of the one certificate in `pem`, as colon
@@ -3113,7 +3146,7 @@ fi"#,
         root: tempfile::TempDir,
         engine: tempfile::TempDir,
         docker: Docker,
-        _home: tempfile::TempDir,
+        home: tempfile::TempDir,
         paths: TrialPaths,
     }
 
@@ -3129,7 +3162,7 @@ fi"#,
                 root,
                 engine,
                 docker,
-                _home: home,
+                home,
                 paths,
             }
         }
@@ -3159,24 +3192,58 @@ fi"#,
 
         /// Every file under the stub volume, with its bytes.
         fn volume(&self) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-            fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
-                for entry in std::fs::read_dir(dir).unwrap() {
-                    let path = entry.unwrap().path();
-                    let meta = std::fs::symlink_metadata(&path).unwrap();
-                    if meta.is_dir() {
-                        walk(&path, out);
-                    } else if meta.is_file() {
-                        out.push((path.clone(), std::fs::read(&path).unwrap()));
-                    } else {
-                        out.push((path, Vec::new()));
-                    }
+            files_under(self.root.path())
+        }
+    }
+
+    /// Every file under `dir`, with its bytes, sorted. Anything that is
+    /// neither a directory nor a regular file is listed without bytes.
+    fn files_under(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.is_dir() {
+                    walk(&path, out);
+                } else if meta.is_file() {
+                    out.push((path.clone(), std::fs::read(&path).unwrap()));
+                } else {
+                    out.push((path, Vec::new()));
                 }
             }
-            let mut out = Vec::new();
-            walk(self.root.path(), &mut out);
-            out.sort();
-            out
         }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// `der` as one PEM section labelled `label`, base64 by hand so the
+    /// test can wrap bytes no encoder here would produce.
+    fn pem_section(label: &str, der: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for chunk in der.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    let index = usize::try_from((n >> (18 - 6 * i)) & 63).unwrap();
+                    b64.push(char::from(ALPHABET[index]));
+                } else {
+                    b64.push('=');
+                }
+            }
+        }
+        let mut out = format!("-----BEGIN {label}-----\n");
+        for line in b64.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(line).unwrap());
+            out.push('\n');
+        }
+        out + "-----END " + label + "-----\n"
     }
 
     /// The mode bits of `path`.
@@ -3303,6 +3370,76 @@ fi"#,
         Directory,
     }
 
+    /// Run the certificate phase on a fresh trial whose volume holds
+    /// `volume` at the certificate's path and a key file beside it, and
+    /// assert it refuses having read the volume once and written nothing:
+    /// no pin, no web copy, no state, no byte in the volume, and no line
+    /// of `key_body` in any file but the two the volume holds.
+    async fn assert_refused(
+        name: &str,
+        phase: bool,
+        tls: Option<&str>,
+        volume: Volume<'_>,
+        key_body: &[&str],
+    ) {
+        let trial = CertTrial::new();
+        let cert = trial.at(compose::TLS_CERT);
+        std::fs::create_dir_all(cert.parent().unwrap()).unwrap();
+        std::fs::write(trial.at(compose::TLS_KEY), b"key").unwrap();
+        match volume {
+            Volume::Empty => {}
+            Volume::Holds(bytes) => std::fs::write(&cert, bytes).unwrap(),
+            Volume::Directory => std::fs::create_dir(&cert).unwrap(),
+        }
+        let mut state = trial.state(phase, tls);
+        let saved = std::fs::read(trial.paths.state_file()).unwrap();
+        let in_memory = state.clone();
+        let files = trial.volume();
+
+        let err = certificate(&trial.docker, &trial.paths, &mut state)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TrialError::CertificateDamaged { .. }),
+            "{name}: {err:?}"
+        );
+        let shown = err.to_string();
+        assert!(shown.contains("`trawl trial down`"), "{name}: {shown}");
+        assert!(shown.contains("`trawl trial up`"), "{name}: {shown}");
+        assert!(!shown.contains('/'), "{name}: {shown}");
+        if let Some(fp) = tls {
+            assert!(!shown.contains(fp), "{name}: {shown}");
+        }
+
+        assert_eq!(
+            trial.take_calls(),
+            format!("read {}\n", compose::TLS_CERT),
+            "{name}"
+        );
+        assert!(!trial.paths.ca_file().exists(), "{name}");
+        assert!(!trial.at(compose::WEB_CA).exists(), "{name}");
+        assert_eq!(
+            std::fs::read(trial.paths.state_file()).unwrap(),
+            saved,
+            "{name}"
+        );
+        assert_eq!(state, in_memory, "{name}");
+        assert_eq!(trial.volume(), files, "{name}");
+
+        let elsewhere =
+            files_under(trial.home.path())
+                .into_iter()
+                .chain(trial.volume().into_iter().filter(|(path, _)| {
+                    *path != trial.at(compose::TLS_CERT) && *path != trial.at(compose::TLS_KEY)
+                }));
+        for (path, bytes) in elsewhere {
+            let text = String::from_utf8_lossy(&bytes);
+            for line in key_body {
+                assert!(!text.contains(line), "{name}: {}", path.display());
+            }
+        }
+    }
+
     /// A recorded trial whose volume certificate is gone, damaged, or not
     /// the recorded one refuses, as does an unrecorded trial whose volume
     /// holds something that is not one certificate. The refusal reads the
@@ -3363,47 +3500,81 @@ fi"#,
             ("unrecorded, a directory", false, None, Volume::Directory),
         ];
         for (name, phase, tls, volume) in cases {
-            let trial = CertTrial::new();
-            let cert = trial.at(compose::TLS_CERT);
-            std::fs::create_dir_all(cert.parent().unwrap()).unwrap();
-            std::fs::write(trial.at(compose::TLS_KEY), b"key").unwrap();
-            match volume {
-                Volume::Empty => {}
-                Volume::Holds(bytes) => std::fs::write(&cert, bytes).unwrap(),
-                Volume::Directory => std::fs::create_dir(&cert).unwrap(),
-            }
-            let mut state = trial.state(phase, tls);
-            let saved = std::fs::read(trial.paths.state_file()).unwrap();
-            let in_memory = state.clone();
-            let files = trial.volume();
+            assert_refused(name, phase, tls, volume, &[]).await;
+        }
+    }
 
-            let err = certificate(&trial.docker, &trial.paths, &mut state)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(err, TrialError::CertificateDamaged { .. }),
-                "{name}: {err:?}"
-            );
-            let shown = err.to_string();
-            assert!(shown.contains("`trawl trial down`"), "{name}: {shown}");
-            assert!(shown.contains("`trawl trial up`"), "{name}: {shown}");
-            assert!(!shown.contains('/'), "{name}: {shown}");
-            assert!(!shown.contains(&fp_a), "{name}: {shown}");
-
-            assert_eq!(
-                trial.take_calls(),
-                format!("read {}\n", compose::TLS_CERT),
-                "{name}"
-            );
-            assert!(!trial.paths.ca_file().exists(), "{name}");
-            assert!(!trial.at(compose::WEB_CA).exists(), "{name}");
-            assert_eq!(
-                std::fs::read(trial.paths.state_file()).unwrap(),
-                saved,
-                "{name}"
-            );
-            assert_eq!(state, in_memory, "{name}");
-            assert_eq!(trial.volume(), files, "{name}");
+    /// The pins are the volume's bytes as they are, so a payload is one
+    /// certificate only when it is one CERTIFICATE section with nothing
+    /// but whitespace around it, holding one well-formed X.509
+    /// certificate. Garbage DER, trailing DER bytes, the certificate's own
+    /// key, text, and an unknown section are each refused, recorded or
+    /// not, before the key reaches any pin.
+    #[tokio::test]
+    async fn a_payload_that_is_not_one_clean_certificate_is_refused() {
+        let pair = TrialPair::generate().unwrap();
+        let a = pair.cert_pem().to_owned();
+        let key = pair.key_pem().to_owned();
+        drop(pair);
+        let fp_a = fingerprint(a.as_bytes()).unwrap();
+        let with_key = format!("{a}{key}");
+        let text_after = format!("{a}trial certificate\n");
+        let text_before = format!("trial certificate\n{a}");
+        let unknown_after = format!("{a}{}", pem_section("NOTE", b"abc"));
+        let trailing_der = {
+            let (_, der) = x509_parser::pem::parse_x509_pem(a.as_bytes()).unwrap();
+            let mut der = der.contents;
+            der.push(0);
+            pem_section("CERTIFICATE", &der)
+        };
+        let cases: [(&str, bool, Option<&str>, Volume<'_>); 7] = [
+            (
+                "unrecorded, garbage DER in a CERTIFICATE block",
+                false,
+                None,
+                Volume::Holds(b"-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n"),
+            ),
+            (
+                "unrecorded, DER with trailing bytes",
+                false,
+                None,
+                Volume::Holds(trailing_der.as_bytes()),
+            ),
+            (
+                "recorded, the certificate and its key",
+                true,
+                Some(&fp_a),
+                Volume::Holds(with_key.as_bytes()),
+            ),
+            (
+                "unrecorded, the certificate and its key",
+                false,
+                None,
+                Volume::Holds(with_key.as_bytes()),
+            ),
+            (
+                "recorded, text after the certificate",
+                true,
+                Some(&fp_a),
+                Volume::Holds(text_after.as_bytes()),
+            ),
+            (
+                "unrecorded, text before the certificate",
+                false,
+                None,
+                Volume::Holds(text_before.as_bytes()),
+            ),
+            (
+                "recorded, an unknown section after the certificate",
+                true,
+                Some(&fp_a),
+                Volume::Holds(unknown_after.as_bytes()),
+            ),
+        ];
+        let key_body: Vec<&str> = key.lines().filter(|l| !l.starts_with("-----")).collect();
+        assert!(!key_body.is_empty());
+        for (name, phase, tls, volume) in cases {
+            assert_refused(name, phase, tls, volume, &key_body).await;
         }
     }
 
