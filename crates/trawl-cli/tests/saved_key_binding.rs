@@ -368,8 +368,16 @@ fn assert_binding_refusal(
 }
 
 fn assert_secret_free(err: &str, secrets: &[&str], case: &str) {
-    for secret in secrets.iter().chain(&[T, K, K2, FK, PK, "127.0.0.1"]) {
-        assert!(!err.contains(secret), "{case}: {secret:?} in {err}");
+    // The message names the leak by position, never by value.
+    for (index, secret) in secrets
+        .iter()
+        .chain(&[T, K, K2, FK, PK, "127.0.0.1"])
+        .enumerate()
+    {
+        assert!(
+            !err.contains(secret),
+            "{case}: forbidden string #{index} appears in stderr"
+        );
     }
 }
 
