@@ -91,9 +91,18 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     if let TabStatus::Error {
         ref message,
         ref details,
+        ref query,
     } = tab.status
     {
-        render_error_display(app, frame, results_area, tab, message, details);
+        render_error_display(
+            app,
+            frame,
+            results_area,
+            tab,
+            message,
+            details,
+            query.as_deref(),
+        );
     } else if let Some(response) = &tab.result {
         let result = &response.result;
         let is_timechart = is_timechart_result(result);
@@ -606,7 +615,8 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// Render error details with span highlighting in the results pane.
 ///
 /// Shows the error message in red, then the query text with the error
-/// span underlined and a caret line below it.
+/// span underlined and a caret line below it. The spans index `query`,
+/// the text the failed run sent, never the editor's current draft.
 #[allow(clippy::too_many_arguments)]
 fn render_error_display(
     app: &App,
@@ -615,6 +625,7 @@ fn render_error_display(
     tab: &crate::tui::state::Tab,
     message: &str,
     details: &[trawl_client::ErrorDetail],
+    query: Option<&str>,
 ) {
     let theme = &app.theme;
     let border_style = if app.focus == Focus::Results {
@@ -632,7 +643,7 @@ fn render_error_display(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let query_text = tab.editor.text();
+    let query_text = query.unwrap_or_default();
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     lines.push(Line::from(Span::styled(

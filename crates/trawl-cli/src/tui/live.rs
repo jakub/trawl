@@ -68,6 +68,7 @@ impl App {
                         result: Err(QueryError {
                             message: e.to_string(),
                             details: e.error_details().to_vec(),
+                            query,
                         }),
                         duration: Duration::from_secs(0),
                         capped: Vec::new(),
