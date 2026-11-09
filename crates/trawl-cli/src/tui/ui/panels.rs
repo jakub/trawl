@@ -1788,4 +1788,33 @@ mod unicode_tests {
         );
         insta::assert_snapshot!(all);
     }
+
+    /// A halfwidth sound mark takes a cell of its own where ratatui draws
+    /// it, so a column holding `ｶﾞ` pads it as two cells. The next column's
+    /// start is read off the buffer's own cell positions, which ratatui
+    /// lays out with its own widths, not with the kit's.
+    #[test]
+    fn unicode_result_columns_align_halfwidth_sound_marks() {
+        let rows = vec![
+            vec![Value::String("ｶﾞ".into()), Value::String("A1".into())],
+            vec![Value::String("web".into()), Value::String("B2".into())],
+            vec![Value::String("ﾊﾟﾊﾟﾊﾟﾊﾟﾊﾟ".into()), Value::String("C3".into())],
+        ];
+        let app = run_app(&["service", "Next"], rows);
+        let terminal = draw(40, 8, |frame| {
+            render_saved_run_results(&app, &app.theme, frame, frame.area());
+        });
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        let start_of = |marker: &str| {
+            buffer
+                .content
+                .chunks(width)
+                .find_map(|row| row.iter().position(|cell| cell.symbol() == marker))
+                .unwrap_or_else(|| panic!("no {marker:?} in\n{buffer:?}"))
+        };
+        let starts: Vec<usize> = ["N", "A", "B", "C"].into_iter().map(start_of).collect();
+        // `ﾊﾟﾊﾟﾊﾟﾊﾟﾊﾟ` is ten cells, then the two-cell gap.
+        assert_eq!(starts, [12, 12, 12, 12], "{buffer:?}");
+    }
 }

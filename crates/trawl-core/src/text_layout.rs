@@ -6,10 +6,11 @@
 //!
 //! The unit is the display cell: the columns a terminal gives a string.
 //! `日` takes two, a combining accent none, `❤` one and `❤\u{FE0F}` two.
-//! Every width here is [`UnicodeWidthStr::width`] of a whole string, never
-//! a sum of per-character widths. A string's width is not the sum of its
-//! parts, and it does not always grow as characters are added: `⌚` takes
-//! two cells and `⌚\u{FE0E}` one.
+//! Every width here is [`UnicodeWidthStr::width`] of a whole string, plus
+//! one cell for each halfwidth katakana sound mark, never a sum of
+//! per-character widths. A string's width is not the sum of its parts,
+//! and it does not always grow as characters are added: `⌚` takes two
+//! cells and `⌚\u{FE0E}` one.
 //!
 //! Text is passed through [`sanitize_display_text`] before it is measured
 //! or returned, so a control, bidi or zero-width character prints as
@@ -63,6 +64,26 @@ fn scan_window(text: &str, budget: usize) -> (&str, bool) {
     }
 }
 
+/// The display cells `s` takes: [`UnicodeWidthStr::width`] of the whole
+/// string, plus one for each halfwidth katakana sound mark, U+FF9E `ﾞ` or
+/// U+FF9F `ﾟ`.
+///
+/// unicode-width gives those two marks no width, as it does a combining
+/// mark, but a terminal draws each in a cell of its own. ratatui-core
+/// counts them the same way (`count_halfwidth_sound_marks` in its
+/// `buffer/cell_width.rs`), so a width measured here is where ratatui puts
+/// the next cell. The combining sound marks U+3099 and U+309A keep their
+/// unicode-width of none.
+///
+/// Every width in this module goes through here.
+fn measure(s: &str) -> usize {
+    let sound_marks = s
+        .chars()
+        .filter(|c| matches!(c, '\u{FF9E}' | '\u{FF9F}'))
+        .count();
+    s.width() + sound_marks
+}
+
 /// The display cells `text` takes once sanitized, measured as one string.
 ///
 /// This reads all of `text`. To size a column from values of any length,
@@ -70,7 +91,7 @@ fn scan_window(text: &str, budget: usize) -> (&str, bool) {
 /// which reads only a bounded prefix.
 #[must_use]
 pub fn cells(text: &str) -> usize {
-    sanitize_display_text(text).width()
+    measure(&sanitize_display_text(text))
 }
 
 /// `text` sanitized and cut to at most `budget` display cells.
@@ -89,7 +110,7 @@ pub fn fit_cells(text: &str, budget: usize) -> String {
     // sanitized text and a cut of it is a cut of the whole.
     let (window, cut) = scan_window(text, budget);
     let shown = sanitize_display_text(window);
-    if !cut && shown.width() <= budget {
+    if !cut && measure(&shown) <= budget {
         return shown;
     }
 
@@ -114,14 +135,14 @@ pub fn fit_cells(text: &str, budget: usize) -> String {
     // first candidate is the marker alone, one cell; it is measured like
     // the rest so that nothing is returned unmeasured.
     let mut best = candidate(0);
-    if best.width() > budget {
+    if measure(&best) > budget {
         return String::new();
     }
     let (mut fits, mut too_wide) = (0, ends.len());
     while too_wide - fits > 1 {
         let mid = fits + (too_wide - fits) / 2;
         let tried = candidate(mid);
-        if tried.width() <= budget {
+        if measure(&tried) <= budget {
             fits = mid;
             best = tried;
         } else {
@@ -135,7 +156,7 @@ pub fn fit_cells(text: &str, budget: usize) -> String {
 #[must_use]
 pub fn pad_cells(text: &str, width: usize) -> String {
     let mut out = fit_cells(text, width);
-    let used = out.width();
+    let used = measure(&out);
     out.extend(std::iter::repeat_n(' ', width.saturating_sub(used)));
     out
 }
@@ -257,8 +278,8 @@ pub fn caret_layout(text: &str, at: &SpanLine) -> CaretLayout {
     let covered = sanitize_display_text(at.covered(text));
     let after = sanitize_display_text(at.after(text));
     CaretLayout {
-        pad: before.width(),
-        carets: covered.width().max(1),
+        pad: measure(&before),
+        carets: measure(&covered).max(1),
         before,
         covered,
         after,
@@ -334,6 +355,21 @@ pub const SPAN_CASES: &[SpanCase] = &[
             excerpt: "service=\"日本\" | where x ~ /(/",
             pad: 9,
             carets: 4,
+        }),
+    },
+    SpanCase {
+        // `ｶ` and its sound mark `ﾞ` are a cell each, as a terminal and
+        // ratatui draw them, though unicode-width gives the mark none. 30
+        // bytes, 26 characters and 26 cells come before the `(`.
+        name: "halfwidth sound mark before the span",
+        text: "service=\"ｶﾞ\" | where x ~ /(/",
+        start: 30,
+        end: 31,
+        expect: Some(SpanExpect {
+            line: 1,
+            excerpt: "service=\"ｶﾞ\" | where x ~ /(/",
+            pad: 26,
+            carets: 1,
         }),
     },
     SpanCase {
@@ -587,10 +623,10 @@ mod tests {
     use super::*;
 
     /// One piece of a generated string, biased toward the text that has
-    /// broken terminal layouts: accents, CJK, combining marks, emoji with
-    /// their selectors and modifiers, ligatures, controls, bidi and
-    /// zero-width characters, long runs of zero-width marks, and anything
-    /// at all.
+    /// broken terminal layouts: accents, CJK, halfwidth katakana and its
+    /// sound marks, combining marks, emoji with their selectors and
+    /// modifiers, ligatures, controls, bidi and zero-width characters, long
+    /// runs of zero-width marks, and anything at all.
     fn piece() -> impl Strategy<Value = String> {
         let pick = |options: &'static [&'static str]| {
             prop::sample::select(options).prop_map(str::to_owned)
@@ -598,7 +634,7 @@ mod tests {
         prop_oneof![
             3 => proptest::char::range(' ', '~').prop_map(String::from),
             2 => pick(&["é", "ñ", "ü", "Å", "ß"]),
-            2 => pick(&["日", "本", "雪", "語", "Ｈ", "한"]),
+            2 => pick(&["日", "本", "雪", "語", "Ｈ", "한", "ｶ", "\u{FF9E}", "\u{FF9F}"]),
             2 => pick(&["\u{301}", "\u{308}", "\u{323}", "\u{302}", "\u{17D2}"]),
             2 => (
                 pick(&["❤", "⌚", "🙂", "🌊", "👍", "‘", "#"]),
@@ -637,14 +673,11 @@ mod tests {
             );
         }
         // Read whole and fitting: returned whole.
-        if budget > 0
-            && text.chars().count() <= scan_cap(budget)
-            && UnicodeWidthStr::width(shown.as_str()) <= budget
-        {
+        if budget > 0 && text.chars().count() <= scan_cap(budget) && measure(&shown) <= budget {
             prop_assert_eq!(&out, &shown);
         }
         let padded = pad_cells(text, budget);
-        prop_assert_eq!(UnicodeWidthStr::width(padded.as_str()), budget);
+        prop_assert_eq!(measure(&padded), budget);
         prop_assert!(
             padded
                 .strip_prefix(out.as_str())
@@ -730,6 +763,12 @@ mod tests {
             ("bidi", "\u{202E}abc", 2, "\u{FFFD}…"),
             ("bidi", "\u{202E}abc", 4, "\u{FFFD}abc"),
             ("zero-width space", "\u{200B}", 1, "\u{FFFD}"),
+            // A halfwidth sound mark takes a cell of its own.
+            ("halfwidth sound mark", "ｶﾞ", 1, "…"),
+            ("halfwidth sound mark", "ｶﾞ", 2, "ｶﾞ"),
+            ("halfwidth sound mark", "ｶﾞx", 2, "ｶ…"),
+            ("halfwidth sound mark", "ｶﾞx", 3, "ｶﾞx"),
+            ("halfwidth sound mark", "ﾊﾟﾊﾟ", 3, "ﾊﾟ…"),
         ];
         for &(class, text, budget, expect) in cases {
             assert_eq!(
@@ -751,6 +790,25 @@ mod tests {
             check_fit("⌚\u{FE0E}abc", budget).expect("fits");
             check_fit("a⌚\u{FE0E}⌚\u{FE0E}⌚\u{FE0E}b", budget).expect("fits");
         }
+    }
+
+    /// unicode-width gives the halfwidth sound marks U+FF9E and U+FF9F no
+    /// width, like the combining marks they are not; a terminal, and
+    /// ratatui, give each a cell. The combining sound marks keep none.
+    #[test]
+    fn text_layout_counts_halfwidth_sound_marks() {
+        assert_eq!(cells("ｶﾞ"), 2);
+        assert_eq!(cells("ﾊﾟ"), 2);
+        assert_eq!(cells("\u{FF9E}"), 1);
+        assert_eq!(cells("ｶﾞｶﾞx"), 5);
+        assert_eq!(cells("か\u{3099}"), 2);
+        assert_eq!(pad_cells("ｶﾞ", 3), "ｶﾞ ");
+        let text = "ｶﾞx";
+        let at = locate_span(text, 6, 7).expect("locates");
+        let layout = caret_layout(text, &at);
+        assert_eq!((layout.pad, layout.carets), (2, 1));
+        let at = locate_span(text, 0, 6).expect("locates");
+        assert_eq!(caret_layout(text, &at).carets, 2);
     }
 
     /// A million combining marks fit any budget, and `fit_cells` still
@@ -826,6 +884,10 @@ mod tests {
         assert_eq!(&issue[9..15], "日本");
         assert_eq!(issue.len(), 32);
         assert_eq!(issue[..30].chars().count(), 26);
+
+        let sound = "service=\"ｶﾞ\" | where x ~ /(/";
+        assert_eq!(sound.find('('), Some(30));
+        assert_eq!(sound[..30].chars().count(), 26);
 
         let ascii = "service=web | stats count( by host";
         assert_eq!(ascii.find("host"), Some(30));
