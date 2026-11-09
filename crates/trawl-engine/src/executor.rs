@@ -2559,7 +2559,13 @@ fn write_wire_ndjson(result: &QueryResult, path: &Path) -> Result<(), EngineErro
             .enumerate()
             .map(|(index, cell)| (format!("c{index}"), cell))
             .collect::<serde_json::Map<_, _>>();
-        serde_json::to_writer(&mut file, &record).map_err(|e| unencodable(&e))?;
+        serde_json::to_writer(&mut file, &record).map_err(|e| {
+            if e.is_io() {
+                EngineError::Io(e.into())
+            } else {
+                unencodable(&e)
+            }
+        })?;
         file.write_all(b"\n")?;
     }
     file.flush()?;
@@ -5028,6 +5034,28 @@ mod tests {
         assert!(
             matches!(err, EngineError::Io(_)),
             "a staging write failure must be an I/O error, got {err:?}"
+        );
+    }
+
+    /// A scheduled result's ndjson staging write that fails inside the
+    /// encoder answers as [`EngineError::Io`], as the capture staging write
+    /// does. `/dev/full` opens fine and fails every write with ENOSPC, and
+    /// the cell is larger than the writer's buffer, so the failure surfaces
+    /// from `serde_json::to_writer` rather than from `File::create`.
+    #[test]
+    fn a_scheduled_result_write_failure_is_an_io_error() {
+        use crate::value::{Column, ColumnType, QueryResult, Value};
+
+        let result = QueryResult {
+            columns: vec![Column::new("big", ColumnType::String)],
+            rows: vec![vec![Value::String("x".repeat(64 * 1024))]],
+        };
+
+        let err = super::write_wire_ndjson(&result, std::path::Path::new("/dev/full"))
+            .expect_err("a write to /dev/full must fail");
+        assert!(
+            matches!(err, EngineError::Io(_)),
+            "a scheduled result write failure must be an I/O error, got {err:?}"
         );
     }
 
