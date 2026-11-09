@@ -150,3 +150,15 @@ Equal-length digit strings compare in numeric order.
 {{- end -}}
 {{- $s -}}
 {{- end }}
+
+{{/*
+The port a listen address binds, for the container port that must match it.
+Takes .key (the values path, for the error) and .addr.
+*/}}
+{{- define "trawl.addrPort" -}}
+{{- $port := regexFind "[0-9]+$" (regexFind ":[0-9]+$" (toString .addr)) -}}
+{{- if not $port -}}
+{{- fail (printf "%s must end in :<port>; got %q" .key (toString .addr)) -}}
+{{- end -}}
+{{- $port -}}
+{{- end }}

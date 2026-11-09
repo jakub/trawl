@@ -174,14 +174,14 @@ spec:
           args: ["--config", "/etc/trawl/trawld.toml", "--no-monitor"]
           ports:
             - name: https
-              containerPort: 5514
+              containerPort: {{ include "trawl.addrPort" (dict "key" "config.server.httpAddr" "addr" .Values.config.server.httpAddr) }}
               protocol: TCP
             {{- if .Values.config.syslog.enabled }}
             - name: syslog-udp
-              containerPort: 1514
+              containerPort: {{ include "trawl.addrPort" (dict "key" "config.syslog.udpAddr" "addr" .Values.config.syslog.udpAddr) }}
               protocol: UDP
             - name: syslog-tcp
-              containerPort: 1514
+              containerPort: {{ include "trawl.addrPort" (dict "key" "config.syslog.tcpAddr" "addr" .Values.config.syslog.tcpAddr) }}
               protocol: TCP
             {{- end }}
           env:
@@ -276,7 +276,7 @@ spec:
           args: ["--config", "/etc/trawl/trawld.toml"]
           ports:
             - name: web
-              containerPort: 8090
+              containerPort: {{ include "trawl.addrPort" (dict "key" "web.bindAddr" "addr" .Values.web.bindAddr) }}
               protocol: TCP
           env:
             - name: HOME

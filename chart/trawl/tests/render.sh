@@ -647,6 +647,20 @@ printf 'config:\n  scheduler:\n    maxRunsPerSchedule: 9007199254740992\n' >"$in
 assert_render_fails "maxRunsPerSchedule: 9007199254740992" "config.scheduler.maxRunsPerSchedule" \
   render_only configmap.yaml -f "$inexact_runs"
 
+# Each container port is the port its configured listen address binds, so the
+# Service's named target ports reach a listener whatever the addresses say.
+ports="$work_dir/ports.yaml"
+render "${web_enabled[@]}" --set config.syslog.enabled=true \
+  --set-string config.server.httpAddr=0.0.0.0:6000 \
+  --set-string web.bindAddr=0.0.0.0:9000 \
+  --set-string config.syslog.udpAddr=0.0.0.0:5140 \
+  --set-string config.syslog.tcpAddr=0.0.0.0:6514 >"$ports"
+for pair in https:6000 web:9000 syslog-udp:5140 syslog-tcp:6514; do
+  assert_followed_by "- name: ${pair%%:*}" "containerPort: ${pair#*:}" "$ports"
+done
+assert_render_fails "an httpAddr with no port" "config.server.httpAddr must end in :<port>" \
+  render --set-string config.server.httpAddr=localhost
+
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
 python3 "$chart/tests/tls.py"
