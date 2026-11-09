@@ -877,6 +877,10 @@ pub enum TabStatus {
         message: String,
         /// Structured error details with optional span info.
         details: Vec<trawl_client::ErrorDetail>,
+        /// The query text the failed run sent, which the details' spans
+        /// index. `None` for an error raised before anything was sent: a
+        /// format refusal or a cancel.
+        query: Option<String>,
     },
 }
 
