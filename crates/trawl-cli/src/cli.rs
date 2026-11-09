@@ -8,6 +8,8 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
 use clap::ValueEnum;
+use trawl_core::sanitize::sanitize_display_text;
+use trawl_core::text_layout::{caret_layout, locate_span};
 use trawl_engine::value::{QueryResult, Value};
 
 use crate::CliError;
@@ -525,62 +527,52 @@ fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_client::Er
 /// underlined:
 /// ```text
 ///   _severity=error | staats count() by host
-///                 ~~~~~~
-///   error: unknown command 'staats'
+///                     ~~~~~~
+///   unknown command 'staats'
 ///   hint: did you mean 'stats'?
 /// ```
 pub fn render_error_details(query: &str, details: &[trawl_client::ErrorDetail]) {
-    for detail in details {
-        if let Some(ref span) = detail.span {
-            render_span_error(
-                query,
-                span.start,
-                span.end,
-                &detail.message,
-                detail.hint.as_deref(),
-            );
-        } else {
-            eprintln!("  {}", detail.message);
-            if let Some(ref hint) = detail.hint {
-                eprintln!("  hint: {hint}");
-            }
-        }
-        eprintln!();
-    }
+    // stderr is the last place to report anything; a failed write has
+    // nowhere to go.
+    let _ = write_error_details(&mut io::stderr().lock(), query, details);
 }
 
-/// Render a single span error with caret underline and optional hint.
-fn render_span_error(query: &str, start: usize, end: usize, message: &str, hint: Option<&str>) {
-    // Clamp to valid byte boundaries.
-    let start = start.min(query.len());
-    let end = end.min(query.len()).max(start);
-
-    // Find the line containing the span start.
-    let mut line_start = 0;
-    let mut line_end = query.len();
-    for (i, ch) in query.char_indices() {
-        if ch == '\n' {
-            if i < start {
-                line_start = i + 1;
-            }
-            if i >= end && line_end == query.len() {
-                line_end = i;
-            }
+/// Write `details` against `query`, the text that was sent.
+///
+/// A span is located with [`locate_span`]. One that cannot index `query`
+/// (reversed, past the end, or inside a character) gets the message and
+/// hint without an excerpt; it is never clamped. A located span shows the
+/// line holding its start, sanitized, and carets under the span's display
+/// cells. A span running onto a later line marks only its start line.
+/// The message and hint are sanitized too: they reach the terminal.
+fn write_error_details(
+    out: &mut impl Write,
+    query: &str,
+    details: &[trawl_client::ErrorDetail],
+) -> io::Result<()> {
+    for detail in details {
+        let located = detail
+            .span
+            .as_ref()
+            .and_then(|span| locate_span(query, span.start, span.end));
+        if let Some(at) = located {
+            let layout = caret_layout(query, &at);
+            writeln!(out)?;
+            writeln!(out, "  {}{}{}", layout.before, layout.covered, layout.after)?;
+            writeln!(
+                out,
+                "  {}{}",
+                " ".repeat(layout.pad),
+                "~".repeat(layout.carets)
+            )?;
         }
+        writeln!(out, "  {}", sanitize_display_text(&detail.message))?;
+        if let Some(hint) = &detail.hint {
+            writeln!(out, "  hint: {}", sanitize_display_text(hint))?;
+        }
+        writeln!(out)?;
     }
-
-    let line = &query[line_start..line_end];
-    let col_start = start - line_start;
-    let col_end = (end - line_start).min(line.len());
-    let underline_len = (col_end - col_start).max(1);
-
-    eprintln!();
-    eprintln!("  {line}");
-    eprintln!("  {}{}", " ".repeat(col_start), "~".repeat(underline_len));
-    eprintln!("  {message}");
-    if let Some(hint) = hint {
-        eprintln!("  hint: {hint}");
-    }
+    Ok(())
 }
 
 /// Render a `ClientError` with span details (if available) for CLI output.
@@ -1191,5 +1183,119 @@ mod tests {
             )
             .unwrap();
         assert_eq!(roundtrip, source);
+    }
+
+    /// What `write_error_details` prints for one detail with `span`.
+    fn render_detail(query: &str, span: Option<(usize, usize)>) -> String {
+        let detail = trawl_client::ErrorDetail {
+            message: "the message".into(),
+            span: span.map(|(start, end)| trawl_client::ErrorSpan { start, end }),
+            label: None,
+            hint: Some("the hint".into()),
+        };
+        let mut buf = Vec::new();
+        write_error_details(&mut buf, query, &[detail]).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// The message and hint, alone: what a span that cannot index the
+    /// query gets.
+    const NO_EXCERPT: &str = "  the message\n  hint: the hint\n\n";
+
+    /// Every row of the shared span table renders its excerpt line and a
+    /// caret line at the row's display cells, or the message and hint with
+    /// no excerpt when the span cannot index the text.
+    #[test]
+    fn terminal_caret_layout_conformance() {
+        for case in trawl_core::text_layout::SPAN_CASES {
+            let out = render_detail(case.text, Some((case.start, case.end)));
+            assert!(!out.contains('\r'), "{}: {out:?}", case.name);
+            match case.expect {
+                Some(expect) => {
+                    let lines: Vec<&str> = out.split('\n').collect();
+                    assert_eq!(
+                        lines,
+                        [
+                            "",
+                            &format!("  {}", expect.excerpt),
+                            &format!("  {}{}", " ".repeat(expect.pad), "~".repeat(expect.carets)),
+                            "  the message",
+                            "  hint: the hint",
+                            "",
+                            "",
+                        ],
+                        "{}",
+                        case.name
+                    );
+                }
+                None => assert_eq!(out, NO_EXCERPT, "{}", case.name),
+            }
+        }
+    }
+
+    /// The issue's query: the caret sits under the `(`, the span's first
+    /// display cell, after two double-width characters.
+    #[test]
+    fn terminal_caret_layout_conformance_issue_query() {
+        let query = "service=\"日本\" | where x ~ /(/";
+        let start = query.find('(').unwrap();
+        let out = render_detail(query, Some((start, start + 1)));
+        // 26 characters but 28 display cells come before the `(`.
+        let caret_line = format!("  {}~", " ".repeat(28));
+        assert_eq!(
+            out,
+            format!(
+                "\n  service=\"日本\" | where x ~ /(/\n{caret_line}\n  the message\n  hint: the hint\n\n"
+            )
+        );
+    }
+
+    /// A CRLF query prints no `\r`, and a span running onto later lines
+    /// marks only its start line.
+    #[test]
+    fn terminal_caret_layout_conformance_crlf() {
+        let query = "service=web\r\n| stats count(\r\nby host";
+        let start = query.find("count").unwrap();
+        let out = render_detail(query, Some((start, query.len())));
+        assert!(!out.contains('\r'), "{out:?}");
+        assert_eq!(
+            out,
+            "\n  | stats count(\n          ~~~~~~\n  the message\n  hint: the hint\n\n"
+        );
+    }
+
+    /// Reversed, past-end and mid-character spans print the message and
+    /// hint with no excerpt, never a clamped caret.
+    #[test]
+    fn terminal_caret_layout_conformance_unusable_spans() {
+        let query = "a=é b";
+        for (name, span) in [
+            ("reversed", (3, 1)),
+            ("past the end", (2, 99)),
+            ("starts past the end", (99, 99)),
+            ("start inside a character", (3, 5)),
+            ("end inside a character", (0, 3)),
+        ] {
+            assert_eq!(render_detail(query, Some(span)), NO_EXCERPT, "{name}");
+        }
+        assert_eq!(render_detail(query, None), NO_EXCERPT, "no span");
+    }
+
+    /// A message or hint holding control or bidi characters cannot rewrite
+    /// the terminal line.
+    #[test]
+    fn terminal_caret_layout_conformance_sanitizes_message_and_hint() {
+        let detail = trawl_client::ErrorDetail {
+            message: "bad\u{1b}[2J\u{202E}x".into(),
+            span: None,
+            label: None,
+            hint: Some("try\r\nthis".into()),
+        };
+        let mut buf = Vec::new();
+        write_error_details(&mut buf, "q", &[detail]).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "  bad\u{FFFD}[2J\u{FFFD}x\n  hint: try\u{FFFD}\u{FFFD}this\n\n"
+        );
     }
 }
