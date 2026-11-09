@@ -40,7 +40,6 @@ use trawl_api::{CatalogConflictRow, CatalogFieldResponse, DegradedVerdict, Repin
 use trawl_core::sanitize::sanitize_display_text;
 
 use crate::api;
-use crate::api::ApiError;
 use crate::components::repin_modal::RepinModal;
 use crate::repin_flow::{
     PollAction, ProbedJob, REPIN_POLL_MS, StatusProbe, accepted_ceilings, claim_toast, poll_decide,
@@ -542,12 +541,13 @@ pub fn FieldCaseDrawer(
                 state=Signal::derive(move || {
                     LoadState::from_resource_with_missing(
                         detail.get(),
-                        |e| matches!(e, ApiError::Status(404)),
-                        |e| match e {
-                            ApiError::Status(503) => {
+                        |e| e.http_status() == Some(404),
+                        |e| {
+                            if e.http_status() == Some(503) {
                                 "the catalog store is unavailable".to_string()
+                            } else {
+                                e.to_string()
                             }
-                            other => other.to_string(),
                         },
                     )
                 })

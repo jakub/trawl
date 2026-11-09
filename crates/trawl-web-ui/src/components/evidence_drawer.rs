@@ -403,7 +403,7 @@ impl Reads {
                 Paced::Answered(result) => result,
             };
             self.waiting.set(false);
-            if matches!(result, Err(ApiError::Unauthorized)) {
+            if matches!(result, Err(ApiError::Unauthorized { .. })) {
                 crate::auth_return::redirect_to_login();
                 return;
             }

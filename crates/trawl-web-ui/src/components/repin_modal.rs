@@ -1015,11 +1015,12 @@ fn probe_slot(adopt_free: bool, handles: Handles) {
 /// where there is one, plus the one piece of context a bare 503 leaves
 /// out.
 fn failure_text(err: &ApiError) -> String {
-    match err {
-        ApiError::Server { status: 503, .. } | ApiError::Status(503) => format!(
+    if err.http_status() == Some(503) {
+        format!(
             "{err} (a repin runs only on the node that owns the data root — a query-only node \
              cannot start one)"
-        ),
-        other => other.to_string(),
+        )
+    } else {
+        err.to_string()
     }
 }

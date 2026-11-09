@@ -124,6 +124,27 @@ pub fn default_target(current: &str, suggested: &str) -> CanonicalType {
         .unwrap_or(CanonicalType::Varchar)
 }
 
+/// What `POST /api/v1/schema/repin` answered. The HTTP status carries
+/// the verdict (ADR-0011), so the call site branches on this rather than
+/// on a single body type. `response_policy::repin` builds it.
+#[derive(Debug, Clone)]
+pub enum RepinOutcome {
+    /// 200 — the scan ran and stopped. The job is the plan.
+    DryRun(RepinJobResponse),
+    /// 202 — the job is claimed and was still running when the server
+    /// stopped waiting for it, dry runs included. Follow it by its id
+    /// (`api::repin_job_status`) for the rest of its life; a row that is
+    /// already terminal is the answer as it stands.
+    Started(RepinJobResponse),
+    /// 409 whose body decoded as a job — the scan projected values the
+    /// target pin cannot keep and no force was passed. Terminal
+    /// (`refused_needs_force`); the corpus is untouched.
+    Refused(RepinJobResponse),
+    /// 409 whose body decoded as the error envelope — the one-running
+    /// slot is held by another job, install-wide.
+    Busy(String),
+}
+
 /// What a 409 from `POST /api/v1/schema/repin` turned out to be.
 #[derive(Debug, Clone)]
 pub enum ConflictBody {

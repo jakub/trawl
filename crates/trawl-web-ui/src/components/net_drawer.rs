@@ -166,7 +166,11 @@ pub fn NetDrawer(
                         if alive.try_get_value() != Some(true) {
                             return;
                         }
-                        bus.push(ToastKind::Error, "Rename failed", Some(e.to_string()));
+                        bus.push(
+                            ToastKind::Error,
+                            "Rename failed",
+                            Some(crate::api_error::saved_name_refusal(&e)),
+                        );
                     }
                 }
             });
@@ -1138,10 +1142,9 @@ pub(crate) fn RunResultPreview(
         move || async move {
             match api::get_run(net_id, run_id).await {
                 Ok(response) => Ok(RunPreview::Available(Box::new(response))),
-                Err(api::ApiError::Server {
-                    status: 409,
-                    message,
-                }) => Ok(RunPreview::Unavailable(message)),
+                Err(e) if e.http_status() == Some(409) && e.envelope().is_some() => {
+                    Ok(RunPreview::Unavailable(e.to_string()))
+                }
                 Err(e) => match e.resource_exhausted() {
                     Some(message) => Ok(RunPreview::Exhausted(message.to_owned())),
                     None => Err(e),

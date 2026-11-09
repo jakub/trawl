@@ -99,7 +99,7 @@ where
                 refresh.run(());
                 return;
             }
-            if matches!(result, Err(ApiError::Unauthorized)) {
+            if matches!(result, Err(ApiError::Unauthorized { .. })) {
                 if crate::auth_return::redirect_to_login() {
                     live.set(false);
                     timer.update_value(|t| *t = None);

@@ -138,7 +138,7 @@ fn NotPermitted() -> impl IntoView {
 
 /// A read refused with 401 sends the page to sign-in, carrying its URL.
 fn sign_in_if_unauthorized<T>(result: &Result<T, ApiError>) -> bool {
-    if matches!(result, Err(ApiError::Unauthorized)) {
+    if matches!(result, Err(ApiError::Unauthorized { .. })) {
         crate::auth_return::redirect_to_login();
         true
     } else {

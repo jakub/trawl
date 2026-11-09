@@ -54,7 +54,7 @@ pub fn AuthShell() -> impl IntoView {
                 Ok(resp) => {
                     me.try_set(Some(resp));
                 }
-                Err(api::ApiError::Unauthorized) => {
+                Err(api::ApiError::Unauthorized { .. }) => {
                     redirect_to_login.try_set(true);
                 }
                 Err(err) => {

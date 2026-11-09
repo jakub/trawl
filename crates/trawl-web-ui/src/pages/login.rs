@@ -41,7 +41,7 @@ pub fn Login() -> impl IntoView {
                 Ok(_) => {
                     crate::auth_return::finish_login();
                 }
-                Err(api::ApiError::Unauthorized) => {
+                Err(api::ApiError::Unauthorized { .. }) => {
                     set_error.try_set(Some("Invalid API key".into()));
                     set_invalid.try_set(true);
                     set_submitting.try_set(false);
