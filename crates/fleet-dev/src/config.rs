@@ -17,7 +17,10 @@ pub const MANIFEST_FILE: &str = "fleet-dev.toml";
 /// Manifest process name of the Trunk-served SPA, identical across apps.
 pub const WEB_UI_PROCESS: &str = "web-ui";
 const OP_SERVICE_ACCOUNT_TOKEN: &str = "OP_SERVICE_ACCOUNT_TOKEN";
-pub const TRAWL_DEV_PERMISSIONS: [&str; 8] = [
+/// The developer role holds every Trawl permission except `ingest`, the
+/// same split ADR-0045 gives `trial-operator`. The list is literal so a new
+/// permission reaches the dev role only by an edit here and in the manifest.
+pub const TRAWL_DEV_PERMISSIONS: [&str; 11] = [
     "trawl:query",
     "trawl:schema_read",
     "trawl:validate",
@@ -26,6 +29,9 @@ pub const TRAWL_DEV_PERMISSIONS: [&str; 8] = [
     "trawl:stream",
     "trawl:query_cancel",
     "trawl:server_manage",
+    "trawl:schema_write",
+    "trawl:investigation_read",
+    "trawl:investigation_write",
 ];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

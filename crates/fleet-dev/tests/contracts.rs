@@ -49,6 +49,28 @@ impl CommandRunner for NoCommands {
 }
 
 #[test]
+fn the_dev_role_holds_every_trawl_permission_except_ingest() {
+    let dev: Vec<&str> = TRAWL_DEV_PERMISSIONS
+        .iter()
+        .map(|p| p.strip_prefix("trawl:").expect("trawl: prefix"))
+        .collect();
+    let expected: Vec<&str> = trawl_api::PERMISSION_NAMES
+        .iter()
+        .copied()
+        .filter(|p| *p != "ingest")
+        .collect();
+    let mut sorted_dev = dev.clone();
+    sorted_dev.sort_unstable();
+    let mut sorted_expected = expected.clone();
+    sorted_expected.sort_unstable();
+    assert_eq!(
+        sorted_dev, sorted_expected,
+        "trawl has a permission the dev role does not hold, or the reverse: add it to \
+         TRAWL_DEV_PERMISSIONS and fleet-dev.toml unless it is `ingest`"
+    );
+}
+
+#[test]
 fn committed_trawl_manifest_pins_the_frozen_contract() {
     let manifest = load_manifest(&trawl_root()).unwrap();
     assert_eq!(manifest.name, App::Trawl);

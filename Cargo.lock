@@ -2020,6 +2020,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "trawl-api",
  "url",
  "zeroize",
 ]

@@ -21,6 +21,9 @@ permissions = [
   "trawl:stream",
   "trawl:query_cancel",
   "trawl:server_manage",
+  "trawl:schema_write",
+  "trawl:investigation_read",
+  "trawl:investigation_write",
 ]
 
 [preparation]
