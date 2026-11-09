@@ -64,7 +64,7 @@ pub enum TrialError {
         "-p trial reads its URL and token from the trial, but {what}. \
          Unset it, or drop -p trial"
     )]
-    ProfileOverride { what: &'static str },
+    ProfileOverride { what: String },
 
     #[error(
         "{config} defines [profiles.trial], and the profile name `trial` is reserved \

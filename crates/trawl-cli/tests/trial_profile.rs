@@ -278,8 +278,12 @@ async fn trial_profile_refuses_overrides_before_connecting() {
     let trial = Trial::new(port, &pem);
     let own_trial = trial.config("[profiles.trial]\nurl = \"https://elsewhere:5514\"\n");
     let own_trial = own_trial.to_str().unwrap();
+    // A readable key file, so the refusal is about -p trial, not the file.
+    let key_file = trial.home.join("other.key");
+    std::fs::write(&key_file, "flt_other\n").unwrap();
+    let key_file = key_file.to_str().unwrap();
 
-    let cases: [Case<'_>; 8] = [
+    let cases: [Case<'_>; 9] = [
         (
             "TRAWL_URL",
             vec![],
@@ -315,6 +319,12 @@ async fn trial_profile_refuses_overrides_before_connecting() {
             vec!["--token", "flt_other"],
             vec![],
             "--token was given",
+        ),
+        (
+            "--token-file",
+            vec!["--token-file", key_file],
+            vec![],
+            "--token-file was given",
         ),
         (
             "[profiles.trial]",

@@ -66,6 +66,7 @@ use super::lock::TrialLock;
 use super::ownership::{self, Claimed, Foreign, Inventory, Kind, Ownership, Resource};
 use super::paths::{TrialPaths, read_private, read_public, sync_dir, write_private};
 use super::preflight::{self, Engine};
+use super::profile::EnvRule;
 use super::render::{self, Containers};
 use super::sample::{self, SampleAction};
 use super::secrets::{self, CookieKey, DbPasswords, HexSecret, Target, put_file};
@@ -1471,24 +1472,31 @@ pub async fn status(paths: &TrialPaths) -> Result<(), TrialError> {
         .map_err(|e| TrialError::io("write", "stdout", e))
 }
 
-/// [`render::moving_variables`] for this process. `TRAWL_INSECURE` and
-/// `TRAWL_PROFILE` are read by the argument parser, as every other command
-/// reads them: the top-level arguments parsed from the program name alone
-/// hold only what the environment gives. That parse cannot fail where
-/// this process's own succeeded; if it does, the two count when set.
-fn moving_variables() -> Vec<&'static str> {
+/// [`render::moving_variables`] for this process, over every variable
+/// clap binds. The switch and the profile are read by the argument parser,
+/// as every other command reads them: the top-level arguments parsed from
+/// the program name alone hold only what the environment gives. That parse
+/// cannot fail where this process's own succeeded; if it does, the switch
+/// counts when its variable is set, and the profile is its variable's text.
+fn moving_variables() -> Vec<(String, EnvRule)> {
     use clap::Parser as _;
+    let bound = super::profile::env_rules();
     let set = |name: &str| std::env::var_os(name).is_some();
-    let (insecure, profile) = match crate::Cli::try_parse_from(["trawl"]) {
-        Ok(cli) => (cli.insecure, cli.profile),
-        Err(_) => (set("TRAWL_INSECURE"), std::env::var("TRAWL_PROFILE").ok()),
+    let (insecure, profile) = if let Ok(cli) = crate::Cli::try_parse_from(["trawl"]) {
+        (cli.insecure, cli.profile)
+    } else {
+        let named = |wanted: EnvRule| {
+            bound
+                .iter()
+                .filter(move |(_, rule)| *rule == wanted)
+                .map(|(name, _)| name.as_str())
+        };
+        (
+            named(EnvRule::RefuseWhenOn).any(set),
+            named(EnvRule::SelectsProfile).find_map(|name| std::env::var(name).ok()),
+        )
     };
-    render::moving_variables(
-        set(super::profile::URL_ENV),
-        set(super::profile::TOKEN_ENV),
-        insecure,
-        profile.as_deref(),
-    )
+    render::moving_variables(&bound, set, insecure, profile.as_deref())
 }
 
 /// `(name, state)` of the trial's containers, one-offs excluded.
