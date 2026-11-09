@@ -90,6 +90,34 @@ fn start(globals: &Globals) -> Result<Started, Refusal> {
         std::env::var_os(name).is_some()
     })?;
     let resolution = resolve::resolve(&selection);
+    let built = build(
+        &selection,
+        resolution,
+        globals.token_file.as_deref(),
+        globals.config.as_deref(),
+    )?;
+    Ok(Started {
+        server: TrawlServer::new(built.client).with_display_zone(built.display_zone),
+        insecure: built.insecure,
+    })
+}
+
+/// What [`build`] makes from a resolution.
+struct Built {
+    client: HttpClient,
+    display_zone: String,
+    insecure: bool,
+}
+
+/// Build the client and the display zone from one resolution. Everything
+/// comes from what the resolution read, so the config file is read once.
+fn build(
+    selection: &TargetSelection,
+    resolution: resolve::Resolution,
+    token_file: Option<&Path>,
+    config: Option<&str>,
+) -> Result<Built, Refusal> {
+    let path = config.unwrap_or(config::DEFAULT_CONFIG_PATH);
     let Some(connection) = resolution.connection else {
         let check = resolution.check;
         return Err(Refusal(format!(
@@ -99,8 +127,16 @@ fn start(globals: &Globals) -> Result<Started, Refusal> {
             check.next_action.unwrap_or_default(),
         )));
     };
-    let key = choose_key(&selection, connection.key, globals.token_file.as_deref())?;
-    let display_zone = display_zone(globals.config.as_deref())?;
+    let key = choose_key(selection, connection.key, token_file)?;
+    // `select` yields only a profile or the trial, and both resolutions
+    // carry the config they read.
+    let Some(ref cfg) = resolution.config else {
+        return Err(Refusal(format!(
+            "config file {path}: the config file cannot be read; check that it exists and is \
+             valid TOML for trawl"
+        )));
+    };
+    let display_zone = display_zone(cfg, path)?;
     let client = HttpClient::with_trust(connection.url.base(), key.secret(), &connection.trust)
         .map_err(|_| {
             Refusal(
@@ -109,8 +145,9 @@ fn start(globals: &Globals) -> Result<Started, Refusal> {
                     .to_owned(),
             )
         })?;
-    Ok(Started {
-        server: TrawlServer::new(client).with_display_zone(display_zone),
+    Ok(Built {
+        client,
+        display_zone,
         insecure: matches!(connection.trust, TlsTrust::AcceptInvalid),
     })
 }
@@ -208,16 +245,9 @@ fn choose_key(
 }
 
 /// The CLI config's `ui.timezone`, checked, for `orient` to display times
-/// in. The doctor's resolution read the same file a moment ago.
-fn display_zone(config: Option<&str>) -> Result<String, Refusal> {
-    let path = config.unwrap_or(config::DEFAULT_CONFIG_PATH);
-    let cfg = Config::load(config).map_err(|_| {
-        Refusal(format!(
-            "config file {path}: the config file cannot be read; check that it exists and is \
-             valid TOML for trawl"
-        ))
-    })?;
-    let zone = cfg.ui.timezone;
+/// in. `cfg` is the config the resolution read; `path` names it.
+fn display_zone(cfg: &Config, path: &str) -> Result<String, Refusal> {
+    let zone = cfg.ui.timezone.clone();
     trawl_engine::timezone::resolve_utc_offset(&zone).map_err(|_| {
         Refusal(format!(
             "ui.timezone in {path} is not \"local\", \"UTC\", or a fixed offset such as \
@@ -354,6 +384,44 @@ mod tests {
                 config: None
             })
         );
+    }
+
+    /// The zone comes from the config the resolution read, so a file that
+    /// changes or vanishes after resolution changes nothing.
+    #[test]
+    fn mcp_uses_one_config_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        let path = file.to_str().unwrap().to_owned();
+        let toml = |zone: &str| {
+            format!(
+                "[ui]\ntimezone = \"{zone}\"\n\n\
+                 [profiles.home]\nurl = \"https://home:5514\"\ntoken = \"flt_home\"\n"
+            )
+        };
+        std::fs::write(&file, toml("+05:30")).unwrap();
+        let selection = TargetSelection::Profile {
+            name: "home".to_owned(),
+            config: Some(path.clone()),
+        };
+        let first = resolve::resolve(&selection);
+        let second = resolve::resolve(&selection);
+        let zone = |resolution| {
+            build(&selection, resolution, None, Some(&path))
+                .map(|built| built.display_zone)
+                .map_err(|Refusal(message)| message)
+        };
+
+        std::fs::write(&file, toml("bogus")).unwrap();
+        assert_eq!(zone(first), Ok("+05:30".to_owned()), "rewritten");
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(zone(second), Ok("+05:30".to_owned()), "deleted");
+
+        // The same check still refuses a bad zone in the snapshot.
+        let mut bogus = Config::default();
+        bogus.ui.timezone = "bogus".to_owned();
+        let Refusal(message) = display_zone(&bogus, &path).unwrap_err();
+        assert!(message.starts_with("ui.timezone in "), "{message}");
     }
 
     #[test]

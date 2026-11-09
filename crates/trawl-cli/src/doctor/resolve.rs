@@ -296,7 +296,6 @@ pub struct Connection {
 }
 
 /// The outcome of [`resolve`].
-#[derive(Debug)]
 pub struct Resolution {
     /// What the report names as its target.
     pub target: Target,
@@ -304,6 +303,22 @@ pub struct Resolution {
     pub check: Check,
     /// Present only when `connection.config` is complete.
     pub connection: Option<Connection>,
+    /// The config file as this resolution read it, for a caller that needs
+    /// more of it without reading the file again. Present when a profile or
+    /// the trial resolved; `--url` reads no config file.
+    pub config: Option<Config>,
+}
+
+/// `Config`'s own `Debug` prints its tokens, so the config is left out.
+impl std::fmt::Debug for Resolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resolution")
+            .field("target", &self.target)
+            .field("check", &self.check)
+            .field("connection", &self.connection)
+            .field("config", &self.config.as_ref().map(|_| "read"))
+            .finish()
+    }
 }
 
 /// Read what the selection names and build the `connection.config` check.
@@ -325,7 +340,11 @@ pub fn resolve(selection: &TargetSelection) -> Resolution {
         ),
     };
     match resolved {
-        Ok((connection, trust_detail)) => {
+        Ok(Resolved {
+            connection,
+            trust_detail,
+            config,
+        }) => {
             let key = connection.key.as_ref().map_or("none selected", Key::source);
             let check = Check {
                 id: CONNECTION_CONFIG.to_owned(),
@@ -343,6 +362,7 @@ pub fn resolve(selection: &TargetSelection) -> Resolution {
                 },
                 check,
                 connection: Some(connection),
+                config,
             }
         }
         Err(failure) => Resolution {
@@ -360,6 +380,7 @@ pub fn resolve(selection: &TargetSelection) -> Resolution {
                 next_action: Some(failure.next_action),
             },
             connection: None,
+            config: None,
         },
     }
 }
@@ -369,10 +390,15 @@ fn config_path(config: Option<&str>) -> String {
     config.unwrap_or(config::DEFAULT_CONFIG_PATH).to_owned()
 }
 
-/// A resolved connection and the trust mode, named.
-type Resolved = Result<(Connection, String), Failure>;
+/// A resolved connection, the trust mode named, and the config it was read
+/// from.
+struct Resolved {
+    connection: Connection,
+    trust_detail: String,
+    config: Option<Config>,
+}
 
-fn resolve_url(url: &CheckedUrl, insecure: bool, key: &KeySource) -> Resolved {
+fn resolve_url(url: &CheckedUrl, insecure: bool, key: &KeySource) -> Result<Resolved, Failure> {
     let key = match key {
         KeySource::None => None,
         KeySource::Env(name) => Some(key_from_env(name)?),
@@ -386,14 +412,15 @@ fn resolve_url(url: &CheckedUrl, insecure: bool, key: &KeySource) -> Resolved {
     } else {
         (TlsTrust::System, "system roots")
     };
-    Ok((
-        Connection {
+    Ok(Resolved {
+        connection: Connection {
             url: url.clone(),
             trust,
             key,
         },
-        detail.to_owned(),
-    ))
+        trust_detail: detail.to_owned(),
+        config: None,
+    })
 }
 
 fn key_from_env(name: &str) -> Result<Key, Failure> {
@@ -436,7 +463,7 @@ fn config_failure(err: &ConfigError, path: &str, profile: &str) -> Failure {
     }
 }
 
-fn resolve_profile(name: &str, config: Option<&str>, path: &str) -> Resolved {
+fn resolve_profile(name: &str, config: Option<&str>, path: &str) -> Result<Resolved, Failure> {
     let mut cfg = Config::load_required(config).map_err(|e| config_failure(&e, path, name))?;
     let table = format!("[profiles.{name}]");
     let source = format!("{table} in {path}");
@@ -530,7 +557,11 @@ fn resolve_profile(name: &str, config: Option<&str>, path: &str) -> Resolved {
         TlsTrust::PinnedCa(_) => format!("pinned CA from {trust_source}"),
         TlsTrust::AcceptInvalid => format!("certificate verification off ({trust_source})"),
     };
-    Ok((Connection { url, trust, key }, detail))
+    Ok(Resolved {
+        connection: Connection { url, trust, key },
+        trust_detail: detail,
+        config: Some(cfg),
+    })
 }
 
 /// Name the table each trust field comes from, after inheritance.
@@ -559,7 +590,7 @@ fn trust_source(cfg: &Config, profile: &ProfileConfig, table: &str) -> String {
     }
 }
 
-fn resolve_trial(config: Option<&str>) -> Resolved {
+fn resolve_trial(config: Option<&str>) -> Result<Resolved, Failure> {
     let path = config_path(config);
     let mut cfg = Config::load(config).map_err(|e| config_failure(&e, &path, trial::PROFILE))?;
     let paths = trial::paths::TrialPaths::from_env().map_err(|e| trial_failure(&e, &path))?;
@@ -590,10 +621,11 @@ fn resolve_trial(config: Option<&str>) -> Resolved {
             "finish the trial with `trawl trial up`",
         )
     })?;
-    Ok((
-        Connection { url, trust, key },
-        "pinned CA from the trial's certificate".to_owned(),
-    ))
+    Ok(Resolved {
+        connection: Connection { url, trust, key },
+        trust_detail: "pinned CA from the trial's certificate".to_owned(),
+        config: Some(cfg),
+    })
 }
 
 /// The `connection.config` failure for `-p trial`.
@@ -911,7 +943,8 @@ mod tests {
         let (_dir, path) = write_config(
             "[server]\nurl = \"https://base:5514\"\ntoken = \"flt_server\"\n\n\
              [profiles.lab]\nurl = \"https://lab:5514\"\n\n\
-             [profiles.own]\nurl = \"https://own:5514\"\ntoken = \" flt_own \"\n",
+             [profiles.own]\nurl = \"https://own:5514\"\ntoken = \" flt_own \"\n\n\
+             [profiles.same]\nurl = \"https://BASE:5514/\"\n",
         );
         let lab = resolve_profile_in("lab", &path);
         let connection = lab.connection.expect("lab resolves");
@@ -921,6 +954,17 @@ mod tests {
         );
         assert_eq!(connection.url.origin(), "https://lab:5514");
         assert_eq!(lab.target.origin.as_deref(), Some("https://lab:5514"));
+
+        // A profile whose url spells [server].url differently but names the
+        // same API base still gets no key from [server].
+        let same = resolve_profile_in("same", &path);
+        let connection = same.connection.as_ref().expect("same resolves");
+        assert!(
+            connection.key.is_none(),
+            "[server].token must not be inherited by an equal base"
+        );
+        assert_eq!(connection.url.origin(), "https://base:5514");
+        assert!(!format!("{same:?}").contains("flt_server"), "{same:?}");
 
         let own = resolve_profile_in("own", &path);
         let key = own.connection.expect("own resolves").key.expect("own key");
