@@ -622,13 +622,28 @@ async fn run_configured(args: Cli, command: Option<Command>) -> Result<u8, CliEr
             output,
         }) => {
             // For embedded mode (--data), no server connection needed.
-            let conn = if data.is_some() {
-                None
-            } else {
-                Some(connection(&cfg, args.token.as_deref())?)
+            let conn = |cfg: &config::Config| -> Result<_, CliError> {
+                data.is_none()
+                    .then(|| connection(cfg, args.token.as_deref()))
+                    .transpose()
             };
-
-            cli::run_query(&query, data.as_deref(), format, output.as_deref(), conn).await?;
+            if format == Some(cli::OutputFormat::Parquet) {
+                // Parquet prints no instants, so it never reads the zone.
+                cli::run_parquet_query(&query, data.as_deref(), output.as_deref(), conn(&cfg)?)
+                    .await?;
+            } else {
+                // Before any request: an invalid zone sends nothing.
+                let zone = cli::display_zone(&cfg.ui.timezone)?;
+                cli::run_query(
+                    &query,
+                    data.as_deref(),
+                    format,
+                    output.as_deref(),
+                    zone,
+                    conn(&cfg)?,
+                )
+                .await?;
+            }
         }
         Some(Command::Validate { query }) => {
             // Validate supports both daemon and local-only mode: no token
