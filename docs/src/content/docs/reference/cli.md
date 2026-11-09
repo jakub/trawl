@@ -103,10 +103,13 @@ backslash or whitespace is refused too. `trawl` checks every URL before it
 reads any token, and the message does not repeat the URL.
 
 `trawl` honours the proxy variables `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
-and `NO_PROXY`. A request sent through a proxy carries its token through that
-proxy too. Over `http`, the proxy can read the token. Over `https`, it can
-read the token only when `insecure` is on. Unset these variables, or list the
-server in `NO_PROXY`, to keep a token off a proxy.
+and `NO_PROXY`, and their lowercase forms (`http_proxy` and so on). A request
+sent through a proxy carries its token through that proxy too. Over `http`,
+the proxy can read the token. Over `https`, it can read the token when
+`insecure` is on, or when it presents a certificate that `trawl` trusts for
+the server, such as one from an interception CA in the system trust store or
+in `ca_cert`. To keep a token off a proxy, unset both the uppercase and the
+lowercase variables, or list the server in `NO_PROXY`.
 
 ### Pin a CA with `ca_cert`
 
