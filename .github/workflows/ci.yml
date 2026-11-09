@@ -508,7 +508,11 @@ jobs:
         with:
           shared-key: msrv
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # rust-toolchain.toml outranks the default the action sets, so name the
+      # MSRV toolchain explicitly or this checks the pinned one instead.
       - run: cargo check --workspace --no-default-features
+        env:
+          RUSTUP_TOOLCHAIN: 1.94.0
 
   wasm-check:
     name: wasm32 clippy (web UI + fleet-ui)
