@@ -1189,11 +1189,7 @@ fn render_series_label(
     series_color: ratatui::style::Color,
 ) {
     let w = area.width as usize;
-    let display_label = if label.len() > w {
-        format!("{}…", &label[..w - 1])
-    } else {
-        label.to_owned()
-    };
+    let display_label = fit_cells(label, w);
 
     if area.height >= 3 {
         frame.render_widget(
@@ -1211,7 +1207,9 @@ fn render_series_label(
         );
 
         frame.render_widget(
-            Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(series_color)),
+            Paragraph::new(display_label)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(series_color)),
             Rect {
                 y: area.y + area.height / 2,
                 height: 1,
@@ -1221,7 +1219,9 @@ fn render_series_label(
     } else {
         // Too short for y-axis labels — just show the series name
         frame.render_widget(
-            Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(series_color)),
+            Paragraph::new(display_label)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(series_color)),
             area,
         );
     }
@@ -2069,5 +2069,61 @@ mod grid_tests {
             rows.iter().all(|row| cells(row) == 80),
             "every row fills the terminal exactly:\n{screen}"
         );
+    }
+}
+
+#[cfg(test)]
+mod series_label_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
+    use trawl_core::text_layout::{MARKER, cells};
+
+    use super::error_pane_tests::rows_of;
+    use super::render_series_label;
+    use crate::tui::tests::test_app;
+
+    /// A grouped value reaches the sparkline label from `extract_series`,
+    /// so a sender picks it. Whether it fits or is cut, by a multibyte
+    /// character past the label's last byte or into a zero-width area, it
+    /// draws right-aligned within the area instead of panicking.
+    #[test]
+    fn series_labels_fit_by_display_cells() {
+        let theme = test_app().theme;
+        for (label, width, expect) in [
+            ("aaaaaaaaaaaaaaaaéz", 18, "aaaaaaaaaaaaaaaaéz"),
+            ("aaaaaaaaaaaaaaaaaéz", 18, "aaaaaaaaaaaaaaaaa…"),
+            ("日本語日本語日", 18, "日本語日本語日"),
+            ("日本語日本語日本語日", 18, "日本語日本語日本…"),
+            ("日本語日本語日", 0, ""),
+        ] {
+            for height in [1, 3] {
+                let mut terminal = Terminal::new(TestBackend::new(20, 3)).expect("terminal");
+                terminal
+                    .draw(|f| {
+                        let area = Rect::new(0, 0, width, height);
+                        render_series_label(f, &theme, area, label, 0, 9, Color::Reset);
+                    })
+                    .expect("render");
+                let rows = rows_of(terminal.backend().buffer());
+                let screen = rows.join("\n");
+                let row = &rows[usize::from(height / 2)];
+                assert_eq!(
+                    cells(row.trim_end()),
+                    usize::from(width),
+                    "{label:?} at {width}x{height} ends on the area's edge:\n{screen}"
+                );
+                assert_eq!(
+                    row.trim(),
+                    expect,
+                    "{label:?} at {width}x{height}:\n{screen}"
+                );
+                assert!(
+                    expect == label || expect.is_empty() || expect.ends_with(MARKER),
+                    "a cut is marked"
+                );
+            }
+        }
     }
 }
