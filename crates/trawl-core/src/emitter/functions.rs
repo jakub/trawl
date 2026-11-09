@@ -4,6 +4,7 @@
 
 use super::EmitError;
 use super::fields::quote_field;
+use crate::aggregate::Aggregate;
 use crate::parser::suggest;
 
 /// Known function names accepted by the emitter (canonical list in `parser::suggest`).
@@ -13,7 +14,8 @@ pub(crate) use crate::parser::suggest::KNOWN_FUNCTIONS;
 ///
 /// Single source of truth for arity: read by pre-emission validation
 /// (`validate.rs`), by the argument walk (`emit_call_args`) and by the
-/// stream compiler (`stream::validate_expr`).
+/// stream compiler (`stream::validate_expr` for a call, and
+/// `stream::compile_agg_expr` for an aggregation slot's head).
 pub(crate) fn validate_function_arity(name: &str, argc: usize) -> Result<(), EmitError> {
     if !KNOWN_FUNCTIONS.contains(&name) {
         return Err(EmitError::UnknownFunction {
@@ -283,23 +285,10 @@ pub(crate) fn translate_function(
     args: &[String],
     state: &mut super::state::EmitterState,
 ) -> Result<String, EmitError> {
+    if let Some(aggregate) = Aggregate::from_name(name) {
+        return translate_aggregate(aggregate, name, args);
+    }
     match name {
-        "count" => {
-            if args.is_empty() {
-                Ok("COUNT(*)".to_string())
-            } else {
-                Ok(format!("COUNT({})", args[0]))
-            }
-        }
-        "avg" => require_one_arg(name, args, |a| format!("AVG({a})")),
-        "sum" => require_one_arg(name, args, |a| format!("SUM({a})")),
-        "min" => require_one_arg(name, args, |a| format!("MIN({a})")),
-        "max" => require_one_arg(name, args, |a| format!("MAX({a})")),
-        "dc" | "distinct_count" => require_one_arg(name, args, |a| format!("COUNT(DISTINCT {a})")),
-        "p50" => percentile(name, args, 0.5),
-        "p90" => percentile(name, args, 0.9),
-        "p95" => percentile(name, args, 0.95),
-        "p99" => percentile(name, args, 0.99),
         "lower" => require_one_arg(name, args, |a| format!("LOWER({a})")),
         "upper" => require_one_arg(name, args, |a| format!("UPPER({a})")),
         "length" | "len" => require_one_arg(name, args, |a| format!("LENGTH({a})")),
@@ -482,16 +471,47 @@ pub(crate) fn translate_function(
         "json_valid" => require_one_arg(name, args, |a| format!("JSON_VALID({a})")),
         "json_keys" => require_one_arg(name, args, |a| format!("JSON_KEYS({a})")),
         "json_array_length" => require_one_arg(name, args, |a| format!("JSON_ARRAY_LENGTH({a})")),
-        // new aggregate functions
-        "first" => require_one_arg(name, args, |a| format!("FIRST({a})")),
-        "last" => require_one_arg(name, args, |a| format!("LAST({a})")),
-        "values" | "list" => require_one_arg(name, args, |a| format!("LIST(DISTINCT {a})")),
-        "median" => require_one_arg(name, args, |a| format!("MEDIAN({a})")),
-        "stddev" => require_one_arg(name, args, |a| format!("STDDEV({a})")),
         _ => Err(EmitError::UnknownFunction {
             name: name.to_string(),
             suggestion: suggest::suggest_function(name).map(String::from),
         }),
+    }
+}
+
+/// Translate an aggregate call to `DuckDB` SQL. `name` is the spelling
+/// the query wrote, which the arity messages repeat.
+///
+/// No wildcard arm: an aggregate added to [`Aggregate`] does not compile
+/// until it has SQL here, and the live lane's `stream::new_acc_state`
+/// holds it to an accumulator the same way (ADR-0001, Amendment
+/// 2026-11-08).
+fn translate_aggregate(
+    aggregate: Aggregate,
+    name: &str,
+    args: &[String],
+) -> Result<String, EmitError> {
+    match aggregate {
+        Aggregate::Count => {
+            if args.is_empty() {
+                Ok("COUNT(*)".to_string())
+            } else {
+                Ok(format!("COUNT({})", args[0]))
+            }
+        }
+        Aggregate::Avg => require_one_arg(name, args, |a| format!("AVG({a})")),
+        Aggregate::Sum => require_one_arg(name, args, |a| format!("SUM({a})")),
+        Aggregate::Min => require_one_arg(name, args, |a| format!("MIN({a})")),
+        Aggregate::Max => require_one_arg(name, args, |a| format!("MAX({a})")),
+        Aggregate::DistinctCount => require_one_arg(name, args, |a| format!("COUNT(DISTINCT {a})")),
+        Aggregate::P50 => percentile(name, args, 0.5),
+        Aggregate::P90 => percentile(name, args, 0.9),
+        Aggregate::P95 => percentile(name, args, 0.95),
+        Aggregate::P99 => percentile(name, args, 0.99),
+        Aggregate::First => require_one_arg(name, args, |a| format!("FIRST({a})")),
+        Aggregate::Last => require_one_arg(name, args, |a| format!("LAST({a})")),
+        Aggregate::Values => require_one_arg(name, args, |a| format!("LIST(DISTINCT {a})")),
+        Aggregate::Median => require_one_arg(name, args, |a| format!("MEDIAN({a})")),
+        Aggregate::Stddev => require_one_arg(name, args, |a| format!("STDDEV({a})")),
     }
 }
 
@@ -520,27 +540,9 @@ pub fn function_result_pin(name: &str) -> Option<crate::schema::CanonicalType> {
     }
 }
 
+/// Whether `name` spells an aggregate ([`Aggregate::from_name`]).
 pub fn is_aggregate_function(name: &str) -> bool {
-    matches!(
-        name,
-        "count"
-            | "avg"
-            | "sum"
-            | "min"
-            | "max"
-            | "dc"
-            | "distinct_count"
-            | "p50"
-            | "p90"
-            | "p95"
-            | "p99"
-            | "first"
-            | "last"
-            | "values"
-            | "list"
-            | "median"
-            | "stddev"
-    )
+    Aggregate::from_name(name).is_some()
 }
 
 /// The quoted SQL identifier an un-aliased aggregation projects.
@@ -1093,6 +1095,100 @@ mod tests {
                 "{name} should not be aggregate"
             );
         }
+    }
+
+    /// Every aggregate spelling: the aggregate it reads as, the argument
+    /// counts the shared check admits, and the SQL it translates to over
+    /// `x`, each written out here rather than read back from the code.
+    #[test]
+    fn aggregate_inventory_is_total() {
+        use crate::aggregate::Aggregate;
+
+        // (spelling, aggregate, admits zero arguments, SQL over `x`)
+        let cases: [(&str, Aggregate, bool, &str); 17] = [
+            ("count", Aggregate::Count, true, "COUNT(x)"),
+            ("avg", Aggregate::Avg, false, "AVG(x)"),
+            ("sum", Aggregate::Sum, false, "SUM(x)"),
+            ("min", Aggregate::Min, false, "MIN(x)"),
+            ("max", Aggregate::Max, false, "MAX(x)"),
+            ("dc", Aggregate::DistinctCount, false, "COUNT(DISTINCT x)"),
+            (
+                "distinct_count",
+                Aggregate::DistinctCount,
+                false,
+                "COUNT(DISTINCT x)",
+            ),
+            (
+                "p50",
+                Aggregate::P50,
+                false,
+                "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)",
+            ),
+            (
+                "p90",
+                Aggregate::P90,
+                false,
+                "PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY x)",
+            ),
+            (
+                "p95",
+                Aggregate::P95,
+                false,
+                "PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY x)",
+            ),
+            (
+                "p99",
+                Aggregate::P99,
+                false,
+                "PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY x)",
+            ),
+            ("first", Aggregate::First, false, "FIRST(x)"),
+            ("last", Aggregate::Last, false, "LAST(x)"),
+            ("values", Aggregate::Values, false, "LIST(DISTINCT x)"),
+            ("list", Aggregate::Values, false, "LIST(DISTINCT x)"),
+            ("median", Aggregate::Median, false, "MEDIAN(x)"),
+            ("stddev", Aggregate::Stddev, false, "STDDEV(x)"),
+        ];
+
+        // The enum's spellings are exactly the table's, and every known
+        // function the enum reads is in the table too: a variant left out
+        // of `Aggregate::ALL` still has a spelling `from_name` accepts.
+        let mut spellings: Vec<&str> = Aggregate::ALL
+            .iter()
+            .flat_map(|aggregate| aggregate.spellings().iter().copied())
+            .collect();
+        spellings.sort_unstable();
+        let mut table: Vec<&str> = cases.iter().map(|(name, ..)| *name).collect();
+        table.sort_unstable();
+        assert_eq!(spellings, table);
+        let mut known: Vec<&str> = KNOWN_FUNCTIONS
+            .iter()
+            .copied()
+            .filter(|name| Aggregate::from_name(name).is_some())
+            .collect();
+        known.sort_unstable();
+        assert_eq!(known, table);
+
+        for (name, aggregate, nullary, sql) in cases {
+            assert_eq!(Aggregate::from_name(name), Some(aggregate), "{name}");
+            assert!(is_aggregate_function(name), "{name}");
+            // Matched exactly, as before the enum.
+            assert_eq!(Aggregate::from_name(&name.to_uppercase()), None, "{name}");
+
+            assert!(validate_function_arity(name, 1).is_ok(), "{name}");
+            assert_eq!(validate_function_arity(name, 0).is_ok(), nullary, "{name}");
+            assert!(validate_function_arity(name, 2).is_err(), "{name}");
+
+            assert_eq!(
+                translate_function(name, &args(&["x"]), &mut state()).unwrap(),
+                sql,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            translate_function("count", &[], &mut state()).unwrap(),
+            "COUNT(*)"
+        );
     }
 
     // ── validate_unit_literal ───────────────────────────────────────────

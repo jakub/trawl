@@ -612,8 +612,8 @@ pub fn materialize_window(dsl: &str, window: &ReportWindow) -> Result<String, Ma
         parse_dsl(&spliced).map_err(|message| MaterializeError::OutputUnparseable { message })?;
 
     let bounds_read_back = reparsed.search.time_filter.is_none()
-        && reparsed.search.earliest.as_ref().map(|b| b.node.as_str()) == Some(start.as_str())
-        && reparsed.search.latest.as_ref().map(|b| b.node.as_str()) == Some(end.as_str());
+        && reparsed.search.earliest.as_ref().map(|b| b.node.text()) == Some(start.as_str())
+        && reparsed.search.latest.as_ref().map(|b| b.node.text()) == Some(end.as_str());
     if !bounds_read_back {
         return Err(MaterializeError::BoundsNotReadBack { start, end });
     }
@@ -1387,8 +1387,8 @@ mod tests {
 
     /// Check 4 compares canonical forms with only the splice's two bounds
     /// cleared. Layout and comments are no change; one predicate changed,
-    /// on a keyword-prefixed field too, is, and so is a `last=` beside the
-    /// bounds.
+    /// on a keyword-prefixed field too, is. A `last=` beside the bounds
+    /// does not parse, so no splice reaches the check with one.
     #[test]
     fn report_window_proof_detects_body_changes() {
         let parse =
@@ -1423,13 +1423,13 @@ mod tests {
             ("x=1", "x=1.0"),
             ("a b", "a NOT b"),
             ("a b", "a OR b"),
-            ("a", "last=1h a"),
         ] {
             assert!(
                 !body_unchanged(spliced(changed), &parse(original)),
                 "{original} against {changed}"
             );
         }
+        assert!(trawl_core::parser::parse(&format!("{SPLICED_PREFIX}last=1h a")).is_err());
     }
 
     /// The bounds the splice writes read back as the instants that were
@@ -1445,8 +1445,11 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc)
         };
-        assert_eq!(read(&parsed.search.earliest.unwrap().node), window.start);
-        assert_eq!(read(&parsed.search.latest.unwrap().node), window.end);
+        assert_eq!(
+            read(parsed.search.earliest.unwrap().node.text()),
+            window.start
+        );
+        assert_eq!(read(parsed.search.latest.unwrap().node.text()), window.end);
     }
 
     /// Ruling 7: a query that owns its own window is refused rather than
