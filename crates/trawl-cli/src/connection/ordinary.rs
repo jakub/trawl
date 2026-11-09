@@ -112,6 +112,16 @@ impl Inputs {
         }
     }
 
+    /// `--token` typed beside `--token-file` is a usage error for every
+    /// command, whether or not it resolves a connection. An exported
+    /// `TRAWL_TOKEN` beside `--token-file` is not: the file wins.
+    pub(crate) fn key_flags(&self) -> Result<(), ConnectionError> {
+        if matches!(self.token, Some((_, Origin::CommandLine))) && self.token_file.is_some() {
+            return Err(ConnectionError::BothKeyFlags);
+        }
+        Ok(())
+    }
+
     /// The error for a command that needs a key when none exists anywhere.
     pub(crate) fn no_credential(&self) -> ConnectionError {
         ConnectionError::NoCredential {
@@ -316,9 +326,7 @@ pub(crate) fn ordinary(
     profile: Option<&str>,
     inputs: &Inputs,
 ) -> Result<Option<ConnectionParams>, ConnectionError> {
-    if matches!(inputs.token, Some((_, Origin::CommandLine))) && inputs.token_file.is_some() {
-        return Err(ConnectionError::BothKeyFlags);
-    }
+    inputs.key_flags()?;
     let table = profile
         .map(|name| cfg.profile(name).map(|table| (name, table)))
         .transpose()?;

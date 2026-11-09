@@ -608,16 +608,21 @@ async fn run_configured(
         return Err(CliError::Usage(DRIVER_UNDER_TRIAL.to_owned()));
     }
 
+    // What the -p trial overlay refuses, noted before the inputs take them.
+    let flags = (
+        args.url.is_some(),
+        args.token.is_some(),
+        args.token_file.is_some(),
+    );
+    let inputs = connection::Inputs::new(args.url, args.token, args.token_file, sources);
+    inputs.key_flags()?;
+
     // Load the config file and apply the profile's trust. A profile's url
     // and token stay in its table, bound to each other.
     let mut cfg = config::Config::load(args.config.as_deref())?;
     let trial_profile = args.profile.as_deref() == Some(trial::PROFILE);
     if trial_profile {
-        let overrides = trial::profile::Overrides::observe(
-            args.url.is_some(),
-            args.token.is_some(),
-            args.token_file.is_some(),
-        );
+        let overrides = trial::profile::Overrides::observe(flags.0, flags.1, flags.2);
         let config_path = args
             .config
             .as_deref()
@@ -640,7 +645,6 @@ async fn run_configured(
     // The connection resolves where a command needs it, not before:
     // `query --data` and `schema fields --data` read none, so neither a
     // refused key nor a broken saved URL stops them.
-    let inputs = connection::Inputs::new(args.url, args.token, args.token_file, sources);
     let profile = args.profile.as_deref();
     let connect = || {
         if trial_profile {

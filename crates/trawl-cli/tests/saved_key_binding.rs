@@ -617,6 +617,38 @@ fn key_sources_never_fall_through() {
     );
     assert_secret_free(&err, &[path], "both key flags");
 
+    // The conflict is a usage error for every command, including those
+    // that never resolve a connection.
+    let data = home.home.join("none/*.parquet");
+    let data = data.to_str().unwrap();
+    for args in [
+        vec![
+            "--token",
+            K2,
+            "--token-file",
+            path,
+            "query",
+            "--data",
+            data,
+            "*",
+        ],
+        vec![
+            "--token",
+            K2,
+            "--token-file",
+            path,
+            "schema",
+            "fields",
+            "--data",
+            data,
+        ],
+    ] {
+        let output = home.run(&args, &[]);
+        let err = stderr(&output);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {err}");
+        assert_secret_free(&err, &[path], "both key flags, embedded");
+    }
+
     let empty = home.file("empty", b"");
     let blank = home.file("blank", b" \n\t\n");
     let oversized = home.file("oversized", &[b'k'; 5000]);
