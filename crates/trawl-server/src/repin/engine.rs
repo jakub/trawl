@@ -1211,18 +1211,15 @@ impl RepinEngine {
             )
             .await
         {
+            let err = ServerError::Store(e);
+            let row = fault_row(job_id, "could not record the repin plan", &err);
             if self
-                .settle_pre_cutover(
-                    job_id,
-                    STAGE_SCAN,
-                    RepinJobStatus::Failed,
-                    Some(&e.to_string()),
-                )
+                .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&row))
                 .await
             {
                 return self.cancelled_outcome(job_id).await;
             }
-            return Err(ServerError::Store(e));
+            return Err(err);
         }
 
         #[allow(clippy::cast_precision_loss)]
@@ -1277,14 +1274,15 @@ impl RepinEngine {
         let available = match fs4::available_space(&self.data_dir) {
             Ok(available) => available,
             Err(e) => {
-                let msg = format!("failed to check free disk space: {e}");
+                let row = disk_check_row(job_id, &e);
                 if self
-                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&msg))
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&row))
                     .await
                 {
                     return self.cancelled_outcome(job_id).await;
                 }
-                return Err(ServerError::Internal(msg));
+                // The row's DEBUG event already carries the error's text.
+                return Err(ServerError::Internal(row));
             }
         };
         let needed = counts
@@ -1319,9 +1317,9 @@ impl RepinEngine {
         let job = match self.job(job_id).await {
             Ok(job) => job,
             Err(e) => {
-                let msg = format!("could not read the claimed repin job row: {e}");
+                let row = fault_row(job_id, "could not read the claimed repin job row", &e);
                 if self
-                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&msg))
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&row))
                     .await
                 {
                     return self.cancelled_outcome(job_id).await;
@@ -1932,7 +1930,11 @@ impl RepinEngine {
             }
             Err(e) => {
                 drop(corpus_gate);
-                return Err(JobAbort::Failed(format!("cutover drain failed: {e}")));
+                return Err(JobAbort::Failed(fault_row(
+                    job_id,
+                    "cutover drain failed",
+                    &e,
+                )));
             }
         };
 
@@ -2470,6 +2472,34 @@ impl From<PassStop> for JobAbort {
 /// most wants confirmed: nothing visible changed.
 fn cancelled_error(actor: &str, stage: &str) -> String {
     format!("cancelled by {actor} during {stage}; the live corpus was never touched")
+}
+
+/// The terminal row for a job stopped by a [`ServerError`]: the error's
+/// public message, the one the request answers with (ADR-0040, amended
+/// 2026-11-08). The error's own text goes to DEBUG only.
+fn fault_row(job_id: i64, what: &'static str, err: &ServerError) -> String {
+    tracing::debug!(
+        event_type = "repin_job_failed",
+        job_id,
+        error = %err,
+        "{what}"
+    );
+    err.safe_message()
+}
+
+/// The terminal row for a free-space check that could not run. It names
+/// the `io::ErrorKind`; the error's own text goes to DEBUG only.
+fn disk_check_row(job_id: i64, err: &std::io::Error) -> String {
+    tracing::debug!(
+        event_type = "repin_job_failed",
+        job_id,
+        error = %err,
+        "could not check free disk space for the repin"
+    );
+    format!(
+        "could not check free disk space for the repin ({})",
+        err.kind()
+    )
 }
 
 /// What the shadow generation holds so far — the numbers the progress
@@ -3462,6 +3492,67 @@ mod tests {
             JobAbort::from(PassStop::Failed("read_parquet failed".to_owned())),
             JobAbort::Failed(msg) if msg == "read_parquet failed"
         ));
+    }
+
+    /// A terminal row built from a `ServerError` stores the error's public
+    /// message, the one the request answers with, and a row built from an
+    /// `io::Error` names its kind. Neither carries a planted driver, path
+    /// or I/O marker (ADR-0040, amended 2026-11-08). The source check pins
+    /// that `decide` and the cutover drain build their rows through these
+    /// two functions rather than from an error's `Display`.
+    #[test]
+    fn repin_terminal_rows_store_public_messages() {
+        use crate::store::StoreError;
+        use trawl_engine::error::EngineError;
+
+        const MARKER: &str = "/var/lib/trawl/data/MARKER-repin-row";
+        const SOURCE: &str = include_str!("engine.rs");
+        let faults = [
+            ServerError::Store(StoreError::Unavailable(sqlx::Error::Protocol(
+                MARKER.into(),
+            ))),
+            ServerError::Engine(EngineError::Io(std::io::Error::other(MARKER))),
+            ServerError::Internal(format!("read {MARKER} failed")),
+        ];
+        for fault in &faults {
+            let row = fault_row(7, "could not record the repin plan", fault);
+            assert_eq!(row, fault.safe_message(), "{fault:?}");
+            assert!(!row.contains("MARKER"), "{fault:?}: {row}");
+        }
+
+        let io = std::io::Error::other(MARKER);
+        let row = disk_check_row(7, &io);
+        assert_eq!(
+            row,
+            "could not check free disk space for the repin (other error)"
+        );
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, MARKER);
+        let row = disk_check_row(7, &denied);
+        assert!(row.contains("permission denied"), "{row}");
+        assert!(!row.contains("MARKER"), "{row}");
+
+        let start = SOURCE
+            .find("    async fn decide(")
+            .expect("decide is still a method on the engine");
+        let end = SOURCE[start..]
+            .find("    async fn run_scan(")
+            .expect("run_scan still follows decide")
+            + start;
+        let decide = &SOURCE[start..end];
+        for leak in [
+            "Some(&e.to_string())",
+            "free disk space: {e}",
+            "claimed repin job row: {e}",
+        ] {
+            assert!(
+                !decide.contains(leak),
+                "decide builds a terminal row from an error's Display: {leak}"
+            );
+        }
+        assert!(
+            !SOURCE.contains(concat!("cutover drain failed: {", "e}")),
+            "the cutover drain row is built from the pool error's Display"
+        );
     }
 
     /// The cancelled row's one prose slot names who, where, and the fact
