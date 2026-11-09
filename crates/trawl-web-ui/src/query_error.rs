@@ -22,6 +22,7 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use trawl_api::{ErrorDetail, ErrorSpan};
+use trawl_core::text_layout::locate_span;
 
 use crate::api_error::ApiError;
 
@@ -44,7 +45,8 @@ pub struct Located {
     pub width: usize,
 }
 
-/// Resolve a byte span against `text`.
+/// Resolve a byte span against `text` with
+/// [`trawl_core::text_layout::locate_span`], in character columns.
 ///
 /// `None` when the span cannot index this text: reversed, past the end,
 /// or off a character boundary at either end. The caller then keeps the
@@ -56,37 +58,15 @@ pub struct Located {
 /// there. `\r\n` is one line ending.
 #[must_use]
 pub fn locate(text: &str, span: &ErrorSpan) -> Option<Located> {
-    let (start, end) = (span.start, span.end);
-    if start > end
-        || end > text.len()
-        || !text.is_char_boundary(start)
-        || !text.is_char_boundary(end)
-    {
-        return None;
-    }
-
-    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = text[start..].find('\n').map_or(text.len(), |i| start + i);
-    let line = text[..line_start].matches('\n').count() + 1;
-    let line_text = text[line_start..line_end]
-        .strip_suffix('\r')
-        .unwrap_or(&text[line_start..line_end]);
-
-    // Measure on the line as displayed: a span starting on the dropped
-    // `\r` (or the `\n` after it) sits just past the displayed text.
-    let displayed_end = line_start + line_text.len();
-    let start_on_line = start.min(displayed_end);
-    let before = &text[line_start..start_on_line];
-    let covered_end = end.min(displayed_end).max(start_on_line);
-    let width = text[start_on_line..covered_end].chars().count().max(1);
-
+    let at = locate_span(text, span.start, span.end)?;
+    let before = at.before(text);
     Some(Located {
-        line,
+        line: at.line,
         column: before.chars().count() + 1,
-        multi_line: text.contains('\n'),
-        line_text: line_text.to_owned(),
+        multi_line: at.multi_line,
+        line_text: at.line_text(text).to_owned(),
         before: before.to_owned(),
-        width,
+        width: at.covered(text).chars().count().max(1),
     })
 }
 
