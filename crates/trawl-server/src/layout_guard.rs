@@ -8,18 +8,25 @@
 
 use std::path::{Path, PathBuf};
 
-/// Byte-shape date checks and glob cuts, spelled without whitespace.
-const FORBIDDEN: &[(&str, &str)] = &[
-    ("[4]==b'-'", "a date checked by its byte shape"),
-    ("[7]==b'-'", "a date checked by its byte shape"),
-    ("get(4)==Some(&b'-')", "a date checked by its byte shape"),
-    ("get(7)==Some(&b'-')", "a date checked by its byte shape"),
-    ("find('*')", "a data root cut out of a glob"),
-    ("find(\"*\")", "a data root cut out of a glob"),
+const DATE_SHAPE: &str = "a date checked by its byte shape";
+const GLOB_CUT: &str = "a data root cut out of a glob";
+
+/// Byte-shape date checks and glob cuts, spelled without whitespace. The
+/// flag marks a date shape, which the layout owner may spell.
+const FORBIDDEN: &[(&str, &str, bool)] = &[
+    ("[4]==b'-'", DATE_SHAPE, true),
+    ("[7]==b'-'", DATE_SHAPE, true),
+    ("get(4)==Some(&b'-')", DATE_SHAPE, true),
+    ("get(7)==Some(&b'-')", DATE_SHAPE, true),
+    ("find('*')", GLOB_CUT, false),
+    ("find(\"*\")", GLOB_CUT, false),
+    // rustfmt's vertical argument layout adds a trailing comma.
+    ("find('*',)", GLOB_CUT, false),
+    ("find(\"*\",)", GLOB_CUT, false),
 ];
 
-/// Files allowed to spell the grammar: the layout owner and this guard.
-const OWNERS: &[&str] = &["env_dirs.rs", "layout_guard.rs"];
+/// The layout owner, which may spell date shapes but not glob cuts.
+const OWNER: &str = "env_dirs.rs";
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -64,21 +71,39 @@ fn test_module_start(source: &str) -> Option<usize> {
 }
 
 /// Every forbidden shape in `source`'s production code, as `line: reason`.
-fn violations(source: &str) -> Vec<String> {
+/// Whitespace is dropped across line breaks before matching, so a shape
+/// split over several lines still matches; each kept byte remembers its
+/// line. `owner` exempts the date shapes.
+fn violations(source: &str, owner: bool) -> Vec<String> {
     let production = &source[..test_module_start(source).unwrap_or(source.len())];
-    let mut found = Vec::new();
-    for (index, line) in production.lines().enumerate() {
+    let lines: Vec<&str> = production.lines().collect();
+    let mut squeezed = String::new();
+    let mut line_of = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
         if line.trim_start().starts_with("//") {
             continue;
         }
-        let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-        for (shape, reason) in FORBIDDEN {
-            if squeezed.contains(shape) {
-                found.push(format!("{}: {reason}: {}", index + 1, line.trim()));
+        for c in line.chars().filter(|c| !c.is_whitespace()) {
+            squeezed.push(c);
+            for _ in 0..c.len_utf8() {
+                line_of.push(index);
             }
         }
     }
+    let mut found = Vec::new();
+    for (shape, reason, date_shape) in FORBIDDEN {
+        if owner && *date_shape {
+            continue;
+        }
+        for (at, _) in squeezed.match_indices(shape) {
+            found.push((line_of[at], *reason));
+        }
+    }
+    found.sort_unstable();
     found
+        .into_iter()
+        .map(|(index, reason)| format!("{}: {reason}: {}", index + 1, lines[index].trim()))
+        .collect()
 }
 
 #[test]
@@ -91,11 +116,11 @@ fn no_date_shape_or_glob_cut_outside_the_layout_owner() {
     let mut offenders = Vec::new();
     for path in &files {
         let relative = path.strip_prefix(&src).unwrap();
-        if OWNERS.iter().any(|owner| relative == Path::new(owner)) {
+        if relative == Path::new("layout_guard.rs") {
             continue;
         }
         let source = std::fs::read_to_string(path).unwrap();
-        for violation in violations(&source) {
+        for violation in violations(&source, relative == Path::new(OWNER)) {
             offenders.push(format!("src/{}:{violation}", relative.display()));
         }
     }
@@ -119,6 +144,12 @@ fn production(bytes: &[u8], base: &str) {
     let _ = base.find('*');
     let _ = chrono::NaiveDate::parse_from_str(base, \"%Y-%m-%d\");
     // base.find('*') in a comment is prose.
+    let _ = bytes[4]
+        == b'-';
+    let _ = base
+        .find(
+            '*',
+        );
 }
 
 #[cfg(test)]
@@ -127,7 +158,16 @@ mod tests {
     fn _t(bytes: &[u8]) -> bool { bytes[4] == b'-' }
 }
 ";
-    let found = violations(source);
-    let lines: Vec<&str> = found.iter().map(|v| v.split_once(':').unwrap().0).collect();
-    assert_eq!(lines, ["5", "6", "7"], "{found:#?}");
+    let lines = |found: Vec<String>| -> Vec<String> {
+        found
+            .iter()
+            .map(|v| v.split_once(':').unwrap().0.to_owned())
+            .collect()
+    };
+    assert_eq!(
+        lines(violations(source, false)),
+        ["5", "6", "7", "10", "13"]
+    );
+    // The owner may spell a date shape, never a glob cut.
+    assert_eq!(lines(violations(source, true)), ["7", "13"]);
 }
