@@ -88,7 +88,11 @@ pub fn SaveAsNetModal(
                     }
                 }
                 Err(e) => {
-                    bus.push(ToastKind::Error, "Couldn't save", Some(e.to_string()));
+                    bus.push(
+                        ToastKind::Error,
+                        "Couldn't save",
+                        Some(crate::api_error::saved_name_refusal(&e)),
+                    );
                     // Leave the modal open so the user can retry / tweak.
                 }
             }

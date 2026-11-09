@@ -1272,9 +1272,11 @@ impl ServerError {
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, e.to_string()),
                 ),
-                StoreError::DuplicateName { .. }
-                | StoreError::ScheduleExists { .. }
-                | StoreError::RepinAlreadyRunning => (
+                StoreError::DuplicateName { .. } => (
+                    StatusCode::CONFLICT,
+                    ErrorEnvelope::simple(ErrorCode::DuplicateName, e.to_string()),
+                ),
+                StoreError::ScheduleExists { .. } | StoreError::RepinAlreadyRunning => (
                     StatusCode::CONFLICT,
                     ErrorEnvelope::simple(ErrorCode::BadRequest, e.to_string()),
                 ),
@@ -1313,10 +1315,13 @@ impl ServerError {
                 | StoreError::InvalidInterval { .. }
                 | StoreError::IntervalTooShort { .. }
                 | StoreError::DurationTooLong { .. }
-                | StoreError::LagWithoutWindow { .. }
-                | StoreError::InvalidName { .. } => (
+                | StoreError::LagWithoutWindow { .. } => (
                     StatusCode::BAD_REQUEST,
                     ErrorEnvelope::simple(ErrorCode::BadRequest, e.to_string()),
+                ),
+                StoreError::InvalidName { .. } => (
+                    StatusCode::BAD_REQUEST,
+                    ErrorEnvelope::simple(ErrorCode::InvalidName, e.to_string()),
                 ),
             },
             Self::Unauthorized(msg) => (
@@ -3801,6 +3806,18 @@ mod tests {
                 StatusCode::CONFLICT,
                 "bad_request",
                 "a repin job is already running (one at a time, install-wide)",
+            ),
+            fact(
+                ServerError::Store(StoreError::DuplicateName { name: "x".into() }),
+                StatusCode::CONFLICT,
+                "duplicate_name",
+                "a saved query with this name already exists",
+            ),
+            fact(
+                ServerError::Store(StoreError::InvalidName { name: "a b".into() }),
+                StatusCode::BAD_REQUEST,
+                "invalid_name",
+                "name must not be blank or contain control or invisible formatting characters",
             ),
             fact(
                 ServerError::BadRequest("offset + limit exceeds max_result_rows (1000)".into()),

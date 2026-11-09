@@ -557,13 +557,18 @@ async fn connect_addr_wrong_name_refused() {
 
 /// The 503 a request gets while the pin file has never held a usable
 /// certificate.
-const CA_UNAVAILABLE_BODY: &str = r#"{"error":"upstream certificate not available"}"#;
+const CA_UNAVAILABLE_BODY: &str =
+    r#"{"error":{"code":"service_unavailable","message":"upstream certificate not available"}}"#;
 
 async fn expect_unavailable(response: axum::response::Response) {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         response.headers().get(header::SET_COOKIE).is_none(),
         "a missing pin must not touch the session cookie"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
     );
     assert_eq!(body_text(response).await, CA_UNAVAILABLE_BODY);
 }

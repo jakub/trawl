@@ -7,17 +7,25 @@
 //! All calls are same-origin (`/api/auth/...`, `/api/v1/...`) and rely on
 //! the httpOnly session cookie being attached automatically by the
 //! browser. Never touches `Authorization` — that's the proxy's job.
+//!
+//! Every ordinary endpoint sends its request once and reads the body
+//! once ([`exchange`]), then hands the answer to [`response_policy`]:
+//! the endpoint names its success statuses, and every failure goes to
+//! the one classifier (ADR-0066). Nothing here reads a status as a
+//! failure class or navigates. The investigation writes keep their own
+//! send-once paths and classifiers, because their unknown outcome must
+//! never read as a refusal.
 
-use gloo_net::http::Request;
+use gloo_net::http::{Request, RequestBuilder, Response};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use trawl_api::{
     CatalogFieldResponse, ClearHistoryResponse, CreateSavedRequest, DeleteSavedResponse,
-    DeleteScheduleResponse, ErrorResponse, ExportFormat, ExportRequest, HealthResponse,
-    HistoryResponse, ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, QueryRequest,
-    QueryResponse, RepinJobResponse, RepinRequest, RepinResponse, RepinStatusResponse,
-    ReportRunResponse, ReportRunSummary, RunsSortDir, RunsSortKey, RunsStatsResponse,
-    SavedQueryResponse, ScheduleResponse, ServiceSchemaResponse, SetScheduleRequest,
-    UpdateSavedRequest,
+    DeleteScheduleResponse, ExportFormat, ExportRequest, HealthResponse, HistoryResponse,
+    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, QueryRequest, QueryResponse,
+    RepinJobResponse, RepinRequest, RepinStatusResponse, ReportRunResponse, ReportRunSummary,
+    RunsSortDir, RunsSortKey, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
+    ServiceSchemaResponse, SetScheduleRequest, UpdateSavedRequest,
 };
 
 use trawl_api::investigations::{
@@ -30,7 +38,8 @@ use crate::evidence_queue::{Paced, retry_after_ms};
 use crate::fetch_plan::FetchPlan;
 use crate::investigation_live::{WriteFailure, write_refusal};
 use crate::query_merge::CaptureParts;
-use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
+use crate::repin_flow::BoundCeilings;
+use crate::response_policy;
 use crate::send_investigation::{SendFailure, send_refusal};
 
 /// Rows per page for the snapshot results table. Defined by the search
@@ -41,15 +50,89 @@ pub use crate::search_url::PAGE_SIZE;
 /// Rows per page in both run browsers.
 pub const RUNS_PAGE_SIZE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(20).unwrap();
 
-/// The failure type lives in a pure module so its body decoder is tested
+/// The failure type lives in a pure module so its classifier is tested
 /// natively; the transport below is the only part that needs a browser.
 pub use crate::api_error::ApiError;
-use crate::api_error::{decode_error_body, export_failure};
+/// What the repin POST answered; built by [`response_policy::repin`].
+pub use crate::repin_flow::RepinOutcome;
 
 impl From<gloo_net::Error> for ApiError {
     fn from(e: gloo_net::Error) -> Self {
         Self::Network(e.to_string())
     }
+}
+
+/// An answer: its status, and its body read once as text. `None` is a
+/// body that could not be read, which leaves the classifier only the
+/// status.
+struct Answer {
+    status: u16,
+    body: Option<String>,
+}
+
+/// Send `request` once. A request that got no answer at all is
+/// [`ApiError::Network`].
+async fn send(request: Request) -> Result<Response, ApiError> {
+    Ok(request.send().await?)
+}
+
+/// Read an answer's body once, as text.
+async fn read(resp: &Response) -> Option<String> {
+    resp.text().await.ok()
+}
+
+/// Send once and read the body once: the one path every ordinary
+/// endpoint takes to the server.
+async fn exchange(request: Request) -> Result<Answer, ApiError> {
+    let resp = send(request).await?;
+    Ok(Answer {
+        status: resp.status(),
+        body: read(&resp).await,
+    })
+}
+
+/// An ordinary JSON endpoint: [`exchange`], then decode a status in
+/// `ok` and classify any other ([`response_policy::answer`]).
+async fn ordinary<T: DeserializeOwned>(request: Request, ok: &[u16]) -> Result<T, ApiError> {
+    let Answer { status, body } = exchange(request).await?;
+    response_policy::answer(status, body.as_deref(), ok)
+}
+
+/// A paced read: [`send`], and a 429 is [`Paced::Throttled`] before its
+/// body is read ([`response_policy::paced`]). Anything else is read once
+/// and decoded as an ordinary 200 answer.
+async fn paced<T: DeserializeOwned>(request: Request) -> Paced<Result<T, ApiError>> {
+    let resp = match send(request).await {
+        Ok(resp) => resp,
+        Err(e) => return Paced::Answered(Err(e)),
+    };
+    let status = resp.status();
+    match response_policy::paced(
+        status,
+        resp.headers().get("retry-after").as_deref(),
+        js_sys::Date::now(),
+        http_date_ms,
+    ) {
+        Paced::Throttled { retry_after_ms } => Paced::Throttled { retry_after_ms },
+        Paced::Answered(()) => Paced::Answered(response_policy::answer(
+            status,
+            read(&resp).await.as_deref(),
+            &[200],
+        )),
+    }
+}
+
+/// An HTTP date as unix milliseconds, for `Retry-After`.
+fn http_date_ms(date: &str) -> Option<f64> {
+    Some(js_sys::Date::parse(date)).filter(|ms| !ms.is_nan())
+}
+
+/// `builder` with `body` as its JSON payload.
+fn with_json<B: Serialize>(builder: RequestBuilder, body: &B) -> Result<Request, ApiError> {
+    let json = serde_json::to_string(body).map_err(|e| ApiError::Decode(e.to_string()))?;
+    Ok(builder
+        .header("content-type", "application/json")
+        .body(json)?)
 }
 
 #[derive(Debug, Serialize)]
@@ -81,57 +164,31 @@ pub struct MeResponse {
 /// POST `/api/auth/login` with the given API key. Returns identity on
 /// success, [`ApiError::Unauthorized`] on bad key.
 pub async fn login(api_key: &str) -> Result<LoginResponse, ApiError> {
-    let body = LoginRequest { api_key };
-    let resp = Request::post("/api/auth/login")
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
-        .send()
-        .await?;
-
-    match resp.status() {
-        200 => resp
-            .json::<LoginResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    let request = with_json(Request::post("/api/auth/login"), &LoginRequest { api_key })?;
+    ordinary(request, &[200]).await
 }
 
 /// GET `/api/auth/me` — read current session identity.
 pub async fn me() -> Result<MeResponse, ApiError> {
-    let resp = Request::get("/api/auth/me").send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<MeResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(Request::get("/api/auth/me").build()?, &[200]).await
 }
 
-/// POST `/api/auth/logout` — clears the session cookie.
+/// POST `/api/auth/logout` — clears the session cookie. Success carries
+/// no JSON body ([`response_policy::logout`]).
 pub async fn logout() -> Result<(), ApiError> {
-    let resp = Request::post("/api/auth/logout").send().await?;
-    match resp.status() {
-        204 | 200 => Ok(()),
-        s => Err(ApiError::Status(s)),
-    }
+    let Answer { status, body } = exchange(Request::post("/api/auth/logout").build()?).await?;
+    response_policy::logout(status, body.as_deref())
 }
 
 /// GET /api/v1/health — health/version probe. trawld serves it without
 /// auth, but the browser reaches it through the trawl-web `/api/v1/*` proxy,
 /// which requires a session; `/healthz` is the public probe.
+///
+/// A 503 is a degraded report only when its body is one
+/// ([`response_policy::health`]).
 pub async fn health() -> Result<HealthResponse, ApiError> {
-    let resp = Request::get("/api/v1/health").send().await?;
-    match resp.status() {
-        200 | 503 => resp
-            .json::<HealthResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        s => Err(ApiError::Status(s)),
-    }
+    let Answer { status, body } = exchange(Request::get("/api/v1/health").build()?).await?;
+    response_policy::health(status, body.as_deref())
 }
 
 /// GET /api/v1/history — paginated query history for the current session.
@@ -145,49 +202,27 @@ pub async fn history(
         url.push_str("&filter=");
         url.push_str(&crate::search_url::percent_encode(filter));
     }
-    let resp = Request::get(&url).send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<HistoryResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(Request::get(&url).build()?, &[200]).await
 }
 
 /// DELETE /api/v1/history clears only the current session key's history.
 pub async fn clear_history() -> Result<ClearHistoryResponse, ApiError> {
-    let resp = Request::delete("/api/v1/history").send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<ClearHistoryResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(Request::delete("/api/v1/history").build()?, &[200]).await
 }
 
-/// POST /api/v1/saved — create a named saved query ("net").
+/// POST /api/v1/saved — create a named saved query ("net"). A name
+/// refusal keeps its code; the form words it with
+/// [`crate::api_error::saved_name_refusal`].
 pub async fn create_saved(name: &str, query: &str) -> Result<SavedQueryResponse, ApiError> {
     let body = CreateSavedRequest {
         name: name.to_owned(),
         query: query.to_owned(),
     };
-    let resp = Request::post("/api/v1/saved")
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
-        .send()
-        .await?;
-    match resp.status() {
-        200 | 201 => resp
-            .json::<SavedQueryResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(saved_write_error(resp, s).await),
-    }
+    ordinary(
+        with_json(Request::post("/api/v1/saved"), &body)?,
+        &[200, 201],
+    )
+    .await
 }
 
 /// GET /api/v1/schema/services — rich per-service metadata (columns,
@@ -195,15 +230,7 @@ pub async fn create_saved(name: &str, query: &str) -> Result<SavedQueryResponse,
 /// `schema_refresh.rs`. Used by the Schema page to render per-service
 /// cards and their drawer inspectors.
 pub async fn schema_services() -> Result<ServiceSchemaResponse, ApiError> {
-    let resp = Request::get("/api/v1/schema/services").send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<ServiceSchemaResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(Request::get("/api/v1/schema/services").build()?, &[200]).await
 }
 
 /// GET `/api/v1/schema/field?name=` — one field's pin, one page of its
@@ -211,9 +238,9 @@ pub async fn schema_services() -> Result<ServiceSchemaResponse, ApiError> {
 /// as `after`), its retained conflict evidence, and the analyzer's
 /// verdict when the pin is degraded.
 ///
-/// A field with no pin answers 404, which surfaces here as
-/// [`ApiError::Status(404)`] — the case file maps that to fleet-ui's
-/// neutral `LoadState::Missing`, never to an error banner.
+/// A field with no pin answers 404, a failure whose
+/// [`ApiError::http_status`] is 404 — the case file maps that to
+/// fleet-ui's neutral `LoadState::Missing`, never to an error banner.
 pub async fn catalog_field(
     name: &str,
     after: Option<&str>,
@@ -227,36 +254,7 @@ pub async fn catalog_field(
         url.push_str("&after=");
         url.push_str(&encode(cursor));
     }
-    let resp = Request::get(&url).send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<CatalogFieldResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
-}
-
-/// What `POST /api/v1/schema/repin` answered. The HTTP status carries
-/// the verdict (ADR-0011), so the call site branches on this rather than
-/// on a single body type.
-#[derive(Debug, Clone)]
-pub enum RepinOutcome {
-    /// 200 — the scan ran and stopped. The job is the plan.
-    DryRun(RepinJobResponse),
-    /// 202 — the job is claimed and was still running when the server
-    /// stopped waiting for it, dry runs included. Follow it by its id
-    /// ([`repin_job_status`]) for the rest of its life; a row that is
-    /// already terminal is the answer as it stands.
-    Started(RepinJobResponse),
-    /// 409 whose body decoded as a job — the scan projected values the
-    /// target pin cannot keep and no force was passed. Terminal
-    /// (`refused_needs_force`); the corpus is untouched.
-    Refused(RepinJobResponse),
-    /// 409 whose body decoded as the error envelope — the one-running
-    /// slot is held by another job, install-wide.
-    Busy(String),
+    ordinary(Request::get(&url).build()?, &[200]).await
 }
 
 /// POST `/api/v1/schema/repin` — plan (`dry_run`) or start a repin.
@@ -267,8 +265,10 @@ pub enum RepinOutcome {
 ///
 /// The 409 is double-shaped — a refusal carries the plan, a held slot
 /// carries the error envelope — and the two are told apart by decoding
-/// the body ([`crate::repin_flow::classify_conflict`]), never by
-/// matching on error text.
+/// the body ([`response_policy::repin`]), never by matching on error
+/// text. Any other failure keeps the server's envelope, so the modal can
+/// show an operator-facing refusal ("not a pinned field", "repin
+/// requires an ingest-enabled node") in the server's words.
 pub async fn repin(
     field: &str,
     to: &str,
@@ -294,32 +294,9 @@ pub async fn repin(
         max_nulled_rows: ceilings.map(|c| c.max_nulled),
         max_ambiguous_rows: ceilings.map(|c| c.max_ambiguous),
     };
-    let resp = Request::post("/api/v1/schema/repin")
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
-        .send()
-        .await?;
-
-    match resp.status() {
-        200 => Ok(RepinOutcome::DryRun(repin_job(&resp).await?)),
-        202 => Ok(RepinOutcome::Started(repin_job(&resp).await?)),
-        409 => {
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| ApiError::Decode(e.to_string()))?;
-            Ok(match classify_conflict(&text) {
-                ConflictBody::Plan(job) => RepinOutcome::Refused(*job),
-                ConflictBody::Busy(msg) => RepinOutcome::Busy(msg),
-            })
-        }
-        // Every other status — including 401/403 — keeps the server's
-        // own message so the modal can show it verbatim. A repin refusal
-        // is an operator-facing sentence ("not a pinned field", "repin
-        // requires an ingest-enabled node"), and replacing it with a
-        // status number would throw away the only actionable part.
-        s => Err(server_error(&resp, s).await),
-    }
+    let request = with_json(Request::post("/api/v1/schema/repin"), &body)?;
+    let Answer { status, body } = exchange(request).await?;
+    response_policy::repin(status, body.as_deref())
 }
 
 /// GET `/api/v1/schema/repin/status` — the running job if any, else the
@@ -329,15 +306,7 @@ pub async fn repin(
 /// holds the id of. A job this page started or adopted is followed by
 /// its id instead ([`repin_job_status`]).
 pub async fn repin_status() -> Result<RepinStatusResponse, ApiError> {
-    let resp = Request::get("/api/v1/schema/repin/status").send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<RepinStatusResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(Request::get("/api/v1/schema/repin/status").build()?, &[200]).await
 }
 
 /// GET `/api/v1/schema/repin/status?id=` — job `id`, whatever has run
@@ -347,37 +316,9 @@ pub async fn repin_status() -> Result<RepinStatusResponse, ApiError> {
 /// Gated server-side on `schema_write` or `schema_read`, so the session
 /// that started a job can always follow it.
 pub async fn repin_job_status(id: i64) -> Result<Option<RepinJobResponse>, ApiError> {
-    let resp = Request::get(&format!("/api/v1/schema/repin/status?id={id}"))
-        .send()
-        .await?;
-    match resp.status() {
-        200 => resp
-            .json::<RepinStatusResponse>()
-            .await
-            .map(|r| r.job)
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        404 => Ok(None),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
-}
-
-/// The job row out of a `RepinResponse` body.
-async fn repin_job(resp: &gloo_net::http::Response) -> Result<RepinJobResponse, ApiError> {
-    resp.json::<RepinResponse>()
-        .await
-        .map(|r| r.job)
-        .map_err(|e| ApiError::Decode(e.to_string()))
-}
-
-/// A non-2xx read through [`decode_error_body`]: a query error keeps its
-/// whole envelope, any other envelope its summary, and an unreadable body
-/// the bare status.
-async fn server_error(resp: &gloo_net::http::Response, status: u16) -> ApiError {
-    let Ok(body) = resp.text().await else {
-        return ApiError::Status(status);
-    };
-    decode_error_body(status, &body)
+    let request = Request::get(&format!("/api/v1/schema/repin/status?id={id}")).build()?;
+    let Answer { status, body } = exchange(request).await?;
+    response_policy::repin_job_status(status, body.as_deref())
 }
 
 /// One URL query-parameter value.
@@ -402,37 +343,14 @@ pub async fn query(q: &str, plan: FetchPlan) -> Result<QueryResponse, ApiError> 
         offset: Some(offset),
         timezone: None,
     };
-    let resp = Request::post("/api/v1/query")
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
-        .send()
-        .await?;
-
-    match resp.status() {
-        200 => resp
-            .json::<QueryResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        // A refusal of the query text arrives as the whole envelope, spans
-        // and all, for the query error notice (ADR-0039); any other
-        // envelope keeps its summary. 401 above keeps its own meaning:
-        // the session, not the query, is what failed.
-        s => Err(server_error(&resp, s).await),
-    }
+    // A refusal of the query text arrives as the whole envelope, spans
+    // and all, for the query error notice (ADR-0039).
+    ordinary(with_json(Request::post("/api/v1/query"), &body)?, &[200]).await
 }
 
 /// GET /api/v1/saved — list all saved queries ("nets") for the session.
 pub async fn list_saved() -> Result<ListSavedResponse, ApiError> {
-    let resp = Request::get("/api/v1/saved").send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<ListSavedResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(Request::get("/api/v1/saved").build()?, &[200]).await
 }
 
 /// PUT /api/v1/saved/{id} — update a saved query's DSL.
@@ -441,34 +359,20 @@ pub async fn update_saved(id: i64, query: &str) -> Result<SavedQueryResponse, Ap
         query: query.to_owned(),
         name: None,
     };
-    let resp = Request::put(&format!("/api/v1/saved/{id}"))
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
-        .send()
-        .await?;
-    match resp.status() {
-        200 => resp
-            .json::<SavedQueryResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(
+        with_json(Request::put(&format!("/api/v1/saved/{id}")), &body)?,
+        &[200],
+    )
+    .await
 }
 
 /// DELETE /api/v1/saved/{id} — delete a saved query.
 pub async fn delete_saved(id: i64) -> Result<DeleteSavedResponse, ApiError> {
-    let resp = Request::delete(&format!("/api/v1/saved/{id}"))
-        .send()
-        .await?;
-    match resp.status() {
-        200 => resp
-            .json::<DeleteSavedResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(
+        Request::delete(&format!("/api/v1/saved/{id}")).build()?,
+        &[200],
+    )
+    .await
 }
 
 /// PUT /api/v1/saved/{id}/schedule — create or update a schedule.
@@ -479,9 +383,9 @@ pub async fn delete_saved(id: i64) -> Result<DeleteSavedResponse, ApiError> {
 /// `schedule_edit::WindowDraft::to_request`, which is what the form is
 /// showing.
 ///
-/// The server refuses several window and lag combinations by name, so a
-/// non-2xx carries its envelope message through rather than collapsing
-/// to a bare status the operator cannot act on.
+/// The server refuses several window and lag combinations by name, and
+/// the refusal keeps its envelope, so the operator reads the server's
+/// sentence rather than a bare status.
 pub async fn set_schedule(
     saved_id: i64,
     interval: &str,
@@ -497,34 +401,14 @@ pub async fn set_schedule(
         window: window.map(str::to_owned),
         lag: lag.map(str::to_owned),
     };
-    let resp = Request::put(&format!("/api/v1/saved/{saved_id}/schedule"))
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
-        .send()
-        .await?;
-    match resp.status() {
-        200 => resp
-            .json::<ScheduleResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(server_error(&resp, s).await),
-    }
+    let builder = Request::put(&format!("/api/v1/saved/{saved_id}/schedule"));
+    ordinary(with_json(builder, &body)?, &[200]).await
 }
 
 /// DELETE /api/v1/saved/{id}/schedule — remove a schedule.
 pub async fn delete_schedule(saved_id: i64) -> Result<DeleteScheduleResponse, ApiError> {
-    let resp = Request::delete(&format!("/api/v1/saved/{saved_id}/schedule"))
-        .send()
-        .await?;
-    match resp.status() {
-        200 => resp
-            .json::<DeleteScheduleResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    let request = Request::delete(&format!("/api/v1/saved/{saved_id}/schedule")).build()?;
+    ordinary(request, &[200]).await
 }
 
 /// GET /api/v1/saved/{id}/runs — paginated runs for a saved query.
@@ -534,15 +418,7 @@ pub async fn list_runs(
     offset: usize,
 ) -> Result<ListReportRunsResponse, ApiError> {
     let url = format!("/api/v1/saved/{saved_id}/runs?limit={limit}&offset={offset}");
-    let resp = Request::get(&url).send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<ListReportRunsResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(Request::get(&url).build()?, &[200]).await
 }
 
 /// GET `/api/v1/saved/{id}/runs/{run_id}` — single run with result data.
@@ -552,15 +428,7 @@ pub async fn list_runs(
 /// shows that sentence rather than inventing copy from a bare status.
 pub async fn get_run(saved_id: i64, run_id: i64) -> Result<ReportRunResponse, ApiError> {
     let url = format!("/api/v1/saved/{saved_id}/runs/{run_id}");
-    let resp = Request::get(&url).send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<ReportRunResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(server_error(&resp, s).await),
-    }
+    ordinary(Request::get(&url).build()?, &[200]).await
 }
 
 /// GET /api/v1/runs — paginated runs across all saved queries.
@@ -575,20 +443,14 @@ pub async fn list_all_runs(
         key.as_str(),
         dir.as_str()
     );
-    let resp = Request::get(&url).send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<ListAllRunsResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(Request::get(&url).build()?, &[200]).await
 }
 
 /// POST /api/v1/export?format={fmt} — export query results as binary.
 ///
 /// Returns raw bytes and a suggested filename from `Content-Disposition`.
+/// The body is read once, as bytes; a failure is classified from those
+/// same bytes ([`response_policy::export`]).
 ///
 /// An empty query never leaves the browser: the server's emitter turns
 /// it into `SELECT *` with no WHERE, so an export posted with the
@@ -608,30 +470,15 @@ pub async fn export(
         limit,
     };
     let url = format!("/api/v1/export?format={format}");
-    let resp = Request::post(&url)
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
-        .send()
-        .await?;
-
-    match resp.status() {
-        200 => {
-            let filename = parse_content_disposition(
-                resp.headers().get("content-disposition").as_deref(),
-                format,
-            );
-            let bytes = resp
-                .binary()
-                .await
-                .map_err(|e| ApiError::Decode(e.to_string()))?;
-            Ok((bytes, filename))
-        }
-        401 => Err(ApiError::Unauthorized),
-        s => Err(export_failure(s, resp.text().await.ok().as_deref())),
-    }
+    let resp = send(with_json(Request::post(&url), &body)?).await?;
+    let filename =
+        parse_content_disposition(resp.headers().get("content-disposition").as_deref(), format);
+    let bytes = response_policy::export(resp.status(), resp.binary().await.ok())?;
+    Ok((bytes, filename))
 }
 
 /// PUT /api/v1/saved/{id} — update a saved query's DSL and optionally its name.
+/// A name refusal keeps its code, as [`create_saved`]'s does.
 pub async fn update_saved_full(
     id: i64,
     query: &str,
@@ -641,52 +488,28 @@ pub async fn update_saved_full(
         query: query.to_owned(),
         name: name.map(str::to_owned),
     };
-    let resp = Request::put(&format!("/api/v1/saved/{id}"))
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
-        .send()
-        .await?;
-    match resp.status() {
-        200 => resp
-            .json::<SavedQueryResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(saved_write_error(resp, s).await),
-    }
+    ordinary(
+        with_json(Request::put(&format!("/api/v1/saved/{id}")), &body)?,
+        &[200],
+    )
+    .await
 }
 
 /// POST /api/v1/saved/{id}/run — Run now: fire the schedule's next
 /// window early. The answer is the claimed run, window included, so the
 /// caller can state the bounds the server chose rather than guess them.
+///
+/// A refusal (a run already in progress, the max-runs cap, nothing new
+/// to read, no schedule) is an operator-facing sentence, and the toast
+/// shows it rather than a bare status.
 pub async fn trigger_run(saved_id: i64) -> Result<ReportRunSummary, ApiError> {
-    let resp = Request::post(&format!("/api/v1/saved/{saved_id}/run"))
-        .send()
-        .await?;
-    match resp.status() {
-        200 => resp
-            .json::<ReportRunSummary>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        // A refusal (a run already in progress, the max-runs cap, nothing
-        // new to read, no schedule) is an operator-facing sentence, and
-        // the toast shows it rather than a bare status.
-        s => Err(server_error(&resp, s).await),
-    }
+    let request = Request::post(&format!("/api/v1/saved/{saved_id}/run")).build()?;
+    ordinary(request, &[200]).await
 }
 
 /// GET /api/v1/runs/stats — aggregate run statistics.
 pub async fn runs_stats() -> Result<RunsStatsResponse, ApiError> {
-    let resp = Request::get("/api/v1/runs/stats").send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<RunsStatsResponse>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
-    }
+    ordinary(Request::get("/api/v1/runs/stats").build()?, &[200]).await
 }
 
 fn parse_content_disposition(header: Option<&str>, format: &ExportFormat) -> String {
@@ -710,30 +533,14 @@ fn parse_content_disposition(header: Option<&str>, format: &ExportFormat) -> Str
 /// capture under, among the rest of what a client plans around (ADR-0058).
 /// Any key with a trawl grant reads it.
 pub async fn capabilities() -> Result<trawl_api::capabilities::CapabilitiesResponse, ApiError> {
-    let resp = Request::get("/api/v1/capabilities").send().await?;
-    match resp.status() {
-        200 => resp
-            .json()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(server_error(&resp, s).await),
-    }
+    ordinary(Request::get("/api/v1/capabilities").build()?, &[200]).await
 }
 
 /// GET `/api/v1/investigations` — every investigation, open ones first,
 /// each group most recently changed first (ADR-0059). Needs
 /// `investigation_read` and `query`; a refusal keeps its envelope.
 pub async fn list_investigations() -> Result<InvestigationList, ApiError> {
-    let resp = Request::get("/api/v1/investigations").send().await?;
-    match resp.status() {
-        200 => resp
-            .json::<InvestigationList>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        s => Err(server_error(&resp, s).await),
-    }
+    ordinary(Request::get("/api/v1/investigations").build()?, &[200]).await
 }
 
 /// GET `/api/v1/investigations/{id}?since=&limit=` — the investigation
@@ -753,19 +560,10 @@ pub async fn read_investigation(
     signal: Option<&web_sys::AbortSignal>,
 ) -> Paced<Result<InvestigationRead, ApiError>> {
     let url = format!("/api/v1/investigations/{id}?since={since}&limit={limit}");
-    let resp = match Request::get(&url).abort_signal(signal).send().await {
-        Ok(resp) => resp,
-        Err(e) => return Paced::Answered(Err(e.into())),
-    };
-    Paced::Answered(match resp.status() {
-        200 => resp
-            .json::<InvestigationRead>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        429 => return throttled(&resp),
-        s => Err(server_error(&resp, s).await),
-    })
+    match Request::get(&url).abort_signal(signal).build() {
+        Ok(request) => paced(request).await,
+        Err(e) => Paced::Answered(Err(e.into())),
+    }
 }
 
 /// POST `/api/v1/investigations/{id}/entries` — keep one captured row of
@@ -874,7 +672,7 @@ pub async fn capture_attached(
             let pause = retry_after_ms(
                 resp.headers().get("retry-after").as_deref(),
                 js_sys::Date::now(),
-                |date| Some(js_sys::Date::parse(date)).filter(|ms| !ms.is_nan()),
+                http_date_ms,
             );
             Err(send_refusal(
                 status,
@@ -882,17 +680,6 @@ pub async fn capture_attached(
                 pause,
             ))
         }
-    }
-}
-
-/// A 429 as the pause its `Retry-After` asks for, in either form.
-fn throttled<T>(resp: &gloo_net::http::Response) -> Paced<T> {
-    Paced::Throttled {
-        retry_after_ms: retry_after_ms(
-            resp.headers().get("retry-after").as_deref(),
-            js_sys::Date::now(),
-            |date| Some(js_sys::Date::parse(date)).filter(|ms| !ms.is_nan()),
-        ),
     }
 }
 
@@ -923,19 +710,10 @@ pub async fn result_page(
         Some(limit) => format!("/api/v1/results/{id}?offset={offset}&limit={limit}"),
         None => format!("/api/v1/results/{id}?offset={offset}"),
     };
-    let resp = match Request::get(&url).abort_signal(signal).send().await {
-        Ok(resp) => resp,
-        Err(e) => return Paced::Answered(Err(e.into())),
-    };
-    Paced::Answered(match resp.status() {
-        200 => resp
-            .json::<ResultPage>()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        401 => Err(ApiError::Unauthorized),
-        429 => return throttled(&resp),
-        s => Err(server_error(&resp, s).await),
-    })
+    match Request::get(&url).abort_signal(signal).build() {
+        Ok(request) => paced(request).await,
+        Err(e) => Paced::Answered(Err(e.into())),
+    }
 }
 
 /// Read capacity for the current admin session.
@@ -953,51 +731,12 @@ pub async fn queries() -> Result<trawl_api::QueriesResponse, ApiError> {
     telemetry_get("/api/v1/queries").await
 }
 
-async fn telemetry_get<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, ApiError> {
-    let resp = Request::get(url).send().await?;
-    match resp.status() {
-        200 => resp
-            .json()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        status => Err(server_error(&resp, status).await),
-    }
+async fn telemetry_get<T: DeserializeOwned>(url: &str) -> Result<T, ApiError> {
+    ordinary(Request::get(url).build()?, &[200]).await
 }
 
 /// Request cancellation without inferring success from an HTTP status alone.
 pub async fn cancel_query(id: u64) -> Result<trawl_api::CancelResponse, ApiError> {
-    let resp = Request::delete(&format!("/api/v1/queries/{id}"))
-        .send()
-        .await?;
-    match resp.status() {
-        200 => resp
-            .json()
-            .await
-            .map_err(|e| ApiError::Decode(e.to_string())),
-        status => Err(server_error(&resp, status).await),
-    }
-}
-
-/// Only expose the fixed messages for recognized name refusals. Other errors
-/// retain the status fallback rather than rendering arbitrary response text.
-async fn saved_write_error(resp: gloo_net::http::Response, status: u16) -> ApiError {
-    if matches!(status, 400 | 409)
-        && let Ok(body) = resp.json::<ErrorResponse>().await
-    {
-        let message = match (status, body.error.message.as_str()) {
-            (
-                400,
-                "name must not be blank or contain control or invisible formatting characters",
-            ) => "Name must not be blank or contain control or invisible formatting characters.",
-            (409, "a saved query with this name already exists") => {
-                "A net with this name already exists. Choose another name."
-            }
-            _ => return ApiError::Status(status),
-        };
-        return ApiError::Server {
-            status,
-            message: message.to_owned(),
-        };
-    }
-    ApiError::Status(status)
+    let request = Request::delete(&format!("/api/v1/queries/{id}")).build()?;
+    ordinary(request, &[200]).await
 }

@@ -104,6 +104,12 @@ async fn record(State(log): State<Log>, request: Request, next: Next) -> Respons
         .await
 }
 
+/// `trawl-web`'s answer to an allowed origin with an empty key.
+const ACCEPTED: &str = r#"{"error":{"code":"bad_request","message":"bad request"}}"#;
+/// `trawl-web`'s answer to an origin outside `public_origins`.
+const REJECTED: &str =
+    r#"{"error":{"code":"forbidden","message":"cross-origin request rejected"}}"#;
+
 /// A router on an owned loopback listener, recording every request.
 struct Origin {
     url: String,
@@ -375,23 +381,84 @@ fn doctor_web_origin_rejected() {
     assert_eq!(web.keyless_requests("rejected"), PROBES);
 }
 
+/// Login answers that are not trawl-web's: the legacy bodies, envelopes
+/// that miss by one field, key or status, and plain text.
+const FOREIGN_LOGINS: &[(&str, (u16, &str))] = &[
+    ("400 legacy body", (400, r#"{"error":"bad request"}"#)),
+    (
+        "403 legacy body",
+        (403, r#"{"error":"cross-origin request rejected"}"#),
+    ),
+    (
+        "400 with another body",
+        (400, r#"{"error":"bad request: api_key is required"}"#),
+    ),
+    (
+        "400 legacy body with extra keys",
+        (400, r#"{"error":"bad request","hint":"x"}"#),
+    ),
+    (
+        "400 envelope with another message",
+        (
+            400,
+            r#"{"error":{"code":"bad_request","message":"bad request: api_key is required"}}"#,
+        ),
+    ),
+    (
+        "400 envelope with another code",
+        (
+            400,
+            r#"{"error":{"code":"validation_error","message":"bad request"}}"#,
+        ),
+    ),
+    (
+        "400 envelope with details",
+        (
+            400,
+            r#"{"error":{"code":"bad_request","message":"bad request","details":[]}}"#,
+        ),
+    ),
+    (
+        "400 envelope with conflict",
+        (
+            400,
+            r#"{"error":{"code":"bad_request","message":"bad request","conflict":{"expected":1,"current":2}}}"#,
+        ),
+    ),
+    (
+        "400 envelope with a sibling key",
+        (
+            400,
+            r#"{"error":{"code":"bad_request","message":"bad request"},"hint":"x"}"#,
+        ),
+    ),
+    ("400 with the rejected envelope", (400, REJECTED)),
+    ("403 with the accepted envelope", (403, ACCEPTED)),
+    (
+        "403 envelope with another message",
+        (
+            403,
+            r#"{"error":{"code":"forbidden","message":"forbidden"}}"#,
+        ),
+    ),
+    (
+        "403 envelope with another code",
+        (
+            403,
+            r#"{"error":{"code":"auth_error","message":"cross-origin request rejected"}}"#,
+        ),
+    ),
+    ("403 with another body", (403, r#"{"error":"forbidden"}"#)),
+    ("403 as plain text", (403, "cross-origin request rejected")),
+    ("401 with the accepted envelope", (401, ACCEPTED)),
+];
+
 /// Something that answers the right statuses with other bodies is not
 /// taken for `trawl-web`; one whose health answer is not `ok` is not
 /// probed further.
 #[test]
 fn doctor_web_foreign_endpoint() {
-    for (case, login) in [
-        (
-            "400 with another body",
-            (400, r#"{"error":"bad request: api_key is required"}"#),
-        ),
-        (
-            "400 with extra keys",
-            (400, r#"{"error":"bad request","hint":"x"}"#),
-        ),
-        ("403 with another body", (403, r#"{"error":"forbidden"}"#)),
-        ("403 as plain text", (403, "cross-origin request rejected")),
-    ] {
+    for &(case, login) in FOREIGN_LOGINS {
         let web = Origin::stub((200, "ok"), login);
         let (output, report) = doctor(&web.url);
         assert_api_failed_independently(&report, case);
@@ -413,10 +480,7 @@ fn doctor_web_foreign_endpoint() {
         assert_eq!(web.keyless_requests(case), PROBES, "{case}");
     }
 
-    let web = Origin::stub(
-        (200, r#"{"status":"ok"}"#),
-        (400, r#"{"error":"bad request"}"#),
-    );
+    let web = Origin::stub((200, r#"{"status":"ok"}"#), (400, ACCEPTED));
     let (output, report) = doctor(&web.url);
     assert_api_failed_independently(&report, "foreign health");
     assert_eq!(
@@ -446,12 +510,8 @@ fn doctor_web_foreign_endpoint() {
 #[test]
 fn doctor_web_truncated_body_is_too_large() {
     for (case, status, signature) in [
-        ("accepted signature", 400, r#"{"error":"bad request"}"#),
-        (
-            "rejected signature",
-            403,
-            r#"{"error":"cross-origin request rejected"}"#,
-        ),
+        ("accepted signature", 400, ACCEPTED),
+        ("rejected signature", 403, REJECTED),
     ] {
         let mut body = signature.to_owned();
         body.push_str(&" ".repeat(trawl_client::OriginProbe::BODY_CAP - signature.len()));
@@ -617,7 +677,7 @@ fn doctor_web_body_cut_short_is_broken() {
 /// `not_sampled` with `rate_limited`, and `web.origin` is not sent.
 #[test]
 fn doctor_web_health_rate_limited() {
-    let web = Origin::stub((429, "slow down"), (400, r#"{"error":"bad request"}"#));
+    let web = Origin::stub((429, "slow down"), (400, ACCEPTED));
     let (output, report) = doctor(&web.url);
     assert_api_failed_independently(&report, "rate limited");
     assert_eq!(

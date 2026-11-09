@@ -141,6 +141,7 @@ pub fn HistoryPage() -> impl IntoView {
             if generation.try_get_untracked() != Some(token)
                 || location.search.get_untracked() != raw
                 || location.pathname.get_untracked() != "/search/history"
+                || crate::auth_return::leaves_for_sign_in(&response)
             {
                 return;
             }

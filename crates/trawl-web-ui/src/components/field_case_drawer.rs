@@ -40,7 +40,6 @@ use trawl_api::{CatalogConflictRow, CatalogFieldResponse, DegradedVerdict, Repin
 use trawl_core::sanitize::sanitize_display_text;
 
 use crate::api;
-use crate::api::ApiError;
 use crate::components::repin_modal::RepinModal;
 use crate::repin_flow::{
     PollAction, ProbedJob, REPIN_POLL_MS, StatusProbe, accepted_ceilings, claim_toast, poll_decide,
@@ -113,13 +112,22 @@ pub fn FieldCaseDrawer(
     on_close: Callback<()>,
 ) -> impl IntoView {
     // Page one. `reload` re-runs the fetcher, which is how the inline
-    // retry recovers from a 503 or a dropped connection.
+    // retry recovers from a 503 or a dropped connection. It is also the
+    // read's generation: a reload retires the read in flight, and a
+    // disposed drawer reads as none, so only the newest read of a living
+    // drawer can send the page to sign-in.
     let reload = RwSignal::new(0_u32);
     let field_for_page_one = field.clone();
     let detail = LocalResource::new(move || {
         let field = field_for_page_one.clone();
-        let _ = reload.get();
-        async move { api::catalog_field(&field, None, SERVICES_PAGE).await }
+        let asked = reload.get();
+        async move {
+            let answer = api::catalog_field(&field, None, SERVICES_PAGE).await;
+            if reload.try_get_untracked() == Some(asked) {
+                crate::auth_return::leaves_for_sign_in(&answer);
+            }
+            answer
+        }
     });
 
     // Paged "services carrying this field". Seeded from page one, so a
@@ -149,8 +157,20 @@ pub fn FieldCaseDrawer(
         more_busy.set(true);
         more_error.set(None);
         let field = field_for_more.clone();
+        // A later page belongs to the page one on screen and the cursor
+        // it handed out. A reload, or a closed drawer, retires it.
+        let asked = reload.get_untracked();
         spawn_local(async move {
-            match api::catalog_field(&field, Some(&after), SERVICES_PAGE).await {
+            let answer = api::catalog_field(&field, Some(&after), SERVICES_PAGE).await;
+            // A disposed drawer's signals read as `None` and drop writes.
+            let _ = more_busy.try_set(false);
+            if reload.try_get_untracked() != Some(asked)
+                || cursor.try_get_untracked().flatten().as_deref() != Some(after.as_str())
+                || crate::auth_return::leaves_for_sign_in(&answer)
+            {
+                return;
+            }
+            match answer {
                 Ok(resp) => {
                     let next = resp.services_cursor;
                     services.update(|rows| {
@@ -168,7 +188,6 @@ pub fn FieldCaseDrawer(
                 // reported inline and the button is the retry.
                 Err(e) => more_error.set(Some(e.to_string())),
             }
-            more_busy.set(false);
         });
     });
 
@@ -307,6 +326,15 @@ pub fn FieldCaseDrawer(
                 return;
             }
             poll_in_flight.set(false);
+            // A 401 may send the page to sign-in only while this is still
+            // the job the drawer follows; the poll ends with the page. A
+            // declined 401 counts as a failed read below.
+            if tracked_job_id.get_untracked() == Some(tracked)
+                && crate::auth_return::leaves_for_sign_in(&result)
+            {
+                stop_poll();
+                return;
+            }
             let (probe, row) = match result {
                 Ok(Some(j)) => (StatusProbe::Job(ProbedJob::from(&j)), Some(j)),
                 // The route's 404: it holds no job with that id.
@@ -383,6 +411,11 @@ pub fn FieldCaseDrawer(
                 return;
             }
             status_probing.set(false);
+            // One probe runs at a time, so a living drawer's answer is the
+            // current one. A declined 401 is a failed read below.
+            if crate::auth_return::leaves_for_sign_in(&result) {
+                return;
+            }
             let Ok(status) = result else {
                 if announce {
                     recheck_note.set(Some(STATUS_RECHECK_FAILED.to_string()));
@@ -542,12 +575,13 @@ pub fn FieldCaseDrawer(
                 state=Signal::derive(move || {
                     LoadState::from_resource_with_missing(
                         detail.get(),
-                        |e| matches!(e, ApiError::Status(404)),
-                        |e| match e {
-                            ApiError::Status(503) => {
+                        |e| e.http_status() == Some(404),
+                        |e| {
+                            if e.http_status() == Some(503) {
                                 "the catalog store is unavailable".to_string()
+                            } else {
+                                e.to_string()
                             }
-                            other => other.to_string(),
                         },
                     )
                 })

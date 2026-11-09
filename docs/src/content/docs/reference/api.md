@@ -76,6 +76,7 @@ Every error that trawld itself produces has this body:
 | `validation_error` | 400 | The DSL parses but fails semantic checks: unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
 | `result_too_large` | 400 | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at a cap. The message names the cap and its limit. See [stream live events](#stream-live-events) for the caps. A capture also answers it when a whole result does not fit the capture's caps. See [shapes and caps](#shapes-and-caps) |
 | `bad_request` | 400 | Malformed input. Also the code on a 409 that has no code of its own. |
+| `invalid_name` | 400 | A saved query's `name` is blank or contains control or unsafe invisible formatting characters |
 | `capture_source_too_large` | 400 | A capture's window selects more stored data than `[capture] source_max_bytes`. Nothing was scanned. Narrow the window. See [admission](#admission-and-quotas) |
 | `focus_incomplete` | 400 | A [context read](#read-the-rows-around-a-captured-row)'s focus row has no usable `_time`, or no text value for a key its scope names. The read is never widened |
 | `focus_ambiguous` | 400 | A context read's focus capture has two columns of a name the read needs |
@@ -89,6 +90,7 @@ Every error that trawld itself produces has this body:
 | `auth_error` | 401 | Authentication failed |
 | `forbidden` | 403 | The key lacks a permission |
 | `not_found` | 404 | No such resource, or the key does not own it. The response does not say which. |
+| `duplicate_name` | 409 | The key already has a saved query with that name |
 | `result_unavailable` | 409 | A captured result's record exists, but its file is missing. See [captured result outcomes](#captured-result-outcomes) |
 | `sequence_conflict` | 409 | An overwrite of an investigation carried an `expected_seq` that is no longer its `seq`. The envelope's `conflict` member holds `expected` and `current`. See [investigations](#investigations) |
 | `investigation_exists` | 409 | A create named an investigation id that exists with another creator or other fields |
@@ -3400,8 +3402,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 |--------|------|------|
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Semantic check failed |
-| 400 | `bad_request` | `name` is blank or contains control or unsafe invisible formatting characters |
-| 409 | `bad_request` | The key already has a saved query with that name |
+| 400 | `invalid_name` | `name` is blank or contains control or unsafe invisible formatting characters |
+| 409 | `duplicate_name` | The key already has a saved query with that name |
 
 ### Update a saved query
 
@@ -3437,9 +3439,10 @@ The updated saved query, in the shape [create a saved query](#create-a-saved-que
 |--------|------|------|
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Semantic check failed |
-| 400 | `bad_request` | Invalid name, or the new text conflicts with the schedule window. The window message names both sides. |
+| 400 | `invalid_name` | `name` is blank or contains control or unsafe invisible formatting characters |
+| 400 | `bad_request` | The new text conflicts with the schedule window. The window message names both sides. |
 | 404 | `not_found` | No saved query with this id belongs to the key |
-| 409 | `bad_request` | The new name is taken |
+| 409 | `duplicate_name` | The new name is taken |
 
 ### Delete a saved query
 
