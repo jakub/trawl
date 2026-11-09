@@ -290,7 +290,7 @@ Which pin applies follows the pipeline, not a flat name lookup.
 
 Inside one `let`, a reference to a sibling target resolves the way the SQL does: an existing column of that name wins, so `let a = 1, b = a` gives `b` the original `a`, and only a name the row does not carry reads the sibling's fresh value, so `let ms = 1000, total = ms * 2` gives `total = 2000`. Pins stay pre-stage, so `let a = status, b = a` gives `b` no pin.
 
-Timestamps in the kv batch tail compare as stored instants and shift to your display timezone last. The shift follows the tail's lineage, so `rename _time as t` and the bare alias `let t2 = _time` render in your zone, while a computed value such as `let t = coalesce(_time, x)` and every aggregate output render as UTC text.
+Timestamps in the kv batch tail compare as stored instants. The result carries them in UTC, and the client shows every `timestamp` column in your display zone. `rename _time as t`, the bare alias `let t2 = _time`, a computed value such as `let t = coalesce(_time, x)`, and an aggregate such as `max(_time)` all show in your zone. A timestamp the tail computes inside a `mixed` column is tagged `string`, so it shows as UTC text.
 
 ### The two namespaces
 
@@ -1055,7 +1055,7 @@ A condition with no reading has no answer, and the lanes part as they do for an 
 - The `last=` window in a batch query evaluates on DuckDB's statement clock, a separate clock from `now()`, and the gap between the two reads is unbounded.
 - Wall-clock sampling carries no monotonic guarantee, so an NTP step backward can put a later event's instant before an earlier one's.
 - An SSE reconnect is a new subscription with a fresh clock, and nothing carries across it.
-- `strftime(now(), ...)` and `tostring(now())` return text. The display timezone offset applies to TIMESTAMP result cells only, and a value the kv batch tail computed renders as UTC text.
+- `strftime(now(), ...)` and `tostring(now())` return text. The display zone applies to `timestamp` result cells only, so text stays as the function wrote it.
 
 ### JSON functions
 

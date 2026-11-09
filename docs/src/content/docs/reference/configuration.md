@@ -1133,12 +1133,19 @@ ca_cert = "~/.config/trawl/dev-ca.pem"
 | `enable_mouse` | bool | `true` | Mouse support in the TUI |
 | `auto_save_history` | bool | `true` | Save query history automatically |
 | `tab_width` | integer | `2` | Editor tab width in spaces |
-| `timezone` | string | `"local"` | Timestamp display: `"local"`, `"UTC"`, or a fixed offset such as `"+05:30"` |
+| `timezone` | string | `"local"` | The display zone: the zone in which the CLI, the TUI, and `trawl mcp`'s `orient` show instants. `"local"`, `"UTC"`, or a fixed offset such as `"+05:30"` |
 
 ```toml
 [ui]
 timezone = "UTC"
 ```
+
+- `local` is the zone of the machine that runs the client, not the zone of the trawld host. The client reads the offset at each instant, so it follows daylight saving time, and each printed instant carries its own offset. On a Berlin autumn night, `2026-10-25T00:30:00Z` prints as `2026-10-25 02:30:00 +02:00`, and `2026-10-25T01:30:00Z` prints as `2026-10-25 02:30:00 +01:00`.
+- `UTC` and `local` match in any case. A fixed offset is exactly `+HH:MM` or `-HH:MM`: two digits each, hours `00` to `23`, and minutes `00` to `59`. IANA names such as `Europe/Berlin` are not accepted here, unlike the `[syslog]` zones of `trawld.toml`.
+- trawld answers in UTC, and the client converts. Only cells of `timestamp` columns convert, inside lists too. Text that looks like a time stays as it was written.
+- `trawl query --format json` and `--format csv` write timestamps in the display zone. `trawl query --format parquet` and `POST /api/v1/export` write UTC.
+- When `local` cannot represent an instant, the table and the TUI print its UTC text with a `not converted` marker. JSON and CSV output write that instant as UTC text with its `Z`.
+- An invalid value is a usage error. `trawl query` reports it before it sends a request, `trawl` before the TUI starts, and `trawl mcp` before it serves. `trawl query --format parquet` and the commands that print no timestamps do not check it.
 
 ### `[tail]`
 

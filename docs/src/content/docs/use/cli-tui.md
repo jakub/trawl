@@ -61,8 +61,11 @@ With no subcommand, `trawl` opens the terminal UI. From its help screen:
 | Ctrl+Q | Quit |
 
 A key acts on whatever has focus, so press Esc to close a panel before a
-shortcut reaches the results. Mouse, theme, and timezone are `[ui]` settings
-in [client configuration](/reference/configuration/).
+shortcut reaches the results. Mouse, theme, and display zone are `[ui]`
+settings in [client configuration](/reference/configuration/#ui). By default,
+the TUI and `trawl query` show each instant in the zone of the machine that
+runs them, with that instant's own offset, whatever zone the trawld host
+uses.
 
 ## Tell a result from the editor
 

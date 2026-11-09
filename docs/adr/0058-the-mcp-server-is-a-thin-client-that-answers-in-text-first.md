@@ -54,3 +54,7 @@ Building #309 settled what the decision left open about `context`, `sightings` a
 ## Amendment: the correlation tools attach as `search` does, 2026-10-26
 
 `context`, `sightings` and `compare` take the flat optional `investigation` and `purpose` inputs that `search` takes, `purpose` only beside `investigation`, and attach as `search` does (ADR-0059, amended for #309): an attached call records a step, keeps its result, and prints the investigation's activity since the session's `seen_seq`. The follow-up searches that an attached `sightings` reply proposes carry the investigation id, not the purpose.
+
+## Amendment: `orient` uses trawl-api's display zone, 2026-11-08
+
+The display zone grammar, and the presenter that `orient` uses for the time now in the display zone, are trawl-api's (`trawl_api::zone`), as ADR-0051's amendment of this date records. `trawl mcp` parses `ui.timezone` once, before it serves, and `orient` has no parser or UTC fallback of its own. Captured rows stay in UTC.
