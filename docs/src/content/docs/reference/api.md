@@ -435,7 +435,7 @@ Permission: `export`
 
 Runs a query and returns the rows as a file. Timestamps are UTC. The row cap is `[server] max_export_rows` (`1000000`) instead of `max_result_rows`. Rows past the cap are dropped; the export is not refused.
 
-An export is tracked like a query. While it runs, [`GET /api/v1/queries`](#active-recent-and-retained-work) lists it, and the key that submitted it or a `server_manage` key can [cancel it](#cancel-a-running-query). Each export adds one to `total_queries` in [server stats](#server-stats). A request refused for its `format` or a malformed body is not counted. Each export that answers adds one to `trawl_queries_total` under its `status`: `success`, `error`, or `timeout`.
+An export is tracked like a query. While it runs, [`GET /api/v1/queries`](#active-recent-and-retained-work) lists it. The key that submitted it can [cancel it](#cancel-a-running-query) if that key holds `query_cancel`. A `server_manage` key can cancel any export. Each export adds one to `total_queries` in [server stats](#server-stats). A request refused for its `format` or a malformed body is not counted. Each export that answers adds one to `trawl_queries_total` under its `status`: `success`, `error`, or `timeout`.
 
 A successful export writes one [query history](#query-history) row for its key. The row count in that row and in the export's `recent` entry is the number of data rows in the file, after `limit` and the row cap. A CSV header is not a row. The history write never fails an export. If the history store fails or does not answer before the export's deadline, the export still answers with its file, and the row can be missing.
 
