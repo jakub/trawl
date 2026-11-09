@@ -212,7 +212,9 @@ pub fn kept_as(code: &ErrorCode) -> Kept {
         | ErrorCode::SequenceConflict
         | ErrorCode::InvestigationExists
         | ErrorCode::InvestigationClosed
-        | ErrorCode::EvidenceBudgetExceeded => Kept::Summary,
+        | ErrorCode::EvidenceBudgetExceeded
+        | ErrorCode::InvalidName
+        | ErrorCode::DuplicateName => Kept::Summary,
     }
 }
 
@@ -268,7 +270,7 @@ mod tests {
     /// Every wire code, spelled out. The match in `kept_as` has no
     /// wildcard, so a new code already fails to compile there; this list
     /// makes the test say how each existing code is kept.
-    const EVERY_CODE: [(ErrorCode, Kept); 32] = [
+    const EVERY_CODE: [(ErrorCode, Kept); 38] = [
         (ErrorCode::ParseError, Kept::Query),
         (ErrorCode::ValidationError, Kept::Query),
         (ErrorCode::ExecutionError, Kept::Summary),
@@ -297,10 +299,16 @@ mod tests {
         (ErrorCode::CaptureBusy, Kept::Summary),
         (ErrorCode::CaptureQuotaExceeded, Kept::Summary),
         (ErrorCode::CaptureSourceTooLarge, Kept::Summary),
+        (ErrorCode::FocusIncomplete, Kept::Summary),
+        (ErrorCode::FocusAmbiguous, Kept::Summary),
+        (ErrorCode::WindowsOverlap, Kept::Summary),
+        (ErrorCode::CorrelationInvalid, Kept::Summary),
         (ErrorCode::SequenceConflict, Kept::Summary),
         (ErrorCode::InvestigationExists, Kept::Summary),
         (ErrorCode::InvestigationClosed, Kept::Summary),
         (ErrorCode::EvidenceBudgetExceeded, Kept::Summary),
+        (ErrorCode::InvalidName, Kept::Summary),
+        (ErrorCode::DuplicateName, Kept::Summary),
     ];
 
     #[test]
