@@ -83,6 +83,10 @@ pub mod row;
 /// that would rewrite or hide a terminal line.
 pub mod sanitize;
 
+/// Terminal text cut, padded and caret-marked in display cells, always
+/// over sanitized text.
+pub mod text_layout;
+
 /// The declared event envelope: field names, the sealed `_` namespace
 /// predicate, and the catalog type vocabulary.
 pub mod schema;
