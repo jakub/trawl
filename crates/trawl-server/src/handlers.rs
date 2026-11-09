@@ -3331,6 +3331,10 @@ pub async fn get_report_run(
 
 /// `POST /api/v1/export` — export query results as CSV, JSON, or Parquet.
 ///
+/// Tracked like a query: listed in `/queries` while it runs, cancellable
+/// there, counted in `total_queries` and `trawl_queries_total`, and
+/// recorded in recent and query history with the rows its body holds.
+///
 /// Bypasses `max_result_rows` in favor of `max_export_rows` to support larger downloads.
 /// Every format keeps the first `limit` rows (the request's, clamped to
 /// `max_export_rows`) and drops the rest rather than refusing the export.
@@ -3350,6 +3354,12 @@ pub async fn export(
     let deadline =
         crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
 
+    // Counted once shaped, as a query is: refused DSL counts, a malformed
+    // request does not.
+    state
+        .total_queries
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let format = params.format.unwrap_or(trawl_api::ExportFormat::Csv);
 
     let max_export_rows = state.query.max_export_rows;
@@ -3359,6 +3369,15 @@ pub async fn export(
     // so the events correlate without carrying the query text.
     let query_id = state.query.pool.allocate_query_id();
     crate::transport::failure::record_query_id(query_id);
+    // Listed under that id like a query, so `DELETE /queries/{id}` reaches
+    // it. `refused` or the ready body takes the entry and closes it once;
+    // left in place when the transport drops this future at an await, it
+    // closes as abandoned. A mutex, not a cell: `refused` lives across
+    // awaits, and the handler's future must stay `Send`.
+    let tracked = parking_lot::Mutex::new(Some(
+        state.query.tracker.start(query_id, &verified, &req.query),
+    ));
+    let tracked_at = std::time::Instant::now();
 
     tracing::info!(
         event_type = "export_start",
@@ -3392,9 +3411,16 @@ pub async fn export(
     );
     // Every early return writes the account with the error it returns;
     // an account the pool already wrote (a timeout, a capacity refusal)
-    // stays as the pool wrote it.
+    // stays as the pool wrote it. It closes the tracker entry with that
+    // error too.
     let refused = |e: ServerError| {
-        timing.emit_complete(Outcome::of_error(&e), std::time::Instant::now());
+        let end = std::time::Instant::now();
+        timing.emit_complete(Outcome::of_error(&e), end);
+        close_failed_export(
+            tracked.lock().take(),
+            &e,
+            end.saturating_duration_since(tracked_at),
+        );
         e
     };
 
@@ -3412,7 +3438,7 @@ pub async fn export(
     // Parquet export uses DuckDB's native COPY TO — no need to materialize
     // the result set in memory.
     if format == trawl_api::ExportFormat::Parquet {
-        let bytes = state
+        let (bytes, rows) = state
             .query
             .pool
             .export_parquet(
@@ -3428,7 +3454,10 @@ pub async fn export(
             .map_err(refused)?;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         // The readback, this format's render, ran inside the worker.
-        timing.emit_complete(Outcome::Success, std::time::Instant::now());
+        let ready = std::time::Instant::now();
+        timing.emit_complete(Outcome::Success, ready);
+        let took = ready.saturating_duration_since(tracked_at);
+        close_ready_export(tracked.lock().take(), rows, took);
 
         tracing::info!(
             event_type = "export_complete",
@@ -3440,6 +3469,17 @@ pub async fn export(
             duration_ms,
             "parquet export complete"
         );
+
+        record_export_history(
+            &state,
+            deadline,
+            verified.id,
+            query_id,
+            &req.query,
+            took,
+            rows,
+        )
+        .await;
 
         return Ok((
             [
@@ -3524,7 +3564,12 @@ pub async fn export(
             )));
         }
     };
-    timing.emit_complete(Outcome::Success, std::time::Instant::now());
+    let ready = std::time::Instant::now();
+    timing.emit_complete(Outcome::Success, ready);
+    let took = ready.saturating_duration_since(tracked_at);
+    // The body's data rows, after the cut at `limit` (a kv tail's groups).
+    let rows = result.row_count();
+    close_ready_export(tracked.lock().take(), rows, took);
 
     tracing::info!(
         event_type = "export_complete",
@@ -3532,7 +3577,7 @@ pub async fn export(
         query_id,
         query_len = req.query.len(),
         %format,
-        rows = result.row_count(),
+        rows,
         bytes = body.len(),
         duration_ms,
         "export complete"
@@ -3549,6 +3594,17 @@ pub async fn export(
         None,
     );
 
+    record_export_history(
+        &state,
+        deadline,
+        verified.id,
+        query_id,
+        &req.query,
+        took,
+        rows,
+    )
+    .await;
+
     Ok((
         [
             (header::CONTENT_TYPE, content_type),
@@ -3556,6 +3612,95 @@ pub async fn export(
         ],
         body,
     ))
+}
+
+/// Close a failed export's tracker entry and count its outcome, as `/query`
+/// does: a timeout as one, anything else as an error under its public
+/// message (ADR-0040). An entry already closed counts nothing.
+fn close_failed_export(
+    tracked: Option<crate::tracker::Tracked>,
+    error: &ServerError,
+    took: std::time::Duration,
+) {
+    let Some(tracked) = tracked else {
+        return;
+    };
+    let status = if matches!(error, ServerError::Timeout) {
+        tracked.timeout();
+        "timeout"
+    } else {
+        tracked.fail(&error.safe_message());
+        "error"
+    };
+    metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => status).increment(1);
+    metrics::histogram!(crate::metrics::QUERY_DURATION).record(took.as_secs_f64());
+}
+
+/// Close a ready export's tracker entry and count its success. The caller
+/// does this before any await: once the body exists the export succeeded,
+/// even if its caller leaves while the history row is written.
+fn close_ready_export(
+    tracked: Option<crate::tracker::Tracked>,
+    rows: usize,
+    took: std::time::Duration,
+) {
+    let Some(tracked) = tracked else {
+        return;
+    };
+    tracked.complete(rows);
+    metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "success").increment(1);
+    metrics::histogram!(crate::metrics::QUERY_DURATION).record(took.as_secs_f64());
+}
+
+/// Write a ready export's one best-effort history row under the request's
+/// own deadline (ADR-0024), so a wedged store neither delays nor fails a
+/// body already in hand. A write that fails or runs out of budget is
+/// logged with the store's error class alone (ADR-0040), never retried.
+async fn record_export_history(
+    state: &AppState,
+    deadline: crate::deadline::Deadline,
+    key_id: i64,
+    query_id: u64,
+    dsl: &str,
+    took: std::time::Duration,
+    rows: usize,
+) {
+    // `Deadline::run` polls its future once even at a passed deadline,
+    // which would start the write.
+    if deadline.expired() {
+        tracing::warn!(
+            event_type = "history_error",
+            key_id,
+            query_id,
+            "skipped the history write: the export's deadline passed with the body already in hand"
+        );
+        return;
+    }
+    let duration_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+    let recorded = deadline
+        .run(
+            state
+                .storage
+                .history
+                .record_query(key_id, dsl, duration_ms, rows, RunStatus::Success),
+        )
+        .await;
+    match recorded {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(
+            event_type = "history_error",
+            key_id,
+            query_id,
+            error_class = error.class(),
+            "failed to record export in history store"
+        ),
+        Err(crate::deadline::Expired) => tracing::warn!(
+            event_type = "history_error",
+            key_id,
+            query_id,
+            "abandoned the history write: the export's deadline passed with the body already in hand"
+        ),
+    }
 }
 
 /// Query parameters for the export endpoint.

@@ -197,11 +197,16 @@ mod telemetry {
 
     /// The event types the timing capture keeps: everything else the
     /// server logs would only grow its buffer.
-    const TIMING_EVENTS: [&str; 3] = ["query_timing", "query_permit_reclaimed", "export_complete"];
+    const TIMING_EVENTS: [&str; 4] = [
+        "query_timing",
+        "query_permit_reclaimed",
+        "export_complete",
+        "history_error",
+    ];
 
     /// One kept event, its fields as JSON values: an integer field is a
     /// JSON number, so a test can tell "recorded as an integer" apart
-    /// from a stringified number.
+    /// from a stringified number. `level` is the event's level.
     pub type Fields = BTreeMap<String, serde_json::Value>;
 
     /// Keeps [`TIMING_EVENTS`], recorded by their own value types.
@@ -268,6 +273,7 @@ mod telemetry {
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|t| TIMING_EVENTS.contains(&t));
             if kept {
+                fields.insert("level".to_owned(), event.metadata().level().as_str().into());
                 self.events.lock().unwrap().push(fields);
             }
         }
@@ -3409,6 +3415,992 @@ async fn export_is_capped_by_max_export_rows_not_max_result_rows() {
             "a kv tail reading past max_export_rows is refused, not cut",
         );
     }
+}
+
+// -- exports are tracked, counted and recorded like queries -------------------
+
+/// Every export format, in the order the export tests walk them.
+const EXPORT_FORMATS: [trawl_api::ExportFormat; 3] = [
+    trawl_api::ExportFormat::Csv,
+    trawl_api::ExportFormat::Json,
+    trawl_api::ExportFormat::Parquet,
+];
+
+/// Rows in an export body of `format`.
+fn export_rows(format: &trawl_api::ExportFormat, body: &[u8]) -> usize {
+    match format {
+        trawl_api::ExportFormat::Csv => csv_rows(body),
+        trawl_api::ExportFormat::Json => ndjson_rows(body),
+        trawl_api::ExportFormat::Parquet => parquet_rows(body),
+    }
+}
+
+/// Rate limits no polling loop trips.
+fn permissive() -> RateLimitConfig {
+    RateLimitConfig {
+        default_rpm: 1_000_000,
+        ..RateLimitConfig::default()
+    }
+}
+
+/// `TEST_QUERY_DELAY_MS`, set while this lives: every pool worker in the
+/// process sleeps that long past its work start. Dropping it clears the
+/// delay, so a test that fails mid-hold leaves nothing set.
+#[derive(Debug)]
+struct QueryDelay;
+
+impl QueryDelay {
+    fn hold(ms: u64) -> Self {
+        trawl_server::pool::TEST_QUERY_DELAY_MS.store(ms, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for QueryDelay {
+    fn drop(&mut self) {
+        trawl_server::pool::TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The status and envelope of a request the server refused.
+fn refused_with<T: std::fmt::Debug>(
+    result: Result<T, trawl_client::ClientError>,
+    what: &str,
+) -> (u16, trawl_api::ErrorEnvelope) {
+    match result {
+        Err(trawl_client::ClientError::Server { status, error, .. }) => (status, error),
+        other => panic!("{what}: expected a refusal, got {other:?}"),
+    }
+}
+
+/// Poll `client`'s `GET /queries` until an answer satisfies `ready`, and
+/// return that answer.
+async fn queries_until(
+    client: &HttpClient,
+    what: &str,
+    ready: impl Fn(&trawl_api::QueriesResponse) -> bool,
+) -> trawl_api::QueriesResponse {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let seen = client.queries().await.expect("list the queries");
+            if ready(&seen) {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for: {what}"))
+}
+
+/// Ask `client` to cancel `id` until the pool reports it cancelled: a
+/// cancel that lands before the pool registers the work is a no-op.
+async fn cancel_until_cancelled(client: &HttpClient, id: u64) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !client
+            .cancel_query(id)
+            .await
+            .expect("this key may cancel the export")
+            .cancelled
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("export {id} was never cancelled"));
+}
+
+/// The outcomes `server`'s tracker holds for `dsl`, newest first.
+fn recent_of(server: &common::TestServer, dsl: &str) -> Vec<trawl_api::CompletedQuerySnapshot> {
+    server
+        .state
+        .query
+        .tracker
+        .recent()
+        .into_iter()
+        .filter(|q| q.query == dsl)
+        .collect()
+}
+
+/// The newest outcome for `dsl`, asserting it is the only one recorded
+/// since the tracker held `before` of them, and that its id is no longer
+/// active.
+fn one_more_outcome(
+    server: &common::TestServer,
+    dsl: &str,
+    before: usize,
+    what: &str,
+) -> trawl_api::CompletedQuerySnapshot {
+    let outcomes = recent_of(server, dsl);
+    assert_eq!(
+        outcomes.len(),
+        before + 1,
+        "{what}: one outcome: {outcomes:?}"
+    );
+    let newest = outcomes.into_iter().next().expect("newest first");
+    assert!(
+        !server
+            .state
+            .query
+            .tracker
+            .active()
+            .iter()
+            .any(|q| q.id == newest.id),
+        "{what}: closed, so no longer active"
+    );
+    newest
+}
+
+/// How many outcomes `server`'s tracker holds for the query id `id`.
+fn outcomes_of(server: &common::TestServer, id: u64) -> usize {
+    server
+        .state
+        .query
+        .tracker
+        .recent()
+        .iter()
+        .filter(|q| q.id == id)
+        .count()
+}
+
+/// Wait until `server`'s pool holds no permit and retains no work.
+async fn pool_idle(server: &common::TestServer) {
+    let pool = &server.state.query.pool;
+    until("the pool gave every permit back", || {
+        pool.retained() == 0 && pool.available_permits() == pool.capacity()
+    })
+    .await;
+}
+
+/// Rows in `server`'s `query_history`, every key's.
+async fn history_rows(server: &common::TestServer) -> i64 {
+    use sqlx::Connection as _;
+
+    let mut db = sqlx::PgConnection::connect(&server.app_db_url)
+        .await
+        .expect("connect to the app database");
+    sqlx::query_scalar("SELECT count(*) FROM query_history")
+        .fetch_one(&mut db)
+        .await
+        .expect("count the history rows")
+}
+
+/// The process's query outcome metrics: `trawl_queries_total` by status and
+/// the observation count of `trawl_query_duration_seconds`. A series not
+/// rendered yet reads 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Outcomes {
+    success: u64,
+    error: u64,
+    timeout: u64,
+    observed: u64,
+}
+
+impl Outcomes {
+    /// Scraped off `server`'s `/metrics`.
+    async fn scrape(server: &common::TestServer) -> Self {
+        let body = raw_client()
+            .get(format!("{}/metrics", server.url))
+            .send()
+            .await
+            .expect("scrape /metrics")
+            .text()
+            .await
+            .expect("a metrics body");
+        let mut outcomes = Self::default();
+        let value = |line: &str| -> u64 {
+            let (_, value) = line.rsplit_once(' ').expect("a sample line");
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("a whole count: {line}"))
+        };
+        for line in body.lines() {
+            if line.starts_with("trawl_queries_total{") {
+                for (status, slot) in [
+                    ("success", &mut outcomes.success),
+                    ("error", &mut outcomes.error),
+                    ("timeout", &mut outcomes.timeout),
+                ] {
+                    if line.contains(&format!("status=\"{status}\"")) {
+                        *slot += value(line);
+                    }
+                }
+            } else if line.starts_with("trawl_query_duration_seconds_count ") {
+                outcomes.observed += value(line);
+            }
+        }
+        outcomes
+    }
+
+    fn since(self, before: Self) -> Self {
+        Self {
+            success: self.success - before.success,
+            error: self.error - before.error,
+            timeout: self.timeout - before.timeout,
+            observed: self.observed - before.observed,
+        }
+    }
+}
+
+/// A running export is listed in `GET /api/v1/queries` like a query: once,
+/// under its submitter's name, with its text, owned by its submitter and by
+/// no one else. It leaves `active` when it answers, and `recent` holds it
+/// once, with the rows its body holds.
+///
+/// This server's pool parks each export's worker at its work start until
+/// both lists are read, so no export can answer first however slow the
+/// runner; `TEST_QUERY_DELAY_MS` then holds each one past the release.
+/// Three exports on a two-permit pool also list the one still waiting for
+/// a permit: the listing starts before the pool does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_export_is_listed() {
+    use trawl_server::pool::seam::Seam;
+
+    let server = setup_with_rate_limit(permissive()).await;
+    // Dropped on every path, which releases every worker it parked.
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+    let key = store
+        .create_key(
+            "export-lister",
+            PrincipalKind::Service,
+            &roles(&["trawl-analyst"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let owner = HttpClient::new_insecure(&server.url, key.plaintext_token.as_str()).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    let exports: Vec<_> = EXPORT_FORMATS
+        .into_iter()
+        .enumerate()
+        .map(|(round, format)| (format!("service=nginx | head {}", 100 + round), format))
+        .collect();
+    let delay = QueryDelay::hold(3_000);
+    let running: Vec<_> = exports
+        .iter()
+        .map(|(dsl, format)| {
+            let owner = owner.clone();
+            let (dsl, format) = (dsl.clone(), format.clone());
+            tokio::spawn(async move { owner.export(&dsl, format, None).await })
+        })
+        .collect();
+
+    let listed = queries_until(&owner, "every running export is listed", |seen| {
+        exports
+            .iter()
+            .all(|(dsl, _)| seen.active.iter().any(|q| &q.snapshot.query == dsl))
+    })
+    .await;
+    let observed = admin.queries().await.unwrap();
+    let mut ids = Vec::new();
+    for (dsl, format) in &exports {
+        let mine: Vec<_> = listed
+            .active
+            .iter()
+            .filter(|q| &q.snapshot.query == dsl)
+            .collect();
+        assert_eq!(mine.len(), 1, "{format}: listed once: {:?}", listed.active);
+        assert_eq!(mine[0].snapshot.user, "export-lister", "{format}");
+        assert!(mine[0].own, "{format}: its submitter owns it");
+        let id = mine[0].snapshot.id;
+        let theirs: Vec<_> = observed
+            .active
+            .iter()
+            .filter(|q| q.snapshot.id == id)
+            .collect();
+        assert_eq!(theirs.len(), 1, "{format}: {:?}", observed.active);
+        assert_eq!(&theirs[0].snapshot.query, dsl, "{format}");
+        assert!(!theirs[0].own, "{format}: another key does not own it");
+        ids.push(id);
+    }
+    started.release();
+
+    let mut bodies = Vec::new();
+    for (run, (_, format)) in running.into_iter().zip(&exports) {
+        let body = run
+            .await
+            .expect("the export task joins")
+            .unwrap_or_else(|e| panic!("{format}: {e:?}"));
+        bodies.push(body);
+    }
+    drop(delay);
+
+    let seen = owner.queries().await.unwrap();
+    for (((dsl, format), body), id) in exports.iter().zip(&bodies).zip(ids) {
+        assert!(
+            !seen.active.iter().any(|q| q.snapshot.id == id),
+            "{format}: answered, so no longer active: {:?}",
+            seen.active
+        );
+        let done: Vec<_> = seen.recent.iter().filter(|q| q.snapshot.id == id).collect();
+        assert_eq!(done.len(), 1, "{format}: recorded once: {:?}", seen.recent);
+        assert_eq!(&done[0].snapshot.query, dsl, "{format}");
+        assert_eq!(done[0].snapshot.rows, Some(2), "{format}: both nginx rows");
+        assert_eq!(
+            done[0].snapshot.rows,
+            Some(export_rows(format, body)),
+            "{format}: the rows its body holds"
+        );
+        assert_eq!(done[0].snapshot.error, None, "{format}");
+        assert!(done[0].own, "{format}");
+    }
+}
+
+/// A listed export is cancelled the way a query is (ADR-0024): the key that
+/// submitted it, holding `query_cancel`, and a `server_manage` key can each
+/// cancel one; a key sharing the submitter's display name cannot; and a key
+/// holding only `export` can neither list exports nor cancel one, its own
+/// included. A cancelled export answers an error and closes its tracker
+/// entry once, with the message its caller read.
+///
+/// This server's pool parks each round's workers at their work start until
+/// both cancels land, so neither export can answer first however slow the
+/// runner; `TEST_QUERY_DELAY_MS` then holds each one past the release, as
+/// `cancel_query_isolated_by_key_id_not_name` holds a query. A cancel that
+/// lands before the pool registers the work is a no-op, so each cancel
+/// retries until the pool reports it.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // three formats, four keys, two cancels each
+async fn a_running_export_is_cancellable_by_its_owner() {
+    use trawl_server::pool::seam::Seam;
+
+    let server = setup_with_rate_limit(permissive()).await;
+    // Dropped on every path, which releases every worker it parked.
+    let seams = server.state.query.pool.seams();
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+    let twin = async || {
+        store
+            .create_key(
+                "twin",
+                PrincipalKind::Service,
+                &roles(&["trawl-analyst"]),
+                None,
+            )
+            .await
+    };
+    let key_a = twin().await.unwrap();
+    let key_b = twin().await.unwrap();
+    assert_ne!(key_a.info.id, key_b.info.id);
+    let a = HttpClient::new_insecure(&server.url, key_a.plaintext_token.as_str()).unwrap();
+    let b = HttpClient::new_insecure(&server.url, key_b.plaintext_token.as_str()).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+    let export_only = common::mint_key(&server.fleet_pool, "export-only", &["export"]).await;
+    let x = HttpClient::new_insecure(&server.url, &export_only.token).unwrap();
+
+    let _delay = QueryDelay::hold(3_000);
+    for (round, format) in EXPORT_FORMATS.into_iter().enumerate() {
+        // A's export, which A cancels, and X's, which the admin cancels.
+        let owned = format!("service=nginx | head {}", 300 + round);
+        let foreign = format!("service=nginx | head {}", 310 + round);
+        let started = seams.hold(Seam::Started);
+        let spawn = |client: &HttpClient, dsl: &str| {
+            let (client, dsl, format) = (client.clone(), dsl.to_owned(), format.clone());
+            tokio::spawn(async move { client.export(&dsl, format, None).await })
+        };
+        let owned_run = spawn(&a, &owned);
+        let foreign_run = spawn(&x, &foreign);
+
+        let listed = queries_until(&admin, "both exports are listed", |seen| {
+            [&owned, &foreign]
+                .iter()
+                .all(|dsl| seen.active.iter().any(|q| &&q.snapshot.query == dsl))
+        })
+        .await;
+        let id_of = |dsl: &str| {
+            listed
+                .active
+                .iter()
+                .find(|q| q.snapshot.query == dsl)
+                .expect("listed")
+                .snapshot
+                .id
+        };
+        let (owned_id, foreign_id) = (id_of(&owned), id_of(&foreign));
+
+        // The twin shares A's name and its `query_cancel`, not its key id.
+        let (status, error) = refused_with(b.cancel_query(owned_id).await, "the twin's cancel");
+        assert_eq!(status, 403, "{format}");
+        assert_eq!(error.message, "cannot cancel this query", "{format}");
+
+        // `export` alone grants neither the listing nor a cancel, not even
+        // of the key's own export.
+        let (status, error) = refused_with(x.queries().await, "the export-only listing");
+        assert_eq!(status, 403, "{format}");
+        assert_eq!(error.message, "insufficient permissions", "{format}");
+        for id in [owned_id, foreign_id] {
+            let (status, error) = refused_with(x.cancel_query(id).await, "the export-only cancel");
+            assert_eq!(status, 403, "{format}");
+            assert_eq!(error.message, "insufficient permissions", "{format}");
+        }
+
+        cancel_until_cancelled(&a, owned_id).await;
+        cancel_until_cancelled(&admin, foreign_id).await;
+        started.release();
+
+        for (run, id, dsl) in [
+            (owned_run, owned_id, &owned),
+            (foreign_run, foreign_id, &foreign),
+        ] {
+            let (_, error) = refused_with(
+                run.await.expect("the export task joins"),
+                "a cancelled export",
+            );
+            let closed: Vec<_> = server
+                .state
+                .query
+                .tracker
+                .recent()
+                .into_iter()
+                .filter(|q| q.id == id)
+                .collect();
+            assert_eq!(closed.len(), 1, "{format} {dsl}: closed once: {closed:?}");
+            assert_eq!(&closed[0].query, dsl, "{format}");
+            assert_eq!(
+                closed[0].error.as_deref(),
+                Some(error.message.as_str()),
+                "{format} {dsl}: recorded with the message its caller read"
+            );
+            assert!(
+                !closed[0].timed_out,
+                "{format} {dsl}: cancelled, not timed out"
+            );
+            assert_eq!(closed[0].rows, None, "{format} {dsl}");
+        }
+    }
+}
+
+/// A successful export records one recent success and one query history
+/// row for its own key, each with the rows its body holds after every limit
+/// and cap: an export that matched nothing, one cut by its own `limit`, and
+/// one cut by `max_export_rows`.
+#[tokio::test(flavor = "multi_thread")]
+async fn exports_record_counts_in_both_histories() {
+    let server = common::setup_with_row_caps(common::RowCaps {
+        max_result_rows: 5,
+        max_export_rows: 50,
+    })
+    .await;
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let records: Vec<_> = (0..60)
+        .map(|i| {
+            let service = if i < 20 {
+                "export-record-small"
+            } else {
+                "export-record-bulk"
+            };
+            serde_json::json!({"service": service, "host": "web01", "_time": now,
+                "message": format!("k=v{}", i % 3)})
+        })
+        .collect();
+    assert_eq!(ingest.ingest(&records).await.unwrap().accepted, 60);
+
+    let cases: [(&str, Option<usize>, usize); 3] = [
+        ("service=export-record-small zz_matches_nothing", None, 0),
+        ("service=export-record-small", Some(7), 7),
+        ("service=export-record-*", None, 50),
+    ];
+    for format in EXPORT_FORMATS {
+        for (dsl, limit, expected) in cases {
+            let what = format!("{format} {dsl:?} (limit {limit:?})");
+            let history_before = analyst.history(Some(1), None).await.unwrap().total;
+            let recent_before = recent_of(&server, dsl).len();
+
+            let body = analyst
+                .export(dsl, format.clone(), limit)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            let rows = export_rows(&format, &body);
+            assert_eq!(rows, expected, "{what}: the body");
+
+            let recent: Vec<_> = analyst
+                .queries()
+                .await
+                .unwrap()
+                .recent
+                .into_iter()
+                .filter(|q| q.snapshot.query == dsl)
+                .collect();
+            assert_eq!(recent.len(), recent_before + 1, "{what}: {recent:?}");
+            assert_eq!(recent[0].snapshot.rows, Some(rows), "{what}");
+            assert_eq!(recent[0].snapshot.error, None, "{what}");
+            assert!(recent[0].own, "{what}");
+
+            let history = analyst.history(Some(1), None).await.unwrap();
+            assert_eq!(history.total, history_before + 1, "{what}: one row");
+            assert_eq!(history.entries[0].query, dsl, "{what}");
+            assert_eq!(history.entries[0].row_count, rows, "{what}");
+            assert_eq!(
+                history.entries[0].status,
+                trawl_api::QueryStatus::Success,
+                "{what}"
+            );
+        }
+    }
+    assert_eq!(
+        admin.history(Some(1), None).await.unwrap().total,
+        0,
+        "history is the submitting key's alone"
+    );
+}
+
+/// Every way an export ends without a body closes its tracker entry
+/// exactly once, with the outcome its caller saw, and writes no query
+/// history row: a DSL refusal, an execution failure and a dropped caller on
+/// a server with the default budget, then a timeout and a capacity refusal
+/// on a one-permit server whose budget is one second.
+///
+/// The pool's `Started` seam holds the work that must still be running
+/// when its request ends. Nothing waits out a wall clock except the
+/// one-second budget that the timeout and the capacity refusal are about.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // five outcomes, three formats
+async fn export_outcomes_are_recorded_once() {
+    use trawl_server::pool::seam::Seam;
+
+    let server = setup().await;
+    let tracker = &server.state.query.tracker;
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    for format in EXPORT_FORMATS {
+        // Refused by the DSL check, before any pool work.
+        let dsl = "| | | zz_refused_export {{{";
+        let before = recent_of(&server, dsl).len();
+        let (status, error) = refused_with(
+            analyst.export(dsl, format.clone(), None).await,
+            "an unparseable export",
+        );
+        assert_eq!(status, 400, "{format}");
+        let closed = one_more_outcome(&server, dsl, before, &format!("{format} refusal"));
+        assert_eq!(closed.error.as_deref(), Some(error.message.as_str()));
+        assert!(!closed.timed_out, "{format}");
+        assert_eq!(closed.rows, None, "{format}");
+
+        // Admitted, then failed by the engine: no sum over text binds.
+        let dsl = "* | stats sum(host)";
+        let before = recent_of(&server, dsl).len();
+        let (status, error) = refused_with(
+            analyst.export(dsl, format.clone(), None).await,
+            "an export the engine fails",
+        );
+        assert_eq!(status, 500, "{format}: {error:?}");
+        assert_eq!(error.code, trawl_api::ErrorCode::ExecutionError, "{format}");
+        let closed = one_more_outcome(&server, dsl, before, &format!("{format} failure"));
+        assert_eq!(closed.error.as_deref(), Some(error.message.as_str()));
+        assert!(!closed.timed_out, "{format}");
+        assert_eq!(closed.rows, None, "{format}");
+
+        // A caller who walks away while the work runs.
+        let dsl = "service=nginx zz_dropped_export";
+        let seams = server.state.query.pool.seams();
+        let started = seams.hold(Seam::Started);
+        let before = recent_of(&server, dsl).len();
+        let dropped = {
+            let (analyst, format) = (analyst.clone(), format.clone());
+            tokio::spawn(async move { analyst.export(dsl, format, None).await })
+        };
+        until("the export's work started", || started.arrivals() == 1).await;
+        let id = tracker
+            .active()
+            .iter()
+            .find(|q| q.query == dsl)
+            .expect("the running export is tracked")
+            .id;
+        dropped.abort();
+        assert!(
+            dropped
+                .await
+                .expect_err("the request was aborted")
+                .is_cancelled(),
+            "{format}: the client future was dropped, not answered"
+        );
+        until("the dropped export recorded its outcome", || {
+            outcomes_of(&server, id) == 1
+        })
+        .await;
+        let closed = one_more_outcome(&server, dsl, before, &format!("{format} drop"));
+        assert_eq!(closed.id, id, "{format}");
+        assert_eq!(
+            closed.error.as_deref(),
+            Some(trawl_server::tracker::ABANDONED),
+            "{format}"
+        );
+        assert!(!closed.timed_out, "{format}");
+        assert_eq!(closed.rows, None, "{format}");
+        started.release();
+        drop(seams);
+        pool_idle(&server).await;
+        assert_eq!(
+            outcomes_of(&server, id),
+            1,
+            "{format}: the work stopping adds none"
+        );
+    }
+    assert_eq!(history_rows(&server).await, 0, "no failure writes history");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tight = common::setup_with_query_knobs(
+        dir.path(),
+        common::seed_data_root(dir.path()),
+        1,
+        common::QueryKnobs {
+            max_concurrent_queries: 1,
+            ..common::QueryKnobs::DEFAULT
+        },
+    )
+    .await;
+    let analyst = HttpClient::new_insecure(&tight.url, &tight.analyst_token).unwrap();
+    for format in EXPORT_FORMATS {
+        // Held past its work start until its one second runs out.
+        let dsl = "service=nginx zz_timed_out_export";
+        let seams = tight.state.query.pool.seams();
+        let started = seams.hold(Seam::Started);
+        let before = recent_of(&tight, dsl).len();
+        let (status, error) = refused_with(
+            analyst.export(dsl, format.clone(), None).await,
+            "a held export",
+        );
+        assert_eq!(status, 504, "{format}: {error:?}");
+        let closed = one_more_outcome(&tight, dsl, before, &format!("{format} timeout"));
+        assert!(closed.timed_out, "{format}");
+        assert_eq!(closed.rows, None, "{format}");
+        started.release();
+        pool_idle(&tight).await;
+        assert_eq!(outcomes_of(&tight, closed.id), 1, "{format}");
+
+        // Refused for capacity: a held query keeps the only permit.
+        let started = seams.hold(Seam::Started);
+        let blocker = {
+            let analyst = analyst.clone();
+            tokio::spawn(async move {
+                analyst
+                    .query_paginated("service=nginx zz_blocker", None, None)
+                    .await
+            })
+        };
+        until("the blocker holds the permit", || started.arrivals() == 1).await;
+        let dsl = "service=nginx zz_capacity_export";
+        let before = recent_of(&tight, dsl).len();
+        let (status, error) = refused_with(
+            analyst.export(dsl, format.clone(), None).await,
+            "an export with no permit",
+        );
+        assert_eq!(status, 503, "{format}: {error:?}");
+        let closed = one_more_outcome(&tight, dsl, before, &format!("{format} capacity"));
+        assert_eq!(closed.error.as_deref(), Some(error.message.as_str()));
+        assert!(!closed.timed_out, "{format}");
+        assert_eq!(closed.rows, None, "{format}");
+        let (status, _) = refused_with(
+            blocker.await.expect("the blocker joins"),
+            "the held blocker",
+        );
+        assert_eq!(status, 504, "{format}");
+        started.release();
+        drop(seams);
+        pool_idle(&tight).await;
+        assert_eq!(outcomes_of(&tight, closed.id), 1, "{format}");
+    }
+    assert_eq!(history_rows(&tight).await, 0, "no failure writes history");
+}
+
+/// Every export that passes request shaping counts once in `/api/v1/stats`
+/// `total_queries`, and every explicit outcome once in
+/// `trawl_queries_total` under its `status` and once in the
+/// `trawl_query_duration_seconds` observations. A request refused by
+/// shaping counts in neither, and a caller who walks away counts as a
+/// request with no outcome.
+///
+/// The metrics belong to the process, so every assertion is a delta
+/// around one request, never an absolute value.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one delta per outcome and format
+async fn exports_are_counted_once() {
+    use trawl_server::pool::seam::Seam;
+
+    let server = setup_with_query_timeout(permissive(), 1).await;
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+    let counted = async |server: &common::TestServer, admin: &HttpClient| {
+        (
+            admin.stats().await.unwrap().total_queries,
+            Outcomes::scrape(server).await,
+        )
+    };
+    let one = |success, error, timeout| Outcomes {
+        success,
+        error,
+        timeout,
+        observed: 1,
+    };
+
+    for format in EXPORT_FORMATS {
+        let (total, outcomes) = counted(&server, &admin).await;
+        analyst
+            .export("service=nginx", format.clone(), None)
+            .await
+            .unwrap_or_else(|e| panic!("{format}: {e:?}"));
+        let (total_after, outcomes_after) = counted(&server, &admin).await;
+        assert_eq!(total_after - total, 1, "{format}: a success");
+        assert_eq!(outcomes_after.since(outcomes), one(1, 0, 0), "{format}");
+
+        let (total, outcomes) = counted(&server, &admin).await;
+        let (status, _) = refused_with(
+            analyst
+                .export("| | | zz_counted {{{", format.clone(), None)
+                .await,
+            "an unparseable export",
+        );
+        assert_eq!(status, 400, "{format}");
+        let (total_after, outcomes_after) = counted(&server, &admin).await;
+        assert_eq!(total_after - total, 1, "{format}: a DSL refusal");
+        assert_eq!(outcomes_after.since(outcomes), one(0, 1, 0), "{format}");
+
+        let seams = server.state.query.pool.seams();
+        let started = seams.hold(Seam::Started);
+        let (total, outcomes) = counted(&server, &admin).await;
+        let (status, _) = refused_with(
+            analyst
+                .export("service=nginx zz_counted_timeout", format.clone(), None)
+                .await,
+            "a held export",
+        );
+        assert_eq!(status, 504, "{format}");
+        let (total_after, outcomes_after) = counted(&server, &admin).await;
+        started.release();
+        drop(seams);
+        pool_idle(&server).await;
+        assert_eq!(total_after - total, 1, "{format}: a timeout");
+        assert_eq!(outcomes_after.since(outcomes), one(0, 0, 1), "{format}");
+
+        // Refused by request shaping: a format no export has, and a body
+        // with no query.
+        let (total, outcomes) = counted(&server, &admin).await;
+        let unknown_format = raw_client()
+            .post(format!("{}/api/v1/export?format=xlsx", server.url))
+            .bearer_auth(&server.analyst_token)
+            .json(&serde_json::json!({ "query": "service=nginx" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown_format.status(), 400, "{unknown_format:?}");
+        let no_query = raw_client()
+            .post(format!("{}/api/v1/export?format={format}", server.url))
+            .bearer_auth(&server.analyst_token)
+            .json(&serde_json::json!({ "limit": 3 }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            no_query.status().is_client_error() && no_query.status() != 403,
+            "{format}: {no_query:?}"
+        );
+        let (total_after, outcomes_after) = counted(&server, &admin).await;
+        assert_eq!(
+            total_after, total,
+            "{format}: shaping refusals are not counted"
+        );
+        assert_eq!(outcomes_after, outcomes, "{format}");
+    }
+
+    // A caller who walks away, on a server whose budget outlasts the drop.
+    let server = setup_with_rate_limit(permissive()).await;
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+    for format in EXPORT_FORMATS {
+        let seams = server.state.query.pool.seams();
+        let started = seams.hold(Seam::Started);
+        let (total, outcomes) = counted(&server, &admin).await;
+        let dropped = {
+            let (analyst, format) = (analyst.clone(), format.clone());
+            tokio::spawn(async move {
+                analyst
+                    .export("service=nginx zz_counted_drop", format, None)
+                    .await
+            })
+        };
+        until("the export's work started", || started.arrivals() == 1).await;
+        dropped.abort();
+        let _ = dropped.await;
+        until("the export was abandoned", || {
+            recent_of(&server, "service=nginx zz_counted_drop")
+                .first()
+                .is_some_and(|q| q.error.as_deref() == Some(trawl_server::tracker::ABANDONED))
+                && server.state.query.tracker.active().is_empty()
+        })
+        .await;
+        started.release();
+        drop(seams);
+        pool_idle(&server).await;
+        let (total_after, outcomes_after) = counted(&server, &admin).await;
+        assert_eq!(
+            total_after - total,
+            1,
+            "{format}: a dropped export is a request"
+        );
+        assert_eq!(
+            outcomes_after.since(outcomes),
+            Outcomes::default(),
+            "{format}: with no outcome"
+        );
+    }
+}
+
+/// A history store that fails or stalls costs an export its history row,
+/// never its body. The export answers 200 with every row, its success is
+/// already in recent history while the write waits, and the server logs
+/// `history_error` at WARN with the store's error class alone. A stalled
+/// write is cut at the request's original deadline and not past it.
+///
+/// The stalled exports first spend `HOLD` of their `BUDGET` parked at
+/// their work start, so the write begins with only the rest of the budget
+/// left. Cut at the original deadline, each answers about `BUDGET` in,
+/// under the `BUDGET` + 1s bound below. A write given a fresh full budget
+/// would answer about `HOLD + BUDGET` in, 2s past that bound.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // a failed store, then a stalled one
+async fn export_history_failure_keeps_the_body() {
+    use sqlx::{Connection as _, Executor as _};
+    use trawl_server::pool::seam::Seam;
+
+    const BUDGET: Duration = Duration::from_secs(6);
+    const HOLD: Duration = Duration::from_secs(3);
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup_with_query_timeout(permissive(), BUDGET.as_secs()).await;
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+    let key = store
+        .create_key(
+            "history-fault",
+            PrincipalKind::Service,
+            &roles(&["trawl-analyst"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let key_id = key.info.id;
+    let client = HttpClient::new_insecure(&server.url, key.plaintext_token.as_str()).unwrap();
+    let mut db = sqlx::PgConnection::connect(&server.app_db_url)
+        .await
+        .expect("connect to the app database");
+    let warned = |id: u64| {
+        capture
+            .of("history_error", "query_id", &id.into())
+            .into_iter()
+            .filter(|e| e.get("key_id") == Some(&key_id.into()))
+            .collect::<Vec<_>>()
+    };
+
+    // A store whose insert fails at once.
+    db.execute("ALTER TABLE query_history RENAME TO query_history_parked")
+        .await
+        .expect("park query_history");
+    for (round, format) in EXPORT_FORMATS.into_iter().enumerate() {
+        let dsl = format!("service=nginx | head {}", 400 + round);
+        let body = client
+            .export(&dsl, format.clone(), None)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{format}: a failed history write failed the export: {e:?}")
+            });
+        assert_eq!(export_rows(&format, &body), 2, "{format}: every row");
+        let recorded = one_more_outcome(&server, &dsl, 0, &format!("{format} failed store"));
+        assert_eq!(recorded.rows, Some(2), "{format}: a success");
+        let events = warned(recorded.id);
+        assert_eq!(events.len(), 1, "{format}: {events:?}");
+        assert_eq!(events[0]["level"], "WARN", "{format}");
+        assert!(
+            events[0].contains_key("error_class"),
+            "{format}: {events:?}"
+        );
+        assert!(
+            !events[0].contains_key("error"),
+            "{format}: the class alone, never the store's text: {events:?}"
+        );
+    }
+    db.execute("ALTER TABLE query_history_parked RENAME TO query_history")
+        .await
+        .expect("restore query_history");
+
+    // A store whose insert waits on a lock the test holds.
+    db.execute("BEGIN; LOCK TABLE query_history IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock query_history");
+    let dsls: Vec<_> = (0..EXPORT_FORMATS.len())
+        .map(|round| format!("service=nginx | head {}", 410 + round))
+        .collect();
+    // Dropped on every path, which releases every worker it parked.
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
+    let held_from = tokio::time::Instant::now();
+    let runs: Vec<_> = EXPORT_FORMATS
+        .into_iter()
+        .zip(&dsls)
+        .map(|(format, dsl)| {
+            let (client, dsl) = (client.clone(), dsl.clone());
+            tokio::spawn(async move {
+                let sent = std::time::Instant::now();
+                let body = client.export(&dsl, format.clone(), None).await;
+                (format, body, sent.elapsed())
+            })
+        })
+        .collect();
+    until("an export's work started", || started.arrivals() > 0).await;
+    tokio::time::sleep_until(held_from + HOLD).await;
+    started.release();
+    // An insert waiting on the lock belongs to an export whose body was
+    // ready, so its success is already recorded.
+    let waiting: i64 = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks \
+                 WHERE NOT granted AND relation = 'query_history'::regclass",
+            )
+            .fetch_one(&mut db)
+            .await
+            .expect("read pg_locks");
+            if waiting > 0 {
+                return waiting;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a history insert waits on the lock");
+    let succeeded = dsls
+        .iter()
+        .filter(|dsl| recent_of(&server, dsl).iter().any(|q| q.rows == Some(2)))
+        .count();
+    assert!(
+        i64::try_from(succeeded).unwrap() >= waiting,
+        "{waiting} inserts wait, {succeeded} successes recorded"
+    );
+
+    for (run, dsl) in runs.into_iter().zip(&dsls) {
+        let (format, body, elapsed) = run.await.expect("the export task joins");
+        let body = body.unwrap_or_else(|e| {
+            panic!("{format}: a stalled history write failed the export: {e:?}")
+        });
+        assert_eq!(export_rows(&format, &body), 2, "{format}: every row");
+        assert!(
+            elapsed + Duration::from_millis(500) >= HOLD,
+            "{format}: answered {elapsed:?} in, before its {HOLD:?} hold ended"
+        );
+        assert!(
+            elapsed < BUDGET + Duration::from_secs(1),
+            "{format}: answered {elapsed:?} in, past its {BUDGET:?} budget"
+        );
+        let recorded = one_more_outcome(&server, dsl, 0, &format!("{format} stalled store"));
+        assert_eq!(recorded.rows, Some(2), "{format}: a success");
+        let events = warned(recorded.id);
+        assert_eq!(events.len(), 1, "{format}: {events:?}");
+        assert_eq!(events[0]["level"], "WARN", "{format}");
+        assert!(!events[0].contains_key("error"), "{format}: {events:?}");
+    }
+    db.execute("ROLLBACK").await.expect("release the lock");
 }
 
 #[tokio::test(flavor = "multi_thread")]
