@@ -21,7 +21,7 @@ use trawl_api::display::{
 use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 use trawl_api::value::ColumnType;
 use trawl_core::sanitize::sanitize_display_text;
-use trawl_core::text_layout::{caret_layout, locate_span};
+use trawl_core::text_layout::{caret_layout, cells, fit_cells, locate_span};
 use trawl_engine::value::Value;
 
 use crate::tui::App;
@@ -328,8 +328,7 @@ fn render_table(
                     } else {
                         cell_text(&result.columns[col_idx].ty, value)
                     };
-                    let truncated = truncate_with_ellipsis(&text, width);
-                    let cell = Cell::from(truncated);
+                    let cell = Cell::from(fit_cells(&text, width));
                     if current_match_cell == Some((abs_row, col_idx)) {
                         cell.style(
                             Style::default()
@@ -1362,6 +1361,9 @@ fn render_stacked_sparklines(
 /// Samples up to `SAMPLE_ROWS` visible rows starting from `v_scroll`, taking
 /// the max display width per column, clamped to `MIN_COL` and to each
 /// column's equal share of `available_width` (itself capped at `MAX_COL`).
+/// Widths are display cells of the text as the grid draws it: each value
+/// is cut to the column's cap with [`fit_cells`] before it is measured, so
+/// a value of any length costs no more than the cap to size.
 /// Respects `width_override` from `ColumnConfig`; hidden columns get width 0.
 fn compute_column_widths(
     result: &trawl_engine::value::QueryResult,
@@ -1394,14 +1396,12 @@ fn compute_column_widths(
                 }
             }
 
-            let mut max_width = col.name.len();
+            let width_of = |text: &str| cells(&fit_cells(text, max_col));
+            let mut max_width = width_of(&col.name);
 
             for row in result.rows.iter().skip(v_scroll).take(SAMPLE_ROWS) {
                 if let Some(value) = row.get(col_idx) {
-                    let display_len = cell_text(&col.ty, value).len();
-                    if display_len > max_width {
-                        max_width = display_len;
-                    }
+                    max_width = max_width.max(width_of(&cell_text(&col.ty, value)));
                 }
             }
 
@@ -1410,16 +1410,6 @@ fn compute_column_widths(
             width
         })
         .collect()
-}
-
-/// Truncate a string to max width, appending `…` if truncated.
-fn truncate_with_ellipsis(value: &str, max_width: usize) -> String {
-    if value.chars().count() <= max_width {
-        value.to_owned()
-    } else {
-        let truncated: String = value.chars().take(max_width.saturating_sub(1)).collect();
-        format!("{truncated}\u{2026}")
-    }
 }
 
 /// Extract time metadata from timechart result.
@@ -1776,9 +1766,7 @@ mod error_pane_tests {
     const HEIGHT: u16 = 12;
 
     /// The error pane alone, drawn for one error whose one detail has
-    /// `span` over `query`, as rows of text. A cell hidden behind a
-    /// double-width character is skipped, so each row reads as the
-    /// terminal shows it.
+    /// `span` over `query`, as rows of text.
     fn pane(query: Option<&str>, span: Option<(usize, usize)>) -> Vec<String> {
         let mut app = test_app();
         app.tab.status = TabStatus::Error {
@@ -1795,10 +1783,15 @@ mod error_pane_tests {
         terminal
             .draw(|f| super::render(&app, f, f.area()))
             .expect("render");
-        let buffer = terminal.backend().buffer();
+        rows_of(terminal.backend().buffer())
+    }
+
+    /// `buffer` as rows of text. A cell hidden behind a double-width
+    /// character is skipped, so each row reads as the terminal shows it.
+    pub(super) fn rows_of(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
         buffer
             .content
-            .chunks(usize::from(WIDTH))
+            .chunks(usize::from(buffer.area.width))
             .map(|cells| {
                 let mut row = String::new();
                 let mut hidden: usize = 0;
@@ -1957,5 +1950,124 @@ mod error_pane_tests {
     #[test]
     fn terminal_caret_layout_conformance_tui_invalid_span_snapshot() {
         insta::assert_snapshot!(snapshot_rows("end inside a character"));
+    }
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_core::text_layout::{MARKER, cells};
+    use trawl_engine::value::{Column, ColumnType, QueryResult, Value};
+
+    use super::compute_column_widths;
+    use super::error_pane_tests::rows_of;
+    use crate::tui::state::TabStatus;
+    use crate::tui::tests::test_app;
+
+    fn result(rows: Vec<Vec<Value>>, columns: &[&str]) -> QueryResult {
+        QueryResult {
+            columns: columns
+                .iter()
+                .map(|name| Column::new(*name, ColumnType::String))
+                .collect(),
+            rows,
+        }
+    }
+
+    /// A column is as wide as its widest value's display cells: six CJK
+    /// characters take 12 cells and 18 bytes, ten accented letters built
+    /// from combining marks take 10 cells and 30 bytes.
+    #[test]
+    fn grid_column_widths_measure_display_cells() {
+        let result = result(
+            vec![vec![
+                Value::String("日本語日本語".into()),
+                Value::String("e\u{301}".repeat(10)),
+            ]],
+            &["s", "t"],
+        );
+        assert_eq!(compute_column_widths(&result, 0, 200, None), [12, 10]);
+    }
+
+    /// A value far past the column's cap, CJK or a run of combining marks,
+    /// is sized by its cut at the cap: 29 CJK characters and the marker
+    /// fill 59 of the 60 cells, and one more character would not fit.
+    #[test]
+    fn grid_column_widths_stop_at_the_cap() {
+        let result = result(
+            vec![vec![
+                Value::String("日".repeat(10_000)),
+                Value::String(format!("x{}", "\u{301}".repeat(100_000))),
+            ]],
+            &["s", "t"],
+        );
+        let widths = compute_column_widths(&result, 0, 200, None);
+        assert_eq!(widths[0], 59);
+        assert_eq!(widths[1], 8);
+    }
+
+    /// A CJK value wider than its column is cut by display cells and
+    /// marked as cut, and the column after it starts in the same place on
+    /// every row.
+    #[test]
+    fn grid_cuts_wide_values_by_display_cells() {
+        let mut app = test_app();
+        let rows = vec![
+            vec![
+                Value::String("日".repeat(50)),
+                Value::String("first".into()),
+            ],
+            vec![Value::String("web".into()), Value::String("second".into())],
+        ];
+        app.tab.result = Some(trawl_client::QueryResponse {
+            execution: None,
+            result: result(rows, &["service", "message"]),
+            pagination: trawl_client::PaginationMeta {
+                limit: 10_000,
+                offset: 0,
+                returned: 2,
+                total: 2,
+            },
+            degraded_fields: Vec::new(),
+            severity_columns: Vec::new(),
+        });
+        app.tab.status = TabStatus::Success { duration_ms: 1 };
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("terminal");
+        terminal
+            .draw(|f| crate::tui::ui::render(&mut app, f))
+            .expect("render");
+        let rows = rows_of(terminal.backend().buffer());
+        let screen = rows.join("\n");
+
+        let wide = rows
+            .iter()
+            .find(|row| row.contains('日'))
+            .unwrap_or_else(|| panic!("a row with the CJK value:\n{screen}"));
+        let narrow = rows
+            .iter()
+            .find(|row| row.contains("web"))
+            .unwrap_or_else(|| panic!("a row with the short value:\n{screen}"));
+        assert!(
+            wide.contains(&format!("日{MARKER}")),
+            "the cut is marked:\n{screen}"
+        );
+        assert!(
+            wide.contains("first") && narrow.contains("second"),
+            "{screen}"
+        );
+
+        // The cell where `message` starts, in display cells from the left.
+        let column_of = |row: &str, value: &str| cells(&row[..row.find(value).expect("value")]);
+        assert_eq!(
+            column_of(wide, "first"),
+            column_of(narrow, "second"),
+            "the message column lines up:\n{screen}"
+        );
+        assert!(
+            rows.iter().all(|row| cells(row) == 80),
+            "every row fills the terminal exactly:\n{screen}"
+        );
     }
 }
