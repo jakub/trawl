@@ -442,10 +442,10 @@ The HTTPS listener, query limits, TLS, and logging.
 | `query_log` | path | *(none)* | ndjson debug log, one entry per query execution. See [the query debug log](#the-query-debug-log) |
 | `query_log_max_bytes` | byte size | `"100M"` | Size cap for the query debug log, with one retained `<path>.1` generation. `0` disables rollover |
 | `cors_allowed_origins` | string array | `[]` | CORS origins. An empty list sends no CORS headers |
-| `schema_cache_ttl_secs` | integer | `60` | Cache lifetime for unscoped `GET /schema` reads, `/schema/values` samples, and the background schema refresh. A `?service=` read is always fresh |
+| `schema_cache_ttl_secs` | integer | `60` | Cache lifetime for unscoped `GET /schema` reads, `/schema/values` samples, and the background schema refresh. A `?service=` read is always fresh. Must be greater than `0` |
 | `max_query_history` | integer | `1000` | Completed queries kept in the in-memory ring buffer |
 | `max_sse_connections` | integer | `32` | Concurrent SSE streams. Past it trawld answers 429 |
-| `monitor_refresh_ms` | integer | `1000` | Monitor dashboard refresh interval. Used only when trawld runs on a TTY |
+| `monitor_refresh_ms` | integer | `1000` | Monitor dashboard refresh interval. Used only when trawld runs on a TTY. Must be greater than `0` |
 
 Notes:
 
@@ -709,8 +709,8 @@ Notes:
 | `event_bus_capacity` | integer | `4096` | Broadcast channel capacity behind SSE. A full channel makes slow subscribers lag |
 | `hot_buffer_max_events` | integer | `100000` | Events the hot buffer holds. A write that does not fit is refused, and admitted events stay until compaction drains them. HTTP and syslog may fill 15/16 of the cap, and internal telemetry may fill all of it. See [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission) |
 | `hot_buffer_max_bytes` | byte size | `"100M"` | Serialized ndjson bytes the hot buffer holds, admitted the same way as `hot_buffer_max_events`. A write must fit both caps |
-| `stats_interval_secs` | integer | `60` | How often server stats are emitted as telemetry. `0` disables |
-| `telemetry_flush_interval_secs` | integer | `1` | How often buffered tracing events are flushed to the WAL |
+| `stats_interval_secs` | integer | `60` | How often server stats are emitted as telemetry. Must be greater than `0` |
+| `telemetry_flush_interval_secs` | integer | `1` | How often buffered tracing events are flushed to the WAL. Must be greater than `0` |
 | `telemetry_buffer_max_bytes` | byte size | `"16M"` | One estimated memory budget for everything self-telemetry holds while the WAL is unhealthy: active buffer, retry queue, and the batch in flight. Minimum `"64K"` |
 | `compaction_chunk_size` | integer | `500` | Maximum WAL files merged per compaction chunk. A larger backlog is split into chunks. At most `4096`, because each chunk's publication marker names every file it merges |
 | `compaction_memory_limit` | string | `"1GiB"` | DuckDB memory limit for each compaction, rollup, conform, and repin database, as a DuckDB memory string. `GiB` and `MiB` are 1024-based; DuckDB reads `GB` and `MB` as powers of ten. At most two of these databases run at once, beside `[server] query_memory_limit`. A statement that runs out of this limit is a resource failure, not bad input: trawld logs `maintenance_resource_exhausted`, counts it in `trawl_maintenance_resource_exhausted_total`. What follows depends on the operation. Compaction and rollup keep their inputs and retry on the next pass of the compaction task. A repin statement that runs out of memory with no fallback aborts the repin: the job ends `failed` and is not retried, so submit a new job. The boot conformance pass leaves the file incomplete and retries it on the next boot. Optional sampling falls back and the pass completes, and trawld logs and counts the statement the same way. Misfit sample capture in compaction and conform records the conflict without samples. The repin scan's sampled measurement reruns as a plain count with no samples, and the repin continues. See [the memory arithmetic](#the-memory-arithmetic) |
@@ -792,7 +792,7 @@ install-wide.
 |-----|------|---------|-------------|
 | `max_age_days` | integer | `90` | Delete data older than this many days in every env without an override. `0` keeps that data forever |
 | `min_free_disk_bytes` | byte size | `"6GiB"` | Below this much free disk, delete date directories until free space is back above it. `0` disables. Not checked against `[server] query_spill_max_bytes`; see [the disk arithmetic](#the-disk-arithmetic) |
-| `retention_interval_secs` | integer | `3600` | How often the retention task runs |
+| `retention_interval_secs` | integer | `3600` | How often the retention task runs. Must be greater than `0` |
 
 ```toml
 [retention]
@@ -833,7 +833,7 @@ Notes:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable scheduled query execution |
-| `poll_interval_secs` | integer | `10` | How often the scheduler looks for due schedules |
+| `poll_interval_secs` | integer | `10` | How often the scheduler looks for due schedules. Must be greater than `0` |
 | `max_runs_per_schedule` | integer | `100` | Finished runs (success, error or timeout) kept per schedule. A running run is never deleted or counted. Must be at least 1; 0 is refused at boot |
 | `report_retention_days` | integer | `30` | Delete finished runs that started more than this many days ago. A running run is never deleted. Must be between 1 and 36500; 0 is refused at boot |
 | `max_catchup_intervals` | integer | `24` | Whole schedule intervals one `since_last` catch-up run may cover. Must be between 1 and 1000000 |
