@@ -43,7 +43,7 @@ function countSignIns(page: Page) {
 async function holdFirst(page: Page, pathname: string, reply: Reply = SESSION_GONE, method = 'GET') {
   let open!: () => void;
   const gate = new Promise<void>(resolve => { open = resolve; });
-  const held = { arrived: false, delivered: false, later: 0, release: () => open() };
+  const held = { arrived: false, delivered: false, aborted: false, later: 0, release: () => open() };
   await page.route(url => url.pathname === pathname, async route => {
     if (route.request().method() !== method) return route.fallback();
     if (held.arrived) {
@@ -52,9 +52,16 @@ async function holdFirst(page: Page, pathname: string, reply: Reply = SESSION_GO
     }
     held.arrived = true;
     await gate;
-    // A request the page aborted meanwhile has nobody to answer.
-    await route.fulfill(reply).catch(() => {});
-    held.delivered = true;
+    // `delivered` means the page received the answer. A request the page
+    // aborted meanwhile has nobody to answer: record that as `aborted`, so
+    // a test waiting on `delivered` fails instead of passing on a 401 that
+    // never arrived.
+    try {
+      await route.fulfill(reply);
+      held.delivered = true;
+    } catch {
+      held.aborted = true;
+    }
   });
   return held;
 }
