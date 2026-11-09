@@ -91,7 +91,19 @@ where
     tick.tick().await;
 
     loop {
+        // Biased, shutdown first: a collection that overran its interval
+        // leaves the next tick ready, and a shutdown sent meanwhile must not
+        // lose a coin flip to another full scan.
         tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                tracing::info!(
+                    event_type = "lifecycle",
+                    action = "stats_emitter_stop",
+                    "stats emitter shutting down"
+                );
+                break;
+            }
             _ = tick.tick() => {
                 let work = on_tick();
                 if let Err(e) = tokio::task::spawn_blocking(work).await {
@@ -102,14 +114,6 @@ where
                         "stats gauge collection did not complete"
                     );
                 }
-            }
-            _ = shutdown_rx.changed() => {
-                tracing::info!(
-                    event_type = "lifecycle",
-                    action = "stats_emitter_stop",
-                    "stats emitter shutting down"
-                );
-                break;
             }
         }
     }
@@ -295,4 +299,53 @@ async fn shutdown_waits_for_the_collection_in_flight() {
     release_tx.send(()).unwrap();
     handle.await.expect("the stats loop returns after shutdown");
     assert_eq!(finished.load(Ordering::SeqCst), 1);
+}
+
+/// A collection that overruns its interval leaves the next tick ready. When
+/// shutdown arrives during that collection, the loop leaves without starting
+/// another. `select!` picks among ready arms at random unless biased, so one
+/// trial would pass half the time; across 32 trials a wrong order slips
+/// through once in 2^32 runs.
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_an_overrun_starts_no_new_collection() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::mpsc;
+
+    for trial in 0..32 {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let collections = Arc::new(AtomicUsize::new(0));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let on_tick = {
+            let collections = Arc::clone(&collections);
+            move || {
+                collections.fetch_add(1, Ordering::SeqCst);
+                let gate = release_rx.lock().unwrap().take();
+                let started_tx = started_tx.clone();
+                move || {
+                    if let Some(gate) = gate {
+                        started_tx.send(()).unwrap();
+                        gate.recv().unwrap();
+                    }
+                }
+            }
+        };
+        let handle = tokio::spawn(run(Duration::from_secs(60), shutdown_rx, on_tick));
+
+        started_rx.recv().await.unwrap();
+        // The collection overruns: the next tick is due before it ends.
+        tokio::time::advance(Duration::from_secs(120)).await;
+        shutdown_tx.send(true).unwrap();
+        release_tx.send(()).unwrap();
+        handle.await.expect("the stats loop returns after shutdown");
+        assert_eq!(
+            collections.load(Ordering::SeqCst),
+            1,
+            "trial {trial}: a collection started after shutdown"
+        );
+    }
 }
