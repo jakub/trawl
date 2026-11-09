@@ -16,9 +16,10 @@ use crate::results::service::{CaptureOverflow, GoneReason};
 use crate::store::StoreError;
 use crate::transport::request_limit::Allowance;
 
-/// The one reason a unit of pool work refused before it ever started
-/// (ADR-0024): the request's budget was gone, or its cancellation was
-/// latched, while the work was still queued behind capacity.
+/// The message of [`ServerError::CapacityNotStarted`], the one reason a
+/// unit of pool work refused before it ever started (ADR-0024): the
+/// request's budget was gone, or its cancellation was latched, while the
+/// work was still queued behind capacity.
 ///
 /// Fixed text, no interpolation: it is a capacity fact about the server,
 /// not a fact about the query, and it travels into the query tracker,
@@ -231,6 +232,15 @@ pub enum ServerError {
     /// Service temporarily unavailable (startup, data not ready).
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// Work refused before it started, for want of capacity (ADR-0024):
+    /// the request's deadline passed, or its cancellation was latched,
+    /// before any of its work ran. 503 `service_unavailable` with
+    /// [`CAPACITY_NOT_STARTED`] and no `Retry-After`. Every producer books
+    /// its timing account as a capacity refusal where it refuses, so
+    /// [`crate::query_timing::Outcome::of_error`] never has to.
+    #[error("service unavailable: {}", CAPACITY_NOT_STARTED)]
+    CapacityNotStarted,
 
     /// The auth backend could not answer a keystore call (503). The
     /// driver's typed kind rides along for [`ServerError::cause_kind`]; the
@@ -792,7 +802,7 @@ impl ServerError {
             // pre-start refusal gives: erasing it to "service unavailable"
             // would leave the scheduler's run row and the query tracker
             // unable to tell a capacity refusal from any other 503.
-            Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => msg.clone(),
+            Self::CapacityNotStarted => CAPACITY_NOT_STARTED.to_owned(),
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
             // `IngestBodyTooLarge`, `RequestTooLarge`, `HotBufferFull`,
             // `IngestBatchTooLarge`, `PreviewTooLarge`,
@@ -870,6 +880,7 @@ impl ServerError {
             | Self::RegexResources(_)
             | Self::EngineSampleFailed
             | Self::ServiceUnavailable(_)
+            | Self::CapacityNotStarted
             | Self::AuthBackend(_)
             | Self::HotBufferFull { .. }
             | Self::CorpusRecovering(_)
@@ -927,12 +938,12 @@ impl ServerError {
             Self::RequestLimitReached(_) => CauseKind::RequestLimitReached,
             Self::EngineSampleFailed => CauseKind::EngineSampleFailed,
             Self::PreparationUnavailable => CauseKind::PreparationAllowanceExhausted,
-            // A pre-start capacity refusal is a pressure outcome the class
-            // names in full. Every other 503 was built from a string and
-            // kept no typed source.
-            Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => CauseKind::None,
+            // Both were built from a string and kept no typed source.
             Self::ServiceUnavailable(_) | Self::Internal(_) => CauseKind::Unknown,
-            Self::Engine(_)
+            // A pre-start capacity refusal is a pressure outcome the class
+            // names in full.
+            Self::CapacityNotStarted
+            | Self::Engine(_)
             | Self::Store(_)
             | Self::Unauthorized(_)
             | Self::Forbidden(_)
@@ -1390,6 +1401,12 @@ impl ServerError {
             Self::ServiceUnavailable(msg) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, msg.clone()),
+            ),
+            // No `Retry-After`: nothing says when a permit frees, and the
+            // caller's own deadline is what ran out.
+            Self::CapacityNotStarted => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, CAPACITY_NOT_STARTED),
             ),
             Self::AuthBackend(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2063,10 +2080,7 @@ mod tests {
             (ServerError::Timeout, CauseKind::None),
             (ServerError::Engine(EngineError::Cancelled), CauseKind::None),
             (ServerError::Panicked("query worker"), CauseKind::None),
-            (
-                ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned()),
-                CauseKind::None,
-            ),
+            (ServerError::CapacityNotStarted, CauseKind::None),
             (
                 ServerError::Internal("zz_detail".into()),
                 CauseKind::Unknown,
@@ -2162,12 +2176,62 @@ mod tests {
     /// store backend's own words are not for a client.
     #[test]
     fn safe_message_keeps_the_capacity_refusal_and_generalizes_the_rest() {
-        let refused = ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned());
+        let refused = ServerError::CapacityNotStarted;
         assert_eq!(refused.safe_message(), CAPACITY_NOT_STARTED);
         assert_eq!(refused.error_class(), "service_unavailable");
 
         let backend = ServerError::ServiceUnavailable("pg://user:pw@host down".into());
         assert_eq!(backend.safe_message(), "service unavailable");
+    }
+
+    /// The pre-start capacity refusal is a typed variant (ADR-0040,
+    /// amended 2026-11-08), and it answers what the string-matched 503 it
+    /// replaced answered: 503 `service_unavailable` with the fixed
+    /// sentence and no `Retry-After`, the class `service_unavailable`, no
+    /// cause beneath it, and the same timing outcome.
+    #[tokio::test]
+    async fn typed_capacity_refusal_preserves_protocol() {
+        use crate::query_timing::Outcome;
+
+        let err = ServerError::CapacityNotStarted;
+        assert_eq!(err.error_class(), "service_unavailable");
+        assert_eq!(err.cause_kind(), CauseKind::None);
+        assert_eq!(err.cause_kind().as_str(), "none");
+        assert_eq!(err.code(), trawl_api::ErrorCode::ServiceUnavailable);
+        assert_eq!(err.safe_message(), CAPACITY_NOT_STARTED);
+        assert_eq!(
+            err.to_string(),
+            "service unavailable: server at capacity: the query was not started"
+        );
+        // Each producer books `CapacityRefused` where it refuses
+        // (`pool::account_refused`, the expired `from saved` lookup,
+        // capture planning), so `of_error` does not name it. Read back from
+        // the error, the refusal keeps the outcome the old 503 had.
+        let untyped = ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned());
+        assert_eq!(Outcome::of_error(&err), Outcome::of_error(&untyped));
+        assert_eq!(
+            Outcome::of_error(&err),
+            Outcome::Error("service_unavailable")
+        );
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        for header in [
+            axum::http::header::RETRY_AFTER,
+            axum::http::header::CACHE_CONTROL,
+        ] {
+            assert!(response.headers().get(&header).is_none(), "{header}");
+        }
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "code": "service_unavailable",
+                    "message": CAPACITY_NOT_STARTED,
+                }
+            })
+        );
     }
 
     #[test]

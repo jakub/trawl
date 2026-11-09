@@ -226,9 +226,7 @@ pub async fn query(
                     // Refused here, before any work: named where it is made,
                     // like the pool's own capacity refusals.
                     timing.emit_complete(Outcome::CapacityRefused, std::time::Instant::now());
-                    Err(ServerError::ServiceUnavailable(
-                        crate::error::CAPACITY_NOT_STARTED.to_owned(),
-                    ))
+                    Err(ServerError::CapacityNotStarted)
                 }
             }
         }
