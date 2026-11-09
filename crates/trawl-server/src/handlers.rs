@@ -3428,7 +3428,7 @@ pub async fn export(
     // Parquet export uses DuckDB's native COPY TO — no need to materialize
     // the result set in memory.
     if format == trawl_api::ExportFormat::Parquet {
-        let bytes = state
+        let (bytes, _rows) = state
             .query
             .pool
             .export_parquet(

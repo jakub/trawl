@@ -531,6 +531,7 @@ impl Corpus {
                 usize::MAX,
             ),
         }
+        .map(drop)
     }
 
     /// The cold files as one glob, the shape embedded `--data` hands the
