@@ -475,6 +475,27 @@ ok up-a-resume t trial up
 note "token files byte-identical, prefixes unchanged (compared privately); sample counts unchanged:"
 indent <<<"$before_samples"
 
+step "trial A: an up with the host ca.pem missing re-pins the served certificate"
+# Fingerprints print as colon-separated uppercase hex pairs, as state.json
+# records them.
+pem_fingerprint() { openssl x509 -noout -fingerprint -sha256 | cut -d= -f2 | tr a-f A-F; }
+served_fingerprint() {
+  openssl s_client -connect 127.0.0.1:15514 -servername localhost </dev/null 2>/dev/null | pem_fingerprint
+}
+before_served=$(served_fingerprint)
+before_state=$(state .tls.sha256_fingerprint)
+[[ -n "$before_served" && "$before_served" == "$before_state" ]] ||
+  fail "trawld serves '$before_served', and state.json records '$before_state'"
+rm "$STATE_DIR/ca.pem"
+ok up-a-repin t trial up
+[[ "$(served_fingerprint)" == "$before_served" ]] || fail "the rerun changed the certificate trawld serves"
+[[ "$(state .tls.sha256_fingerprint)" == "$before_state" ]] || fail "the rerun changed the recorded fingerprint"
+[[ -f "$STATE_DIR/ca.pem" ]] || fail "the rerun did not restore ca.pem"
+[[ "$(pem_fingerprint <"$STATE_DIR/ca.pem")" == "$before_served" ]] || fail "the restored ca.pem is not the served certificate"
+[[ "$(sample_counts)" == "$before_samples" ]] || fail "a query through the restored pin returned other sample counts"
+note "served and recorded fingerprint unchanged: $before_served"
+note "ca.pem restored with the served certificate; a query through the pin returned the same sample counts"
+
 step "trial A: status"
 ok status t trial status
 says status "http://127.0.0.1:18090"
@@ -561,7 +582,7 @@ grep -E '^(upstream_url|upstream_ca_path|public_origins) ' "$EVIDENCE/web.toml" 
 step "trial A: the certificate's SANs"
 openssl x509 -in "$STATE_DIR/ca.pem" -noout -subject -ext subjectAltName | sed 's/^/   /'
 sans=$(openssl x509 -in "$STATE_DIR/ca.pem" -noout -ext subjectAltName | tail -n +2)
-for san in DNS:trawld DNS:localhost 'IP Address:127.0.0.1'; do
+for san in DNS:trawld DNS:localhost 'IP Address:127.0.0.1' 'IP Address:0:0:0:0:0:0:0:1'; do
   grep -qF "$san" <<<"$sans" || fail "the certificate lacks $san"
 done
 

@@ -29,12 +29,16 @@ nix = { workspace = true }
 nucleo-matcher = { workspace = true }
 ratatui = { workspace = true }
 rand = { workspace = true }
+# `trawl trial up` generates the trial certificate in process (ADR-0045).
+rcgen = { workspace = true }
 rustls-pki-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 shellexpand = { workspace = true }
 thiserror = { workspace = true }
+# The trial certificate's validity window, from one clock reading.
+time = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 tokio-stream = { workspace = true }
 toml = { workspace = true }
@@ -42,6 +46,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 unicode-width = { workspace = true }
 url = { workspace = true }
+# `trawl trial up` checks the volume's certificate is one well-formed
+# X.509 certificate before it publishes those bytes as pins.
+x509-parser = { workspace = true }
 zeroize = { workspace = true }
 
 [features]
@@ -63,7 +70,6 @@ insta = { workspace = true }
 # schema tests do.
 jsonschema = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
-rcgen = { workspace = true }
 rustls = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }

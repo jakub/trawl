@@ -219,7 +219,7 @@ and `tls/cert.pem`. It reaches stored events only through trawld's API.
 
 | Path | Owner and mode | Purpose |
 | --- | --- | --- |
-| `/usr/bin/trawld`, `/usr/bin/trawl-web`, `/usr/bin/fleet-admin`, `/usr/bin/trawl-admin` | root:root 0755 | Executables. `trawl-cli` adds `/usr/bin/trawl`. |
+| `/usr/bin/trawld`, `/usr/bin/trawl-web`, `/usr/bin/fleet-admin` | root:root 0755 | Executables. `trawl-cli` adds `/usr/bin/trawl`. |
 | `/usr/lib/systemd/system/trawld.service`, `trawl-web.service` | root:root 0644 | Run `trawld --config /etc/trawl/trawld.toml --no-monitor` as `trawl:trawl`, and `trawl-web --config /etc/trawl/trawld.toml` as `trawl-web:trawl` after it. |
 | `/etc/trawl/trawld.toml` | root:trawl 0640 | Configuration for both daemons. |
 | `/etc/default/trawld` | root:trawl 0640 | Environment for `trawld.service`: `FLEET_DATABASE_URL`, `TRAWL_DATABASE_URL`, `RUST_LOG`. |
@@ -737,8 +737,10 @@ See [Set the browser origin](/operate/access/#set-the-browser-origin).
 
 ## Install from a tarball
 
-The [release tarball](/getting-started/) holds the five executables and
-nothing else. You supply what the package supplies:
+The [release tarball](/getting-started/) holds the four executables, the
+DuckDB library they share, the Trawl and DuckDB licenses, and `distribution.json`, which
+records the build. It has no systemd units, users, or directories. You supply
+what the package supplies:
 
 - A user `trawl` and a user `trawl-web`, with `trawl-web` in group `trawl`.
 - `/var/lib/trawl`, owned by `trawl:trawl`, mode 0750, with the data

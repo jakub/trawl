@@ -50,7 +50,7 @@ class EmbeddedProvenance(unittest.TestCase):
             header = bytearray(20)
             header[:6] = b"\x7fELF\x02\x01"
             header[18:20] = (62).to_bytes(2, "little")
-            for name in ("trawl", "trawld", "trawl-admin", "fleet-admin", "trawl-web"):
+            for name in ("trawl", "trawld", "fleet-admin", "trawl-web"):
                 (package / "bin" / name).write_bytes(header)
             (package / "lib/trawl/libduckdb.so").write_bytes(header)
             for name in ("LICENSE", "LICENSE.duckdb"):

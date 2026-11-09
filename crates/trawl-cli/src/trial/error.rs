@@ -175,6 +175,17 @@ pub enum TrialError {
     #[error("the trial certificate is not usable: {reason}")]
     Certificate { reason: &'static str },
 
+    /// The certificate in the trawld volume is not one `up` may use, and
+    /// `up` never replaces a published certificate. Names no fingerprint,
+    /// path, or engine output.
+    #[error(
+        "the trial certificate in the trial's trawld volume {problem}. trawl never \
+         replaces a trial certificate once it is in the volume, because the trial's \
+         clients may already pin it. Run `trawl trial down` to delete the trial, then \
+         `trawl trial up` to create a new one"
+    )]
+    CertificateDamaged { problem: &'static str },
+
     #[error("the trial API at {url} did not answer: {source}")]
     Api {
         url: String,

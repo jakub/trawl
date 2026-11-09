@@ -16,7 +16,7 @@ SCANNER = Path(__file__).resolve().parent / "scan-trial-secrets.py"
 TOKEN = "flt_Zm9vYmFyYmF6cXV4LXRyaWFsLXRva2VuLXZhbHVl"
 PASSWORD = "5f0c3a9e7b1d24c6a8e0f2b4d6c8e0a1"
 COOKIE = bytes(range(7, 39))
-# A throwaway P-256 key in PKCS #8, as `trawl-admin tls generate` writes it.
+# A throwaway P-256 key in PKCS #8, as `trawl trial up` generates it.
 KEY_PEM = """-----BEGIN PRIVATE KEY-----
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgA5uE5d3a9I3tv+eC
 3fMBIjAxuugGpX1CQM0gd4tiq02hRANCAASpTrCkJRcBlhop/T4SKG0FL1tVWFeq

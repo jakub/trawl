@@ -16,15 +16,15 @@
 //!   0400 file in its own volume, named by `POSTGRES_PASSWORD_FILE`. No
 //!   published port.
 //! - `trawld`: the trial image with [`trawld_toml`], its data, the pgpass
-//!   file, and the TLS pair in the `trawld` volume. `PGPASSFILE` is the
-//!   only environment entry, and it is a path.
+//!   file, and the TLS pair in the `trawld` volume. `up` generates the pair
+//!   in process and writes it there. `PGPASSFILE` is the only environment
+//!   entry, and it is a path.
 //! - `trawl-web`: the same image running `trawl-web` with [`web_toml`], the
 //!   cookie key, and a copy of the public certificate in the `web` volume.
 //!   It pins that certificate for its upstream.
-//! - `fleet-admin` and `tls-init` (profile `init`): one-shot steps run with
-//!   `compose run`. `fleet-admin` connects with a passwordless URL and the
-//!   pgpass file, and its container keeps no log, because `keys create`
-//!   prints a token.
+//! - `fleet-admin` (profile `init`): one-shot steps run with `compose run`.
+//!   It connects with a passwordless URL and the pgpass file, and its
+//!   container keeps no log, because `keys create` prints a token.
 //!
 //! Every service, the network, and every volume carry the trial id label.
 //! No service inherits the host's DNS search domains, and Docker's
@@ -80,9 +80,8 @@ pub const TRAWL_VOLUME_ROOT: &str = "/var/lib/trawl";
 pub const TRAWLD_TOML: &str = "/var/lib/trawl/trial/trawld.toml";
 /// Both database roles' passwords, 0400, owned by `trawl`.
 pub const PGPASS: &str = "/var/lib/trawl/trial/secrets/pgpass";
-/// Where `tls-init` publishes the certificate and key.
-#[cfg(test)]
-pub const TLS_DIR: &str = "/var/lib/trawl/trial/tls";
+/// The trial's certificate and its key, 0400, owned by `trawl`. `up`
+/// writes the key first, so a certificate always has its key beside it.
 pub const TLS_CERT: &str = "/var/lib/trawl/trial/tls/cert.pem";
 pub const TLS_KEY: &str = "/var/lib/trawl/trial/tls/key.pem";
 /// trawld's parquet data.
@@ -103,18 +102,11 @@ pub enum Service {
     Trawld,
     Web,
     FleetAdmin,
-    TlsInit,
 }
 
 impl Service {
     #[cfg(test)]
-    pub const ALL: [Self; 5] = [
-        Self::Postgres,
-        Self::Trawld,
-        Self::Web,
-        Self::FleetAdmin,
-        Self::TlsInit,
-    ];
+    pub const ALL: [Self; 4] = [Self::Postgres, Self::Trawld, Self::Web, Self::FleetAdmin];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -122,7 +114,6 @@ impl Service {
             Self::Trawld => "trawld",
             Self::Web => "trawl-web",
             Self::FleetAdmin => "fleet-admin",
-            Self::TlsInit => "tls-init",
         }
     }
 }
@@ -140,23 +131,6 @@ pub fn fleet_database_url() -> String {
 pub fn trawl_database_url() -> String {
     format!("postgres://trawl@{DB_HOST}:{DB_PORT}/trawl")
 }
-
-/// `tls-init`: generate the trial certificate unless one is published.
-///
-/// The pair is written into a fresh directory, the key is made 0400, and
-/// the directory is renamed into place, so `tls/` either holds a complete
-/// pair or does not exist. `trawl-admin` always adds `localhost`,
-/// `127.0.0.1`, and `::1`; the SANs are still listed so the certificate's
-/// contract reads here.
-const TLS_INIT: &str = r#"set -eu
-umask 077
-d=/var/lib/trawl/trial/tls
-if [ -e "$d/cert.pem" ]; then exit 0; fi
-t="$d.new"
-rm -rf -- "$t"
-trawl-admin tls generate --output-dir "$t" --san trawld --san localhost --san 127.0.0.1
-chmod 0400 "$t/key.pem"
-mv -T -- "$t" "$d""#;
 
 /// Render the Compose project for `state`.
 pub fn render_compose(state: &TrialState) -> Value {
@@ -231,12 +205,6 @@ pub fn render_compose(state: &TrialState) -> Value {
             "volumes": [volume("trawld", TRAWL_VOLUME_ROOT, true)],
             // `keys create` prints a token; no container log may keep it.
             "logging": { "driver": "none" },
-        })),
-        Service::TlsInit.name(): service(trawl, json!({
-            "profiles": [INIT_PROFILE],
-            "entrypoint": ["/bin/sh", "-c", TLS_INIT],
-            "volumes": [volume("trawld", TRAWL_VOLUME_ROOT, false)],
-            "network_mode": "none",
         })),
     });
 
@@ -462,6 +430,26 @@ mod tests {
         insta::assert_snapshot!(text);
     }
 
+    /// The CLI generates the certificate itself, so no one-shot service
+    /// does, and nothing runs `trawl-admin`, which no release ships.
+    #[test]
+    fn the_project_runs_four_services_and_no_certificate_step() {
+        let project = render_compose(&state());
+        let services: std::collections::BTreeSet<&str> = project["services"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            services,
+            ["fleet-admin", "postgres", "trawl-web", "trawld"].into()
+        );
+        let text = serde_json::to_string(&project).unwrap();
+        assert!(!text.contains("tls-init"), "{text}");
+        assert!(!text.contains("trawl-admin"), "{text}");
+    }
+
     #[test]
     fn the_rendered_configs() {
         insta::assert_snapshot!("trawld_toml", trawld_toml());
@@ -624,9 +612,7 @@ mod tests {
         for service in Service::ALL {
             let recorded = match service {
                 Service::Postgres => &state.images.postgres,
-                Service::Trawld | Service::Web | Service::FleetAdmin | Service::TlsInit => {
-                    &state.images.trawl
-                }
+                Service::Trawld | Service::Web | Service::FleetAdmin => &state.images.trawl,
             };
             let image = &services[service.name()]["image"];
             assert_eq!(image, recorded.id.as_str(), "{}", service.name());
@@ -706,17 +692,34 @@ mod tests {
     fn dollars_are_escaped_everywhere() {
         let mut state = state();
         state.images.trawl.id = "sha256:${HOME}".into();
+        state.images.postgres.id = "sha256:$PGDATA".into();
+        state.trial_id = "id-$USER".into();
         let project = render_compose(&state);
-        assert_eq!(project["services"]["trawld"]["image"], "sha256:$${HOME}");
-        let script = project["services"]["tls-init"]["entrypoint"][2]
-            .as_str()
-            .unwrap();
-        assert!(script.contains(r#"if [ -e "$$d/cert.pem" ]"#), "{script}");
+        for service in [Service::Trawld, Service::Web, Service::FleetAdmin] {
+            let rendered = &project["services"][service.name()];
+            assert_eq!(rendered["image"], "sha256:$${HOME}", "{}", service.name());
+            assert_eq!(
+                rendered["labels"][LABEL_ID],
+                "id-$$USER",
+                "{}",
+                service.name()
+            );
+        }
+        assert_eq!(project["services"]["postgres"]["image"], "sha256:$$PGDATA");
+        assert_eq!(
+            project["volumes"]["trawld"]["labels"][LABEL_ID],
+            "id-$$USER"
+        );
         walk(&project, "", &mut |path, value| {
             if let Value::String(s) = value {
                 assert!(!s.replace("$$", "").contains('$'), "{path}: {s}");
             }
         });
+
+        // Keys too, though no key the renderer writes holds a `$` today.
+        let mut value = json!({ "a$b": ["$x", { "$": "$$" }] });
+        escape_interpolation(&mut value);
+        assert_eq!(value, json!({ "a$$b": ["$$x", { "$$": "$$$$" }] }));
     }
 
     #[test]
@@ -843,17 +846,6 @@ mod tests {
             let prefix = format!("{host_port}:{db}:{user}:");
             assert!(lines.iter().any(|l| l.starts_with(&prefix)), "{url}");
         }
-    }
-
-    #[test]
-    fn tls_init_publishes_the_pair_where_trawld_reads_it() {
-        assert!(TLS_INIT.contains(&format!("d={TLS_DIR}\n")), "{TLS_INIT}");
-        assert_eq!(TLS_CERT, format!("{TLS_DIR}/cert.pem"));
-        assert_eq!(TLS_KEY, format!("{TLS_DIR}/key.pem"));
-        for san in ["--san trawld", "--san localhost", "--san 127.0.0.1"] {
-            assert!(TLS_INIT.contains(san), "{san}");
-        }
-        assert!(TLS_INIT.contains(r#"chmod 0400 "$t/key.pem""#));
     }
 
     #[test]
