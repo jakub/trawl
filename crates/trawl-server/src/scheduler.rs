@@ -850,12 +850,18 @@ fn write_result_parquet(
     match executor.write_query_result_to_parquet(result, temp) {
         Ok(_) => {}
         // Not a failure: the result's shape has no exact parquet form, and
-        // the blob is its representation.
+        // the blob is its representation. The reason names a column, which
+        // is query or sender content, so it stays at DEBUG.
         Err(e @ trawl_engine::error::EngineError::NotParquetStorable { .. }) => {
-            tracing::info!(
+            tracing::debug!(
                 event_type = "scheduler_result_blob",
                 run_id,
                 reason = %e,
+                "the run's result has no exact parquet form"
+            );
+            tracing::info!(
+                event_type = "scheduler_result_blob",
+                run_id,
                 "storing the run's result as a blob"
             );
             return zstd_fallback(result);
@@ -1757,6 +1763,66 @@ mod tests {
         assert!(
             reason.contains("encoding failed") && reason.contains("\"n\""),
             "{reason}"
+        );
+    }
+
+    /// A run whose result has no exact parquet form stores a blob, and
+    /// the default-level event says so without the refusal's reason: the
+    /// reason names the column, which is query or sender content (a
+    /// renamed field, an `extract kv` key). The reason goes to DEBUG.
+    #[test]
+    fn result_blob_event_carries_no_column_name() {
+        use crate::test_events::events_of;
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+
+        // A mixed column has no exact parquet form, so the run stores a
+        // blob. Its name is query or sender content (a renamed field, an
+        // `extract kv` key), so the default-level event must not carry the
+        // refusal that quotes it.
+        const MARKER: &str = "zz_content_marker";
+        let result = QueryResult {
+            columns: vec![Column::new(MARKER, ColumnType::Mixed)],
+            rows: vec![
+                vec![Value::Integer(1)],
+                vec![Value::String("word".to_owned())],
+            ],
+        };
+        let data = tempfile::tempdir().unwrap();
+        let executors = crate::pool::ExecutorPool::for_test(
+            data.path().display().to_string(),
+            1,
+            100_000,
+            None,
+        )
+        .unwrap();
+
+        let mut stored = None;
+        let events = events_of(|| {
+            stored = Some(super::write_result_parquet(&executors, 1, &result));
+        });
+        let (path, blob) = stored.unwrap().expect("the blob encodes");
+        assert!(
+            path.is_none() && blob.is_some(),
+            "a mixed column stores a blob"
+        );
+
+        let blob_event = events
+            .iter()
+            .find(|e| {
+                e.is_default_level()
+                    && e.fields.get("event_type").map(String::as_str)
+                        == Some("scheduler_result_blob")
+            })
+            .unwrap_or_else(|| panic!("no default-level blob event: {events:?}"));
+        assert!(!blob_event.text().contains(MARKER), "{blob_event:?}");
+        for event in events.iter().filter(|e| e.is_default_level()) {
+            assert!(!event.text().contains(MARKER), "{event:?}");
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| e.level == tracing::Level::DEBUG && e.text().contains(MARKER)),
+            "the refusal keeps its reason at DEBUG: {events:?}"
         );
     }
 
