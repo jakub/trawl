@@ -60,9 +60,9 @@ warning on stderr before the server starts.
 
 ### Refusals
 
-`trawl mcp` exits `2` for each of these cases. No message contains a value of
-a variable, a flag, or a key. The one value a message names is a refused
-`ui.timezone`, which is not secret.
+`trawl mcp` exits `2` for each of these cases. No message contains the value
+of a variable or a key. A message about the config file names its path, and
+the `ui.timezone` refusal also names the value, which is not secret.
 
 - Any of `TRAWL_URL`, `TRAWL_TOKEN`, `TRAWL_PROFILE`, or `TRAWL_INSECURE` is
   set, even empty. The message names every variable that is present.
