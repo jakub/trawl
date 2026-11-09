@@ -574,6 +574,15 @@ async fn run(mut args: Cli, sources: connection::Sources) -> Result<u8, CliError
     // must not block `trawl trial up` or `down`. `doctor` and `mcp` select
     // their own target and key, and never read config.toml the way other
     // commands do.
+    // `--token` typed beside `--token-file` is a usage error for every
+    // command but `doctor` and `mcp`, which refuse a typed `--token` in
+    // their own words.
+    if !matches!(args.command, Some(Command::Doctor(_) | Command::Mcp))
+        && matches!(sources.token, Some(connection::Origin::CommandLine))
+        && args.token_file.is_some()
+    {
+        return Err(connection::ConnectionError::BothKeyFlags.into());
+    }
     let command = match args.command.take() {
         Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd).await.map(|()| 0)?),
         Some(Command::Doctor(doctor_args)) => return doctor::run(args.into(), doctor_args).await,
@@ -615,7 +624,6 @@ async fn run_configured(
         args.token_file.is_some(),
     );
     let inputs = connection::Inputs::new(args.url, args.token, args.token_file, sources);
-    inputs.key_flags()?;
 
     // Load the config file and apply the profile's trust. A profile's url
     // and token stay in its table, bound to each other.

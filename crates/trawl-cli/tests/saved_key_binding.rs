@@ -650,11 +650,13 @@ fn key_sources_never_fall_through() {
             "--data",
             data,
         ],
+        vec!["--token", K2, "--token-file", path, "trial", "status"],
+        vec!["trial", "key", "--token", K2, "--token-file", path],
     ] {
         let output = home.run(&args, &[]);
         let err = stderr(&output);
         assert_eq!(output.status.code(), Some(2), "{args:?}: {err}");
-        assert_secret_free(&err, &[path], "both key flags, embedded");
+        assert_secret_free(&err, &[path], "both key flags, no connection");
     }
 
     let empty = home.file("empty", b"");

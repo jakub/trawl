@@ -112,9 +112,10 @@ impl Inputs {
         }
     }
 
-    /// `--token` typed beside `--token-file` is a usage error for every
-    /// command, whether or not it resolves a connection. An exported
-    /// `TRAWL_TOKEN` beside `--token-file` is not: the file wins.
+    /// `--token` typed beside `--token-file` is a usage error. `run`
+    /// refuses it before any command; the policy checks again so it never
+    /// depends on its caller. An exported `TRAWL_TOKEN` beside
+    /// `--token-file` is not a conflict: the file wins.
     pub(crate) fn key_flags(&self) -> Result<(), ConnectionError> {
         if matches!(self.token, Some((_, Origin::CommandLine))) && self.token_file.is_some() {
             return Err(ConnectionError::BothKeyFlags);
