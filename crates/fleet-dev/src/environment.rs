@@ -65,7 +65,9 @@ fn allowed_name(name: &OsStr) -> bool {
             | "https_proxy"
             | "no_proxy"
             // Build shaping the developer already chose for this checkout.
-            | "CARGO_TARGET_DIR"
+            // CARGO_TARGET_DIR stays out: the controller runs what it built
+            // from `target/debug` (fleet-admin, the manifest's trawl-web), so
+            // a build elsewhere would leave it running a stale binary.
             | "CARGO_BUILD_JOBS"
             | "RUSTFLAGS"
             | "NO_COLOR"
@@ -90,6 +92,7 @@ mod tests {
             ("DATABASE_URL", "secret"),
             ("SSH_AUTH_SOCK", "/tmp/agent"),
             ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("CARGO_TARGET_DIR", "/elsewhere"),
         ]
         .map(|(k, v)| (OsString::from(k), OsString::from(v)));
         let base = sanitized_base_from(input);
@@ -100,6 +103,7 @@ mod tests {
         assert!(!base.contains_key(OsStr::new("DATABASE_URL")));
         assert!(!base.contains_key(OsStr::new("SSH_AUTH_SOCK")));
         assert!(!base.contains_key(OsStr::new("AWS_SECRET_ACCESS_KEY")));
+        assert!(!base.contains_key(OsStr::new("CARGO_TARGET_DIR")));
     }
 
     #[test]
@@ -110,7 +114,6 @@ mod tests {
             "SSL_CERT_FILE",
             "HTTPS_PROXY",
             "https_proxy",
-            "CARGO_TARGET_DIR",
             "RUSTFLAGS",
         ] {
             let base = sanitized_base_from([(OsString::from(name), OsString::from("value"))]);
