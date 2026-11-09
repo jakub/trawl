@@ -96,14 +96,15 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     let column_mode_service = input.find('.').map(|pos| &input[..pos]);
 
     let list_width = list_area.width as usize;
-    let display = build_display_lines(
-        input,
-        items,
-        filtered,
-        theme,
-        column_mode_service,
-        list_width,
-    );
+    let build =
+        |width| build_display_lines(input, items, filtered, theme, column_mode_service, width);
+    let mut display = build(list_width);
+    // A list that scrolls draws its scrollbar over its last column, so its
+    // lines are laid out one column narrower. How many lines there are
+    // does not depend on the width.
+    if display.len() > visible_height {
+        display = build(list_width.saturating_sub(1));
+    }
 
     // Headers and detail lines mean display lines outnumber items, so scroll is
     // computed from the selected item's line index, not its item index.
@@ -464,5 +465,31 @@ mod unicode_tests {
             writeln!(frames, "width {width}:\n{}", terminal.backend()).unwrap();
         }
         insta::assert_snapshot!(frames);
+    }
+
+    /// When the list scrolls, the scrollbar takes the list's last column,
+    /// and a detail cut to the full width would have its marker drawn
+    /// over. Every detail row on screen still ends in the marker.
+    #[test]
+    fn palette_detail_marker_clears_the_scrollbar() {
+        let details: Vec<String> = (0..12)
+            .map(|i| format!("service=\"web{i}\" | where message = {}", "x".repeat(80)))
+            .collect();
+        let app = palette_app(&details);
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = terminal.backend().to_string();
+        let detail_rows: Vec<&str> = screen
+            .lines()
+            .filter(|row| row.contains("service=\"web"))
+            .collect();
+        assert!(detail_rows.len() >= 2, "the list shows details:\n{screen}");
+        assert!(
+            detail_rows.len() < details.len(),
+            "the list scrolls:\n{screen}"
+        );
+        for row in detail_rows {
+            assert!(row.contains(MARKER), "{row:?} lost its marker:\n{screen}");
+        }
     }
 }
