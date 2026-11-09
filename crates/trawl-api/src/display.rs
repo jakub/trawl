@@ -204,6 +204,18 @@ fn series_total(values: &[u64]) -> u128 {
 /// distinct series before any truncation.
 #[must_use]
 pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) {
+    extract_series_labelled(result, |_, value| value_to_string(value))
+}
+
+/// [`extract_series`] with each group-by label written by `label` from the
+/// group column's type and a cell of the group, so a surface can show a
+/// `timestamp` group in its display zone. Series still group, rank and
+/// sort by [`value_to_string`] of the cell.
+#[must_use]
+pub fn extract_series_labelled(
+    result: &QueryResult,
+    label: impl Fn(&ColumnType, &Value) -> String,
+) -> (Vec<(String, Vec<u64>)>, usize) {
     const MAX_SERIES: usize = 6;
 
     let Some(time_col) = result.columns.iter().position(|c| c.name == "_time") else {
@@ -243,20 +255,29 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
             let group_idx = string_cols[0];
             let metric_idx = numeric_cols[0];
 
-            let mut series_map: HashMap<String, Vec<u64>> = HashMap::new();
+            let mut series_map: HashMap<String, (&Value, Vec<u64>)> = HashMap::new();
             for row in &result.rows {
-                let label = value_to_string(&row[group_idx]);
+                let group = &row[group_idx];
                 let value = value_to_u64(&row[metric_idx]);
-                series_map.entry(label).or_default().push(value);
+                series_map
+                    .entry(value_to_string(group))
+                    .or_insert_with(|| (group, Vec::new()))
+                    .1
+                    .push(value);
             }
 
-            let mut series: Vec<(String, Vec<u64>)> = series_map.into_iter().collect();
+            let mut series: Vec<(String, (&Value, Vec<u64>))> = series_map.into_iter().collect();
             let total = series.len();
             if series.len() > MAX_SERIES {
-                series.sort_by_key(|s| std::cmp::Reverse(series_total(&s.1)));
+                series.sort_by_key(|s| std::cmp::Reverse(series_total(&s.1.1)));
                 series.truncate(MAX_SERIES);
             }
             series.sort_by(|a, b| a.0.cmp(&b.0));
+            let group_ty = &result.columns[group_idx].ty;
+            let series = series
+                .into_iter()
+                .map(|(_, (group, values))| (label(group_ty, group), values))
+                .collect();
             (series, total)
         } else if string_cols.is_empty() {
             let mut series: Vec<(String, Vec<u64>)> = numeric_cols

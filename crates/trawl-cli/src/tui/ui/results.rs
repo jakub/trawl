@@ -15,7 +15,9 @@ use ratatui::widgets::{
     Table,
 };
 use std::collections::HashSet;
-use trawl_api::display::{downsample, extract_series, is_timechart_result, value_to_string};
+use trawl_api::display::{
+    downsample, extract_series_labelled, is_timechart_result, value_to_string,
+};
 use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 use trawl_api::value::ColumnType;
 use trawl_api::zone::{
@@ -768,7 +770,7 @@ fn render_line_chart(
         Style::default().fg(theme.border_unfocused)
     };
 
-    let (series, total_series) = extract_series(result);
+    let (series, total_series) = chart_series(result, app.display_zone);
 
     if series.is_empty() {
         render_placeholder(app, frame, area);
@@ -1080,7 +1082,7 @@ fn render_sparkline(
         Style::default().fg(theme.border_unfocused)
     };
 
-    let (series, total_series) = extract_series(result);
+    let (series, total_series) = chart_series(result, app.display_zone);
 
     if series.is_empty() {
         // Fallback to placeholder if extraction failed
@@ -1505,6 +1507,15 @@ fn extract_time_metadata(
     Some((first, last, span))
 }
 
+/// A timechart's series as the TUI draws them: a `timestamp` group label
+/// in `zone` through [`cell_text`], as the grid shows that column.
+fn chart_series(
+    result: &trawl_engine::value::QueryResult,
+    zone: DisplayZone,
+) -> (Vec<(String, Vec<u64>)>, usize) {
+    extract_series_labelled(result, |ty, value| cell_text(ty, value, zone))
+}
+
 /// Format a duration in seconds as a human-readable string.
 fn format_duration(secs: u64) -> String {
     if secs >= 86400 {
@@ -1587,6 +1598,73 @@ fn timechart_labels_follow_response_order() {
     assert_eq!(span, "1h");
 }
 
+/// A timechart grouped by a `timestamp` column names each series by its
+/// instant in the display zone, as the grid shows that column, not by the
+/// UTC wire text.
+#[cfg(test)]
+#[test]
+fn timechart_timestamp_group_labels_use_the_display_zone() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_engine::value::{Column, QueryResult};
+
+    let row = |time: &str, ingested: &str| {
+        vec![
+            Value::String(time.into()),
+            Value::String(ingested.into()),
+            Value::Integer(2),
+        ]
+    };
+    let result = QueryResult {
+        columns: vec![
+            Column::new("_time", ColumnType::Timestamp),
+            Column::new("_ingested", ColumnType::Timestamp),
+            Column::new("count", ColumnType::Integer),
+        ],
+        rows: vec![
+            row("2026-01-15T00:00:00.000000Z", "2026-01-15T04:30:00.000000Z"),
+            row("2026-01-15T00:00:00.000000Z", "2026-01-15T05:30:00.000000Z"),
+            row("2026-01-15T01:00:00.000000Z", "2026-01-15T04:30:00.000000Z"),
+            row("2026-01-15T01:00:00.000000Z", "2026-01-15T05:30:00.000000Z"),
+        ],
+    };
+
+    for view in [ChartView::LineChart, ChartView::Sparkline] {
+        let mut app = crate::tui::tests::test_app();
+        app.display_zone = "+05:30".parse().unwrap();
+        let returned = result.rows.len();
+        app.tab.result = Some(trawl_client::QueryResponse {
+            execution: None,
+            result: result.clone(),
+            pagination: trawl_client::PaginationMeta {
+                limit: 10_000,
+                offset: 0,
+                returned,
+                total: returned,
+            },
+            degraded_fields: Vec::new(),
+            severity_columns: Vec::new(),
+        });
+        app.tab.chart_view = view;
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).expect("terminal");
+        terminal
+            .draw(|f| crate::tui::ui::render(&mut app, f))
+            .expect("render");
+        let screen = terminal.backend().to_string();
+
+        assert!(!screen.contains("15T0"), "{view:?} wire label:\n{screen}");
+        if view == ChartView::LineChart {
+            for label in ["2026-01-15 10:00:00 +05:30", "2026-01-15 11:00:00 +05:30"] {
+                assert!(
+                    screen.contains(label),
+                    "{view:?} {label} missing:\n{screen}"
+                );
+            }
+        }
+    }
+}
+
 /// Both timechart views survive metrics at the top of the `u64` range.
 ///
 /// The stacked sparkline rebases each series by subtracting its own
@@ -1625,7 +1703,7 @@ fn timechart_sparklines_survive_unsigned_magnitudes() {
     // or zeroed the unsigned cells would still leave non-empty series
     // (the fixture carries integers too), and both draws below would
     // succeed over zeros.
-    let (series, _) = extract_series(&result);
+    let (series, _) = trawl_api::display::extract_series(&result);
     assert!(
         series.contains(&("m0".to_owned(), vec![0, u64::MAX]))
             && series.contains(&("m1".to_owned(), vec![u64::MAX, 0])),
