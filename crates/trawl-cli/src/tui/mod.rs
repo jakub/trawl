@@ -71,6 +71,8 @@ pub(super) struct QueryError {
     pub(super) message: String,
     /// Structured error details with optional span info.
     pub(super) details: Vec<trawl_client::ErrorDetail>,
+    /// The query text the run sent: what the details' spans index.
+    pub(super) query: String,
 }
 
 /// Result of an async query execution.
@@ -292,6 +294,7 @@ impl App {
                 .map_err(|e| QueryError {
                     message: e.to_string(),
                     details: e.error_details().to_vec(),
+                    query: query.clone(),
                 });
             let duration = start.elapsed();
             tracing::info!(
@@ -341,6 +344,7 @@ impl App {
                 tab.status = TabStatus::Error {
                     message: format!("not formatted: {refusal}"),
                     details: Vec::new(),
+                    query: None,
                 };
                 return;
             }
@@ -363,6 +367,7 @@ impl App {
         self.active_tab_mut().status = TabStatus::Error {
             message: "cancelled".to_owned(),
             details: Vec::new(),
+            query: None,
         };
         tracing::info!("query cancelled by user");
     }
@@ -678,6 +683,7 @@ impl App {
                 tab.status = TabStatus::Error {
                     message: err.message,
                     details: err.details,
+                    query: Some(err.query),
                 };
             }
         }
@@ -2089,6 +2095,7 @@ mod tests {
                 Err(QueryError {
                     message: "something broke".to_owned(),
                     details: Vec::new(),
+                    query: "* | stats count() by host".to_owned(),
                 }),
             ))
             .unwrap();
@@ -2097,8 +2104,158 @@ mod tests {
 
         assert!(matches!(
             app.tab.status,
-            TabStatus::Error { ref message, .. } if message == "something broke"
+            TabStatus::Error { ref message, ref query, .. }
+                if message == "something broke"
+                    && query.as_deref() == Some("* | stats count() by host")
         ));
+    }
+
+    /// A query endpoint that holds every answer until the test releases
+    /// it, then refuses the query with a parse error whose span is
+    /// `span`. Each query text it receives goes out on the returned
+    /// receiver as the request arrives.
+    async fn held_parse_error_server(
+        span: (usize, usize),
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        use axum::http::{StatusCode, header};
+
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate = std::sync::Arc::clone(&release);
+        let route = axum::routing::post(move |body: axum::body::Bytes| {
+            let seen_tx = seen_tx.clone();
+            let gate = std::sync::Arc::clone(&gate);
+            async move {
+                let request: trawl_api::QueryRequest =
+                    serde_json::from_slice(&body).expect("a query request");
+                let _ = seen_tx.send(request.query);
+                gate.notified().await;
+                let envelope = trawl_client::ErrorResponse {
+                    error: trawl_client::ErrorEnvelope {
+                        code: trawl_client::ErrorCode::ParseError,
+                        message: "parse error: unclosed group".to_owned(),
+                        details: vec![trawl_client::ErrorDetail {
+                            message: "unclosed group".to_owned(),
+                            span: Some(trawl_client::ErrorSpan {
+                                start: span.0,
+                                end: span.1,
+                            }),
+                            label: None,
+                            hint: Some("close the group".to_owned()),
+                        }],
+                        conflict: None,
+                    },
+                };
+                (
+                    StatusCode::BAD_REQUEST,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_vec(&envelope).expect("envelope"),
+                )
+            }
+        });
+        let app = axum::Router::new().route("/api/v1/query", route);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, seen_rx, release)
+    }
+
+    /// The query a run sends travels with its error. The editor is changed
+    /// while the server holds the answer, so the pane can quote the sent
+    /// query only if the run captured it: the draft is not what failed.
+    #[tokio::test]
+    async fn tui_error_excerpt_uses_submitted_query() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        const SENT: &str = "service=web | stats count( by host";
+        const DRAFT: &str = "service=api | head 5";
+        // The span covers `by`, 27 cells into the line.
+        let span = (27, 29);
+        assert_eq!(&SENT[span.0..span.1], "by");
+
+        let (url, mut seen, release) = held_parse_error_server(span).await;
+        let client = HttpClient::new_insecure(&url, "flt_test_not_real").expect("client");
+        let mut app = App::new(client, DisplayZone::Utc);
+        app.tab.editor.insert_text(SENT);
+        app.execute_query();
+
+        let bound = Duration::from_secs(10);
+        let received = tokio::time::timeout(bound, seen.recv())
+            .await
+            .expect("the query reaches the server")
+            .expect("a query");
+        assert_eq!(received, SENT, "the run sends the editor's query");
+
+        // The answer is still held: edit the query, then let it go.
+        app.tab.editor.clear();
+        app.tab.editor.insert_text(DRAFT);
+        assert!(matches!(app.tab.status, TabStatus::Running { .. }));
+        release.notify_one();
+
+        tokio::time::timeout(bound, async {
+            while app.tab.execution.is_batch() {
+                app.poll_query_results();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the held answer arrives");
+
+        match &app.tab.status {
+            TabStatus::Error { query, details, .. } => {
+                assert_eq!(query.as_deref(), Some(SENT));
+                assert_eq!(details.len(), 1);
+            }
+            other => panic!("expected the parse error, got {other:?}"),
+        }
+        assert_eq!(
+            app.tab.editor.text(),
+            DRAFT,
+            "the draft stays in the editor"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|f| crate::tui::ui::render(&mut app, f))
+            .expect("render");
+        let screen = terminal.backend().to_string();
+        let rows: Vec<&str> = screen.lines().collect();
+        let excerpt_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains(SENT))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            excerpt_rows.len(),
+            1,
+            "the sent query is quoted once, in the error pane:\n{screen}"
+        );
+        let excerpt_row = rows[excerpt_rows[0]];
+        let query_column = excerpt_row
+            .chars()
+            .collect::<Vec<_>>()
+            .windows(SENT.len())
+            .position(|w| w.iter().copied().eq(SENT.chars()))
+            .expect("the excerpt row holds the query");
+        let caret_row: Vec<char> = rows[excerpt_rows[0] + 1].chars().collect();
+        let first_caret = caret_row
+            .iter()
+            .position(|&c| c == '^')
+            .unwrap_or_else(|| panic!("a caret row under the excerpt:\n{screen}"));
+        assert_eq!(first_caret, query_column + span.0, "{screen}");
+        assert_eq!(
+            caret_row.iter().filter(|&&c| c == '^').count(),
+            2,
+            "two carets mark `by`:\n{screen}"
+        );
     }
 
     #[tokio::test]
@@ -2351,13 +2508,18 @@ mod tests {
             "the editor and its undo history are unchanged"
         );
         match &app.tab.status {
-            TabStatus::Error { message, details } => {
+            TabStatus::Error {
+                message,
+                details,
+                query,
+            } => {
                 assert_eq!(
                     message,
                     "not formatted: the formatted query would be 80002 bytes, \
                      over the 65536-byte query limit"
                 );
                 assert!(details.is_empty());
+                assert_eq!(query, &None, "a local refusal sent no query");
             }
             other => panic!("expected the refusal on the tab status, got {other:?}"),
         }
@@ -2712,6 +2874,7 @@ mod tests {
                 Err(QueryError {
                     message: "something broke".to_owned(),
                     details: Vec::new(),
+                    query: "* | stats count() by host".to_owned(),
                 }),
             ))
             .unwrap();

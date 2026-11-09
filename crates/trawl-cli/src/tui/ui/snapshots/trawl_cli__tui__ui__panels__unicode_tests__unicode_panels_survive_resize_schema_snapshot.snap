@@ -1,0 +1,52 @@
+---
+source: crates/trawl-cli/src/tui/ui/panels.rs
+assertion_line: 1630
+expression: frames
+---
+width 15:
+"★ common (5)  ↑"
+"  common_… TS █"
+"  common_… TS █"
+"  common_… TS █"
+"  common_… TS ║"
+"  common_… TS ║"
+"▾ résumé… (6) ║"
+"    STR   75% ║"
+"    STR   75% ║"
+"    STR   75% ║"
+"    STR   75% ║"
+"    STR   75% ║"
+"    DÉCIM…  7 ║"
+"▾ 日本語… (6) ↓" Hidden by multi-width symbols: [(3, " "), (5, " "), (7, " ")]
+
+width 19:
+"★ common (5)      ↑"
+"  common_résu… TS █"
+"  common_日本… TS █" Hidden by multi-width symbols: [(10, " "), (12, " ")]
+"  common_ééé_… TS █"
+"  common_❤️❤️… TS ║" Hidden by multi-width symbols: [(10, " "), (12, " ")]
+"  common_a�b�… TS ║"
+"▾ résumé_ñ (6)    ║"
+"   ré… STR   75%  ║"
+"   日… STR   75%  ║" Hidden by multi-width symbols: [(4, " ")]
+"   éé… STR   75%  ║"
+"   ❤️… STR   75%  ║" Hidden by multi-width symbols: [(4, " ")]
+"   a�… STR   75%  ║"
+"   … DÉCIM…  75%  ║"
+"▾ 日本語フィ… (6) ↓" Hidden by multi-width symbols: [(3, " "), (5, " "), (7, " "), (9, " "), (11, " ")]
+
+width 26:
+"★ common (5)             ↑"
+"  common_résumé_ñ TS     █"
+"  common_日本語フィ… TS  █" Hidden by multi-width symbols: [(10, " "), (12, " "), (14, " "), (16, " "), (18, " ")]
+"  common_ééé_field TS    █"
+"  common_❤️❤️_love TS    ║" Hidden by multi-width symbols: [(10, " "), (12, " ")]
+"  common_a�b�c_bidi TS   ║"
+"▾ résumé_ñ (6)           ║"
+"   résumé_ñ   STR   75%  ║"
+"   日本語フ…  STR   75%  ║" Hidden by multi-width symbols: [(4, " "), (6, " "), (8, " "), (10, " ")]
+"   ééé_field  STR   75%  ║"
+"   ❤️❤️_love  STR   75%  ║" Hidden by multi-width symbols: [(4, " "), (6, " ")]
+"   a�b�c_bidi STR   75%  ║"
+"   日本     DÉCIM…  75%  ║" Hidden by multi-width symbols: [(4, " "), (6, " ")]
+"▾ 日本語フィールド (6)   ↓" Hidden by multi-width symbols: [(3, " "), (5, " "), (7, " "), (9, " "), (11, " "), (13, " "), (15, " "), (17, " ")]

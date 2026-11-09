@@ -1,0 +1,16 @@
+---
+source: crates/trawl-cli/src/tui/ui/results.rs
+expression: "snapshot_rows(\"multi-line span clips to its start line\")"
+---
+┌ Error ───────────────────────────────────────────────────┐
+│ error: parse error: the error                            │
+│                                                          │
+│   | stats count(                                         │
+│           ^^^^^^                                         │
+│   the message                                            │
+│   hint: the hint                                         │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘

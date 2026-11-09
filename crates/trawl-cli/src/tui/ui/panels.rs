@@ -18,6 +18,7 @@ use ratatui::widgets::{
 use crate::tui::App;
 use crate::tui::state::{Focus, LoadedRun, MainTab, SavedFocus, SchemaBrowser};
 use crate::tui::theme::Theme;
+use trawl_core::text_layout::{cells, fit_cells, pad_cells};
 
 /// Render panel content based on the active `MainTab`.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -126,6 +127,7 @@ fn render_filter_bar(filter: &str, active: bool, theme: &Theme, frame: &mut Fram
 // ---------------------------------------------------------------------------
 
 /// A node in the flattened schema tree (computed at render time).
+#[derive(Debug)]
 enum TreeNode<'a> {
     /// Common fields section header.
     CommonHeader { field_count: usize },
@@ -284,101 +286,6 @@ fn render_schema_tree(schema: &SchemaBrowser, theme: &Theme, frame: &mut Frame<'
         return;
     }
 
-    let items: Vec<ListItem<'_>> = nodes
-        .iter()
-        .map(|node| match node {
-            TreeNode::CommonHeader { field_count } => ListItem::new(Line::from(Span::styled(
-                format!("\u{2605} common ({field_count})"),
-                Style::default()
-                    .fg(theme.text_muted)
-                    .add_modifier(Modifier::BOLD),
-            ))),
-            TreeNode::CommonField { name, data_type } => {
-                let type_str = abbreviate_type(data_type);
-                let tc = type_color(data_type, theme);
-                ListItem::new(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled((*name).to_string(), Style::default().fg(theme.text_accent)),
-                    Span::raw(" "),
-                    Span::styled(type_str, Style::default().fg(tc)),
-                ]))
-            }
-            TreeNode::ServiceField {
-                name,
-                data_type,
-                coverage,
-            } => {
-                let type_str = abbreviate_type(data_type);
-                let tc = type_color(data_type, theme);
-
-                // Column layout: "   " + name (padded) + " " + type (4) + " " + coverage (4) + " "
-                let indent = 3usize;
-                let type_width = 4usize;
-                let cov_width = 4usize;
-                let trailing = 1usize; // padding before detail pane border
-                let overhead = indent + 1 + type_width + 1 + cov_width + trailing;
-                #[allow(clippy::cast_possible_truncation)]
-                let max_name = (area.width as usize).saturating_sub(overhead);
-                let display_name = if name.len() > max_name {
-                    &name[..max_name]
-                } else {
-                    name
-                };
-                let name_pad = max_name.saturating_sub(display_name.len());
-
-                let mut spans = vec![
-                    Span::raw(" ".repeat(indent)),
-                    Span::styled(
-                        (*display_name).to_string(),
-                        Style::default().fg(theme.text_accent),
-                    ),
-                    Span::raw(" ".repeat(name_pad + 1)),
-                    Span::styled(format!("{type_str:<type_width$}"), Style::default().fg(tc)),
-                ];
-                if let Some((ref label, color)) = *coverage {
-                    spans.push(Span::raw(" "));
-                    spans.push(Span::styled(label.clone(), Style::default().fg(color)));
-                }
-                ListItem::new(Line::from(spans))
-            }
-            TreeNode::Service {
-                name,
-                expanded,
-                field_count,
-            } => {
-                let arrow = if *expanded { "\u{25be}" } else { "\u{25b8}" };
-                let count_str = if *field_count > 0 {
-                    format!(" ({field_count})")
-                } else {
-                    String::new()
-                };
-                #[allow(clippy::cast_possible_truncation)]
-                let max_name = (area.width as usize).saturating_sub(6);
-                let display_name = if name.len() > max_name {
-                    &name[..max_name]
-                } else {
-                    name
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{arrow} "), Style::default().fg(theme.text_muted)),
-                    Span::styled(
-                        display_name.to_string(),
-                        Style::default()
-                            .fg(theme.text_primary)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(count_str, Style::default().fg(theme.text_muted)),
-                ]))
-            }
-        })
-        .collect();
-
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .bg(theme.surface_highlight)
-            .add_modifier(Modifier::BOLD),
-    );
-
     let total = nodes.len();
     #[allow(clippy::cast_possible_truncation)]
     let visible_height = area.height as usize;
@@ -394,6 +301,16 @@ fn render_schema_tree(schema: &SchemaBrowser, theme: &Theme, frame: &mut Frame<'
         area
     };
 
+    let items: Vec<ListItem<'_>> = nodes
+        .iter()
+        .map(|node| ListItem::new(tree_line(node, theme, usize::from(list_area.width))))
+        .collect();
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(theme.surface_highlight)
+            .add_modifier(Modifier::BOLD),
+    );
+
     let offset = compute_center_offset(selected, visible_height, total);
     let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
@@ -405,6 +322,94 @@ fn render_schema_tree(schema: &SchemaBrowser, theme: &Theme, frame: &mut Frame<'
             .begin_symbol(Some("\u{2191}"))
             .end_symbol(Some("\u{2193}"));
         frame.render_stateful_widget(scrollbar, area, &mut sb_state);
+    }
+}
+
+/// One schema tree row, fitted to `width` display cells.
+///
+/// Names come from senders, so each is cut by display cells after the
+/// row's fixed parts (indent, arrow, type and coverage columns, count) are
+/// reserved. A width too narrow for the fixed parts leaves the name empty.
+fn tree_line(node: &TreeNode<'_>, theme: &Theme, width: usize) -> Line<'static> {
+    match node {
+        TreeNode::CommonHeader { field_count } => Line::from(Span::styled(
+            format!("\u{2605} common ({field_count})"),
+            Style::default()
+                .fg(theme.text_muted)
+                .add_modifier(Modifier::BOLD),
+        )),
+        TreeNode::CommonField { name, data_type } => {
+            // Layout: "  " + name + " " + type.
+            let type_str = abbreviate_type(data_type);
+            let tc = type_color(data_type, theme);
+            let max_name = width.saturating_sub(2 + 1 + cells(&type_str));
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    fit_cells(name, max_name),
+                    Style::default().fg(theme.text_accent),
+                ),
+                Span::raw(" "),
+                Span::styled(type_str, Style::default().fg(tc)),
+            ])
+        }
+        TreeNode::ServiceField {
+            name,
+            data_type,
+            coverage,
+        } => {
+            let type_str = abbreviate_type(data_type);
+            let tc = type_color(data_type, theme);
+
+            // Column layout: "   " + name (padded) + " " + type (4) + " " + coverage (4) + " "
+            // A fallback type label wider than its column takes its cells
+            // from the name.
+            let indent = 3usize;
+            let type_width = cells(&type_str).max(4);
+            let cov_width = 4usize;
+            let trailing = 1usize; // padding before detail pane border
+            let overhead = indent + 1 + type_width + 1 + cov_width + trailing;
+            let max_name = width.saturating_sub(overhead);
+            let type_cell = pad_cells(&type_str, type_width);
+
+            let mut spans = vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(
+                    pad_cells(name, max_name),
+                    Style::default().fg(theme.text_accent),
+                ),
+                Span::raw(" "),
+                Span::styled(type_cell, Style::default().fg(tc)),
+            ];
+            if let Some((ref label, color)) = *coverage {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(label.clone(), Style::default().fg(color)));
+            }
+            Line::from(spans)
+        }
+        TreeNode::Service {
+            name,
+            expanded,
+            field_count,
+        } => {
+            let arrow = if *expanded { "\u{25be} " } else { "\u{25b8} " };
+            let count_str = if *field_count > 0 {
+                format!(" ({field_count})")
+            } else {
+                String::new()
+            };
+            let max_name = width.saturating_sub(cells(arrow) + cells(&count_str));
+            Line::from(vec![
+                Span::styled(arrow, Style::default().fg(theme.text_muted)),
+                Span::styled(
+                    fit_cells(name, max_name),
+                    Style::default()
+                        .fg(theme.text_primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(count_str, Style::default().fg(theme.text_muted)),
+            ])
+        }
     }
 }
 
@@ -439,12 +444,7 @@ fn abbreviate_type(data_type: &str) -> String {
     } else if dt.starts_with("DATE") {
         "DATE".to_owned()
     } else {
-        // Truncate long type names
-        if data_type.len() > 6 {
-            data_type[..6].to_owned()
-        } else {
-            data_type.to_owned()
-        }
+        fit_cells(data_type, 6)
     }
 }
 
@@ -454,36 +454,15 @@ fn abbreviate_type(data_type: &str) -> String {
 
 /// Render history entries in the left pane (relative time + truncated query).
 fn render_history_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
-    // Layout: "{4-char time}  {query…} "
-    const TIME_WIDTH: usize = 4;
-    const GAP: usize = 2;
-    const TRAILING: usize = 2; // padding before detail pane
-
     let selected = app.panel.history_selected;
 
     // Caller handles None / empty — we always have entries here.
     let history = app.history_cache.as_ref().expect("history_cache populated");
 
-    #[allow(clippy::cast_possible_truncation)]
-    let max_query = (area.width as usize).saturating_sub(TIME_WIDTH + GAP + TRAILING);
-
     let items: Vec<ListItem<'_>> = history
         .entries
         .iter()
-        .map(|entry| {
-            let time_str = format_relative_time(&entry.executed_at);
-            let query = entry.query.replace('\n', " ");
-            let display = if query.len() > max_query {
-                format!("{}…  ", &query[..max_query.saturating_sub(1)])
-            } else {
-                format!("{query}  ")
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(time_str, Style::default().fg(theme.text_muted)),
-                Span::raw("  "),
-                Span::styled(display, Style::default().fg(theme.text_primary)),
-            ]))
-        })
+        .map(|entry| ListItem::new(history_line(entry, theme, usize::from(area.width))))
         .collect();
 
     let total = items.len();
@@ -514,6 +493,29 @@ fn render_history_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Re
             &mut sb_state,
         );
     }
+}
+
+/// One history row: `"{4-char time}  {query…}  "`, the query flattened to
+/// one line and cut to what the time, gap and trailing room leave of `width`.
+/// The trailing room also clears the scrollbar drawn over the last column.
+fn history_line(
+    entry: &trawl_api::HistoryEntryResponse,
+    theme: &Theme,
+    width: usize,
+) -> Line<'static> {
+    const TIME_WIDTH: usize = 4;
+    const GAP: usize = 2;
+    const TRAILING: usize = 2; // padding before detail pane
+
+    let max_query = width.saturating_sub(TIME_WIDTH + GAP + TRAILING);
+    let time_str = format_relative_time(&entry.executed_at);
+    let query = entry.query.replace('\n', " ");
+    let display = format!("{}  ", fit_cells(&query, max_query));
+    Line::from(vec![
+        Span::styled(time_str, Style::default().fg(theme.text_muted)),
+        Span::raw("  "),
+        Span::styled(display, Style::default().fg(theme.text_primary)),
+    ])
 }
 
 /// Format an ISO 8601 timestamp as a compact relative time from now.
@@ -1048,29 +1050,14 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
     )));
 
     // -- column headers --
-    let col_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
-    // Widths sample the header and the first 100 rows, so a wider value further down
-    // renders truncated.
-    let col_widths: Vec<usize> = col_names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let mut w = name.len();
-            for row in result.rows.iter().take(100) {
-                if let Some(val) = row.get(i) {
-                    w = w.max(format_value(val).len());
-                }
-            }
-            w.min(30) // cap at 30 chars
-        })
-        .collect();
-
-    let header_spans: Vec<Span<'static>> = col_names
+    let col_widths = run_result_widths(result);
+    let header_spans: Vec<Span<'static>> = result
+        .columns
         .iter()
         .zip(&col_widths)
-        .map(|(name, &width)| {
+        .map(|(column, &width)| {
             Span::styled(
-                format!("{name:<width$}  "),
+                run_result_cell(&column.name, width),
                 Style::default()
                     .fg(theme.text_accent)
                     .add_modifier(Modifier::BOLD),
@@ -1100,14 +1087,8 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
             .iter()
             .zip(&col_widths)
             .map(|(val, &width)| {
-                let display = format_value(val);
-                let truncated = if display.len() > width {
-                    format!("{}…", &display[..width.saturating_sub(1)])
-                } else {
-                    display
-                };
                 Span::styled(
-                    format!("{truncated:<width$}  "),
+                    run_result_cell(&format_value(val), width),
                     Style::default().fg(theme.text_primary),
                 )
             })
@@ -1130,6 +1111,39 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
 
     let p = Paragraph::new(lines);
     frame.render_widget(p, area);
+}
+
+/// The widest a run result column gets, in display cells.
+const RUN_RESULT_COLUMN_CAP: usize = 30;
+
+/// Display-cell widths of the run result columns.
+///
+/// Widths sample the header and the first 100 rows, so a wider value further
+/// down renders cut. Each sample is measured as it would render at the cap.
+fn run_result_widths(result: &trawl_api::value::QueryResult) -> Vec<usize> {
+    let fitted = |text: &str| cells(&fit_cells(text, RUN_RESULT_COLUMN_CAP));
+    result
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, column)| {
+            result
+                .rows
+                .iter()
+                .take(100)
+                .filter_map(|row| row.get(i))
+                .map(|val| fitted(&format_value(val)))
+                .fold(fitted(&column.name), usize::max)
+        })
+        .collect()
+}
+
+/// One run result cell: `text` cut and padded to `width` display cells, then
+/// the two-cell gap before the next column.
+fn run_result_cell(text: &str, width: usize) -> String {
+    let mut cell = pad_cells(text, width);
+    cell.push_str("  ");
+    cell
 }
 
 /// Format a `Value` for display in the run results table.
@@ -1401,5 +1415,406 @@ mod saved_name_tests {
             }
             assert_eq!(actual, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod unicode_tests {
+    use std::fmt::Write as _;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::text::Line;
+    use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+    use trawl_core::text_layout::{MARKER, cells};
+
+    use super::*;
+    use crate::tui::state::{CommonField, SavedDetailState};
+    use crate::tui::tests::test_app;
+
+    /// Sender-controlled names a cut must not split: accented, CJK, a
+    /// combining mark, an emoji with its variation selector, and a bidi
+    /// override with a control character.
+    const FIXTURES: &[&str] = &[
+        "résumé_ñ",
+        "日本語フィールド",
+        "e\u{301}e\u{301}e\u{301}_field",
+        "❤\u{FE0F}❤\u{FE0F}_love",
+        "a\u{202E}b\u{7}c_bidi",
+    ];
+
+    /// Widths from nothing to past every fixture's natural width.
+    const WIDTHS: std::ops::RangeInclusive<u16> = 0..=48;
+
+    fn text_of(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn draw(width: u16, height: u16, render: impl FnOnce(&mut Frame<'_>)) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(render).expect("render");
+        terminal
+    }
+
+    fn schema() -> SchemaBrowser {
+        let column = |name: &str, data_type: &str| trawl_api::ServiceColumnStats {
+            name: name.to_owned(),
+            data_type: data_type.to_owned(),
+            null_count: 1,
+            total_count: 4,
+            min_value: None,
+            max_value: None,
+            compressed_bytes: 0,
+        };
+        let services: Vec<_> = FIXTURES
+            .iter()
+            .map(|name| trawl_api::ServiceSchema {
+                name: (*name).to_owned(),
+                columns: FIXTURES
+                    .iter()
+                    .map(|field| column(field, "VARCHAR"))
+                    .chain([column("日本", "DÉCIMAL(18,3)")])
+                    .collect(),
+                earliest_date: None,
+                latest_date: None,
+                file_count: 1,
+                total_bytes: 1,
+                total_events: 4,
+                daily_event_counts: Vec::new(),
+                degraded_fields: Vec::new(),
+            })
+            .collect();
+        let mut schema = SchemaBrowser::new(services);
+        schema.common_fields = FIXTURES
+            .iter()
+            .map(|name| CommonField {
+                name: format!("common_{name}"),
+                data_type: "TIMESTAMP".to_owned(),
+                service_count: FIXTURES.len(),
+                null_count: 0,
+                total_count: 4,
+                min_value: None,
+                max_value: None,
+            })
+            .collect();
+        schema.expanded = FIXTURES.iter().map(|name| (*name).to_owned()).collect();
+        schema
+    }
+
+    /// Every schema tree row keeps its name inside the cells left after the
+    /// row's fixed parts, and a service field's name column is exactly that
+    /// wide so the type column lines up.
+    #[test]
+    fn unicode_panels_survive_resize_schema_tree() {
+        let schema = schema();
+        let theme = test_app().theme;
+        let nodes = flatten_tree(&schema, &theme);
+        for width in WIDTHS.map(usize::from) {
+            for node in &nodes {
+                let line = tree_line(node, &theme, width);
+                let name = line.spans.get(1).map_or(0, |span| cells(&span.content));
+                match node {
+                    TreeNode::CommonHeader { .. } => {}
+                    TreeNode::CommonField { data_type, .. } => {
+                        let budget = width.saturating_sub(3 + cells(&abbreviate_type(data_type)));
+                        assert!(name <= budget, "{node:?} at {width}");
+                    }
+                    TreeNode::ServiceField { data_type, .. } => {
+                        let type_width = cells(&abbreviate_type(data_type)).max(4);
+                        let budget = width.saturating_sub(10 + type_width);
+                        assert_eq!(name, budget, "{node:?} at {width}");
+                    }
+                    TreeNode::Service { field_count, .. } => {
+                        let count = format!(" ({field_count})").len();
+                        assert!(
+                            name <= width.saturating_sub(2 + count),
+                            "{node:?} at {width}"
+                        );
+                    }
+                }
+                // Once the fixed parts fit, the whole row does.
+                if width >= 16 + 2 {
+                    assert!(cells(&text_of(&line)) <= width, "{node:?} at {width}");
+                }
+            }
+            for height in [3, 40] {
+                draw(u16::try_from(width).unwrap(), height, |frame| {
+                    render_schema_tree(&schema, &theme, frame, frame.area());
+                });
+            }
+        }
+    }
+
+    /// The fallback type label is cut by display cells, not bytes.
+    #[test]
+    fn unicode_panels_survive_resize_type_label() {
+        assert_eq!(abbreviate_type("DÉCIMAL(18,3)"), format!("DÉCIM{MARKER}"));
+        assert_eq!(abbreviate_type("日本語型"), format!("日本{MARKER}"));
+        assert_eq!(abbreviate_type("LIST"), "LIST");
+    }
+
+    fn history_app(queries: &[&str]) -> crate::tui::App {
+        let mut app = test_app();
+        app.history_cache = Some(trawl_api::HistoryResponse {
+            entries: queries
+                .iter()
+                .enumerate()
+                .map(|(id, query)| trawl_api::HistoryEntryResponse {
+                    id: i64::try_from(id).unwrap(),
+                    query: (*query).to_owned(),
+                    executed_at: "garbage".to_owned(),
+                    duration_ms: 1,
+                    row_count: 1,
+                    status: trawl_api::QueryStatus::Success,
+                })
+                .collect(),
+            total: queries.len(),
+        });
+        app
+    }
+
+    fn history_queries() -> Vec<String> {
+        FIXTURES
+            .iter()
+            .map(|name| format!("service=\"{name}\"\n| where {name} ~ /x/"))
+            .collect()
+    }
+
+    /// A history row's query keeps inside what the time, the gap and the
+    /// trailing room leave, and the row inside the pane once those fit.
+    #[test]
+    fn unicode_panels_survive_resize_history() {
+        let queries = history_queries();
+        let queries: Vec<&str> = queries.iter().map(String::as_str).collect();
+        let app = history_app(&queries);
+        for width in WIDTHS {
+            for entry in &app.history_cache.as_ref().unwrap().entries {
+                let line = history_line(entry, &app.theme, usize::from(width));
+                // The query, then its two trailing cells.
+                let query = cells(&line.spans[2].content) - 2;
+                assert!(
+                    query <= usize::from(width).saturating_sub(4 + 2 + 2),
+                    "{width}"
+                );
+                if width >= 8 {
+                    assert!(cells(&text_of(&line)) <= usize::from(width), "{width}");
+                }
+            }
+            for height in [2, 20] {
+                draw(width, height, |frame| {
+                    render_history_list(&app, &app.theme, frame, frame.area());
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_panels_survive_resize_history_snapshot() {
+        let queries = history_queries();
+        let queries: Vec<&str> = queries.iter().map(String::as_str).collect();
+        let app = history_app(&queries);
+        let mut frames = String::new();
+        for width in [13, 17, 24] {
+            let terminal = draw(width, 5, |frame| {
+                render_history_list(&app, &app.theme, frame, frame.area());
+            });
+            writeln!(frames, "width {width}:\n{}", terminal.backend()).unwrap();
+        }
+        insta::assert_snapshot!(frames);
+    }
+
+    #[test]
+    fn unicode_panels_survive_resize_schema_snapshot() {
+        let schema = schema();
+        let theme = test_app().theme;
+        let mut frames = String::new();
+        for width in [15, 19, 26] {
+            let terminal = draw(width, 14, |frame| {
+                render_schema_tree(&schema, &theme, frame, frame.area());
+            });
+            writeln!(frames, "width {width}:\n{}", terminal.backend()).unwrap();
+        }
+        insta::assert_snapshot!(frames);
+    }
+
+    fn run_app(columns: &[&str], rows: Vec<Vec<Value>>) -> crate::tui::App {
+        let mut app = test_app();
+        app.panel.saved_detail = Some(SavedDetailState {
+            saved_id: 1,
+            runs: Vec::new(),
+            total_runs: 0,
+            run_selected: 0,
+            run_scroll: 0,
+            result: Some(LoadedRun {
+                run_id: 7,
+                result: QueryResult {
+                    columns: columns
+                        .iter()
+                        .map(|name| Column::new(*name, ColumnType::String))
+                        .collect(),
+                    rows,
+                },
+            }),
+            result_scroll: 0,
+            pending: None,
+        });
+        app
+    }
+
+    /// Saved-run headers and cells are each exactly their column's width
+    /// plus the gap, and no column passes the cap.
+    #[test]
+    fn unicode_panels_survive_resize_saved_run() {
+        let rows = FIXTURES
+            .iter()
+            .map(|name| {
+                vec![
+                    Value::String((*name).to_owned()),
+                    Value::String(name.repeat(10)),
+                ]
+            })
+            .collect();
+        let header = FIXTURES.concat();
+        let app = run_app(&["日本語フィールド", &header], rows);
+        let result = &app
+            .panel
+            .saved_detail
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()
+            .result;
+        let widths = run_result_widths(result);
+        assert!(
+            widths.iter().all(|&w| w <= RUN_RESULT_COLUMN_CAP),
+            "{widths:?}"
+        );
+        assert_eq!(widths[0], 16);
+        for (i, column) in result.columns.iter().enumerate() {
+            for budget in 0..=RUN_RESULT_COLUMN_CAP + 2 {
+                assert_eq!(cells(&run_result_cell(&column.name, budget)), budget + 2);
+            }
+            for row in &result.rows {
+                let cell = run_result_cell(&format_value(&row[i]), widths[i]);
+                assert_eq!(cells(&cell), widths[i] + 2, "{cell:?}");
+            }
+        }
+        for width in WIDTHS {
+            for height in [3, 12] {
+                draw(width, height, |frame| {
+                    render_saved_run_results(&app, &app.theme, frame, frame.area());
+                });
+            }
+        }
+    }
+
+    /// Columns holding CJK, accented and combining text, with a header and a
+    /// value past the 30-cell cap: on every rendered row each column starts
+    /// on the same cell.
+    #[test]
+    fn unicode_result_columns_align() {
+        let rows = vec![
+            vec![
+                Value::String("日本語フィールド".into()),
+                Value::String("résumé_ñ".into()),
+                Value::String("7001".into()),
+            ],
+            vec![
+                Value::String("web".into()),
+                Value::String("x".repeat(50)),
+                Value::String("7022".into()),
+            ],
+            vec![
+                Value::String("e\u{301}e\u{301}".into()),
+                Value::String("❤\u{FE0F} ok".into()),
+                Value::String("7333".into()),
+            ],
+        ];
+        let long_header = "message_header_that_is_well_over_thirty_cells";
+        let app = run_app(&["service", long_header, "count"], rows);
+        let terminal = draw(90, 8, |frame| {
+            render_saved_run_results(&app, &app.theme, frame, frame.area());
+        });
+        let screen = terminal.backend().buffer();
+
+        // Rows as text, one symbol per drawn grapheme (a wide symbol hides
+        // the cell after it).
+        let rows: Vec<String> = screen
+            .content
+            .chunks(usize::from(screen.area.width))
+            .map(|row| {
+                let mut text = String::new();
+                let mut hidden = 0usize;
+                for cell in row {
+                    if hidden == 0 {
+                        text.push_str(cell.symbol());
+                    }
+                    hidden = hidden.max(cells(cell.symbol())).saturating_sub(1);
+                }
+                text
+            })
+            .collect();
+        let all = rows.join("\n");
+
+        // The header and the three data rows, by their last column.
+        let starts = [
+            ("count", "message_"),
+            ("7001", "résumé"),
+            ("7022", "xxx"),
+            ("7333", "❤"),
+        ];
+        let column_of = |row: &str, value: &str| cells(&row[..row.find(value).expect("value")]);
+        let mut boundaries = Vec::new();
+        for (third, second) in starts {
+            let row = rows
+                .iter()
+                .find(|row| row.contains(third))
+                .unwrap_or_else(|| panic!("row with {third}:\n{all}"));
+            boundaries.push((column_of(row, second), column_of(row, third)));
+        }
+        // `service` is 16 cells wide (the CJK value), the second column is
+        // capped at 30, each followed by a two-cell gap.
+        assert!(
+            boundaries.iter().all(|&b| b == (18, 50)),
+            "{boundaries:?}\n{all}"
+        );
+        assert!(
+            all.contains(&format!("message_header_that_is_well_o{MARKER}")),
+            "{all}"
+        );
+        insta::assert_snapshot!(all);
+    }
+
+    /// A halfwidth sound mark takes a cell of its own where ratatui draws
+    /// it, so a column holding `ｶﾞ` pads it as two cells. The next column's
+    /// start is read off the buffer's own cell positions, which ratatui
+    /// lays out with its own widths, not with the kit's.
+    #[test]
+    fn unicode_result_columns_align_halfwidth_sound_marks() {
+        let rows = vec![
+            vec![Value::String("ｶﾞ".into()), Value::String("A1".into())],
+            vec![Value::String("web".into()), Value::String("B2".into())],
+            vec![Value::String("ﾊﾟﾊﾟﾊﾟﾊﾟﾊﾟ".into()), Value::String("C3".into())],
+        ];
+        let app = run_app(&["service", "Next"], rows);
+        let terminal = draw(40, 8, |frame| {
+            render_saved_run_results(&app, &app.theme, frame, frame.area());
+        });
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        let start_of = |marker: &str| {
+            buffer
+                .content
+                .chunks(width)
+                .find_map(|row| row.iter().position(|cell| cell.symbol() == marker))
+                .unwrap_or_else(|| panic!("no {marker:?} in\n{buffer:?}"))
+        };
+        let starts: Vec<usize> = ["N", "A", "B", "C"].into_iter().map(start_of).collect();
+        // `ﾊﾟﾊﾟﾊﾟﾊﾟﾊﾟ` is ten cells, then the two-cell gap.
+        assert_eq!(starts, [12, 12, 12, 12], "{buffer:?}");
     }
 }

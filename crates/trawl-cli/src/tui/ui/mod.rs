@@ -849,6 +849,7 @@ mod tests {
         app.tab.status = TabStatus::Error {
             message: "parse error: unexpected token".to_owned(),
             details: Vec::new(),
+            query: None,
         };
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -867,6 +868,7 @@ mod tests {
             app.tab.status = TabStatus::Error {
                 message: "unknown function: countt (did you mean 'count'?)".to_owned(),
                 details,
+                query: Some("* | stats countt(x) by host".to_owned()),
             };
             let backend = TestBackend::new(80, 24);
             let mut terminal = Terminal::new(backend).unwrap();

@@ -13,9 +13,10 @@
 //! did not parse is named by its class only: no stack trace, no internal
 //! path, no library reason.
 //!
-//! A span is checked before it is used, by the rules of the web UI's
-//! error notice (ADR-0039): reversed, past the end of the sent text, or
-//! off a character boundary at either end, and the excerpt is dropped
+//! A span is checked before it is used, by
+//! [`trawl_core::text_layout::locate_span`], the rule the web UI's error
+//! notice follows too (ADR-0039): reversed, past the end of the sent text,
+//! or off a character boundary at either end, and the excerpt is dropped
 //! while the message stays. A caret under the wrong character is worse
 //! than none.
 //!
@@ -28,6 +29,7 @@
 use rmcp::model::{CallToolResult, ContentBlock};
 use trawl_client::{ClientError, ErrorDetail, ErrorSpan, NetworkKind};
 use trawl_core::sanitize::is_unsafe_display_char;
+use trawl_core::text_layout::locate_span;
 use unicode_width::UnicodeWidthStr;
 
 use super::one_line;
@@ -318,22 +320,9 @@ pub(crate) fn diagnostic_lines(diagnostics: &[Diagnostic], lines: &mut Vec<Strin
 /// stays on its two lines and cannot reorder or hide the text around it.
 #[must_use]
 pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
-    let (start, end) = (span.start, span.end);
-    if start > end
-        || end > sent.len()
-        || !sent.is_char_boundary(start)
-        || !sent.is_char_boundary(end)
-    {
-        return None;
-    }
-    let line_start = sent[..start].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = sent[start..].find('\n').map_or(sent.len(), |i| start + i);
-    let line_number = sent[..line_start].matches('\n').count() + 1;
-    let full_line = &sent[line_start..line_end];
-    let line = full_line.strip_suffix('\r').unwrap_or(full_line);
-    let displayed_end = line_start + line.len();
-    let start_on_line = start.min(displayed_end);
-    let covered_end = end.min(displayed_end).max(start_on_line);
+    let at = locate_span(sent, span.start, span.end)?;
+    let (line_start, displayed_end) = (at.line_start, at.line_end);
+    let (start_on_line, covered_end) = (at.start, at.end);
 
     // The window, on character boundaries of the sent text.
     let window_start =
@@ -344,8 +333,8 @@ pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
     let after_end =
         floor_char_boundary(sent, shown_covered_end + EXCERPT_CONTEXT_BYTES).min(displayed_end);
 
-    let prefix = if sent.contains('\n') {
-        format!("line {line_number}: ")
+    let prefix = if at.multi_line {
+        format!("line {}: ", at.line)
     } else {
         String::new()
     };
