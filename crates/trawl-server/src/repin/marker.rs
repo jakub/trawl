@@ -300,6 +300,18 @@ where
     let rel = |path: &Path| crate::catalog::gc::root_relative(data_dir, path);
     let meta = std::fs::symlink_metadata(dir)
         .map_err(|e| io_refusal(&format!("stat {}", rel(dir)), dir, &e))?;
+    // Only an env directory can be a link here: the listing follows one,
+    // and the walk below never descends into a link. Reading on would
+    // walk the link's target outside the data root and name its children
+    // as entries of this env.
+    if meta.is_symlink() {
+        return Err(format!(
+            "the env directory {} is a symlink: the repin shadow cannot carry \
+             symlinked entries under the data root — replace it with the real \
+             directory and retry",
+            rel(dir)
+        ));
+    }
     if dev_of(&meta) != root_dev {
         return Err(nested_mount_message(data_dir, dir));
     }
@@ -613,6 +625,48 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains(&tmp.path().display().to_string()), "{err}");
+    }
+
+    /// A symlinked env directory is refused before the walk reads it. The
+    /// listing follows the link, so reading on would name the link
+    /// target's children as `prod/...` entries of the data root, and a
+    /// refusal about one of them would carry a name from outside the data
+    /// root. The refusal names the env relative to the data root only.
+    #[cfg(unix)]
+    #[test]
+    fn staging_preflight_refuses_a_symlinked_env_dir() {
+        const MARKER: &str = "MARKER-outside-file";
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let planted = outside.path().join(MARKER);
+        std::fs::write(&planted, b"rows").unwrap();
+        std::os::unix::fs::symlink(outside.path(), data.join("prod")).unwrap();
+        let outside_abs = outside.path().display().to_string();
+        let expected = "the env directory prod is a symlink: the repin shadow cannot \
+                        carry symlinked entries under the data root — replace it with \
+                        the real directory and retry";
+
+        // The real device lookup: both tempdirs share a filesystem, so
+        // only the link itself can refuse.
+        let err = check_staging_filesystem(&data).expect_err("a symlinked env must refuse");
+        assert_eq!(err, expected);
+
+        // A link target's child on another device must not be named.
+        let foreign_ino = inode(&planted);
+        let dev_of = |meta: &std::fs::Metadata| {
+            if inode_of(meta) == foreign_ino {
+                7777
+            } else {
+                0
+            }
+        };
+        let err =
+            check_env_subtree_devices(&data, 0, &dev_of).expect_err("a symlinked env must refuse");
+        assert!(!err.contains(MARKER), "{err}");
+        assert!(!err.contains(&outside_abs), "{err}");
+        assert_eq!(err, expected);
     }
 
     /// Only what the engine moves is in scope: `wal/` and `scheduled/`
