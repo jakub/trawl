@@ -1119,7 +1119,7 @@ async fn check_identity(
     let seen = look(move || {
         let marker = read_catalog_marker(&data_root);
         let linked = marker.is_err()
-            && std::fs::symlink_metadata(data_root.join("CATALOG"))
+            && std::fs::symlink_metadata(data_root.join(trawl_config::CATALOG_MARKER))
                 .is_ok_and(|meta| meta.file_type().is_symlink());
         let mut walked = None;
         let judgement = marker.as_ref().ok().map(|marker| {

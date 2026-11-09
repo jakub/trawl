@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Marker filename inside the data root.
-pub const REPIN_MARKER: &str = "REPIN";
+pub const REPIN_MARKER: &str = trawl_config::REPIN_MARKER;
 
 /// Suffix of the shadow (next-generation) sibling root. Config owns the
 /// spelling, because its query scratch check refuses these roots too.

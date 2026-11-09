@@ -103,7 +103,7 @@ use crate::ingest::publication_marker::{PublicationClaims, scan_claims};
 use crate::store::{CatalogStore, FieldConflict, PinProposal, ServiceObservation};
 
 /// Marker file mirroring `catalog_state.catalog_id` into the data root.
-const CATALOG_MARKER: &str = "CATALOG";
+const CATALOG_MARKER: &str = trawl_config::CATALOG_MARKER;
 
 /// `pinned_from` value for pins seeded by the boot pass.
 const BOOT_PIN_SOURCE: &str = "_boot";
