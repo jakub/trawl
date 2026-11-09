@@ -106,7 +106,8 @@ replace a fixed source.
 | Unparseable first value | Arrival time, recorded as `time.unparseable`. An explicit `null` counts as present. The value does not fall through to a later source. Derivation leaves a bare source field in place. A `_time` proposal is consumed, and trawld keeps no copy of it outside `_raw`. A sender-supplied `_raw` replaces the one trawld would capture, so it may not contain the value |
 | Consumption | Only the `_time` proposal is consumed. Every bare source field stays in the event |
 | Normalization | RFC 3339 UTC at microsecond precision |
-| Plausibility | A parseable time more than ten years before arrival, or more than one day after it, is kept and flagged `time.out_of_range` |
+| Plausibility | A parseable time more than ten years before arrival is kept and flagged `time.out_of_range` |
+| Ahead of arrival | A parseable time more than 15 minutes after arrival is replaced by arrival time, recorded as `time.ahead_of_arrival`. A time at most 15 minutes ahead is kept. Derivation leaves a bare source field, such as `timestamp`, in place with the sender's value. A `_time` proposal is consumed, and trawld keeps no copy of it outside `_raw`. A sender-supplied `_raw` replaces the one trawld would capture, so it may not contain the value |
 
 Accepted string forms:
 
@@ -205,7 +206,8 @@ action. An actionable repair means someone should inspect the sender.
 | `service.from_profile` | actionable | A profile used its service default after an unusable frame service |
 | `time.from_ingest` | routine | No configured time source was present, so arrival time was used |
 | `time.unparseable` | actionable | The first present time source did not parse, so arrival time was used |
-| `time.out_of_range` | actionable | A parseable event time was kept outside the plausibility window |
+| `time.out_of_range` | actionable | A parseable event time more than ten years before arrival was kept |
+| `time.ahead_of_arrival` | actionable | A parseable event time more than 15 minutes after arrival was replaced by arrival time |
 | `field.truncated` | actionable | A stored string value, `_raw` included, exceeded 65536 characters and was cut |
 | `field.reserved_prefix` | routine | A reserved prefix was stripped |
 | `field.name_empty` | actionable | A name made only of underscores was dropped |

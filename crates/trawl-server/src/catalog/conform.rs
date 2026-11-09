@@ -903,8 +903,10 @@ pub(crate) struct LayoutPath {
 ///
 /// It doubles as the rewrite's never-NULL `_time` fallback: a standing file
 /// has no WAL filename to recover an ingest instant from, but it does sit in
-/// a directory that already claims an hour — the closest honest answer
-/// available, and by construction inside the window the row was pruned to.
+/// a directory that names the hour compaction wrote it, at or after the
+/// row's arrival — the closest honest answer available. That hour need not
+/// match any query window: a `last=` walk floors its start to the hour and
+/// pads it.
 pub(crate) fn layout_path(data_dir: &Path, path: &Path) -> Option<LayoutPath> {
     let rel = path.strip_prefix(data_dir).ok()?;
     let mut parts: Vec<&str> = Vec::new();

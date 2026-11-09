@@ -79,8 +79,14 @@ wire_enum! {
         /// source in place. A `_time` proposal is consumed, and trawld
         /// keeps no copy of it outside `_raw`.
         TimeUnparseable => "time.unparseable",
-        /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
+        /// `_time` was more than ten years before arrival; kept, but flagged.
         TimeOutOfRange => "time.out_of_range",
+        /// the first present `_time` source parsed to more than
+        /// [`MAX_TIME_LEAD`] after arrival; used arrival time (ADR-0013,
+        /// amendment of 2026-11-08). Derivation leaves a bare source in
+        /// place. A `_time` proposal is consumed, and trawld keeps no copy
+        /// of it outside `_raw`.
+        TimeAheadOfArrival => "time.ahead_of_arrival",
         /// a stored string value, `_raw` included, exceeded
         /// [`MAX_RAW_CHARS`] characters and was cut to that many, on a
         /// character boundary.
@@ -176,6 +182,7 @@ impl RepairCode {
             | Self::FieldNameCaseFolded => RepairClass::Routine,
             Self::TimeUnparseable
             | Self::TimeOutOfRange
+            | Self::TimeAheadOfArrival
             | Self::FieldTruncated
             | Self::FieldNameEmpty
             | Self::FieldStampClaimed
@@ -263,6 +270,10 @@ pub enum TimeSource {
     /// `null` included), which earns `time.unparseable`; `None` means no
     /// source was present, which earns `time.from_ingest`.
     Arrival { unparseable: Option<usize> },
+    /// The first present source parsed to more than [`MAX_TIME_LEAD`]
+    /// after arrival, so arrival time filled `_time`, which earns
+    /// `time.ahead_of_arrival`.
+    AheadOfArrival(usize),
 }
 
 /// How an accepted event's `_severity` was decided, recorded as
@@ -396,8 +407,14 @@ pub const MAX_RAW_CHARS: usize = 65_536;
 /// How far in the past a parsed `_time` may sit before it is flagged
 /// `time.out_of_range` (kept, never substituted).
 const OUT_OF_RANGE_PAST_DAYS: i64 = 3653; // ~10 years
-/// How far in the future a parsed `_time` may sit before it is flagged.
-const OUT_OF_RANGE_FUTURE_DAYS: i64 = 1;
+
+/// How far after arrival a parsed `_time` may sit and still be kept. A later
+/// one is replaced by arrival time and flagged `time.ahead_of_arrival`
+/// (ADR-0013, amendment of 2026-11-08). Compaction files a row in the hour
+/// directory of its own clock, after arrival, so this bound is what lets a
+/// `last=` walk over hour directories reach every row (ADR-0008, amendment
+/// of 2026-11-08); source selection asserts its padding covers it.
+pub const MAX_TIME_LEAD: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
 /// Date-time formats carrying an explicit UTC offset, tried after RFC 3339.
 ///
@@ -1095,8 +1112,9 @@ fn host_absent(out: &Map<String, Value>) -> bool {
 /// `time_from` list, returning the canonical RFC 3339 UTC-microsecond
 /// text and the repair it earned, if any (ADR-0013 §2, ADR-0008 grammar):
 /// `time.from_ingest` when no source is present, `time.unparseable` when
-/// the first present one fails to parse, `time.out_of_range` when it parses
-/// to an implausible instant.
+/// the first present one fails to parse, `time.ahead_of_arrival` when it
+/// parses to more than [`MAX_TIME_LEAD`] after arrival, and
+/// `time.out_of_range` when it parses to more than ten years before it.
 ///
 /// Derivation observes, it never consumes. Only `_time` itself is removed,
 /// being the proposal slot the canonical value replaces;
@@ -1106,7 +1124,7 @@ fn host_absent(out: &Map<String, Value>) -> bool {
 /// First present, not first parseable: an unparseable value claims the
 /// derivation and falls to arrival time rather than reaching past itself
 /// to a lower-precedence source, so what `_time` holds is always
-/// explicable from one input. The returned [`TimeSource`] names that
+/// explicable from one input. An ahead value claims it the same way. The returned [`TimeSource`] names that
 /// input, including when it claimed the derivation and failed to parse.
 fn derive_time(
     out: &mut Map<String, Value>,
@@ -1127,12 +1145,18 @@ fn derive_time(
         );
     };
     match parse_event_time(&v) {
+        // Compared as parsed instants, before the microsecond spelling, so
+        // no rounding can pull a lead back inside the bound.
+        Some(dt) if dt > ctx.arrival_instant + MAX_TIME_LEAD => (
+            ctx.arrival.to_owned(),
+            Some(RepairCode::TimeAheadOfArrival),
+            TimeSource::AheadOfArrival(index),
+        ),
         Some(dt) => {
             let past = ctx.arrival_instant - chrono::Duration::days(OUT_OF_RANGE_PAST_DAYS);
-            let future = ctx.arrival_instant + chrono::Duration::days(OUT_OF_RANGE_FUTURE_DAYS);
             // Implausible, but parseable: kept — flagged, never
             // substituted (the client said what it said).
-            let repair = (dt < past || dt > future).then_some(RepairCode::TimeOutOfRange);
+            let repair = (dt < past).then_some(RepairCode::TimeOutOfRange);
             (
                 dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
                 repair,
@@ -2124,6 +2148,56 @@ mod tests {
         assert_eq!(c.obj["@timestamp"], "2025-06-01T12:00:00Z");
     }
 
+    /// A source more than [`MAX_TIME_LEAD`] ahead of arrival loses the
+    /// derivation to arrival time, but an alias source is still the
+    /// sender's own column and keeps the sender's value. A `_time` proposal
+    /// is consumed, so its value survives only in the `_raw` trawld builds.
+    #[test]
+    fn ahead_alias_source_stays_as_a_column() {
+        const AHEAD: &str = "2026-01-01T03:00:00Z";
+        for alias in ["timestamp", "@timestamp"] {
+            let c = canon(&format!(r#"{{"service":"s","{alias}":"{AHEAD}"}}"#));
+            assert_eq!(c.obj["_time"], ARRIVAL, "{alias}");
+            assert!(codes(&c).contains(&"time.ahead_of_arrival"), "{alias}");
+            assert_eq!(c.obj[alias], AHEAD, "{alias} keeps the sender's value");
+        }
+
+        let c = canon(&format!(r#"{{"service":"s","_time":"{AHEAD}"}}"#));
+        assert_eq!(c.obj["_time"], ARRIVAL);
+        assert!(codes(&c).contains(&"time.ahead_of_arrival"));
+        let holders: Vec<&String> = c
+            .obj
+            .iter()
+            .filter(|(_, v)| v.as_str().is_some_and(|s| s.contains(AHEAD)))
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(holders, ["_raw"], "only the built `_raw` keeps a proposal");
+
+        // First present claims the derivation: an ahead `_time` does not
+        // fall through to a healthy alias below it.
+        let c = canon(&format!(
+            r#"{{"service":"s","_time":"{AHEAD}","timestamp":"2025-12-31T23:00:00Z"}}"#
+        ));
+        assert_eq!(c.obj["_time"], ARRIVAL);
+        assert!(codes(&c).contains(&"time.ahead_of_arrival"));
+        assert_eq!(c.obj["timestamp"], "2025-12-31T23:00:00Z", "still stored");
+
+        // A sender-supplied `_raw` replaces trawld's capture, so a consumed
+        // proposal survives nowhere.
+        let c = canon(&format!(
+            r#"{{"service":"s","_time":"{AHEAD}","_raw":"own line"}}"#
+        ));
+        assert_eq!(c.obj["_time"], ARRIVAL);
+        assert_eq!(c.obj["_raw"], "own line");
+        assert!(
+            !c.obj
+                .values()
+                .any(|v| v.as_str().is_some_and(|s| s.contains(AHEAD))),
+            "{:?}",
+            c.obj
+        );
+    }
+
     /// First present claims the derivation: an unparseable `_time` falls
     /// to arrival time rather than reaching past itself to a
     /// lower-precedence source.
@@ -2721,16 +2795,98 @@ mod tests {
         }
     }
 
+    /// A parsed `_time` more than [`MAX_TIME_LEAD`] after arrival is
+    /// replaced by arrival time and flagged `time.ahead_of_arrival`
+    /// (ADR-0013, amendment of 2026-11-08); one at most that far ahead is
+    /// kept. The bound compares parsed instants, so a lead past it by a
+    /// nanosecond is replaced even though its microsecond spelling would
+    /// equal the bound.
     #[test]
-    fn time_out_of_range_kept_but_flagged() {
-        // >10y past and >1d future parse fine but are implausible.
-        for input in ["1999-01-01T00:00:00Z", "2026-01-03T00:00:00Z"] {
+    fn time_ahead_of_arrival_is_replaced_by_arrival() {
+        for input in [
+            "2026-01-01T00:15:00.000001Z",
+            "2026-01-01T00:15:00.000000001Z",
+            "2026-01-01T02:00:00Z",
+            "2026-01-03T00:00:00Z",
+        ] {
             let c = canon(&format!(
                 r#"{{"service":"s","env":"prod","host":"h","_time":"{input}"}}"#
             ));
-            assert_ne!(c.obj["_time"], ARRIVAL, "out-of-range is KEPT: {input}");
-            assert!(codes(&c).contains(&"time.out_of_range"), "input {input}");
-            assert!(!codes(&c).contains(&"time.from_ingest"), "input {input}");
+            assert_eq!(c.obj["_time"], ARRIVAL, "replaced by arrival: {input}");
+            assert_eq!(codes(&c), ["time.ahead_of_arrival"], "input {input}");
+            assert_eq!(c.lineage.time, TimeSource::AheadOfArrival(0), "{input}");
+        }
+        for (input, kept) in [
+            ("2026-01-01T00:15:00Z", "2026-01-01T00:15:00.000000Z"),
+            ("2026-01-01T00:14:00Z", "2026-01-01T00:14:00.000000Z"),
+        ] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"{input}"}}"#
+            ));
+            assert_eq!(c.obj["_time"], kept, "within the bound: {input}");
+            assert!(c.repairs.is_empty(), "{input}: {:?}", c.repairs);
+            assert!(!c.obj.contains_key("_repairs"), "{input}");
+            assert_eq!(c.lineage.time, TimeSource::Field(0), "{input}");
+        }
+
+        // A fractional arrival: the bound is measured from the instant,
+        // not from its whole second.
+        let arrival = "2026-01-01T00:00:00.500000Z";
+        let e = envs(&["prod"]);
+        let ctx = EnvelopeContext {
+            arrival,
+            arrival_instant: chrono::DateTime::parse_from_rfc3339(arrival)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            ..ctx_with(&e, false)
+        };
+        for (input, replaced) in [
+            ("2026-01-01T00:15:00.499999Z", false),
+            ("2026-01-01T00:15:00.5Z", false),
+            ("2026-01-01T00:15:00.500000001Z", true),
+            ("2026-01-01T00:15:00.500001Z", true),
+        ] {
+            let json = format!(r#"{{"service":"s","env":"prod","host":"h","_time":"{input}"}}"#);
+            let c = canonicalize(&event(&json), &ctx).expect("event must canonicalize");
+            assert_eq!(c.obj["_time"] == arrival, replaced, "input {input}");
+            assert_eq!(
+                codes(&c).contains(&"time.ahead_of_arrival"),
+                replaced,
+                "input {input}"
+            );
+        }
+    }
+
+    /// `time.out_of_range` is past-only: a time more than ten years before
+    /// arrival is kept and flagged, and no future time earns it (a future
+    /// time is either within [`MAX_TIME_LEAD`] or replaced).
+    #[test]
+    fn time_out_of_range_flags_only_the_past() {
+        for (input, kept) in [
+            ("2015-01-01T00:00:00Z", "2015-01-01T00:00:00.000000Z"),
+            ("1999-01-01T00:00:00Z", "1999-01-01T00:00:00.000000Z"),
+        ] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"{input}"}}"#
+            ));
+            assert_eq!(c.obj["_time"], kept, "out-of-range is KEPT: {input}");
+            assert_eq!(codes(&c), ["time.out_of_range"], "input {input}");
+        }
+        for input in [
+            "2026-01-01T00:15:00Z",
+            "2026-01-01T00:16:00Z",
+            "2026-01-02T00:00:01Z",
+            "2036-01-01T00:00:00Z",
+            "9999-12-31T23:59:59.999999Z",
+        ] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"{input}"}}"#
+            ));
+            assert!(
+                !codes(&c).contains(&"time.out_of_range"),
+                "a future time is never out of range: {input} {:?}",
+                c.repairs
+            );
         }
     }
 
@@ -3553,6 +3709,7 @@ mod tests {
             | RepairCode::TimeFromIngest
             | RepairCode::TimeUnparseable
             | RepairCode::TimeOutOfRange
+            | RepairCode::TimeAheadOfArrival
             | RepairCode::HostOmitted
             | RepairCode::ServiceFromProfile => false,
         }
@@ -3574,6 +3731,7 @@ mod tests {
         const ACTIONABLE: &[&str] = &[
             "time.unparseable",
             "time.out_of_range",
+            "time.ahead_of_arrival",
             "field.truncated",
             "field.name_too_long",
             "field.name_empty",
@@ -3583,8 +3741,8 @@ mod tests {
             "field.producer_asserted",
             "service.from_profile",
         ];
-        assert_eq!(ROUTINE.len() + ACTIONABLE.len(), 16);
-        assert_eq!(RepairCode::ALL.len(), 16);
+        assert_eq!(ROUTINE.len() + ACTIONABLE.len(), 17);
+        assert_eq!(RepairCode::ALL.len(), 17);
 
         for code in RepairCode::ALL {
             let wire = code.as_str();
@@ -3670,6 +3828,41 @@ mod tests {
                     || (code == RepairCode::FieldStampClaimed && stamp)))
     }
 
+    /// Each time repair code appears exactly when the time lineage records
+    /// the decision that earns it.
+    fn assert_time_lineage_agrees(label: &str, c: &Canonical) {
+        let time = &c.lineage.time;
+        for (code, decided) in [
+            (
+                RepairCode::TimeFromIngest,
+                matches!(time, TimeSource::Arrival { unparseable: None }),
+            ),
+            (
+                RepairCode::TimeUnparseable,
+                matches!(
+                    time,
+                    TimeSource::Arrival {
+                        unparseable: Some(_)
+                    }
+                ),
+            ),
+            (
+                RepairCode::TimeAheadOfArrival,
+                matches!(time, TimeSource::AheadOfArrival(_)),
+            ),
+        ] {
+            assert_eq!(
+                c.repairs.contains(&code),
+                decided,
+                "{label}: time lineage disagrees with {code} in {:?}",
+                c.repairs
+            );
+        }
+        if c.repairs.contains(&RepairCode::TimeOutOfRange) {
+            assert!(matches!(time, TimeSource::Field(_)), "{label}");
+        }
+    }
+
     #[test]
     fn lineage_and_repairs_agree() {
         let long_name = "a".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1);
@@ -3690,6 +3883,8 @@ mod tests {
             r#"{"service":"s","k8s":{"pod":"p"},"tags":[1]}"#.to_owned(),
             r#"{"service":"s","_time":"garbage"}"#.to_owned(),
             r#"{"service":"s","_time":"1990-01-01T00:00:00Z"}"#.to_owned(),
+            r#"{"service":"s","_time":"2026-01-01T03:00:00Z"}"#.to_owned(),
+            r#"{"service":"s","timestamp":"2026-01-01T03:00:00Z"}"#.to_owned(),
             r#"{"service":"s","severity":"gold","level":"warn"}"#.to_owned(),
             format!(r#"{{"service":"s","{long_name}":1}}"#),
             format!(r#"{{"service":"s","_raw":"{long_raw}"}}"#),
@@ -3747,24 +3942,7 @@ mod tests {
                     c.lineage.fields
                 );
             }
-            assert_eq!(
-                c.repairs.contains(&RepairCode::TimeFromIngest),
-                matches!(c.lineage.time, TimeSource::Arrival { unparseable: None }),
-                "{label}: time lineage disagrees with repairs"
-            );
-            assert_eq!(
-                c.repairs.contains(&RepairCode::TimeUnparseable),
-                matches!(
-                    c.lineage.time,
-                    TimeSource::Arrival {
-                        unparseable: Some(_)
-                    }
-                ),
-                "{label}: time lineage disagrees with repairs"
-            );
-            if c.repairs.contains(&RepairCode::TimeOutOfRange) {
-                assert!(matches!(c.lineage.time, TimeSource::Field(_)), "{label}");
-            }
+            assert_time_lineage_agrees(label, &c);
             if is_http {
                 assert_eq!(
                     c.repairs.contains(&RepairCode::HostFromPeer),
