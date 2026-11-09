@@ -16,6 +16,7 @@ use crate::tui::App;
 use crate::tui::palette::{FilteredItem, PaletteCategory, PaletteItem};
 use crate::tui::state::Popup;
 use crate::tui::theme::Theme;
+use trawl_core::text_layout::fit_cells;
 
 use super::common::centered_rect;
 
@@ -209,7 +210,7 @@ fn build_display_lines<'a>(
                 )
             {
                 lines.push(DisplayLine {
-                    line: render_detail_line(detail, theme),
+                    line: render_detail_line(detail, theme, width),
                     filtered_index: None,
                 });
             }
@@ -255,7 +256,7 @@ fn build_display_lines<'a>(
                 )
             {
                 lines.push(DisplayLine {
-                    line: render_detail_line(detail, theme),
+                    line: render_detail_line(detail, theme, width),
                     filtered_index: None,
                 });
             }
@@ -327,14 +328,18 @@ fn render_item_line<'a>(
     Line::from(spans)
 }
 
-/// Render a detail line (indented, dimmed).
-fn render_detail_line<'a>(detail: &'a str, theme: &Theme) -> Line<'a> {
-    let max_len = 60;
-    let display = if detail.len() > max_len {
-        format!("    {}…", &detail[..max_len])
-    } else {
-        format!("    {detail}")
-    };
+/// Render a detail line (indented, dimmed), fitted to `width` display cells.
+///
+/// The detail is cut to at most 60 cells, marker included, and to what is
+/// left of the line after its indent. A line under four cells wide gets
+/// a shorter indent.
+fn render_detail_line(detail: &str, theme: &Theme, width: usize) -> Line<'static> {
+    const INDENT: usize = 4;
+    const MAX_DETAIL: usize = 60;
+    let indent = INDENT.min(width);
+    let budget = MAX_DETAIL.min(width.saturating_sub(indent));
+    let mut display = " ".repeat(indent);
+    display.push_str(&fit_cells(&detail.replace('\n', " "), budget));
     Line::from(Span::styled(display, Style::default().fg(theme.text_muted)))
 }
 
@@ -354,4 +359,110 @@ fn compute_scroll(selected_line: usize, visible_height: usize, total_lines: usiz
     let half = visible_height / 2;
     let max_scroll = total_lines.saturating_sub(visible_height);
     selected_line.saturating_sub(half).min(max_scroll)
+}
+
+#[cfg(test)]
+mod unicode_tests {
+    use std::fmt::Write as _;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_core::text_layout::{MARKER, cells};
+
+    use super::*;
+    use crate::tui::palette::PaletteAction;
+    use crate::tui::tests::test_app;
+
+    /// Saved-query bodies a cut must not split: accented, CJK, a combining
+    /// mark, an emoji with its variation selector, and a bidi override with
+    /// a control character, each long enough to pass the 60-cell cap.
+    fn details() -> Vec<String> {
+        [
+            "résumé_ñ",
+            "日本語フィールド",
+            "e\u{301}e\u{301}e\u{301}_field",
+            "❤\u{FE0F}❤\u{FE0F}_love",
+            "a\u{202E}b\u{7}c_bidi",
+        ]
+        .iter()
+        .map(|name| format!("service=\"{name}\"\n| where {}", name.repeat(8)))
+        .collect()
+    }
+
+    fn palette_app(details: &[String]) -> crate::tui::App {
+        let items: Vec<PaletteItem> = details
+            .iter()
+            .enumerate()
+            .map(|(i, detail)| PaletteItem {
+                label: format!("saved {i}"),
+                detail: Some(detail.clone()),
+                category: PaletteCategory::SavedQuery,
+                shortcut: None,
+                action: PaletteAction::LoadQuery(detail.clone()),
+            })
+            .collect();
+        let filtered = (0..items.len())
+            .map(|item_index| FilteredItem {
+                item_index,
+                score: 0,
+                match_positions: Vec::new(),
+            })
+            .collect();
+        let mut app = test_app();
+        app.popup = Some(Popup::CommandPalette {
+            input: String::new(),
+            cursor: 0,
+            selected: 0,
+            scroll: 0,
+            items,
+            filtered,
+            ghost: None,
+        });
+        app
+    }
+
+    fn text_of(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// The detail line fits the pane at every width, and at most four cells
+    /// of indent and 60 of detail, marker included.
+    #[test]
+    fn unicode_panels_survive_resize_palette_detail() {
+        let theme = test_app().theme;
+        for detail in details() {
+            for width in 0..=80 {
+                let line = text_of(&render_detail_line(&detail, &theme, width));
+                assert!(cells(&line) <= width.min(64), "{line:?} at {width}");
+                let indent = line.len() - line.trim_start_matches(' ').len();
+                assert_eq!(indent, width.min(4), "{line:?} at {width}");
+            }
+            let full = text_of(&render_detail_line(&detail, &theme, 200));
+            assert!(full.ends_with(MARKER), "{full:?}");
+            assert!(cells(&full) >= 63, "{full:?}");
+        }
+
+        let app = palette_app(&details());
+        for width in 0..=130 {
+            for height in [4, 30] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| render(&app, frame)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_panels_survive_resize_palette_snapshot() {
+        let app = palette_app(&details());
+        let mut frames = String::new();
+        for width in [24, 41] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 22)).unwrap();
+            terminal.draw(|frame| render(&app, frame)).unwrap();
+            writeln!(frames, "width {width}:\n{}", terminal.backend()).unwrap();
+        }
+        insta::assert_snapshot!(frames);
+    }
 }

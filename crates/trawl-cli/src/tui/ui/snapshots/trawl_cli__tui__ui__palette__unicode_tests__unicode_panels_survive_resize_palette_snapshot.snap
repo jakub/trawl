@@ -1,0 +1,52 @@
+---
+source: crates/trawl-cli/src/tui/ui/palette.rs
+assertion_line: 461
+expression: frames
+---
+width 24:
+"                        "
+"                        "
+"                        "
+"    ┌ Command Palet┐    "
+"    │>             │    "
+"    │──────────────│    "
+"    │  Saved Querie│    "
+"    │  saved 0     │    "
+"    │    service="…│    "
+"    │  saved 1     │    "
+"    │    service="…│    "
+"    │  saved 2     │    "
+"    │    service="…│    "
+"    │  saved 3     │    "
+"    │    service="…│    "
+"    │  saved 4     │    "
+"    │    service="…│    "
+"    │              │    "
+"    └──────────────┘    "
+"                        "
+"                        "
+"                        "
+
+width 41:
+"                                         "
+"                                         "
+"                                         "
+"       ┌ Command Palette ────────┐       "
+"       │>                        │       "
+"       │─────────────────────────│       "
+"       │  Saved Queries          │       "
+"       │  saved 0                │       "
+"       │    service="résumé_ñ" |…│       "
+"       │  saved 1                │       "
+"       │    service="日本語フィ… │       " Hidden by multi-width symbols: [(22, " "), (24, " "), (26, " "), (28, " "), (30, " ")]
+"       │  saved 2                │       "
+"       │    service="ééé_field" …│       "
+"       │  saved 3                │       "
+"       │    service="❤️❤️_love" …│       " Hidden by multi-width symbols: [(22, " "), (24, " ")]
+"       │  saved 4                │       "
+"       │    service="a�b�c_bidi"…│       "
+"       │                         │       "
+"       └Esc close ───────────────┘       "
+"                                         "
+"                                         "
+"                                         "
