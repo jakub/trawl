@@ -1800,7 +1800,13 @@ mod tests {
                 trawl_core::context::EvalContext::capture(),
             )
             .unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
-            let (start, end) = window_of(&resolved);
+            // A bound binds as its instant's cast text (ADR-0017's
+            // amendment of 2026-11-08).
+            let Source::Live { earliest, latest } = &resolved.source else {
+                unreachable!("a stored source was skipped")
+            };
+            let bound = |at: &DateTime<Utc>| Instant::At(at.naive_utc()).cast_text();
+            let (start, end) = (bound(earliest), bound(latest));
             let params = format!("{:?}", emitted.params);
             assert!(
                 params.contains(&start) && params.contains(&end),
