@@ -3606,6 +3606,12 @@ mod tests {
             .expect("run_scan still follows decide")
             + start;
         let decide = &SOURCE[start..end];
+        // The positive control: the range is the one that builds the rows,
+        // so the absence checks below can see a leak if one is there.
+        assert!(
+            decide.contains("disk_check_row(") && decide.contains(" fault_row("),
+            "decide must build its terminal rows through the two helpers"
+        );
         for leak in [
             "Some(&e.to_string())",
             "free disk space: {e}",
@@ -3707,8 +3713,14 @@ mod tests {
         ] {
             let start = SOURCE.find(from).expect(from);
             let end = SOURCE[start..].find(to).expect(to) + start;
+            let body = &SOURCE[start..end];
             assert!(
-                !SOURCE[start..end].contains(concat!("error = ", "%e")),
+                body.contains("log_store_fault("),
+                "{from} must log its store faults through the helper"
+            );
+            assert!(
+                !body.contains(concat!("error = ", "%"))
+                    && !body.contains(concat!("error = ", "?")),
                 "{from} logs a store error's text itself"
             );
         }
