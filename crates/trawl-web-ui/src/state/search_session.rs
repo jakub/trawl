@@ -170,6 +170,10 @@ pub fn rows_resource(
                 && intent.try_get_untracked() == Some(request_intent)
             {
                 let _ = pending.try_set(false);
+                // Only the current request of a living page may send it to
+                // sign-in. A declined 401 still lands below as a failure,
+                // which reads as the session-ended sentence.
+                crate::auth_return::leaves_for_sign_in(&response);
             }
             rearm_if_stale(intent, request_intent, rearm);
             match response {

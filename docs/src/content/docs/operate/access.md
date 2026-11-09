@@ -316,8 +316,9 @@ Restart `trawl-web` after you change `trawld.toml`.
 `trawl-web` starts even when the pinned file does not exist yet, because
 trawld writes its generated certificate only on its first start. Until the
 file exists, `/healthz` answers `ok`, and every request that needs trawld gets
-a 503 response with `{"error":"upstream certificate not available"}`. The
-first request after the file appears reads it and succeeds.
+a 503 response with
+`{"error":{"code":"service_unavailable","message":"upstream certificate not available"}}`.
+The first request after the file appears reads it and succeeds.
 
 `trawl-web` also reads the file again every 30 seconds and compares its
 contents. A CA that you replace takes effect within 30 seconds, with no

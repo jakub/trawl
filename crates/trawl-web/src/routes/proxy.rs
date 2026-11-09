@@ -22,12 +22,13 @@
 use axum::body::{Body, Bytes, HttpBody as _};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use futures::StreamExt as _;
+use trawl_api::ErrorCode;
 
 use crate::body_budget::{BODY_BUDGET_NAME, BodyBudget, BodyReservation};
 use crate::config::ProxyLimits;
-use crate::error::ProxyError;
+use crate::error::{ProxyError, envelope};
 use crate::middleware::body_deadline::BodyDeadlineElapsed;
 use crate::middleware::session_extractor::Auth;
 use crate::state::AppState;
@@ -50,15 +51,10 @@ const HOP_BY_HOP: &[&str] = &[
     "host",
 ];
 
-/// Always-404 handler for blocked or unknown browser API paths.
+/// Always-404 handler for blocked or unknown browser API paths: the
+/// `not_found` envelope, uncached (ADR-0066).
 pub async fn not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        axum::Json(serde_json::json!({
-            "error": "not found"
-        })),
-    )
-        .into_response()
+    envelope(StatusCode::NOT_FOUND, ErrorCode::NotFound, "not found")
 }
 
 /// The browser never ingests, so keep that path outside the generic proxy.
@@ -1995,6 +1991,55 @@ mod tests {
         assert!(
             relayed.is_empty(),
             "/ingest must not relay to the upstream: {relayed:?}"
+        );
+    }
+
+    /// The blocked ingest path and every unknown browser API path answer
+    /// trawl-web's own 404 envelope, uncached, and never reach upstream.
+    #[tokio::test]
+    async fn blocked_and_unknown_api_paths_answer_the_not_found_envelope() {
+        let upstream = TlsUpstream::start().await;
+        let app = build_app(state_pointing_at(&upstream));
+
+        for (method_name, uri) in [
+            ("POST", "/api/v1/ingest"),
+            ("GET", "/api/v1/ingest"),
+            ("GET", "/api"),
+            ("GET", "/api/v2/query"),
+            ("DELETE", "/api/admin/keys"),
+        ] {
+            let req = Request::builder()
+                .method(method_name)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method_name} {uri}");
+            assert_eq!(
+                resp.headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{method_name} {uri}"
+            );
+            assert!(
+                !resp.headers().contains_key(header::SET_COOKIE),
+                "{method_name} {uri}"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body,
+                json!({"error": {"code": "not_found", "message": "not found"}}),
+                "{method_name} {uri}"
+            );
+        }
+        let relayed = upstream.mock().received_requests().await.unwrap();
+        assert!(
+            relayed.is_empty(),
+            "a 404 stub reached upstream: {relayed:?}"
         );
     }
 

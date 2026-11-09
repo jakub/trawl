@@ -76,8 +76,15 @@ pub fn StatusBar(
     spawn_local(async move {
         loop {
             let report = api::health().await;
+            if !looping.load(Ordering::Relaxed) {
+                return;
+            }
+            // A 401 while the footer lives sends the page to sign-in and
+            // ends the loop. A declined one is a failed read like any
+            // other, and the next tick asks again.
+            let leaving = crate::auth_return::leaves_for_sign_in(&report);
             // `try_set` hands the value back once the footer is disposed.
-            if !looping.load(Ordering::Relaxed) || server.try_set(Some(report)).is_some() {
+            if server.try_set(Some(report)).is_some() || leaving {
                 return;
             }
             gloo_timers::future::TimeoutFuture::new(HEALTH_REFRESH_MS).await;

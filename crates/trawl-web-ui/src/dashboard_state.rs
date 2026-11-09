@@ -12,6 +12,10 @@ pub enum DashboardPhase {
     Live,
     Stale,
     Forbidden,
+    /// The bootstrap read was answered 401 and the page did not leave for
+    /// sign-in (an explicit logout was under way, or another redirect
+    /// started first).
+    SessionEnded,
     Failed,
 }
 
@@ -23,6 +27,7 @@ impl DashboardPhase {
             Self::Live => "Live",
             Self::Stale => "Stale; reconnecting",
             Self::Forbidden => "Forbidden",
+            Self::SessionEnded => "Session ended",
             Self::Failed => "Live updates failed",
         }
     }
@@ -52,6 +57,12 @@ impl<T> DashboardState<T> {
         self.phase = DashboardPhase::Live;
     }
 
+    /// Whether a bootstrap answer still counts. A stream snapshot supersedes
+    /// the bootstrap read, so its answer, a 401 included, must not act.
+    pub fn awaits_bootstrap(&self) -> bool {
+        !self.stream_seen
+    }
+
     pub fn bootstrap(&mut self, result: Result<T, Option<u16>>) {
         if self.stream_seen {
             return;
@@ -64,9 +75,13 @@ impl<T> DashboardState<T> {
                 }
             }
             Err(Some(503)) => {}
-            Err(Some(401 | 403)) => {
+            Err(Some(403)) => {
                 self.snapshot = None;
                 self.phase = DashboardPhase::Forbidden;
+            }
+            Err(Some(401)) => {
+                self.snapshot = None;
+                self.phase = DashboardPhase::SessionEnded;
             }
             Err(_) => {
                 self.phase = DashboardPhase::Failed;
@@ -75,11 +90,11 @@ impl<T> DashboardState<T> {
     }
 
     pub fn stream_error(&mut self, reconnecting: bool) {
-        // EventSource errors carry no HTTP status. Keep failure and permission
-        // verdicts until a valid stream snapshot proves recovery.
+        // EventSource errors carry no HTTP status. Keep failure, permission
+        // and session verdicts until a valid stream snapshot proves recovery.
         if matches!(
             self.phase,
-            DashboardPhase::Forbidden | DashboardPhase::Failed
+            DashboardPhase::Forbidden | DashboardPhase::SessionEnded | DashboardPhase::Failed
         ) {
             return;
         }
@@ -96,9 +111,17 @@ mod tests {
     use super::*;
     #[test]
     fn stream_authority_survives_delayed_bootstrap_and_reconnect() {
-        for result in [Ok(1), Err(Some(503)), Err(Some(403)), Err(None)] {
+        for result in [
+            Ok(1),
+            Err(Some(503)),
+            Err(Some(403)),
+            Err(Some(401)),
+            Err(None),
+        ] {
             let mut state = DashboardState::default();
+            assert!(state.awaits_bootstrap());
             state.stream_snapshot(2);
+            assert!(!state.awaits_bootstrap());
             state.bootstrap(result);
             assert_eq!(state.snapshot, Some(2));
             assert_eq!(state.phase, DashboardPhase::Live);
@@ -131,24 +154,31 @@ mod callback_order_tests {
 
     #[test]
     fn forbidden_survives_stream_errors_in_both_callback_orders() {
-        for reconnecting in [false, true] {
-            for error_first in [false, true] {
-                let mut state = DashboardState::<u8>::default();
-                if error_first {
-                    state.stream_error(reconnecting);
-                    state.bootstrap(Err(Some(403)));
-                } else {
-                    state.bootstrap(Err(Some(403)));
-                    state.stream_error(reconnecting);
+        // A 403 is a permission verdict; a 401 is the session, never
+        // read as a missing permission (ADR-0066).
+        for (status, verdict) in [
+            (403, DashboardPhase::Forbidden),
+            (401, DashboardPhase::SessionEnded),
+        ] {
+            for reconnecting in [false, true] {
+                for error_first in [false, true] {
+                    let mut state = DashboardState::<u8>::default();
+                    if error_first {
+                        state.stream_error(reconnecting);
+                        state.bootstrap(Err(Some(status)));
+                    } else {
+                        state.bootstrap(Err(Some(status)));
+                        state.stream_error(reconnecting);
+                    }
+                    assert_eq!(state.phase, verdict);
+                    assert_eq!(state.snapshot, None);
+                    // A later error must not erase the GET's verdict.
+                    state.stream_error(!reconnecting);
+                    assert_eq!(state.phase, verdict);
+                    state.stream_snapshot(7);
+                    assert_eq!(state.phase, DashboardPhase::Live);
+                    assert_eq!(state.snapshot, Some(7));
                 }
-                assert_eq!(state.phase, DashboardPhase::Forbidden);
-                assert_eq!(state.snapshot, None);
-                // A later error must not erase the GET's permission verdict.
-                state.stream_error(!reconnecting);
-                assert_eq!(state.phase, DashboardPhase::Forbidden);
-                state.stream_snapshot(7);
-                assert_eq!(state.phase, DashboardPhase::Live);
-                assert_eq!(state.snapshot, Some(7));
             }
         }
     }

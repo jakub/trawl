@@ -31,6 +31,7 @@ use trawl_api::{QueryResponse, ServiceColumnStats, ServiceSchema};
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::api;
+use crate::components::read_turn::ReadTurn;
 use crate::components::sort_th::sort_th;
 use crate::drawer_query::{decode_cardinality, value_as_u64};
 use crate::fetch_plan::FetchPlan;
@@ -96,7 +97,13 @@ pub fn ServiceDrawer(
     // Shared cardinality fetch: runs once on drawer mount for this
     // service. Signal is exposed to both OverviewPane and FieldsPane so
     // neither re-fetches on tab switch.
-    let cardinality = cardinality_resource(svc_for_card);
+    let cardinality_turn = ReadTurn::new();
+    let cardinality = cardinality_resource(svc_for_card, cardinality_turn);
+    let retry_cardinality = Callback::new(move |()| {
+        cardinality_turn.supersede();
+        cardinality.set(None);
+        cardinality.refetch();
+    });
     let cardinality_sig: Signal<Option<Result<HashMap<String, u64>, String>>> =
         Signal::derive(move || {
             cardinality
@@ -154,7 +161,7 @@ pub fn ServiceDrawer(
                         <FieldsPane
                             svc=svc_for_fields.clone()
                             cardinality=cardinality_sig
-                            on_retry_cardinality=Callback::new(move |()| { cardinality.set(None); cardinality.refetch(); })
+                            on_retry_cardinality=retry_cardinality
                             focus_field=focus_field
                             on_use_field=on_use_field
                             on_open_field=on_open_field
@@ -169,7 +176,7 @@ pub fn ServiceDrawer(
                         <OverviewPane
                             svc=svc_for_over.clone()
                             cardinality=cardinality_sig
-                            on_retry_cardinality=Callback::new(move |()| { cardinality.set(None); cardinality.refetch(); })
+                            on_retry_cardinality=retry_cardinality
                             on_use_field=on_use_field
                         />
                     }.into_any()
@@ -190,12 +197,18 @@ fn OverviewPane(
     on_use_field: Callback<String>,
 ) -> impl IntoView {
     let svc_name = svc.name.clone();
+    let histogram_turn = ReadTurn::new();
     let histogram = LocalResource::new(move || {
         let q = format!(
             r#"service="{}" last=24h | timechart span=1h count()"#,
             svc_name.replace('"', "")
         );
-        async move { api::query(&q, FetchPlan::for_query(&q, 0)).await }
+        let turn = histogram_turn.begin();
+        async move {
+            let answer = api::query(&q, FetchPlan::for_query(&q, 0)).await;
+            histogram_turn.leaves_for_sign_in(turn, &answer);
+            answer
+        }
     });
 
     // Field-type donut is pure — derive from columns synchronously.
@@ -208,7 +221,7 @@ fn OverviewPane(
         <div class="sd-overview">
             <div class="sd-card chart">
                 <div class="ttl">"Ingest · last 24h"</div>
-                <HistogramChart resource=histogram/>
+                <HistogramChart resource=histogram turn=histogram_turn/>
             </div>
 
             <div class="sd-card types">
@@ -501,13 +514,17 @@ fn FieldDetail(
     let plan = crate::drawer_query::top_values_query(&svc, &field_name);
     let count_column = plan.as_ref().map_or("count", |p| p.count_column);
     let top_dsl = plan.map(|p| p.dsl);
+    let top_turn = ReadTurn::new();
     let top = LocalResource::new(move || {
         let q = top_dsl.clone();
+        let turn = top_turn.begin();
         async move {
-            match q {
+            let answer = match q {
                 Some(q) => api::query(&q, FetchPlan::for_query(&q, 0)).await,
                 None => Ok(declined_query_response()),
-            }
+            };
+            top_turn.leaves_for_sign_in(turn, &answer);
+            answer
         }
     });
 
@@ -529,7 +546,7 @@ fn FieldDetail(
                 <Loaded
                     state=Signal::derive(move || LoadState::from_resource(top.get()))
                     label="values"
-                    retry=Callback::new(move |()| { top.set(None); top.refetch(); })
+                    retry=Callback::new(move |()| { top_turn.supersede(); top.set(None); top.refetch(); })
                     render=Box::new(move |resp: QueryResponse| {
                         let rows = parse_top_values(&resp, &field_name, count_column);
                         if rows.is_empty() {
@@ -713,17 +730,21 @@ fn declined_query_response() -> trawl_api::QueryResponse {
 
 fn cardinality_resource(
     svc: ServiceSchema,
+    reads: ReadTurn,
 ) -> LocalResource<Result<HashMap<String, u64>, api::ApiError>> {
     let svc_name = svc.name;
     let fields: Vec<String> = svc.columns.into_iter().map(|c| c.name).collect();
     LocalResource::new(move || {
         let svc_name = svc_name.clone();
         let fields = fields.clone();
+        let turn = reads.begin();
         async move {
             let Some(q) = crate::drawer_query::cardinality_query(&svc_name, &fields) else {
                 return Ok(HashMap::new());
             };
-            let resp = api::query(&q.dsl, FetchPlan::for_query(&q.dsl, 0)).await?;
+            let answer = api::query(&q.dsl, FetchPlan::for_query(&q.dsl, 0)).await;
+            reads.leaves_for_sign_in(turn, &answer);
+            let resp = answer?;
             // Read back against the fields the BUILDER emitted, not the
             // service's whole column list: a name it could not render is
             // absent from the response and from `q.fields` alike
@@ -824,12 +845,16 @@ fn top_cardinality_rows(
 // ───────────────────────── Histogram chart ─────────────────────────
 
 #[component]
-fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>) -> impl IntoView {
+fn HistogramChart(
+    resource: LocalResource<Result<QueryResponse, api::ApiError>>,
+    /// The resource's read turn, which Retry retires.
+    turn: ReadTurn,
+) -> impl IntoView {
     view! {
         <Loaded
             state=Signal::derive(move || LoadState::from_resource(resource.get()))
             label="histogram"
-            retry=Callback::new(move |()| { resource.set(None); resource.refetch(); })
+            retry=Callback::new(move |()| { turn.supersede(); resource.set(None); resource.refetch(); })
             render=Box::new(move |resp: QueryResponse| {
                 let slots = build_histogram(&resp);
                 if slots.is_empty() {

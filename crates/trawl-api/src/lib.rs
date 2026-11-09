@@ -224,6 +224,11 @@ pub enum ErrorCode {
     /// ages out or `server_manage` deletes an investigation, so waiting a
     /// moment does not help.
     EvidenceBudgetExceeded,
+    /// A saved query's name is blank or contains control or invisible
+    /// formatting characters (400).
+    InvalidName,
+    /// The key already has a saved query with that name (409).
+    DuplicateName,
 }
 
 /// Source location within a query string.
@@ -2788,7 +2793,7 @@ mod tests {
     }
 
     /// Every wire code with its spelling.
-    const EVERY_ERROR_CODE: [(ErrorCode, &str); 36] = [
+    const EVERY_ERROR_CODE: [(ErrorCode, &str); 38] = [
         (ErrorCode::ParseError, "parse_error"),
         (ErrorCode::ValidationError, "validation_error"),
         (ErrorCode::ExecutionError, "execution_error"),
@@ -2831,6 +2836,8 @@ mod tests {
             ErrorCode::EvidenceBudgetExceeded,
             "evidence_budget_exceeded",
         ),
+        (ErrorCode::InvalidName, "invalid_name"),
+        (ErrorCode::DuplicateName, "duplicate_name"),
     ];
 
     /// The declaration index of a code. No wildcard arm, so a new code
@@ -2874,6 +2881,8 @@ mod tests {
             ErrorCode::InvestigationExists => 33,
             ErrorCode::InvestigationClosed => 34,
             ErrorCode::EvidenceBudgetExceeded => 35,
+            ErrorCode::InvalidName => 36,
+            ErrorCode::DuplicateName => 37,
         }
     }
 

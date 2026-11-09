@@ -751,23 +751,22 @@ mod tests {
     fn only_a_query_error_builds_a_refusal_notice() {
         for error in [
             ApiError::Status(500),
-            ApiError::Unauthorized,
+            ApiError::Unauthorized { envelope: None },
             ApiError::Network("offline".to_owned()),
             ApiError::Server {
                 status: 500,
-                message: "execution failed".to_owned(),
+                envelope: Box::new(envelope(trawl_api::ErrorCode::ExecutionError, vec![])),
             },
             ApiError::Recovering {
                 status: 503,
-                message: "Search is unavailable while the server finishes loading data from \
-                          before its restart."
-                    .to_owned(),
+                envelope: Box::new(envelope(trawl_api::ErrorCode::CorpusRecovering, vec![])),
             },
             ApiError::ResourceExhausted {
                 status: 503,
-                message: "query could not complete with the available query resources; narrow \
-                          the time range or simplify the query"
-                    .to_owned(),
+                envelope: Box::new(envelope(
+                    trawl_api::ErrorCode::QueryResourceExhausted,
+                    vec![],
+                )),
             },
         ] {
             assert_eq!(refusal_notice(&error, SAMPLE), None, "{error}");
