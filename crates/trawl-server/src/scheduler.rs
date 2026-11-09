@@ -741,19 +741,34 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
     let full = format!("{}/{relative}", base_dir.trim_end_matches('/'));
     match std::fs::remove_file(&full) {
         Ok(()) => true,
+        // The default-level events name the file relative to the data root;
+        // the absolute path and the error text go to DEBUG (ADR-0040,
+        // amended 2026-11-08).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(
+            tracing::debug!(
                 event_type = "result_file_already_absent",
                 path = %full,
+                error = %e,
+                "no parquet result file to delete: it is already gone"
+            );
+            tracing::info!(
+                event_type = "result_file_already_absent",
+                path = %relative,
                 "no parquet result file to delete: it is already gone"
             );
             false
         }
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "result_file_cleanup_error",
                 path = %full,
                 error = %e,
+                "failed to delete parquet result file"
+            );
+            tracing::warn!(
+                event_type = "result_file_cleanup_error",
+                path = %relative,
+                error_kind = %e.kind(),
                 "failed to delete parquet result file"
             );
             false
@@ -1488,6 +1503,64 @@ mod tests {
             !remove_result_file(base, "scheduled/foo/does_not_exist.parquet"),
             "missing file must report false"
         );
+    }
+
+    /// Both cleanup events name the result by its data-root-relative path
+    /// and never carry the absolute host path or the `io::Error` text,
+    /// which go to a DEBUG event (ADR-0040, amended 2026-11-08). The
+    /// failure is a directory where the file should be, so `remove_file`
+    /// fails with something other than `NotFound`.
+    #[test]
+    fn result_file_cleanup_events_carry_no_host_path_or_io_text() {
+        use crate::test_events::events_of;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap().to_owned();
+        let abs = tmp.path().display().to_string();
+        let blocked = "scheduled/foo/run_dir.parquet";
+        std::fs::create_dir_all(tmp.path().join(blocked)).unwrap();
+        let io_text = std::fs::remove_file(tmp.path().join(blocked))
+            .expect_err("a directory cannot be unlinked as a file")
+            .to_string();
+        let missing = "scheduled/foo/does_not_exist.parquet";
+
+        for (rel, event_type, removal_error) in [
+            (missing, "result_file_already_absent", false),
+            (blocked, "result_file_cleanup_error", true),
+        ] {
+            let events = events_of(|| assert!(!remove_result_file(&base, rel)));
+            let loud: Vec<_> = events.iter().filter(|e| e.is_default_level()).collect();
+            assert_eq!(loud.len(), 1, "{rel}: {events:?}");
+            let event = loud[0];
+            assert_eq!(
+                event.fields.get("event_type").map(String::as_str),
+                Some(event_type),
+                "{event:?}"
+            );
+            assert_eq!(
+                event.fields.get("path").map(String::as_str),
+                Some(rel),
+                "{event:?}"
+            );
+            assert!(!event.text().contains(&abs), "{event:?}");
+            assert!(!event.text().contains("os error"), "{event:?}");
+            if removal_error {
+                assert_eq!(event.level, tracing::Level::WARN, "{event:?}");
+                assert!(event.fields.contains_key("error_kind"), "{event:?}");
+                assert!(!event.text().contains(&io_text), "{event:?}");
+            } else {
+                assert_eq!(event.level, tracing::Level::INFO, "{event:?}");
+            }
+
+            let debug = events
+                .iter()
+                .find(|e| e.level == tracing::Level::DEBUG)
+                .unwrap_or_else(|| panic!("{rel}: no DEBUG event: {events:?}"));
+            assert!(debug.text().contains(&abs), "{debug:?}");
+            if removal_error {
+                assert!(debug.text().contains(&io_text), "{debug:?}");
+            }
+        }
     }
 
     /// A scheduled run times itself: one `query_timing` of kind
