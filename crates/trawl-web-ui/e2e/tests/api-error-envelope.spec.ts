@@ -241,10 +241,18 @@ async function openBoard(page: Page) {
   return main;
 }
 
-/** No second request reaches the endpoint, given time to send one. */
+/** No second request reaches the endpoint, given time for a browser timer
+ * to send one. The page clock is installed, so real waiting alone would
+ * never fire a retry or the board's poll (POLL_MS 5 s, backoff up to
+ * 60 s). Advance it past several of each, a slice at a time, letting the
+ * reads each slice starts settle before the next. */
 async function sentOnce(page: Page, sent: { count: number }) {
   expect(sent.count).toBe(1);
-  await page.waitForTimeout(500);
+  for (let slice = 0; slice < 18; slice += 1) {
+    await page.clock.runFor(10_000);
+    await page.waitForTimeout(40);
+  }
+  await page.waitForTimeout(300);
   expect(sent.count).toBe(1);
 }
 
@@ -300,6 +308,7 @@ for (const answer of answers) {
     const reset = await request.post('/__ctl/reset', { data: { scenario: 'investigations-writer', investigationSearch: true } });
     expect(reset.ok()).toBe(true);
     const sent = await oneWrite(page, (url, method) => method === 'POST' && url.pathname === '/api/v1/results', answer, 200);
+    await page.clock.install();
     await page.goto('/search?q=status%3E%3D500&r=2026-09-15T12:00:00Z..2026-09-15T12:30:00Z');
     await expect(page.locator('#search-results table.results-table > tbody > tr:not(:has(td.detail))')).toHaveCount(7);
     await page.locator('.tabs-actions').getByRole('button', { name: 'Send to investigation' }).click();
