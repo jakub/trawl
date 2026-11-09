@@ -24,7 +24,11 @@ Use a pure, corpus-independent calculation in `trawl-core`, shared by
 `emitter::validate_pipeline` and `stream::compile_stream_plan`. Refuse
 conservative lateral expansion above `MAX_LATERAL_EXPANSION = 512`, or
 more than `MAX_PIPELINE_STAGES = 128` pipeline stages. Neither limit is
-configurable.
+configurable. Both doors run this check first. Each then runs
+`aggregate::check_positions` (ADR-0001, Amendment 2026-11-08), so one
+query gets one first refusal from both lanes. `validate_pipeline` then
+checks the name and arity of every aggregation slot, `eventstats`
+included.
 
 The original substituted-DSL-node calculation admits a chain starting
 with `a0 = _severity + _severity`, followed by eight assignments of this
