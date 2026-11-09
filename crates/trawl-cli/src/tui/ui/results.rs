@@ -1439,10 +1439,11 @@ fn truncate_with_ellipsis(value: &str, max_width: usize) -> String {
 /// Extract time metadata from timechart result.
 ///
 /// Returns (`start_time`, `end_time`, `span_interval`) as formatted strings:
-/// the earliest and latest instants shown in `zone`, offset included, and
-/// the smallest gap between distinct instants. Both read the UTC instants
-/// the rows carry, never display text, so a fall-back night's two 02:30s
-/// stay an hour apart in any zone. Row order is left alone.
+/// the first and last rows' instants shown in `zone`, offset included, and
+/// the smallest gap between distinct instants. The chart plots rows in
+/// response order, so the endpoint labels follow it too. The span reads
+/// the UTC instants the rows carry, never display text, so a fall-back
+/// night's two 02:30s stay an hour apart in any zone.
 fn extract_time_metadata(
     result: &trawl_engine::value::QueryResult,
     zone: DisplayZone,
@@ -1455,21 +1456,18 @@ fn extract_time_metadata(
     let time_col = result.columns.iter().position(|c| c.name == "_time")?;
     let time_ty = &result.columns[time_col].ty;
 
-    let mut instants: Vec<(i64, &Value)> = result
+    let mut instants: Vec<i64> = result
         .rows
         .iter()
-        .filter_map(|row| {
-            let cell = row.get(time_col)?;
-            match cell {
-                Value::String(wire) => wire_micros(wire).map(|micros| (micros, cell)),
-                _ => None,
-            }
+        .filter_map(|row| match row.get(time_col)? {
+            Value::String(wire) => wire_micros(wire),
+            _ => None,
         })
         .collect();
-    instants.sort_by_key(|(micros, _)| *micros);
-    instants.dedup_by_key(|(micros, _)| *micros);
-    let (first, last) = (instants.first()?, instants.last()?);
-    let shown = |cell: &Value| cell_text(time_ty, cell, zone);
+    instants.sort_unstable();
+    instants.dedup();
+    let shown = |row: &[Value]| row.get(time_col).map(|cell| cell_text(time_ty, cell, zone));
+    let (first, last) = (shown(result.rows.first()?)?, shown(result.rows.last()?)?);
 
     // Derive span from the minimum gap between distinct instants. Using the
     // minimum handles sparse data (empty buckets aren't emitted by
@@ -1478,7 +1476,7 @@ fn extract_time_metadata(
     let span = if instants.len() >= 2 {
         let finite: Vec<i64> = instants
             .iter()
-            .map(|(micros, _)| *micros)
+            .copied()
             .filter(|micros| !matches!(*micros, TIMESTAMP_INFINITY | TIMESTAMP_NEG_INFINITY))
             .collect();
         finite
@@ -1492,7 +1490,7 @@ fn extract_time_metadata(
         "N/A".to_owned()
     };
 
-    Some((shown(first.1), shown(last.1), span))
+    Some((first, last, span))
 }
 
 /// Format a duration in seconds as a human-readable string.
@@ -1522,9 +1520,9 @@ fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
     crate::cli::severity_token(value).map_or_else(|| value_to_string(value), str::to_owned)
 }
 
-/// The timechart's bounds and span come from the UTC instants: rows out of
-/// order and a repeated bucket still give the earliest and latest instants,
-/// and an infinity bounds no gap.
+/// The timechart's span comes from the UTC instants: rows out of order and
+/// a repeated bucket still give the smallest gap, and an infinity bounds no
+/// gap. The endpoint labels are the first and last rows.
 #[cfg(test)]
 #[test]
 fn timechart_metadata_reads_utc_instants() {
@@ -1546,8 +1544,34 @@ fn timechart_metadata_reads_utc_instants() {
     };
     let zone = "+02:00".parse::<DisplayZone>().unwrap();
     let (start, end, span) = extract_time_metadata(&result, zone).unwrap();
-    assert_eq!(start, "2026-10-25 02:30:00 +02:00");
+    assert_eq!(start, "2026-10-25 03:30:00 +02:00");
     assert_eq!(end, "infinity");
+    assert_eq!(span, "1h");
+}
+
+/// The chart plots rows in response order, so its endpoint labels do too:
+/// under `| sort -_time` the left label names the latest bucket, which is
+/// the left-most point.
+#[cfg(test)]
+#[test]
+fn timechart_labels_follow_response_order() {
+    use trawl_engine::value::{Column, QueryResult};
+
+    let s = |t: &str| vec![Value::String(t.into()), Value::Integer(1)];
+    let result = QueryResult {
+        columns: vec![
+            Column::new("_time", ColumnType::Timestamp),
+            Column::new("count", ColumnType::Integer),
+        ],
+        rows: vec![
+            s("2026-10-25T01:30:00.000000Z"),
+            s("2026-10-25T00:30:00.000000Z"),
+        ],
+    };
+    let zone = "+02:00".parse::<DisplayZone>().unwrap();
+    let (start, end, span) = extract_time_metadata(&result, zone).unwrap();
+    assert_eq!(start, "2026-10-25 03:30:00 +02:00");
+    assert_eq!(end, "2026-10-25 02:30:00 +02:00");
     assert_eq!(span, "1h");
 }
 
