@@ -69,6 +69,7 @@ pub fn start_stats_stream(stats: SharedDashboard) -> Option<StatsLifecycle> {
     leptos::task::spawn_local(async move {
         let result = crate::api::dashboard().await;
         if bootstrap_alive.load(Ordering::SeqCst)
+            && stats.with_untracked(DashboardState::awaits_bootstrap)
             && !crate::auth_return::leaves_for_sign_in(&result)
         {
             stats.update(|s| s.bootstrap(result.map_err(|e| e.http_status())));

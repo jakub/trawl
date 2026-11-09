@@ -57,6 +57,12 @@ impl<T> DashboardState<T> {
         self.phase = DashboardPhase::Live;
     }
 
+    /// Whether a bootstrap answer still counts. A stream snapshot supersedes
+    /// the bootstrap read, so its answer, a 401 included, must not act.
+    pub fn awaits_bootstrap(&self) -> bool {
+        !self.stream_seen
+    }
+
     pub fn bootstrap(&mut self, result: Result<T, Option<u16>>) {
         if self.stream_seen {
             return;
@@ -105,9 +111,17 @@ mod tests {
     use super::*;
     #[test]
     fn stream_authority_survives_delayed_bootstrap_and_reconnect() {
-        for result in [Ok(1), Err(Some(503)), Err(Some(403)), Err(None)] {
+        for result in [
+            Ok(1),
+            Err(Some(503)),
+            Err(Some(403)),
+            Err(Some(401)),
+            Err(None),
+        ] {
             let mut state = DashboardState::default();
+            assert!(state.awaits_bootstrap());
             state.stream_snapshot(2);
+            assert!(!state.awaits_bootstrap());
             state.bootstrap(result);
             assert_eq!(state.snapshot, Some(2));
             assert_eq!(state.phase, DashboardPhase::Live);
