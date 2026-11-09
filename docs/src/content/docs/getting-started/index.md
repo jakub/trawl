@@ -16,8 +16,11 @@ its trust boundary. A server installation has these parts:
 | `trawld` | Ingest, storage, queries, and the HTTPS API |
 | `trawl-web` | Browser UI and session proxy |
 | `fleet-admin` | Fleet migrations, keys, roles, and session keys |
-| `trawl-admin` | Self-signed TLS certificate generation |
 | PostgreSQL | The Fleet keystore and the Trawl app-state database |
+
+trawld generates a self-signed TLS certificate on its first start. To use
+your own certificate and key, set `[server] tls_cert_path` and
+`tls_key_path`.
 
 Run the command blocks on this page in Bash. On macOS, run `bash` to start it
 before pasting the commands.
@@ -25,7 +28,7 @@ before pasting the commands.
 ## Install from APT on Debian or Ubuntu
 
 `trawl-cli` installs `trawl`. `trawl-server` installs `trawld`, `trawl-web`,
-`fleet-admin`, and `trawl-admin`, with systemd units for the two daemons.
+and `fleet-admin`, with systemd units for the two daemons.
 Both packages depend on the exact matching `trawl-runtime` package, which owns
 the shared DuckDB library. APT installs it automatically.
 
@@ -86,7 +89,7 @@ and add its origin to `public_origins`.
 
 ## Install from a GitHub release tarball
 
-Linux tarballs contain all five executables in `bin/`. Native macOS arm64
+Linux tarballs contain all four executables in `bin/`. Native macOS arm64
 and Intel tarballs contain the CLI. Every tarball includes its DuckDB library
 in `lib/trawl/`; keep both directories together. Pick a tag from
 [GitHub releases](https://github.com/jakub/trawl/releases) and enter it, with
@@ -123,7 +126,7 @@ trawl --version
 ```
 
 Expect the version from your tag, without the `v`. The tarball has no systemd
-units, databases, or data directory. On Linux, keep all five executables on one
+units, databases, or data directory. On Linux, keep all four executables on one
 release. On both platforms, keep the executable and shared runtime versions
 together.
 

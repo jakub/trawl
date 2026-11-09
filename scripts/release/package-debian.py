@@ -56,7 +56,7 @@ def package(source, binaries, runtime, output, target):
         )
         destination = output / f"trawl-runtime_{version}_{arch}.deb"
         run("dpkg-deb", "--root-owner-group", "--build", root, destination)
-        for crate, names in (("trawl-cli", ["trawl"]), ("trawl-server", ["trawld", "trawl-admin", "fleet-admin", "trawl-web"])):
+        for crate, names in (("trawl-cli", ["trawl"]), ("trawl-server", ["trawld", "fleet-admin", "trawl-web"])):
             manifest = source / "crates" / crate / "Cargo.toml"
             original = manifest.read_text()
             metadata = tomllib.loads(original)["package"]["metadata"]["deb"]

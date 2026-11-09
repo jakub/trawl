@@ -17,6 +17,7 @@ use super::keys::TrialKey;
 use super::lifecycle::Entry;
 use super::ownership::{Inventory, Kind};
 use super::paths::TrialPaths;
+use super::profile::EnvRule;
 use super::sample::{DOCUMENTED_QUERY, documented_row};
 use super::state::{ImageRecord, Samples, TrialState};
 use super::{CLAIM_NAME, PROFILE};
@@ -254,46 +255,50 @@ fn image(out: &mut impl Write, role: &str, record: &ImageRecord, note: &str) -> 
     }
 }
 
-/// The connection variables that change where commands go, by name:
+/// The connection variables that change where commands go, by name, from
+/// `bound` (every variable clap binds, with its rule):
 ///
-/// - `TRAWL_URL` and `TRAWL_TOKEN` when set at all, even empty, because
+/// - [`EnvRule::RefuseWhenSet`] when `set` at all, even empty, because
 ///   `trawl -p trial` then refuses.
-/// - `TRAWL_INSECURE` when the argument parser reads it as on, because
-///   `trawl -p trial` then refuses. `false` changes nothing.
-/// - `TRAWL_PROFILE` when it names a profile other than `trial`, because
-///   commands without -p then use that profile. `trial` sends them to the
-///   trial.
+/// - [`EnvRule::RefuseWhenOn`] when the argument parser reads it as on
+///   (`insecure`), because `trawl -p trial` then refuses. Off changes
+///   nothing.
+/// - [`EnvRule::SelectsProfile`] when the parser's `profile` names one other
+///   than `trial`, because commands without -p then use that profile.
+///   `trial` sends them to the trial.
 pub fn moving_variables(
-    url_set: bool,
-    token_set: bool,
+    bound: &[(String, EnvRule)],
+    set: impl Fn(&str) -> bool,
     insecure: bool,
     profile: Option<&str>,
-) -> Vec<&'static str> {
-    [
-        ("TRAWL_URL", url_set),
-        ("TRAWL_TOKEN", token_set),
-        ("TRAWL_INSECURE", insecure),
-        ("TRAWL_PROFILE", profile.is_some_and(|name| name != PROFILE)),
-    ]
-    .into_iter()
-    .filter_map(|(name, moves)| moves.then_some(name))
-    .collect()
+) -> Vec<(String, EnvRule)> {
+    bound
+        .iter()
+        .filter(|(name, rule)| match rule {
+            EnvRule::RefuseWhenSet => set(name),
+            EnvRule::RefuseWhenOn => insecure,
+            EnvRule::SelectsProfile => profile.is_some_and(|name| name != PROFILE),
+        })
+        .cloned()
+        .collect()
 }
 
 /// One stderr warning per variable [`moving_variables`] names, by name
 /// only.
-pub fn render_env_warnings(out: &mut impl Write, moving: &[&str]) -> io::Result<()> {
-    for name in moving {
-        let warning = match *name {
-            "TRAWL_PROFILE" => format!(
+pub fn render_env_warnings(out: &mut impl Write, moving: &[(String, EnvRule)]) -> io::Result<()> {
+    for (name, rule) in moving {
+        let warning = match rule {
+            EnvRule::SelectsProfile => format!(
                 "{name} names a profile other than `{PROFILE}`, so commands without -p use \
                  that profile, not the trial"
             ),
-            "TRAWL_INSECURE" => format!(
+            EnvRule::RefuseWhenOn => format!(
                 "{name} is true, so `trawl -p {PROFILE}` refuses to run, because the trial is \
                  reached only through its pinned certificate"
             ),
-            _ => format!("{name} is set, so `trawl -p {PROFILE}` refuses to run until it is unset"),
+            EnvRule::RefuseWhenSet => {
+                format!("{name} is set, so `trawl -p {PROFILE}` refuses to run until it is unset")
+            }
         };
         writeln!(out, "trawl: warning: {warning}")?;
     }
@@ -512,14 +517,34 @@ mod tests {
         }
     }
 
+    /// The bindings as clap declares them today, with their rules.
+    fn bound() -> Vec<(String, EnvRule)> {
+        [
+            ("TRAWL_URL", EnvRule::RefuseWhenSet),
+            ("TRAWL_TOKEN", EnvRule::RefuseWhenSet),
+            ("TRAWL_INSECURE", EnvRule::RefuseWhenOn),
+            ("TRAWL_PROFILE", EnvRule::SelectsProfile),
+        ]
+        .map(|(name, rule)| (name.to_owned(), rule))
+        .into()
+    }
+
     #[test]
     fn env_warnings_name_variables_only() {
-        let warnings = text(|out| render_env_warnings(out, &["TRAWL_URL", "TRAWL_PROFILE"]));
-        assert_eq!(warnings.lines().count(), 2);
-        assert!(warnings.starts_with("trawl: warning: TRAWL_URL is set, so"));
-        assert!(
-            warnings.contains("TRAWL_PROFILE names a profile other than `trial`"),
-            "{warnings}"
+        let moving = [
+            ("TRAWL_URL".to_owned(), EnvRule::RefuseWhenSet),
+            ("TRAWL_INSECURE".to_owned(), EnvRule::RefuseWhenOn),
+            ("TRAWL_PROFILE".to_owned(), EnvRule::SelectsProfile),
+        ];
+        let warnings = text(|out| render_env_warnings(out, &moving));
+        assert_eq!(
+            warnings,
+            "trawl: warning: TRAWL_URL is set, so `trawl -p trial` refuses to run until it is \
+             unset\n\
+             trawl: warning: TRAWL_INSECURE is true, so `trawl -p trial` refuses to run, because \
+             the trial is reached only through its pinned certificate\n\
+             trawl: warning: TRAWL_PROFILE names a profile other than `trial`, so commands \
+             without -p use that profile, not the trial\n"
         );
         assert!(text(|out| render_env_warnings(out, &[])).is_empty());
     }
@@ -529,29 +554,32 @@ mod tests {
     /// `TRAWL_INSECURE=false` leaves `-p trial` working.
     #[test]
     fn only_variables_that_move_commands_are_warned_about() {
-        let none: Vec<&str> = Vec::new();
-        assert_eq!(moving_variables(false, false, false, None), none);
-        assert_eq!(moving_variables(false, false, false, Some("trial")), none);
+        let names = |set: bool, insecure: bool, profile: Option<&str>| -> Vec<String> {
+            moving_variables(&bound(), |_| set, insecure, profile)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        };
+        let none: Vec<String> = Vec::new();
+        assert_eq!(names(false, false, None), none);
+        assert_eq!(names(false, false, Some("trial")), none);
+        assert_eq!(names(false, false, Some("home")), ["TRAWL_PROFILE"]);
+        assert_eq!(names(false, false, Some("")), ["TRAWL_PROFILE"]);
+        assert_eq!(names(false, true, None), ["TRAWL_INSECURE"]);
         assert_eq!(
-            moving_variables(false, false, false, Some("home")),
-            ["TRAWL_PROFILE"]
-        );
-        assert_eq!(
-            moving_variables(false, false, false, Some("")),
-            ["TRAWL_PROFILE"]
-        );
-        assert_eq!(
-            moving_variables(false, false, true, None),
-            ["TRAWL_INSECURE"]
-        );
-        assert_eq!(
-            moving_variables(true, true, true, Some("home")),
+            names(true, true, Some("home")),
             [
                 "TRAWL_URL",
                 "TRAWL_TOKEN",
                 "TRAWL_INSECURE",
                 "TRAWL_PROFILE"
             ]
+        );
+        // `set` is asked per name.
+        let only_token = moving_variables(&bound(), |name| name == "TRAWL_TOKEN", false, None);
+        assert_eq!(
+            only_token,
+            [("TRAWL_TOKEN".to_owned(), EnvRule::RefuseWhenSet)]
         );
     }
 

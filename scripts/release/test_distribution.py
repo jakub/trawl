@@ -52,7 +52,7 @@ class Distribution(unittest.TestCase):
     def test_image_staging_does_not_require_or_ship_the_cli(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            names = {"trawld", "trawl-admin", "fleet-admin", "trawl-web"}
+            names = {"trawld", "fleet-admin", "trawl-web"}
             for name in names:
                 (root / name).write_bytes(b"image executable fixture")
             (root / "libduckdb.so").write_bytes(b"library fixture")

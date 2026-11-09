@@ -864,17 +864,18 @@ fn apply_whoami_result(app: &mut App, whoami_result: Result<WhoAmIResponse, Clie
     }
 }
 
-/// Run the TUI application.
+/// Run the TUI application against `conn`, which the caller resolved
+/// before taking the terminal.
 #[allow(clippy::too_many_lines)] // orchestration entry point — splitting adds indirection without clarity
 pub async fn run(
     config: &Config,
-    direct_token: Option<&str>,
+    conn: crate::cli::ConnectionParams,
     driver_path: Option<&Path>,
 ) -> Result<(), CliError> {
     // Before any request and before raw mode or the alternate screen: an
     // invalid zone leaves the terminal as it was.
     let display_zone = crate::cli::display_zone(&config.ui.timezone)?;
-    let client = crate::connection(config, direct_token)?.client()?;
+    let client = conn.client()?;
 
     // Set up terminal.
     enable_raw_mode()?;

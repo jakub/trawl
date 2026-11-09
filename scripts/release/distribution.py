@@ -143,7 +143,7 @@ def verify(source, target, runtime, deps):
 def stage(binaries, runtime, output, target, source_sha, tooling_sha, cli_only, source, image_only=False):
     if output.exists():
         raise SystemExit("staging destination already exists")
-    names = ["trawl"] if cli_only else ["trawl", "trawld", "trawl-admin", "fleet-admin", "trawl-web"]
+    names = ["trawl"] if cli_only else ["trawl", "trawld", "fleet-admin", "trawl-web"]
     if image_only:
         names.remove("trawl")
     library = "libduckdb.dylib" if "apple" in target else "libduckdb.so"

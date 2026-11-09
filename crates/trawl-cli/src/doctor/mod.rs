@@ -251,10 +251,6 @@ pub(crate) struct DoctorArgs {
     #[arg(long, value_name = "NAME")]
     token_env: Option<String>,
 
-    /// With --url: read the API key from the file PATH.
-    #[arg(long, value_name = "PATH")]
-    token_file: Option<PathBuf>,
-
     /// Also check this browser origin (https, or http on a loopback host).
     #[arg(long, value_name = "ORIGIN")]
     web_url: Option<String>,
@@ -269,6 +265,9 @@ pub(crate) struct DoctorArgs {
 pub(crate) struct Globals {
     pub url: Option<String>,
     pub token: bool,
+    /// `--token-file PATH`. With `--url` it names the doctor's key; `trawl
+    /// mcp` takes it for a profile that holds no token.
+    pub token_file: Option<PathBuf>,
     pub insecure: bool,
     pub profile: Option<String>,
     pub config: Option<String>,
@@ -318,7 +317,7 @@ pub(crate) async fn run(globals: Globals, args: DoctorArgs) -> Result<u8, CliErr
         profile: globals.profile,
         config: globals.config,
         token_env: args.token_env,
-        token_file: args.token_file,
+        token_file: globals.token_file,
         web_url: args.web_url,
     };
     let selection = resolve::select(&invocation, &refused_env_names(), |name| {

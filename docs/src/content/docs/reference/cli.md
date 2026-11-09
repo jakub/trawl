@@ -17,21 +17,99 @@ Every subcommand accepts these options.
 | `-p, --profile` | `<NAME>` | *(none)* | Named profile from the config file. Overrides `[server]`. `trial` is reserved for the [trial](#trial-mode) |
 | `--url` | `<URL>` | `https://localhost:5514` | Server URL |
 | `--token` | `<TOKEN>` | *(none)* | API token |
+| `--token-file` | `<PATH>` | *(none)* | Read the API token from this file. Not with `--token` |
 | `--insecure` | *(flag)* | `false` | Accept self-signed TLS certificates |
 | `-c, --config` | `<PATH>` | `~/.config/trawl/config.toml` | Config file path |
 | `-V, --version` | *(flag)* | | Print the version and exit |
 | `-h, --help` | *(flag)* | | Print help and exit |
 
-A flag beats an environment variable, which beats the config file. Profiles and
-the `[ui]` and `[tail]` settings live in
+A flag beats an environment variable, which beats the config file. A saved or
+exported token is the exception: it goes only to the URL it was saved for. See
+[where a token goes](#where-a-token-goes). Profiles and the `[ui]` and `[tail]`
+settings live in
 [client configuration](/reference/configuration/#client-configuration).
 
-[`trawl doctor`](#doctor-mode) reads these options by its own rules. It has
-no default URL, and it refuses some combinations.
+[`trawl doctor`](#doctor-mode) and [`trawl mcp`](#mcp-mode) read these options
+by their own, stricter rules. The doctor has no default URL, and both refuse
+some combinations.
 
 When `insecure` is on from the flag, `TRAWL_INSECURE`, `[server]`, or a profile,
 `trawl` writes one warning line to stderr before any other output. Stdout does
 not change.
+
+### Where a token goes
+
+`trawl` first picks the target URL. The first source that is set wins:
+
+1. `--url` on the command line.
+2. `TRAWL_URL`.
+3. `url` in the selected profile.
+4. `url` in `[server]`, or `https://localhost:5514` when it is absent.
+
+Then it picks the token. The first source that is set wins:
+
+1. `--token` on the command line.
+2. `--token-file PATH` on the command line.
+3. `TRAWL_TOKEN`.
+4. `token` in the selected profile.
+5. `token` in `[server]`.
+
+`--token` and `--token-file` go to the target, whatever it is. Giving both is
+a usage error. `--token-file` reads a regular file of at most 4 KiB and trims
+the whitespace around the key. It fails when the file is missing, unreadable,
+empty, not a regular file, larger than 4 KiB, or not UTF-8. It has no
+environment variable.
+
+Every other token is bound to the URL it was saved for:
+
+- `token` in `[server]` is bound to `url` in `[server]`.
+- A profile's own `token` is bound to the profile's URL: its own `url`, or
+  `url` in `[server]` when it sets none.
+- A profile without `token` can use `token` in `[server]`, but only when the
+  target equals `url` in `[server]`. A profile that sets only trust, such as
+  `insecure = true`, therefore uses the `[server]` token.
+- `TRAWL_TOKEN` is bound to `TRAWL_URL` when both are set. Otherwise it is
+  bound to the saved URL: the profile's URL, or `url` in `[server]`.
+
+A token goes only to a target equal to its binding. When they differ, `trawl`
+fails before it sends anything. The message names where the token and the
+target came from, says that the API bases differ, and names `--token` and
+`--token-file`. It does not print the token, the file path, or either URL. So
+a `--url` typed on the command line that names another server needs `--token`
+or `--token-file`, even when `TRAWL_TOKEN` is set:
+
+```bash
+trawl --url https://lab-logs.example.com:5514 \
+  --token-file ~/.config/trawl/lab.key query 'last=15m | head 20'
+```
+
+The selected source never falls through to the next one. An empty
+`TRAWL_TOKEN`, an unreadable token file, or a token bound to another URL
+fails, even when a matching token is saved further down the list.
+
+Two URLs name the same API base when their scheme, host, port, and path
+prefix are equal. Case in the scheme and host does not matter, a default port
+(`443` for `https`, `80` for `http`) is the same as no port, and one trailing
+`/` does not matter. So `https://Logs.example.com:443/` equals
+`https://logs.example.com`. A different path prefix, such as `/a` and `/b` or
+`/Trawl` and `/trawl`, makes a different base. So do another port, `localhost`
+against `127.0.0.1`, and a host with a trailing dot.
+
+Every URL `trawl` uses, from the command line, the environment, `[server]`, or
+the selected profile, must be an `http` or `https` URL with a host. It must not
+carry credentials (`user@` or `user:password@` before the host), a query, or a
+fragment. A `%3F` or `%23` in the path counts as a query or a fragment, and a
+backslash or whitespace is refused too. `trawl` checks every URL before it
+reads any token, and the message does not repeat the URL.
+
+`trawl` honours the proxy variables `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+and `NO_PROXY`, and their lowercase forms (`http_proxy` and so on). A request
+sent through a proxy carries its token through that proxy too. Over `http`,
+the proxy can read the token. Over `https`, it can read the token when
+`insecure` is on, or when it presents a certificate that `trawl` trusts for
+the server, such as one from an interception CA in the system trust store or
+in `ca_cert`. To keep a token off a proxy, unset both the uppercase and the
+lowercase variables, or list the server in `NO_PROXY`.
 
 ### Pin a CA with `ca_cert`
 
@@ -51,7 +129,7 @@ error. See [client configuration](/reference/configuration/#client-configuration
 |----------|-----------------|-------------|
 | `TRAWL_PROFILE` | `-p, --profile` | Named profile to select |
 | `TRAWL_URL` | `--url` | Server URL |
-| `TRAWL_TOKEN` | `--token` | API token |
+| `TRAWL_TOKEN` | `--token` | API token, bound to `TRAWL_URL` or the saved URL. See [where a token goes](#where-a-token-goes) |
 | `TRAWL_INSECURE` | `--insecure` | Accept self-signed certificates |
 | `RUST_LOG` | `warn` | Tracing filter for the TUI log file |
 
@@ -143,9 +221,10 @@ trawl query --data 'data/**/*.parquet' "* | stats count() by service"
 trawl validate <QUERY>
 ```
 
-Validate checks syntax without executing. With a resolvable token the server
-also checks semantics, function arity, and regex patterns. Without one, `trawl`
-parses locally.
+Validate checks syntax without executing. With a token the server also checks
+semantics, function arity, and regex patterns. With no token from any source,
+`trawl` parses locally. A token bound to another URL is an error, not a local
+parse. See [where a token goes](#where-a-token-goes).
 
 ```bash
 trawl validate "_severity>=error | stats count() by host"
@@ -740,8 +819,8 @@ to the trial. It reads the URL `https://127.0.0.1:<api-port>`, the operator
 token, and the certificate from the trial directory, and never edits the
 config file. It exits `1` and sends nothing when:
 
-- `TRAWL_URL` or `TRAWL_TOKEN` is set, even to an empty value, or `--url` or
-  `--token` is given.
+- `TRAWL_URL` or `TRAWL_TOKEN` is set, even to an empty value, or `--url`,
+  `--token`, or `--token-file` is given.
 - The config file defines `[profiles.trial]`.
 - `--insecure` or `TRAWL_INSECURE` is on, through the `ca_cert` with
   `insecure` rule.

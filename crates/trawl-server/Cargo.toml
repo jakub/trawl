@@ -148,7 +148,6 @@ systemd-units = [
 ]
 assets = [
     ["target/release/trawld", "usr/bin/", "755"],
-    ["target/release/trawl-admin", "usr/bin/", "755"],
     ["target/release/fleet-admin", "usr/bin/", "755"],
     ["target/release/trawl-web", "usr/bin/", "755"],
     # 0640: these two carry the fleet-auth Postgres DSN (keystore credential).

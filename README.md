@@ -37,8 +37,11 @@ trawl query --data 'data/**/*.parquet' '* | stats count() by service'
 | `trawld` | Ingest, storage, queries, and the HTTPS API |
 | `trawl-web` | Browser UI and session proxy |
 | `fleet-admin` | Fleet migrations, keys, roles, and session keys |
-| `trawl-admin` | Self-signed TLS certificate generation |
 | PostgreSQL | The Fleet keystore and the Trawl app-state database |
+
+trawld generates a self-signed TLS certificate on its first start. To use
+your own certificate and key, set `[server] tls_cert_path` and
+`tls_key_path`.
 
 The manual at [trawl.sh](https://trawl.sh) covers
 [requirements](https://trawl.sh/start/overview/),

@@ -6674,17 +6674,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "trawl-admin"
-version = "0.9.4"
-dependencies = [
- "clap",
- "rcgen",
- "shellexpand",
- "time",
- "trawl-core",
-]
-
-[[package]]
 name = "trawl-api"
 version = "0.9.4"
 dependencies = [
@@ -6722,6 +6711,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "thiserror 2.0.19",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -6738,6 +6728,8 @@ dependencies = [
  "trawl-server",
  "trawl-web",
  "unicode-width",
+ "url",
+ "x509-parser",
  "zeroize",
 ]
 

@@ -13,12 +13,14 @@
 //! checks the engine, [`docker`] is the only place that spawns `docker`,
 //! [`compose`] renders the project and the containers' configs,
 //! [`secrets`] generates secrets and writes them into volumes,
-//! [`keys`] drives `fleet-admin`, and [`ownership`] decides which
-//! resources are the trial's.
+//! [`certificate`] generates the trial's TLS pair, [`keys`] drives
+//! `fleet-admin`, and [`ownership`] decides which resources are the
+//! trial's.
 //!
 //! The verbs dispatch before `config.toml` is read, so a broken or absent
 //! client config never blocks `up` or `down`.
 
+mod certificate;
 mod compose;
 mod docker;
 mod error;

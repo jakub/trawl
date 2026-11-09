@@ -10,15 +10,21 @@
 //! writes `config.toml`.
 //!
 //! Anything else that could point the command somewhere else is refused
-//! rather than silently losing or winning: `TRAWL_URL` or `TRAWL_TOKEN` in
-//! the environment (even empty), `--url` or `--token`, and a
-//! `[profiles.trial]` of the user's own. The overlay turns `insecure` off
-//! and pins the trial's `ca.pem`, so `--insecure` or `TRAWL_INSECURE` then
+//! rather than silently losing or winning: the variables clap binds to
+//! `--url` and `--token` (even empty), `--url`, `--token` or `--token-file`,
+//! and a `[profiles.trial]` of the user's own. The overlay turns `insecure`
+//! off and pins the trial's `ca.pem`, so `--insecure` or its variable then
 //! fails through the `ca_cert`-with-`insecure` rule.
+//!
+//! Variable names come from clap's metadata, through [`env_rules`]: each
+//! argument clap binds to a variable has an [`EnvRule`], and one without a
+//! rule is refused when set.
 //!
 //! The certificate is read once, here, through the same checked read as
 //! the token, and the connection pins those bytes. No pathname is handed
 //! on for a later step to open again.
+
+use clap::CommandFactory as _;
 
 use crate::config::Config;
 
@@ -26,54 +32,130 @@ use super::TrialError;
 use super::paths::{TrialPaths, read_private, read_public};
 use super::state::TrialState;
 
-/// The environment variable clap binds to `--url`.
-pub const URL_ENV: &str = "TRAWL_URL";
-/// The environment variable clap binds to `--token`.
-pub const TOKEN_ENV: &str = "TRAWL_TOKEN";
-
 /// A token file holds the token and one newline.
 const MAX_TOKEN_BYTES: u64 = 4096;
 
 /// `ca.pem` holds one self-signed certificate: a few kilobytes.
 const MAX_CA_BYTES: u64 = 64 * 1024;
 
+/// What `-p trial`, and `trawl trial status`'s warnings, do about one
+/// argument clap binds to an environment variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvRule {
+    /// The variable moves the connection when set at all, even empty:
+    /// `-p trial` refuses it.
+    RefuseWhenSet,
+    /// The variable is a switch, and moves the connection when the argument
+    /// parser reads it as on: `-p trial` then refuses through the
+    /// `ca_cert`-with-`insecure` rule.
+    RefuseWhenOn,
+    /// The variable selects the profile: one other than `trial` sends
+    /// commands without -p elsewhere.
+    SelectsProfile,
+}
+
+/// The rule for the clap argument `id`, or `None` when it has none.
+pub fn env_rule(id: &str) -> Option<EnvRule> {
+    match id {
+        "url" | "token" => Some(EnvRule::RefuseWhenSet),
+        "insecure" => Some(EnvRule::RefuseWhenOn),
+        "profile" => Some(EnvRule::SelectsProfile),
+        _ => None,
+    }
+}
+
+/// `(argument id, variable name)` for every argument clap binds to an
+/// environment variable, anywhere in the command tree, once each, in
+/// clap's order.
+pub fn bound_env() -> Vec<(String, String)> {
+    fn walk(command: &clap::Command, out: &mut Vec<(String, String)>) {
+        for arg in command.get_arguments() {
+            if let Some(name) = arg.get_env() {
+                let pair = (
+                    arg.get_id().as_str().to_owned(),
+                    name.to_string_lossy().into_owned(),
+                );
+                if !out.contains(&pair) {
+                    out.push(pair);
+                }
+            }
+        }
+        for subcommand in command.get_subcommands() {
+            walk(subcommand, out);
+        }
+    }
+    let mut command = crate::Cli::command();
+    command.build();
+    let mut out = Vec::new();
+    walk(&command, &mut out);
+    out
+}
+
+/// `(variable name, rule)` for every variable clap binds. A variable whose
+/// argument has no rule is refused when set: a new binding fails closed.
+pub fn env_rules() -> Vec<(String, EnvRule)> {
+    bound_env()
+        .into_iter()
+        .map(|(id, name)| (name, env_rule(&id).unwrap_or(EnvRule::RefuseWhenSet)))
+        .collect()
+}
+
 /// Connection settings the invocation supplied besides the profile.
 ///
-/// clap merges a flag and its environment variable into one value, and
-/// ignores an empty variable, so the environment is read separately.
-#[derive(Debug, Clone, Copy, Default)]
-#[allow(clippy::struct_excessive_bools)] // four independent sources
+/// clap merges a flag and its environment variable into one value, so the
+/// environment is read separately. clap passes a variable set to the empty
+/// string through as a value, and here it counts as set too.
+#[derive(Debug, Clone, Default)]
 pub struct Overrides {
-    pub url_env: bool,
-    pub token_env: bool,
-    /// `--url`, or clap's merge of `TRAWL_URL`.
+    /// Each variable `-p trial` refuses that is set, in clap's order.
+    pub env_set: Vec<String>,
+    /// `--url`, or clap's merge of its variable.
     pub url_arg: bool,
-    /// `--token`, or clap's merge of `TRAWL_TOKEN`.
+    /// `--token`, or clap's merge of its variable.
     pub token_arg: bool,
+    /// `--token-file`, which has no variable.
+    pub token_file_arg: bool,
 }
 
 impl Overrides {
-    /// Observe this process: `url_arg` and `token_arg` come from the
-    /// parsed command line, the rest from the environment. A variable that
-    /// is set to the empty string counts as set.
-    pub fn observe(url_arg: bool, token_arg: bool) -> Self {
+    /// Observe this process: the `_arg`s come from the parsed command
+    /// line, the rest from the environment. A variable that is set to the
+    /// empty string counts as set.
+    pub fn observe(url_arg: bool, token_arg: bool, token_file_arg: bool) -> Self {
+        Self::observe_with(url_arg, token_arg, token_file_arg, |name| {
+            std::env::var_os(name).is_some()
+        })
+    }
+
+    /// [`Overrides::observe`], with `set` answering whether a variable is
+    /// present.
+    fn observe_with(
+        url_arg: bool,
+        token_arg: bool,
+        token_file_arg: bool,
+        set: impl Fn(&str) -> bool,
+    ) -> Self {
         Self {
-            url_env: std::env::var_os(URL_ENV).is_some(),
-            token_env: std::env::var_os(TOKEN_ENV).is_some(),
+            env_set: env_rules()
+                .into_iter()
+                .filter(|(name, rule)| *rule == EnvRule::RefuseWhenSet && set(name))
+                .map(|(name, _)| name)
+                .collect(),
             url_arg,
             token_arg,
+            token_file_arg,
         }
     }
 
-    fn refusal(self) -> Option<&'static str> {
-        if self.url_env {
-            Some("TRAWL_URL is set")
-        } else if self.token_env {
-            Some("TRAWL_TOKEN is set")
+    fn refusal(self) -> Option<String> {
+        if let Some(name) = self.env_set.into_iter().next() {
+            Some(format!("{name} is set"))
         } else if self.url_arg {
-            Some("--url was given")
+            Some("--url was given".to_owned())
         } else if self.token_arg {
-            Some("--token was given")
+            Some("--token was given".to_owned())
+        } else if self.token_file_arg {
+            Some("--token-file was given".to_owned())
         } else {
             None
         }
@@ -132,7 +214,8 @@ pub fn apply(
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory as _;
+    use std::collections::BTreeSet;
+
     use trawl_client::TlsTrust;
 
     use super::*;
@@ -185,7 +268,7 @@ url = "https://lab.example:5514"
         assert!(!cfg.server.insecure, "the overlay turns insecure off");
         assert_eq!(cfg.server.pinned_ca.as_deref(), Some(PEM));
 
-        let conn = crate::connection(&cfg, None).unwrap();
+        let conn = crate::connection::trial(&cfg).unwrap();
         assert_eq!(conn.url, "https://127.0.0.1:15999");
         assert_eq!(conn.token, TOKEN);
         assert_eq!(conn.trust, TlsTrust::PinnedCa(PEM.to_vec()));
@@ -207,11 +290,11 @@ url = "https://lab.example:5514"
 
         let substitute = b"-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
         write_private(&paths.ca_file(), substitute, 0o644).unwrap();
-        let conn = crate::connection(&cfg, None).unwrap();
+        let conn = crate::connection::trial(&cfg).unwrap();
         assert_eq!(conn.trust, TlsTrust::PinnedCa(PEM.to_vec()));
 
         std::fs::remove_dir_all(&paths.dir).unwrap();
-        let conn = crate::connection(&cfg, None).unwrap();
+        let conn = crate::connection::trial(&cfg).unwrap();
         assert_eq!(
             conn.trust,
             TlsTrust::PinnedCa(PEM.to_vec()),
@@ -274,7 +357,7 @@ url = "https://lab.example:5514"
         let (_tmp, paths) = ready_trial(15999);
         let mut cfg = Config::default();
         apply_default(&mut cfg, &paths).unwrap();
-        cfg.apply_overrides(None, true);
+        cfg.apply_overrides(true);
         assert!(matches!(
             cfg.tls_trust(),
             Err(crate::config::ConfigError::CaCertWithInsecure)
@@ -284,21 +367,14 @@ url = "https://lab.example:5514"
     #[test]
     fn every_connection_override_is_refused() {
         let (_tmp, paths) = ready_trial(15999);
+        let env = |names: &[&str]| Overrides {
+            env_set: names.iter().map(|&name| name.to_owned()).collect(),
+            ..Overrides::default()
+        };
         let cases = [
-            (
-                Overrides {
-                    url_env: true,
-                    ..Overrides::default()
-                },
-                "TRAWL_URL is set",
-            ),
-            (
-                Overrides {
-                    token_env: true,
-                    ..Overrides::default()
-                },
-                "TRAWL_TOKEN is set",
-            ),
+            (env(&["TRAWL_URL"]), "TRAWL_URL is set"),
+            (env(&["TRAWL_TOKEN"]), "TRAWL_TOKEN is set"),
+            (env(&["TRAWL_URL", "TRAWL_TOKEN"]), "TRAWL_URL is set"),
             (
                 Overrides {
                     url_arg: true,
@@ -313,13 +389,29 @@ url = "https://lab.example:5514"
                 },
                 "--token was given",
             ),
+            (
+                Overrides {
+                    token_file_arg: true,
+                    ..Overrides::default()
+                },
+                "--token-file was given",
+            ),
+            (
+                Overrides {
+                    env_set: vec!["TRAWL_TOKEN".to_owned()],
+                    url_arg: true,
+                    ..Overrides::default()
+                },
+                "TRAWL_TOKEN is set",
+            ),
         ];
         for (overrides, expected) in cases {
+            let label = format!("{overrides:?}");
             let mut cfg = Config::default();
             let err = apply(&mut cfg, overrides, "config.toml", &paths).unwrap_err();
             assert!(
-                matches!(err, TrialError::ProfileOverride { what } if what == expected),
-                "{overrides:?}: {err:?}"
+                matches!(&err, TrialError::ProfileOverride { what } if what == expected),
+                "{label}: {err:?}"
             );
             assert_eq!(
                 cfg.server.url,
@@ -404,20 +496,76 @@ url = "https://lab.example:5514"
         assert!(!format!("{err:?}").contains(TOKEN));
     }
 
-    /// The refusal reads the environment by name; the names must be the
-    /// ones clap binds to `--url` and `--token`.
+    /// Every variable clap binds anywhere in the command tree has a rule,
+    /// and between them `-p trial`'s refusals and `trawl trial status`'s
+    /// warnings cover all of them. Every global flag that moves the
+    /// connection is refused as a flag.
     #[test]
-    fn refused_env_names_are_the_ones_clap_binds() {
-        let command = crate::Cli::command();
-        let env_of = |id: &str| {
-            command
-                .get_arguments()
-                .find(|arg| arg.get_id() == id)
-                .and_then(|arg| arg.get_env())
-                .map(|env| env.to_str().unwrap().to_owned())
-        };
-        assert_eq!(env_of("url").as_deref(), Some(URL_ENV));
-        assert_eq!(env_of("token").as_deref(), Some(TOKEN_ENV));
+    fn clap_binding_policies_are_complete() {
+        let bound = bound_env();
+        let all: BTreeSet<String> = bound.iter().map(|(_, name)| name.clone()).collect();
+        for (id, name) in &bound {
+            assert!(
+                env_rule(id).is_some(),
+                "{name} (argument {id}) is bound by clap and has no -p trial rule"
+            );
+        }
+
+        let refused: BTreeSet<String> = Overrides::observe_with(false, false, false, |_| true)
+            .env_set
+            .into_iter()
+            .collect();
+        assert!(
+            refused.is_superset(&["TRAWL_URL", "TRAWL_TOKEN"].map(str::to_owned).into()),
+            "{refused:?}"
+        );
+        let warned: BTreeSet<String> =
+            super::super::render::moving_variables(&env_rules(), |_| true, true, Some("elsewhere"))
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+        assert_eq!(&refused | &warned, all);
+
+        // Globals that move the connection without a variable of their own
+        // are refused as flags; the rest are named here so a new global
+        // has to be placed.
+        let mut command = crate::Cli::command();
+        command.build();
+        let (_tmp, paths) = ready_trial(15999);
+        let mut flags = BTreeSet::new();
+        for arg in command.get_arguments().filter(|arg| arg.is_global_set()) {
+            let id = arg.get_id().as_str();
+            let overrides = match id {
+                "url" => Overrides {
+                    url_arg: true,
+                    ..Overrides::default()
+                },
+                "token" => Overrides {
+                    token_arg: true,
+                    ..Overrides::default()
+                },
+                "token_file" => Overrides {
+                    token_file_arg: true,
+                    ..Overrides::default()
+                },
+                // --insecure's variable has a rule above, and the flag fails
+                // through the ca_cert-with-insecure rule after the overlay.
+                // --profile is -p trial itself, and --config the file it
+                // reads.
+                "insecure" | "profile" | "config" => continue,
+                other => panic!("global --{other} has no -p trial policy"),
+            };
+            let err = apply(&mut Config::default(), overrides, "config.toml", &paths).unwrap_err();
+            assert!(
+                matches!(err, TrialError::ProfileOverride { .. }),
+                "--{id}: {err:?}"
+            );
+            flags.insert(id.to_owned());
+        }
+        assert_eq!(
+            flags,
+            ["url", "token", "token_file"].map(str::to_owned).into()
+        );
         assert_eq!(crate::trial::PROFILE, "trial");
     }
 }

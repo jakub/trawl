@@ -29,7 +29,6 @@ API connection, a public origin, and a session key.
 | `trawld` | Ingest, storage, queries, and the HTTPS API |
 | `trawl-web` | Browser UI and session proxy |
 | `fleet-admin` | Fleet migrations, keys, roles, and session keys |
-| `trawl-admin` | Self-signed TLS certificate generation |
 | PostgreSQL | The Fleet keystore and the Trawl app-state database |
 
 ## Size a node
@@ -41,5 +40,7 @@ sample of your logs and measure with [health and storage](/operate/health/).
 
 Continuous operation needs persistent volumes for the data directory and
 PostgreSQL, a [backup and restore](/operate/backup-restore/) plan, and a TLS
-certificate your clients trust. See [deployment choices](/operate/deployment/)
+certificate your clients trust. trawld generates a self-signed certificate on
+its first start. To use your own certificate and key, set
+`[server] tls_cert_path` and `tls_key_path`. See [deployment choices](/operate/deployment/)
 and the [process overview](/architecture/overview/).

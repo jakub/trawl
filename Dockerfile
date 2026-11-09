@@ -12,7 +12,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libstdc++6 libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY docker-ctx/${TARGETARCH}/bin/trawld docker-ctx/${TARGETARCH}/bin/trawl-admin docker-ctx/${TARGETARCH}/bin/fleet-admin docker-ctx/${TARGETARCH}/bin/trawl-web /usr/bin/
+COPY docker-ctx/${TARGETARCH}/bin/trawld docker-ctx/${TARGETARCH}/bin/fleet-admin docker-ctx/${TARGETARCH}/bin/trawl-web /usr/bin/
 COPY docker-ctx/${TARGETARCH}/lib/trawl/ /usr/lib/trawl/
 COPY docker-ctx/${TARGETARCH}/LICENSE docker-ctx/${TARGETARCH}/LICENSE.duckdb docker-ctx/${TARGETARCH}/distribution.json /usr/share/doc/trawl/
 
