@@ -102,6 +102,12 @@ fragment. A `%3F` or `%23` in the path counts as a query or a fragment, and a
 backslash or whitespace is refused too. `trawl` checks every URL before it
 reads any token, and the message does not repeat the URL.
 
+`trawl` honours the proxy variables `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+and `NO_PROXY`. A request sent through a proxy carries its token through that
+proxy too. Over `http`, the proxy can read the token. Over `https`, it can
+read the token only when `insecure` is on. Unset these variables, or list the
+server in `NO_PROXY`, to keep a token off a proxy.
+
 ### Pin a CA with `ca_cert`
 
 `ca_cert` names a PEM file of CA certificates. It is a config file key on
