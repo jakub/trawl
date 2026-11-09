@@ -10,6 +10,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use trawl_core::sanitize::sanitize_display_text;
+
 use crate::tui::App;
 use crate::tui::state::{Focus, MainTab, TabStatus};
 
@@ -36,7 +38,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 Style::default().fg(theme.status_success),
             ),
             TabStatus::Error { message, .. } => Span::styled(
-                format!("error: {message}"),
+                format!("error: {}", sanitize_display_text(message)),
                 Style::default().fg(theme.status_error),
             ),
         };

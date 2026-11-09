@@ -275,7 +275,7 @@ fn render_table(
     let header_cells: Vec<Cell<'_>> = display_cols
         .iter()
         .map(|&col_idx| {
-            let cell = Cell::from(result.columns[col_idx].name.as_str());
+            let cell = Cell::from(sanitize_display_text(&result.columns[col_idx].name));
             if col_cursor == Some(col_idx) {
                 cell.style(
                     Style::default()
@@ -743,6 +743,18 @@ pub fn is_bar_chartable(result: &trawl_engine::value::QueryResult) -> bool {
     has_string && has_numeric
 }
 
+/// [`extract_series`] with each series label sanitized. A label is a
+/// metric column's name or a grouped value, so a sender can pick it, and
+/// it reaches titles, legends and axis labels.
+fn chart_series(result: &trawl_engine::value::QueryResult) -> (Vec<(String, Vec<u64>)>, usize) {
+    let (series, total) = extract_series(result);
+    let series = series
+        .into_iter()
+        .map(|(label, values)| (sanitize_display_text(&label), values))
+        .collect();
+    (series, total)
+}
+
 /// Render braille line chart for timechart results using `Chart` widget.
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn render_line_chart(
@@ -758,7 +770,7 @@ fn render_line_chart(
         Style::default().fg(theme.border_unfocused)
     };
 
-    let (series, total_series) = extract_series(result);
+    let (series, total_series) = chart_series(result);
 
     if series.is_empty() {
         render_placeholder(app, frame, area);
@@ -972,8 +984,8 @@ fn render_bar_chart(
         .position(|v| matches!(v, Value::Integer(_) | Value::UInt(_) | Value::Float(_)))
         .unwrap_or(1);
 
-    let metric_name = &result.columns[value_col].name;
-    let label_name = &result.columns[label_col].name;
+    let metric_name = sanitize_display_text(&result.columns[value_col].name);
+    let label_name = sanitize_display_text(&result.columns[label_col].name);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -996,7 +1008,8 @@ fn render_bar_chart(
         .take(max_bars)
         .enumerate()
         .map(|(idx, row)| {
-            let label = cell_text(&result.columns[label_col].ty, &row[label_col]);
+            let label =
+                sanitize_display_text(&cell_text(&result.columns[label_col].ty, &row[label_col]));
             // A bar's height is a `u64`, which is `Value::UInt`'s own
             // width, so an oversized unsigned draws at its real
             // magnitude. A negative or a NaN clamps to the bottom of the
@@ -1066,7 +1079,7 @@ fn render_sparkline(
         Style::default().fg(theme.border_unfocused)
     };
 
-    let (series, total_series) = extract_series(result);
+    let (series, total_series) = chart_series(result);
 
     if series.is_empty() {
         // Fallback to placeholder if extraction failed
@@ -1449,14 +1462,16 @@ fn extract_time_metadata(
         "N/A".to_owned()
     };
 
-    // Format times (truncate if too long)
+    // Format times (truncate if too long), sanitized: a `_time` cell is
+    // whatever the result holds.
     let format_time = |s: String| {
-        if s.len() > 19 {
+        let s = if s.len() > 19 {
             // Keep just date and time, drop subseconds/timezone
             s.chars().take(19).collect()
         } else {
             s
-        }
+        };
+        sanitize_display_text(&s)
     };
 
     Some((format_time(first_time), format_time(last_time), span))
@@ -2125,5 +2140,182 @@ mod series_label_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sender_text_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_engine::value::{Column, ColumnType, QueryResult, Value};
+
+    use crate::tui::App;
+    use crate::tui::state::{ChartView, TabStatus};
+    use crate::tui::tests::test_app;
+
+    /// A bidi override a sender can put in a field name or a grouped value.
+    const BIDI: &str = "a\u{202E}b";
+
+    fn with_result(result: QueryResult, view: ChartView) -> App {
+        let mut app = test_app();
+        let returned = result.rows.len();
+        app.tab.result = Some(trawl_client::QueryResponse {
+            execution: None,
+            result,
+            pagination: trawl_client::PaginationMeta {
+                limit: 10_000,
+                offset: 0,
+                returned,
+                total: returned,
+            },
+            degraded_fields: Vec::new(),
+            severity_columns: Vec::new(),
+        });
+        app.tab.status = TabStatus::Success { duration_ms: 1 };
+        app.tab.chart_view = view;
+        app
+    }
+
+    /// The results pane drawn alone, as the terminal's text.
+    fn pane(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("terminal");
+        terminal
+            .draw(|f| super::render(app, f, f.area()))
+            .expect("render");
+        terminal.backend().to_string()
+    }
+
+    fn assert_sanitized(surface: &str, screen: &str) {
+        assert!(
+            !screen.contains('\u{202E}'),
+            "{surface} draws the override:\n{screen}"
+        );
+        assert!(
+            screen.contains('\u{FFFD}'),
+            "{surface} draws no replacement:\n{screen}"
+        );
+    }
+
+    fn time(i: i64) -> Value {
+        Value::String(format!("2026-01-01 00:0{i}:00"))
+    }
+
+    /// `timechart count by host`: the hosts are the series labels.
+    fn grouped_timechart() -> QueryResult {
+        let rows = (0..3_i64)
+            .flat_map(|i| {
+                [BIDI, "web"]
+                    .map(|host| vec![time(i), Value::String(host.into()), Value::Integer(i)])
+            })
+            .collect();
+        QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("host", ColumnType::String),
+                Column::new("count", ColumnType::Integer),
+            ],
+            rows,
+        }
+    }
+
+    /// One series, named for its metric column: the label is in the title.
+    fn single_timechart() -> QueryResult {
+        QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new(BIDI, ColumnType::Integer),
+            ],
+            rows: (0..3_i64)
+                .map(|i| vec![time(i), Value::Integer(i)])
+                .collect(),
+        }
+    }
+
+    /// The line chart's legend.
+    #[test]
+    fn sender_text_is_sanitized_in_the_line_chart_legend() {
+        let screen = pane(&with_result(grouped_timechart(), ChartView::LineChart));
+        assert_sanitized("line chart legend", &screen);
+    }
+
+    #[test]
+    fn sender_text_is_sanitized_in_the_line_chart_title() {
+        let screen = pane(&with_result(single_timechart(), ChartView::LineChart));
+        assert_sanitized("line chart title", &screen);
+    }
+
+    /// The stacked sparklines' labels.
+    #[test]
+    fn sender_text_is_sanitized_in_sparkline_labels() {
+        let screen = pane(&with_result(grouped_timechart(), ChartView::Sparkline));
+        assert_sanitized("sparkline labels", &screen);
+    }
+
+    #[test]
+    fn sender_text_is_sanitized_in_the_sparkline_title() {
+        let screen = pane(&with_result(single_timechart(), ChartView::Sparkline));
+        assert_sanitized("sparkline title", &screen);
+    }
+
+    /// The time axis and the title quote the first and last `_time`.
+    #[test]
+    fn sender_text_is_sanitized_in_chart_time_labels() {
+        let mut result = grouped_timechart();
+        for row in &mut result.rows {
+            row[0] = Value::String(BIDI.into());
+        }
+        for view in [ChartView::LineChart, ChartView::Sparkline] {
+            let screen = pane(&with_result(result.clone(), view));
+            assert_sanitized(&format!("{view:?} time labels"), &screen);
+        }
+    }
+
+    #[test]
+    fn sender_text_is_sanitized_in_the_bar_chart() {
+        let result = QueryResult {
+            columns: vec![
+                Column::new("host", ColumnType::String),
+                Column::new(BIDI, ColumnType::Integer),
+            ],
+            rows: vec![
+                vec![Value::String(BIDI.into()), Value::Integer(3)],
+                vec![Value::String("web".into()), Value::Integer(5)],
+            ],
+        };
+        let screen = pane(&with_result(result, ChartView::BarChart));
+        assert_sanitized("bar chart", &screen);
+        assert_eq!(
+            screen.matches('\u{FFFD}').count(),
+            2,
+            "the title and the label:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn sender_text_is_sanitized_in_result_headers() {
+        let result = QueryResult {
+            columns: vec![Column::new(BIDI, ColumnType::String)],
+            rows: vec![vec![Value::String("web".into())]],
+        };
+        let screen = pane(&with_result(result, ChartView::Table));
+        assert_sanitized("result header", &screen);
+    }
+
+    #[test]
+    fn sender_text_is_sanitized_in_the_status_bar() {
+        let mut app = test_app();
+        app.main_tab = crate::tui::state::MainTab::History;
+        app.tab.status = TabStatus::Error {
+            message: format!("unknown field {BIDI}"),
+            details: Vec::new(),
+            query: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).expect("terminal");
+        terminal
+            .draw(|f| super::super::status::render(&app, f, f.area()))
+            .expect("render");
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("error: unknown field"), "{screen}");
+        assert_sanitized("status bar", &screen);
     }
 }
