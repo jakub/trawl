@@ -19,7 +19,6 @@ Paths are relative to the repository root.
 | `crates/trawl-config` | Shared config types and filesystem helpers |
 | `crates/trawl-cli` | `trawl` command declarations and the TUI |
 | `crates/trawl-dashboard` | Shared ratatui dashboard rendering |
-| `crates/trawl-admin` | Local TLS certificate tooling |
 | `crates/trawl-crashdump` | Crash-dump capture |
 | `crates/trawl-web` | Browser session proxy that serves the SPA and adds bearer tokens |
 | `crates/trawl-web-ui` | Leptos SPA, its routes, and app-specific state |
