@@ -432,6 +432,37 @@ fn kv_stats_sort_stats_is_refused() {
     );
 }
 
+/// A scalar head in an aggregation slot is legal in the SQL prefix, where
+/// it projects (ADR-0024). The tail compiles through the live lane's
+/// accumulators, which have nothing to run for one, so it is refused
+/// rather than counted (ADR-0001, Amendment 2026-11-08). The tail frames
+/// the live sentence with `post-processing: `, so the reason is matched
+/// inside it.
+#[test]
+fn kv_tail_refuses_scalar_heads() {
+    let (_dir, glob) = three_sizes();
+    for (dsl, sentence) in [
+        (
+            "* | extract kv | stats lower(x)",
+            "stats is not supported in streaming mode: lower() is not an aggregate",
+        ),
+        (
+            "* | sort seq | extract kv | timechart lower(k)",
+            "timechart is not supported in streaming mode: lower() is not an aggregate",
+        ),
+        (
+            "* | extract kv | stats coalesce(sum(bytes), 0)",
+            "stats is not supported in streaming mode: coalesce() is not an aggregate",
+        ),
+    ] {
+        let message = refusal(dsl, &glob);
+        assert!(
+            message.starts_with("post-processing: ") && message.contains(sentence),
+            "{dsl}: {message}"
+        );
+    }
+}
+
 #[test]
 fn kv_tail_is_refused() {
     let (_dir, glob) = six_sizes();

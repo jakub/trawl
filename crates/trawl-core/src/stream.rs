@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::aggregate::Aggregate;
 use crate::ast::{
     AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
     LiteralValue, PipeStage, RenameStage, Spanned, TableStage, TrawlDuration, WhereStage,
@@ -1999,11 +2000,9 @@ type GroupKey = Vec<Option<String>>;
 /// A compiled accumulator descriptor (what function + which field).
 #[derive(Debug, Clone)]
 pub struct CompiledAcc {
-    pub function: String,
+    pub function: Aggregate,
     pub field: Option<String>,
     pub alias: String,
-    /// For percentile functions, the target percentile (e.g. 0.95).
-    pub percentile: Option<f64>,
 }
 
 /// Runtime state for a single accumulator instance.
@@ -2070,46 +2069,68 @@ impl WelfordState {
     }
 }
 
+/// No wildcard arm: an aggregate added to [`Aggregate`] does not compile
+/// until it has an accumulator here, and the SQL translator holds it to
+/// SQL the same way (ADR-0001, Amendment 2026-11-08).
 fn new_acc_state(acc: &CompiledAcc) -> AccState {
-    match acc.function.as_str() {
-        "count" => {
+    match acc.function {
+        Aggregate::Count => {
             if acc.field.is_some() {
                 AccState::CountField { non_null: 0 }
             } else {
                 AccState::Count(0)
             }
         }
-        "sum" => AccState::Sum(None),
-        "avg" => AccState::Avg { sum: 0.0, count: 0 },
-        "min" => AccState::Min(None),
-        "max" => AccState::Max(None),
-        "dc" | "distinct_count" => AccState::Dc(HashSet::new()),
-        "first" => AccState::First(None),
-        "last" => AccState::Last(None),
-        "values" | "list" => AccState::Values(HashSet::new()),
-        "median" => AccState::Median(Vec::new()),
-        "stddev" => AccState::Stddev(WelfordState::new()),
-        "p50" => AccState::Percentile {
+        Aggregate::Sum => AccState::Sum(None),
+        Aggregate::Avg => AccState::Avg { sum: 0.0, count: 0 },
+        Aggregate::Min => AccState::Min(None),
+        Aggregate::Max => AccState::Max(None),
+        Aggregate::DistinctCount => AccState::Dc(HashSet::new()),
+        Aggregate::First => AccState::First(None),
+        Aggregate::Last => AccState::Last(None),
+        Aggregate::Values => AccState::Values(HashSet::new()),
+        Aggregate::Median => AccState::Median(Vec::new()),
+        Aggregate::Stddev => AccState::Stddev(WelfordState::new()),
+        Aggregate::P50 => AccState::Percentile {
             values: Vec::new(),
             target: 0.5,
         },
-        "p90" => AccState::Percentile {
+        Aggregate::P90 => AccState::Percentile {
             values: Vec::new(),
             target: 0.9,
         },
-        "p95" => AccState::Percentile {
+        Aggregate::P95 => AccState::Percentile {
             values: Vec::new(),
             target: 0.95,
         },
-        "p99" => AccState::Percentile {
+        Aggregate::P99 => AccState::Percentile {
             values: Vec::new(),
             target: 0.99,
         },
-        _ => AccState::Count(0), // fallback
     }
 }
 
 fn compile_agg_expr(agg: &AggExpr, stage: &str) -> Result<CompiledAcc, StreamPlanError> {
+    // The head's name and arity first, from the emitter's own table, so
+    // an unknown or misspelt head is refused with the sentence batch
+    // returns.
+    validate_function_arity(&agg.function, agg.args.len())
+        .map_err(|e| StreamPlanError::InvalidFunction(e.to_string()))?;
+    // A scalar head is legal in batch, where it projects (ADR-0024). The
+    // accumulators have nothing to run for one, so it is refused here,
+    // before its operand is read, rather than counted (ADR-0001,
+    // Amendment 2026-11-08). The batch tail behind `extract kv` compiles
+    // through this function too.
+    let Some(function) = Aggregate::from_name(&agg.function) else {
+        return Err(StreamPlanError::UnsupportedStage {
+            stage: stage.to_string(),
+            reason: format!(
+                "{}() is not an aggregate; a scalar head in an aggregation slot runs only in SQL",
+                agg.function
+            ),
+        });
+    };
+
     // The live accumulators read a bare field out of the event; they have
     // no expression evaluator. A computed argument would therefore feed
     // nothing and answer NULL under a column the SQL lane fills with a
@@ -2121,7 +2142,8 @@ fn compile_agg_expr(agg: &AggExpr, stage: &str) -> Result<CompiledAcc, StreamPla
         Some(a) => match &a.node {
             crate::ast::Expr::FieldRef(name) => Some(name.clone()),
             crate::ast::Expr::Literal(lit)
-                if agg.function == "count" && !matches!(lit, crate::ast::LiteralValue::Null) =>
+                if function == Aggregate::Count
+                    && !matches!(lit, crate::ast::LiteralValue::Null) =>
             {
                 // SQL COUNT(non-null constant) is COUNT(*). The row-count
                 // accumulator represents that exactly; COUNT(NULL) does not.
@@ -2145,19 +2167,10 @@ fn compile_agg_expr(agg: &AggExpr, stage: &str) -> Result<CompiledAcc, StreamPla
     // its innermost field here exactly as it does in batch.
     let alias = crate::projection::agg_output_name(agg);
 
-    let percentile = match agg.function.as_str() {
-        "p50" => Some(0.5),
-        "p90" => Some(0.9),
-        "p95" => Some(0.95),
-        "p99" => Some(0.99),
-        _ => None,
-    };
-
     Ok(CompiledAcc {
-        function: agg.function.clone(),
+        function,
         field,
         alias,
-        percentile,
     })
 }
 
@@ -4798,6 +4811,202 @@ mod tests {
         let (_, rows) = aggregation.snapshot();
         let sd = cell(&rows[0], "stddev_v").as_f64().unwrap();
         assert!((sd - 2.138).abs() < 0.01, "stddev was {sd}");
+    }
+
+    /// An accumulator's variant, by name.
+    fn acc_kind(state: &AccState) -> &'static str {
+        match state {
+            AccState::Count(_) => "Count",
+            AccState::CountField { .. } => "CountField",
+            AccState::Sum(_) => "Sum",
+            AccState::Avg { .. } => "Avg",
+            AccState::Min(_) => "Min",
+            AccState::Max(_) => "Max",
+            AccState::Dc(_) => "Dc",
+            AccState::First(_) => "First",
+            AccState::Last(_) => "Last",
+            AccState::Values(_) => "Values",
+            AccState::Median(_) => "Median",
+            AccState::Stddev(_) => "Stddev",
+            AccState::Percentile { .. } => "Percentile",
+        }
+    }
+
+    /// Every aggregate spelling compiles to its own accumulator and
+    /// answers its own value over one sample, with the kind and the answer
+    /// written out here.
+    ///
+    /// The answer is the half that matters: the row-count fallback this
+    /// replaced built *an* accumulator for any name, so a check that one
+    /// was built would pass with every answer wrong.
+    #[test]
+    fn aggregate_inventory_is_total() {
+        use crate::aggregate::Aggregate;
+
+        // `x` takes 0..=20 once each, in the order (8i + 5) mod 21, so the
+        // first value seen is 5 and the last is 18, apart from every
+        // extreme and from the middle. One more event carries no `x`, so
+        // `count()` and `count(x)` differ.
+        let mut events: Vec<Row> = (0..21)
+            .map(|i| event(&json!({ "x": (8 * i + 5) % 21 })))
+            .collect();
+        events.insert(10, event(&json!({ "y": 0 })));
+
+        let mut texts: Vec<String> = (0..=20).map(|n: i32| n.to_string()).collect();
+        texts.sort();
+        let values = Value::from(texts);
+        // The sample standard deviation of 0..=20: a sum of squared
+        // deviations of 770 over 20 degrees of freedom.
+        let stddev = 38.5_f64.sqrt();
+
+        // (spelling, reads `x`, aggregate, accumulator, answer). The
+        // percentiles share an accumulator kind and take the nearest rank,
+        // round(p * 20), so their answers are what tell the targets apart.
+        let cases: [(&str, bool, Aggregate, &str, Value); 18] = [
+            ("count", false, Aggregate::Count, "Count", json!(22)),
+            ("count", true, Aggregate::Count, "CountField", json!(21)),
+            ("avg", true, Aggregate::Avg, "Avg", json!(10.0)),
+            ("sum", true, Aggregate::Sum, "Sum", json!(210.0)),
+            ("min", true, Aggregate::Min, "Min", json!(0.0)),
+            ("max", true, Aggregate::Max, "Max", json!(20.0)),
+            ("dc", true, Aggregate::DistinctCount, "Dc", json!(21)),
+            (
+                "distinct_count",
+                true,
+                Aggregate::DistinctCount,
+                "Dc",
+                json!(21),
+            ),
+            ("p50", true, Aggregate::P50, "Percentile", json!(10.0)),
+            ("p90", true, Aggregate::P90, "Percentile", json!(18.0)),
+            ("p95", true, Aggregate::P95, "Percentile", json!(19.0)),
+            ("p99", true, Aggregate::P99, "Percentile", json!(20.0)),
+            ("first", true, Aggregate::First, "First", json!(5)),
+            ("last", true, Aggregate::Last, "Last", json!(18)),
+            ("values", true, Aggregate::Values, "Values", values.clone()),
+            ("list", true, Aggregate::Values, "Values", values.clone()),
+            ("median", true, Aggregate::Median, "Median", json!(10.0)),
+            ("stddev", true, Aggregate::Stddev, "Stddev", json!(stddev)),
+        ];
+
+        // Every spelling of every aggregate has a case.
+        let mut spellings: Vec<&str> = Aggregate::ALL
+            .iter()
+            .flat_map(|aggregate| aggregate.spellings().iter().copied())
+            .collect();
+        spellings.sort_unstable();
+        let mut covered: Vec<&str> = cases.iter().map(|(name, ..)| *name).collect();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(covered, spellings, "a spelling without a case");
+
+        for (name, with_x, aggregate, kind, want) in cases {
+            let agg = AggExpr {
+                function: name.into(),
+                args: if with_x {
+                    vec![span(Expr::FieldRef("x".into()))]
+                } else {
+                    vec![]
+                },
+                alias: Some("out".into()),
+            };
+            let acc = compile_agg_expr(&agg, "stats")
+                .unwrap_or_else(|e| panic!("{name}: an aggregate compiles live: {e}"));
+            assert_eq!(acc.function, aggregate, "{name}");
+            assert_eq!(acc_kind(&new_acc_state(&acc)), kind, "{name}");
+
+            let pipeline = vec![span(PipeStage::Stats(StatsStage {
+                aggregations: vec![agg],
+                group_by: vec![],
+            }))];
+            let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let StreamPlan::Aggregate {
+                mut aggregation, ..
+            } = plan
+            else {
+                panic!("{name}: expected Aggregate");
+            };
+            for row in &events {
+                aggregation.feed_event(row, &ctx());
+            }
+            let (_, rows) = aggregation.snapshot();
+            let got = cell(&rows[0], "out");
+            match (got.as_f64(), want.as_f64()) {
+                (Some(got), Some(want)) => {
+                    assert!((got - want).abs() < 1e-9, "{name}: {got} != {want}");
+                }
+                _ => assert_eq!(got, want, "{name}"),
+            }
+        }
+    }
+
+    /// A scalar head in an aggregation slot is legal in batch, where it
+    /// projects (ADR-0024), and the accumulators have nothing to run for
+    /// one, so the live compiler refuses it by name instead of counting
+    /// rows (ADR-0001, Amendment 2026-11-08). A scalar wrapped around an
+    /// aggregate is a scalar head too.
+    ///
+    /// `eventstats` is unstreamable whatever its heads, and needs an alias
+    /// before the stage refusal is reached at all.
+    #[test]
+    fn live_scalar_heads_are_refused() {
+        let scalar_head =
+            "is not an aggregate; a scalar head in an aggregation slot runs only in SQL";
+        for (dsl, stage, reason) in [
+            (
+                "* | stats lower(x)",
+                "stats",
+                format!("lower() {scalar_head}"),
+            ),
+            (
+                "* | timechart lower(x)",
+                "timechart",
+                format!("lower() {scalar_head}"),
+            ),
+            (
+                "* | stats coalesce(sum(x), 0)",
+                "stats",
+                format!("coalesce() {scalar_head}"),
+            ),
+            (
+                "* | eventstats lower(x) as y",
+                "eventstats",
+                "window functions require the full dataset".to_owned(),
+            ),
+        ] {
+            let query = crate::parser::parse(dsl).expect("dsl parses");
+            match compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None) {
+                Err(StreamPlanError::UnsupportedStage {
+                    stage: refused,
+                    reason: why,
+                }) => {
+                    assert_eq!(refused, stage, "{dsl}");
+                    assert_eq!(why, reason, "{dsl}");
+                }
+                other => panic!("{dsl}: must be refused as unstreamable: {other:?}"),
+            }
+        }
+    }
+
+    /// An aggregation slot's head goes through the emitter's name and
+    /// arity table live, so an unknown or misspelt head is the sentence
+    /// `validate_pipeline` returns, not a row count.
+    #[test]
+    fn live_slot_heads_share_the_batch_name_and_arity_check() {
+        for dsl in [
+            "* | stats bogus(x)",
+            "* | stats avg()",
+            "* | timechart avg(x, y)",
+        ] {
+            let query = crate::parser::parse(dsl).expect("dsl parses");
+            let batch = crate::emitter::validate_pipeline(&query.pipeline)
+                .expect_err("batch refuses the head")
+                .to_string();
+            let live = compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None)
+                .expect_err("live refuses the head");
+            assert_eq!(live, StreamPlanError::InvalidFunction(batch), "{dsl}");
+        }
     }
 
     #[test]
