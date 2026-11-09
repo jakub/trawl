@@ -314,16 +314,22 @@ fn host_cell(host: String, depends_on_sender: bool) -> String {
 }
 
 /// `_time` with its source: the value and the field it came from, or
-/// `arrival` when the arrival time (in the header) filled it.
+/// `arrival` when the arrival time (in the header) filled it, naming a
+/// source that failed to parse or was too far ahead of arrival.
 fn time_cell(value: Option<&serde_json::Value>, source: &TimeLineage) -> String {
     match source {
         TimeLineage::Field { field } => {
             format!("{} ({})", slot(value), sanitize_display_text(field))
         }
-        TimeLineage::Arrival { unparseable: None } => "arrival".to_owned(),
         TimeLineage::Arrival {
             unparseable: Some(field),
+            ..
         } => format!("arrival (bad {})", sanitize_display_text(field)),
+        TimeLineage::Arrival {
+            ahead_of_arrival: Some(field),
+            ..
+        } => format!("arrival ({} ahead)", sanitize_display_text(field)),
+        TimeLineage::Arrival { .. } => "arrival".to_owned(),
     }
 }
 
@@ -612,17 +618,34 @@ mod tests {
     #[test]
     fn time_and_severity_name_arrival_and_absence() {
         assert_eq!(
-            time_cell(None, &TimeLineage::Arrival { unparseable: None }),
+            time_cell(
+                None,
+                &TimeLineage::Arrival {
+                    unparseable: None,
+                    ahead_of_arrival: None,
+                }
+            ),
             "arrival"
         );
         assert_eq!(
             time_cell(
                 None,
                 &TimeLineage::Arrival {
-                    unparseable: Some("ts".into())
+                    unparseable: Some("ts".into()),
+                    ahead_of_arrival: None,
                 }
             ),
             "arrival (bad ts)"
+        );
+        assert_eq!(
+            time_cell(
+                None,
+                &TimeLineage::Arrival {
+                    unparseable: None,
+                    ahead_of_arrival: Some("timestamp".into()),
+                }
+            ),
+            "arrival (timestamp ahead)"
         );
         assert_eq!(severity_cell(None, &SeverityLineage::Missing), "missing");
         assert_eq!(

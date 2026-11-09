@@ -2536,7 +2536,7 @@ Each entry in `events` has `outcome` set to `accepted` or `rejected`.
 | `input` | both | any | The parsed input. Absent when the position was not valid JSON. Present for a non-object element, `null` included |
 | `event` | `accepted` | object | The canonical event as trawld would store it, `_ingested` included |
 | `repairs` | `accepted` | array | Repair codes in the order trawld applied them, the same codes as `_repairs`. See [repair codes](/reference/events/#repair-codes) |
-| `lineage.time` | `accepted` | object | `{"from": "field", "field": F}` when field `F` gave `_time`. `{"from": "arrival"}` when the arrival time filled it, with `unparseable` naming the first present source when that source did not parse |
+| `lineage.time` | `accepted` | object | `{"from": "field", "field": F}` when field `F` gave `_time`. `{"from": "arrival"}` when the arrival time filled it, with `unparseable` naming the first present source when that source did not parse, or `ahead_of_arrival` naming it when it was more than 15 minutes after arrival |
 | `lineage.severity` | `accepted` | object | `{"from": "field", "field": F, "skipped_unmappable": [...]}` when `F` gave `_severity`, listing earlier present sources that did not map. `{"from": "missing"}` when no source was present. `{"from": "unmapped", "sources": [...]}` when sources were present and none mapped |
 | `lineage.fields` | `accepted` | array | One entry per field change, in the order trawld made them: `field` as that step saw it, `change` (`renamed`, `dropped`, `truncated`, or `stringified`), `to` for a rename, and `code` for a change that is a repair. A stringified value carries no code |
 | `reason` | `rejected` | string | The reason code, as on [ingest](#ingest-events) |

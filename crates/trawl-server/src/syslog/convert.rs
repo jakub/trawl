@@ -660,6 +660,38 @@ mod tests {
             .expect("the syslog profile must not reject")
     }
 
+    /// A header time more than `MAX_TIME_LEAD` ahead of arrival loses the
+    /// derivation to arrival time, as on every door, and the header value
+    /// stays in its own column. The zone-less RFC 3164 frame is the common
+    /// case: a host east of UTC sends local time, which reads as UTC.
+    #[test]
+    fn header_time_ahead_of_arrival_is_replaced() {
+        let arrival = at(2026, 2, 15, 20, 0);
+        for raw in [
+            "<165>1 2026-02-15T23:00:00Z web01 app 1234 ID47 - boom",
+            "<13>Feb 15 23:00:00 host app: x",
+        ] {
+            let event = admit_from(&door(), raw, "10.0.0.1", arrival);
+            assert_eq!(event.map["_time"], stamp(arrival), "{raw}");
+            assert!(repairs(&event).contains(&"time.ahead_of_arrival"), "{raw}");
+            assert_eq!(
+                event.map[SYSLOG_TIMESTAMP_FIELD],
+                stamp(at(2026, 2, 15, 23, 0)),
+                "the header value stays as its column: {raw}"
+            );
+        }
+
+        // At the bound the header time is kept.
+        let event = admit_from(
+            &door(),
+            "<13>Feb 15 20:15:00 host app: x",
+            "10.0.0.1",
+            arrival,
+        );
+        assert_eq!(event.map["_time"], stamp(at(2026, 2, 15, 20, 15)));
+        assert!(!repairs(&event).contains(&"time.ahead_of_arrival"));
+    }
+
     const CHICAGO_PEER: &str = r#"
 [sender_timezones]
 "192.0.2.10" = "America/Chicago"

@@ -162,6 +162,6 @@ SQL (`source.rs:117-136`, `report_window.rs:609-633`).
 repair code `time.ahead_of_arrival`. The padding stays one hour, at least that bound.
 The axis of ruling 8 stays `_time`. Rejecting `_ingested` windows still holds,
 because a `_ingested` window would still disagree with interactive queries.
-Retention keeps deleting by directory date. With the bound, no row is more than
-15 minutes newer than the hour of its directory, so age-based expiry never
+Retention keeps deleting by directory date. With the bound, no row has a `_time`
+more than 15 minutes past the end of its directory's hour, so age-based expiry never
 deletes a row before its own `_time` has nearly reached the age limit.

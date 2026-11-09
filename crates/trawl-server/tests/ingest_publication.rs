@@ -6,13 +6,21 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, SecondsFormat, SubsecRound as _, TimeDelta, Utc};
+use common::captured;
 use indexmap::IndexMap;
+use serde_json::json;
+use trawl_api::value::Value;
+use trawl_config::CaptureConfig;
+use trawl_server::config::RateLimitConfig;
 use trawl_server::hot_buffer::{HotBuffer, HotBufferConfig};
+use trawl_server::ingest::envelope::{EnvelopeContext, canonicalize};
 use trawl_server::ingest::pipeline::{PipelineWriter, ServiceBatch};
+use trawl_server::ingest::producer::{Derivation, Producer};
 use trawl_server::ingest::wal::WalWriter;
 
 async fn assert_cancelled_caller_finishes_insert(
@@ -442,4 +450,237 @@ async fn pending_rollup_does_not_reject_ingest() {
     );
     assert_eq!(hot.event_count(), 1);
     assert!(publication.read().await.is_err());
+}
+
+/// One `/api/v1/query` answer as rows of column name to value, read with
+/// real `DuckDB` over the hot buffer and the selected parquet files.
+async fn query_rows(server: &common::TestServer, dsl: &str) -> Vec<Row> {
+    let response = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .post(format!("{}/api/v1/query", server.url))
+        .bearer_auth(&server.analyst_token)
+        .json(&trawl_api::QueryRequest {
+            query: dsl.to_owned(),
+            limit: Some(10_000),
+            offset: None,
+            timezone: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{dsl}: {:?}", response.text().await);
+    let result = response
+        .json::<trawl_api::QueryResponse>()
+        .await
+        .unwrap()
+        .result;
+    let names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+    result
+        .rows
+        .into_iter()
+        .map(|row| names.iter().cloned().zip(row).collect())
+        .collect()
+}
+
+type Row = std::collections::BTreeMap<String, Value>;
+
+/// The instant a query answer spells as RFC 3339 UTC text.
+fn instant(value: &Value) -> DateTime<Utc> {
+    match value {
+        Value::String(text) => DateTime::parse_from_rfc3339(text)
+            .unwrap_or_else(|e| panic!("{text}: {e}"))
+            .to_utc(),
+        other => panic!("not a timestamp: {other:?}"),
+    }
+}
+
+/// The repair codes a row's `_repairs` lists.
+fn repairs(row: &Row) -> Vec<&str> {
+    match row.get("_repairs") {
+        Some(Value::String(codes)) => codes.split(',').collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every file named `name` under `root`, at any depth.
+fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|n| n == name) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// The one `ahead` row, stored at its arrival with the repair, and the
+/// sender's time still in its `timestamp` column.
+fn assert_stored_at_arrival(
+    rows: &[Row],
+    sent: DateTime<Utc>,
+    arrived: std::ops::RangeInclusive<DateTime<Utc>>,
+    label: &str,
+) {
+    assert_eq!(rows.len(), 1, "{label}: exactly once: {rows:?}");
+    let row = &rows[0];
+    assert!(
+        arrived.contains(&instant(&row["_time"])),
+        "{label}: `_time` is the arrival: {row:?}"
+    );
+    assert_eq!(row["_time"], row["_ingested"], "{label}: arrival filled it");
+    assert!(
+        repairs(row).contains(&"time.ahead_of_arrival"),
+        "{label}: {row:?}"
+    );
+    assert_eq!(
+        instant(&row["timestamp"]),
+        sent,
+        "{label}: the sender's time stays as its column"
+    );
+}
+
+/// An event whose sender stamps it three hours ahead is stored at its
+/// arrival with `time.ahead_of_arrival`, so `last=15m` returns it exactly
+/// once, from its hourly file and from its day file.
+///
+/// The real rollup skips today and compaction has no clock seam, so the
+/// day-file leg moves the compacted hourly file to the name the rollup
+/// writes, `{day}/{service}.parquet`. The aged-directory property, where
+/// the walk must still reach a directory older than an hour, is
+/// `source::tests::last_window_reaches_every_row_within_the_lead`. A
+/// `recent` service keeps its hourly file in the same hour, so the walk
+/// has a recent directory and the day holds daily and hourly files.
+#[tokio::test(flavor = "multi_thread")]
+async fn ahead_of_arrival_event_is_found_by_last_after_compaction_and_rollup() {
+    let (fixture, server) =
+        captured::Restartable::boot(RateLimitConfig::default(), CaptureConfig::default(), |_| {})
+            .await;
+    let before = Utc::now();
+    let sent = DateTime::from_timestamp((before + TimeDelta::hours(3)).timestamp(), 0).unwrap();
+    captured::ingest(
+        &server,
+        &[
+            json!({"service": "ahead", "host": "h", "message": "m",
+                   "timestamp": sent.format("%Y-%m-%dT%H:%M:%SZ").to_string()}),
+            json!({"service": "recent", "host": "h", "message": "r"}),
+        ],
+    )
+    .await;
+    let arrived = before..=Utc::now();
+    captured::compact(&server, &fixture.disk).await;
+    let hot = server.state.query.hot_buffer.as_ref().unwrap();
+    assert_eq!(hot.event_count(), 0, "both events are stored, not hot");
+
+    let rows = query_rows(&server, "service=ahead last=15m").await;
+    assert_stored_at_arrival(&rows, sent, arrived.clone(), "hourly");
+
+    let prod = Path::new(&fixture.disk.data).join("prod");
+    let [hourly] = files_named(&prod, "ahead.parquet").try_into().unwrap();
+    let hour_dir = hourly.parent().unwrap();
+    assert!(
+        hour_dir.join("recent.parquet").exists(),
+        "the recent directory"
+    );
+    let daily = hour_dir.parent().unwrap().join("ahead.parquet");
+    std::fs::rename(&hourly, &daily).unwrap();
+
+    let rows = query_rows(&server, "service=ahead last=15m").await;
+    assert_stored_at_arrival(&rows, sent, arrived, "daily");
+    let rows = query_rows(&server, "last=15m").await;
+    for service in ["ahead", "recent"] {
+        let found = rows
+            .iter()
+            .filter(|row| row["service"] == Value::String(service.to_owned()))
+            .count();
+        assert_eq!(found, 1, "{service} once from the day's mixed files");
+    }
+}
+
+/// Rows stored before the bound keep the `_time` they were written with. A
+/// WAL batch in the writer's own format, planted before boot with a `_time`
+/// three hours ahead, keeps it through hydration and compaction, since
+/// neither canonicalizes again, and a parquet file holding such a `_time`
+/// reads as it is. Neither earns `time.ahead_of_arrival`.
+#[tokio::test(flavor = "multi_thread")]
+async fn preexisting_future_time_is_not_rewritten() {
+    let now = Utc::now().trunc_subsecs(6);
+    let future = now + TimeDelta::hours(3);
+    let planted = future.to_rfc3339_opts(SecondsFormat::Micros, true);
+    let (fixture, server) = captured::Restartable::boot(
+        RateLimitConfig::default(),
+        CaptureConfig::default(),
+        |data| {
+            // What the canonicalizer wrote before the bound for a sender
+            // three hours ahead: a clean event with that `_time`.
+            let arrival = now.to_rfc3339_opts(SecondsFormat::Micros, true);
+            let envs = ["prod".to_owned()];
+            let derivation = Derivation::defaults();
+            let ctx = EnvelopeContext {
+                arrival: &arrival,
+                arrival_instant: now,
+                envs: &envs,
+                default_env: "prod",
+                producer: Producer::Http {
+                    peer_host: "10.0.4.55",
+                    peer_is_trusted_relay: false,
+                },
+                derivation: &derivation,
+            };
+            let event = json!({"service": "planted", "env": "prod", "host": "h",
+                               "message": "m", "_time": arrival});
+            let mut canonical = canonicalize(event.as_object().unwrap(), &ctx).unwrap();
+            assert!(canonical.repairs.is_empty(), "{:?}", canonical.repairs);
+            canonical.obj.insert("_time".into(), json!(planted));
+            let mut batch = ServiceBatch::default();
+            batch.push(canonical.obj);
+            let wal = Path::new(data).parent().unwrap().join("wal");
+            let pipeline = PipelineWriter::new(Arc::new(WalWriter::new(wal)), None, None);
+            let batches = IndexMap::from([(("prod".into(), "planted".into()), batch)]);
+            assert_eq!(pipeline.write(pipeline.admit_for_test(batches)), 1);
+
+            captured::seed_partition(
+                data,
+                &format!("prod/{}", now.format("%Y-%m-%d/%H")),
+                "stored",
+                &[captured::Event {
+                    time: future,
+                    host: "h".into(),
+                    message: "stored".into(),
+                }],
+            );
+        },
+    )
+    .await;
+    let hot = server.state.query.hot_buffer.as_ref().unwrap();
+    assert_eq!(hot.event_count(), 1, "hydration took the planted batch");
+
+    let kept = |rows: &[Row], label: &str| {
+        assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+        assert_eq!(rows[0]["_time"], Value::String(planted.clone()), "{label}");
+        assert!(
+            !repairs(&rows[0]).contains(&"time.ahead_of_arrival"),
+            "{label}: {rows:?}"
+        );
+    };
+    kept(
+        &query_rows(&server, "service=planted last=15m").await,
+        "hydrated",
+    );
+    captured::compact(&server, &fixture.disk).await;
+    assert_eq!(hot.event_count(), 0, "the planted batch is stored, not hot");
+    kept(
+        &query_rows(&server, "service=planted last=15m").await,
+        "compacted",
+    );
+    kept(
+        &query_rows(&server, "service=stored last=15m").await,
+        "parquet",
+    );
 }

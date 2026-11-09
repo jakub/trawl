@@ -246,6 +246,11 @@ fn wire_time(time: &TimeSource, derivation: &Derivation) -> TimeLineage {
         },
         TimeSource::Arrival { unparseable } => TimeLineage::Arrival {
             unparseable: unparseable.map(name),
+            ahead_of_arrival: None,
+        },
+        TimeSource::AheadOfArrival(index) => TimeLineage::Arrival {
+            unparseable: None,
+            ahead_of_arrival: Some(name(*index)),
         },
     }
 }
