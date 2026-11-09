@@ -1162,13 +1162,13 @@ mod arg_tests {
         // run sets stands in for TRAWL_URL and TRAWL_TOKEN.
         const SET: &str = "CARGO_MANIFEST_DIR";
         assert!(std::env::var_os(SET).is_some(), "{SET} is set under cargo");
+        // Not exported: the bindings are cleared, so a TRAWL_URL or
+        // TRAWL_TOKEN in the host's environment cannot leak in.
         let sources = |exported: bool, argv: &[&str]| {
-            let mut command = Cli::command();
-            if exported {
-                command = command
-                    .mut_arg("url", |arg| arg.env(SET))
-                    .mut_arg("token", |arg| arg.env(SET));
-            }
+            let var = exported.then_some(SET);
+            let command = Cli::command()
+                .mut_arg("url", |arg| arg.env(var))
+                .mut_arg("token", |arg| arg.env(var));
             let matches = command
                 .try_get_matches_from(argv)
                 .unwrap_or_else(|e| panic!("{argv:?}: {e}"));
