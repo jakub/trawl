@@ -922,6 +922,132 @@ async fn a_materialize_failure_is_loud_and_leaves_the_cursor() {
     assert_eq!(h.cursor(sq).await, (t0(), Some(at(hours(-1)))));
 }
 
+/// A stored query that a newer release refuses fails its own run and
+/// nothing else (issue #382).
+///
+/// The texts are planted straight in the column, below the write-time gate,
+/// because that is how they reach a scheduler after an upgrade: they were
+/// saved by a release that accepted them. Each refused schedule records one
+/// failed run that carries the refusal sentence, keeps its row enabled, and
+/// moves its cursor on the ordinary cadence like any other failed run. Its
+/// coverage watermark does not move. A valid schedule in the same tick runs
+/// normally.
+///
+/// The expression grammar spells equality `==`, so the aggregate texts use
+/// a comparison the parser accepts and reach the position check, not a
+/// parse error.
+#[tokio::test]
+async fn stored_semantic_refusal_does_not_stop_scheduler() {
+    const UNREADABLE_BOUND: &str = "cannot read this time bound as a timestamp";
+    const AGGREGATE_IN_ROW: &str =
+        "count() is an aggregation; use it in stats, timechart, eventstats or pivot";
+
+    let h = harness().await;
+    let bound = h.schedule("stored-bound", DSL, None, 3600, 0).await;
+    let row_agg = h.schedule("stored-row-agg", DSL, None, 3600, 0).await;
+    let windowed_agg = h
+        .schedule(
+            "stored-windowed-agg",
+            DSL,
+            Some(ScheduleWindow::SinceLast),
+            3600,
+            0,
+        )
+        .await;
+    let valid = h.schedule("valid", DSL, None, 3600, 0).await;
+
+    let refused = [
+        (
+            bound,
+            r#"earliest="yesterday" service=fx | table _time"#,
+            UNREADABLE_BOUND,
+            None,
+        ),
+        (
+            row_agg,
+            "service=fx | where count(x) > 1 | table _time",
+            AGGREGATE_IN_ROW,
+            None,
+        ),
+        (
+            windowed_agg,
+            "service=fx | where count(x) > 1 | table _time",
+            AGGREGATE_IN_ROW,
+            Some(at(hours(-1))),
+        ),
+    ];
+    for (sq, text, _, watermark) in refused {
+        sqlx::query("UPDATE saved_queries SET query = $1 WHERE id = $2")
+            .bind(text)
+            .bind(sq)
+            .execute(&h.app_pool)
+            .await
+            .expect("plant the stored text");
+        assert_eq!(
+            h.cursor(sq).await,
+            (t0(), watermark),
+            "the schedule starts on its first boundary"
+        );
+    }
+
+    h.tick(at(Duration::seconds(3))).await;
+
+    for (sq, text, sentence, watermark) in refused {
+        let runs = h.runs(sq).await;
+        assert_eq!(runs.len(), 1, "{text}: one attempt, recorded once");
+        assert_eq!(runs[0].status, RunStatus::Error, "{text}: {:?}", runs[0]);
+        let message = runs[0]
+            .error_message
+            .as_deref()
+            .unwrap_or_else(|| panic!("{text}: a failed run records why"));
+        assert!(
+            message.contains(sentence),
+            "{text}: the refusal sentence reaches the run row: {message}"
+        );
+        assert_eq!(runs[0].row_count, None, "{text}");
+        assert_eq!(runs[0].result_path, None, "{text}");
+
+        let schedule = h
+            .schedules
+            .get_schedule_for_saved_query(sq, h.key_id)
+            .await
+            .expect("read schedule")
+            .unwrap_or_else(|| panic!("{text}: the schedule row survives"));
+        assert!(schedule.enabled, "{text}: a refusal never disables");
+        assert_eq!(
+            (schedule.next_fire_at, schedule.covered_through),
+            (at(hours(1)), watermark),
+            "{text}: the cursor moves on cadence; the watermark holds"
+        );
+    }
+
+    let runs = h.runs(valid).await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].status,
+        RunStatus::Success,
+        "the valid schedule runs in the same tick: {:?}",
+        runs[0]
+    );
+    assert_eq!(h.run_rows(&runs[0]).len(), fixture_offsets().len());
+
+    // The next boundary fails each refused text again, on cadence, and the
+    // valid schedule keeps running.
+    h.tick(at(hours(1) + Duration::seconds(3))).await;
+    for (sq, text, _, watermark) in refused {
+        let runs = h.runs(sq).await;
+        assert_eq!(runs.len(), 2, "{text}");
+        assert!(
+            runs.iter().all(|run| run.status == RunStatus::Error),
+            "{text}: {runs:?}"
+        );
+        assert_eq!(h.cursor(sq).await, (at(hours(2)), watermark), "{text}");
+    }
+    let runs = h.runs(valid).await;
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].status, RunStatus::Success);
+}
+
 /// Renaming affects lookup only; recorded legacy paths stay readable, while
 /// new runs use their ID and cannot interpret display-name punctuation as a path.
 #[tokio::test]
