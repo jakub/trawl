@@ -565,14 +565,15 @@ fn text_time(text: &str) -> TextTime {
     if search.time_clause().is_none() {
         return TextTime::Free;
     }
-    // Read as the server reads a clause's literal (`results/bounds.rs`
-    // `clause_instant`): a `DuckDB` timestamp, its offset dropped.
-    let absolute = |bound: Option<&trawl_core::ast::Spanned<String>>| match bound
-        .map(|bound| trawl_core::compare::literal_timestamp(&bound.node))
-    {
-        Some(Some(trawl_core::compare::Instant::At(at))) => Some(at.and_utc()),
-        _ => None,
-    };
+    // The instant the clause executes as, which the server's
+    // `results/bounds.rs` `clause_instant` reads too.
+    let absolute =
+        |bound: Option<&trawl_core::ast::Spanned<trawl_core::ast::TimeBound>>| match bound
+            .map(|bound| bound.node.instant())
+        {
+            Some(trawl_core::compare::Instant::At(at)) => Some(at.and_utc()),
+            _ => None,
+        };
     match (
         &search.time_filter,
         absolute(search.earliest.as_ref()),
@@ -1357,8 +1358,8 @@ mod tests {
             r#"earliest="2026-01-01T00:00:00Z" service=web"#,
             r#"latest="2026-01-02T00:00:00Z" service=web"#,
             r#"service=web earliest="2026-01-01T00:00:00Z" | stats count()"#,
-            r#"earliest="-1h" latest="2026-01-02T00:00:00Z" service=web"#,
-            r#"earliest="2026-01-01T00:00:00Z" latest="now" service=web"#,
+            r#"earliest="-infinity" latest="2026-01-02T00:00:00Z" service=web"#,
+            r#"earliest="-infinity" latest="infinity" service=web"#,
             r#"earliest="2026-01-01T00:00:00Z" latest="infinity" service=web"#,
         ] {
             for range in [
@@ -1948,7 +1949,7 @@ mod tests {
         );
         let ast = trawl_core::parser::parse(&merged).unwrap();
         assert_eq!(
-            ast.search.earliest.map(|t| t.node).as_deref(),
+            ast.search.earliest.as_ref().map(|t| t.node.text()),
             Some("2026-01-01T00:00:00Z")
         );
     }
