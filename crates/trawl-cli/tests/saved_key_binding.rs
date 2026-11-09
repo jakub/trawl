@@ -5,7 +5,8 @@
 //! Where a saved or exported key may go, observed on the real binary
 //! (ADR-0065).
 //!
-//! Every run starts from an empty environment, with a temp `HOME` and
+//! Every run starts from an empty environment (keeping only the dynamic
+//! loader's search path, see `loader_path`), with a temp `HOME` and
 //! `XDG_STATE_HOME`, plus only the variables the case sets. Tests cannot
 //! set the environment in-process (`unsafe_code = forbid`), so every case
 //! is a subprocess, killed if it outlives its deadline.
@@ -287,6 +288,7 @@ impl Sandbox {
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_trawl"));
         cmd.env_clear()
+            .envs(loader_path())
             .env("HOME", &self.home)
             .env("XDG_STATE_HOME", &self.state_home)
             .envs(env.iter().copied())
@@ -776,4 +778,19 @@ fn embedded_mode_never_resolves() {
         }
     }
     b.assert_untouched("B");
+}
+
+/// The dynamic loader's search path, kept when the rest of the environment
+/// is cleared. It is not configuration trawl reads: the test runner sets it
+/// so a binary built in this target directory finds the libraries it links
+/// (libduckdb in CI's archive), and a child that lost it would die before
+/// it resolves anything. Every other variable stays cleared.
+fn loader_path() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
+    [
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
 }
