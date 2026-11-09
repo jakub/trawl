@@ -300,26 +300,66 @@ struct Walk {
 }
 
 /// Paths the walk could not make sense of, for one fail-closed message.
-#[derive(Debug, Default)]
-struct Problems {
+///
+/// The message is a free-text 409, so it reaches the wire and every record
+/// of the failure (ADR-0040, amendment of 2026-11-08). It names each path
+/// relative to the data root and each I/O failure by its
+/// [`std::io::ErrorKind`]; the absolute path and the error text go to a
+/// DEBUG event only.
+#[derive(Debug)]
+pub(crate) struct Problems {
+    root: PathBuf,
     count: usize,
     shown: Vec<String>,
 }
 
 impl Problems {
-    fn note(&mut self, path: &Path, why: &str) {
-        self.count += 1;
-        if self.shown.len() < MAX_REPORTED_PATHS {
-            self.shown.push(format!("{} ({why})", path.display()));
+    pub(crate) fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            count: 0,
+            shown: Vec::new(),
         }
     }
 
+    /// Record `path` with a reason trawl wrote.
+    pub(crate) fn note(&mut self, path: &Path, why: &str) {
+        self.count += 1;
+        if self.shown.len() < MAX_REPORTED_PATHS {
+            self.shown
+                .push(format!("{} ({why})", root_relative(&self.root, path)));
+        }
+    }
+
+    /// Record `path` as failing with `e`: the kind in the message, the text
+    /// at DEBUG.
+    pub(crate) fn note_io(&mut self, path: &Path, what: &str, e: &std::io::Error) {
+        tracing::debug!(
+            event_type = "catalog_gc_unreadable_path",
+            path = %path.display(),
+            error = %e,
+            "pin gc could not read a path under the data root"
+        );
+        self.note(path, &format!("{what}: {}", e.kind()));
+    }
+
+    /// Record a parquet whose column names could not be read.
+    pub(crate) fn note_parquet(
+        &mut self,
+        path: &Path,
+        e: &trawl_engine::parquet_stats::ParquetStatsError,
+    ) {
+        tracing::debug!(
+            event_type = "catalog_gc_unreadable_path",
+            path = %path.display(),
+            error = %e,
+            "pin gc could not read a parquet footer under the data root"
+        );
+        self.note(path, &parquet_problem(e));
+    }
+
     /// The refusal message, or `None` when the walk was clean.
-    ///
-    /// Data-root paths are operator-visible by design (the operator chose
-    /// them and can read the directory), so naming them is help rather
-    /// than disclosure.
-    fn refusal(&self) -> Option<String> {
+    pub(crate) fn refusal(&self) -> Option<String> {
         (self.count > 0).then(|| {
             format!(
                 "pin gc cannot read {} path(s) under the data root, so it \
@@ -330,6 +370,51 @@ impl Problems {
             )
         })
     }
+}
+
+/// `path` named relative to the data root, env component included
+/// (`prod/junk.parquet`). The root itself is "the data root". A path the
+/// root does not prefix is named by that fact, never by its absolute form.
+pub(crate) fn root_relative(root: &Path, path: &Path) -> String {
+    match path.strip_prefix(root) {
+        Ok(rel) if rel.as_os_str().is_empty() => "the data root".to_owned(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => "a path outside the data root".to_owned(),
+    }
+}
+
+/// Why a parquet's column names could not be read, from the variant alone.
+/// Every variant's text carries the absolute path, and the footer's carries
+/// parser text, so none of it is used.
+pub(crate) fn parquet_problem(e: &trawl_engine::parquet_stats::ParquetStatsError) -> String {
+    use trawl_engine::parquet_stats::ParquetStatsError;
+    match e {
+        ParquetStatsError::Open { source, .. } => {
+            format!("unreadable parquet: {}", source.kind())
+        }
+        ParquetStatsError::Footer { .. } => "unreadable parquet: the footer does not parse".into(),
+        ParquetStatsError::NonScalarColumn { .. } => {
+            "unreadable parquet: a top-level column is not a scalar".into()
+        }
+    }
+}
+
+/// The refusal when the repin evidence check itself fails.
+pub(crate) fn unreadable_evidence_refusal(kind: std::io::ErrorKind) -> String {
+    format!(
+        "pin gc cannot tell whether a repin owns the data root (checking \
+         for its marker, shadow and aside roots failed: {kind}), so it \
+         refuses rather than delete on a guess"
+    )
+}
+
+/// The refusal when the data root cannot be listed at all.
+pub(crate) fn data_root_unreadable_refusal(kind: std::io::ErrorKind) -> String {
+    format!(
+        "pin gc cannot read the data root ({kind}), so it cannot prove any \
+         pin dead and deleted nothing. Check that the volume is mounted and \
+         [data] path is right, then re-run."
+    )
 }
 
 impl PinGc {
@@ -758,10 +843,14 @@ impl PinGc {
                  parquet footer proves anything right now; pin gc stands \
                  down until the repin finishes"
             ))),
-            Err(e) => Err(ServerError::Conflict(format!(
-                "pin gc cannot tell whether a repin owns the data root \
-                 ({e}), so it refuses rather than delete on a guess"
-            ))),
+            Err(e) => {
+                tracing::debug!(
+                    event_type = "catalog_gc_unreadable_path",
+                    error = %e,
+                    "pin gc could not check for repin evidence"
+                );
+                Err(ServerError::Conflict(unreadable_evidence_refusal(e.kind())))
+            }
         }
     }
 
@@ -995,14 +1084,14 @@ fn iso8601(dt: DateTime<Utc>) -> String {
 /// [`MAX_REPORTED_PATHS`] paths.
 fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, String> {
     let mut files_scanned = 0u64;
-    let mut problems = Problems::default();
+    let mut problems = Problems::new(data_dir);
 
     let mut stack = env_dirs_strict(data_dir, &mut problems)?;
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
-                problems.note(&dir, &format!("unreadable directory: {e}"));
+                problems.note_io(&dir, "unreadable directory", &e);
                 continue;
             }
         };
@@ -1010,7 +1099,7 @@ fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, S
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    problems.note(&dir, &format!("unreadable directory entry: {e}"));
+                    problems.note_io(&dir, "unreadable directory entry", &e);
                     continue;
                 }
             };
@@ -1021,7 +1110,7 @@ fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, S
             let meta = match std::fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
                 Err(e) => {
-                    problems.note(&path, &format!("unreadable: {e}"));
+                    problems.note_io(&path, "unreadable", &e);
                     continue;
                 }
             };
@@ -1055,7 +1144,7 @@ fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, S
                             });
                         }
                     }
-                    Err(e) => problems.note(&path, &format!("unreadable parquet: {e}")),
+                    Err(e) => problems.note_parquet(&path, &e),
                 }
             }
         }
@@ -1084,7 +1173,7 @@ fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, S
 /// directory reads identically to a corpus of zero files, and a corpus of
 /// zero files disproves nothing, so every candidate would be "dead" and the
 /// run would delete the whole catalog. An unmounted volume, a typo'd
-/// `[storage] data_dir`, a root moved aside by hand: each is a reason to
+/// `[data] path`, a root moved aside by hand: each is a reason to
 /// refuse, and none is a reason to reclaim. A genuine cold start has an
 /// empty data root (trawld creates it at boot), which walks to zero files
 /// and is still refused only if a candidate exists — which, on a corpus
@@ -1093,13 +1182,13 @@ fn env_dirs_strict(data_dir: &Path, problems: &mut Problems) -> Result<Vec<PathB
     let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,
         Err(e) => {
-            return Err(format!(
-                "pin gc cannot read the data root {} ({e}), so it cannot \
-                 prove any pin dead and deleted nothing. Check that the \
-                 volume is mounted and [storage] data_dir is right, then \
-                 re-run.",
-                data_dir.display()
-            ));
+            tracing::debug!(
+                event_type = "catalog_gc_unreadable_path",
+                path = %data_dir.display(),
+                error = %e,
+                "pin gc could not list the data root"
+            );
+            return Err(data_root_unreadable_refusal(e.kind()));
         }
     };
     let mut dirs = Vec::new();
@@ -1107,7 +1196,7 @@ fn env_dirs_strict(data_dir: &Path, problems: &mut Problems) -> Result<Vec<PathB
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                problems.note(data_dir, &format!("unreadable data-root entry: {e}"));
+                problems.note_io(data_dir, "unreadable data-root entry", &e);
                 continue;
             }
         };
@@ -1123,7 +1212,7 @@ fn env_dirs_strict(data_dir: &Path, problems: &mut Problems) -> Result<Vec<PathB
             Ok(meta) if meta.is_symlink() => problems.note(&path, "symlinked env directory"),
             Ok(meta) if meta.is_dir() => dirs.push(path),
             Ok(_) => {}
-            Err(e) => problems.note(&path, &format!("unreadable: {e}")),
+            Err(e) => problems.note_io(&path, "unreadable", &e),
         }
     }
     dirs.sort();
@@ -1421,5 +1510,90 @@ mod tests {
     #[test]
     fn a_never_observed_pin_is_a_candidate() {
         assert_eq!(candidacy("typoed_feild", None, at(0)), Candidacy::Candidate);
+    }
+
+    /// Pin gc's refusals are free-text 409s, so their text reaches the wire
+    /// and every record. Given injected I/O text and a data root at an
+    /// absolute path, they carry neither, and they still name the remedy.
+    #[test]
+    fn refusals_do_not_carry_io_text_or_the_absolute_root() {
+        const MARKER: &str = "zz_io_marker_/srv/secret";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        std::fs::create_dir_all(root.join("prod")).unwrap();
+        let abs = root.display().to_string();
+        assert!(root.is_absolute());
+        let clean = |what: &str, msg: &str| {
+            assert!(!msg.contains(MARKER), "{what} carries the io text: {msg}");
+            assert!(!msg.contains(&abs), "{what} carries the root: {msg}");
+            let tmp_abs = tmp.path().display().to_string();
+            assert!(!msg.contains(&tmp_abs), "{what} carries a host path: {msg}");
+        };
+
+        // The unreadable-evidence refusal (`refuse_if_repin_owns_the_root`).
+        let injected = std::io::Error::other(MARKER);
+        let msg = unreadable_evidence_refusal(injected.kind());
+        clean("evidence refusal", &msg);
+        assert!(msg.contains("other error"), "names the kind: {msg}");
+        assert!(msg.contains("refuses rather than delete"), "{msg}");
+
+        // The walk refusal, with injected text on every kind of note.
+        let mut problems = Problems::new(&root);
+        problems.note_io(&root.join("prod"), "unreadable directory", &injected);
+        problems.note_io(&root, "unreadable data-root entry", &injected);
+        problems.note_io(
+            &std::path::PathBuf::from("/elsewhere/prod/x.parquet"),
+            "unreadable",
+            &injected,
+        );
+        let msg = problems.refusal().expect("a walk with problems refuses");
+        clean("walk refusal", &msg);
+        assert!(
+            msg.contains("prod (unreadable directory: other error)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("the data root (unreadable data-root entry"),
+            "{msg}"
+        );
+        assert!(msg.contains("a path outside the data root"), "{msg}");
+        assert!(
+            msg.contains("Repair or move them aside, then re-run"),
+            "{msg}"
+        );
+
+        // A real ParquetStatsError: its Display names the absolute path and
+        // the parser's text; the note names the file relative to the root.
+        let junk = root.join("prod").join("junk.parquet");
+        std::fs::write(&junk, b"PAR1 and then some lies").unwrap();
+        let e = trawl_engine::parquet_stats::read_column_names(&junk)
+            .expect_err("a junk footer does not parse");
+        assert!(e.to_string().contains(&abs), "premise: Display carries it");
+        let mut problems = Problems::new(&root);
+        problems.note_parquet(&junk, &e);
+        let opened =
+            trawl_engine::parquet_stats::read_column_names(&root.join("prod/gone.parquet"))
+                .expect_err("a missing file does not open");
+        problems.note_parquet(&root.join("prod/gone.parquet"), &opened);
+        let msg = problems.refusal().unwrap();
+        clean("parquet refusal", &msg);
+        assert!(
+            msg.contains("prod/junk.parquet (unreadable parquet: the footer does not parse)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("prod/gone.parquet (unreadable parquet: entity not found)"),
+            "{msg}"
+        );
+
+        // The data root that cannot be listed: the real read_dir failure.
+        let vanished = tmp.path().join("not-mounted");
+        let msg = env_dirs_strict(&vanished, &mut Problems::new(&vanished))
+            .expect_err("a missing data root refuses");
+        clean("data-root refusal", &msg);
+        assert!(!msg.contains("not-mounted"), "{msg}");
+        assert!(!msg.contains("os error"), "{msg}");
+        assert!(msg.contains("entity not found"), "{msg}");
+        assert!(msg.contains("[data] path is right, then re-run"), "{msg}");
     }
 }

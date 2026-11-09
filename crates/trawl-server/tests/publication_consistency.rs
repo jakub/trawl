@@ -104,7 +104,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
     // (ADR-0024).
     assert!(matches!(
         blocked.result,
-        Err(ServerError::ServiceUnavailable(_))
+        Err(ServerError::CapacityNotStarted)
     ));
     let blocked_export = pool
         .export_parquet(
@@ -117,7 +117,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         .await;
     assert!(matches!(
         blocked_export,
-        Err(ServerError::ServiceUnavailable(_))
+        Err(ServerError::CapacityNotStarted)
     ));
     assert_eq!(
         pool.available_permits(),

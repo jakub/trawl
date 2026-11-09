@@ -52,7 +52,7 @@ use trawl_engine::timing::{PhaseClock, QueryPhase};
 use trawl_engine::value::QueryResult;
 
 use crate::deadline::Deadline;
-use crate::error::{CAPACITY_NOT_STARTED, ServerError};
+use crate::error::ServerError;
 use crate::hot_buffer::{HotBuffer, HotSnapshot};
 use crate::query_timing::{Outcome, PhysicalOutcome, QueryTiming, Reclaim, emit_reclaimed};
 use crate::source::{compute_source, select, selection_bytes};
@@ -731,7 +731,7 @@ impl RefusalOnce {
                 "query work refused before it started"
             );
         }
-        ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned())
+        ServerError::CapacityNotStarted
     }
 
     fn refuse_outcome(&self, id: u64, kind: WorkKind, refusal: StartRefusal) -> ExecuteOutcome {
@@ -4025,7 +4025,7 @@ mod tests {
         let waited = start.elapsed();
 
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "a query that never left the queue is refused, not timed out: {:?}",
             outcome.result
         );
@@ -4061,7 +4061,7 @@ mod tests {
         let waited = start.elapsed();
 
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "a query that never passed the gate is refused, not timed out: {:?}",
             outcome.result
         );
@@ -4240,7 +4240,7 @@ mod tests {
         .expect("publication wait must return before the writer releases its guard");
 
         assert!(
-            matches!(&result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&result, Err(ServerError::CapacityNotStarted)),
             "a sample that never started is a capacity refusal, got {result:?}"
         );
         assert_eq!(
@@ -4339,7 +4339,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         let outcome = request.await.expect("the request joins");
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "expected a capacity refusal, got {:?}",
             outcome.result
         );
@@ -4600,7 +4600,7 @@ mod tests {
         entry.release();
         let outcome = request.await.expect("the request joins");
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "expected a refusal, got {:?}",
             outcome.result
         );
@@ -4732,7 +4732,7 @@ mod tests {
         until("cleanup", || pool.retained() == 0).await;
 
         assert!(
-            matches!(&expiry_first, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&expiry_first, Err(ServerError::CapacityNotStarted)),
             "expiry before the start is a capacity refusal, got {expiry_first:?}"
         );
         assert!(
@@ -5153,7 +5153,7 @@ mod tests {
             .expect("the sample task joins")
             .expect_err("a full pool cannot be sampled");
         assert!(
-            matches!(&refused, ServerError::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED),
+            matches!(&refused, ServerError::CapacityNotStarted),
             "expected the safe capacity refusal, got {refused:?}"
         );
 
@@ -5173,9 +5173,12 @@ mod tests {
         settle().await;
         tokio::time::advance(Duration::from_millis(301)).await;
         settle().await;
-        assert!(short.await.expect("the sample task joins").is_err_and(
-            |e| matches!(&e, ServerError::ServiceUnavailable(m) if m == CAPACITY_NOT_STARTED)
-        ),);
+        assert!(
+            short
+                .await
+                .expect("the sample task joins")
+                .is_err_and(|e| matches!(&e, ServerError::CapacityNotStarted)),
+        );
 
         // Nothing a refused helper touched is still held: it never got a
         // permit, so it never registered.
@@ -5730,7 +5733,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "{:?}",
             outcome.result
         );
@@ -5754,7 +5757,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
             "{:?}",
             outcome.result
         );
@@ -6496,7 +6499,7 @@ mod tests {
             .await
             .expect_err("a window waits for the guard the writer holds");
         assert!(
-            matches!(&refused, ServerError::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED),
+            matches!(&refused, ServerError::CapacityNotStarted),
             "{refused:?}"
         );
         drop(writer);

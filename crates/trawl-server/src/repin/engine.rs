@@ -63,6 +63,7 @@ use crate::repin::plan::{ScanCounts, ScanTallies, scan};
 use crate::repin::rewrite::{FileSig, ProcessTally, process_file, snapshot_env_files};
 use crate::store::{
     CatalogStore, JobTotals, MAX_CONFLICTS_PER_FIELD, RepinJob, RepinJobStatus, RepinStore,
+    StoreError,
 };
 
 /// Catch-up passes before the job gives up (steadily-shrinking deltas
@@ -1211,18 +1212,15 @@ impl RepinEngine {
             )
             .await
         {
+            let err = ServerError::Store(e);
+            let row = fault_row(job_id, "could not record the repin plan", &err);
             if self
-                .settle_pre_cutover(
-                    job_id,
-                    STAGE_SCAN,
-                    RepinJobStatus::Failed,
-                    Some(&e.to_string()),
-                )
+                .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&row))
                 .await
             {
                 return self.cancelled_outcome(job_id).await;
             }
-            return Err(ServerError::Store(e));
+            return Err(err);
         }
 
         #[allow(clippy::cast_precision_loss)]
@@ -1277,14 +1275,15 @@ impl RepinEngine {
         let available = match fs4::available_space(&self.data_dir) {
             Ok(available) => available,
             Err(e) => {
-                let msg = format!("failed to check free disk space: {e}");
+                let row = disk_check_row(job_id, &e);
                 if self
-                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&msg))
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&row))
                     .await
                 {
                     return self.cancelled_outcome(job_id).await;
                 }
-                return Err(ServerError::Internal(msg));
+                // The row's DEBUG event already carries the error's text.
+                return Err(ServerError::Internal(row));
             }
         };
         let needed = counts
@@ -1319,9 +1318,9 @@ impl RepinEngine {
         let job = match self.job(job_id).await {
             Ok(job) => job,
             Err(e) => {
-                let msg = format!("could not read the claimed repin job row: {e}");
+                let row = fault_row(job_id, "could not read the claimed repin job row", &e);
                 if self
-                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&msg))
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&row))
                     .await
                 {
                     return self.cancelled_outcome(job_id).await;
@@ -1396,12 +1395,16 @@ impl RepinEngine {
             .catalog_store
             .field_services(field, None, 1)
             .await
-            .inspect_err(|e| {
-                tracing::warn!(
-                    event_type = "catalog_bookkeeping_error",
-                    field = %field,
-                    error = %e,
-                    "could not read repin subject liveness; the report omits it"
+            .map_err(|e| {
+                log_store_fault(
+                    Loudness::Warn,
+                    StoreFault {
+                        event_type: "catalog_bookkeeping_error",
+                        field: Some(field),
+                        ..StoreFault::default()
+                    },
+                    e,
+                    "could not read repin subject liveness; the report omits it",
                 );
             })
             .ok()?;
@@ -1459,23 +1462,31 @@ impl RepinEngine {
                     return;
                 }
                 Err(e) if attempt < FAST_ATTEMPTS => {
-                    tracing::warn!(
-                        event_type = "repin_store_retry",
-                        job_id,
-                        attempt,
-                        error = %e,
-                        "failed to record repin job outcome; retrying"
+                    log_store_fault(
+                        Loudness::Warn,
+                        StoreFault {
+                            event_type: "repin_store_retry",
+                            job_id: Some(job_id),
+                            attempt: Some(attempt),
+                            ..StoreFault::default()
+                        },
+                        e,
+                        "failed to record repin job outcome; retrying",
                     );
                     tokio::time::sleep(Duration::from_millis(100 << (attempt - 1))).await;
                 }
                 Err(e) => {
-                    tracing::error!(
-                        event_type = "repin_store_error",
-                        job_id,
-                        error = %e,
+                    log_store_fault(
+                        Loudness::Error,
+                        StoreFault {
+                            event_type: "repin_store_error",
+                            job_id: Some(job_id),
+                            ..StoreFault::default()
+                        },
+                        e,
                         "failed to record repin job outcome; handing the \
                          terminal write to a background retry so the \
-                         one-running slot cannot stay wedged"
+                         one-running slot cannot stay wedged",
                     );
                 }
             }
@@ -1500,11 +1511,15 @@ impl RepinEngine {
                         return;
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            event_type = "repin_store_retry",
-                            job_id,
-                            error = %e,
-                            "repin job outcome write still failing; will retry"
+                        log_store_fault(
+                            Loudness::Warn,
+                            StoreFault {
+                                event_type: "repin_store_retry",
+                                job_id: Some(job_id),
+                                ..StoreFault::default()
+                            },
+                            e,
+                            "repin job outcome write still failing; will retry",
                         );
                     }
                 }
@@ -1932,7 +1947,11 @@ impl RepinEngine {
             }
             Err(e) => {
                 drop(corpus_gate);
-                return Err(JobAbort::Failed(format!("cutover drain failed: {e}")));
+                return Err(JobAbort::Failed(fault_row(
+                    job_id,
+                    "cutover drain failed",
+                    &e,
+                )));
             }
         };
 
@@ -2470,6 +2489,84 @@ impl From<PassStop> for JobAbort {
 /// most wants confirmed: nothing visible changed.
 fn cancelled_error(actor: &str, stage: &str) -> String {
     format!("cancelled by {actor} during {stage}; the live corpus was never touched")
+}
+
+/// The default level a repin store fault logs at.
+#[derive(Debug, Clone, Copy)]
+enum Loudness {
+    Warn,
+    Error,
+}
+
+/// What a repin store-fault event names besides the fault.
+#[derive(Debug, Default, Clone, Copy)]
+struct StoreFault<'a> {
+    event_type: &'static str,
+    job_id: Option<i64>,
+    attempt: Option<u32>,
+    field: Option<&'a str>,
+}
+
+/// Log a store fault on a repin path: `error_class` and `cause_kind` at
+/// `level`, and the error's text and the field name at DEBUG only
+/// (ADR-0040, amended 2026-11-08), as the scheduler's `log_store_fault`
+/// does. A pinned field's name can come from an ingest sender.
+fn log_store_fault(level: Loudness, at: StoreFault<'_>, err: StoreError, what: &'static str) {
+    let StoreFault {
+        event_type,
+        job_id,
+        attempt,
+        field,
+    } = at;
+    tracing::debug!(event_type, job_id, attempt, field, error = %err, "{what}");
+    let fault = ServerError::from(err);
+    let (error_class, cause_kind) = (fault.error_class(), fault.cause_kind().as_str());
+    match level {
+        Loudness::Warn => tracing::warn!(
+            event_type,
+            job_id,
+            attempt,
+            error_class,
+            cause_kind,
+            "{what}"
+        ),
+        Loudness::Error => tracing::error!(
+            event_type,
+            job_id,
+            attempt,
+            error_class,
+            cause_kind,
+            "{what}"
+        ),
+    }
+}
+
+/// The terminal row for a job stopped by a [`ServerError`]: the error's
+/// public message, the one the request answers with (ADR-0040, amended
+/// 2026-11-08). The error's own text goes to DEBUG only.
+fn fault_row(job_id: i64, what: &'static str, err: &ServerError) -> String {
+    tracing::debug!(
+        event_type = "repin_job_failed",
+        job_id,
+        error = %err,
+        "{what}"
+    );
+    err.safe_message()
+}
+
+/// The terminal row for a free-space check that could not run. It names
+/// the `io::ErrorKind`; the error's own text goes to DEBUG only.
+fn disk_check_row(job_id: i64, err: &std::io::Error) -> String {
+    tracing::debug!(
+        event_type = "repin_job_failed",
+        job_id,
+        error = %err,
+        "could not check free disk space for the repin"
+    );
+    format!(
+        "could not check free disk space for the repin ({})",
+        err.kind()
+    )
 }
 
 /// What the shadow generation holds so far — the numbers the progress
@@ -3462,6 +3559,178 @@ mod tests {
             JobAbort::from(PassStop::Failed("read_parquet failed".to_owned())),
             JobAbort::Failed(msg) if msg == "read_parquet failed"
         ));
+    }
+
+    /// A terminal row built from a `ServerError` stores the error's public
+    /// message, the one the request answers with, and a row built from an
+    /// `io::Error` names its kind. Neither carries a planted driver, path
+    /// or I/O marker (ADR-0040, amended 2026-11-08). The source check pins
+    /// that `decide` and the cutover drain build their rows through these
+    /// two functions rather than from an error's `Display`.
+    #[test]
+    fn repin_terminal_rows_store_public_messages() {
+        use trawl_engine::error::EngineError;
+
+        const MARKER: &str = "/var/lib/trawl/data/MARKER-repin-row";
+        const SOURCE: &str = include_str!("engine.rs");
+        let faults = [
+            ServerError::Store(StoreError::Unavailable(sqlx::Error::Protocol(
+                MARKER.into(),
+            ))),
+            ServerError::Engine(EngineError::Io(std::io::Error::other(MARKER))),
+            ServerError::Internal(format!("read {MARKER} failed")),
+        ];
+        for fault in &faults {
+            let row = fault_row(7, "could not record the repin plan", fault);
+            assert_eq!(row, fault.safe_message(), "{fault:?}");
+            assert!(!row.contains("MARKER"), "{fault:?}: {row}");
+        }
+
+        let io = std::io::Error::other(MARKER);
+        let row = disk_check_row(7, &io);
+        assert_eq!(
+            row,
+            "could not check free disk space for the repin (other error)"
+        );
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, MARKER);
+        let row = disk_check_row(7, &denied);
+        assert!(row.contains("permission denied"), "{row}");
+        assert!(!row.contains("MARKER"), "{row}");
+
+        let start = SOURCE
+            .find("    async fn decide(")
+            .expect("decide is still a method on the engine");
+        let end = SOURCE[start..]
+            .find("    async fn run_scan(")
+            .expect("run_scan still follows decide")
+            + start;
+        let decide = &SOURCE[start..end];
+        // The positive control: the range is the one that builds the rows,
+        // so the absence checks below can see a leak if one is there.
+        assert!(
+            decide.contains("disk_check_row(") && decide.contains(" fault_row("),
+            "decide must build its terminal rows through the two helpers"
+        );
+        for leak in [
+            "Some(&e.to_string())",
+            "free disk space: {e}",
+            "claimed repin job row: {e}",
+        ] {
+            assert!(
+                !decide.contains(leak),
+                "decide builds a terminal row from an error's Display: {leak}"
+            );
+        }
+        assert!(
+            !SOURCE.contains(concat!("cutover drain failed: {", "e}")),
+            "the cutover drain row is built from the pool error's Display"
+        );
+    }
+
+    /// The repin store-fault events (the liveness read and every
+    /// terminal-write retry) say which failure it was and what it came
+    /// from at their own level, and keep the driver's text at DEBUG only
+    /// (ADR-0040, amended 2026-11-08). The engine has no store seam in
+    /// lib tests, so `field_liveness` and `finish` log through
+    /// `log_store_fault`, and this drives that helper; the source check
+    /// pins that neither function logs an `error` field itself.
+    #[test]
+    fn repin_store_fault_events_carry_no_error_text() {
+        use crate::test_events::events_of;
+        use tracing::Level;
+
+        const MARKER: &str = "/var/lib/trawl/data/MARKER-repin-store";
+        // A pinned field's name can come from an ingest sender, so it is
+        // content: DEBUG only, like the driver text.
+        const FIELD: &str = "zz_field_marker";
+        const SOURCE: &str = include_str!("engine.rs");
+        let planted = || StoreError::Unavailable(sqlx::Error::Protocol(MARKER.into()));
+        let expected = ServerError::from(planted());
+        let (class, cause) = (expected.error_class(), expected.cause_kind().as_str());
+
+        for (loudness, level, at) in [
+            (
+                Loudness::Warn,
+                Level::WARN,
+                StoreFault {
+                    event_type: "catalog_bookkeeping_error",
+                    field: Some(FIELD),
+                    ..StoreFault::default()
+                },
+            ),
+            (
+                Loudness::Warn,
+                Level::WARN,
+                StoreFault {
+                    event_type: "repin_store_retry",
+                    job_id: Some(7),
+                    attempt: Some(1),
+                    ..StoreFault::default()
+                },
+            ),
+            (
+                Loudness::Error,
+                Level::ERROR,
+                StoreFault {
+                    event_type: "repin_store_error",
+                    job_id: Some(7),
+                    ..StoreFault::default()
+                },
+            ),
+        ] {
+            let (event_type, at_field) = (at.event_type, at.field.is_some());
+            let events = events_of(|| log_store_fault(loudness, at, planted(), "a repin fault"));
+            let loud: Vec<_> = events.iter().filter(|e| e.is_default_level()).collect();
+            assert_eq!(loud.len(), 1, "{event_type}: {events:?}");
+            let event = loud[0];
+            assert_eq!(event.level, level, "{event:?}");
+            assert_eq!(
+                event.fields.get("event_type").map(String::as_str),
+                Some(event_type),
+                "{event:?}"
+            );
+            assert_eq!(
+                event.fields.get("error_class").map(String::as_str),
+                Some(class),
+                "{event:?}"
+            );
+            assert_eq!(
+                event.fields.get("cause_kind").map(String::as_str),
+                Some(cause),
+                "{event:?}"
+            );
+            assert!(!event.fields.contains_key("error"), "{event:?}");
+            assert!(!event.text().contains("MARKER"), "{event:?}");
+            assert!(!event.fields.contains_key("field"), "{event:?}");
+            assert!(!event.text().contains(FIELD), "{event:?}");
+
+            let debug = events
+                .iter()
+                .find(|e| e.level == Level::DEBUG)
+                .unwrap_or_else(|| panic!("{event_type}: no DEBUG event: {events:?}"));
+            assert!(debug.text().contains(MARKER), "{debug:?}");
+            if at_field {
+                assert!(debug.text().contains(FIELD), "{debug:?}");
+            }
+        }
+
+        for (from, to) in [
+            ("    async fn field_liveness(", "    async fn job("),
+            ("    async fn finish(", "    async fn cancelled_outcome("),
+        ] {
+            let start = SOURCE.find(from).expect(from);
+            let end = SOURCE[start..].find(to).expect(to) + start;
+            let body = &SOURCE[start..end];
+            assert!(
+                body.contains("log_store_fault("),
+                "{from} must log its store faults through the helper"
+            );
+            assert!(
+                !body.contains(concat!("error = ", "%"))
+                    && !body.contains(concat!("error = ", "?")),
+                "{from} logs a store error's text itself"
+            );
+        }
     }
 
     /// The cancelled row's one prose slot names who, where, and the fact
