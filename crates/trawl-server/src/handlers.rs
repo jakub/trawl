@@ -569,7 +569,7 @@ pub async fn query(
 pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let hot_buffer = state.query.hot_buffer.clone();
     let publication = state.query.pool.publication();
-    let fallback_glob = state.query.pool.fallback_glob().to_owned();
+    let data_root = std::path::PathBuf::from(state.query.pool.base_dir());
     // Read here, on the reactor: the closure below deliberately holds no
     // pool state, so the registry lock never travels onto the blocking
     // pool behind a filesystem walk.
@@ -587,7 +587,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
         crate::metrics::collect_gauges(
             hot_buffer.as_ref(),
             &publication,
-            &fallback_glob,
+            &data_root,
             wal_dir.as_deref(),
             &scratch_dir,
             query,
@@ -910,9 +910,9 @@ pub async fn schema(
         }
         _ => {
             let start = std::time::Instant::now();
-            let fallback_glob = state.query.pool.fallback_glob().clone();
+            let data_root = std::path::PathBuf::from(state.query.pool.base_dir());
             let (earliest_date, latest_date, total_bytes, services, file_count) =
-                tokio::task::spawn_blocking(move || collect_catalog_metadata(&fallback_glob))
+                tokio::task::spawn_blocking(move || collect_catalog_metadata(&data_root))
                     .await
                     .unwrap_or_default();
             let facts = crate::state::CachedCorpusFacts {
@@ -997,15 +997,9 @@ fn hot_buffer_stats(state: &AppState) -> (Option<u64>, Option<u64>) {
 /// `{base}/{env}/{YYYY-MM-DD}/{service}.parquet` for a daily rollup — hence
 /// the ancestor walk for the date component rather than a fixed depth.
 fn collect_catalog_metadata(
-    fallback_glob: &str,
+    base: &std::path::Path,
 ) -> (Option<String>, Option<String>, u64, Vec<String>, u64) {
     use std::collections::BTreeSet;
-    use std::path::Path;
-
-    let base = fallback_glob
-        .find('*')
-        .map_or(fallback_glob, |pos| &fallback_glob[..pos]);
-    let base = Path::new(base.trim_end_matches('/'));
 
     if !base.is_dir() {
         return (None, None, 0, Vec::new(), 0);
@@ -1028,7 +1022,7 @@ fn collect_catalog_metadata(
 
         for ancestor in path.ancestors().skip(1) {
             if let Some(name) = ancestor.file_name().and_then(|n| n.to_str())
-                && is_date_dir(name)
+                && crate::env_dirs::parse_date(name).is_some()
             {
                 dates.insert(name.to_owned());
                 break;
@@ -1042,16 +1036,6 @@ fn collect_catalog_metadata(
     let file_count = u64::try_from(entries.len()).unwrap_or(0);
 
     (earliest, latest, total_bytes, services, file_count)
-}
-
-/// Check if a directory name looks like YYYY-MM-DD.
-fn is_date_dir(name: &str) -> bool {
-    name.len() == 10
-        && name.as_bytes()[4] == b'-'
-        && name.as_bytes()[7] == b'-'
-        && name[..4].bytes().all(|b| b.is_ascii_digit())
-        && name[5..7].bytes().all(|b| b.is_ascii_digit())
-        && name[8..10].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// One unit of retained work as a given reader may see it (ADR-0024).
@@ -3985,6 +3969,32 @@ pub struct StreamParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Corpus facts read the configured root as a path. A root whose name
+    /// holds `*` would be cut short by any glob-based recovery and read
+    /// nothing.
+    #[test]
+    fn configured_data_root_is_passed_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data[1]*");
+        let hour = root.join("prod/2026-06-20/00");
+        std::fs::create_dir_all(&hour).unwrap();
+        std::fs::write(hour.join("nginx.parquet"), "0123456789").unwrap();
+
+        // With and without a trailing separator.
+        for root in [root.clone(), root.join("")] {
+            let (earliest, latest, bytes, services, files) = collect_catalog_metadata(&root);
+            assert_eq!(
+                earliest.as_deref(),
+                Some("2026-06-20"),
+                "{}",
+                root.display()
+            );
+            assert_eq!(latest.as_deref(), Some("2026-06-20"));
+            assert_eq!((bytes, files), (10, 1));
+            assert_eq!(services, ["nginx"]);
+        }
+    }
 
     /// Stream setup prepares the filter and the plan through one ledger
     /// (ADR-0063): a pattern the search and a stage share builds once in

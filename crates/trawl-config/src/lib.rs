@@ -592,8 +592,41 @@ impl IngestConfig {
     }
 }
 
+// The data root's reserved entries (ADR-0009): the names under it that are
+// never an env directory. Every consumer reads them from here.
+
+/// The default WAL directory under the data root.
+pub const WAL_DIR_NAME: &str = "wal";
+/// The directory under the data root that holds scheduled report results.
+pub const SCHEDULED_DIR_NAME: &str = "scheduled";
+/// The storage epoch marker in the data root.
+pub const EPOCH_MARKER: &str = "EPOCH";
+/// The marker mirroring the catalog id into the data root.
+pub const CATALOG_MARKER: &str = "CATALOG";
+/// The marker of a repin job in progress in the data root.
+pub const REPIN_MARKER: &str = "REPIN";
+/// Prefix of the staged `EPOCH.next.<pid>` file an epoch publication writes.
+pub const EPOCH_STAGING_PREFIX: &str = "EPOCH.next.";
+/// The marker files in the data root that `server.log_file` must not alias.
+pub const STORAGE_MARKERS: [&str; 3] = [EPOCH_MARKER, CATALOG_MARKER, REPIN_MARKER];
+/// The reserved directories in the data root.
+pub const RESERVED_ROOT_DIRS: [&str; 2] = [WAL_DIR_NAME, SCHEDULED_DIR_NAME];
 /// Env names reserved for sibling directories under the data root.
-pub const RESERVED_ENV_NAMES: &[&str] = &["wal", "scheduled"];
+pub const RESERVED_ENV_NAMES: &[&str] = &RESERVED_ROOT_DIRS;
+/// Suffix of the repin shadow (next-generation) root. A sibling of the data
+/// root, not an entry in it.
+pub const REPIN_SHADOW_SUFFIX: &str = ".repin-next";
+/// Suffix of the repin aside (previous-generation) root. A sibling of the
+/// data root, not an entry in it.
+pub const REPIN_ASIDE_SUFFIX: &str = ".repin-aside";
+
+/// Whether `name`, an entry of the data root, is one trawl reserves: a
+/// reserved directory, a storage marker or a staged epoch file.
+pub fn is_reserved_root_entry(name: &str) -> bool {
+    RESERVED_ROOT_DIRS.contains(&name)
+        || STORAGE_MARKERS.contains(&name)
+        || name.starts_with(EPOCH_STAGING_PREFIX)
+}
 
 /// Whether `name` is a valid environment name: `[a-z0-9_-]{1,32}`.
 ///
@@ -1258,10 +1291,6 @@ pub const QUERY_SCRATCH_SUFFIX: &str = ".query-scratch";
 /// Suffix of the data root's sibling that [`Config::results_dir`] defaults
 /// to.
 pub const RESULTS_SUFFIX: &str = ".results";
-/// Suffix of the repin shadow (next-generation) sibling root.
-pub const REPIN_SHADOW_SUFFIX: &str = ".repin-next";
-/// Suffix of the repin aside (previous-generation) sibling root.
-pub const REPIN_ASIDE_SUFFIX: &str = ".repin-aside";
 /// Default `DuckDB` memory limit for compaction connections (1 GiB). A raw
 /// `DuckDB` string, so the unit is spelled `GiB`: `DuckDB` reads `GB` as
 /// 10^9 bytes.
@@ -2372,7 +2401,7 @@ impl Config {
         self.ingest
             .wal_dir
             .clone()
-            .unwrap_or_else(|| self.data.base_dir().join("wal"))
+            .unwrap_or_else(|| self.data.base_dir().join(WAL_DIR_NAME))
     }
 
     /// Resolve the query scratch directory: explicit config value or the

@@ -1235,6 +1235,8 @@ impl QueryGauges {
 ///
 /// Called by Prometheus scrapes and the stats emitter. Filesystem scans and
 /// competing attempts may block; dashboard readers only read the short cache.
+/// `data_root` is the configured data root: the Parquet gauges walk it and
+/// the headroom's data role samples its filesystem.
 /// `scratch_dir` is the query scratch directory, which the headroom's spill
 /// role samples (ADR-0056). `repin_jobs` is this process's repin job
 /// generation ([`crate::state::AppState::repin_jobs`]), which fences both
@@ -1243,7 +1245,7 @@ impl QueryGauges {
 pub fn collect_gauges(
     hot_buffer: Option<&Arc<HotBuffer>>,
     publication: &PublicationGate,
-    fallback_glob: &str,
+    data_root: &Path,
     wal_dir: Option<&Path>,
     scratch_dir: &Path,
     query: QueryGauges,
@@ -1277,8 +1279,6 @@ pub fn collect_gauges(
         metrics::gauge!(COMPACTION_INTERVAL_SECONDS).set(secs as f64);
     }
 
-    // Parquet file gauges — walk the glob pattern's parent directory.
-    let data_root = data_root(fallback_glob);
     collect_parquet_gauges(data_root, repin_jobs);
 
     if let Some(dir) = wal_dir {
@@ -1286,22 +1286,6 @@ pub fn collect_gauges(
     }
 
     collect_headroom(data_root, wal_dir, scratch_dir, repin_jobs);
-}
-
-/// The data root the fallback glob selects: the Parquet scan walks it and
-/// headroom stats its filesystem.
-fn data_root(fallback_glob: &str) -> &Path {
-    // Preserve the fallback glob's existing root selection.
-    let base = fallback_glob
-        .find('*')
-        .map_or(fallback_glob, |pos| &fallback_glob[..pos]);
-    // Preserve `/` itself rather than turning an absolute root into an empty path.
-    let trimmed = base.trim_end_matches('/');
-    Path::new(if trimmed.is_empty() && base.starts_with('/') {
-        "/"
-    } else {
-        trimmed
-    })
 }
 
 /// Collect the ingested Parquet totals with the shared attempt/cache policy.
@@ -1454,7 +1438,7 @@ fn walk_dir_recursive(dir: &Path, results: &mut Vec<ParquetEntry>, errors: &mut 
         };
         if ft.is_dir() {
             // Skip `scheduled/` — contains saved query result parquet, not ingested logs.
-            if entry.file_name() == "scheduled" {
+            if entry.file_name() == trawl_config::SCHEDULED_DIR_NAME {
                 continue;
             }
             walk_dir_recursive(&path, results, errors);
@@ -1486,7 +1470,10 @@ impl StorageKind {
     }
 
     fn excluded_dir(self, path: &Path) -> bool {
-        matches!(self, Self::Parquet) && path.file_name().is_some_and(|name| name == "scheduled")
+        matches!(self, Self::Parquet)
+            && path
+                .file_name()
+                .is_some_and(|name| name == trawl_config::SCHEDULED_DIR_NAME)
     }
 }
 
@@ -3314,7 +3301,7 @@ mod tests {
         collect_gauges(
             None,
             &PublicationGate::new(),
-            "/nonexistent/path/**/*.parquet",
+            Path::new("/nonexistent/path"),
             None,
             Path::new("/nonexistent/scratch"),
             QueryGauges::default(),
@@ -3334,7 +3321,7 @@ mod tests {
                 collect_gauges(
                     None,
                     &PublicationGate::new(),
-                    "/nonexistent/path/**/*.parquet",
+                    Path::new("/nonexistent/path"),
                     None,
                     Path::new("/nonexistent/scratch"),
                     QueryGauges {
@@ -3401,6 +3388,36 @@ mod tests {
             .unwrap_or_else(|| panic!("missing series {series} in {rendered}"))
     }
 
+    /// The Parquet gauges walk the configured root as a path. A root whose
+    /// name holds `*` would be cut short by any glob-based recovery and
+    /// count nothing.
+    #[test]
+    fn configured_data_root_is_passed_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data[1]*");
+        let hour = root.join("prod/2026-06-20/00");
+        std::fs::create_dir_all(&hour).unwrap();
+        std::fs::write(hour.join("nginx.parquet"), "0123456789").unwrap();
+
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            collect_gauges(
+                None,
+                &PublicationGate::new(),
+                &root,
+                None,
+                Path::new("/nonexistent/scratch"),
+                QueryGauges::default(),
+                &crate::repin::JobGeneration::default(),
+            );
+        });
+        let rendered = handle.render();
+        assert_eq!(gauge_value(&rendered, PARQUET_FILES), "1");
+        assert_eq!(gauge_value(&rendered, PARQUET_BYTES), "10");
+    }
+
     #[test]
     fn admission_gauges_follow_the_hot_buffer() {
         use crate::hot_buffer::{AdmissionState, HotBufferConfig};
@@ -3419,7 +3436,7 @@ mod tests {
             collect_gauges(
                 Some(&buf),
                 &buf.publication(),
-                "/nonexistent/path/**/*.parquet",
+                Path::new("/nonexistent/path"),
                 None,
                 Path::new("/nonexistent/scratch"),
                 QueryGauges::default(),
@@ -3445,7 +3462,7 @@ mod tests {
             collect_gauges(
                 Some(&buf),
                 &buf.publication(),
-                "/nonexistent/path/**/*.parquet",
+                Path::new("/nonexistent/path"),
                 None,
                 Path::new("/nonexistent/scratch"),
                 QueryGauges::default(),
@@ -3474,7 +3491,7 @@ mod tests {
             collect_gauges(
                 Some(&buf),
                 &buf.publication(),
-                "/nonexistent/path/**/*.parquet",
+                Path::new("/nonexistent/path"),
                 None,
                 Path::new("/nonexistent/scratch"),
                 QueryGauges::default(),
@@ -3517,7 +3534,7 @@ mod tests {
                 collect_gauges(
                     None,
                     gate,
-                    "/nonexistent/path/**/*.parquet",
+                    Path::new("/nonexistent/path"),
                     None,
                     Path::new("/nonexistent/scratch"),
                     QueryGauges::default(),
@@ -3613,7 +3630,7 @@ mod tests {
             collect_gauges(
                 Some(&buf),
                 &buf.publication(),
-                "/nonexistent/path/**/*.parquet",
+                Path::new("/nonexistent/path"),
                 None,
                 Path::new("/nonexistent/scratch"),
                 QueryGauges::default(),

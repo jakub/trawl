@@ -86,8 +86,8 @@
 //! a power loss the marker may come back, and recovery proves its rollup by
 //! the daily file's exact bytes, which a rewrite would change.
 //!
-//! The repin engine reuses this machinery: `layout_path`, `Progress` and
-//! `open_bounded_connection`.
+//! The repin engine reuses this machinery: `Progress`,
+//! `open_bounded_connection` and the same `layout_path` gate.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -95,6 +95,7 @@ use std::path::{Path, PathBuf};
 use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb_type};
 
 use super::FieldCatalog;
+use crate::env_dirs::{LayoutPath, layout_path};
 use crate::ingest::compaction::{
     AGG_CHUNK_COLS, ColInfo, ConformPlan, ConformPolicy, StatementFailure, describe_source,
     is_valid_parquet, quote_ident, structured_errors,
@@ -103,7 +104,7 @@ use crate::ingest::publication_marker::{PublicationClaims, scan_claims};
 use crate::store::{CatalogStore, FieldConflict, PinProposal, ServiceObservation};
 
 /// Marker file mirroring `catalog_state.catalog_id` into the data root.
-const CATALOG_MARKER: &str = "CATALOG";
+const CATALOG_MARKER: &str = trawl_config::CATALOG_MARKER;
 
 /// `pinned_from` value for pins seeded by the boot pass.
 const BOOT_PIN_SOURCE: &str = "_boot";
@@ -869,84 +870,6 @@ fn publication_claimed(claims: &PublicationClaims, layout: &LayoutPath) -> bool 
     })
 }
 
-/// Where one standing file sits in trawl's own storage layout.
-pub(crate) struct LayoutPath {
-    /// The env directory the path sits under.
-    pub(crate) env: String,
-    /// The hour directory, or `None` for a daily rollup.
-    pub(crate) hour: Option<u8>,
-    /// The service the path names — read off the layout, not guessed from a
-    /// file stem, so it is the same string ingest wrote verbatim.
-    pub(crate) service: String,
-    /// The instant this file's partition directory claims (see
-    /// [`ConformPolicy::StandingFile`]).
-    pub(crate) instant: chrono::DateTime<chrono::Utc>,
-}
-
-/// Read `path` back as trawl's own storage layout — `{env}/{date}/{HH}/
-/// {service}.parquet`, or `{env}/{date}/{service}.parquet` for a daily
-/// rollup — relative to the data root. `None` = foreign, i.e. not ours.
-///
-/// This is the whole safety gate on an in-place, lossy, irreversible rewrite,
-/// so it is deliberately the strict inverse of the write path rather than a
-/// loose shape match: every component is checked against the same injective
-/// predicates ingest funnels names through (`is_valid_env_name` minus the
-/// reserved names, `is_valid_service_name`), and the date/hour must be a real
-/// instant. A file that ingest could not have produced this path for is not
-/// trawl's file, whatever it contains.
-///
-/// The boundary it can draw is "a path the writer could have produced", not
-/// provenance: a file planted at an exactly-valid layout path is ours as far
-/// as anything here can tell. Deliberately not tightened with the configured
-/// `[ingest] envs` allowlist — an env retired from the config still has a
-/// standing corpus that queries read and the invariant must therefore cover.
-///
-/// It doubles as the rewrite's never-NULL `_time` fallback: a standing file
-/// has no WAL filename to recover an ingest instant from, but it does sit in
-/// a directory that names the hour compaction wrote it, at or after the
-/// row's arrival — the closest honest answer available. That hour need not
-/// match any query window: a `last=` walk floors its start to the hour and
-/// pads it.
-pub(crate) fn layout_path(data_dir: &Path, path: &Path) -> Option<LayoutPath> {
-    let rel = path.strip_prefix(data_dir).ok()?;
-    let mut parts: Vec<&str> = Vec::new();
-    for component in rel.components() {
-        match component {
-            std::path::Component::Normal(part) => parts.push(part.to_str()?),
-            // `..`, a root, a prefix: not a path the writer can produce.
-            _ => return None,
-        }
-    }
-    let (env, day, hour, file) = match parts.as_slice() {
-        [env, day, file] => (*env, *day, None, *file),
-        [env, day, hour, file] => (*env, *day, Some(*hour), *file),
-        _ => return None,
-    };
-    if !trawl_config::is_valid_env_name(env) || trawl_config::RESERVED_ENV_NAMES.contains(&env) {
-        return None;
-    }
-    let service = file.strip_suffix(".parquet")?;
-    if !trawl_config::is_valid_service_name(service) {
-        return None;
-    }
-    let day = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
-    let hour = match hour {
-        // Two digits, and an hour that exists: `and_hms_opt` rejects 24+.
-        Some(hh) if hh.len() == 2 => Some(hh.parse::<u8>().ok()?),
-        Some(_) => return None,
-        None => None,
-    };
-    let instant = day
-        .and_hms_opt(u32::from(hour.unwrap_or(0)), 0, 0)?
-        .and_utc();
-    Some(LayoutPath {
-        env: env.to_owned(),
-        hour,
-        service: service.to_owned(),
-        instant,
-    })
-}
-
 /// Describe one parquet file: magic-byte sniff first (the cheap catch for a
 /// truncated or non-parquet file), then the schema, then — only if some
 /// column still needs a pin vote — that column's non-null count.
@@ -1588,65 +1511,6 @@ mod tests {
         assert_eq!(
             obs[0].row_count, 6,
             "the file is weighed once, not per column"
-        );
-    }
-
-    /// Both of trawl's own layouts read back, service and instant intact —
-    /// the service off the path (verbatim, as ingest wrote it) and the
-    /// rewrite's never-NULL `_time` fallback off the partition directory.
-    #[test]
-    fn layout_path_reads_the_hour_and_the_daily_rollup() {
-        let root = PathBuf::from("/var/lib/trawl/data");
-        let hourly =
-            super::layout_path(&root, &root.join("prod/2026-08-01/10/api.v2.parquet")).unwrap();
-        assert_eq!(hourly.service, "api.v2");
-        assert_eq!(hourly.instant.to_rfc3339(), "2026-08-01T10:00:00+00:00");
-        assert_eq!((hourly.env.as_str(), hourly.hour), ("prod", Some(10)));
-
-        let daily = super::layout_path(&root, &root.join("prod/2026-08-01/svc-a.parquet")).unwrap();
-        assert_eq!(daily.service, "svc-a");
-        assert_eq!(daily.instant.to_rfc3339(), "2026-08-01T00:00:00+00:00");
-        assert_eq!((daily.env.as_str(), daily.hour), ("prod", None));
-    }
-
-    /// The gate on an in-place, lossy, irreversible rewrite: anything the
-    /// write path could not have produced is foreign, and a foreign file is
-    /// never scanned, never votes, and above all is never rewritten.
-    #[test]
-    fn layout_path_declines_everything_trawl_did_not_write() {
-        let root = PathBuf::from("/var/lib/trawl/data");
-        let foreign = [
-            // Depth: loose at the root, or nested past the layout.
-            "svc-a.parquet",
-            "prod/svc-a.parquet",
-            "prod/2026-08-01/10/extra/svc-a.parquet",
-            // An operator's own tree that happens to sit under the data root.
-            "backups/exports/10/svc-a.parquet",
-            "prod/backup-2026-08-01/svc-a.parquet",
-            // Reserved env names are trawl's, but not the corpus.
-            "wal/2026-08-01/10/svc-a.parquet",
-            "scheduled/2026-08-01/10/svc-a.parquet",
-            // Names ingest's injective encoding cannot emit.
-            "PROD/2026-08-01/10/svc-a.parquet",
-            "prod/2026-08-01/10/Living Room AP.parquet",
-            // Not an instant.
-            "prod/2026-08-01/99/svc-a.parquet",
-            "prod/2026-08-01/1/svc-a.parquet",
-            "prod/2026-13-01/10/svc-a.parquet",
-        ];
-        for rel in foreign {
-            assert!(
-                super::layout_path(&root, &root.join(rel)).is_none(),
-                "{rel} is not a path trawl wrote and must not be adopted"
-            );
-        }
-        // Outside the data root entirely.
-        assert!(
-            super::layout_path(
-                &root,
-                &PathBuf::from("/srv/other/prod/2026-08-01/10/s.parquet")
-            )
-            .is_none()
         );
     }
 
