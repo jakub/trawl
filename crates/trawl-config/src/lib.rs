@@ -385,7 +385,7 @@ pub struct IngestConfig {
     /// How often server stats (pool utilization, SSE connections, hot buffer
     /// metrics) are emitted as telemetry events (seconds). Default: 60.
     /// Lower values give more granular observability at the cost of telemetry
-    /// volume. Set to 0 to disable.
+    /// volume. Must be greater than 0.
     #[serde(default = "default_stats_interval_secs")]
     pub stats_interval_secs: u64,
 
@@ -2537,6 +2537,8 @@ impl Config {
         self.validate_ingest_env_names()?;
         self.validate_retention_env_keys()?;
 
+        self.validate_task_periods()?;
+
         // A zero interval would run normal compaction passes back to back
         // and turn the pressure cooldown (ADR-0043) into no wait at all.
         if self.ingest.enabled && self.ingest.compaction_interval_secs == 0 {
@@ -2684,6 +2686,42 @@ impl Config {
             return Err(ConfigError::Validation(format!(
                 "{key} must not be {relation} {what}; set {key} to a directory of its own"
             )));
+        }
+        Ok(())
+    }
+
+    /// A task period is never 0: tokio's `interval` panics on it and
+    /// `sleep` spins. Only `auth.audit_interval_secs` and
+    /// `server.tls_reload_interval_secs` treat 0 as "skip the task". The
+    /// rule holds even when the owning component is off, so a dormant
+    /// value cannot fail later when someone turns the component on.
+    fn validate_task_periods(&self) -> Result<(), ConfigError> {
+        for (key, value) in [
+            (
+                "ingest.stats_interval_secs",
+                self.ingest.stats_interval_secs,
+            ),
+            (
+                "ingest.telemetry_flush_interval_secs",
+                self.ingest.telemetry_flush_interval_secs,
+            ),
+            (
+                "retention.retention_interval_secs",
+                self.retention.retention_interval_secs,
+            ),
+            (
+                "scheduler.poll_interval_secs",
+                self.scheduler.poll_interval_secs,
+            ),
+            (
+                "server.schema_cache_ttl_secs",
+                self.server.schema_cache_ttl_secs,
+            ),
+            ("server.monitor_refresh_ms", self.server.monitor_refresh_ms),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Validation(format!("{key} must be > 0")));
+            }
         }
         Ok(())
     }
@@ -2933,6 +2971,8 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     #[test]
@@ -3929,18 +3969,106 @@ telemetry_flush_interval_secs = 5
         assert_eq!(config.ingest.telemetry_flush_interval_secs, 5);
     }
 
+    /// The six task periods and the section each lives in.
+    const TASK_PERIODS: [(&str, &str); 6] = [
+        ("ingest", "stats_interval_secs"),
+        ("ingest", "telemetry_flush_interval_secs"),
+        ("retention", "retention_interval_secs"),
+        ("scheduler", "poll_interval_secs"),
+        ("server", "schema_cache_ttl_secs"),
+        ("server", "monitor_refresh_ms"),
+    ];
+
+    /// A minimal valid document with `key = value` set in `section`.
+    fn task_period_doc(section: &str, key: &str, value: Option<u64>) -> String {
+        let mut doc = String::new();
+        for name in ["server", "data", "auth", "ingest", "retention", "scheduler"] {
+            writeln!(doc, "[{name}]").unwrap();
+            if name == "data" {
+                doc.push_str("path = \"/data\"\n");
+            }
+            if name == section
+                && let Some(value) = value
+            {
+                writeln!(doc, "{key} = {value}").unwrap();
+            }
+        }
+        doc
+    }
+
+    fn task_period_value(config: &Config, key: &str) -> u64 {
+        match key {
+            "stats_interval_secs" => config.ingest.stats_interval_secs,
+            "telemetry_flush_interval_secs" => config.ingest.telemetry_flush_interval_secs,
+            "retention_interval_secs" => config.retention.retention_interval_secs,
+            "poll_interval_secs" => config.scheduler.poll_interval_secs,
+            "schema_cache_ttl_secs" => config.server.schema_cache_ttl_secs,
+            "monitor_refresh_ms" => config.server.monitor_refresh_ms,
+            other => panic!("not a task period: {other}"),
+        }
+    }
+
     #[test]
-    fn stats_interval_disabled() {
-        let toml = r#"
-[server]
-[data]
-path = "/data"
-[auth]
-[ingest]
-stats_interval_secs = 0
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.ingest.stats_interval_secs, 0);
+    fn zero_task_periods_are_refused() {
+        for (section, key) in TASK_PERIODS {
+            let err = Config::from_toml(&task_period_doc(section, key, Some(0))).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("config validation error: {section}.{key} must be > 0"),
+            );
+        }
+    }
+
+    #[test]
+    fn task_periods_accept_defaults_and_one() {
+        for (section, key) in TASK_PERIODS {
+            let config = Config::from_toml(&task_period_doc(section, key, None)).unwrap();
+            assert!(
+                task_period_value(&config, key) > 0,
+                "{section}.{key} default must be > 0"
+            );
+
+            let config = Config::from_toml(&task_period_doc(section, key, Some(1))).unwrap();
+            assert_eq!(task_period_value(&config, key), 1, "{section}.{key}");
+        }
+    }
+
+    #[test]
+    fn task_period_rules_ignore_component_enablement() {
+        for enabled in [true, false] {
+            let doc = format!("[scheduler]\nenabled = {enabled}\npoll_interval_secs = 0\n");
+            let err = Config::from_toml(&format!(
+                "[server]\n[data]\npath = \"/data\"\n[auth]\n{doc}"
+            ))
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "config validation error: scheduler.poll_interval_secs must be > 0",
+                "scheduler.enabled = {enabled}"
+            );
+        }
+
+        for telemetry in [true, false] {
+            let doc = format!(
+                "[server]\n[data]\npath = \"/data\"\n[auth]\n[ingest]\n\
+                 internal_telemetry = {telemetry}\ntelemetry_flush_interval_secs = 0\n"
+            );
+            let err = Config::from_toml(&doc).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "config validation error: ingest.telemetry_flush_interval_secs must be > 0",
+                "internal_telemetry = {telemetry}"
+            );
+        }
+
+        // The two periods that mean "skip the task" at 0 still load.
+        let config = Config::from_toml(
+            "[server]\ntls_reload_interval_secs = 0\n[data]\npath = \"/data\"\n\
+             [auth]\naudit_interval_secs = 0\n",
+        )
+        .unwrap();
+        assert_eq!(config.auth.audit_interval_secs, 0);
+        assert_eq!(config.server.tls_reload_interval_secs, 0);
     }
 
     #[test]
