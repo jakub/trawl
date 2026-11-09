@@ -1375,6 +1375,9 @@ fn render_stacked_sparklines(
 /// Samples up to `SAMPLE_ROWS` visible rows starting from `v_scroll`, taking
 /// the max display width per column, clamped to `MIN_COL` and to each
 /// column's equal share of `available_width` (itself capped at `MAX_COL`).
+/// A column of instants may take the whole `available_width` instead: its
+/// offset is often the only difference between two rows (a fall-back
+/// night's two 01:30s), so cutting it would show one reading twice.
 /// Respects `width_override` from `ColumnConfig`; hidden columns get width 0.
 fn compute_column_widths(
     result: &trawl_engine::value::QueryResult,
@@ -1393,6 +1396,10 @@ fn compute_column_widths(
         .max(1);
     let per_col_budget = (available_width / visible_count).saturating_sub(CELL_PADDING);
     let max_col = per_col_budget.clamp(MIN_COL, MAX_COL);
+    let instant_col = available_width
+        .saturating_sub(CELL_PADDING)
+        .clamp(MIN_COL, MAX_COL)
+        .max(max_col);
 
     result
         .columns
@@ -1409,18 +1416,23 @@ fn compute_column_widths(
             }
 
             let mut max_width = col.name.len();
+            let mut cap = max_col;
 
             for row in result.rows.iter().skip(v_scroll).take(SAMPLE_ROWS) {
                 if let Some(value) = row.get(col_idx) {
-                    let display_len = cell_text(&col.ty, value, zone).len();
-                    if display_len > max_width {
-                        max_width = display_len;
-                    }
+                    let text = present_cell(&col.ty, value, zone).map_or_else(
+                        || value_to_string(value),
+                        |shown| {
+                            cap = instant_col;
+                            shown
+                        },
+                    );
+                    max_width = max_width.max(text.len());
                 }
             }
 
             #[allow(clippy::cast_possible_truncation)]
-            let width = max_width.clamp(MIN_COL, max_col) as u16;
+            let width = max_width.clamp(MIN_COL, cap) as u16;
             width
         })
         .collect()

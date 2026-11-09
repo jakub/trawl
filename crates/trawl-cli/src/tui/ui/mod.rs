@@ -747,6 +747,79 @@ mod tests {
         insta::assert_snapshot!("utc_timechart_arithmetic_survives_local_display", screen);
     }
 
+    /// Set only in the child process: the grid draws there under
+    /// `TZ=America/New_York`.
+    const NEW_YORK_CHILD: &str = "TRAWL_TUI_NEW_YORK_CHILD";
+
+    /// The fall-back night's two 01:30s differ only in their offsets, so a
+    /// grid column that cuts the offset shows the same text twice. Four
+    /// columns in a 100-column terminal leave each an equal share of 19,
+    /// shorter than one instant. Drawn in a child process under
+    /// `TZ=America/New_York`, as [`utc_timechart_arithmetic_survives_local_display`]
+    /// does for Berlin.
+    #[test]
+    fn grid_keeps_the_offset_of_each_instant() {
+        const CHILD: &str = "tui::ui::tests::grid_offset_child_under_new_york";
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("locate this test binary"))
+                .args([
+                    CHILD,
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("TZ", "America/New_York")
+                .env(NEW_YORK_CHILD, "1")
+                .output()
+                .expect("run the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the New York child failed or did not run; status {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status,
+        );
+    }
+
+    /// The subprocess entry point. Without [`NEW_YORK_CHILD`] it does
+    /// nothing, so a run with `--run-ignored` passes it untouched.
+    #[test]
+    #[ignore = "entry point for the New York child process; the test above runs it"]
+    fn grid_offset_child_under_new_york() {
+        if std::env::var_os(NEW_YORK_CHILD).is_none() {
+            return;
+        }
+
+        let mut app = test_app();
+        app.display_zone = trawl_api::zone::DisplayZone::Local;
+        let row = |t: &str| {
+            vec![
+                Value::String(t.into()),
+                Value::String("nginx".into()),
+                Value::Integer(3),
+                Value::String("request ok".into()),
+            ]
+        };
+        let mut response = make_query_response(
+            vec!["_time", "host", "count", "message"],
+            vec![
+                row("2026-11-01T05:30:00.000000Z"),
+                row("2026-11-01T06:30:00.000000Z"),
+            ],
+        );
+        response.result.columns[0].ty = trawl_engine::value::ColumnType::Timestamp;
+        app.tab.result = Some(response);
+        app.tab.status = TabStatus::Success { duration_ms: 4 };
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        for reading in ["2026-11-01 01:30:00 -04:00", "2026-11-01 01:30:00 -05:00"] {
+            assert!(screen.contains(reading), "{reading} missing:\n{screen}");
+        }
+    }
+
     #[test]
     fn render_with_error_status() {
         let mut app = test_app();
