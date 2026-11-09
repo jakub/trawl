@@ -43,9 +43,15 @@ assert subprocess.check_output(['dpkg-query', '-S', '/usr/lib/trawl/libduckdb.so
 PY
 python3 "$tooling/smoke-cli.py" /usr/bin/trawl "$tooling/fixtures/cli.parquet"
 python3 "$tooling/check-runtime.py" /usr/lib/trawl/libduckdb.so "$tooling/fixtures/cli.parquet"
-for binary in trawld trawl-admin fleet-admin trawl-web; do
+for binary in trawld fleet-admin trawl-web; do
   "/usr/bin/$binary" --help >/dev/null
 done
+# trawl-admin is retired: no package installs it and no package claims it.
+test ! -e /usr/bin/trawl-admin
+if dpkg -S /usr/bin/trawl-admin >/dev/null 2>&1; then
+  echo '/usr/bin/trawl-admin is owned by an installed package' >&2
+  exit 1
+fi
 # Test the actual daemon with its deployed capability, not only an unprivileged
 # ldd invocation. AT_SECURE is independently asserted by the small loader probe.
 setcap cap_sys_ptrace+p /usr/bin/trawld

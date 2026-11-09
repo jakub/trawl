@@ -31,11 +31,17 @@
 //! 2. images: pulled on the first `up` when absent, then recorded by id; a
 //!    resume refuses another engine, another image id, or a changed flag.
 //! 3. the state, then the engine claim, then `compose.json`.
-//! 4. databases: the superuser password file, PostgreSQL, the two owner
+//! 4. every `up`, before PostgreSQL starts: the certificate in the trawld
+//!    volume is read and judged. A trial that recorded one refuses unless
+//!    the volume holds exactly that certificate. A new trial generates a
+//!    pair in process and writes the key, then the certificate, into the
+//!    volume. The certificate is copied to the host and to trawl-web's
+//!    volume until the phase is recorded, and again when the host copy is
+//!    missing. It is never replaced.
+//! 5. databases: the superuser password file, PostgreSQL, the two owner
 //!    roles and databases, the pgpass file, and both configs. Every secret
 //!    goes through [`put_file`] or sealed stdin.
-//! 5. `fleet-admin migrate`, through the pgpass file.
-//! 6. the certificate, copied to the host and to trawl-web's volume.
+//! 6. `fleet-admin migrate`, through the pgpass file.
 //! 7. the two keys: kept when the token file matches the recorded prefix,
 //!    else every active key of that name is revoked and a new one minted.
 //! 8. every `up`: trawl-web stopped and given a new cookie key, so no
@@ -59,6 +65,7 @@ use std::time::{Duration, Instant};
 use trawl_client::{HttpClient, TlsTrust};
 use zeroize::Zeroizing;
 
+use super::certificate::TrialPair;
 use super::compose::{self, Service};
 use super::docker::{Args, Docker, DockerCli, PROBE_TIMEOUT, Sensitivity};
 use super::keys::{self, MintedToken, TrialKey};
@@ -69,7 +76,7 @@ use super::preflight::{self, Engine};
 use super::profile::EnvRule;
 use super::render::{self, Containers};
 use super::sample::{self, SampleAction};
-use super::secrets::{self, CookieKey, DbPasswords, HexSecret, Target, put_file};
+use super::secrets::{self, CookieKey, DbPasswords, HexSecret, Target, VolumeFile, put_file};
 use super::state::{
     DownView, ImageRecord, Images, KeyRecord, Phases, Ports, SCHEMA, Samples, TlsRecord, TrialState,
 };
@@ -78,7 +85,7 @@ use super::{
     default_image,
 };
 
-/// A one-shot `compose run` step: `fleet-admin`, `tls-init`, a key.
+/// A one-shot `compose run` step: `fleet-admin` or a key.
 const RUN_TIMEOUT: Duration = Duration::from_mins(3);
 /// `compose up --wait`, whose own `--wait-timeout` is [`WAIT_SECS`].
 const UP_TIMEOUT: Duration = Duration::from_mins(5);
@@ -97,6 +104,9 @@ const API_WAIT: Duration = Duration::from_secs(30);
 const MAX_TOKEN_BYTES: u64 = 4096;
 /// `ca.pem` holds one certificate.
 const MAX_CA_BYTES: u64 = 64 * 1024;
+// `read_file` returns more than `MAX_CA_BYTES` of a longer volume
+// certificate, so `judge_certificate` sees that it is too long.
+const _: () = assert!(secrets::READ_LIMIT >= MAX_CA_BYTES);
 
 /// The query `up` runs to prove an authenticated query works.
 const PROOF_QUERY: &str = "* | head 1";
@@ -448,13 +458,16 @@ fn require_storage(inventory: &Inventory, state: &TrialState) -> Result<(), Tria
     })
 }
 
-/// The recorded phases that are not done yet: databases, the Fleet
-/// schema, the certificate, and the keys.
+/// The certificate, judged on every `up`, then the phases that are not
+/// recorded yet: databases, the Fleet schema, and the keys.
 async fn setup(
     docker: &Docker,
     paths: &TrialPaths,
     state: &mut TrialState,
 ) -> Result<(), TrialError> {
+    // First, on every `up`: a certificate `up` refuses stops it before
+    // PostgreSQL starts or any phase writes.
+    certificate(docker, paths, state).await?;
     if state.phases.database {
         // A stopped or resumed trial: every `fleet-admin` step below runs
         // with `--no-deps` and needs PostgreSQL up.
@@ -469,9 +482,6 @@ async fn setup(
         compose_capture(docker, keys::migrate_args(), None, Sensitivity::Diagnose).await?;
         state.phases.fleet_migrated = true;
         state.save(&paths.state_file())?;
-    }
-    if !state.phases.tls || read_public(&paths.ca_file(), MAX_CA_BYTES)?.is_none() {
-        certificate(docker, paths, state).await?;
     }
     for key in TrialKey::ALL {
         ensure_key(docker, paths, state, key).await?;
@@ -930,32 +940,48 @@ async fn start_postgres(docker: &Docker) -> Result<(), TrialError> {
     .await
 }
 
-/// The certificate phase: generate it unless it exists, then copy the
-/// public certificate to the host and to trawl-web, and record its
-/// fingerprint.
+/// The certificate phase, on every `up`.
+///
+/// The certificate in the trawld volume is the trial's identity, and the
+/// host `ca.pem` and trawl-web's copy are pins taken from it. `up` reads
+/// it and lets [`judge_certificate`] decide before it writes anything. A
+/// new trial gets a generated pair: the key first, then the certificate,
+/// so a certificate in the volume always has its key beside it. The pins
+/// are written, and the fingerprint recorded, while the phase is not
+/// recorded or the host `ca.pem` is missing. `up` never replaces a
+/// certificate in the volume.
 async fn certificate(
     docker: &Docker,
     paths: &TrialPaths,
     state: &mut TrialState,
 ) -> Result<(), TrialError> {
-    progress("generating the trial certificate");
-    compose_capture(
-        docker,
-        Args::new().args(["run", "--rm", "--no-deps", "-T", Service::TlsInit.name()]),
-        None,
-        Sensitivity::Diagnose,
-    )
-    .await?;
-    let out = compose_capture(
-        docker,
-        Args::new()
-            .args(["run", "--rm", "--no-deps", "-T", "--entrypoint", "cat"])
-            .args([Service::TlsInit.name(), compose::TLS_CERT]),
-        None,
-        Sensitivity::Diagnose,
-    )
-    .await?;
-    let pem = out.stdout.to_vec();
+    progress("reading the trial certificate from the trawld volume");
+    let found = secrets::read_file(docker, Target::Trawld, compose::TLS_CERT).await?;
+    let plan = judge_certificate(state, found)?;
+    let publish = !state.phases.tls || read_public(&paths.ca_file(), MAX_CA_BYTES)?.is_none();
+    let pem = match plan {
+        CertificatePlan::Reuse(pem) => {
+            if !publish {
+                return Ok(());
+            }
+            progress("pinning the trial certificate from the trawld volume");
+            pem
+        }
+        CertificatePlan::Generate => {
+            progress("generating the trial certificate");
+            let pair = TrialPair::generate()?;
+            put_file(
+                docker,
+                Target::Trawld,
+                compose::TLS_KEY,
+                pair.key_pem().as_bytes(),
+            )
+            .await?;
+            let pem = pair.into_cert_pem().into_bytes();
+            put_file(docker, Target::Trawld, compose::TLS_CERT, &pem).await?;
+            pem
+        }
+    };
     let fingerprint = fingerprint(&pem)?;
     write_private(&paths.ca_file(), &pem, 0o644)?;
     put_file(docker, Target::Web, compose::WEB_CA, &pem).await?;
@@ -964,6 +990,85 @@ async fn certificate(
     });
     state.phases.tls = true;
     state.save(&paths.state_file())
+}
+
+/// What `up` does about the trial certificate.
+#[derive(Debug, PartialEq, Eq)]
+enum CertificatePlan {
+    /// The volume holds no certificate, and the trial recorded none.
+    Generate,
+    /// Pin the certificate the volume holds: these bytes.
+    Reuse(Vec<u8>),
+}
+
+/// Decide from what the volume holds at [`compose::TLS_CERT`] and what the
+/// state recorded. A trial recorded a certificate when its phase is done or
+/// it holds a fingerprint.
+///
+/// - Recorded: reuse the volume's certificate when its fingerprint is the
+///   recorded one. Missing, damaged, or another one refuses.
+/// - Not recorded: generate when the volume holds nothing at the path,
+///   reuse one certificate, and refuse anything else, because it was
+///   published and `up` cannot tell which pins it reached.
+///
+/// Damaged means not a regular file, empty, longer than ca.pem may be, or
+/// not exactly one PEM certificate ([`is_one_certificate`]).
+fn judge_certificate(state: &TrialState, found: VolumeFile) -> Result<CertificatePlan, TrialError> {
+    let refuse = |problem| Err(TrialError::CertificateDamaged { problem });
+    let recorded = state.phases.tls || state.tls.is_some();
+    let pem = match found {
+        VolumeFile::Absent if recorded => return refuse("is missing"),
+        VolumeFile::Absent => return Ok(CertificatePlan::Generate),
+        VolumeFile::NotAFile => return refuse("is not a regular file"),
+        VolumeFile::Present(pem) => pem,
+    };
+    if pem.is_empty() {
+        return refuse("is empty");
+    }
+    if u64::try_from(pem.len()).map_or(true, |len| len > MAX_CA_BYTES) {
+        return refuse("is too large to be one certificate");
+    }
+    if !is_one_certificate(&pem) {
+        return refuse("is not one PEM certificate");
+    }
+    let Ok(found) = fingerprint(&pem) else {
+        return refuse("is not one PEM certificate");
+    };
+    if recorded && state.tls.as_ref().map(|t| t.sha256_fingerprint.as_str()) != Some(found.as_str())
+    {
+        return refuse("is not the one the trial recorded");
+    }
+    Ok(CertificatePlan::Reuse(pem))
+}
+
+/// Whether `pem` is one PEM `CERTIFICATE` section with nothing but
+/// whitespace around it, whose DER is one well-formed X.509 certificate
+/// with no bytes after it. The pins are these bytes as they are, so
+/// anything else in them, a private key included, would be published.
+///
+/// The text check runs first, so a payload holding any other section is
+/// refused before a byte of it is decoded.
+fn is_one_certificate(pem: &[u8]) -> bool {
+    use rustls_pki_types::pem::{PemObject as _, SectionKind};
+
+    const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    const END: &[u8] = b"-----END CERTIFICATE-----";
+    let Some(body) = pem
+        .trim_ascii()
+        .strip_prefix(BEGIN)
+        .and_then(|rest| rest.strip_suffix(END))
+    else {
+        return false;
+    };
+    if body.windows(5).any(|w| w == b"-----") {
+        return false;
+    }
+    let mut sections = <(SectionKind, Vec<u8>)>::pem_slice_iter(pem);
+    let (Some(Ok((SectionKind::Certificate, der))), None) = (sections.next(), sections.next())
+    else {
+        return false;
+    };
+    matches!(x509_parser::parse_x509_certificate(&der), Ok((rest, _)) if rest.is_empty())
 }
 
 /// The SHA-256 fingerprint of the one certificate in `pem`, as colon
@@ -3033,5 +3138,538 @@ fi"#,
         assert_eq!(bytes, expected.as_slice());
         assert!(fingerprint(b"").is_err());
         assert!(fingerprint(format!("{pem}{pem}").as_bytes()).is_err());
+    }
+
+    /// A trial directory, its stub trawld volume, and a stub engine that
+    /// runs the real volume scripts there and logs each call.
+    struct CertTrial {
+        root: tempfile::TempDir,
+        engine: tempfile::TempDir,
+        docker: Docker,
+        home: tempfile::TempDir,
+        paths: TrialPaths,
+    }
+
+    impl CertTrial {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let (engine, docker) = crate::trial::secrets::tests::local_writer(root.path());
+            let home = tempfile::tempdir().unwrap();
+            let paths = TrialPaths::resolve(Some(&home.path().join("state")), None).unwrap();
+            paths.ensure_root().unwrap();
+            paths.ensure_dir().unwrap();
+            Self {
+                root,
+                engine,
+                docker,
+                home,
+                paths,
+            }
+        }
+
+        /// `path` in the stub volume.
+        fn at(&self, path: &str) -> std::path::PathBuf {
+            self.root.path().join(path.trim_start_matches('/'))
+        }
+
+        /// The calls the engine logged since the last `take_calls`.
+        fn take_calls(&self) -> String {
+            let calls = crate::trial::secrets::tests::calls(&self.engine);
+            let _ = std::fs::remove_file(self.engine.path().join("calls"));
+            calls
+        }
+
+        /// A state that recorded `tls` and the phase flag `phase`, saved.
+        fn state(&self, phase: bool, tls: Option<&str>) -> TrialState {
+            let mut state = fixture(DEFAULT_API_PORT);
+            state.phases.tls = phase;
+            state.tls = tls.map(|fp| TlsRecord {
+                sha256_fingerprint: fp.to_owned(),
+            });
+            state.save(&self.paths.state_file()).unwrap();
+            state
+        }
+
+        /// Every file under the stub volume, with its bytes.
+        fn volume(&self) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+            files_under(self.root.path())
+        }
+    }
+
+    /// Every file under `dir`, with its bytes, sorted. Anything that is
+    /// neither a directory nor a regular file is listed without bytes.
+    fn files_under(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.is_dir() {
+                    walk(&path, out);
+                } else if meta.is_file() {
+                    out.push((path.clone(), std::fs::read(&path).unwrap()));
+                } else {
+                    out.push((path, Vec::new()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// `der` as one PEM section labelled `label`, base64 by hand so the
+    /// test can wrap bytes no encoder here would produce.
+    fn pem_section(label: &str, der: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for chunk in der.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    let index = usize::try_from((n >> (18 - 6 * i)) & 63).unwrap();
+                    b64.push(char::from(ALPHABET[index]));
+                } else {
+                    b64.push('=');
+                }
+            }
+        }
+        let mut out = format!("-----BEGIN {label}-----\n");
+        for line in b64.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(line).unwrap());
+            out.push('\n');
+        }
+        out + "-----END " + label + "-----\n"
+    }
+
+    /// The mode bits of `path`.
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Whether rustls takes `key` as the key of `cert`, as trawld does.
+    fn pair_loads(cert: &[u8], key: &[u8]) -> bool {
+        use rustls_pki_types::pem::PemObject as _;
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+        let chain = CertificateDer::pem_slice_iter(cert)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(key).unwrap();
+        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .is_ok()
+    }
+
+    /// The first `up` generates the pair into the volume, key first, and
+    /// publishes its certificate. Every later `up` reuses that pair: one
+    /// that lost the host `ca.pem` restores the pins from the volume, and
+    /// one killed before the phase was recorded adopts what it published.
+    #[tokio::test]
+    async fn completed_trial_pair_is_reused() {
+        let trial = CertTrial::new();
+        let (cert, key, web) = (compose::TLS_CERT, compose::TLS_KEY, compose::WEB_CA);
+        let ca = trial.paths.ca_file();
+
+        // An empty volume and an unrecorded phase: generate.
+        let mut state = trial.state(false, None);
+        certificate(&trial.docker, &trial.paths, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            trial.take_calls(),
+            format!("read {cert}\nput {key}\nput {cert}\nput {web}\n")
+        );
+        assert_eq!(mode(&trial.at(key)), 0o400);
+        assert_eq!(mode(&trial.at(cert)), 0o400);
+        let cert_bytes = std::fs::read(trial.at(cert)).unwrap();
+        let key_bytes = std::fs::read(trial.at(key)).unwrap();
+        assert!(pair_loads(&cert_bytes, &key_bytes));
+        assert_eq!(std::fs::read(&ca).unwrap(), cert_bytes);
+        assert_eq!(std::fs::read(trial.at(web)).unwrap(), cert_bytes);
+        let fp = fingerprint(&cert_bytes).unwrap();
+        let recorded = |state: &TrialState| {
+            let saved = TrialState::load(&trial.paths.state_file())
+                .unwrap()
+                .unwrap();
+            assert_eq!(&saved, state);
+            (
+                state.phases.tls,
+                state.tls.as_ref().map(|t| t.sha256_fingerprint.clone()),
+            )
+        };
+        assert_eq!(recorded(&state), (true, Some(fp.clone())));
+
+        // Recorded, with the host pin present: read, and nothing else.
+        let before = std::fs::read(trial.paths.state_file()).unwrap();
+        certificate(&trial.docker, &trial.paths, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(trial.take_calls(), format!("read {cert}\n"));
+        assert_eq!(std::fs::read(trial.paths.state_file()).unwrap(), before);
+
+        // Recorded, with the host pin deleted: re-pin from the volume.
+        std::fs::remove_file(&ca).unwrap();
+        certificate(&trial.docker, &trial.paths, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(trial.take_calls(), format!("read {cert}\nput {web}\n"));
+        assert_eq!(std::fs::read(trial.at(cert)).unwrap(), cert_bytes);
+        assert_eq!(std::fs::read(trial.at(key)).unwrap(), key_bytes);
+        assert_eq!(std::fs::read(&ca).unwrap(), cert_bytes);
+        assert_eq!(std::fs::read(trial.at(web)).unwrap(), cert_bytes);
+        assert_eq!(recorded(&state), (true, Some(fp.clone())));
+
+        // Unrecorded, though the certificate is published: a run killed
+        // after the certificate write, before the state was saved. And a
+        // fingerprint recorded without its phase flag.
+        for tls in [None, Some(fp.as_str())] {
+            let mut state = trial.state(false, tls);
+            certificate(&trial.docker, &trial.paths, &mut state)
+                .await
+                .unwrap();
+            assert_eq!(trial.take_calls(), format!("read {cert}\nput {web}\n"));
+            assert_eq!(std::fs::read(trial.at(cert)).unwrap(), cert_bytes);
+            assert_eq!(std::fs::read(trial.at(key)).unwrap(), key_bytes);
+            assert_eq!(std::fs::read(&ca).unwrap(), cert_bytes);
+            assert_eq!(recorded(&state), (true, Some(fp.clone())));
+        }
+    }
+
+    /// A key with no certificate beside it was never published: an
+    /// unrecorded trial replaces it with a new pair.
+    #[tokio::test]
+    async fn an_orphan_key_is_replaced_by_a_new_pair() {
+        let trial = CertTrial::new();
+        let key = trial.at(compose::TLS_KEY);
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, b"orphan").unwrap();
+        let mut state = trial.state(false, None);
+        certificate(&trial.docker, &trial.paths, &mut state)
+            .await
+            .unwrap();
+        let cert_bytes = std::fs::read(trial.at(compose::TLS_CERT)).unwrap();
+        let key_bytes = std::fs::read(&key).unwrap();
+        assert_ne!(key_bytes, b"orphan");
+        assert!(pair_loads(&cert_bytes, &key_bytes));
+    }
+
+    /// A key path the writer cannot replace stops the new pair at the key:
+    /// no certificate is written beside it, nothing is pinned, and the
+    /// state is unchanged.
+    #[tokio::test]
+    async fn a_key_path_that_is_a_directory_stops_generation_at_the_key() {
+        let trial = CertTrial::new();
+        let key = trial.at(compose::TLS_KEY);
+        std::fs::create_dir_all(&key).unwrap();
+        let mut state = trial.state(false, None);
+        let saved = std::fs::read(trial.paths.state_file()).unwrap();
+        let in_memory = state.clone();
+
+        let err = certificate(&trial.docker, &trial.paths, &mut state)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrialError::Docker(_)), "{err:?}");
+        assert_eq!(
+            trial.take_calls(),
+            format!("read {}\nput {}\n", compose::TLS_CERT, compose::TLS_KEY)
+        );
+        assert!(!trial.at(compose::TLS_CERT).exists());
+        assert!(!trial.at(compose::WEB_CA).exists());
+        assert!(!trial.paths.ca_file().exists());
+        assert_eq!(std::fs::read(trial.paths.state_file()).unwrap(), saved);
+        assert_eq!(state, in_memory);
+        // The directory is untouched and the temporary file is gone.
+        assert!(trial.volume().is_empty(), "{:?}", trial.volume());
+        assert!(key.is_dir());
+    }
+
+    /// What a refusal case puts at the certificate's path.
+    enum Volume<'a> {
+        Empty,
+        Holds(&'a [u8]),
+        Directory,
+    }
+
+    /// Run the certificate phase on a fresh trial whose volume holds
+    /// `volume` at the certificate's path and a key file beside it, and
+    /// assert it refuses having read the volume once and written nothing:
+    /// no pin, no web copy, no state, no byte in the volume, and no line
+    /// of `key_body` in any file but the two the volume holds.
+    async fn assert_refused(
+        name: &str,
+        phase: bool,
+        tls: Option<&str>,
+        volume: Volume<'_>,
+        key_body: &[&str],
+    ) {
+        let trial = CertTrial::new();
+        let cert = trial.at(compose::TLS_CERT);
+        std::fs::create_dir_all(cert.parent().unwrap()).unwrap();
+        std::fs::write(trial.at(compose::TLS_KEY), b"key").unwrap();
+        match volume {
+            Volume::Empty => {}
+            Volume::Holds(bytes) => std::fs::write(&cert, bytes).unwrap(),
+            Volume::Directory => std::fs::create_dir(&cert).unwrap(),
+        }
+        let mut state = trial.state(phase, tls);
+        let saved = std::fs::read(trial.paths.state_file()).unwrap();
+        let in_memory = state.clone();
+        let files = trial.volume();
+
+        let err = certificate(&trial.docker, &trial.paths, &mut state)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TrialError::CertificateDamaged { .. }),
+            "{name}: {err:?}"
+        );
+        let shown = err.to_string();
+        assert!(shown.contains("`trawl trial down`"), "{name}: {shown}");
+        assert!(shown.contains("`trawl trial up`"), "{name}: {shown}");
+        assert!(!shown.contains('/'), "{name}: {shown}");
+        if let Some(fp) = tls {
+            assert!(!shown.contains(fp), "{name}: {shown}");
+        }
+
+        assert_eq!(
+            trial.take_calls(),
+            format!("read {}\n", compose::TLS_CERT),
+            "{name}"
+        );
+        assert!(!trial.paths.ca_file().exists(), "{name}");
+        assert!(!trial.at(compose::WEB_CA).exists(), "{name}");
+        assert_eq!(
+            std::fs::read(trial.paths.state_file()).unwrap(),
+            saved,
+            "{name}"
+        );
+        assert_eq!(state, in_memory, "{name}");
+        assert_eq!(trial.volume(), files, "{name}");
+
+        let elsewhere =
+            files_under(trial.home.path())
+                .into_iter()
+                .chain(trial.volume().into_iter().filter(|(path, _)| {
+                    *path != trial.at(compose::TLS_CERT) && *path != trial.at(compose::TLS_KEY)
+                }));
+        for (path, bytes) in elsewhere {
+            let text = String::from_utf8_lossy(&bytes);
+            for line in key_body {
+                assert!(!text.contains(line), "{name}: {}", path.display());
+            }
+        }
+    }
+
+    /// A recorded trial whose volume certificate is gone, damaged, or not
+    /// the recorded one refuses, as does an unrecorded trial whose volume
+    /// holds something that is not one certificate. The refusal reads the
+    /// volume once and writes nothing: no pin, no web copy, no state, and
+    /// no byte in the volume.
+    #[tokio::test]
+    async fn recorded_trial_certificate_damage_is_refused() {
+        let a = TrialPair::generate().unwrap().into_cert_pem();
+        let b = TrialPair::generate().unwrap().into_cert_pem();
+        let fp_a = fingerprint(a.as_bytes()).unwrap();
+        let limit = usize::try_from(MAX_CA_BYTES).unwrap();
+        let oversized = format!("{a}{}", "#".repeat(limit));
+        let cases: [(&str, bool, Option<&str>, Volume<'_>); 10] = [
+            ("recorded, missing", true, Some(&fp_a), Volume::Empty),
+            (
+                "recorded, another",
+                true,
+                Some(&fp_a),
+                Volume::Holds(b.as_bytes()),
+            ),
+            (
+                "recorded, not PEM",
+                true,
+                Some(&fp_a),
+                Volume::Holds(b"not pem"),
+            ),
+            ("recorded, empty", true, Some(&fp_a), Volume::Holds(b"")),
+            (
+                "recorded, oversized",
+                true,
+                Some(&fp_a),
+                Volume::Holds(oversized.as_bytes()),
+            ),
+            (
+                "recorded, a directory",
+                true,
+                Some(&fp_a),
+                Volume::Directory,
+            ),
+            (
+                "phase without a fingerprint",
+                true,
+                None,
+                Volume::Holds(a.as_bytes()),
+            ),
+            (
+                "fingerprint without the phase",
+                false,
+                Some(&fp_a),
+                Volume::Empty,
+            ),
+            (
+                "unrecorded, not PEM",
+                false,
+                None,
+                Volume::Holds(b"not pem"),
+            ),
+            ("unrecorded, a directory", false, None, Volume::Directory),
+        ];
+        for (name, phase, tls, volume) in cases {
+            assert_refused(name, phase, tls, volume, &[]).await;
+        }
+    }
+
+    /// The pins are the volume's bytes as they are, so a payload is one
+    /// certificate only when it is one CERTIFICATE section with nothing
+    /// but whitespace around it, holding one well-formed X.509
+    /// certificate. Garbage DER, trailing DER bytes, the certificate's own
+    /// key, text, and an unknown section are each refused, recorded or
+    /// not, before the key reaches any pin.
+    #[tokio::test]
+    async fn a_payload_that_is_not_one_clean_certificate_is_refused() {
+        let pair = TrialPair::generate().unwrap();
+        let a = pair.cert_pem().to_owned();
+        let key = pair.key_pem().to_owned();
+        drop(pair);
+        let fp_a = fingerprint(a.as_bytes()).unwrap();
+        let with_key = format!("{a}{key}");
+        let text_after = format!("{a}trial certificate\n");
+        let text_before = format!("trial certificate\n{a}");
+        let unknown_after = format!("{a}{}", pem_section("NOTE", b"abc"));
+        let trailing_der = {
+            let (_, der) = x509_parser::pem::parse_x509_pem(a.as_bytes()).unwrap();
+            let mut der = der.contents;
+            der.push(0);
+            pem_section("CERTIFICATE", &der)
+        };
+        let cases: [(&str, bool, Option<&str>, Volume<'_>); 7] = [
+            (
+                "unrecorded, garbage DER in a CERTIFICATE block",
+                false,
+                None,
+                Volume::Holds(b"-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n"),
+            ),
+            (
+                "unrecorded, DER with trailing bytes",
+                false,
+                None,
+                Volume::Holds(trailing_der.as_bytes()),
+            ),
+            (
+                "recorded, the certificate and its key",
+                true,
+                Some(&fp_a),
+                Volume::Holds(with_key.as_bytes()),
+            ),
+            (
+                "unrecorded, the certificate and its key",
+                false,
+                None,
+                Volume::Holds(with_key.as_bytes()),
+            ),
+            (
+                "recorded, text after the certificate",
+                true,
+                Some(&fp_a),
+                Volume::Holds(text_after.as_bytes()),
+            ),
+            (
+                "unrecorded, text before the certificate",
+                false,
+                None,
+                Volume::Holds(text_before.as_bytes()),
+            ),
+            (
+                "recorded, an unknown section after the certificate",
+                true,
+                Some(&fp_a),
+                Volume::Holds(unknown_after.as_bytes()),
+            ),
+        ];
+        let key_body: Vec<&str> = key.lines().filter(|l| !l.starts_with("-----")).collect();
+        assert!(!key_body.is_empty());
+        for (name, phase, tls, volume) in cases {
+            assert_refused(name, phase, tls, volume, &key_body).await;
+        }
+    }
+
+    /// A read that fails says nothing about the certificate: it is the
+    /// engine's error, never the damage refusal, and it never lets `up`
+    /// generate.
+    #[tokio::test]
+    async fn a_failed_certificate_read_is_a_docker_error_and_writes_nothing() {
+        for (phase, tls) in [(true, Some("AB:CD")), (false, None)] {
+            let trial = CertTrial::new();
+            let (engine, docker) = crate::trial::docker::tests::stub(
+                r#"echo call >> "${0%/*}/calls"
+echo 'Error response from daemon: an engine fault' >&2
+exit 1"#,
+            );
+            let mut state = trial.state(phase, tls);
+            let saved = std::fs::read(trial.paths.state_file()).unwrap();
+            let err = certificate(&docker, &trial.paths, &mut state)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, TrialError::Docker(_)), "{err:?}");
+            assert!(err.to_string().contains("an engine fault"), "{err}");
+            assert_eq!(crate::trial::secrets::tests::calls(&engine), "call\n");
+            assert!(!trial.paths.ca_file().exists());
+            assert_eq!(std::fs::read(trial.paths.state_file()).unwrap(), saved);
+            assert!(trial.volume().is_empty());
+        }
+    }
+
+    /// The certificate is judged first in setup, so a refusal or a failed
+    /// read leaves PostgreSQL stopped and every other phase untouched. A
+    /// new trial gets its certificate before its databases.
+    #[tokio::test]
+    async fn setup_judges_the_certificate_before_anything_else() {
+        let trial = CertTrial::new();
+        let mut state = trial.state(true, Some("AB:CD"));
+        let err = setup(&trial.docker, &trial.paths, &mut state)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TrialError::CertificateDamaged { .. }),
+            "{err:?}"
+        );
+        assert_eq!(trial.take_calls(), format!("read {}\n", compose::TLS_CERT));
+
+        // A new trial: the certificate, then the superuser password, then
+        // `compose up postgres`, which the stub engine fails.
+        let trial = CertTrial::new();
+        let mut state = trial.state(false, None);
+        state.phases = Phases::default();
+        state.tls = None;
+        state.save(&trial.paths.state_file()).unwrap();
+        let err = setup(&trial.docker, &trial.paths, &mut state)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrialError::Docker(_)), "{err:?}");
+        assert_eq!(
+            trial.take_calls(),
+            format!(
+                "read {cert}\nput {key}\nput {cert}\nput {web}\nput {pg}\nother\n",
+                cert = compose::TLS_CERT,
+                key = compose::TLS_KEY,
+                web = compose::WEB_CA,
+                pg = compose::PG_SUPERUSER_PASSWORD,
+            )
+        );
     }
 }

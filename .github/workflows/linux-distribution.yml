@@ -205,7 +205,7 @@ jobs:
         run: |
           set -euo pipefail
           bindir="${{ matrix.build-root }}/${{ matrix.target }}/release"
-          for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
+          for bin in trawld trawl trawl-web fleet-admin; do
             dump_syms --store symbols/ "${bindir}/${bin}"
           done
           dump_syms --store symbols/ runtime/libduckdb.so
@@ -244,7 +244,7 @@ jobs:
           fi
           echo "using ${llvm_strip}"
           bindir="${{ matrix.build-root }}/${{ matrix.target }}/release"
-          for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
+          for bin in trawld trawl trawl-web fleet-admin; do
             "${llvm_strip}" "${bindir}/${bin}"
             rm -f build-id.note
             "${llvm_objcopy}" -O binary --only-section=.note.gnu.build-id "${bindir}/${bin}" build-id.note 2>/dev/null || true
@@ -407,6 +407,10 @@ jobs:
             --label "org.opencontainers.image.revision=$SOURCE_SHA" \
             --tag "$image" .
           docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' "$image"
+          # The image ships trawld, trawl-web and fleet-admin only. The retired
+          # trawl-admin must not come back, at its old path or on PATH.
+          docker run --rm --entrypoint /bin/sh "$image" -c \
+            'test ! -e /usr/bin/trawl-admin && ! command -v trawl-admin >/dev/null'
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
         with:
           node-version: '22'

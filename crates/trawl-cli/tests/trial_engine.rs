@@ -386,9 +386,9 @@ const THEIRS: &str = "fedcba9876543210fedcba9876543210";
 const RESPONSE_DENIED: &str =
     "Error response from daemon: authorization denied by plugin authz: response denied";
 
-/// The first step `up` takes once it holds the claim. The stub runs no
-/// services, so `up` fails there.
-const PAST_THE_CLAIM: &str = "writing the PostgreSQL superuser password";
+/// The first step `up` takes once it holds the claim. The stub fails
+/// every `compose` call, so `up` fails there.
+const PAST_THE_CLAIM: &str = "reading the trial certificate from the trawld volume";
 
 impl Engine {
     fn put(&self, name: &str, body: &str) {
