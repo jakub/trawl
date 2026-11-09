@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use fleet_auth::KeyStore;
 
 use crate::config::SchedulerConfig;
+use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
 use crate::publication::CorpusUnsettled;
@@ -471,16 +472,11 @@ pub(crate) async fn execute_scheduled_query(
             );
         }
         Err(e) => {
-            let (status, error_msg) = if matches!(e, crate::error::ServerError::Timeout) {
-                (RunStatus::Timeout, format!("{e}"))
-            } else {
-                (RunStatus::Error, format!("{e}"))
-            };
-
-            finish_failed_run(&schedule_store, run_id, status, duration_ms, &error_msg).await;
+            let status = record_failed_run(&schedule_store, run_id, duration_ms, &e).await;
 
             // The class only: the error's text can quote the saved query
-            // (ADR-0040). The run record keeps the text for its owner.
+            // (ADR-0040). The run row stores the error's public message,
+            // the one the wire sends (ADR-0046, amended 2026-11-08).
             tracing::warn!(
                 event_type = "scheduled_query_failed",
                 run_id,
@@ -492,6 +488,31 @@ pub(crate) async fn execute_scheduled_query(
             );
         }
     }
+}
+
+/// Record a run whose query failed: a timeout as `timeout`, anything else
+/// as `error`, with the error's public message as the run's text. Returns
+/// the status it recorded.
+async fn record_failed_run(
+    schedule_store: &ScheduleStore,
+    run_id: i64,
+    duration_ms: u64,
+    error: &ServerError,
+) -> RunStatus {
+    let status = if matches!(error, ServerError::Timeout) {
+        RunStatus::Timeout
+    } else {
+        RunStatus::Error
+    };
+    finish_failed_run(
+        schedule_store,
+        run_id,
+        status,
+        duration_ms,
+        &error.safe_message(),
+    )
+    .await;
+    status
 }
 
 /// Fail a run whose result has neither a file nor a blob. A success here
@@ -523,8 +544,9 @@ async fn fail_unpersisted_run(
     );
 }
 
-/// Record a run as failed with `error_msg`, its owner's to read. A store
-/// error is logged; the run then stays `running` until boot-time cleanup.
+/// Record a run as failed with `error_msg`, which every reader of the run
+/// sees. A store error is logged; the run then stays `running` until
+/// boot-time cleanup.
 async fn finish_failed_run(
     schedule_store: &ScheduleStore,
     run_id: i64,
@@ -544,13 +566,23 @@ async fn finish_failed_run(
         )
         .await
     {
-        tracing::error!(
-            event_type = "scheduler_error",
-            run_id,
-            error = %e,
-            "failed to finish run"
-        );
+        log_store_fault(run_id, e, "failed to finish run");
     }
+}
+
+/// Log a store failure the scheduler swallows: the class and the cause
+/// kind at ERROR, and the driver's text, which can quote paths and
+/// diagnostics, at DEBUG only (ADR-0040, amended 2026-11-08).
+fn log_store_fault(run_id: i64, err: crate::store::StoreError, what: &'static str) {
+    tracing::debug!(event_type = "scheduler_error", run_id, error = %err, "{what}");
+    let fault = ServerError::from(err);
+    tracing::error!(
+        event_type = "scheduler_error",
+        run_id,
+        error_class = fault.error_class(),
+        cause_kind = fault.cause_kind().as_str(),
+        "{what}"
+    );
 }
 
 /// Persist a successful run's result, then reconcile the parquet file on disk
@@ -608,28 +640,27 @@ pub(crate) async fn finish_run_or_recover(
             // Err even though the row was written to status='success' with
             // result_path set. So the parquet must not be deleted here —
             // recovery flips the row only while it is still 'running'.
-            tracing::error!(
-                event_type = "scheduler_error",
-                run_id,
-                error = %e,
-                result_path = result_path.unwrap_or("(blob)"),
-                "failed to finish run (ambiguous commit); recovering via guarded flip"
-            );
             recover_ambiguous_finish(
                 schedule_store,
                 base_dir,
                 run_id,
                 duration_ms,
                 result_path,
-                &e,
+                e,
             )
             .await;
         }
     }
 }
 
+/// The text a run row stores when its result could not be persisted. The
+/// store's error is not part of it: its text is the driver's, which the run's
+/// readers never see (ADR-0046, amended 2026-11-08).
+const RESULT_PERSISTENCE_FAILED: &str = "result persistence failed";
+
 /// Recover from an ambiguous `finish_run` commit and reconcile the parquet on
-/// disk, without ever destroying a success that actually committed.
+/// disk, without ever destroying a success that actually committed. `err` is
+/// the ambiguous commit's failure, which is logged and never stored.
 ///
 /// Guarded state transition: flip the row to `error` only while it is still
 /// `running`. If the success commit actually landed (status is already
@@ -652,14 +683,25 @@ pub(crate) async fn recover_ambiguous_finish(
     run_id: i64,
     duration_ms: u64,
     result_path: Option<&str>,
-    err: &crate::store::StoreError,
+    err: crate::store::StoreError,
 ) {
+    tracing::debug!(
+        event_type = "scheduler_error",
+        run_id,
+        error = %err,
+        "failed to finish run (ambiguous commit); recovering via guarded flip"
+    );
+    let fault = ServerError::from(err);
+    tracing::error!(
+        event_type = "scheduler_error",
+        run_id,
+        error_class = fault.error_class(),
+        cause_kind = fault.cause_kind().as_str(),
+        result_path = result_path.unwrap_or("(blob)"),
+        "failed to finish run (ambiguous commit); recovering via guarded flip"
+    );
     match schedule_store
-        .fail_run_if_running(
-            run_id,
-            duration_ms,
-            &format!("result persistence failed: {err}"),
-        )
+        .fail_run_if_running(run_id, duration_ms, RESULT_PERSISTENCE_FAILED)
         .await
     {
         Ok(FlipOutcome::FlippedToError) => {
@@ -675,14 +717,11 @@ pub(crate) async fn recover_ambiguous_finish(
             }
         }
         Ok(FlipOutcome::NotRunning) => {}
-        Err(e2) => {
-            tracing::error!(
-                event_type = "scheduler_error",
-                run_id,
-                error = %e2,
-                "failed to flip wedged run to error; run stays stuck until restart"
-            );
-        }
+        Err(e2) => log_store_fault(
+            run_id,
+            e2,
+            "failed to flip wedged run to error; run stays stuck until restart",
+        ),
     }
 }
 
@@ -872,12 +911,16 @@ pub(crate) fn decode_result_blob(blob: Option<Vec<u8>>) -> Option<trawl_api::val
 /// tested in `tests/store_pg.rs`; these tests pin the file-cleanup decision the
 /// store outcome alone doesn't prove (swapping the arms would leak files or
 /// destroy committed results with the store tests still green). The Err/Err
-/// double-fault arm needs fault injection and stays uncovered.
+/// double-fault arm is driven through a closed pool, for its events only.
 #[cfg(test)]
 mod pg_tests {
     use sqlx::PgPool;
 
-    use super::{finish_run_or_recover, recover_ambiguous_finish};
+    use super::{
+        RESULT_PERSISTENCE_FAILED, finish_run_or_recover, record_failed_run,
+        recover_ambiguous_finish,
+    };
+    use crate::error::ServerError;
     use crate::store::{RunClaim, RunStatus, SavedQueryStore, ScheduleStore, StoreError};
 
     /// Seed a saved query + schedule + started (`running`) run, returning the
@@ -963,7 +1006,7 @@ mod pg_tests {
         touch(base, rel);
 
         let err = StoreError::Validation("boom".to_owned());
-        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), &err).await;
+        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), err).await;
 
         assert!(
             !exists(base, rel),
@@ -992,7 +1035,7 @@ mod pg_tests {
             .unwrap();
 
         let err = StoreError::Validation("boom".to_owned());
-        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), &err).await;
+        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), err).await;
 
         assert!(
             exists(base, rel),
@@ -1006,6 +1049,243 @@ mod pg_tests {
         );
         assert_eq!(run.result_path.as_deref(), Some(rel));
         assert_eq!(run.row_count, Some(7));
+    }
+
+    const MARKER: &str = "/var/lib/trawl/data/MARKER-sched/prod/x.parquet";
+
+    /// The run as both runs reads serve it: the run itself, and the saved
+    /// query's run list.
+    async fn read_back(
+        store: &ScheduleStore,
+        saved_id: i64,
+        rid: i64,
+    ) -> Vec<crate::store::ReportRun> {
+        let one = store.get_run(rid, 1).await.unwrap().unwrap();
+        let listed = store
+            .list_runs(saved_id, 1, 50, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == rid)
+            .expect("the run is listed");
+        vec![one, listed]
+    }
+
+    /// A run that fails in `DuckDB` stores the public message the wire
+    /// sends, not the driver's or the `io::Error`'s text (ADR-0046,
+    /// amended 2026-11-08).
+    #[sqlx::test]
+    async fn scheduled_execution_errors_store_the_public_message(pool: PgPool) {
+        use trawl_engine::error::EngineError;
+
+        let failures = [
+            (
+                "database",
+                ServerError::Engine(EngineError::Database(duckdb::Error::InvalidColumnName(
+                    MARKER.into(),
+                ))),
+            ),
+            (
+                "io",
+                ServerError::Engine(EngineError::Io(std::io::Error::other(MARKER))),
+            ),
+        ];
+        for (name, failure) in failures {
+            let (store, saved_id, rid) = seed_run(&pool, name).await;
+            let status = record_failed_run(&store, rid, 9, &failure).await;
+            assert_eq!(status, RunStatus::Error, "{name}");
+            for run in read_back(&store, saved_id, rid).await {
+                assert_eq!(run.status, RunStatus::Error, "{name}: {run:?}");
+                assert_eq!(
+                    run.error_message.as_deref(),
+                    Some("query execution failed"),
+                    "{name}: {run:?}"
+                );
+                assert_eq!(
+                    run.error_message,
+                    Some(failure.safe_message()),
+                    "{name}: the row and the wire carry one message"
+                );
+                assert!(!format!("{run:?}").contains("MARKER"), "{name}: {run:?}");
+            }
+        }
+    }
+
+    /// A run whose result persistence failed stores a fixed summary, never
+    /// the store driver's text.
+    #[sqlx::test]
+    async fn scheduled_persistence_recovery_stores_a_fixed_summary(pool: PgPool) {
+        let (store, saved_id, rid) = seed_run(&pool, "persistence").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let rel = "scheduled/persistence/run.parquet";
+        touch(base, rel);
+
+        let err = StoreError::Unavailable(sqlx::Error::Protocol(MARKER.into()));
+        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), err).await;
+
+        assert!(!exists(base, rel), "the flipped run's file is removed");
+        for run in read_back(&store, saved_id, rid).await {
+            assert_eq!(run.status, RunStatus::Error, "{run:?}");
+            assert_eq!(
+                run.error_message.as_deref(),
+                Some(RESULT_PERSISTENCE_FAILED),
+                "{run:?}"
+            );
+            assert!(!format!("{run:?}").contains("MARKER"), "{run:?}");
+        }
+    }
+
+    #[derive(Debug)]
+    struct LoggedEvent {
+        level: tracing::Level,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    struct EventFields<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for EventFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct EventLog(std::sync::Arc<std::sync::Mutex<Vec<LoggedEvent>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLog {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::HashMap::new();
+            event.record(&mut EventFields(&mut fields));
+            self.0.lock().unwrap().push(LoggedEvent {
+                level: *event.metadata().level(),
+                fields,
+            });
+        }
+    }
+
+    /// Every event `work` emits on this thread, at every level.
+    async fn events_of(work: impl std::future::Future<Output = ()>) -> Vec<LoggedEvent> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let log = EventLog::default();
+        let capturing =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        work.await;
+        drop(capturing);
+        std::mem::take(&mut *log.0.lock().unwrap())
+    }
+
+    /// The scheduler's store-fault events say which failure it was and
+    /// what it came from, at ERROR, and keep the driver's text at DEBUG
+    /// only (ADR-0040, amended 2026-11-08). The ambiguous commit is driven
+    /// with a planted marker; a failed finish and a failed flip run
+    /// against a closed pool, whose own text must stay at DEBUG too.
+    #[sqlx::test]
+    async fn scheduler_fault_events_carry_no_error_text(pool: PgPool) {
+        use tracing::Level;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap().to_owned();
+        let planted = || StoreError::Unavailable(sqlx::Error::Protocol(MARKER.into()));
+        let fields_of = |e: StoreError| {
+            let fault = ServerError::from(e);
+            (fault.error_class(), fault.cause_kind().as_str())
+        };
+        let ambiguous = fields_of(planted());
+        let closed_pool = fields_of(StoreError::Unavailable(sqlx::Error::PoolClosed));
+
+        let (store, _, ambiguous_run) = seed_run(&pool, "ambiguous").await;
+        let (_, _, finish_run) = seed_run(&pool, "finish").await;
+        let (_, _, flip_run) = seed_run(&pool, "flip").await;
+
+        let ambiguous_events = events_of(recover_ambiguous_finish(
+            &store,
+            &base,
+            ambiguous_run,
+            5,
+            None,
+            planted(),
+        ))
+        .await;
+        // The rest run against the store with its pool closed, so its
+        // writes fail with a real driver error.
+        pool.close().await;
+        let closed = store;
+
+        let cases = [
+            ("ambiguous commit", vec![ambiguous], ambiguous_events),
+            (
+                "failed finish",
+                vec![closed_pool],
+                events_of(async {
+                    let failure = ServerError::Engine(trawl_engine::error::EngineError::Io(
+                        std::io::Error::other(MARKER),
+                    ));
+                    record_failed_run(&closed, finish_run, 5, &failure).await;
+                })
+                .await,
+            ),
+            (
+                "failed flip",
+                vec![ambiguous, closed_pool],
+                events_of(recover_ambiguous_finish(
+                    &closed,
+                    &base,
+                    flip_run,
+                    5,
+                    None,
+                    planted(),
+                ))
+                .await,
+            ),
+        ];
+
+        for (label, expected, events) in cases {
+            let faults: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    e.level == Level::ERROR
+                        && e.fields.get("event_type").map(String::as_str) == Some("scheduler_error")
+                })
+                .map(|e| {
+                    (
+                        e.fields.get("error_class").map_or("", String::as_str),
+                        e.fields.get("cause_kind").map_or("", String::as_str),
+                    )
+                })
+                .collect();
+            assert_eq!(faults, expected, "{label}: {events:?}");
+            for event in events
+                .iter()
+                .filter(|e| [Level::INFO, Level::WARN, Level::ERROR].contains(&e.level))
+            {
+                assert!(!event.fields.contains_key("error"), "{label}: {event:?}");
+                for (field, value) in &event.fields {
+                    assert!(
+                        !value.contains("MARKER"),
+                        "{label}: {field} carries the error's text at {}: {value}",
+                        event.level
+                    );
+                }
+            }
+            let texts = events
+                .iter()
+                .filter(|e| e.level == Level::DEBUG && e.fields.contains_key("error"))
+                .count();
+            assert_eq!(
+                texts,
+                expected.len(),
+                "{label}: each fault's text is kept at DEBUG: {events:?}"
+            );
+        }
     }
 }
 
@@ -1213,7 +1493,8 @@ mod tests {
     /// A scheduled run times itself: one `query_timing` of kind
     /// `scheduled` per run, keyed by its `query_id` and `run_id`, whose
     /// id the lifecycle events carry too. A failed run's event says its
-    /// class and never its text, which only the run record keeps.
+    /// class and never its text. The run row stores the error's public
+    /// message, which for an emit error names the caller's function.
     #[sqlx::test]
     async fn scheduled_run_emits_query_timing_and_no_error_text(pool: sqlx::PgPool) {
         use std::collections::HashMap;
@@ -1341,7 +1622,7 @@ mod tests {
             run.error_message
                 .as_deref()
                 .is_some_and(|m| m.contains("zz_sched_needle")),
-            "the run record keeps the text: {run:?}"
+            "the run row stores the public message, which names the emit error's function: {run:?}"
         );
     }
 
