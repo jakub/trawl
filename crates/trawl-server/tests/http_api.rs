@@ -3647,13 +3647,19 @@ impl Outcomes {
 /// no one else. It leaves `active` when it answers, and `recent` holds it
 /// once, with the rows its body holds.
 ///
-/// `TEST_QUERY_DELAY_MS` holds each export's worker past its work start, so
-/// every export is still running while the lists are read. Three exports
-/// on a two-permit pool also list the one still waiting for a permit: the
-/// listing starts before the pool does.
+/// This server's pool parks each export's worker at its work start until
+/// both lists are read, so no export can answer first however slow the
+/// runner; `TEST_QUERY_DELAY_MS` then holds each one past the release.
+/// Three exports on a two-permit pool also list the one still waiting for
+/// a permit: the listing starts before the pool does.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_running_export_is_listed() {
+    use trawl_server::pool::seam::Seam;
+
     let server = setup_with_rate_limit(permissive()).await;
+    // Dropped on every path, which releases every worker it parked.
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
     let store = KeyStore::from_pool(server.fleet_pool.clone());
     let key = store
         .create_key(
@@ -3710,6 +3716,7 @@ async fn a_running_export_is_listed() {
         assert!(!theirs[0].own, "{format}: another key does not own it");
         ids.push(id);
     }
+    started.release();
 
     let mut bodies = Vec::new();
     for (run, (_, format)) in running.into_iter().zip(&exports) {
@@ -3749,14 +3756,20 @@ async fn a_running_export_is_listed() {
 /// included. A cancelled export answers an error and closes its tracker
 /// entry once, with the message its caller read.
 ///
-/// `TEST_QUERY_DELAY_MS` holds each export running, as
+/// This server's pool parks each round's workers at their work start until
+/// both cancels land, so neither export can answer first however slow the
+/// runner; `TEST_QUERY_DELAY_MS` then holds each one past the release, as
 /// `cancel_query_isolated_by_key_id_not_name` holds a query. A cancel that
 /// lands before the pool registers the work is a no-op, so each cancel
 /// retries until the pool reports it.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // three formats, four keys, two cancels each
 async fn a_running_export_is_cancellable_by_its_owner() {
+    use trawl_server::pool::seam::Seam;
+
     let server = setup_with_rate_limit(permissive()).await;
+    // Dropped on every path, which releases every worker it parked.
+    let seams = server.state.query.pool.seams();
     let store = KeyStore::from_pool(server.fleet_pool.clone());
     let twin = async || {
         store
@@ -3782,6 +3795,7 @@ async fn a_running_export_is_cancellable_by_its_owner() {
         // A's export, which A cancels, and X's, which the admin cancels.
         let owned = format!("service=nginx | head {}", 300 + round);
         let foreign = format!("service=nginx | head {}", 310 + round);
+        let started = seams.hold(Seam::Started);
         let spawn = |client: &HttpClient, dsl: &str| {
             let (client, dsl, format) = (client.clone(), dsl.to_owned(), format.clone());
             tokio::spawn(async move { client.export(&dsl, format, None).await })
@@ -3824,6 +3838,7 @@ async fn a_running_export_is_cancellable_by_its_owner() {
 
         cancel_until_cancelled(&a, owned_id).await;
         cancel_until_cancelled(&admin, foreign_id).await;
+        started.release();
 
         for (run, id, dsl) in [
             (owned_run, owned_id, &owned),
@@ -4240,12 +4255,20 @@ async fn exports_are_counted_once() {
 /// already in recent history while the write waits, and the server logs
 /// `history_error` at WARN with the store's error class alone. A stalled
 /// write is cut at the request's original deadline and not past it.
+///
+/// The stalled exports first spend `HOLD` of their `BUDGET` parked at
+/// their work start, so the write begins with only the rest of the budget
+/// left. Cut at the original deadline, each answers about `BUDGET` in,
+/// under the `BUDGET` + 1s bound below. A write given a fresh full budget
+/// would answer about `HOLD + BUDGET` in, 2s past that bound.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // a failed store, then a stalled one
 async fn export_history_failure_keeps_the_body() {
     use sqlx::{Connection as _, Executor as _};
+    use trawl_server::pool::seam::Seam;
 
-    const BUDGET: Duration = Duration::from_secs(3);
+    const BUDGET: Duration = Duration::from_secs(6);
+    const HOLD: Duration = Duration::from_secs(3);
     let (capture, _turn) = telemetry::timing().await;
     let server = setup_with_query_timeout(permissive(), BUDGET.as_secs()).await;
     let store = KeyStore::from_pool(server.fleet_pool.clone());
@@ -4309,6 +4332,10 @@ async fn export_history_failure_keeps_the_body() {
     let dsls: Vec<_> = (0..EXPORT_FORMATS.len())
         .map(|round| format!("service=nginx | head {}", 410 + round))
         .collect();
+    // Dropped on every path, which releases every worker it parked.
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
+    let held_from = tokio::time::Instant::now();
     let runs: Vec<_> = EXPORT_FORMATS
         .into_iter()
         .zip(&dsls)
@@ -4321,6 +4348,9 @@ async fn export_history_failure_keeps_the_body() {
             })
         })
         .collect();
+    until("an export's work started", || started.arrivals() > 0).await;
+    tokio::time::sleep_until(held_from + HOLD).await;
+    started.release();
     // An insert waiting on the lock belongs to an export whose body was
     // ready, so its success is already recorded.
     let waiting: i64 = tokio::time::timeout(Duration::from_secs(30), async {
@@ -4355,6 +4385,10 @@ async fn export_history_failure_keeps_the_body() {
             panic!("{format}: a stalled history write failed the export: {e:?}")
         });
         assert_eq!(export_rows(&format, &body), 2, "{format}: every row");
+        assert!(
+            elapsed + Duration::from_millis(500) >= HOLD,
+            "{format}: answered {elapsed:?} in, before its {HOLD:?} hold ended"
+        );
         assert!(
             elapsed < BUDGET + Duration::from_secs(1),
             "{format}: answered {elapsed:?} in, past its {BUDGET:?} budget"
