@@ -1,0 +1,11 @@
+---
+source: crates/trawl-cli/src/tui/ui/panels.rs
+assertion_line: 1760
+expression: all
+---
+3 rows                                                                                    
+service           message_header_that_is_well_o…  count                                   
+──────────────────────────────────────────────────────────────────────────────────────────
+日本語フィールド  résumé_ñ                        7001                                    
+web               xxxxxxxxxxxxxxxxxxxxxxxxxxxxx…  7022                                    
+éé                ❤️ ok                           7333
