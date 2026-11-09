@@ -1028,7 +1028,7 @@ fn collect_catalog_metadata(
 
         for ancestor in path.ancestors().skip(1) {
             if let Some(name) = ancestor.file_name().and_then(|n| n.to_str())
-                && is_date_dir(name)
+                && crate::env_dirs::parse_date(name).is_some()
             {
                 dates.insert(name.to_owned());
                 break;
@@ -1042,16 +1042,6 @@ fn collect_catalog_metadata(
     let file_count = u64::try_from(entries.len()).unwrap_or(0);
 
     (earliest, latest, total_bytes, services, file_count)
-}
-
-/// Check if a directory name looks like YYYY-MM-DD.
-fn is_date_dir(name: &str) -> bool {
-    name.len() == 10
-        && name.as_bytes()[4] == b'-'
-        && name.as_bytes()[7] == b'-'
-        && name[..4].bytes().all(|b| b.is_ascii_digit())
-        && name[5..7].bytes().all(|b| b.is_ascii_digit())
-        && name[8..10].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// One unit of retained work as a given reader may see it (ADR-0024).

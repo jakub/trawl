@@ -58,10 +58,6 @@ pub(crate) fn date_name(date: NaiveDate) -> String {
 }
 
 /// The name of an hour directory, `00` to `23`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the walkers adopt the builders next")
-)]
 pub(crate) fn hour_name(hour: u8) -> String {
     debug_assert!(hour <= 23, "hour {hour} has no directory");
     format!("{hour:02}")
@@ -94,28 +90,16 @@ pub(crate) fn parse_hour(name: &str) -> Option<u8> {
 }
 
 /// `date`'s directory under the env directory `env_root`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the walkers adopt the builders next")
-)]
 pub(crate) fn day_dir(env_root: &Path, date: NaiveDate) -> PathBuf {
     env_root.join(date_name(date))
 }
 
 /// The hour directory of `date` and `hour` under `env_root`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the walkers adopt the builders next")
-)]
 pub(crate) fn hour_dir(env_root: &Path, date: NaiveDate, hour: u8) -> PathBuf {
     day_dir(env_root, date).join(hour_name(hour))
 }
 
 /// The hourly file `service` writes for `date` and `hour` under `env_root`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the walkers adopt the builders next")
-)]
 pub(crate) fn hourly_file(env_root: &Path, date: NaiveDate, hour: u8, service: &str) -> PathBuf {
     hour_dir(env_root, date, hour).join(format!("{service}{PARQUET_EXTENSION}"))
 }

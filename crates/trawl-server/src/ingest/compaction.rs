@@ -19,7 +19,10 @@ use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb
 use trawl_core::severity::Dialect;
 
 use crate::catalog::CatalogContext;
-use crate::env_dirs::{list_env_dirs, try_list_env_dirs_observed};
+use crate::env_dirs::{
+    date_name, hour_dir, hourly_file, list_env_dirs, parse_date, parse_hour,
+    try_list_env_dirs_observed,
+};
 use crate::hot_buffer::{AdmissionState, HotBuffer};
 use crate::ingest::coverage_proof;
 use crate::ingest::no_follow;
@@ -1340,7 +1343,7 @@ fn rollup_waits(
     claims: &PublicationClaims,
     publication: Option<&PublicationGate>,
 ) -> bool {
-    let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok();
+    let day = parse_date(date);
     if day.is_some_and(|day| claims.claims_service_day(env, day, service)) {
         log_rollup_blocked(env, date, service);
         return true;
@@ -1404,7 +1407,7 @@ fn historical_rollup_date(path: &Path, today: &str) -> Option<String> {
         return None;
     }
     let name = path.file_name()?.to_str()?;
-    (name != today && looks_like_date(name)).then(|| name.to_owned())
+    (name != today && parse_date(name).is_some()).then(|| name.to_owned())
 }
 
 /// Roll up one env root (`data_dir/{env}`): consolidate each historical
@@ -1421,7 +1424,7 @@ async fn rollup_env_once(
     repin: Option<&Arc<RepinCoordinator>>,
     publication: Option<Arc<PublicationGate>>,
 ) -> Result<u64, String> {
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = date_name(chrono::Utc::now().date_naive());
     let mut failures: u64 = 0;
     let mut quarantined_total: u64 = 0;
 
@@ -1588,15 +1591,7 @@ async fn rollup_unit_blocking(
     })
 }
 
-/// Check if a directory name looks like a date (YYYY-MM-DD).
-fn looks_like_date(name: &str) -> bool {
-    name.len() == 10
-        && name.as_bytes().get(4) == Some(&b'-')
-        && name.as_bytes().get(7) == Some(&b'-')
-        && name[..4].bytes().all(|b| b.is_ascii_digit())
-}
-
-/// Collect subdirectories that look like hour directories (00-23).
+/// Collect the hour directories (`00` to `23`) of a day directory.
 fn collect_hour_dirs(day_dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(day_dir) {
         Ok(entries) => entries,
@@ -1631,7 +1626,7 @@ fn collect_hour_dirs(day_dir: &Path) -> Vec<PathBuf> {
             };
             if metadata.is_dir() {
                 let name = p.file_name()?.to_str()?;
-                if name.len() == 2 && name.bytes().all(|b| b.is_ascii_digit()) {
+                if parse_hour(name).is_some() {
                     return Some(p);
                 }
             }
@@ -1998,7 +1993,7 @@ fn log_rollup_unresolved(day_dir: &Path, service: &str, proof: rollup_marker::Pr
     let date = day_dir
         .file_name()
         .and_then(|name| name.to_str())
-        .filter(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok())
+        .filter(|date| parse_date(date).is_some())
         .unwrap_or(INVALID);
     let env = day_dir
         .parent()
@@ -4783,15 +4778,14 @@ fn write_output(
     let now = chrono::Utc::now();
     let date = now.date_naive();
     let hour = u8::try_from(now.hour()).map_err(|e| format!("hour out of range: {e}"))?;
-    let day_dir = data_dir.join(date.format("%Y-%m-%d").to_string());
-    let output_dir = day_dir.join(format!("{hour:02}"));
+    let output_dir = hour_dir(data_dir, date, hour);
 
     std::fs::create_dir_all(&output_dir)
         .map_err(|e| format!("failed to create output dir: {e}"))?;
 
     // Canonical filename: one parquet file per service per hour-directory.
     // Merge with existing data if present, then atomic-rename into place.
-    let canonical_path = output_dir.join(format!("{service}.parquet"));
+    let canonical_path = hourly_file(data_dir, date, hour, service);
     let tmp_path = output_dir.join(format!("{service}.parquet.tmp"));
 
     let merged = canonical_path.exists();
@@ -5155,7 +5149,7 @@ fn cleanup_stale_tmp_files(
         let date = day_path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| chrono::NaiveDate::parse_from_str(name, "%Y-%m-%d").ok());
+            .and_then(parse_date);
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -5163,8 +5157,7 @@ fn cleanup_stale_tmp_files(
                 let hour = path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .filter(|name| name.len() == 2)
-                    .and_then(|name| name.parse::<u8>().ok());
+                    .and_then(parse_hour);
                 let claimed = |service: &str| match (date, hour) {
                     (Some(date), Some(hour)) => claims.claims_output(env, date, hour, service),
                     // A marker only ever names a valid date and hour.
@@ -10382,18 +10375,41 @@ mod tests {
         assert!(!stale.exists(), "day-level stale .tmp should be removed");
     }
 
-    #[test]
-    fn looks_like_date_valid() {
-        assert!(looks_like_date("2026-02-13"));
-        assert!(looks_like_date("2025-01-01"));
-    }
+    /// An hour directory the writer never produces, `24/` or `99/`, is not
+    /// an hour: daily rollup leaves its file on disk and out of the merge,
+    /// and canonical attribution does not count it either.
+    #[tokio::test]
+    async fn rollup_skips_noncanonical_hour_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env_data = data.join("prod");
+        let day = "2026-01-15";
+        let row = |message: &str| {
+            format!(
+                r#"{{"_time":"{day}T07:00:00Z","_ingested":"{day}T07:00:00Z","service":"svc","message":"{message}"}}"#
+            )
+        };
+        let hourly = write_hourly_parquet(&env_data, day, "07", "svc", &[&row("hourly")]);
+        let strays: Vec<PathBuf> = ["24", "99"]
+            .into_iter()
+            .map(|hour| write_hourly_parquet(&env_data, day, hour, "svc", &[&row("stray")]))
+            .collect();
+        for stray in &strays {
+            assert!(
+                crate::env_dirs::layout_path(&data, stray).is_none(),
+                "{} is not a layout path",
+                stray.display()
+            );
+        }
 
-    #[test]
-    fn looks_like_date_invalid() {
-        assert!(!looks_like_date("wal"));
-        assert!(!looks_like_date("00"));
-        assert!(!looks_like_date("2026-1-01"));
-        assert!(!looks_like_date(""));
+        rollup_env_unclaimed(&env_data).await.unwrap();
+
+        let daily = env_data.join(day).join("svc.parquet");
+        assert_eq!(read_strings(&daily, "message"), ["hourly"]);
+        assert!(!hourly.exists(), "the real hour's file was rolled up");
+        for stray in &strays {
+            assert!(stray.exists(), "{} was left on disk", stray.display());
+        }
     }
 
     /// Helper: create a parquet file with the given rows in a specific hour-dir.

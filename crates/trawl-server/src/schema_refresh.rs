@@ -379,22 +379,12 @@ fn build_service_schema(
 fn find_date_ancestor(path: &Path) -> Option<String> {
     for ancestor in path.ancestors().skip(1) {
         if let Some(name) = ancestor.file_name().and_then(|n| n.to_str())
-            && is_date_dir(name)
+            && crate::env_dirs::parse_date(name).is_some()
         {
             return Some(name.to_owned());
         }
     }
     None
-}
-
-/// Check if a directory name looks like YYYY-MM-DD.
-fn is_date_dir(name: &str) -> bool {
-    name.len() == 10
-        && name.as_bytes()[4] == b'-'
-        && name.as_bytes()[7] == b'-'
-        && name[..4].bytes().all(|b| b.is_ascii_digit())
-        && name[5..7].bytes().all(|b| b.is_ascii_digit())
-        && name[8..10].bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(test)]
