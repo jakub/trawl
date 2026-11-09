@@ -98,7 +98,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # change the protocol revisions it negotiates. Default features are off:
 # they pull base64 0.23 and the tool macros, and trawl uses neither.
 # `server` brings schemars and `transport-io` the stdio pipes.
-rmcp = { version = "=3.7.0", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = { version = "1", features = ["std"] }
