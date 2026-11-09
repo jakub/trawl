@@ -5,9 +5,15 @@
 //! Visible-page polling for Jobs. Reads are serialized; a newer intent makes
 //! the pending response obsolete and queues one fresh read. Last good data
 //! remains available through transport failures.
-//! An eligible 401 replaces the page with sign-in carrying its current URL;
-//! disposed or superseded reads must pass the lifetime checks first.
+//! An eligible 401 goes to the shared sign-in handler, which replaces the
+//! page with sign-in carrying its current URL; disposed or superseded
+//! reads must pass the lifetime checks first. Polling stops only when
+//! navigation started. A declined 401 (an explicit logout is pending, or
+//! another redirect started first) keeps polling, so a failed logout
+//! still lets the next 401 sign in, and settles on the session-ended
+//! sentence.
 use crate::api::ApiError;
+use crate::auth_return::sign_in_if_unauthorized;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::{cell::Cell, future::Future, rc::Rc};
@@ -99,11 +105,10 @@ where
                 refresh.run(());
                 return;
             }
-            if matches!(result, Err(ApiError::Unauthorized { .. })) {
-                if crate::auth_return::redirect_to_login() {
-                    live.set(false);
-                    timer.update_value(|t| *t = None);
-                }
+            let signing_in = result.as_ref().err().and_then(sign_in_if_unauthorized);
+            if signing_in == Some(true) {
+                live.set(false);
+                timer.update_value(|t| *t = None);
                 return;
             }
             match result {
@@ -117,11 +122,8 @@ where
                     restore_focus_after_refresh(focused, live, desired, generation, active);
                 }
                 Err(e) => {
-                    error.set(Some(if matches!(data.get_untracked(), Some(Ok(_))) {
-                        "Refresh failed. Showing the last available data; retrying automatically."
-                    } else {
-                        "Could not load data. Retrying automatically."
-                    }.into()));
+                    let held = matches!(data.get_untracked(), Some(Ok(_)));
+                    error.set(refresh_failure(&e, signing_in == Some(false), held));
                     if data.get_untracked().is_none() {
                         data.set(Some(Err(e)));
                     }
@@ -130,6 +132,21 @@ where
         });
     });
     (data, error, refresh)
+}
+
+/// The refresh line after a failed read. `declined` is a 401 the sign-in
+/// handler declined; `held` says the page still shows earlier data.
+fn refresh_failure(error: &ApiError, declined: bool, held: bool) -> Option<String> {
+    match (declined, held) {
+        // With no data, the page's own failure state shows the
+        // session-ended sentence; once is enough.
+        (true, false) => None,
+        (true, true) => Some(error.to_string()),
+        (false, true) => {
+            Some("Refresh failed. Showing the last available data; retrying automatically.".into())
+        }
+        (false, false) => Some("Could not load data. Retrying automatically.".into()),
+    }
 }
 
 fn restore_focus_after_refresh(

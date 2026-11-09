@@ -45,6 +45,7 @@ use leptos::task::spawn_local;
 use trawl_api::investigations::{InvestigationId, PURPOSE_MAX_BYTES};
 
 use crate::api;
+use crate::components::read_turn::ReadTurn;
 use crate::query_merge::{CaptureParts, RangeSpec};
 use crate::send_investigation::{
     Choice, SendFailure, SendPlan, SendSnapshot, busy_copy, open_choices, plan, purpose,
@@ -155,7 +156,9 @@ pub fn SendToInvestigation(
         let alive = Arc::clone(&alive);
         spawn_local(async move {
             let read = api::capabilities().await;
-            if alive.load(Ordering::Acquire) {
+            // One read per dialog: a living dialog's answer is current. A
+            // declined 401 leaves the limit unknown.
+            if alive.load(Ordering::Acquire) && !crate::auth_return::leaves_for_sign_in(&read) {
                 let _ = span_limit.try_set(match read {
                     Ok(capabilities) => SpanLimit::Known(capabilities.bounds.max_span_secs),
                     Err(_) => SpanLimit::Unknown,
@@ -164,14 +167,22 @@ pub fn SendToInvestigation(
         });
     }
 
+    // Each listing takes the next turn; only the newest may land, and
+    // only it may send the page to sign-in. A declined 401 is a failed
+    // listing.
+    let choices_turn = ReadTurn::new();
     let load_choices = {
         let alive = Arc::clone(&alive);
         move || {
             choices.set(Choices::Loading);
             let alive = Arc::clone(&alive);
+            let turn = choices_turn.begin();
             spawn_local(async move {
                 let listed = api::list_investigations().await;
-                if !alive.load(Ordering::Acquire) {
+                if !alive.load(Ordering::Acquire)
+                    || !choices_turn.is_current(turn)
+                    || crate::auth_return::leaves_for_sign_in(&listed)
+                {
                     return;
                 }
                 let open = match listed {

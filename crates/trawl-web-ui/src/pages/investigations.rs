@@ -94,6 +94,7 @@ use trawl_api::investigations::{
 use wasm_bindgen::{JsCast, closure::Closure};
 
 use crate::api::{self, ApiError};
+use crate::auth_return::leaves_for_sign_in;
 use crate::components::evidence_drawer::{EvidenceDrawer, KeepGate, Opened};
 use crate::evidence_queue::{EvidenceQueue, Next, Paced, wait_ms};
 use crate::investigation_live::{
@@ -134,16 +135,6 @@ fn NotPermitted() -> impl IntoView {
             <p class="inv-denied" role="status">{NOT_PERMITTED}</p>
         </div>
     }
-}
-
-/// A read refused with 401 sends the page to sign-in, carrying its URL,
-/// through the shared handler.
-fn sign_in_if_unauthorized<T>(result: &Result<T, ApiError>) -> bool {
-    result
-        .as_ref()
-        .err()
-        .and_then(crate::auth_return::sign_in_if_unauthorized)
-        .is_some()
 }
 
 /// Whether the server refused a read for want of a grant.
@@ -189,7 +180,7 @@ fn InvestigationList() -> impl IntoView {
         busy.set(true);
         spawn_local(async move {
             let result = api::list_investigations().await;
-            if generation.try_get_untracked() != Some(mine) || sign_in_if_unauthorized(&result) {
+            if generation.try_get_untracked() != Some(mine) || leaves_for_sign_in(&result) {
                 return;
             }
             match result {
@@ -466,7 +457,7 @@ impl EvidenceReads {
             if self.queue.try_update_value(|q| q.settled(&reference)) != Some(true) {
                 return;
             }
-            if sign_in_if_unauthorized(&result) {
+            if leaves_for_sign_in(&result) {
                 return;
             }
             let state = match result {
@@ -898,7 +889,7 @@ impl BoardReads {
                     }
                     Paced::Answered(result) => result,
                 };
-                if sign_in_if_unauthorized(&result) {
+                if leaves_for_sign_in(&result) {
                     self.unauthorized();
                     return;
                 }
@@ -976,7 +967,7 @@ impl BoardReads {
             let (end, added) = match paced {
                 Paced::Throttled { retry_after_ms } => (ReadEnd::Throttled { retry_after_ms }, 0),
                 Paced::Answered(result) => {
-                    if sign_in_if_unauthorized(&result) {
+                    if leaves_for_sign_in(&result) {
                         self.unauthorized();
                         return;
                     }

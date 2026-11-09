@@ -62,7 +62,7 @@ use trawl_api::investigations::InvestigationId;
 use trawl_api::results::ResultPage;
 use wasm_bindgen::JsCast;
 
-use crate::api::{self, ApiError};
+use crate::api;
 use crate::evidence_queue::{Paced, wait_ms};
 use crate::investigation_live::{WriteFailure, keep_reason};
 use crate::investigation_log::{
@@ -403,8 +403,9 @@ impl Reads {
                 Paced::Answered(result) => result,
             };
             self.waiting.set(false);
-            if matches!(result, Err(ApiError::Unauthorized { .. })) {
-                crate::auth_return::redirect_to_login();
+            // Past the generation check: a 401 sends the page to sign-in.
+            // A declined one fails the read with the session-ended sentence.
+            if crate::auth_return::leaves_for_sign_in(&result) {
                 return;
             }
             match result {
