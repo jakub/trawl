@@ -227,6 +227,36 @@ fn config_check_rejects_daemon_globs_without_side_effects() {
 }
 
 #[test]
+fn config_check_rejects_zero_task_periods() {
+    for (section, key) in [
+        ("ingest", "stats_interval_secs"),
+        ("ingest", "telemetry_flush_interval_secs"),
+        ("retention", "retention_interval_secs"),
+        ("scheduler", "poll_interval_secs"),
+        ("server", "schema_cache_ttl_secs"),
+        ("server", "monitor_refresh_ms"),
+    ] {
+        // `server` is already the first header, so its key goes under it.
+        let document = if section == "server" {
+            format!("[server]\n{key} = 0\n[data]\npath = '~/data'\n")
+        } else {
+            format!("[server]\n[data]\npath = '~/data'\n[{section}]\n{key} = 0\n")
+        };
+        let output = check(&document);
+        assert_eq!(output.status.code(), Some(1), "{section}.{key}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("{section}.{key} must be > 0")),
+            "{section}.{key}: {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("Configuration is valid"),
+            "{section}.{key}"
+        );
+    }
+}
+
+#[test]
 fn config_check_requires_an_explicit_config() {
     let output = command().arg("--check-config").output().unwrap();
     assert_eq!(output.status.code(), Some(2));
