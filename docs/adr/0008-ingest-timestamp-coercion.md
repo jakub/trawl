@@ -1,6 +1,6 @@
 # Malformed ingest timestamps are substituted, never fatal
 
-status: accepted (2026-07-28)
+status: accepted (2026-07-28); amended (2026-11-08): the hour directory bounds `_time` from above, see the Amendment
 
 `timestamp` is trawl's partition and sort key: compaction writes
 `data/{date}/{HH}/{service}.parquet` ordered by it, row-group min/max stats on
@@ -112,3 +112,27 @@ plain globs.
 ## Amendment: ADR-0062, 2026-11-02
 
 The hot-only route keeps only its cold-start purpose. [ADR-0062](0062-a-field-the-input-does-not-carry-reads-as-null-in-every-lane.md) deletes the missing-column carve-out that sent a binder error to hot-only and then returned an empty result. An absent field now reads as NULL, and a missing-column error that remains is a loud 400 on every lane.
+
+## Amendment (2026-11-08): the hour directory bounds `_time` from above
+
+Prep record for the untangle prep of 2026-11-08 (defect D3). ADR-0013's
+amendment of the same date holds the full record and the human's ruling.
+
+The opening paragraph calls the event time "trawl's partition and sort key".
+It is the sort key only. Compaction files each batch in the hour directory of
+its own wall clock (`ingest/compaction.rs:4783-4787`) and sorts rows by `_time`
+inside the file. The directory records when compaction wrote the file, not
+when the events happened.
+
+The invariant that `last=` pruning needs is now enforced at ingest: no stored
+row has a `_time` more than `MAX_TIME_LEAD` = 15 minutes after its arrival.
+Compaction runs at or after arrival, so every row in hour directory H has
+`_time` at most `MAX_TIME_LEAD` past the end of H. The selection padding in
+`source.rs` is checked at compile time to be at least `MAX_TIME_LEAD`. It stays one hour, so rows stored before this change with a lead under an hour stay visible to `last=`. A `_time` further ahead is replaced
+by arrival and flagged `time.ahead_of_arrival`, the same substitution this ADR
+applies to a malformed value. The "We do not reject the event" decision holds:
+the event is kept.
+
+Past rows need no bound. Compaction time is at or after `_time` for them, and a
+`last=` window always runs to now, so the walk always reaches their directory.
+Rows on disk before this amendment keep their stored `_time`.

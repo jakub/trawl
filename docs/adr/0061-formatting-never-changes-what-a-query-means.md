@@ -1,6 +1,6 @@
 # Formatting never changes what a query means
 
-status: accepted (2026-11-02), prep record for the format round-trip fix; human rulings of 2026-11-02 recorded below
+status: accepted (2026-11-02), prep record for the format round-trip fix; human rulings of 2026-11-02 recorded below; amended (2026-11-08), see the Amendment
 
 Trawl rewrites query text in several places. The web and TUI editors' Format button writes the formatted text back into the buffer. `/api/v1/validate` returns it as `formatted`, and the CLI client and the MCP server print it. `Composed::new` formats the compare and sightings queries it builds. The MCP server offers formatted queries as suggestions. ADR-0014 ruling 6, as amended by ADR-0060, promises that `format → reparse` gives the same query, proven by a property over generated ASTs.
 
@@ -80,3 +80,21 @@ Considered and rejected:
 Out of scope, and not filed by this prep: `extract kv sep="ab"` silently falls back to `=`, and unquoted `NOT @x=1` reads `NOT` as a search word. Both are parse-level meaning defects that format faithfully.
 
 The reference (`docs/src/content/docs/reference/dsl.md`, also served by the MCP server) changes with the code: the regex body rule, the time-clause placement rule, the three other new errors, and a sentence that Format removes comments. ADR-0014 ruling 6 and ADR-0060 are amended by this decision.
+
+## Amendment (2026-11-08): `last=` with an absolute bound, and an unreadable absolute bound, are refused before either lane compiles
+
+This amendment records the untangle prep of 2026-11-08 (defect D7). Ruling 2 made a time clause legal only as a top-level search token. Two more time-clause refusals now sit beside it.
+
+- **`last=` combined with `earliest=` or `latest=` is refused in both lanes.** Before this amendment the refusal lived only in the SQL emitter (`crates/trawl-core/src/emitter/search.rs:24-28`). The stream setup runs admission, which parses and calls `validate_pipeline` (`crates/trawl-server/src/admission.rs:87-93`), and never reached the emitter's check. So `/api/v1/stream` opened a live tail on text that `/api/v1/query` refused. The emitter check is removed.
+- **An `earliest=` or `latest=` clause that `compare::literal_timestamp` cannot read or represent is refused** (ADR-0017's amendment of the same date). Every clause is checked, including one that a later clause of the same kind overrides.
+
+Both refusals live in trawl-core and run before either lane compiles. Each one carries a span over the offending clause: for the combination, the later of the two clauses. `SearchStage.hoisted` already records each clause's kind and span (`crates/trawl-core/src/parser/search.rs:540-565`). `/api/v1/query`, `/api/v1/validate`, embedded emission and stream setup return the same body for one text. Whether the parser or a core validator raises them is the implementer's call, as long as the span reaches the error envelope. The web editor's local marks then agree with the server's verdict on these clauses.
+
+Last-clause-wins for valid clauses is unchanged. The canonical form is unchanged: the AST keeps each bound's written text, and the formatter prints it as written. An inverted interval stays an empty answer, not an error.
+
+Stored query text that combines `last=` with an absolute bound already failed in batch. Under this amendment it also stops opening a live tail. The Revert pair is the one this ADR names above.
+
+Considered, not adopted:
+
+- **Leave the combination refusal in the emitter and add a mirror to the stream compiler.** A second hand mirror is the defect class D12 names (`crates/trawl-core/src/stream.rs:72-90`). One check before both lanes cannot drift.
+- **Make the refusal an unspanned validation error.** `EmitError` carries no span (`crates/trawl-core/src/emitter/mod.rs:212-232`). A caret over the clause is what ruling 2 already gives the other time-clause errors.

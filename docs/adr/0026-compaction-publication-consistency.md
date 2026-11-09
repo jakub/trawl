@@ -1,5 +1,7 @@
 # Query consistency across compaction publication
 
+status: amended (2026-11-08): rollup marker discovery ignores the parent's name, and a day has 24 hour inputs, see the Amendment
+
 Queries must not count an accepted event twice because compaction moves it
 from the hot buffer to Parquet. Daily rollup must not expose both a merged
 daily file and its hourly inputs. The previous publish-then-drain ordering
@@ -90,3 +92,15 @@ reads refuse until compaction proves that the rest is covered.
 Two identical accepted events remain two events. Another process modifying
 the archive does not share this lock. Retention can still expire files,
 and corrupt files retain their existing error and quarantine policy.
+
+## Amendment (2026-11-08): rollup marker discovery ignores the parent's name
+
+Prep record for the untangle prep of 2026-11-08 (defect D13). ADR-0041's
+amendment of the same date holds the full rule.
+
+"Query-only processes also scan for unfinished markers before admitting
+reads." That scan now finds a `.rollup-` marker in any directory child of a
+valid env, not only in a child whose name parses as a date. A marker under a
+non-canonical parent refuses reads like any unresolved marker. A rollup merges
+at most 24 hourly files, `00` to `23`, and the marker reader refuses any other
+hour.

@@ -1,6 +1,6 @@
 # A query reports its phases in one timing event
 
-status: accepted (2026-09-27), prep record for slice A of query-path observability; amended (2026-10-22) by ADR-0057 and ADR-0058: four new kinds; amended (2026-10-23): the capture kind and the write phase; amended (2026-11-03) by ADR-0062: the raw-free retry is gone, and `probe` books the input-column probe
+status: accepted (2026-09-27), prep record for slice A of query-path observability; amended (2026-10-22) by ADR-0057 and ADR-0058: four new kinds; amended (2026-10-23): the capture kind and the write phase; amended (2026-11-03) by ADR-0062: the raw-free retry is gone, and `probe` books the input-column probe; amended (2026-11-08): a run record keeps the public message, see the Amendment
 
 `/metrics` shows that queries got slow, but nothing shows where a single query spent its time. The only split today is the permit wait in the opt-in query debug log. This record adds a `query_timing` event to trawld's own telemetry. The event splits each executed query into named **query phases**, so an operator finds the slow phase with the DSL. Per-operator DuckDB profiles are slice B and are out of scope here.
 
@@ -88,3 +88,11 @@ The kind enum gains `capture` ([ADR-0057](0057-a-capture-is-an-immutable-expirin
 ## Amendment: the raw-free retry is gone, 2026-11-03
 
 [ADR-0062](0062-a-field-the-input-does-not-carry-reads-as-null-in-every-lane.md) removed the `_raw`-free retry, so `fallback` loses `raw_retry` and `both` and keeps `none` and `hot_only`. The `probe` phase now also books the one input-column `DESCRIBE` each request runs before emission.
+
+## Amendment (2026-11-08): a run record keeps the public message, not the error's text
+
+The Decision's cleanup paragraph says "the run record keeps the text". The untangle prep of 2026-11-08 (defect D8) replaces that clause. A report run row stores the error's public message, the one string the wire also sends ([ADR-0040](0040-every-server-failure-names-its-request-and-stage.md), amendment of 2026-11-08). A run that fails in DuckDB with an I/O error stores `query execution failed`, not the `io::Error` text. A run whose result persistence fails stores a fixed summary, not the store driver's text. `scheduled_query_failed` keeps `error_class` and adds nothing.
+
+The clause was wrong because run rows reach readers through the runs API, and the scheduler wrote `format!("{e}")` (`scheduler.rs:475`, `:477`) and `format!("result persistence failed: {err}")` (`scheduler.rs:661`). The comment at `scheduler.rs:482-483` and the assertion message at `scheduler.rs:1344` restate the old clause and change with it.
+
+Considered, not adopted: keeping the raw text for the run's owner. A query reader who shares the run sees it too, and ADR-0040's amendment rejects an owner exception.

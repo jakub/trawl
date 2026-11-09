@@ -1,6 +1,6 @@
 # A declared event schema, and a catalog that makes column types authoritative at write time
 
-status: accepted (2026-07-29), amended (2026-07-29) after adversarial review, amended (2026-08-03) after the slice-2 implementation review — see Amendments; amended (2026-10-14): repair classes and request logging, prep record for #302
+status: accepted (2026-07-29), amended (2026-07-29) after adversarial review, amended (2026-08-03) after the slice-2 implementation review — see Amendments; amended (2026-10-14): repair classes and request logging, prep record for #302; amended (2026-11-08): one owner defines the data-root layout, see the Amendment
 
 trawl has no data model. `validate_event` requires exactly one field — `service` —
 and every other top-level JSON key becomes a physical parquet column whose type
@@ -429,3 +429,86 @@ routine or actionable, and adds `time.unparseable`, `field.name_empty` and
 and is routine. ADR-0055 also decides how trawld logs repairs per ingest
 request and how the repair metric counts a request whose WAL write partly
 failed. `trawl_ingest_repairs_total{code, service}` keeps its labels.
+
+## Amendment (2026-11-08): one owner defines the data-root layout
+
+Prep record for the untangle prep of 2026-11-08 (defect D13).
+
+The two-path-dimension decision fixed the layout
+`data/{env}/{date}/{HH}/{service}.parquet` but gave its grammar no owner.
+At `b71f9e6e` every walker carries its own recognizer, and they disagree:
+
+- Date directories: `ingest/compaction.rs:1591` and `env_dirs.rs:88` check the
+  year digits only. `source.rs:643`, `handlers.rs:1048`, `schema_refresh.rs:391`
+  and `epoch.rs:475` check the shape only, so `2026-13-45` passes.
+  `publication.rs:735`, `:789`, `ingest/compaction.rs:1343`, `:2001`, `:5158`,
+  `catalog/conform.rs:930` and `doctor/output.rs:259` parse a calendar date.
+  `ingest/publication_marker.rs:335-336` also requires the canonical spelling.
+- Hour directories: `ingest/compaction.rs:1634`, `:5162-5166`, `source.rs:693`
+  and `ingest/rollup_marker.rs:296-301` accept `00` to `99`.
+  `ingest/publication_marker.rs:332-340` accepts `00` to `23`.
+- The partition path is built in `ingest/compaction.rs:4786-4787`,
+  `ingest/publication_marker.rs:191-199` and `source.rs:580-600`, and parsed
+  back in `catalog/conform.rs:908-946`.
+- Reserved root entries are literals: `epoch.rs:323`, `epoch.rs:26`,
+  `catalog/conform.rs:106`, `repin/marker.rs:45`, `config_check.rs:164` and
+  `scheduler.rs:756`, beside `trawl_config::RESERVED_ENV_NAMES`.
+- `publication.rs:729` and `:799` spell `.rollup-` beside
+  `rollup_marker::MARKER_PREFIX`.
+- `schema_refresh.rs:187-189`, `metrics.rs:1287-1291`, `handlers.rs:1005-1007`
+  and `pool.rs:2536` recover the data root by cutting the fallback glob at its
+  first `*`, although the pool already holds it (`pool.rs:2460`).
+
+**The rule.** One layout owner defines the names and the grammar of the data
+root. It owns no IO.
+
+- **Reserved root entries** (`wal`, `scheduled`, `CATALOG`, `EPOCH`, `REPIN`,
+  the `EPOCH.next.` prefix and the repin shadow suffix) have one production
+  definition in `trawl-config`, beside `RESERVED_ENV_NAMES`. The env exclusions
+  derive from it. `trawl-server` already depends on `trawl-config`, so every
+  consumer reads the one list and no copy is tied to it by a test.
+- **A canonical date** is ten ASCII bytes `YYYY-MM-DD` that name a real
+  calendar date and that the date formats back to the same spelling. **A
+  canonical hour** is two ASCII digits, `00` to `23`. The grammar, the
+  builders for hourly and daily directories and files, and the full-path
+  parser that inverts them live in the server's layout module (`env_dirs.rs`,
+  which already claims to be the single definition, or a module beside it).
+  Every partition recognizer and path builder listed above uses them, and the
+  parser stays the inverse of the builders.
+- **Rollup marker names** come from `rollup_marker`'s helpers. No other site
+  spells the prefix.
+- **The data root** reaches every consumer from configuration through
+  `ExecutorPool::base_dir()`. No consumer derives it from a glob. That is
+  equivalent today only because `trawl-config` refuses glob metacharacters in
+  `data.path` (`data_dir_refuses_glob_metacharacters`, `lib.rs:3265`), and that
+  refusal stays.
+
+Canonical partition attribution, rollup, retention and statistics use the
+strict grammar. A non-calendar date directory and an hour directory `24` to
+`99` stop counting as partitions. Retention never deleted them, and nothing
+renames, adopts or deletes them now. Generic recursive discovery is not part
+of this rule: a query without a time clause still reads a valid date
+directory through `**`, and it may still read a stray `24/` file there.
+
+Each walker keeps its own IO, absence, cancellation and symlink policy.
+Two places need more than the strict grammar, and they have their own rules:
+epoch's owned-residue check (ADR-0036 amendment of this date) and rollup
+marker discovery (ADR-0041 amendment of this date). Issue #321 §2, the
+absence checks that skip `env_dirs::is_absent`, stays a separate change.
+
+**Considered, not adopted.**
+
+- A copy of the reserved names in the server, tied to `trawl-config` by a
+  subset test. A test finds drift only after it exists. One definition
+  removes it.
+- Moving the date grammar into `trawl-config`. Config needs the names only.
+  The grammar is server layout policy.
+- Reserving date-shaped env names. The env grammar accepts `2026-01-01` as an
+  env, and refusing it is a config change this fix does not need.
+- One shared filesystem walker. The walkers differ on purpose in how they
+  treat absence, errors and symlinks (ADR-0026, ADR-0041, ADR-0042).
+- Making generic recursive query discovery skip stray hour `24` files. It
+  would change a walker outside this rule.
+- A source-wide grep guard against `"%Y-%m-%d"` parsing. Event timestamp
+  parsing uses the same format legitimately (`ingest/envelope.rs`). A guard,
+  if any, is scoped to directory recognition.

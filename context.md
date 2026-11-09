@@ -46,6 +46,10 @@ _Avoid_: metadata, system fields, keywords
 Any field name starting with `_`. Reserved is a namespace rule, not a list: only trawl creates these names, and it is never said of `service` or the other sender-asserted slots.
 _Avoid_: internal field, special field
 
+**Time lead**:
+How far an event's `_time` is after its arrival. Ingest bounds it at 15 minutes and stores the arrival time, with the `time.ahead_of_arrival` repair, in place of a `_time` further ahead.
+_Avoid_: clock skew, future timestamp
+
 **Producer**:
 The entry point an event arrived through: http, syslog, or trawld (self-telemetry). Stamped on every event as `_producer`; senders cannot forge it.
 _Avoid_: source, door, listener
@@ -115,6 +119,12 @@ _Avoid_: replay, reload, warm-up
 **Overhang**:
 WAL that existed at boot and did not become resident in the hot buffer. While any may exist, a corpus read cannot count every acknowledged event exactly once. Overhang ends when compaction proves that none remains.
 _Avoid_: backlog (that is all surviving WAL), spill
+
+**Canonical partition**:
+An `{env}/{YYYY-MM-DD}/{HH}` directory whose date is a real calendar date in exactly that spelling and whose hour is 00 to 23. One layout owner parses and builds these names.
+
+**Reserved root entry**:
+A top-level name in the data root that trawl owns and no env may take: `wal`, `scheduled`, `CATALOG`, `EPOCH`, `REPIN`, staged `EPOCH.next.*` files and the repin shadow root. Not a reserved name, which is a field rule.
 
 **Epoch**:
 A generation of the stored data's format and meaning. Files in one epoch share the same interpretation rules.
@@ -223,6 +233,16 @@ _Avoid_: normalized query, round-trip (that names the conform guard's lossless c
 **Pattern**:
 A glob, a regex, or a `like` or `ilike` pattern in a query. A pattern is always literal text the author wrote, so its cost is known before any event arrives. An exact or quoted value is not a pattern.
 _Avoid_: computed pattern (refused), matcher, expression (that is the larger tree a pattern sits in)
+
+**Row-scalar position**:
+An expression evaluated once per row: `where`, `let`, `sort`, and a scalar call's argument. An aggregate call there is refused in both lanes.
+
+**Aggregation slot**:
+The head of a `stats`, `timechart`, `eventstats` or `pivot` aggregation. It names an aggregate; batch also takes a scalar head there, and the live lane refuses one.
+
+**Display zone**:
+The zone a client renders instants in. It is presentation only: trawld answers in UTC, and `local` means the machine running the client, read per instant.
+_Avoid_: server timezone, query timezone
 
 **Lateral expansion**:
 Additional expression work caused by substituting earlier same-stage targets, including repeated references introduced by SQL translation. Independent expressions and flat lists without such references have zero lateral expansion.
@@ -393,6 +413,17 @@ _Avoid_: pin, star, flag, save (that is a write stage)
 **Finding**:
 An attributed statement about the investigation with a status of hypothesis, supported, refuted or unresolved, the captured rows it cites, optional counterevidence and an optional remaining question. The status is the author's claim; trawl checks the citations exist, not that they prove the sentence.
 _Avoid_: conclusion, result, verdict, note (that is uncited)
+
+### API
+
+**Error envelope**:
+The `ErrorResponse` body every trawld and trawl-web failure carries: a code, a public message, and optional details. Not the ingest envelope.
+
+**Public message**:
+The one client-safe text of a server error. The wire sends it, and every record of the failure stores the same text. Internal detail stays in logs.
+
+**Credential binding**:
+The API base (scheme, host, effective port, path prefix) a saved or exported token belongs to. The CLI sends the token only to a target equal to that base.
 
 ### Outcome verbs
 

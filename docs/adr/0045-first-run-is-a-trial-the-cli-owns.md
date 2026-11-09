@@ -1,6 +1,6 @@
 # First run is a trial the CLI owns; an installation starts fresh
 
-status: accepted (2026-09-25), prep record for #203; amended (2026-09-25, 2026-09-27) during the #203 run, by ADR-0048 (2026-09-28), and (2026-11-06) by the prep record for #354, see the Amendments
+status: accepted (2026-09-25), prep record for #203; amended (2026-09-25, 2026-09-27) during the #203 run, by ADR-0048 (2026-09-28), (2026-11-06) by the prep record for #354, and (2026-11-08) by the untangle prep for defects D11 and D10, see the Amendments
 
 Before a first query, an evaluator needs five executables, PostgreSQL with two databases, two roles, two keys, a certificate, and a hand-written config. No install channel creates a key. A fresh `apt install` starts `trawld` against placeholder database URLs, and systemd restarts it every five seconds. This record adds a **trial**: a disposable installation that the `trawl` CLI creates, runs, and deletes on one Linux machine. It also makes the Debian package install without starting anything.
 
@@ -87,3 +87,35 @@ Considered and rejected:
 - **A teardown phase inside `state.json`.** `TrialState` denies unknown fields, so an older CLI would refuse the whole file. The directory removal also deletes the file before the teardown ends.
 - **A marker inside the trial directory.** The directory removal deletes it before the removal finishes, so it cannot be the last thing removed.
 - **Refuse `down` when the marker and the state disagree.** It leaves the user with no command that recovers the trial.
+
+## Amendment (2026-11-08): `-p trial` refuses `--token-file`, and its refusals come from clap
+
+The untangle prep of 2026-11-08 (defect D11) adds `--token-file PATH` to ordinary commands and binds every saved token to the URL it was saved for ([ADR-0065](0065-a-saved-token-goes-only-to-the-url-it-was-saved-for.md)). The Decision says "`-p trial` fails if `TRAWL_URL` or `TRAWL_TOKEN` is set". The code also refuses `--url` and `--token` (`crates/trawl-cli/src/trial/profile.rs:67-80`). Two rules are added:
+
+1. **`-p trial` refuses `--token-file`.** The trial is reached only with its own operator key. A token file beside `-p trial` would either send another key to the trial URL or be dropped without a word, and the overlay refuses an input rather than lose it.
+2. **The refusal and warning lists derive their environment names from clap.** Today the trial hard-codes `TRAWL_URL`, `TRAWL_TOKEN`, `TRAWL_INSECURE`, and `TRAWL_PROFILE` (`trial/profile.rs:30-32`, `trial/lifecycle.rs:1482-1488`), while the doctor and `trawl mcp` read the names from clap's metadata. The trial reads them from clap's metadata too, so a flag bound to a new variable is covered when it is added.
+
+The trial overlay keeps setting the URL, the operator token, and the checked certificate as one unit.
+
+Considered and not adopted: **deriving the names from clap in a later change.** The new flag has to reach the trial's refusals in the same change, and the metadata is the place that keeps the next flag covered.
+
+## Amendment (2026-11-08): the CLI generates the trial certificate
+
+The untangle prep of 2026-11-08 (defect D10) deletes `trawl-admin`, as the human ruled ([ADR-0004's amendment of 2026-11-08](0004-fleet-auth-adoption.md)). The Decision says "The trial generates its own certificate with a SAN for the in-network service name." It did so with a one-shot `tls-init` service that runs `trawl-admin tls generate` inside the image (`crates/trawl-cli/src/trial/compose.rs:144-159`). trawld's own first-boot generator cannot replace it: its SANs are `localhost`, `127.0.0.1`, and `::1` only (`crates/trawl-server/src/tls.rs:354-358`), and the trial's `trawl-web` verifies `https://trawld:5514`.
+
+The CLI now generates the pair in process during the certificate phase:
+
+1. **Parameters stay the same.** `rcgen` generates a P-256 key and a self-signed certificate valid from now for 730 days, with the SANs `trawld`, `localhost`, `127.0.0.1`, and `::1`. `rcgen` moves from a dev-dependency to a dependency of `trawl-cli`. It is already in the workspace graph through `trawl-server`.
+2. **The key travels like every other trial secret.** The CLI writes the key with `put_file` into the `trawld` volume at `/var/lib/trawl/trial/tls/key.pem`, then the certificate at `/var/lib/trawl/trial/tls/cert.pem`. `put_file` sends the bytes on stdin, creates the parent directory, writes at mode 0400 as the `trawl` user, and renames each file into place (`crates/trawl-cli/src/trial/secrets.rs:143-154`). The key never touches a host file, an argument, the environment, or a diagnostic.
+3. **The key is written first.** A present certificate therefore implies a present key.
+4. **A resume reuses the published certificate and never rotates it.** The certificate phase reruns whenever the host `ca.pem` is missing, even on a recorded trial (`crates/trawl-cli/src/trial/lifecycle.rs:472`), and `up` runs it before it restarts services (`lifecycle.rs:355-359`). When the volume holds `cert.pem`, the CLI reads it back with the bounded `cat` read the phase already uses (`lifecycle.rs:948-956`), restores the host `ca.pem` and the web copy from those bytes, and generates nothing.
+5. **Damaged recorded material is a named refusal.** When the state records the TLS phase and the volume's certificate is missing or unreadable, or its fingerprint differs from the recorded one, `up` refuses and names the remedy: `trawl trial down`, then `trawl trial up`. It never generates a replacement over a recorded trial. A trial that has not recorded the phase generates a pair when the volume holds no certificate.
+6. **The paths and layout stay.** `trawld.toml` keeps `tls_cert_path` and `tls_key_path` (`compose.rs:319-320`). Existing trials resume as they are. The release trial proof and the secret harvester keep checking `/var/lib/trawl/trial/tls/key.pem` (`scripts/release/test-trial.sh:522`, `scripts/release/harvest-trial-secrets.py:45`, `:135`).
+7. **`tls-init` is gone.** The service, `TLS_INIT`, `Service::TlsInit`, their tests, and their block in the rendered-project snapshot are deleted.
+
+Considered and not adopted:
+
+- **Staging both files in a private directory and publishing the directory with one rename**, as `tls-init` does. `put_file` already renames each file atomically. Writing the certificate last gives the invariant that matters, a present certificate implies its key, and a recorded trial never replaces a published pair.
+- **Regenerating whenever the host pin is missing.** A running trawld keeps serving the old certificate, so the new host pin and web copy fail verification until a restart.
+- **Moving the trial key into a separate `tls-key/` directory**, as durable installations do. Durable trawld splits the two because the Helm sidecar mounts `tls/`. Nothing mounts the trial's `tls/` except trawld. The move would break the release proof and the secret scan, and force every existing trial down.
+- **A SAN setting for trawld's generator.** It adds a configuration surface to every installation for one disposable consumer.

@@ -2,7 +2,7 @@
 
 Status: accepted 2026-09-05, amended 2026-09-07 after re-prep of
 [#150](https://github.com/jakub/trawl/issues/150), amended 2026-10-17 by
-ADR-0056 (the ping no longer takes a permit).
+ADR-0056 (the ping no longer takes a permit), amended (2026-11-08): an export is tracked like a query, see the Amendment.
 
 A short query can spend seconds in DuckDB binding before reading a row.
 In a single SELECT list, DuckDB copies an earlier alias's original
@@ -227,3 +227,34 @@ ADR-0054 adds a server-wide count of HTTP requests in progress. A query's count 
 ## Amendment: the ping no longer takes a permit, 2026-10-17
 
 ADR-0056 replaces the request-triggered ping. The sentence "Ping has a 250 ms total probe budget" and the 503 on its exhaustion no longer describe health. A dedicated thread samples `SELECT 1` every 10 seconds on a diagnostic connection cloned from the query database, outside the executor pool, with a 250 ms budget per sample. Health reads the latest sample and never waits for a permit, so a full or retained pool cannot fail it. Field sampling keeps its 1 second acquisition bound and its permit. The retained-permit rules above apply to every permit the pool still issues.
+
+## Amendment (2026-11-08): an export is tracked, counted and recorded like a query
+
+The untangle prep of 2026-11-08 (defect D15) found that `POST /api/v1/export` runs pool work under its own query id but opens no tracker entry, records no history and does not count itself (`handlers.rs:3354`). `/query` does all three (`handlers.rs:103`, `:138`, `:370-404`), and so does a capture (`results/service.rs:590`, `:696`, `:901`). A long Parquet export is invisible in `GET /api/v1/queries`, cannot be cancelled there, and `total_queries` undercounts. The human ruled on 2026-11-08:
+
+> Q: D15: exports (`trawl export`, the Export button) do not show in /queries, query history, or the total query count; queries and captures do. Is that deliberate?
+> Options offered: No, track them (Recommended) / Yes, deliberate
+> A: "No, track them (Recommended)"
+
+**An export in every format follows the `/query` account.** After it stamps its deadline, the export increments `total_queries` once. It opens a tracker entry under the query id it already allocates, before the DSL check, so the entry lists the export while it waits. One completion point closes the entry exactly once: complete with the exact exported row count, fail with the public message ([ADR-0040](0040-every-server-failure-names-its-request-and-stage.md), amendment of 2026-11-08), or time out. A request that ends without an outcome records `ABANDONED` through the tracker guard. Each explicit outcome increments `trawl_queries_total` once with the existing `status` labels. A success writes one best-effort row to the key's query history, under the original deadline, as `/query` does. A failed or expired history write never turns a ready export into an error. Success means the body is ready, not that the client received it.
+
+**The Parquet row count is exact and costs no second run.** Query history needs a row count. The export reads it from its staging table or from the finished file's metadata. A byte length, the row limit or a placeholder zero would write false history.
+
+**Cancellation is the same as for `/query`.** `DELETE /api/v1/queries/{id}` applies its existing authority check and interrupts through the pool registry the export already uses. As for `/query` today, a cancel that arrives before the pool registers the work returns false (`pool.rs:277-280`), and a cancel during CSV or NDJSON rendering has nothing to interrupt. That gap belongs to the pool and every route that uses it, not to exports.
+
+**Visibility and grants.** Every key with `query` now sees export DSL among active and recent entries, which follows from the ruling. A key with only `export` gains no listing and no cancel grant. The permissions this ADR preserves stay as they are. Captures keep their order (count first, tracker after capture admission). Scheduled runs and live-tail setup keep their counters unchanged.
+
+### Considered, not adopted
+
+- **One shared run object for every route that runs pool work.** Rejected for this fix: the routes do not share an order. A capture tracks its executed text after planning, the scheduler owns system work and run rows, and live-tail setup is unbounded. The export change stands alone.
+- **A request-level stop latch for exports** that covers the wait before registration and the render phase. Rejected: `/query` has the same gap, so an export-only latch makes the routes diverge again and adds races between cancel and completion.
+- **Move the `total_queries` increment into `tracker.start`.** Rejected: `tests/results_admission.rs:580-596` uses the capture's early increment as its arrival barrier.
+- **A `kind` field on `/queries` entries.** Rejected: a wire addition the ruling does not need.
+
+### Premise checks at `b71f9e6e`
+
+- `handlers.rs:3354-3460`: the export handler allocates and records its query id (`:3376-3377`), builds a `refused` closure for its timing account (`:3412`), runs the DSL check (`:3422`) and Parquet export (`:3433-3444`). It never calls `tracker.start`, `total_queries` or `history.record_query`.
+- `store/history.rs:91-98`: `record_query` takes `row_count: usize`.
+- `trawl-engine/src/executor.rs:1850-1908`: Parquet export stages its bounded result in `__trawl_export` before `COPY`.
+- `pool.rs:4996-5005`: `every_lane_registers_its_kind_and_owner` already parks `export_parquet` at `Seam::Started`.
+- `results/service.rs:931-965`: captures already increment `trawl_queries_total`.

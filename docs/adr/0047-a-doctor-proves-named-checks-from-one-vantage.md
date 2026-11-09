@@ -1,6 +1,6 @@
 # A doctor proves named checks from one vantage and never writes
 
-status: accepted (2026-09-27), prep record for #199; amended (2026-09-28) for the server-host doctors, see the Amendments
+status: accepted (2026-09-27), prep record for #199; amended (2026-09-28) for the server-host doctors; amended (2026-11-08) for the web-origin probe bodies, see the Amendments
 
 `trawld --check-config` proves that a configuration file parses and names every required setting. It never connects to anything. An installation can pass it while a database rejects the service's credentials, a client distrusts the certificate, or the browser address is not in `public_origins`. Today the operator finds these by working through a manual script in the deployment guide: curl the health endpoint, curl `whoami` with a key, run a query, sign in from a browser. This record adds a **doctor**: a command that runs those checks and reports each one.
 
@@ -63,3 +63,17 @@ The prep of the second slice settled how the server-host doctors read an install
 - **trawl-web has no unverified mode.** ADR-0048 removes the loopback switch. A web doctor with no persistent session key reports `not_configured` and says that sessions end on every restart. An upstream URL that carries credentials is refused before any request.
 
 The shared report and exit contract lives in a crate that the CLI, trawld, and trawl-web all use. The second slice ships as three pull requests after #199 and #265: `trawld --doctor`; the trust change in ADR-0048; then `trawl-web --doctor`.
+
+## Amendment (2026-11-08): the web-origin probe recognizes trawl-web's envelope
+
+The untangle prep of 2026-11-08 (defect D14) makes trawl-web answer every refusal with the `ErrorResponse` envelope ([ADR-0066](0066-the-spa-reads-every-failure-through-one-envelope-decoder.md)). The Decision says the browser half "recognizes `trawl-web`'s own responses by status and body, not by status alone". That rule stands. The bodies it recognizes change in the same change that changes trawl-web:
+
+- **Accepted origin:** HTTP 400 with code `bad_request` and message `bad request`.
+- **Rejected origin:** HTTP 403 with code `forbidden` and message `cross-origin request rejected`.
+
+The probe no longer accepts the legacy `{"error":"bad request"}` and `{"error":"cross-origin request rejected"}` bodies (`crates/trawl-cli/src/doctor/web.rs:38-40`, `:116-151`). Any other body, the legacy one included, still means the origin is not a trawl-web login endpoint. `reference/cli.md` documents the new bodies.
+
+Considered and not adopted:
+
+- **Accepting both forms.** No trawl-web of this release emits the legacy body, and the doctor ships with trawl-web. A second accepted shape only widens what the doctor mistakes for trawl-web.
+- **Matching the status and code without the message.** The message is a fixed string trawl-web writes, and checking it keeps the probe as specific as it is today.

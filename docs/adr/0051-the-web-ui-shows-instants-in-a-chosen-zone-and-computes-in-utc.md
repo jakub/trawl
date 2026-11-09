@@ -1,6 +1,6 @@
 # The web UI shows instants in a chosen zone and computes in UTC
 
-status: accepted (2026-10-02), prep record for #201; implementation blocked by #214
+status: accepted (2026-10-02), prep record for #201; implementation blocked by #214; amended (2026-11-08), see the Amendment
 
 Every time in the web UI shows as UTC. An operator comparing logs with an incident report written in local time converts in their head. Trawl stores, compares and buckets in UTC (ADR-0008, ADR-0017), and the browser reads `_time` text back as UTC instants in five places: the context window, the Visualization series, both histogram paths, and facets. The query API's `timezone` field cannot serve the browser. It applies one fixed offset to result text, it reads `local` as the server's zone, and the browser's instant parsers would read the shifted text as UTC. This record adds a display zone that changes only what the browser prints.
 
@@ -59,7 +59,7 @@ No accepted instant means the wall time does not exist: "02:30 does not exist on
 
 ## Considered options
 
-**Using the query API's `timezone` field**, rejected. Its offset is fixed and ignores DST. It reads `local` as the server's zone. It shifts only some columns, and the browser's instant parsers would read shifted text as UTC.
+**Using the query API's `timezone` field**, rejected, and the field is now gone (see the Amendment of 2026-11-08). It applied one fixed offset per query and ignored DST. It read `local` as the server's zone, which is not the zone of the person reading. It shifted only some columns, and the browser's instant parsers would have read shifted text as UTC. The same faults made the terminal clients disagree with themselves, so the amendment removes the field and moves every client to the rule this record set for the browser.
 
 **Bucketing in the display zone**, rejected for now. It needs server-side IANA support in query execution and an answer for #197's whole-window histogram. Labels with offsets never misstate where a UTC bucket starts.
 
@@ -74,3 +74,34 @@ No accepted instant means the wall time does not exist: "02:30 does not exist on
 **Requiring an offset on every range input**, rejected. The incident report says "14:00". Asking the user which offset applies on a DST night is the question this feature answers for them. The algorithm above refuses only the two cases that have no single answer.
 
 **Zone abbreviations or locale formatting**, rejected. `CST` names several zones, and the browser's locale changes date order and the hour cycle.
+
+## Amendment (2026-11-08): the zone is presentation in every client, and trawld answers in UTC only
+
+This amendment records the untangle prep of 2026-11-08 (defect D9). The decision above made the zone presentation in the browser. The terminal clients still sent `ui.timezone` (default `local`) to trawld as `QueryRequest.timezone`, and `local` meant different machines on different paths:
+
+- The CLI and the TUI's batch path sent the raw value (`crates/trawl-cli/src/cli.rs:323-329`, `crates/trawl-cli/src/tui/mod.rs:282-289`). trawld resolved `local` as its own zone, from one `Local::now()` offset per query (`crates/trawl-server/src/handlers.rs:116-128`, `crates/trawl-engine/src/timezone.rs:20-30`).
+- The TUI's live tail resolved `local` on the client, and an invalid value silently became UTC (`crates/trawl-cli/src/tui/live.rs:52-54`, `unwrap_or(0)`), where batch answered 400.
+- `trawl mcp`'s `orient` parsed the zone a second way with chrono (`crates/trawl-mcp/src/tools/orient.rs:367-390`). It agreed with the engine's parser only because `crates/trawl-cli/src/mcp.rs:218-235` had validated the value first.
+
+With the CLI in New York and the homelab pod in UTC, the TUI's batch results and live tail showed different clocks, and `trawl query` printed UTC times labelled `local`.
+
+**The rule for every client.**
+
+- **trawld and the embedded executor answer in UTC only.** `QueryRequest.timezone`, its resolution in `handlers.rs`, `trawl-engine::timezone`, and the executor's display-offset plumbing (`display_offset`, `TimestampText::Wire` at an offset) are deleted. The executor keeps its distinction between wire text and the UTC cast text that the Rust tail evaluates. The request field is removed without a named refusal. Pre-1.0, the release notes say so.
+- **trawl-api owns one zone grammar.** It accepts `UTC` and `local` in any case, trimmed, and a strict ASCII `±HH:MM` with exactly two digits per component, hours 00-23 and minutes 00-59. Anything else is one refusal sentence. The engine's looser parser, which reads each component with `parse::<i32>()` and so accepts signs and other widths, does not survive. There is no IANA name and no `chrono-tz` dependency. #201's closed browser list stays the browser's own vocabulary.
+- **`local` is the machine that runs the client, resolved per instant.** The presenter in trawl-api takes the offset at each displayed instant, so the two 02:30s of a Berlin fall-back night print with `+02:00` and `+01:00`. Each human-readable instant carries its own offset, as the browser's do.
+- **Each consumer parses the zone once, at start.** An invalid `ui.timezone` is a usage error before `trawl query` sends a request, before the TUI enters the alternate screen, and before `trawl mcp` serves. Commands that print no timestamps do not check it. `orient` uses the validated value and loses its second parser and its UTC fallback.
+- **Only typed timestamp cells and timestamp lists convert.** Text that looks like a time stays text, as above. Computation reads UTC instants, never display text. The TUI's timechart interval discovery and ordering (`crates/trawl-cli/src/tui/ui/results.rs:1435-1507` reads offset-stripped display text today) move to raw instants, or a fall-back night would turn a one-hour interval into zero.
+- **An instant that local conversion cannot represent stays UTC text marked as not converted**, as the browser's "not converted" does. The fixed-offset path keeps the wire's whole domain: microseconds, the infinities and expanded years.
+- **Output formats.** `--format json` and `--format csv` keep their display-zone conversion, now applied by the client at serialization. Exports and Parquet stay UTC.
+
+The browser path in #201 is unchanged. It already sends no zone (`crates/trawl-web-ui/src/series.rs:199`), and it keeps its own preference and `Intl` presenter.
+
+Considered, not adopted:
+
+- **Resolve `local` on the client and keep sending an offset to trawld.** One offset per query or per session is wrong for every row on the other side of a DST change. It also keeps two rendering sites that agree only because one value reaches both.
+- **Refuse a request that still sends `timezone` with a named 400.** It is a compatibility shim for a field that no first-party client sends after this change. Pre-1.0, the release notes cover it.
+- **Accept IANA names in `ui.timezone`.** It adds a `chrono-tz` dependency this defect does not need. The per-instant `local` already handles DST.
+- **Switch `--format json` to UTC as a machine format.** It changes script output in a display fix. Exports already give UTC.
+
+Premise checks at `b71f9e6e`: `cli.rs:323-329` and `tui/mod.rs:282-289` send the raw value; `config.rs:383-385` defaults it to `local`; `handlers.rs:116-128` and `timezone.rs:20-55` resolve on the server with one offset and a loose component parse; `tui/live.rs:52-54` falls back to UTC; `orient.rs:367-390` is a second grammar; `crates/trawl-api/src/lib.rs:310-326` holds the field and has no `deny_unknown_fields`; `crates/trawl-mcp/Cargo.toml` has no trawl-engine dependency, so the grammar's home is trawl-api.

@@ -1,6 +1,6 @@
 # Retention and report windows: age is per-env policy, pressure is survival, the schedule owns its window
 
-status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class; amended (2026-10-23): the capture sweep without the scheduler; amended (2026-11-06): stale runs at boot, retention of terminal runs only, and a lifetime run budget
+status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class; amended (2026-10-23): the capture sweep without the scheduler; amended (2026-11-06): stale runs at boot, retention of terminal runs only, and a lifetime run budget; amended (2026-11-08): ruling 8's pruning claim, see the Amendment
 
 Two parked halves of PR #58, one subject: who owns time. Retention is one
 install-wide `max_age_days`, so keeping `prod` a year forces keeping the
@@ -144,3 +144,24 @@ Both knobs must be at least 1. `report_retention_days = 0` and `max_runs_per_sch
 Editing a schedule keeps `runs_claimed`. Raising `max_runs` lets the schedule claim again; lowering it below `runs_claimed` refuses new claims and leaves a running run to finish. Only deleting the schedule and creating a new one starts a new budget. A schedule is exhausted when `max_runs` is set and `runs_claimed >= max_runs`. Exhausted is derived from those two values and is never stored. `max_runs = 0` stays legal and makes a schedule exhausted from the start. The API reports `runs_claimed` as the schedule's `total_runs` and adds `exhausted`. Counts that describe kept runs, such as the run statistics and the run list's total, stay retained counts and say so.
 
 The upgrade seeds `runs_claimed` from the runs each schedule still has. That is a lower bound: a schedule whose older runs retention already deleted may claim up to its cap again before it stops. History that retention deleted cannot be counted. Seeding every capped schedule as spent would also stop schedules that never reached their cap, so the seed is only what the kept rows prove.
+
+## Amendment: ruling 8 prunes by ingest hour, not by `_time`, 2026-11-08
+
+Prep record for the untangle prep of 2026-11-08 (defect D3). ADR-0013's
+amendment of the same date holds the full record and the human's ruling.
+
+Ruling 8 says "the layout prunes by" `_time`. That was never true. A
+directory names the hour compaction wrote it (`ingest/compaction.rs:4783-4787`).
+Only `last=` prunes by directory: it walks the hours from `now - N - padding`
+to now (`source.rs:527-551`). Absolute windows, and the materialized report
+windows of ruling 11, select every date directory and filter by `_time` in
+SQL (`source.rs:117-136`, `report_window.rs:609-633`).
+
+`last=` pruning is sound because ingest now bounds `_time` from above: a
+`_time` more than 15 minutes after arrival is replaced by arrival with the
+repair code `time.ahead_of_arrival`. The padding stays one hour, at least that bound.
+The axis of ruling 8 stays `_time`. Rejecting `_ingested` windows still holds,
+because a `_ingested` window would still disagree with interactive queries.
+Retention keeps deleting by directory date. With the bound, no row is more than
+15 minutes newer than the hour of its directory, so age-based expiry never
+deletes a row before its own `_time` has nearly reached the age limit.

@@ -1,6 +1,6 @@
 # trawl adopts the fleet-auth postgres keystore; sqlite trawl-auth retires
 
-status: accepted (2026-07-11); amended (2026-11-06): the key audit reports observed changes and survives a failed first snapshot, prep record for #353, see the Amendment
+status: accepted (2026-07-11); amended (2026-11-06): the key audit reports observed changes and survives a failed first snapshot, prep record for #353; amended (2026-11-08): the trawl-admin binary is deleted, see the Amendments
 
 Completes the auth half of ADR-0030 step 4 (canonical text in the coastwatch repo;
 the UI half landed via #27/PR #29). trawld takes a **hard postgres dependency**:
@@ -315,3 +315,25 @@ assignments, so it would be a partial trail that reads as a complete one.
 Not covered: `retype` and expiry are not audited, and `list_keys` reads
 each key's roles in a separate query, so one snapshot can mix two moments.
 Coastwatch runs no such poller, so fleet-auth is unchanged.
+
+## Amendment (2026-11-08): the trawl-admin binary is deleted
+
+The Decisions say "trawl-admin sheds its `keys` subcommands and survives as the TLS cert generator only." That decision is superseded. The untangle prep of 2026-11-08 (defect D10) found that `trawl-admin tls generate` writes `key.pem` with `truncate` and `mode(0o600)` (`crates/trawl-admin/src/commands/tls.rs:62-67`), and the mode applies only when the file is created, so an existing world-readable key keeps its mode. It also writes the key beside the certificate, while trawld reads a generated pair from `tls/` and `tls-key/`. The human ruled. The question and the answer, verbatim:
+
+> D10: `trawl-admin tls generate` (a 196-line binary) writes key.pem in a layout trawld does not read, and an existing world-readable key keeps its mode. trawld already generates its own TLS on first boot. What should happen to trawl-admin?
+>
+> Options offered: Delete the crate (Recommended) / Fix it
+>
+> A: "Delete the crate (Recommended)"
+
+The new rules:
+
+- **The `trawl-admin` crate and executable are deleted.** No release channel ships it: not the tarballs, the `trawl-server` Debian package, or the container image. A Debian upgrade removes `/usr/bin/trawl-admin`, because the new package no longer lists it.
+- **Durable installations get TLS from trawld.** trawld generates a self-signed pair on first start into `tls/` and `tls-key/`. An operator with their own certificate sets `tls_cert_path` and `tls_key_path`. No replacement command and no compatibility executable is added.
+- **The trial generates its certificate in the CLI.** ADR-0045's amendment of 2026-11-08 records how.
+- **`fleet-admin` remains the only key-management tool.** The RBAC role named `trawl-admin` is a different thing and keeps its name.
+
+Considered and not adopted:
+
+- **Fixing the generator** (open with a fixed mode, write the `tls/` and `tls-key/` split). trawld already generates its own pair, and the trial's one remaining use moves into the CLI, so a fixed binary would have no caller.
+- **A thin `trawl-admin` that calls trawld's generator.** That generator lacks the `trawld` SAN the trial needs, and nothing else calls it.

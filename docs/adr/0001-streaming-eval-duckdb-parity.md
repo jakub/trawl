@@ -1,7 +1,8 @@
 # Streaming eval mirrors DuckDB scalar-function semantics
 
 **Status:** Accepted; amended 2026-10-17 (#304): aggregation caps are reported
-live and refused in batch, see the Amendment
+live and refused in batch, see the Amendment; amended (2026-11-08), see the
+Amendment (2026-11-08)
 
 trawl has two expression evaluators that must produce the same answer for the
 same DSL: the **batch path** (`emitter/` → DuckDB SQL → DuckDB) used by
@@ -137,3 +138,28 @@ The same review found that `drop` of a field that no event carries refused in
 batch and passed every event live. Batch now ignores the field too
 ([ADR-0056](0056-queries-spill-into-a-bounded-scratch-directory-and-health-samples-the-engine.md)'s
 amendment of 2026-10-17).
+
+## Amendment (2026-11-08): aggregates are a closed set, and an aggregate stands only where both lanes can run it
+
+This amendment records the untangle prep of 2026-11-08 (defects D7 and D12). The enforcement bullet above covers scalar functions: the coverage test makes the catch-all in `eval_scalar_fn` unable to swallow a known scalar. Aggregates had no such guard, and two silent divergences followed from it.
+
+- **An aggregation slot fell through to a row count.** The live accumulator constructor ends in `_ => AccState::Count(0), // fallback` (`crates/trawl-core/src/stream.rs:2108`). `stats lower(x)` passes the slot check, because a scalar head is legal in batch (`emitter/validate.rs` and `sev_is_not_an_aggregate`, `emitter/mod.rs:2992`). It then counted rows on the live lane and on the kv batch tail, which compiles through the stream plan (`crates/trawl-engine/src/post_process.rs:209`).
+- **An aggregate in a row-scalar position was NULL live.** `| where count(x) > 1` and `| let y = avg(x)` pass the live name and arity check (`stream.rs:1211-1214`) and reach `eval_scalar_fn(..).unwrap_or(EvalValue::Null)` (`crates/trawl-core/src/eval.rs:342`). No core check refused them in either lane. Batch left it to DuckDB's binder.
+
+The enforcement bullet gains three rules:
+
+- **The aggregates are one closed enum in trawl-core.** It parses from a name and maps the aliases (`dc` and `distinct_count`, for example). `is_aggregate_function` (`emitter/functions.rs:523`) derives from it. The SQL aggregate translator and the live `new_acc_state` (`stream.rs:2073`) both match the enum exhaustively, with no wildcard arm. A new aggregate does not compile until both lanes implement it.
+- **An aggregate in a row-scalar position is refused before either lane compiles.** Row-scalar positions are `where`, `let`, `sort` and every other per-row expression, at any depth, including inside a scalar call. An aggregate nested inside another aggregate's operand (`stats sum(count(x))`) is refused the same way. A scalar wrapped around an aggregate output in an aggregation slot is not nested in an operand, and keeps its batch meaning. Both lanes return one sentence for each refusal, for example "count() is an aggregation; use it in stats, timechart, eventstats or pivot". A field named `count` stays legal.
+- **A scalar head in an aggregation slot stays legal in batch and is refused live.** ADR-0024 says stats and timechart accept scalar function heads, and `sev_is_not_an_aggregate` pins `* | stats sev(level)` as a projection without `GROUP BY`. The live compiler has no implementation for a scalar head, so it refuses one with an explicit `UnsupportedStage`, never a count. The refusal also covers stages after `extract kv` in batch, because that tail compiles through the stream plan.
+
+The slot check covers `eventstats` as well as `stats`, `timechart` and `pivot`; `validate_pipeline` skipped it before (`emitter/validate.rs:65`, `_ => {}`). New expression walks use an explicit work stack, as ADR-0061 requires for whole-tree walks, because a flat chain can be deeper than a worker stack allows. The `stream.rs` comments that say "this lane never runs `validate_pipeline`" are corrected: `/api/v1/stream` runs it through admission (`crates/trawl-server/src/admission.rs:87-93`).
+
+A stored query that one of these refusals now catches fails its next validation or scheduled attempt with the diagnostic, and the scheduler records the failed run and continues. ADR-0061 names the backup pair that restores the old behaviour.
+
+Considered, not adopted:
+
+- **Refuse every scalar head in every lane.** It breaks `stats sev(level)` and the ADR-0024 contract in batch.
+- **One lane-neutral validator over the whole query, with an exhaustive stage match, in the same change.** It is the right destination: it deletes the hand mirrors in `stream.rs:72-90` and the `_ => {}` arm in `validate_pipeline`. Removing several mirrors in the change that also alters admission makes a dropped mirror hard to bisect, so it needs its own change. This prep records it and files nothing for it.
+- **A full function registry that also owns SQL rendering, result pins and cost profiles.** It is larger than the defect and is not needed to close either divergence.
+
+Premise checks at `b71f9e6e`: `stream.rs:2073-2108` (string descriptor, wildcard `Count(0)`); `stream.rs:1211-1214` (name and arity only); `eval.rs:340-342` (unhandled call is NULL); `emitter/expr.rs:23` and `emitter/functions.rs:287-298` (the general translator emits any known aggregate wherever it appears); `emitter/mod.rs:2989-2998` (`sev_is_not_an_aggregate`); `post_process.rs:209` (the kv tail calls `compile_stream_plan_with`). The DuckDB binder's answer to `where count(x) > 1` was not reproduced; the refusal no longer depends on it.

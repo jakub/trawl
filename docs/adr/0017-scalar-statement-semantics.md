@@ -1,6 +1,6 @@
 # Scalar statement semantics: one mirror per value domain, one instant per unit of output
 
-status: accepted (2026-08-18) — prep ruling record for #93
+status: accepted (2026-08-18) — prep ruling record for #93; amended (2026-11-08), see the Amendment
 
 The DSL evaluates in two lanes: DuckDB SQL (batch) and the in-memory Rust
 evaluator (SSE live tail, and the `rust_stages` batch tail behind
@@ -89,3 +89,32 @@ DuckDB bump.
 Three implementation issues, in order: (1) hostile harness + this ADR's
 pinned-divergence tests; (2) value-domain fixes (§1, §2, §4); (3) `now()`
 anchor plumbing (§3). `sev()` is out of scope (already one kernel).
+
+## Amendment (2026-11-08): absolute search bounds go through `literal_timestamp`, and a bound it cannot read is refused
+
+This amendment records the untangle prep of 2026-11-08 (defects D7 and D12). §1 said "the search stage keeps its door". That door was a second, unprobed timestamp parser, and the two lanes read one bound two ways:
+
+- The live filter parsed `earliest=` and `latest=` with chrono's RFC 3339 parser and `.ok()` (`crates/trawl-core/src/filter.rs:212-222`). A spelling that `CAST(… AS TIMESTAMP)` accepts and RFC 3339 does not, such as `earliest="2026-03-14"` or a space separator, dropped the bound. The live stream then matched every event on that side.
+- The live filter applied a bound's offset and converted it to UTC. The SQL emitter binds the written text and casts it with `CAST(? AS TIMESTAMP)` (`crates/trawl-core/src/emitter/search.rs:44-57`), which discards the offset. `earliest="2026-03-14T09:00:00+05:30"` was 03:30 live and 09:00 in batch.
+
+**The search stage has no door of its own.** §1's sentence "the search stage keeps its door" is withdrawn. The new rule:
+
+- Every `earliest=` and `latest=` clause is read once through `compare::literal_timestamp` (`ZoneRule::Ignore`, `crates/trawl-core/src/compare.rs:410-422`), the probe-pinned mirror of the cast a bound string gets. That reading is the accepted domain: date-only, `T` or space separator, a fraction, `infinity` and `-infinity`, and an offset that is read and then discarded.
+- Both lanes discard a bound's offset and keep its wall clock, as ADR-0001 says for literals. The live lane changes. Batch does not.
+- A clause that `literal_timestamp` cannot read or represent is refused before either lane compiles, with a span over that clause. No lane drops it. The refusal covers every clause in the text, including one that a later clause of the same kind overrides. A typo in an overridden clause is still a typo. For valid clauses, the last clause of each kind still wins (ADR-0061).
+- The query AST keeps the bound as written, because the formatter prints it verbatim and ADR-0061's canonical form compares written slots. The parsed `compare::Instant` is what executes. The live filter compares `Instant`s: `earliest` is inclusive, `latest` exclusive, and the infinities order by `Instant`'s `Ord`. The emitter binds `Instant::cast_text()` (`compare.rs:343-350`), not the written text, so DuckDB reads canonical text and both lanes consume one value.
+- An inverted interval (`earliest` after `latest`) stays an empty answer in both lanes.
+- An unquoted `earliest=` or `latest=` stays a field filter (ADR-0062). Only parsed time clauses are checked.
+
+`last=` combined with `earliest=` or `latest=` is refused in both lanes; ADR-0061's amendment of the same date records that rule.
+
+**Stored query text may stop parsing on upgrade.** A saved query, schedule, investigation step or captured result whose DSL holds an unreadable bound fails its next validation or run with the diagnostic. Batch already failed on most of those texts at DuckDB's cast. A scheduled attempt goes through admission (`crates/trawl-server/src/scheduler.rs:386-398`) and records a refusal as a failed run (`:473-480`). The schedule keeps its row, and startup and other schedules continue. Restoring the old reading means restoring the consistent pair named in ADR-0061: the Postgres database and `[server] results_dir`, taken together with trawld stopped.
+
+Considered, not adopted:
+
+- **Refuse a bound that spells a non-zero offset.** Honoring or refusing offsets in literals is a separate decision (ADR-0051). Both lanes now agree on the wall clock, which is what ADR-0001 and this ADR already say.
+- **Check only the effective bound after hoisting.** It keeps `earliest="bad" earliest="2026-03-14"` legal. Refusing the overridden typo costs nothing a forward-only, pre-1.0 product must keep.
+- **Keep the RFC 3339 door and widen it to DuckDB's set.** It would be a second parser to keep in step with the probe matrix, which is the class §1 removed from `eval.rs`.
+- **Cache the parsed instant beside the text and let the emitter keep binding the text.** Two parsers would remain on the execution path, and a residual difference between them would change SQL without a test noticing.
+
+Premise checks at `b71f9e6e`: `filter.rs:212-222` (RFC 3339, `.ok()`, `with_timezone(Utc)`); `emitter/search.rs:44-57` (`CAST`, not `TRY_CAST`, over the bound text); `compare.rs:322-350` (`Instant` with ordered infinities and `cast_text`); `parser/search.rs:540-565` (each clause overwrites its slot, and `hoisted` keeps every clause's kind and span); `format.rs:450` prints the written text, and `canonical_form.rs:139-158` compares the written slots.

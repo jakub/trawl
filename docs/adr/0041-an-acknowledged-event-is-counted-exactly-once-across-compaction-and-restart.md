@@ -1,6 +1,6 @@
 # An acknowledged event is counted exactly once across compaction and restart
 
-status: accepted (2026-09-23), prep record for the restart-visibility work
+status: accepted (2026-09-23), prep record for the restart-visibility work; amended (2026-11-08): rollup marker discovery ignores the parent's name, and marker hours are 00 to 23, see the Amendment
 
 A search can read an acknowledged event from two places: the hot buffer and the parquet files. Two defects break that on disk today.
 
@@ -170,3 +170,38 @@ Hydration gives the same guarantee for the usual backlog, and the overhang refus
 When compaction writes a parquet file, it also writes and removes a marker file, and it adds up to three directory fsyncs. Ingest can now fail on a failed directory fsync where it used to warn. The architecture pages `data-flow.md` and `recovery.md` gain the restart guarantee and the boot steps. The shutdown comment in `main.rs` is corrected to say that compaction stops without a final pass, because the next boot recovers.
 
 Slice 2 adds the `corpus_recovering` error code, the cause kinds `restart_backlog` and `rollup_pending`, a sixth health check and an alert. A client that handled the rollup refusal as `service_unavailable` now sees `corpus_recovering`. The WAL writer publishes a file name without replacing an existing one. Lowering the hot-buffer caps across a restart can turn a backlog that fitted into overhang once. `recovery.md`, `data-flow.md`, `health.md`, `api.md`, `operational-alerts.md` and `configuration.md` document the boot steps, the refusal and the alert.
+
+## Amendment (2026-11-08): rollup marker discovery ignores the parent's name, and marker hours are 00 to 23
+
+Prep record for the untangle prep of 2026-11-08 (defect D13). ADR-0009's
+amendment of the same date gives the data-root layout one owner and one
+strict grammar.
+
+**Discovery stays fail-closed.** `publication::scan_markers` skips a child of
+an env directory whose name does not parse as a date
+(`publication.rs:787-793`), so a `.rollup-` marker under such a directory is
+never registered and never refuses reads. Its own doc says an unknown marker
+must be an `Err` (`publication.rs:766-768`). A stricter date grammar must not
+widen that hole. Discovery now inspects every directory child of a valid env
+for the rollup marker prefix, whatever the child's name. A marker found under
+a directory that is not a canonical date keeps corpus reads refused as
+`rollup_pending`, like any marker recovery cannot resolve. Recovery leaves the
+marker and every file in place for the operator.
+
+**Marker hours share the partition grammar.** `rollup_marker::parse_input_name`
+accepts the hours `00` to `99` (`ingest/rollup_marker.rs:296-301`), and
+`MAX_INPUTS` = 100 is justified by that domain (`:56-59`). The rollup scan
+now takes only canonical hours, so the reader narrows with it: an input named
+`24/{service}.parquet` or `99/{service}.parquet` fails validation and sends the
+marker to case d. `MAX_INPUTS` becomes 24, and the size bound and its tests are
+derived again from it. The record encoding and the identity checks do not
+change. The publication marker already accepts `00` to `23` only
+(`ingest/publication_marker.rs:332-340`).
+
+Compaction never writes an hour directory above `23`. An earlier release could
+list a higher hour only by merging a stray directory someone else created. Such
+a marker now fails closed and stays, with its files, for the operator.
+
+**Considered, not adopted.** Filtering discovery by the strict date grammar.
+It would hide a marker under a non-canonical parent and admit reads while a
+rollup may be pending.

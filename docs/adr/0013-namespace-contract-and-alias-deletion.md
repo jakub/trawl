@@ -2,7 +2,7 @@
 
 status: accepted (2026-08-14) — prep ruling record for #60; slice 1 is #60,
 slice 2 is the producer-profile/operator-surface issue filed beside it; amended (2026-10-08): status-only collectors; amended (2026-10-14):
-repair classes and three split codes, prep record for #302, see the Amendment
+repair classes and three split codes, prep record for #302, see the Amendment; amended (2026-11-08): a `_time` more than 15 minutes ahead of arrival is replaced by arrival, see the Amendment
 
 ADR-0009 declared the event envelope and made ingest canonicalize into it, but
 it inherited a rule trawl never wrote down and then broke: a name that ingest
@@ -489,3 +489,88 @@ second, independent axis. Routine: `env.defaulted`, `host.from_peer`,
 `field.truncated`, `field.name_too_long`, `field.name_empty`,
 `field.name_case_collision`, `field.reserved_prefix_collision`,
 `field.stamp_claimed`, `field.producer_asserted`, `service.from_profile`.
+
+## Amendment (2026-11-08): a `_time` more than 15 minutes ahead of arrival is replaced by arrival
+
+Prep record for the untangle prep of 2026-11-08 (defect D3).
+
+**The defect.** Compaction files each batch in the hour directory of its own
+wall clock (`ingest/compaction.rs:4783-4787`). A `last=N` query walks hour
+directories from `now - N - 1h` to `now` (`source.rs:31`, `:527-551`), and
+its SQL has a lower bound only (`trawl-core` `emitter/search.rs:38`). Ingest
+keeps any parseable `_time` and flags it only when it is more than one day
+ahead (`ingest/envelope.rs:396-400`, `:1129-1140`). An event stamped hours
+ahead of arrival still matches `last=N`, but its directory leaves the walk
+after `N + 1h`. Example: a host in UTC+2 sends local times without a zone,
+trawl reads them as UTC, and every event lands 2 hours in the future.
+
+**The rule.** A parseable `_time` more than `MAX_TIME_LEAD` = 15 minutes after
+the arrival instant is replaced by the arrival value and earns a new
+actionable repair code, `time.ahead_of_arrival`. A `_time` at most 15 minutes
+ahead is kept with no repair. The past arm of the plausibility window does
+not change: a `_time` more than ten years before arrival is still kept and
+flagged `time.out_of_range`. The future arm of `time.out_of_range` (more than
+one day ahead) is deleted, because the new rule covers every case it caught.
+
+The §3 row for `_time` now reads: absent → arrival + `time.from_ingest`;
+unparseable → arrival + `time.unparseable`; more than 15 minutes ahead of
+arrival → arrival + `time.ahead_of_arrival`; more than ten years before
+arrival → kept + `time.out_of_range`. It replaces the 2026-10-14 row
+"implausible → kept + `time.out_of_range`" for the future case only.
+
+What survives of the sender's value is what survives an unparseable `_time`
+today: the alias column when the source was `timestamp` or `@timestamp`, and
+`_raw` when trawl built it. A sender that supplies its own `_raw` string and
+sends its time only in `_time` loses the original value. No preservation
+column is added.
+
+**The human's ruling.** The question was: "D3: Trawl files each event in the
+folder for the hour it ARRIVED, but `last=15m` only opens folders from the
+last ~75 minutes. So an event stamped hours in the future (example: a host in
+UTC+2 sending local times without a zone, read as UTC, so 2h ahead) drops out
+of `last=` searches before its own time comes up. Fix A: at ingest, if `_time`
+is more than 1h past arrival, store the arrival time instead and add a repair
+tag (the original stays in `_raw`). Fix B: keep every timestamp as sent, and
+make `last=` open every retained date folder, filtering by `_time` inside the
+files; every short search then reads metadata of the whole archive. Which?"
+The answer was "A, with a 15m bound". The 15-minute bound also catches a
+UTC+1 sender without a zone, at the same query cost as a 1-hour bound.
+
+**Why the bound holds the walk.** Compaction runs at or after arrival, and
+arrival is at least `_time - MAX_TIME_LEAD`. So a row that matches
+`_time >= now - N` sits in a directory no older than the hour of
+`now - N - MAX_TIME_LEAD`. The selection padding in `source.rs` is therefore
+checked at compile time to be at least `MAX_TIME_LEAD`. It stays one hour, so rows stored before this change with a lead under an hour stay visible to `last=`.
+The old comment there, which justifies the padding by compaction delay, is
+wrong: compaction delay only moves rows into later directories, which the
+walk always reaches.
+
+**Premise checks** at `b71f9e6e`: every ingest door derives `_time` through
+the one call at `envelope.rs:1315`. Hydration never canonicalizes again
+(`ingest/hydration/recognizer.rs:5-16`), so WAL written before the upgrade
+keeps its `_time`. Absolute windows and materialized report windows never
+use the hour walk (`source.rs:117-136`, `report_window.rs:609-633`).
+Every cold read is `read_parquet(..., union_by_name=true)`
+(`emitter/state.rs:379`, `:401`), so it binds the schema of every file it
+lists.
+
+**Considered, not adopted.**
+
+- Read every retained date directory for `last=` and filter by `_time` (fix
+  B). It keeps the sender's value, but every `last=15m` query would bind the
+  schema of every file in the archive and meet every historical union
+  conflict. Retention still deletes by directory date, so a far-future row
+  still vanishes before its time.
+- Partition by `_time`. One WAL batch would need several outputs, which
+  breaks the single-output publication marker of ADR-0041, and backfilled
+  rows would land in already expired directories.
+- A persisted per-file `_time` index. It needs crash-consistent upkeep
+  across publication, rollup, repin and retention.
+- Reject the event. ADR-0008 rules out dropping a line over a bad clock.
+- A 1-hour bound. It keeps today's walk but misses a UTC+1 sender.
+
+**Out of the rule.** Rows and WAL already on disk keep the `_time` they were
+written with. Trawl is forward-only, so no migration rewrites them. A
+backward step of the server clock between arrival and compaction larger than
+`MAX_TIME_LEAD` can still place a row outside the walk. That case is out of
+scope.
