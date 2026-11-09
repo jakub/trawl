@@ -2,17 +2,25 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! What counts as an env directory on disk (ADR-0009).
+//! The data root's layout (ADR-0009): `{env}/{date}/{HH}/{service}.parquet`,
+//! with daily rollups at `{env}/{date}/{service}.parquet`.
 //!
-//! The single definition, shared by the query planner (`source.rs`, which
-//! globs `data/{env}/…`), the compactor (`ingest::compaction`, which walks
-//! both `wal/{env}/` and `data/{env}/`) and the repin engine. They must all
-//! agree on the set of envs, so the rule lives here once.
+//! The single definition of what counts as an env directory, a date
+//! directory and an hour directory, shared by the query planner
+//! (`source.rs`, which globs `data/{env}/…`), the compactor
+//! (`ingest::compaction`, which walks both `wal/{env}/` and `data/{env}/`),
+//! retention, conformance and the repin engine. They must all agree, so the
+//! grammar lives here once: [`parse_date`] and [`parse_hour`] accept only
+//! the spelling [`date_name`] and [`hour_name`] write, the path builders
+//! compose them, and [`layout_path`] is their inverse.
 //!
-//! [`date_partition`] extends it one level down: which `{env}/{date}`
-//! directory is a date partition. Retention deletes by it and the storage
-//! scan buckets bytes by it (ADR-0042), so the two agree on what a
-//! partition is.
+//! [`date_partition`] extends env recognition one level down: which
+//! `{env}/{date}` directory is a date partition. Retention deletes by it and
+//! the storage scan buckets bytes by it (ADR-0042), so the two agree on what
+//! a partition is.
+//!
+//! The grammar functions do no IO. Each listing here keeps its own policy
+//! for absence and errors.
 
 use std::collections::BinaryHeap;
 use std::path::{Component, Path, PathBuf};
@@ -27,15 +35,193 @@ pub(crate) fn is_env_dir_name(name: &str) -> bool {
 
 /// The date of the partition directory `{env}/{date}`, or `None` when the
 /// pair is not one: `env` must be an env directory name and `date` a
-/// `YYYY-MM-DD` calendar date.
+/// canonical date name ([`parse_date`]).
 ///
 /// The single env/date recognition rule. It says nothing about today:
 /// retention skips today's partition, the storage scan counts it.
 pub(crate) fn date_partition(env: &str, date: &str) -> Option<NaiveDate> {
-    if !is_env_dir_name(env) || !looks_like_date(date) {
+    if !is_env_dir_name(env) {
         return None;
     }
-    NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+    parse_date(date)
+}
+
+/// How a date directory is spelled: `YYYY-MM-DD`.
+const DATE_FORMAT: &str = "%Y-%m-%d";
+
+/// Extension of a partition file; the stem is the service name.
+const PARQUET_EXTENSION: &str = ".parquet";
+
+/// The name of `date`'s directory.
+pub(crate) fn date_name(date: NaiveDate) -> String {
+    date.format(DATE_FORMAT).to_string()
+}
+
+/// The name of an hour directory, `00` to `23`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the walkers adopt the builders next")
+)]
+pub(crate) fn hour_name(hour: u8) -> String {
+    debug_assert!(hour <= 23, "hour {hour} has no directory");
+    format!("{hour:02}")
+}
+
+/// The date a date directory names, or `None` when `name` is not exactly
+/// what [`date_name`] writes for a calendar date.
+///
+/// `chrono` alone also reads `2026-2-01`, `+026-01-01` and `2026-01- 1`, so
+/// the parsed date must spell `name` back.
+pub(crate) fn parse_date(name: &str) -> Option<NaiveDate> {
+    if name.len() != 10 || !name.is_ascii() {
+        return None;
+    }
+    let date = NaiveDate::parse_from_str(name, DATE_FORMAT).ok()?;
+    (date_name(date) == name).then_some(date)
+}
+
+/// The hour an hour directory names: exactly two ASCII digits, `00` to
+/// `23`.
+pub(crate) fn parse_hour(name: &str) -> Option<u8> {
+    let &[tens, ones] = name.as_bytes() else {
+        return None;
+    };
+    if !tens.is_ascii_digit() || !ones.is_ascii_digit() {
+        return None;
+    }
+    let hour = (tens - b'0') * 10 + (ones - b'0');
+    (hour <= 23).then_some(hour)
+}
+
+/// `date`'s directory under the env directory `env_root`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the walkers adopt the builders next")
+)]
+pub(crate) fn day_dir(env_root: &Path, date: NaiveDate) -> PathBuf {
+    env_root.join(date_name(date))
+}
+
+/// The hour directory of `date` and `hour` under `env_root`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the walkers adopt the builders next")
+)]
+pub(crate) fn hour_dir(env_root: &Path, date: NaiveDate, hour: u8) -> PathBuf {
+    day_dir(env_root, date).join(hour_name(hour))
+}
+
+/// The hourly file `service` writes for `date` and `hour` under `env_root`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the walkers adopt the builders next")
+)]
+pub(crate) fn hourly_file(env_root: &Path, date: NaiveDate, hour: u8, service: &str) -> PathBuf {
+    hour_dir(env_root, date, hour).join(format!("{service}{PARQUET_EXTENSION}"))
+}
+
+/// The daily rollup of `service` for `date` under `env_root`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the walkers adopt the builders next")
+)]
+pub(crate) fn daily_file(env_root: &Path, date: NaiveDate, service: &str) -> PathBuf {
+    day_dir(env_root, date).join(format!("{service}{PARQUET_EXTENSION}"))
+}
+
+/// Where one standing file sits in trawl's own storage layout.
+pub(crate) struct LayoutPath {
+    /// The env directory the path sits under.
+    pub(crate) env: String,
+    /// The hour directory, or `None` for a daily rollup.
+    pub(crate) hour: Option<u8>,
+    /// The service the path names — read off the layout, not guessed from a
+    /// file stem, so it is the same string ingest wrote verbatim.
+    pub(crate) service: String,
+    /// The instant this file's partition directory claims (see
+    /// [`crate::ingest::compaction::ConformPolicy::StandingFile`]).
+    pub(crate) instant: chrono::DateTime<chrono::Utc>,
+}
+
+/// Read `path` back as trawl's own storage layout — `{env}/{date}/{HH}/
+/// {service}.parquet`, or `{env}/{date}/{service}.parquet` for a daily
+/// rollup — relative to the data root. `None` = foreign, i.e. not ours.
+///
+/// This is the whole safety gate on an in-place, lossy, irreversible rewrite,
+/// so it is deliberately the strict inverse of the write path rather than a
+/// loose shape match: every component is checked against the same injective
+/// predicates ingest funnels names through ([`is_env_dir_name`],
+/// `is_valid_service_name`), and the date and hour must be the canonical
+/// names of a real instant ([`parse_date`], [`parse_hour`]). A file that
+/// ingest could not have produced this path for is not trawl's file,
+/// whatever it contains.
+///
+/// The boundary it can draw is "a path the writer could have produced", not
+/// provenance: a file planted at an exactly-valid layout path is ours as far
+/// as anything here can tell. Deliberately not tightened with the configured
+/// `[ingest] envs` allowlist — an env retired from the config still has a
+/// standing corpus that queries read and the invariant must therefore cover.
+///
+/// It doubles as the rewrite's never-NULL `_time` fallback: a standing file
+/// has no WAL filename to recover an ingest instant from, but it does sit in
+/// a directory that names the hour compaction wrote it, at or after the
+/// row's arrival — the closest honest answer available. That hour need not
+/// match any query window: a `last=` walk floors its start to the hour and
+/// pads it.
+pub(crate) fn layout_path(data_root: &Path, path: &Path) -> Option<LayoutPath> {
+    let rel = path.strip_prefix(data_root).ok()?;
+    let mut parts: Vec<&str> = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str()?),
+            // `..`, a root, a prefix: not a path the writer can produce.
+            _ => return None,
+        }
+    }
+    let (env, day, hour, file) = match parts.as_slice() {
+        [env, day, file] => (*env, *day, None, *file),
+        [env, day, hour, file] => (*env, *day, Some(*hour), *file),
+        _ => return None,
+    };
+    if !is_env_dir_name(env) {
+        return None;
+    }
+    let service = file.strip_suffix(PARQUET_EXTENSION)?;
+    if !trawl_config::is_valid_service_name(service) {
+        return None;
+    }
+    let day = parse_date(day)?;
+    let hour = match hour {
+        Some(hh) => Some(parse_hour(hh)?),
+        None => None,
+    };
+    let instant = day
+        .and_hms_opt(u32::from(hour.unwrap_or(0)), 0, 0)?
+        .and_utc();
+    Some(LayoutPath {
+        env: env.to_owned(),
+        hour,
+        service: service.to_owned(),
+        instant,
+    })
+}
+
+/// Whether a top-level directory name of an unmarked data root could be
+/// trawl's own residue: date-shaped, ten ASCII bytes `DDDD-DD-DD`, whether
+/// or not it names a calendar date (ADR-0036).
+///
+/// Never a partition test, and retention never uses it: it is deliberately
+/// looser than [`parse_date`], so boot refuses a root holding `2026-13-45`
+/// rather than reading it as a generic archive.
+pub(crate) fn is_owned_residue_dir_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
 }
 
 /// Whether `path` is absent: there is no entry at the name, and the
@@ -82,14 +268,6 @@ pub(crate) fn is_absent(path: &Path) -> bool {
             Err(_) => return false,
         }
     }
-}
-
-/// Check if a directory name looks like a date (YYYY-MM-DD).
-fn looks_like_date(name: &str) -> bool {
-    name.len() == 10
-        && name.as_bytes().get(4) == Some(&b'-')
-        && name.as_bytes().get(7) == Some(&b'-')
-        && name[..4].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Enumerate env directories under `root`, reporting an unreadable root.
@@ -302,20 +480,175 @@ pub(crate) fn first_env_names(
 mod tests {
     use super::*;
 
+    /// A date or hour directory parses only in the spelling the builders
+    /// write: a calendar date as `YYYY-MM-DD`, an hour as `00` to `23`.
     #[test]
-    fn looks_like_date_valid() {
-        assert!(looks_like_date("2026-02-13"));
-        assert!(looks_like_date("2025-01-01"));
-        assert!(looks_like_date("1999-12-31"));
+    fn canonical_date_and_hour_matrix() {
+        for name in ["2024-02-29", "2026-02-13", "1999-12-31", "0999-01-01"] {
+            let date = parse_date(name).unwrap_or_else(|| panic!("{name} is a date"));
+            assert_eq!(date_name(date), name);
+        }
+        for name in [
+            "2026-13-45",
+            "2026-02-30",
+            "2023-02-29",
+            "2026-2-01",
+            "2026-02-1",
+            "+026-01-01",
+            "2026-0\u{661}-01",
+            // Ten bytes, one of them a two-byte digit.
+            "2026-\u{661}-01",
+            "2026-01- 1",
+            " 2026-01-01",
+            "2026-01-01 ",
+            "20260101",
+            "wal",
+            "",
+        ] {
+            assert_eq!(parse_date(name), None, "{name:?} is not a date name");
+            assert!(date_partition("prod", name).is_none(), "{name:?}");
+        }
+        for (name, hour) in [("00", 0), ("07", 7), ("23", 23)] {
+            assert_eq!(parse_hour(name), Some(hour));
+            assert_eq!(hour_name(hour), name);
+        }
+        for name in [
+            "24",
+            "99",
+            "7",
+            "0x",
+            "+1",
+            "-1",
+            " 7",
+            "007",
+            "\u{661}\u{661}",
+            "",
+        ] {
+            assert_eq!(parse_hour(name), None, "{name:?} is not an hour name");
+        }
     }
 
+    /// The builders and [`layout_path`] are inverses on every canonical
+    /// path, and a path the builders cannot write does not parse.
     #[test]
-    fn looks_like_date_invalid() {
-        assert!(!looks_like_date("wal"));
-        assert!(!looks_like_date("00"));
-        assert!(!looks_like_date("2026-1-01"));
-        assert!(!looks_like_date(""));
-        assert!(!looks_like_date("not-a-date"));
+    fn layout_paths_round_trip() {
+        let root = PathBuf::from("/var/lib/trawl/data");
+        let env_root = root.join("prod");
+        let date = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        for hour in [0, 9, 23] {
+            let path = hourly_file(&env_root, date, hour, "api.v2");
+            let layout = layout_path(&root, &path).unwrap();
+            assert_eq!(
+                (layout.env.as_str(), layout.hour, layout.service.as_str()),
+                ("prod", Some(hour), "api.v2")
+            );
+            assert_eq!(
+                layout.instant,
+                date.and_hms_opt(u32::from(hour), 0, 0).unwrap().and_utc()
+            );
+            assert_eq!(
+                path.parent(),
+                Some(hour_dir(&env_root, date, hour).as_path())
+            );
+        }
+        let path = daily_file(&env_root, date, "svc-a");
+        assert_eq!(path, root.join("prod/2026-08-01/svc-a.parquet"));
+        assert_eq!(path.parent(), Some(day_dir(&env_root, date).as_path()));
+        let layout = layout_path(&root, &path).unwrap();
+        assert_eq!(
+            (layout.env.as_str(), layout.hour, layout.service.as_str()),
+            ("prod", None, "svc-a")
+        );
+        assert_eq!(layout.instant, date.and_hms_opt(0, 0, 0).unwrap().and_utc());
+
+        for rel in [
+            "prod/2026-8-1/10/s.parquet",
+            "prod/2026-08-01/+1/s.parquet",
+            "prod/2026-08-01/24/s.parquet",
+            "prod/2026-08-01/7/s.parquet",
+            "prod/2026-13-45/s.parquet",
+            "prod/2026-13-45/10/s.parquet",
+            "prod/2026-01- 1/s.parquet",
+        ] {
+            assert!(
+                layout_path(&root, &root.join(rel)).is_none(),
+                "{rel} is not a canonical layout path"
+            );
+        }
+    }
+
+    /// A date-shaped name is still a valid env: the layout tells env from
+    /// date by depth, not by spelling.
+    #[test]
+    fn date_shaped_env_stays_valid() {
+        assert!(is_env_dir_name("2026-01-01"));
+        assert_eq!(
+            date_partition("2026-01-01", "2026-01-02"),
+            NaiveDate::from_ymd_opt(2026, 1, 2)
+        );
+        let root = PathBuf::from("/var/lib/trawl/data");
+        let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let path = hourly_file(&root.join("2026-01-01"), date, 3, "svc");
+        let layout = layout_path(&root, &path).unwrap();
+        assert_eq!((layout.env.as_str(), layout.hour), ("2026-01-01", Some(3)));
+    }
+
+    /// Both of trawl's own layouts read back, service and instant intact —
+    /// the service off the path (verbatim, as ingest wrote it) and the
+    /// rewrite's never-NULL `_time` fallback off the partition directory.
+    #[test]
+    fn layout_path_reads_the_hour_and_the_daily_rollup() {
+        let root = PathBuf::from("/var/lib/trawl/data");
+        let hourly = layout_path(&root, &root.join("prod/2026-08-01/10/api.v2.parquet")).unwrap();
+        assert_eq!(hourly.service, "api.v2");
+        assert_eq!(hourly.instant.to_rfc3339(), "2026-08-01T10:00:00+00:00");
+        assert_eq!((hourly.env.as_str(), hourly.hour), ("prod", Some(10)));
+
+        let daily = layout_path(&root, &root.join("prod/2026-08-01/svc-a.parquet")).unwrap();
+        assert_eq!(daily.service, "svc-a");
+        assert_eq!(daily.instant.to_rfc3339(), "2026-08-01T00:00:00+00:00");
+        assert_eq!((daily.env.as_str(), daily.hour), ("prod", None));
+    }
+
+    /// The gate on an in-place, lossy, irreversible rewrite: anything the
+    /// write path could not have produced is foreign, and a foreign file is
+    /// never scanned, never votes, and above all is never rewritten.
+    #[test]
+    fn layout_path_declines_everything_trawl_did_not_write() {
+        let root = PathBuf::from("/var/lib/trawl/data");
+        let foreign = [
+            // Depth: loose at the root, or nested past the layout.
+            "svc-a.parquet",
+            "prod/svc-a.parquet",
+            "prod/2026-08-01/10/extra/svc-a.parquet",
+            // An operator's own tree that happens to sit under the data root.
+            "backups/exports/10/svc-a.parquet",
+            "prod/backup-2026-08-01/svc-a.parquet",
+            // Reserved env names are trawl's, but not the corpus.
+            "wal/2026-08-01/10/svc-a.parquet",
+            "scheduled/2026-08-01/10/svc-a.parquet",
+            // Names ingest's injective encoding cannot emit.
+            "PROD/2026-08-01/10/svc-a.parquet",
+            "prod/2026-08-01/10/Living Room AP.parquet",
+            // Not an instant.
+            "prod/2026-08-01/99/svc-a.parquet",
+            "prod/2026-08-01/1/svc-a.parquet",
+            "prod/2026-13-01/10/svc-a.parquet",
+        ];
+        for rel in foreign {
+            assert!(
+                layout_path(&root, &root.join(rel)).is_none(),
+                "{rel} is not a path trawl wrote and must not be adopted"
+            );
+        }
+        // Outside the data root entirely.
+        assert!(
+            layout_path(
+                &root,
+                &PathBuf::from("/srv/other/prod/2026-08-01/10/s.parquet")
+            )
+            .is_none()
+        );
     }
 
     #[test]

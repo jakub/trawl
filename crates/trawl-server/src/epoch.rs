@@ -321,7 +321,7 @@ pub fn classify_data_root<R: RootReader>(
         let name = entry.file_name();
         let name = name.to_string_lossy();
         owned |= trawl_config::is_reserved_root_entry(&name)
-            || (meta.is_dir() && is_date_partition(&name));
+            || (meta.is_dir() && crate::env_dirs::is_owned_residue_dir_name(&name));
         // A PID name alone is not authority to discard an entry. An initial
         // publication can leave only a regular file containing a prefix of
         // the current marker, including zero bytes before its first write.
@@ -468,18 +468,6 @@ fn validate_wal<E>(wal_dir: &Path) -> Result<(), RootFault<E>> {
         }
     }
     Ok(())
-}
-
-/// A top-level date partition is an owned storage layout, not a generic archive.
-fn is_date_partition(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
 }
 
 fn publish_epoch(data_root: &Path) -> Result<(), String> {
@@ -1118,6 +1106,22 @@ mod tests {
             assert!(err.contains("nonempty but has no EPOCH"), "{err}");
             assert_eq!(snapshot(tmp.path()), before);
         }
+    }
+
+    /// Owned-residue detection is looser than partition validity: a
+    /// date-shaped directory that is no calendar date still marks the root
+    /// as trawl's, so a query-only node refuses it and changes nothing.
+    #[test]
+    fn refuses_impossible_date_as_owned_residue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("2026-13-45")).unwrap();
+        let before = snapshot(tmp.path());
+        let err = ensure_current_epoch(&data, &data.join("wal"), false).unwrap_err();
+        assert!(err.contains("nonempty but has no EPOCH"), "{err}");
+        assert_eq!(snapshot(tmp.path()), before);
+        assert!(crate::env_dirs::is_owned_residue_dir_name("2026-13-45"));
+        assert_eq!(crate::env_dirs::parse_date("2026-13-45"), None);
     }
 
     /// Every consumer of the reserved root entries reads the one
