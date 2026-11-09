@@ -34,9 +34,9 @@
 //!   appended to the URL, so `https://h/x#frag` would send every request,
 //!   the keyed one included, to `/x`.
 //!
-//! Nothing here calls `Config::load_token`, which falls back to
-//! `[server].token`, and nothing renders the `Display` of a `ConfigError` or
-//! `TrialError`: every reason is written here, from names alone.
+//! Nothing here takes a profile's key from `[server].token`, and nothing
+//! renders the `Display` of a `ConfigError` or `TrialError`: every reason is
+//! written here, from names alone.
 
 use std::path::PathBuf;
 
@@ -480,8 +480,8 @@ fn resolve_profile(name: &str, config: Option<&str>, path: &str) -> Resolved {
             format!("set url = \"https://HOST:PORT\" in {table}"),
         ),
     })?;
-    // The key comes from this table alone: `apply_profile` would fill it
-    // from `[server].token`, a key saved for whatever server that is.
+    // The key comes from this table alone, never from `[server].token`, a
+    // key saved for whatever server that is.
     let key = match profile.token {
         None => None,
         Some(ref token) => Some(
@@ -565,7 +565,7 @@ fn resolve_trial(config: Option<&str>) -> Resolved {
     let paths = trial::paths::TrialPaths::from_env().map_err(|e| trial_failure(&e, &path))?;
     // The environment and the flags that would move the trial were refused
     // by `select`; they are observed again here all the same.
-    let overrides = trial::profile::Overrides::observe(false, false);
+    let overrides = trial::profile::Overrides::observe(false, false, false);
     trial::profile::apply(&mut cfg, overrides, &path, &paths)
         .map_err(|e| trial_failure(&e, &path))?;
     let Some(token) = cfg.server.token.as_deref() else {

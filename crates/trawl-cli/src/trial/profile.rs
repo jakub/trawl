@@ -11,8 +11,8 @@
 //!
 //! Anything else that could point the command somewhere else is refused
 //! rather than silently losing or winning: `TRAWL_URL` or `TRAWL_TOKEN` in
-//! the environment (even empty), `--url` or `--token`, and a
-//! `[profiles.trial]` of the user's own. The overlay turns `insecure` off
+//! the environment (even empty), `--url`, `--token` or `--token-file`, and
+//! a `[profiles.trial]` of the user's own. The overlay turns `insecure` off
 //! and pins the trial's `ca.pem`, so `--insecure` or `TRAWL_INSECURE` then
 //! fails through the `ca_cert`-with-`insecure` rule.
 //!
@@ -39,10 +39,11 @@ const MAX_CA_BYTES: u64 = 64 * 1024;
 
 /// Connection settings the invocation supplied besides the profile.
 ///
-/// clap merges a flag and its environment variable into one value, and
-/// ignores an empty variable, so the environment is read separately.
+/// clap merges a flag and its environment variable into one value, so the
+/// environment is read separately, and a variable set to the empty string
+/// counts as set.
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(clippy::struct_excessive_bools)] // four independent sources
+#[allow(clippy::struct_excessive_bools)] // five independent sources
 pub struct Overrides {
     pub url_env: bool,
     pub token_env: bool,
@@ -50,18 +51,21 @@ pub struct Overrides {
     pub url_arg: bool,
     /// `--token`, or clap's merge of `TRAWL_TOKEN`.
     pub token_arg: bool,
+    /// `--token-file`, which has no variable.
+    pub token_file_arg: bool,
 }
 
 impl Overrides {
-    /// Observe this process: `url_arg` and `token_arg` come from the
-    /// parsed command line, the rest from the environment. A variable that
-    /// is set to the empty string counts as set.
-    pub fn observe(url_arg: bool, token_arg: bool) -> Self {
+    /// Observe this process: the `_arg`s come from the parsed command
+    /// line, the rest from the environment. A variable that is set to the
+    /// empty string counts as set.
+    pub fn observe(url_arg: bool, token_arg: bool, token_file_arg: bool) -> Self {
         Self {
             url_env: std::env::var_os(URL_ENV).is_some(),
             token_env: std::env::var_os(TOKEN_ENV).is_some(),
             url_arg,
             token_arg,
+            token_file_arg,
         }
     }
 
@@ -74,6 +78,8 @@ impl Overrides {
             Some("--url was given")
         } else if self.token_arg {
             Some("--token was given")
+        } else if self.token_file_arg {
+            Some("--token-file was given")
         } else {
             None
         }
@@ -185,7 +191,7 @@ url = "https://lab.example:5514"
         assert!(!cfg.server.insecure, "the overlay turns insecure off");
         assert_eq!(cfg.server.pinned_ca.as_deref(), Some(PEM));
 
-        let conn = crate::connection(&cfg, None).unwrap();
+        let conn = crate::connection::trial(&cfg).unwrap();
         assert_eq!(conn.url, "https://127.0.0.1:15999");
         assert_eq!(conn.token, TOKEN);
         assert_eq!(conn.trust, TlsTrust::PinnedCa(PEM.to_vec()));
@@ -207,11 +213,11 @@ url = "https://lab.example:5514"
 
         let substitute = b"-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
         write_private(&paths.ca_file(), substitute, 0o644).unwrap();
-        let conn = crate::connection(&cfg, None).unwrap();
+        let conn = crate::connection::trial(&cfg).unwrap();
         assert_eq!(conn.trust, TlsTrust::PinnedCa(PEM.to_vec()));
 
         std::fs::remove_dir_all(&paths.dir).unwrap();
-        let conn = crate::connection(&cfg, None).unwrap();
+        let conn = crate::connection::trial(&cfg).unwrap();
         assert_eq!(
             conn.trust,
             TlsTrust::PinnedCa(PEM.to_vec()),
@@ -274,7 +280,7 @@ url = "https://lab.example:5514"
         let (_tmp, paths) = ready_trial(15999);
         let mut cfg = Config::default();
         apply_default(&mut cfg, &paths).unwrap();
-        cfg.apply_overrides(None, true);
+        cfg.apply_overrides(true);
         assert!(matches!(
             cfg.tls_trust(),
             Err(crate::config::ConfigError::CaCertWithInsecure)
@@ -312,6 +318,13 @@ url = "https://lab.example:5514"
                     ..Overrides::default()
                 },
                 "--token was given",
+            ),
+            (
+                Overrides {
+                    token_file_arg: true,
+                    ..Overrides::default()
+                },
+                "--token-file was given",
             ),
         ];
         for (overrides, expected) in cases {

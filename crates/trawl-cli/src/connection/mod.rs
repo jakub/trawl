@@ -18,6 +18,15 @@
 //!   go to another.
 //! - [`Key`], a key with the name of where it came from, and
 //!   [`key_from_file`], the bounded reader for a key file.
+//! - [`ConnectionError`], whose every message names sources and flags and
+//!   never a URL, a key, or a path.
+//!
+//! The ordinary policy is [`ordinary()`], and the trial's is [`trial()`].
+//! They, and the doctor's own trial resolution after the overlay, are the
+//! only readers of `[server].token`. The doctor's and mcp's policies live
+//! in [`crate::doctor::resolve`] and [`crate::mcp`].
+
+mod ordinary;
 
 use std::fmt;
 use std::io::Read as _;
@@ -25,6 +34,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::OpenOptionsExt as _;
 
 use zeroize::Zeroizing;
+
+pub(crate) use self::ordinary::{Inputs, ordinary};
+use crate::cli::ConnectionParams;
+use crate::config::{Config, ConfigError};
 
 /// A key file holds one key and a newline; anything larger is not a key.
 const MAX_KEY_BYTES: u64 = 4096;
@@ -204,10 +217,6 @@ fn host_of(authority: &str) -> Option<&str> {
 /// built on [`ApiBase::request_base`], the same parsed URL the comparison
 /// used.
 #[derive(Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the ordinary policy builds on it next")
-)]
 pub(crate) struct ApiBase {
     url: url::Url,
 }
@@ -222,10 +231,6 @@ impl fmt::Debug for ApiBase {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the ordinary policy builds on it next")
-)]
 impl ApiBase {
     /// Check `raw`'s shape, then parse it as the client will.
     ///
@@ -281,10 +286,6 @@ pub(crate) enum Origin {
 /// so the parsed value cannot say which one the user gave. clap's own
 /// record of the source can.
 #[derive(Debug, Clone, Copy, Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the ordinary policy reads it next")
-)]
 pub(crate) struct Sources {
     /// `None` when neither `--url` nor `TRAWL_URL` gave a value.
     pub(crate) url: Option<Origin>,
@@ -427,6 +428,99 @@ pub(crate) fn key_from_text(text: &str, source: &str) -> Option<Key> {
     (!trimmed.is_empty()).then(|| Key {
         secret: Zeroizing::new(trimmed.to_owned()),
         source: source.to_owned(),
+    })
+}
+
+/// Why no connection was built. Every message names sources (`--url`,
+/// `TRAWL_TOKEN`, `token in [server]`, ...) and flags, and never a URL, a
+/// key, or a path: a key pasted where a URL or a path belongs would be
+/// printed with it.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectionError {
+    /// A URL failed [`check_url`]. Nothing was read or sent.
+    #[error("{}", url_refusal(.input, *.problem))]
+    Url { input: String, problem: UrlProblem },
+    /// `--token` and `--token-file` were both typed: a usage error.
+    #[error("--token and --token-file both give a key; give one")]
+    BothKeyFlags,
+    /// The selected key source is empty or cannot be read. No other source
+    /// is tried in its place.
+    #[error("{input}: {reason}; {next}")]
+    Key {
+        input: String,
+        reason: String,
+        next: String,
+    },
+    /// The selected key is bound to a base other than the target.
+    #[error(
+        "the key from {credential} belongs to a different API base than the one {target} \
+         selects (the two can differ by a path prefix alone), so it was not sent. Give the key \
+         for this server with --token or --token-file"
+    )]
+    Binding { credential: String, target: String },
+    /// No key anywhere. `trawl validate` then validates locally.
+    #[error(
+        "no API token found (set {token_env}, use --token or --token-file, or add token to config)"
+    )]
+    NoCredential { token_env: String },
+    /// The trust (`ca_cert`, `insecure`) did not resolve.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+}
+
+impl From<Failure> for ConnectionError {
+    fn from(failure: Failure) -> Self {
+        Self::Key {
+            input: failure.source,
+            reason: failure.reason,
+            next: failure.next_action,
+        }
+    }
+}
+
+/// The refusal for a URL from `input` that failed [`check_url`].
+fn url_refusal(input: &str, problem: UrlProblem) -> String {
+    match problem {
+        UrlProblem::Credentials => format!(
+            "{input} carries credentials (a user or password before the host), which would be \
+             sent to the server. Remove them, and give the key with --token or --token-file, or \
+             as token in the config file"
+        ),
+        UrlProblem::QueryOrFragment => format!(
+            "{input} has a query or fragment (a ? or #), which would carry requests somewhere \
+             other than the API. Give the API's base URL, such as https://HOST:PORT"
+        ),
+        UrlProblem::Malformed => format!(
+            "{input} must be an http or https URL with a host and nothing after its path, such \
+             as https://HOST:PORT"
+        ),
+    }
+}
+
+/// The `-p trial` connection, after [`crate::trial::profile::apply`] put
+/// the trial's URL, operator key and certificate into `[server]`. The URL
+/// and the key are read together, as the one unit the overlay wrote; the
+/// overlay already refused every flag and variable that could move either.
+pub(crate) fn trial(cfg: &Config) -> Result<ConnectionParams, ConnectionError> {
+    const KEY: &str = "the trial's operator key";
+    let base = ApiBase::parse(&cfg.server.url).map_err(|problem| ConnectionError::Url {
+        input: "the trial's recorded API address".to_owned(),
+        problem,
+    })?;
+    let key = cfg
+        .server
+        .token
+        .as_deref()
+        .and_then(|token| key_from_text(token, KEY))
+        .ok_or_else(|| ConnectionError::Key {
+            input: KEY.to_owned(),
+            reason: "the trial has no operator key yet".to_owned(),
+            next: "finish the trial with `trawl trial up`".to_owned(),
+        })?;
+    Ok(ConnectionParams {
+        url: base.request_base(),
+        token: key.secret().to_owned(),
+        trust: cfg.tls_trust()?,
     })
 }
 

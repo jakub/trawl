@@ -439,9 +439,26 @@ pub enum CliError {
     Usage(String),
     #[error("{0}")]
     Trial(#[from] trial::TrialError),
+    /// The connection did not resolve: a URL or key was refused, or no
+    /// key exists. Nothing was sent.
+    #[error("{0}")]
+    Connection(connection::ConnectionError),
     /// A usage error found after parsing; it exits 2 as clap's own do.
     #[error("{0}")]
     Arg(Box<clap::Error>),
+}
+
+/// `--token` beside `--token-file` is a usage error (exit 2), as clap's
+/// own conflicts are; every other connection error exits 1.
+impl From<connection::ConnectionError> for CliError {
+    fn from(err: connection::ConnectionError) -> Self {
+        if matches!(err, connection::ConnectionError::BothKeyFlags) {
+            let usage =
+                Cli::command().error(clap::error::ErrorKind::ArgumentConflict, err.to_string());
+            return Self::Arg(Box::new(usage));
+        }
+        Self::Connection(err)
+    }
 }
 
 /// The binary's entry point: parse argv, run, and map errors to an exit code.
@@ -579,7 +596,7 @@ async fn run(mut args: Cli, sources: connection::Sources) -> Result<u8, CliError
 /// reads it: everything but `trial` and `doctor`.
 async fn run_configured(
     args: Cli,
-    _sources: connection::Sources,
+    sources: connection::Sources,
     command: Option<Command>,
 ) -> Result<u8, CliError> {
     // The driver sends to whatever TUI holds the socket and never uses the
@@ -591,12 +608,16 @@ async fn run_configured(
         return Err(CliError::Usage(DRIVER_UNDER_TRIAL.to_owned()));
     }
 
-    // Load config file and apply overrides.
+    // Load the config file and apply the profile's trust. A profile's url
+    // and token stay in its table, bound to each other.
     let mut cfg = config::Config::load(args.config.as_deref())?;
     let trial_profile = args.profile.as_deref() == Some(trial::PROFILE);
     if trial_profile {
-        let overrides =
-            trial::profile::Overrides::observe(args.url.is_some(), args.token.is_some());
+        let overrides = trial::profile::Overrides::observe(
+            args.url.is_some(),
+            args.token.is_some(),
+            args.token_file.is_some(),
+        );
         let config_path = args
             .config
             .as_deref()
@@ -606,7 +627,7 @@ async fn run_configured(
     } else if let Some(ref profile) = args.profile {
         cfg.apply_profile(profile)?;
     }
-    cfg.apply_overrides(args.url, args.insecure);
+    cfg.apply_overrides(args.insecure);
     if trial_profile {
         // The trial is only ever reached through its pinned certificate:
         // --insecure or TRAWL_INSECURE fails here, through the
@@ -616,32 +637,31 @@ async fn run_configured(
     // Before any output, and before the TUI takes the terminal.
     warn_if_insecure(&cfg, &mut io::stderr().lock())?;
 
+    // The connection resolves where a command needs it, not before:
+    // `query --data` and `schema fields --data` read none, so neither a
+    // refused key nor a broken saved URL stops them.
+    let inputs = connection::Inputs::new(args.url, args.token, args.token_file, sources);
+    let profile = args.profile.as_deref();
+    let connect = || {
+        if trial_profile {
+            connection::trial(&cfg).map(Some)
+        } else {
+            connection::ordinary(&cfg, profile, &inputs)
+        }
+    };
+    let required = || -> Result<cli::ConnectionParams, CliError> {
+        match connect()? {
+            Some(conn) => Ok(conn),
+            None => Err(inputs.no_credential().into()),
+        }
+    };
+
     match command {
         None => {
-            // TUI mode — tracing goes to a log file, not stderr (which corrupts the UI).
-            let log_dir = shellexpand::tilde("~/.config/trawl");
-            std::fs::create_dir_all(log_dir.as_ref())?;
-            let log_file = open_tui_log(std::path::Path::new(&format!("{log_dir}/tui.log")))?;
-
-            tracing_subscriber::fmt()
-                .with_writer(Mutex::new(log_file))
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-                )
-                .with_ansi(false)
-                .init();
-
-            // Resolve driver socket path.
-            let driver_path: Option<PathBuf> = args.driver.map(|v| {
-                if v.is_empty() {
-                    tui::driver::default_socket_path()
-                } else {
-                    PathBuf::from(v)
-                }
-            });
-
-            tui::run(&cfg, args.token.as_deref(), driver_path.as_deref()).await?;
+            // Before the log file, tracing, and the terminal: a refusal
+            // prints to a normal terminal and leaves nothing behind.
+            let conn = required()?;
+            run_tui(&cfg, conn, args.driver).await?;
         }
         Some(Command::Query {
             query,
@@ -653,7 +673,7 @@ async fn run_configured(
             let conn = if data.is_some() {
                 None
             } else {
-                Some(connection(&cfg, args.token.as_deref())?)
+                Some(required()?)
             };
 
             cli::run_query(
@@ -667,19 +687,16 @@ async fn run_configured(
             .await?;
         }
         Some(Command::Validate { query }) => {
-            // Validate supports both daemon and local-only mode: no token
-            // means local. Any other resolution failure is still an error.
-            let conn = match connection(&cfg, args.token.as_deref()) {
-                Ok(conn) => Some(conn),
-                Err(CliError::Config(config::ConfigError::TokenNotFound)) => None,
-                Err(e) => return Err(e),
-            };
+            // Validate supports both daemon and local-only mode: no key
+            // anywhere means local. Every refusal, a key bound to another
+            // server included, is still an error, never a local result.
+            let conn = connect()?;
 
             cli::run_validate(&query, conn).await?;
         }
 
         Some(Command::Schema { cmd }) => {
-            run_schema(cmd, &cfg, args.token.as_deref()).await?;
+            run_schema(cmd, required).await?;
         }
 
         Some(Command::Driver { socket, cmd }) => {
@@ -687,8 +704,9 @@ async fn run_configured(
         }
 
         Some(Command::PreviewIngest(preview)) => {
+            // Before the sample is read, so a refusal never waits on stdin.
+            let conn = required()?;
             let body = preview_ingest::read_sample(preview.file.as_deref())?;
-            let conn = connection(&cfg, args.token.as_deref())?;
             let stdout = io::stdout();
             return preview_ingest::run(&mut stdout.lock(), &conn, body, &preview).await;
         }
@@ -699,6 +717,39 @@ async fn run_configured(
     }
 
     Ok(0)
+}
+
+/// Start the TUI on a connection already resolved. `driver` is `--driver`,
+/// empty for the default socket.
+async fn run_tui(
+    cfg: &config::Config,
+    conn: cli::ConnectionParams,
+    driver: Option<String>,
+) -> Result<(), CliError> {
+    // TUI mode — tracing goes to a log file, not stderr (which corrupts the UI).
+    let log_dir = shellexpand::tilde("~/.config/trawl");
+    std::fs::create_dir_all(log_dir.as_ref())?;
+    let log_file = open_tui_log(std::path::Path::new(&format!("{log_dir}/tui.log")))?;
+
+    tracing_subscriber::fmt()
+        .with_writer(Mutex::new(log_file))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_ansi(false)
+        .init();
+
+    // Resolve driver socket path.
+    let driver_path: Option<PathBuf> = driver.map(|v| {
+        if v.is_empty() {
+            tui::driver::default_socket_path()
+        } else {
+            PathBuf::from(v)
+        }
+    });
+
+    tui::run(cfg, conn, driver_path.as_deref()).await
 }
 
 impl From<Cli> for doctor::Globals {
@@ -720,20 +771,6 @@ const DRIVER_UNDER_TRIAL: &str = "-p trial cannot select the trial for `trawl dr
      Start the TUI with `trawl -p trial --driver`, then run `trawl driver` without -p trial \
      or TRAWL_PROFILE=trial";
 
-/// Resolve the connection every server-bound command and the TUI use:
-/// the token first, then the certificate trust.
-pub(crate) fn connection(
-    cfg: &config::Config,
-    direct_token: Option<&str>,
-) -> Result<cli::ConnectionParams, CliError> {
-    let token = cfg.load_token(direct_token)?;
-    Ok(cli::ConnectionParams {
-        url: cfg.server.url.clone(),
-        token,
-        trust: cfg.tls_trust()?,
-    })
-}
-
 /// The one line `trawl` writes when certificate verification is off,
 /// whichever of `--insecure`, `TRAWL_INSECURE`, `[server]`, or the profile
 /// turned it on. It goes to stderr so stdout stays byte-identical.
@@ -748,7 +785,7 @@ fn warn_if_insecure(cfg: &config::Config, stderr: &mut impl Write) -> io::Result
 
 /// Dispatch `trawl schema <cmd>`. Connection resolution mirrors `query`,
 /// not `validate`: only `fields --data` has a serverless fallback, so
-/// everywhere else a token-resolution failure must surface as itself.
+/// everywhere else a resolution failure must surface as itself.
 /// Swallowing it into an `Option` would re-report a broken profile as
 /// "schema field requires a server".
 // Long because it is one arm per subcommand: every arm unpacks its flags
@@ -757,10 +794,8 @@ fn warn_if_insecure(cfg: &config::Config, stderr: &mut impl Write) -> io::Result
 #[allow(clippy::too_many_lines)]
 async fn run_schema(
     cmd: SchemaSubcommand,
-    cfg: &config::Config,
-    token: Option<&str>,
+    conn: impl Fn() -> Result<cli::ConnectionParams, CliError>,
 ) -> Result<(), CliError> {
-    let conn = |token: Option<&str>| connection(cfg, token);
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match cmd {
@@ -771,11 +806,7 @@ async fn run_schema(
             data,
             format,
         } => {
-            let conn = if data.is_some() {
-                None
-            } else {
-                Some(conn(token)?)
-            };
+            let conn = if data.is_some() { None } else { Some(conn()?) };
             schema::run_fields(
                 &mut out,
                 conn,
@@ -795,7 +826,7 @@ async fn run_schema(
         } => {
             schema::run_field(
                 &mut out,
-                Some(conn(token)?),
+                Some(conn()?),
                 &name,
                 limit,
                 after.as_deref(),
@@ -812,7 +843,7 @@ async fn run_schema(
         } => {
             schema::run_conflicts(
                 &mut out,
-                Some(conn(token)?),
+                Some(conn()?),
                 field.as_deref(),
                 service.as_deref(),
                 last.as_deref(),
@@ -823,41 +854,24 @@ async fn run_schema(
         }
         SchemaSubcommand::Repin(args) => {
             let flags = args.flags();
-            schema::run_repin(
-                &mut out,
-                conn(token)?,
-                &args.field,
-                &args.to,
-                flags,
-                args.format,
-            )
-            .await
+            schema::run_repin(&mut out, conn()?, &args.field, &args.to, flags, args.format).await
         }
         SchemaSubcommand::RepinStatus { format } => {
-            schema::run_repin_status(&mut out, conn(token)?, format).await
+            schema::run_repin_status(&mut out, conn()?, format).await
         }
         SchemaSubcommand::RepinCancel { format } => {
-            schema::run_repin_cancel(&mut out, conn(token)?, format).await
+            schema::run_repin_cancel(&mut out, conn()?, format).await
         }
         SchemaSubcommand::GcPins {
             dry_run,
             older_than,
             format,
-        } => {
-            schema::run_gc_pins(
-                &mut out,
-                conn(token)?,
-                dry_run,
-                older_than.as_deref(),
-                format,
-            )
-            .await
-        }
+        } => schema::run_gc_pins(&mut out, conn()?, dry_run, older_than.as_deref(), format).await,
         SchemaSubcommand::Ack(args) => {
             let note = args.note.as_deref();
             schema::run_ack(
                 &mut out,
-                conn(token)?,
+                conn()?,
                 &args.field,
                 note,
                 args.clear,

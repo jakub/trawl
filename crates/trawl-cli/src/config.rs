@@ -32,8 +32,6 @@ pub enum ConfigError {
         path: String,
         source: toml::de::Error,
     },
-    #[error("no API token found (set TRAWL_TOKEN, use --token, or add token to config)")]
-    TokenNotFound,
     #[error("unknown profile '{name}' (available: {available})")]
     UnknownProfile { name: String, available: String },
     #[error(
@@ -112,7 +110,10 @@ impl Default for ServerConfig {
     }
 }
 
-/// Named profile — overlays `[server]` settings when selected via `--profile`.
+/// Named profile, selected with `--profile`. Its `insecure` and `ca_cert`
+/// overlay `[server]`'s. Its `url` and `token` stay in this table: the
+/// connection module reads them in place, so a key keeps the base it was
+/// saved for (ADR-0065).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileConfig {
     /// Server URL override.
@@ -241,9 +242,9 @@ impl Config {
         })
     }
 
-    /// Apply a named profile's overrides to the server config.
-    pub fn apply_profile(&mut self, name: &str) -> Result<(), ConfigError> {
-        let profile = self.profiles.get(name).ok_or_else(|| {
+    /// The named profile's table.
+    pub fn profile(&self, name: &str) -> Result<&ProfileConfig, ConfigError> {
+        self.profiles.get(name).ok_or_else(|| {
             let mut available: Vec<&str> = self.profiles.keys().map(String::as_str).collect();
             available.sort_unstable();
             ConfigError::UnknownProfile {
@@ -254,33 +255,32 @@ impl Config {
                     available.join(", ")
                 },
             }
-        })?;
+        })
+    }
 
-        if let Some(ref url) = profile.url {
-            self.server.url = url.clone();
-        }
-        if let Some(ref token) = profile.token {
-            self.server.token = Some(token.clone());
-        }
-        if let Some(insecure) = profile.insecure {
+    /// Apply a named profile's trust (`insecure`, `ca_cert`) to `[server]`.
+    ///
+    /// The profile's `url` and `token` are not copied: a token copied into
+    /// `[server]` would lose the URL it was saved for.
+    pub fn apply_profile(&mut self, name: &str) -> Result<(), ConfigError> {
+        let profile = self.profile(name)?;
+        let (insecure, ca_cert) = (profile.insecure, profile.ca_cert.clone());
+        if let Some(insecure) = insecure {
             self.server.insecure = insecure;
         }
-        if let Some(ref ca_cert) = profile.ca_cert {
+        if let Some(ca_cert) = ca_cert {
             self.server.ca_cert = if ca_cert.as_os_str().is_empty() {
                 None
             } else {
-                Some(ca_cert.clone())
+                Some(ca_cert)
             };
         }
 
         Ok(())
     }
 
-    /// Apply CLI argument overrides.
-    pub fn apply_overrides(&mut self, url: Option<String>, insecure: bool) {
-        if let Some(u) = url {
-            self.server.url = u;
-        }
+    /// Apply `--insecure` or `TRAWL_INSECURE`.
+    pub fn apply_overrides(&mut self, insecure: bool) {
         if insecure {
             self.server.insecure = true;
         }
@@ -322,23 +322,6 @@ impl Config {
             });
         }
         Ok(trawl_client::TlsTrust::PinnedCa(pem))
-    }
-
-    /// Load the API token.
-    ///
-    /// Resolution order:
-    /// 1. `direct_token` (from `--token` flag / `TRAWL_TOKEN` env)
-    /// 2. Inline token from config (post-profile overlay)
-    pub fn load_token(&self, direct_token: Option<&str>) -> Result<String, ConfigError> {
-        if let Some(token) = direct_token {
-            return Ok(token.trim().to_owned());
-        }
-
-        if let Some(ref token) = self.server.token {
-            return Ok(token.trim().to_owned());
-        }
-
-        Err(ConfigError::TokenNotFound)
     }
 }
 
@@ -426,20 +409,19 @@ mod tests {
         ));
     }
 
+    /// `--insecure` turns verification off; its absence never turns it
+    /// back on. The URL is not an override here: the connection module
+    /// reads `--url` itself.
     #[test]
-    fn apply_overrides_updates_config() {
+    fn apply_overrides_sets_only_insecure() {
         let mut config = Config::default();
-        config.apply_overrides(Some("https://example.com:8443".into()), true);
-        assert_eq!(config.server.url, "https://example.com:8443");
-        assert!(config.server.insecure);
-    }
-
-    #[test]
-    fn partial_overrides_preserve_defaults() {
-        let mut config = Config::default();
-        config.apply_overrides(Some("https://example.com".into()), false);
-        assert_eq!(config.server.url, "https://example.com");
+        config.apply_overrides(false);
         assert!(!config.server.insecure);
+        assert_eq!(config.server.url, DEFAULT_URL);
+        config.apply_overrides(true);
+        assert!(config.server.insecure);
+        config.apply_overrides(false);
+        assert!(config.server.insecure);
     }
 
     #[test]
@@ -463,38 +445,10 @@ url = "https://custom:9000"
         assert_eq!(config.ui.theme, "default");
     }
 
+    /// A profile overlays its trust and leaves its `url` and `token` in
+    /// its own table, where the connection module binds them.
     #[test]
-    fn direct_token_overrides_config_token() {
-        let mut config = Config::default();
-        config.server.token = Some("config-token".into());
-        let token = config.load_token(Some("direct-token")).unwrap();
-        assert_eq!(token, "direct-token");
-    }
-
-    #[test]
-    fn config_token_used_when_no_direct_token() {
-        let mut config = Config::default();
-        config.server.token = Some("config-token".into());
-        let token = config.load_token(None).unwrap();
-        assert_eq!(token, "config-token");
-    }
-
-    #[test]
-    fn config_token_is_trimmed() {
-        let mut config = Config::default();
-        config.server.token = Some("  spaced-token  ".into());
-        let token = config.load_token(None).unwrap();
-        assert_eq!(token, "spaced-token");
-    }
-
-    #[test]
-    fn no_token_returns_error() {
-        let config = Config::default();
-        assert!(config.load_token(None).is_err());
-    }
-
-    #[test]
-    fn profile_overlays_server_config() {
+    fn profile_overlays_only_its_trust() {
         let toml_str = r#"
 [server]
 url = "https://prod:5514"
@@ -507,9 +461,12 @@ insecure = true
 "#;
         let mut config: Config = toml::from_str(toml_str).unwrap();
         config.apply_profile("dev").unwrap();
-        assert_eq!(config.server.url, "https://localhost:5514");
-        assert_eq!(config.server.token.as_deref(), Some("dev-token"));
+        assert_eq!(config.server.url, "https://prod:5514");
+        assert_eq!(config.server.token.as_deref(), Some("prod-token"));
         assert!(config.server.insecure);
+        let dev = config.profile("dev").unwrap();
+        assert_eq!(dev.url.as_deref(), Some("https://localhost:5514"));
+        assert_eq!(dev.token.as_deref(), Some("dev-token"));
     }
 
     #[test]
@@ -525,7 +482,7 @@ url = "https://staging:5514"
 "#;
         let mut config: Config = toml::from_str(toml_str).unwrap();
         config.apply_profile("staging").unwrap();
-        assert_eq!(config.server.url, "https://staging:5514");
+        assert_eq!(config.server.url, "https://prod:5514");
         assert_eq!(config.server.token.as_deref(), Some("prod-token"));
         assert!(!config.server.insecure);
     }
@@ -573,21 +530,6 @@ url = "https://staging:5514"
         let mut config = Config::default();
         let err = config.apply_profile("dev").unwrap_err();
         assert!(err.to_string().contains("none"));
-    }
-
-    #[test]
-    fn profile_token_overrides_base_token() {
-        let toml_str = r#"
-[server]
-token = "base-token"
-
-[profiles.other]
-token = "other-token"
-"#;
-        let mut config: Config = toml::from_str(toml_str).unwrap();
-        config.apply_profile("other").unwrap();
-        let token = config.load_token(None).unwrap();
-        assert_eq!(token, "other-token");
     }
 
     #[test]
@@ -740,7 +682,7 @@ ca_cert = ""
 
         // --insecure / TRAWL_INSECURE
         let (_dir, _, mut config) = with_ca_file("");
-        config.apply_overrides(None, true);
+        config.apply_overrides(true);
         assert!(matches!(
             config.tls_trust(),
             Err(ConfigError::CaCertWithInsecure)
@@ -793,7 +735,7 @@ ca_cert = ""
         let toml = toml::to_string(&config).unwrap();
         assert!(!toml.contains("pinned_ca"), "never serialized: {toml}");
 
-        config.apply_overrides(None, true);
+        config.apply_overrides(true);
         assert!(matches!(
             config.tls_trust(),
             Err(ConfigError::CaCertWithInsecure)
@@ -804,7 +746,7 @@ ca_cert = ""
     fn without_ca_cert_insecure_picks_the_trust() {
         let mut config = Config::default();
         assert_eq!(config.tls_trust().unwrap(), TlsTrust::System);
-        config.apply_overrides(None, true);
+        config.apply_overrides(true);
         assert_eq!(config.tls_trust().unwrap(), TlsTrust::AcceptInvalid);
     }
 }
