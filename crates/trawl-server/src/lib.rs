@@ -58,6 +58,8 @@ pub mod stats;
 pub mod store;
 pub mod syslog;
 pub mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_events;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_timing;
 pub mod tls;

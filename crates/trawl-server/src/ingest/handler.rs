@@ -804,7 +804,16 @@ fn decompress_gzip(data: &[u8], max_body_bytes: usize) -> Result<Vec<u8>, Server
     decoder
         .take(u64::try_from(max_body_bytes.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut decompressed)
-        .map_err(|e| ServerError::Ingest(format!("gzip decompression failed: {e}")))?;
+        .map_err(|e| {
+            // The refusal is a public message (ADR-0040, amendment of
+            // 2026-11-08): the error's kind, never its text.
+            tracing::debug!(
+                event_type = "ingest_gzip_failed",
+                error = %e,
+                "gzip decompression failed"
+            );
+            ServerError::Ingest(format!("gzip decompression failed: {}", e.kind()))
+        })?;
     if decompressed.len() > max_body_bytes {
         tracing::warn!(
             event_type = "ingest_body_too_large",
@@ -1798,6 +1807,20 @@ mod tests {
         );
         let decompressed = decompress_gzip(&wire, 1024 * 1024).unwrap();
         assert_eq!(decompressed, raw);
+    }
+
+    /// A broken stream is refused by the error's kind, not its text: the
+    /// refusal reaches the wire and every record of the failure.
+    #[test]
+    fn a_broken_gzip_stream_is_refused_by_error_kind() {
+        let mut wire = gzip(&repetitive_ndjson(4096));
+        wire.truncate(wire.len() / 2);
+        let err = decompress_gzip(&wire, 1024 * 1024).unwrap_err();
+        let ServerError::Ingest(msg) = &err else {
+            panic!("expected an ingest refusal, got {err:?}");
+        };
+        assert_eq!(msg, "gzip decompression failed: unexpected end of file");
+        assert_eq!(err.safe_message(), *msg);
     }
 
     /// A body that decompresses to exactly the limit is accepted.

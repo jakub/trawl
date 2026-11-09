@@ -265,7 +265,7 @@ use super::charge::{EvidenceBudget, Refusal, Reservation};
 use super::root::{self, Published, ResultsRoot, Verified};
 use super::{Entered, InFlight, ResultsState};
 use crate::deadline::{Deadline, Expired};
-use crate::error::{CAPACITY_NOT_STARTED, ServerError};
+use crate::error::ServerError;
 use crate::from_saved::RunFile;
 use crate::investigations::service::{activity, unlink_evidence};
 use crate::investigations::step::{self, StepCompletion};
@@ -1083,17 +1083,13 @@ async fn plan(
     let (resolved, executed) = match prepared {
         Err(ServerError::Timeout) => {
             timing.emit_complete(Outcome::CapacityRefused, Instant::now());
-            return Err(ServerError::ServiceUnavailable(
-                CAPACITY_NOT_STARTED.to_owned(),
-            ));
+            return Err(ServerError::CapacityNotStarted);
         }
         prepared => prepared?,
     };
     if deadline.expired() {
         timing.emit_complete(Outcome::CapacityRefused, Instant::now());
-        return Err(ServerError::ServiceUnavailable(
-            CAPACITY_NOT_STARTED.to_owned(),
-        ));
+        return Err(ServerError::CapacityNotStarted);
     }
 
     match resolved.source {
@@ -1131,9 +1127,7 @@ async fn plan(
                 // saved lookup, and named where it is made.
                 Err(Expired) => {
                     timing.emit_complete(Outcome::CapacityRefused, Instant::now());
-                    return Err(ServerError::ServiceUnavailable(
-                        CAPACITY_NOT_STARTED.to_owned(),
-                    ));
+                    return Err(ServerError::CapacityNotStarted);
                 }
             };
             if let Some(conflict) =

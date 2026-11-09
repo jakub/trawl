@@ -1611,10 +1611,16 @@ impl Encoded {
                 row.format_version
             ))
         })?;
-        let columns = serde_json::to_string(&row.columns)
-            .map_err(|e| StoreError::Validation(format!("columns do not encode: {e}")))?;
-        let column_facts = serde_json::to_string(&row.column_facts)
-            .map_err(|e| StoreError::Validation(format!("column facts do not encode: {e}")))?;
+        let columns = serde_json::to_string(&row.columns).map_err(|e| {
+            // A public message names no serde_json text (ADR-0040,
+            // amendment of 2026-11-08).
+            tracing::debug!(error = %e, "a capture's columns did not encode");
+            StoreError::Validation("columns do not encode".to_owned())
+        })?;
+        let column_facts = serde_json::to_string(&row.column_facts).map_err(|e| {
+            tracing::debug!(error = %e, "a capture's column facts did not encode");
+            StoreError::Validation("column facts do not encode".to_owned())
+        })?;
         Ok(Self {
             format_version,
             columns,

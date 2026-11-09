@@ -226,9 +226,7 @@ pub async fn query(
                     // Refused here, before any work: named where it is made,
                     // like the pool's own capacity refusals.
                     timing.emit_complete(Outcome::CapacityRefused, std::time::Instant::now());
-                    Err(ServerError::ServiceUnavailable(
-                        crate::error::CAPACITY_NOT_STARTED.to_owned(),
-                    ))
+                    Err(ServerError::CapacityNotStarted)
                 }
             }
         }
@@ -481,8 +479,9 @@ pub async fn query(
             Err(ServerError::Timeout)
         }
         Err(e) => {
-            // SECURITY: use safe_message() to redact database internals
-            // from tracker history and logs.
+            // SECURITY: the tracker stores the public message, the string
+            // the client reads, which never carries database internals
+            // (ADR-0040).
             let safe_msg = e.safe_message();
             tracked.fail(&safe_msg);
 
@@ -490,12 +489,13 @@ pub async fn query(
             metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
 
             // Default-filter failure events carry the class only. Neither
-            // `safe_msg` nor the raw error is safe to persist here:
-            // safe_message() deliberately preserves parser/emitter text
-            // (which quotes the user's own tokens and format strings), and
-            // the raw database error embeds the generated SQL plus the
-            // values it choked on. Both live on in the client response, the
-            // tracker, the opt-in query debug log, and the DEBUG event below.
+            // `safe_msg` nor the raw error belongs in them: the public
+            // message keeps parser/emitter text (which quotes the user's
+            // own tokens and format strings), and the raw database error
+            // embeds the generated SQL plus the values it choked on. The
+            // public message lives on in the client response, the tracker
+            // and the opt-in query debug log; the raw error only in the
+            // DEBUG event below.
             let error_class = e.error_class();
             match &e {
                 // Every 400-class engine answer, including the refusal
