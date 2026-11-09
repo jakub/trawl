@@ -811,11 +811,20 @@ fn write_result_parquet(
     let full_path = format!("{base}/{relative}");
     let temp_path = format!("{full_path}.tmp");
 
+    // The fallback events name the error's kind, never its text, which
+    // can carry host paths and engine diagnostics; the text goes to DEBUG
+    // (ADR-0040, amended 2026-11-08).
     if let Err(e) = std::fs::create_dir_all(format!("{base}/scheduled")) {
-        tracing::warn!(
+        tracing::debug!(
             event_type = "scheduler_parquet_error",
             run_id,
             error = %e,
+            "failed to create scheduled result directory, falling back to blob"
+        );
+        tracing::warn!(
+            event_type = "scheduler_parquet_error",
+            run_id,
+            error_kind = %e.kind(),
             "failed to create scheduled result directory, falling back to blob"
         );
         return zstd_fallback(result);
@@ -826,11 +835,10 @@ fn write_result_parquet(
     let executor = match pool.detached_executor() {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(
-                event_type = "scheduler_parquet_error",
+            log_parquet_engine_fault(
                 run_id,
-                error = %e,
-                "failed to create executor for parquet write, falling back to blob"
+                e,
+                "failed to create executor for parquet write, falling back to blob",
             );
             return zstd_fallback(result);
         }
@@ -853,11 +861,10 @@ fn write_result_parquet(
             return zstd_fallback(result);
         }
         Err(e) => {
-            tracing::warn!(
-                event_type = "scheduler_parquet_error",
+            log_parquet_engine_fault(
                 run_id,
-                error = %e,
-                "failed to write parquet result, falling back to blob"
+                e,
+                "failed to write parquet result, falling back to blob",
             );
             let _ = std::fs::remove_file(temp);
             return zstd_fallback(result);
@@ -865,10 +872,16 @@ fn write_result_parquet(
     }
 
     if let Err(e) = std::fs::rename(temp, final_path) {
-        tracing::warn!(
+        tracing::debug!(
             event_type = "scheduler_parquet_error",
             run_id,
             error = %e,
+            "failed to rename parquet temp file, falling back to blob"
+        );
+        tracing::warn!(
+            event_type = "scheduler_parquet_error",
+            run_id,
+            error_kind = %e.kind(),
             "failed to rename parquet temp file, falling back to blob"
         );
         let _ = std::fs::remove_file(temp);
@@ -876,6 +889,21 @@ fn write_result_parquet(
     }
 
     Ok((Some(relative), None))
+}
+
+/// Log an engine failure that sends a run's result to the blob: its class
+/// and cause kind at WARN, its text, which can quote `DuckDB` diagnostics or
+/// an `io::Error`, at DEBUG.
+fn log_parquet_engine_fault(run_id: i64, err: trawl_engine::error::EngineError, what: &str) {
+    tracing::debug!(event_type = "scheduler_parquet_error", run_id, error = %err, "{what}");
+    let fault = ServerError::from(err);
+    tracing::warn!(
+        event_type = "scheduler_parquet_error",
+        run_id,
+        error_class = fault.error_class(),
+        cause_kind = fault.cause_kind().as_str(),
+        "{what}"
+    );
 }
 
 /// Compress a `QueryResult` as a zstd blob of its typed wire JSON, the
@@ -1730,5 +1758,82 @@ mod tests {
             reason.contains("encoding failed") && reason.contains("\"n\""),
             "{reason}"
         );
+    }
+
+    /// Each parquet fallback the test can provoke falls back to the blob
+    /// with a WARN that names the error's kind and class but carries
+    /// neither its text nor the data root, which go to a DEBUG event
+    /// beside it (ADR-0040, amended 2026-11-08). The arms: the result
+    /// directory blocked by a file, the engine's ndjson staging path
+    /// blocked by a directory (an [`EngineError::Io`]), and the final path
+    /// blocked by a non-empty directory, so the rename fails. The detached
+    /// executor arm takes the same engine path and is not provoked here.
+    ///
+    /// [`EngineError::Io`]: trawl_engine::error::EngineError::Io
+    #[test]
+    fn parquet_fallback_events_carry_no_error_text() {
+        use crate::test_events::events_of;
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+
+        type Block = fn(&std::path::Path);
+
+        let result = QueryResult {
+            columns: vec![Column::new("n", ColumnType::Integer)],
+            rows: vec![vec![Value::Integer(7)]],
+        };
+        let block_dir = |base: &std::path::Path| {
+            std::fs::write(base.join("scheduled"), b"").unwrap();
+        };
+        let block_write = |base: &std::path::Path| {
+            std::fs::create_dir_all(base.join("scheduled/run_1.parquet.tmp.ndjson.tmp")).unwrap();
+        };
+        let block_rename = |base: &std::path::Path| {
+            std::fs::create_dir_all(base.join("scheduled/run_1.parquet/inner")).unwrap();
+        };
+        let cases: [(&str, Block, &[&str]); 3] = [
+            ("directory", block_dir, &["error_kind"]),
+            ("engine write", block_write, &["error_class", "cause_kind"]),
+            ("rename", block_rename, &["error_kind"]),
+        ];
+        for (arm, block, carried) in cases {
+            let data = tempfile::tempdir().unwrap();
+            let abs = data.path().display().to_string();
+            block(data.path());
+            let executors =
+                crate::pool::ExecutorPool::for_test(abs.clone(), 1, 100_000, None).unwrap();
+
+            let mut stored = None;
+            let events = events_of(|| {
+                stored = Some(super::write_result_parquet(&executors, 1, &result));
+            });
+            let (path, blob) = stored.unwrap().expect("the blob fallback encodes");
+            assert!(path.is_none() && blob.is_some(), "{arm}: no blob fallback");
+
+            for event in events.iter().filter(|e| e.is_default_level()) {
+                assert!(!event.text().contains(&abs), "{arm}: {event:?}");
+                assert!(!event.text().contains("os error"), "{arm}: {event:?}");
+                assert!(!event.fields.contains_key("error"), "{arm}: {event:?}");
+            }
+            let warn = events
+                .iter()
+                .find(|e| {
+                    e.level == tracing::Level::WARN
+                        && e.fields.get("event_type").map(String::as_str)
+                            == Some("scheduler_parquet_error")
+                })
+                .unwrap_or_else(|| panic!("{arm}: no WARN: {events:?}"));
+            for field in carried {
+                assert!(warn.fields.contains_key(*field), "{arm}: {warn:?}");
+            }
+            let debug = events
+                .iter()
+                .find(|e| {
+                    e.level == tracing::Level::DEBUG
+                        && e.fields.get("event_type").map(String::as_str)
+                            == Some("scheduler_parquet_error")
+                })
+                .unwrap_or_else(|| panic!("{arm}: no DEBUG: {events:?}"));
+            assert!(debug.text().contains("os error"), "{arm}: {debug:?}");
+        }
     }
 }
