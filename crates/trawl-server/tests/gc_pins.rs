@@ -796,7 +796,14 @@ async fn gc_refuses_the_whole_run_on_an_unreadable_parquet() {
 
     assert_eq!(err.error_class(), "conflict", "{err}");
     let msg = err.to_string();
-    assert!(msg.contains("junk.parquet"), "the refusal names it: {msg}");
+    assert!(
+        msg.contains("prod/junk.parquet (unreadable parquet: the footer does not parse)"),
+        "the refusal names it relative to the data root: {msg}"
+    );
+    assert!(
+        !msg.contains(&h.data_dir.display().to_string()),
+        "no absolute root: {msg}"
+    );
     assert!(msg.contains("deleted nothing"), "{msg}");
     assert!(h.pinned("dead"), "a refused run deletes nothing");
     assert!(h.pinned_in_store("dead").await);
@@ -815,7 +822,7 @@ async fn gc_refuses_the_whole_run_on_an_unreadable_parquet() {
 /// A data root that is not there is UNKNOWN, never an empty corpus. Read as
 /// empty, no footer would disprove anything and the run would reclaim every
 /// candidate pin in the catalog — an unmounted volume or a mistyped
-/// `data_dir` turned into a mass delete.
+/// `[data] path` turned into a mass delete.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_refuses_a_data_root_that_is_not_there() {
     let h = harness().await;
@@ -840,10 +847,17 @@ async fn gc_refuses_a_data_root_that_is_not_there() {
         .expect_err("a missing data root fails the run closed");
     assert_eq!(err.error_class(), "conflict", "{err}");
     let msg = err.to_string();
+    // The refusal names the setting and the error kind, never the
+    // absolute root: its text reaches the wire and every record.
     assert!(
-        msg.contains("not-mounted"),
-        "the refusal names the root: {msg}"
+        msg.contains("cannot read the data root (entity not found)"),
+        "the refusal names the root by its role: {msg}"
     );
+    assert!(
+        msg.contains("[data] path"),
+        "the refusal names the setting: {msg}"
+    );
+    assert!(!msg.contains("not-mounted"), "no host path: {msg}");
     assert!(msg.contains("deleted nothing"), "{msg}");
     assert!(h.pinned("dead"), "a refused run deletes nothing");
     assert!(h.pinned_in_store("dead").await);

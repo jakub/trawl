@@ -1993,10 +1993,16 @@ mod tests {
 
         assert_eq!(ServerError::Timeout.error_class(), "timeout");
         // Pin gc's refusals carry an operator instruction and data-root
-        // paths; the class stays a literal either way.
-        let conflict = ServerError::Conflict("/var/lib/trawl/data/prod/x.parquet".into());
+        // relative names, never the absolute root; the class stays a
+        // literal either way.
+        let root = std::path::Path::new("/var/lib/trawl/data");
+        let mut problems = crate::catalog::gc::Problems::new(root);
+        problems.note(&root.join("prod/x.parquet"), "not a regular file");
+        let conflict = ServerError::Conflict(problems.refusal().expect("one problem refuses"));
         assert_eq!(conflict.error_class(), "conflict");
-        assert!(conflict.safe_message().contains("x.parquet"));
+        let public = conflict.safe_message();
+        assert!(public.contains("prod/x.parquet"), "{public}");
+        assert!(!public.contains("/var/lib/trawl"), "{public}");
         assert_eq!(
             ServerError::Internal("dsn leaked".into()).error_class(),
             "internal"
