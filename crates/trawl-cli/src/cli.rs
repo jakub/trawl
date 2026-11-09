@@ -577,16 +577,35 @@ fn write_error_details(
 
 /// Render a `ClientError` with span details (if available) for CLI output.
 pub fn render_client_error(query: &str, err: &trawl_client::ClientError) {
+    // stderr is the last place to report anything; a failed write has
+    // nowhere to go.
+    let _ = write_client_error(&mut io::stderr().lock(), query, err);
+}
+
+/// Write `err` for the query `query`, the text that was sent.
+///
+/// The summary line is sanitized like the details: the server's message
+/// and the error around it reach the terminal.
+fn write_client_error(
+    out: &mut impl Write,
+    query: &str,
+    err: &trawl_client::ClientError,
+) -> io::Result<()> {
     let details = err.error_details();
     // A validation error's one detail has no span and repeats the summary
     // the error already prints, so only a span earns the detailed form.
     if details.iter().any(|d| d.span.is_some()) {
         if let Some(envelope) = err.error_envelope() {
-            eprintln!("trawl: {:?}: {}", envelope.code, envelope.message);
+            writeln!(
+                out,
+                "trawl: {:?}: {}",
+                envelope.code,
+                sanitize_display_text(&envelope.message)
+            )?;
         }
-        render_error_details(query, details);
+        write_error_details(out, query, details)
     } else {
-        eprintln!("trawl: {err}");
+        writeln!(out, "trawl: {}", sanitize_display_text(&err.to_string()))
     }
 }
 
@@ -1279,6 +1298,54 @@ mod tests {
             assert_eq!(render_detail(query, Some(span)), NO_EXCERPT, "{name}");
         }
         assert_eq!(render_detail(query, None), NO_EXCERPT, "no span");
+    }
+
+    /// What `write_client_error` prints for a server error whose message
+    /// is `message` and whose one detail has `span`.
+    fn render_server_error(message: &str, span: Option<(usize, usize)>) -> String {
+        let err = trawl_client::ClientError::Server {
+            status: 400,
+            error: trawl_api::ErrorEnvelope {
+                code: trawl_api::ErrorCode::ParseError,
+                message: message.into(),
+                details: vec![trawl_client::ErrorDetail {
+                    message: "the message".into(),
+                    span: span.map(|(start, end)| trawl_client::ErrorSpan { start, end }),
+                    label: None,
+                    hint: None,
+                }],
+                conflict: None,
+            },
+            request_id: None,
+            retry_after_secs: None,
+        };
+        let mut buf = Vec::new();
+        write_client_error(&mut buf, "q", &err).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// The summary line, with a span (the envelope's message) or without
+    /// one (the whole error), cannot rewrite the terminal either.
+    #[test]
+    fn client_error_summary_is_sanitized() {
+        let message = "bad\u{1b}[2J\u{202E}x";
+        for span in [Some((0, 1)), None] {
+            let out = render_server_error(message, span);
+            let summary = out.lines().next().unwrap();
+            assert!(!out.contains(['\u{1b}', '\u{202E}']), "{span:?}: {out:?}");
+            assert!(
+                summary.contains("bad\u{FFFD}[2J\u{FFFD}x"),
+                "{span:?}: {out:?}"
+            );
+        }
+        assert_eq!(
+            render_server_error(message, Some((0, 1))),
+            "trawl: ParseError: bad\u{FFFD}[2J\u{FFFD}x\n\n  q\n  ~\n  the message\n\n"
+        );
+        assert_eq!(
+            render_server_error(message, None),
+            "trawl: server error (HTTP 400): bad\u{FFFD}[2J\u{FFFD}x\n"
+        );
     }
 
     /// A message or hint holding control or bidi characters cannot rewrite
