@@ -349,7 +349,7 @@ fn tree_line(node: &TreeNode<'_>, theme: &Theme, width: usize) -> Line<'static> 
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
-                    fit_cells(name, max_name),
+                    advancing_by_cells(fit_cells(name, max_name)),
                     Style::default().fg(theme.text_accent),
                 ),
                 Span::raw(" "),
@@ -407,7 +407,7 @@ fn tree_line(node: &TreeNode<'_>, theme: &Theme, width: usize) -> Line<'static> 
             Line::from(vec![
                 Span::styled(arrow, Style::default().fg(theme.text_muted)),
                 Span::styled(
-                    fit_cells(name, max_name),
+                    advancing_by_cells(fit_cells(name, max_name)),
                     Style::default()
                         .fg(theme.text_primary)
                         .add_modifier(Modifier::BOLD),
@@ -416,6 +416,14 @@ fn tree_line(node: &TreeNode<'_>, theme: &Theme, width: usize) -> Line<'static> 
             ])
         }
     }
+}
+
+/// `text`, already sanitized, then spaces until a `Span` holding it
+/// advances its `Line` by the cells its grapheme clusters draw in, so the
+/// span after it in a ragged row starts right after its glyphs.
+fn advancing_by_cells(text: String) -> String {
+    let column = cells(&text);
+    span_advancing(text, column)
 }
 
 /// Compute scroll offset for center-locked scrolling.
@@ -656,34 +664,6 @@ fn render_saved_panel(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     render_saved_detail(app, theme, frame, detail_col);
 }
 
-/// Fit a name into terminal columns without splitting a grapheme. Ratatui's
-/// grapheme iterator uses the same segmentation as the list renderer. The
-/// name is sanitized first, so U+FFFD is what gets measured and cut.
-fn fit_saved_name(name: &str, columns: usize) -> String {
-    use unicode_width::UnicodeWidthStr as _;
-
-    let name = sanitize_display_text(name);
-    if columns == 0 {
-        return String::new();
-    }
-    if name.width() <= columns {
-        return name;
-    }
-    let span = Span::raw(name.as_str());
-    let mut remaining = columns - "…".width();
-    let mut fitted = String::new();
-    for grapheme in span.styled_graphemes(Style::default()) {
-        let width = grapheme.symbol.width();
-        if width > remaining {
-            break;
-        }
-        fitted.push_str(grapheme.symbol);
-        remaining -= width;
-    }
-    fitted.push('…');
-    fitted
-}
-
 /// Render the left-pane saved query list.
 fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let selected = app.panel.saved_selected;
@@ -699,10 +679,14 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
         .queries
         .iter()
         .map(|entry| {
+            // Each part's cells, and a span that advances by them.
+            let mut suffix_width = 0;
             let mut suffixes = Vec::new();
             if let Some(ref sched) = entry.schedule {
+                let badge = sanitize_display_text(&format_schedule_badge(sched));
+                suffix_width += cells(&badge);
                 suffixes.push(Span::styled(
-                    sanitize_display_text(&format_schedule_badge(sched)),
+                    advancing_by_cells(badge),
                     Style::default().fg(theme.text_accent),
                 ));
                 if let Some(ref last_run) = sched.last_run {
@@ -712,14 +696,13 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
                         "running" => (" \u{25cf}", theme.status_warning),
                         _ => (" ?", theme.text_muted),
                     };
+                    suffix_width += cells(icon);
                     suffixes.push(Span::styled(icon, Style::default().fg(color)));
                 }
             }
 
-            // Compute suffix width for name budget.
-            let suffix_width: usize = suffixes.iter().map(Span::width).sum();
             let name_budget = max_width.saturating_sub(suffix_width);
-            let display_name = fit_saved_name(&entry.name, name_budget);
+            let display_name = advancing_by_cells(fit_cells(&entry.name, name_budget));
 
             let mut spans = vec![Span::styled(
                 display_name,
@@ -984,7 +967,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
             // Some(false)`, which shows its bounds with no marker.
             if let Some(ref kind) = run.window_kind {
                 spans.push(Span::styled(
-                    format!("  {}", sanitize_display_text(kind)),
+                    advancing_by_cells(format!("  {}", sanitize_display_text(kind))),
                     Style::default().fg(theme.text_muted),
                 ));
             }
@@ -1528,10 +1511,10 @@ mod saved_name_tests {
     /// the cell it takes on the fast path and on the clipping path.
     #[test]
     fn saved_name_sanitizes_before_fit() {
-        assert_eq!(fit_saved_name("nm\u{202e}x", 10), "nm\u{fffd}x");
-        assert_eq!(fit_saved_name("nl\nx", 10), "nl\u{fffd}x");
-        assert_eq!(fit_saved_name("ab\u{200b}cdefgh", 5), "ab\u{fffd}c…");
-        assert_eq!(fit_saved_name("sh\u{00ad}yz", 4), "sh\u{fffd}…");
+        assert_eq!(fit_cells("nm\u{202e}x", 10), "nm\u{fffd}x");
+        assert_eq!(fit_cells("nl\nx", 10), "nl\u{fffd}x");
+        assert_eq!(fit_cells("ab\u{200b}cdefgh", 5), "ab\u{fffd}c…");
+        assert_eq!(fit_cells("sh\u{00ad}yz", 4), "sh\u{fffd}…");
     }
 
     #[test]
@@ -1553,7 +1536,7 @@ mod saved_name_tests {
             // sequence, so the name is cut after the first emoji.
             ("👩\u{200d}💻ab", 3, "👩…"),
         ] {
-            let actual = fit_saved_name(name, columns);
+            let actual = fit_cells(name, columns);
             assert_eq!(actual, expected, "{name:?}, columns={columns}");
             assert!(actual.width() <= columns);
         }
@@ -2070,6 +2053,279 @@ mod unicode_tests {
                     );
                     assert_eq!(got, want, "{case}");
                 }
+            }
+        }
+    }
+
+    /// Row `y`'s cell symbols, one per cell. A cell hidden behind a
+    /// two-cell glyph reads as a space.
+    fn row_symbols(terminal: &Terminal<TestBackend>, y: u16) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_owned())
+            .collect()
+    }
+
+    /// `symbols`, then spaces to `width` cells.
+    fn padded_row(symbols: &[&str], width: usize) -> Vec<String> {
+        let mut row: Vec<String> = symbols.iter().map(|s| (*s).to_owned()).collect();
+        row.resize(width, " ".to_owned());
+        row
+    }
+
+    /// The same five names as `list_rows_keep_column_alignment`, in one
+    /// service, so every one is promoted to a common field. A common
+    /// field's row is ragged: its type follows the name's cells, one
+    /// space after them, on every row selected and not, where the names
+    /// fit and where they are cut.
+    #[test]
+    fn common_field_rows_keep_the_type_after_the_name() {
+        const NAMES: [&str; 5] = ["host", "ｶﾞｶﾞ", "لالا", "e\u{301}e\u{301}", "❤\u{FE0F}x"];
+        let column = |name: &str| trawl_api::ServiceColumnStats {
+            name: name.to_owned(),
+            data_type: "VARCHAR".to_owned(),
+            null_count: 1,
+            total_count: 4,
+            min_value: None,
+            max_value: None,
+            compressed_bytes: 0,
+        };
+        let mut schema = SchemaBrowser::new(vec![trawl_api::ServiceSchema {
+            name: "svc".to_owned(),
+            columns: NAMES.iter().map(|name| column(name)).collect(),
+            earliest_date: None,
+            latest_date: None,
+            file_count: 1,
+            total_bytes: 1,
+            total_events: 4,
+            daily_event_counts: Vec::new(),
+            degraded_fields: Vec::new(),
+        }]);
+        let theme = test_app().theme;
+
+        // Rows 1 to 5, under the `★ common (5)` header: `host` first as a
+        // well-known field, then the rest in byte order.
+        let fits: [&[&str]; 5] = [
+            &[" ", " ", "h", "o", "s", "t", " ", "S", "T", "R"],
+            &[" ", " ", "e\u{301}", "e\u{301}", " ", "S", "T", "R"],
+            &[" ", " ", "ل", "ا", "ل", "ا", " ", "S", "T", "R"],
+            &[" ", " ", "❤\u{FE0F}", " ", "x", " ", "S", "T", "R"],
+            &[" ", " ", "ｶﾞ", " ", "ｶﾞ", " ", " ", "S", "T", "R"],
+        ];
+        // Nine cells leave three for a name.
+        let cut: [&[&str]; 5] = [
+            &[" ", " ", "h", "o", "…", " ", "S", "T", "R"],
+            &[" ", " ", "e\u{301}", "e\u{301}", " ", "S", "T", "R", " "],
+            &[" ", " ", "ل", "ا", "…", " ", "S", "T", "R"],
+            &[" ", " ", "❤\u{FE0F}", " ", "x", " ", "S", "T", "R"],
+            &[" ", " ", "ｶﾞ", " ", "…", " ", "S", "T", "R"],
+        ];
+        for (width, rows) in [(20u16, fits), (9, cut)] {
+            for selected in 0..=NAMES.len() + 1 {
+                schema.selected = selected;
+                let terminal = draw(width, 7, |frame| {
+                    render_schema_tree(&schema, &theme, frame, frame.area());
+                });
+                for (y, row) in (1u16..).zip(rows) {
+                    assert_eq!(
+                        row_symbols(&terminal, y),
+                        padded_row(row, usize::from(width)),
+                        "width {width}, row {y}, selected {selected}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A service row's field count follows the name's cells.
+    #[test]
+    fn service_row_count_follows_the_name() {
+        let mut schema = SchemaBrowser::new(vec![trawl_api::ServiceSchema {
+            name: "لالا".to_owned(),
+            columns: vec![trawl_api::ServiceColumnStats {
+                name: "a".to_owned(),
+                data_type: "VARCHAR".to_owned(),
+                null_count: 0,
+                total_count: 1,
+                min_value: None,
+                max_value: None,
+                compressed_bytes: 0,
+            }],
+            earliest_date: None,
+            latest_date: None,
+            file_count: 1,
+            total_bytes: 1,
+            total_events: 1,
+            daily_event_counts: Vec::new(),
+            degraded_fields: Vec::new(),
+        }]);
+        schema.common_fields = Vec::new();
+        let theme = test_app().theme;
+        for (width, row) in [
+            (
+                12u16,
+                &["▸", " ", "ل", "ا", "ل", "ا", " ", "(", "1", ")"][..],
+            ),
+            (9, &["▸", " ", "ل", "ا", "…", " ", "(", "1", ")"]),
+        ] {
+            let terminal = draw(width, 1, |frame| {
+                render_schema_tree(&schema, &theme, frame, frame.area());
+            });
+            assert_eq!(
+                row_symbols(&terminal, 0),
+                padded_row(row, usize::from(width)),
+                "width {width}"
+            );
+        }
+    }
+
+    fn saved_entry(
+        id: i64,
+        name: &str,
+        interval: &str,
+        last_run: Option<&str>,
+    ) -> trawl_api::SavedQueryResponse {
+        trawl_api::SavedQueryResponse {
+            id,
+            name: name.to_owned(),
+            query: "*".to_owned(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            schedule: Some(trawl_api::ScheduleResponse {
+                id,
+                saved_query_id: id,
+                interval: interval.to_owned(),
+                interval_secs: 3600,
+                max_runs: None,
+                enabled: true,
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                last_run: last_run.map(|status| {
+                    let mut run = run(1, None);
+                    status.clone_into(&mut run.status);
+                    run
+                }),
+                total_runs: 0,
+                exhausted: false,
+                window: None,
+                lag: None,
+                lag_secs: None,
+                covered_through: None,
+                next_fire_at: "2026-01-01T01:00:00Z".to_owned(),
+            }),
+        }
+    }
+
+    /// A run that started at no readable time, with no duration or row
+    /// count, so its row is the same on every clock.
+    fn run(id: i64, window_kind: Option<&str>) -> trawl_api::ReportRunSummary {
+        trawl_api::ReportRunSummary {
+            id,
+            query: "*".to_owned(),
+            status: "success".to_owned(),
+            started_at: "garbage".to_owned(),
+            finished_at: None,
+            duration_ms: None,
+            row_count: None,
+            error_message: None,
+            result_path: None,
+            window_start: None,
+            window_end: None,
+            window_truncated: Some(true),
+            window_kind: window_kind.map(ToOwned::to_owned),
+            origin: None,
+        }
+    }
+
+    /// A saved row's schedule badge and run icon follow the name's cells,
+    /// and the icon follows the badge's, where the name fits and where it
+    /// is cut, on every row selected and not.
+    #[test]
+    fn saved_rows_keep_suffixes_after_sender_text() {
+        let mut app = test_app();
+        app.saved_cache = Some(trawl_api::ListSavedResponse {
+            queries: vec![
+                saved_entry(1, "لالا", "1h", None),
+                saved_entry(2, "ｶﾞｶﾞ", "1h", Some("success")),
+                saved_entry(3, "abcdefghij", "لا", Some("success")),
+            ],
+        });
+        let rows_at: [(u16, [&[&str]; 3]); 2] = [
+            (
+                12,
+                [
+                    &["ل", "ا", "ل", "ا", " ", "[", "1", "h", "]"],
+                    &["ｶﾞ", " ", "ｶﾞ", " ", " ", "[", "1", "h", "]", " ", "✓"],
+                    &["a", "b", "c", "d", "…", " ", "[", "ل", "ا", "]", " ", "✓"],
+                ],
+            ),
+            (
+                10,
+                [
+                    &["ل", "ا", "ل", "ا", " ", "[", "1", "h", "]"],
+                    &["ｶﾞ", " ", "…", " ", "[", "1", "h", "]", " ", "✓"],
+                    &["a", "b", "…", " ", "[", "ل", "ا", "]", " ", "✓"],
+                ],
+            ),
+        ];
+        for (width, rows) in rows_at {
+            for selected in 0..3 {
+                app.panel.saved_selected = selected;
+                let terminal = draw(width, 3, |frame| {
+                    render_saved_list(&app, &app.theme, frame, frame.area());
+                });
+                for (y, row) in (0u16..).zip(rows) {
+                    assert_eq!(
+                        row_symbols(&terminal, y),
+                        padded_row(row, usize::from(width)),
+                        "width {width}, row {y}, selected {selected}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A run row's window kind is sender text, and the marker after it
+    /// follows its cells.
+    #[test]
+    fn run_rows_keep_the_marker_after_the_window_kind() {
+        let mut app = test_app();
+        app.saved_cache = Some(trawl_api::ListSavedResponse {
+            queries: vec![saved_entry(1, "q", "1h", None)],
+        });
+        app.panel.saved_detail = Some(SavedDetailState {
+            saved_id: 1,
+            runs: vec![run(7, Some("لالا")), run(8, Some("ｶﾞ"))],
+            total_runs: 2,
+            run_selected: 0,
+            run_scroll: 0,
+            result: None,
+            result_scroll: 0,
+            pending: None,
+        });
+        let head = ["✓", " ", "#", "7", " ", " ", " ", " ", "?", "?", "?", "?"];
+        let truncated = [" ", "T", "R", "U", "N", "C", "A", "T", "E", "D"];
+        let kinds: [&[&str]; 2] = [&[" ", " ", "ل", "ا", "ل", "ا"], &[" ", " ", "ｶﾞ", " "]];
+        for selected in 0..2 {
+            app.panel.saved_detail.as_mut().unwrap().run_selected = selected;
+            let terminal = draw(32, 10, |frame| {
+                render_saved_detail_inner(&app, &app.theme, frame, frame.area());
+            });
+            // The name, the rule, the query, the schedule's three lines, a
+            // blank line and the runs header come first.
+            for ((y, id), kind) in (8u16..).zip(["7", "8"]).zip(kinds) {
+                let mut row = head;
+                row[3] = id;
+                let want: Vec<&str> = row
+                    .into_iter()
+                    .chain(kind.iter().copied())
+                    .chain(truncated)
+                    .collect();
+                assert_eq!(
+                    row_symbols(&terminal, y),
+                    padded_row(&want, 32),
+                    "row {y}, selected {selected}"
+                );
             }
         }
     }
