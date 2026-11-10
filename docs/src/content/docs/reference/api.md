@@ -483,7 +483,7 @@ An export file is not the [result wire](#result-columns). Each format keeps its 
 | 400 | `bad_request` | `format` is not `csv`, `json`, or `parquet`. The envelope's message quotes the request's reason. |
 | 500 | `execution_error` | DuckDB failed |
 | 503 | `query_resource_exhausted` | The export went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
-| 503 | `service_unavailable` | The deadline passed before the export started, or a cancel reached it |
+| 503 | `service_unavailable` | The deadline passed, or a cancel reached the export, before it started |
 | 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
 | 504 | `timeout` | The deadline passed after the export started |
