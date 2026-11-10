@@ -16,9 +16,12 @@
 //! ([`PrepJob`]), which the blocking closure owns and drops last. So a job
 //! whose request stopped waiting keeps its slot, and whatever its work
 //! holds, such as a regex reservation, until its closure exits. When the
-//! request stops waiting, at its deadline or because its caller went away,
-//! its guard ([`Waiting`]) requests the job's [`Stop`], and the work ends at
-//! its next cancellation point.
+//! request stops waiting, at its deadline, because its caller went away or
+//! because a cancel by id reached it, its guard ([`Waiting`]) requests the
+//! job's [`Stop`], and the work ends at its next cancellation point. A
+//! tracked request's job stops on the request's own cancel flag
+//! ([`Preparation::run_with`]), so a cancel reaches the job even before the
+//! request hears it.
 //!
 //! The allowance shares only its shape with the ADR-0054 allowances: a
 //! size fixed in code, gauges, a fixed refusal sentence and no
@@ -36,6 +39,7 @@ use crate::deadline::Deadline;
 use crate::error::ServerError;
 #[cfg(any(test, feature = "test-support"))]
 use crate::pool::seam;
+use crate::pool::{Pending, StartRefusal};
 
 /// The allowance's size: half the cores, at least 2, at most the executor
 /// permits. With one permit the allowance is one slot.
@@ -160,7 +164,43 @@ impl Preparation {
         F: FnOnce(&Stop) -> T + Send + 'static,
         T: Send + 'static,
     {
-        let slot = match deadline.run(Arc::clone(&self.slots).acquire_owned()).await {
+        self.run_with(deadline, door, None, work).await
+    }
+
+    /// [`Self::run`] for a request that a cancel by id can reach
+    /// ([`crate::pool::ExecutorPool::pend`]), or for an untracked one with
+    /// `pending` `None`.
+    ///
+    /// A cancel ends the wait for a slot at once. Once the job runs, its
+    /// [`Stop`] is the request's cancel flag, so the job ends at its next
+    /// cancellation point, and the request ends at once while the job keeps
+    /// its slot until then, as at the deadline.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run`], and [`ServerError::CapacityNotStarted`] once a
+    /// cancel reached `pending`, whatever the job answered: nothing it
+    /// prepared ran, and a job that ended on the cancel answers the
+    /// engine's cancellation, which is not what the request asked about.
+    pub(crate) async fn run_with<T, F>(
+        &self,
+        deadline: Deadline,
+        door: Door,
+        pending: Option<&Pending>,
+        work: F,
+    ) -> Result<T, ServerError>
+    where
+        F: FnOnce(&Stop) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let wake = pending.map(Pending::wake).cloned().unwrap_or_default();
+        // Only a pending request's wake fires and only its flag latches, so
+        // the fallback is never the answer.
+        let cancelled = || pending.map_or(ServerError::CapacityNotStarted, Pending::refuse);
+        let slot = match wake
+            .run(deadline, Arc::clone(&self.slots).acquire_owned())
+            .await
+        {
             // A free slot is taken on the first poll, before the wait reads
             // the deadline, so a spent deadline is checked here too: a job
             // is never dispatched after its deadline. The slot was free, so
@@ -173,7 +213,7 @@ impl Preparation {
                     "query preparation allowance closed".into(),
                 ));
             }
-            Err(crate::deadline::Expired) => {
+            Err(StartRefusal::Expired) => {
                 tracing::info!(
                     event_type = "preparation_refused",
                     door = door.as_str(),
@@ -182,8 +222,9 @@ impl Preparation {
                 );
                 return Err(ServerError::PreparationUnavailable);
             }
+            Err(StartRefusal::Cancelled) => return Err(cancelled()),
         };
-        let stop = Stop::new();
+        let stop = pending.map_or_else(Stop::new, Pending::stop);
         let shared = Arc::new(Mutex::new(JobState::default()));
         let job = PrepJob {
             slot: Some(slot),
@@ -215,12 +256,17 @@ impl Preparation {
             counters: Arc::clone(&self.counters),
             door,
             armed: true,
-            timed_out: false,
+            left: Left::Abandoned,
         };
         tokio::select! {
             biased;
             out = &mut answered => {
                 waiting.armed = false;
+                // The job finished, maybe on the cancel itself: a cancelled
+                // request answers the cancel's refusal either way.
+                if pending.is_some_and(Pending::latched) {
+                    return Err(cancelled());
+                }
                 match out {
                     Ok(Some(out)) => Ok(out),
                     Ok(None) => Err(ServerError::Panicked("query preparation")),
@@ -229,11 +275,37 @@ impl Preparation {
                     )),
                 }
             }
+            () = wake.cancelled() => {
+                waiting.left = Left::Cancelled;
+                drop(waiting);
+                Err(cancelled())
+            }
             () = tokio::time::sleep_until(deadline.instant()) => {
-                waiting.timed_out = true;
+                waiting.left = Left::Deadline;
                 drop(waiting);
                 Err(ServerError::Timeout)
             }
+        }
+    }
+}
+
+/// Why a request stopped waiting on its job, for the retained-slot log.
+#[derive(Debug, Clone, Copy)]
+enum Left {
+    /// The caller walked away.
+    Abandoned,
+    /// The request's deadline passed.
+    Deadline,
+    /// A cancel by id reached the request.
+    Cancelled,
+}
+
+impl Left {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Abandoned => "abandoned",
+            Self::Deadline => "deadline",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -283,16 +355,17 @@ impl Drop for PrepJob {
 
 /// The request side of one job, armed while the request waits on it.
 ///
-/// Dropped armed, at the deadline or because the caller walked away, it
-/// asks the job to stop and stamps the job retained if it is still
-/// running. The job's own drop then reclaims the slot.
+/// Dropped armed, at the deadline, on a cancel by id or because the caller
+/// walked away, it asks the job to stop and stamps the job retained if it
+/// is still running. The job's own drop then reclaims the slot.
 struct Waiting {
     stop: Stop,
     shared: Arc<Mutex<JobState>>,
     counters: Arc<Counters>,
     door: Door,
     armed: bool,
-    timed_out: bool,
+    /// Why the request stopped waiting, should it stop while armed.
+    left: Left,
 }
 
 impl Drop for Waiting {
@@ -314,11 +387,7 @@ impl Drop for Waiting {
             tracing::info!(
                 event_type = "preparation_retained",
                 door = self.door.as_str(),
-                reason = if self.timed_out {
-                    "deadline"
-                } else {
-                    "abandoned"
-                },
+                reason = self.left.as_str(),
                 "the request stopped waiting; its preparation keeps its slot until it stops"
             );
         }
@@ -702,6 +771,144 @@ mod tests {
         let (in_use, thread) = dropped.lock().unwrap().expect("the answer dropped");
         assert_eq!(in_use, 1, "the answer dropped while the job held its slot");
         assert_ne!(thread, std::thread::current().id(), "inside the closure");
+    }
+
+    /// A cancel by id reaches a tracked request in preparation (#343). In
+    /// the slot wait it ends the request at once, and the job never runs.
+    /// During a job it ends the request at once while the job keeps its
+    /// slot, which comes back when the job reaches its next check. The
+    /// job's stop is the request's cancel flag, so the job sees the cancel
+    /// with the request not polled at all, and an answer the job finished
+    /// with the flag latched is the capacity refusal, never the engine's
+    /// cancellation (a 500).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // three cancels on one allowance, in order
+    async fn a_cancel_stops_a_preparation_and_its_slot_wait() {
+        use crate::pool::{ExecutorPool, WorkKind};
+        use std::sync::atomic::Ordering::SeqCst;
+        use trawl_engine::error::EngineError;
+
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100, None).unwrap();
+        let preparation = pool.preparation().clone();
+        assert_eq!(preparation.size(), 1, "one permit, one slot");
+        let seams = pool.seams();
+        let parked = seams.hold(Seam::Preparing);
+        let deadline = far();
+
+        // A holder parks in the only slot, and a waiter queues behind it.
+        let holder_id = pool.allocate_query_id();
+        let holder_pending = pool.pend(holder_id, WorkKind::Query);
+        let holder_saw_stop = Arc::new(AtomicBool::new(false));
+        let holder = tokio::spawn({
+            let preparation = preparation.clone();
+            let saw_stop = Arc::clone(&holder_saw_stop);
+            async move {
+                preparation
+                    .run_with(
+                        deadline,
+                        Door::Admission,
+                        Some(&holder_pending),
+                        move |stop| {
+                            saw_stop.store(stop.requested(), SeqCst);
+                        },
+                    )
+                    .await
+            }
+        });
+        until("the holder parks", || parked.arrivals() == 1).await;
+
+        let waiter_id = pool.allocate_query_id();
+        let waiter_pending = pool.pend(waiter_id, WorkKind::Query);
+        let waiter_ran = Arc::new(AtomicBool::new(false));
+        let waiter = tokio::spawn({
+            let preparation = preparation.clone();
+            let ran = Arc::clone(&waiter_ran);
+            async move {
+                preparation
+                    .run_with(
+                        deadline,
+                        Door::Admission,
+                        Some(&waiter_pending),
+                        move |_| {
+                            ran.store(true, SeqCst);
+                        },
+                    )
+                    .await
+            }
+        });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiter.is_finished(), "the waiter waits for the slot");
+
+        // A cancel during the slot wait.
+        assert!(pool.cancel_by_id(waiter_id));
+        let answer = waiter.await.unwrap();
+        assert!(
+            matches!(answer, Err(ServerError::CapacityNotStarted)),
+            "{answer:?}"
+        );
+        assert!(!deadline.expired(), "the cancel ended it, not the deadline");
+        assert_eq!(parked.arrivals(), 1, "the waiter's job never ran");
+        assert!(!waiter_ran.load(SeqCst));
+        assert_eq!(preparation.in_use(), 1, "the holder still has the slot");
+
+        // A cancel during a running job.
+        assert!(pool.cancel_by_id(holder_id));
+        let answer = holder.await.unwrap();
+        assert!(
+            matches!(answer, Err(ServerError::CapacityNotStarted)),
+            "{answer:?}"
+        );
+        assert!(!deadline.expired());
+        assert_eq!(preparation.in_use(), 1, "the job keeps its slot");
+        assert_eq!(preparation.retained(), 1);
+        assert_eq!(preparation.reclaimed(), 0);
+        parked.release();
+        until("the slot comes back", || preparation.reclaimed() == 1).await;
+        assert_eq!(preparation.in_use(), 0);
+        assert_eq!(preparation.retained(), 0);
+        assert!(holder_saw_stop.load(SeqCst), "the job saw its stop");
+
+        // The job reads the request's flag: the request future is polled
+        // once to dispatch the job and not again until the job answered, so
+        // nothing on the request's side can have asked it to stop. The
+        // work answers what admission answers on its stop.
+        let parked = seams.hold(Seam::Preparing);
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+        let saw_stop = Arc::new(AtomicBool::new(false));
+        let mut request =
+            Box::pin(
+                preparation.run_with(deadline, Door::Admission, Some(&pending), {
+                    let saw_stop = Arc::clone(&saw_stop);
+                    move |stop| {
+                        saw_stop.store(stop.requested(), SeqCst);
+                        stop.check()
+                            .map_err(|_| ServerError::Engine(EngineError::Cancelled))
+                    }
+                }),
+            );
+        assert!(poll_once(&mut request).is_pending(), "dispatched");
+        until("the job parks", || parked.arrivals() == 1).await;
+        assert!(pool.cancel_by_id(id));
+        parked.release();
+        until("the job answered and gave its slot back", || {
+            preparation.in_use() == 0
+        })
+        .await;
+        assert!(
+            saw_stop.load(SeqCst),
+            "the job's stop is the request's cancel flag"
+        );
+        let answer = request.await;
+        assert!(
+            matches!(answer, Err(ServerError::CapacityNotStarted)),
+            "an answer ready with the flag latched is the cancel's refusal: {answer:?}"
+        );
+        assert_eq!(preparation.retained(), 0, "the job ended first");
+        assert_eq!(preparation.reclaimed(), 1);
+        drop(pending);
     }
 
     /// Preparation takes no executor permit: with every permit held, a job

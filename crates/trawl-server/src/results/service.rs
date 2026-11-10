@@ -692,7 +692,14 @@ pub(crate) async fn run(
     // The entry closes with `tracked`: through the outcome the capture
     // reaches, or as abandoned if the transport drops this future at an
     // await before the commit task takes it over.
+    //
+    // `_pending` puts the id in the pool's registry before the entry
+    // opens, so a cancel by id reaches the capture while it waits for a
+    // permit or a window's publication guard (ADR-0024, Amendment
+    // 2026-11-09). The plan, the step and the gate's admission above run
+    // before it, outside a cancel's reach.
     let executed = plan.resolved.executed.as_str();
+    let _pending = pool.pend(query_id, WorkKind::Capture);
     let tracked = state.query.tracker.start(query_id, verified, executed);
     tracing::info!(
         event_type = "query_start",

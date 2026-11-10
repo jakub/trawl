@@ -39,7 +39,7 @@ use trawl_engine::error::EngineError;
 
 use crate::deadline::Deadline;
 use crate::error::ServerError;
-use crate::pool::ExecutorPool;
+use crate::pool::{ExecutorPool, Pending};
 use crate::prepare::Door;
 
 /// Admit one DSL query on the blocking pool, behind the preparation
@@ -49,22 +49,30 @@ use crate::prepare::Door;
 /// never run on the calling task's thread. A request that stops waiting
 /// asks the check to stop, and it ends at its next cancellation point.
 ///
+/// A tracked request passes its `pending` guard, so a cancel by id ends
+/// the wait for a preparation slot and stops the check
+/// ([`crate::prepare::Preparation::run_with`]); an untracked one passes
+/// `None`.
+///
 /// # Errors
 ///
 /// As [`check_dsl_with`], and as [`ExecutorPool::prepare`]:
 /// [`ServerError::PreparationUnavailable`] when no preparation slot came
 /// free before `deadline`, [`ServerError::Timeout`] when `deadline` passed
-/// while the check ran.
-pub async fn admit(
+/// while the check ran, and [`ServerError::CapacityNotStarted`] once a
+/// cancel reached `pending`.
+pub(crate) async fn admit(
     pool: &ExecutorPool,
     dsl: &str,
     deadline: Deadline,
+    pending: Option<&Pending>,
 ) -> Result<Query, ServerError> {
     let dsl = dsl.to_owned();
-    pool.prepare(deadline, Door::Admission, move |stop| {
-        check_dsl_with(&dsl, stop)
-    })
-    .await?
+    pool.preparation()
+        .run_with(deadline, Door::Admission, pending, move |stop| {
+            check_dsl_with(&dsl, stop)
+        })
+        .await?
 }
 
 /// Admit one DSL query on the caller's thread under `stop`, and hand back
@@ -123,6 +131,7 @@ mod tests {
             &pool,
             "zz_cp5_admit_marker | where message matches /zz_cp5_admit_marker(s)?/",
             Deadline::after(Duration::from_secs(60)),
+            None,
         )
         .await
         .expect("admitted");
@@ -140,12 +149,12 @@ mod tests {
     async fn admit_refuses_as_check_dsl_does() {
         let pool = pool();
         let deadline = Deadline::after(Duration::from_secs(60));
-        let parse = admit(&pool, "| | | broken {{{", deadline).await;
+        let parse = admit(&pool, "| | | broken {{{", deadline, None).await;
         assert!(
             matches!(parse, Err(ServerError::Engine(EngineError::Parse(_)))),
             "{parse:?}"
         );
-        let emit = admit(&pool, &doubling_chain(12), deadline).await;
+        let emit = admit(&pool, &doubling_chain(12), deadline, None).await;
         assert!(
             matches!(emit, Err(ServerError::Engine(EngineError::Emit(_)))),
             "{emit:?}"
