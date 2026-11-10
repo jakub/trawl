@@ -349,6 +349,27 @@ fn render_set_schedule(frame: &mut Frame<'_>, theme: &Theme, form: &ScheduleForm
         Line::from(spans)
     };
 
+    // The cap and the paused state are sent back as loaded, never edited
+    // here. `(kept)` marks a value taken from the schedule in force; with no
+    // schedule, they are what a new schedule starts with.
+    let kept = if form.schedule_loaded { " (kept)" } else { "" };
+    let fixed = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(
+                format!("{label:<10}"),
+                Style::default().fg(theme.text_muted),
+            ),
+            Span::styled(
+                format!("{value}{kept}"),
+                Style::default().fg(theme.text_muted),
+            ),
+        ])
+    };
+    let max_runs = form
+        .max_runs
+        .map_or_else(|| "unlimited".to_owned(), |cap| cap.to_string());
+    let enabled = if form.enabled { "yes" } else { "no" };
+
     let text = vec![
         Line::from(Span::styled(
             form.name.clone(),
@@ -375,6 +396,8 @@ fn render_set_schedule(frame: &mut Frame<'_>, theme: &Theme, form: &ScheduleForm
             "5m | empty = 0s",
             form.focus == ScheduleField::Lag,
         ),
+        fixed("max_runs", max_runs),
+        fixed("enabled", enabled.to_owned()),
         Line::from(""),
         Line::from(Span::styled(
             "Tab next field  Enter save  Esc cancel",
