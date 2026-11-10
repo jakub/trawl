@@ -743,8 +743,9 @@ fn apply_aggregate(
 /// row, into one table of references to the rows' own cells, so no cell
 /// is copied and a comparison binds nothing. The row indices are sorted by
 /// that table ([`sort_rows`]), and the rows then move out in sorted order.
-/// The bind pass and the move read the lane's latch every
-/// [`TAIL_CANCEL_STRIDE`] rows, and the sort reads it as it goes.
+/// Every pass over the rows reads the lane's latch each
+/// [`TAIL_CANCEL_STRIDE`] rows: the bind pass, the sort, which draws its
+/// indices one run at a time, and both halves of the move.
 fn sort_step(
     rows: Vec<Row>,
     sort: &SortStage,
@@ -774,7 +775,7 @@ fn sort_step_with(
             keys.extend(sort.fields.iter().map(|field| bind(row, &field.field)));
         }
         let keys_of = |at: usize| &keys[at * width..(at + 1) * width];
-        sort_rows((0..rows.len()).collect(), cancel, |&a, &b| {
+        sort_rows(0..rows.len(), cancel, |&a, &b| {
             for ((&x, &y), field) in keys_of(a).iter().zip(keys_of(b)).zip(&sort.fields) {
                 let cmp = compare_cells(x, y);
                 let cmp = match field.direction {
@@ -789,7 +790,13 @@ fn sort_step_with(
         })?
     };
 
-    let mut slots: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
+    let mut slots: Vec<Option<Row>> = Vec::with_capacity(rows.len());
+    for (at, row) in rows.into_iter().enumerate() {
+        if at.is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        slots.push(Some(row));
+    }
     let mut sorted = Vec::with_capacity(slots.len());
     for (moved, at) in order.into_iter().enumerate() {
         if moved.is_multiple_of(TAIL_CANCEL_STRIDE) {
@@ -908,12 +915,12 @@ pub(crate) const TAIL_CANCEL_STRIDE: usize = 4096;
 /// order, as [`compare_cells`] is not over a column mixing numbers and
 /// text, may make `sort_by` panic.
 fn sort_rows<T>(
-    items: Vec<T>,
+    items: impl IntoIterator<Item = T, IntoIter: ExactSizeIterator>,
     cancel: &CancelLatch,
     mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering,
 ) -> Result<Vec<T>, EngineError> {
-    let mut runs = Vec::with_capacity(items.len().div_ceil(TAIL_CANCEL_STRIDE));
     let mut items = items.into_iter();
+    let mut runs = Vec::with_capacity(items.len().div_ceil(TAIL_CANCEL_STRIDE));
     loop {
         let run: Vec<T> = items.by_ref().take(TAIL_CANCEL_STRIDE).collect();
         if run.is_empty() {
