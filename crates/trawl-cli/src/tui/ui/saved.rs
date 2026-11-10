@@ -13,6 +13,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
+use trawl_core::sanitize::sanitize_display_text;
+
 use crate::tui::App;
 
 /// Render the saved-queries overlay.
@@ -44,14 +46,14 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
                 // Format: "name - query (truncated)"
                 let line = Line::from(vec![
                     Span::styled(
-                        format!("{:25}", query.name),
+                        format!("{:25}", sanitize_display_text(&query.name)),
                         Style::default()
                             .fg(theme.status_success)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" - "),
                     Span::styled(
-                        truncate_query(&query.query, 80),
+                        sanitize_display_text(&truncate_query(&query.query, 80)),
                         Style::default().fg(theme.text_accent),
                     ),
                 ]);
@@ -101,5 +103,52 @@ fn truncate_query(query: &str, max_len: usize) -> String {
     } else {
         let truncated: String = query.chars().take(max_len.saturating_sub(3)).collect();
         format!("{truncated}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// The overlay has no caller, but it is compiled, so it draws a saved
+    /// name and query through the sanitize rule like every other sink.
+    #[test]
+    fn dormant_saved_overlay_sanitizes_text() {
+        let mut app = crate::tui::tests::test_app();
+        app.saved_cache = Some(trawl_api::ListSavedResponse {
+            queries: vec![trawl_api::SavedQueryResponse {
+                id: 1,
+                name: "sn\u{202e}sz".to_owned(),
+                query: "qy\u{200b}qz\u{00ad}q2".to_owned(),
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                schedule: None,
+            }],
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| super::render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        for forbidden in ['\u{202e}', '\u{200b}', '\u{00ad}'] {
+            assert!(
+                !screen.contains(forbidden),
+                "U+{:04X} drawn: {screen}",
+                u32::from(forbidden)
+            );
+        }
+        for (field, fragment) in [
+            ("name", "sn\u{fffd}sz"),
+            ("query", "qy\u{fffd}qz\u{fffd}q2"),
+        ] {
+            assert!(
+                screen.contains(fragment),
+                "{field} not drawn as {fragment:?}: {screen}"
+            );
+        }
     }
 }
