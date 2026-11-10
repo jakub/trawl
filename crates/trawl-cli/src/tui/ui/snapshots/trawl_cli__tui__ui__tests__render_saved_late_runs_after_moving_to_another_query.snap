@@ -13,4 +13,4 @@ expression: screen
 "│                                                                                                  │"
 "│                                                                                                  │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
-"idle [panel]                              ↑↓: navigate | Enter: load | s: schedule | Del: delete    "
+"idle [panel]                                  ↑↓: navigate | Enter: load | s: schedule | Del: delete"
