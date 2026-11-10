@@ -90,7 +90,7 @@ PACKAGES=(-p fleet-auth -p trawl-web -p trawl-server -p trawl-engine -p trawl-cl
 ND_FEATURES=(--no-default-features --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash)
 
 # The reporter settings the outcome count below parses: one status line per
-# test per iteration ("PASS [ 1.234s] [3/50] (7/52) <binary> <test>"), no
+# test per iteration ("PASS [ 1.234s] [ 3/50] <binary> <test>"), no
 # colour, no progress bar, and the final summary repeats only failures.
 REPORTER=(--color never --show-progress none --status-level pass
   --final-status-level fail --failure-output immediate --success-output never)
@@ -347,7 +347,7 @@ say ""
 count_outcomes() {
   awk '
     /^ *Summary \[/ { exit }
-    match($0, /^ *[A-Z][A-Z-]*( [0-9]+)? +\[ *[0-9.]+s\] \[ *[0-9]+\/[0-9]+\] \( *[0-9]+\/[0-9]+\) /) {
+    match($0, /^ *[A-Z][A-Z-]*( [0-9]+)? +\[ *[0-9.]+s\] \[ *[0-9]+\/[0-9]+\] (\( *[0-9]+\/[0-9]+\) )?/) {
       status = $1
       if (status == "SLOW" || status == "START") next
       print status "\t" substr($0, RSTART + RLENGTH)
