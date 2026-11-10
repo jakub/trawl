@@ -96,6 +96,7 @@ use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb
 
 use super::FieldCatalog;
 use crate::env_dirs::{LayoutPath, layout_path};
+use crate::error::CauseKind;
 use crate::ingest::compaction::{
     AGG_CHUNK_COLS, ColInfo, ConformPlan, ConformPolicy, StatementFailure, describe_source,
     is_valid_parquet, quote_ident, structured_errors,
@@ -942,12 +943,28 @@ fn scan_file(
     // `parquet_metadata()`. A file `DuckDB` just described but this reader
     // cannot is not a skip — the pass proves type conformance, and a missing
     // row count costs only an observation's weight.
+    // A footer error quotes the parquet crate's text, so the text goes to
+    // DEBUG; only an open failure has a typed cause, as in `schema_refresh`.
     let rows = trawl_engine::parquet_stats::read_file_stats(&path).map_or_else(
         |e| {
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "catalog_conform_row_count_unreadable",
                 file = %path.display(),
                 error = %e,
+                "parquet footer row count unreadable; the file still conforms, \
+                 its field_services observation carries no row weight"
+            );
+            let (error_class, cause_kind) = match &e {
+                trawl_engine::parquet_stats::ParquetStatsError::Open { source, .. } => {
+                    ("io", CauseKind::of_io(source))
+                }
+                _ => ("internal", CauseKind::Unknown),
+            };
+            tracing::warn!(
+                event_type = "catalog_conform_row_count_unreadable",
+                file = %path.display(),
+                error_class,
+                cause_kind = cause_kind.as_str(),
                 "parquet footer row count unreadable; the file still conforms, \
                  its field_services observation carries no row weight"
             );

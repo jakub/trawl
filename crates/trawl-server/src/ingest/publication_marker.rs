@@ -341,13 +341,68 @@ pub(crate) fn parse_hex_digest(hex: &str) -> Option<blake3::Hash> {
     blake3::Hash::from_hex(hex).ok()
 }
 
+/// Why a marker fails confinement or parsing: a reason in trawl's own
+/// words, and serde's wording apart from it when the body did not parse,
+/// so a retained event can name the reason without the parser's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidReason {
+    reason: String,
+    parse_error: Option<String>,
+}
+
+impl InvalidReason {
+    fn unparseable(error: &serde_json::Error) -> Self {
+        Self {
+            reason: "unparseable marker".to_owned(),
+            parse_error: Some(error.to_string()),
+        }
+    }
+
+    /// The reason in trawl's own words.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// serde's wording, when the body did not parse.
+    #[must_use]
+    pub fn parse_error(&self) -> Option<&str> {
+        self.parse_error.as_deref()
+    }
+}
+
+impl From<String> for InvalidReason {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            parse_error: None,
+        }
+    }
+}
+
+impl From<&str> for InvalidReason {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
+impl fmt::Display for InvalidReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)?;
+        if let Some(parse_error) = &self.parse_error {
+            write!(f, ": {parse_error}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Why a marker could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerError {
     /// No marker exists at the path.
     Missing,
     /// The marker is readable but fails confinement or parsing.
-    Invalid(String),
+    Invalid(InvalidReason),
     /// The marker could not be inspected or read.
     Io(String),
 }
@@ -396,18 +451,19 @@ fn read_marker_with(
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| MarkerError::Invalid("marker file name is not UTF-8".to_owned()))?;
-    let service = marker_service(file_name)
-        .ok_or_else(|| MarkerError::Invalid(format!("{file_name:?} is not a marker name")))?;
+        .ok_or_else(|| MarkerError::Invalid("marker file name is not UTF-8".into()))?;
+    let service = marker_service(file_name).ok_or_else(|| {
+        MarkerError::Invalid(format!("{file_name:?} is not a marker name").into())
+    })?;
     let env = path
         .parent()
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
-        .ok_or_else(|| MarkerError::Invalid("marker env directory is not UTF-8".to_owned()))?;
-    validate_env(env).map_err(MarkerError::Invalid)?;
-    validate_service(service).map_err(MarkerError::Invalid)?;
+        .ok_or_else(|| MarkerError::Invalid("marker env directory is not UTF-8".into()))?;
+    validate_env(env).map_err(|reason| MarkerError::Invalid(reason.into()))?;
+    validate_service(service).map_err(|reason| MarkerError::Invalid(reason.into()))?;
 
-    let not_regular = || MarkerError::Invalid("marker is not a regular file".to_owned());
+    let not_regular = || MarkerError::Invalid("marker is not a regular file".into());
     let file = open(path).map_err(|e| {
         if no_follow::is_symlink_refusal(&e) {
             not_regular()
@@ -420,7 +476,7 @@ fn read_marker_with(
         return Err(not_regular());
     }
     let over_limit =
-        || MarkerError::Invalid(format!("marker is over the {MAX_MARKER_BYTES}-byte limit"));
+        || MarkerError::Invalid(format!("marker is over the {MAX_MARKER_BYTES}-byte limit").into());
     if metadata.len() > MAX_MARKER_BYTES {
         return Err(over_limit());
     }
@@ -432,8 +488,9 @@ fn read_marker_with(
         return Err(over_limit());
     }
     let record: PublicationMarker = serde_json::from_slice(&body)
-        .map_err(|e| MarkerError::Invalid(format!("unparseable marker: {e}")))?;
-    ValidatedMarker::from_record(env, service, record).map_err(MarkerError::Invalid)
+        .map_err(|e| MarkerError::Invalid(InvalidReason::unparseable(&e)))?;
+    ValidatedMarker::from_record(env, service, record)
+        .map_err(|reason| MarkerError::Invalid(reason.into()))
 }
 
 /// Write `marker` durably into `wal_dir/{env}`: staged write, fsync, rename,
@@ -655,7 +712,7 @@ pub fn census(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Contradiction {
     /// The marker is unparseable or fails confinement.
-    InvalidMarker(String),
+    InvalidMarker(InvalidReason),
     /// A path the marker names is a symlink, directory or other non-file.
     NotRegularFile(PathBuf),
     /// Neither the canonical output nor the temporary output exists.
@@ -673,6 +730,24 @@ impl Contradiction {
             Self::NotRegularFile(_) => "not_regular_file",
             Self::OutputMissing => "output_missing",
             Self::OutputMismatch => "output_mismatch",
+        }
+    }
+
+    /// serde's wording behind an unparseable marker. A retained event
+    /// never carries it.
+    fn parse_error(&self) -> Option<&str> {
+        match self {
+            Self::InvalidMarker(reason) => reason.parse_error(),
+            _ => None,
+        }
+    }
+
+    /// The [`Display`](fmt::Display) text without serde's wording: what a
+    /// retained event carries as its `detail`.
+    fn in_own_words(&self) -> String {
+        match self {
+            Self::InvalidMarker(reason) => format!("invalid marker: {}", reason.reason()),
+            other => other.to_string(),
         }
     }
 }
@@ -882,15 +957,28 @@ fn log_outcome(env: &str, service: &str, marker: &Path, result: &Result<Recovery
             outcome = "unpublished",
             "rolled back an unpublished output; its WAL stays for compaction"
         ),
-        Ok(RecoveryOutcome::Contradictory(reason)) => tracing::error!(
-            event_type = "publication_recovery_failed",
-            env = %env,
-            compact_service = %service,
-            marker = %marker.display(),
-            reason = reason.code(),
-            detail = %reason,
-            "contradictory publication marker; nothing touched and the service stays blocked"
-        ),
+        Ok(RecoveryOutcome::Contradictory(reason)) => {
+            if let Some(parse_error) = reason.parse_error() {
+                tracing::debug!(
+                    event_type = "publication_recovery_failed",
+                    env = %env,
+                    compact_service = %service,
+                    marker = %marker.display(),
+                    reason = reason.code(),
+                    error = %parse_error,
+                    "contradictory publication marker; nothing touched and the service stays blocked"
+                );
+            }
+            tracing::error!(
+                event_type = "publication_recovery_failed",
+                env = %env,
+                compact_service = %service,
+                marker = %marker.display(),
+                reason = reason.code(),
+                detail = %reason.in_own_words(),
+                "contradictory publication marker; nothing touched and the service stays blocked"
+            );
+        }
         Err(error) => tracing::error!(
             event_type = "publication_recovery_failed",
             env = %env,
@@ -1323,7 +1411,8 @@ mod tests {
     fn assert_invalid(result: Result<ValidatedMarker, MarkerError>, needle: &str) {
         match result {
             Err(MarkerError::Invalid(reason)) => {
-                assert!(reason.contains(needle), "{needle:?} not in {reason:?}");
+                let text = reason.to_string();
+                assert!(text.contains(needle), "{needle:?} not in {text:?}");
             }
             other => panic!("expected Invalid({needle}), got {other:?}"),
         }
@@ -1414,6 +1503,27 @@ mod tests {
             read_body(ENV, SERVICE, &missing.to_string()),
             "missing field",
         );
+    }
+
+    #[test]
+    fn an_unparseable_marker_keeps_serde_wording_out_of_the_retained_detail() {
+        let f = published_fixture();
+        let body = serde_json::json!({
+            "partition": "2026-09-23/07", "wal": [WAL_A], "size": 3,
+            "blake3": hex(), "SENTINEL_field": 1
+        })
+        .to_string();
+        std::fs::write(f.marker.marker_path(&f.wal), body).unwrap();
+        let report = recover_all(&f, &mut Vec::new());
+        match only_result(&report) {
+            Ok(RecoveryOutcome::Contradictory(c @ Contradiction::InvalidMarker(_))) => {
+                let parse_error = c.parse_error().expect("serde's wording is kept for DEBUG");
+                assert!(parse_error.contains("SENTINEL_field"), "{parse_error}");
+                assert!(c.to_string().contains(parse_error), "{c}");
+                assert_eq!(c.in_own_words(), "invalid marker: unparseable marker");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[cfg(unix)]
@@ -1837,7 +1947,10 @@ mod tests {
         let report = recover_all(&f, &mut Vec::new());
         match only_result(&report) {
             Ok(RecoveryOutcome::Contradictory(Contradiction::InvalidMarker(reason))) => {
-                assert!(reason.contains("not a single file name"), "{reason}");
+                assert!(
+                    reason.reason().contains("not a single file name"),
+                    "{reason}"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -1857,7 +1970,7 @@ mod tests {
             let report = recover_all(&f, &mut Vec::new());
             match only_result(&report) {
                 Ok(RecoveryOutcome::Contradictory(Contradiction::InvalidMarker(reason))) => {
-                    assert!(reason.contains("byte limit"), "{reason}");
+                    assert!(reason.reason().contains("byte limit"), "{reason}");
                 }
                 other => panic!("{other:?}"),
             }

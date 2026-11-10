@@ -40,7 +40,7 @@ use trawl_core::schema::CanonicalType;
 use crate::catalog::FieldCatalog;
 use crate::catalog::conform::open_bounded_connection;
 use crate::deadline::Deadline;
-use crate::error::ServerError;
+use crate::error::{CauseKind, ServerError};
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
 use crate::publication::CorpusUnsettled;
@@ -972,9 +972,17 @@ impl RepinEngine {
                     Err(unreadable())
                 }
                 Err(e) => {
-                    tracing::error!(
+                    // The text mixes the read's I/O wording with serde's
+                    // parse wording and keeps no typed source.
+                    tracing::debug!(
                         event_type = "repin_staging_unreadable",
                         error = %e,
+                        "the repin marker could not be read; refusing the repin"
+                    );
+                    tracing::error!(
+                        event_type = "repin_staging_unreadable",
+                        error_class = "internal",
+                        cause_kind = CauseKind::Unknown.as_str(),
                         "the repin marker could not be read; refusing the repin"
                     );
                     Err(unreadable())
@@ -1810,13 +1818,35 @@ impl RepinEngine {
     /// different terminal write: `cancelled` is only legal once the request
     /// row exists (see [`Self::finish_cancelled`]).
     async fn unwind_staging(&self, job_id: i64, status: RepinJobStatus, msg: &str) {
-        tracing::warn!(
-            event_type = "repin_abandoned",
-            job_id,
-            status = status.as_str(),
-            error = %msg,
-            "repin job abandoned before any visible change; corpus untouched"
-        );
+        if status == RepinJobStatus::Failed {
+            // A failed step's message can carry DuckDB, serde or I/O
+            // wording, and no typed source is left to classify it by.
+            tracing::debug!(
+                event_type = "repin_abandoned",
+                job_id,
+                status = status.as_str(),
+                error = %msg,
+                "repin job abandoned before any visible change; corpus untouched"
+            );
+            tracing::warn!(
+                event_type = "repin_abandoned",
+                job_id,
+                status = status.as_str(),
+                error_class = "internal",
+                cause_kind = CauseKind::Unknown.as_str(),
+                "repin job abandoned before any visible change; corpus untouched"
+            );
+        } else {
+            // A blocked, refused or cancelled job's message is a sentence
+            // trawl wrote.
+            tracing::warn!(
+                event_type = "repin_abandoned",
+                job_id,
+                status = status.as_str(),
+                error = %msg,
+                "repin job abandoned before any visible change; corpus untouched"
+            );
+        }
         // The marker is what licenses the next boot to delete the staging
         // roots. Removing it over a failed sweep strands whichever root
         // survived, which suppresses retention and refuses every later
@@ -2149,7 +2179,7 @@ impl RepinEngine {
                 event_type = "repin_cutover_fatal",
                 job_id,
                 error_class = "internal",
-                cause_kind = crate::error::CauseKind::Unknown.as_str(),
+                cause_kind = CauseKind::Unknown.as_str(),
                 "per-env swap failed mid-cutover; terminating so the boot \
                  marker replay completes it rather than serving a \
                  mixed-type corpus"
@@ -2229,7 +2259,15 @@ impl RepinEngine {
             ..marker
         };
         if let Err(e) = write_marker(&self.data_dir, &marker) {
-            tracing::warn!(event_type = "repin_marker_error", error = %e, "cleanup marker write failed (boot replay covers it)");
+            // The text mixes serde's serialize wording with the staged
+            // write's I/O wording and keeps no typed source.
+            tracing::debug!(event_type = "repin_marker_error", error = %e, "cleanup marker write failed (boot replay covers it)");
+            tracing::warn!(
+                event_type = "repin_marker_error",
+                error_class = "internal",
+                cause_kind = CauseKind::Unknown.as_str(),
+                "cleanup marker write failed (boot replay covers it)"
+            );
         }
         drop(pool_guard);
         drop(corpus_gate);
