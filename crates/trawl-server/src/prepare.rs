@@ -15,7 +15,9 @@
 //! its executor work are (ADR-0024). The slot belongs to the job
 //! ([`PrepJob`]), which the blocking closure owns and drops last. So a job
 //! whose request stopped waiting keeps its slot, and whatever its work
-//! holds, such as a regex reservation, until its closure exits. When the
+//! holds, such as a regex reservation, until its closure exits. A charge
+//! the caller attached ([`Preparation::run_with_holding`]), such as a
+//! scheduled run's lease, stays with the job too. When the
 //! request stops waiting, at its deadline, because its caller went away or
 //! because a cancel by id reached it, its guard ([`Waiting`]) requests the
 //! job's [`Stop`], and the work ends at its next cancellation point. A
@@ -27,6 +29,7 @@
 //! size fixed in code, gauges, a fixed refusal sentence and no
 //! `Retry-After`. A job never holds or awaits an executor permit.
 
+use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -193,6 +196,33 @@ impl Preparation {
         F: FnOnce(&Stop) -> T + Send + 'static,
         T: Send + 'static,
     {
+        self.run_with_holding(deadline, door, pending, None, work)
+            .await
+    }
+
+    /// [`Self::run_with`] for a caller whose charge must stay charged
+    /// while its preparation runs, as a scheduled run's lease must
+    /// (ADR-0018, amended 2026-11-09).
+    ///
+    /// The job keeps `hold` and drops it after its slot returned, so the
+    /// charge outlives a request that stopped waiting, as the slot does.
+    /// A request that never took a slot drops `hold` when it answers.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run_with`].
+    pub(crate) async fn run_with_holding<T, F>(
+        &self,
+        deadline: Deadline,
+        door: Door,
+        pending: Option<&Pending>,
+        hold: Option<Arc<dyn Any + Send + Sync>>,
+        work: F,
+    ) -> Result<T, ServerError>
+    where
+        F: FnOnce(&Stop) -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let wake = pending.map(Pending::wake).cloned().unwrap_or_default();
         // Only a pending request's wake fires and only its flag latches, so
         // the fallback is never the answer.
@@ -231,6 +261,7 @@ impl Preparation {
             shared: Arc::clone(&shared),
             counters: Arc::clone(&self.counters),
             door,
+            hold,
         };
         let (answer, mut answered) = tokio::sync::oneshot::channel();
         #[cfg(any(test, feature = "test-support"))]
@@ -320,14 +351,18 @@ struct JobState {
     retained_since: Option<Instant>,
 }
 
-/// What one preparation job holds: its slot. The blocking closure owns it
-/// and drops it last, so a timeout, a caller that walked away, a panic and
-/// an ordinary finish all give the slot back in the same place, once.
+/// What one preparation job holds: its slot, and its caller's charge when
+/// it has one. The blocking closure owns it and drops it last, so a
+/// timeout, a caller that walked away, a panic and an ordinary finish all
+/// give the slot back in the same place, once.
 struct PrepJob {
     slot: Option<OwnedSemaphorePermit>,
     shared: Arc<Mutex<JobState>>,
     counters: Arc<Counters>,
     door: Door,
+    /// The caller's charge ([`Preparation::run_with_holding`]), dropped
+    /// after the slot.
+    hold: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl Drop for PrepJob {
@@ -350,6 +385,9 @@ impl Drop for PrepJob {
                 "retained query preparation slot reclaimed"
             );
         }
+        // Last, the caller's charge: it stops being charged once the slot
+        // is back and the job is no longer counted, and never before.
+        drop(self.hold.take());
     }
 }
 

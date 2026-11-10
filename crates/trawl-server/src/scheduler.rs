@@ -4,8 +4,9 @@
 
 //! Background scheduler for periodic query execution.
 //!
-//! Polls [`ScheduleStore`] for enabled schedules and spawns query execution
-//! tasks on the [`ExecutorPool`]. Results are written as exact-typed parquet
+//! Polls [`ScheduleStore`] for due schedules and spawns query execution
+//! tasks on the [`ExecutorPool`], no more at once than the pool's
+//! scheduled-run leases allow. Results are written as exact-typed parquet
 //! files (with a typed zstd-JSON blob for what parquet cannot hold and for a
 //! failed write) and recorded as report runs in the app-state database.
 //!
@@ -25,12 +26,14 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
-use crate::pool::ExecutorPool;
+use crate::pool::{ExecutorPool, ScheduledLease};
 use crate::publication::CorpusUnsettled;
 use crate::query_timing::{Outcome, TimingGuard};
 use crate::report_window::{ReportWindow, format_window_bound, truncate_to_micros};
 use crate::results::ResultsState;
-use crate::store::{ClaimedRun, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
+use crate::store::{
+    ClaimedRun, DUE_SCHEDULE_PAGE, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore,
+};
 
 /// Spawn the scheduler background task.
 ///
@@ -185,7 +188,8 @@ impl CorpusWatch {
     }
 }
 
-/// One scheduler tick: claim and spawn every schedule due at `now`.
+/// One scheduler tick: claim and spawn the schedules due at `now`, as many
+/// as there are free scheduled-run leases.
 ///
 /// `now` is a parameter rather than a clock reading, and [`scheduler_loop`]
 /// samples it once per tick, so every schedule in a poll is judged against
@@ -195,6 +199,14 @@ impl CorpusWatch {
 ///
 /// Returns the spawned execution tasks. The loop drops them — each run
 /// records its own outcome through `finish_run` — and tests await them.
+///
+/// At most `max(1, max_concurrent_queries / 2)` scheduled runs are in
+/// flight (ADR-0018, amended 2026-11-09). The tick reads the due schedules
+/// in pages of [`DUE_SCHEDULE_PAGE`], oldest fire cursor first, and takes
+/// a lease ([`ExecutorPool::try_lease_scheduled`]) before each claim. When
+/// no lease is free the tick ends. A schedule it did not reach keeps its
+/// cursor, watermark, run rows and run budget, is among the oldest due at
+/// a later tick, and its missed boundaries coalesce there (ruling 9).
 ///
 /// While the corpus is unsettled (ADR-0041) the poll claims nothing. A
 /// claim moves the fire cursor in the transaction that plans the window,
@@ -218,88 +230,139 @@ pub async fn poll_and_execute(
         return spawned;
     }
 
-    let schedules = match schedule_store.list_enabled_schedules().await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                event_type = "scheduler_error",
-                error = %e,
-                "failed to list enabled schedules"
-            );
-            return spawned;
-        }
-    };
-
-    // The listing is the enumeration and nothing more: which schedules
-    // exist. Every value the run depends on — cadence, window, watermark,
-    // and above all the saved DSL — is re-read inside `claim_due_run`,
-    // under the row locks it takes.
-    for (schedule, _saved_query) in schedules {
-        // Key liveness comes BEFORE the claim, so an unusable key leaves the
-        // fire cursor exactly where it was. The cursor is the coverage
-        // boundary: skipping the claim means a `since_last` schedule covers
-        // the whole outage in one window once the key is usable again,
-        // instead of losing every boundary that passed while it was not.
-        if !owning_key_is_usable(key_store, schedule.id, schedule.key_id).await {
-            continue;
-        }
-
-        // Plan, materialize, claim and move the cursor — one transaction.
-        let claimed = match schedule_store
-            .claim_due_run(schedule.id, now, config.max_catchup_intervals)
-            .await
-        {
-            Ok(DueClaim::Started(claimed)) => claimed,
-            Ok(
-                DueClaim::NotDue
-                | DueClaim::Advanced
-                | DueClaim::AlreadyRunning
-                | DueClaim::MaxRunsReached,
-            ) => continue,
-            Err(e) => {
-                // The class, never the message: a window failure's Display
-                // can quote the saved DSL and the parser's own text, and
-                // this event lands in the retained `service=trawld` corpus.
-                tracing::error!(
-                    event_type = "scheduler_error",
-                    schedule_id = schedule.id,
-                    error_class = e.class(),
-                    "failed to claim a due run; the schedule's fire cursor is unchanged"
-                );
-                continue;
-            }
-        };
-
-        if let Some(window) = &claimed.window {
-            note_truncated_window(schedule.id, claimed.run_id, window);
-        }
-
-        // Execute the text the claim RESOLVED and stored, never the saved
-        // DSL from the listing: with a window those two differ by the very
-        // bounds the run row claims to cover.
-        let ClaimedRun {
-            run_id,
-            query_name,
-            resolved_query,
-            ..
-        } = claimed;
-        let store = schedule_store.clone();
-        let pool = pool.clone();
-
-        spawned.push(tokio::spawn(async move {
-            execute_scheduled_query(
-                store,
-                pool,
-                run_id,
-                &resolved_query,
-                &query_name,
-                timeout_secs,
-            )
-            .await;
-        }));
+    // With no lease free the tick could claim nothing, so it lists
+    // nothing. Only an observation: each claim below takes its own lease.
+    if pool.scheduled_leases_available() == 0 {
+        return spawned;
     }
 
-    spawned
+    // Each page starts after the last row the previous page LISTED. No
+    // schedule returns in the same tick through this tick's own claims: a
+    // claim moves the cursor past `now` or leaves it where it was, behind
+    // that row. A concurrent cursor write, such as a manual run finishing,
+    // can list one again, and its claim reads it again under its lock.
+    let mut after = None;
+    loop {
+        let page = match schedule_store
+            .list_due_schedule_page(now, after, DUE_SCHEDULE_PAGE)
+            .await
+        {
+            Ok(page) => page,
+            Err(e) => {
+                tracing::error!(
+                    event_type = "scheduler_error",
+                    error = %e,
+                    "failed to list due schedules"
+                );
+                return spawned;
+            }
+        };
+        let last_page = page.len() < DUE_SCHEDULE_PAGE;
+        after = page.last().map(|due| (due.next_fire_at, due.id));
+
+        for due in page {
+            // Key liveness comes BEFORE the claim, so an unusable key leaves
+            // the fire cursor exactly where it was. The cursor is the
+            // coverage boundary: skipping the claim means a `since_last`
+            // schedule covers the whole outage in one window once the key is
+            // usable again, instead of losing every boundary that passed
+            // while it was not.
+            if !owning_key_is_usable(key_store, due.id, due.key_id).await {
+                continue;
+            }
+
+            // The lease comes before the claim too: a claim moves the cursor
+            // and starts a run row, which needs a lease to run under. No
+            // free lease ends the tick.
+            let Some(lease) = pool.try_lease_scheduled() else {
+                return spawned;
+            };
+            let Some((claimed, lease)) = claim_leased(
+                schedule_store,
+                due.id,
+                now,
+                config.max_catchup_intervals,
+                lease,
+            )
+            .await
+            else {
+                continue;
+            };
+
+            if let Some(window) = &claimed.window {
+                note_truncated_window(due.id, claimed.run_id, window);
+            }
+
+            // Execute the text the claim RESOLVED and stored: with a window
+            // it differs from the saved DSL by the very bounds the run row
+            // claims to cover.
+            let ClaimedRun {
+                run_id,
+                query_name,
+                resolved_query,
+                ..
+            } = claimed;
+            let store = schedule_store.clone();
+            let pool = pool.clone();
+
+            spawned.push(tokio::spawn(async move {
+                execute_scheduled_query(
+                    store,
+                    pool,
+                    run_id,
+                    &resolved_query,
+                    &query_name,
+                    timeout_secs,
+                    Some(lease),
+                )
+                .await;
+            }));
+        }
+
+        if last_page {
+            return spawned;
+        }
+    }
+}
+
+/// Plan, materialize and claim `schedule_id`'s due run, and move its
+/// cursor, in one transaction ([`ScheduleStore::claim_due_run`]), under
+/// `lease`.
+///
+/// A started run comes back with the lease, for its task to keep. Every
+/// other outcome, a failed claim included, starts no run and drops the
+/// lease here, before the tick asks the next schedule.
+async fn claim_leased(
+    schedule_store: &ScheduleStore,
+    schedule_id: i64,
+    now: DateTime<Utc>,
+    max_catchup_intervals: u32,
+    lease: ScheduledLease,
+) -> Option<(ClaimedRun, ScheduledLease)> {
+    match schedule_store
+        .claim_due_run(schedule_id, now, max_catchup_intervals)
+        .await
+    {
+        Ok(DueClaim::Started(claimed)) => Some((claimed, lease)),
+        Ok(
+            DueClaim::NotDue
+            | DueClaim::Advanced
+            | DueClaim::AlreadyRunning
+            | DueClaim::MaxRunsReached,
+        ) => None,
+        Err(e) => {
+            // The class, never the message: a window failure's Display
+            // can quote the saved DSL and the parser's own text, and
+            // this event lands in the retained `service=trawld` corpus.
+            tracing::error!(
+                event_type = "scheduler_error",
+                schedule_id,
+                error_class = e.class(),
+                "failed to claim a due run; the schedule's fire cursor is unchanged"
+            );
+            None
+        }
+    }
 }
 
 /// Count and announce a claimed window whose start was clamped forward;
@@ -364,6 +427,14 @@ async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i6
     usable
 }
 
+/// Execute one claimed run and record its outcome on its run row.
+///
+/// `lease` is the run's place among the scheduled runs in flight, or
+/// `None` for a manual run, which takes none (ADR-0018, amended
+/// 2026-11-09). This frame keeps it to its last statement, and the run's
+/// preparation job and its executor work each keep it until they stop,
+/// so the lease returns when the last of the three ends: a run that timed
+/// out still holds it while its work runs.
 pub(crate) async fn execute_scheduled_query(
     schedule_store: ScheduleStore,
     pool: ExecutorPool,
@@ -371,7 +442,9 @@ pub(crate) async fn execute_scheduled_query(
     query: &str,
     _query_name: &str,
     timeout_secs: u64,
+    lease: Option<ScheduledLease>,
 ) {
+    let lease = lease.map(ScheduledLease::into_hold);
     let start = std::time::Instant::now();
     // One budget for this attempt, stamped before the first pool wait
     // (ADR-0024): a scheduled run that spends its whole timeout queueing
@@ -391,28 +464,28 @@ pub(crate) async fn execute_scheduled_query(
     // the operator repairs the saved DSL rather than re-enabling a
     // schedule the server disabled behind their back. The check runs on
     // the blocking pool behind the preparation allowance, and its wait for
-    // a slot spends this attempt's deadline (ADR-0063).
+    // a slot spends this attempt's deadline (ADR-0063). Its job keeps the
+    // lease until it ends.
     let checked = {
         let _check = timing
             .clock()
             .guard(trawl_engine::timing::QueryPhase::DslCheck);
-        crate::admission::admit(&pool, query, deadline, None).await
+        crate::admission::admit_holding(&pool, query, deadline, None, lease.clone()).await
     };
-    let result = match checked {
-        Err(refusal) => Err(refusal),
+    let result = if let Err(refusal) = checked {
+        Err(refusal)
+    } else {
         // Execute the query on the pool (no debug capture, UTC timestamps).
-        Ok(_) => {
-            pool.execute(
-                query_id,
-                query,
-                deadline,
-                false,
-                crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled)
-                    .with_timing(timing.timing().clone()),
-            )
+        // The work keeps the lease until it stops.
+        let work = crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled)
+            .with_timing(timing.timing().clone());
+        let work = match &lease {
+            Some(hold) => work.holding(Arc::clone(hold)),
+            None => work,
+        };
+        pool.execute(query_id, query, deadline, false, work)
             .await
             .result
-        }
     };
 
     // The account closes here, before the result is persisted: the window
@@ -1421,6 +1494,7 @@ mod off_reactor_tests {
                 "zz_cp6b_scheduled_run | where message matches /zz_(a|b)+/",
                 "prepared",
                 30,
+                None,
             ),
         )
         .await;
@@ -1733,6 +1807,7 @@ mod tests {
             "* | head 1",
             "timed_ok",
             30,
+            None,
         )
         .await;
         super::execute_scheduled_query(
@@ -1742,6 +1817,7 @@ mod tests {
             "* | stats zz_sched_needle()",
             "timed_failure",
             30,
+            None,
         )
         .await;
         drop(capturing);
@@ -1803,6 +1879,242 @@ mod tests {
                 .is_some_and(|m| m.contains("zz_sched_needle")),
             "the run row stores the public message, which names the emit error's function: {run:?}"
         );
+    }
+
+    /// A scheduled run whose request timed out while its preparation job
+    /// still ran keeps its lease until the job ends (ADR-0018, amended
+    /// 2026-11-09). The job is parked twice: before its work runs, and
+    /// after its work returned, when everything the work captured has
+    /// dropped and only the job is left holding its slot. On a pool of two
+    /// permits the one lease is the run's, so no other lease is free until
+    /// the job lets it go.
+    #[sqlx::test]
+    async fn a_preparation_job_holds_its_lease(pool: sqlx::PgPool) {
+        use crate::pool::seam::Seam;
+        use crate::store::RunStatus;
+
+        for seam in [Seam::Preparing, Seam::Prepared] {
+            let data = tempfile::tempdir().unwrap();
+            let executors = crate::pool::ExecutorPool::for_test(
+                data.path().to_str().unwrap().into(),
+                2,
+                100_000,
+                None,
+            )
+            .unwrap();
+            let seams = executors.seams();
+            let parked = seams.hold(seam);
+            let (store, _, run_id) =
+                super::pg_tests::seed_run(&pool, &format!("held_{seam:?}")).await;
+            let lease = executors.try_lease_scheduled().expect("a free lease");
+
+            super::execute_scheduled_query(
+                store.clone(),
+                executors.clone(),
+                run_id,
+                "* | head 1",
+                "held",
+                1,
+                Some(lease),
+            )
+            .await;
+            let run = store.get_run(run_id, 1).await.unwrap().unwrap();
+            assert_eq!(run.status, RunStatus::Timeout, "{seam:?}: {run:?}");
+            crate::test_timing::until("the job parks", || parked.arrivals() == 1).await;
+            assert!(
+                executors.try_lease_scheduled().is_none(),
+                "{seam:?}: the parked job keeps the run's lease"
+            );
+
+            parked.release();
+            crate::test_timing::until("the job gives the lease back", || {
+                executors.scheduled_leases_available() == 1
+            })
+            .await;
+            assert_eq!(executors.preparation().in_use(), 0, "{seam:?}");
+        }
+    }
+
+    /// A pool of 1 permit has 1 scheduled-run lease, and pools of 1 to 5
+    /// permits have 1, 1, 1, 2 and 2 (ADR-0018, amended 2026-11-09). A
+    /// pool's clones share its leases, and a lease returns when its last
+    /// clone drops. A claim through [`super::claim_leased`] that starts no
+    /// run, `NotDue`, `Advanced`, `AlreadyRunning`, `MaxRunsReached` or a
+    /// failed claim, returns its lease at once; a started run keeps it.
+    #[sqlx::test]
+    #[allow(clippy::too_many_lines)] // one fixture per claim outcome
+    async fn lease_count_and_return(pool: sqlx::PgPool) {
+        use chrono::{DateTime, Utc};
+
+        use crate::pool::ExecutorPool;
+        use crate::report_window::{ScheduleWindow, truncate_to_micros};
+        use crate::store::{DueClaim, RunClaim, RunStatus, SavedQueryStore, ScheduleStore};
+
+        /// A saved query over `dsl` and its hourly schedule, firing first
+        /// at `fire`. Returns the schedule id.
+        async fn net(
+            pool: &sqlx::PgPool,
+            name: &str,
+            dsl: &str,
+            max_runs: Option<u64>,
+            window: Option<ScheduleWindow>,
+            fire: DateTime<Utc>,
+        ) -> i64 {
+            let saved = SavedQueryStore::new(pool.clone())
+                .create(1, name, dsl)
+                .await
+                .unwrap();
+            ScheduleStore::new(pool.clone())
+                .create_schedule(saved.id, 1, 3600, max_runs, window, 0, fire)
+                .await
+                .unwrap()
+                .id
+        }
+
+        const CATCHUP: u32 = 24;
+
+        for (permits, leases) in [(1, 1), (2, 1), (3, 1), (4, 2), (5, 2)] {
+            let executors =
+                ExecutorPool::for_test("/nonexistent".into(), permits, 100, None).unwrap();
+            assert_eq!(
+                executors.scheduled_leases_available(),
+                leases,
+                "{permits} permits"
+            );
+        }
+
+        let executors = ExecutorPool::for_test("/nonexistent".into(), 1, 100, None).unwrap();
+        let clone = executors.clone();
+        let lease = executors.try_lease_scheduled().expect("one lease");
+        assert!(executors.try_lease_scheduled().is_none(), "only one");
+        assert!(
+            clone.try_lease_scheduled().is_none(),
+            "a clone of the pool shares it"
+        );
+        let kept = lease.clone();
+        drop(lease);
+        assert_eq!(
+            executors.scheduled_leases_available(),
+            0,
+            "a clone of the lease keeps it"
+        );
+        drop(kept);
+        assert_eq!(
+            executors.scheduled_leases_available(),
+            1,
+            "the last clone returns it"
+        );
+
+        let store = ScheduleStore::new(pool.clone());
+        let now = truncate_to_micros(Utc::now());
+        let hour = chrono::Duration::hours(1);
+        let not_due = net(&pool, "not_due", "error", None, None, now + hour).await;
+        let advanced = net(
+            &pool,
+            "advanced",
+            "error",
+            None,
+            Some(ScheduleWindow::SinceLast),
+            now,
+        )
+        .await;
+        sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+            .bind(now + hour * 10)
+            .bind(advanced)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let running = net(&pool, "running", "error", None, None, now).await;
+        let capped = net(&pool, "capped", "error", Some(1), None, now).await;
+        for schedule_id in [running, capped] {
+            let saved_id: i64 =
+                sqlx::query_scalar("SELECT saved_query_id FROM schedules WHERE id = $1")
+                    .bind(schedule_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let RunClaim::Started(run_id) = store
+                .claim_run(schedule_id, saved_id, "error", None)
+                .await
+                .unwrap()
+            else {
+                panic!("the seeded run starts");
+            };
+            if schedule_id == capped {
+                store
+                    .finish_run(run_id, RunStatus::Success, 1, Some(0), None, None, None)
+                    .await
+                    .unwrap();
+            }
+        }
+        // A query that owns its own time clause under a window: the claim
+        // fails, and leaves the cursor alone.
+        let failing = net(
+            &pool,
+            "failing",
+            "error last=1h",
+            None,
+            Some(ScheduleWindow::SinceLast),
+            now,
+        )
+        .await;
+        let started = net(&pool, "started", "error", None, None, now).await;
+
+        for (outcome, schedule_id) in [
+            ("NotDue", not_due),
+            ("Advanced", advanced),
+            ("AlreadyRunning", running),
+            ("MaxRunsReached", capped),
+            ("a failed claim", failing),
+        ] {
+            let lease = executors.try_lease_scheduled().expect("the lease is free");
+            let claimed = super::claim_leased(&store, schedule_id, now, CATCHUP, lease).await;
+            assert!(claimed.is_none(), "{outcome}: {claimed:?}");
+            assert_eq!(
+                executors.scheduled_leases_available(),
+                1,
+                "{outcome} returned its lease"
+            );
+        }
+        // Each was the outcome it is named for. The ones that write nothing
+        // answer the same again, and the advance moved the cursor past
+        // `now` without a run.
+        for (schedule_id, outcome) in [
+            (not_due, DueClaim::NotDue),
+            (running, DueClaim::AlreadyRunning),
+            (capped, DueClaim::MaxRunsReached),
+        ] {
+            assert_eq!(
+                store
+                    .claim_due_run(schedule_id, now, CATCHUP)
+                    .await
+                    .unwrap(),
+                outcome
+            );
+        }
+        assert!(store.claim_due_run(failing, now, CATCHUP).await.is_err());
+        let advanced_cursor: DateTime<Utc> =
+            sqlx::query_scalar("SELECT next_fire_at FROM schedules WHERE id = $1")
+                .bind(advanced)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(advanced_cursor, now + hour);
+        assert_eq!(store.count_runs(advanced).await.unwrap(), 0);
+
+        let lease = executors.try_lease_scheduled().expect("the lease is free");
+        let (claimed, lease) = super::claim_leased(&store, started, now, CATCHUP, lease)
+            .await
+            .expect("a due schedule starts a run");
+        assert_eq!(
+            executors.scheduled_leases_available(),
+            0,
+            "a started run keeps its lease"
+        );
+        let run = store.get_run(claimed.run_id, 1).await.unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+        drop(lease);
+        assert_eq!(executors.scheduled_leases_available(), 1);
     }
 
     /// The blob is the typed wire, and decodes back to the same result.
