@@ -27,8 +27,8 @@
 //! - `finding_status` sends `PUT …/findings/{seq}/status` and `status`
 //!   sends `PATCH …` with `status` alone, the one field per request trawld
 //!   takes; both carry `expected_seq`, and a stale one prints trawld's
-//!   expected and current sequence. Neither sends a `seen_seq`, so
-//!   trawld answers neither with activity.
+//!   expected and current sequence. Both carry the session's `seen_seq`
+//!   too, and the reply prints the activity as an append's does.
 //!
 //! Changing the title or question, deleting an investigation and
 //! extending its evidence are not actions here: deletion and extension
@@ -42,8 +42,8 @@ use trawl_api::investigations::{
     REMAINING_QUESTION_MAX_BYTES, SCOPE_MAX_BYTES, TITLE_MAX_BYTES,
 };
 use trawl_client::{
-    AppendEntry, ClientError, CreateInvestigation, ErrorCode, EvidenceRef, FindingStatus,
-    FindingStatusUpdate, InvestigationStatus, PatchInvestigation,
+    Activity, AppendEntry, ClientError, CreateInvestigation, ErrorCode, EvidenceRef, FindingStatus,
+    FindingStatusUpdate, InvestigationStatus, LogEntry, PatchInvestigation,
 };
 
 use super::schema::{INVESTIGATION, InvestigationInput, RowRef, StatusWord};
@@ -63,10 +63,6 @@ use crate::session::{Seen, SeenGuard};
 /// The response budget usually prints fewer, and the continuation reads
 /// on from the last one printed.
 pub const BOARD_PAGE_ENTRIES: u64 = 50;
-
-/// The note when trawld answers a write with no activity.
-pub const NO_ACTIVITY_ROUTE: &str = "trawld answers this write with no activity; the next note, \
-finding, keep or attached search prints what other keys wrote";
 
 /// Run `investigation` against `backend`, keeping this session's
 /// bookkeeping in `seen`.
@@ -657,6 +653,46 @@ fn first_touch(id: &InvestigationId, seq: u64) -> String {
     )
 }
 
+/// What a write's reply prints for the activity: with no `seen_seq` sent,
+/// no activity and the note that the session starts at `written`, the
+/// entry the write wrote; with one, the activity trawld answered, or a
+/// note that it sent none.
+fn written_activity(
+    id: &InvestigationId,
+    seen_seq: Option<u64>,
+    written: &LogEntry,
+    activity: Option<&Activity>,
+) -> (Option<ActivityView>, Option<String>) {
+    match (seen_seq, activity) {
+        (None, _) => (None, Some(first_touch(id, written.updated_seq))),
+        (Some(since), Some(activity)) => (Some(activity_view(id.as_str(), since, activity)), None),
+        (Some(_), None) => (
+            None,
+            Some("trawld sent no activity with this write".to_owned()),
+        ),
+    }
+}
+
+/// Record what the fitted reply `result` to a write showed. With no
+/// `seen_seq` sent, the session starts following `id` at `written`, the
+/// entry the write wrote, never at the investigation's header, which can
+/// count another key's later entry. With one, `seen` moves through the
+/// activity the reply printed and no further: not to trawld's
+/// `through_seq`, and not past an entry the budget dropped. The caller
+/// holds `guard` from the moment it read `seen_seq`.
+fn record_written(
+    guard: &mut SeenGuard<'_>,
+    id: &InvestigationId,
+    seen_seq: Option<u64>,
+    written: &LogEntry,
+    result: &CallToolResult,
+) {
+    match seen_seq {
+        None => guard.touch(id, written.updated_seq),
+        Some(since) => guard.printed(id, since, printed_through(result, &["activity"])),
+    }
+}
+
 /// `note`, `finding` and `keep`.
 async fn append<B: Backend>(
     backend: &B,
@@ -675,14 +711,8 @@ async fn append<B: Backend>(
         Err(error) => return refused(input.action, Some(&id), &error),
     };
     let entry = entry_view(&answer.entry);
-    let (activity, activity_note) = match (seen_seq, &answer.activity) {
-        (None, _) => (None, Some(first_touch(&id, answer.entry.updated_seq))),
-        (Some(since), Some(activity)) => (Some(activity_view(id.as_str(), since, activity)), None),
-        (Some(_), None) => (
-            None,
-            Some("trawld sent no activity with this write".to_owned()),
-        ),
-    };
+    let (activity, activity_note) =
+        written_activity(&id, seen_seq, &answer.entry, answer.activity.as_ref());
     let reply = InvestigationReply {
         outcome: format!(
             "Wrote {} #{} to investigation {}.",
@@ -704,10 +734,7 @@ async fn append<B: Backend>(
         Ok(result) => result,
         Err(unfitted) => return unfitted,
     };
-    match seen_seq {
-        None => guard.touch(&id, answer.entry.updated_seq),
-        Some(since) => guard.printed(&id, since, printed_through(&result, &["activity"])),
-    }
+    record_written(&mut guard, &id, seen_seq, &answer.entry, &result);
     result
 }
 
@@ -720,15 +747,16 @@ async fn finding_status<B: Backend>(
 ) -> CallToolResult {
     let id = id_of(input);
     let finding_seq = input.finding_seq.unwrap_or_default();
+    let mut guard = seen.lock().await;
+    let seen_seq = guard.get(&id);
     let request = FindingStatusUpdate {
         expected_seq: input.expected_seq.unwrap_or_default(),
-        seen_seq: None,
+        seen_seq,
         status: input
             .status
             .and_then(finding_status_of)
             .unwrap_or(FindingStatus::Hypothesis),
     };
-    let mut guard = seen.lock().await;
     let answer = match backend
         .set_finding_status(id.as_str(), finding_seq, &request)
         .await
@@ -737,6 +765,8 @@ async fn finding_status<B: Backend>(
         Err(error) => return refused(InvestigationAction::FindingStatus, Some(&id), &error),
     };
     let entry = entry_view(&answer.entry);
+    let (activity, activity_note) =
+        written_activity(&id, seen_seq, &answer.entry, answer.activity.as_ref());
     let reply = InvestigationReply {
         outcome: format!(
             "Finding #{finding_seq} of investigation {} is now {}; the investigation is at seq {}.",
@@ -748,8 +778,8 @@ async fn finding_status<B: Backend>(
         investigation: None,
         entry: Some(entry),
         entries: None,
-        activity: None,
-        activity_note: Some(NO_ACTIVITY_ROUTE.to_owned()),
+        activity,
+        activity_note,
         investigations: Vec::new(),
         investigations_dropped_to_fit: 0,
         next_actions: Vec::new(),
@@ -758,7 +788,7 @@ async fn finding_status<B: Backend>(
         Ok(result) => result,
         Err(unfitted) => return unfitted,
     };
-    guard.touch(&id, answer.entry.updated_seq);
+    record_written(&mut guard, &id, seen_seq, &answer.entry, &result);
     result
 }
 
@@ -783,19 +813,22 @@ async fn status<B: Backend>(
         .status
         .and_then(investigation_status)
         .unwrap_or(InvestigationStatus::Open);
+    let mut guard = seen.lock().await;
+    let seen_seq = guard.get(&id);
     let request = PatchInvestigation {
         expected_seq: input.expected_seq.unwrap_or_default(),
-        seen_seq: None,
+        seen_seq,
         title: None,
         question: None,
         status: Some(status),
     };
-    let mut guard = seen.lock().await;
-    let investigation = match backend.patch_investigation(id.as_str(), &request).await {
-        Ok(answer) => answer.investigation,
+    let answer = match backend.patch_investigation(id.as_str(), &request).await {
+        Ok(answer) => answer,
         Err(error) => return refused(InvestigationAction::Status, Some(&id), &error),
     };
-    let view = investigation_view(&investigation);
+    let view = investigation_view(&answer.investigation);
+    let (activity, activity_note) =
+        written_activity(&id, seen_seq, &answer.entry, answer.activity.as_ref());
     let reply = InvestigationReply {
         outcome: format!(
             "Investigation {} is now {} at seq {}.",
@@ -807,8 +840,8 @@ async fn status<B: Backend>(
         investigation: Some(view),
         entry: None,
         entries: None,
-        activity: None,
-        activity_note: Some(NO_ACTIVITY_ROUTE.to_owned()),
+        activity,
+        activity_note,
         investigations: Vec::new(),
         investigations_dropped_to_fit: 0,
         next_actions: Vec::new(),
@@ -817,7 +850,7 @@ async fn status<B: Backend>(
         Ok(result) => result,
         Err(unfitted) => return unfitted,
     };
-    guard.touch(&id, investigation.seq);
+    record_written(&mut guard, &id, seen_seq, &answer.entry, &result);
     result
 }
 

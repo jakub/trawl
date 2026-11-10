@@ -434,6 +434,17 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         )
         .await;
     assert!(!reopened.is_error, "{}", reopened.text);
+    // The reopen sends A's seen_seq, so it prints B's close, once.
+    let close_line = format!(
+        "#{} status by {} \"investigator-b-key\"",
+        closed.entry.seq, closed.entry.actor.prefix
+    );
+    assert_eq!(
+        reopened.text.matches(&close_line).count(),
+        1,
+        "{}",
+        reopened.text
+    );
     a.finish().await.assert_clean("session one");
 
     // A second session starts following at its first touch: B's notes are

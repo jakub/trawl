@@ -615,9 +615,8 @@ fn investigation() -> Tool {
         "Work in an investigation other keys read too: create one (you get its id), read its \
          entries, list them, append a note, a finding or a keep of rows from a captured \
          result, set a finding's status, or close and reopen it (status with expected_seq). \
-         A note, a finding or a keep prints what other keys wrote since this session last \
-         saw it, each entry once; finding_status and status print no activity, the next \
-         note, finding, keep or attached search does. Changing the title or question, \
+         A note, a finding, a keep, finding_status or status prints what other keys wrote \
+         since this session last saw it, each entry once. Changing the title or question, \
          deleting an investigation and extending its evidence are not here; deletion and \
          extension are operator actions that need server_manage.",
         // A write appends to a shared log: not read-only, not idempotent
