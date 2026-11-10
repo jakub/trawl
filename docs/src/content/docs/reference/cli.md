@@ -197,26 +197,22 @@ trawl query "last=1h | stats count() by service" | jq '.service'
 
 A sender chooses field names and values, and they can hold characters that a
 terminal acts on: control characters such as ESC, bidirectional controls,
-zero-width characters, and the soft hyphen. Trawl does not write those
-characters to a terminal.
+zero-width characters, and the soft hyphen. `trawl query`, `trawl schema`, and
+the results and status that `trawl driver` prints do not write those
+characters to a terminal. `trawl driver capture` prints the screen as the TUI
+drew it.
 
 | Format | On a terminal | In a pipe or an `-o` file |
 |--------|---------------|---------------------------|
-| `table` | Each such character is shown as `�` (U+FFFD). A line break in a value stays a line break inside its cell. | The same as on a terminal |
-| `json` | Each such character in a key or a string is written as a `\uXXXX` escape. A JSON parser reads the original value. | Every value is exact |
-| `csv` | Each such character is shown as `�`, line breaks included | Every value is exact |
+| `table` | Each such character is shown as `�` (U+FFFD) or as an escape in printable text. A table can keep a line break in a value as a line break inside the cell. | The same as on a terminal |
+| `json` | Each such character in a key or a string is written as a `\uXXXX` escape. A JSON parser reads the original value. | No change for a terminal |
+| `csv` | Each such character is shown as `�` or as an escape in printable text | No change for a terminal |
 
-`trawl schema` output follows the same rules, and so do the results and the
-status that `trawl driver` prints. `trawl driver capture` prints the screen as
-the TUI drew it. Messages on stderr always replace these characters with `�`.
+On stderr, these commands also replace or escape these characters. A line
+break in an argument that a usage error quotes can stay a line break.
 
-Three `trawl schema` values are the exception. An acknowledgement's
-`acked_by` and `note`, and a repin cancel's `detail`, have these characters
-replaced with `�` in every format, in a pipe and in a file too. In a table,
-an acknowledgement's field name also shows a line break as `�`.
-
-To read exact values, send `json` or `csv` to a pipe or to a file with
-`-o, --output`.
+`trawl schema` replaces these characters in an acknowledgement's `acked_by`
+and `note`, and in a repin cancel's `detail`, in every format.
 
 ### The incomplete-results footer
 
