@@ -463,3 +463,96 @@ fn the_kv_tail_timechart_cuts_the_buckets_the_sql_lane_cuts() {
     assert_eq!(instant(cell(&without_tail, 0, "_time")), bucket);
     assert_eq!(cell(&without_tail, 0, "count"), &Value::Integer(2));
 }
+
+/// The `id` of each row of `result`, in order.
+fn ids(result: &QueryResult) -> Vec<String> {
+    (0..result.rows.len())
+        .map(|row| match cell(result, row, "id") {
+            Value::String(id) => id.clone(),
+            other => panic!("id must be text: {other:?}"),
+        })
+        .collect()
+}
+
+/// A `where … matches` in the kv tail reads `\d`, `\w`, `\s`, `\b` and
+/// `\B` as the batch lane reads them: `extract kv … | where f matches /…/`
+/// keeps the rows the same filter keeps in pure SQL. Each body keeps an
+/// ASCII subject and drops its non-ASCII twin in both lanes, over a
+/// column the source carries and over a field the kv split writes.
+#[test]
+fn kv_tail_regex_classes_match_batch() {
+    // (id, subject, kv value): the kv value is the subject where the kv
+    // split would not cut it, and a word otherwise.
+    let subjects = [
+        ("d-ascii", "3", "3x"),
+        ("d-arabic", "\u{663}", "\u{663}x"),
+        ("w-ascii", "e", "e"),
+        ("w-accent", "\u{e9}", "\u{e9}"),
+        ("s-ascii", "a b", "a"),
+        ("s-hair", "a\u{200a}b", "b"),
+        ("b-ascii", "xa", "xa"),
+        ("b-accent", "x\u{e9}", "x\u{e9}"),
+        ("kelvin", "\u{212a}", "\u{212a}"),
+    ];
+    let rows: Vec<String> = subjects
+        .iter()
+        .map(|(id, subject, value)| {
+            serde_json::json!({
+                "id": id,
+                "subject": subject,
+                "value": value,
+                "message": format!("k={value}"),
+            })
+            .to_string()
+        })
+        .collect();
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let (_dir, glob) = source(&rows);
+    let exec = Executor::new().unwrap();
+
+    // (body, the ids it keeps over `subject`)
+    let cases: [(&str, &[&str]); 7] = [
+        (r"^\d+$", &["d-ascii"]),
+        (r"^\w$", &["d-ascii", "w-ascii"]),
+        (r"\s", &["s-ascii"]),
+        (r"x\b", &["b-accent"]),
+        (r"x\B", &["b-ascii"]),
+        (r"^\W$", &["d-arabic", "w-accent", "kelvin"]),
+        (r"(?i)^\w$", &["d-ascii", "w-ascii", "kelvin"]),
+    ];
+    for (body, expected) in cases {
+        let in_sql = run(
+            &exec,
+            &format!("* | where subject matches /{body}/ | sort id | table id"),
+            &glob,
+        );
+        let in_tail = run(
+            &exec,
+            &format!(
+                "* | extract kv from message | where subject matches /{body}/ | sort id | table id"
+            ),
+            &glob,
+        );
+        let mut expected: Vec<String> = expected.iter().map(|id| (*id).to_owned()).collect();
+        expected.sort();
+        assert_eq!(ids(&in_sql), expected, "SQL for /{body}/");
+        assert_eq!(ids(&in_tail), expected, "the kv tail for /{body}/");
+    }
+
+    // A field the kv split writes, against the same text in a column.
+    for body in [r"\d", r"^\w+$", r"x\b", r"x\B", r"(?i)^\w$"] {
+        let in_sql = run(
+            &exec,
+            &format!("* | where value matches /{body}/ | sort id | table id"),
+            &glob,
+        );
+        let in_tail = run(
+            &exec,
+            &format!("* | extract kv from message | where k matches /{body}/ | sort id | table id"),
+            &glob,
+        );
+        assert!(!ids(&in_sql).is_empty(), "/{body}/ keeps a row");
+        assert!(ids(&in_sql).len() < subjects.len(), "/{body}/ drops a row");
+        assert_eq!(ids(&in_tail), ids(&in_sql), "the kv field for /{body}/");
+    }
+}
