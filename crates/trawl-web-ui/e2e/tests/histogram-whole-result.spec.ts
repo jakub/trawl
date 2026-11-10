@@ -111,6 +111,30 @@ async function stripSeen(page: Pg): Promise<Array<{ bars: number; caption: strin
   return page.evaluate(() => (window as any).__stripSeen);
 }
 
+/** Trace whether the strip is drawn at every DOM change, from now on.
+ * Call it before a transition, while the settled strip still shows. */
+async function traceStrip(page: Pg) {
+  await page.evaluate(() => {
+    const w = window as any;
+    w.__stripTrace = [];
+    const look = () => {
+      const drawn = document.querySelectorAll('.histo .bar').length > 0
+        || document.querySelector('.histo .histo-scope') !== null;
+      if (w.__stripTrace.at(-1) !== drawn) w.__stripTrace.push(drawn);
+    };
+    look();
+    w.__traceObserver?.disconnect();
+    w.__traceObserver = new MutationObserver(look);
+    w.__traceObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+  });
+}
+
+/** Since `traceStrip`, the settled strip cleared once and nothing drew
+ * again: no old bar or caption came back on the way to the wait. */
+async function expectClearedOnce(page: Pg) {
+  expect(await page.evaluate(() => (window as any).__stripTrace)).toEqual([true, false]);
+}
+
 /** The strip is waiting: the shared loading hint, and nothing else. */
 async function expectWaiting(page: Pg) {
   await expect(histo(page)).toBeVisible();
@@ -219,9 +243,11 @@ test('histogram never shows bins from a pending or superseded query', async ({ p
 
   // A resubmit of the same query: its bins are the old ones, and the
   // strip still waits for them.
+  await traceStrip(page);
   await resubmit(page);
   await expect.poll(async () => (await state(request)).pagination.heldQueryNumbers).toEqual([2]);
   await expectWaiting(page);
+  await expectClearedOnce(page);
   await watchStrip(page);
 
   // A second resubmit supersedes the first. The first one's response
@@ -237,9 +263,11 @@ test('histogram never shows bins from a pending or superseded query', async ({ p
 
   // A new query that fails after another superseded it: neither the
   // failure nor the wait shows the old bins.
+  await traceStrip(page);
   await follow(page, '/search?q=service%3Dkept');
   await expect.poll(async () => (await state(request)).pagination.heldQueryNumbers).toEqual([4]);
   await expectWaiting(page);
+  await expectClearedOnce(page);
   await watchStrip(page);
   await follow(page, '/search?q=service%3Dplain');
   await release(request, { status: 500 });
