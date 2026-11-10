@@ -17,7 +17,7 @@ use crate::tui::palette::{FilteredItem, PaletteCategory, PaletteItem};
 use crate::tui::state::Popup;
 use crate::tui::theme::Theme;
 use trawl_core::sanitize::sanitize_display_text;
-use trawl_core::text_layout::fit_cells;
+use trawl_core::text_layout::{cells, fit_cells};
 
 use super::common::centered_rect;
 
@@ -285,7 +285,7 @@ fn render_item_line<'a>(
     // Label with match highlighting. The replacement is one character for
     // one, so a match position indexes the drawn label as it did the raw one.
     let label = sanitize_display_text(&item.label);
-    let label_len = label.chars().count();
+    let label_cells = cells(&label);
     if match_positions.is_empty() {
         spans.push(Span::styled(label, Style::default().fg(theme.text_primary)));
     } else {
@@ -313,17 +313,14 @@ fn render_item_line<'a>(
     });
 
     if let Some(hint_text) = hint {
-        let used = indent + label_len;
-        let hint_len = hint_text.len();
+        let hint = sanitize_display_text(hint_text);
+        let used = indent + label_cells;
         let trailing_pad = 2; // breathing room before the right edge
-        let pad = width.saturating_sub(used + hint_len + trailing_pad);
+        let pad = width.saturating_sub(used + cells(&hint) + trailing_pad);
         if pad > 0 {
             spans.push(Span::raw(" ".repeat(pad)));
         }
-        spans.push(Span::styled(
-            sanitize_display_text(hint_text),
-            Style::default().fg(theme.text_muted),
-        ));
+        spans.push(Span::styled(hint, Style::default().fg(theme.text_muted)));
     }
 
     Line::from(spans)

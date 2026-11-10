@@ -10,6 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use trawl_core::sanitize::sanitize_display_text;
+use trawl_core::text_layout::cells;
 
 use crate::tui::App;
 use crate::tui::state::{Popup, ScheduleField, ScheduleForm};
@@ -218,8 +219,8 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
         .borders(Borders::ALL)
         .style(Style::default().bg(theme.surface).fg(theme.text_primary));
 
-    // Find max name width across all visible fields for alignment.
-    let max_name_len = fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    // The widest name's cells, which every name is right-aligned to.
+    let max_name_cells = fields.iter().map(|(n, _)| cells(n)).max().unwrap_or(0);
 
     let divider = Line::from(Span::styled(
         "─".repeat(area.width.saturating_sub(4) as usize),
@@ -232,7 +233,7 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
     if !well_known.is_empty() {
         lines.push(Line::from(""));
         for (name, val) in &well_known {
-            lines.push(field_line(name, val, max_name_len, theme));
+            lines.push(field_line(name, val, max_name_cells, theme));
         }
     }
 
@@ -243,7 +244,7 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
             lines.push(divider);
         }
         for (name, val) in &others {
-            lines.push(field_line(name, val, max_name_len, theme));
+            lines.push(field_line(name, val, max_name_cells, theme));
         }
     }
 
@@ -261,11 +262,14 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
     frame.render_widget(paragraph, area);
 }
 
-/// Build a single key-value line for the event detail popup.
-fn field_line<'a>(name: &str, value: &str, max_name_len: usize, theme: &Theme) -> Line<'a> {
+/// Build a single key-value line for the event detail popup, the name
+/// right-aligned to `name_cells` cells.
+fn field_line<'a>(name: &str, value: &str, name_cells: usize, theme: &Theme) -> Line<'a> {
+    let name = sanitize_display_text(name);
+    let indent = " ".repeat(name_cells.saturating_sub(cells(&name)));
     Line::from(vec![
         Span::styled(
-            format!("{:>max_name_len$}  ", sanitize_display_text(name)),
+            format!("{indent}{name}  "),
             Style::default()
                 .fg(theme.text_accent)
                 .add_modifier(Modifier::BOLD),
