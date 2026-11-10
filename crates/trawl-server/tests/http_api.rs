@@ -4759,6 +4759,150 @@ async fn max_runs_zero_is_exhausted_from_the_start() {
     assert!(after.exhausted);
 }
 
+/// Assert that a schedule PUT was refused for a `max_runs` above
+/// `i64::MAX`.
+fn assert_max_runs_refused<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) {
+    match result {
+        Err(trawl_client::ClientError::Server { status, error, .. }) => {
+            assert_eq!(status, 400, "{}", error.message);
+            assert_eq!(error.code, trawl_api::ErrorCode::BadRequest);
+            assert_eq!(
+                error.message,
+                "invalid max_runs: at most 9223372036854775807"
+            );
+        }
+        other => panic!("expected a 400, got: {other:?}"),
+    }
+}
+
+/// Claim and finish one run of a schedule through the store, the way the
+/// scheduler spends a run of its budget.
+async fn claim_one_run(
+    store: &trawl_server::store::schedule::ScheduleStore,
+    schedule_id: i64,
+    saved_id: i64,
+) {
+    use trawl_server::store::RunStatus;
+    use trawl_server::store::schedule::RunClaim;
+
+    let claimed = store
+        .claim_run(schedule_id, saved_id, "* | head 3", None)
+        .await
+        .unwrap();
+    let RunClaim::Started(run_id) = claimed else {
+        panic!("claim must start a run, got {claimed:?}")
+    };
+    store
+        .finish_run(run_id, RunStatus::Success, 5, Some(0), None, None, None)
+        .await
+        .unwrap();
+}
+
+/// `max_runs` is stored as a signed 64-bit count. Every value up to
+/// `i64::MAX` saves and reads back unchanged, on create and on update. A
+/// larger one is a 400 that names `max_runs` and writes nothing: a refused
+/// create stores no schedule, and a refused update leaves the cap, the
+/// paused state and the spent budget as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn schedule_max_runs_round_trips_or_refuses() {
+    use trawl_server::store::schedule::ScheduleStore;
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let store = ScheduleStore::new(common::app_pool(&server.app_db_url).await);
+    let largest: u64 = 9_223_372_036_854_775_807;
+    let refused_values = [largest + 1, u64::MAX];
+
+    for (at, max_runs) in [None, Some(0), Some(largest)].into_iter().enumerate() {
+        let saved = client
+            .create_saved(&format!("budget-accept-{at}"), "* | head 3")
+            .await
+            .unwrap();
+        let created = client
+            .set_schedule(saved.id, "1h", max_runs, true, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            created.max_runs, max_runs,
+            "the create answers the cap sent"
+        );
+        assert_eq!(
+            client.get_schedule(saved.id).await.unwrap().max_runs,
+            max_runs
+        );
+
+        let updated = client
+            .set_schedule(saved.id, "2h", max_runs, true, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.max_runs, max_runs,
+            "the update answers the cap sent"
+        );
+        let read = client.get_schedule(saved.id).await.unwrap();
+        assert_eq!(read.max_runs, max_runs);
+        assert_eq!(read.interval, "2h", "the update was written");
+    }
+
+    for (at, max_runs) in refused_values.into_iter().enumerate() {
+        let saved = client
+            .create_saved(&format!("budget-refuse-create-{at}"), "* | head 3")
+            .await
+            .unwrap();
+        assert_max_runs_refused(
+            client
+                .set_schedule(saved.id, "1h", Some(max_runs), true, None, None)
+                .await,
+        );
+        match client.get_schedule(saved.id).await {
+            Err(trawl_client::ClientError::Server { status, .. }) => {
+                assert_eq!(status, 404, "a refused create stores no schedule");
+            }
+            other => panic!("expected 404 for no schedule, got: {other:?}"),
+        }
+        let listed = client.list_saved().await.unwrap();
+        assert!(
+            listed.queries.iter().any(|q| q.id == saved.id),
+            "the saved query survives the refusal"
+        );
+    }
+
+    // A spent, paused budget: cap 1, one claimed run, then paused. The claim
+    // happens while the schedule is enabled, and the pause keeps the count.
+    let saved = client
+        .create_saved("budget-refuse-update", "* | head 3")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", Some(1), true, None, None)
+        .await
+        .unwrap();
+    claim_one_run(&store, schedule.id, saved.id).await;
+    client
+        .set_schedule(saved.id, "1h", Some(1), false, None, None)
+        .await
+        .unwrap();
+    let before = client.get_schedule(saved.id).await.unwrap();
+    assert_eq!(before.max_runs, Some(1));
+    assert!(!before.enabled);
+    assert_eq!(before.total_runs, 1);
+    assert!(before.exhausted);
+
+    for max_runs in refused_values {
+        assert_max_runs_refused(
+            client
+                .set_schedule(saved.id, "2h", Some(max_runs), true, None, None)
+                .await,
+        );
+        let after = client.get_schedule(saved.id).await.unwrap();
+        assert_eq!(after.max_runs, Some(1), "the cap is unchanged");
+        assert!(!after.enabled, "the schedule stays paused");
+        assert_eq!(after.total_runs, 1, "the claim count is unchanged");
+        assert!(after.exhausted, "the budget stays spent");
+        assert_eq!(after.interval, "1h", "nothing of the update was written");
+    }
+}
+
 /// A run in flight refuses another with 409, and says so even when the
 /// cap is also reached: the run in progress is the actionable answer.
 #[tokio::test(flavor = "multi_thread")]

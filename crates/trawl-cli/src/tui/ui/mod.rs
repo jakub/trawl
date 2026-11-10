@@ -971,16 +971,66 @@ mod tests {
     fn render_schedule_popup_on_a_tiny_terminal() {
         use crate::tui::state::ScheduleForm;
 
-        let mut app = test_app();
-        app.popup = Some(Popup::SetSchedule(Box::new(ScheduleForm::new(
-            5,
-            "nightly errors".to_owned(),
-            None,
-        ))));
+        let capped = trawl_api::ScheduleResponse {
+            max_runs: Some(60),
+            enabled: false,
+            ..make_schedule(Some("since_last"), None)
+        };
+        for schedule in [None, Some(&capped)] {
+            let mut app = test_app();
+            app.popup = Some(Popup::SetSchedule(Box::new(ScheduleForm::new(
+                5,
+                "nightly errors".to_owned(),
+                schedule,
+            ))));
 
-        let backend = TestBackend::new(42, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+            let backend = TestBackend::new(42, 8);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        }
+    }
+
+    /// The popup shows the cap and the paused state it will send back, marked
+    /// `(kept)`, so the operator sees what an edit leaves in place. With no
+    /// schedule, they are the values a new schedule starts with, unmarked.
+    #[test]
+    fn render_schedule_popup_shows_the_kept_budget() {
+        use crate::tui::state::ScheduleForm;
+
+        const HINT: &str = "Tab next field  Enter save  Esc cancel";
+
+        let draw = |schedule: Option<&trawl_api::ScheduleResponse>| {
+            let mut app = test_app();
+            app.popup = Some(Popup::SetSchedule(Box::new(ScheduleForm::new(
+                5,
+                "nightly errors".to_owned(),
+                schedule,
+            ))));
+            let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+            terminal.draw(|f| super::render(&mut app, f)).unwrap();
+            terminal.backend().to_string()
+        };
+
+        let capped = trawl_api::ScheduleResponse {
+            max_runs: Some(60),
+            enabled: false,
+            ..make_schedule(Some("since_last"), None)
+        };
+        let screen = draw(Some(&capped));
+        assert!(screen.contains("max_runs  60 (kept)"), "{screen}");
+        assert!(screen.contains("enabled   no (kept)"), "{screen}");
+        assert!(screen.contains(HINT), "{screen}");
+
+        let unlimited = make_schedule(Some("since_last"), None);
+        let screen = draw(Some(&unlimited));
+        assert!(screen.contains("max_runs  unlimited (kept)"), "{screen}");
+        assert!(screen.contains("enabled   yes (kept)"), "{screen}");
+
+        let screen = draw(None);
+        assert!(screen.contains("max_runs  unlimited "), "{screen}");
+        assert!(screen.contains("enabled   yes "), "{screen}");
+        assert!(!screen.contains("(kept)"), "{screen}");
+        assert!(screen.contains(HINT), "{screen}");
     }
 
     #[test]
