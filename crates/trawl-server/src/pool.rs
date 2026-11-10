@@ -223,6 +223,35 @@ impl WorkContext {
     }
 }
 
+/// How many scheduled runs may be in flight on a pool of `permits`
+/// executor permits: half of them, at least 1 (ADR-0018, amended
+/// 2026-11-09). On a pool of 4, two scheduled runs leave two permits to
+/// interactive work.
+pub(crate) fn scheduled_cap(permits: usize) -> usize {
+    (permits / 2).max(1)
+}
+
+/// One scheduled run's place in the cap on scheduled runs in flight
+/// ([`ExecutorPool::try_lease_scheduled`]).
+///
+/// Clones share one permit, which returns when the last clone drops. A
+/// run's place lasts until its physical work ends, not until its request
+/// does: the run, its preparation job and its executor work each keep a
+/// clone, so a run that timed out keeps its place while its work still
+/// runs.
+#[derive(Debug, Clone)]
+pub struct ScheduledLease(Arc<OwnedSemaphorePermit>);
+
+impl ScheduledLease {
+    /// This lease as a charge that work keeps until it stops
+    /// ([`WorkContext::holding`]): the same shared permit, never a second
+    /// one.
+    #[must_use]
+    pub fn into_hold(self) -> Arc<dyn Any + Send + Sync> {
+        self.0
+    }
+}
+
 /// One registered query's cancellation state.
 ///
 /// The slot exists from registration — before the blocking task runs, let
@@ -1415,6 +1444,9 @@ pub struct ExecutorPool {
     /// The query preparation allowance (ADR-0063), sized from the host's
     /// cores and this pool's permits.
     preparation: crate::prepare::Preparation,
+    /// The cap on scheduled runs in flight ([`scheduled_cap`]), one
+    /// permit per [`ScheduledLease`].
+    scheduled: Arc<Semaphore>,
     /// The query scratch directory: the query database spills into it, and
     /// hot-buffer snapshots and export staging files are made in it
     /// (ADR-0056). Its lock is not held here but by every connection to
@@ -1750,6 +1782,7 @@ impl ExecutorPool {
             seams,
             clone_source: Arc::new(Mutex::new(root)),
             preparation,
+            scheduled: Arc::new(Semaphore::new(scheduled_cap(max_concurrent))),
             scratch: query_scratch,
             #[cfg(any(test, feature = "test-support"))]
             _test_scratch: None,
@@ -2679,6 +2712,23 @@ impl ExecutorPool {
         &self.preparation
     }
 
+    /// Take a scheduled run's lease if one is free, and never wait for
+    /// one: the scheduler claims a due run only while it holds a lease
+    /// (ADR-0018, amended 2026-11-09).
+    #[must_use]
+    pub fn try_lease_scheduled(&self) -> Option<ScheduledLease> {
+        Arc::clone(&self.scheduled)
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| ScheduledLease(Arc::new(permit)))
+    }
+
+    /// How many scheduled-run leases are free right now.
+    #[must_use]
+    pub fn scheduled_leases_available(&self) -> usize {
+        self.scheduled.available_permits()
+    }
+
     /// Prepare query text on the blocking pool, behind the preparation
     /// allowance and never behind an executor permit
     /// ([`crate::prepare::Preparation::run`]).
@@ -3244,6 +3294,40 @@ mod tests {
 
     fn idle_len(pool: &ExecutorPool) -> usize {
         pool.registry.lock().idle.len()
+    }
+
+    /// Scheduled runs in flight are capped at half the permits, at least
+    /// one (ADR-0018, amended 2026-11-09). A pool's clones share its
+    /// leases, and a lease's clones and holds share one permit, which
+    /// returns when the last of them drops.
+    #[test]
+    fn scheduled_leases_are_half_the_permits_and_shared() {
+        for (permits, cap) in [(1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (8, 4)] {
+            assert_eq!(scheduled_cap(permits), cap, "{permits} permits");
+        }
+
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 4, 100, None).unwrap();
+        let clone = pool.clone();
+        assert_eq!(pool.scheduled_leases_available(), 2);
+        let first = pool.try_lease_scheduled().expect("a free lease");
+        let second = clone
+            .try_lease_scheduled()
+            .expect("a clone of the pool takes from the same leases");
+        assert!(pool.try_lease_scheduled().is_none(), "the cap is full");
+        assert!(clone.try_lease_scheduled().is_none());
+
+        drop(second);
+        assert_eq!(pool.scheduled_leases_available(), 1);
+        let kept = first.clone();
+        let hold = first.into_hold();
+        drop(kept);
+        assert_eq!(
+            clone.scheduled_leases_available(),
+            1,
+            "the hold keeps the lease"
+        );
+        drop(hold);
+        assert_eq!(clone.scheduled_leases_available(), 2);
     }
 
     /// Nothing is registered: no pending entry, no interrupt slot, no
