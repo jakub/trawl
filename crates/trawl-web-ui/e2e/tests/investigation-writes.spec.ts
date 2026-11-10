@@ -155,7 +155,10 @@ test('a stale close shows the conflict, reads the board again, and the person cl
   await expect(activity).toHaveCount(8);
   await expect(activity.nth(7)).toContainText('Closed the investigation.');
   await expect(activity.nth(7)).toContainText('jakub');
-  expect((await writes(request))[1]).toEqual({ method: 'PATCH', id: ID, body: { expected_seq: 10, status: 'closed' } });
+  const landed = (await writes(request))[1];
+  expect(landed).toEqual({ method: 'PATCH', id: ID, body: { expected_seq: 10, status: 'closed' } });
+  // The board's cursor moves only with its own reads: no `seen_seq`.
+  expect(landed.body).not.toHaveProperty('seen_seq');
   expect(await boardReads(request)).toEqual([0, 9, 10]);
 });
 

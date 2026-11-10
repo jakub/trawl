@@ -404,7 +404,8 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         )
         .await
         .expect("B closes the investigation");
-    assert_eq!(closed.status, InvestigationStatus::Closed);
+    assert_eq!(closed.investigation.status, InvestigationStatus::Closed);
+    assert_eq!(closed.investigation.seq, closed.entry.seq);
     let refused = a
         .call(
             "investigation",
@@ -429,7 +430,7 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         .call(
             "investigation",
             json!({"action": "status", "id": id.as_str(), "status": "open",
-                   "expected_seq": closed.seq}),
+                   "expected_seq": closed.investigation.seq}),
         )
         .await;
     assert!(!reopened.is_error, "{}", reopened.text);

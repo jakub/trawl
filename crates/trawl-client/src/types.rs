@@ -96,8 +96,8 @@ pub use trawl_api::investigations::{
     Activity, Actor, AppendEntry, AppendResponse, Attach, CreateInvestigation, EntryKind,
     EntryPayload, EvidenceRef, FindingStatus, FindingStatusUpdate, Investigation, InvestigationId,
     InvestigationList, InvestigationRead, InvestigationStatus, InvestigationSummary, LogEntry,
-    PatchInvestigation, RetentionExtension, SequenceConflict, StepBounds, StepOutcome,
-    StepOutcomeKind,
+    PatchInvestigation, PatchResponse, RetentionExtension, SequenceConflict, StepBounds,
+    StepOutcome, StepOutcomeKind,
 };
 pub use trawl_api::results::{
     COMPARE_DEFAULT_MIN_COUNT, COMPARE_MAX_GROUP_FIELDS, CONTEXT_DEFAULT_SECONDS,

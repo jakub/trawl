@@ -30,7 +30,7 @@ use trawl_api::{
 
 use trawl_api::investigations::{
     AppendEntry, AppendResponse, Attach, Investigation, InvestigationId, InvestigationList,
-    InvestigationRead, InvestigationStatus, PatchInvestigation,
+    InvestigationRead, InvestigationStatus, PatchInvestigation, PatchResponse,
 };
 use trawl_api::results::{CaptureRequest, CaptureResponse, CaptureWindow, ResultPage};
 
@@ -603,6 +603,8 @@ pub async fn append_keep(
 
 /// PATCH `/api/v1/investigations/{id}` — close or reopen it, if its
 /// sequence is still `expected_seq` (ADR-0059). One field per request.
+/// The answer's investigation, as the write left it, is the result. No
+/// `seen_seq`: the board's cursor moves only with its own reads.
 /// A sequence that moved is [`WriteFailure::Stale`]; a close of an
 /// investigation already closed is [`WriteFailure::Closed`]. Nothing is
 /// retried here, and an answer that never arrived, or a server error, is
@@ -625,7 +627,11 @@ pub async fn patch_status(
         .map_err(|_| WriteFailure::Unknown)?;
     let resp = request.send().await.map_err(|_| WriteFailure::Unknown)?;
     match resp.status() {
-        200 => resp.json().await.map_err(|_| WriteFailure::Unknown),
+        200 => resp
+            .json::<PatchResponse>()
+            .await
+            .map(|answer| answer.investigation)
+            .map_err(|_| WriteFailure::Unknown),
         status => Err(write_refusal(
             status,
             &resp.text().await.unwrap_or_default(),

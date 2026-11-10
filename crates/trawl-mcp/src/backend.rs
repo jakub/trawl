@@ -19,8 +19,8 @@ use trawl_client::{
     CatalogFieldsResponse, ClientError, CompareRequest, ContextRequest, CorrelationResponse,
     CreateInvestigation, DashboardSnapshot, FieldValuesResponse, FindingStatusUpdate,
     HealthResponse, HttpClient, Investigation, InvestigationList, InvestigationRead,
-    PatchInvestigation, QueryResponse, ResultCell, ResultList, ResultPage, RetentionExtension,
-    SchemaResponse, SightingsRequest, ValidationResponse, WhoAmIResponse,
+    PatchInvestigation, PatchResponse, QueryResponse, ResultCell, ResultList, ResultPage,
+    RetentionExtension, SchemaResponse, SightingsRequest, ValidationResponse, WhoAmIResponse,
 };
 
 /// The trawld calls the MCP tools make, typed as trawl-client types them.
@@ -187,7 +187,7 @@ pub trait Backend: Send + Sync {
         &self,
         id: &str,
         request: &PatchInvestigation,
-    ) -> impl Future<Output = Result<Investigation, ClientError>> + Send;
+    ) -> impl Future<Output = Result<PatchResponse, ClientError>> + Send;
 
     /// Overwrite a finding's status
     /// (`PUT /api/v1/investigations/{id}/findings/{seq}/status`).
@@ -356,7 +356,7 @@ impl Backend for HttpClient {
         &self,
         id: &str,
         request: &PatchInvestigation,
-    ) -> Result<Investigation, ClientError> {
+    ) -> Result<PatchResponse, ClientError> {
         HttpClient::patch_investigation(self, id, request).await
     }
 

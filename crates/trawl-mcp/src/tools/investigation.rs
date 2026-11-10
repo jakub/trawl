@@ -27,7 +27,8 @@
 //! - `finding_status` sends `PUT …/findings/{seq}/status` and `status`
 //!   sends `PATCH …` with `status` alone, the one field per request trawld
 //!   takes; both carry `expected_seq`, and a stale one prints trawld's
-//!   expected and current sequence. Neither route answers activity.
+//!   expected and current sequence. Neither sends a `seen_seq`, so
+//!   trawld answers neither with activity.
 //!
 //! Changing the title or question, deleting an investigation and
 //! extending its evidence are not actions here: deletion and extension
@@ -791,7 +792,7 @@ async fn status<B: Backend>(
     };
     let mut guard = seen.lock().await;
     let investigation = match backend.patch_investigation(id.as_str(), &request).await {
-        Ok(investigation) => investigation,
+        Ok(answer) => answer.investigation,
         Err(error) => return refused(InvestigationAction::Status, Some(&id), &error),
     };
     let view = investigation_view(&investigation);

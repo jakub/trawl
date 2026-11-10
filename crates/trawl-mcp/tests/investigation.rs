@@ -18,7 +18,7 @@ use serde_json::{Value as Json, json};
 use trawl_api::investigations::{
     Activity, AppendResponse, EntryPayload, EvidenceRef, FindingStatus, InvestigationId,
     InvestigationList, InvestigationRead, InvestigationStatus, InvestigationSummary, LogEntry,
-    SequenceConflict, StepBounds, StepOutcome, StepOutcomeKind,
+    PatchResponse, SequenceConflict, StepBounds, StepOutcome, StepOutcomeKind,
 };
 use trawl_client::{ClientError, ErrorCode, ErrorEnvelope};
 use trawl_mcp::render::activity::ENTRY_ALLOWANCE_BYTES;
@@ -61,6 +61,21 @@ fn sent(call: &str) -> Json {
 
 fn appended(entry: LogEntry, activity: Option<Activity>) -> AppendResponse {
     AppendResponse { entry, activity }
+}
+
+/// trawld's answer to a `PATCH` that left the investigation at `header`:
+/// the agent's status entry at the header's seq, and `activity`.
+fn patched(header: Investigation, activity: Option<Activity>) -> PatchResponse {
+    PatchResponse {
+        entry: LogEntry {
+            payload: EntryPayload::Status {
+                status: header.status,
+            },
+            ..note(header.seq, agent(), "")
+        },
+        investigation: header,
+        activity,
+    }
 }
 
 /// trawld's answers to the appends, in order.
@@ -301,10 +316,13 @@ async fn every_write_sends_its_request_and_the_sessions_seen_seq() {
             },
             None,
         )]),
-        patch_investigation: ok(Investigation {
-            status: InvestigationStatus::Closed,
-            ..investigation(5)
-        }),
+        patch_investigation: ok(patched(
+            Investigation {
+                status: InvestigationStatus::Closed,
+                ..investigation(5)
+            },
+            None,
+        )),
         ..Fake::default()
     };
     let seen = Seen::default();
@@ -1746,10 +1764,13 @@ fn maximal_writes(fill: char) -> Vec<(Json, Fake, u64)> {
             json!({"action": "status", "id": INVESTIGATION_ID, "status": "closed",
                    "expected_seq": 3}),
             Fake {
-                patch_investigation: ok(Investigation {
-                    status: InvestigationStatus::Closed,
-                    ..maximal_investigation(fill, 4)
-                }),
+                patch_investigation: ok(patched(
+                    Investigation {
+                        status: InvestigationStatus::Closed,
+                        ..maximal_investigation(fill, 4)
+                    },
+                    None,
+                )),
                 ..Fake::default()
             },
             4,
@@ -2009,7 +2030,7 @@ async fn seen_moves_only_after_a_fitted_success() {
                 ..unprintable.clone()
             },
         )),
-        patch_investigation: ok(unprintable),
+        patch_investigation: ok(patched(unprintable, None)),
         set_finding_status: ok(appended(
             LogEntry {
                 actor: huge.clone(),
