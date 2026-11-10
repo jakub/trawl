@@ -641,19 +641,16 @@ async fn cli_timestamp_output_formats() {
 /// The display zone is presentation only: a Rust-tail filter on `_time`
 /// keeps the same rows under every `ui.timezone`, daemon and embedded.
 ///
-/// The daemon's tail compares under trawld's `_time` TIMESTAMP pin, so it
-/// reads the stored instant against the RFC 3339 bound. Embedded `--data`
-/// is pin-blind (ADR-0011): its tail compares `_time`'s UTC cast text
-/// (`YYYY-MM-DD HH:MM:SS`) as text, and an RFC 3339 bound keeps no row
-/// there, so the embedded case spells its bound as cast text. Either way
-/// a bound or a value read in +05:30 would move the cut by 5h30 and keep
-/// `k=b` (05:59:59Z reads 11:29:59 there).
+/// One RFC 3339 bound serves both modes, because both tails read `_time`
+/// as the stored instant. The daemon's tail reads it under trawld's `_time`
+/// TIMESTAMP pin. Embedded `--data` has no catalog (ADR-0011), and its tail
+/// reads `_time` under the TIMESTAMP type the SQL step returned. A bound
+/// or a value read in +05:30 would move the cut by 5h30 and keep `k=b`
+/// (05:59:59Z reads 11:29:59 there).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn display_zone_does_not_change_evaluation() {
-    const DAEMON_TAIL: &str = "service=zone_probe | extract kv \
+    const TAIL: &str = "service=zone_probe | extract kv \
         | where _time > \"2026-11-01T06:00:00Z\" | table _time, message";
-    const EMBEDDED_TAIL: &str = "service=zone_probe | extract kv \
-        | where _time > \"2026-11-01 06:00:00\" | table _time, message";
     let server = Server::start(true).await;
     server
         .ingest(&[
@@ -674,7 +671,7 @@ async fn display_zone_does_not_change_evaluation() {
     for zone in ["UTC", "+05:30", "local"] {
         let config = home.config(&pinned(&server, &token), zone);
         let daemon = home
-            .query_ok(KOLKATA, &config, &[DAEMON_TAIL, "--format", "json"])
+            .query_ok(KOLKATA, &config, &[TAIL, "--format", "json"])
             .await;
         assert_eq!(
             rows(&daemon),
@@ -685,7 +682,7 @@ async fn display_zone_does_not_change_evaluation() {
             .query_ok(
                 KOLKATA,
                 &config,
-                &[EMBEDDED_TAIL, "--data", &glob, "--format", "json"],
+                &[TAIL, "--data", &glob, "--format", "json"],
             )
             .await;
         assert_eq!(
@@ -693,6 +690,81 @@ async fn display_zone_does_not_change_evaluation() {
             expected,
             "embedded, ui.timezone={zone}:\n{embedded}"
         );
+    }
+    server.stop().await;
+}
+
+/// Embedded `--data` answers a kv-tail filter on `_time` with the rows the
+/// same query keeps without `extract kv`, in csv and in json.
+///
+/// The SQL step returns `_time` as a TIMESTAMP, so the tail compares it as
+/// an instant against the RFC 3339 bound, as the all-SQL lane does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn embedded_kv_tail_matches_the_sql_lane() {
+    const TAIL: &str = "service=zone_probe | extract kv \
+        | where _time > \"2026-11-01T06:00:00Z\" | table _time, message";
+    const SQL: &str = "service=zone_probe \
+        | where _time > \"2026-11-01T06:00:00Z\" | table _time, message";
+    let server = Server::start(true).await;
+    server
+        .ingest(&[
+            event("2026-11-01T01:00:00Z", "k=a"),
+            event("2026-11-01T05:59:59Z", "k=b"),
+            event("2026-11-01T06:30:00Z", "k=c"),
+            event("2026-11-01T12:00:00Z", "k=d"),
+        ])
+        .await;
+    server.compact().await;
+    let home = Home::new();
+    let token = reader(&server).await;
+    let glob = data_glob(&server);
+    let config = home.config(&pinned(&server, &token), "UTC");
+    let embedded = |query: &'static str, format: &'static str| {
+        let (home, config, glob) = (&home, &config, &glob);
+        async move {
+            home.query_ok(
+                KOLKATA,
+                config,
+                &[query, "--data", glob, "--format", format],
+            )
+            .await
+        }
+    };
+
+    let tail = embedded(TAIL, "json").await;
+    let sql = embedded(SQL, "json").await;
+    let expected = vec![
+        ("2026-11-01T06:30:00Z".parse().unwrap(), "k=c".to_owned()),
+        ("2026-11-01T12:00:00Z".parse().unwrap(), "k=d".to_owned()),
+    ];
+    assert_eq!(
+        rows(&sql),
+        expected,
+        "embedded json without the tail:\n{sql}"
+    );
+    assert_eq!(
+        rows(&tail),
+        expected,
+        "embedded json with the tail:\n{tail}"
+    );
+
+    // csv: the same header, and the same data lines in any order.
+    let lines = |csv: &str| {
+        let mut lines = csv.lines().filter(|line| !line.trim().is_empty());
+        let header = lines.next().map(str::to_owned);
+        let mut data: Vec<String> = lines.map(str::to_owned).collect();
+        data.sort();
+        (header, data)
+    };
+    let tail = embedded(TAIL, "csv").await;
+    let sql = embedded(SQL, "csv").await;
+    let (tail_header, tail_rows) = lines(&tail);
+    let (sql_header, sql_rows) = lines(&sql);
+    assert_eq!(tail_header, sql_header, "csv headers:\n{tail}\n{sql}");
+    assert_eq!(tail_rows, sql_rows, "csv rows:\n{tail}\n{sql}");
+    assert_eq!(tail_rows.len(), 2, "embedded csv with the tail:\n{tail}");
+    for (line, message) in tail_rows.iter().zip(["k=c", "k=d"]) {
+        assert!(line.contains(message), "{message} in csv line {line:?}");
     }
     server.stop().await;
 }
