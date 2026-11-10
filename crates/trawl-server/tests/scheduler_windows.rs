@@ -27,6 +27,7 @@ use std::time::Duration as StdDuration;
 use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use fleet_auth::{KeyStore, PrincipalKind};
 use sqlx::PgPool;
+use tokio::task::JoinHandle;
 use trawl_api::value::Value;
 use trawl_server::config::SchedulerConfig;
 use trawl_server::deadline::Deadline;
@@ -201,6 +202,12 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(2).await
+}
+
+/// [`harness`] over an executor pool of `permits` permits, which allows
+/// half of them, at least 1, scheduled runs in flight.
+async fn harness_with(permits: usize) -> Harness {
     let fleet_db_url = common::create_fleet_database().await;
     let app_db_url = common::create_app_database().await;
 
@@ -229,7 +236,7 @@ async fn harness() -> Harness {
     Harness {
         pool: ExecutorPool::for_test(
             data_dir.to_str().expect("utf-8 data dir").to_owned(),
-            2,
+            permits,
             100_000,
             None,
         )
@@ -278,6 +285,55 @@ impl Harness {
             .await
             .expect("create schedule");
         saved.id
+    }
+
+    /// Create a query-mode saved query over [`DSL`] whose hourly schedule
+    /// has its fire cursor at `fire`, returning the saved-query id.
+    async fn schedule_at(&self, name: &str, fire: DateTime<Utc>) -> i64 {
+        let saved = self
+            .saved
+            .create(self.key_id, name, DSL)
+            .await
+            .expect("create saved query");
+        self.schedules
+            .create_schedule(saved.id, self.key_id, 3600, None, None, 0, fire)
+            .await
+            .expect("create schedule");
+        saved.id
+    }
+
+    /// One scheduler tick at `now` with a `timeout_secs` budget per run,
+    /// handing back the executions it spawned unawaited: a test that
+    /// parks their work cannot await them first.
+    async fn spawn_tick(&self, timeout_secs: u64, now: DateTime<Utc>) -> Vec<JoinHandle<()>> {
+        poll_and_execute(
+            &self.schedules,
+            &self.key_store,
+            &self.pool,
+            &self.config,
+            timeout_secs,
+            truncate_to_micros(now),
+        )
+        .await
+    }
+
+    /// What a claim moves or spends: the fire cursor, the watermark and
+    /// the run budget spent so far.
+    async fn claim_state(
+        &self,
+        saved_query_id: i64,
+    ) -> (DateTime<Utc>, Option<DateTime<Utc>>, u64) {
+        let schedule = self
+            .schedules
+            .get_schedule_for_saved_query(saved_query_id, self.key_id)
+            .await
+            .expect("read schedule")
+            .expect("schedule exists");
+        (
+            schedule.next_fire_at,
+            schedule.covered_through,
+            schedule.runs_claimed,
+        )
     }
 
     /// One scheduler tick at `now`, awaiting the executions it spawned.
@@ -941,7 +997,8 @@ async fn stored_semantic_refusal_does_not_stop_scheduler() {
     const AGGREGATE_IN_ROW: &str =
         "count() is an aggregation; use it in stats, timechart, eventstats or pivot";
 
-    let h = harness().await;
+    // Four schedules run in one tick: 8 permits allow 4 scheduled runs.
+    let h = harness_with(8).await;
     let bound = h.schedule("stored-bound", DSL, None, 3600, 0).await;
     let row_agg = h.schedule("stored-row-agg", DSL, None, 3600, 0).await;
     let windowed_agg = h
@@ -1137,11 +1194,11 @@ async fn runs_of(db: &PgPool, saved_id: i64) -> Vec<(i64, String, bool, Option<S
 ///
 /// The real loop runs, over the shared fixture that boots through
 /// `boot::prepare_corpus`. The target net A fires a day out, so the loop
-/// never claims it. The sentinel net B is created after A and is due, and
-/// `list_enabled_schedules` orders by id, so B getting its run shows the
-/// iteration's claim pass reached past A. Stopping and joining the loop is
-/// the barrier that the iteration finished. The default poll interval
-/// keeps report-run retention out of the first iteration.
+/// never claims it. The sentinel net B is due, so B getting its run shows
+/// that the iteration's claim pass ran, and stopping and joining the loop
+/// shows that the pass finished. The manual run takes no scheduled-run
+/// lease, so B's lease is free. The default poll interval keeps report-run
+/// retention out of the first iteration.
 #[tokio::test(flavor = "multi_thread")]
 async fn scheduler_start_keeps_a_fresh_manual_claim() {
     let server = common::setup().await;
@@ -1472,4 +1529,188 @@ async fn retention_during_a_scheduled_run_keeps_its_result() {
         h.data_dir.join(relative).exists(),
         "the run's result file is kept"
     );
+}
+
+// ---------------------------------------------------------------------------
+// scheduled runs in flight (ADR-0018, amended 2026-11-09)
+// ---------------------------------------------------------------------------
+
+/// A tick starts at most half the executor permits' worth of scheduled
+/// runs. On a pool of 4 permits with 6 schedules due and every run's work
+/// parked at `Seam::Started`, one tick starts exactly 2. The 4 it did not
+/// reach keep their cursor, watermark and run budget, and have no run row:
+/// a later tick claims each as a missed run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tick_starts_at_most_half_the_permits() {
+    let h = harness_with(4).await;
+    let mut nets = Vec::new();
+    for i in 0..6 {
+        let sq = h
+            .schedule(
+                &format!("capped-{i}"),
+                DSL,
+                Some(ScheduleWindow::SinceLast),
+                3600,
+                0,
+            )
+            .await;
+        nets.push((sq, h.claim_state(sq).await));
+    }
+
+    let seams = h.pool.seams();
+    let started = seams.hold(trawl_server::pool::seam::Seam::Started);
+    let handles = h.spawn_tick(TIMEOUT_SECS, at(Duration::seconds(3))).await;
+    assert_eq!(handles.len(), 2, "a pool of 4 permits allows 2 runs");
+    until("both runs' work started", || async {
+        started.arrivals() == 2
+    })
+    .await;
+    assert_eq!(h.pool.scheduled_leases_available(), 0);
+
+    // Every cursor is T0, so the listing's tie-break, the id, decides
+    // which two the tick reached.
+    for (i, (sq, before)) in nets.iter().enumerate() {
+        let runs = h.runs(*sq).await;
+        if i < 2 {
+            assert_eq!(runs.len(), 1, "net {i}: {runs:?}");
+            assert_eq!(runs[0].status, RunStatus::Running, "net {i}: {runs:?}");
+        } else {
+            assert!(runs.is_empty(), "net {i} has a run: {runs:?}");
+            assert_eq!(
+                h.claim_state(*sq).await,
+                *before,
+                "net {i} keeps its cursor, watermark and budget"
+            );
+        }
+    }
+    assert_eq!(started.arrivals(), 2, "no third run reached its work");
+
+    started.release();
+    for handle in handles {
+        handle.await.expect("a scheduled execution must not panic");
+    }
+    for (sq, _) in &nets[..2] {
+        assert_eq!(h.runs(*sq).await[0].status, RunStatus::Success);
+    }
+}
+
+/// A run whose request timed out keeps its lease while its work still
+/// runs: on a pool of 2 permits, whose one lease that run holds, the next
+/// tick starts nothing and the deferred schedules keep their state. Once
+/// the parked work ends the lease is free, and the next tick starts the
+/// OLDEST deferred schedule, which has the higher id of the two.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_run_keeps_its_lease_until_its_work_ends() {
+    let h = harness_with(2).await;
+    let newer = h.schedule_at("deferred-newer", at(hours(-1))).await;
+    let first = h.schedule_at("oldest", at(hours(-3))).await;
+    let older = h.schedule_at("deferred-older", at(hours(-2))).await;
+    let now = at(Duration::seconds(3));
+
+    let seams = h.pool.seams();
+    let started = seams.hold(trawl_server::pool::seam::Seam::Started);
+    let handles = h.spawn_tick(1, now).await;
+    assert_eq!(handles.len(), 1, "a pool of 2 permits allows 1 run");
+    for handle in handles {
+        handle.await.expect("a scheduled execution must not panic");
+    }
+    until("the run's work started", || async {
+        started.arrivals() == 1
+    })
+    .await;
+    let runs = h.runs(first).await;
+    assert_eq!(runs.len(), 1, "the oldest cursor runs first: {runs:?}");
+    assert_eq!(runs[0].status, RunStatus::Timeout, "{runs:?}");
+    assert_eq!(
+        h.pool.scheduled_leases_available(),
+        0,
+        "the parked work keeps the run's lease"
+    );
+
+    let deferred = [
+        (newer, h.claim_state(newer).await),
+        (older, h.claim_state(older).await),
+    ];
+    let handles = h.spawn_tick(TIMEOUT_SECS, now).await;
+    assert!(handles.is_empty(), "no lease is free");
+    for (sq, before) in deferred {
+        assert!(h.runs(sq).await.is_empty());
+        assert_eq!(h.claim_state(sq).await, before);
+    }
+
+    started.release();
+    until("the parked work returns the lease", || async {
+        h.pool.scheduled_leases_available() == 1
+    })
+    .await;
+    let handles = h.spawn_tick(TIMEOUT_SECS, now).await;
+    assert_eq!(handles.len(), 1);
+    for handle in handles {
+        handle.await.expect("a scheduled execution must not panic");
+    }
+    let runs = h.runs(older).await;
+    assert_eq!(runs.len(), 1, "the older cursor runs next: {runs:?}");
+    assert_eq!(runs[0].status, RunStatus::Success, "{runs:?}");
+    assert!(h.runs(newer).await.is_empty(), "the newer cursor waits");
+}
+
+/// A manual run takes no lease: with every scheduled-run lease of the
+/// server's pool held, a run triggered over HTTP still starts its work,
+/// and finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_run_takes_no_lease() {
+    let server = common::setup().await;
+    let key_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let storage = &server.state.storage;
+    let saved = storage
+        .saved
+        .create(key_id, "manual_no_lease", "service=nginx | stats count()")
+        .await
+        .unwrap();
+    storage
+        .schedule
+        .create_schedule(
+            saved.id,
+            key_id,
+            3600,
+            None,
+            None,
+            0,
+            Utc::now() + Duration::days(1),
+        )
+        .await
+        .unwrap();
+    let db = common::fixture_pool(&server.app_db_url, 1).await;
+
+    let pool = &server.state.query.pool;
+    let leases: Vec<_> = std::iter::from_fn(|| pool.try_lease_scheduled()).collect();
+    assert!(!leases.is_empty());
+    assert_eq!(pool.scheduled_leases_available(), 0, "every lease is held");
+
+    let seams = pool.seams();
+    let started = seams.hold(trawl_server::pool::seam::Seam::Started);
+    let manual = trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token)
+        .unwrap()
+        .trigger_run(saved.id)
+        .await
+        .expect("the manual run is accepted");
+    until("the manual run's work started", || async {
+        started.arrivals() == 1
+    })
+    .await;
+    assert_eq!(
+        runs_of(&db, saved.id).await,
+        [(manual.id, "running".to_owned(), false, None)]
+    );
+
+    started.release();
+    until("the manual run finished", || async {
+        runs_of(&db, saved.id).await[0].1 != "running"
+    })
+    .await;
+    assert_eq!(
+        runs_of(&db, saved.id).await,
+        [(manual.id, "success".to_owned(), true, None)]
+    );
+    drop(leases);
 }

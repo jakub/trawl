@@ -2811,40 +2811,6 @@ async fn latest_run_returns_newest(pool: PgPool) {
     assert_eq!(latest.query, "q2");
 }
 
-#[sqlx::test]
-async fn list_enabled_schedules_filters_disabled(pool: PgPool) {
-    let store = schedules(&pool);
-    let sq1 = seed_saved(&pool, 1, "enabled-query").await;
-    let sq2 = seed_saved(&pool, 2, "disabled-query").await;
-
-    store
-        .create_schedule(sq1, 1, 300, None, None, 0, chrono::Utc::now())
-        .await
-        .unwrap();
-    let disabled = store
-        .create_schedule(sq2, 2, 600, None, None, 0, chrono::Utc::now())
-        .await
-        .unwrap();
-    store
-        .update_schedule(
-            disabled.id,
-            2,
-            600,
-            None,
-            false,
-            None,
-            0,
-            chrono::Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let enabled = store.list_enabled_schedules().await.unwrap();
-    assert_eq!(enabled.len(), 1);
-    assert_eq!(enabled[0].1.name, "enabled-query");
-    assert_eq!(store.count_enabled_schedules().await.unwrap(), 1);
-}
-
 /// The scheduler tick's listing (ADR-0018, amended 2026-11-09): enabled,
 /// due schedules only, oldest fire cursor first and then by id, in pages
 /// of at most [`DUE_SCHEDULE_PAGE`] that resume strictly after the key

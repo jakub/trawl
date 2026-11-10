@@ -60,7 +60,6 @@ use sqlx::{AssertSqlSafe, PgPool, Row as _};
 
 use super::error::{PgViolation, StoreError, WindowWriteError, classify_violation};
 use super::history::{bind_u64, bind_usize};
-use super::saved::{SavedQuery, row_to_saved_query_at};
 use super::status::{RunOrigin, RunStatus, decode_origin, decode_status};
 use crate::report_window::{
     Due, ManualPlan, MaterializeError, PlanError, PlanInput, ReportWindow, ScheduleWindow,
@@ -214,9 +213,9 @@ pub enum ManualRunClaim {
 ///
 /// The text comes from the saved-query row the claim locked, never from a
 /// snapshot the handler read a moment earlier, for the reason
-/// [`ClaimedRun`] gives about the scheduler's enumeration: what a run
-/// executes and what `report_runs.query` stores are one string, and reading
-/// it outside the lock lets an edit land in between.
+/// [`ClaimedRun`] gives: what a run executes and what `report_runs.query`
+/// stores are one string, and reading it outside the lock lets an edit land
+/// in between.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedManualRun {
     /// The `report_runs` row id.
@@ -267,11 +266,10 @@ pub enum DueClaim {
 /// The run a due claim created, with everything executing it needs.
 ///
 /// `resolved_query` is what the run executes AND what `report_runs.query`
-/// stores. It is deliberately not the saved DSL the enumeration handed the
-/// scheduler: the saved text is read inside the claim transaction, under
-/// the saved-query row lock, and a window is spliced onto it there (ADR-0018
-/// ruling 11). Executing the enumeration's copy would run text nobody
-/// recorded.
+/// stores. The saved text is read inside the claim transaction, under the
+/// saved-query row lock, and a window is spliced onto it there (ADR-0018
+/// ruling 11). The tick's listing carries no query text, so there is no
+/// other copy to execute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedRun {
     /// The `report_runs` row id.
@@ -1052,33 +1050,6 @@ impl ScheduleStore {
             })
             .collect::<Result<_, sqlx::Error>>()?;
         Ok(page)
-    }
-
-    /// List all enabled schedules with their associated saved queries.
-    /// Used by the scheduler — no ownership check (internal/cross-user).
-    pub async fn list_enabled_schedules(&self) -> Result<Vec<(Schedule, SavedQuery)>, StoreError> {
-        let rows = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {cols},
-                    sq.id         AS sq_id,
-                    sq.key_id     AS sq_key_id,
-                    sq.name       AS sq_name,
-                    sq.query      AS sq_query,
-                    sq.created_at AS sq_created_at,
-                    sq.updated_at AS sq_updated_at
-             FROM schedules s
-             JOIN saved_queries sq ON sq.id = s.saved_query_id
-             WHERE s.enabled = TRUE
-             ORDER BY s.id",
-            cols = schedule_cols("s.")
-        )))
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            out.push((row_to_schedule(row)?, row_to_saved_query_at(row, "sq_")?));
-        }
-        Ok(out)
     }
 
     /// Count enabled schedules (dashboard/monitor).
@@ -2131,9 +2102,9 @@ struct LockedSchedule {
 ///
 /// `saved_queries` FOR UPDATE, then `schedules` FOR UPDATE: the order every
 /// multi-row path in this module takes, extended one level up. Both rows are
-/// re-read here rather than trusted from the caller's enumeration snapshot,
-/// because an operator can edit the DSL, disable the schedule or delete
-/// either one between the list and the claim.
+/// read here rather than trusted from the tick's listing, because an
+/// operator can edit the DSL, disable the schedule or delete either one
+/// between the listing and the claim.
 ///
 /// `None` means there is nothing to run — the schedule or its saved query
 /// was deleted, or the schedule is disabled — and the caller answers
