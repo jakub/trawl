@@ -1968,6 +1968,7 @@ impl LiveBuffer {
             // …and no severity token rendering: the stream carries numbers,
             // and a live tail's columns are whatever the events bring.
             severity_columns: Vec::new(),
+            histogram: None,
         }
     }
 

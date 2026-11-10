@@ -63,6 +63,7 @@ fn response(result: QueryResult) -> QueryResponse {
         },
         degraded_fields: Vec::new(),
         severity_columns: Vec::new(),
+        histogram: None,
     }
 }
 

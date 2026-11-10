@@ -25,6 +25,7 @@ pub mod epoch;
 pub mod error;
 pub(crate) mod from_saved;
 pub mod handlers;
+pub mod histogram;
 mod history_params;
 pub mod hot_buffer;
 pub mod ingest;

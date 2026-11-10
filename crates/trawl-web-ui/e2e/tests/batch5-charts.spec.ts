@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { test, expect, resetScenario, trackIntervals, intervalCount } from '../fixtures';
 import { expectFocusRing } from '../a11y';
 import { SEL } from '../selectors';
@@ -33,8 +35,11 @@ const snapshotTime = (minute: number) => `2026-09-01T00:0${minute}:00.000000Z`;
 const TIME = { name: '_time', type: 'timestamp' };
 const col = (name: string, type: string) => ({ name, type });
 const COUNT = col('count', 'integer');
-/** The histogram's two columns: an instant and an integer severity. */
-const SEVERITY_EVENTS = [TIME, col('_severity', 'integer')];
+/** A whole raw result with the histogram trawld would count for it, from
+ * `harness/wire/`, where the fixture contract test decodes it and checks
+ * the count against its rows. */
+const histogramResult = (name: string) =>
+  JSON.parse(readFileSync(path.join(__dirname, `../harness/wire/query-histogram-${name}.json`), 'utf8'));
 
 const countResult = {
   columns: [TIME, COUNT],
@@ -254,8 +259,10 @@ test('supported snapshot chart fits initial narrow viewport and resizes with its
 });
 
 test('subsecond events fall inside their histogram tooltip intervals', async ({ page }) => {
-  const events = [['2026-09-01T00:00:00.100000Z', '9'], ['2026-09-01T00:00:00.900000Z', '17']];
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: SEVERITY_EVENTS, rows: events } }));
+  // An event at .100 (severity 9) and one at .900 (severity 17).
+  const result = histogramResult('subsecond');
+  const events: string[][] = result.rows;
+  await page.route('**/api/v1/query', route => route.fulfill({ json: result }));
   await page.goto('/search?q=service%3Dnginx');
   const tips = page.locator('.histo .bar .tip');
   await expect(tips).toHaveCount(48);
@@ -296,8 +303,7 @@ test('histogram tooltip stays inside the strip at both edges', async ({ page }) 
   // they land in buckets 0 and 38, so bar 0 carries the longest tip text
   // and bar 47 an empty bucket's shorter one. The clamp is measured per
   // tip, so each edge is checked with whatever text its bar draws.
-  const events = [['2026-09-01T00:00:00.100000Z', '17'], ['2026-09-01T00:00:00.900000Z', '17']];
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: SEVERITY_EVENTS, rows: events } }));
+  await page.route('**/api/v1/query', route => route.fulfill({ json: histogramResult('two-errors') }));
   await page.goto('/search?q=service%3Dnginx');
   const histo = page.locator('.histo');
   const bars = page.locator('.histo .bar');
@@ -346,8 +352,7 @@ test('histogram tooltip stays inside the strip at both edges', async ({ page }) 
 });
 
 test('a shown histogram tooltip is re-placed when the strip resizes', async ({ page }) => {
-  const events = [['2026-09-01T00:00:00.100000Z', '17'], ['2026-09-01T00:00:00.900000Z', '17']];
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: SEVERITY_EVENTS, rows: events } }));
+  await page.route('**/api/v1/query', route => route.fulfill({ json: histogramResult('two-errors') }));
   const histo = page.locator('.histo');
   const bars = page.locator('.histo .bar');
   // Whole-pixel rounding, as in the edge test above.
@@ -396,9 +401,7 @@ test('a hovered histogram tooltip is re-placed when new bars render under it', a
   let responses = 0;
   await page.route('**/api/v1/query', route => {
     responses += 1;
-    const rows = [['2026-09-01T00:00:00.100000Z', '17'], ['2026-09-01T00:00:00.900000Z', '17']];
-    if (responses > 1) rows.push(['2026-09-01T00:00:00.860000Z', '17']);
-    return route.fulfill({ json: { ...countResult, columns: SEVERITY_EVENTS, rows } });
+    return route.fulfill({ json: histogramResult(responses > 1 ? 'three-errors' : 'two-errors') });
   });
   await page.setViewportSize({ width: 800, height: 900 });
   await page.goto('/search?q=service%3Dnginx');
@@ -458,8 +461,7 @@ test('the deferred tip placement is skipped once the histogram unmounts', async 
   });
   const panics: string[] = [];
   page.on('console', msg => { if (/panicked/.test(msg.text())) panics.push(msg.text()); });
-  const events = [['2026-09-01T00:00:00.100000Z', '17'], ['2026-09-01T00:00:00.900000Z', '17']];
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: SEVERITY_EVENTS, rows: events } }));
+  await page.route('**/api/v1/query', route => route.fulfill({ json: histogramResult('two-errors') }));
   await page.goto('/search?q=service%3Dnginx');
   await expect(page.locator('.histo .bar')).toHaveCount(48);
   expect(await page.evaluate(() => (window as any).__heldFrames()), 'the placement is queued').toBeGreaterThan(0);

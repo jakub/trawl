@@ -1665,6 +1665,7 @@ fn timechart_timestamp_group_labels_use_the_display_zone() {
             },
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),
+            histogram: None,
         });
         app.tab.chart_view = view;
 
@@ -1745,6 +1746,7 @@ fn timechart_sparklines_survive_unsigned_magnitudes() {
             },
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),
+            histogram: None,
         });
         app.tab.chart_view = view;
 
@@ -1799,6 +1801,7 @@ fn bar_chart_renders_uint_metric() {
         },
         degraded_fields: Vec::new(),
         severity_columns: Vec::new(),
+        histogram: None,
     });
     app.tab.chart_view = ChartView::BarChart;
 
@@ -2206,6 +2209,7 @@ mod grid_tests {
             },
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),
+            histogram: None,
         });
         app.tab.status = TabStatus::Success { duration_ms: 1 };
 
@@ -2330,6 +2334,7 @@ mod sender_text_tests {
             },
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),
+            histogram: None,
         });
         app.tab.status = TabStatus::Success { duration_ms: 1 };
         app.tab.chart_view = view;

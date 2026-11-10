@@ -903,7 +903,7 @@ fn dedup_step(
 /// of the lane's latch: a sort step's bind pass, run, merge or move, a
 /// dedup step's pass, a copy in or out, or the render of a tracked
 /// timestamp column.
-pub(crate) const TAIL_CANCEL_STRIDE: usize = 4096;
+pub const TAIL_CANCEL_STRIDE: usize = 4096;
 
 /// A stable sort of `items` by `compare` that a cancellation stops within
 /// [`TAIL_CANCEL_STRIDE`] items of work. A sort step sorts its row indices

@@ -1420,7 +1420,7 @@ pub fn Search() -> impl IntoView {
                     }.into_any(),
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
-                            <Histogram rows=rows/>
+                            <Histogram rows=rows pending=running/>
                             <ResultsTable
                                 busy=running
                                 page=page

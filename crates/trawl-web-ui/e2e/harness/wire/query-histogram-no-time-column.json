@@ -1,0 +1,21 @@
+{
+  "columns": [
+    { "name": "host", "type": "string" }
+  ],
+  "rows": [
+    ["web-01"],
+    ["web-02"],
+    ["web-03"],
+    ["db-01"],
+    ["cache-01"],
+    ["web-01"],
+    ["edge-01"],
+    ["web-01"]
+  ],
+  "pagination": { "limit": 50, "offset": 0, "returned": 8, "total": 8 },
+  "execution": { "started_at": "2026-09-15T12:34:56Z", "duration_ms": 125 },
+  "histogram": {
+    "state": "unavailable",
+    "reason": "no_time_column"
+  }
+}

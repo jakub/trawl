@@ -293,6 +293,7 @@ impl HttpClient {
             query: dsl.to_owned(),
             limit,
             offset,
+            histogram: false,
         };
         let req = self.client.post(&url).json(&body);
         self.send_authenticated(req).await
@@ -3827,6 +3828,7 @@ mod tests {
             query: "service=nginx | stats count()".to_string(),
             limit: Some(10),
             offset: Some(5),
+            histogram: false,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["query"], "service=nginx | stats count()");
@@ -3840,6 +3842,7 @@ mod tests {
             query: "service=nginx".to_string(),
             limit: None,
             offset: None,
+            histogram: false,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["query"], "service=nginx");

@@ -725,6 +725,7 @@ fn declined_query_response() -> trawl_api::QueryResponse {
         },
         degraded_fields: Vec::new(),
         severity_columns: Vec::new(),
+        histogram: None,
     }
 }
 
