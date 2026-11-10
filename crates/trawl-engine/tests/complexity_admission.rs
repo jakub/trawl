@@ -23,7 +23,7 @@ mod common;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use trawl_core::complexity::MAX_PIPELINE_STAGES;
+use trawl_core::complexity::{MAX_PIPELINE_STAGES, MAX_STAGE_FIELDS};
 use trawl_core::schema::FieldTypes;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, hot_columns_of, prepare_probe};
@@ -35,13 +35,14 @@ fn counter_lock() -> MutexGuard<'static, ()> {
     COUNTER.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The two shapes the budget refuses, one per limit.
+/// The shapes the budget refuses, at least one per limit.
 ///
 /// The severity chain is ADR-0024's worked example: each link reads the
 /// previous one through a severity set, which the emitter writes as
 /// twelve copies of its subject, so eight links multiply the seed
 /// expression far past 512 while the text stays a couple of hundred
-/// bytes. The stage case is the other limit, one over 128.
+/// bytes. The stage case is one over 128. The `sort` and `dedup` cases
+/// name one field over 64.
 fn refused_queries() -> Vec<(&'static str, String)> {
     use std::fmt::Write as _;
     let points = (0..12).map(|i| (i * 2 + 1).to_string()).collect::<Vec<_>>();
@@ -49,12 +50,18 @@ fn refused_queries() -> Vec<(&'static str, String)> {
     for i in 1..=8 {
         let _ = write!(chain, ", a{i} = sev(a{}) in ({})", i - 1, points.join(","));
     }
+    let fields = (0..=MAX_STAGE_FIELDS)
+        .map(|i| format!("f{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     vec![
         ("severity chain", chain),
         (
             "129 stages",
             format!("*{}", " | head 1".repeat(MAX_PIPELINE_STAGES + 1)),
         ),
+        ("65-field sort", format!("* | sort {fields}")),
+        ("65-field dedup", format!("* | dedup {fields}")),
     ]
 }
 
