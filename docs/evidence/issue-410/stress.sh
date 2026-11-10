@@ -231,11 +231,22 @@ filter_for() {
 FILTER="$(filter_for)"
 
 LOAD_PIDS=()
+RUN_PIDS=()
+
+# Kill a process and every descendant, children first, so a writer's
+# running dd or a selection's cargo and test processes do not outlive it.
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    kill_tree "$child"
+  done
+  kill "$1" 2>/dev/null || true
+}
 
 stop_load() {
   local pid
   for pid in "${LOAD_PIDS[@]+"${LOAD_PIDS[@]}"}"; do
-    kill "$pid" 2>/dev/null || true
+    kill_tree "$pid"
   done
   for pid in "${LOAD_PIDS[@]+"${LOAD_PIDS[@]}"}"; do
     wait "$pid" 2>/dev/null || true
@@ -244,8 +255,21 @@ stop_load() {
   rm -rf "$LOAD_DIR"
 }
 
-trap stop_load EXIT
-trap 'stop_load; exit 130' INT TERM
+# An interrupted run also stops both selections, so no test keeps running
+# after the script has gone.
+stop_run() {
+  local pid
+  for pid in "${RUN_PIDS[@]+"${RUN_PIDS[@]}"}"; do
+    kill_tree "$pid"
+  done
+  for pid in "${RUN_PIDS[@]+"${RUN_PIDS[@]}"}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  RUN_PIDS=()
+}
+
+trap 'stop_run; stop_load' EXIT
+trap 'stop_run; stop_load; exit 130' INT TERM
 
 # nextest for one selection. The rest of the arguments follow the shared
 # ones.
@@ -357,10 +381,12 @@ nextest default "${ARGS[@]}" >"$LOG_DIR/default.log" 2>&1 &
 pid_default=$!
 nextest no-default-features "${ARGS[@]}" >"$LOG_DIR/no-default-features.log" 2>&1 &
 pid_nd=$!
+RUN_PIDS=("$pid_default" "$pid_nd")
 wait "$pid_default"
 status_default=$?
 wait "$pid_nd"
 status_nd=$?
+RUN_PIDS=()
 set -e
 say "finished:      $(date -u +%Y-%m-%dT%H:%M:%SZ), load average $(cut -d' ' -f1-3 /proc/loadavg)"
 say "exit:          default $status_default, no-default-features $status_nd"
