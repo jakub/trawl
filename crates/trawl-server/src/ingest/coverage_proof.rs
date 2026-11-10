@@ -134,14 +134,13 @@ fn prove(
 
     // Every producer that published a listed file inserts it before it
     // releases its read guard, so under the write guard a candidate is
-    // resident, gone, or really left over. Only `NotFound` proves it gone.
+    // resident, gone, or really left over. Only a confirmed absence proves
+    // it gone: a `NotFound` below a dangling link is not one, and the next
+    // pass retries.
     let publication = gate.blocking_write();
     for (batch_id, path) in &candidates {
         let resident = batch_id.as_deref().is_some_and(|id| hot.is_resident(id));
-        let gone = matches!(
-            std::fs::symlink_metadata(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        );
+        let gone = crate::env_dirs::is_absent(path);
         if !resident && !gone {
             return ProofOutcome::NotResident;
         }
@@ -249,6 +248,56 @@ mod tests {
         });
         assert_eq!(outcome, ProofOutcome::Settled);
         assert_settled(&gate);
+    }
+
+    /// Only a candidate confirmed absent is gone: no entry, below a
+    /// directory. A file removed, or its whole env directory, settles. A
+    /// candidate below a dangling link or a regular file answers no entry
+    /// too, or a different error, but nothing established that it is
+    /// gone, so the overhang stays and the next pass retries.
+    #[cfg(unix)]
+    #[test]
+    fn coverage_proof_needs_confirmed_absence() {
+        let outcome_after = |change: &dyn Fn(&Path, &Path)| {
+            let tmp = tempfile::tempdir().unwrap();
+            let wal = tmp.path().join("wal");
+            let (hot, gate) = overhang();
+            let (candidate, _) = plant(&wal, "prod", "api", BASE);
+            let outcome = prove(&wal, &hot, &gate, |candidates| {
+                assert_eq!(candidates, 1);
+                change(&wal, &candidate);
+            });
+            (outcome, gate)
+        };
+        let env_replaced_by = |wal: &Path, plant_in_place: &dyn Fn(&Path)| {
+            let env = wal.join("prod");
+            std::fs::rename(&env, wal.join("prod.moved")).unwrap();
+            plant_in_place(&env);
+        };
+
+        let (outcome, gate) =
+            outcome_after(&|_, candidate| std::fs::remove_file(candidate).unwrap());
+        assert_eq!(outcome, ProofOutcome::Settled, "the file is gone");
+        assert_settled(&gate);
+
+        let (outcome, gate) =
+            outcome_after(&|wal, _| std::fs::remove_dir_all(wal.join("prod")).unwrap());
+        assert_eq!(outcome, ProofOutcome::Settled, "its env directory is gone");
+        assert_settled(&gate);
+
+        let (outcome, gate) = outcome_after(&|wal, _| {
+            env_replaced_by(wal, &|env| {
+                std::os::unix::fs::symlink(wal.join("nowhere"), env).unwrap();
+            });
+        });
+        assert_eq!(outcome, ProofOutcome::NotResident, "below a dangling link");
+        assert_overhang(&gate);
+
+        let (outcome, gate) = outcome_after(&|wal, _| {
+            env_replaced_by(wal, &|env| std::fs::write(env, b"not a directory").unwrap());
+        });
+        assert_eq!(outcome, ProofOutcome::NotResident, "below a regular file");
+        assert_overhang(&gate);
     }
 
     #[test]
