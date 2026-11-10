@@ -294,7 +294,9 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     );
     if let Some(warning) = &log_filter.warning {
         if let Some(parse_error) = &log_filter.parse_error {
-            tracing::debug!(event_type = "config_warning", error = %parse_error, "{warning}");
+            // The fallback filter drops DEBUG, so stderr is the one place an
+            // operator can read the cause. Stderr is not the retained corpus.
+            eprintln!("[trawld] RUST_LOG could not be parsed: {parse_error}");
         }
         tracing::warn!(event_type = "config_warning", "{warning}");
     }

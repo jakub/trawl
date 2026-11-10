@@ -438,9 +438,9 @@ pub struct ResolvedLogFilter {
     /// message in trawl's own words, carrying neither the raw env value nor
     /// the parse error.
     pub warning: Option<String>,
-    /// The parse error behind [`Self::warning`], for a DEBUG
-    /// `config_warning` only: `tracing_subscriber`'s wording can quote a
-    /// piece of the raw value.
+    /// The parse error behind [`Self::warning`], for stderr only:
+    /// `tracing_subscriber`'s wording can quote a piece of the raw value,
+    /// and the fallback filter would drop a DEBUG event that carried it.
     pub parse_error: Option<String>,
 }
 
@@ -451,7 +451,7 @@ pub struct ResolvedLogFilter {
 /// - set and invalid → [`DEFAULT_LOG_FILTER`] plus a fixed warning that
 ///   carries neither the raw environment value (it may contain anything —
 ///   pasted secrets included — and the warning is persisted as telemetry)
-///   nor the parse error, which is returned apart for DEBUG.
+///   nor the parse error, which is returned apart for stderr.
 ///
 /// Takes the env value as a parameter so it is unit-testable without
 /// mutating process env (`unsafe_code = "forbid"`).
@@ -2580,7 +2580,7 @@ mod tests {
         );
         let parse_error = resolved
             .parse_error
-            .expect("the parse error is kept for DEBUG");
+            .expect("the parse error is kept for stderr");
         assert!(
             !parse_error.is_empty() && !warning.contains(&parse_error),
             "the parse error is apart from the warning: {parse_error}"
