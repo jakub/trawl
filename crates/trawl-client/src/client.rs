@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 use crate::error::{ClientError, NetworkError, NetworkKind};
 use crate::types::{
     AppendEntry, AppendResponse, CreateInvestigation, FindingStatusUpdate, Investigation,
-    InvestigationList, InvestigationRead, PatchInvestigation, RetentionExtension,
+    InvestigationList, InvestigationRead, PatchInvestigation, PatchResponse, RetentionExtension,
 };
 use crate::types::{
     CancelResponse, CapabilitiesResponse, CaptureRequest, CaptureResponse, CompareRequest,
@@ -729,7 +729,10 @@ impl HttpClient {
     /// Overwrite the title, the question or the status of investigation
     /// `id` if its sequence is still `request.expected_seq`
     /// (`PATCH /api/v1/investigations/{id}`, needs `investigation_write` as
-    /// well; ADR-0059). The server takes one field per request.
+    /// well; ADR-0059). The server takes one field per request. The answer
+    /// is the investigation as the write left it, the entry written, and,
+    /// when `request.seen_seq` is set, the other actors' entries changed
+    /// since it, in `activity`.
     ///
     /// An `id` that is not 32 lowercase hex digits is
     /// [`ClientError::InvalidUrl`] before any request. Refusals are
@@ -738,17 +741,16 @@ impl HttpClient {
     /// `sequence_conflict`, whose envelope's `conflict` carries the
     /// expected and the current sequence, and 409 `investigation_closed`
     /// for anything but a reopen of a closed investigation. No body is read
-    /// past [`INVESTIGATION_BODY_CAP`].
+    /// past [`PATCH_BODY_CAP`].
     pub async fn patch_investigation(
         &self,
         id: &str,
         request: &PatchInvestigation,
-    ) -> Result<Investigation, ClientError> {
+    ) -> Result<PatchResponse, ClientError> {
         check_investigation_id(id)?;
         let url = self.endpoint(&format!("/api/v1/investigations/{id}"));
         let req = self.client.patch(&url).json(request);
-        self.send_capped(req, INVESTIGATION_BODY_CAP, "an investigation")
-            .await
+        self.send_capped(req, PATCH_BODY_CAP, "a patch").await
     }
 
     /// Overwrite the status of the finding whose entry is `finding_seq` in
@@ -756,7 +758,8 @@ impl HttpClient {
     /// `request.expected_seq`
     /// (`PUT /api/v1/investigations/{id}/findings/{seq}/status`, needs
     /// `investigation_write` as well; ADR-0059). The answer is the
-    /// `finding_status` entry written, with no activity.
+    /// `finding_status` entry written and, when `request.seen_seq` is set,
+    /// the other actors' entries changed since it, in `activity`.
     ///
     /// An `id` that is not 32 lowercase hex digits is
     /// [`ClientError::InvalidUrl`] before any request. Refusals are
@@ -1742,8 +1745,8 @@ pub const INVESTIGATION_BODY_CAP: usize = 64 * 1024;
 /// The most entries one read answers: the server's `READ_MAX_LIMIT`.
 const READ_MAX_ENTRIES: usize = 200;
 
-/// The most entries of other actors' activity one append answers: the
-/// server's `ACTIVITY_LIMIT`.
+/// The most entries of other actors' activity one append or overwrite
+/// answers: the server's `ACTIVITY_LIMIT`.
 const ACTIVITY_MAX_ENTRIES: usize = 50;
 
 /// The most an investigation read body may hold: the investigation and
@@ -1761,6 +1764,13 @@ pub const INVESTIGATION_READ_BODY_CAP: usize =
 /// 26 MiB.
 pub const APPEND_BODY_CAP: usize =
     (ACTIVITY_MAX_ENTRIES + 1) * (ENTRY_PAYLOAD_MAX_BYTES + ENTRY_FRAMING_BYTES) + 1024;
+
+/// The most a `PATCH` body may hold: the investigation as the write left
+/// it, plus what an append's answer holds (the entry written and
+/// [`ACTIVITY_MAX_ENTRIES`] entries of activity), about 26 MiB. At
+/// [`INVESTIGATION_BODY_CAP`] alone, an overwrite that committed with full
+/// activity would read as too large.
+pub const PATCH_BODY_CAP: usize = INVESTIGATION_BODY_CAP + APPEND_BODY_CAP;
 
 /// The most an investigation list body may hold: the server's 200 rows,
 /// each a summary of at most 4 KiB (a title escaped six-fold, the

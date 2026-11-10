@@ -1815,6 +1815,7 @@ Changes one of the investigation's title, question, or status, if its `seq` is s
 |------|----|------|----------|-------------|
 | `id` | path | string | yes | The investigation id |
 | `expected_seq` | body | integer | yes | The `seq` the caller last saw |
+| `seen_seq` | body | integer | no | The latest `seq` the caller has seen. With it, the response carries `activity`. It is not one of the three fields, so a patch with `seen_seq` still changes one field |
 | `title` | body | string | one of three | A new title |
 | `question` | body | string | one of three | A new question |
 | `status` | body | string | one of three | `open` or `closed` |
@@ -1822,37 +1823,53 @@ Changes one of the investigation's title, question, or status, if its `seq` is s
 **Request**
 
 ```json
-{ "expected_seq": 8, "status": "closed" }
+{ "expected_seq": 8, "seen_seq": 8, "status": "closed" }
 ```
 
 ```bash
 curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X PATCH -H "Content-Type: application/json" \
-  -d '{"expected_seq": 8, "status": "closed"}' \
+  -d '{"expected_seq": 8, "seen_seq": 8, "status": "closed"}' \
   "$TRAWL_URL/api/v1/investigations/6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f"
 ```
 
 **Response**
 
-The investigation after the change:
+200, with the investigation after the change, the entry written, and the activity:
 
 ```json
 {
-  "id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f",
-  "title": "502s on checkout",
-  "question": "Why does checkout return 502 since 09:00?",
-  "scope": "env=prod, service=nginx and shop-api",
-  "status": "closed",
-  "seq": 9,
-  "created_at": "2026-10-24T09:00:00.000000Z",
-  "updated_at": "2026-10-24T10:02:15.000000Z",
-  "retain_until": "2026-10-31T10:02:15.000000Z",
-  "retain_ceiling": "2026-11-23T09:00:00.000000Z",
-  "created_by": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
-  "updated_by": { "prefix": "Hn4vX9aT", "name": "jakub" }
+  "investigation": {
+    "id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f",
+    "title": "502s on checkout",
+    "question": "Why does checkout return 502 since 09:00?",
+    "scope": "env=prod, service=nginx and shop-api",
+    "status": "closed",
+    "seq": 9,
+    "created_at": "2026-10-24T09:00:00.000000Z",
+    "updated_at": "2026-10-24T10:02:15.000000Z",
+    "retain_until": "2026-10-31T10:02:15.000000Z",
+    "retain_ceiling": "2026-11-23T09:00:00.000000Z",
+    "created_by": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
+    "updated_by": { "prefix": "Hn4vX9aT", "name": "jakub" }
+  },
+  "entry": {
+    "seq": 9,
+    "updated_seq": 9,
+    "actor": { "prefix": "Hn4vX9aT", "name": "jakub" },
+    "at": "2026-10-24T10:02:15.000000Z",
+    "payload": { "kind": "status", "status": "closed" }
+  },
+  "activity": { "entries": [], "through_seq": 9, "more": false }
 }
 ```
 
-The response carries no `activity`, and the request takes no `seen_seq`.
+| Field | Type | Description |
+|-------|------|-------------|
+| `investigation` | object | The investigation as the write left it, in the shape a [create](#create-an-investigation) returns. trawld reads it in the write's own transaction, so its `seq` is the entry's |
+| `entry` | object | The `title`, `question`, or `status` entry written, as a [read](#read-an-investigation) returns it |
+| `activity` | object | Present when the request sent `seen_seq`. It has the meaning and the limits of an [append](#append-a-keep-a-finding-or-a-note)'s `activity`. When its read fails, the change stays made |
+
+Nobody else wrote after seq 8, so `activity` has no entries and reaches `through_seq` 9, the close itself.
 
 **Errors**
 
@@ -1880,17 +1897,18 @@ Sets the status of the finding whose `seq` is `{seq}`, if the investigation's `s
 | `id` | path | string | yes | The investigation id |
 | `seq` | path | integer | yes | The finding's `seq` |
 | `expected_seq` | body | integer | yes | The investigation's `seq` that the caller last saw |
+| `seen_seq` | body | integer | no | The latest `seq` the caller has seen. With it, the response carries `activity` |
 | `status` | body | string | yes | `hypothesis`, `supported`, `refuted`, or `unresolved` |
 
 **Request**
 
 ```json
-{ "expected_seq": 7, "status": "supported" }
+{ "expected_seq": 7, "seen_seq": 6, "status": "supported" }
 ```
 
 ```bash
 curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X PUT -H "Content-Type: application/json" \
-  -d '{"expected_seq": 7, "status": "supported"}' \
+  -d '{"expected_seq": 7, "seen_seq": 6, "status": "supported"}' \
   "$TRAWL_URL/api/v1/investigations/6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f/findings/7/status"
 ```
 
@@ -1904,11 +1922,34 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X PUT -H "Content-Type: app
     "actor": { "prefix": "Hn4vX9aT", "name": "jakub" },
     "at": "2026-10-24T09:41:20.000000Z",
     "payload": { "kind": "finding_status", "finding_seq": 7, "status": "supported" }
+  },
+  "activity": {
+    "entries": [
+      {
+        "seq": 7,
+        "updated_seq": 7,
+        "actor": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
+        "at": "2026-10-24T09:31:47.000000Z",
+        "payload": {
+          "kind": "finding",
+          "statement": "The 502s start when shop-api begins refusing database connections after deploy 4812.",
+          "status": "hypothesis",
+          "references": [
+            { "result_id": "4f2a9c1e7b3d40e8a6c5f1d2e3b4a597", "row": 0 },
+            { "result_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "row": 1 }
+          ],
+          "counterevidence": [],
+          "remaining_question": "Why does the connection pool not recover?"
+        }
+      }
+    ],
+    "through_seq": 8,
+    "more": false
   }
 }
 ```
 
-The response has the shape of an [append](#append-a-keep-a-finding-or-a-note) and never carries `activity`. The request takes no `seen_seq`.
+The response has the shape of an [append](#append-a-keep-a-finding-or-a-note)'s: the entry written, and `activity` when the request sent `seen_seq`. Here `activity` holds the finding that another key wrote after seq 6. The finding keeps its `updated_seq`: a status change is an entry of its own.
 
 **Errors**
 

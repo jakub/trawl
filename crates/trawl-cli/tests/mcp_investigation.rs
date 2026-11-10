@@ -317,6 +317,7 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         finding_seq,
         &trawl_client::FindingStatusUpdate {
             expected_seq: at,
+            seen_seq: None,
             status: trawl_client::FindingStatus::Supported,
         },
     )
@@ -395,6 +396,7 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
             id.as_str(),
             &PatchInvestigation {
                 expected_seq: at,
+                seen_seq: None,
                 title: None,
                 question: None,
                 status: Some(InvestigationStatus::Closed),
@@ -402,7 +404,8 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         )
         .await
         .expect("B closes the investigation");
-    assert_eq!(closed.status, InvestigationStatus::Closed);
+    assert_eq!(closed.investigation.status, InvestigationStatus::Closed);
+    assert_eq!(closed.investigation.seq, closed.entry.seq);
     let refused = a
         .call(
             "investigation",
@@ -427,10 +430,21 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         .call(
             "investigation",
             json!({"action": "status", "id": id.as_str(), "status": "open",
-                   "expected_seq": closed.seq}),
+                   "expected_seq": closed.investigation.seq}),
         )
         .await;
     assert!(!reopened.is_error, "{}", reopened.text);
+    // The reopen sends A's seen_seq, so it prints B's close, once.
+    let close_line = format!(
+        "#{} status by {} \"investigator-b-key\"",
+        closed.entry.seq, closed.entry.actor.prefix
+    );
+    assert_eq!(
+        reopened.text.matches(&close_line).count(),
+        1,
+        "{}",
+        reopened.text
+    );
     a.finish().await.assert_clean("session one");
 
     // A second session starts following at its first touch: B's notes are

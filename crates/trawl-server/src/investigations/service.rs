@@ -35,9 +35,9 @@
 //! # Allowances
 //!
 //! A read answers [`READ_DEFAULT_LIMIT`] entries unless it asks for
-//! another `limit`, at most [`READ_MAX_LIMIT`]. An append that carries a
-//! `seen_seq` answers at most [`ACTIVITY_LIMIT`] entries of other actors'
-//! activity, with `more` when it cut some.
+//! another `limit`, at most [`READ_MAX_LIMIT`]. An append or an overwrite
+//! that carries a `seen_seq` answers at most [`ACTIVITY_LIMIT`] entries of
+//! other actors' activity, with `more` when it cut some.
 
 use std::sync::Arc;
 
@@ -47,9 +47,9 @@ use trawl_api::investigations::{
     Activity, AppendEntry, AppendResponse, CreateInvestigation, EntryPayload, EvidenceRef,
     FINDING_MAX_COUNTEREVIDENCE, FINDING_MAX_REFERENCES, FINDING_STATEMENT_MAX_BYTES,
     FindingStatusUpdate, Investigation, InvestigationId, InvestigationList, InvestigationRead,
-    InvestigationStatus, KEEP_MAX_ROWS, KEEP_REASON_MAX_BYTES, NOTE_MAX_BYTES, PatchInvestigation,
-    QUESTION_MAX_BYTES, REMAINING_QUESTION_MAX_BYTES, RetentionExtension, SCOPE_MAX_BYTES,
-    TITLE_MAX_BYTES,
+    InvestigationStatus, KEEP_MAX_ROWS, KEEP_REASON_MAX_BYTES, LogEntry, NOTE_MAX_BYTES,
+    PatchInvestigation, PatchResponse, QUESTION_MAX_BYTES, REMAINING_QUESTION_MAX_BYTES,
+    RetentionExtension, SCOPE_MAX_BYTES, TITLE_MAX_BYTES,
 };
 use trawl_api::results::ResultState;
 
@@ -65,7 +65,8 @@ use crate::state::AppState;
 use crate::store::investigations::MAX_LIST;
 use crate::store::{
     Appended, CaptureRow, Citing, CreateOutcome, DeleteOutcome, ExpiredFile, InvestigationRow,
-    InvestigationStore, NewInvestigation, Overwrite, RetentionRule, StoreActor, StoreError,
+    InvestigationStore, NewInvestigation, Overwrite, Overwritten, RetentionRule, StoreActor,
+    StoreError,
 };
 use crate::transport::request_limit;
 
@@ -75,9 +76,9 @@ pub const READ_DEFAULT_LIMIT: u64 = 100;
 /// The most entries one read answers.
 pub const READ_MAX_LIMIT: u64 = 200;
 
-/// The most entries of other actors' activity an append answers. Small
-/// beside a read: it rides every append, and `more` points at the read
-/// that has the rest.
+/// The most entries of other actors' activity an append or an overwrite
+/// answers. Small beside a read: it rides every write, and `more` points
+/// at the read that has the rest.
 pub const ACTIVITY_LIMIT: u64 = 50;
 
 // -- authority ---------------------------------------------------------------
@@ -867,23 +868,34 @@ pub async fn append(
         }
     };
     unlink_evidence(&state.results.root, pruned).await;
-    let activity = match seen_seq {
-        None => None,
-        Some(seen) => Some(activity(store, &id, seen, actor.key_id, written.seq.max(seen)).await),
-    };
+    let activity = written_activity(store, &id, seen_seq, actor.key_id, &written).await;
     Ok(AppendResponse {
         entry: written,
         activity,
     })
 }
 
+/// The activity a committed append or overwrite answers: none when the
+/// request sent no `seen_seq`, otherwise [`activity`] since it. An
+/// investigation deleted since reads through the written entry.
+async fn written_activity(
+    investigations: &InvestigationStore,
+    id: &InvestigationId,
+    seen_seq: Option<u64>,
+    key_id: i64,
+    written: &LogEntry,
+) -> Option<Activity> {
+    let seen = seen_seq?;
+    Some(activity(investigations, id, seen, key_id, written.seq.max(seen)).await)
+}
+
 /// What other keys wrote to investigation `id` after `seen`, read after a
-/// write to it committed: an append, or a capture attached to it. The
-/// write is committed whatever this read meets, and must never read as a
-/// failure that invites a second write (ADR-0059). So a failure answers no
-/// entries with `more` set, sending the caller to the investigation's
-/// read, and an investigation deleted since answers none through
-/// `deleted_through`.
+/// write to it committed: an append, an overwrite, or a capture attached
+/// to it. The write is committed whatever this read meets, and must never
+/// read as a failure that invites a second write (ADR-0059). So a failure
+/// answers no entries with `more` set, sending the caller to the
+/// investigation's read, and an investigation deleted since answers none
+/// through `deleted_through`.
 pub(crate) async fn activity(
     investigations: &InvestigationStore,
     id: &InvestigationId,
@@ -919,11 +931,14 @@ pub(crate) async fn activity(
 
 /// Overwrite the title, the question or the status of investigation `id`
 /// if its sequence is still `expected_seq`. A closed investigation takes
-/// only a reopen.
+/// only a reopen. The answer is the investigation as the write left it,
+/// the entry it wrote, and, when the request sent a `seen_seq`, the
+/// activity since it.
 ///
 /// One field per request: the store applies one overwrite per sequence
 /// check, and two applied under one `expected_seq` would conflict with
-/// each other.
+/// each other. `seen_seq` is not a field: it changes no check and no
+/// conflict.
 ///
 /// # Errors
 /// 403 without write authority; 400 for a malformed id, a patch that
@@ -935,7 +950,7 @@ pub async fn patch(
     verified: &VerifiedKey,
     id: &str,
     req: PatchInvestigation,
-) -> Result<Investigation, ServerError> {
+) -> Result<PatchResponse, ServerError> {
     authorize(verified, Authority::Write)?;
     let id = parse_id(id)?;
     let mut changes = Vec::new();
@@ -966,28 +981,36 @@ pub async fn patch(
         }
     };
     let store = &state.storage.investigations;
+    let actor = actor(verified);
     let now = state.results.clock.now();
-    store
+    // The header comes from the write's own transaction, and the activity
+    // read cannot fail: nothing after the commit answers a landed write as
+    // a failure.
+    let Overwritten {
+        entry,
+        investigation,
+    } = store
         .overwrite(
             &id,
             req.expected_seq,
-            &actor(verified),
+            &actor,
             &change,
             now,
             retention(state),
         )
         .await?;
-    // A delete between the overwrite and this read leaves nothing to show.
-    store
-        .get(&id)
-        .await?
-        .map(|row| row.to_wire())
-        .ok_or(ServerError::Store(StoreError::InvestigationNotFound))
+    let activity = written_activity(store, &id, req.seen_seq, actor.key_id, &entry).await;
+    Ok(PatchResponse {
+        investigation: investigation.to_wire(),
+        entry,
+        activity,
+    })
 }
 
 /// Overwrite the status of the finding whose entry is `finding_seq` in
 /// investigation `id`, if its sequence is still `expected_seq`. The
-/// investigation must be open.
+/// investigation must be open. The answer is the entry written and, when
+/// the request sent a `seen_seq`, the activity since it.
 ///
 /// # Errors
 /// 403 without write authority; 400 for a malformed id; 404 for an
@@ -1002,24 +1025,22 @@ pub async fn set_finding_status(
 ) -> Result<AppendResponse, ServerError> {
     authorize(verified, Authority::Write)?;
     let id = parse_id(id)?;
+    let store = &state.storage.investigations;
+    let actor = actor(verified);
     let now = state.results.clock.now();
-    let entry = state
-        .storage
-        .investigations
+    let entry = store
         .set_finding_status(
             &id,
             finding_seq,
             req.expected_seq,
             req.status,
-            &actor(verified),
+            &actor,
             now,
             retention(state),
         )
         .await?;
-    Ok(AppendResponse {
-        entry,
-        activity: None,
-    })
+    let activity = written_activity(store, &id, req.seen_seq, actor.key_id, &entry).await;
+    Ok(AppendResponse { entry, activity })
 }
 
 /// Keep the evidence of investigation `id` until `retain_until`, raising

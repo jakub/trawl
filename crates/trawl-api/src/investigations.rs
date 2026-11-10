@@ -522,13 +522,18 @@ impl AppendEntry {
 /// Request body for `PATCH /api/v1/investigations/{id}`: overwrite the
 /// title, the question or the status. A patch carries exactly one of the
 /// three; the server refuses a body with none or more than one as
-/// `bad_request`. The change advances the sequence by one and records its
-/// own entry.
+/// `bad_request`. `seen_seq` is read bookkeeping and is not one of the
+/// three. The change advances the sequence by one and records its own
+/// entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatchInvestigation {
     /// The `seq` the caller observed.
     pub expected_seq: u64,
+    /// The latest `seq` the caller has seen, for the response's
+    /// `activity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_seq: Option<u64>,
     /// A new title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -546,6 +551,10 @@ pub struct PatchInvestigation {
 pub struct FindingStatusUpdate {
     /// The `seq` the caller observed.
     pub expected_seq: u64,
+    /// The latest `seq` the caller has seen, for the response's
+    /// `activity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_seq: Option<u64>,
     /// The new status.
     pub status: FindingStatus,
 }
@@ -597,8 +606,8 @@ pub struct InvestigationRead {
 }
 
 /// The entries other actors changed after the caller's `seen_seq`, carried
-/// by an attached or append response. Bounded: `more` says a read
-/// `since=<through_seq>` has the rest.
+/// by an attached, append or overwrite response. Bounded: `more` says a
+/// read `since=<through_seq>` has the rest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Activity {
     /// The entries, in `updated_seq` order.
@@ -609,9 +618,23 @@ pub struct Activity {
     pub more: bool,
 }
 
-/// Response body for an append.
+/// Response body for an append or a finding-status overwrite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendResponse {
+    /// The entry written.
+    pub entry: LogEntry,
+    /// The other actors' entries since the request's `seen_seq`. Absent
+    /// when the request sent none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Activity>,
+}
+
+/// Response body for `PATCH /api/v1/investigations/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchResponse {
+    /// The investigation as the write's own transaction left it: its
+    /// `seq` is the entry's.
+    pub investigation: Investigation,
     /// The entry written.
     pub entry: LogEntry,
     /// The other actors' entries since the request's `seen_seq`. Absent
@@ -986,6 +1009,7 @@ mod tests {
             patch,
             PatchInvestigation {
                 expected_seq: 4,
+                seen_seq: None,
                 title: None,
                 question: None,
                 status: Some(InvestigationStatus::Closed),
@@ -995,6 +1019,14 @@ mod tests {
             serde_json::to_value(&patch).unwrap(),
             json!({"expected_seq": 4, "status": "closed"})
         );
+        let seen: PatchInvestigation =
+            serde_json::from_value(json!({"expected_seq": 4, "seen_seq": 3, "title": "t"}))
+                .unwrap();
+        assert_eq!(seen.seen_seq, Some(3));
+        assert_eq!(
+            serde_json::to_value(&seen).unwrap(),
+            json!({"expected_seq": 4, "seen_seq": 3, "title": "t"})
+        );
         assert!(serde_json::from_value::<PatchInvestigation>(json!({"status": "closed"})).is_err());
         assert!(
             serde_json::from_value::<PatchInvestigation>(json!({"expected_seq": 4, "scope": "x"}))
@@ -1003,6 +1035,17 @@ mod tests {
 
         let status: FindingStatusUpdate =
             serde_json::from_value(json!({"expected_seq": 9, "status": "unresolved"})).unwrap();
+        assert_eq!(status.seen_seq, None);
+        assert_eq!(round_trip(&status), status);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            json!({"expected_seq": 9, "status": "unresolved"})
+        );
+        let status: FindingStatusUpdate = serde_json::from_value(
+            json!({"expected_seq": 9, "seen_seq": 7, "status": "unresolved"}),
+        )
+        .unwrap();
+        assert_eq!(status.seen_seq, Some(7));
         assert_eq!(round_trip(&status), status);
         assert!(
             serde_json::from_value::<FindingStatusUpdate>(json!({"status": "refuted"})).is_err()
@@ -1116,6 +1159,30 @@ mod tests {
                 .is_none()
         );
         assert_eq!(round_trip(&appended), appended);
+
+        let patched = PatchResponse {
+            investigation: investigation(),
+            entry: LogEntry {
+                seq: 4,
+                updated_seq: 4,
+                actor: agent(),
+                at: "2026-10-24T09:05:00.000000Z".into(),
+                payload: EntryPayload::Status {
+                    status: InvestigationStatus::Closed,
+                },
+            },
+            activity: None,
+        };
+        let wire = serde_json::to_value(&patched).unwrap();
+        assert!(wire.get("activity").is_none(), "{wire}");
+        assert_eq!(wire["investigation"]["seq"], json!(4));
+        assert_eq!(wire["entry"]["payload"]["kind"], json!("status"));
+        assert_eq!(round_trip(&patched), patched);
+        let patched = PatchResponse {
+            activity: Some(activity),
+            ..patched
+        };
+        assert_eq!(round_trip(&patched), patched);
 
         let conflict = SequenceConflict {
             expected: 4,
