@@ -2671,6 +2671,7 @@ mod cell_alignment_tests {
             },
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),
+            histogram: None,
         });
         app.tab.status = TabStatus::Success { duration_ms: 1 };
         app.tab.chart_view = view;
