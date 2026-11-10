@@ -377,12 +377,28 @@ fn status_warns_only_about_variables_that_move_commands() {
 /// so no two ports match; they are dropped on return, which a caller does
 /// right before the spawn.
 ///
-/// Residual exposure: between that drop and the child's own bind another
-/// process can take a port. The child must bind the port itself, so no
-/// test can hold it across the spawn.
+/// The ports come from below the kernel's ephemeral range (it starts at
+/// 32768 on Linux and at 49152 on macOS). The kernel never gives such a
+/// port to a bind to port 0 or to an outgoing connection, which is what
+/// every other test on a busy machine asks for.
+///
+/// Residual exposure: between that drop and the child's own bind, a
+/// process that asks for one of these ports by number can still take it:
+/// a service with a fixed port, or another call of this helper that draws
+/// the same number. The child must bind the port itself, so no test can
+/// hold it across the spawn.
 fn free_ports<const N: usize>() -> [u16; N] {
+    use rand::Rng as _;
+
+    let mut rng = rand::thread_rng();
     let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
-        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap()
+        loop {
+            let port = rng.gen_range(20_000..32_768);
+            if let Ok(listener) = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            {
+                break listener;
+            }
+        }
     });
     listeners.map(|listener| listener.local_addr().unwrap().port())
 }
