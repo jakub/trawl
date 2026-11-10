@@ -416,7 +416,8 @@ fn payload_text(payload: &EntryPayload) -> String {
     }
 }
 
-/// A step's outcome, appended to its text.
+/// A step's outcome, appended to its text. A capture cut short of the rows
+/// its query produced says so, as `with 4 of 5000 rows (cut)`.
 fn outcome_text(outcome: &StepOutcome, text: &mut String) {
     let _ = write!(text, "; outcome {}", word(&outcome.outcome));
     if let Some(code) = &outcome.code {
@@ -426,7 +427,14 @@ fn outcome_text(outcome: &StepOutcome, text: &mut String) {
         let _ = write!(text, "; kept result {}", json_string(result_id));
     }
     if let Some(rows) = outcome.rows {
-        let _ = write!(text, " with {rows} {}", plural_u64(rows, "row", "rows"));
+        match outcome.total_rows {
+            Some(total) if total > rows => {
+                let _ = write!(text, " with {rows} of {total} rows (cut)");
+            }
+            _ => {
+                let _ = write!(text, " with {rows} {}", plural_u64(rows, "row", "rows"));
+            }
+        }
     }
     if let Some(ms) = outcome.duration_ms {
         let _ = write!(text, "; ran {ms} ms");
@@ -1133,6 +1141,7 @@ mod tests {
                     code: None,
                     result_id: Some("fedcba9876543210fedcba9876543210".into()),
                     rows: Some(1),
+                    total_rows: None,
                     duration_ms: Some(12),
                 }),
             },
@@ -1167,6 +1176,44 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn a_cut_step_says_it_was_cut() {
+        let step = |rows: u64, total_rows: Option<u64>| {
+            entry(EntryPayload::Step {
+                executed: "_service=api".into(),
+                bounds: None,
+                request_id: "req-1".into(),
+                query_id: None,
+                purpose: None,
+                outcome: Some(StepOutcome {
+                    outcome: StepOutcomeKind::Success,
+                    code: None,
+                    result_id: Some("fedcba9876543210fedcba9876543210".into()),
+                    rows: Some(rows),
+                    total_rows,
+                    duration_ms: Some(12),
+                }),
+            })
+        };
+        let cut = entry_view(&step(4, Some(5000)));
+        let line = entry_line(&cut);
+        assert!(
+            line.contains(" with 4 of 5000 rows (cut); ran 12 ms"),
+            "{line}"
+        );
+        assert_eq!(
+            cut.payload.as_ref().unwrap()["outcome"]["total_rows"],
+            serde_json::json!(5000)
+        );
+        for whole in [step(4, Some(4)), step(4, None)] {
+            let line = entry_line(&entry_view(&whole));
+            assert!(line.contains(" with 4 rows; ran 12 ms"), "{line}");
+            assert!(!line.contains("cut"), "{line}");
+        }
+        let line = entry_line(&entry_view(&step(1, Some(1))));
+        assert!(line.contains(" with 1 row; ran 12 ms"), "{line}");
     }
 
     #[test]
