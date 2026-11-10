@@ -1,0 +1,14 @@
+claude --version: 2.1.322 (Claude Code)
+control: --setting-sources 'project,local'
+  exit status: 0
+  project hook marker: present
+  local hook marker: present
+  init output_style: Explanatory
+  answered: yes
+probe: --setting-sources ''
+  exit status: 0
+  project hook marker: absent
+  local hook marker: absent
+  init output_style: default
+  answered: yes
+verdict: pass (the control loaded both sources; the probe loaded neither and answered)
