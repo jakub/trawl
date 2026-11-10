@@ -140,6 +140,7 @@ fn render_save_query(
         Line::from(""),
     ];
 
+    let inner = block.inner(area);
     let paragraph = Paragraph::new(text)
         .block(block)
         .alignment(Alignment::Center)
@@ -147,11 +148,17 @@ fn render_save_query(
 
     frame.render_widget(paragraph, area);
 
-    // Position the cursor inside the input field.
-    let cursor_col = editor.cursor.1;
-    #[allow(clippy::cast_possible_truncation)]
-    let cursor_x =
-        area.x + (area.width / 2).saturating_sub((input.len() as u16) / 2) + 2 + cursor_col as u16;
+    // The cursor sits on the input line's cell after the input before it.
+    // The paragraph centres that line, `> `, the input and `█`, in the
+    // block's inner area, half the line's cells left of the middle, both
+    // halves rounded down. A line too wide for the area wraps, and the
+    // cursor is not placed on the wrapped rows. The cursor's column counts
+    // characters.
+    let line_cells = u16::try_from(2 + cells(&input) + 1).unwrap_or(u16::MAX);
+    let before: String = input.chars().take(editor.cursor.1).collect();
+    let offset = (inner.width / 2).saturating_sub(line_cells.min(inner.width) / 2);
+    let before_cells = u16::try_from(2 + cells(&before)).unwrap_or(u16::MAX);
+    let cursor_x = inner.x.saturating_add(offset).saturating_add(before_cells);
     let cursor_y = area.y + 5; // Row of the input line within the popup
     frame.set_cursor_position((cursor_x, cursor_y));
 }
@@ -492,3 +499,52 @@ fn render_column_picker(app: &App, frame: &mut Frame<'_>, selected: usize, scrol
 }
 
 use super::common::centered_rect;
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::tui::state::SimpleEditor;
+    use crate::tui::tests::test_app;
+
+    /// At 100x30 the save popup's input line is row 15, centred in the 58
+    /// cells from x = 21. A line of odd and of even cells starts where the
+    /// paragraph puts it, and the cursor sits after the cells of the input
+    /// before it, with CJK, lam-alef and a combining accent there.
+    #[test]
+    fn save_popup_cursor_sits_after_the_input_cells() {
+        // Input, cursor, where `>` is drawn, where the cursor sits.
+        let cases = [
+            // `> ab█`, five cells.
+            ("ab", 2, 48, 52),
+            ("ab", 0, 48, 50),
+            // `> abc█`, six cells.
+            ("abc", 3, 47, 52),
+            ("abc", 1, 47, 50),
+            // `> 日لاe\u{301}█`, eight cells; the cursor after the accent.
+            ("日لاe\u{301}", 5, 46, 53),
+            // Nine cells; the cursor before the `z`, then after `日`.
+            ("日لاe\u{301}z", 5, 46, 53),
+            ("日لاe\u{301}z", 1, 46, 50),
+        ];
+        for (input, cursor, prompt_x, cursor_x) in cases {
+            let mut app = test_app();
+            let mut editor = SimpleEditor::new_single_line();
+            editor.insert_text(input);
+            editor.cursor = (0, cursor);
+            app.popup = Some(Popup::SaveQuery { editor });
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| render(&app, frame)).unwrap();
+            assert_eq!(
+                terminal.backend().buffer()[(prompt_x, 15)].symbol(),
+                ">",
+                "{input:?}: the prompt"
+            );
+            terminal
+                .backend_mut()
+                .assert_cursor_position((cursor_x, 15));
+        }
+    }
+}
