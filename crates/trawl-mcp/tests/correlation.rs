@@ -653,6 +653,7 @@ async fn sightings_names_both_denominators_and_sums_the_groups() {
 #[tokio::test]
 async fn sightings_escapes_format_characters_in_the_literal() {
     let literal = format!("10.0.4.17{FORMAT_CHARS}");
+    // One group and one field: a block that fits beside a cut row.
     let Correlation::Sightings(mut facts) = sightings_facts(both_fields()) else {
         unreachable!()
     };
@@ -693,6 +694,7 @@ async fn sightings_escapes_format_characters_in_the_literal() {
 /// attribute them.
 #[tokio::test]
 async fn sightings_counts_the_fields_trawld_did_not_list() {
+    // One group and one field: a block that fits beside a cut row.
     let Correlation::Sightings(mut facts) = sightings_facts(both_fields()) else {
         unreachable!()
     };
@@ -821,6 +823,7 @@ async fn fields_restrict_attribution_and_leave_the_counted_matches_alone() {
 
 /// Fifty (env, service) groups with distinct services.
 fn fifty_groups() -> Correlation {
+    // One group and one field: a block that fits beside a cut row.
     let Correlation::Sightings(mut facts) = sightings_facts(both_fields()) else {
         unreachable!()
     };
@@ -1548,4 +1551,291 @@ async fn the_correlation_tools_dispatch_by_name() {
     .unwrap();
     assert_eq!(refused.is_error, Some(true));
     assert!(text_of(&refused).starts_with("invalid arguments for sightings:"));
+}
+
+// -- a wide sightings result (#373) -------------------------------------------
+
+/// The columns null in every row before each of [`WIDE_NAMED`]'s.
+const WIDE_GAP: usize = 40;
+/// The long-named columns of [`wide_sightings_columns`] holding a value
+/// in every row.
+const WIDE_NAMED: usize = 9;
+/// The named column, counted from 0, that holds [`wide_payload`].
+const WIDE_PAYLOAD: usize = 4;
+/// The budget every page call of [`wide_sightings_stays_readable`] sends:
+/// a row of every named column does not fit it, and a row of the named
+/// columns before [`WIDE_PAYLOAD`]'s fits beside the whole block and the
+/// proposed calls.
+const WIDE_MAX_BYTES: usize = 6912;
+
+/// `_time`, `service`, then [`WIDE_NAMED`] times: [`WIDE_GAP`] columns
+/// null in every row, then one column whose name is 250 bytes long. The
+/// union of columns a sightings read over many services captures.
+fn wide_sightings_columns() -> Vec<(String, ColumnType)> {
+    let mut columns = vec![
+        ("_time".to_owned(), ColumnType::Timestamp),
+        ("service".to_owned(), ColumnType::String),
+    ];
+    for named in 0..WIDE_NAMED {
+        for gap in 0..WIDE_GAP {
+            columns.push((format!("sparse_{named}_{gap}"), ColumnType::String));
+        }
+        columns.push((
+            format!("attr_{named}_{}", "n".repeat(243)),
+            ColumnType::String,
+        ));
+    }
+    columns
+}
+
+/// Whether column `index` of [`wide_sightings_columns`] holds a value in
+/// every row.
+fn wide_named(index: usize) -> bool {
+    index < 2 || (index - 1).is_multiple_of(WIDE_GAP + 1)
+}
+
+/// [`WIDE_PAYLOAD`]'s cell in captured row `row`: longer than a page
+/// prints whole, so the page abbreviates it.
+fn wide_payload(row: u64) -> String {
+    format!("{row}{}", "p".repeat(900))
+}
+
+/// The captured position of the named column [`WIDE_PAYLOAD`].
+fn wide_payload_column() -> usize {
+    2 + WIDE_PAYLOAD * (WIDE_GAP + 1) + WIDE_GAP
+}
+
+/// Captured row `row` of the wide sightings result: a short value in every
+/// named column but [`WIDE_PAYLOAD`]'s, which holds [`wide_payload`].
+fn wide_sightings_row(row: u64, columns: usize) -> Vec<Value> {
+    (0..columns)
+        .map(|index| match index {
+            0 => s(EARLIEST),
+            1 => s("nginx"),
+            _ if index == wide_payload_column() => s(&wide_payload(row)),
+            _ if wide_named(index) => s(&format!("{row}{}", "v".repeat(40))),
+            _ => Value::Null,
+        })
+        .collect()
+}
+
+/// The captured positions `answer`'s mirror prints, after checking that
+/// every printed row holds one cell per printed column.
+fn printed_positions(answer: &CallToolResult) -> Vec<u64> {
+    let view = &mirror(answer)["result"];
+    let positions: Vec<u64> = view["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|column| column["position"].as_u64().unwrap())
+        .collect();
+    let rows = view["rows"].as_array().unwrap();
+    assert!(!rows.is_empty(), "{}", text_of(answer));
+    for row in rows {
+        assert_eq!(row.as_array().unwrap().len(), positions.len(), "{row}");
+    }
+    positions
+}
+
+/// The lines of a sightings block, which state its population facts.
+fn population_lines(text: &str) -> Vec<&str> {
+    [
+        "sightings of",
+        "groups (",
+        "matches per service:",
+        "matches per env:",
+        "fields holding the literal",
+        "_raw only:",
+    ]
+    .iter()
+    .flat_map(|prefix| lines_starting(text, prefix))
+    .collect()
+}
+
+/// A backend holding the wide sightings capture: the `sightings` answer,
+/// its first page and a later one of two rows each, then the zero-row page
+/// a cell read takes its metadata from, and `wire`, the whole wire text of
+/// [`WIDE_PAYLOAD`]'s cell in row 0.
+fn wide_sightings_backend(wire: &str) -> Fake {
+    let named = wide_sightings_columns();
+    let columns: Vec<(&str, ColumnType)> = named
+        .iter()
+        .map(|(name, ty)| (name.as_str(), ty.clone()))
+        .collect();
+    // One group and one field: a block that fits beside a cut row.
+    let Correlation::Sightings(mut facts) = sightings_facts(both_fields()) else {
+        unreachable!()
+    };
+    facts.groups.truncate(1);
+    facts.fields.truncate(1);
+    facts.follow_ups.clear();
+    let facts = Correlation::Sightings(facts);
+    let result = correlated(CaptureKind::Sightings, &facts, &columns, 5000, 20_000);
+    let rows_of = |from: u64| {
+        (from..from + 2)
+            .map(|row| wide_sightings_row(row, columns.len()))
+            .collect()
+    };
+    Fake {
+        capabilities: ok(capabilities(None)),
+        sightings: ok(response(&result)),
+        result_page: each(vec![
+            Ok(page(&result, rows_of(0), 0)),
+            Ok(page(&result, rows_of(2), 2)),
+            Ok(page(&result, vec![], 0)),
+        ]),
+        result_cell: ok(trawl_client::ResultCell {
+            ty: ColumnType::String,
+            offset: 0,
+            length: wire.len() as u64,
+            total_bytes: wire.len() as u64,
+            next_offset: None,
+            text: wire.to_owned(),
+        }),
+        ..Fake::default()
+    }
+}
+
+/// Check that `tool`'s `answer`, a page of the wide sightings capture,
+/// fits [`WIDE_MAX_BYTES`] and prints rows of `_time`, `service` and the
+/// named columns before [`WIDE_PAYLOAD`]'s, at their captured positions,
+/// counting every other column omitted and the null ones apart.
+fn assert_wide_page(tool: &str, answer: &CallToolResult) {
+    let width = wide_sightings_columns().len();
+    let nulls = (0..width).filter(|&index| !wide_named(index)).count();
+    let text = text_of(answer);
+    assert_ne!(answer.is_error, Some(true), "{tool}: {text}");
+    assert!(
+        used_bytes(answer) <= WIDE_MAX_BYTES,
+        "{tool}: {}",
+        used_bytes(answer)
+    );
+    assert_valid_output(tool, answer);
+    // The null columns go, then a suffix of the named ones: what prints is
+    // a prefix of the named columns, at their captured positions.
+    let named: Vec<u64> = (0..width)
+        .filter(|&index| wide_named(index))
+        .map(|index| u64::try_from(index).unwrap())
+        .collect();
+    assert_eq!(
+        printed_positions(answer),
+        named[..2 + WIDE_PAYLOAD],
+        "{tool}: {text}"
+    );
+    let omitted = width - (2 + WIDE_PAYLOAD);
+    let presentation = &mirror(answer)["result"]["presentation"];
+    assert_eq!(presentation["columns_omitted"], json!(omitted), "{tool}");
+    assert_eq!(presentation["null_columns_omitted"], json!(nulls), "{tool}");
+    assert!(
+        text.contains(&format!(
+            "omits {omitted} columns ({nulls} null in every row read); fields source=result \
+             describes them;"
+        )),
+        "{tool}: {text}"
+    );
+}
+
+/// #373: a `sightings` result over hundreds of columns, most null in every
+/// row and a few with long names, prints rows on its first page and on a
+/// later one. Each page omits its null columns, then a suffix of the rest,
+/// and keeps the block's population facts whole. The abbreviated cell the
+/// tool proposes stays proposed when the fit cuts its column, and following
+/// that call reads the cell without a new capture (ruling R10).
+#[tokio::test]
+async fn wide_sightings_stays_readable() {
+    let named = wide_sightings_columns();
+    let width = named.len();
+    let nulls = (0..width).filter(|&index| !wide_named(index)).count();
+    assert_eq!((width, nulls), (371, 360));
+    assert!(wide_named(wide_payload_column()));
+    let payload_column = u64::try_from(wide_payload_column()).unwrap();
+    let wire = serde_json::to_string(&wide_payload(0)).unwrap();
+    let backend = wide_sightings_backend(&wire);
+
+    let first = sightings::run(
+        &backend,
+        &Seen::default(),
+        input::<SightingsInput>(json!({
+            "literal": LITERAL, "last": "1h", "max_bytes": WIDE_MAX_BYTES,
+        })),
+    )
+    .await;
+    let later = read::run(
+        &backend,
+        &Seen::default(),
+        input::<ReadInput>(json!({
+            "action": "page", "result_id": CORRELATED_ID, "offset": 2, "rows": 2,
+            "max_bytes": WIDE_MAX_BYTES,
+        })),
+    )
+    .await;
+
+    assert_wide_page("sightings", &first);
+    assert_wide_page("read", &later);
+    assert_eq!(
+        mirror(&first)["correlation"]["sightings"],
+        mirror(&later)["correlation"]["sightings"]
+    );
+    let block = population_lines(text_of(&first));
+    assert_eq!(block.len(), 6, "{}", text_of(&first));
+    assert_eq!(block, population_lines(text_of(&later)));
+    assert!(text_of(&first).contains(DENOMINATORS));
+
+    // The tool proposed the abbreviated payload cell whole; the fit cut its
+    // column from print and kept the call.
+    let proposed = mirror(&first)["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["arguments"]["action"] == json!("cell"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no cell call: {}", text_of(&first)));
+    assert_eq!(
+        json!({"tool": proposed["tool"], "arguments": proposed["arguments"]}),
+        json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": CORRELATED_ID, "row": 0, "column": payload_column,
+        }}),
+        "{}",
+        text_of(&first)
+    );
+
+    let before = backend.calls().len();
+    let followed = trawl_mcp::tools::dispatch(
+        "read",
+        proposed["arguments"].as_object().cloned(),
+        &backend,
+        DisplayZone::Utc,
+        &Seen::default(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
+    assert!(used_bytes(&followed) <= 16_384, "{}", used_bytes(&followed));
+    let cell = &mirror(&followed)["cell"];
+    assert_eq!(cell["row"], json!(0));
+    assert_eq!(cell["column"], json!(payload_column));
+    assert_eq!(cell["name"], json!(named[wide_payload_column()].0));
+    assert_eq!(cell["text"], json!(wire));
+    assert!(cell.get("next_offset").is_none(), "{cell}");
+    assert_eq!(
+        backend.calls()[before..],
+        [
+            "capabilities".to_owned(),
+            format!("result_page {CORRELATED_ID} 0 0 None"),
+            format!("result_cell {CORRELATED_ID} 0 {payload_column} None Some(16384)"),
+        ]
+    );
+    let methods = backend.methods();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| *method == "sightings")
+            .count(),
+        1,
+        "{methods:?}"
+    );
+    assert!(
+        !methods.iter().any(|method| method == "capture"),
+        "{methods:?}"
+    );
 }
