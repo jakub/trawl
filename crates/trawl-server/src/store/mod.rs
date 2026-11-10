@@ -77,9 +77,9 @@ pub use results::{
 };
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
-    ClaimedManualRun, ClaimedRun, DueClaim, DueClaimError, FinishOutcome, FlipOutcome,
-    MAX_DURATION_SECS, ManualRunClaim, ReportRun, RunClaim, Schedule, ScheduleStore,
-    format_interval, parse_duration_secs, parse_interval,
+    ClaimedManualRun, ClaimedRun, DUE_SCHEDULE_PAGE, DueClaim, DueClaimError, DueSchedule,
+    FinishOutcome, FlipOutcome, MAX_DURATION_SECS, ManualRunClaim, ReportRun, RunClaim, Schedule,
+    ScheduleStore, format_interval, parse_duration_secs, parse_interval,
 };
 pub use status::{RunOrigin, RunStatus};
 

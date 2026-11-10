@@ -111,6 +111,21 @@ pub struct Schedule {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The most rows one page of [`ScheduleStore::list_due_schedule_page`]
+/// holds.
+pub const DUE_SCHEDULE_PAGE: usize = 64;
+
+/// A due schedule as the scheduler tick lists it: the fields the tick
+/// needs before a claim, and no query text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DueSchedule {
+    pub id: i64,
+    /// The owning key, whose liveness the tick checks before the claim.
+    pub key_id: i64,
+    /// The fire cursor, which orders the listing and is its page key.
+    pub next_fire_at: DateTime<Utc>,
+}
+
 impl Schedule {
     /// Whether the run budget is spent: `max_runs` is set and
     /// `runs_claimed` has reached it. Derived from the two, never stored.
@@ -992,6 +1007,51 @@ impl ScheduleStore {
         let schedule = row_to_schedule(&row)?;
         let latest_run = latest_run_from_row(&row)?;
         Ok(Some((schedule, latest_run)))
+    }
+
+    /// One page of the schedules due at `now`, for the scheduler tick:
+    /// enabled, with `next_fire_at <= now`, oldest fire cursor first and
+    /// then by id (ADR-0018, amended 2026-11-09). A page holds at most
+    /// `limit` rows and never more than [`DUE_SCHEDULE_PAGE`]. `after` is
+    /// the `(next_fire_at, id)` of the last row of the previous page, and
+    /// the page starts strictly after it.
+    ///
+    /// No ownership check: the scheduler runs every key's schedules. No
+    /// query text: [`Self::claim_due_run`] reads every value a run depends
+    /// on again under its row locks.
+    pub async fn list_due_schedule_page(
+        &self,
+        now: DateTime<Utc>,
+        after: Option<(DateTime<Utc>, i64)>,
+        limit: usize,
+    ) -> Result<Vec<DueSchedule>, StoreError> {
+        let (after_fire, after_id) = after.unzip();
+        let rows = sqlx::query(
+            "SELECT id, key_id, next_fire_at
+             FROM schedules
+             WHERE enabled
+               AND next_fire_at <= $1
+               AND ($2::timestamptz IS NULL OR (next_fire_at, id) > ($2::timestamptz, $3::bigint))
+             ORDER BY next_fire_at, id
+             LIMIT $4",
+        )
+        .bind(now)
+        .bind(after_fire)
+        .bind(after_id)
+        .bind(bind_usize(limit.min(DUE_SCHEDULE_PAGE)))
+        .fetch_all(&self.pool)
+        .await?;
+        let page = rows
+            .iter()
+            .map(|row| {
+                Ok(DueSchedule {
+                    id: row.try_get("id")?,
+                    key_id: row.try_get("key_id")?,
+                    next_fire_at: row.try_get("next_fire_at")?,
+                })
+            })
+            .collect::<Result<_, sqlx::Error>>()?;
+        Ok(page)
     }
 
     /// List all enabled schedules with their associated saved queries.

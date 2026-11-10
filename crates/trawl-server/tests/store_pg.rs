@@ -23,8 +23,9 @@ mod common;
 use sqlx::PgPool;
 use trawl_server::report_window::{ReportWindow, ScheduleWindow, WindowKind, truncate_to_micros};
 use trawl_server::store::{
-    DueClaim, DueClaimError, FinishOutcome, FlipOutcome, HistoryStore, ManualRunClaim, RunClaim,
-    RunStatus, SavedQueryStore, ScheduleStore, StorageState, StoreError, WindowWriteError,
+    DUE_SCHEDULE_PAGE, DueClaim, DueClaimError, DueSchedule, FinishOutcome, FlipOutcome,
+    HistoryStore, ManualRunClaim, RunClaim, RunStatus, SavedQueryStore, ScheduleStore,
+    StorageState, StoreError, WindowWriteError,
 };
 
 fn history(pool: &PgPool) -> HistoryStore {
@@ -2842,6 +2843,120 @@ async fn list_enabled_schedules_filters_disabled(pool: PgPool) {
     assert_eq!(enabled.len(), 1);
     assert_eq!(enabled[0].1.name, "enabled-query");
     assert_eq!(store.count_enabled_schedules().await.unwrap(), 1);
+}
+
+/// The scheduler tick's listing (ADR-0018, amended 2026-11-09): enabled,
+/// due schedules only, oldest fire cursor first and then by id, in pages
+/// of at most [`DUE_SCHEDULE_PAGE`] that resume strictly after the key
+/// they are given.
+///
+/// 141 schedules fall due over the 37 minutes before `now`, their cursors
+/// out of id order and tied in groups of three or four, and a tie spans
+/// each page boundary; one more falls due exactly at `now`. A disabled
+/// schedule that is due and an enabled one a microsecond in the future are
+/// left out. The pages, read back to back, are the expected rows sorted on
+/// their own.
+#[sqlx::test]
+async fn due_schedule_pages_order_and_resume(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+
+    // (next_fire_at, id, key_id) of every schedule the listing must return.
+    let mut expected = Vec::new();
+    for i in 0..142_i64 {
+        let fire = if i == 141 {
+            now
+        } else {
+            now - chrono::Duration::minutes((i * 29) % 37 + 1)
+        };
+        let key_id = 1 + i % 3;
+        let sq = seed_saved(&pool, key_id, &format!("due-{i}")).await;
+        let schedule = store
+            .create_schedule(sq, key_id, 3600, None, None, 0, fire)
+            .await
+            .unwrap();
+        expected.push((fire, schedule.id, key_id));
+    }
+    let off = seed_saved(&pool, 1, "due-but-disabled").await;
+    let off = store
+        .create_schedule(
+            off,
+            1,
+            3600,
+            None,
+            None,
+            0,
+            now - chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    store
+        .update_schedule(off.id, 1, 3600, None, false, None, 0, now)
+        .await
+        .unwrap();
+    let future = seed_saved(&pool, 1, "not-yet-due").await;
+    store
+        .create_schedule(
+            future,
+            1,
+            3600,
+            None,
+            None,
+            0,
+            now + chrono::Duration::microseconds(1),
+        )
+        .await
+        .unwrap();
+
+    expected.sort_unstable();
+    let page = DUE_SCHEDULE_PAGE;
+    assert_eq!(
+        (expected[page - 1].0, expected[2 * page - 1].0),
+        (expected[page].0, expected[2 * page].0),
+        "the fixture ties a cursor across each page boundary"
+    );
+    assert!(
+        !expected.is_sorted_by_key(|(_, id, _)| *id),
+        "the fixture's cursors are out of id order"
+    );
+
+    let mut listed = Vec::new();
+    let mut sizes = Vec::new();
+    let mut after = None;
+    loop {
+        let rows = store
+            .list_due_schedule_page(now, after, 10 * page)
+            .await
+            .unwrap();
+        sizes.push(rows.len());
+        let Some(last) = rows.last() else { break };
+        after = Some((last.next_fire_at, last.id));
+        for row in rows {
+            let DueSchedule {
+                id,
+                key_id,
+                next_fire_at,
+            } = row;
+            listed.push((next_fire_at, id, key_id));
+        }
+    }
+    assert_eq!(sizes, [page, page, 142 - 2 * page, 0], "page sizes");
+    assert_eq!(listed, expected);
+
+    let (first, second) = (expected[0], expected[1]);
+    assert_eq!(
+        store
+            .list_due_schedule_page(now, Some((first.0, first.1)), 1)
+            .await
+            .unwrap(),
+        [DueSchedule {
+            id: second.1,
+            key_id: second.2,
+            next_fire_at: second.0,
+        }],
+        "a smaller limit is a smaller page, resumed after the key"
+    );
+    assert_eq!(store.count_enabled_schedules().await.unwrap(), 143);
 }
 
 #[sqlx::test]
