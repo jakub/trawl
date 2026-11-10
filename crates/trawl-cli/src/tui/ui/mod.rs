@@ -543,6 +543,39 @@ mod tests {
         );
     }
 
+    /// An instant with a fraction below the rows the widths sample still
+    /// shows its offset once it scrolls on screen.
+    #[test]
+    fn a_saved_run_instant_past_the_width_sample_keeps_its_offset() {
+        use crate::tui::state::{LoadedRun, SavedFocus};
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+
+        let mut rows = vec![vec![Value::String("2026-03-14T02:00:00.000000Z".to_owned())]; 100];
+        rows.push(vec![Value::String(
+            "2026-03-14T02:00:00.123456Z".to_owned(),
+        )]);
+        let mut app = saved_app(None, vec![make_run(41, 45)]);
+        app.display_zone = "+05:30".parse().unwrap();
+        app.panel.saved_focus = SavedFocus::RunResults;
+        let detail = app.panel.saved_detail.as_mut().unwrap();
+        detail.result = Some(LoadedRun {
+            run_id: 41,
+            result: QueryResult {
+                columns: vec![Column::new("_time", ColumnType::Timestamp)],
+                rows,
+            },
+        });
+        detail.result_scroll = 100;
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        let drawn = terminal.backend().to_string();
+        assert!(
+            drawn.contains("2026-03-14 07:30:00.123456 +05:30"),
+            "{drawn}"
+        );
+    }
+
     /// A fixed trailing window with no lag: no `lag 0s`, and no watermark,
     /// because a fixed window keeps none.
     #[test]

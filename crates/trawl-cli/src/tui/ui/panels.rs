@@ -1059,8 +1059,16 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
             .add_modifier(Modifier::BOLD),
     )));
 
+    // -- the rows on screen (windowed by scroll offset) --
+    // After the title: the header, the separator and the footer.
+    #[allow(clippy::cast_possible_truncation)]
+    let visible_rows = (area.height as usize).saturating_sub(lines.len() + 3);
+    let total_rows = result.rows.len();
+    let start = detail.result_scroll.min(total_rows);
+    let end = (start + visible_rows).min(total_rows);
+
     // -- column headers --
-    let col_widths = run_result_widths(result, app.display_zone);
+    let col_widths = run_result_widths(result, start..end, app.display_zone);
     let header_spans: Vec<Span<'static>> = result
         .columns
         .iter()
@@ -1084,14 +1092,7 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
         Style::default().fg(theme.text_muted),
     )));
 
-    // -- data rows (windowed by scroll offset) --
-    #[allow(clippy::cast_possible_truncation)]
-    let visible_rows = (area.height as usize).saturating_sub(lines.len() + 1); // reserve for footer
-    let scroll = detail.result_scroll;
-    let total_rows = result.rows.len();
-    let start = scroll.min(total_rows);
-    let end = (start + visible_rows).min(total_rows);
-
+    // -- data rows --
     for row in &result.rows[start..end] {
         let row_spans: Vec<Span<'static>> = row
             .iter()
@@ -1130,27 +1131,40 @@ const RUN_RESULT_COLUMN_CAP: usize = 30;
 /// Display-cell widths of the run result columns.
 ///
 /// Widths sample the header and the first 100 rows, so a wider value further
-/// down renders cut. Each sample is measured as it would render at the cap,
-/// except in a timestamp column, where an instant is measured whole: its
-/// offset is at the end, and a cut there would hide the zone it reads in.
-fn run_result_widths(result: &trawl_api::value::QueryResult, zone: DisplayZone) -> Vec<usize> {
+/// down renders cut. Each sample is measured as it would render at the cap.
+///
+/// A timestamp column is the exception. Its offset is at the end, and a cut
+/// there would hide the zone the instant reads in, so each instant is
+/// measured whole, and the rows on screen (`visible`) are measured with the
+/// sample.
+fn run_result_widths(
+    result: &trawl_api::value::QueryResult,
+    visible: std::ops::Range<usize>,
+    zone: DisplayZone,
+) -> Vec<usize> {
     let fitted = |text: &str| cells(&fit_cells(text, RUN_RESULT_COLUMN_CAP));
+    let sample = result.rows.iter().take(100);
+    let on_screen = result.rows.get(visible).unwrap_or_default();
     result
         .columns
         .iter()
         .enumerate()
         .map(|(i, column)| {
-            let whole = column.ty == trawl_api::value::ColumnType::Timestamp;
-            result
-                .rows
-                .iter()
-                .take(100)
-                .filter_map(|row| row.get(i))
-                .map(|val| {
-                    let text = run_result_text(column, val, zone);
-                    if whole { cells(&text) } else { fitted(&text) }
-                })
-                .fold(fitted(&column.name), usize::max)
+            let width = fitted(&column.name);
+            if column.ty == trawl_api::value::ColumnType::Timestamp {
+                sample
+                    .clone()
+                    .chain(on_screen)
+                    .filter_map(|row| row.get(i))
+                    .map(|val| cells(&run_result_text(column, val, zone)))
+                    .fold(width, usize::max)
+            } else {
+                sample
+                    .clone()
+                    .filter_map(|row| row.get(i))
+                    .map(|val| fitted(&run_result_text(column, val, zone)))
+                    .fold(width, usize::max)
+            }
         })
         .collect()
 }
@@ -1828,7 +1842,7 @@ mod unicode_tests {
             .as_ref()
             .unwrap()
             .result;
-        let widths = run_result_widths(result, DisplayZone::Utc);
+        let widths = run_result_widths(result, 0..0, DisplayZone::Utc);
         assert!(
             widths.iter().all(|&w| w <= RUN_RESULT_COLUMN_CAP),
             "{widths:?}"
