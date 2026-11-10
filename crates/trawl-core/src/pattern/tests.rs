@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::*;
@@ -2506,14 +2506,55 @@ fn duckdb_version(conn: &duckdb::Connection) -> String {
         .unwrap_or_else(|e| format!("(version unknown: {e})"))
 }
 
+/// The premise bodies that can match empty on `\B`, before their case
+/// forms ([`premise_case_forms`]).
+const EMPTY_NON_BOUNDARY_FORMS: [&str; 2] = [r"\B", r"x*\B"];
+
+/// The premise subjects that put one multi-byte character between two
+/// ASCII word characters.
+const SPLIT_WORD_SUBJECTS: [&str; 4] = ["x\u{e9}y", "x\u{663}y", "x\u{212a}y", "x\u{17f}y"];
+
+/// The rows where the view and `DuckDB` answer differently, all accepted:
+/// every case form of [`EMPTY_NON_BOUNDARY_FORMS`] over every
+/// [`SPLIT_WORD_SUBJECTS`] subject. RE2 tests an assertion at every byte
+/// offset, so an empty match on `\B` can sit inside a multi-byte
+/// character and `DuckDB` answers true. The view runs with
+/// `utf8_empty(true)`, which never places an empty match inside a
+/// character, so it answers false.
+fn empty_non_boundary_rows() -> BTreeSet<(String, &'static str)> {
+    EMPTY_NON_BOUNDARY_FORMS
+        .iter()
+        .flat_map(|form| premise_case_forms(form))
+        .flat_map(|body| SPLIT_WORD_SUBJECTS.map(|subject| (body.clone(), subject)))
+        .collect()
+}
+
 /// The view of a regex body reads `\d \D \w \W \s \S`, `\b` and `\B` as
 /// the bundled `DuckDB` (RE2) reads the body itself. Each row runs the
 /// view, compiled as `prepare` compiles it, as an unanchored match over a
 /// subject, and asks `DuckDB` `regexp_matches(subject, body)` with the
-/// original body bound, as the batch lane binds it. Every disagreeing row
-/// is reported, not just the first.
+/// original body bound, as the batch lane binds it. The rows that disagree
+/// must be exactly [`empty_non_boundary_rows`], each `DuckDB` true and the
+/// view false: a disagreement outside that set fails, and so does a row of
+/// it that now agrees. Every unexpected row is reported, not just the
+/// first.
 #[test]
 fn regex_class_view_premise() {
+    let split_word = |subject: &str| {
+        let chars: Vec<char> = subject.chars().collect();
+        matches!(chars.as_slice(), [a, c, b]
+            if a.is_ascii_alphanumeric() && b.is_ascii_alphanumeric() && c.len_utf8() > 1)
+    };
+    let split_subjects: Vec<&str> = PREMISE_SUBJECTS
+        .into_iter()
+        .filter(|subject| split_word(subject))
+        .collect();
+    assert_eq!(
+        split_subjects, SPLIT_WORD_SUBJECTS,
+        "SPLIT_WORD_SUBJECTS must name every premise subject of that shape"
+    );
+    let accepted = empty_non_boundary_rows();
+    let mut differing = BTreeSet::new();
     let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
     let mut mismatches = Vec::new();
     let mut answers: BTreeMap<String, (bool, bool)> = BTreeMap::new();
@@ -2547,10 +2588,25 @@ fn regex_class_view_premise() {
                     seen.1 = true;
                 }
             }
+            let row = (body.clone(), subject);
+            let expected = accepted.contains(&row);
             if duck != ours {
+                differing.insert(row);
+            }
+            let unexpected = if expected {
+                (&duck, &ours) != (&Ok(true), &Ok(false))
+            } else {
+                duck != ours
+            };
+            if unexpected {
                 mismatches.push(format!(
-                    "body {body:?} | view {view:?} | subject {} | duckdb {duck:?} | view {ours:?}",
-                    code_points(subject)
+                    "body {body:?} | view {view:?} | subject {} | duckdb {duck:?} | view {ours:?}{}",
+                    code_points(subject),
+                    if expected {
+                        " | accepted as DuckDB true, view false"
+                    } else {
+                        ""
+                    }
                 ));
             }
         }
@@ -2564,10 +2620,14 @@ fn regex_class_view_premise() {
     }
     assert!(
         mismatches.is_empty(),
-        "{} of {rows} rows disagree, DuckDB {}:\n{}",
+        "{} of {rows} rows answer other than expected, DuckDB {}:\n{}",
         mismatches.len(),
         duckdb_version(&conn),
         mismatches.join("\n")
+    );
+    assert_eq!(
+        differing, accepted,
+        "the disagreeing rows are the accepted set"
     );
 }
 
