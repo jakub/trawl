@@ -317,6 +317,7 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         finding_seq,
         &trawl_client::FindingStatusUpdate {
             expected_seq: at,
+            seen_seq: None,
             status: trawl_client::FindingStatus::Supported,
         },
     )
@@ -395,6 +396,7 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
             id.as_str(),
             &PatchInvestigation {
                 expected_seq: at,
+                seen_seq: None,
                 title: None,
                 question: None,
                 status: Some(InvestigationStatus::Closed),

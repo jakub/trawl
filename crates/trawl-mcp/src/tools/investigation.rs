@@ -721,6 +721,7 @@ async fn finding_status<B: Backend>(
     let finding_seq = input.finding_seq.unwrap_or_default();
     let request = FindingStatusUpdate {
         expected_seq: input.expected_seq.unwrap_or_default(),
+        seen_seq: None,
         status: input
             .status
             .and_then(finding_status_of)
@@ -783,6 +784,7 @@ async fn status<B: Backend>(
         .unwrap_or(InvestigationStatus::Open);
     let request = PatchInvestigation {
         expected_seq: input.expected_seq.unwrap_or_default(),
+        seen_seq: None,
         title: None,
         question: None,
         status: Some(status),

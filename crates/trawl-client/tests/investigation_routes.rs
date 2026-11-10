@@ -335,6 +335,7 @@ async fn append_posts_the_tagged_entry_and_reads_the_activity() {
 async fn patch_sends_the_expected_sequence_and_one_field() {
     let request = PatchInvestigation {
         expected_seq: 4,
+        seen_seq: None,
         title: None,
         question: None,
         status: Some(InvestigationStatus::Closed),
@@ -367,6 +368,7 @@ async fn finding_status_addresses_the_finding_by_its_sequence() {
     };
     let request = FindingStatusUpdate {
         expected_seq: 6,
+        seen_seq: None,
         status: FindingStatus::Refuted,
     };
     let (client, served) = serve_ok(&answer).await;
@@ -430,6 +432,7 @@ async fn a_sequence_conflict_carries_expected_and_current() {
     };
     let request = PatchInvestigation {
         expected_seq: 4,
+        seen_seq: None,
         title: None,
         question: None,
         status: Some(InvestigationStatus::Closed),
@@ -497,12 +500,14 @@ async fn a_malformed_id_is_refused_before_any_connection() {
     };
     let patch = PatchInvestigation {
         expected_seq: 0,
+        seen_seq: None,
         title: None,
         question: None,
         status: Some(InvestigationStatus::Closed),
     };
     let finding = FindingStatusUpdate {
         expected_seq: 0,
+        seen_seq: None,
         status: FindingStatus::Supported,
     };
     let extension = RetentionExtension {

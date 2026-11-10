@@ -614,6 +614,7 @@ pub async fn patch_status(
 ) -> Result<Investigation, WriteFailure> {
     let body = PatchInvestigation {
         expected_seq,
+        seen_seq: None,
         title: None,
         question: None,
         status: Some(status),
