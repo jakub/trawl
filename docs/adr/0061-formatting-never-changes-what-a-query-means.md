@@ -107,7 +107,7 @@ The search stage reads its group separator as `OR` or `or` (`parser/search.rs:63
 
 `NOT` is now read where an expression operand starts, so a bare field named `NOT` there no longer parses as a field. `AND` and `OR` are read only after a left operand, so they claim no new field-start position. The formatter backticks a field named `AND`, as it already backticks `OR` and `NOT`, so a rendered name always reads back as a field.
 
-Stored query text that names a bare field `NOT` in an expression stops parsing on upgrade, under the rule above: restoring the old behaviour means restoring the Postgres database and `[server] results_dir` together, taken with trawld stopped.
+Stored query text with a bare field whose name or first dot segment is `NOT`, at the start of an expression operand, changes on upgrade. `NOT == 1` and `NOT.x == 1` stop parsing. Other shapes read as negation: `NOT(x)` becomes `not x`, `NOT in (1, 2)` becomes `not` over a call named `in`, and `NOT - 1` becomes `not (-1)`. Under the rule above, restoring the old behaviour means restoring the Postgres database and `[server] results_dir` together, taken with trawld stopped.
 
 Considered, not adopted:
 
