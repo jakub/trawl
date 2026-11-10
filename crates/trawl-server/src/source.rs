@@ -117,24 +117,44 @@ fn service_pins(search: &SearchStage) -> Services {
 
 /// What an OR of `branches` pins ([`service_pins`]): nothing unless every
 /// branch pins, and nothing for no branch at all.
+///
+/// Each union merges the smaller set into the larger, so a group of one
+/// branch hands its set up unchanged and nesting adds no insertions.
 fn disjunction_pins(branches: &[Vec<Spanned<SearchToken>>]) -> Option<BTreeSet<&str>> {
     if branches.is_empty() {
         return None;
     }
     let mut union = BTreeSet::new();
     for branch in branches {
-        union.extend(conjunction_pins(branch)?);
+        let mut pinned = conjunction_pins(branch)?;
+        if pinned.len() > union.len() {
+            std::mem::swap(&mut union, &mut pinned);
+        }
+        union.extend(pinned);
     }
     Some(union)
 }
 
 /// What an AND of `tokens` pins ([`service_pins`]): nothing when no token
 /// pins, an empty AND included.
+///
+/// Each intersection keeps the smaller set and drops from it what the
+/// larger lacks, so it never copies the larger.
 fn conjunction_pins(tokens: &[Spanned<SearchToken>]) -> Option<BTreeSet<&str>> {
-    tokens
-        .iter()
-        .filter_map(|token| token_pins(&token.node))
-        .reduce(|common, pinned| common.intersection(&pinned).copied().collect())
+    let mut common: Option<BTreeSet<&str>> = None;
+    for token in tokens {
+        let Some(mut pinned) = token_pins(&token.node) else {
+            continue;
+        };
+        if let Some(mut so_far) = common.take() {
+            if pinned.len() > so_far.len() {
+                std::mem::swap(&mut pinned, &mut so_far);
+            }
+            pinned.retain(|name| so_far.contains(name));
+        }
+        common = Some(pinned);
+    }
+    common
 }
 
 /// What one search token pins ([`service_pins`]).
@@ -1638,6 +1658,45 @@ mod tests {
         let mut search = parsed("service=a");
         search.groups.push(vec![no_branch]);
         assert_eq!(service_pins(&search), any, "nor does it pin an OR branch");
+    }
+
+    /// A pin costs what its names cost, however deep its groups nest. A
+    /// 64 KiB query can wrap a list of 10,000 names in 2,764 groups, and a
+    /// union that copied the set at every group would make about 27
+    /// million insertions before the cap on the final set applies.
+    ///
+    /// The bound is wall-clock, far from both sides in a debug build: a
+    /// copy at every group takes about 12 s on this input, and the
+    /// derivation about 3 ms. The recursion runs on a thread with room for
+    /// this depth.
+    #[test]
+    fn nesting_does_not_multiply_what_a_pin_costs() {
+        let names: Vec<String> = (0..10_000).map(|i| format!("s{i:04x}")).collect();
+        let depth = 2764;
+        let dsl = format!(
+            "{}service={}{}",
+            "(".repeat(depth),
+            names.join(","),
+            ")".repeat(depth)
+        );
+        assert!(dsl.len() <= trawl_core::parser::MAX_QUERY_LEN);
+        let elapsed = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let query = trawl_core::parser::parse(&dsl).unwrap();
+                let started = std::time::Instant::now();
+                let pinned = service_pins(&query.search);
+                let elapsed = started.elapsed();
+                assert_eq!(pinned, Services::Any, "10,000 names are over the cap");
+                elapsed
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "{elapsed:?}"
+        );
     }
 
     /// A pin reads only `{name}.parquet`, so it is sound only while every
