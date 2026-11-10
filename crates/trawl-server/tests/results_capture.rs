@@ -1198,3 +1198,143 @@ async fn an_events_capture_keeps_one_stage_for_its_order() {
     assert!(!whole.executed_query.ends_with(IMPOSED_ORDER));
     assert_eq!(whole.captured_rows, 1);
 }
+
+// -- cancel by id --------------------------------------------------------------
+
+/// A window capture that waits for a permit is cancelled by its owner's
+/// first `DELETE /queries/{id}` (ADR-0024, Amendment 2026-11-09). It answers
+/// the not-started 503 while every permit is still held, well before its
+/// deadline, closes its tracker entry once with that text, and gives back
+/// what the gate admitted it with: its lane and installation slots and its
+/// quota charge, so the key's next capture is admitted at once. The worker
+/// never took it.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one capture, its queued state, its refusal, and what it gives back
+async fn a_queued_capture_is_cancellable_by_its_owner() {
+    let server = Arc::new(
+        captured::boot(
+            RateLimitConfig {
+                default_rpm: 1_000_000,
+                ..RateLimitConfig::default()
+            },
+            CaptureConfig {
+                per_key_results: 1,
+                installation_running: 1,
+                deadline_secs: 60,
+                ..CaptureConfig::default()
+            },
+        )
+        .await,
+    );
+    server.results_clock.set(at("2024-01-16T10:30:00Z"));
+    let pool = &server.state.query.pool;
+    let capacity = pool.capacity();
+    let key = captured::key_id(&server, &server.analyst_token).await;
+    let seams = pool.seams();
+    let entry = seams.watch(Seam::Entry);
+    let owner = trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let query = corpus_query();
+    let body = json!({ "query": query, "window": { "last": "1h" } });
+
+    // Every permit, taken before the capture is sent and held until it
+    // answered: it cannot start while this lives.
+    let held = pool
+        .exclusive(std::time::Duration::from_secs(30))
+        .await
+        .expect("hold every permit of an idle pool");
+    let sent = std::time::Instant::now();
+    let run = {
+        let server = Arc::clone(&server);
+        let (token, body) = (server.analyst_token.clone(), body.clone());
+        tokio::spawn(async move { captured::capture(&server, &token, &body).await })
+    };
+    let id = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let seen = owner.queries().await.expect("list the queries");
+            if let Some(q) = seen
+                .active
+                .iter()
+                // The tracker lists the text the capture runs: the window's
+                // bounds, the query and the imposed order.
+                .find(|q| q.snapshot.query.contains(&query))
+            {
+                return q.snapshot.id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the queued capture is listed");
+    assert!(!run.is_finished(), "the capture waits for a permit");
+
+    // Admitted and charged while it waits: the key's quota is full, and
+    // the installation's one running slot is taken.
+    let (_, _, answer) = captured::capture(&server, &server.analyst_token, &body).await;
+    assert_eq!(code(&answer), "capture_quota_exceeded", "{answer}");
+    let (_, _, answer) = captured::capture(&server, &server.reader_token, &body).await;
+    assert_eq!(code(&answer), "capture_busy", "{answer}");
+
+    let cancel = owner
+        .cancel_query(id)
+        .await
+        .expect("the owner may cancel its capture");
+    assert!(cancel.cancelled, "one cancel reaches the queued capture");
+    let (status, _, answer) = tokio::time::timeout(std::time::Duration::from_secs(15), run)
+        .await
+        .expect("answered well before the capture's deadline")
+        .expect("the capture task joins");
+    // `sent` is taken before the capture leaves, and its deadline starts
+    // later, in the handler: an answer inside `deadline_secs` since `sent`
+    // cannot be the deadline's own refusal, which says the same thing.
+    assert!(
+        sent.elapsed() < std::time::Duration::from_secs(60),
+        "the capture answered before its deadline"
+    );
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert_eq!(code(&answer), "service_unavailable", "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        trawl_server::error::CAPACITY_NOT_STARTED,
+        "{answer}"
+    );
+    assert_eq!(
+        permits(&server),
+        0,
+        "it answered while every permit was held"
+    );
+    let closed: Vec<_> = server
+        .state
+        .query
+        .tracker
+        .recent()
+        .into_iter()
+        .filter(|q| q.id == id)
+        .collect();
+    assert_eq!(closed.len(), 1, "closed once: {closed:?}");
+    assert_eq!(
+        closed[0].error.as_deref(),
+        Some(trawl_server::error::CAPACITY_NOT_STARTED),
+        "closed with the message its caller read"
+    );
+    assert!(!closed[0].timed_out, "cancelled, not timed out");
+    assert!(
+        !pool.cancel_by_id(id),
+        "the pool holds nothing under the id"
+    );
+
+    drop(held);
+    captured::assert_nothing_held(&server, capacity, "a cancelled capture").await;
+    assert_eq!(entry.arrivals(), 0, "the worker never took the capture");
+    assert!(captured::root_names(&server).is_empty(), "no file");
+    assert!(
+        captured::listed(&server, &server.analyst_token)
+            .await
+            .is_empty(),
+        "no row"
+    );
+
+    // Its lane slot, its installation slot and its charge came back.
+    let answer = captured::capture(&server, &server.analyst_token, &body).await;
+    assert_eq!(answer.0, StatusCode::OK, "admitted at once: {}", answer.2);
+    assert_eq!(server.state.results.gate.queued(key), 0);
+}
