@@ -174,11 +174,11 @@ A release whose WAL sits off the volume now fails `helm upgrade` at render, and 
 
 The spill cap bounds the bytes DuckDB writes into its temp files: their lengths, plus the one block per live file that the decision already describes. It does not bound blocks that the filesystem allocates past a file's end.
 
-XFS allocates ahead of the end of a file that keeps growing. `spill_stays_within_budget_plus_class_slack` measured both totals while a capped sort ran. With the temp directory on XFS, and on the `k8s-big` CI runners, the files' lengths stayed within the cap plus the slack, and their allocated blocks went 13 MiB to 55 MiB past the sweep's lowest cap, about 95 MiB, and up to 113 MiB past its higher caps. On btrfs and on the hosted CI runners the two totals matched.
+XFS allocates ahead of the end of a file that keeps growing. `spill_stays_within_budget_plus_class_slack` measured both totals while a capped sort ran. With the temp directory on XFS, and on the `k8s-big` CI runners, the files' lengths stayed within the cap plus the slack, and their allocated blocks went 12 MiB to 51 MiB past the sweep's lowest cap, about 95 MiB, and up to 113 MiB past its higher caps. On btrfs and on the hosted CI runners the two totals matched.
 
 The directory bound is now on the files' lengths, in `crates/trawl-engine/tests/query_budgets.rs` and in the two server tests that sample the same directory, `spill_budget` and `clones_share_one_spill_budget` in `crates/trawl-server/tests/query_resources.rs`. The sweep prints the largest allocated total it sampled beside the largest length, and each failing run's message carries both. The slack figure is unchanged.
 
-The server tests saw more allocation ahead than the sweep: on the `k8s-big` runners, 283 MiB allocated for files 134 MiB long.
+The server tests saw more allocation ahead than the sweep: on the `k8s-big` runners, 270 MiB allocated for files 128 MiB long (283,443,200 and 134,643,712 bytes).
 
 What this leaves open:
 
