@@ -685,6 +685,7 @@ jobs:
               35-board-write-gate.patch
               36-send-window-merged-text.patch
               37-board-read-while-hidden.patch
+              38-board-read-inside-pause.patch
     # At most six apply/build/run cycles after browser and package setup.
     timeout-minutes: 45
     permissions:

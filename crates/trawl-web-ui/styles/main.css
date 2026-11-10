@@ -3138,7 +3138,7 @@ body .bdg {
 .inv-row-scroll { flex: none; max-width: 100%; }
 .inv-pruned { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: var(--fs-small); color: var(--ink-2); }
 .inv-empty, .inv-denied { margin: 0; color: var(--ink-3); }
-.inv-stale { margin: 0; color: var(--ink-2); }
+.inv-stale, .inv-wait { margin: 0; color: var(--ink-2); }
 .inv-throttled { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--ink-2); }
 .inv-throttled p { margin: 0; }
 /* The evidence viewer (components/evidence_drawer.rs): one captured

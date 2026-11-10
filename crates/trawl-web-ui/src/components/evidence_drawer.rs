@@ -47,7 +47,8 @@
 //! the draft that was sent, so a reason begun or edited while the keep
 //! was in flight, for another row or for the same one, stays as it is. A keep whose answer was lost says
 //! its outcome is unknown, keeps the reason, and offers a refresh of the
-//! board, which it waits for before it sends again.
+//! board, which it waits for before it sends again. A board that stopped
+//! reading offers no refresh.
 //!
 //! The drawer is fixed over the page, so nothing it reads moves the
 //! board under the reader.
@@ -97,6 +98,9 @@ pub struct KeepGate {
     pub landed: Callback<()>,
     /// The person's own refresh of the board.
     pub refresh: Callback<()>,
+    /// Whether the board still reads on this visit: once a read was
+    /// refused for want of a grant, nothing here offers its refresh.
+    pub reading: Signal<bool>,
 }
 
 /// What became of the person's last keep.
@@ -112,13 +116,22 @@ enum KeepNote {
 }
 
 impl KeepNote {
-    fn text(&self) -> String {
+    /// The notice's words. `reading` is whether the board still reads: a
+    /// stopped board has no refresh to point at.
+    fn text(&self, reading: bool) -> String {
         match self {
             Self::Kept(row) => format!("Kept row {row}. The board shows it in the activity."),
-            Self::Unknown(row, _) => format!(
-                "The answer to your keep of row {row} was lost, so it may or may not have been \
-                 kept. Refresh the board and look for it in the activity before you keep it again."
-            ),
+            Self::Unknown(row, _) => {
+                let next = if reading {
+                    "Refresh the board"
+                } else {
+                    "The board stopped reading, so reload the page"
+                };
+                format!(
+                    "The answer to your keep of row {row} was lost, so it may or may not have \
+                     been kept. {next} and look for it in the activity before you keep it again."
+                )
+            }
             Self::Closed(row) => format!(
                 "The investigation was closed before your keep of row {row} reached it, so \
                  nothing was kept."
@@ -652,8 +665,8 @@ fn KeepForm(keeping: Keeping) -> impl IntoView {
     view! {
         {move || k.note.get().map(|note| view! {
             <div class="inv-write-note" class:inv-write-warn=!matches!(note, KeepNote::Kept(_))>
-                <p role="status">{note.text()}</p>
-                {unknown().then(|| view! {
+                <p role="status">{note.text(k.gate.reading.get())}</p>
+                {(unknown() && k.gate.reading.get()).then(|| view! {
                     <Btn variant=Variant::Secondary size=Size::Xs on_click=k.gate.refresh>"Refresh the board"</Btn>
                 })}
             </div>

@@ -450,10 +450,14 @@ waits for the tab. The evidence waits too: a cited row, a row **Refresh** asks
 for again, and a page of the evidence viewer, including one whose 429
 `Retry-After` passed while the tab was hidden. A board opened in a hidden tab
 shows **Paused** and loads when the tab shows. When the tab shows again, it
-reads at once and then every 5 seconds. A read that waited for the tab also
-waits out a 429's `Retry-After` that is still running, however often the tab
-hides and shows, and a 403 or a 404 drops it. **Refresh** in a visible tab does
-not wait for a `Retry-After`.
+reads at once and then every 5 seconds.
+
+Every board read waits out a 429's `Retry-After`, in a visible tab too. This
+includes **Refresh**, **Load more entries**, the read after a close, a reopen,
+or a keep, and the reads that follow a short read. The reads asked for during
+the wait join into one read, which starts when the wait ends. While a read
+waits, the board says so. The wait holds however often the tab hides and
+shows. A 403 or a 404 drops a read that waits.
 
 The header's badge names the connection state:
 
@@ -463,7 +467,7 @@ The header's badge names the connection state:
 | **Live** | The last read was accepted |
 | **Paused** | The tab is hidden, so the board reads nothing |
 | **Retrying** | The last read failed. The next read waits 5 seconds after the first failure, then 10, 20, 40, and at most 60. A 429 waits at least its `Retry-After` |
-| **Stopped** | The server refused a read with 403, or no longer holds the investigation. The board reads nothing more on this visit and drops its write controls |
+| **Stopped** | The server refused a read with 403, or no longer holds the investigation. The board reads nothing more on this visit. It drops its write controls and every control that would read it: **Refresh**, **Refresh the board**, and **Load more entries**. Reload the page to start a new visit |
 
 **checked** gives the time of the last read the board accepted, including a
 read that brought nothing new. A failed read changes neither the board nor that
