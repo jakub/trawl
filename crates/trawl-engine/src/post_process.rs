@@ -730,40 +730,102 @@ fn apply_aggregate(
 /// A `sort` step: a stable sort of `rows` by the stage's fields, the
 /// first field written the primary one.
 ///
-/// Each field binds per row through [`bind_event_key`], as every other
-/// stage of the tail binds a name, and a row without it reads NULL. A
-/// NULL sorts after every value in both directions, as batch SQL puts it:
-/// [`compare_cells`] puts it last, and `-` reverses only the comparison of
-/// two values. Rows whose keys compare equal keep their input order, so of
-/// several `sort` steps the last is the primary key and the earlier ones
-/// break its ties.
+/// Each field binds per row through [`bind_event_key`] ([`sort_cell`]), as
+/// every other stage of the tail binds a name, and a row without it reads
+/// NULL. A NULL sorts after every value in both directions, as batch SQL
+/// puts it: [`compare_cells`] puts it last, and `-` reverses only the
+/// comparison of two values. Rows whose keys compare equal keep their
+/// input order, so of several `sort` steps the last is the primary key and
+/// the earlier ones break its ties.
 ///
-/// The sort reads the lane's latch as it goes ([`sort_rows`]).
+/// Each row's keys bind once, before any comparison. One pass binds every
+/// field the stage writes, a repeated or absent name included, for every
+/// row, into one table of references to the rows' own cells, so no cell
+/// is copied and a comparison binds nothing. The row indices are sorted by
+/// that table ([`sort_rows`]), and the rows then move out in sorted order.
+/// Every pass over the rows reads the lane's latch each
+/// [`TAIL_CANCEL_STRIDE`] rows: the bind pass, the sort, which draws its
+/// indices one run at a time, and both halves of the move.
 fn sort_step(
     rows: Vec<Row>,
     sort: &SortStage,
     cancel: &CancelLatch,
 ) -> Result<Vec<Row>, EngineError> {
-    sort_rows(rows, cancel, |a, b| {
-        for field in &sort.fields {
-            let (x, y) = (sort_cell(a, &field.field), sort_cell(b, &field.field));
-            let cmp = compare_cells(x, y);
-            let cmp = match field.direction {
-                SortDirection::Desc if is_value(x) && is_value(y) => cmp.reverse(),
-                SortDirection::Asc | SortDirection::Desc => cmp,
-            };
-            if cmp.is_ne() {
-                return cmp;
+    sort_step_with(rows, sort, cancel, sort_cell)
+}
+
+/// [`sort_step`], with `bind` reading the cell a sort key names in a row,
+/// so a test can watch the bind pass.
+fn sort_step_with(
+    rows: Vec<Row>,
+    sort: &SortStage,
+    cancel: &CancelLatch,
+    mut bind: impl for<'r> FnMut(&'r Row, &str) -> Option<&'r EvalValue>,
+) -> Result<Vec<Row>, EngineError> {
+    let width = sort.fields.len();
+    // The keys borrow the rows, so they end with this block, before the
+    // rows move.
+    let order = {
+        // Row-major: row `at`'s keys are `keys[at * width..(at + 1) * width]`.
+        let mut keys = Vec::with_capacity(rows.len() * width);
+        for (at, row) in rows.iter().enumerate() {
+            if at.is_multiple_of(TAIL_CANCEL_STRIDE) {
+                cancel.check()?;
             }
+            keys.extend(sort.fields.iter().map(|field| bind(row, &field.field)));
         }
-        std::cmp::Ordering::Equal
-    })
+        let keys_of = |at: usize| &keys[at * width..(at + 1) * width];
+        sort_rows(0..rows.len(), cancel, |&a, &b| {
+            for ((&x, &y), field) in keys_of(a).iter().zip(keys_of(b)).zip(&sort.fields) {
+                let cmp = compare_cells(x, y);
+                let cmp = match field.direction {
+                    SortDirection::Desc if is_value(x) && is_value(y) => cmp.reverse(),
+                    SortDirection::Asc | SortDirection::Desc => cmp,
+                };
+                if cmp.is_ne() {
+                    return cmp;
+                }
+            }
+            std::cmp::Ordering::Equal
+        })?
+    };
+
+    let mut slots: Vec<Option<Row>> = Vec::with_capacity(rows.len());
+    for (at, row) in rows.into_iter().enumerate() {
+        if at.is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        slots.push(Some(row));
+    }
+    let mut sorted = Vec::with_capacity(slots.len());
+    for (moved, at) in order.into_iter().enumerate() {
+        if moved.is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        sorted.push(
+            slots[at]
+                .take()
+                .expect("the sort answers each row's index exactly once"),
+        );
+    }
+    Ok(sorted)
 }
 
 /// The cell a sort key `name` reads in `row`, bound as `DuckDB` binds an
-/// identifier.
+/// identifier. A sort step calls it once per row and written key
+/// ([`sort_step`]).
 fn sort_cell<'r>(row: &'r Row, name: &str) -> Option<&'r EvalValue> {
+    #[cfg(test)]
+    SORT_BINDS.with(|binds| binds.set(binds.get() + 1));
     bind_event_key(row, name).and_then(|key| row.get(key))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many keys [`sort_cell`] has bound on this thread. Per thread,
+    /// so a test reads only its own sorts whether the harness runs tests
+    /// on threads or in processes.
+    static SORT_BINDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a sort key read a value rather than a NULL or nothing.
@@ -836,34 +898,36 @@ fn dedup_step(
 }
 
 /// How many rows a row pass of the batch tail takes between two reads
-/// of the lane's latch: a sort step's run or merge, a dedup step's pass,
-/// a copy in or out, or the render of a tracked timestamp column.
+/// of the lane's latch: a sort step's bind pass, run, merge or move, a
+/// dedup step's pass, a copy in or out, or the render of a tracked
+/// timestamp column.
 pub(crate) const TAIL_CANCEL_STRIDE: usize = 4096;
 
-/// A stable sort of `rows` by `compare` that a cancellation stops within
-/// [`TAIL_CANCEL_STRIDE`] rows of work.
+/// A stable sort of `items` by `compare` that a cancellation stops within
+/// [`TAIL_CANCEL_STRIDE`] items of work. A sort step sorts its row indices
+/// with it ([`sort_step`]).
 ///
-/// One `sort_by` call cannot be left early, and a comparator that starts
-/// answering `Equal` once the latch is set breaks the total order
-/// `sort_by` may panic over. So the rows are sorted in runs of one stride,
-/// each run reading the latch first, and the runs are merged pairwise,
-/// reading it every stride of output. Ties keep the earlier run's row
-/// first, so the sort is as stable as `sort_by`.
-fn sort_rows(
-    rows: Vec<Row>,
+/// One sort call cannot be left early, so the items are sorted in runs of
+/// one stride, each run reading the latch first, and the runs are merged
+/// pairwise, reading it every stride of output. Ties keep the earlier
+/// run's item first, so the sort is stable. Each run is sorted by
+/// [`stable_sort`] rather than `sort_by`: a comparator that is not a total
+/// order, as [`compare_cells`] is not over a column mixing numbers and
+/// text, may make `sort_by` panic.
+fn sort_rows<T>(
+    items: impl IntoIterator<Item = T, IntoIter: ExactSizeIterator>,
     cancel: &CancelLatch,
-    mut compare: impl FnMut(&Row, &Row) -> std::cmp::Ordering,
-) -> Result<Vec<Row>, EngineError> {
-    let mut runs = Vec::with_capacity(rows.len().div_ceil(TAIL_CANCEL_STRIDE));
-    let mut rows = rows.into_iter();
+    mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) -> Result<Vec<T>, EngineError> {
+    let mut items = items.into_iter();
+    let mut runs = Vec::with_capacity(items.len().div_ceil(TAIL_CANCEL_STRIDE));
     loop {
-        let mut run: Vec<Row> = rows.by_ref().take(TAIL_CANCEL_STRIDE).collect();
+        let run: Vec<T> = items.by_ref().take(TAIL_CANCEL_STRIDE).collect();
         if run.is_empty() {
             break;
         }
         cancel.check()?;
-        run.sort_by(&mut compare);
-        runs.push(run);
+        runs.push(stable_sort(run, &mut compare));
     }
     while runs.len() > 1 {
         let mut merged = Vec::with_capacity(runs.len().div_ceil(2));
@@ -879,14 +943,14 @@ fn sort_rows(
     Ok(runs.pop().unwrap_or_default())
 }
 
-/// Merge two runs sorted by `compare` into one, `left`'s row first on a
-/// tie, reading the latch every [`TAIL_CANCEL_STRIDE`] rows of output.
-fn merge_runs(
-    left: Vec<Row>,
-    right: Vec<Row>,
+/// Merge two runs sorted by `compare` into one, `left`'s item first on a
+/// tie, reading the latch every [`TAIL_CANCEL_STRIDE`] items of output.
+fn merge_runs<T>(
+    left: Vec<T>,
+    right: Vec<T>,
     cancel: &CancelLatch,
-    compare: &mut impl FnMut(&Row, &Row) -> std::cmp::Ordering,
-) -> Result<Vec<Row>, EngineError> {
+    compare: &mut impl FnMut(&T, &T) -> std::cmp::Ordering,
+) -> Result<Vec<T>, EngineError> {
     let mut out = Vec::with_capacity(left.len() + right.len());
     let mut left = left.into_iter().peekable();
     let mut right = right.into_iter().peekable();
@@ -903,13 +967,59 @@ fn merge_runs(
     }
     // At most one run is left, and the move reads the latch on the same
     // stride: that run can be most of the result.
-    for row in left.chain(right) {
+    for item in left.chain(right) {
         if out.len().is_multiple_of(TAIL_CANCEL_STRIDE) {
             cancel.check()?;
         }
-        out.push(row);
+        out.push(item);
     }
     Ok(out)
+}
+
+/// The most items [`stable_sort`] insertion-sorts rather than halving.
+const INSERTION_SORT_MAX: usize = 16;
+
+/// A stable sort of `items` by `compare` that answers each item exactly
+/// once whatever `compare` answers, even when `compare` is not a total
+/// order. Up to [`INSERTION_SORT_MAX`] items are insertion-sorted. A
+/// longer input is split in half, each half is sorted the same way, and
+/// the halves are merged, the left half's item first on a tie.
+///
+/// For a total order it answers what `sort_by` answers: a stable order is
+/// unique. It reads no latch, since [`sort_rows`] gives it one stride at a
+/// time.
+fn stable_sort<T>(
+    mut items: Vec<T>,
+    compare: &mut impl FnMut(&T, &T) -> std::cmp::Ordering,
+) -> Vec<T> {
+    if items.len() <= INSERTION_SORT_MAX {
+        // An item moves back only past items it is strictly less than.
+        for next in 1..items.len() {
+            let mut at = next;
+            while at > 0 && compare(&items[at], &items[at - 1]).is_lt() {
+                items.swap(at, at - 1);
+                at -= 1;
+            }
+        }
+        return items;
+    }
+    let right = items.split_off(items.len() / 2);
+    let left = stable_sort(items, compare);
+    let right = stable_sort(right, compare);
+
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    while let (Some(l), Some(r)) = (left.peek(), right.peek()) {
+        let right_first = compare(r, l).is_lt();
+        out.extend(if right_first {
+            right.next()
+        } else {
+            left.next()
+        });
+    }
+    out.extend(left.chain(right));
+    out
 }
 
 /// Compare two optional cells for sorting purposes.
@@ -2265,6 +2375,32 @@ mod tests {
         assert_eq!(sorted, expected);
     }
 
+    /// For a total order with many ties, the run sort answers exactly what
+    /// a stable `sort_by` answers: for no item and one, at the insertion
+    /// sort's limit and either side of it, over an odd split, for an odd
+    /// few thousand items, and for a whole stride.
+    #[test]
+    fn the_run_sort_matches_a_stable_sort() {
+        let mut by_key = |a: &(usize, usize), b: &(usize, usize)| a.0.cmp(&b.0);
+        let lens = [
+            0,
+            1,
+            2,
+            INSERTION_SORT_MAX - 1,
+            INSERTION_SORT_MAX,
+            INSERTION_SORT_MAX + 1,
+            2 * INSERTION_SORT_MAX + 3,
+            3_001,
+            TAIL_CANCEL_STRIDE,
+        ];
+        for len in lens {
+            let items: Vec<(usize, usize)> = (0..len).map(|at| ((at * 7_919) % 13, at)).collect();
+            let mut expected = items.clone();
+            expected.sort_by(by_key);
+            assert_eq!(stable_sort(items, &mut by_key), expected, "{len} items");
+        }
+    }
+
     /// A latch set inside a sort's comparator ends the sort within one
     /// stride's worth of work: the run being sorted finishes, and the
     /// next run reads the latch. Unstopped, the sort of sixteen strides
@@ -2371,6 +2507,239 @@ mod tests {
             "{:?}",
             outcome.map(|rows| rows.len())
         );
+    }
+
+    /// A sort stage over `fields`, each a name and its direction.
+    fn sort_over(fields: &[(&str, SortDirection)]) -> SortStage {
+        SortStage {
+            fields: fields
+                .iter()
+                .map(|&(field, direction)| SortField {
+                    field: field.to_owned(),
+                    direction,
+                })
+                .collect(),
+        }
+    }
+
+    /// The order a sort step answers with (ADR-0064), computed by binding
+    /// both rows' keys again on every comparison.
+    fn compare_by_binding(sort: &SortStage, a: &Row, b: &Row) -> std::cmp::Ordering {
+        for field in &sort.fields {
+            let (x, y) = (sort_cell(a, &field.field), sort_cell(b, &field.field));
+            let cmp = compare_cells(x, y);
+            let cmp = match field.direction {
+                SortDirection::Desc if is_value(x) && is_value(y) => cmp.reverse(),
+                SortDirection::Asc | SortDirection::Desc => cmp,
+            };
+            if cmp.is_ne() {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    /// `len` rows over every way a sort key can bind, `i` holding each
+    /// row's arrival. `n` is an explicit NULL in some rows. `b` and `B`
+    /// are exact-case variants, each absent from some rows, so a name
+    /// binds its own spelling where the row has it and the other one
+    /// where it does not. No row has `cx`: it binds `Cx` or `cX`, two keys
+    /// that collide under ASCII case folding, whichever the row has, and
+    /// the lowest where it has both. `gone` is absent from most rows, and
+    /// `mixed` holds text, integers and doubles.
+    fn binding_rows(len: usize) -> Vec<Row> {
+        (0..len)
+            .map(|at| {
+                let i = i64::try_from(at).expect("fits");
+                let mut row = Row::from([
+                    ("i".to_owned(), EvalValue::Int(i)),
+                    (
+                        "n".to_owned(),
+                        if i % 7 == 0 {
+                            EvalValue::Null
+                        } else {
+                            EvalValue::Int(i % 3)
+                        },
+                    ),
+                    (
+                        "mixed".to_owned(),
+                        match i % 3 {
+                            0 => EvalValue::Str("x".to_owned()),
+                            1 => EvalValue::Int((i / 7) % 2),
+                            _ => EvalValue::Float(0.5),
+                        },
+                    ),
+                ]);
+                if i % 5 != 0 {
+                    row.insert("b".to_owned(), EvalValue::Int((i / 2) % 2));
+                }
+                if i % 3 != 0 {
+                    row.insert("B".to_owned(), EvalValue::Int((i / 5) % 2));
+                }
+                if i % 2 == 0 {
+                    row.insert("Cx".to_owned(), EvalValue::Int((i / 3) % 2));
+                }
+                if i % 4 != 1 {
+                    row.insert("cX".to_owned(), EvalValue::Str(((i / 4) % 3).to_string()));
+                }
+                if i % 8 == 0 {
+                    row.insert("gone".to_owned(), EvalValue::Str(format!("g{}", i % 3)));
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// A sort step binds each row's keys once, whatever the keys are: an
+    /// explicit NULL, exact-case variants, names that collide under ASCII
+    /// case folding, a key most rows lack, one no row has, and a repeated
+    /// name. It answers what a stable sort that binds on every comparison
+    /// answers, and some row ties the first one in every run of
+    /// [`TAIL_CANCEL_STRIDE`] rows, so ties keep their arrival order
+    /// across the runs too.
+    #[test]
+    fn sort_binds_keys_once_per_row() {
+        use SortDirection::{Asc, Desc};
+
+        let sort = sort_over(&[
+            ("n", Desc),
+            ("B", Asc),
+            ("cx", Asc),
+            ("gone", Desc),
+            ("b", Desc),
+            ("n", Asc),
+            ("mixed", Desc),
+            ("nowhere", Asc),
+        ]);
+        let rows = binding_rows(10_000);
+        let mut expected = rows.clone();
+        expected.sort_by(|a, b| compare_by_binding(&sort, a, b));
+        for (run, run_rows) in rows.chunks(TAIL_CANCEL_STRIDE).enumerate().skip(1) {
+            assert!(
+                run_rows
+                    .iter()
+                    .any(|row| compare_by_binding(&sort, &rows[0], row).is_eq()),
+                "run {run} has no row tying the first"
+            );
+        }
+
+        SORT_BINDS.with(|binds| binds.set(0));
+        let sorted = sort_step(rows, &sort, &CancelLatch::never()).expect("not cancelled");
+        assert_eq!(SORT_BINDS.with(std::cell::Cell::get), 80_000, "key binds");
+
+        let arrival = |rows: &[Row]| -> Vec<Option<EvalValue>> {
+            rows.iter().map(|row| row.get("i").cloned()).collect()
+        };
+        let (got, want) = (arrival(&sorted), arrival(&expected));
+        let first = got.iter().zip(&want).position(|(got, want)| got != want);
+        assert!(
+            got.len() == want.len() && first.is_none(),
+            "{} rows, {} expected, first difference at {first:?}",
+            got.len(),
+            want.len()
+        );
+        assert!(sorted == expected, "the rows move out unchanged");
+    }
+
+    /// A sort step's bind pass reads the latch before every stride of
+    /// rows, so a stop set while the last row of the first stride binds
+    /// ends the step before the next row binds: one stride of rows bound,
+    /// every key of each, and none after them.
+    #[test]
+    fn a_sort_bind_pass_stops_within_a_stride_of_its_cancellation() {
+        let stride = TAIL_CANCEL_STRIDE;
+        let sort = sort_over(&[("n", SortDirection::Desc), ("i", SortDirection::Asc)]);
+        let len = i64::try_from(2 * stride + 1).expect("fits");
+        let rows: Vec<Row> = (0..len)
+            .map(|i| {
+                Row::from([
+                    ("i".to_owned(), EvalValue::Int(i)),
+                    ("n".to_owned(), EvalValue::Int(i % 3)),
+                ])
+            })
+            .collect();
+        let last_of_stride = EvalValue::Int(i64::try_from(stride - 1).expect("fits"));
+
+        let (flag, cancel) = tripwire();
+        let binds = std::cell::Cell::new(0_usize);
+        let outcome = sort_step_with(rows, &sort, &cancel, |row, name| {
+            binds.set(binds.get() + 1);
+            if row.get("i") == Some(&last_of_stride) {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            sort_cell(row, name)
+        });
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "{:?}",
+            outcome.map(|rows| rows.len())
+        );
+        assert_eq!(binds.get(), stride * sort.fields.len(), "key binds");
+    }
+
+    /// A column mixing integers and number-led text has no total order:
+    /// 2 < 10 as numbers, 10 < `11x` and `11x` < 2 as text. A sort step
+    /// over it still answers every row exactly once, in some order, rather
+    /// than failing the query. The first input is one that made a sort of
+    /// row indices panic. The others cover every length from 21 to 64, and
+    /// one length over two strides, so the merges run too.
+    #[test]
+    fn a_sort_over_an_inconsistent_order_answers_rows_instead_of_panicking() {
+        let rows_of = |keys: &[String]| -> Vec<Row> {
+            keys.iter()
+                .zip(0_i64..)
+                .map(|(key, at)| {
+                    let cell = key
+                        .parse()
+                        .map_or_else(|_| EvalValue::Str(key.clone()), EvalValue::Int);
+                    Row::from([
+                        ("k".to_owned(), cell),
+                        ("at".to_owned(), EvalValue::Int(at)),
+                    ])
+                })
+                .collect()
+        };
+        let sort = sort_over(&[("k", SortDirection::Asc)]);
+
+        let found = [
+            "11x", "10", "10", "2", "11x", "11x", "11x", "10", "2", "11x", "11x", "11x", "10",
+            "11x", "10", "2", "2", "11x", "10", "2", "2",
+        ];
+        let mut inputs = vec![Vec::from(found.map(str::to_owned))];
+        let mut state = 0x9e37_79b9_u64;
+        let mut key = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let n = (state >> 33) % 50;
+            if (state >> 40).is_multiple_of(2) {
+                n.to_string()
+            } else {
+                format!("{n}x")
+            }
+        };
+        for len in (21..=64).chain([2 * TAIL_CANCEL_STRIDE + 5]) {
+            inputs.push(std::iter::repeat_with(&mut key).take(len).collect());
+        }
+
+        for keys in inputs {
+            let sorted =
+                sort_step(rows_of(&keys), &sort, &CancelLatch::never()).expect("not cancelled");
+            let mut arrivals: Vec<i64> = sorted
+                .iter()
+                .map(|row| match row.get("at") {
+                    Some(EvalValue::Int(at)) => *at,
+                    other => panic!("a row without its arrival: {other:?}"),
+                })
+                .collect();
+            arrivals.sort_unstable();
+            let len = i64::try_from(keys.len()).expect("fits");
+            assert!(
+                arrivals.iter().copied().eq(0..len),
+                "{} keys: not every row exactly once",
+                keys.len()
+            );
+        }
     }
 
     fn run_tail(dsl: &str, result: QueryResult) -> Result<QueryResult, EngineError> {
