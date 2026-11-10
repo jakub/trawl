@@ -1,0 +1,478 @@
+# Human-judged columns of retained-events.tsv, keyed so a line shift does not
+# change a key: file, event_type, level and kind, plus the ordinal of that
+# combination in the file. kind is `site` for an emission, `call:<helper>` for a
+# call of a logging helper, `expand:<macro>!` for a macro_rules invocation.
+# enumerate.py joins this file and fails on a key with no row, or a row with no key.
+file	event_type	level	kind	ordinal	source type	disposition
+audit.rs	lifecycle	info	site	1	none	unchanged: no error text
+audit.rs	audit_error	warn	site	1	operation: &'static str literal	unchanged: fixed text trawl wrote
+audit.rs	audit_gap	warn	site	1	none	unchanged: no error text
+audit.rs	audit_error	error	site	1	operation: &'static str literal	unchanged: fixed text trawl wrote
+audit.rs	lifecycle	info	site	2	none	unchanged: no error text
+audit.rs	role_created	info	site	1	none	unchanged: no error text
+audit.rs	role_changed	info	site	1	none	unchanged: no error text
+audit.rs	role_deleted	info	site	1	none	unchanged: no error text
+audit.rs	key_created	info	site	1	none	unchanged: no error text
+audit.rs	key_roles_changed	info	site	1	none	unchanged: no error text
+audit.rs	key_revoked	info	site	1	none	unchanged: no error text
+boot.rs	catalog_conform	info	site	1	none	unchanged: no error text
+boot.rs	investigations_boot	info	site	1	none	unchanged: no error text
+boot.rs	catalog_identity_unproven	warn	site	1	none	unchanged: no error text
+boot.rs	catalog_identity	info	site	1	ArchiveIdentity enum (Debug)	unchanged: closed enum
+boot.rs	wal_present_on_query_node	warn	site	1	none	unchanged: no error text
+catalog/conform.rs	catalog_conform_progress	info	site	1	none	unchanged: no error text
+catalog/conform.rs	catalog_identity_walk_failed	warn	site	1	metrics::WalkError: std::io::Error from read_dir	D2b
+catalog/conform.rs	catalog_conform_start	info	site	1	none	unchanged: no error text
+catalog/conform.rs	catalog_conform_complete	info	site	1	none	unchanged: no error text
+catalog/conform.rs	catalog_conform_incomplete	warn	site	1	counts; fixed message	unchanged: no error text
+catalog/conform.rs	catalog_conform_skip	warn	site	1	helper skip_file: &str from callers, a fixed reason or the walk's io::Error	D2b
+catalog/conform.rs	catalog_conform_skip	warn	site	2	helper skip_failed: StatementFailure (DuckDB text); 62b519b4 logs class/cause, text at DEBUG	changed
+catalog/conform.rs	catalog_bookkeeping_error	warn	site	1	StoreError; 62b519b4 logs class/cause, text at DEBUG	changed
+catalog/conform.rs	catalog_conform_skip	warn	call:skip_file	1	via skip_file: walk_parquet_files_lossy io::Error to_string()	D2b
+catalog/conform.rs	catalog_conform_claims_unreadable	warn	site	1	String from scan_claims: list_wal_envs io::Error with path	D2b
+catalog/conform.rs	catalog_conform_rollups_unreadable	warn	site	1	io::Error from pending_rollup_days	D2b
+catalog/conform.rs	catalog_conform_scan_start	info	site	1	none	unchanged: no error text
+catalog/conform.rs	catalog_conform_skip	warn	call:skip_file	2	via skip_file: fixed layout reason	unchanged: fixed text trawl wrote
+catalog/conform.rs	catalog_conform_skip	warn	call:skip_file	3	via skip_file: fixed publication reason	unchanged: fixed text trawl wrote
+catalog/conform.rs	catalog_conform_skip	warn	call:skip_file	4	via skip_file: fixed rollup reason	unchanged: fixed text trawl wrote
+catalog/conform.rs	catalog_conform_skip	warn	call:skip_file	5	via skip_file: fixed sniff reason, moved to this call by 62b519b4	unchanged: fixed text trawl wrote
+catalog/conform.rs	catalog_conform_skip	warn	call:skip_failed	1	via skip_failed: StatementFailure from scan_file (DuckDB text); was skip_file(e.to_string()) before 62b519b4	changed
+catalog/conform.rs	catalog_conform_row_count_unreadable	warn	site	1	ParquetStatsError (io Open, parquet footer); ed3e6907 logs class/cause, text at DEBUG	changed
+catalog/conform.rs	maintenance_resource_exhausted	error	call:duckdb	1	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+catalog/conform.rs	catalog_conform_skip	warn	call:skip_failed	2	via skip_failed: StatementFailure from rewrite_file (DuckDB text); 62b519b4	changed
+catalog/conform.rs	maintenance_resource_exhausted	error	call:duckdb	2	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+catalog/conform.rs	catalog_conform_rewrite	info	site	1	none	unchanged: no error text
+catalog/gc.rs	catalog_gc_reconcile_failed	error	site	1	StoreError by class	unchanged: class/cause only
+catalog/gc.rs	catalog_pin_gc_complete	info	site	1	none	unchanged: no error text
+catalog/gc.rs	catalog_pin_gc	info	site	1	none	unchanged: no error text
+engine_sample.rs	engine_sample_panicked	error	site	1	none	unchanged: no error text
+env_dirs.rs	-	warn	call:warn_unlisted	1	via warn_unlisted: io::Error from read_dir	D2b
+env_dirs.rs	-	warn	site	1	helper warn_unlisted: std::io::Error	D2b
+epoch.rs	epoch_dir_fsync_failed	warn	site	1	std::io::Error from fsync	D2b
+error.rs	-	error	call:auth_backend_fault	1	via auth_backend_fault: fleet_auth::AuthError source; class/cause only	unchanged: class/cause only
+error.rs	-	error	site	1	StoreError::Unavailable by class/cause; text at DEBUG	unchanged: class/cause only
+error.rs	-	error	site	2	StoreError::Migration by class/cause; text at DEBUG	unchanged: class/cause only
+error.rs	report_window_error	error	site	1	ServerError window plan by class/cause; text at DEBUG	unchanged: class/cause only
+error.rs	missing_prepared_pattern	error	site	1	EngineError::MissingPreparedPattern by class/cause; text at DEBUG	unchanged: class/cause only
+error.rs	internal_error	error	site	1	ServerError::Internal/Panicked by class/cause; text at DEBUG	unchanged: class/cause only
+error.rs	-	error	site	3	helper auth_backend_fault: fleet_auth error by class/cause; text at DEBUG; what is a literal	unchanged: class/cause only
+error.rs	-/internal_error/missing_prepared_pattern/report_window_error	error	call:log_fault	1	via log_fault: the ServerError itself; class/cause only	unchanged: class/cause only
+from_saved.rs	from_saved_run_file_unresolved	warn	site	1	io::ErrorKind Display	unchanged: closed enum
+handlers.rs	query_start	info	site	1	none	unchanged: no error text
+handlers.rs	history_error	warn	site	1	StoreError; e4c1d44d logs class/cause, text at DEBUG	changed
+handlers.rs	history_error	warn	site	2	none	unchanged: no error text
+handlers.rs	query_complete	info	site	1	none	unchanged: no error text
+handlers.rs	query_timeout	warn	site	1	none	unchanged: no error text
+handlers.rs	query_failed	warn	site	1	ServerError by class	unchanged: class/cause only
+handlers.rs	query_failed	error	site	1	ServerError by class	unchanged: class/cause only
+handlers.rs	schema_facts_refresh	info	site	1	none	unchanged: no error text
+handlers.rs	query_cancelled	info	site	1	none	unchanged: no error text
+handlers.rs	field_degraded_acked	info	site	1	none	unchanged: no error text
+handlers.rs	field_degraded_ack_cleared	info	site	1	reason is a literal; actor name and prefix	unchanged: no error text
+handlers.rs	field_values_cache_hit	info	site	1	none	unchanged: no error text
+handlers.rs	field_values_complete	info	site	1	none	unchanged: no error text
+handlers.rs	history_cleared	info	site	1	none	unchanged: no error text
+handlers.rs	repin_store_error	error	site	1	StoreError by class	unchanged: class/cause only
+handlers.rs	report_run_parquet_read_failed	warn	site	1	ServerError by class/cause	unchanged: class/cause only
+handlers.rs	report_run_parquet_read_failed	warn	site	2	trawl_engine EngineError (DuckDB text); 746047a8 logs class/cause, text at DEBUG	changed
+handlers.rs	report_run_parquet_task_failed	error	site	1	ServerError by class	unchanged: class/cause only
+handlers.rs	export_start	info	site	1	none	unchanged: no error text
+handlers.rs	export_complete	info	site	1	none	unchanged: no error text
+handlers.rs	export_complete	info	site	2	none	unchanged: no error text
+handlers.rs	history_error	warn	site	3	none	unchanged: no error text
+handlers.rs	history_error	warn	site	4	StoreError by class	unchanged: class/cause only
+handlers.rs	history_error	warn	site	5	none	unchanged: no error text
+handlers.rs	stream_start	info	site	1	none	unchanged: no error text
+hot_buffer.rs	hot_buffer_duplicate_batch	error	site	1	none	unchanged: no error text
+ingest/compaction.rs	lifecycle	info	site	1	none	unchanged: no error text
+ingest/compaction.rs	lifecycle	info	site	2	none	unchanged: no error text
+ingest/compaction.rs	lifecycle	info	site	3	none	unchanged: no error text
+ingest/compaction.rs	compaction_error	error	site	1	String from compact_pass: io listings, fixed repin-pause text, join_failure_text	D2b
+ingest/compaction.rs	compaction_error	error	site	2	PublishIncomplete.error: io fsync, retire and marker-removal text	D2b
+ingest/compaction.rs	compaction_error	error	site	3	String mixing DuckDB, store and io text; a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	coverage_proof	info	site	1	none	unchanged: no error text
+ingest/compaction.rs	rollup_suppressed	info	site	1	none	unchanged: no error text
+ingest/compaction.rs	rollup_error	error	site	1	String from rollup_once: io listings, join_failure_text, fixed proof text	D2b
+ingest/compaction.rs	rollup_error	error	site	2	String from scan_claims: io only	D2b
+ingest/compaction.rs	publication_recovery_failed	error	site	1	String from publication_marker::recover: list_wal_envs io::Error	D2b
+ingest/compaction.rs	rollup_boot_recovery	error	site	1	none	unchanged: no error text
+ingest/compaction.rs	rollup_boot_recovery	info	site	1	none	unchanged: no error text
+ingest/compaction.rs	rollup_boot_recovery	error	site	2	none	unchanged: no error text
+ingest/compaction.rs	-	warn	site	1	io::Error from try_list_env_dirs_observed	D2b
+ingest/compaction.rs	rollup_suppressed	info	site	2	none	unchanged: no error text
+ingest/compaction.rs	rollup_blocked	info	site	1	none	unchanged: no error text
+ingest/compaction.rs	rollup_blocked	info	site	2	none	unchanged: no error text
+ingest/compaction.rs	rollup_error	error	site	3	String from rollup marker recovery: io, fixed proof and day text	D2b
+ingest/compaction.rs	rollup_error	error	site	4	String from the rollup merge (DuckDB and io); a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	rollup_recovery	info	site	1	none	unchanged: no error text
+ingest/compaction.rs	rollup_recovery	info	site	2	none	unchanged: no error text
+ingest/compaction.rs	rollup_recovery	warn	site	1	none	unchanged: no error text
+ingest/compaction.rs	rollup_recovery_unresolved	error	site	1	rollup_marker::Proof label	unchanged: closed enum
+ingest/compaction.rs	rollup_recovery_unresolved	error	site	2	LOGGED_INVALID constant, not the day name	unchanged: fixed text trawl wrote
+ingest/compaction.rs	{event_type}	error	site	1	String from quarantine_target: io::Error with path	D2b
+ingest/compaction.rs	{event_type}	warn	site	1	none	unchanged: no error text
+ingest/compaction.rs	quarantine_reservation_stranded	warn	site	1	io::Error from remove_file	D2b
+ingest/compaction.rs	{event_type}	error	site	2	io::Error from rename	D2b
+ingest/compaction.rs	rollup_data_loss	error	site	1	none	unchanged: no error text
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	1	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	rollup_unreadable	error	site	1	StatementFailure; a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	rollup_complete	info	site	1	none	unchanged: no error text
+ingest/compaction.rs	catalog_bookkeeping_error	warn	site	1	StoreError; a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	catalog_bookkeeping_timeout	warn	site	1	none	unchanged: no error text
+ingest/compaction.rs	compaction_isolation	warn	site	1	ServerError (engine/store); a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	compaction_depth_fallback	warn	site	1	duckdb::Error; a57556c7 logs CauseKind::of_duckdb, text at DEBUG	changed
+ingest/compaction.rs	compaction_provenance_rename	warn	site	1	duckdb::Error; a57556c7 logs CauseKind::of_duckdb, text at DEBUG	changed
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	2	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	3	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	4	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	5	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	maintenance_resource_exhausted	error	site	1	helper StatementFailure::duckdb: duckdb::Error (out of memory); a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	6	via StatementFailure::duckdb from statement_failed: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	7	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	8	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	9	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	10	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	catalog_invariant_violation	error	site	1	StatementFailure, path kept; a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	compaction_data_loss	error	site	1	none	unchanged: no error text
+ingest/compaction.rs	compaction_data_loss	error	site	2	none	unchanged: no error text
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	11	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	catalog_sample_capture_failed	warn	site	1	StatementFailure or serde text from capture_samples; a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	maintenance_resource_exhausted	error	call:duckdb	12	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	compaction_complete	info	site	1	none	unchanged: no error text
+ingest/compaction.rs	catalog_pin_deferred	info	site	1	column names (ingest data, not error text)	unchanged: no error text
+ingest/compaction.rs	compaction_error	error	site	4	io::Error from scan_wal_files	D2b
+ingest/handler.rs	wal_write_failed	warn	site	1	WalWriteError: io::Error, or sync and withdraw io::Errors	D2b
+ingest/handler.rs	ingest_rejections	warn	site	1	Rejection messages: bounded client values, fixed reasons, serde_json parse wording (ingest/body.rs:213)	unchanged: decided: ADR-0053 keeps the rejection samples
+ingest/handler.rs	ingest_repairs	warn	site	1	RepairDetail text: trawl's repair codes with sender service names and counts	unchanged: fixed text trawl wrote
+ingest/handler.rs	ingest_complete	info	site	1	RepairDetail text: trawl's repair codes with sender service names and counts	unchanged: fixed text trawl wrote
+ingest/handler.rs	ingest_body_too_large	warn	site	1	none	unchanged: no error text
+ingest/hydration/mod.rs	boot_hydration	info	site	1	none	unchanged: no error text
+ingest/pipeline.rs	pipeline_wal_write_failed	warn	call:record_discarded_group	1	via record_discarded_group: WalWriteError (io only)	D2b
+ingest/pipeline.rs	pipeline_wal_write_failed	warn	site	1	helper record_discarded_group: WalWriteError (io only)	D2b
+ingest/publication_marker.rs	publication_recovery_failed	error	site	1	String: list_markers io::Error with path	D2b
+ingest/publication_marker.rs	publication_recovered/publication_recovery_failed	info/error	call:log_outcome	1	via log_outcome: Result from recover_one; Err is io and fixed text, Contradictory is a closed reason	D2b
+ingest/publication_marker.rs	publication_recovered	info	site	1	none	unchanged: no error text
+ingest/publication_marker.rs	publication_recovered	info	site	2	none	unchanged: no error text
+ingest/publication_marker.rs	publication_recovery_failed	error	site	2	Contradiction reason; InvalidMarker serde_json text; ed3e6907 logs the reason in trawl's words, serde text at DEBUG	changed
+ingest/publication_marker.rs	publication_recovery_failed	error	site	3	String from recover_one: MarkerError Io/Missing, hash io, fixed text; the drain closures return Ok	D2b
+ingest/wal.rs	wal_tmp_unlink_failed	warn	site	1	io::Error from remove_file	D2b
+ingest/wal.rs	wal_dir_fsync_failed	warn	site	1	io::Errors from sync_directory and the withdrawal	D2b
+ingest/wal.rs	wal_dir_fsync_failed	warn	site	2	io::Error from fsync	D2b
+ingest/wal.rs	wal_dir_fsync_failed	warn	site	3	io::Error from fsync	D2b
+investigations/service.rs	investigation_promotion_in_doubt	warn	site	1	id and grace; fixed message	unchanged: no error text
+investigations/service.rs	investigation_promotion_settled	info	site	1	none	unchanged: no error text
+investigations/service.rs	investigation_activity_failed	warn	site	1	StoreError by class	unchanged: class/cause only
+investigations/service.rs	results_unlink_failed	warn	site	1	io::Error from ResultsRoot::unlink	D2b
+investigations/service.rs	results_unlink_failed	warn	site	2	tokio JoinError; 746047a8 logs join_failure_text, payload dropped	changed
+investigations/step.rs	investigation_step	info	site	1	none	unchanged: no error text
+investigations/step.rs	investigation_step_past_deadline	warn	site	1	none	unchanged: no error text
+investigations/step.rs	investigation_step	info/warn	call:log	1	via log: Result<bool, StoreError>; class only	unchanged: class/cause only
+investigations/step.rs	investigation_step	info	site	2	none	unchanged: no error text
+investigations/step.rs	investigation_step	warn	site	1	helper log: StoreError by class	unchanged: class/cause only
+investigations/step.rs	investigation_step	info/warn	call:log	2	via log: Result<bool, StoreError>; class only	unchanged: class/cause only
+live.rs	stream_job_lost	error	site	1	none	unchanged: no error text
+live.rs	stream_missing_prepared_pattern	error	call:log_missing_prepared_pattern	1	via log_missing_prepared_pattern: PatternError from a running stream (Missing, Computed or a RegexRefusal)	unchanged: fixed text trawl wrote
+live.rs	stream_lagged	warn	site	1	none	unchanged: no error text
+live.rs	stream_missing_prepared_pattern	error	site	1	helper log_missing_prepared_pattern: PatternError fixed sentences; Syntax arises only at preparation	unchanged: fixed text trawl wrote
+live.rs	stream_frame_unencodable	error	site	1	serde_json::Error; ed3e6907 logs class/cause, text at DEBUG	changed
+main.rs	config_warning	warn	site	1	RUST_LOG parse error; ed3e6907 keeps a fixed sentence, parse error at DEBUG	changed
+main.rs	crash_dump	info/warn	call:log_crash_dump	1	via log_crash_dump: trawl_crashdump Status, closed enums and a path	unchanged: closed enum
+main.rs	lifecycle	info	site	1	none	unchanged: no error text
+main.rs	config_warning	warn	site	2	config.warnings(): four fixed literals	unchanged: fixed text trawl wrote
+main.rs	lifecycle	info	site	2	none	unchanged: no error text
+main.rs	lifecycle	error	site	1	none	unchanged: no error text
+main.rs	epoch_gate	info	site	1	epoch::Outcome enum (Debug)	unchanged: closed enum
+main.rs	query_log_enabled	warn	site	1	configured path and size	unchanged: no error text
+main.rs	lifecycle	info	site	3	none	unchanged: no error text
+main.rs	lifecycle	info	site	4	none	unchanged: no error text
+main.rs	lifecycle	error	site	2	ServerError from http::serve (rustls/PEM text in Internal); ed3e6907 logs class/cause, text at DEBUG	changed
+main.rs	lifecycle	error	site	3	io::Error from monitor::run	D2b
+main.rs	task_panic	warn	site	1	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+main.rs	publication_recovery	info	site	1	none	unchanged: no error text
+main.rs	task_panic	warn	site	2	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+main.rs	lifecycle	info	site	5	none	unchanged: no error text
+main.rs	lifecycle	info	site	6	none	unchanged: no error text
+main.rs	env_not_in_allowlist	warn	site	1	none	unchanged: no error text
+main.rs	retention_env_without_dir	warn	site	1	none	unchanged: no error text
+main.rs	crash_dump	info	expand:emit!	1	helper log_crash_dump (emit! info): readiness and FailureReason closed enums, dump dir path, fixed message	unchanged: closed enum
+main.rs	crash_dump	warn	expand:emit!	1	helper log_crash_dump (emit! warn): readiness and FailureReason closed enums, dump dir path, fixed message	unchanged: closed enum
+main.rs	lifecycle	info	site	7	none	unchanged: no error text
+main.rs	lifecycle	info	site	8	none	unchanged: no error text
+main.rs	config_warning	warn	site	3	rustix Errno from setrlimit (an OS errno)	D2b
+monitor/mod.rs	monitor_schedule_count_error	warn	site	1	StoreError; e4c1d44d logs class/cause, text at DEBUG	changed
+owner_only.rs	storage_root_closed	warn	site	1	root kind, path and octal modes	unchanged: no error text
+policy.rs	-	warn	site	1	role permission string from the keystore (config data, not error text)	unchanged: no error text
+policy.rs	-	error	site	1	none	unchanged: no error text
+policy.rs	auth_failure	info	site	1	key name and roles on trawl_server::policy::unmetered	unchanged: unmetered target, never persisted
+pool.rs	query_request_abandoned	info	site	1	none	unchanged: no error text
+pool.rs	query_not_started	info	site	1	StartRefusal closed enum	unchanged: closed enum
+pool.rs	pool_invariant	error	site	1	none	unchanged: no error text
+pool.rs	query_permit_retained	info	site	1	none	unchanged: no error text
+pool.rs	pool_pressure	warn	site	1	none	unchanged: no error text
+pool.rs	pool_pressure	warn	site	2	none	unchanged: no error text
+pool.rs	pool_exclusive_blocked	warn	site	1	none	unchanged: no error text
+pool.rs	lifecycle	info	site	1	none	unchanged: no error text
+pool.rs	capture_refused	warn	site	1	reason is a literal; sizes	unchanged: no error text
+prepare.rs	preparation_refused	info	site	1	none	unchanged: no error text
+prepare.rs	preparation_reclaimed	info	site	1	none	unchanged: no error text
+prepare.rs	preparation_retained	info	site	1	closed enum as_str	unchanged: closed enum
+publication.rs	publication_scan_failed	error	site	1	io::Error from scan_markers	D2b
+publication.rs	publication_scan_recovered	info	site	1	none	unchanged: no error text
+publication.rs	corpus_settled	info	site	1	none	unchanged: no error text
+publication.rs	rollup_removal_sync_owed	error	call:log_removal_sync_owed	1	via log_removal_sync_owed: io::Error	D2b
+publication.rs	rollup_removal_sync_owed	error	call:log_removal_sync_owed	2	via log_removal_sync_owed: io::Error	D2b
+publication.rs	rollup_removal_sync_owed	error	site	1	helper log_removal_sync_owed: io::ErrorKind (Debug)	unchanged: closed enum
+query_log.rs	{event_type}	warn	call:check_owner_only	1	via check_owner_only: chmod io::Error	D2b
+query_log.rs	{event_type}	warn	site	1	helper check_owner_only: chmod io::Error	D2b
+query_log.rs	-	warn	site	1	serde_json::Error; ed3e6907 logs class/cause, text at DEBUG	changed
+query_log.rs	-	warn	site	2	none	unchanged: no error text
+query_log.rs	-	warn	site	3	io::Error from rollover	D2b
+query_log.rs	-	warn	site	4	io::Error from write	D2b
+query_log.rs	-	warn	site	5	io::Error from flush	D2b
+query_log.rs	-	error	site	1	io::Errors from restore and reopen	D2b
+query_timing.rs	query_timing	info	site	1	outcome by class	unchanged: class/cause only
+query_timing.rs	query_permit_reclaimed	info	site	1	none	unchanged: no error text
+rate_limit.rs	rate_limit_exceeded	warn	site	1	none	unchanged: no error text
+repin/cancel.rs	repin_cancel_registry_overlap	warn	site	1	none	unchanged: no error text
+repin/cancel.rs	repin_cancel_requested	info	site	1	none	unchanged: no error text
+repin/cancel.rs	repin_cancelled	info	site	1	none	unchanged: no error text
+repin/cancel.rs	repin_cancel_refused	info	site	1	none	unchanged: no error text
+repin/cutover.rs	repin_shadow_sweep_failed	warn	site	1	io::Error from remove_dir_all	D2b
+repin/cutover.rs	repin_stale_aside_parked	warn	site	1	none	unchanged: no error text
+repin/cutover.rs	repin_sweep_failed	warn	site	1	io::Error; what is a literal	D2b
+repin/cutover.rs	repin_marker_error	warn	site	1	String from remove_marker: io::Error with path	D2b
+repin/engine.rs	repin_claim_unanswered	warn	site	1	none	unchanged: no error text
+repin/engine.rs	repin_start	info	site	1	none	unchanged: no error text
+repin/engine.rs	repin_cancel_unobserved	warn	site	1	job id and actor	unchanged: no error text
+repin/engine.rs	repin_store_error	error	site	1	StoreError by class	unchanged: class/cause only
+repin/engine.rs	repin_staging_unreadable	error	site	1	io::Error from staging_evidence	D2b
+repin/engine.rs	repin_staging_unreadable	error	site	2	none	unchanged: no error text
+repin/engine.rs	repin_staging_unreadable	error	site	3	String mixing io and serde_json (read_marker); ed3e6907 logs class/cause, text at DEBUG	changed
+repin/engine.rs	repin_store_error	error	site	2	StoreError by class	unchanged: class/cause only
+repin/engine.rs	catalog_bookkeeping_error	warn	call:log_store_fault	1	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+repin/engine.rs	repin_store_retry	warn	call:log_store_fault	1	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+repin/engine.rs	repin_store_error	error	call:log_store_fault	1	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+repin/engine.rs	repin_store_recovered	info	site	1	none	unchanged: no error text
+repin/engine.rs	repin_store_retry	warn	call:log_store_fault	2	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+repin/engine.rs	repin_store_error	error	site	3	StoreError by class	unchanged: class/cause only
+repin/engine.rs	repin_complete	info	site	1	none	unchanged: no error text
+repin/engine.rs	repin_abandoned	warn	site	1	JobAbort::Failed String (DuckDB, serde, io); ed3e6907 logs class/cause, text at DEBUG	changed
+repin/engine.rs	repin_abandoned	warn	site	2	blocked, refused or cancelled sentence trawl wrote (split from the failed branch by ed3e6907)	unchanged: fixed text trawl wrote
+repin/engine.rs	repin_sweep_failed	warn	site	1	StepDied: fixed "{what} task panicked" or "was cancelled"	unchanged: fixed text trawl wrote
+repin/engine.rs	repin_marker_error	warn	site	1	String from remove_marker: io::Error with path	D2b
+repin/engine.rs	repin_recovery_incomplete	warn	site	1	none	unchanged: no error text
+repin/engine.rs	repin_pass	info	site	1	none	unchanged: no error text
+repin/engine.rs	repin_store_error	error	call:log_store_fault	2	via log_store_fault: StoreError; 17b8f28a routes it through the helper	changed
+repin/engine.rs	repin_force_accepted	info	site	1	none	unchanged: no error text
+repin/engine.rs	repin_cutover_fatal	error	site	1	String from swap_envs (io and paths); 17b8f28a logs internal/unknown, text at DEBUG	changed
+repin/engine.rs	field_degraded_ack_cleared	info	site	1	reason is a literal; field name	unchanged: no error text
+repin/engine.rs	repin_flip_retry	warn	call:log_store_fault	1	via log_store_fault: StoreError; 17b8f28a routes it through the helper	changed
+repin/engine.rs	repin_cutover_fatal	error	call:log_store_fault	1	via log_store_fault: StoreError; 17b8f28a routes it through the helper	changed
+repin/engine.rs	repin_marker_error	warn	site	2	String mixing serde_json and io (write_marker); ed3e6907 logs class/cause, text at DEBUG	changed
+repin/engine.rs	repin_sweep_failed	warn	site	2	StepDied: fixed text	unchanged: fixed text trawl wrote
+repin/engine.rs	repin_store_error	warn	call:log_store_fault	1	via log_store_fault: StoreError; 17b8f28a routes it through the helper	changed
+repin/engine.rs	repin_publication_claims_unreadable	error	site	1	String from scan_claims: io only	D2b
+repin/engine.rs	repin_publication_claims_unreadable	error	site	2	StepDied: fixed text	unchanged: fixed text trawl wrote
+repin/engine.rs	repin_cutover_refused	warn	site	1	refusal: fixed literal	unchanged: fixed text trawl wrote
+repin/engine.rs	{event_type}	warn	site	1	helper log_store_fault: StoreError by class/cause; text at DEBUG	unchanged: class/cause only
+repin/engine.rs	{event_type}	error	site	1	helper log_store_fault: StoreError by class/cause; text at DEBUG	unchanged: class/cause only
+repin/recover.rs	repin_stale_shadow	warn	site	1	none	unchanged: no error text
+repin/recover.rs	repin_stale_aside	warn	site	1	none	unchanged: no error text
+repin/recover.rs	repin_recovery_deferred	warn	site	1	none	unchanged: no error text
+repin/recover.rs	repin_recovered	info	site	1	RepinPhase and RecoveredAction enums (Debug)	unchanged: closed enum
+repin/recover.rs	field_degraded_ack_cleared	info	site	1	reason is a literal; field name	unchanged: no error text
+repin/recover.rs	repin_recovery_incomplete	warn	site	1	RecoveredAction enum (Debug)	unchanged: closed enum
+repin/recover.rs	repin_orphans_reconciled	warn	site	1	none	unchanged: no error text
+repin/rewrite.rs	repin_sample_failed	warn	site	1	StatementFailure (DuckDB/serde); ed3e6907 logs class/cause, text at DEBUG	changed
+repin/rewrite.rs	maintenance_resource_exhausted	error	call:duckdb	1	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+results/charge.rs	{what.error_event()}	warn	call:warn_retire_store	1	via warn_retire_store: StoreError by class	unchanged: class/cause only
+results/charge.rs	{what.error_event()}	warn	call:warn_retire_store	2	via warn_retire_store: StoreError by class	unchanged: class/cause only
+results/charge.rs	{what.error_event()}	warn	call:warn_retire	1	via warn_retire: io::Error from ResultsRoot::unlink	D2b
+results/charge.rs	{what.error_event()}	warn	call:warn_retire	2	via warn_retire: tokio JoinError; 746047a8 passes join_failure_text	changed
+results/charge.rs	{what.error_event()}	warn	site	1	helper warn_retire: dyn Display, io::Error (:693) or join_failure_text (:710)	D2b
+results/charge.rs	{what.error_event()}	warn	site	2	helper warn_retire_store: StoreError by class	unchanged: class/cause only
+results/compare.rs	-	warn	call:unlisted	1	via unlisted: FirstEnvNamesError::Root (io::Error)	D2b
+results/compare.rs	-	warn	site	1	helper unlisted: FirstEnvNamesError::Root io::Error	D2b
+results/compare.rs	-	warn	site	2	helper unlisted: FirstEnvNamesError::Entry io::Error	D2b
+results/compare.rs	-	warn	call:unlisted	2	via unlisted: FirstEnvNamesError::Entry (io::Error)	D2b
+results/root.rs	results_stage_unlink_failed	warn	site	1	io::Error from unlink	D2b
+results/root.rs	results_root_foreign_entry	warn	site	1	fixed what literals; entry is a file name	unchanged: fixed text trawl wrote
+results/service.rs	query_start	info	site	1	none	unchanged: no error text
+results/service.rs	history_error	warn	call:log_history_failed	1	via log_history_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	history_error	warn	site	1	none	unchanged: no error text
+results/service.rs	query_complete	info	site	1	none	unchanged: no error text
+results/service.rs	query_timeout	warn	site	1	none	unchanged: no error text
+results/service.rs	query_failed	warn	site	1	ServerError by class	unchanged: class/cause only
+results/service.rs	query_failed	error	site	1	ServerError by class	unchanged: class/cause only
+results/service.rs	capture_refused	warn	site	1	reason is a literal; sizes	unchanged: no error text
+results/service.rs	capture_refused	warn	site	2	reason is a literal; scope and sizes	unchanged: no error text
+results/service.rs	capture_refused	warn	site	3	reason: fixed literal	unchanged: fixed text trawl wrote
+results/service.rs	results_unlink_failed	warn	site	1	io::Error from ResultsRoot::unlink	D2b
+results/service.rs	results_commit_fenced	warn	call:log_fenced	1	via log_fenced: StoreError by class	unchanged: class/cause only
+results/service.rs	results_commit_fenced	warn	call:log_fenced	2	via log_fenced: StoreError by class	unchanged: class/cause only
+results/service.rs	history_error	warn	site	2	helper log_history_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	results_commit_fenced	warn	site	1	helper log_fenced: StoreError by class; message is a literal	unchanged: class/cause only
+results/service.rs	results_commit_unreadable	warn	site	1	none	unchanged: no error text
+results/service.rs	results_commit_unreadable	warn	site	2	StoreError by class	unchanged: class/cause only
+results/service.rs	results_commit_orphaned	error	site	1	none	unchanged: no error text
+results/service.rs	results_commit_in_doubt	warn	site	1	none	unchanged: no error text
+results/service.rs	results_commit_settled	info	site	1	none	unchanged: no error text
+results/service.rs	results_commit_settled	info	site	2	none	unchanged: no error text
+results/service.rs	results_commit_settled	warn	site	1	none	unchanged: no error text
+results/service.rs	results_expire_failed	warn	site	1	helper log_expire_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	results_expire_failed	warn	call:log_expire_failed	1	via log_expire_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	results_unlink_failed	warn	site	2	io::Error from ResultsRoot::unlink	D2b
+results/service.rs	results_unlink_failed	warn	site	3	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+results/service.rs	results_mark_missing_failed	warn	call:log_mark_missing_failed	1	via log_mark_missing_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	results_mark_missing_failed	warn	site	1	helper log_mark_missing_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	result_corrupt	error	site	1	none	unchanged: no error text
+results/sweep.rs	results_reconcile	info	site	1	none	unchanged: no error text
+results/sweep.rs	results_sweep_error	warn	call:warn_store	1	via warn_store: StoreError by class	unchanged: class/cause only
+results/sweep.rs	results_sweep_error	warn	call:warn_store	2	via warn_store: StoreError by class	unchanged: class/cause only
+results/sweep.rs	results_sweep_error	warn	call:warn_store	3	via warn_store: StoreError by class	unchanged: class/cause only
+results/sweep.rs	results_sweep_error	warn	call:warn	1	via warn: io::Error, or io::Error::other(join_failure_text) from on_root	D2b
+results/sweep.rs	results_sweep_error	warn	call:warn_store	4	via warn_store: StoreError by class	unchanged: class/cause only
+results/sweep.rs	results_sweep	info	site	1	none	unchanged: no error text
+results/sweep.rs	lifecycle	info	site	1	none	unchanged: no error text
+results/sweep.rs	lifecycle	info	site	2	none	unchanged: no error text
+results/sweep.rs	results_sweep_error	warn	site	1	helper warn: dyn Display, io::Error or io::Error::other(join_failure_text)	D2b
+results/sweep.rs	results_sweep_error	warn	site	2	helper warn_store: StoreError by class	unchanged: class/cause only
+results/sweep.rs	results_sweep_error	warn	call:warn	2	via warn: io::Error from ResultsRoot::unlink	D2b
+results/sweep.rs	results_sweep_error	warn	call:warn	3	via warn: io::Error::other(join_failure_text) from on_root	D2b
+results/sweep.rs	results_sweep_error	warn	call:warn	4	via warn: io::Error from the file age read	D2b
+results/sweep.rs	results_sweep_error	warn	call:warn	5	via warn: io::Error from ResultsRoot::unlink	D2b
+results/sweep.rs	results_sweep_error	warn	call:warn	6	via warn: io::Error::other(join_failure_text) from on_root	D2b
+retention.rs	lifecycle	info	site	1	none	unchanged: no error text
+retention.rs	retention_error	error	site	1	String from retention_tick: io and fixed text	D2b
+retention.rs	retention_error	error	site	2	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+retention.rs	lifecycle	info	site	2	none	unchanged: no error text
+retention.rs	retention_repin_suppressed	info	site	1	what: &'static str from repin_in_flight	unchanged: fixed text trawl wrote
+retention.rs	retention_publication_claims_unreadable	warn	site	1	String from scan_claims: io only	D2b
+retention.rs	retention_publication_claimed	info	site	1	none	unchanged: no error text
+retention.rs	retention_delete	info	site	1	none	unchanged: no error text
+retention.rs	retention_error	error	site	3	String from remove_dir_all: io::Error	D2b
+retention.rs	retention_sweep	info	site	1	none	unchanged: no error text
+retention.rs	retention_disk_pressure	warn	site	1	none	unchanged: no error text
+retention.rs	retention_delete	info	site	2	none	unchanged: no error text
+retention.rs	retention_error	error	site	4	String from remove_dir_all: io::Error	D2b
+retention.rs	retention_repin_suppressed	info	site	2	what: &'static str from repin_in_flight	unchanged: fixed text trawl wrote
+retention.rs	retention_publication_claimed	info	site	2	none	unchanged: no error text
+retention.rs	retention_publication_claims_unreadable	warn	site	2	String from scan_claims: io only	D2b
+retention.rs	retention_repin_evidence_unreadable	warn	site	1	io::Error from in_flight_evidence	D2b
+scheduler.rs	scheduler_started	info	site	1	none	unchanged: no error text
+scheduler.rs	scheduler_shutdown	info	site	1	none	unchanged: no error text
+scheduler.rs	scheduler_retention_error	warn	site	1	StoreError; 2d4d4a25 logs class/cause, text at DEBUG	changed
+scheduler.rs	scheduler_paused	info	site	1	pause reason label, closed enum	unchanged: closed enum
+scheduler.rs	scheduler_resumed	info	site	1	none	unchanged: no error text
+scheduler.rs	scheduler_error	error	site	1	StoreError; 2d4d4a25 logs class/cause, text at DEBUG	changed
+scheduler.rs	scheduler_error	error	site	2	StoreError by class	unchanged: class/cause only
+scheduler.rs	scheduler_window_truncated	warn	site	1	none	unchanged: no error text
+scheduler.rs	scheduler_error	warn	site	1	fleet_auth::AuthError; 2d4d4a25 logs class/cause, text at DEBUG	changed
+scheduler.rs	scheduler_skip	info	site	1	none	unchanged: no error text
+scheduler.rs	scheduled_query_completed	info	site	1	none	unchanged: no error text
+scheduler.rs	scheduled_query_failed	warn	site	1	ServerError by class	unchanged: class/cause only
+scheduler.rs	scheduled_query_failed	warn	site	2	none	unchanged: no error text
+scheduler.rs	scheduler_error	error	call:log_store_fault	1	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+scheduler.rs	scheduler_error	error	site	3	helper log_store_fault: StoreError by class/cause; what is a literal	unchanged: class/cause only
+scheduler.rs	scheduler_orphan_cleanup	info	site	1	none	unchanged: no error text
+scheduler.rs	scheduler_error/scheduler_orphan_cleanup	info/error	call:recover_ambiguous_finish	1	via recover_ambiguous_finish: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+scheduler.rs	scheduler_error	error	site	4	helper recover_ambiguous_finish: StoreError by class/cause	unchanged: class/cause only
+scheduler.rs	scheduler_orphan_cleanup	info	site	2	none	unchanged: no error text
+scheduler.rs	scheduler_error	error	call:log_store_fault	2	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+scheduler.rs	result_file_already_absent	info	site	1	none	unchanged: no error text
+scheduler.rs	result_file_cleanup_error	warn	site	1	io::ErrorKind Display	unchanged: closed enum
+scheduler.rs	scheduler_parquet_error	warn	site	1	io::ErrorKind Display	unchanged: closed enum
+scheduler.rs	scheduler_parquet_error	warn	call:log_parquet_engine_fault	1	via log_parquet_engine_fault: EngineError; class/cause, text at DEBUG	unchanged: class/cause only
+scheduler.rs	scheduler_result_blob	info	site	1	none	unchanged: no error text
+scheduler.rs	scheduler_parquet_error	warn	call:log_parquet_engine_fault	2	via log_parquet_engine_fault: EngineError; class/cause, text at DEBUG	unchanged: class/cause only
+scheduler.rs	scheduler_parquet_error	warn	site	2	io::ErrorKind Display	unchanged: closed enum
+scheduler.rs	scheduler_parquet_error	warn	site	3	helper log_parquet_engine_fault: EngineError by class/cause; what is a literal	unchanged: class/cause only
+scheduler.rs	run_result_blob_zstd_decode_failed	warn	site	1	io::Error carrying zstd codec text; 746047a8 logs class/cause, text at DEBUG	changed
+scheduler.rs	run_result_blob_deserialize_failed	warn	site	1	serde_json::Error; 2d4d4a25 logs class/cause, text at DEBUG	changed
+schema_refresh.rs	schema_refresh_complete	info	site	1	none	unchanged: no error text
+schema_refresh.rs	schema_refresh_error	warn	site	1	Box<dyn Error> from walk_parquet_files: io::Error	D2b
+schema_refresh.rs	schema_refresh_panic	warn	site	1	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+schema_refresh.rs	degraded_refresh_error	warn	site	1	StoreError; e4c1d44d logs class/cause, text at DEBUG	changed
+schema_refresh.rs	schema_refresh_unpinned_columns	warn	site	1	column names (ingest data, not error text)	unchanged: no error text
+schema_refresh.rs	schema_refresh_file_skip	warn	site	1	ParquetStatsError (parquet footer text); e4c1d44d logs class/cause, text at DEBUG	changed
+shutdown.rs	shutdown_signal	info	site	1	none	unchanged: no error text
+shutdown.rs	shutdown_signal	info	site	2	none	unchanged: no error text
+state.rs	lifecycle	info	site	1	none	unchanged: no error text
+state.rs	lifecycle	info	site	2	none	unchanged: no error text
+stats.rs	lifecycle	info	site	1	none	unchanged: no error text
+stats.rs	stats_collection_failed	warn	site	1	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+stats.rs	server_stats	info	site	1	none	unchanged: no error text
+store/catalog.rs	catalog_pin_purge_commit_failed	warn	site	1	sqlx::Error; 9d0e846a logs class/cause, text at DEBUG	changed
+store/catalog.rs	catalog_pin_purge_commit_late	info	site	1	none	unchanged: no error text
+store/catalog.rs	catalog_pin_purge_commit_late_failed	warn	site	1	sqlx::Error; 9d0e846a logs class/cause, text at DEBUG	changed
+store/catalog.rs	catalog_field_name_unstorable	warn	site	1	field names (ingest data, not error text)	unchanged: no error text
+store/catalog.rs	catalog_pin_cap_reached	warn	site	1	field names (ingest data, not error text)	unchanged: no error text
+store/catalog.rs	catalog_pin_purge_prepare_timeout	warn	site	1	none	unchanged: no error text
+store/mod.rs	pool_connection_returned_in_transaction	warn	site	1	none	unchanged: no error text
+store/mod.rs	storage_lock_lost	error	site	1	sqlx::Error; 9d0e846a logs class/cause, text at DEBUG	changed
+store/mod.rs	storage_ready	info	site	1	none	unchanged: no error text
+store/repin.rs	repin_evidence_unstaged	warn	site	1	none	unchanged: no error text
+store/saved.rs	saved_query_created	info	site	1	none	unchanged: no error text
+store/saved.rs	saved_query_updated	info	site	1	none	unchanged: no error text
+store/saved.rs	saved_query_deleted	info	site	1	none	unchanged: no error text
+store/schedule.rs	schedule_deleted	info	site	1	none	unchanged: no error text
+store/schedule.rs	report_run_started	info	site	1	none	unchanged: no error text
+store/schedule.rs	report_run_started	info	site	2	none	unchanged: no error text
+store/schedule.rs	schedule_cursor_advanced	info	site	1	none	unchanged: no error text
+store/schedule.rs	report_run_started	info	site	3	none	unchanged: no error text
+store/schedule.rs	report_run_finished	info	site	1	none	unchanged: no error text
+store/schedule.rs	report_run_fail_if_running	info	site	1	none	unchanged: no error text
+store/schedule.rs	stale_runs_cleaned	warn	site	1	none	unchanged: no error text
+store/schedule.rs	old_runs_deleted	info	site	1	none	unchanged: no error text
+store/schedule.rs	schedule_created	info	site	1	none	unchanged: no error text
+store/schedule.rs	schedule_updated	info	site	1	none	unchanged: no error text
+store/schedule.rs	schedule_cursor_advanced	info	site	2	none	unchanged: no error text
+store/schedule.rs	scheduler_error	error	site	1	report_window::PlanError	unchanged: decided: PlanError has fixed messages
+syslog/batch.rs	syslog_batcher_shutdown	info	site	1	none	unchanged: no error text
+syslog/batch.rs	syslog_backpressure_shutdown_drop	warn	site	1	none	unchanged: no error text
+syslog/batch.rs	syslog_event_oversized	warn	site	1	none	unchanged: no error text
+syslog/batch.rs	syslog_backpressure	warn	site	1	none	unchanged: no error text
+syslog/batch.rs	syslog_backpressure_cleared	info	site	1	none	unchanged: no error text
+syslog/batch.rs	syslog_flush_panic	error	site	1	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+syslog/listener_error.rs	{self.listener.failed()}	warn	call:record_failure	1	via record_failure: io::Error on preauth.transport	unchanged: unmetered target, never persisted
+syslog/listener_error.rs	{self.listener.failed()}	warn	site	1	helper record_failure: io::Error on preauth.transport	unchanged: unmetered target, never persisted
+syslog/listener_error.rs	{self.listener.recovered()}	info	site	1	listener operation literal on preauth.transport	unchanged: unmetered target, never persisted
+syslog/mod.rs	syslog_udp_error	error	site	1	io::Error from run_udp_listener	D2b
+syslog/mod.rs	syslog_tcp_error	error	site	1	io::Error from run_tcp_listener	D2b
+syslog/tcp.rs	syslog_tcp_listening	info	site	1	none	unchanged: no error text
+syslog/tcp.rs	syslog_tcp_limit_reached	warn	site	1	source is the peer IP	unchanged: no error text
+syslog/tcp.rs	syslog_tcp_shutdown	info	site	1	none	unchanged: no error text
+syslog/tcp.rs	syslog_tcp_event_limit	info	site	1	source is the peer IP	unchanged: no error text
+syslog/udp.rs	syslog_udp_listening	info	site	1	none	unchanged: no error text
+syslog/udp.rs	syslog_udp_shutdown	info	site	1	none	unchanged: no error text
+telemetry.rs	panic	error	site	1	panic location on trawl_server::panic, no payload	unchanged: unmetered target, never persisted
+telemetry.rs	telemetry_dropped	warn	site	1	drop counts; fixed message	unchanged: no error text
+tls.rs	tls_cert_details	info	site	1	x509 ASN1Time format error; ed3e6907 writes (invalid), formatter text at DEBUG	changed
+tls.rs	tls_cert_details	warn	call:cert_details_unparsed	1	via cert_details_unparsed: X.509 parse error; ed3e6907	changed
+tls.rs	tls_cert_details	warn	call:cert_details_unparsed	2	via cert_details_unparsed: PEM parse error; ed3e6907	changed
+tls.rs	tls_cert_details	warn	site	1	helper cert_details_unparsed: x509_parser/PEM error; ed3e6907 logs class/cause, text at DEBUG	changed
+tls.rs	lifecycle	info	site	1	none	unchanged: no error text
+tls.rs	lifecycle	warn	site	1	exposure reason: fixed sentence with link count and uids	unchanged: fixed text trawl wrote
+tls.rs	lifecycle	info	site	2	none	unchanged: no error text
+tls.rs	lifecycle	info	site	3	none	unchanged: no error text
+tls.rs	lifecycle	info	site	4	none	unchanged: no error text
+tls.rs	tls_reload	info	site	1	none	unchanged: no error text
+tls.rs	tls_reload	info	site	2	none	unchanged: no error text
+tls.rs	tls_reload_error	error	site	1	TlsError ReadCert/ReadKey/Write (path and io::Error) or Unsafe (trawl's refusal)	D2b
+tls.rs	tls_reload_error	error	site	2	TlsError InvalidCert/InvalidKey/Config/Generation (PEM, rustls, rcgen text); ed3e6907 logs class/cause, text at DEBUG	changed
+transport/failure.rs	http_failure	warn	site	1	Failure record by class/cause	unchanged: class/cause only
+transport/failure.rs	http_failure	error	site	1	Failure record by class/cause	unchanged: class/cause only
+transport/failure.rs	http_failure	warn	site	2	Failure record by class/cause	unchanged: class/cause only
+transport/failure.rs	http_failure	error	site	2	Failure record by class/cause	unchanged: class/cause only
+transport/http.rs	lifecycle	warn	site	1	none	unchanged: no error text
+transport/http.rs	lifecycle	info	site	1	none	unchanged: no error text
+transport/http.rs	lifecycle	info	site	2	none	unchanged: no error text
+transport/http.rs	accept_failed	warn	site	1	io::Error on preauth.transport	unchanged: unmetered target, never persisted
+transport/http.rs	lifecycle	info	site	3	none	unchanged: no error text
+transport/http.rs	tls_handshake_failed	warn	site	1	rustls/io handshake error on preauth.transport	unchanged: unmetered target, never persisted
+transport/http.rs	tls_handshake_failed	warn	site	2	fixed text on preauth.transport	unchanged: unmetered target, never persisted
+transport/http.rs	connection_task_panicked	error	site	1	fixed text on preauth.transport	unchanged: unmetered target, never persisted
+transport/http.rs	lifecycle	info	site	4	none	unchanged: no error text
+transport/http.rs	lifecycle	info	site	5	none	unchanged: no error text
+transport/http.rs	lifecycle	warn	site	2	none	unchanged: no error text
+transport/http.rs	lifecycle	info	site	6	none	unchanged: no error text
