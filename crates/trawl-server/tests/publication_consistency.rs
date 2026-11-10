@@ -4,6 +4,7 @@
 
 //! Real WAL, hot buffer and `DuckDB` reads across a paused publication.
 
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,8 +15,8 @@ use trawl_server::error::ServerError;
 use trawl_server::hot_buffer::{HotBuffer, HotBufferConfig};
 use trawl_server::ingest::{compaction::compact_once, wal::WalWriter};
 use trawl_server::pool::{ExecutorPool, WorkContext, WorkKind, seam};
-use trawl_server::publication::CorpusUnsettled;
-use trawl_server::test_timing::HANG_GUARD;
+use trawl_server::publication::{CorpusUnsettled, PublicationGate};
+use trawl_server::test_timing::{HANG_GUARD, frozen, until, until_polling};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // one controlled publication, checked through both readers
@@ -231,61 +232,81 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
     assert!(pool.publication().read().await.is_ok());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn query_timeout_keeps_publication_guard_until_duckdb_task_finishes() {
-    use std::sync::atomic::Ordering;
-    use trawl_server::pool::TEST_QUERY_DELAY_MS;
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
-        }
-    }
-    let _reset = Reset;
-    let root = tempfile::tempdir().unwrap();
-    let pool = ExecutorPool::for_test(root.path().to_str().unwrap().into(), 1, 100, None).unwrap();
-    TEST_QUERY_DELAY_MS.store(500, Ordering::Relaxed);
-    let result = pool
-        .execute(
-            pool.allocate_query_id(),
-            "*",
-            Deadline::after(Duration::from_millis(30)),
-            false,
-            WorkContext::system(WorkKind::Query),
-        )
-        .await;
-    assert!(matches!(result.result, Err(ServerError::Timeout)));
-    let publication = pool.publication();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), publication.write())
-            .await
-            .is_err(),
-        "async timeout must not let a writer change files still used by the blocking reader"
-    );
-    tokio::time::timeout(Duration::from_secs(5), publication.write())
-        .await
-        .unwrap();
+/// Whether `publication.write()` is still pending after one poll: a writer
+/// that would change files the blocking reader still has open.
+async fn writer_waits(publication: &PublicationGate) -> bool {
+    until_polling(
+        "one poll of the writer",
+        &mut pin!(publication.write()),
+        || true,
+    )
+    .await
+    .is_none()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn aborting_request_keeps_running_reader_protected() {
-    use std::sync::atomic::Ordering;
-    use trawl_server::pool::TEST_QUERY_DELAY_MS;
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
-        }
-    }
-    let _reset = Reset;
+/// A request that times out answers at once, but the `DuckDB` worker keeps
+/// the publication guard until it really finishes. The worker is held
+/// past its work-start transition, so the deadline lands on running work,
+/// and the paused clock reaches the deadline only when the test advances
+/// it. Residual exposure: the real-clock hang guard on each wait.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn query_timeout_keeps_publication_guard_until_duckdb_task_finishes() {
+    const DEADLINE: Duration = Duration::from_secs(1);
     let root = tempfile::tempdir().unwrap();
     let pool = ExecutorPool::for_test(root.path().to_str().unwrap().into(), 1, 100, None).unwrap();
-    TEST_QUERY_DELAY_MS.store(1000, Ordering::Relaxed);
+    // Held for the whole test: its drop releases every gate.
     let seams = pool.seams();
-    let started = seams.watch(seam::Seam::Started);
+    let started = seams.hold(seam::Seam::Started);
+    let released = seams.watch(seam::Seam::Released);
     let reader_pool = pool.clone();
     let id = pool.allocate_query_id();
-    let request = tokio::spawn(async move {
+    let mut request = tokio::spawn(async move {
+        reader_pool
+            .execute(
+                id,
+                "*",
+                Deadline::after(DEADLINE),
+                false,
+                WorkContext::system(WorkKind::Query),
+            )
+            .await
+    });
+    // The worker is past its work-start transition and parked.
+    until("the reader started", || started.arrivals() == 1).await;
+    tokio::time::advance(DEADLINE + Duration::from_millis(1)).await;
+    let result = frozen("the timed-out request", &mut request).await.unwrap();
+    assert!(
+        matches!(result.result, Err(ServerError::Timeout)),
+        "expected Timeout, got: {:?}",
+        result.result
+    );
+    let publication = pool.publication();
+    assert!(
+        writer_waits(&publication).await,
+        "async timeout must not let a writer change files still used by the blocking reader"
+    );
+    started.release();
+    drop(frozen("the writer after the reader", publication.write()).await);
+    // The worker has dropped everything it held.
+    until("the worker released its work", || released.arrivals() == 1).await;
+}
+
+/// Aborting the request that started a read leaves the `DuckDB` worker
+/// running and holding the publication guard until it finishes. The
+/// worker is held past its work-start transition, so the abort lands on
+/// running work. Residual exposure: the real-clock hang guard on each
+/// wait.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn aborting_request_keeps_running_reader_protected() {
+    let root = tempfile::tempdir().unwrap();
+    let pool = ExecutorPool::for_test(root.path().to_str().unwrap().into(), 1, 100, None).unwrap();
+    // Held for the whole test: its drop releases every gate.
+    let seams = pool.seams();
+    let started = seams.hold(seam::Seam::Started);
+    let released = seams.watch(seam::Seam::Released);
+    let reader_pool = pool.clone();
+    let id = pool.allocate_query_id();
+    let mut request = tokio::spawn(async move {
         reader_pool
             .execute(
                 id,
@@ -300,22 +321,21 @@ async fn aborting_request_keeps_running_reader_protected() {
     // enough: work that has not passed its work-start transition holds no
     // files open, and cancelling it there would end it before the abort
     // could prove anything (ADR-0024).
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while started.arrivals() == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    until("the reader started", || started.arrivals() == 1).await;
     request.abort();
-    assert!(request.await.unwrap_err().is_cancelled());
+    assert!(
+        frozen("the aborted request", &mut request)
+            .await
+            .unwrap_err()
+            .is_cancelled()
+    );
     let publication = pool.publication();
     assert!(
-        tokio::time::timeout(Duration::from_millis(30), publication.write())
-            .await
-            .is_err()
+        writer_waits(&publication).await,
+        "an aborted request must not let a writer change files still used by the blocking reader"
     );
-    tokio::time::timeout(Duration::from_secs(5), publication.write())
-        .await
-        .unwrap();
+    started.release();
+    drop(frozen("the writer after the reader", publication.write()).await);
+    // The worker has dropped everything it held.
+    until("the worker released its work", || released.arrivals() == 1).await;
 }
