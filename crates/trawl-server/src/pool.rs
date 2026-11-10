@@ -52,7 +52,7 @@ use trawl_engine::timing::{PhaseClock, QueryPhase};
 use trawl_engine::value::QueryResult;
 
 use crate::deadline::Deadline;
-use crate::error::ServerError;
+use crate::error::{CaptureSourceKind, ServerError};
 use crate::hot_buffer::{HotBuffer, HotSnapshot};
 use crate::query_timing::{Outcome, PhysicalOutcome, QueryTiming, Reclaim, emit_reclaimed};
 use crate::source::{compute_source, select, selection_bytes};
@@ -2872,6 +2872,7 @@ impl ExecutorPool {
                                 return Err(ServerError::CaptureSourceTooLarge {
                                     selected_bytes,
                                     max_bytes,
+                                    kind: CaptureSourceKind::Window,
                                 });
                             }
                             (
@@ -6433,9 +6434,11 @@ mod tests {
             ServerError::CaptureSourceTooLarge {
                 selected_bytes,
                 max_bytes,
+                kind,
             } => {
                 assert_eq!(selected_bytes, stored);
                 assert_eq!(max_bytes, 1);
+                assert_eq!(kind, CaptureSourceKind::Window);
             }
             other => panic!("expected the source budget refusal, got {other:?}"),
         }
