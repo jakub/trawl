@@ -1161,84 +1161,225 @@ fn one_row_capture(columns: usize) -> trawl_client::CapturedResult {
     )
 }
 
-#[tokio::test]
-async fn a_row_the_budget_cannot_print_is_proposed_alone_at_the_hard_cap() {
-    // One row of 25 cells of 400 bytes, the result's last, needs more than
-    // the default budget: reading it again at that budget would print no
-    // row again.
-    let captured = one_row_capture(25);
-    let row = (0..25)
-        .map(|i| s(&format!("{i:02}{}", "w".repeat(398))))
-        .collect();
-    let backend = Fake {
-        result_page: ok(page(&captured, vec![row], 0)),
-        capabilities: ok(capabilities(None)),
-        ..Fake::default()
-    };
-    let result = read::run(
-        &backend,
-        &trawl_mcp::session::Seen::default(),
-        read_input(json!({"action": "page", "result_id": RESULT_ID})),
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
-    assert!(used_bytes(&result) <= 16_384, "{}", used_bytes(&result));
+/// What a page reply that read one row printed and proposed, in the order
+/// a growing fixed part moves it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OneRowReply {
+    /// It printed the row.
+    Printed,
+    /// It printed no row and proposed calls that read on.
+    Advanced,
+    /// It printed no row and proposed no call, or did not fit at all.
+    Stuck,
+}
+
+/// What `result`, a page reply over one row under `max_bytes`, did.
+fn one_row_reply(result: &CallToolResult, max_bytes: usize) -> OneRowReply {
+    if result.is_error == Some(true) {
+        return OneRowReply::Stuck;
+    }
+    assert!(used_bytes(result) <= max_bytes, "{}", used_bytes(result));
     let mirror = result.structured_content.as_ref().unwrap();
-    assert_eq!(mirror["result"]["rows"], json!([]));
+    if !mirror["result"]["rows"].as_array().unwrap().is_empty() {
+        OneRowReply::Printed
+    } else if agreed_actions(result).is_empty() {
+        OneRowReply::Stuck
+    } else {
+        OneRowReply::Advanced
+    }
+}
+
+/// `captured` with an executed query ending in a comment of `comment`
+/// bytes. The query prints in the text and the mirror, and no fitting
+/// gives it up.
+fn with_long_query(
+    mut captured: trawl_client::CapturedResult,
+    comment: usize,
+) -> trawl_client::CapturedResult {
+    captured.executed_query = format!("service=api # {}", "q".repeat(comment));
+    captured
+}
+
+/// A one-row capture of `columns` string cells of `bytes` bytes each, at
+/// most 509 so that no page abbreviates one, read with `action: page` at
+/// `max_bytes`.
+#[derive(Debug, Clone, Copy)]
+struct WideRow {
+    columns: usize,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl WideRow {
+    /// The cell at `column`.
+    fn cell(self, column: usize) -> String {
+        format!("{column:03}{}", "w".repeat(self.bytes - 3))
+    }
+
+    /// The backend and the reply of the read, over a capture whose
+    /// executed query ends in a comment of `comment` bytes.
+    async fn page(self, comment: usize) -> (Fake, CallToolResult) {
+        let captured = with_long_query(one_row_capture(self.columns), comment);
+        let row = (0..self.columns).map(|i| s(&self.cell(i))).collect();
+        let backend = Fake {
+            result_page: ok(page(&captured, vec![row], 0)),
+            capabilities: ok(capabilities(None)),
+            ..Fake::default()
+        };
+        let result = read::run(
+            &backend,
+            &trawl_mcp::session::Seen::default(),
+            read_input(json!({
+                "action": "page", "result_id": RESULT_ID, "max_bytes": self.max_bytes,
+            })),
+        )
+        .await;
+        (backend, result)
+    }
+}
+
+/// Check that `result`, the reply of `wide`'s read, which printed none of
+/// its row, proposes that row alone at the hard cap and says why, and that
+/// following the call prints the row there. The number of the row's cells
+/// it prints, each whole, from the first.
+async fn proposes_the_row_at_the_hard_cap(
+    backend: &Fake,
+    result: &CallToolResult,
+    wide: WideRow,
+) -> usize {
+    let text = text_of(result);
+    let mirror = result.structured_content.as_ref().unwrap();
     assert_eq!(
         mirror["result"]["presentation"]["rows_dropped_to_fit"],
         json!(1)
     );
-    let actions = agreed_actions(&result);
+    assert_eq!(
+        mirror["result"]["columns"].as_array().unwrap().len(),
+        wide.columns,
+        "a reply that prints no row omits no column: {text}"
+    );
+    let actions = agreed_actions(result);
     assert_eq!(
         actions,
         [json!({"tool": "read", "arguments": {
             "action": "page", "result_id": RESULT_ID, "offset": 0, "rows": 1, "max_bytes": 32768,
         }})],
-        "{}",
-        text_of(&result)
+        "{text}"
     );
     let reason = mirror["next_actions"][0]["reason"].as_str().unwrap();
     assert!(
         reason.contains("does not fit this call's max_bytes") && reason.contains("32768"),
         "{reason}"
     );
-    let text = text_of(&result);
-    assert_eq!(
-        lines_starting(text, "no row fits "),
-        ["no row fits max_bytes 16384; see next actions"],
-        "{text}"
-    );
+    let no_row = format!("no row fits max_bytes {}; see next actions", wide.max_bytes);
+    assert_eq!(lines_starting(text, "no row fits "), [no_row], "{text}");
     let outcome = format!(
         "Result \"{RESULT_ID}\" holds 1 captured row; the row at 0 does not fit this response."
     );
     assert_eq!(text.lines().next(), Some(outcome.as_str()), "{text}");
     assert_eq!(mirror["outcome"], json!(outcome));
 
-    let followed = follow(&actions[0], &backend).await;
-    assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
+    let followed = follow(&actions[0], backend).await;
+    let text = text_of(&followed);
+    assert_ne!(followed.is_error, Some(true), "{text}");
     assert!(used_bytes(&followed) <= 32_768, "{}", used_bytes(&followed));
-    let printed = &followed.structured_content.as_ref().unwrap()["result"]["rows"];
+    let view = &followed.structured_content.as_ref().unwrap()["result"];
+    let rows = view["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{text}");
+    let printed = rows[0].as_array().unwrap();
+    let positions: Vec<u64> = view["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|column| column["position"].as_u64().unwrap())
+        .collect();
+    assert_eq!(positions, (0..printed.len() as u64).collect::<Vec<_>>());
+    assert!(!printed.is_empty(), "{text}");
+    for (i, cell) in printed.iter().enumerate() {
+        assert_eq!(cell, &json!(wide.cell(i)));
+    }
     assert_eq!(
-        printed.as_array().unwrap().len(),
-        1,
-        "{}",
-        text_of(&followed)
+        view["presentation"]["columns_omitted"],
+        json!(wide.columns - printed.len())
     );
+    printed.len()
 }
 
 #[tokio::test]
-async fn a_row_no_budget_can_print_is_proposed_cell_by_cell() {
-    // 119 cells of 400 bytes after one of 40000 that the page abbreviates
-    // to 512: no budget holds the row, so the reply proposes its first
-    // cell, and the cell read pages that cell's bytes in turn.
-    let captured = one_row_capture(120);
-    let first = "a".repeat(40_000);
-    let mut row = vec![s(&first)];
-    row.extend((1..120).map(|i| s(&format!("{i:03}{}", "w".repeat(397)))));
+async fn a_row_the_budget_cannot_print_is_proposed_alone_at_the_hard_cap() {
+    // A long executed query leaves the call's budget room for a reply that
+    // prints no row, and none for the row at even one column. The reply
+    // proposes the row alone at the hard cap, which prints it: one column
+    // there whole, and of three, the first that fit, a row the hard cap
+    // prints only by omitting the rest. As the query grows, the replies go
+    // from printing the row, through proposing it, to neither.
+    let cases = [
+        (
+            WideRow {
+                columns: 1,
+                bytes: 400,
+                max_bytes: 16_384,
+            },
+            4_000..8_600,
+        ),
+        (
+            WideRow {
+                columns: 3,
+                bytes: 500,
+                max_bytes: 31_000,
+            },
+            12_000..16_600,
+        ),
+    ];
+    for (wide, comments) in cases {
+        let mut replies = Vec::new();
+        let mut widths = Vec::new();
+        for comment in comments.step_by(20) {
+            let (backend, result) = wide.page(comment).await;
+            let reply = one_row_reply(&result, wide.max_bytes);
+            if reply == OneRowReply::Advanced {
+                widths.push(proposes_the_row_at_the_hard_cap(&backend, &result, wide).await);
+            }
+            replies.push(reply);
+        }
+        assert!(replies.is_sorted(), "{wide:?}: {replies:?}");
+        assert!(
+            replies.contains(&OneRowReply::Printed) && replies.contains(&OneRowReply::Stuck),
+            "{wide:?}: {replies:?}"
+        );
+        assert!(!widths.is_empty(), "{wide:?}: {replies:?}");
+        if wide.columns == 1 {
+            assert!(widths.iter().all(|&width| width == 1), "{widths:?}");
+        } else {
+            assert!(
+                widths.iter().all(|&width| width < wide.columns),
+                "{widths:?}"
+            );
+        }
+    }
+}
+
+/// The backend and the reply of `read` with `action: page` at the hard cap
+/// over a one-row capture of 12 columns whose page holds captured
+/// positions 7 and 11, as a projected read's does, and whose executed
+/// query ends in a comment of `comment` bytes. The cell at 7 is the
+/// returned text, 40000 bytes the page abbreviates; the cell read answers
+/// its first 16384 bytes.
+async fn projected_row_page(first: &str, comment: usize) -> (Fake, CallToolResult) {
+    let captured = with_long_query(one_row_capture(12), comment);
+    let mut fetched = page(
+        &captured,
+        vec![vec![s(first), s(&format!("011{}", "w".repeat(397)))]],
+        0,
+    );
+    fetched.positions = vec![7, 11];
+    fetched.page.columns = [7, 11]
+        .iter()
+        .map(|position| Column::new(format!("c{position:03}"), ColumnType::String))
+        .collect();
     let wire = format!("\"{first}\"");
     let backend = Fake {
-        result_page: ok(page(&captured, vec![row], 0)),
+        result_page: ok(fetched),
         capabilities: ok(capabilities(None)),
         result_cell: ok(trawl_client::ResultCell {
             ty: ColumnType::String,
@@ -1253,147 +1394,525 @@ async fn a_row_no_budget_can_print_is_proposed_cell_by_cell() {
     let result = read::run(
         &backend,
         &trawl_mcp::session::Seen::default(),
-        read_input(json!({"action": "page", "result_id": RESULT_ID})),
+        read_input(json!({"action": "page", "result_id": RESULT_ID, "max_bytes": 32768})),
     )
     .await;
-    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
-    assert!(used_bytes(&result) <= 16_384, "{}", used_bytes(&result));
-    let mirror = result.structured_content.as_ref().unwrap();
-    assert_eq!(mirror["result"]["rows"], json!([]));
-    let actions = agreed_actions(&result);
-    assert_eq!(
-        actions,
-        [json!({"tool": "read", "arguments": {
-            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
-        }})],
-        "{}",
-        text_of(&result)
-    );
-    let reason = mirror["next_actions"][0]["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("does not fit a page at any max_bytes") && reason.contains("one at a time"),
-        "{reason}"
-    );
-    assert_eq!(
-        lines_starting(text_of(&result), "no row fits "),
-        ["no row fits max_bytes 16384; see next actions"]
-    );
-
-    let followed = follow(&actions[0], &backend).await;
-    assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
-    let cell = &followed.structured_content.as_ref().unwrap()["cell"];
-    assert!(
-        cell["text"].as_str().unwrap().starts_with("\"aaa"),
-        "{cell}"
-    );
-    let next = cell["next_offset"].as_u64().expect("the cell continues");
-    assert!(next > 0, "{next}");
-    assert_eq!(
-        agreed_actions(&followed),
-        [json!({"tool": "read", "arguments": {
-            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0, "byte_offset": next,
-        }})]
-    );
-}
-
-/// The smallest `max_bytes` a cell refusal names, from its text.
-fn named_max_bytes(text: &str) -> usize {
-    let (_, rest) = text
-        .rsplit_once("the smallest max_bytes that prints part of it is ")
-        .unwrap_or_else(|| panic!("no smallest max_bytes named: {text}"));
-    rest.trim_end_matches('.').parse().unwrap()
+    (backend, result)
 }
 
 #[tokio::test]
-async fn a_cell_range_with_no_room_for_a_byte_names_the_budget_that_prints_one() {
-    // A long column name grows the fixed text of a cell reply until, at
-    // max_bytes=4096, no byte of the range fits beside it: a continuation
-    // from byte_offset 0 would be the very call that printed nothing. The
-    // names run from some bytes printed, through none, to a reply that
-    // does not fit at all.
+async fn a_row_no_budget_can_print_is_proposed_cell_by_cell() {
+    // At the hard cap a long executed query leaves room for a reply that
+    // prints no row, and none for the row at even one column: no budget
+    // holds the row, so the reply proposes its cells from the page's first
+    // captured position, 7, and the cell read pages that cell's bytes in
+    // turn. Past the last query length that prints the row, the replies
+    // go from proposing its cells to proposing nothing. A shorter query
+    // can leave a reply that prints no row where the row would print with
+    // the proposed calls dropped: the fitting keeps the calls, and a page
+    // at the hard cap would print no row again, so it proposes the cells
+    // there too. No reply proposes the page again.
+    let first = "a".repeat(40_000);
+    let mut replies = Vec::new();
+    for comment in (13_000..17_400).step_by(20) {
+        let (backend, result) = projected_row_page(&first, comment).await;
+        let reply = one_row_reply(&result, 32_768);
+        replies.push(reply);
+        if reply != OneRowReply::Advanced {
+            continue;
+        }
+        let text = text_of(&result);
+        let mirror = result.structured_content.as_ref().unwrap();
+        let positions: Vec<&Json> = mirror["result"]["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|column| &column["position"])
+            .collect();
+        assert_eq!(positions, [&json!(7), &json!(11)], "{text}");
+        let actions = agreed_actions(&result);
+        assert_eq!(
+            actions,
+            [json!({"tool": "read", "arguments": {
+                "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 7,
+            }})],
+            "{text}"
+        );
+        assert_eq!(
+            mirror["next_actions"][0]["reason"],
+            json!(
+                "the row does not fit a page at any max_bytes; read its cells one at a time, \
+                 from column 7"
+            )
+        );
+        assert_eq!(
+            lines_starting(text, "no row fits "),
+            ["no row fits max_bytes 32768; see next actions"],
+            "{text}"
+        );
+
+        let followed = follow(&actions[0], &backend).await;
+        assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|call| call.starts_with(&format!("result_cell {RESULT_ID} 0 7 None "))),
+            "{:?}",
+            backend.calls()
+        );
+        let cell = &followed.structured_content.as_ref().unwrap()["cell"];
+        assert!(
+            cell["text"].as_str().unwrap().starts_with("\"aaa"),
+            "{cell}"
+        );
+        assert_eq!(cell["name"], json!("c007"));
+        let next = cell["next_offset"].as_u64().expect("the cell continues");
+        assert!(next > 0, "{next}");
+        assert_eq!(
+            agreed_actions(&followed),
+            [json!({"tool": "read", "arguments": {
+                "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 7, "byte_offset": next,
+            }})]
+        );
+    }
+    let last_printed = replies
+        .iter()
+        .rposition(|&reply| reply == OneRowReply::Printed)
+        .expect("a short query prints the row");
+    let longer = &replies[last_printed + 1..];
+    assert!(
+        longer.is_sorted()
+            && longer.contains(&OneRowReply::Advanced)
+            && longer.contains(&OneRowReply::Stuck),
+        "{replies:?}"
+    );
+}
+
+/// The marker a cell reply ends a column name with when it prints the name
+/// abbreviated, for a name of `bytes` bytes.
+fn name_cut_marker(bytes: usize) -> String {
+    format!("…[name cut from {bytes} bytes to fit the response's byte budget]")
+}
+
+/// The backend and the reply of `read` with `action: cell` at `max_bytes`
+/// for row 0, column 0 of a capture whose one column is named `name`; the
+/// cell read answers the first 4096 bytes of a 5002-byte string cell.
+async fn named_cell(name: &str, max_bytes: usize) -> (Fake, CallToolResult) {
     let wire = format!("\"{}\"", "v".repeat(5000));
-    let (mut printed, mut refused, mut unfit) = (0, 0, 0);
+    let captured = captured(
+        "service=api",
+        &[(name, ColumnType::String)],
+        vec![no_values(1)],
+        1,
+        1,
+    );
+    let backend = Fake {
+        result_page: ok(page(&captured, vec![], 0)),
+        capabilities: ok(capabilities(None)),
+        result_cell: ok(trawl_client::ResultCell {
+            ty: ColumnType::String,
+            offset: 0,
+            length: 4096,
+            total_bytes: wire.len() as u64,
+            next_offset: Some(4096),
+            text: wire[..4096].to_owned(),
+        }),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        &trawl_mcp::session::Seen::default(),
+        read_input(json!({
+            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+            "max_bytes": max_bytes,
+        })),
+    )
+    .await;
+    (backend, result)
+}
+
+/// The column name the `cell:` line of `text` prints, decoded.
+fn printed_cell_name(text: &str) -> String {
+    let line = lines_starting(text, "cell: row 0, column 0 ")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no cell line: {text}"));
+    let rest = line.strip_prefix("cell: row 0, column 0 ").unwrap();
+    let mut names = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+    names.next().unwrap().unwrap()
+}
+
+/// Whether a cell reply printed the column's name whole or abbreviated, in
+/// the order a growing name moves it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CellName {
+    Whole,
+    Abbreviated,
+}
+
+/// Check that `result`, the reply of [`named_cell`] for `name` under
+/// `max_bytes`, fits, prints at least the cell's first character with its
+/// row, position, type and byte counts exact, proposes the rest from where
+/// it stopped, and prints the name whole or abbreviated, the same in the
+/// text and the mirror.
+fn printed_cell(result: &CallToolResult, name: &str, max_bytes: usize) -> CellName {
+    let text = text_of(result);
+    let label = format!("{} bytes at {max_bytes}", name.len());
+    assert_ne!(result.is_error, Some(true), "{label}: {text}");
+    assert!(
+        used_bytes(result) <= max_bytes,
+        "{label}: {}",
+        used_bytes(result)
+    );
+    let cell = &result.structured_content.as_ref().unwrap()["cell"];
+    assert_eq!(
+        (
+            &cell["row"],
+            &cell["column"],
+            &cell["type"],
+            &cell["offset"]
+        ),
+        (&json!(0), &json!(0), &json!("string"), &json!(0)),
+        "{label}: {cell}"
+    );
+    assert_eq!(cell["total_bytes"], json!(5002), "{label}");
+    let length = cell["length"].as_u64().unwrap();
+    assert!(length > 0, "{label}: {text}");
+    assert_eq!(
+        cell["text"].as_str().unwrap(),
+        &format!("\"{}", "v".repeat(usize::try_from(length).unwrap() - 1)),
+        "{label}"
+    );
+    assert_eq!(
+        agreed_actions(result),
+        [json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+            "byte_offset": length,
+        }})],
+        "{label}: {text}"
+    );
+    let printed = printed_cell_name(text);
+    assert_eq!(cell["name"], json!(printed), "{label}");
+    if printed == name {
+        return CellName::Whole;
+    }
+    let kept = printed
+        .strip_suffix(&name_cut_marker(name.len()))
+        .unwrap_or_else(|| panic!("{label}: no marker on {printed:?}"));
+    assert!(name.starts_with(kept), "{label}: {kept:?}");
+    let escaped = serde_json::to_string(&printed).unwrap().len();
+    assert!(escaped <= 255, "{label}: {escaped}");
+    CellName::Abbreviated
+}
+
+#[tokio::test]
+async fn a_cell_reply_abbreviates_a_column_name_that_leaves_no_room_for_the_cell() {
+    // A long column name grows the fixed text of a cell reply until, at
+    // max_bytes=4096, no byte of the range fits beside it. Up to there the
+    // name prints whole beside the bytes that fit; past it the name prints
+    // abbreviated, at most 255 bytes as a JSON string with the marker, and
+    // the reply prints the cell. No name makes a reply that does not fit or
+    // that prints none of the range. Names whose JSON escapes are longer
+    // than their bytes, and names many times the budget, are cut on a
+    // character boundary within the same bound.
+    let mut names = Vec::new();
     for name_len in 1575..1595 {
         let name = "n".repeat(name_len);
-        let captured = captured(
-            "service=api",
-            &[(name.as_str(), ColumnType::String)],
-            vec![no_values(1)],
-            1,
-            1,
-        );
-        let backend = Fake {
-            result_page: ok(page(&captured, vec![], 0)),
-            capabilities: ok(capabilities(None)),
-            result_cell: ok(trawl_client::ResultCell {
-                ty: ColumnType::String,
-                offset: 0,
-                length: 4096,
-                total_bytes: wire.len() as u64,
-                next_offset: Some(4096),
-                text: wire[..4096].to_owned(),
-            }),
-            ..Fake::default()
-        };
-        let at_budget = |max_bytes: usize| {
-            read_input(json!({
-                "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
-                "max_bytes": max_bytes,
-            }))
-        };
-        let result = read::run(
-            &backend,
-            &trawl_mcp::session::Seen::default(),
-            at_budget(4096),
-        )
-        .await;
-        let text = text_of(&result).to_owned();
-        if result.is_error != Some(true) {
-            let cell = &result.structured_content.as_ref().unwrap()["cell"];
-            assert!(cell["length"].as_u64().unwrap() > 0, "{name_len}: {text}");
-            for action in agreed_actions(&result) {
-                assert!(
-                    action["arguments"]["byte_offset"].as_u64().unwrap() > 0,
-                    "{name_len}: {text}"
-                );
+        let (_, result) = named_cell(&name, 4096).await;
+        names.push(printed_cell(&result, &name, 4096));
+    }
+    assert!(names.is_sorted(), "{names:?}");
+    assert!(
+        names.contains(&CellName::Whole) && names.contains(&CellName::Abbreviated),
+        "{names:?}"
+    );
+    for name in [
+        "n".repeat(5000),
+        "n".repeat(20_000),
+        "\"\\é".repeat(2000),
+        "日".repeat(7000),
+    ] {
+        for max_bytes in [4096, 16_384, 32_768] {
+            let (backend, result) = named_cell(&name, max_bytes).await;
+            let printed = printed_cell(&result, &name, max_bytes);
+            if name.len() >= 16_384 || max_bytes == 4096 {
+                assert_eq!(printed, CellName::Abbreviated, "{}", name.len());
             }
-            printed += 1;
-        } else if text.contains("no room for any byte") {
-            assert!(
-                text.contains(RESULT_ID) && text.contains("row 0, column 0"),
-                "{name_len}: {text}"
+            assert_eq!(
+                backend.calls()[2],
+                format!("result_cell {RESULT_ID} 0 0 None Some({max_bytes})")
             );
-            let needed = named_max_bytes(&text);
-            assert!(needed > 4096, "{name_len}: {text}");
-            let at_needed = read::run(
-                &backend,
-                &trawl_mcp::session::Seen::default(),
-                at_budget(needed),
-            )
-            .await;
-            assert_ne!(at_needed.is_error, Some(true), "{name_len}: {needed}");
-            assert!(used_bytes(&at_needed) <= needed);
-            let cell = &at_needed.structured_content.as_ref().unwrap()["cell"];
-            assert!(cell["length"].as_u64().unwrap() > 0, "{name_len}: {needed}");
-            let below = read::run(
-                &backend,
-                &trawl_mcp::session::Seen::default(),
-                at_budget(needed - 1),
-            )
-            .await;
-            assert_eq!(below.is_error, Some(true), "{name_len}: {needed}");
-            refused += 1;
-        } else {
-            assert!(
-                text.contains("does not fit max_bytes=4096"),
-                "{name_len}: {text}"
-            );
-            unfit += 1;
         }
     }
+}
+
+/// The `read action=cell` call a refusal names, as a `{tool, arguments}`
+/// object [`follow`] makes; `None` when it names none.
+fn named_cell_call(text: &str) -> Option<Json> {
+    let (_, rest) = text.split_once("read action=cell result_id=")?;
+    let mut ids = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+    let result_id = ids.next()?.ok()?;
+    let rest = &rest[ids.byte_offset()..];
+    let rest = rest.strip_prefix(" row=")?;
+    let (row, rest) = rest.split_once(" column=")?;
+    let column: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some(json!({"tool": "read", "arguments": {
+        "action": "cell", "result_id": result_id,
+        "row": row.parse::<u64>().ok()?, "column": column.parse::<u64>().ok()?,
+    }}))
+}
+
+/// Check that `text`, a refusal at the hard cap, offers no larger budget
+/// and names `fields source=result` and the `columns` route for result
+/// [`RESULT_ID`].
+fn names_the_hard_cap_routes(text: &str) {
+    let id = format!("\"{RESULT_ID}\"");
+    assert!(text.len() <= MAX_ERROR_BYTES, "{}", text.len());
+    assert!(!text.contains("larger max_bytes"), "{text}");
     assert!(
-        printed > 0 && refused > 0 && unfit > 0,
-        "printed {printed}, refused {refused}, unfit {unfit}"
+        text.contains(&format!("fields source=result result_id={id}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("read action=page result_id={id} columns=[")),
+        "{text}"
+    );
+    assert!(text.contains("at most 16 names"), "{text}");
+}
+
+/// A 5002-byte string cell's first range of at most 16384 bytes, as the
+/// cell route answers it.
+fn first_range() -> Option<support::Handler<trawl_client::ResultCell>> {
+    let wire = format!("\"{}\"", "v".repeat(5000));
+    ok(trawl_client::ResultCell {
+        ty: ColumnType::String,
+        offset: 0,
+        length: wire.len() as u64,
+        total_bytes: wire.len() as u64,
+        next_offset: None,
+        text: wire,
+    })
+}
+
+#[tokio::test]
+async fn hard_cap_refusal_names_routes_that_work() {
+    the_hard_cap_refusal_names_a_cell_that_prints().await;
+    the_hard_cap_refusal_names_a_cell_under_a_long_alias().await;
+    a_zero_row_refusal_names_no_cell().await;
+    a_refusal_below_the_hard_cap_offers_a_budget_and_columns().await;
+    the_search_refusal_at_the_hard_cap_names_a_cell().await;
+}
+
+/// A capture of 10 rows over 12 columns whose executed text alone
+/// overflows the hard cap.
+fn too_long_to_print() -> trawl_client::CapturedResult {
+    with_long_query(twelve_columns(10), 17_000)
+}
+
+/// A projected page from row 3 whose executed text alone overflows the
+/// hard cap: the refusal names the cell at row 3 and the page's first
+/// captured position, 7, and that call prints it. A cell call sends no
+/// projection.
+async fn the_hard_cap_refusal_names_a_cell_that_prints() {
+    let long = too_long_to_print();
+    let backend = Fake {
+        result_page: ok(projected(
+            &long,
+            &[7, 11],
+            (3..5).map(|row| projected_row(row, 40)).collect(),
+            3,
+        )),
+        capabilities: ok(capabilities(None)),
+        result_cell: first_range(),
+        ..Fake::default()
+    };
+    let refused = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": 3, "rows": 2,
+            "max_bytes": 32768, "columns": PROJECTION,
+        }}),
+        &backend,
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let text = text_of(&refused);
+    names_the_hard_cap_routes(text);
+    let named = named_cell_call(text).unwrap_or_else(|| panic!("no cell call: {text}"));
+    assert_eq!(
+        named,
+        json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 3, "column": 7,
+        }})
+    );
+    let followed = follow(&named, &backend).await;
+    assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
+    assert_eq!(
+        backend.calls()[2..],
+        [
+            "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 3 0 None"),
+            format!("result_cell {RESULT_ID} 3 7 None Some(16384)"),
+        ]
+    );
+    let cell = &followed.structured_content.as_ref().unwrap()["cell"];
+    assert_eq!(cell["name"], json!("c007"));
+    assert_eq!(cell["length"], json!(5002));
+}
+
+/// A first column named by a 20000-byte alias the query created: its name
+/// alone overflows the page at the hard cap, and the named cell call
+/// prints the cell under the name abbreviated.
+async fn the_hard_cap_refusal_names_a_cell_under_a_long_alias() {
+    let alias = "a".repeat(20_000);
+    let mut aliased = captured(
+        "service=api",
+        &[
+            (alias.as_str(), ColumnType::String),
+            ("message", ColumnType::String),
+        ],
+        vec![no_values(1), no_values(1)],
+        1,
+        1,
+    );
+    aliased.executed_query = format!("service=api | eval {alias}=message");
+    let backend = Fake {
+        result_page: ok(page(&aliased, vec![vec![s("x"), s("x")]], 0)),
+        capabilities: ok(capabilities(None)),
+        result_cell: first_range(),
+        ..Fake::default()
+    };
+    let refused = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "max_bytes": 32768,
+        }}),
+        &backend,
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let text = text_of(&refused);
+    names_the_hard_cap_routes(text);
+    let named = named_cell_call(text).unwrap_or_else(|| panic!("no cell call: {text}"));
+    assert_eq!(
+        named,
+        json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+        }})
+    );
+    let followed = follow(&named, &backend).await;
+    let followed_text = text_of(&followed);
+    assert_ne!(followed.is_error, Some(true), "{followed_text}");
+    assert!(used_bytes(&followed) <= 16_384, "{}", used_bytes(&followed));
+    assert_eq!(
+        backend.calls()[2..],
+        [
+            "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 0 0 None"),
+            format!("result_cell {RESULT_ID} 0 0 None Some(16384)"),
+        ]
+    );
+    let cell = &followed.structured_content.as_ref().unwrap()["cell"];
+    let shown = cell["name"].as_str().unwrap();
+    assert!(
+        shown.ends_with(&name_cut_marker(20_000)) && shown.starts_with("aaaa"),
+        "{shown}"
+    );
+    assert_eq!(printed_cell_name(followed_text), shown);
+    assert_eq!(cell["column"], json!(0));
+    assert_eq!(cell["length"], json!(5002));
+    assert!(
+        followed_text.ends_with(&format!(
+            "text: {}",
+            serde_json::to_string(&format!("\"{}\"", "v".repeat(5000))).unwrap()
+        )),
+        "{followed_text}"
+    );
+}
+
+/// A page that read no row names no cell call.
+async fn a_zero_row_refusal_names_no_cell() {
+    let backend = Fake {
+        result_page: ok(page(&too_long_to_print(), vec![], 10)),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let refused = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": 10, "max_bytes": 32768,
+        }}),
+        &backend,
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let text = text_of(&refused);
+    names_the_hard_cap_routes(text);
+    assert!(!text.contains("read action=cell"), "{text}");
+}
+
+/// Below the hard cap the refusal offers a larger `max_bytes` and the
+/// `columns` route.
+async fn a_refusal_below_the_hard_cap_offers_a_budget_and_columns() {
+    let backend = Fake {
+        result_page: ok(page(
+            &with_long_query(twelve_columns(10), 9_000),
+            vec![(0..12).map(|i| s(&format!("c{i:03}"))).collect()],
+            0,
+        )),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let refused = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "max_bytes": 16384,
+        }}),
+        &backend,
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let text = text_of(&refused);
+    assert!(
+        text.contains("a larger max_bytes, at most 32768")
+            && text.contains(&format!(
+                "read action=page result_id=\"{RESULT_ID}\" columns=["
+            )),
+        "{text}"
+    );
+}
+
+/// `search`'s refusal at the hard cap names the first row's first cell too.
+async fn the_search_refusal_at_the_hard_cap_names_a_cell() {
+    let long = too_long_to_print();
+    let backend = Fake {
+        capabilities: ok(capabilities(None)),
+        capture: ok(trawl_client::CaptureResponse {
+            result: long.clone(),
+            execution: None,
+            activity: None,
+            step_seq: None,
+        }),
+        result_page: ok(page(
+            &long,
+            vec![(0..12).map(|i| s(&format!("c{i:03}"))).collect()],
+            0,
+        )),
+        ..Fake::default()
+    };
+    let refused = search::run(
+        &backend,
+        &trawl_mcp::session::Seen::default(),
+        search_input(json!({"mode": "execute", "query": "service=api", "max_bytes": 32768})),
+        now(),
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let text = text_of(&refused);
+    names_the_hard_cap_routes(text);
+    assert_eq!(
+        named_cell_call(text),
+        Some(json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+        }})),
+        "{text}"
     );
 }
 
@@ -1557,6 +2076,394 @@ async fn an_expired_result_is_a_tool_error_naming_result_gone() {
     assert!(text.contains("trawld says: the result expired"), "{text}");
     assert!(result.structured_content.is_none());
     assert_eq!(backend.methods(), ["capabilities", "result_page"]);
+}
+
+// -- the columns projection -----------------------------------------------------
+
+/// The names a projected read asks for: two of a 12-column capture, in
+/// the reverse of their stored order.
+const PROJECTION: [&str; 2] = ["c011", "c007"];
+
+/// How the Fake records a page call that sent [`PROJECTION`]: the slice
+/// `read` passes to the backend, which trawl-client joins as
+/// `columns=c011,c007` on the wire.
+fn projected_call(offset: u64, rows: u64) -> String {
+    format!("result_page {RESULT_ID} {offset} {rows} Some([\"c011\", \"c007\"])")
+}
+
+/// A capture of `captured_rows` rows over the 12 string columns `c000` to
+/// `c011`.
+fn twelve_columns(captured_rows: u64) -> trawl_client::CapturedResult {
+    let names: Vec<String> = (0..12).map(|i| format!("c{i:03}")).collect();
+    let typed: Vec<(&str, ColumnType)> = names
+        .iter()
+        .map(|name| (name.as_str(), ColumnType::String))
+        .collect();
+    captured(
+        "service=api",
+        &typed,
+        (0..12).map(|_| no_values(captured_rows)).collect(),
+        captured_rows,
+        captured_rows,
+    )
+}
+
+/// The page of `captured` from `offset` holding `rows`, projected to
+/// captured `positions`, as trawld answers a `columns` read: the selected
+/// columns in stored order, each with its position.
+fn projected(
+    captured: &trawl_client::CapturedResult,
+    positions: &[usize],
+    rows: Vec<Vec<Value>>,
+    offset: u64,
+) -> trawl_client::ResultPage {
+    let mut fetched = page(captured, rows, offset);
+    fetched.positions = positions.to_vec();
+    fetched.page.columns = positions
+        .iter()
+        .map(|&position| Column::new(format!("c{position:03}"), ColumnType::String))
+        .collect();
+    fetched
+}
+
+/// The two cells of row `row` of a page projected to positions 7 and 11,
+/// each `bytes` bytes.
+fn projected_row(row: u64, bytes: usize) -> Vec<Value> {
+    [7, 11]
+        .iter()
+        .map(|position| s(&format!("{row:04}c{position:03}{}", "p".repeat(bytes - 8))))
+        .collect()
+}
+
+/// The captured positions `result`'s mirror prints, in printed order.
+fn printed_positions(result: &CallToolResult) -> Vec<u64> {
+    result.structured_content.as_ref().unwrap()["result"]["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|column| column["position"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn read_page_projects_columns_and_keeps_them_in_continuations() {
+    the_tools_continuation_sends_the_columns().await;
+    the_fits_continuation_sends_the_columns().await;
+    the_hard_cap_page_sends_the_columns().await;
+    columns_trawld_cannot_select_are_refused_before_any_call().await;
+}
+
+/// The tool's continuation: the page reads 2 of 40 rows and fits whole.
+async fn the_tools_continuation_sends_the_columns() {
+    let captured = twelve_columns(40);
+    let backend = Fake {
+        result_page: ok(projected(
+            &captured,
+            &[7, 11],
+            (0..2).map(|row| projected_row(row, 40)).collect(),
+            0,
+        )),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let result = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "rows": 2, "columns": PROJECTION,
+        }}),
+        &backend,
+    )
+    .await;
+    let text = text_of(&result);
+    assert_ne!(result.is_error, Some(true), "{text}");
+    assert_eq!(
+        backend.calls(),
+        ["capabilities".to_owned(), projected_call(0, 2)]
+    );
+    assert_eq!(printed_positions(&result), [7, 11], "{text}");
+    let mirror = result.structured_content.as_ref().unwrap();
+    assert_eq!(
+        mirror["result"]["presentation"]["columns_omitted"],
+        json!(10)
+    );
+    let proposed = agreed_actions(&result);
+    assert_eq!(
+        proposed,
+        [json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": 2, "rows": 2,
+            "columns": PROJECTION,
+        }})],
+        "{text}"
+    );
+    follow(&proposed[0], &backend).await;
+    assert_eq!(backend.calls()[3], projected_call(2, 2));
+}
+
+/// The fit's continuation: the final page reads 30 rows the default
+/// budget cannot print, so the fitting creates the continuation.
+async fn the_fits_continuation_sends_the_columns() {
+    let captured = twelve_columns(30);
+    let backend = Fake {
+        result_page: ok(projected(
+            &captured,
+            &[7, 11],
+            (0..30).map(|row| projected_row(row, 400)).collect(),
+            0,
+        )),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let result = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "rows": 50, "columns": PROJECTION,
+        }}),
+        &backend,
+    )
+    .await;
+    let text = text_of(&result);
+    assert_ne!(result.is_error, Some(true), "{text}");
+    assert!(used_bytes(&result) <= 16_384, "{}", used_bytes(&result));
+    let printed = result.structured_content.as_ref().unwrap()["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(printed > 0 && printed < 30, "{printed}: {text}");
+    assert_eq!(printed_positions(&result), [7, 11], "{text}");
+    let proposed = agreed_actions(&result);
+    assert_eq!(
+        proposed,
+        [json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": printed, "rows": 50,
+            "columns": PROJECTION,
+        }})],
+        "{text}"
+    );
+    follow(&proposed[0], &backend).await;
+    assert_eq!(
+        backend.calls(),
+        [
+            "capabilities".to_owned(),
+            projected_call(0, 50),
+            "capabilities".to_owned(),
+            projected_call(printed as u64, 50),
+        ]
+    );
+}
+
+/// The fit's one-row page at the hard cap: a long executed query leaves
+/// the call's budget room for a reply printing no row, and none for the
+/// row at even its first printed column.
+async fn the_hard_cap_page_sends_the_columns() {
+    let mut advanced = 0;
+    for comment in (4_000..8_600).step_by(40) {
+        let captured = with_long_query(twelve_columns(1), comment);
+        let backend = Fake {
+            result_page: ok(projected(
+                &captured,
+                &[7, 11],
+                vec![projected_row(0, 400)],
+                0,
+            )),
+            capabilities: ok(capabilities(None)),
+            ..Fake::default()
+        };
+        let result = follow(
+            &json!({"tool": "read", "arguments": {
+                "action": "page", "result_id": RESULT_ID, "columns": PROJECTION,
+                "max_bytes": 16_384,
+            }}),
+            &backend,
+        )
+        .await;
+        if one_row_reply(&result, 16_384) != OneRowReply::Advanced {
+            continue;
+        }
+        let text = text_of(&result);
+        let proposed = agreed_actions(&result);
+        assert_eq!(
+            proposed,
+            [json!({"tool": "read", "arguments": {
+                "action": "page", "result_id": RESULT_ID, "offset": 0, "rows": 1,
+                "max_bytes": 32768, "columns": PROJECTION,
+            }})],
+            "{text}"
+        );
+        let followed = follow(&proposed[0], &backend).await;
+        assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
+        assert_eq!(
+            backend.calls(),
+            [
+                "capabilities".to_owned(),
+                projected_call(0, 50),
+                "capabilities".to_owned(),
+                projected_call(0, 1),
+            ]
+        );
+        advanced += 1;
+    }
+    assert!(
+        advanced > 0,
+        "no query length proposed the row at the hard cap"
+    );
+}
+
+/// Each list trawld cannot select is refused before the capabilities read
+/// and the page: an empty list, 17 names, a 256-byte name, an empty name,
+/// a 128-character name of 256 bytes, and a name trawld would split at its
+/// comma. 16 names, one of them 255 bytes, reach trawld.
+async fn columns_trawld_cannot_select_are_refused_before_any_call() {
+    let seventeen: Vec<String> = (0..17).map(|i| format!("c{i:03}")).collect();
+    let cases = [
+        (json!([]), "read: columns names no column"),
+        (
+            json!(seventeen),
+            "read: columns names 17 columns; at most 16",
+        ),
+        (
+            json!(["c007", "n".repeat(256)]),
+            "read: columns[1] is 256 bytes; columns takes names of 1 to 255 bytes",
+        ),
+        (
+            json!(["c007", ""]),
+            "read: columns[1] is empty; columns takes names of 1 to 255 bytes",
+        ),
+        (
+            json!(["é".repeat(128)]),
+            "read: columns[0] is 256 bytes; columns takes names of 1 to 255 bytes",
+        ),
+        (
+            json!(["c011", "c007,c011"]),
+            "read: columns[1] holds a comma",
+        ),
+    ];
+    for (columns, says) in cases {
+        let backend = Fake::default();
+        let result = follow(
+            &json!({"tool": "read", "arguments": {
+                "action": "page", "result_id": RESULT_ID, "columns": columns,
+            }}),
+            &backend,
+        )
+        .await;
+        let text = text_of(&result);
+        assert_eq!(result.is_error, Some(true), "{columns}: {text}");
+        assert!(text.starts_with(says), "{columns}: {text}");
+        assert!(
+            backend.calls().is_empty(),
+            "{columns}: {:?}",
+            backend.calls()
+        );
+    }
+
+    // 16 names, one of them 255 bytes, reach trawld as sent: in order,
+    // with nothing trimmed, folded or merged.
+    let mut sixteen: Vec<String> = (0..15).rev().map(|i| format!("c{i:03}")).collect();
+    sixteen.push(format!("{}n", "é".repeat(127)));
+    let captured = twelve_columns(1);
+    let backend = Fake {
+        result_page: ok(projected(
+            &captured,
+            &[7, 11],
+            vec![projected_row(0, 40)],
+            0,
+        )),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let result = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "rows": 1, "columns": sixteen,
+        }}),
+        &backend,
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let sent: Vec<&str> = sixteen.iter().map(String::as_str).collect();
+    assert_eq!(
+        backend.calls(),
+        [
+            "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 0 1 {:?}", Some(sent.as_slice())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn projected_columns_do_not_count_as_null() {
+    // Column 3 is null in rows 0 to 9 and not in rows 10 to 19; column 5
+    // is null in every row. Ten rows of 400-byte cells do not fit the
+    // default budget whole, so every reply omits its null columns. Read
+    // at full width, column 3 counts as null in the first range only. A
+    // projection that leaves it out reads none of its cells, so neither
+    // range counts it, and both count column 5 alone.
+    let captured = twelve_columns(20);
+    let cell = |row: u64, position: usize| -> Value {
+        if position == 5 || (position == 3 && row < 10) {
+            Value::Null
+        } else {
+            s(&format!("{row:04}c{position:03}{}", "q".repeat(392)))
+        }
+    };
+    let wide = |offset: u64| -> Vec<Vec<Value>> {
+        (offset..offset + 10)
+            .map(|row| (0..12).map(|position| cell(row, position)).collect())
+            .collect()
+    };
+    let narrow = |offset: u64| -> Vec<Vec<Value>> {
+        (offset..offset + 10)
+            .map(|row| {
+                [5, 7, 11]
+                    .iter()
+                    .map(|&position| cell(row, position))
+                    .collect()
+            })
+            .collect()
+    };
+    for offset in [0, 10] {
+        let full = Fake {
+            result_page: ok(page(&captured, wide(offset), offset)),
+            capabilities: ok(capabilities(None)),
+            ..Fake::default()
+        };
+        let result = follow(
+            &json!({"tool": "read", "arguments": {
+                "action": "page", "result_id": RESULT_ID, "offset": offset, "rows": 10,
+            }}),
+            &full,
+        )
+        .await;
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true), "{text}");
+        let presentation = &result.structured_content.as_ref().unwrap()["result"]["presentation"];
+        let nulls = if offset == 0 { 2 } else { 1 };
+        assert_eq!(presentation["null_columns_omitted"], json!(nulls), "{text}");
+        assert_eq!(presentation["columns_omitted"], json!(nulls), "{text}");
+
+        let backend = Fake {
+            result_page: ok(projected(&captured, &[5, 7, 11], narrow(offset), offset)),
+            capabilities: ok(capabilities(None)),
+            ..Fake::default()
+        };
+        let result = follow(
+            &json!({"tool": "read", "arguments": {
+                "action": "page", "result_id": RESULT_ID, "offset": offset, "rows": 10,
+                "columns": ["c011", "c007", "c005"],
+            }}),
+            &backend,
+        )
+        .await;
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true), "{text}");
+        assert_eq!(printed_positions(&result), [7, 11], "{text}");
+        let presentation = &result.structured_content.as_ref().unwrap()["result"]["presentation"];
+        assert_eq!(presentation["null_columns_omitted"], json!(1), "{text}");
+        assert_eq!(presentation["columns_omitted"], json!(10), "{text}");
+        assert!(
+            text.contains(
+                "omits 10 columns (1 null in every row read); fields source=result describes them"
+            ),
+            "{text}"
+        );
+    }
 }
 
 // -- the page limit -------------------------------------------------------------
@@ -2244,7 +3151,6 @@ const STATIC_MIRROR_KEYS: &[&str] = &[
     "link",
     "message",
     "mode",
-    "more",
     "name",
     "next_actions",
     "next_actions_dropped_to_fit",
@@ -2273,6 +3179,7 @@ const STATIC_MIRROR_KEYS: &[&str] = &[
     "text",
     "through_seq",
     "title",
+    "trawld_holds_more",
     "type",
     "updated_at",
     "updated_by",

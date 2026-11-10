@@ -7,7 +7,9 @@
 //!
 //! Both actions read trawld's capabilities once, first, for the limits
 //! trawld holds a read to. `action: page` reads `GET /api/v1/results/{id}`
-//! from `offset`, at most `[capture] page_max_rows` rows; a page of a
+//! from `offset`, at most `[capture] page_max_rows` rows, of the columns
+//! `columns` names when the call sends it, and every page continuation of
+//! the reply sends the same `columns`; a page of a
 //! `context`, `sightings` or `compare` result prints that read's block,
 //! as the read itself printed it. `action: cell`
 //! reads the result's metadata with a zero-row page, for the column's name
@@ -27,10 +29,11 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 use trawl_api::CapabilitiesResponse;
 use trawl_client::Correlation;
+use trawl_core::schema::MAX_FIELD_NAME_BYTES;
 
 use super::attach::may_attach;
 use super::orient::object;
-use super::schema::{DEFAULT_ROWS, MAX_ROWS, READ, ReadInput};
+use super::schema::{DEFAULT_ROWS, MAX_ROWS, PAGE_MAX_COLUMNS, READ, ReadInput};
 use super::{continuations, follow_ups, page_rows, result_view, unencodable};
 use crate::backend::Backend;
 use crate::render::activity::{Continue, board_through};
@@ -117,7 +120,9 @@ async fn investigation<B: Backend>(
 }
 
 /// `action: page`, reading the call's `rows` rows, or the fewer trawld's
-/// page limit allows.
+/// page limit allows, of the columns the call's `columns` names, or of
+/// every column. A `columns` list trawld cannot select by is refused
+/// before any call.
 async fn page<B: Backend>(
     backend: &B,
     result_id: &str,
@@ -125,10 +130,19 @@ async fn page<B: Backend>(
     budget: Budget,
     rows: u64,
 ) -> CallToolResult {
+    let projection = input.columns.as_deref();
+    if let Some(refused) = projection.and_then(refused_columns) {
+        return refusal::error_result(refused);
+    }
+    let names: Option<Vec<&str>> =
+        projection.map(|columns| columns.iter().map(String::as_str).collect());
     let capabilities = backend.capabilities().await.ok();
     let rows = page_rows(rows, capabilities.as_ref());
     let offset = input.offset.unwrap_or(0);
-    let page = match backend.result_page(result_id, offset, rows, None).await {
+    let page = match backend
+        .result_page(result_id, offset, rows, names.as_deref())
+        .await
+    {
         Ok(page) => page,
         Err(error) => return refusal::refusal(READ, &error, None),
     };
@@ -140,7 +154,8 @@ async fn page<B: Backend>(
         url: None,
         reason: Some(READ_LINK.to_owned()),
     };
-    let view = result_view(&page.result, offset, encoded, Vec::new(), link).await;
+    let mut view = result_view(&page.result, offset, encoded, Vec::new(), link).await;
+    view.read.projection = input.columns.clone();
     // The renderer says this again over the rows it prints, when its
     // budget prints fewer than were read.
     let outcome = render::page_outcome(&view);
@@ -176,6 +191,48 @@ async fn page<B: Backend>(
         next_actions,
     };
     render::read(reply, budget, rows)
+}
+
+/// Why `read` refuses `columns`, or `None` when trawld can select by
+/// every name: the list holds 1 to [`PAGE_MAX_COLUMNS`] names, each 1 to
+/// [`MAX_FIELD_NAME_BYTES`] bytes, and none holds a comma, because trawld
+/// splits the list on commas. A name is named by its index, never echoed.
+fn refused_columns(columns: &[String]) -> Option<String> {
+    if columns.is_empty() {
+        return Some(format!(
+            "read: columns names no column; send 1 to {PAGE_MAX_COLUMNS} names, or leave \
+             columns out to read every column."
+        ));
+    }
+    if columns.len() > PAGE_MAX_COLUMNS {
+        return Some(format!(
+            "read: columns names {} columns; at most {PAGE_MAX_COLUMNS} are accepted.",
+            columns.len()
+        ));
+    }
+    columns.iter().enumerate().find_map(|(index, name)| {
+        if name.is_empty() {
+            Some(format!(
+                "read: columns[{index}] is empty; columns takes names of 1 to \
+                 {MAX_FIELD_NAME_BYTES} bytes."
+            ))
+        } else if name.len() > MAX_FIELD_NAME_BYTES {
+            Some(format!(
+                "read: columns[{index}] is {} bytes; columns takes names of 1 to \
+                 {MAX_FIELD_NAME_BYTES} bytes. read action=cell reads a column of any name by \
+                 its position, which fields source=result gives.",
+                name.len()
+            ))
+        } else if name.contains(',') {
+            Some(format!(
+                "read: columns[{index}] holds a comma, and trawld splits columns on commas. read \
+                 action=cell reads that column by its position, which fields source=result \
+                 gives."
+            ))
+        } else {
+            None
+        }
+    })
 }
 
 /// `action: cell`. `rows` is the call's `rows` argument, which a cell

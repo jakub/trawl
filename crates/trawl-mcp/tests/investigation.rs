@@ -1194,6 +1194,320 @@ async fn a_board_entry_that_cannot_print_is_an_error_naming_it_and_the_read_past
     );
 }
 
+// -- trawld's paging and the budget's drops ----------------------------------------
+
+/// Notes #`from` to #`to` by `actor`, each holding `bytes` of text after
+/// its sequence.
+fn notes_by(actor: &Actor, from: u64, to: u64, bytes: usize) -> Vec<LogEntry> {
+    (from..=to)
+        .map(|seq| {
+            note(
+                seq,
+                actor.clone(),
+                &format!("{seq:02} {}", "p".repeat(bytes)),
+            )
+        })
+        .collect()
+}
+
+/// The human key's notes #`from` to #`to`, each holding `bytes` of text
+/// after its sequence.
+fn human_notes(from: u64, to: u64, bytes: usize) -> Vec<LogEntry> {
+    notes_by(&human(), from, to, bytes)
+}
+
+/// trawld's answer to a read of `board` after `since`: at most `page`
+/// entries in change order, with `more` when it holds others past them.
+fn trawld_read(board: &[LogEntry], since: u64, page: usize) -> InvestigationRead {
+    let after: Vec<LogEntry> = board
+        .iter()
+        .filter(|entry| entry.updated_seq > since)
+        .cloned()
+        .collect();
+    let more = after.len() > page;
+    let entries: Vec<LogEntry> = after.into_iter().take(page).collect();
+    let last = board.last().map_or(0, |entry| entry.updated_seq);
+    let through_seq = match entries.last() {
+        Some(entry) => entry.updated_seq,
+        None if more => since,
+        None => last.max(since),
+    };
+    InvestigationRead {
+        investigation: investigation(last),
+        entries,
+        through_seq,
+        more,
+    }
+}
+
+/// What the entries block at `part` of `result` says about paging, after
+/// checking the rule every block keeps: trawld's paging is
+/// `trawld_holds_more` and never `more`, and `continuation` is present
+/// exactly when trawld holds more or the budget dropped some. Returns
+/// `trawld_holds_more`, `entries_dropped_to_fit`, the `updated_seq` of
+/// each printed entry, and the continuation.
+fn paging_facts(
+    result: &CallToolResult,
+    part: &str,
+    label: &str,
+) -> (bool, u64, Vec<u64>, Option<Json>) {
+    assert_ok(result);
+    let view = block(result, part);
+    let fields = view
+        .as_object()
+        .unwrap_or_else(|| panic!("{label}: no {part} block"));
+    assert!(!fields.contains_key("more"), "{label}: {view}");
+    let holds = view["trawld_holds_more"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("{label}: {view}"));
+    let dropped = view["entries_dropped_to_fit"].as_u64().unwrap();
+    let continuation = view.get("continuation").cloned();
+    assert_eq!(
+        continuation.is_some(),
+        holds || dropped > 0,
+        "{label}: {view}"
+    );
+    let text = text_of(result);
+    assert_eq!(
+        text.contains("trawld holds more past #"),
+        holds,
+        "{label}: {text}"
+    );
+    let printed = view["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["updated_seq"].as_u64().unwrap())
+        .collect();
+    (holds, dropped, printed, continuation)
+}
+
+/// Follow `next` and every continuation after it as a model would, its
+/// arguments as proposed, each read answered by [`trawld_read`] at `page`;
+/// the `updated_seq` of every entry the reads printed, in order.
+async fn follow_continuations(
+    seen: &Seen,
+    mut next: Option<Json>,
+    board: &[LogEntry],
+    page: usize,
+    label: &str,
+) -> Vec<u64> {
+    let mut printed = Vec::new();
+    let mut hops = 0;
+    while let Some(call) = next {
+        hops += 1;
+        assert!(
+            hops <= board.len() + 1,
+            "{label}: the continuation never ends"
+        );
+        let arguments = call["arguments"].clone();
+        let since = arguments["since"].as_u64().unwrap();
+        let backend = Fake {
+            read_investigation: ok(trawld_read(board, since, page)),
+            ..Fake::default()
+        };
+        let result = match call["tool"].as_str() {
+            Some(INVESTIGATION) => investigation::run(&backend, seen, input(arguments)).await,
+            Some("read") => {
+                read::run(&backend, seen, serde_json::from_value(arguments).unwrap()).await
+            }
+            other => panic!("{label}: a continuation to {other:?}"),
+        };
+        assert_eq!(
+            backend.calls(),
+            [format!(
+                "read_investigation {INVESTIGATION_ID} {since} Some(50)"
+            )],
+            "{label}"
+        );
+        let (_, _, seqs, continuation) = paging_facts(&result, "entries", label);
+        printed.extend(seqs);
+        next = continuation;
+    }
+    printed
+}
+
+/// A board read for [`activity_paging_and_budget_drops_are_independent`]:
+/// what trawld holds and how it pages, the read, and what its first reply
+/// must show.
+struct BoardCase {
+    label: &'static str,
+    board: Vec<LogEntry>,
+    since: u64,
+    /// trawld's page size for the first read, and for every later one.
+    pages: (usize, usize),
+    max_bytes: Option<u32>,
+    /// The first reply's `trawld_holds_more`, whether its budget dropped
+    /// entries, and whether it printed none.
+    holds: bool,
+    drops: bool,
+    none_printed: bool,
+}
+
+/// Read `case`'s board through `investigation action=read`, or through
+/// `read action=investigation` when `via_read`, check its first reply, and
+/// follow its continuations to the end: every entry after `since` prints
+/// once, in change order.
+async fn read_paged_board(case: &BoardCase, via_read: bool) {
+    let label = format!("{}, via_read={via_read}", case.label);
+    let backend = Fake {
+        read_investigation: ok(trawld_read(&case.board, case.since, case.pages.0)),
+        ..Fake::default()
+    };
+    let seen = Seen::default();
+    let mut arguments = if via_read {
+        json!({"action": "investigation", "investigation_id": INVESTIGATION_ID,
+               "since": case.since})
+    } else {
+        json!({"action": "read", "id": INVESTIGATION_ID, "since": case.since})
+    };
+    if let Some(max_bytes) = case.max_bytes {
+        arguments["max_bytes"] = json!(max_bytes);
+    }
+    let result = if via_read {
+        read::run(&backend, &seen, serde_json::from_value(arguments).unwrap()).await
+    } else {
+        call(&backend, &seen, arguments).await
+    };
+    let budget = case
+        .max_bytes
+        .map_or(16_384, |max_bytes| max_bytes as usize);
+    assert!(used_bytes(&result) <= budget, "{label}");
+    let (holds, dropped, mut printed, next) = paging_facts(&result, "entries", &label);
+    assert_eq!(holds, case.holds, "{label}");
+    assert_eq!(dropped > 0, case.drops, "{label}");
+    assert_eq!(printed.is_empty(), case.none_printed, "{label}");
+    printed.extend(follow_continuations(&seen, next, &case.board, case.pages.1, &label).await);
+    let expected: Vec<u64> = case
+        .board
+        .iter()
+        .map(|entry| entry.updated_seq)
+        .filter(|&seq| seq > case.since)
+        .collect();
+    assert_eq!(printed, expected, "{label}");
+}
+
+/// A note written while another key's `theirs` entries are unseen, trawld
+/// carrying them as activity in pages of `page`, at the minimum budget:
+/// the other key's name, which no entry prints shorter, makes each of its
+/// entries larger than the budget leaves beside the acknowledgement, so
+/// the activity prints none of them. Checks the reply and follows its
+/// continuation to the end: every entry prints once, in change order.
+async fn write_with_unprintable_activity(label: &str, theirs: u64, page: usize, holds: bool) {
+    let long_named = Actor {
+        name: "n".repeat(2000),
+        ..human()
+    };
+    let mine = note(theirs + 1, agent(), "mine");
+    let mut board = notes_by(&long_named, 1, theirs, 10);
+    board.push(mine.clone());
+    let others = trawld_read(&board[..board.len() - 1], 0, page);
+    let backend = Fake {
+        append_entry: ok(appended(
+            mine,
+            Some(Activity {
+                entries: others.entries,
+                through_seq: others.through_seq,
+                more: others.more,
+            }),
+        )),
+        ..Fake::default()
+    };
+    let seen = Seen::default();
+    seen.lock().await.touch(&id(), 0);
+    let result = call(
+        &backend,
+        &seen,
+        json!({"action": "note", "id": INVESTIGATION_ID, "text": "mine", "max_bytes": 4096}),
+    )
+    .await;
+    assert!(used_bytes(&result) <= 4096, "{label}");
+    let (first_holds, dropped, mut printed, next) = paging_facts(&result, "activity", label);
+    assert_eq!(first_holds, holds, "{label}");
+    assert!(dropped > 0, "{label}");
+    assert!(printed.is_empty(), "{label}: {printed:?}");
+    printed.extend(follow_continuations(&seen, next, &board, 50, label).await);
+    let expected: Vec<u64> = board.iter().map(|entry| entry.updated_seq).collect();
+    assert_eq!(printed, expected, "{label}");
+}
+
+/// #373: trawld's paging and the budget's drops are two facts. Every
+/// combination of the two, blocks printing no entry among them, says
+/// trawld's paging as `trawld_holds_more` and has no `more` key; it
+/// proposes a continuation exactly when either is set; and following the
+/// continuations from the first reply prints every entry after its
+/// `since` once, in change order.
+#[tokio::test]
+async fn activity_paging_and_budget_drops_are_independent() {
+    let case = |label, board, since, pages, max_bytes, facts: (bool, bool, bool)| BoardCase {
+        label,
+        board,
+        since,
+        pages,
+        max_bytes,
+        holds: facts.0,
+        drops: facts.1,
+        none_printed: facts.2,
+    };
+    let boards = [
+        case(
+            "no paging, no drops",
+            human_notes(1, 3, 10),
+            0,
+            (50, 50),
+            None,
+            (false, false, false),
+        ),
+        case(
+            "paging, no drops",
+            human_notes(1, 5, 10),
+            0,
+            (2, 2),
+            None,
+            (true, false, false),
+        ),
+        case(
+            "no paging, drops",
+            human_notes(1, 8, 400),
+            0,
+            (50, 50),
+            Some(4096),
+            (false, true, false),
+        ),
+        case(
+            "paging and drops",
+            human_notes(1, 12, 400),
+            0,
+            (6, 6),
+            Some(4096),
+            (true, true, false),
+        ),
+        case(
+            "no entry, no paging",
+            human_notes(1, 3, 10),
+            3,
+            (50, 50),
+            None,
+            (false, false, true),
+        ),
+        case(
+            "no entry, paging",
+            human_notes(1, 4, 10),
+            0,
+            (0, 2),
+            None,
+            (true, false, true),
+        ),
+    ];
+    for board in &boards {
+        for via_read in [false, true] {
+            read_paged_board(board, via_read).await;
+        }
+    }
+    write_with_unprintable_activity("no entry, drops, no paging", 3, 50, false).await;
+    write_with_unprintable_activity("no entry, drops and paging", 6, 3, true).await;
+}
+
 #[tokio::test]
 async fn list_prints_every_investigation_on_one_line() {
     let summary = |id: &str, status: InvestigationStatus, title: &str| InvestigationSummary {

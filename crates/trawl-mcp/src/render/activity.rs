@@ -204,7 +204,7 @@ pub fn activity_view(id: &str, since: u64, activity: &Activity) -> ActivityView 
         since,
         entries,
         through_seq: activity.through_seq,
-        more: activity.more,
+        trawld_holds_more: activity.more,
         entries_dropped_to_fit: 0,
         entries_abbreviated: 0,
         printed_through: None,
@@ -224,7 +224,7 @@ pub fn board_view(id: &str, since: u64, read: &InvestigationRead, tool: Continue
         since,
         entries: read.entries.iter().map(entry_view).collect(),
         through_seq: read.through_seq,
-        more: read.more,
+        trawld_holds_more: read.more,
         entries_dropped_to_fit: 0,
         entries_abbreviated: 0,
         printed_through: None,
@@ -252,7 +252,7 @@ pub(crate) fn keep_entries(view: &mut ActivityView, kept: usize, total: usize, t
         Continue::Investigation => ACTIVITY_CONTINUATION,
         Continue::Read => BOARD_CONTINUATION,
     };
-    view.continuation = (view.entries_dropped_to_fit > 0 || view.more)
+    view.continuation = (view.entries_dropped_to_fit > 0 || view.trawld_holds_more)
         .then(|| tool.call(&view.investigation_id, from, reason));
 }
 
@@ -296,7 +296,7 @@ pub fn board_through(result: &CallToolResult, part: &[&str]) -> Option<u64> {
         at = at.get(key)?;
     }
     let whole = at.get("entries_dropped_to_fit").and_then(Json::as_u64) == Some(0)
-        && at.get("more").and_then(Json::as_bool) == Some(false);
+        && at.get("trawld_holds_more").and_then(Json::as_bool) == Some(false);
     match at.get("through_seq").and_then(Json::as_u64) {
         Some(through) if whole => Some(printed.map_or(through, |printed| printed.max(through))),
         _ => printed,
@@ -571,7 +571,7 @@ fn block_facts(view: &ActivityView, budget: Budget) -> String {
             view.entries_dropped_to_fit
         );
     }
-    if view.more {
+    if view.trawld_holds_more {
         let _ = write!(facts, "; trawld holds more past #{}", view.through_seq);
     }
     facts
@@ -579,7 +579,7 @@ fn block_facts(view: &ActivityView, budget: Budget) -> String {
 
 /// An entry block's lines: the facts line, the entries, the continuation.
 fn block_lines(heading: &str, view: &ActivityView, budget: Budget, lines: &mut Vec<String>) {
-    if view.entries.is_empty() && view.entries_dropped_to_fit == 0 && !view.more {
+    if view.entries.is_empty() && view.entries_dropped_to_fit == 0 && !view.trawld_holds_more {
         lines.push(format!("{heading}: none."));
         return;
     }
