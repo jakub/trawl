@@ -229,6 +229,37 @@ test('a stale reopen shows the conflict and leaves the board open, as someone el
   ]);
 });
 
+test('a reopen at the current sequence lands, and the board reads the investigation open', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:43:00.000000Z', payload: { kind: 'status', status: 'closed' } }]);
+  await freezeClock(page);
+  const main = await openBoard(page);
+  const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
+  await expect(status(main)).toHaveText('Closed');
+  await expect(activity).toHaveCount(7);
+  expect(await boardReads(request)).toEqual([0]);
+
+  await main.getByRole('button', { name: 'Reopen investigation' }).click();
+  const note = main.locator('.inv-write-note [role="status"]');
+  await expect(note).toHaveText('You reopened the investigation.');
+  await expect(status(main)).toHaveText('Open');
+  // The control is now the one that applies.
+  await expect(main.getByRole('button', { name: 'Close investigation' })).toBeEnabled();
+  await expect(main.getByRole('button', { name: 'Reopen investigation' })).toHaveCount(0);
+  await expect(activity).toHaveCount(8);
+  await expect(activity.nth(7)).toContainText('Reopened the investigation.');
+  await expect(activity.nth(7)).toContainText('jakub');
+  // Neither a lost answer nor a conflict reads on the board.
+  await expect(note).not.toContainText('may or may not have taken effect');
+  await expect(note).not.toContainText('nothing changed');
+  const [landed] = await writes(request);
+  expect(landed).toEqual({ method: 'PATCH', id: ID, body: { expected_seq: 10, status: 'open' } });
+  // The board's cursor moves only with its own reads: no `seen_seq`.
+  expect(landed.body).not.toHaveProperty('seen_seq');
+  expect(await writes(request)).toHaveLength(1);
+  expect(await boardReads(request)).toEqual([0, 10]);
+});
+
 test('a keep posts one row and its reason once, and the keep then reads on the board', async ({ page, request }) => {
   await as(request, 'investigations-writer');
   await freezeClock(page);
