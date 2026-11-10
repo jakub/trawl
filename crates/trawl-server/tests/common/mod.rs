@@ -3944,7 +3944,9 @@ pub mod investigating {
         count
     }
 
-    async fn waiting(probe: &sqlx::PgPool, pattern: &str) -> i64 {
+    /// [`lock_waiters`] through the caller's `probe`, for a test that polls
+    /// it without sleeping, as one on a paused clock does.
+    pub async fn waiting(probe: &sqlx::PgPool, pattern: &str) -> i64 {
         sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity
              WHERE datname = current_database() AND wait_event_type = 'Lock'

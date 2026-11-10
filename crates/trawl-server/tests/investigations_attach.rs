@@ -30,7 +30,7 @@ use common::audit_capture::Capture;
 use common::captured::{self, SLOW_PATTERN, SLOW_SERVICE, at};
 use common::investigating::{
     INVESTIGATION_LOCK, attached, call, code, create, hold, hold_result, id, lock_waiters,
-    lock_waits, message, outcome, read, routed, settled, steps, until_admitted,
+    lock_waits, message, outcome, read, routed, settled, steps, until_admitted, waiting,
 };
 use common::{MintedKey, TestServer, mint_key, trawl_perms};
 use reqwest::{Method, StatusCode};
@@ -40,6 +40,7 @@ use trawl_api::investigations::{EntryPayload, StepOutcomeKind};
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::pool::seam::Seam;
+use trawl_server::test_timing::frozen;
 
 /// Where the clock stands when a test captures: half an hour into the
 /// capture corpus's hour.
@@ -993,13 +994,43 @@ async fn a_step_admission_waiting_on_one_result_after_another_answers_by_the_cap
     );
 }
 
+/// The `statement_timeout` of each statement of the one step admission
+/// the server's statement record holds, in milliseconds, in the order
+/// the statements ran. Fails unless exactly one admission was recorded
+/// since the record was armed.
+fn admission_budgets(server: &TestServer) -> Vec<u128> {
+    let mut admissions: Vec<_> = server
+        .state
+        .storage
+        .investigations
+        .statement_record()
+        .writes()
+        .into_iter()
+        .filter(|(write, _)| *write == "begin_step")
+        .collect();
+    assert_eq!(
+        admissions.len(),
+        1,
+        "one step admission was recorded: {admissions:?}"
+    );
+    admissions.remove(0).1
+}
+
 /// The statement after a wait gets only what remains of the capture's
 /// deadline (ADR-0059). The due-write rule's prune waits three seconds on
 /// a kept result another session holds, with the investigation's lock
 /// free; then the step's log insert waits on a session holding the log
-/// table in `EXCLUSIVE` mode. The capture answers 429 `capture_busy` by
-/// its five-second deadline, and by then no session waits on the insert;
-/// its request count is free, and nothing was written.
+/// table in `EXCLUSIVE` mode. The capture answers 429 `capture_busy`, and
+/// by then no session waits on the insert; its request count is free, and
+/// nothing was written. The server's statement record shows the insert
+/// was sent under a timeout of its own, after the lock and the prune;
+/// [`a_step_admission_spends_one_deadline_across_statements`] proves the
+/// timeout is what remained of the deadline.
+///
+/// The test runs on the live clock, and its waits are real Postgres lock
+/// waits, each under a hang guard. The prune's waiter is still polled
+/// for while it waits, and it waits no longer than its five-second
+/// `statement_timeout`, so heavy enough load can still miss it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_deadline() {
     use sqlx::Connection as _;
@@ -1020,6 +1051,7 @@ async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_dea
         .execute(&mut log)
         .await
         .unwrap();
+    server.state.storage.investigations.statement_record().arm();
 
     let sent = tokio::time::Instant::now();
     let request = support::send(
@@ -1034,16 +1066,17 @@ async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_dea
     lock_waits(&server, EVIDENCE_PRUNE, 1).await;
     tokio::time::sleep_until(sent + Duration::from_secs(3)).await;
     sqlx::query("COMMIT").execute(&mut result).await.unwrap();
-    lock_waits(&server, LOG_INSERT, 1).await;
 
     let response = support::finish(request).await;
-    let answered = sent.elapsed();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     let body = support::body_json(response).await;
     assert_eq!(code(&body), "capture_busy", "{body}");
-    assert!(
-        answered < deadline + FLOOR,
-        "answered {answered:?} after the capture began, past its {deadline:?} deadline"
+    let budgets = admission_budgets(&server);
+    assert_eq!(
+        budgets.len(),
+        3,
+        "the admission sent its lock, its prune and its log insert, the last refused: \
+         {budgets:?}"
     );
     assert_eq!(
         lock_waiters(&server, LOG_INSERT).await,
@@ -1059,6 +1092,91 @@ async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_dea
         (2, 1),
         "the admission appended no step"
     );
+}
+
+/// A step admission's statements spend one capture deadline between them
+/// (ADR-0059): each statement's `statement_timeout` is what remains of the
+/// deadline when it is sent, never a fresh budget. The due-write rule's
+/// prune waits on a kept result another session holds, three seconds of
+/// the five-second deadline pass, and the session lets go: the admission's
+/// first statement had more than four seconds, and its log insert, after
+/// the prune, no more than two. The capture then runs, answers 200, and
+/// its step settles.
+///
+/// The deadline is a tokio one, so the server boots and the result is
+/// held on the live clock, and the clock is then paused: the three
+/// seconds are one explicit advance, and every wait after the pause runs
+/// under `frozen`, so the real work of Postgres and the capture never
+/// lets tokio jump the clock. The admission's budgets are read from the
+/// server's statement record, armed after the setup, which keeps each
+/// write transaction apart, so the step's own outcome write, or a write
+/// from a background timer the advance fires, is never read as the
+/// admission's. Postgres's clock is not paused: the prune waits under a
+/// real five-second `statement_timeout`, and after the advance each later
+/// statement gets at most two real seconds, under the hang guard.
+#[tokio::test(flavor = "current_thread")]
+async fn a_step_admission_spends_one_deadline_across_statements() {
+    let deadline = Duration::from_secs(5);
+    let (server, keys) = boot_unmetered(deadline.as_secs()).await;
+    create(&server, &keys.agent, 1).await;
+    let kept = keep_results(&server, &keys, 1).await;
+    server
+        .results_clock
+        .set(at(START) + chrono::TimeDelta::days(8));
+    let app = server.router_with(|_| {});
+    let mut result = hold_result(&server, &kept[0]).await;
+    let probe = common::fixture_pool(&server.app_db_url, 1).await;
+    server.state.storage.investigations.statement_record().arm();
+
+    tokio::time::pause();
+    let request = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&attached(&corpus_query(), 1, &json!({}))),
+        ),
+    );
+    frozen("the admission's prune waits on the held result", async {
+        while waiting(&probe, EVIDENCE_PRUNE).await != 1 {}
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+    frozen(
+        "the held result's COMMIT",
+        sqlx::query("COMMIT").execute(&mut result),
+    )
+    .await
+    .unwrap();
+    let response = frozen("the capture answers", request)
+        .await
+        .expect("the request task did not panic");
+    let status = response.status();
+    let body = frozen("the capture's body", support::body_json(response)).await;
+    // The fixture's reads and teardown run on the live clock.
+    tokio::time::resume();
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let budgets = admission_budgets(&server);
+    assert_eq!(
+        budgets.len(),
+        4,
+        "the admission's lock, prune, log insert and advance: {budgets:?}"
+    );
+    assert!(
+        budgets[0] > 4_000,
+        "the admission began with no more than 4 s of its 5 s deadline: {budgets:?}"
+    );
+    assert!(
+        budgets[2] > 0 && budgets[2] <= 2_000,
+        "the log insert, 3 s into the 5 s deadline, was not bounded by the 2 s that remained: \
+         {budgets:?}"
+    );
+    let step = settled(&server, &keys.human, 1, 3).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Success, "{recorded:?}");
+    probe.close().await;
 }
 
 /// The `aborted` write of a step whose request went away waits no later
