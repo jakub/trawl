@@ -174,11 +174,13 @@ A release whose WAL sits off the volume now fails `helm upgrade` at render, and 
 
 The spill cap bounds the bytes DuckDB writes into its temp files: their lengths, plus the one block per live file that the decision already describes. It does not bound blocks that the filesystem allocates past a file's end.
 
-XFS allocates ahead of the end of a file that keeps growing. `spill_stays_within_budget_plus_class_slack` measured both totals while a capped sort ran. With the temp directory on XFS, and on the `k8s-big` CI runners, the files' lengths stayed within the cap plus the slack, and their allocated blocks went 13 MiB to 55 MiB past a cap of about 100 MiB. On btrfs and on the hosted CI runners the two totals matched.
+XFS allocates ahead of the end of a file that keeps growing. `spill_stays_within_budget_plus_class_slack` measured both totals while a capped sort ran. With the temp directory on XFS, and on the `k8s-big` CI runners, the files' lengths stayed within the cap plus the slack, and their allocated blocks went 13 MiB to 55 MiB past the sweep's lowest cap, about 95 MiB, and up to 113 MiB past its higher caps. On btrfs and on the hosted CI runners the two totals matched.
 
-The test's directory bound is now on the files' lengths. It still prints the allocated total. The slack figure is unchanged.
+The directory bound is now on the files' lengths, in `crates/trawl-engine/tests/query_budgets.rs` and in the two server tests that sample the same directory, `spill_budget` and `clones_share_one_spill_budget` in `crates/trawl-server/tests/query_resources.rs`. The sweep prints the largest allocated total it sampled beside the largest length, and each failing run's message carries both. The slack figure is unchanged.
+
+The server tests saw more allocation ahead than the sweep: on the `k8s-big` runners, 283 MiB allocated for files 134 MiB long.
 
 What this leaves open:
 
-- A tool that counts allocated blocks, such as `du`, a quota or the kubelet's accounting of an `emptyDir`, can see more than the cap while a query spills on such a filesystem. The measurements here cover caps near 100 MiB only. How far allocation ahead goes at the 4 GiB default, and when the filesystem gives the blocks back, have not been measured.
+- A tool that counts allocated blocks, such as `du`, a quota or the kubelet's accounting of an `emptyDir`, can see more than the cap while a query spills on such a filesystem. The measurements here cover caps from 24 MiB to about 230 MiB only. How far allocation ahead goes at the 4 GiB default, and when the filesystem gives the blocks back, have not been measured.
 - The chart, the Debian package and `trawl trial` put query scratch on the data volume, so this allocation competes with data for the same free space while a query runs.

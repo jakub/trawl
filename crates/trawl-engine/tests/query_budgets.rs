@@ -191,9 +191,10 @@ fn random_strings_parquet(dir: &Path, rows: usize) -> PathBuf {
 /// the sum of the files' lengths and of their allocated blocks.
 ///
 /// The directory bound is on `length`, the bytes `DuckDB` wrote and
-/// counts. `allocated` is printed as evidence and is not bounded: a
+/// counts. `allocated` is printed with each run's result and is not
+/// bounded: a
 /// filesystem that allocates ahead of a growing file's end (XFS does)
-/// holds blocks `DuckDB` never asked for, 13 to 55 MiB of them at these
+/// holds blocks `DuckDB` never asked for, up to 113 MiB of them at these
 /// caps (ADR-0056, amendment of 2026-11-10).
 #[derive(Debug, Default, Clone, Copy)]
 struct Peak {
@@ -559,6 +560,7 @@ fn spill_stays_within_budget_plus_class_slack() {
 
     let (mut completed, mut refused) = (0u32, 0u32);
     let mut worst: Option<i128> = None;
+    let mut worst_allocated: Option<i128> = None;
     for percent in (40..=TOP_PERCENT).step_by(4) {
         let cap = natural.length * percent / 100;
         let (outcome, peak) = spill_under(&sql, &budgets(cap, memory, 2));
@@ -576,11 +578,15 @@ fn spill_stays_within_budget_plus_class_slack() {
         }
         let over = i128::from(held) - i128::from(cap);
         worst = Some(worst.map_or(over, |worst| worst.max(over)));
+        let ahead = i128::from(peak.allocated) - i128::from(cap);
+        worst_allocated = Some(worst_allocated.map_or(ahead, |worst| worst.max(ahead)));
     }
     let worst = worst.expect("the sweep runs at least one cap");
+    let worst_allocated = worst_allocated.expect("the sweep runs at least one cap");
     eprintln!(
         "natural spill {} bytes; {refused} caps refused, {completed} completed; worst overshoot \
-         past the cap {worst} bytes (block {BLOCK})",
+         past the cap {worst} bytes by length (block {BLOCK}), {worst_allocated} bytes by \
+         allocated blocks",
         natural.length,
     );
 }
