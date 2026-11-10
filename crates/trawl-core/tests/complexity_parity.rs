@@ -16,7 +16,7 @@
 //! is unstreamable, or where a later stage is a projection collision.
 
 use trawl_core::ast::{PipeStage, Spanned};
-use trawl_core::complexity::{MAX_LATERAL_EXPANSION, MAX_PIPELINE_STAGES};
+use trawl_core::complexity::{MAX_LATERAL_EXPANSION, MAX_PIPELINE_STAGES, MAX_STAGE_FIELDS};
 use trawl_core::context::EvalContext;
 use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
@@ -185,7 +185,19 @@ fn matrix() -> Vec<String> {
             "* | let x = abs(y), z = coalesce({}) | stats count() by count",
             vec!["x"; 513].join(", ")
         ),
+        // One field over the field-list limit. The stream door refuses
+        // every `sort` as unstreamable, but the limit is checked first.
+        format!("* | sort {}", wide_field_list()),
+        format!("* | extract kv | dedup {}", wide_field_list()),
     ]
+}
+
+/// [`MAX_STAGE_FIELDS`] + 1 distinct field names.
+fn wide_field_list() -> String {
+    (0..=MAX_STAGE_FIELDS)
+        .map(|i| format!("f{i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[test]
@@ -197,7 +209,8 @@ fn both_doors_refuse_with_one_sentence() {
         assert_eq!(sql, stream, "{dsl}: the two doors disagreed");
         assert!(
             sql.contains(&MAX_LATERAL_EXPANSION.to_string())
-                || sql.contains(&MAX_PIPELINE_STAGES.to_string()),
+                || sql.contains(&MAX_PIPELINE_STAGES.to_string())
+                || sql.contains(&format!("limit of {MAX_STAGE_FIELDS} ")),
             "{dsl}: {sql}"
         );
     }

@@ -577,6 +577,8 @@ A leading `-` sorts descending. There is no `+` prefix.
 
 NULL and a missing field sort last, in both directions.
 
+One `sort` names at most 64 fields. A repeated name counts each time. See [Query limits](#query-limits).
+
 ### limit / head
 
 ```text
@@ -764,7 +766,7 @@ dedup
 dedup host, service
 ```
 
-Bare `dedup` keeps distinct whole rows. With fields, `dedup` keeps the row with the latest `_time` in each key group.
+Bare `dedup` keeps distinct whole rows. With fields, `dedup` keeps the row with the latest `_time` in each key group. One `dedup` names at most 64 fields, and a repeated name counts each time. See [Query limits](#query-limits).
 
 In the kv batch tail behind `extract kv`, `dedup` is exact: it reads every row first and keeps one row per key, however many keys there are.
 
@@ -910,12 +912,13 @@ The remedy is usually `as`, as in `| stats count() as hits by count`. `top` and 
 
 ### Query limits
 
-Two fixed limits, checked before anything runs and identical in every lane. Neither is configurable.
+Three fixed limits, checked before anything runs and identical in every lane. None is configurable.
 
 | Limit | Value | Counted over |
 | --- | --- | --- |
 | Pipeline stages | 128 | Every stage, including `from saved` and the stages after `extract kv`. The search stage is not a pipeline stage. |
 | Alias expansion | 512 | The whole query. |
+| Fields in one sort or dedup | 64 | Each sort or named dedup stage, counting repeated names. |
 
 Alias expansion scores one thing: an output of a stage naming an earlier output of the same stage. The database writes that earlier expression into the new one, once for every place the name appears.
 
@@ -923,7 +926,7 @@ Alias expansion scores one thing: an output of a stage naming an earlier output 
 - Naming the same earlier output many times is charged for the whole expression copied at each use, minus the one reference it replaces. `base = status + 1` has three nodes, so each later `xN = base + N` adds two, and 256 such outputs score 512, exactly the admitted limit.
 - trawl's generated SQL multiplies too. `sev(x) in (1,3,5,7,9,11,13,15,17,19,21,23)` writes its subject twelve times, once per contiguous range of the ladder.
 
-Over either limit, trawl refuses the query before it reaches the database, naming the stage and the output that crossed the line.
+Over any limit, trawl refuses the query before it reaches the database. The refusal names the stage. An alias-expansion refusal also names the output that crossed the line. The pipeline-stage limit is checked first. After it, the first stage over a limit is the one refused.
 
 ```text
 pipeline stage 1 (`let`) goes over this query's alias-expansion budget of
@@ -934,6 +937,9 @@ stages, so each one reads a finished column
 
 this query has 129 pipeline stages, over the limit of 128; shorten the
 pipeline, or save part of it and read it back with `from saved`
+
+pipeline stage 2 (`dedup`) names 65 fields, over the limit of 64 for one
+`sort` or `dedup` stage
 ```
 
 One `| let` per dependent step carries no alias expansion, however deep it goes.
