@@ -2389,4 +2389,253 @@ mod tests {
             assert_eq!(bar_at, Some(bar), "{case}, `|`");
         }
     }
+
+    /// Each character of `text` as the symbol of one cell. Only for text
+    /// whose every character draws in one cell.
+    fn one_cell_each(text: &str) -> Vec<String> {
+        text.chars().map(String::from).collect()
+    }
+
+    /// Each character of `text` as a two-cell glyph: its symbol, then the
+    /// hidden cell behind it, which reads as a space.
+    fn two_cells_each(text: &str) -> Vec<String> {
+        text.chars()
+            .flat_map(|c| [String::from(c), " ".to_owned()])
+            .collect()
+    }
+
+    /// Cells `xs` of row `y`, one symbol each.
+    fn row_cells(buffer: &Buffer, xs: std::ops::Range<u16>, y: u16) -> Vec<String> {
+        xs.map(|x| buffer[(x, y)].symbol().to_owned()).collect()
+    }
+
+    /// With ASCII, CJK, Arabic lam-alef and a combining accent in sender
+    /// text, every column after it starts on the cell its cells say, as
+    /// ratatui draws them: the status bar's hints end on its last cell
+    /// although they hold three-byte arrows, the palette's hint ends two
+    /// cells before the list's edge, the event popup's values line up
+    /// after the names, the save popup's cursor sits after the input's
+    /// cells, and the schema range stays on one line up to 40 cells. A
+    /// selected palette item marks `e\u{301}` as one styled cluster.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn terminal_columns_keep_cell_alignment() {
+        use crate::tui::palette::FilteredItem;
+        use crate::tui::state::{Focus, SchemaBrowser, SimpleEditor};
+
+        // The status bar at 60 cells: `error: `, the message, ` [panel] `,
+        // two cells of padding, then 32 cells of hints.
+        let mut app = test_app();
+        app.main_tab = MainTab::History;
+        app.focus = Focus::Panel;
+        app.tab.status = TabStatus::Error {
+            message: "日本 لا e\u{301}x".to_owned(),
+            details: Vec::new(),
+            query: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 1)).expect("terminal");
+        terminal
+            .draw(|f| super::status::render(&app, f, f.area()))
+            .expect("render");
+        let want = [
+            one_cell_each("error: "),
+            two_cells_each("日本"),
+            one_cell_each(" لا "),
+            vec!["e\u{301}".to_owned()],
+            one_cell_each("x [panel]   "),
+            one_cell_each("↑↓: navigate | Enter: load query"),
+        ]
+        .concat();
+        assert_eq!(
+            row_cells(terminal.backend().buffer(), 0..60, 0),
+            want,
+            "status bar"
+        );
+
+        // The palette at 100x30 draws its list from x = 18, 63 cells wide.
+        // The service's hint ends two cells before the list's edge, and
+        // the query `e` marks the `e\u{301}` cluster whole.
+        let mut app = test_app();
+        let items = vec![PaletteItem {
+            label: "日本 لا e\u{301}x".to_owned(),
+            detail: Some("ログ لا".to_owned()),
+            category: PaletteCategory::Service,
+            shortcut: None,
+            action: PaletteAction::DrillService("svc".to_owned()),
+        }];
+        let filtered: Vec<FilteredItem> = refilter("e", &items);
+        app.popup = Some(Popup::CommandPalette {
+            input: "e".to_owned(),
+            cursor: 1,
+            selected: 0,
+            scroll: 0,
+            items,
+            filtered,
+            ghost: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|f| super::render(&mut app, f))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let want = [
+            one_cell_each("  "),
+            two_cells_each("日本"),
+            one_cell_each(" لا "),
+            vec!["e\u{301}".to_owned()],
+            one_cell_each(&format!("x{}", " ".repeat(42))),
+            two_cells_each("ログ"),
+            one_cell_each(" لا  "),
+        ]
+        .concat();
+        assert_eq!(row_cells(buffer, 18..81, 7), want, "palette item");
+        let accent = app.theme.text_accent;
+        let marked = &buffer[(28, 7)];
+        assert_eq!(
+            (marked.symbol(), marked.fg),
+            ("e\u{301}", accent),
+            "the matched cluster"
+        );
+        assert!(
+            marked.modifier.contains(ratatui::style::Modifier::BOLD),
+            "{marked:?}"
+        );
+        assert_eq!(buffer[(28, 7)].bg, app.theme.surface_highlight);
+        let after = &buffer[(29, 7)];
+        assert_eq!(
+            (after.symbol(), after.fg),
+            ("x", app.theme.text_primary),
+            "the cell after the matched cluster"
+        );
+
+        // The event popup at 100x30 draws its fields from x = 16, the
+        // names right-aligned to the widest, `日本`, at four cells.
+        let mut app = test_app();
+        app.tab.result = Some(make_query_response(
+            vec!["ab", "e\u{301}", "لا", "日本"],
+            vec![vec![
+                Value::String("1".into()),
+                Value::String("2".into()),
+                Value::String("3".into()),
+                Value::String("4".into()),
+            ]],
+        ));
+        app.popup = Some(Popup::EventDetail {
+            row_index: 0,
+            scroll: 0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|f| super::render(&mut app, f))
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        let fields = [
+            one_cell_each("  ab  1"),
+            [
+                one_cell_each("   "),
+                vec!["e\u{301}".to_owned()],
+                one_cell_each("  2"),
+            ]
+            .concat(),
+            one_cell_each("  لا  3"),
+            [two_cells_each("日本"), one_cell_each("  4")].concat(),
+        ];
+        for (y, want) in (5u16..).zip(fields) {
+            assert_eq!(row_cells(buffer, 16..23, y), want, "event field row {y}");
+        }
+
+        // The save popup at 100x30: its input line `> …█` is centred in
+        // the 58 cells from x = 21, on row 15. Nine cells start at x = 46.
+        for (cursor, x) in [(6, 54), (3, 52), (0, 48)] {
+            let mut app = test_app();
+            let mut editor = SimpleEditor::new_single_line();
+            editor.insert_text("日لاe\u{301}x");
+            editor.cursor = (0, cursor);
+            app.popup = Some(Popup::SaveQuery { editor });
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+            terminal
+                .draw(|f| super::render(&mut app, f))
+                .expect("render");
+            let want = [
+                one_cell_each("> "),
+                two_cells_each("日"),
+                one_cell_each("لا"),
+                vec!["e\u{301}".to_owned()],
+                one_cell_each("x█"),
+            ]
+            .concat();
+            assert_eq!(
+                row_cells(terminal.backend().buffer(), 46..55, 15),
+                want,
+                "save input"
+            );
+            terminal.backend_mut().assert_cursor_position((x, 15));
+        }
+
+        // A service field's range: forty cells of `min – max` stay on one
+        // line, forty-one split after the dash.
+        let schema_with = |min: &str, max: &str| {
+            let mut schema = SchemaBrowser::new(vec![trawl_api::ServiceSchema {
+                name: "svc".to_owned(),
+                columns: vec![trawl_api::ServiceColumnStats {
+                    name: "f".to_owned(),
+                    data_type: "VARCHAR".to_owned(),
+                    null_count: 0,
+                    total_count: 10,
+                    min_value: Some(min.to_owned()),
+                    max_value: Some(max.to_owned()),
+                    compressed_bytes: 0,
+                }],
+                earliest_date: None,
+                latest_date: None,
+                file_count: 1,
+                total_bytes: 1,
+                total_events: 10,
+                daily_event_counts: Vec::new(),
+                degraded_fields: Vec::new(),
+            }]);
+            schema.common_fields = Vec::new();
+            schema.expanded = std::collections::HashSet::from(["svc".to_owned()]);
+            schema.selected = 1;
+            schema
+        };
+        let min = "日本語".repeat(4);
+        let label = one_cell_each("range:      ");
+        let indent = one_cell_each(&" ".repeat(12));
+        let blank = one_cell_each(&" ".repeat(60));
+        let fits = [
+            label.clone(),
+            two_cells_each(&min),
+            one_cell_each(" – "),
+            two_cells_each("日本語日本語"),
+            vec!["e\u{301}".to_owned()],
+        ]
+        .concat();
+        let split = [label, two_cells_each(&min), one_cell_each(" –")].concat();
+        let continued = [
+            indent,
+            two_cells_each("日本語日本語"),
+            vec!["e\u{301}".to_owned()],
+            one_cell_each("x"),
+        ]
+        .concat();
+        for (max, row5, row6) in [
+            ("日本語日本語e\u{301}", fits, blank.clone()),
+            ("日本語日本語e\u{301}x", split, continued),
+        ] {
+            let schema = schema_with(&min, max);
+            let theme = test_app().theme;
+            let mut terminal = Terminal::new(TestBackend::new(60, 8)).expect("terminal");
+            terminal
+                .draw(|f| super::schema::render_detail_pane(&schema, f, f.area(), &theme))
+                .expect("render");
+            let buffer = terminal.backend().buffer();
+            let pad = |mut cells: Vec<String>| {
+                cells.resize(60, " ".to_owned());
+                cells
+            };
+            assert_eq!(row_cells(buffer, 0..60, 5), pad(row5), "range, max {max:?}");
+            assert_eq!(row_cells(buffer, 0..60, 6), pad(row6), "range, max {max:?}");
+        }
+    }
 }
