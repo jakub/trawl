@@ -15,6 +15,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Paragraph, Wrap};
+use trawl_core::sanitize::sanitize_display_text;
 
 use crate::tui::state::SchemaBrowser;
 use crate::tui::theme::Theme;
@@ -150,9 +151,12 @@ fn render_common_header_detail(
 
     for f in &schema.common_fields {
         lines.push(Line::from(vec![
-            Span::styled(&f.name, Style::default().fg(theme.text_accent)),
             Span::styled(
-                format!("  ({})", f.data_type),
+                sanitize_display_text(&f.name),
+                Style::default().fg(theme.text_accent),
+            ),
+            Span::styled(
+                format!("  ({})", sanitize_display_text(&f.data_type)),
                 Style::default().fg(theme.text_muted),
             ),
         ]));
@@ -203,7 +207,7 @@ fn render_service_detail(
 
     let mut lines = vec![
         Line::from(Span::styled(
-            service_name,
+            sanitize_display_text(service_name),
             Style::default()
                 .fg(theme.text_primary)
                 .add_modifier(Modifier::BOLD),
@@ -222,7 +226,9 @@ fn render_service_detail(
 
     if let (Some(earliest), Some(latest)) = (&svc.earliest_date, &svc.latest_date) {
         lines.push(Line::from(format!(
-            "data:      {earliest} \u{2192} {latest}"
+            "data:      {} \u{2192} {}",
+            sanitize_display_text(earliest),
+            sanitize_display_text(latest)
         )));
     }
 
@@ -258,7 +264,10 @@ fn render_service_detail(
             .join(", ");
         lines.push(Line::from(vec![
             Span::styled("  common: ", Style::default().fg(theme.text_muted)),
-            Span::styled(common_list, Style::default().fg(theme.text_primary)),
+            Span::styled(
+                sanitize_display_text(&common_list),
+                Style::default().fg(theme.text_primary),
+            ),
         ]));
     }
 
@@ -272,7 +281,10 @@ fn render_service_detail(
             .join(", ");
         lines.push(Line::from(vec![
             Span::styled("  unique: ", Style::default().fg(theme.text_muted)),
-            Span::styled(unique_list, Style::default().fg(theme.text_primary)),
+            Span::styled(
+                sanitize_display_text(&unique_list),
+                Style::default().fg(theme.text_primary),
+            ),
         ]));
     }
 
@@ -327,8 +339,8 @@ fn render_service_detail(
                     .style(Style::default().fg(theme.text_muted))
                     .bounds([0.0, x_max.max(1.0)])
                     .labels(vec![
-                        Span::raw(first_date.clone()),
-                        Span::raw(last_date.clone()),
+                        Span::raw(sanitize_display_text(first_date)),
+                        Span::raw(sanitize_display_text(last_date)),
                     ]),
             )
             .y_axis(
@@ -353,7 +365,7 @@ fn render_field_detail(
 ) {
     let mut lines = vec![
         Line::from(Span::styled(
-            field_name,
+            sanitize_display_text(field_name),
             Style::default()
                 .fg(theme.text_accent)
                 .add_modifier(Modifier::BOLD),
@@ -369,8 +381,14 @@ fn render_field_detail(
         if let Some(svc) = schema.services.iter().find(|s| s.name == svc_name)
             && let Some(col) = svc.columns.iter().find(|c| c.name == field_name)
         {
-            lines.push(Line::from(format!("type:       {}", col.data_type)));
-            lines.push(Line::from(format!("in:         {svc_name}")));
+            lines.push(Line::from(format!(
+                "type:       {}",
+                sanitize_display_text(&col.data_type)
+            )));
+            lines.push(Line::from(format!(
+                "in:         {}",
+                sanitize_display_text(svc_name)
+            )));
 
             if col.total_count > 0 {
                 let non_null = col.total_count - col.null_count;
@@ -393,7 +411,10 @@ fn render_field_detail(
         }
     } else if let Some(cf) = schema.common_fields.iter().find(|f| f.name == field_name) {
         // Common field — aggregate across services.
-        lines.push(Line::from(format!("type:       {}", cf.data_type)));
+        lines.push(Line::from(format!(
+            "type:       {}",
+            sanitize_display_text(&cf.data_type)
+        )));
         lines.push(Line::from(format!(
             "in:         {} services",
             cf.service_count
@@ -442,16 +463,26 @@ fn trim_timestamp(s: &str) -> &str {
 /// Render a range value across one or two lines.
 ///
 /// If `min – max` fits on one line after the label, render inline.
-/// Otherwise split across two lines with the continuation indented.
+/// Otherwise split across two lines with the continuation indented. The
+/// split reads the raw values; what is drawn is sanitized.
 fn push_range_lines(lines: &mut Vec<Line<'_>>, min_v: &str, max_v: &str) {
     let min_t = trim_timestamp(min_v);
     let max_t = trim_timestamp(max_v);
     let inline = format!("{min_t} \u{2013} {max_t}");
     if inline.len() <= 40 {
-        lines.push(Line::from(format!("range:      {inline}")));
+        lines.push(Line::from(format!(
+            "range:      {}",
+            sanitize_display_text(&inline)
+        )));
     } else {
-        lines.push(Line::from(format!("range:      {min_t} \u{2013}")));
-        lines.push(Line::from(format!("            {max_t}")));
+        lines.push(Line::from(format!(
+            "range:      {} \u{2013}",
+            sanitize_display_text(min_t)
+        )));
+        lines.push(Line::from(format!(
+            "            {}",
+            sanitize_display_text(max_t)
+        )));
     }
 }
 

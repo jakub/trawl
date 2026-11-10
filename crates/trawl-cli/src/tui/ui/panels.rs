@@ -115,9 +115,9 @@ fn render_filter_bar(filter: &str, active: bool, theme: &Theme, frame: &mut Fram
     } else if filter.is_empty() {
         "/ \u{2588}".to_owned()
     } else if active {
-        format!("/ {filter}\u{2588}")
+        format!("/ {}\u{2588}", sanitize_display_text(filter))
     } else {
-        format!("/ {filter}")
+        format!("/ {}", sanitize_display_text(filter))
     };
 
     let paragraph = Paragraph::new(Line::from(Span::styled(text, style)));
@@ -654,17 +654,19 @@ fn render_saved_panel(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rec
 }
 
 /// Fit a name into terminal columns without splitting a grapheme. Ratatui's
-/// grapheme iterator uses the same segmentation as the list renderer.
+/// grapheme iterator uses the same segmentation as the list renderer. The
+/// name is sanitized first, so U+FFFD is what gets measured and cut.
 fn fit_saved_name(name: &str, columns: usize) -> String {
     use unicode_width::UnicodeWidthStr as _;
 
+    let name = sanitize_display_text(name);
     if columns == 0 {
         return String::new();
     }
     if name.width() <= columns {
-        return name.to_owned();
+        return name;
     }
-    let span = Span::raw(name);
+    let span = Span::raw(name.as_str());
     let mut remaining = columns - "…".width();
     let mut fitted = String::new();
     for grapheme in span.styled_graphemes(Style::default()) {
@@ -697,7 +699,7 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
             let mut suffixes = Vec::new();
             if let Some(ref sched) = entry.schedule {
                 suffixes.push(Span::styled(
-                    format_schedule_badge(sched),
+                    sanitize_display_text(&format_schedule_badge(sched)),
                     Style::default().fg(theme.text_accent),
                 ));
                 if let Some(ref last_run) = sched.last_run {
@@ -816,7 +818,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
 
     // -- name --
     lines.push(Line::from(Span::styled(
-        entry.name.clone(),
+        sanitize_display_text(&entry.name),
         Style::default()
             .fg(theme.text_primary)
             .add_modifier(Modifier::BOLD),
@@ -835,7 +837,10 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
     let value_style = Style::default().fg(theme.text_primary);
     lines.push(Line::from(vec![
         Span::styled("query  ", label_style),
-        Span::styled(entry.query.replace('\n', " "), value_style),
+        Span::styled(
+            sanitize_display_text(&entry.query.replace('\n', " ")),
+            value_style,
+        ),
     ]));
 
     // -- schedule info --
@@ -844,7 +849,11 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
         lines.push(Line::from(vec![
             Span::styled("sched  ", label_style),
             Span::styled(
-                format!("every {} ({})", sched.interval, enabled_str),
+                format!(
+                    "every {} ({})",
+                    sanitize_display_text(&sched.interval),
+                    enabled_str
+                ),
                 value_style,
             ),
         ]));
@@ -853,7 +862,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
         if let Some(window) = format_schedule_window(sched, app.display_zone) {
             lines.push(Line::from(vec![
                 Span::styled("       ", label_style),
-                Span::styled(window, value_style),
+                Span::styled(sanitize_display_text(&window), value_style),
             ]));
         }
         lines.push(Line::from(vec![
@@ -972,7 +981,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
             // Some(false)`, which shows its bounds with no marker.
             if let Some(ref kind) = run.window_kind {
                 spans.push(Span::styled(
-                    format!("  {kind}"),
+                    format!("  {}", sanitize_display_text(kind)),
                     Style::default().fg(theme.text_muted),
                 ));
             }
@@ -1512,6 +1521,16 @@ mod saved_name_tests {
     use ratatui::{Terminal, backend::TestBackend};
     use unicode_width::UnicodeWidthStr as _;
 
+    /// A saved name is sanitized before it is measured, so U+FFFD counts as
+    /// the cell it takes on the fast path and on the clipping path.
+    #[test]
+    fn saved_name_sanitizes_before_fit() {
+        assert_eq!(fit_saved_name("nm\u{202e}x", 10), "nm\u{fffd}x");
+        assert_eq!(fit_saved_name("nl\nx", 10), "nl\u{fffd}x");
+        assert_eq!(fit_saved_name("ab\u{200b}cdefgh", 5), "ab\u{fffd}c…");
+        assert_eq!(fit_saved_name("sh\u{00ad}yz", 4), "sh\u{fffd}…");
+    }
+
     #[test]
     fn saved_name_column_boundaries_preserve_graphemes() {
         for (name, columns, expected) in [
@@ -1526,8 +1545,10 @@ mod saved_name_tests {
             ("🙂🙂", 3, "🙂…"),
             ("👍🏽ab", 3, "👍🏽…"),
             ("🇯🇵ab", 3, "🇯🇵…"),
-            // A legacy name can contain a joiner even though new writes refuse it.
-            ("👩\u{200d}💻ab", 3, "👩\u{200d}💻…"),
+            // A legacy name can contain a joiner even though new writes
+            // refuse it. U+200D is drawn as U+FFFD, which splits the
+            // sequence, so the name is cut after the first emoji.
+            ("👩\u{200d}💻ab", 3, "👩…"),
         ] {
             let actual = fit_saved_name(name, columns);
             assert_eq!(actual, expected, "{name:?}, columns={columns}");
@@ -1542,7 +1563,7 @@ mod saved_name_tests {
             ("é".repeat(20), 4, "ééé…"),
             ("e\u{301}".repeat(20), 4, "e\u{301}e\u{301}e\u{301}…"),
             ("🙂".repeat(20), 4, "🙂… "),
-            ("👩\u{200d}💻".repeat(20), 4, "👩\u{200d}💻… "),
+            ("👩\u{200d}💻".repeat(20), 4, "👩\u{fffd}…"),
         ] {
             let mut app = crate::tui::tests::test_app();
             app.saved_cache = Some(trawl_api::ListSavedResponse {

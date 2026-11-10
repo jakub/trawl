@@ -111,6 +111,7 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
 fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
     use ratatui::style::Style;
     use ratatui::widgets::Paragraph;
+    use trawl_core::sanitize::sanitize_display_text;
     let theme = &app.theme;
 
     let [tab_bar, content, status_area] = vertical![==2, >=1, ==1].areas(frame.area());
@@ -132,14 +133,14 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
             .dashboard
             .last_error
             .as_deref()
-            .map(|e| format!(" [stale] {e}"));
+            .map(|e| format!(" [stale] {}", sanitize_display_text(e)));
         let opts = trawl_dashboard::DashboardOptions {
             footer_text: footer,
         };
         trawl_dashboard::render_dashboard(snapshot, frame, content, &opts);
     } else if let Some(ref err) = app.dashboard.last_error {
-        let msg =
-            Paragraph::new(format!(" Error: {err}")).style(Style::default().fg(theme.status_error));
+        let msg = Paragraph::new(format!(" Error: {}", sanitize_display_text(err)))
+            .style(Style::default().fg(theme.status_error));
         frame.render_widget(msg, content);
     } else {
         let msg =
