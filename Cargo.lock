@@ -6803,7 +6803,6 @@ dependencies = [
  "ratatui",
  "trawl-api",
  "trawl-core",
- "unicode-width",
 ]
 
 [[package]]

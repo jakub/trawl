@@ -19,10 +19,10 @@ use ratatui::macros::{horizontal, line, vertical};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Row, Table};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use trawl_api::DashboardSnapshot;
 use trawl_core::sanitize::sanitize_display_text;
+use trawl_core::text_layout::fit_cells;
 
 /// Rendering options for the dashboard.
 #[derive(Debug, Clone)]
@@ -708,29 +708,15 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Truncate a query string to fit within `max_width` display columns,
-/// appending "..." if needed. Uses unicode display width, not byte length.
-/// Whitespace runs collapse to one space, then the text is sanitized before
-/// it is measured, so each replaced character counts as the cell it takes.
+/// A query string cut to fit within `max_width` display cells, ending in
+/// `…` when cut. Whitespace runs collapse to one space, then
+/// [`fit_cells`] sanitizes the text and cuts it between grapheme clusters,
+/// each measured in the cells ratatui draws it in.
 pub fn truncate_query(query: &str, max_width: usize) -> String {
-    let collapsed = sanitize_display_text(&query.split_whitespace().collect::<Vec<_>>().join(" "));
-    if UnicodeWidthStr::width(collapsed.as_str()) <= max_width {
-        return collapsed;
-    }
-    let suffix = if max_width > 3 { "..." } else { "" };
-    let target = max_width.saturating_sub(suffix.len());
-    let mut result = String::new();
-    let mut width = 0;
-    for ch in collapsed.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_width > target {
-            break;
-        }
-        result.push(ch);
-        width += ch_width;
-    }
-    result.push_str(suffix);
-    result
+    fit_cells(
+        &query.split_whitespace().collect::<Vec<_>>().join(" "),
+        max_width,
+    )
 }
 
 #[cfg(test)]
@@ -1244,17 +1230,46 @@ mod tests {
         assert_eq!(truncate_query("short", 10), "short");
         assert_eq!(
             truncate_query("a really long query string", 10),
-            "a reall..."
+            "a really …"
         );
         assert_eq!(truncate_query("abc", 3), "abc");
-        assert_eq!(truncate_query("abcd", 3), "abc");
+        assert_eq!(truncate_query("abcd", 3), "ab…");
     }
 
     #[test]
     fn truncate_query_multibyte() {
         // CJK characters are 2 display columns wide.
         assert_eq!(truncate_query("日本語テスト", 12), "日本語テスト");
-        assert_eq!(truncate_query("日本語テスト", 10), "日本語...");
+        assert_eq!(truncate_query("日本語テスト", 10), "日本語テ…");
+    }
+
+    /// A query is cut between grapheme clusters, each measured in the
+    /// cells ratatui draws it in: `لا` is two cells, `ｶﾞ` is two, `e` with
+    /// a combining accent is one, and `❤` with its emoji selector is two.
+    /// A cluster is never split from its mark or selector.
+    #[test]
+    fn truncate_query_cuts_between_clusters() {
+        for (query, budget, want) in [
+            ("لا", 0, ""),
+            ("لا", 1, "…"),
+            ("لا", 2, "لا"),
+            ("لاx", 2, "ل…"),
+            ("ｶﾞ", 0, ""),
+            ("ｶﾞ", 1, "…"),
+            ("ｶﾞ", 2, "ｶﾞ"),
+            ("ｶﾞx", 2, "…"),
+            ("e\u{301}", 0, ""),
+            ("e\u{301}", 1, "e\u{301}"),
+            ("e\u{301}x", 1, "…"),
+            ("e\u{301}xy", 2, "e\u{301}…"),
+            ("❤\u{FE0F}", 0, ""),
+            ("❤\u{FE0F}", 1, "…"),
+            ("❤\u{FE0F}", 2, "❤\u{FE0F}"),
+            ("❤\u{FE0F}x", 2, "…"),
+            ("❤\u{FE0F}xy", 3, "❤\u{FE0F}…"),
+        ] {
+            assert_eq!(truncate_query(query, budget), want, "{query:?} at {budget}");
+        }
     }
 
     #[test]
@@ -1315,7 +1330,7 @@ mod tests {
     #[test]
     fn truncate_query_sanitizes_before_width() {
         assert_eq!(truncate_query("a\u{202e}b", 10), "a\u{fffd}b");
-        assert_eq!(truncate_query("ab\u{200b}cdefgh", 6), "ab\u{fffd}...");
-        assert_eq!(truncate_query("abc\u{00ad}", 3), "abc");
+        assert_eq!(truncate_query("ab\u{200b}cdefgh", 6), "ab\u{fffd}cd…");
+        assert_eq!(truncate_query("abc\u{00ad}", 3), "ab…");
     }
 }

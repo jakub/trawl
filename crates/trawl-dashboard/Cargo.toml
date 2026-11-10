@@ -11,7 +11,6 @@ publish.workspace = true
 trawl-api = { workspace = true }
 trawl-core = { workspace = true }
 ratatui = { workspace = true }
-unicode-width = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
