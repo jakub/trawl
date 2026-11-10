@@ -430,8 +430,9 @@ pub fn outcome_tone(outcome: Option<&StepOutcome>) -> Tone {
 }
 
 /// The facts of a finished step after its outcome badge: the error code,
-/// the rows kept and the duration, whichever it has, joined by ` · `.
-/// Empty for a running step.
+/// the rows kept and the duration, whichever it has, joined by ` · `. A
+/// capture cut short of the rows its query produced says so, as
+/// `4 of 5000 rows (cut)`. Empty for a running step.
 #[must_use]
 pub fn outcome_facts(outcome: Option<&StepOutcome>) -> String {
     let Some(outcome) = outcome else {
@@ -444,7 +445,10 @@ pub fn outcome_facts(outcome: Option<&StepOutcome>) -> String {
         facts.push(code);
     }
     if let Some(rows) = outcome.rows {
-        facts.push(format!("{rows} row{}", if rows == 1 { "" } else { "s" }));
+        facts.push(match outcome.total_rows {
+            Some(total) if total > rows => format!("{rows} of {total} rows (cut)"),
+            _ => format!("{rows} row{}", if rows == 1 { "" } else { "s" }),
+        });
     }
     if let Some(ms) = outcome.duration_ms {
         facts.push(fleet_ui::time::format_duration(ms));
@@ -650,6 +654,7 @@ mod tests {
                 code: None,
                 result_id: None,
                 rows: None,
+                total_rows: None,
                 duration_ms: None,
             }),
         }
@@ -1064,6 +1069,7 @@ mod tests {
                 code: None,
                 result_id: None,
                 rows: None,
+                total_rows: None,
                 duration_ms: None,
             };
             assert_eq!(outcome_label(Some(&outcome)), label);
@@ -1085,6 +1091,26 @@ mod tests {
             outcome_facts(Some(&success)),
             format!("1 row · {}", fleet_ui::time::format_duration(250))
         );
+        assert_eq!(outcome_facts(None), "");
+    }
+
+    #[test]
+    fn outcome_facts_distinguishes_cut_and_complete_captures() {
+        let facts = |rows: u64, total_rows: Option<u64>| {
+            outcome_facts(Some(&StepOutcome {
+                outcome: StepOutcomeKind::Success,
+                code: None,
+                result_id: Some(RESULT.into()),
+                rows: Some(rows),
+                total_rows,
+                duration_ms: None,
+            }))
+        };
+        assert_eq!(facts(4, Some(5000)), "4 of 5000 rows (cut)");
+        assert_eq!(facts(4, Some(4)), "4 rows");
+        assert_eq!(facts(4, None), "4 rows");
+        assert_eq!(facts(0, Some(1)), "0 of 1 rows (cut)");
+        assert_eq!(facts(1, Some(1)), "1 row");
         assert_eq!(outcome_facts(None), "");
     }
 

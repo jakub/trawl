@@ -733,6 +733,7 @@ fn every_kind() -> Vec<LogEntry> {
                     code: None,
                     result_id: Some(RESULT_ID.to_owned()),
                     rows: Some(120),
+                    total_rows: None,
                     duration_ms: Some(250),
                 }),
             },
