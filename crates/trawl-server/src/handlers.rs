@@ -433,10 +433,18 @@ pub async fn query(
                 .await;
             match recorded {
                 Ok(Err(e)) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         event_type = "history_error",
                         key_id = verified.id,
                         error = %e,
+                        "failed to record query in history store"
+                    );
+                    let fault = ServerError::from(e);
+                    tracing::warn!(
+                        event_type = "history_error",
+                        key_id = verified.id,
+                        error_class = fault.error_class(),
+                        cause_kind = fault.cause_kind().as_str(),
                         "failed to record query in history store"
                     );
                 }

@@ -727,7 +727,7 @@ impl CauseKind {
     }
 
     /// The kind of an I/O error, from its [`std::io::ErrorKind`] alone.
-    fn of_io(err: &std::io::Error) -> Self {
+    pub(crate) fn of_io(err: &std::io::Error) -> Self {
         use std::io::ErrorKind as K;
         match err.kind() {
             K::NotFound => Self::IoNotFound,
