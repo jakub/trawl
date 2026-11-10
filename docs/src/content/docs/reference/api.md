@@ -307,6 +307,7 @@ Runs a DSL query and returns one page of rows. A query whose first stage is `fro
 | `query` | body | string | yes | The DSL query |
 | `limit` | body | integer | no | Rows per page. Default and cap: `[server] max_result_rows` (`100000`). |
 | `offset` | body | integer | no | Rows to skip. Default `0`. `offset + limit` may not exceed `max_result_rows`. |
+| `histogram` | body | boolean | no | `true` asks for the whole result counted by `_time`. Default `false`. See **Histogram** below. |
 
 trawld ignores a body field it does not know. A request that still carries a `timezone` field gets UTC timestamps, as every request does.
 
@@ -346,8 +347,86 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | `execution.duration_ms` | integer | Server-measured duration in milliseconds. Zero is valid. |
 | `degraded_fields` | array | Fields the query bound whose pin is degraded, including fields filtered on and then projected away. Absent when empty. Stale by at most `schema_cache_ttl_secs`. |
 | `severity_columns` | array | Result columns that hold OTel severity numbers other than `_severity`. Absent when empty. |
+| `histogram` | object | Every row of the result counted by `_time`. Present only when the request sets `histogram` to `true` and the query does not aggregate. See **Histogram**. |
 
 The server captures `execution.started_at` beside its monotonic timer. The duration includes admission and execution within that timed section. It excludes subsequent history processing, response serialization, and browser transit. Each page request has its own execution metadata.
+
+**Histogram**
+
+Set `histogram` to `true` to count every row of the result by `_time`. The count comes in the same response as the page, so it includes the rows on other pages. trawld counts the result after the last stage of the query and before it cuts the page. Each page of one query answers the same count when the data does not change between the requests.
+
+A query that aggregates, with `stats`, `timechart`, `top`, `rare` or `pivot`, gets no `histogram` field. An error response has no `histogram` field. Otherwise the field is in one of two states, named by `state`.
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
+  -d '{"query": "service=api last=1h", "limit": 2, "histogram": true}' \
+  "$TRAWL_URL/api/v1/query"
+```
+
+```json
+{
+  "columns": [
+    { "name": "_time", "type": "timestamp" },
+    { "name": "_severity", "type": "integer" },
+    { "name": "message", "type": "string" }
+  ],
+  "rows": [
+    ["2026-09-15T12:34:55.000000Z", "9", "GET /health 200"],
+    ["2026-09-15T12:34:50.000000Z", "9", "GET /health 200"]
+  ],
+  "execution": { "started_at": "2026-09-15T12:35:00.120Z", "duration_ms": 41 },
+  "pagination": { "limit": 2, "offset": 0, "returned": 2, "total": 6 },
+  "histogram": {
+    "state": "ready",
+    "start": "2026-09-15T11:40:00.000000Z",
+    "end": "2026-09-15T12:34:55.000032Z",
+    "buckets": [
+      { "events": 1, "errors": 1 }, { "events": 1, "errors": 1 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 1, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 1, "errors": 0 }, { "events": 0, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 },
+      { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 0, "errors": 0 }, { "events": 2, "errors": 0 }
+    ],
+    "undated": 0,
+    "severity": true,
+    "kept_some": false
+  }
+}
+```
+
+The page holds the two latest events. The histogram counts all six. The two errors in its first two buckets are not on this page.
+
+A `ready` histogram has these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | string | `ready` |
+| `start` | string | The earliest usable `_time` in the result, as a timestamp cell in UTC. The order of the rows does not change it. |
+| `end` | string | `start` plus 48 bucket widths. It is later than the latest usable `_time`. |
+| `buckets` | array | Exactly 48 buckets, oldest first. `width` is `(end - start) / 48` microseconds, and bucket `i` holds the rows whose `_time` is at or after `start + i × width` and before `start + (i + 1) × width`. So each row with a usable `_time` is in exactly one bucket. The width is the span from the earliest to the latest usable `_time` plus one microsecond, or one second if that is longer, divided by 48 and rounded up. The smallest width is 20,834 microseconds. |
+| `buckets[].events` | integer | The rows in the bucket, as a JSON number |
+| `buckets[].errors` | integer | The rows in the bucket whose `_severity` is an integer of 17 or more: `error`, `fatal` and their numbered forms. Never more than `events`. |
+| `undated` | integer | The rows without a usable `_time`. No bucket holds them. A `_time` cell is not usable when it is null, `infinity` or `-infinity`, or in the last 1,000,032 microseconds before `infinity`. |
+| `severity` | boolean | `false` when the result has no `_severity` column. Every `errors` is then `0`. |
+| `kept_some` | boolean | `true` when the query has a `head`, `limit`, `tail` or `dedup` stage. The count then includes only the rows that stage kept. |
+
+The `events` of all 48 buckets plus `undated` equal `pagination.total`.
+
+An `unavailable` histogram has `state` set to `unavailable` and a `reason`, for example `{"state": "unavailable", "reason": "sample"}`. When more than one reason applies, the first in this table wins.
+
+| `reason` | When |
+|----------|------|
+| `stored_result` | The query reads a stored report run with `from saved`. Its rows are not events, and trawld does not count them. |
+| `sample` | The query has a `sample` stage, so the result is not every matching event. |
+| `no_time_column` | The result has no `_time` column of type `timestamp`, for example after `fields host`. |
+| `no_usable_time` | The result has a `_time` column of type `timestamp`, but no row has a usable `_time`. A result with that column and no rows has this reason. |
 
 **Errors**
 
