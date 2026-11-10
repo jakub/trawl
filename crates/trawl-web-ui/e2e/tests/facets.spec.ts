@@ -313,15 +313,23 @@ test('Enter and Space on the rail summary open and close the rail', async ({ pag
   // Each key, each way. One toggle per press: the press cancels the
   // native toggle and records the choice, so a key the browser turns
   // into a click must not move the rail twice.
+  //
+  // Each press waits for its own toggle before the next key. The browser
+  // fires `toggle` from a queued task, and a second change made before
+  // that task runs folds both into one event, so two quick presses can
+  // count as one. The settled re-read after the loop catches a press that
+  // toggled twice. Residual exposure: each poll's expect timeout (5 s,
+  // playwright.config.ts) bounds how late a toggle may arrive.
   let pressed = 0;
   for (const key of ['Enter', ' ']) {
-    await page.keyboard.press(key);
-    await expectRail(page, false);
-    await page.keyboard.press(key);
-    await expectRail(page, true);
-    pressed += 2;
-    expect(await toggles()).toBe(pressed);
+    for (const open of [false, true]) {
+      await page.keyboard.press(key);
+      await expectRail(page, open);
+      pressed += 1;
+      await expect.poll(toggles).toBe(pressed);
+    }
   }
+  expect(await toggles()).toBe(4);
   await expectFocusRing(summary);
 });
 
