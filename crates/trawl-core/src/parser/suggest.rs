@@ -112,16 +112,19 @@ pub const GRAMMAR_KEYWORDS: &[&str] = &["last", "earliest", "latest"];
 
 /// The words an EXPRESSION position reads before it tries a field
 /// reference: the literal words (`true`/`false`/`null`) and the operator
-/// words (`and`/`or`/`not`/`in`/`matches`/`like`/`ilike`).
+/// words (`and`/`or`/`not`/`in`/`matches`/`like`/`ilike`). The boolean
+/// operators are also read in capitals; `OR` and `NOT` are quoted through
+/// [`SEARCH_KEYWORDS`] and [`FIELD_START_KEYWORDS`], so only `AND` is
+/// listed here.
 ///
 /// Bare, these do not name a column inside `| where` / `| let`: a field
 /// called `true` renders as the boolean literal — a silent change of
-/// meaning — and one called `not` turns the surrounding text into a
-/// parse error. A rendered name must be pasteable in every field
+/// meaning — and one called `not` or `NOT` turns the surrounding text
+/// into a parse error. A rendered name must be pasteable in every field
 /// position, so [`quote_dsl_field`] backticks the whole set, exactly as
 /// it does [`GRAMMAR_KEYWORDS`].
 pub const EXPRESSION_KEYWORDS: &[&str] = &[
-    "true", "false", "null", "and", "or", "not", "in", "matches", "like", "ilike",
+    "true", "false", "null", "and", "AND", "or", "not", "in", "matches", "like", "ilike",
 ];
 
 /// The SEARCH stage's group separator, in the two spellings the grammar
@@ -136,7 +139,7 @@ pub const SEARCH_KEYWORDS: &[&str] = &["OR", "or"];
 
 /// The keywords a parser tries at the START of a field reference's
 /// position, before the field: `OR`/`or`/`NOT` at a search token start,
-/// and `true`/`false`/`null`/`not` at an expression atom or a `not`
+/// and `true`/`false`/`null`/`not`/`NOT` at an expression atom or a `not`
 /// operand.
 ///
 /// `keyword()` ends a match at any character that cannot continue an
@@ -162,7 +165,7 @@ pub const FIELD_START_KEYWORDS: &[&str] = &["OR", "or", "NOT", "true", "false", 
 /// [`FIELD_START_KEYWORDS`].
 pub const POSITIONAL_KEYWORDS: &[&str] = &[
     // operators read after a left operand
-    "and", "in", "matches", "like", "ilike", // stage clause words
+    "and", "AND", "in", "matches", "like", "ilike", // stage clause words
     "by", "as", "on", "from", "sep", "kv", "span", "run", "saved", "all", "latest",
 ];
 
@@ -354,6 +357,17 @@ mod tests {
         }
     }
 
+    /// The capital boolean keywords: `AND` is read only after a left
+    /// operand, so it claims no first dot segment, but `OR` and `NOT` are
+    /// read at a field's start and claim one.
+    #[test]
+    fn capital_boolean_keywords_are_quoted_where_they_claim_the_name() {
+        assert_eq!(quote_dsl_field("AND").as_deref(), Some("`AND`"));
+        assert_eq!(quote_dsl_field("AND.x").as_deref(), Some("AND.x"));
+        assert_eq!(quote_dsl_field("OR.x").as_deref(), Some("`OR.x`"));
+        assert_eq!(quote_dsl_field("NOT.x").as_deref(), Some("`NOT.x`"));
+    }
+
     /// An expression position reads its keywords BEFORE it tries a field
     /// reference, so a bare rendering there is either a silent change of
     /// meaning (`true`, `false`, `null` lex as literals) or a parse error
@@ -376,7 +390,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
                 let names = crate::field_refs::referenced_fields(&parsed);
                 assert!(
-                    names.contains(*kw),
+                    names.contains(&crate::schema::catalog_key(kw)),
                     "{query} must bind the field {kw:?}, bound {names:?}"
                 );
             }
@@ -753,6 +767,7 @@ mod tests {
             "and",
             "or",
             "not",
+            "AND",
             "OR",
             "NOT",
             "in",
@@ -785,6 +800,7 @@ mod tests {
             "sample",
             "fields",
             // a field-start keyword as the first dot segment
+            "AND.a",
             "OR.a",
             "or.a.b",
             "NOT.a",
