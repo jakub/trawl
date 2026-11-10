@@ -869,6 +869,46 @@ async fn boot_unmetered_with(capture: CaptureConfig) -> (Arc<TestServer>, Keys) 
     (Arc::new(server), keys)
 }
 
+/// A router over `server`'s state whose captures run under `deadline`,
+/// with the fixture's HTTP config as `http` leaves it. Only the capture
+/// under test goes through it: the setup's captures run through the
+/// fixture's own router under the default deadline, so a machine stall
+/// during setup cannot time them out. The capture gate is a new one built
+/// from the same limits, store, root and clock, as the gate holds no
+/// deadline of its own; the in-flight set and the step writer are the
+/// fixture's, so the sweep and the writer see this router's captures.
+fn router_under(
+    server: &TestServer,
+    deadline: Duration,
+    http: impl FnOnce(&mut trawl_server::state::HttpConfig),
+) -> axum::Router {
+    use trawl_server::results::ResultsState;
+    use trawl_server::results::charge::CaptureGate;
+
+    let results = &server.state.results;
+    let capture = CaptureConfig {
+        deadline_secs: deadline.as_secs(),
+        ..results.capture.clone()
+    };
+    let mut state = server.state.clone();
+    state.results = Arc::new(ResultsState {
+        root: Arc::clone(&results.root),
+        store: results.store.clone(),
+        gate: CaptureGate::new(
+            &capture,
+            results.store.clone(),
+            Arc::clone(&results.root),
+            results.clock.clone(),
+        ),
+        capture,
+        investigation: results.investigation.clone(),
+        clock: results.clock.clone(),
+        in_flight: Arc::clone(&results.in_flight),
+        steps: results.steps.clone(),
+    });
+    server.router_over(state, http)
+}
+
 /// Keep `n` results in investigation 1 through attached captures, each
 /// step settled, and answer their ids. The investigation's sequence ends
 /// at `2 * n`.
@@ -1027,6 +1067,9 @@ fn admission_budgets(server: &TestServer) -> Vec<u128> {
 /// [`a_step_admission_spends_one_deadline_across_statements`] proves the
 /// timeout is what remained of the deadline.
 ///
+/// Only the capture under test runs under the five-second deadline
+/// ([`router_under`]); the setup's capture keeps the default one.
+///
 /// The test runs on the live clock, and its waits are real Postgres lock
 /// waits, each under a hang guard. The prune's waiter is still polled
 /// for while it waits, and it waits no longer than its five-second
@@ -1035,13 +1078,13 @@ fn admission_budgets(server: &TestServer) -> Vec<u128> {
 async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_deadline() {
     use sqlx::Connection as _;
     let deadline = Duration::from_secs(5);
-    let (server, keys) = boot_unmetered(deadline.as_secs()).await;
+    let (server, keys) = boot_unmetered_with(CaptureConfig::default()).await;
     create(&server, &keys.agent, 1).await;
     let kept = keep_results(&server, &keys, 1).await;
     server
         .results_clock
         .set(at(START) + chrono::TimeDelta::days(8));
-    let app = server.router_with(|http| http.max_concurrent_requests = 1);
+    let app = router_under(&server, deadline, |http| http.max_concurrent_requests = 1);
     let mut result = hold_result(&server, &kept[0]).await;
     let mut log = sqlx::PgConnection::connect(&server.app_db_url)
         .await
@@ -1103,6 +1146,9 @@ async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_dea
 /// the prune, no more than two. The capture then runs, answers 200, and
 /// its step settles.
 ///
+/// Only the capture under test runs under the five-second deadline
+/// ([`router_under`]); the setup's capture keeps the default one.
+///
 /// The deadline is a tokio one, so the server boots and the result is
 /// held on the live clock, and the clock is then paused: the three
 /// seconds are one explicit advance, and every wait after the pause runs
@@ -1117,13 +1163,13 @@ async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_dea
 #[tokio::test(flavor = "current_thread")]
 async fn a_step_admission_spends_one_deadline_across_statements() {
     let deadline = Duration::from_secs(5);
-    let (server, keys) = boot_unmetered(deadline.as_secs()).await;
+    let (server, keys) = boot_unmetered_with(CaptureConfig::default()).await;
     create(&server, &keys.agent, 1).await;
     let kept = keep_results(&server, &keys, 1).await;
     server
         .results_clock
         .set(at(START) + chrono::TimeDelta::days(8));
-    let app = server.router_with(|_| {});
+    let app = router_under(&server, deadline, |_| {});
     let mut result = hold_result(&server, &kept[0]).await;
     let probe = common::fixture_pool(&server.app_db_url, 1).await;
     server.state.storage.investigations.statement_record().arm();
