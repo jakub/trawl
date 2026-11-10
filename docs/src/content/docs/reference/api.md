@@ -353,7 +353,7 @@ The server captures `execution.started_at` beside its monotonic timer. The durat
 
 **Histogram**
 
-Set `histogram` to `true` to count every row of the result by `_time`. The count comes in the same response as the page, so it includes the rows on other pages. trawld counts the result after the last stage of the query and before it cuts the page. Each page of one query answers the same count when the data does not change between the requests.
+Set `histogram` to `true` to count every row of the result by `_time`. The count comes in the same response as the page, so it includes the rows on other pages. trawld counts the result after the last stage of the query and before it cuts the page. Each page request runs the query again and answers the count of its own result. A relative range such as `last=1h` moves with the clock, so two pages can answer different counts even when no event arrives between them.
 
 A query that aggregates, with `stats`, `timechart`, `top`, `rare` or `pivot`, gets no `histogram` field. An error response has no `histogram` field. Otherwise the field is in one of two states, named by `state`.
 
