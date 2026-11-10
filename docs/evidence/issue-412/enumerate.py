@@ -542,7 +542,7 @@ def helper_params(mod, fn_start):
             out.append(("self", raw))
         elif ":" in raw:
             name, typ = raw.split(":", 1)
-            out.append((name.strip().lstrip("mut ").strip(), typ.strip()))
+            out.append((re.sub(r"^mut\s+", "", name.strip()), typ.strip()))
     return out
 
 
@@ -728,11 +728,19 @@ def search_hits(modules, rows):
             covered.setdefault(rel, []).append((op, match_bracket(mod.code, op)))
     out = []
     for rel, mod in sorted(modules.items()):
+        # `blank` keeps string delimiters and wipes literal contents, so an
+        # odd count of quotes before an offset means it is inside a literal.
+        quotes = [0]
+        for ch in mod.code:
+            quotes.append(quotes[-1] + (ch == '"'))
         offset = 0
         for n, line in enumerate(mod.text.split("\n"), 1):
             for m in SEARCH_RE.finditer(line):
                 at = offset + m.start()
-                if in_spans(at, mod.masked) or mod.code[at] == " " and mod.text[at] != " ":
+                wiped = mod.code[at] == " " and mod.text[at] != " "
+                # A wiped hit outside a literal is in a comment. One inside a
+                # literal is a format string and stays reportable.
+                if in_spans(at, mod.masked) or wiped and quotes[at] % 2 == 0:
                     continue
                 if any(a <= at < b for a, b in covered.get(rel, [])):
                     continue
