@@ -65,7 +65,7 @@ pub use error::{StoreError, WindowWriteError};
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use investigations::{
     Appended, Citing, CreateOutcome, DeleteOutcome, InvestigationRow, InvestigationStore, LogPage,
-    NewInvestigation, Overwrite, RetentionRule, StoreActor,
+    NewInvestigation, Overwrite, Overwritten, RetentionRule, StoreActor,
 };
 pub use repin::{
     CutoverOutcome, JobTotals, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore,
