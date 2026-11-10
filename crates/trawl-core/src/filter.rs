@@ -180,10 +180,10 @@ impl CompiledFilter {
     /// match-nothing predicate would turn a typo into a silently empty
     /// live stream while the same query errors on `/api/v1/query`.
     ///
-    /// Also errors when a glob or regex does not compile here (a glob's
-    /// character class can, `a[z-a]*`). Dropping the token instead would
-    /// change which events match: under `!=` or inside a comma list the
-    /// filter would silently widen.
+    /// Also errors when a regex does not compile here. Dropping the token
+    /// instead would change which events match: under `!=` or inside a
+    /// comma list the filter would silently widen. Every glob compiles: a
+    /// malformed one (`a[z-a]*`) matches nothing, as `DuckDB`'s GLOB does.
     ///
     /// Each of those is [`FilterError::Emit`]. A pattern whose regex
     /// memory the ledger refuses is [`FilterError::RegexResources`].
@@ -412,9 +412,9 @@ fn compile_token(
 /// pattern this lane cannot compile raises (see [`CompiledFilter::compile`]).
 ///
 /// A refusal names the pattern, then gives the owner's own cause, as the
-/// parser words it. A syntax error gives none: regex-syntax's text spans
-/// several lines and quotes the translated regex, not the glob the query
-/// holds. A resource refusal is the query's memory, not this pattern's
+/// parser words it. A syntax error, which only a regex can raise since
+/// every glob translates to a regex that parses, gives none:
+/// regex-syntax's text spans several lines. A resource refusal is the query's memory, not this pattern's
 /// fault, so it carries the refusal alone, typed, and names no pattern. A
 /// cancellation is no verdict at all, so it is typed too.
 fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern, FilterError> {
@@ -970,26 +970,27 @@ mod tests {
         ));
     }
 
-    /// A glob this lane cannot compile is a compile error, never a dropped
-    /// token: under `!=` or inside a list a drop would silently widen the
-    /// filter to every event.
+    /// A malformed glob compiles and matches no event, as `DuckDB`'s GLOB
+    /// matches none, so its `!=` matches every event, one without the
+    /// field among them. `NOT` over an absent field stays unknown.
     #[test]
-    fn an_uncompilable_glob_fails_the_filter() {
-        for dsl in [
-            "host!=a[z-a]*",
-            "host=a[z-a]*",
-            "host!=x,a[z-a]*",
-            "NOT host=a[z-a]*",
-        ] {
-            let query = parser::parse(dsl).expect("parses");
-            let err = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
-                .expect_err(dsl);
-            assert_eq!(
-                err.to_string(),
-                "unsupported operation: invalid glob pattern 'a[z-a]*'",
-                "{dsl}"
-            );
+    fn a_malformed_glob_matches_nothing() {
+        let carried = [
+            r#"{"host": "a", "message": "ok"}"#,
+            r#"{"host": "az", "message": "ok"}"#,
+            r#"{"host": "a[z-a]", "message": "ok"}"#,
+        ];
+        let absent = r#"{"message": "ok"}"#;
+        for event in carried.into_iter().chain([absent]) {
+            assert!(!matches_event("host=a[z-a]*", event), "{event}");
+            assert!(matches_event("host!=a[z-a]*", event), "{event}");
         }
+        for event in carried {
+            assert!(matches_event("NOT host=a[z-a]*", event), "{event}");
+        }
+        assert!(!matches_event("NOT host=a[z-a]*", absent));
+        assert!(matches_event("host=x,a[z-a]*", r#"{"host": "x"}"#));
+        assert!(!matches_event("host=x,a[z-a]*", r#"{"host": "a"}"#));
     }
 
     /// What the live lane says when it refuses `body` as the regex of a
