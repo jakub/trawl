@@ -254,6 +254,9 @@ const investigation = {
 // whose `expected_seq` is not the board's `seq` is 409
 // `sequence_conflict` with both numbers. Their bodies are the
 // `investigation-closed` and `investigation-sequence-conflict` fixtures.
+// A landed keep answers its entry; a landed PATCH answers the
+// investigation as it now stands and the entry, with no activity, since
+// the board sends no `seen_seq`.
 // `POST /__ctl/investigation/drop-write` makes the next write land and
 // then cuts its answer short, as a connection lost on the way back does;
 // with `{ status, code }` the landed write is answered with that status
@@ -1233,7 +1236,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         res.end('{"entry":');
         return;
       }
-      const [status, answer] = req.method === 'PATCH' ? [200, structuredClone(head)] : [201, { entry }];
+      const [status, answer] = req.method === 'PATCH'
+        ? [200, { investigation: structuredClone(head), entry }]
+        : [201, { entry }];
       if (investigation.holdWrite) {
         investigation.holdWrite = false;
         investigation.heldWrite = { res, status, body: answer };
