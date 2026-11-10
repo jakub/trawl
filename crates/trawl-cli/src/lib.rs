@@ -10,7 +10,7 @@
 //! [`doctor`], [`preview_ingest`] and [`schema`] are public for exactly
 //! that reason — `config` and `tui` stay private.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Mutex;
@@ -24,6 +24,7 @@ pub mod doctor;
 mod mcp;
 pub mod preview_ingest;
 pub mod schema;
+mod terminal;
 mod trial;
 mod tui;
 
@@ -115,8 +116,12 @@ enum Command {
 
     /// Control a running TUI via driver socket.
     Driver {
-        /// Path to the driver unix socket.
-        #[arg(long, default_value_t = tui::driver::default_socket_path().display().to_string())]
+        #[arg(
+            long,
+            default_value_t = tui::driver::default_socket_path().display().to_string(),
+            hide_default_value = true,
+            help = socket_help(&tui::driver::default_socket_path())
+        )]
         socket: String,
 
         #[command(subcommand)]
@@ -471,7 +476,7 @@ pub async fn main() {
         // a status other than 0.
         Ok(0) => {}
         Ok(status) => process::exit(i32::from(status)),
-        Err(CliError::Arg(e)) => e.exit(),
+        Err(CliError::Arg(e)) => exit_on_arg_error(&e),
         Err(e) => exit_on_error(&e),
     }
 }
@@ -509,7 +514,7 @@ fn parse_cli() -> (Cli, connection::Sources) {
         {
             let sources = connection::Sources::from_matches(&matches);
             return (
-                Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit()),
+                Cli::from_arg_matches(&matches).unwrap_or_else(|e| exit_on_arg_error(&e)),
                 sources,
             );
         }
@@ -524,16 +529,18 @@ fn parse_cli() -> (Cli, connection::Sources) {
                 .skip(1)
                 .any(|arg| ENVLESS.iter().any(|name| arg == name)) =>
         {
-            e.exit()
+            exit_on_arg_error(&e)
         }
         Ok(_) | Err(_) => {}
     }
     // What `Cli::parse_from` does, keeping the matches.
-    let matches = Cli::command().get_matches_from(args);
+    let matches = Cli::command()
+        .try_get_matches_from(args)
+        .unwrap_or_else(|e| exit_on_arg_error(&e));
     let sources = connection::Sources::from_matches(&matches);
     let cli = Cli::from_arg_matches(&matches)
         .map_err(|e| e.format(&mut Cli::command()))
-        .unwrap_or_else(|e| e.exit());
+        .unwrap_or_else(|e| exit_on_arg_error(&e));
     (cli, sources)
 }
 
@@ -549,6 +556,37 @@ fn envless_command() -> clap::Command {
         command = command.mut_arg(id, |arg| arg.env(None));
     }
     command
+}
+
+/// What clap says about `e`, without styling and with each line through
+/// the sanitize rule. clap quotes the offending argument, and a field name
+/// copied from the catalog is sender text. clap's own line breaks stay.
+fn arg_error_text(e: &clap::Error) -> String {
+    e.render()
+        .to_string()
+        .split('\n')
+        .map(trawl_core::sanitize::sanitize_display_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Report a usage error and exit with clap's status for it, whether or
+/// not stderr takes the text. clap prints help and version itself.
+fn exit_on_arg_error(e: &clap::Error) -> ! {
+    if !e.use_stderr() {
+        e.exit();
+    }
+    let _ = write!(io::stderr().lock(), "{}", arg_error_text(e));
+    process::exit(e.exit_code());
+}
+
+/// The help line of `driver --socket`. The default sits under the
+/// operator's home directory, so its text goes through the sanitize rule.
+fn socket_help(default: &Path) -> String {
+    format!(
+        "Path to the driver unix socket [default: {}]",
+        trawl_core::sanitize::sanitize_display_text(&default.display().to_string())
+    )
 }
 
 /// Report `e` and exit 1.
@@ -908,7 +946,7 @@ async fn run_driver(socket: &str, cmd: DriverSubcommand) -> Result<(), CliError>
     match cmd {
         DriverSubcommand::Status => {
             let resp = driver_send(&socket_path, &DriverRequest::Status).await?;
-            let json = serde_json::to_string_pretty(&resp.data)
+            let json = terminal::json_pretty(&resp.data, terminal::Destination::stdout())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             println!("{json}");
         }
@@ -1077,17 +1115,15 @@ fn render_driver_data(
     let columns = data.columns.as_deref().unwrap_or_default();
     let rows = data.rows.as_deref().unwrap_or_default();
 
-    let format = format.unwrap_or_else(|| {
-        if io::stdout().is_terminal() {
-            cli::OutputFormat::Table
-        } else {
-            cli::OutputFormat::Json
-        }
+    let destination = terminal::Destination::stdout();
+    let format = format.unwrap_or(match destination {
+        terminal::Destination::Terminal => cli::OutputFormat::Table,
+        terminal::Destination::Data => cli::OutputFormat::Json,
     });
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    cli::render_driver_results(columns, rows, format, &mut out)?;
+    cli::render_driver_results(columns, rows, format, destination, &mut out)?;
     out.flush()?;
     Ok(())
 }
@@ -1311,5 +1347,52 @@ mod arg_tests {
             message: message.to_string(),
         });
         assert_eq!(err.to_string(), message);
+    }
+
+    #[test]
+    fn argument_errors_sanitize_sender_text() {
+        // A stored field name may start with `--`, and clap quotes what it
+        // refuses.
+        let hostile = "--x\u{1b}]0;owned\u{7}\u{202e}\u{9b}31mname";
+        let error = Cli::command()
+            .try_get_matches_from(["trawl", "schema", "field", hostile])
+            .expect_err("an option-shaped field name is refused");
+        let text = arg_error_text(&error);
+        let unsafe_chars: Vec<char> = text
+            .chars()
+            .filter(|c| *c != '\n' && trawl_core::sanitize::is_unsafe_display_char(*c))
+            .collect();
+        assert!(
+            unsafe_chars.is_empty(),
+            "the usage error holds {unsafe_chars:?}: {}",
+            text.escape_debug()
+        );
+        // clap's plain rendering drops the OSC sequence itself.
+        assert!(
+            text.contains("\u{fffd}\u{fffd}31mname"),
+            "{}",
+            text.escape_debug()
+        );
+        assert!(text.contains("Usage:"), "{}", text.escape_debug());
+    }
+
+    #[test]
+    fn driver_help_sanitizes_the_default_socket_path() {
+        let help = socket_help(Path::new("/home/x\u{202e}y\u{1b}[2J/trawl.sock"));
+        assert_eq!(
+            help,
+            "Path to the driver unix socket [default: /home/x\u{fffd}y\u{fffd}[2J/trawl.sock]"
+        );
+        // clap shows this line and no second, raw default.
+        let rendered = Cli::command()
+            .try_get_matches_from(["trawl", "driver", "--help"])
+            .expect_err("help is an early exit")
+            .render()
+            .to_string();
+        assert_eq!(rendered.matches("[default: ").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains(&socket_help(&tui::driver::default_socket_path())),
+            "{rendered}"
+        );
     }
 }

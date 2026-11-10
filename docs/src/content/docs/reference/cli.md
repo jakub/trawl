@@ -193,6 +193,27 @@ trawl query "_severity>=error last=1h | stats count() by service"
 trawl query "last=1h | stats count() by service" | jq '.service'
 ```
 
+### Sender text on a terminal
+
+A sender chooses field names and values, and they can hold characters that a
+terminal acts on: control characters such as ESC, bidirectional controls,
+zero-width characters, and the soft hyphen. `trawl query`, `trawl schema`, and
+the results and status that `trawl driver` prints do not write those
+characters to a terminal. `trawl driver capture` prints the screen as the TUI
+drew it.
+
+| Format | On a terminal | In a pipe or an `-o` file |
+|--------|---------------|---------------------------|
+| `table` | Each such character is shown as `�` (U+FFFD) or as an escape in printable text. A table can keep a line break in a value as a line break inside the cell. | The same as on a terminal |
+| `json` | Each such character in a key or a string is written as a `\uXXXX` escape. A JSON parser reads the original value. | No change for a terminal |
+| `csv` | Each such character is shown as `�` or as an escape in printable text | No change for a terminal |
+
+On stderr, these commands also replace or escape these characters. A line
+break in an argument that a usage error quotes can stay a line break.
+
+`trawl schema` replaces these characters in an acknowledgement's `acked_by`
+and `note`, and in a repin cancel's `detail`, in every format.
+
 ### The incomplete-results footer
 
 When a query binds a field whose catalog pin is degraded, `table` output adds
