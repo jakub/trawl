@@ -2338,4 +2338,55 @@ mod tests {
         assert!(matches!(&items[0].action, PaletteAction::LoadQuery(q) if *q == hostile("pd")));
         assert!(matches!(&items[2].action, PaletteAction::DrillService(s) if *s == hostile("ks")));
     }
+
+    /// Text fitted to `n` cells draws in at most `n` cells, as ratatui
+    /// draws each grapheme cluster. Bounded to `n` cells, it leaves a
+    /// sentinel in cell `n` alone. Unbounded and followed by `|`, it puts
+    /// the `|` at a literal x no greater than `n`, which a clipped draw
+    /// alone could not show.
+    #[test]
+    fn terminal_width_matches_ratatui_cells() {
+        use ratatui::layout::Rect;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::Paragraph;
+        use trawl_core::text_layout::fit_cells;
+
+        // Text, budget, the symbols of cells 0..budget, and where `|`
+        // lands after the unbounded draw.
+        let cases: &[(&str, u16, &[&str], u16)] = &[
+            ("لاx", 2, &["ل", "…"], 2),
+            ("لاx", 3, &["ل", "ا", "x"], 3),
+            ("ｶﾞ", 1, &["…"], 1),
+            ("ｶﾞ", 2, &["ｶﾞ", " "], 2),
+            ("e\u{301}", 1, &["e\u{301}"], 1),
+            ("❤\u{FE0F}", 1, &["…"], 1),
+            ("❤\u{FE0F}", 2, &["❤\u{FE0F}", " "], 2),
+            ("❤\u{FE0F}x", 2, &["…", " "], 1),
+        ];
+        for &(text, budget, symbols, bar) in cases {
+            let fitted = fit_cells(text, usize::from(budget));
+            let mut terminal = Terminal::new(TestBackend::new(8, 2)).expect("terminal");
+            terminal
+                .draw(|f| {
+                    f.buffer_mut()[(budget, 0)].set_symbol("#");
+                    f.render_widget(Paragraph::new(fitted.as_str()), Rect::new(0, 0, budget, 1));
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::raw(fitted.as_str()),
+                            Span::raw("|"),
+                        ])),
+                        Rect::new(0, 1, 8, 1),
+                    );
+                })
+                .expect("render");
+            let buffer = terminal.backend().buffer();
+            let case = format!("{text:?} at {budget}: {fitted:?}");
+            for (x, symbol) in (0..).zip(symbols) {
+                assert_eq!(buffer[(x, 0)].symbol(), *symbol, "{case}, cell {x}");
+            }
+            assert_eq!(buffer[(budget, 0)].symbol(), "#", "{case}, sentinel");
+            let bar_at = (0..8).find(|&x| buffer[(x, 1)].symbol() == "|");
+            assert_eq!(bar_at, Some(bar), "{case}, `|`");
+        }
+    }
 }
