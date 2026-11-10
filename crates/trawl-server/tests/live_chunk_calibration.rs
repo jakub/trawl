@@ -72,7 +72,8 @@ const FRAME_P95_BOUND: Duration = Duration::from_millis(250);
 
 /// Long subjects, in characters.
 const SUBJECT: usize = 65_536;
-/// The heavy bodies (`tests/query_resources.rs` `HEAVY`) one ledger admits.
+/// Three bodies of the `\w{20}` class, which one ledger admits. Each runs
+/// its ASCII batch-engine view.
 const HEAVY: [&str; 3] = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w"];
 
 struct Workload {

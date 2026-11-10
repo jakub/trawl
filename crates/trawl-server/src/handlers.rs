@@ -4234,16 +4234,30 @@ mod tests {
 
     /// Stream setup refuses a query over its regex budget with the typed
     /// refusal, whether the filter's patterns or the plan's take it past
-    /// (ADR-0063). Four bodies of the `\w{20}` class charge past it at
-    /// the fourth.
+    /// (ADR-0063). Seven bodies of the `(\pL{12})` class charge past it at
+    /// the seventh.
     #[test]
     fn stream_setup_refuses_regex_memory_typed() {
         use trawl_core::pattern::RegexRefusal;
-        let heavy = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w", r"\w\w{19}"];
+        let heavy = [
+            r"(\pL{12})0",
+            r"(\pL{12})1",
+            r"(\pL{12})2",
+            r"(\pL{12})3",
+            r"(\pL{12})4",
+            r"(\pL{12})5",
+            r"(\pL{12})6",
+        ];
         let in_filter = format!("message=/{}/", heavy.join("/,/"));
-        let in_plan = format!(
-            "message=/{}/,/{}/ | where message matches /{}/ | where message matches /{}/",
-            heavy[0], heavy[1], heavy[2], heavy[3]
+        let (searched, staged) = heavy.split_at(4);
+        let in_plan = staged.iter().fold(
+            format!("message=/{}/", searched.join("/,/")),
+            |mut dsl, body| {
+                dsl.push_str(" | where message matches /");
+                dsl.push_str(body);
+                dsl.push('/');
+                dsl
+            },
         );
         for dsl in [in_filter, in_plan] {
             let refused = prepare_stream_with(
