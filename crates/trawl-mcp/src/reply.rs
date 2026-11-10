@@ -195,8 +195,17 @@ pub struct DslEffects {
 pub struct Presentation {
     /// Cells printed shorter than they are, each listed in `abbreviated`.
     pub cells_abbreviated: u64,
-    /// Columns of the result this response did not print.
+    /// Columns of the result this response did not print: those trawld's
+    /// projection left out of the page, and those this response omitted
+    /// to fit its byte budget. `fields` with `source: result` describes
+    /// them, and `read` with `action: cell` reads any of their cells.
     pub columns_omitted: u64,
+    /// Of `columns_omitted`, the columns this response omitted because
+    /// their cell was null in every row it read; absent when none. A
+    /// column trawld's projection left out is not counted: its cells were
+    /// not read.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub null_columns_omitted: u64,
     /// Captured rows after the last printed row.
     pub rows_omitted: u64,
     /// Of `rows_omitted`, the rows this response read and dropped from
@@ -269,6 +278,38 @@ pub struct ResultView {
     pub rows: Vec<Vec<Value>>,
     /// The cells printed shorter than they are.
     pub abbreviated: Vec<AbbreviatedCell>,
+    /// What the renderer recorded about the page as the tool handed it
+    /// over, before it fitted the reply; never serialized.
+    #[serde(skip)]
+    pub read: PageRead,
+}
+
+/// What the renderer records about a page before it fits the reply: the
+/// mirror says what the reply printed, and this says what the call read.
+/// The renderer fills it, but for `projection`, which the tool sets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageRead {
+    /// The `columns` the call projected the page to, as the caller sent
+    /// them; every page continuation of the reply sends them again.
+    /// `None` for a page of every column.
+    pub(crate) projection: Option<Vec<String>>,
+    /// For each column of the page, by index, whether its cell was JSON
+    /// null in every row read; empty when the page read no row.
+    pub(crate) null_columns: Vec<bool>,
+    /// The columns the page carried.
+    pub(crate) columns: u64,
+    /// The columns trawld's projection left out: `columns_omitted` before
+    /// the renderer omitted any.
+    pub(crate) projected_out: u64,
+    /// The captured position of the page's first column; 0 for a page
+    /// without columns.
+    pub(crate) first_position: u64,
+}
+
+/// For `skip_serializing_if`, which passes the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// One diagnostic of a query trawld refused or found invalid.
@@ -908,10 +949,11 @@ pub struct ActivityView {
     pub entries: Vec<EntryView>,
     /// The `updated_seq` trawld's answer reached.
     pub through_seq: u64,
-    /// Whether trawld holds entries past `through_seq`.
-    pub more: bool,
+    /// Whether trawld holds entries past `through_seq`: trawld's paging,
+    /// apart from what this response dropped.
+    pub trawld_holds_more: bool,
     /// Entries trawld sent that this response dropped from the end to fit
-    /// its byte budget.
+    /// its byte budget, apart from trawld's paging.
     pub entries_dropped_to_fit: u64,
     /// Printed entries abbreviated to their header line.
     pub entries_abbreviated: u64,
@@ -919,8 +961,9 @@ pub struct ActivityView {
     /// printed. This session counts the entries through it as seen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub printed_through: Option<u64>,
-    /// The call that prints the entries after the printed ones, when trawld
-    /// holds more or this response dropped some.
+    /// The call that prints the entries after the printed ones: present
+    /// when `trawld_holds_more` is true or `entries_dropped_to_fit` is not
+    /// zero, absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<NextAction>,
 }

@@ -24,6 +24,7 @@ use trawl_api::results::{
     COMPARE_DEFAULT_MIN_COUNT, COMPARE_MAX_GROUP_FIELDS, CONTEXT_DEFAULT_SECONDS,
     CONTEXT_DEFAULT_SIDE_ROWS, CONTEXT_MAX_SIDE_ROWS,
 };
+use trawl_core::schema::MAX_FIELD_NAME_BYTES;
 
 use crate::reply::{
     ContextScope, CorrelationReply, FieldsReply, FieldsSource, InvestigationAction,
@@ -49,6 +50,8 @@ pub const INVESTIGATION: &str = "investigation";
 
 /// The most fields a `sightings` call may restrict attribution to.
 pub const SIGHTINGS_MAX_FIELDS: usize = 16;
+/// The most column names a `read` page may project to.
+pub const PAGE_MAX_COLUMNS: usize = 16;
 /// The longest literal a `sightings` call may send, in bytes.
 pub const SIGHTINGS_MAX_LITERAL_BYTES: usize = 1024;
 
@@ -138,6 +141,17 @@ pub struct ReadInput {
     #[serde(default)]
     #[schemars(with = "u32", range(min = 1, max = MAX_ROWS), extend("default" = DEFAULT_ROWS))]
     pub rows: Option<u32>,
+    /// For `page`: print only the columns with these names, each 1 to 255
+    /// bytes and without a comma. A name selects every column it names,
+    /// in stored order. Omit it to print every column.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        with = "Vec<String>",
+        length(min = 1, max = PAGE_MAX_COLUMNS),
+        inner(length(min = 1, max = MAX_FIELD_NAME_BYTES))
+    )]
+    pub columns: Option<Vec<String>>,
     /// For `cell`: the 0-based captured row.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]

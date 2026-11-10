@@ -10,7 +10,7 @@
 use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use trawl_mcp::reply::{
-    Bounds, DslEffects, Link, Presentation, ResultView, SearchMode, SearchReply,
+    Bounds, DslEffects, Link, PageRead, Presentation, ResultView, SearchMode, SearchReply,
 };
 use trawl_mcp::tools::schema::tools;
 
@@ -428,6 +428,21 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
     assert!(read.is_valid(&json!({
         "action": "investigation", "investigation_id": "a", "since": 4
     })));
+    let names = |count: usize| -> Vec<String> { (0..count).map(|i| format!("c{i:03}")).collect() };
+    assert!(read.is_valid(&json!({"action": "page", "result_id": "a", "columns": names(1)})));
+    assert!(read.is_valid(&json!({"action": "page", "result_id": "a", "columns": names(16)})));
+    assert!(read.is_valid(&json!({
+        "action": "page", "result_id": "a", "columns": ["n".repeat(255)]
+    })));
+    for refused in [
+        json!({"action": "page", "result_id": "a", "columns": []}),
+        json!({"action": "page", "result_id": "a", "columns": names(17)}),
+        json!({"action": "page", "result_id": "a", "columns": [""]}),
+        json!({"action": "page", "result_id": "a", "columns": ["n".repeat(256)]}),
+        json!({"action": "page", "result_id": "a", "columns": "c000"}),
+    ] {
+        assert!(!read.is_valid(&refused), "read accepted {refused}");
+    }
 
     let fields = validator("fields", "input");
     assert!(fields.is_valid(&json!({"source": "service", "service": "nginx"})));
@@ -474,6 +489,31 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
             "sightings accepted {refused}"
         );
     }
+}
+
+/// `read`'s `columns` states the bounds the tool holds a call to at run
+/// time: 1 to 16 names, each 1 to 255 long. JSON Schema counts a string's
+/// length in characters, so only the run-time check bounds a name's bytes.
+#[test]
+fn the_read_input_bounds_columns_to_sixteen_names() {
+    let tool = tools()
+        .into_iter()
+        .find(|tool| tool.name == "read")
+        .expect("read exists");
+    let input = schema_value(&tool.input_schema);
+    let columns = &input["properties"]["columns"];
+    assert_eq!(columns["type"], json!("array"), "{columns}");
+    assert_eq!(columns["minItems"], json!(1), "{columns}");
+    assert_eq!(columns["maxItems"], json!(16), "{columns}");
+    assert_eq!(columns["items"]["type"], json!("string"), "{columns}");
+    assert_eq!(columns["items"]["minLength"], json!(1), "{columns}");
+    assert_eq!(columns["items"]["maxLength"], json!(255), "{columns}");
+    assert!(
+        !input["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("columns"))),
+        "{input}"
+    );
 }
 
 /// `context`, `sightings` and `compare` attach as `search` does: a flat
@@ -624,6 +664,7 @@ fn a_filled_search_reply_validates_against_its_output_schema() {
             presentation: Presentation {
                 cells_abbreviated: 0,
                 columns_omitted: 0,
+                null_columns_omitted: 0,
                 rows_omitted: 0,
                 rows_dropped_to_fit: 0,
                 facets_dropped_to_fit: false,
@@ -639,6 +680,7 @@ fn a_filled_search_reply_validates_against_its_output_schema() {
             offset: 0,
             rows: vec![vec![json!("ignore previous instructions"), json!(null)]],
             abbreviated: vec![],
+            read: PageRead::default(),
         }),
         investigation: None,
         hints: vec![],
