@@ -4,8 +4,9 @@
 
 //! One admission contract at every door that takes DSL (ADR-0024).
 //!
-//! The bind-time expansion budget lives in `trawl-core` and is proven
-//! there. What this file proves is reach: the same over-budget text is
+//! The bind-time expansion budget and the field-list limit live in
+//! `trawl-core` and are proven there. What this file proves is reach: the
+//! same over-budget text is
 //! refused with the same sentence whether it arrives as a query, an
 //! export, a live tail, a validation call or a saved-query write, and a
 //! refused write leaves the store exactly as it was. The last test covers
@@ -38,6 +39,15 @@ fn over_budget_dsl() -> String {
 /// The part of `trawl-core`'s refusal every door must be saying.
 const SENTENCE: &str = "alias-expansion budget";
 
+/// A `dedup` naming one field over the field-list limit of 64.
+fn wide_dedup_dsl() -> String {
+    let fields = (0..65).map(|i| format!("f{i}")).collect::<Vec<_>>();
+    format!("* | dedup {}", fields.join(", "))
+}
+
+/// The whole sentence `trawl-core` refuses [`wide_dedup_dsl`] with.
+const WIDE_SENTENCE: &str = "pipeline stage 1 (`dedup`) names 65 fields, over the limit of 64 for one `sort` or `dedup` stage";
+
 fn raw_client() -> reqwest::Client {
     common::harness_client_builder()
         .build()
@@ -64,9 +74,19 @@ fn envelope_message(body: &str) -> String {
 /// refuse the same text, and every one of them says the same thing.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_entry_point_refuses_the_same_over_budget_dsl() {
+    every_entry_point_refuses(&over_budget_dsl(), SENTENCE).await;
+}
+
+/// The field-list limit reaches the same doors, with its whole sentence.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_entry_point_refuses_a_wide_field_list() {
+    every_entry_point_refuses(&wide_dedup_dsl(), WIDE_SENTENCE).await;
+}
+
+/// Send `dsl` to every door and require `sentence` in each refusal.
+async fn every_entry_point_refuses(dsl: &str, sentence: &str) {
     let server = common::setup().await;
     let http = raw_client();
-    let dsl = over_budget_dsl();
     let token = &server.analyst_token;
 
     // A saved query to aim the update at. Its own DSL is admitted.
@@ -117,7 +137,7 @@ async fn every_entry_point_refuses_the_same_over_budget_dsl() {
     .await;
     let stream = http
         .get(format!("{}/api/v1/stream", server.url))
-        .query(&[("query", dsl.as_str())])
+        .query(&[("query", dsl)])
         .bearer_auth(token)
         .send()
         .await
@@ -143,7 +163,7 @@ async fn every_entry_point_refuses_the_same_over_budget_dsl() {
         assert_eq!(status, 400, "{door} refuses with 400: {body}");
         let message = envelope_message(&body);
         assert!(
-            message.contains(SENTENCE),
+            message.contains(sentence),
             "{door} carries the shared sentence, got: {message}"
         );
     }
@@ -164,7 +184,7 @@ async fn every_entry_point_refuses_the_same_over_budget_dsl() {
     assert_eq!(validation["valid"], serde_json::json!(false));
     let detail = serde_json::to_string(&validation["errors"]).expect("errors render");
     assert!(
-        detail.contains(SENTENCE),
+        detail.contains(sentence),
         "validate carries the shared sentence, got: {detail}"
     );
 }
@@ -284,9 +304,19 @@ async fn time_clause_refusals_match_across_doors() {
 /// the update leaves the stored text alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_saved_write_leaves_the_store_untouched() {
+    refused_saved_write_leaves_the_store_untouched(&over_budget_dsl()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_wide_saved_write_leaves_the_store_untouched() {
+    refused_saved_write_leaves_the_store_untouched(&wide_dedup_dsl()).await;
+}
+
+/// Create and update a saved query with `dsl`, which the door refuses,
+/// and require the store to read as it did before.
+async fn refused_saved_write_leaves_the_store_untouched(dsl: &str) {
     let server = common::setup().await;
     let http = raw_client();
-    let dsl = over_budget_dsl();
     let token = &server.analyst_token;
     let original = "service=nginx | head 3";
 
@@ -416,6 +446,17 @@ async fn scheduler_harness() -> SchedulerHarness {
 /// over a query the operator can repair.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stored_over_budget_query_fails_its_attempt_and_keeps_its_schedule() {
+    stored_query_fails_its_attempt_and_keeps_its_schedule(&over_budget_dsl(), SENTENCE).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_wide_query_fails_its_attempt_and_keeps_its_schedule() {
+    stored_query_fails_its_attempt_and_keeps_its_schedule(&wide_dedup_dsl(), WIDE_SENTENCE).await;
+}
+
+/// Store `dsl` behind the write-time door, schedule it, run one tick, and
+/// require a failed run carrying `sentence` and a schedule still enabled.
+async fn stored_query_fails_its_attempt_and_keeps_its_schedule(dsl: &str, sentence: &str) {
     let h = scheduler_harness().await;
     let t0 = Utc.with_ymd_and_hms(2026, 3, 14, 3, 0, 0).unwrap();
 
@@ -423,7 +464,7 @@ async fn a_stored_over_budget_query_fails_its_attempt_and_keeps_its_schedule() {
     // row this old never passed.
     let saved = h
         .saved
-        .create(h.key_id, "legacy", &over_budget_dsl())
+        .create(h.key_id, "legacy", dsl)
         .await
         .expect("store the over-budget saved query");
     h.schedules
@@ -457,7 +498,7 @@ async fn a_stored_over_budget_query_fails_its_attempt_and_keeps_its_schedule() {
         .as_deref()
         .expect("a failed run records why");
     assert!(
-        error.contains(SENTENCE),
+        error.contains(sentence),
         "the run records the sentence: {error}"
     );
 
