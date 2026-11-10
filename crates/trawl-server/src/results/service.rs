@@ -1317,8 +1317,9 @@ fn refused(refusal: Refusal) -> (Outcome, ServerError) {
 /// `/query`'s vanished-run post-check ([`crate::handlers`]'s
 /// `guard_vanished_run_result`) over a capture's outcome: a `from saved`
 /// read that came back with no columns, or with an engine error, asks its
-/// run files once more, and a file now gone is the named 409. A capture
-/// dropped here unlinks the file it published.
+/// run files once more: a file now confirmed absent is the named 409, and
+/// one whose absence cannot be established is a redacted I/O error. A
+/// capture dropped here unlinks the file it published.
 fn guard_vanished_run(
     outcome: Result<Captured, ServerError>,
     run_files: &[RunFile],
