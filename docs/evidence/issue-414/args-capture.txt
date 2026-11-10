@@ -1,0 +1,99 @@
+docs/evidence/issue-308/transcripts.sh: exit status 0, 2 claude invocation(s)
+invocation
+  '-p'
+  <prompt, 846 bytes>
+  '--setting-sources'
+  ''
+  '--strict-mcp-config'
+  '--mcp-config'
+  '<checkout>/docs/evidence/issue-308/mcp-current.json'
+  '--output-format'
+  'stream-json'
+  '--verbose'
+  '--no-session-persistence'
+  '--permission-mode'
+  'dontAsk'
+  '--allowedTools'
+  'mcp__trawl__orient,mcp__trawl__fields,mcp__trawl__search,mcp__trawl__read'
+  '--model'
+  'opus'
+invocation (MCP_PROTOCOL_NEGOTIATION=legacy)
+  '-p'
+  <prompt, 846 bytes>
+  '--setting-sources'
+  ''
+  '--strict-mcp-config'
+  '--mcp-config'
+  '<checkout>/docs/evidence/issue-308/mcp-legacy.json'
+  '--output-format'
+  'stream-json'
+  '--verbose'
+  '--no-session-persistence'
+  '--permission-mode'
+  'dontAsk'
+  '--allowedTools'
+  'mcp__trawl__orient,mcp__trawl__fields,mcp__trawl__search,mcp__trawl__read'
+  '--model'
+  'opus'
+docs/evidence/issue-309/transcripts.sh: exit status 0, 1 claude invocation(s)
+invocation
+  '-p'
+  <prompt, 1418 bytes>
+  '--setting-sources'
+  ''
+  '--strict-mcp-config'
+  '--mcp-config'
+  '<checkout>/docs/evidence/issue-309/mcp-current.json'
+  '--output-format'
+  'stream-json'
+  '--verbose'
+  '--no-session-persistence'
+  '--permission-mode'
+  'dontAsk'
+  '--allowedTools'
+  'mcp__trawl__orient,mcp__trawl__sightings,mcp__trawl__context,mcp__trawl__compare,mcp__trawl__read,mcp__trawl__search,mcp__trawl__fields'
+  '--model'
+  'opus'
+docs/evidence/issue-310/transcripts.sh: exit status 0, 2 claude invocation(s)
+invocation
+  '-p'
+  <prompt, 1451 bytes>
+  '--setting-sources'
+  ''
+  '--strict-mcp-config'
+  '--mcp-config'
+  '<checkout>/docs/evidence/issue-310/mcp-agent.json'
+  '--output-format'
+  'stream-json'
+  '--verbose'
+  '--no-session-persistence'
+  '--permission-mode'
+  'dontAsk'
+  '--allowedTools'
+  'mcp__trawl__orient,mcp__trawl__search,mcp__trawl__read,mcp__trawl__fields,mcp__trawl__investigation'
+  '--model'
+  'opus'
+invocation
+  '-p'
+  <prompt, 590 bytes>
+  '--setting-sources'
+  ''
+  '--strict-mcp-config'
+  '--mcp-config'
+  '<checkout>/docs/evidence/issue-310/mcp-human.json'
+  '--output-format'
+  'stream-json'
+  '--verbose'
+  '--no-session-persistence'
+  '--permission-mode'
+  'dontAsk'
+  '--allowedTools'
+  'mcp__trawl__orient,mcp__trawl__investigation,mcp__trawl__read'
+  '--model'
+  'opus'
+summary: 5 invocations, 5 with --setting-sources '', 5 with --permission-mode dontAsk
+summary: 5 with --strict-mcp-config
+summary: 5 with --mcp-config
+summary: 5 with --allowedTools
+summary: 5 with --no-session-persistence
+verdict: pass

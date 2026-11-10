@@ -35,7 +35,7 @@ json.dump({"mcpServers": {"trawl": {"command": wrapper, "args": [],
           "HOME": home, "PATH": "/usr/bin:/bin"}}}},
   open(cfg, "w"))
 PY
-  (cd "$RUN/cwd" && claude -p "$prompt" --setting-sources user --strict-mcp-config --mcp-config "$cfg" \
+  (cd "$RUN/cwd" && claude -p "$prompt" --setting-sources '' --strict-mcp-config --mcp-config "$cfg" \
       --output-format stream-json --verbose --no-session-persistence --permission-mode dontAsk \
       --allowedTools "$tools" \
       --model opus > "$OUT/$name.raw.jsonl" 2> "$OUT/$name.stderr.log") || echo "claude exit $?"
