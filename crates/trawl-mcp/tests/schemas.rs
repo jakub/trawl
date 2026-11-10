@@ -694,3 +694,160 @@ fn a_filled_search_reply_validates_against_its_output_schema() {
         .collect();
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+/// The raw schemas rmcp generates for each tool, before the format walk,
+/// in the order `tools()` lists the tools.
+fn raw_schemas() -> Vec<(&'static str, Value, Value)> {
+    use rmcp::handler::server::tool::{schema_for_input, schema_for_output};
+    use trawl_mcp::reply::{
+        CorrelationReply, FieldsReply, InvestigationReply, OrientReply, ReadReply,
+    };
+    use trawl_mcp::tools::schema::{
+        CompareInput, ContextInput, FieldsInput, InvestigationInput, OrientInput, ReadInput,
+        SearchInput, SightingsInput,
+    };
+
+    fn pair<I, O>(name: &'static str) -> (&'static str, Value, Value)
+    where
+        I: schemars::JsonSchema + 'static,
+        O: schemars::JsonSchema + 'static,
+    {
+        let input = schema_for_input::<I>().expect("an object input schema");
+        (
+            name,
+            schema_value(&input),
+            schema_value(&schema_for_output::<O>()),
+        )
+    }
+
+    vec![
+        pair::<OrientInput, OrientReply>("orient"),
+        pair::<SearchInput, SearchReply>("search"),
+        pair::<ReadInput, ReadReply>("read"),
+        pair::<ContextInput, CorrelationReply>("context"),
+        pair::<SightingsInput, CorrelationReply>("sightings"),
+        pair::<CompareInput, CorrelationReply>("compare"),
+        pair::<FieldsInput, FieldsReply>("fields"),
+        pair::<InvestigationInput, InvestigationReply>("investigation"),
+    ]
+}
+
+/// The format names JSON Schema 2020-12 defines, written out here so the
+/// test does not read the list it checks.
+const VOCABULARY: [&str; 19] = [
+    "date-time",
+    "date",
+    "time",
+    "duration",
+    "email",
+    "idn-email",
+    "hostname",
+    "idn-hostname",
+    "ipv4",
+    "ipv6",
+    "uri",
+    "uri-reference",
+    "iri",
+    "iri-reference",
+    "uuid",
+    "uri-template",
+    "json-pointer",
+    "relative-json-pointer",
+    "regex",
+];
+
+/// The JSON pointer of every string-valued `format` key outside the
+/// vocabulary, at any depth.
+fn nonstandard_formats(value: &Value, pointer: &str, found: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_pointer =
+                    format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1"));
+                if key == "format"
+                    && let Value::String(format) = child
+                    && !VOCABULARY.contains(&format.as_str())
+                {
+                    found.push(format!("{child_pointer} = {format}"));
+                }
+                nonstandard_formats(child, &child_pointer, found);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                nonstandard_formats(item, &format!("{pointer}/{index}"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `value` without its non-standard string `format` keys, at any depth.
+fn without_nonstandard_formats(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|key, child| {
+                key != "format"
+                    || child
+                        .as_str()
+                        .is_none_or(|format| VOCABULARY.contains(&format))
+            });
+            map.values_mut().for_each(without_nonstandard_formats);
+        }
+        Value::Array(items) => items.iter_mut().for_each(without_nonstandard_formats),
+        _ => {}
+    }
+}
+
+fn has_key(value: &Value, wanted: &str) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, child)| key == wanted || has_key(child, wanted)),
+        Value::Array(items) => items.iter().any(|item| has_key(item, wanted)),
+        _ => false,
+    }
+}
+
+/// Claude Code warns once per field about a format it does not know, so
+/// the schemas carry only the 2020-12 vocabulary, and the walk removes
+/// nothing else: every bound and keyword the raw schema had is still there.
+#[test]
+fn tool_schemas_have_only_standard_formats() {
+    let raw = raw_schemas();
+    let raw_names: Vec<_> = raw.iter().map(|(name, ..)| *name).collect();
+    let tool_names: Vec<_> = tools().iter().map(|tool| tool.name.to_string()).collect();
+    assert_eq!(raw_names, tool_names, "the raw table must mirror tools()");
+
+    let mut raw_nonstandard = 0;
+    let mut raw_minimum = false;
+    for ((name, raw_input, raw_output), tool) in raw.into_iter().zip(tools()) {
+        let walked = schemas(&tool);
+        assert_eq!(walked.len(), 2, "{name} has an input and an output schema");
+        for ((direction, walked), raw) in walked.into_iter().zip([raw_input, raw_output]) {
+            let mut found = Vec::new();
+            nonstandard_formats(&walked, "", &mut found);
+            assert!(
+                found.is_empty(),
+                "{name} {direction} carries non-standard formats: {found:?}"
+            );
+
+            let mut raw_found = Vec::new();
+            nonstandard_formats(&raw, "", &mut raw_found);
+            raw_nonstandard += raw_found.len();
+            raw_minimum |= has_key(&raw, "minimum");
+
+            let mut expected = raw;
+            without_nonstandard_formats(&mut expected);
+            assert_eq!(
+                walked, expected,
+                "{name} {direction}: the walk removed or changed more than the non-standard formats"
+            );
+        }
+    }
+    assert!(
+        raw_nonstandard > 0,
+        "no raw schema had a non-standard format"
+    );
+    assert!(raw_minimum, "no raw schema had a minimum");
+}
