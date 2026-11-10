@@ -169,3 +169,16 @@ The chart now applies the scratch rule to the WAL and to the data root:
 A WAL equal to the data root is not refused. No contract it would break has been shown. A WAL inside the `tls` directory beside the data root is outside this amendment: whether it exposes anything depends on the order the init container and trawld run in and on directory modes, and the same question applies to every root, not only the WAL.
 
 A release whose WAL sits off the volume now fails `helm upgrade` at render, and the running release stays as it was. To move the WAL onto the volume, drain it first: stop the senders, let compaction empty the WAL, and back up the PVC. Then set `config.ingest.walDir` below `/var/lib/trawl`, or clear it. No step moves the WAL automatically.
+
+## Amendment: the spill cap bounds file lengths, not blocks a filesystem allocates ahead, 2026-11-10
+
+The spill cap bounds the bytes DuckDB writes into its temp files: their lengths, plus the one block per live file that the decision already describes. It does not bound blocks that the filesystem allocates past a file's end.
+
+XFS allocates ahead of the end of a file that keeps growing. `spill_stays_within_budget_plus_class_slack` measured both totals while a capped sort ran. With the temp directory on XFS, and on the `k8s-big` CI runners, the files' lengths stayed within the cap plus the slack, and their allocated blocks went 13 MiB to 55 MiB past a cap of about 100 MiB. On btrfs and on the hosted CI runners the two totals matched.
+
+The test's directory bound is now on the files' lengths. It still prints the allocated total. The slack figure is unchanged.
+
+What this leaves open:
+
+- A tool that counts allocated blocks, such as `du`, a quota or the kubelet's accounting of an `emptyDir`, can see more than the cap while a query spills on such a filesystem. The measurements here cover caps near 100 MiB only. How far allocation ahead goes at the 4 GiB default, and when the filesystem gives the blocks back, have not been measured.
+- The chart, the Debian package and `trawl trial` put query scratch on the data volume, so this allocation competes with data for the same free space while a query runs.

@@ -189,6 +189,12 @@ fn random_strings_parquet(dir: &Path, rows: usize) -> PathBuf {
 
 /// The largest byte totals the spill directory reached across samples:
 /// the sum of the files' lengths and of their allocated blocks.
+///
+/// The directory bound is on `length`, the bytes `DuckDB` wrote and
+/// counts. `allocated` is printed as evidence and is not bounded: a
+/// filesystem that allocates ahead of a growing file's end (XFS does)
+/// holds blocks `DuckDB` never asked for, 13 to 55 MiB of them at these
+/// caps (ADR-0056, amendment of 2026-11-10).
 #[derive(Debug, Default, Clone, Copy)]
 struct Peak {
     length: u64,
@@ -501,7 +507,7 @@ fn assert_refused_by_the_spill_cap(run: &str, cap: u64, outcome: &str, peak: Pea
         used <= accounted_cap,
         "{run}: DuckDB accounted {used} past its cap {accounted_cap}"
     );
-    let held = peak.length.max(peak.allocated);
+    let held = peak.length;
     assert!(
         held <= cap + CLASS_SLACK,
         "{run}: the spill directory held {held} bytes, {} past the cap ({peak:?})",
@@ -557,7 +563,7 @@ fn spill_stays_within_budget_plus_class_slack() {
         let cap = natural.length * percent / 100;
         let (outcome, peak) = spill_under(&sql, &budgets(cap, memory, 2));
         let run = format!("cap {cap} ({percent}%)");
-        let held = peak.length.max(peak.allocated);
+        let held = peak.length;
         if outcome == "ok 1" {
             assert!(
                 held <= cap + CLASS_SLACK,
