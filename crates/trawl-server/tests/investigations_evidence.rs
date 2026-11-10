@@ -201,6 +201,25 @@ async fn evidence(server: &TestServer, n: u32) -> (u64, u64) {
     )
 }
 
+/// The refusal message of an evidence budget, named as `budget`, with
+/// `used` of `limit` bytes counted against it.
+fn budget_refusal(budget: &str, used: u64, limit: u64) -> String {
+    format!(
+        "keeping this result would exceed {budget}: {used} of {limit} bytes are counted \
+         against it, kept evidence and reservations together; evidence frees as it ages out, \
+         or when an operator with server_manage deletes an investigation"
+    )
+}
+
+/// The `scope` of every `capture_refused` event for an evidence budget.
+fn evidence_refusal_scopes() -> Vec<String> {
+    events_of("capture_refused")
+        .into_iter()
+        .filter(|event| event.field("reason") == "\"evidence_budget_exceeded\"")
+        .map(|event| event.field("scope"))
+        .collect()
+}
+
 /// Rows of `captured_results` attached to investigation `n`.
 async fn kept_rows(server: &TestServer, n: u32) -> i64 {
     let pool = common::fixture_pool(&server.app_db_url, 1).await;
@@ -292,8 +311,9 @@ async fn an_attached_capture_is_kept_from_birth() {
 
 /// A per-investigation evidence budget below `max_file_bytes` refuses an
 /// attached capture before any permit: 409 `evidence_budget_exceeded`
-/// naming the usage and the budget, no query started, the step `refused`
-/// with the code, and nothing held.
+/// naming this investigation's budget, the bytes counted against it and
+/// its size, no query started, the step `refused` with the code, and
+/// nothing held. The `capture_refused` event logs the scope.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_investigations_budget_refuses_an_attached_capture_before_any_permit() {
     let limit = max_file_bytes() - 1;
@@ -316,10 +336,12 @@ async fn the_investigations_budget_refuses_an_attached_capture_before_any_permit
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(code(&body), "evidence_budget_exceeded", "{body}");
-    assert!(
-        message(&body).contains(&format!("0 of {limit} bytes")),
+    assert_eq!(
+        message(&body),
+        budget_refusal("this investigation's evidence budget", 0, limit),
         "{body}"
     );
+    assert_eq!(evidence_refusal_scopes(), ["\"investigation\""]);
     captured::assert_nothing_held(&server, permits, "a refused attached capture").await;
 
     let step = settled(&server, &keys.human, 1, 1).await;
@@ -332,7 +354,8 @@ async fn the_investigations_budget_refuses_an_attached_capture_before_any_permit
 }
 
 /// The installation's evidence budget refuses the same way, whichever
-/// investigation the capture names.
+/// investigation the capture names, and its message and event name the
+/// installation's budget.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_installations_budget_refuses_an_attached_capture_before_any_permit() {
     let limit = max_file_bytes() - 1;
@@ -355,10 +378,12 @@ async fn the_installations_budget_refuses_an_attached_capture_before_any_permit(
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(code(&body), "evidence_budget_exceeded", "{body}");
-    assert!(
-        message(&body).contains(&format!("0 of {limit} bytes")),
+    assert_eq!(
+        message(&body),
+        budget_refusal("the installation's evidence budget", 0, limit),
         "{body}"
     );
+    assert_eq!(evidence_refusal_scopes(), ["\"installation\""]);
     captured::assert_nothing_held(&server, permits, "a refused attached capture").await;
     let step = settled(&server, &keys.human, 1, 1).await;
     let recorded = outcome(&step).unwrap();
@@ -532,6 +557,72 @@ async fn an_attached_capture_holds_its_reservation_until_it_settles() {
         evidence(&server, 1).await.0,
         file_bytes + third.result.file_bytes
     );
+}
+
+/// A reservation not yet kept is counted against the budget, and the
+/// message says so rather than calling it kept. The first capture's kept
+/// insert is held before its statement, so its reservation is in the book
+/// and no row of it exists; a second capture is refused with the first's
+/// reservation in its count. Released, the first capture commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_reservation_is_counted_not_called_kept() {
+    let limit = max_file_bytes() / 2 * 3;
+    let (server, keys) = boot(
+        CaptureConfig {
+            deadline_secs: 300,
+            ..CaptureConfig::default()
+        },
+        InvestigationConfig {
+            evidence_per_investigation_bytes: limit,
+            ..InvestigationConfig::default()
+        },
+    )
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let hold = server.state.results.store.faults().hold_next_insert();
+    let first = spawn_capture(
+        &server,
+        &keys.agent.token,
+        attached(&corpus_query(), 1, &json!({})),
+    );
+    tokio::time::timeout(Duration::from_mins(1), hold.parked)
+        .await
+        .expect("the first capture reaches its kept insert")
+        .expect("the insert parks");
+    assert_eq!(kept_rows(&server, 1).await, 0, "the first is not kept yet");
+    assert_eq!(evidence(&server, 1).await, (0, 0));
+    assert_eq!(
+        server.state.results.gate.evidence_reserved(),
+        max_file_bytes()
+    );
+
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code(&body), "evidence_budget_exceeded", "{body}");
+    assert_eq!(
+        message(&body),
+        budget_refusal(
+            "this investigation's evidence budget",
+            max_file_bytes(),
+            limit
+        ),
+        "the count is the first capture's reservation: {body}"
+    );
+    assert!(!message(&body).contains("already kept"), "{body}");
+    assert_eq!(kept_rows(&server, 1).await, 0, "still nothing kept");
+
+    hold.release.send(()).unwrap();
+    let (status, _, body) = first.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["state"], "kept", "{body}");
+    assert_eq!(kept_rows(&server, 1).await, 1);
+    let file_bytes = body["result"]["file_bytes"].as_u64().unwrap();
+    assert_eq!(evidence(&server, 1).await, (file_bytes, file_bytes));
 }
 
 // -- the fence ---------------------------------------------------------------

@@ -1275,17 +1275,18 @@ fn stored_bytes(files: &[RunFile]) -> std::io::Result<u64> {
 /// budget is a capacity refusal, a store failure an error.
 fn refused(refusal: Refusal) -> (Outcome, ServerError) {
     let (reason, retry_after_secs, error) = match refusal {
-        Refusal::EvidenceBudgetExceeded { used, limit } => {
+        Refusal::EvidenceBudgetExceeded { scope, used, limit } => {
             tracing::warn!(
                 event_type = "capture_refused",
                 reason = "evidence_budget_exceeded",
+                scope = scope.as_str(),
                 used,
                 limit,
                 "attached capture refused before it took an executor permit"
             );
             return (
                 Outcome::CapacityRefused,
-                ServerError::EvidenceBudgetExceeded { used, limit },
+                ServerError::EvidenceBudgetExceeded { scope, used, limit },
             );
         }
         Refusal::Busy { retry_after_secs } => (

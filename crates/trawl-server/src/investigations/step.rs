@@ -1345,6 +1345,7 @@ mod tests {
     use trawl_api::ErrorCode;
 
     use super::*;
+    use crate::results::charge::EvidenceScope;
 
     #[test]
     fn each_ending_maps_to_its_outcome_and_wire_code() {
@@ -1357,7 +1358,11 @@ mod tests {
         };
         assert_eq!(outcome_of(&busy, None).outcome, StepOutcomeKind::Refused);
         assert_eq!(outcome_of(&busy, None).code, Some(ErrorCode::CaptureBusy));
-        let budget = ServerError::EvidenceBudgetExceeded { used: 1, limit: 2 };
+        let budget = ServerError::EvidenceBudgetExceeded {
+            scope: EvidenceScope::Investigation,
+            used: 1,
+            limit: 2,
+        };
         assert_eq!(outcome_of(&budget, None).outcome, StepOutcomeKind::Refused);
         assert_eq!(
             outcome_of(&budget, None).code,
