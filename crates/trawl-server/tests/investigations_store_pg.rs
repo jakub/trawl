@@ -125,6 +125,7 @@ fn success(result: &str) -> StepOutcome {
         code: None,
         result_id: Some(result.into()),
         rows: Some(12),
+        total_rows: None,
         duration_ms: Some(250),
     }
 }
@@ -324,6 +325,7 @@ async fn the_largest_step_fits_the_payload_bound(pool: PgPool) {
         code: Some(ErrorCode::ExecutionError),
         result_id: None,
         rows: None,
+        total_rows: None,
         duration_ms: Some(u64::MAX),
     };
     assert!(
@@ -1353,6 +1355,7 @@ async fn a_step_completes_once(pool: PgPool) {
         code: Some(ErrorCode::EvidenceBudgetExceeded),
         result_id: None,
         rows: None,
+        total_rows: None,
         duration_ms: None,
     };
     assert!(

@@ -318,6 +318,12 @@ pub struct StepOutcome {
     /// Rows the result holds, for a success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<u64>,
+    /// For a success, the rows the execution produced before the capture
+    /// cut; equals the kept result's `total_rows`, and exceeds `rows` when
+    /// the capture was cut. Absent on other outcomes and on steps written
+    /// before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_rows: Option<u64>,
     /// How long the work ran, in milliseconds, when it ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -734,6 +740,7 @@ mod tests {
                         code: None,
                         result_id: Some("fedcba9876543210fedcba9876543210".into()),
                         rows: Some(120),
+                        total_rows: None,
                         duration_ms: Some(250),
                     }),
                 },
@@ -872,6 +879,7 @@ mod tests {
             code: Some(ErrorCode::EvidenceBudgetExceeded),
             result_id: None,
             rows: None,
+            total_rows: None,
             duration_ms: None,
         };
         assert_eq!(
@@ -889,6 +897,23 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), json!(wire));
         }
+    }
+
+    #[test]
+    fn a_step_outcome_total_rows_is_optional_on_the_wire() {
+        let absent: StepOutcome =
+            serde_json::from_value(json!({"outcome": "success", "rows": 4})).unwrap();
+        assert_eq!(absent.total_rows, None);
+        let none = serde_json::to_value(&absent).unwrap();
+        assert!(none.get("total_rows").is_none(), "{none}");
+        let empty = StepOutcome {
+            rows: Some(0),
+            total_rows: Some(0),
+            ..absent
+        };
+        let zero = serde_json::to_value(&empty).unwrap();
+        assert_eq!(zero["total_rows"], json!(0));
+        assert_eq!(round_trip(&empty), empty);
     }
 
     #[test]

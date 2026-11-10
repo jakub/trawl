@@ -502,6 +502,7 @@ async fn a_boot_interrupts_a_dead_step_and_leaves_the_clock() {
         outcome.as_ref().map(|o| o.outcome),
         Some(StepOutcomeKind::Interrupted)
     );
+    assert_eq!(outcome.as_ref().and_then(|o| o.total_rows), None);
     // AC: the interruption advances the sequence and leaves the clock.
     let after = read(&server, &keys.human, 4, "").await.investigation;
     assert_eq!(after.seq, before.seq + 1);

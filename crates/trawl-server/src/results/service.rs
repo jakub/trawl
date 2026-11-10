@@ -1944,7 +1944,7 @@ async fn commit_kept(
     step: StepCompletion,
     duration_ms: u64,
 ) -> Result<CaptureRow, ServerError> {
-    let outcome = step::success(&new.id, new.captured_rows, duration_ms);
+    let outcome = step::success(&new.id, new.captured_rows, new.total_rows, duration_ms);
     let kept = KeptStep {
         seq: step.seq(),
         outcome: &outcome,
