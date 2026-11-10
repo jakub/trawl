@@ -316,6 +316,35 @@ test('a step that finishes updates in place, and a step the reader opened stays 
   await expect(activity.nth(6)).toContainText('Succeeded');
 });
 
+test("a cut capture's step card says it was cut", async ({ page, request }) => {
+  await asReader(request);
+  await freezeClock(page);
+  await page.goto(`/investigations/${ID}`);
+  const main = page.locator('.inv-page');
+  const steps = main.getByRole('list', { name: 'Steps' }).locator('> li');
+  await expect(steps).toHaveCount(3);
+
+  await write(request, [{
+    actor: AGENT,
+    at: '2026-10-24T09:44:00.000000Z',
+    payload: {
+      kind: 'step',
+      executed: 'service=payments-gateway earliest="2026-10-24T09:00:00.000000Z" latest="2026-10-24T09:45:00.000000Z"',
+      bounds: { earliest: '2026-10-24T09:00:00.000000Z', latest: '2026-10-24T09:45:00.000000Z' },
+      request_id: 'req-0012',
+      query_id: 12,
+      purpose: 'Every gateway error',
+      outcome: { outcome: 'success', result_id: 'fedcba9876543210fedcba9876543210', rows: 4, total_rows: 5000, duration_ms: 310 },
+    },
+  }]);
+  await page.clock.fastForward(5_000);
+  await expect(steps).toHaveCount(4);
+  const step = steps.nth(3);
+  // The collapsed card says so; the viewer was never opened.
+  await expect(step.locator('summary')).toContainText('4 of 5000 rows (cut)');
+  await expect(step.locator('details')).not.toHaveAttribute('open', /.*/);
+});
+
 test('a lost poll keeps the board and its last check, backs off, and the board comes back live', async ({ page, request }) => {
   await asReader(request);
   await freezeClock(page);
