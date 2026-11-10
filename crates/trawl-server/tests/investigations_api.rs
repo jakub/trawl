@@ -2014,13 +2014,17 @@ async fn an_overwrite_whose_activity_read_fails_stays_acknowledged() {
     );
 }
 
-/// An investigation deleted between an overwrite's commit and its activity
-/// read still answers 200 with the header and the entry the write's own
-/// transaction saw, and activity through the written entry with nothing
-/// more: no read after the commit can turn the landed write into a 404.
-/// The proxy holds the answer to the `SET TRANSACTION` that opens the
-/// activity read, before its snapshot exists, while the test reads the
-/// written entry and deletes the investigation from other sessions.
+/// An investigation deleted the moment an overwrite commits still answers
+/// 200 with the header and the entry the write's own transaction saw, and
+/// activity through the written entry with nothing more: no read after the
+/// commit can turn the landed write into a 404.
+///
+/// The proxy holds Postgres's answer to the write's `COMMIT`. Postgres has
+/// committed by the time it answers, so while the answer is held the test
+/// reads the written entry and deletes the investigation from sessions of
+/// its own. The handler learns that its commit landed only after the
+/// investigation is gone, so any read it sends after the commit, wherever
+/// in the handler, finds nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_overwrite_answers_its_header_when_deleted_after_commit() {
     let capture = telemetry();
@@ -2030,9 +2034,10 @@ async fn an_overwrite_answers_its_header_when_deleted_after_commit() {
     let proxy = answer_hold::Proxy::start(&server.app_db_url.parse().unwrap()).await;
     let (app, _through) = proxied(&server, &proxy).await;
 
-    // Nothing in the overwrite's transaction asks for a read-only
-    // snapshot; the activity read's first statement does.
-    proxy.hold_next(b"REPEATABLE READ, READ ONLY");
+    // `WriteTx::finish` sends `COMMIT` as a simple query, and no statement
+    // of the write before it carries that text. The activity read's own
+    // `COMMIT` comes later, after the proxy has disarmed.
+    proxy.hold_next(b"COMMIT");
     let answer = answer_of(
         &app,
         routed(
@@ -2055,14 +2060,20 @@ async fn an_overwrite_answers_its_header_when_deleted_after_commit() {
         .map(|e| e.seq)
         .collect();
     assert_eq!(written, [other.entry.seq + 1], "the close is written once");
-    let (status, body) = call(
-        &server,
-        &keys.operator.token,
-        Method::DELETE,
-        &format!("/investigations/{}", id(1)),
-        None,
+    // The write's row lock went with its commit, so the delete does not
+    // wait for the held answer.
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        call(
+            &server,
+            &keys.operator.token,
+            Method::DELETE,
+            &format!("/investigations/{}", id(1)),
+            None,
+        ),
     )
-    .await;
+    .await
+    .expect("the delete waits on no lock of the committed write");
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     proxy.release();
 
