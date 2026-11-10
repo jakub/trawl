@@ -116,6 +116,7 @@ const INVENTORY: &[(&str, &str, usize)] = &[
     ("crates/trawl-core/tests/scalar_parity.rs", PREPARER_NEW, 1),
     ("crates/trawl-engine/src/executor.rs", PREPARER_NEW, 4),
     ("crates/trawl-engine/src/post_process.rs", PREPARER_NEW, 1),
+    ("crates/trawl-engine/tests/duckdb_probe.rs", PREPARER_NEW, 1),
     ("crates/trawl-engine/tests/re2_memory.rs", PREPARER_NEW, 3),
     ("crates/trawl-engine/tests/regex_cost.rs", PREPARER_NEW, 1),
     ("crates/trawl-server/src/handlers.rs", PREPARER_NEW, 1),
@@ -1100,9 +1101,9 @@ fn the_live_compile_refuses_class_set_syntax() {
 
 /// A `like` or `ilike` operand never becomes class set syntax: its
 /// translation escapes every `[` and `]`, so it holds no class at all.
-/// A glob's `[…]` copies through to a class, and a glob may nest one
-/// (`[a[b]]`), but the batch lane runs a glob as `DuckDB`'s GLOB, never
-/// RE2, so the refusal is for regex bodies alone.
+/// A glob's translation writes each class as byte escapes, and the batch
+/// lane runs a glob as `DuckDB`'s GLOB, never RE2, so the refusal is for
+/// regex bodies alone.
 #[test]
 fn like_operands_never_become_class_set_syntax() {
     let operand = "[a[b]]&&x--y~~[c&&a]%_";
@@ -1175,7 +1176,7 @@ fn the_batch_view_compiles_to_what_re2_compiles() {
         .expect("measures");
     assert_eq!(ledger.batch_compiled_bytes(r"\pL{4}"), Ok(rust));
     // The measure is the smallest limit the build fits.
-    let hir = parse_hir(r"\pL{4}").expect("parses");
+    let hir = parse_hir(r"\pL{4}", PatternKind::Regex).expect("parses");
     assert!(compile(&hir, rust).is_ok());
     assert!(compile(&hir, rust - 1).is_err());
 }
@@ -1610,7 +1611,7 @@ fn calibration_bodies() -> impl Iterator<Item = &'static str> {
     reason = "a twin with the lazy DFA off, built only to tell whether the owner's build kept it on"
 )]
 fn without_lazy_dfa(body: &str, capacity: usize) -> meta::Regex {
-    let hir = parse_hir(body).expect("the body parses");
+    let hir = parse_hir(body, PatternKind::Regex).expect("the body parses");
     meta::Builder::new()
         .configure(meta_config(MAX_REGEX_COMPILED_BYTES, capacity).hybrid(false))
         .build_from_hir(&hir)
@@ -1830,7 +1831,7 @@ fn corpus_charges() {
             .expect("one pattern fits a query");
         let charge = pattern.0.charge;
         let (_, profile) = compile(
-            &parse_hir(body).expect("the body parses"),
+            &parse_hir(body, PatternKind::Regex).expect("the body parses"),
             MAX_REGEX_COMPILED_BYTES,
         )
         .expect("the body compiles");
@@ -2189,14 +2190,14 @@ fn a_build_reads_its_stop_before_it_compiles() {
     assert_ne!(view, body);
     let never = crate::cancel::Stop::never();
     assert_eq!(
-        prepare(body, None, &never).err(),
+        prepare(PatternKind::Regex, body, None, &never).err(),
         Some(PatternError::CompiledSize)
     );
     let stop = crate::cancel::Stop::new();
     stop.request();
     for view in [None, Some(body), Some(view.as_str())] {
         assert_eq!(
-            prepare(body, view, &stop).err(),
+            prepare(PatternKind::Regex, body, view, &stop).err(),
             Some(PatternError::Cancelled),
             "{view:?}"
         );
@@ -2271,29 +2272,52 @@ fn like_translation_is_unchanged() {
     assert_eq!(like_to_regex("a%", true), "(?i)^a.*$");
 }
 
+/// A glob's translation, byte for byte: every glob byte is a `\xNN`
+/// escape, `*` and `?` are `.*` and `.` over bytes, and a class is the
+/// positive class of its byte set's runs.
 #[test]
 fn glob_conversion_star() {
-    assert_eq!(glob_to_regex("*.txt"), r"(?s)^.*\.txt$");
+    assert_eq!(glob_to_regex("*.txt"), r"(?s-u:^.*\x2E\x74\x78\x74$)");
+    assert_eq!(glob_to_regex("a**"), r"(?s-u:^\x61.*.*$)");
 }
 
 #[test]
 fn glob_conversion_question() {
-    assert_eq!(glob_to_regex("file?.log"), r"(?s)^file.\.log$");
+    assert_eq!(
+        glob_to_regex("file?.log"),
+        r"(?s-u:^\x66\x69\x6C\x65.\x2E\x6C\x6F\x67$)"
+    );
 }
 
 #[test]
 fn glob_conversion_character_class() {
-    assert_eq!(glob_to_regex("[abc]"), "(?s)^[abc]$");
+    assert_eq!(glob_to_regex("[abc]"), r"(?s-u:^[\x61-\x63]$)");
+    assert_eq!(glob_to_regex("[^4]"), r"(?s-u:^[\x34\x5E]$)");
+    assert_eq!(glob_to_regex("[é]"), r"(?s-u:^[\xA9\xC3]$)");
 }
 
 #[test]
 fn glob_conversion_negated_class() {
-    assert_eq!(glob_to_regex("[!abc]"), "(?s)^[^abc]$");
+    assert_eq!(glob_to_regex("[!abc]"), r"(?s-u:^[\x00-\x60\x64-\xFF]$)");
 }
 
 #[test]
-fn glob_conversion_escapes_dots() {
-    assert_eq!(glob_to_regex("foo.bar"), r"(?s)^foo\.bar$");
+fn glob_conversion_escapes_every_byte() {
+    assert_eq!(
+        glob_to_regex("foo.bar"),
+        r"(?s-u:^\x66\x6F\x6F\x2E\x62\x61\x72$)"
+    );
+    assert_eq!(glob_to_regex(r"\*é"), r"(?s-u:^\x2A\xC3\xA9$)");
+    assert_eq!(glob_to_regex(""), "(?s-u:^$)");
+}
+
+/// A malformed glob, or one whose class holds no byte, is the one regex
+/// that matches nothing.
+#[test]
+fn glob_conversion_malformed_matches_nothing() {
+    for glob in [r"x\", "[", "[a-]", "[]", "[!]", "a[z-a]*", "*[", "[a-]]"] {
+        assert_eq!(glob_to_regex(glob), GLOB_NEVER, "{glob}");
+    }
 }
 
 #[test]
