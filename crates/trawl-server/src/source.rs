@@ -157,9 +157,10 @@ fn token_pins(token: &SearchToken) -> Option<BTreeSet<&str>> {
 
 /// The one service whose file holds every row `service=` `scalar` matches:
 /// an exact value the `service` pin compares as text, which only a stored
-/// service of the same bytes matches. A numeric value also matches the
-/// same number spelled another way (`service=1` matches a stored `01`, in
-/// `01.parquet`), and a pattern matches many names, so neither pins.
+/// service of the same bytes matches, and which no other name is stored as
+/// ([`compaction_can_store_another_name_as`]). A numeric value also matches
+/// the same number spelled another way (`service=1` matches a stored `01`,
+/// in `01.parquet`), and a pattern matches many names, so neither pins.
 fn pinned_name(scalar: &Scalar) -> Option<&str> {
     let Scalar::Exact(value) = scalar else {
         return None;
@@ -169,9 +170,49 @@ fn pinned_name(scalar: &Scalar) -> Option<&str> {
         .iter()
         .find_map(|(field, ty)| (*field == SERVICE).then_some(*ty));
     match compare_form(pin, FilterOp::Eq, value) {
-        Ok(CompareForm::Text(text)) if text == *value => Some(value),
+        Ok(CompareForm::Text(text))
+            if text == *value && !compaction_can_store_another_name_as(value) =>
+        {
+            Some(value)
+        }
         _ => None,
     }
+}
+
+/// Whether compaction can store a service under the text `value` in the
+/// file of a different name, so that `{value}.parquet` does not hold every
+/// row whose stored service is `value`.
+///
+/// Compaction names the file after the service as sent, but reads the WAL
+/// with `read_json`'s type detection, and the VARCHAR conform writes back
+/// `DuckDB`'s rendering of whatever type it detected. Only two detections
+/// change a valid service name: a DATE (`2026-1-1`, `26-01-01`, `epoch` and
+/// `infinity` are stored as `YYYY-MM-DD`) and a UUID (an upper-case one is
+/// stored lower-cased). So the two canonical renderings are the values that
+/// can sit in another name's file. The shape alone decides: `2026-13-01`,
+/// which no date renders as, reads every file too, which costs reads and
+/// never rows. `a_value_compaction_rewrites_never_pins` runs the real
+/// compaction over a corpus to keep this list complete.
+fn compaction_can_store_another_name_as(value: &str) -> bool {
+    let digits =
+        |part: &str, len: usize| part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
+    let hex = |part: &str, len: usize| {
+        part.len() == len && part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let parts: Vec<&str> = value.split('-').collect();
+    // A DATE renders its year padded to four digits.
+    let date = matches!(parts.as_slice(), [year, month, day]
+        if year.len() >= 4
+            && year.bytes().all(|b| b.is_ascii_digit())
+            && digits(month, 2)
+            && digits(day, 2));
+    // A UUID renders as lower-case hex in groups of 8, 4, 4, 4 and 12.
+    let uuid = parts.len() == 5
+        && parts
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(part, len)| hex(part, len));
+    date || uuid
 }
 
 /// Extract an exact value for `field` from the search stage, if present.
@@ -1496,6 +1537,33 @@ mod tests {
             ("service=inf", any.clone()),
             ("service=1e5", any.clone()),
             ("service=1 service=api", only(&["api"])),
+            // Compaction can store another name as a canonical date or UUID
+            // (`2026-1-1` is stored as `2026-01-01`, in `2026-1-1.parquet`),
+            // so neither shape pins.
+            ("service=2026-01-01", any.clone()),
+            ("service=2026-01-01,nginx", any.clone()),
+            ("(service=2026-01-01 OR service=nginx)", any.clone()),
+            ("service=1900-01-01", any.clone()),
+            ("service=550e8400-e29b-41d4-a716-446655440000", any.clone()),
+            (
+                "service=nginx,550e8400-e29b-41d4-a716-446655440000",
+                any.clone(),
+            ),
+            ("service=2026-01-01 service=nginx", only(&["nginx"])),
+            // No name is stored as another spelling of a date or a UUID,
+            // nor as a boolean or a null word, so those still pin.
+            ("service=2026-1-1", only(&["2026-1-1"])),
+            ("service=2026-01-01T10", only(&["2026-01-01T10"])),
+            (
+                "service=550E8400-E29B-41D4-A716-446655440000",
+                only(&["550E8400-E29B-41D4-A716-446655440000"]),
+            ),
+            (
+                "service=550e8400e29b41d4a716446655440000",
+                only(&["550e8400e29b41d4a716446655440000"]),
+            ),
+            ("service=true,null", only(&["null", "true"])),
+            ("service=nginx,api.v2", only(&["api.v2", "nginx"])),
             // Names are checked on the final set: one the intersection
             // removes never reaches a path, one left in reads everything.
             ("service=a,\".x\"", any.clone()),
@@ -1570,6 +1638,115 @@ mod tests {
         let mut search = parsed("service=a");
         search.groups.push(vec![no_branch]);
         assert_eq!(service_pins(&search), any, "nor does it pin an OR branch");
+    }
+
+    /// A pin reads only `{name}.parquet`, so it is sound only while every
+    /// row stored with service `name` sits in that file. Compaction names
+    /// the file after the service as sent, but its `read_json` detection
+    /// can read the value as a DATE or a UUID, and the VARCHAR conform then
+    /// stores the canonical rendering instead. Run the real WAL writer and
+    /// compaction over valid names, and require that no stored value that
+    /// differs from its file's name pins.
+    #[tokio::test]
+    async fn a_value_compaction_rewrites_never_pins() {
+        use crate::ingest::wal::WalWriter;
+
+        const CORPUS: &[&str] = &[
+            "2026-1-1",
+            "2026-01-01",
+            "26-01-01",
+            "12-30-00",
+            "01-02-2026",
+            "31-12-2026",
+            "1-1-1",
+            "20260101",
+            "2026-01-01T10",
+            "epoch",
+            "infinity",
+            "-infinity",
+            "INFINITY",
+            "550E8400-E29B-41D4-A716-446655440000",
+            "550e8400e29b41d4a716446655440000",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "true",
+            "TRUE",
+            "false",
+            "t",
+            "yes",
+            "null",
+            "NULL",
+            "nan",
+            "1",
+            "01",
+            "1.0",
+            "1e5",
+            "0x10",
+            "1-2",
+            "a",
+            "cafe",
+            "dead-beef",
+            "api.v2",
+            "nginx",
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (dir.path().join("wal"), dir.path().join("data"));
+        let wal = WalWriter::new(wal_dir.clone());
+        wal.ensure_dir().unwrap();
+        for name in CORPUS {
+            assert!(trawl_config::is_valid_service_name(name), "{name}");
+            let event = serde_json::json!({
+                "_time": "2026-01-03T00:05:00Z",
+                "_ingested": "2026-01-03T00:05:01Z",
+                "service": name,
+                "message": "probe",
+            });
+            let mut line = serde_json::to_vec(&event).unwrap();
+            line.push(b'\n');
+            wal.write("prod", name, &line).unwrap();
+        }
+        let failures = crate::ingest::compaction::compact_once(
+            &wal_dir,
+            &data_dir,
+            std::time::Duration::ZERO,
+            false,
+            None,
+            500,
+            "2GB",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failures, 0);
+
+        let files = glob_matches(&format!("{}/**/*.parquet", data_dir.display()));
+        assert_eq!(files.len(), CORPUS.len(), "{files:?}");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut rewrites = Vec::new();
+        for file in &files {
+            let name = Path::new(file).file_stem().unwrap().to_str().unwrap();
+            let stored: Vec<String> = conn
+                .prepare(&format!(
+                    "SELECT DISTINCT service FROM read_parquet('{file}')"
+                ))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for value in stored.into_iter().filter(|value| value != name) {
+                rewrites.push(format!("{name} -> {value}"));
+                assert_eq!(
+                    pinned_name(&Scalar::Exact(value.clone())),
+                    None,
+                    "{value} is stored in {name}.parquet"
+                );
+            }
+        }
+        assert!(
+            rewrites.iter().any(|r| r == "2026-1-1 -> 2026-01-01"),
+            "the corpus still makes compaction rewrite a value: {rewrites:?}"
+        );
     }
 
     /// Every file `source` reaches: each entry of its list, or the bare
