@@ -362,7 +362,7 @@ The server captures `execution.started_at` beside its monotonic timer. The durat
 | 409 | `bad_request` | A `from saved` stage selects a run that has columns but no Parquet file. The message names the run route. |
 | 500 | `execution_error` | DuckDB failed or the query was cancelled |
 | 503 | `query_resource_exhausted` | The query went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
-| 503 | `service_unavailable` | The deadline passed before the query started, or a cold file moved during the read. Retry. |
+| 503 | `service_unavailable` | The deadline passed before the query started, or a cold file moved during the read. Retry. A cancel that reached the query before it started answers the same way; do not retry that one. |
 | 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
 | 504 | `timeout` | The deadline passed after the query started |
@@ -483,7 +483,7 @@ An export file is not the [result wire](#result-columns). Each format keeps its 
 | 400 | `bad_request` | `format` is not `csv`, `json`, or `parquet`. The envelope's message quotes the request's reason. |
 | 500 | `execution_error` | DuckDB failed |
 | 503 | `query_resource_exhausted` | The export went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
-| 503 | `service_unavailable` | The deadline passed before the export started |
+| 503 | `service_unavailable` | The deadline passed, or a cancel reached the export, before it started |
 | 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
 | 504 | `timeout` | The deadline passed after the export started |
@@ -685,7 +685,7 @@ A capture writes its file to the [results root](/reference/configuration/#the-re
 | 429 | `capture_quota_exceeded` | The key's or the installation's quota cannot take one more result. Sent with `Retry-After` |
 | 500 | `execution_error` | DuckDB failed or the capture was cancelled |
 | 503 | `query_resource_exhausted` | The query went over the spill or memory budget |
-| 503 | `service_unavailable` | The deadline passed after admission and before the work started: in the wait for an executor permit or the publication guard, or in the hand-off to the worker. The message is `server at capacity: the query was not started`. Nothing stays charged |
+| 503 | `service_unavailable` | The deadline passed after admission and before the work started, or a cancel reached it: in the wait for an executor permit or the publication guard, or in the hand-off to the worker. The message is `server at capacity: the query was not started`. Nothing stays charged |
 | 503 | `service_unavailable` | The metadata store did not answer |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering) |
 | 504 | `timeout` | The deadline passed after the work started, including while the file was being written. The work keeps its slots and its reservation until it stops, and a file it had not yet published is removed |
@@ -3243,7 +3243,7 @@ Permission: `query_cancel` for the key's own work, `server_manage` for any work
 
 Asks the pool to interrupt the work with this id, including retained work. Ownership is the submitting key's id, not its name. The response acknowledges the request and does not prove the worker stopped. Repeating the request is safe.
 
-An export is cancelled the same way, by its id from `/api/v1/queries`. A key that holds only `export` cannot cancel an export, its own included. A cancel has no effect before the pool registers the work. It also has no effect while a `csv` or `json` export renders its file, because the pool work has already ended. The same holds for a query.
+An export is cancelled the same way, by its id from `/api/v1/queries`. A key that holds only `export` cannot cancel an export, its own included. A cancel also reaches a query, an export or a capture that still waits to start. That request then answers 503 `service_unavailable` with `server at capacity: the query was not started`. A cancel has no effect while a `csv` or `json` export renders its file, because the pool work has already ended. The same holds for a query.
 
 **Parameters**
 
@@ -3263,7 +3263,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X DELETE "$TRAWL_URL/api/v1
 { "cancelled": true, "query_id": 41 }
 ```
 
-`cancelled` is `false` when no work with that id is registered.
+`cancelled` is `false` when no work with that id waits to start or is registered.
 
 **Errors**
 

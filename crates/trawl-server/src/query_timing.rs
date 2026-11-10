@@ -159,12 +159,16 @@ impl Outcome {
     /// the pool names them with [`Outcome::CapacityRefused`] where it
     /// refuses, rather than reading one back out of a 503's message. A
     /// preparation refusal is typed, so every door that books it reads
-    /// it here (ADR-0063).
+    /// it here (ADR-0063). So is the not-started refusal a cancel by id
+    /// ends a request with in one of its own waits, where no pool account
+    /// was written (ADR-0024, Amendment 2026-11-09).
     #[must_use]
     pub fn of_error(error: &ServerError) -> Self {
         match error {
             ServerError::Timeout => Self::Timeout,
-            ServerError::PreparationUnavailable => Self::CapacityRefused,
+            ServerError::PreparationUnavailable | ServerError::CapacityNotStarted => {
+                Self::CapacityRefused
+            }
             other => Self::Error(other.error_class()),
         }
     }
@@ -1104,6 +1108,17 @@ mod tests {
     fn a_preparation_refusal_is_a_capacity_refusal() {
         assert_eq!(
             Outcome::of_error(&ServerError::PreparationUnavailable),
+            Outcome::CapacityRefused
+        );
+    }
+
+    /// A cancel by id that ends a request in one of its own waits answers
+    /// the not-started refusal: nothing ran, so the account books it as a
+    /// capacity refusal, not as an error.
+    #[test]
+    fn a_not_started_refusal_is_a_capacity_refusal() {
+        assert_eq!(
+            Outcome::of_error(&ServerError::CapacityNotStarted),
             Outcome::CapacityRefused
         );
     }
