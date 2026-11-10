@@ -790,6 +790,7 @@ pub(crate) mod calibration {
         "timeout|refused",
         "(?i)timeout",
         "connection refused",
+        "^a b",
         "err|warn",
         "err| warn",
         "a,b",

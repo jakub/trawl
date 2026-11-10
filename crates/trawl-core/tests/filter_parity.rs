@@ -90,6 +90,10 @@ const STRING_VALS: &[&str] = &[
     "db-01",
 ];
 
+/// Text values holding a character of two, three and four bytes, which a
+/// byte-reading glob meets one byte at a time.
+const MULTIBYTE_VALS: &[&str] = &["café", "é-1", "€uro", "😀ok"];
+
 const PATH_VALS: &[&str] = &["/api/users", "/api/health", "/web/index"];
 
 const INT_VALS: &[i64] = &[200, 301, 404, 500, 0, 42, 100];
@@ -211,8 +215,35 @@ fn random_field_glob(rng: &mut Rng) -> String {
     // DuckDB conversion errors on BIGINT columns.
     let field = string_field(rng);
     let base = rng.pick(STRING_VALS);
-    // Append `*` so the parser auto-detects as glob.
-    format!("{field}={base}*")
+    let (c, d) = (&base[..1], &base[1..2]);
+    // Every shape holds `*` or `?`, so the parser reads it as a glob.
+    let glob = match rng.range(8) {
+        0 => format!("{base}*"),
+        1 => format!("{c}?{}*", &base[2..]),
+        2 => "?*".to_owned(),
+        3 => "??*".to_owned(),
+        4 => format!("[{c}{d}]*"),
+        5 => format!("[!{c}]*"),
+        6 => format!("[^{c}]*"),
+        _ => byte_wildcards(rng.pick(MULTIBYTE_VALS)),
+    };
+    format!("{field}={glob}")
+}
+
+/// `value` with its first non-ASCII character spelled as one `?` per byte,
+/// which matches `value` only when a glob reads bytes.
+fn byte_wildcards(value: &str) -> String {
+    let (at, ch) = value
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii())
+        .expect("a multi-byte value");
+    let after = at + ch.len_utf8();
+    format!(
+        "{}{}{}",
+        &value[..at],
+        "?".repeat(ch.len_utf8()),
+        &value[after..]
+    )
 }
 
 /// A glob or regex under `=` or `!=`, alone or in a comma list beside an
@@ -303,6 +334,7 @@ fn random_event_value(rng: &mut Rng, field: &str) -> Value {
             Value::Number((*rng.pick(INT_VALS)).into())
         }
         "path" => Value::String((*rng.pick(PATH_VALS)).to_string()),
+        _ if rng.range(5) == 0 => Value::String((*rng.pick(MULTIBYTE_VALS)).to_string()),
         _ => Value::String((*rng.pick(STRING_VALS)).to_string()),
     }
 }
@@ -386,6 +418,7 @@ fn filter_matches_sql_parity() {
     let mut passed = 0u32;
     let mut skipped = 0u32;
     let mut read_absent = 0u32;
+    let mut met_multibyte = 0u32;
 
     for i in 0..1000 {
         let dsl = random_dsl(&mut rng);
@@ -451,11 +484,24 @@ fn filter_matches_sql_parity() {
         if ABSENT_FIELDS.iter().any(|name| dsl.contains(name)) {
             read_absent += 1;
         }
+        // A glob beside a field holding a multi-byte value: the bytes a
+        // `?` or a class reads differ from the characters.
+        let multibyte = event
+            .values()
+            .any(|v| v.as_str().is_some_and(|s| !s.is_ascii()));
+        if multibyte && (dsl.contains('?') || dsl.contains('[')) {
+            met_multibyte += 1;
+        }
         passed += 1;
     }
 
     eprintln!(
-        "filter parity: {passed} passed, {skipped} skipped, {read_absent} read an absent field"
+        "filter parity: {passed} passed, {skipped} skipped, {read_absent} read an absent field, \
+         {met_multibyte} put a byte glob beside a multi-byte value"
+    );
+    assert!(
+        met_multibyte >= 30,
+        "too few iterations put a byte glob beside a multi-byte value: {met_multibyte}"
     );
     assert!(
         read_absent >= 100,
@@ -2128,6 +2174,89 @@ fn stored_timestamp(wire: &str) -> String {
     trawl_core::conform::guarded_cast(&format!("'{wire}'"), CanonicalType::Timestamp)
 }
 
+/// The text-pin cases for globs that read bytes, as `DuckDB`'s GLOB does
+/// (ADR-0001's amendment of 2026-11-09): `?` is one byte, so `é` (two
+/// bytes), `€` (three) and `😀` (four) miss it; a class is a byte set, so
+/// `[^4]` holds `^` and `4`, and `[!4]` every byte but `4`. A malformed
+/// glob matches no value, so its `!=` selects every event.
+fn byte_glob_cases(pin: Option<CanonicalType>) -> Vec<ComplementCase> {
+    let rows = |rows: Vec<Row>| -> Vec<Row> {
+        let mut all = null_rows("VARCHAR").to_vec();
+        all.extend(rows);
+        all
+    };
+    let newline = "chr(10)";
+    vec![
+        ComplementCase {
+            pin,
+            patterns: &["?"],
+            rows: rows(vec![
+                row("match, one byte", Value::from("a"), "'a'", Hit::Match),
+                row("match, digit", Value::from("4"), "'4'", Hit::Match),
+                row("match, newline", Value::from("\n"), newline, Hit::Match),
+                row("miss, empty", Value::from(""), "''", Hit::Miss),
+                row("miss, two bytes", Value::from("é"), "'é'", Hit::Miss),
+                row("miss, three bytes", Value::from("€"), "'€'", Hit::Miss),
+                row("miss, four bytes", Value::from("😀"), "'😀'", Hit::Miss),
+                row("miss, two chars", Value::from("ab"), "'ab'", Hit::Miss),
+            ]),
+        },
+        ComplementCase {
+            pin,
+            patterns: &["??"],
+            rows: rows(vec![
+                row("match, two bytes", Value::from("é"), "'é'", Hit::Match),
+                row("match, two chars", Value::from("ab"), "'ab'", Hit::Match),
+                row("match, 4x", Value::from("4x"), "'4x'", Hit::Match),
+                row("miss, empty", Value::from(""), "''", Hit::Miss),
+                row("miss, one byte", Value::from("a"), "'a'", Hit::Miss),
+                row("miss, three bytes", Value::from("€"), "'€'", Hit::Miss),
+                row("miss, four bytes", Value::from("😀"), "'😀'", Hit::Miss),
+            ]),
+        },
+        ComplementCase {
+            pin,
+            patterns: &["[^4]*"],
+            rows: rows(vec![
+                row("match, 4x", Value::from("4x"), "'4x'", Hit::Match),
+                row("match, ^a", Value::from("^a"), "'^a'", Hit::Match),
+                row("match, 4", Value::from("4"), "'4'", Hit::Match),
+                row("miss, empty", Value::from(""), "''", Hit::Miss),
+                row("miss, a4", Value::from("a4"), "'a4'", Hit::Miss),
+                row("miss, two bytes", Value::from("é"), "'é'", Hit::Miss),
+                row("miss, four bytes", Value::from("😀"), "'😀'", Hit::Miss),
+            ]),
+        },
+        ComplementCase {
+            pin,
+            patterns: &["[!4]*"],
+            rows: rows(vec![
+                row("match, a4", Value::from("a4"), "'a4'", Hit::Match),
+                row("match, ^a", Value::from("^a"), "'^a'", Hit::Match),
+                row("match, newline", Value::from("\n"), newline, Hit::Match),
+                row("match, two bytes", Value::from("é"), "'é'", Hit::Match),
+                row("match, three bytes", Value::from("€"), "'€'", Hit::Match),
+                row("match, four bytes", Value::from("😀"), "'😀'", Hit::Match),
+                row("miss, empty", Value::from(""), "''", Hit::Miss),
+                row("miss, 4x", Value::from("4x"), "'4x'", Hit::Miss),
+                row("miss, 4", Value::from("4"), "'4'", Hit::Miss),
+            ]),
+        },
+        ComplementCase {
+            pin,
+            patterns: &["a[z-a]*", "[*", r"?\"],
+            rows: rows(vec![
+                row("miss, a", Value::from("a"), "'a'", Hit::Miss),
+                row("miss, az", Value::from("az"), "'az'", Hit::Miss),
+                row("miss, empty", Value::from(""), "''", Hit::Miss),
+                row("miss, [", Value::from("["), "'['", Hit::Miss),
+                row("miss, two bytes", Value::from("é"), "'é'", Hit::Miss),
+                row(r"miss, a\", Value::from(r"a\"), r"'a\'", Hit::Miss),
+            ]),
+        },
+    ]
+}
+
 #[allow(clippy::too_many_lines)] // one matrix, kept in one place to stay readable
 fn complement_cases() -> Vec<ComplementCase> {
     use CanonicalType as CT;
@@ -2191,6 +2320,7 @@ fn complement_cases() -> Vec<ComplementCase> {
             patterns: &["*", "db-02,*"],
             rows,
         });
+        cases.extend(byte_glob_cases(pin));
     }
 
     // A VARCHAR exact element binds through its two-armed numeric form.
