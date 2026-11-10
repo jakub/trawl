@@ -4,12 +4,13 @@
 
 //! A regex body as the batch engine reads it (ADR-0063).
 //!
-//! The live lane builds a regex body with regex-automata's meta engine, and
-//! the batch lane hands the same text to `DuckDB`'s RE2. The two dialects differ
-//! (ADR-0001), and some of the differences change what a body costs as
-//! well as what it matches. This module holds the two checks a regex body
-//! passes for the batch engine: the refusal of class syntax RE2 reads
-//! differently, and the view whose compiled size the ledger caps at
+//! The live lane and the kv tail build a regex with regex-automata's meta
+//! engine, and the batch lane hands the body to `DuckDB`'s RE2. The two
+//! dialects differ (ADR-0001), and some of the differences change what a
+//! body costs as well as what it matches. This module holds the two
+//! things a regex body passes through for the batch engine: the refusal
+//! of class syntax RE2 reads differently, and the view, the program the
+//! meta engine runs, whose compiled size the ledger caps at
 //! [`super::MAX_BATCH_COMPILED_BYTES`].
 //!
 //! # Class set syntax
@@ -30,18 +31,20 @@
 //! # The view
 //!
 //! RE2 reads the Perl classes `\w`, `\d` and `\s` and the word assertions
-//! `\b` and `\B` as ASCII, and the Rust engine reads them as Unicode. So
-//! the same body compiles to a far larger program in Rust than in RE2 when
-//! it holds them: `\w{20}` is about 1 MiB in Rust and 2 KiB in RE2. The
+//! `\b` and `\B` as ASCII, and the Rust engine reads them as Unicode. The
 //! view ([`view`]) is the body with each of them written out in its ASCII
 //! meaning, in syntax the Rust engine reads the way RE2 reads the
-//! original, so the size the Rust engine compiles it to measures what
-//! RE2 compiles. [`super::Preparer::build`] compiles the view of every
-//! regex body it builds under [`super::MAX_BATCH_COMPILED_BYTES`]; an
-//! `extract` body's view keeps its groups as written, though the batch
-//! lane binds unnamed ones as non-capturing, which counts a few KiB more
-//! at most, toward refusal. A glob, `like` or `ilike` operand never
-//! reaches RE2 and has no view.
+//! original. It is the program that runs in the live lane and the kv
+//! tail, so they match as the batch lane does. [`super::Preparer::build`]
+//! compiles the body as written under [`super::MAX_REGEX_COMPILED_BYTES`]
+//! to admit it, then compiles the view under
+//! [`super::MAX_BATCH_COMPILED_BYTES`] and keeps the view's program, which
+//! is the one charged. The view's size also measures what RE2 compiles:
+//! `\w{20}` is about 1 MiB in Rust as written and 2 KiB as RE2 reads it.
+//! An `extract` body's view keeps its groups as written, so capture names
+//! and indices do not move; the batch lane binds unnamed ones as
+//! non-capturing, which counts a few KiB more at most, toward refusal. A
+//! glob, `like` or `ilike` operand never reaches RE2 and has no view.
 //!
 //! RE2's ASCII meanings, from the bundled `perl_groups.cc` and `parse.cc`:
 //!
@@ -55,6 +58,13 @@
 //! - `\b` and `\B` test ASCII word characters. The view writes each word
 //!   assertion as `(?-u:…)`. A word assertion compiles to one state either
 //!   way, so this keeps the meaning and does not change the size.
+//!
+//! One difference remains. RE2 tests an assertion at every byte offset, so
+//! an empty match on `\B` can sit inside a multi-byte character: `\B`
+//! matches `xéy` in RE2. The meta engine never places an empty match
+//! inside a character, so the view does not match there. Only a body that
+//! can match empty on `\B`, such as `\B` or `x*\B`, is affected
+//! (`regex_class_view_premise` pins those rows).
 //!
 //! Everything else that this module does not refuse reads the same in
 //! both engines, or is syntax RE2 refuses, which `DuckDB` reports when the

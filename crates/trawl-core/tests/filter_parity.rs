@@ -922,6 +922,26 @@ fn text_search_metacharacters_are_literal_in_both_lanes() {
     }
 }
 
+/// A search-stage regex reads `\d` and `\w` as ASCII in both lanes: `/\d+/`
+/// does not match the Arabic-Indic digit three (U+0663), and `/\w/` does not
+/// match e with an acute accent (U+00E9), while each matches its ASCII
+/// control.
+#[test]
+fn regex_perl_classes_are_ascii_in_both_lanes() {
+    const ROWS: [&str; 4] = ["\u{663}", "3", "\u{e9}", "e"];
+    let conn = Connection::open_in_memory().unwrap();
+    let tmp = message_rows_file(&ROWS);
+    let path = tmp.path().to_str().unwrap();
+    for (dsl, expected) in [
+        (r"message=/\d+/", vec!["3"]),
+        (r"message=/\w/", vec!["3", "e"]),
+    ] {
+        let (filter_hits, sql_hits) = rows_selected_by_both_lanes(&conn, path, &ROWS, dsl);
+        assert_eq!(sql_hits, expected, "SQL lane for {dsl:?}");
+        assert_eq!(filter_hits, expected, "in-memory lane for {dsl:?}");
+    }
+}
+
 /// Text containment folds Unicode case in both lanes (ADR-0015): `DuckDB`'s
 /// `ILIKE` decides what each Unicode term selects, and the in-memory filter
 /// selects the same rows, positive and negated, bare and quoted. Each term

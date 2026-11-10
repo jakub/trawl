@@ -36,10 +36,10 @@ const MIB: usize = 1 << 20;
 /// one [`BUILD_TRANSIENT`], in bytes. A fixed constant with no config key,
 /// like `MAX_LATERAL_EXPANSION`.
 ///
-/// At 32 MiB, the whole of [`LOG_REGEXES`] fits one query, and so do three
-/// patterns near the 1 MiB compiled-size limit, such as `\w{20}`, at about
-/// 7.3 MiB each. A fourth does not. An ordinary query of ASCII patterns
-/// charges a few hundred KiB a pattern.
+/// At 32 MiB, the whole of [`LOG_REGEXES`] fits one query, and so do six
+/// patterns near the 512 KiB batch compiled-size limit, such as
+/// `(\pL{12})`, at about 4.3 MiB each. A seventh does not. An ordinary
+/// query of ASCII patterns charges about 100 KiB a pattern.
 pub const REGEX_QUERY_BUDGET: usize = 32 * MIB;
 
 /// How far over a pattern's forward lazy-DFA minimum its cache capacity

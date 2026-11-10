@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::*;
@@ -1131,8 +1131,12 @@ fn batch_view(body: &str) -> String {
 /// The view writes `\w`, `\d` and `\s` as RE2's ASCII classes, negated as
 /// written and inside a bracket too, and each word assertion under
 /// `(?-u:…)`, so the Rust engine compiles it the way RE2 compiles the
-/// body. Every other node prints back as written. A nested class in the
-/// view is the Rust engine's union: the view is measured, never run.
+/// body. Every other node prints back as written. The view is the program
+/// that runs in the live lane and the kv tail, and a nested class in it is
+/// the Rust engine's union, which matches what RE2 matches for the class
+/// the body wrote. The one difference is an empty match on `\B` inside a
+/// multi-byte character, which RE2 finds and the view does not
+/// ([`regex_class_view_premise`]).
 #[test]
 fn the_batch_view_reads_perl_classes_and_word_assertions_as_ascii() {
     const WORD: &str = r"[\x30-\x39\x41-\x5A\x5F\x61-\x7A]";
@@ -1606,17 +1610,18 @@ fn calibration_bodies() -> impl Iterator<Item = &'static str> {
         .copied()
 }
 
-/// A twin of `body`'s program at `capacity`, with the lazy DFA off.
+/// A twin of the program `body` runs at `capacity`, with the lazy DFA
+/// off: the program of its batch-engine view.
 #[expect(
     clippy::disallowed_methods,
     reason = "a twin with the lazy DFA off, built only to tell whether the owner's build kept it on"
 )]
 fn without_lazy_dfa(body: &str, capacity: usize) -> meta::Regex {
-    let hir = parse_hir(body, PatternKind::Regex).expect("the body parses");
+    let hir = parse_hir(&batch_view(body), PatternKind::Regex).expect("the view parses");
     meta::Builder::new()
         .configure(meta_config(MAX_REGEX_COMPILED_BYTES, capacity).hybrid(false))
         .build_from_hir(&hir)
-        .expect("the body compiles under 1 MiB")
+        .expect("the view compiles under 1 MiB")
 }
 
 /// Every pattern of the corpus and the Unicode table builds with its lazy
@@ -1646,12 +1651,22 @@ fn lazy_dfa_stays_enabled() {
     }
 }
 
-/// Four distinct bodies of the `\w{20}` class, each near the 1 MiB
-/// compiled-size limit and each charging about 7.3 MiB.
-const HEAVY: [&str; 4] = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w", r"\w\w{19}"];
+/// Seven distinct bodies of the `(\pL{12})` class, each its own batch-engine
+/// view, near the 512 KiB batch compiled-size limit, and each charging
+/// about 4.3 MiB (4 474 264 bytes on the reference host). Six fit one
+/// query's budget beside a build transient, and the seventh does not.
+const HEAVY: [&str; 7] = [
+    r"(\pL{12})0",
+    r"(\pL{12})1",
+    r"(\pL{12})2",
+    r"(\pL{12})3",
+    r"(\pL{12})4",
+    r"(\pL{12})5",
+    r"(\pL{12})6",
+];
 
-/// The whole corpus fits one query at the shipped budget, and four
-/// [`HEAVY`] bodies do not: the fourth is refused.
+/// The whole corpus fits one query at the shipped budget, and the
+/// [`HEAVY`] bodies do not: the last is refused.
 ///
 /// A query whose patterns charge exactly the budget, less one build
 /// transient, is admitted. One byte less of budget refuses it at the
@@ -1684,14 +1699,16 @@ fn query_budget_exact_and_one_over() {
     assert_eq!(shipped.charged(), sum);
 
     let refused = PatternError::Resources(RegexRefusal::Budget);
+    let (over, under) = HEAVY.split_last().expect("HEAVY has bodies");
     let mut heavy = preparer();
-    for body in &HEAVY[..3] {
+    for body in under {
+        assert_eq!(batch_view(body), *body, "a heavy body runs as written");
         assert!(heavy.build(PatternKind::Regex, body).is_ok(), "{body}");
     }
     assert_eq!(
-        heavy.build(PatternKind::Regex, HEAVY[3]).err(),
+        heavy.build(PatternKind::Regex, over).err(),
         Some(refused.clone()),
-        "the fourth heavy body is over the budget"
+        "the last heavy body is over the budget"
     );
 
     let mut exact = preparer();
@@ -1743,12 +1760,13 @@ fn check_mode_meters_nothing() {
     use crate::filter::CompiledFilter;
     use crate::schema::FieldTypes;
 
+    let (over, under) = HEAVY.split_last().expect("HEAVY has bodies");
     let mut metered = preparer();
-    for body in &HEAVY[..3] {
+    for body in under {
         assert!(metered.build(PatternKind::Regex, body).is_ok(), "{body}");
     }
     assert_eq!(
-        metered.build(PatternKind::Regex, HEAVY[3]).err(),
+        metered.build(PatternKind::Regex, over).err(),
         Some(PatternError::Resources(RegexRefusal::Budget))
     );
     let mut check = Preparer::check();
@@ -1804,14 +1822,15 @@ fn check_mode_meters_nothing() {
 
 /// The most any pattern of the corpus or the Unicode table may charge for
 /// its program, in bytes. The largest on the reference host is
-/// `\w{20}`'s, 1 129 304 bytes. A prefilter is a small part of any
+/// `\pL{12}`'s, 590 160 bytes. A prefilter is a small part of any
 /// program here, so another CPU's choice of one stays well under the
 /// ceiling, and a change that makes programs grow does not.
 const PROGRAM_CEILING: usize = 3 << 19;
 
 /// What each pattern of the corpus and the Unicode table charges for its
 /// caches and scratch, in bytes, term by term, with the lazy-DFA capacity
-/// it builds with and the forward minimum that capacity comes from. A
+/// it builds with and the forward minimum that capacity comes from, both
+/// read from the program that runs: its batch-engine view's. A
 /// dependency bump or a changed constant that moves one shows here as a
 /// diff.
 ///
@@ -1832,10 +1851,10 @@ fn corpus_charges() {
             .expect("one pattern fits a query");
         let charge = pattern.0.charge;
         let (_, profile) = compile(
-            &parse_hir(body, PatternKind::Regex).expect("the body parses"),
-            MAX_REGEX_COMPILED_BYTES,
+            &parse_hir(&batch_view(body), PatternKind::Regex).expect("the view parses"),
+            MAX_BATCH_COMPILED_BYTES,
         )
-        .expect("the body compiles");
+        .expect("the view compiles");
         writeln!(
             table,
             "{:>8} {:>8} {:>8} {:>7} {:>8}  {body}",
@@ -2016,10 +2035,17 @@ fn a_refused_build_leaves_the_reservation_where_it_started() {
     );
     assert_eq!((pool.reserved(), pool.holds()), (0, 0));
 
-    // The transient fits and the charge does not: `\w{20}` charges more.
+    // The transient fits and the charge does not: `(\pL{12})` charges more.
+    let heavy = r"(\pL{12})";
+    let charge = unmetered()
+        .build(PatternKind::Regex, heavy)
+        .expect("builds")
+        .charge()
+        .total();
+    assert!(charge > BUILD_TRANSIENT, "{heavy} charges {charge}");
     let (mut ledger, pool) = reserving(transient);
     assert_eq!(
-        ledger.build(PatternKind::Regex, r"\w{20}").err(),
+        ledger.build(PatternKind::Regex, heavy).err(),
         Some(reservation.clone())
     );
     assert_eq!((ledger.builds(), ledger.charged()), (1, 0));
@@ -2111,6 +2137,70 @@ fn one_ledger_holds_a_shared_pattern_once() {
     drop((filter, plan));
     assert_eq!(pool.reserved(), 0);
     assert_eq!((pool.holds(), pool.releases()), (2, 2));
+}
+
+/// A regex body whose batch-engine view differs from it runs the view's
+/// program and is charged for that program alone: `\w{20}` charges what a
+/// build of its view text charges, less than the program of the body as
+/// written would. The ledger holds that charge once however often the
+/// body is asked for, a build cancelled before it starts holds nothing,
+/// and once the ledger and every returned pattern drop, the reservation
+/// is back where it started.
+#[test]
+fn regex_class_resource_ownership() {
+    let body = r"\w{20}";
+    let view = batch_view(body);
+    assert_ne!(view, body);
+    let charge = unmetered()
+        .build(PatternKind::Regex, body)
+        .expect("builds")
+        .charge();
+    let of_view = unmetered()
+        .build(PatternKind::Regex, &view)
+        .expect("the view builds")
+        .charge();
+    assert_eq!(charge, of_view, "the body charges for its view's program");
+    let (regex, profile) = compile(
+        &parse_hir(body, PatternKind::Regex).expect("the body parses"),
+        MAX_REGEX_COMPILED_BYTES,
+    )
+    .expect("the body compiles under 1 MiB");
+    let as_written = Charge::new(&profile, regex.memory_usage());
+    drop(regex);
+    assert!(
+        charge.total() < as_written.total(),
+        "the view charges {} bytes, the body as written {}",
+        charge.total(),
+        as_written.total()
+    );
+
+    let (mut ledger, pool) = reserving(u64::MAX);
+    let start = pool.reserved();
+    let first = ledger.build(PatternKind::Regex, body).expect("builds");
+    let again = ledger.build(PatternKind::Regex, body).expect("held");
+    assert_eq!(ledger.builds(), 1, "one build for the shared body");
+    assert_eq!(ledger.charged(), charge.total());
+    assert_eq!(pool.reserved(), start + bytes(charge.total()));
+    assert_eq!(pool.holds(), 1);
+    drop((ledger, first, again));
+    assert_eq!(pool.reserved(), start);
+    assert_eq!((pool.holds(), pool.releases()), (1, 1));
+
+    let (ledger, pool) = reserving(u64::MAX);
+    let stop = crate::cancel::Stop::new();
+    stop.request();
+    let mut ledger = ledger.with_stop(stop);
+    let before = thread_builds();
+    assert_eq!(
+        ledger.build(PatternKind::Regex, body).err(),
+        Some(PatternError::Cancelled)
+    );
+    assert_eq!(
+        (ledger.builds(), thread_builds()),
+        (0, before),
+        "no build ran"
+    );
+    assert_eq!((pool.reserved(), pool.holds()), (0, 0), "nothing held");
 }
 
 /// A paused reservation parks a metered build once its pattern's charge
@@ -2386,4 +2476,396 @@ fn capture_names_lists_named_groups_in_order() {
     assert_eq!(capture_names(r"(\d+)-(\d+)"), Some(Vec::new()));
     assert_eq!(capture_names(r"(?P<code>\d+"), None);
     assert_eq!(thread_builds(), before, "capture_names built a regex");
+}
+
+/// The subjects the regex-class premise runs every body over: the
+/// non-ASCII characters where the Rust engine's Unicode classes and RE2's
+/// ASCII ones part, ASCII controls, and composites that put a non-ASCII
+/// character next to a word character or a line end.
+const PREMISE_SUBJECTS: [&str; 29] = [
+    "\u{663}",
+    "\u{e9}",
+    "\u{200a}",
+    "\u{b}",
+    "\u{c}",
+    "\u{212a}",
+    "\u{17f}",
+    "3",
+    "e",
+    "_",
+    "K",
+    "s",
+    " ",
+    "\t",
+    "\n",
+    "\r",
+    "",
+    "x\u{e9}y",
+    "x\u{e9}",
+    "\u{e9}x",
+    "x\u{663}y",
+    "x\u{212a}y",
+    "x\u{17f}y",
+    "\u{e9}\u{e9}",
+    "a\n",
+    "a\r\n",
+    "x y",
+    "Ka",
+    "aK",
+];
+
+/// `text` as its code points, `U+…` each, so a mismatch report names
+/// the subject whatever it holds.
+fn code_points(text: &str) -> String {
+    if text.is_empty() {
+        return "(empty)".to_owned();
+    }
+    text.chars()
+        .map(|c| format!("U+{:04X}", u32::from(c)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `body` under each case-folding form the premise checks: as written,
+/// under `(?i)`, and scoped `(?i:…)` followed by an unscoped copy.
+fn premise_case_forms(body: &str) -> [String; 3] {
+    [
+        body.to_owned(),
+        format!("(?i){body}"),
+        format!("(?i:{body}){body}"),
+    ]
+}
+
+/// The premise's bodies, each with its construct family.
+fn premise_bodies() -> Vec<(String, String)> {
+    let mut bodies = Vec::new();
+    for class in [r"\d", r"\D", r"\w", r"\W", r"\s", r"\S"] {
+        for form in [
+            class.to_owned(),
+            format!("^{class}$"),
+            format!("{class}+"),
+            format!("[{class}]"),
+            format!("[x{class}]"),
+            format!("[^{class}]"),
+        ] {
+            for body in premise_case_forms(&form) {
+                bodies.push((class.to_owned(), body));
+            }
+        }
+    }
+    for (family, forms) in [
+        (r"\b", &[r"\b", r"x\b", r"\bx", r"\b\w+\b"][..]),
+        (r"\B", &[r"\B", r"x\B", r"\Bx", r"x*\B"][..]),
+    ] {
+        for form in forms {
+            for body in premise_case_forms(form) {
+                bodies.push((family.to_owned(), body));
+            }
+        }
+    }
+    for body in [r"(?i)k", r"(?i)s", r"(?i)\w", r"(?i)\W"] {
+        bodies.push(("case fold".to_owned(), body.to_owned()));
+    }
+    for body in ["a$", "(?m)a$", "^.$", "(?s)^.$"] {
+        bodies.push(("anchor and dot".to_owned(), body.to_owned()));
+    }
+    for body in [r"\pN", r"\p{Nd}", r"\pL"] {
+        bodies.push(("Unicode class control".to_owned(), body.to_owned()));
+    }
+    bodies
+}
+
+/// `body`'s view, built as `prepare` builds a view: parsed as a regex
+/// body and compiled under [`MAX_BATCH_COMPILED_BYTES`] with the meta
+/// configuration every pattern uses.
+fn premise_view_program(body: &str) -> Result<(String, meta::Regex), String> {
+    let ast = regex_syntax::ast::parse::Parser::new()
+        .parse(body)
+        .map_err(|e| format!("the body does not parse: {e}"))?;
+    let view = re2::view(&ast);
+    let hir = parse_hir(&view, PatternKind::Regex)
+        .map_err(|e| format!("the view {view:?} does not parse: {e}"))?;
+    let (regex, _) = compile(&hir, MAX_BATCH_COMPILED_BYTES)
+        .map_err(|e| format!("the view {view:?} does not compile: {e}"))?;
+    Ok((view, regex))
+}
+
+/// The bundled `DuckDB`'s version, for a mismatch report.
+fn duckdb_version(conn: &duckdb::Connection) -> String {
+    conn.query_row("SELECT version()", [], |row| row.get::<_, String>(0))
+        .unwrap_or_else(|e| format!("(version unknown: {e})"))
+}
+
+/// The premise bodies that can match empty on `\B`, before their case
+/// forms ([`premise_case_forms`]).
+const EMPTY_NON_BOUNDARY_FORMS: [&str; 2] = [r"\B", r"x*\B"];
+
+/// The premise subjects that put one multi-byte character between two
+/// ASCII word characters.
+const SPLIT_WORD_SUBJECTS: [&str; 4] = ["x\u{e9}y", "x\u{663}y", "x\u{212a}y", "x\u{17f}y"];
+
+/// The rows where the view and `DuckDB` answer differently, all accepted:
+/// every case form of [`EMPTY_NON_BOUNDARY_FORMS`] over every
+/// [`SPLIT_WORD_SUBJECTS`] subject. RE2 tests an assertion at every byte
+/// offset, so an empty match on `\B` can sit inside a multi-byte
+/// character and `DuckDB` answers true. The view runs with
+/// `utf8_empty(true)`, which never places an empty match inside a
+/// character, so it answers false.
+fn empty_non_boundary_rows() -> BTreeSet<(String, &'static str)> {
+    EMPTY_NON_BOUNDARY_FORMS
+        .iter()
+        .flat_map(|form| premise_case_forms(form))
+        .flat_map(|body| SPLIT_WORD_SUBJECTS.map(|subject| (body.clone(), subject)))
+        .collect()
+}
+
+/// The view of a regex body reads `\d \D \w \W \s \S`, `\b` and `\B` as
+/// the bundled `DuckDB` (RE2) reads the body itself. Each row runs the
+/// view, compiled as `prepare` compiles it, as an unanchored match over a
+/// subject, and asks `DuckDB` `regexp_matches(subject, body)` with the
+/// original body bound, as the batch lane binds it. The rows that disagree
+/// must be exactly [`empty_non_boundary_rows`], each `DuckDB` true and the
+/// view false: a disagreement outside that set fails, and so does a row of
+/// it that now agrees. Every unexpected row is reported, not just the
+/// first.
+#[test]
+fn regex_class_view_premise() {
+    let split_word = |subject: &str| {
+        let chars: Vec<char> = subject.chars().collect();
+        matches!(chars.as_slice(), [a, c, b]
+            if a.is_ascii_alphanumeric() && b.is_ascii_alphanumeric() && c.len_utf8() > 1)
+    };
+    let split_subjects: Vec<&str> = PREMISE_SUBJECTS
+        .into_iter()
+        .filter(|subject| split_word(subject))
+        .collect();
+    assert_eq!(
+        split_subjects, SPLIT_WORD_SUBJECTS,
+        "SPLIT_WORD_SUBJECTS must name every premise subject of that shape"
+    );
+    let accepted = empty_non_boundary_rows();
+    let mut differing = BTreeSet::new();
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    let mut mismatches = Vec::new();
+    let mut answers: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+    let mut rows = 0usize;
+    for (family, body) in premise_bodies() {
+        let program = premise_view_program(&body);
+        for subject in PREMISE_SUBJECTS {
+            rows += 1;
+            let duck = conn
+                .prepare_cached("SELECT regexp_matches(?::VARCHAR, ?)")
+                .and_then(|mut stmt| {
+                    stmt.query_row(duckdb::params![subject, body], |row| row.get::<_, bool>(0))
+                })
+                .map_err(|e| format!("DuckDB error: {e}"));
+            let (view, ours) = match &program {
+                Ok((view, regex)) => {
+                    let mut cache = regex.create_cache();
+                    let input = Input::new(subject).earliest(true);
+                    (
+                        view.clone(),
+                        Ok(regex.search_half_with(&mut cache, &input).is_some()),
+                    )
+                }
+                Err(e) => ("(none)".to_owned(), Err(e.clone())),
+            };
+            if let Ok(answer) = duck {
+                let seen = answers.entry(family.clone()).or_default();
+                if answer {
+                    seen.0 = true;
+                } else {
+                    seen.1 = true;
+                }
+            }
+            let row = (body.clone(), subject);
+            let expected = accepted.contains(&row);
+            if duck != ours {
+                differing.insert(row);
+            }
+            let unexpected = if expected {
+                (&duck, &ours) != (&Ok(true), &Ok(false))
+            } else {
+                duck != ours
+            };
+            if unexpected {
+                mismatches.push(format!(
+                    "body {body:?} | view {view:?} | subject {} | duckdb {duck:?} | view {ours:?}{}",
+                    code_points(subject),
+                    if expected {
+                        " | accepted as DuckDB true, view false"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+    }
+    for (family, (any_true, any_false)) in &answers {
+        assert!(
+            *any_true && *any_false,
+            "{family}: DuckDB answered only {}",
+            if *any_true { "true" } else { "false" }
+        );
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {rows} rows answer other than expected, DuckDB {}:\n{}",
+        mismatches.len(),
+        duckdb_version(&conn),
+        mismatches.join("\n")
+    );
+    assert_eq!(
+        differing, accepted,
+        "the disagreeing rows are the accepted set"
+    );
+}
+
+/// Each named group of `batch`, in its order, as the view program
+/// `regex` captures it over `subject`: null for no match, a group that
+/// takes no part and an empty capture. A span that splits a character is
+/// an error, not a panic.
+fn premise_view_captures(
+    regex: &meta::Regex,
+    batch: &BatchExtract,
+    subject: &str,
+) -> Result<Vec<Option<String>>, String> {
+    let mut cache = regex.create_cache();
+    let mut groups = regex.create_captures();
+    regex.search_captures_with(&mut cache, &Input::new(subject), &mut groups);
+    batch
+        .captures
+        .iter()
+        .map(|capture| {
+            if !groups.is_match() {
+                return Ok(None);
+            }
+            let Some(span) = groups.get_group_by_name(&capture.name) else {
+                return Ok(None);
+            };
+            if !subject.is_char_boundary(span.start) || !subject.is_char_boundary(span.end) {
+                return Err(format!(
+                    "group {} span {}..{} splits a character",
+                    capture.name, span.start, span.end
+                ));
+            }
+            let text = &subject[span.range()];
+            Ok((!text.is_empty()).then(|| text.to_owned()))
+        })
+        .collect()
+}
+
+/// The view of an `extract` body captures what the bundled `DuckDB`
+/// captures from the body. Each row reads every named group of the
+/// view's program by name, as the live lane does, against the struct
+/// form of `regexp_extract` over the body's batch copy, as the emitter
+/// writes it. Both read a group that takes no part in the match, a row
+/// that does not match and an empty capture as null, as the product
+/// does. A capture whose span splits a character is a mismatch row.
+#[test]
+fn regex_class_view_capture_premise() {
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    let mut mismatches = Vec::new();
+    let (mut rows, mut some, mut none) = (0usize, 0usize, 0usize);
+    let mut cells = 0usize;
+    for body in [
+        r"(?P<n>\d+)",
+        r"(?P<n>\D+)",
+        r"(\w)(?P<n>\s)",
+        r"(?P<n>\S+)",
+        r"(?P<a>\w+)\b(?P<b>\W*)",
+        r"(?P<n>\B)",
+        r"x(?P<n>\B)",
+        r"(?P<n>\b)",
+        r"(?P<a>\b\w)(?P<b>.)",
+        r"(?i:(?P<n>\w))",
+        r"(?i)(?P<n>[\w\s]+)",
+        r"(?P<n>[^\w])",
+    ] {
+        let batch = batch_extract(body).expect("the body parses");
+        let reads: Vec<String> = batch
+            .captures
+            .iter()
+            .map(|capture| format!("nullif(struct_extract(x, 'g{}'), '')", capture.index))
+            .collect();
+        let fields: Vec<String> = (1..=batch.captures.len())
+            .map(|k| format!("g{k}"))
+            .collect();
+        let sql = format!(
+            "SELECT {} FROM (SELECT regexp_extract(?::VARCHAR, ?, ?::VARCHAR[]) AS x)",
+            reads.join(", ")
+        );
+        let names = format!("[{}]", fields.join(", "));
+        let program = premise_view_program(body);
+        for subject in PREMISE_SUBJECTS {
+            rows += 1;
+            let duck: Result<Vec<Option<String>>, String> = conn
+                .prepare_cached(&sql)
+                .and_then(|mut stmt| {
+                    stmt.query_row(duckdb::params![subject, batch.regex, names], |row| {
+                        (0..batch.captures.len())
+                            .map(|i| row.get::<_, Option<String>>(i))
+                            .collect()
+                    })
+                })
+                .map_err(|e| format!("DuckDB error: {e}"));
+            let (view, ours) = match &program {
+                Ok((view, regex)) => (view.clone(), premise_view_captures(regex, &batch, subject)),
+                Err(e) => ("(none)".to_owned(), Err(e.clone())),
+            };
+            for (i, _) in batch.captures.iter().enumerate() {
+                cells += 1;
+                match duck.as_ref().map(|read| read[i].is_some()) {
+                    Ok(true) => some += 1,
+                    Ok(false) => none += 1,
+                    Err(_) => {}
+                }
+            }
+            if duck != ours {
+                let names: Vec<&str> = batch.captures.iter().map(|c| c.name.as_str()).collect();
+                mismatches.push(format!(
+                    "body {body:?} | batch {:?} | view {view:?} | groups {names:?} | subject {} | duckdb {duck:?} | view {ours:?}",
+                    batch.regex,
+                    code_points(subject)
+                ));
+            }
+        }
+    }
+    assert!(
+        some > 0 && none > 0,
+        "captures: {some} present, {none} null"
+    );
+    assert!(
+        mismatches.is_empty(),
+        "{} of {rows} rows ({cells} group cells) disagree, DuckDB {}:\n{}",
+        mismatches.len(),
+        duckdb_version(&conn),
+        mismatches.join("\n")
+    );
+}
+
+/// The accepted empty `\B` difference also reaches a capture. RE2 takes
+/// the empty alternative between the bytes of the character, so the named
+/// group takes no part. The view cannot match there, so it goes on and
+/// captures `y`. The reference documents this row.
+#[test]
+fn regex_class_view_capture_differs_on_an_empty_non_boundary() {
+    let body = r"(?:\B|(?P<n>y))";
+    let subject = "x\u{e9}y";
+    let batch = batch_extract(body).expect("the body parses");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    let duck: Option<String> = conn
+        .query_row(
+            "SELECT nullif(struct_extract(x, 'g1'), '') \
+             FROM (SELECT regexp_extract(?::VARCHAR, ?, ?::VARCHAR[]) AS x)",
+            duckdb::params![subject, batch.regex, "[g1]"],
+            |row| row.get(0),
+        )
+        .expect("DuckDB extracts");
+    assert_eq!(duck, None, "DuckDB {}", duckdb_version(&conn));
+    let (_, regex) = premise_view_program(body).expect("the view compiles");
+    assert_eq!(
+        premise_view_captures(&regex, &batch, subject),
+        Ok(vec![Some("y".to_owned())])
+    );
 }

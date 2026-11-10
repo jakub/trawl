@@ -1334,9 +1334,18 @@ async fn resource_failure_released_before_the_deadline_is_the_answer() {
 
 const STREAM_ROUTE: &str = "/api/v1/stream";
 
-/// Four bodies of the `\w{20}` class, each near the 1 MiB compiled-size
-/// limit. One query's regex budget holds three and refuses the fourth.
-const HEAVY: [&str; 4] = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w", r"\w\w{19}"];
+/// Seven bodies of the `(\pL{12})` class, each near the 512 KiB batch
+/// compiled-size limit. One query's regex budget holds six and refuses
+/// the seventh.
+const HEAVY: [&str; 7] = [
+    r"(\pL{12})0",
+    r"(\pL{12})1",
+    r"(\pL{12})2",
+    r"(\pL{12})3",
+    r"(\pL{12})4",
+    r"(\pL{12})5",
+    r"(\pL{12})6",
+];
 
 /// The pattern the reservation tests' streams and tails match the hot
 /// events with.
@@ -1442,7 +1451,7 @@ async fn regex_budget_refusal_is_typed() {
         for record in records_for("http_failure", request_id) {
             let record = record.to_string();
             assert!(
-                !record.contains("w{"),
+                !record.contains("pL{"),
                 "a record quotes a pattern: {record}"
             );
         }
