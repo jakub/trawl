@@ -608,7 +608,6 @@ pub(crate) fn check_pattern(
             sites.record(span, kind, text, units);
             false
         }
-        Ok(Checked::Unbuilt) => false,
     }
 }
 
@@ -627,8 +626,6 @@ enum Checked {
     /// Recorded, to be built once the query has parsed, with what
     /// translating it costs.
     Recorded { units: u64 },
-    /// A glob whose regex does not parse: neither refused nor built.
-    Unbuilt,
 }
 
 /// Why a pattern is refused before anything builds it, in the order every
@@ -646,10 +643,9 @@ enum Checked {
 /// is the operand's: the regex it stands for is longer, and is not capped
 /// again, but it is priced like any regex. The class check is a regex
 /// body's alone: the batch lane runs a glob, `like` or `ilike` operand as
-/// `DuckDB`'s GLOB, LIKE or ILIKE, never RE2. A glob whose regex does not
-/// parse (`[z-a]*`) is left as it was before these checks existed: the
-/// parser neither refuses, prices nor builds it, and the live lane refuses
-/// it when it compiles the filter.
+/// `DuckDB`'s GLOB, LIKE or ILIKE, never RE2. Every glob and `like`
+/// translation parses: a malformed glob (`[z-a]*`) translates to a regex
+/// that matches nothing, and is priced and built like any other.
 fn pattern_refusal(kind: PatternKind, text: &str) -> Result<Checked, String> {
     let body = match kind {
         PatternKind::Regex => Some(regex_syntax(text)?),
@@ -667,10 +663,7 @@ fn pattern_refusal(kind: PatternKind, text: &str) -> Result<Checked, String> {
             re2::class_set_refusal(&ast).map_err(|e| e.to_string())?;
             ast
         }
-        None => match regex_syntax(&kind.regex_source(text)) {
-            Ok(ast) => ast,
-            Err(_) => return Ok(Checked::Unbuilt),
-        },
+        None => regex_syntax(&kind.regex_source(text))?,
     };
     let shape = price::shape(&ast);
     if shape.positions > price::MAX_REPEAT_POSITIONS {

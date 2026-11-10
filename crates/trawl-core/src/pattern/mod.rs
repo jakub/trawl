@@ -137,8 +137,8 @@ pub enum PatternKind {
     Like,
     /// `like`, ignoring case.
     ILike,
-    /// A `DuckDB` GLOB in a search value, matched whole and across
-    /// newlines.
+    /// A `DuckDB` GLOB in a search value, matched whole, byte for byte, as
+    /// `DuckDB`'s GLOB reads it.
     Glob,
 }
 
@@ -757,7 +757,7 @@ impl Preparer {
     /// limit, and [`PatternError::CompiledSize`] when it compiles past
     /// [`MEASURE_LIMIT_BYTES`].
     pub fn compiled_bytes(&mut self, kind: PatternKind, text: &str) -> Result<usize, PatternError> {
-        self.bisect(&kind.regex_source(text))
+        self.bisect(kind, &kind.regex_source(text))
     }
 
     /// [`compiled_bytes`](Self::compiled_bytes) of a regex body's view as
@@ -773,15 +773,15 @@ impl Preparer {
         let ast = regex_syntax::ast::parse::Parser::new()
             .parse(text)
             .map_err(|e| PatternError::Syntax(e.to_string()))?;
-        self.bisect(&re2::view(&ast))
+        self.bisect(PatternKind::Regex, &re2::view(&ast))
     }
 
-    /// The smallest size limit under which `source` builds, by bisection
-    /// up to [`MEASURE_LIMIT_BYTES`].
-    fn bisect(&mut self, source: &str) -> Result<usize, PatternError> {
+    /// The smallest size limit under which `source`, the regex of a
+    /// `kind` pattern, builds, by bisection up to [`MEASURE_LIMIT_BYTES`].
+    fn bisect(&mut self, kind: PatternKind, source: &str) -> Result<usize, PatternError> {
         let mut fits = |limit| {
             self.ledger.count_build();
-            compile(&parse_hir(source)?, limit).map(|_| ())
+            compile(&parse_hir(source, kind)?, limit).map(|_| ())
         };
         fits(MEASURE_LIMIT_BYTES)?;
         let (mut fails, mut builds) = (0, MEASURE_LIMIT_BYTES);
@@ -899,7 +899,7 @@ impl<T: Clone> Ledger<T> {
         }
         let built = match reserve() {
             Ok(reserved) => {
-                let built = prepare(&kind.regex_source(text), view.as_deref(), &self.stop);
+                let built = prepare(kind, &kind.regex_source(text), view.as_deref(), &self.stop);
                 self.count_build();
                 built.and_then(|program| keep(program, reserved))
             }
@@ -974,7 +974,7 @@ struct Program {
     charge: Charge,
 }
 
-/// One build of a pattern: its program `source` under
+/// One build of a `kind` pattern: its program `source` under
 /// [`MAX_REGEX_COMPILED_BYTES`], and, for a regex body, its batch-engine
 /// `view` under [`MAX_BATCH_COMPILED_BYTES`].
 ///
@@ -985,8 +985,13 @@ struct Program {
 ///
 /// It reads `stop` after each translation and between compiles, and ends
 /// with [`PatternError::Cancelled`] at the first that finds it requested.
-fn prepare(source: &str, view: Option<&str>, stop: &Stop) -> Result<Program, PatternError> {
-    let hir = parse_hir(source)?;
+fn prepare(
+    kind: PatternKind,
+    source: &str,
+    view: Option<&str>,
+    stop: &Stop,
+) -> Result<Program, PatternError> {
+    let hir = parse_hir(source, kind)?;
     stop.check()?;
     let (regex, profile) = match view {
         None => compile(&hir, MAX_REGEX_COMPILED_BYTES)?,
@@ -1001,7 +1006,7 @@ fn prepare(source: &str, view: Option<&str>, stop: &Stop) -> Result<Program, Pat
         Some(view) => {
             let program = compile(&hir, MAX_REGEX_COMPILED_BYTES)?;
             stop.check()?;
-            let view = parse_hir(view).and_then(|view| {
+            let view = parse_hir(view, PatternKind::Regex).and_then(|view| {
                 stop.check()?;
                 compile(&view, MAX_BATCH_COMPILED_BYTES)
             });
@@ -1016,10 +1021,13 @@ fn prepare(source: &str, view: Option<&str>, stop: &Stop) -> Result<Program, Pat
     Ok(Program { regex, charge })
 }
 
-/// `source` parsed as the `regex` crate's `Regex` parses it: every flag at
-/// the value `RegexBuilder::new` leaves it, and UTF-8 on (regex 1.13.1,
-/// `builders.rs:69-83`).
-fn parse_hir(source: &str) -> Result<Hir, PatternError> {
+/// `source`, the regex of a `kind` pattern, parsed as the `regex` crate's
+/// `Regex` parses it: every flag at the value `RegexBuilder::new` leaves
+/// it (regex 1.13.1, `builders.rs:69-83`). A glob's regex matches bytes,
+/// as `DuckDB`'s GLOB reads them, so it parses with Unicode and UTF-8
+/// off; every other kind parses with both on, as `RegexBuilder` does.
+fn parse_hir(source: &str, kind: PatternKind) -> Result<Hir, PatternError> {
+    let chars = kind != PatternKind::Glob;
     let syntax = syntax::Config::new()
         .case_insensitive(false)
         .multi_line(false)
@@ -1028,8 +1036,8 @@ fn parse_hir(source: &str) -> Result<Hir, PatternError> {
         .line_terminator(b'\n')
         .swap_greed(false)
         .ignore_whitespace(false)
-        .unicode(true)
-        .utf8(true)
+        .unicode(chars)
+        .utf8(chars)
         .nest_limit(250)
         .octal(false);
     syntax::parse_with(source, &syntax).map_err(|e| PatternError::Syntax(e.to_string()))
@@ -1130,68 +1138,144 @@ fn like_to_regex(pattern: &str, case_insensitive: bool) -> String {
     regex_str
 }
 
-/// Convert a `DuckDB` GLOB pattern to an anchored, dot-all regex.
-///
-/// `DuckDB` GLOB is a full-match pattern (like SQL LIKE):
-/// - `*` matches any sequence of characters, newlines included
-/// - `?` matches any single character, a newline included
-/// - `[...]` matches a character class (`[!...]` for negation)
-/// - Everything else is literal (case-sensitive)
-///
-/// The newline rule is probed, not assumed: without `(?s)` a multiline
-/// value matches `f=*` in batch and not live, and `f!=*` inverts that
-/// (the complement matrix in `tests/filter_parity.rs` carries the row).
-fn glob_to_regex(glob: &str) -> String {
-    let mut regex = String::from("(?s)^");
-    let mut chars = glob.chars().peekable();
+/// The regex a malformed glob translates to: an empty byte class, which
+/// matches nothing. It parses only with UTF-8 off, as a glob's build
+/// parses, and it is priced and charged like any pattern.
+const GLOB_NEVER: &str = r"(?-u:[^\x00-\xFF])";
 
-    while let Some(c) = chars.next() {
-        match c {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            '[' => {
-                regex.push('[');
-                // DuckDB uses `!` for negation in character classes.
-                if chars.peek() == Some(&'!') {
-                    chars.next();
-                    regex.push('^');
-                }
-                // Copy until closing `]`.
-                let mut first = true;
-                loop {
-                    match chars.next() {
-                        Some(']') if !first => {
-                            regex.push(']');
-                            break;
-                        }
-                        Some(nc) => {
-                            regex.push(nc);
-                            first = false;
-                        }
-                        None => {
-                            // Unterminated bracket — close it.
-                            regex.push(']');
-                            break;
-                        }
-                    }
-                }
+/// Translate a `DuckDB` GLOB pattern to a regex over bytes that matches
+/// exactly what `DuckDB` 1.5.6's `Glob()` (`like.cpp`) matches.
+///
+/// The glob reads bytes and must match the whole value:
+/// - `*` matches any run of bytes, newlines included. Each `*` is one
+///   `.*`, so the repeat budget prices a run of them as written.
+/// - `?` matches one byte, so a two-byte character needs `??`.
+/// - `\` matches the next byte literally. A trailing `\` matches nothing.
+/// - `[…]` matches one byte of a set. One leading `!` complements the
+///   set; `^` is a member. A `]` right after `[` or `[!` is a member, and
+///   a later one closes the class. A member followed by `-` always takes
+///   the next byte, even `]`, as the end of a range, which holds every
+///   byte between its ends as C `char`s compare them (signed on `x86_64`),
+///   so a reversed range holds nothing. `\` is a member.
+/// - Every other byte matches itself.
+///
+/// A malformed glob (an unterminated class, `[]`, `[!]`, a trailing `\`)
+/// or a class whose set is empty makes the whole glob [`GLOB_NEVER`], as
+/// `DuckDB`'s scan answers false for every value. The text is ASCII, every
+/// glob byte written `\xNN`, inside `(?s-u:^…$)`: the inline `-u` makes the
+/// repeat walk, which reads flags only from the text, price bytes.
+fn glob_to_regex(glob: &str) -> String {
+    let p = glob.as_bytes();
+    let mut regex = String::from("(?s-u:^");
+    let mut i = 0;
+    while i < p.len() {
+        match p[i] {
+            b'*' => {
+                regex.push_str(".*");
+                i += 1;
             }
-            c if is_regex_meta(c) => {
-                regex.push('\\');
-                regex.push(c);
+            b'?' => {
+                regex.push('.');
+                i += 1;
             }
-            c => regex.push(c),
+            b'\\' => {
+                let Some(&next) = p.get(i + 1) else {
+                    return GLOB_NEVER.to_owned();
+                };
+                push_byte(&mut regex, next);
+                i += 2;
+            }
+            b'[' => match glob_class(p, i + 1) {
+                Some((set, after)) => {
+                    push_class(&mut regex, &set);
+                    i = after;
+                }
+                None => return GLOB_NEVER.to_owned(),
+            },
+            byte => {
+                push_byte(&mut regex, byte);
+                i += 1;
+            }
         }
     }
-
-    regex.push('$');
+    regex.push_str("$)");
     regex
 }
 
-/// Characters that have special meaning in regex and need escaping.
-fn is_regex_meta(c: char) -> bool {
-    matches!(
-        c,
-        '.' | '+' | '^' | '$' | '|' | '(' | ')' | '{' | '}' | '\\'
-    )
+/// The byte set of the glob class whose members start at `p[i]`, just
+/// after its `[`, and the index after its closing `]`. `None` when the
+/// class does not close or its set is empty.
+fn glob_class(p: &[u8], mut i: usize) -> Option<([bool; 256], usize)> {
+    let negated = p.get(i) == Some(&b'!');
+    if negated {
+        i += 1;
+    }
+    let first = i;
+    let mut set = [false; 256];
+    loop {
+        let &c = p.get(i)?;
+        if c == b']' && i > first {
+            i += 1;
+            break;
+        }
+        if p.get(i + 1) == Some(&b'-') {
+            let &hi = p.get(i + 2)?;
+            let (lo, hi) = (c_char(c), c_char(hi));
+            for byte in 0..=u8::MAX {
+                if (lo..=hi).contains(&c_char(byte)) {
+                    set[usize::from(byte)] = true;
+                }
+            }
+            i += 3;
+        } else {
+            set[usize::from(c)] = true;
+            i += 1;
+        }
+    }
+    if negated {
+        for member in &mut set {
+            *member = !*member;
+        }
+    }
+    set.contains(&true).then_some((set, i))
+}
+
+/// `byte` as a C `char`, which `DuckDB`'s range test compares, signed or
+/// not as the target's `char` is.
+fn c_char(byte: u8) -> std::ffi::c_char {
+    std::ffi::c_char::from_ne_bytes([byte])
+}
+
+/// Append `set` as a positive regex class of its sorted byte runs.
+fn push_class(regex: &mut String, set: &[bool; 256]) {
+    regex.push('[');
+    let mut lo = 0;
+    while lo < set.len() {
+        if !set[lo] {
+            lo += 1;
+            continue;
+        }
+        let mut hi = lo;
+        while hi + 1 < set.len() && set[hi + 1] {
+            hi += 1;
+        }
+        push_byte(regex, byte_at(lo));
+        if hi > lo {
+            regex.push('-');
+            push_byte(regex, byte_at(hi));
+        }
+        lo = hi + 1;
+    }
+    regex.push(']');
+}
+
+/// The byte a set index under 256 stands for.
+fn byte_at(index: usize) -> u8 {
+    u8::try_from(index).expect("a byte set has 256 entries")
+}
+
+/// Append `byte` as a `\xNN` escape, which matches that byte alone.
+fn push_byte(regex: &mut String, byte: u8) {
+    use std::fmt::Write as _;
+    write!(regex, r"\x{byte:02X}").expect("writing to a String cannot fail");
 }
