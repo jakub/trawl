@@ -23,12 +23,13 @@ mod common;
 
 use std::io::{self, Read as _};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdout, ExitStatus, Output, Stdio};
+use std::process::{ExitStatus, Output, Stdio};
 use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::pty::Winsize;
 use serde_json::{Map, Value};
+use tokio::io::AsyncReadExt as _;
 use trawl_api::IngestResponse;
 use trawl_core::sanitize::is_unsafe_display_char;
 
@@ -207,37 +208,60 @@ struct PtyRun {
     stdout: Vec<u8>,
 }
 
-/// Run `cmd` on a PTY to its exit. `None` when it is still running at
-/// `deadline`: the child is then killed and reaped first, so no thread
-/// and no process outlives the answer.
+/// Run `cmd` on a PTY to its exit. `None` when the child is still running
+/// at `deadline`, whether or not it still holds the terminal: it is then
+/// killed and reaped first.
 async fn pty_run(
     cmd: std::process::Command,
     stdout: StdoutTo,
     deadline: Duration,
 ) -> Option<PtyRun> {
     let (mut child, master) = spawn_on_pty(cmd, stdout);
-    let piped = child.stdout.take();
-    let mut drain = tokio::task::spawn_blocking(move || drain_pty(master, piped));
-    let drained = tokio::time::timeout(deadline, &mut drain).await;
-    if drained.is_err() {
-        // The kill closes the child's slave ends, which ends the drain.
-        child.kill().expect("kill the child");
-        let _ = drain.await;
-        child.wait().expect("reap the child");
+    let mut piped = child.stdout.take();
+    let mut terminal = tokio::task::spawn_blocking(move || read_master(master));
+    let finished = tokio::time::timeout(deadline, async {
+        let read_piped = async {
+            let mut bytes = Vec::new();
+            if let Some(pipe) = piped.as_mut() {
+                pipe.read_to_end(&mut bytes).await.map(|_| bytes)
+            } else {
+                Ok(bytes)
+            }
+        };
+        // Both streams drain while the child runs, so neither can fill
+        // and stall it, and the child is reaped whatever the reads answer.
+        tokio::join!(&mut terminal, read_piped, child.wait())
+    })
+    .await;
+    let Ok((terminal, stdout, status)) = finished else {
+        child.kill().await.expect("kill and reap the child");
+        // The kill closed the child's slave ends, which ends the read.
+        if !terminal.is_finished() {
+            let _ = terminal.await;
+        }
         return None;
-    }
-    let (terminal, stdout) = drained.ok()?.expect("the PTY task");
-    let status = child.wait().expect("reap the child");
+    };
+    let status = status.expect("reap the child");
+    let bytes = terminal.expect("the PTY reader");
+    let text = String::from_utf8(bytes).unwrap_or_else(|e| {
+        panic!(
+            "the child wrote non-UTF-8 to its terminal: {}",
+            String::from_utf8_lossy(e.as_bytes()).escape_debug()
+        )
+    });
     Some(PtyRun {
         status,
-        terminal,
-        stdout,
+        terminal: text.replace("\r\n", "\n"),
+        stdout: stdout.expect("read the child's stdout"),
     })
 }
 
 /// Spawn `cmd` with stderr, and stdout unless `stdout` pipes it, on the
 /// slave side of a fresh PTY. Returns the child and the master side.
-fn spawn_on_pty(mut cmd: std::process::Command, stdout: StdoutTo) -> (Child, std::fs::File) {
+fn spawn_on_pty(
+    mut cmd: std::process::Command,
+    stdout: StdoutTo,
+) -> (tokio::process::Child, std::fs::File) {
     let size = Winsize {
         ws_row: 50,
         ws_col: 400,
@@ -256,24 +280,17 @@ fn spawn_on_pty(mut cmd: std::process::Command, stdout: StdoutTo) -> (Child, std
     };
     cmd.stderr(slave());
     drop(pty);
-    let child = cmd.spawn().expect("spawn trawl");
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.kill_on_drop(true);
+    let child = cmd.spawn().expect("spawn the child");
     // The command holds the parent's slave ends; the master reads EOF only
     // once the child's are the last ones.
     drop(cmd);
     (child, master)
 }
 
-/// Read the PTY master to EOF while a piped stdout drains on its own
-/// thread, so neither stream can fill and stall the child. Returns the
-/// terminal's text, with the `\r\n` of ONLCR folded back, and the piped
-/// bytes.
-fn drain_pty(mut master: std::fs::File, piped: Option<ChildStdout>) -> (String, Vec<u8>) {
-    let piped = piped.map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes).map(|_| bytes)
-        })
-    });
+/// Read the PTY master to EOF.
+fn read_master(mut master: std::fs::File) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -286,19 +303,7 @@ fn drain_pty(mut master: std::fs::File, piped: Option<ChildStdout>) -> (String, 
             Err(e) => panic!("read the PTY master: {e}"),
         }
     }
-    let stdout = piped.map_or_else(Vec::new, |reader| {
-        reader
-            .join()
-            .expect("the stdout reader")
-            .expect("read trawl's stdout")
-    });
-    let text = String::from_utf8(bytes).unwrap_or_else(|e| {
-        panic!(
-            "trawl wrote non-UTF-8 to its terminal: {}",
-            String::from_utf8_lossy(e.as_bytes()).escape_debug()
-        )
-    });
-    (text.replace("\r\n", "\n"), stdout)
+    bytes
 }
 
 fn describe(output: &Output) -> String {
@@ -672,17 +677,6 @@ async fn assert_schema_labels_on_stderr(client: &Client) {
 /// in every format and both `schema` views write no terminal control: the
 /// table, csv and schema views show U+FFFD in its place, and json escapes
 /// it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_child_past_the_pty_deadline_is_killed_and_reaped() {
-    let mut cmd = std::process::Command::new("sleep");
-    cmd.arg("600").stdin(Stdio::null());
-    let run = pty_run(cmd, StdoutTo::Pty, Duration::from_millis(200)).await;
-    assert!(
-        run.is_none(),
-        "a child that outlives the deadline has no run"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_terminal_sinks_reach_no_terminal_control() {
     let server = Server::start(true).await;
@@ -707,4 +701,29 @@ async fn cli_terminal_sinks_reach_no_terminal_control() {
     assert_schema_labels_on_stderr(&client).await;
 
     server.stop().await;
+}
+
+/// The harness's deadline covers the child's exit, not only its terminal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_past_the_pty_deadline_is_killed_and_reaped() {
+    let deadline = Duration::from_millis(200);
+    let mut holds_the_terminal = std::process::Command::new("sleep");
+    holds_the_terminal.arg("600").stdin(Stdio::null());
+    assert!(
+        pty_run(holds_the_terminal, StdoutTo::Pty, deadline)
+            .await
+            .is_none(),
+        "a child that outlives the deadline has no run"
+    );
+
+    let mut closed_the_terminal = std::process::Command::new("sh");
+    closed_the_terminal
+        .args(["-c", "exec sleep 600 >&- 2>&-"])
+        .stdin(Stdio::null());
+    assert!(
+        pty_run(closed_the_terminal, StdoutTo::Pty, deadline)
+            .await
+            .is_none(),
+        "a child that closed its terminal and runs on has no run"
+    );
 }
