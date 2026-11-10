@@ -728,6 +728,7 @@ mod pg_tests {
     use crate::deadline::Deadline;
     use crate::results::ResultsClock;
     use crate::store::{InvestigationStore, NewInvestigation, RetentionRule, StoreActor};
+    use crate::test_timing::frozen;
     use crate::transport::request_limit::Lease;
 
     const RULE: RetentionRule = RetentionRule {
@@ -968,6 +969,22 @@ mod pg_tests {
         }
     }
 
+    /// [`until_written`] for a test on a paused clock: it polls without
+    /// sleeping, under [`frozen`], so the clock moves only when the test
+    /// advances it, and gives up with `what` only at the real-clock
+    /// [`crate::test_timing::HANG_GUARD`].
+    async fn until_written_paused(
+        store: &InvestigationStore,
+        id: &InvestigationId,
+        seq: u64,
+        what: &str,
+    ) {
+        frozen(what, async {
+            while outcome(store, id, seq).await.is_none() {}
+        })
+        .await;
+    }
+
     /// A one-connection pool through which every wait for a connection
     /// gives up after 300 ms, the pool's own acquire timeout, well before
     /// a test's deadline.
@@ -1130,12 +1147,22 @@ mod pg_tests {
     }
 
     /// An attempt Postgres refuses before the writer's bound, whose
-    /// `ROLLBACK` answer never comes, ends at the bound too: the outcome
-    /// queued behind it is written within the bound and a second, the
-    /// stalled attempt's session is closed while its answer is held, and
-    /// the stalled outcome lands on a new session once its investigation's
-    /// lock is free. Another session holds that lock, and the stalled
-    /// writes' sessions wait for it no longer than a 50 ms `lock_timeout`.
+    /// `ROLLBACK` answer never comes, ends at the bound too: once the clock
+    /// passes the bound, and with no further time, the outcome queued
+    /// behind it is written, the stalled attempt's session is closed while
+    /// its answer is held, and the stalled outcome lands on a new session
+    /// once its investigation's lock is free. Another session holds that
+    /// lock, and the stalled writes' sessions wait for it no longer than a
+    /// 50 ms `lock_timeout`.
+    ///
+    /// The writer's bound is a tokio deadline, so the sessions are set up
+    /// on the live clock and the clock is then paused: it moves only by
+    /// the one advance past the bound. Every wait from the pause on runs
+    /// under [`frozen`], so the proxy's and Postgres's real I/O never lets
+    /// tokio jump it. Postgres's own clock is not paused: each statement's
+    /// `statement_timeout`, set from what remains of the paused deadline,
+    /// and the 50 ms `lock_timeout` still run on real time, under the
+    /// hang guard.
     #[sqlx::test]
     async fn a_stalled_rollback_does_not_stop_the_writer(pool: PgPool) {
         let store = InvestigationStore::new(pool.clone());
@@ -1175,6 +1202,7 @@ mod pg_tests {
             )
         };
 
+        tokio::time::pause();
         proxy.hold_next(b"ROLLBACK");
         drop(completion(
             &InvestigationStore::new(through),
@@ -1182,35 +1210,52 @@ mod pg_tests {
             stalled_seq,
             place(&writer),
         ));
-        proxy.holding().await;
-        let queued = tokio::time::Instant::now();
+        frozen(
+            "the stalled attempt's ROLLBACK answer is held",
+            proxy.holding(),
+        )
+        .await;
         drop(completion(&store, &healthy, healthy_seq, place(&writer)));
-        until_written(
+        // The stalled attempt's bound began on the paused clock, when the
+        // writer took it, so this passes it by a millisecond.
+        tokio::time::advance(budget + Duration::from_millis(1)).await;
+        until_written_paused(
             &store,
             &healthy,
             healthy_seq,
-            queued + budget + Duration::from_secs(1),
-            "the outcome behind a stalled rollback waited past the writer's bound",
+            "the outcome behind a stalled rollback was not written once the writer's bound passed",
         )
         .await;
-        tokio::time::timeout(Duration::from_secs(5), proxy.closed())
-            .await
-            .expect("the stalled attempt's session was not closed while its answer was held");
+        frozen(
+            "the stalled attempt's session was not closed while its answer was held",
+            proxy.closed(),
+        )
+        .await;
         assert_eq!(
-            outcome(&store, &stalled, stalled_seq).await,
+            frozen(
+                "the stalled outcome's read",
+                outcome(&store, &stalled, stalled_seq)
+            )
+            .await,
             None,
             "the stalled outcome was written behind a held lock"
         );
-        sqlx::query("COMMIT").execute(&mut held).await.unwrap();
-        until_written(
+        frozen(
+            "the held lock's COMMIT",
+            sqlx::query("COMMIT").execute(&mut held),
+        )
+        .await
+        .unwrap();
+        until_written_paused(
             &store,
             &stalled,
             stalled_seq,
-            tokio::time::Instant::now() + Duration::from_secs(30),
             "the stalled outcome was never written on a new session",
         )
         .await;
         proxy.release();
+        // The fixture's teardown runs on the live clock.
+        tokio::time::resume();
     }
 
     /// Wait, bounded, until `writer` keeps no key's share: every place has
