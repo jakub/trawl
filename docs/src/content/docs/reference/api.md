@@ -3490,7 +3490,7 @@ Creates or replaces the schedule on a saved query. On an update, `next_fire_at` 
 | `interval` | body | string | yes | The period. At least `60s`. |
 | `window` | body | string | no | What each run covers. `"since_last"` tiles from the previous run's window end. A duration such as `"2h"` is a fixed trailing span, at least `60s`. Absent is query mode: the saved DSL runs verbatim. |
 | `lag` | body | string | no | Late-arrival allowance. Shifts both window bounds back. Default `"0s"`. Requires `window`. |
-| `max_runs` | body | integer | no | Stop after this many claimed runs over the schedule's life, scheduled and manual. Retention does not give runs back. `0` means the schedule is exhausted from the start. An edit keeps the count; only deleting the schedule and creating it again starts it at 0. Absent means unlimited. |
+| `max_runs` | body | integer | no | Stop after this many claimed runs over the schedule's life, scheduled and manual. Retention does not give runs back. `0` means the schedule is exhausted from the start. An edit keeps the count; only deleting the schedule and creating it again starts it at 0. Absent means unlimited. At most `9223372036854775807`. A larger value is a 400 and writes nothing. |
 | `enabled` | body | boolean | no | Default `true`, on create and on update |
 
 **Request**
@@ -3534,6 +3534,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X PUT -H "Content-Type: app
 | 400 | `bad_request` | `interval` is short: `invalid interval: schedule interval 30s is below minimum of 60s` |
 | 400 | `bad_request` | `window` does not parse: `invalid window: invalid interval format: "5x"; window takes "since_last" or a duration: a number and one of s, m, h, d, w` |
 | 400 | `bad_request` | `lag` does not parse: `invalid lag: invalid interval format: "5x"; lag takes a duration: a number and one of s, m, h, d, w` |
+| 400 | `bad_request` | `max_runs` is above `9223372036854775807`: `invalid max_runs: at most 9223372036854775807` |
 | 400 | `bad_request` | A duration is over 10 years: `duration 315360001s exceeds the maximum of 315360000 seconds (10 years)` |
 | 400 | `bad_request` | `lag` without `window`: ``lag 300s needs a report window: without `window` the saved query owns its own time clause and trawl shifts no bounds. Set window to "since_last" or a duration, or drop lag`` |
 | 400 | `bad_request` | The saved query carries a time clause: `schedule window "since_last" conflicts with the saved query's last= time clause; remove one side` |

@@ -1797,7 +1797,9 @@ pub struct ScheduleResponse {
 pub struct SetScheduleRequest {
     /// Interval string (e.g. "5m", "1h", "24h").
     pub interval: String,
-    /// Maximum number of runs (omit or null for unlimited).
+    /// Maximum number of runs (omit or null for unlimited). At most
+    /// `9223372036854775807` (`i64::MAX`). A larger value is a 400
+    /// `bad_request`, and the schedule is not written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_runs: Option<u64>,
     /// Whether the schedule is enabled.
