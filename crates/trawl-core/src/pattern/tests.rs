@@ -1131,8 +1131,12 @@ fn batch_view(body: &str) -> String {
 /// The view writes `\w`, `\d` and `\s` as RE2's ASCII classes, negated as
 /// written and inside a bracket too, and each word assertion under
 /// `(?-u:…)`, so the Rust engine compiles it the way RE2 compiles the
-/// body. Every other node prints back as written. A nested class in the
-/// view is the Rust engine's union: the view is measured, never run.
+/// body. Every other node prints back as written. The view is the program
+/// that runs in the live lane and the kv tail, and a nested class in it is
+/// the Rust engine's union, which matches what RE2 matches for the class
+/// the body wrote. The one difference is an empty match on `\B` inside a
+/// multi-byte character, which RE2 finds and the view does not
+/// ([`regex_class_view_premise`]).
 #[test]
 fn the_batch_view_reads_perl_classes_and_word_assertions_as_ascii() {
     const WORD: &str = r"[\x30-\x39\x41-\x5A\x5F\x61-\x7A]";
