@@ -252,7 +252,7 @@ A field the current stage's input does not carry reads as NULL. This holds when 
 - In the search stage, `f!=x`, `f!=*`, `f!=a*`, `f!=/re/` and `f!=a,b` match every event. Every other comparison on `f` is unknown, so it matches nothing.
 - `OR` and `AND` keep three-valued logic, so an absent field never removes a sibling's matches: `host=web1 OR nosuch=x` returns the `web1` events.
 - `where` stays strict: `where f != "x"` matches nothing, and `where isnull(f)` matches every row.
-- `count(f)` and `dc(f)` are 0. `sum(f)`, `avg(f)`, `min(f)` and `max(f)` are NULL.
+- `count(f)` and `dc(f)` are 0. `sum(f)`, `avg(f)`, `min(f)` and `max(f)` are NULL. A zero from `dc` does not tell an absent field from a field with no non-null values.
 - `stats ... by f`, `top f`, `rare f`, `timechart ... by f` and `dedup f` put absent and explicit null in one null group. That group is apart from the empty string and from the text `null`.
 
 A misspelled name reads as absent too: `levle=debug` returns nothing, and `levle!=debug` returns every event. No notice reports an absent name.
