@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Axis, Bar, BarChart as BarChartWidget, BarGroup, Block, Borders, Cell, Chart, Dataset,
     GraphType, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline,
-    Table,
+    Table, Wrap,
 };
 use std::collections::HashSet;
 use trawl_api::display::{
@@ -784,7 +784,7 @@ fn render_line_chart(
     let time_info = extract_time_metadata(result, app.display_zone);
 
     let title = if series.len() == 1 {
-        let label = &series[0].0;
+        let label = &series[0].label;
         if let Some((ref start, ref end, ref span)) = time_info {
             format!(" {label} \u{2022} {start} to {end} \u{2022} span: {span} ")
         } else {
@@ -814,7 +814,7 @@ fn render_line_chart(
 
     // Compute per-series data points and global bounds
     let colors = &theme.chart_series;
-    let n_points = series.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
+    let n_points = series.iter().map(|s| s.values.len()).max().unwrap_or(0);
     let x_max = (n_points.saturating_sub(1)) as f64;
 
     // Downsample series to fit within available width (braille gives 2x resolution)
@@ -824,7 +824,7 @@ fn render_line_chart(
     let mut all_points: Vec<Vec<(f64, f64)>> = Vec::with_capacity(series.len());
     let mut y_max: f64 = 0.0;
 
-    for (_, values) in &series {
+    for ChartSeries { values, .. } in &series {
         let ds = downsample(values, target);
         let ds_max = (ds.len().saturating_sub(1)) as f64;
         let pts: Vec<(f64, f64)> = ds
@@ -855,9 +855,9 @@ fn render_line_chart(
         .iter()
         .zip(all_points.iter())
         .enumerate()
-        .map(|(idx, ((label, _), pts))| {
+        .map(|(idx, (s, pts))| {
             Dataset::default()
-                .name(label.as_str())
+                .name(s.label.as_str())
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(colors[idx % colors.len()]))
@@ -894,7 +894,7 @@ fn render_line_chart(
         let legend_spans: Vec<Span<'_>> = series
             .iter()
             .enumerate()
-            .flat_map(|(idx, (label, _))| {
+            .flat_map(|(idx, ChartSeries { label, .. })| {
                 let color = colors[idx % colors.len()];
                 let mut spans = Vec::with_capacity(3);
                 if idx > 0 {
@@ -1107,7 +1107,7 @@ fn render_sparkline(
 
     // Single series: render one large sparkline
     if series.len() == 1 {
-        let (label, values) = &series[0];
+        let ChartSeries { label, values, .. } = &series[0];
 
         let title = if let Some((ref start, ref end, ref span)) = time_info {
             format!(" {label} • {start} to {end} • span: {span} ")
@@ -1253,13 +1253,59 @@ fn render_series_label(
     }
 }
 
+/// The stacked view's label column holds at least this many cells.
+const STACKED_LABEL_FLOOR: usize = 18;
+
+/// The fewest plot cells the stacked view draws: fewer show too few
+/// buckets to read a shape.
+const STACKED_PLOT_MIN: usize = 10;
+
+/// What the stacked view says when its labels leave too few plot cells.
+const STACKED_TOO_NARROW: &str =
+    "too narrow for the stacked view: press v for the table, or widen the terminal";
+
+/// The stacked view's labels as drawn and the width of their column,
+/// for an inner width of `inner_width`, or `None` when fewer than
+/// [`STACKED_PLOT_MIN`] cells would remain for the plot.
+fn stacked_labels(series: &[ChartSeries], inner_width: u16) -> Option<(Vec<String>, u16)> {
+    let inner_width = usize::from(inner_width);
+    let ordinary_cap = (inner_width / 2).saturating_sub(2).max(STACKED_LABEL_FLOOR);
+    let labels: Vec<String> = series
+        .iter()
+        .map(|s| {
+            if s.instant {
+                s.label.clone()
+            } else {
+                fit_cells(&s.label, ordinary_cap)
+            }
+        })
+        .collect();
+    let label_w = labels
+        .iter()
+        .map(|label| cells(label))
+        .fold(STACKED_LABEL_FLOOR, usize::max);
+    if inner_width.saturating_sub(label_w + 2) < STACKED_PLOT_MIN {
+        return None;
+    }
+    // Less than `inner_width`, which is a `u16`.
+    Some((labels, u16::try_from(label_w).ok()?))
+}
+
 /// Render multiple sparklines stacked vertically for multi-series timechart.
+///
+/// Labels sit in a column on the right, two cells from the plot. An
+/// instant label is drawn whole, offset included. Any other label is cut
+/// to the wider of [`STACKED_LABEL_FLOOR`] cells and half the inner width
+/// less two, so a long group name leaves room for its plot. The column is
+/// as wide as its widest label and at least the floor. When fewer than
+/// [`STACKED_PLOT_MIN`] cells remain for the plot, the pane says so and
+/// draws no label, sparkline or axis: it never cuts an instant to fit.
 #[allow(clippy::cast_possible_truncation)]
 fn render_stacked_sparklines(
     app: &App,
     frame: &mut Frame<'_>,
     area: Rect,
-    series: &[(String, Vec<u64>)],
+    series: &[ChartSeries],
     total_series: usize,
     border_style: Style,
     time_info: Option<(String, String, String)>,
@@ -1291,6 +1337,17 @@ fn render_stacked_sparklines(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let Some((labels, label_w)) = stacked_labels(series, inner.width) else {
+        frame.render_widget(
+            Paragraph::new(STACKED_TOO_NARROW)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(theme.text_muted)),
+            inner,
+        );
+        return;
+    };
+    let label_width = label_w + 2;
+
     // Calculate per-series height: 1 row for x-axis labels, 1-row gaps between series
     let gap_rows = series.len().saturating_sub(1);
     let available_height = inner.height.saturating_sub(1) as usize; // 1 row for x-axis
@@ -1306,18 +1363,17 @@ fn render_stacked_sparklines(
         total_chart_rows % series.len()
     };
 
-    let label_width: u16 = 20;
     let colors = &theme.chart_series;
 
     let mut y_offset: u16 = 0;
-    for (idx, (label, values)) in series.iter().enumerate() {
+    for (idx, (ChartSeries { values, .. }, label)) in series.iter().zip(&labels).enumerate() {
         // Distribute remainder rows: first `remainder` series get +1 height
         let row_height = base_height + usize::from(idx < remainder);
 
         let sparkline_area = Rect {
             x: inner.x,
             y: inner.y + y_offset,
-            width: inner.width.saturating_sub(label_width),
+            width: inner.width - label_width,
             height: row_height as u16,
         };
 
@@ -1345,9 +1401,8 @@ fn render_stacked_sparklines(
         frame.render_widget(sparkline, sparkline_area);
 
         // Y-axis labels + centered series name in right-side label area
-        let label_w = label_width - 2;
         let label_area = Rect {
-            x: inner.x + inner.width.saturating_sub(label_w),
+            x: inner.x + inner.width - label_w,
             y: inner.y + y_offset,
             width: label_w,
             height: row_height as u16,
@@ -1363,7 +1418,7 @@ fn render_stacked_sparklines(
 
     // Render x-axis time labels (1 row at bottom)
     if let Some((start, end, _)) = time_info {
-        let sparkline_width = inner.width.saturating_sub(label_width) as usize;
+        let sparkline_width = usize::from(inner.width - label_width);
         let padding = sparkline_width.saturating_sub(cells(&start) + cells(&end));
 
         let x_axis_text = format!("{start}{}{end}", " ".repeat(padding));
@@ -1373,7 +1428,7 @@ fn render_stacked_sparklines(
             Rect {
                 x: inner.x,
                 y: inner.y + y_offset,
-                width: inner.width.saturating_sub(label_width),
+                width: inner.width - label_width,
                 height: 1,
             },
         );
@@ -1525,19 +1580,40 @@ fn extract_time_metadata(
     ))
 }
 
+/// One timechart series as the TUI draws it.
+struct ChartSeries {
+    /// A metric column's name or a grouped value, sanitized.
+    label: String,
+    /// Whether `label` is an instant from a `timestamp` group column. The
+    /// stacked view never cuts one: its offset is often the only
+    /// difference between two series (ADR-0051).
+    instant: bool,
+    values: Vec<u64>,
+}
+
 /// A timechart's series as the TUI draws them: a `timestamp` group label
 /// in `zone` through [`cell_text`], as the grid shows that column, and
 /// every label sanitized. A label is a metric column's name or a grouped
 /// value, so a sender can pick it, and it reaches titles, legends and axis
-/// labels.
+/// labels. Whether a label is an instant comes from its column's type,
+/// never from how its text reads.
 fn chart_series(
     result: &trawl_engine::value::QueryResult,
     zone: DisplayZone,
-) -> (Vec<(String, Vec<u64>)>, usize) {
-    let (series, total) = extract_series_labelled(result, |ty, value| cell_text(ty, value, zone));
+) -> (Vec<ChartSeries>, usize) {
+    let instant = std::cell::Cell::new(false);
+    let (series, total) = extract_series_labelled(result, |ty, value| {
+        instant.set(matches!(ty, ColumnType::Timestamp));
+        cell_text(ty, value, zone)
+    });
+    let instant = instant.get();
     let series = series
         .into_iter()
-        .map(|(label, values)| (sanitize_display_text(&label), values))
+        .map(|(label, values)| ChartSeries {
+            label: sanitize_display_text(&label),
+            instant,
+            values,
+        })
         .collect();
     (series, total)
 }
@@ -1680,13 +1756,11 @@ fn timechart_timestamp_group_labels_use_the_display_zone() {
         let screen = terminal.backend().to_string();
 
         assert!(!screen.contains("15T0"), "{view:?} wire label:\n{screen}");
-        if view == ChartView::LineChart {
-            for label in ["2026-01-15 10:00:00 +05:30", "2026-01-15 11:00:00 +05:30"] {
-                assert!(
-                    screen.contains(label),
-                    "{view:?} {label} missing:\n{screen}"
-                );
-            }
+        for label in ["2026-01-15 10:00:00 +05:30", "2026-01-15 11:00:00 +05:30"] {
+            assert!(
+                screen.contains(label),
+                "{view:?} {label} missing:\n{screen}"
+            );
         }
     }
 }
@@ -2768,5 +2842,192 @@ mod cell_alignment_tests {
                 .chain(cells_of(&[], " ", 21, &["│"]))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// `timechart count by _ingested` over two hours, shown at `+05:30`:
+    /// the series labels are `2026-01-15 10:00:00 +05:30` and
+    /// `2026-01-15 11:00:00 +05:30`, 26 cells each. `group` types the
+    /// grouped column.
+    fn grouped_by_instant(group: ColumnType) -> App {
+        let row = |time: &str, ingested: &str, n: i64| {
+            vec![
+                Value::String(time.into()),
+                Value::String(ingested.into()),
+                Value::Integer(n),
+            ]
+        };
+        let result = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("_ingested", group),
+                Column::new("count", ColumnType::Integer),
+            ],
+            rows: vec![
+                row(
+                    "2026-01-15T00:00:00.000000Z",
+                    "2026-01-15T04:30:00.000000Z",
+                    1,
+                ),
+                row(
+                    "2026-01-15T00:00:00.000000Z",
+                    "2026-01-15T05:30:00.000000Z",
+                    2,
+                ),
+                row(
+                    "2026-01-15T01:00:00.000000Z",
+                    "2026-01-15T04:30:00.000000Z",
+                    3,
+                ),
+                row(
+                    "2026-01-15T01:00:00.000000Z",
+                    "2026-01-15T05:30:00.000000Z",
+                    4,
+                ),
+            ],
+        };
+        let mut app = with_result(result, ChartView::Sparkline);
+        app.display_zone = "+05:30".parse().expect("zone");
+        app
+    }
+
+    /// The pane's rows `ys` as text, one symbol per cell. Every symbol in
+    /// these rows is one character, so the text's characters are cells.
+    fn text_rows(terminal: &Terminal<TestBackend>, ys: std::ops::Range<u16>) -> Vec<String> {
+        ys.map(|y| row(terminal, y).concat()).collect()
+    }
+
+    /// A timestamp series label keeps its offset: at 42 cells the inner
+    /// width is 38, the 26-cell labels take a 28-cell column and 10 plot
+    /// cells remain, so both labels draw whole. At 41, 9 would remain: the
+    /// pane says so and draws no label, no sparkline and no axis.
+    #[test]
+    fn stacked_labels_keep_offsets_or_refuse_width() {
+        let app = grouped_by_instant(ColumnType::Timestamp);
+
+        // The plot is x = 2 to 11, the gap x = 12 and 13, the label column
+        // x = 14 to 39. The axis quotes the first `_time`, cut by the plot.
+        let terminal = draw(&app, 42, 12);
+        assert_eq!(
+            text_rows(&terminal, 1..11),
+            [
+                "│                                        │",
+                "│  █                                   3 │",
+                "│  █                                     │",
+                "│  █          2026-01-15 10:00:00 +05:30 │",
+                "│  █                                   1 │",
+                "│                                        │",
+                "│  █                                   4 │",
+                "│  █          2026-01-15 11:00:00 +05:30 │",
+                "│  █                                   2 │",
+                "│ 2026-01-15                             │",
+            ],
+            "{:?}",
+            terminal.backend()
+        );
+
+        let terminal = draw(&app, 41, 12);
+        let blank = format!("│{}│", " ".repeat(39));
+        let mut want = vec![
+            blank.clone(),
+            "│ too narrow for the stacked view:      │".to_owned(),
+            "│ press v for the table, or widen the   │".to_owned(),
+            "│ terminal                              │".to_owned(),
+        ];
+        want.resize(10, blank);
+        assert_eq!(
+            text_rows(&terminal, 1..11),
+            want,
+            "{:?}",
+            terminal.backend()
+        );
+    }
+
+    /// A `VARCHAR` group that reads like a timestamp (here the wire text
+    /// `2026-01-15T04:30:00.000000Z`, 27 cells) is an ordinary label: at
+    /// 42 cells it is cut to the 18-cell column, and 18 plot cells remain.
+    #[test]
+    fn stacked_labels_cut_a_text_group_that_looks_like_a_timestamp() {
+        let app = grouped_by_instant(ColumnType::String);
+        // The plot is x = 2 to 19, the label column x = 22 to 39.
+        let terminal = draw(&app, 42, 12);
+        assert_eq!(
+            text_rows(&terminal, 1..11),
+            [
+                "│                                        │",
+                "│  █                                   3 │",
+                "│  █                                     │",
+                "│  █                  2026-01-15T04:30:… │",
+                "│  █                                   1 │",
+                "│                                        │",
+                "│  █                                   4 │",
+                "│  █                  2026-01-15T05:30:… │",
+                "│  █                                   2 │",
+                "│ 2026-01-15 05:30:0                     │",
+            ],
+            "{:?}",
+            terminal.backend()
+        );
+    }
+
+    /// An ordinary label is cut to half the inner width less two even
+    /// when an instant label widens the column past it. At 48 cells the
+    /// inner width is 44: the instant takes a 26-cell column, the plot
+    /// keeps 16 cells, and thirty `a`s are cut to 20 cells.
+    #[test]
+    fn stacked_labels_cap_an_ordinary_label_beside_an_instant() {
+        let app = test_app();
+        let series = [
+            super::ChartSeries {
+                label: "2026-01-15 10:00:00 +05:30".to_owned(),
+                instant: true,
+                values: vec![1, 3],
+            },
+            super::ChartSeries {
+                label: "a".repeat(30),
+                instant: false,
+                values: vec![2, 4],
+            },
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(48, 12)).expect("terminal");
+        terminal
+            .draw(|f| {
+                super::render_stacked_sparklines(
+                    &app,
+                    f,
+                    f.area(),
+                    &series,
+                    series.len(),
+                    ratatui::style::Style::default(),
+                    None,
+                );
+            })
+            .expect("render");
+        // The plot is x = 2 to 17, the label column x = 20 to 45.
+        assert_eq!(
+            text_rows(&terminal, 1..11),
+            [
+                "│                                              │",
+                "│  █                                         3 │",
+                "│  █                                           │",
+                "│  █                2026-01-15 10:00:00 +05:30 │",
+                "│  █                                         1 │",
+                "│                                              │",
+                "│  █                                         4 │",
+                "│  █                      aaaaaaaaaaaaaaaaaaa… │",
+                "│  █                                         2 │",
+                "│                                              │",
+            ],
+            "{:?}",
+            terminal.backend()
+        );
+    }
+
+    /// A pane zero or one cell wide draws without a panic.
+    #[test]
+    fn stacked_view_survives_widths_zero_and_one() {
+        let app = grouped_by_instant(ColumnType::Timestamp);
+        for width in [0, 1] {
+            draw(&app, width, 12);
+        }
     }
 }
