@@ -29,7 +29,7 @@ use fleet_auth::VerifiedKey;
 use serde::Deserialize;
 use trawl_api::investigations::{
     AppendEntry, AppendResponse, CreateInvestigation, FindingStatusUpdate, Investigation,
-    InvestigationList, InvestigationRead, PatchInvestigation, RetentionExtension,
+    InvestigationList, InvestigationRead, PatchInvestigation, PatchResponse, RetentionExtension,
 };
 
 use super::service;
@@ -110,7 +110,7 @@ pub(crate) async fn patch(
     verified: Authorized<needs::InvestigationWrite>,
     id: Result<Path<String>, PathRejection>,
     body: Result<Json<PatchInvestigation>, JsonRejection>,
-) -> Result<Json<Investigation>, ServerError> {
+) -> Result<Json<PatchResponse>, ServerError> {
     let Path(id) = shaped("investigation path", id)?;
     let Json(req) = shaped("patch", body)?;
     service::patch(&state, &verified, &id, req).await.map(Json)
