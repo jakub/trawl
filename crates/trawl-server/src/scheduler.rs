@@ -733,8 +733,10 @@ pub(crate) async fn recover_ambiguous_finish(
 ///
 /// A file that was already gone is not a failure and does not log like one:
 /// it is the ordinary state after a `data_dir` repoint, and it is the same
-/// absence every read surface answers as a named unavailable result. A
-/// permission or I/O error keeps the warning, because that one is the
+/// absence every read surface answers as a named unavailable result. Gone
+/// means confirmed absent ([`crate::env_dirs::is_absent`]). A `NotFound`
+/// below a dangling link, a permission error or an I/O error keeps the
+/// warning, because the file may still be there and that one is the
 /// operator's to fix.
 pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
     let full = format!("{}/{relative}", base_dir.trim_end_matches('/'));
@@ -743,7 +745,10 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
         // The default-level events name the file relative to the data root;
         // the absolute path and the error text go to DEBUG (ADR-0040,
         // amended 2026-11-08).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && crate::env_dirs::is_absent(std::path::Path::new(&full)) =>
+        {
             tracing::debug!(
                 event_type = "result_file_already_absent",
                 path = %full,
@@ -1549,6 +1554,24 @@ mod tests {
         assert!(!std::path::Path::new(&full).exists(), "file must be gone");
     }
 
+    /// A dangling link AT the result's name is the entry itself, not a
+    /// path below one: it is unlinked, and that is a removal.
+    #[cfg(unix)]
+    #[test]
+    fn remove_result_file_unlinks_a_dangling_link_at_the_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = "scheduled/foo/run_1.parquet";
+        let full = tmp.path().join(rel);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &full).unwrap();
+
+        assert!(remove_result_file(tmp.path().to_str().unwrap(), rel));
+        assert!(
+            std::fs::symlink_metadata(&full).is_err(),
+            "the link is gone"
+        );
+    }
+
     /// A missing file is a no-op that reports `false` (gates orphan logging).
     #[test]
     fn remove_result_file_returns_false_when_missing() {
@@ -1563,9 +1586,12 @@ mod tests {
 
     /// Both cleanup events name the result by its data-root-relative path
     /// and never carry the absolute host path or the `io::Error` text,
-    /// which go to a DEBUG event (ADR-0040, amended 2026-11-08). The
-    /// failure is a directory where the file should be, so `remove_file`
-    /// fails with something other than `NotFound`.
+    /// which go to a DEBUG event (ADR-0040, amended 2026-11-08). Only a
+    /// file confirmed absent is the INFO event. The failures are a
+    /// directory where the file should be, which `remove_file` refuses
+    /// with something other than `NotFound`, and a file below a dangling
+    /// link, which answers `NotFound` without being absent.
+    #[cfg(unix)]
     #[test]
     fn result_file_cleanup_events_carry_no_host_path_or_io_text() {
         use crate::test_events::events_of;
@@ -1575,14 +1601,34 @@ mod tests {
         let abs = tmp.path().display().to_string();
         let blocked = "scheduled/foo/run_dir.parquet";
         std::fs::create_dir_all(tmp.path().join(blocked)).unwrap();
-        let io_text = std::fs::remove_file(tmp.path().join(blocked))
-            .expect_err("a directory cannot be unlinked as a file")
-            .to_string();
         let missing = "scheduled/foo/does_not_exist.parquet";
+        let below_link = "scheduled/linked/run.parquet";
+        std::os::unix::fs::symlink(
+            tmp.path().join("nowhere"),
+            tmp.path().join("scheduled/linked"),
+        )
+        .unwrap();
+        let io_error = |rel: &str| {
+            std::fs::remove_file(tmp.path().join(rel))
+                .expect_err("the fixture cannot be unlinked as a file")
+        };
+        let blocked_error = io_error(blocked);
 
         for (rel, event_type, removal_error) in [
-            (missing, "result_file_already_absent", false),
-            (blocked, "result_file_cleanup_error", true),
+            (missing, "result_file_already_absent", None),
+            (
+                blocked,
+                "result_file_cleanup_error",
+                Some((blocked_error.to_string(), blocked_error.kind().to_string())),
+            ),
+            (
+                below_link,
+                "result_file_cleanup_error",
+                Some((
+                    io_error(below_link).to_string(),
+                    std::io::ErrorKind::NotFound.to_string(),
+                )),
+            ),
         ] {
             let events = events_of(|| assert!(!remove_result_file(&base, rel)));
             let loud: Vec<_> = events.iter().filter(|e| e.is_default_level()).collect();
@@ -1600,10 +1646,14 @@ mod tests {
             );
             assert!(!event.text().contains(&abs), "{event:?}");
             assert!(!event.text().contains("os error"), "{event:?}");
-            if removal_error {
+            if let Some((io_text, error_kind)) = &removal_error {
                 assert_eq!(event.level, tracing::Level::WARN, "{event:?}");
-                assert!(event.fields.contains_key("error_kind"), "{event:?}");
-                assert!(!event.text().contains(&io_text), "{event:?}");
+                assert_eq!(
+                    event.fields.get("error_kind"),
+                    Some(error_kind),
+                    "{event:?}"
+                );
+                assert!(!event.text().contains(io_text), "{event:?}");
             } else {
                 assert_eq!(event.level, tracing::Level::INFO, "{event:?}");
             }
@@ -1613,8 +1663,8 @@ mod tests {
                 .find(|e| e.level == tracing::Level::DEBUG)
                 .unwrap_or_else(|| panic!("{rel}: no DEBUG event: {events:?}"));
             assert!(debug.text().contains(&abs), "{debug:?}");
-            if removal_error {
-                assert!(debug.text().contains(&io_text), "{debug:?}");
+            if let Some((io_text, _)) = &removal_error {
+                assert!(debug.text().contains(io_text), "{debug:?}");
             }
         }
     }

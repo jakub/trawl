@@ -5545,6 +5545,77 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
     );
 }
 
+/// A `from saved` read whose run file sits below a dangling link is an
+/// error. `DuckDB` answers "no files" for a path it cannot resolve, which
+/// reads as an empty result, and the file is not established as gone, so
+/// the answer is neither an empty success nor the 409 for a missing file.
+/// The 500 names no host path.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_from_saved_read_below_a_dangling_link_is_an_error() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let saved = client
+        .create_saved("dangling_report", "service=nginx | table service")
+        .await
+        .unwrap();
+    client
+        .set_schedule(saved.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+    client.trigger_run(saved.id).await.unwrap();
+    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    let run = &runs[0];
+    assert_eq!(run.status, "success", "{run:?}");
+    assert!(run.row_count.unwrap_or(0) > 0, "{run:?}");
+
+    let data_dir = server.state.query.pool.base_dir().trim_end_matches('/');
+    let stored = std::path::PathBuf::from(format!(
+        "{data_dir}/{}",
+        run.result_path.as_deref().expect("the run stored a file")
+    ));
+
+    // It reads while the file is there, so what follows is about the path.
+    let queries = [
+        format!(
+            "| from saved dangling_report run={} | table service",
+            run.id
+        ),
+        "| from saved dangling_report run=latest | stats count()".to_owned(),
+    ];
+    for dsl in &queries {
+        let read = client
+            .query_paginated(dsl, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{dsl}: the stored run reads: {e:?}"));
+        assert!(!read.result.rows.is_empty(), "{dsl}: {:?}", read.result);
+    }
+
+    // The run file's directory becomes a link to nothing.
+    let parent = stored.parent().expect("the run file has a directory");
+    std::fs::rename(parent, parent.with_extension("moved")).unwrap();
+    std::os::unix::fs::symlink(parent.with_extension("missing"), parent).unwrap();
+
+    for dsl in &queries {
+        match client.query_paginated(dsl, None, None).await {
+            Err(trawl_client::ClientError::Server { status, error, .. }) => {
+                assert_eq!(status, 500, "{dsl}: {error:?}");
+                assert_eq!(
+                    error.code,
+                    trawl_api::ErrorCode::ExecutionError,
+                    "{dsl}: {error:?}"
+                );
+                assert_eq!(error.message, "query execution failed", "{dsl}");
+                assert!(
+                    !format!("{error:?}").contains(data_dir),
+                    "{dsl}: the error names a host path: {error:?}"
+                );
+            }
+            other => panic!("{dsl}: expected the redacted 500, got: {other:?}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rename net (update with name)
 // ---------------------------------------------------------------------------

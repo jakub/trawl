@@ -774,6 +774,9 @@ fn directory_exists(path: &Path) -> std::io::Result<bool> {
 pub(crate) fn scan_markers(root: &Path, markers: &mut HashSet<PathBuf>) -> std::io::Result<()> {
     let envs = match std::fs::read_dir(root) {
         Ok(entries) => entries,
+        // A missing root, a dangling root link included, holds no marker, as
+        // ADR-0026 rules; boot's epoch gate already refuses a data root it
+        // cannot inspect.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };

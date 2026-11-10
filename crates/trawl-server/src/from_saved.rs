@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use trawl_core::ast::{FromSavedStage, SavedRunSelector};
 use trawl_core::emitter::ZERO_COLUMN_SOURCE;
+use trawl_engine::error::EngineError;
 
 use crate::error::ServerError;
 use crate::store::{ReportRun, RunStatus, SavedQueryStore, ScheduleStore};
@@ -71,26 +72,38 @@ pub(crate) fn unavailable_run_message(run_id: i64) -> String {
     )
 }
 
-/// The single place a missing result file becomes an answer.
+/// The single place a result file that cannot be read becomes an answer.
 ///
-/// One `stat` per file, in selected-run order; the FIRST file that is not
-/// there names the refusal, so `run=all` fails naming the missing member
-/// rather than skipping it or reporting a partial union.
+/// One `stat` per file, in selected-run order; the FIRST file that refuses
+/// names the refusal, so `run=all` fails naming that member rather than
+/// skipping it or reporting a partial union.
 ///
-/// Only [`std::io::ErrorKind::NotFound`] maps. A permission error, an I/O
-/// error, or anything else means the file's presence is unknown, not
-/// established as absent — relabelling those as "unavailable" would tell an
-/// operator a file is gone when it is sitting right there unreadable. Those
-/// return `None` and the read reports them as what they are.
+/// A file that is confirmed absent ([`crate::env_dirs::is_absent`]: no entry,
+/// below a directory) is the 409 that names the run. Any other `stat` error
+/// is a redacted I/O error: a `NotFound` below a dangling link, a file where a
+/// directory should be, a link loop, a permission error. The file's absence
+/// is not established, so the 409 would tell the caller something unknown;
+/// and `None` would be worse, because `DuckDB` answers "no files" for every
+/// path it cannot resolve, which the executor reads as an empty result. The
+/// error is built from the error kind alone, so neither it nor the WARN
+/// carries the path or the OS text.
 pub(crate) fn unavailable_run_conflict(files: &[RunFile]) -> Option<ServerError> {
     files.iter().find_map(|file| {
-        match std::fs::metadata(&file.absolute_path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Some(ServerError::Conflict(unavailable_run_message(file.run_id)))
-            }
-            // Present, or present-but-unreadable: not this refusal's case.
-            Ok(_) | Err(_) => None,
+        let error = std::fs::metadata(&file.absolute_path).err()?;
+        if error.kind() == std::io::ErrorKind::NotFound
+            && crate::env_dirs::is_absent(&file.absolute_path)
+        {
+            return Some(ServerError::Conflict(unavailable_run_message(file.run_id)));
         }
+        tracing::warn!(
+            event_type = "from_saved_run_file_unresolved",
+            run_id = file.run_id,
+            error_kind = %error.kind(),
+            "a stored result file could not be resolved, and its absence is not established"
+        );
+        Some(ServerError::Engine(EngineError::Io(std::io::Error::from(
+            error.kind(),
+        ))))
     })
 }
 
@@ -450,34 +463,175 @@ mod tests {
         assert_eq!(counted.rows[0][0].to_string(), "1");
     }
 
-    /// Only a file that is NOT THERE is the unavailable answer, and the
-    /// answer names the first missing run in selector order, without
-    /// saying where the file was.
+    /// `DuckDB` cannot tell a run file that is gone from one it cannot
+    /// reach: below a dangling link, below a regular file, below a link
+    /// loop or below a directory it may not search, the read answers "no
+    /// files", and the executor turns that into a result with no columns.
+    /// So the engine never refuses such a read itself, and
+    /// [`unavailable_run_conflict`] is the only place it can.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_file_duckdb_cannot_resolve_reads_as_no_columns() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let executor = trawl_engine::executor::Executor::new().unwrap();
+        let read = |data_dir: &std::path::Path| {
+            let source = run_source(data_dir.to_str().unwrap(), "scheduled/run_1.parquet");
+            executor.run_query(
+                "* | head 10",
+                &source,
+                &trawl_core::schema::FieldTypes::new(),
+                100,
+            )
+        };
+
+        let dangling = dir.path().join("dangling");
+        std::fs::create_dir(&dangling).unwrap();
+        symlink(dir.path().join("nowhere"), dangling.join("scheduled")).unwrap();
+        let below_file = dir.path().join("below_file");
+        std::fs::create_dir(&below_file).unwrap();
+        std::fs::write(below_file.join("scheduled"), b"not a directory").unwrap();
+        let looped = dir.path().join("looped");
+        std::fs::create_dir(&looped).unwrap();
+        symlink("scheduled", looped.join("scheduled")).unwrap();
+        let cases = [
+            ("dangling link", dangling),
+            ("regular file", below_file),
+            ("link loop", looped),
+        ];
+
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(locked.join("scheduled")).unwrap();
+        let unsearchable = !rustix::process::geteuid().is_root();
+        if unsearchable {
+            std::fs::set_permissions(
+                locked.join("scheduled"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+        }
+        let locked_read = read(&locked);
+        std::fs::set_permissions(
+            locked.join("scheduled"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        for (case, data_dir) in &cases {
+            let result = read(data_dir)
+                .unwrap_or_else(|e| panic!("{case}: the executor refused the read itself: {e:?}"));
+            assert!(result.columns.is_empty(), "{case}: {result:?}");
+            assert!(result.rows.is_empty(), "{case}: {result:?}");
+        }
+        if unsearchable {
+            let result = locked_read.unwrap_or_else(|e| {
+                panic!("unsearchable directory: the executor refused the read itself: {e:?}")
+            });
+            assert!(
+                result.columns.is_empty(),
+                "unsearchable directory: {result:?}"
+            );
+        } else {
+            eprintln!("skipped the unsearchable case: running as root");
+        }
+    }
+
+    /// Only a file that is NOT THERE is the unavailable answer: no entry,
+    /// below a directory that exists. A file whose absence cannot be
+    /// established, below a dangling link or below a regular file, is a
+    /// redacted I/O error and a WARN naming the run. Either answer names
+    /// the first refusing run in selector order, and neither the answer
+    /// nor the event says where the file was.
+    #[cfg(unix)]
     #[test]
     fn unavailable_run_conflict_maps_only_absence() {
+        use std::io::ErrorKind;
+        use std::os::unix::fs::symlink;
+
         let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_owned();
         let present = dir.path().join("here.parquet");
         std::fs::write(&present, b"parquet").unwrap();
+        let gone = dir.path().join("gone.parquet");
+        let gone_ancestor = dir.path().join("never/made/run.parquet");
+        symlink(dir.path().join("nowhere"), dir.path().join("dangling")).unwrap();
+        let below_link = dir.path().join("dangling/run.parquet");
+        let below_file = present.join("run.parquet");
         let file = |id: i64, path: &std::path::Path| RunFile {
             run_id: id,
             absolute_path: path.to_path_buf(),
         };
+        let check = |files: &[RunFile]| {
+            let mut answer = None;
+            let events = crate::test_events::events_of(|| answer = unavailable_run_conflict(files));
+            if let Some(err) = &answer {
+                for text in [format!("{err:?}"), err.to_string(), err.safe_message()] {
+                    assert!(!text.contains(&root), "the answer names the path: {text}");
+                }
+            }
+            for event in &events {
+                assert!(!event.text().contains(&root), "{event:?}");
+            }
+            (answer, events)
+        };
+        let conflict = |files: &[RunFile], run_id: i64| {
+            let (answer, events) = check(files);
+            match answer {
+                Some(ServerError::Conflict(msg)) => {
+                    assert_eq!(msg, unavailable_run_message(run_id));
+                }
+                other => panic!("expected a Conflict naming run {run_id}, got: {other:?}"),
+            }
+            assert!(
+                events.is_empty(),
+                "absence is an answer, not a fault: {events:?}"
+            );
+        };
+        let unresolved = |files: &[RunFile], run_id: i64, kind: ErrorKind| {
+            let (answer, events) = check(files);
+            match &answer {
+                Some(err @ ServerError::Engine(EngineError::Io(e))) => {
+                    assert_eq!(e.kind(), kind, "{e:?}");
+                    assert_eq!(err.code(), trawl_api::ErrorCode::ExecutionError);
+                    assert_eq!(err.safe_message(), "query execution failed");
+                }
+                other => panic!("expected the redacted I/O error, got: {other:?}"),
+            }
+            let [event] = events.as_slice() else {
+                panic!("expected one event: {events:?}");
+            };
+            assert_eq!(event.level, tracing::Level::WARN, "{event:?}");
+            let field = |name: &str| event.fields.get(name).map(String::as_str);
+            assert_eq!(field("event_type"), Some("from_saved_run_file_unresolved"));
+            assert_eq!(field("run_id"), Some(run_id.to_string().as_str()));
+            assert_eq!(field("error_kind"), Some(kind.to_string().as_str()));
+        };
 
-        assert!(unavailable_run_conflict(&[]).is_none(), "nothing to check");
+        assert!(check(&[]).0.is_none(), "nothing to check");
         assert!(
-            unavailable_run_conflict(&[file(1, &present)]).is_none(),
+            check(&[file(1, &present)]).0.is_none(),
             "a file that is there is not a refusal"
         );
 
-        let gone = dir.path().join("gone.parquet");
-        let members = [file(1, &present), file(7, &gone), file(9, &gone)];
-        match unavailable_run_conflict(&members) {
-            Some(ServerError::Conflict(msg)) => {
-                assert_eq!(msg, unavailable_run_message(7), "the FIRST absent member");
-                assert!(!msg.contains(dir.path().to_str().unwrap()), "{msg}");
-            }
-            other => panic!("expected a Conflict naming run 7, got: {other:?}"),
-        }
+        // Confirmed absence: a missing leaf, and a missing ancestor whose
+        // own parent is a directory.
+        conflict(&[file(1, &present), file(7, &gone), file(9, &gone)], 7);
+        conflict(&[file(3, &gone_ancestor)], 3);
+
+        // Absence unknown: `metadata` answers NotFound below a dangling
+        // link and NotADirectory below a regular file, and DuckDB would
+        // read either as an empty result.
+        unresolved(&[file(4, &below_link)], 4, ErrorKind::NotFound);
+        unresolved(&[file(5, &below_file)], 5, ErrorKind::NotADirectory);
+
+        // The first refusal in file order wins, of either kind.
+        unresolved(
+            &[file(4, &below_link), file(7, &gone)],
+            4,
+            ErrorKind::NotFound,
+        );
+        conflict(&[file(7, &gone), file(4, &below_link)], 7);
     }
 
     #[test]
