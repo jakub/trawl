@@ -193,6 +193,25 @@ trawl query "_severity>=error last=1h | stats count() by service"
 trawl query "last=1h | stats count() by service" | jq '.service'
 ```
 
+### Sender text on a terminal
+
+A sender chooses field names and values, and they can hold characters that a
+terminal acts on: control characters such as ESC, bidirectional controls,
+zero-width characters, and the soft hyphen. Trawl does not write those
+characters to a terminal.
+
+| Format | On a terminal | In a pipe or an `-o` file |
+|--------|---------------|---------------------------|
+| `table` | Each such character is shown as `�` (U+FFFD). A line break in a value stays a line break inside its cell. | The same as on a terminal |
+| `json` | Each such character in a key or a string is written as a `\uXXXX` escape. A JSON parser reads the original value. | Every value is exact |
+| `csv` | Each such character is shown as `�`, line breaks included | Every value is exact |
+
+`trawl schema` and `trawl driver` output follows the same rules. Messages on
+stderr always replace these characters with `�`.
+
+To read exact values, send `json` or `csv` to a pipe or to a file with
+`-o, --output`.
+
 ### The incomplete-results footer
 
 When a query binds a field whose catalog pin is degraded, `table` output adds
