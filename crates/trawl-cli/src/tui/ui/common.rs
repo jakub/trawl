@@ -5,6 +5,7 @@
 //! Shared UI helpers used across multiple rendering modules.
 
 use ratatui::layout::{Constraint, Layout, Rect};
+use unicode_width::UnicodeWidthStr;
 
 /// Create a centered rect using percentage-based constraints.
 pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -26,4 +27,20 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     .areas(mid);
 
     center
+}
+
+/// `fitted`, then spaces until a ratatui `Span` holding it advances its
+/// `Line` by `column` cells.
+///
+/// A `Line` moves the next span on by `Span::width`, the unicode-width of
+/// the whole span, which can be less than the cells its grapheme clusters
+/// draw in: `ｶﾞ` draws in two cells and has a width of one. `fitted` must
+/// already fit `column` cells as
+/// [`fit_cells`](trawl_core::text_layout::fit_cells) measures them, so its
+/// glyphs end inside the column. The next span starts at the column's edge
+/// and draws over any spaces drawn past it.
+pub fn span_advancing(mut fitted: String, column: usize) -> String {
+    let advance = UnicodeWidthStr::width(fitted.as_str());
+    fitted.extend(std::iter::repeat_n(' ', column.saturating_sub(advance)));
+    fitted
 }

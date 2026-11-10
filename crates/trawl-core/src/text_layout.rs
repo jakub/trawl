@@ -5,38 +5,36 @@
 //! Terminal text cut, padded and caret-marked in display cells.
 //!
 //! The unit is the display cell: the columns a terminal gives a string.
-//! `日` takes two, a combining accent none, `❤` one and `❤\u{FE0F}` two.
-//! Every width here is [`UnicodeWidthStr::width`] of a whole string, plus
-//! one cell for each halfwidth katakana sound mark, never a sum of
-//! per-character widths. A string's width is not the sum of its parts,
-//! and it does not always grow as characters are added: `⌚` takes two
-//! cells and `⌚\u{FE0E}` one.
+//! A string is measured as ratatui-core draws it, one extended grapheme
+//! cluster at a time: `日` takes two cells, `e\u{301}` one, `❤\u{FE0F}`
+//! two, `ｶﾞ` two and `لا` two, one for each letter. The width of a string
+//! is the sum of its clusters' widths. It is not the unicode-width of the
+//! whole string, which gives `لا` one cell where ratatui draws two.
 //!
-//! Text is passed through [`sanitize_display_text`] before it is measured
-//! or returned, so a control, bidi or zero-width character prints as
-//! U+FFFD and cannot rewrite the line around it.
+//! Text is passed through [`sanitize_display_text`] before it is measured,
+//! segmented or returned, so a control, bidi or zero-width character
+//! prints as U+FFFD and cannot rewrite the line around it.
 //!
 //! [`fit_cells`] returns the sanitized text whole when it fits its budget.
-//! Otherwise it returns a prefix of the sanitized text, cut on a character
-//! boundary, followed by one [`MARKER`], all within the budget. The prefix
-//! fits, but it is not always the longest one that would: when a character
-//! makes the text narrower, a longer prefix can fit after a shorter one did
-//! not. For text that only grows as it lengthens, which includes Latin, CJK
-//! and combining marks, the cut is the longest prefix that fits.
+//! Otherwise it returns the longest run of whole leading clusters that
+//! fits beside one [`MARKER`], then the marker. It never cuts inside a
+//! cluster, so a selector, combining mark or sound mark is never split
+//! from its base.
 //!
 //! The work [`fit_cells`] does is bounded by the budget, not by the input.
-//! It reads at most `8 × (budget + 1)` characters of the input. It then
-//! measures about log₂ of that many candidates, none longer than what it
-//! read. A value of any length, a million combining marks included, costs
-//! O(budget × log budget). Text longer than that read window is cut even
-//! when its width would fit: ordinary text needs far fewer than eight
-//! characters per cell.
+//! It reads at most `8 × (budget + 1)` characters of the input and walks
+//! the clusters of what it read once. A value of any length, a million
+//! combining marks included, costs O(budget). Text longer than that read
+//! window is cut even when its width would fit: ordinary text needs far
+//! fewer than eight characters per cell. The window's last cluster can go
+//! on past the window, so a cut text never keeps it.
 //!
 //! [`locate_span`] resolves a span, a pair of UTF-8 byte offsets into the
 //! text it indexes, to the line holding its start. It refuses a span that
 //! cannot index the text and never clamps one. [`caret_layout`] lays that
-//! line out for a caret line underneath it.
+//! line out for a caret line underneath it, whole clusters at a time.
 
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::sanitize::sanitize_display_text;
@@ -47,7 +45,7 @@ pub const MARKER: char = '…';
 /// How many input characters [`fit_cells`] reads per cell of budget.
 ///
 /// A base letter with its accents, or a flag with its tag characters,
-/// stays under this. A longer run is cut whatever its width.
+/// stays under this. A longer cluster is cut whatever its width.
 const CHARS_PER_CELL: usize = 8;
 
 /// How many input characters [`fit_cells`] reads at `budget`.
@@ -64,27 +62,37 @@ fn scan_window(text: &str, budget: usize) -> (&str, bool) {
     }
 }
 
-/// The display cells `s` takes: [`UnicodeWidthStr::width`] of the whole
-/// string, plus one for each halfwidth katakana sound mark, U+FF9E `ﾞ` or
-/// U+FF9F `ﾟ`.
+/// The display cells `s` takes: the sum of [`cluster_cells`] over its
+/// extended grapheme clusters, which is where ratatui puts the next cell
+/// after drawing `s`.
+///
+/// `s` must already be sanitized. Every width in this module goes through
+/// here or through [`cluster_cells`].
+fn measure(s: &str) -> usize {
+    s.graphemes(true).map(cluster_cells).sum()
+}
+
+/// The display cells ratatui-core 0.1.2 gives one grapheme cluster
+/// (`CellWidth for str` in its `buffer/cell_width.rs`): one for a one-byte
+/// cluster, otherwise [`UnicodeWidthStr::width`] of the cluster plus one
+/// for each halfwidth katakana sound mark, U+FF9E `ﾞ` or U+FF9F `ﾟ`.
 ///
 /// unicode-width gives those two marks no width, as it does a combining
-/// mark, but a terminal draws each in a cell of its own. ratatui-core
-/// counts them the same way (`count_halfwidth_sound_marks` in its
-/// `buffer/cell_width.rs`), so a width measured here is where ratatui puts
-/// the next cell. The combining sound marks U+3099 and U+309A keep their
-/// unicode-width of none.
-///
-/// Every width in this module goes through here.
-fn measure(s: &str) -> usize {
-    let sound_marks = s
+/// mark, but a terminal draws each in a cell of its own. The combining
+/// sound marks U+3099 and U+309A keep their unicode-width of none.
+fn cluster_cells(cluster: &str) -> usize {
+    if cluster.len() == 1 {
+        return 1;
+    }
+    let sound_marks = cluster
         .chars()
         .filter(|c| matches!(c, '\u{FF9E}' | '\u{FF9F}'))
         .count();
-    s.width() + sound_marks
+    cluster.width() + sound_marks
 }
 
-/// The display cells `text` takes once sanitized, measured as one string.
+/// The display cells `text` takes once sanitized, the sum of its grapheme
+/// clusters' cells.
 ///
 /// This reads all of `text`. To size a column from values of any length,
 /// measure each value's [`fit_cells`] at the widest the column may be,
@@ -96,10 +104,12 @@ pub fn cells(text: &str) -> usize {
 
 /// `text` sanitized and cut to at most `budget` display cells.
 ///
-/// The sanitized text whole when it fits; otherwise a prefix of it that
-/// ends on a character boundary, then [`MARKER`]. A budget of 0 returns an
-/// empty string. See the module documentation for which prefix is kept,
-/// and for the bound on the work done.
+/// The sanitized text whole when it fits and [`fit_cells`] read all of it;
+/// otherwise the longest run of its leading grapheme clusters that fits
+/// beside [`MARKER`], then the marker. A budget of 0 returns an empty
+/// string. A budget of 1 returns the marker alone unless the text fits
+/// whole or opens with clusters of no width. See the module documentation
+/// for the bound on the work done.
 #[must_use]
 pub fn fit_cells(text: &str, budget: usize) -> String {
     if budget == 0 {
@@ -114,45 +124,31 @@ pub fn fit_cells(text: &str, budget: usize) -> String {
         return shown;
     }
 
-    // The prefix ends a candidate may keep. When the window held the whole
-    // text, the whole did not fit, so only a shorter prefix may be kept.
-    let ends: Vec<usize> = shown
-        .char_indices()
-        .map(|(at, _)| at)
-        .chain(cut.then_some(shown.len()))
-        .collect();
-    let candidate = |n: usize| {
-        let mut out = String::with_capacity(ends[n] + MARKER.len_utf8());
-        out.push_str(&shown[..ends[n]]);
-        out.push(MARKER);
-        out
-    };
-
-    // Binary search for the last candidate that fits, measuring each one
-    // whole. `best` is always a candidate that was measured and fit, so the
-    // result fits even where width shrinks as the text lengthens and the
-    // search settles on a shorter prefix than the longest that fits. The
-    // first candidate is the marker alone, one cell; it is measured like
-    // the rest so that nothing is returned unmeasured.
-    let mut best = candidate(0);
-    if measure(&best) > budget {
-        return String::new();
+    // Every cluster boundary inside the window is one of the whole text,
+    // but the window's last cluster may go on past the window, so a cut
+    // window never keeps it.
+    let mut clusters: Vec<&str> = shown.graphemes(true).collect();
+    if cut {
+        clusters.pop();
     }
-    let (mut fits, mut too_wide) = (0, ends.len());
-    while too_wide - fits > 1 {
-        let mid = fits + (too_wide - fits) / 2;
-        let tried = candidate(mid);
-        if measure(&tried) <= budget {
-            fits = mid;
-            best = tried;
-        } else {
-            too_wide = mid;
+    let mut kept = 0;
+    let mut used = 0;
+    for cluster in clusters {
+        let cells = cluster_cells(cluster);
+        if used + cells + 1 > budget {
+            break;
         }
+        used += cells;
+        kept += cluster.len();
     }
-    best
+    let mut out = String::with_capacity(kept + MARKER.len_utf8());
+    out.push_str(&shown[..kept]);
+    out.push(MARKER);
+    out
 }
 
-/// [`fit_cells`] of `text`, then spaces to exactly `width` display cells.
+/// [`fit_cells`] of `text`, then spaces to exactly `width` display cells,
+/// measured by grapheme cluster as [`cells`] measures them.
 #[must_use]
 pub fn pad_cells(text: &str, width: usize) -> String {
     let mut out = fit_cells(text, width);
@@ -252,31 +248,67 @@ pub fn locate_span(text: &str, start: usize, end: usize) -> Option<SpanLine> {
 
 /// A located line laid out for a terminal: its three parts, sanitized,
 /// and where a caret line marks the span under it.
+///
+/// The parts are cut between grapheme clusters of the sanitized line. A
+/// cluster that holds either end of the span falls whole into `covered`,
+/// so each part can be drawn as a span of its own and every cluster still
+/// draws in the cells it takes in the whole line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaretLayout {
-    /// The line before the span.
+    /// The line before the cluster that holds the span's start.
     pub before: String,
-    /// The part of the line the span covers.
+    /// The clusters from the one that holds the span's start through the
+    /// one that holds its last byte. Empty for an empty span between two
+    /// clusters; for an empty span inside a cluster, that cluster.
     pub covered: String,
-    /// The line after the span.
+    /// The line after `covered`.
     pub after: String,
-    /// The display cells before the first caret: the width of `before`.
+    /// The display cells before the first caret: the cells of `before`.
     pub pad: usize,
-    /// How many carets mark the span: the width of `covered`, at least
+    /// How many carets mark the span: the cells of `covered`, at least
     /// one, so an empty span still gets a caret where it sits.
     pub carets: usize,
 }
 
 /// Lay out the line `at` names in `text` for a caret line underneath.
 ///
-/// Each part is sanitized, so a tab or any other character
+/// The line is sanitized, so a tab or any other character
 /// [`is_unsafe_display_char`](crate::sanitize::is_unsafe_display_char)
 /// names prints as one U+FFFD cell, in the line and in the count alike.
+/// The span's ends then move out to the edges of the sanitized line's
+/// grapheme clusters that hold them.
 #[must_use]
 pub fn caret_layout(text: &str, at: &SpanLine) -> CaretLayout {
-    let before = sanitize_display_text(at.before(text));
-    let covered = sanitize_display_text(at.covered(text));
-    let after = sanitize_display_text(at.after(text));
+    let line = at.line_text(text);
+    let shown = sanitize_display_text(line);
+    // Sanitizing maps each character to one character, but not each byte
+    // to one byte, so an offset into `line` moves to `shown` by the number
+    // of characters before it.
+    let to_shown = |raw: usize| {
+        let chars = line[..raw - at.line_start].chars().count();
+        shown
+            .char_indices()
+            .nth(chars)
+            .map_or(shown.len(), |(i, _)| i)
+    };
+    let (start, end) = (to_shown(at.start), to_shown(at.end));
+    let boundaries = shown
+        .grapheme_indices(true)
+        .map(|(boundary, _)| boundary)
+        .chain([shown.len()]);
+    let (mut cluster_start, mut cluster_end) = (0, shown.len());
+    for boundary in boundaries {
+        if boundary <= start {
+            cluster_start = boundary;
+        }
+        if boundary >= end {
+            cluster_end = boundary;
+            break;
+        }
+    }
+    let before = shown[..cluster_start].to_owned();
+    let covered = shown[cluster_start..cluster_end].to_owned();
+    let after = shown[cluster_end..].to_owned();
     CaretLayout {
         pad: measure(&before),
         carets: measure(&covered).max(1),
@@ -408,6 +440,104 @@ pub const SPAN_CASES: &[SpanCase] = &[
             line: 1,
             excerpt: "❤\u{FE0F} x",
             pad: 3,
+            carets: 1,
+        }),
+    },
+    SpanCase {
+        // `ل` and `ا` are a cluster and a cell each, though unicode-width
+        // gives the pair one cell as a whole string. 5 bytes, 3 characters
+        // and 3 cells come before the `x`.
+        name: "lam-alef before the span",
+        text: "لا x",
+        start: 5,
+        end: 6,
+        expect: Some(SpanExpect {
+            line: 1,
+            excerpt: "لا x",
+            pad: 3,
+            carets: 1,
+        }),
+    },
+    SpanCase {
+        // The span ends after `e` and before its accent: the caret marks
+        // the whole one-cell cluster.
+        name: "span ends inside a combining cluster",
+        text: "e\u{301}x",
+        start: 0,
+        end: 1,
+        expect: Some(SpanExpect {
+            line: 1,
+            excerpt: "e\u{301}x",
+            pad: 0,
+            carets: 1,
+        }),
+    },
+    SpanCase {
+        // The span ends after the heart and before its selector: the
+        // carets mark the whole two-cell cluster, not the heart's one.
+        name: "span ends inside an emoji presentation cluster",
+        text: "❤\u{FE0F}x",
+        start: 0,
+        end: 3,
+        expect: Some(SpanExpect {
+            line: 1,
+            excerpt: "❤\u{FE0F}x",
+            pad: 0,
+            carets: 2,
+        }),
+    },
+    SpanCase {
+        // The span starts on the accent: the carets start under its base.
+        name: "span starts inside a cluster",
+        text: "e\u{301}x",
+        start: 1,
+        end: 4,
+        expect: Some(SpanExpect {
+            line: 1,
+            excerpt: "e\u{301}x",
+            pad: 0,
+            carets: 2,
+        }),
+    },
+    SpanCase {
+        // An end on a cluster boundary does not take the `日` after it.
+        name: "span ends on a cluster boundary",
+        text: "e\u{301}日",
+        start: 0,
+        end: 3,
+        expect: Some(SpanExpect {
+            line: 1,
+            excerpt: "e\u{301}日",
+            pad: 0,
+            carets: 1,
+        }),
+    },
+    SpanCase {
+        // An empty span between `日` and its accent marks the whole
+        // two-cell cluster.
+        name: "empty span inside a cluster",
+        text: "日\u{301}x",
+        start: 3,
+        end: 3,
+        expect: Some(SpanExpect {
+            line: 1,
+            excerpt: "日\u{301}x",
+            pad: 0,
+            carets: 2,
+        }),
+    },
+    SpanCase {
+        // The tab is one byte and prints as a three-byte U+FFFD, which
+        // the accent then joins. The `x` is byte 3 of the text and byte 5
+        // of the printed line, after one cell.
+        name: "replacement before combining text",
+        text: "\t\u{301}x",
+        start: 3,
+        end: 4,
+        expect: Some(SpanExpect {
+            line: 1,
+            excerpt: "\u{FFFD}\u{301}x",
+            pad: 1,
             carets: 1,
         }),
     },
@@ -708,10 +838,25 @@ mod tests {
         }
     }
 
-    /// Each named class at budgets 0 and 1, and the longest prefix that
-    /// fits wherever width only grows as the text lengthens.
+    /// Each grapheme cluster takes the cells ratatui draws it in.
+    #[test]
+    fn text_layout_measures_by_grapheme_cluster() {
+        assert_eq!(cells("لا"), 2);
+        assert_eq!(cells("ｶﾞ"), 2);
+        assert_eq!(cells("❤\u{FE0F}لا"), 4);
+        assert_eq!(cells("e\u{301}"), 1);
+        assert_eq!(cells("‘\u{FE01}"), 2);
+        assert_eq!(cells("⌚\u{FE0E}"), 1);
+        // Nine lam-alef pairs: nine cells as one string, eighteen drawn.
+        assert_eq!(cells(&"لا".repeat(9)), 18);
+    }
+
+    /// Each named class at budgets 0 and 1, and the longest run of whole
+    /// clusters that fits beside the marker.
     #[test]
     fn text_layout_fits_cell_budget_fixed_cases() {
+        // `a`, then `b` with a hundred combining accents.
+        let ab_marks = format!("ab{}", "\u{301}".repeat(100));
         let cases: &[(&str, &str, usize, &str)] = &[
             ("empty", "", 0, ""),
             ("empty", "", 1, ""),
@@ -744,14 +889,16 @@ mod tests {
             ("emoji presentation", "❤\u{FE0F}", 0, ""),
             ("emoji presentation", "❤\u{FE0F}", 1, "…"),
             ("emoji presentation", "❤\u{FE0F}", 2, "❤\u{FE0F}"),
-            ("emoji presentation", "❤\u{FE0F}x", 2, "❤…"),
+            ("emoji presentation", "❤\u{FE0F}x", 2, "…"),
             ("emoji presentation", "❤\u{FE0F}xy", 3, "❤\u{FE0F}…"),
-            // Two cells whole, one as a sum of its characters.
-            ("quote with selector", "‘\u{FE01}x", 2, "‘…"),
+            // One cluster of two cells: no room beside the marker.
+            ("quote with selector", "‘\u{FE01}x", 2, "…"),
             ("quote with selector", "‘\u{FE01}x", 3, "‘\u{FE01}x"),
-            // One cell whole, two as a sum of its characters.
-            ("lam-alef ligature", "لاxy", 2, "لا…"),
-            ("lam-alef ligature", "لاx", 2, "لاx"),
+            // Two clusters of a cell each, though unicode-width gives the
+            // pair one cell as a whole string.
+            ("lam-alef ligature", "لاxy", 2, "ل…"),
+            ("lam-alef ligature", "لاx", 2, "ل…"),
+            ("lam-alef ligature", "لاx", 3, "لاx"),
             ("text presentation", "⌚\u{FE0E}", 0, ""),
             ("text presentation", "⌚\u{FE0E}", 1, "⌚\u{FE0E}"),
             ("control", "a\u{1}b", 0, ""),
@@ -766,9 +913,12 @@ mod tests {
             // A halfwidth sound mark takes a cell of its own.
             ("halfwidth sound mark", "ｶﾞ", 1, "…"),
             ("halfwidth sound mark", "ｶﾞ", 2, "ｶﾞ"),
-            ("halfwidth sound mark", "ｶﾞx", 2, "ｶ…"),
+            ("halfwidth sound mark", "ｶﾞx", 2, "…"),
             ("halfwidth sound mark", "ｶﾞx", 3, "ｶﾞx"),
             ("halfwidth sound mark", "ﾊﾟﾊﾟ", 3, "ﾊﾟ…"),
+            // Budget 3 reads 32 characters: `a`, `b` and 30 of its marks.
+            // `b`'s cluster runs past that window, so it is dropped whole.
+            ("combining run past the window", &ab_marks, 3, "a…"),
         ];
         for &(class, text, budget, expect) in cases {
             assert_eq!(
@@ -830,9 +980,11 @@ mod tests {
             );
             assert!(out.chars().count() <= scan_cap(budget) + 1);
         }
-        // Budget 10 reads `a` and 87 marks, which fit with the marker.
-        let out = fit_cells(&text, 10);
-        assert_eq!(out, format!("a{}…", "\u{301}".repeat(87)));
+        // Every window holds part of one cluster, `a` and its marks, which
+        // runs past it, so nothing but the marker is kept.
+        for budget in [1, 2, 10, 80] {
+            assert_eq!(fit_cells(&text, budget), "…", "{budget}");
+        }
     }
 
     #[test]
@@ -875,6 +1027,26 @@ mod tests {
         }
     }
 
+    /// A cluster that holds either end of a span falls whole into the
+    /// covered part, so the three parts can be drawn as separate spans.
+    #[test]
+    fn caret_layout_cuts_parts_between_clusters() {
+        let parts = |text: &str, start: usize, end: usize| {
+            let at = locate_span(text, start, end).expect("locates");
+            let layout = caret_layout(text, &at);
+            (layout.before, layout.covered, layout.after)
+        };
+        let owned = |a: &str, b: &str, c: &str| (a.to_owned(), b.to_owned(), c.to_owned());
+        assert_eq!(parts("e\u{301}x", 0, 1), owned("", "e\u{301}", "x"));
+        assert_eq!(parts("e\u{301}x", 1, 4), owned("", "e\u{301}x", ""));
+        assert_eq!(parts("e\u{301}x", 1, 1), owned("", "e\u{301}", "x"));
+        assert_eq!(parts("e\u{301}x", 3, 3), owned("e\u{301}", "", "x"));
+        assert_eq!(parts("❤\u{FE0F}x", 0, 3), owned("", "❤\u{FE0F}", "x"));
+        assert_eq!(parts("e\u{301}日", 0, 3), owned("", "e\u{301}", "日"));
+        assert_eq!(parts("\t\u{301}x", 3, 4), owned("\u{FFFD}\u{301}", "x", ""));
+        assert_eq!(parts("\t\u{301}x", 1, 1), owned("", "\u{FFFD}\u{301}", "x"));
+    }
+
     /// The hand-worked offsets in [`SPAN_CASES`] point where the rows say.
     #[test]
     fn shared_span_contract_offsets_are_what_the_rows_say() {
@@ -896,6 +1068,13 @@ mod tests {
         assert_eq!("❤\u{FE0F} x".find('x'), Some(7));
         assert_eq!("a\u{202E}b x".find('x'), Some(6));
         assert_eq!("a=é b".find('é'), Some(2));
+        assert_eq!("لا x".find('x'), Some(5));
+        assert_eq!("e\u{301}x".find('\u{301}'), Some(1));
+        assert_eq!("e\u{301}x".find('x'), Some(3));
+        assert_eq!("❤\u{FE0F}x".find('\u{FE0F}'), Some(3));
+        assert_eq!("e\u{301}日".find('日'), Some(3));
+        assert_eq!("日\u{301}x".find('\u{301}'), Some(3));
+        assert_eq!("\t\u{301}x".find('x'), Some(3));
 
         let crlf = "service=web\r\n| stats count( by host\r\n| head 5";
         assert_eq!(crlf.find("host"), Some(31));

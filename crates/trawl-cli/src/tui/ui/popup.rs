@@ -10,6 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use trawl_core::sanitize::sanitize_display_text;
+use trawl_core::text_layout::cells;
 
 use crate::tui::App;
 use crate::tui::state::{Popup, ScheduleField, ScheduleForm};
@@ -139,6 +140,7 @@ fn render_save_query(
         Line::from(""),
     ];
 
+    let inner = block.inner(area);
     let paragraph = Paragraph::new(text)
         .block(block)
         .alignment(Alignment::Center)
@@ -146,11 +148,17 @@ fn render_save_query(
 
     frame.render_widget(paragraph, area);
 
-    // Position the cursor inside the input field.
-    let cursor_col = editor.cursor.1;
-    #[allow(clippy::cast_possible_truncation)]
-    let cursor_x =
-        area.x + (area.width / 2).saturating_sub((input.len() as u16) / 2) + 2 + cursor_col as u16;
+    // The cursor sits on the input line's cell after the input before it.
+    // The paragraph centres that line, `> `, the input and `█`, in the
+    // block's inner area, half the line's cells left of the middle, both
+    // halves rounded down. A line too wide for the area wraps, and the
+    // cursor is not placed on the wrapped rows. The cursor's column counts
+    // characters.
+    let line_cells = u16::try_from(2 + cells(&input) + 1).unwrap_or(u16::MAX);
+    let before: String = input.chars().take(editor.cursor.1).collect();
+    let offset = (inner.width / 2).saturating_sub(line_cells.min(inner.width) / 2);
+    let before_cells = u16::try_from(2 + cells(&before)).unwrap_or(u16::MAX);
+    let cursor_x = inner.x.saturating_add(offset).saturating_add(before_cells);
     let cursor_y = area.y + 5; // Row of the input line within the popup
     frame.set_cursor_position((cursor_x, cursor_y));
 }
@@ -218,8 +226,8 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
         .borders(Borders::ALL)
         .style(Style::default().bg(theme.surface).fg(theme.text_primary));
 
-    // Find max name width across all visible fields for alignment.
-    let max_name_len = fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    // The widest name's cells, which every name is right-aligned to.
+    let max_name_cells = fields.iter().map(|(n, _)| cells(n)).max().unwrap_or(0);
 
     let divider = Line::from(Span::styled(
         "─".repeat(area.width.saturating_sub(4) as usize),
@@ -232,7 +240,7 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
     if !well_known.is_empty() {
         lines.push(Line::from(""));
         for (name, val) in &well_known {
-            lines.push(field_line(name, val, max_name_len, theme));
+            lines.push(field_line(name, val, max_name_cells, theme));
         }
     }
 
@@ -243,7 +251,7 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
             lines.push(divider);
         }
         for (name, val) in &others {
-            lines.push(field_line(name, val, max_name_len, theme));
+            lines.push(field_line(name, val, max_name_cells, theme));
         }
     }
 
@@ -261,11 +269,14 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
     frame.render_widget(paragraph, area);
 }
 
-/// Build a single key-value line for the event detail popup.
-fn field_line<'a>(name: &str, value: &str, max_name_len: usize, theme: &Theme) -> Line<'a> {
+/// Build a single key-value line for the event detail popup, the name
+/// right-aligned to `name_cells` cells.
+fn field_line<'a>(name: &str, value: &str, name_cells: usize, theme: &Theme) -> Line<'a> {
+    let name = sanitize_display_text(name);
+    let indent = " ".repeat(name_cells.saturating_sub(cells(&name)));
     Line::from(vec![
         Span::styled(
-            format!("{:>max_name_len$}  ", sanitize_display_text(name)),
+            format!("{indent}{name}  "),
             Style::default()
                 .fg(theme.text_accent)
                 .add_modifier(Modifier::BOLD),
@@ -488,3 +499,52 @@ fn render_column_picker(app: &App, frame: &mut Frame<'_>, selected: usize, scrol
 }
 
 use super::common::centered_rect;
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::tui::state::SimpleEditor;
+    use crate::tui::tests::test_app;
+
+    /// At 100x30 the save popup's input line is row 15, centred in the 58
+    /// cells from x = 21. A line of odd and of even cells starts where the
+    /// paragraph puts it, and the cursor sits after the cells of the input
+    /// before it, with CJK, lam-alef and a combining accent there.
+    #[test]
+    fn save_popup_cursor_sits_after_the_input_cells() {
+        // Input, cursor, where `>` is drawn, where the cursor sits.
+        let cases = [
+            // `> ab█`, five cells.
+            ("ab", 2, 48, 52),
+            ("ab", 0, 48, 50),
+            // `> abc█`, six cells.
+            ("abc", 3, 47, 52),
+            ("abc", 1, 47, 50),
+            // `> 日لاe\u{301}█`, eight cells; the cursor after the accent.
+            ("日لاe\u{301}", 5, 46, 53),
+            // Nine cells; the cursor before the `z`, then after `日`.
+            ("日لاe\u{301}z", 5, 46, 53),
+            ("日لاe\u{301}z", 1, 46, 50),
+        ];
+        for (input, cursor, prompt_x, cursor_x) in cases {
+            let mut app = test_app();
+            let mut editor = SimpleEditor::new_single_line();
+            editor.insert_text(input);
+            editor.cursor = (0, cursor);
+            app.popup = Some(Popup::SaveQuery { editor });
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| render(&app, frame)).unwrap();
+            assert_eq!(
+                terminal.backend().buffer()[(prompt_x, 15)].symbol(),
+                ">",
+                "{input:?}: the prompt"
+            );
+            terminal
+                .backend_mut()
+                .assert_cursor_position((cursor_x, 15));
+        }
+    }
+}
