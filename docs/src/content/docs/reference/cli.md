@@ -206,8 +206,9 @@ characters to a terminal.
 | `json` | Each such character in a key or a string is written as a `\uXXXX` escape. A JSON parser reads the original value. | Every value is exact |
 | `csv` | Each such character is shown as `�`, line breaks included | Every value is exact |
 
-`trawl schema` and `trawl driver` output follows the same rules. Messages on
-stderr always replace these characters with `�`.
+`trawl schema` output follows the same rules, and so do the results and the
+status that `trawl driver` prints. `trawl driver capture` prints the screen as
+the TUI drew it. Messages on stderr always replace these characters with `�`.
 
 To read exact values, send `json` or `csv` to a pipe or to a file with
 `-o, --output`.
