@@ -2829,6 +2829,15 @@ pub async fn set_schedule(
     let key_id = verified.id;
     let interval_secs = parse_interval(&req.interval)
         .map_err(|e| ServerError::BadRequest(format!("invalid interval: {e}")))?;
+    // The store keeps the cap as a signed 64-bit count and clamps anything
+    // larger. Refuse it here, so a caller never gets back a smaller cap than
+    // the one it sent.
+    if req.max_runs.is_some_and(|cap| i64::try_from(cap).is_err()) {
+        return Err(ServerError::BadRequest(format!(
+            "invalid max_runs: at most {}",
+            i64::MAX
+        )));
+    }
     let window = req
         .window
         .as_deref()
