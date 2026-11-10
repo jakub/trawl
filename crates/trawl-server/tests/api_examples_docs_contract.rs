@@ -44,8 +44,9 @@
 //! included, decodes as the `trawl_api::investigations` or
 //! `trawl_api::results` type the route takes or answers with (ADR-0059).
 //! The examples agree with each other: a response echoes its request, an
-//! overwrite answers the sequence after the one it expected, and a read
-//! reaches the investigation's own `seq`. The limits and the fixed texts
+//! overwrite answers the sequence after the one it expected and carries
+//! activity exactly when its request sent `seen_seq`, and a read reaches
+//! the investigation's own `seq`. The limits and the fixed texts
 //! the pages quote are the server's constants and messages.
 
 use std::collections::BTreeMap;
@@ -56,9 +57,9 @@ use serde_json::Value;
 use trawl_api::capabilities::CapabilitiesResponse;
 use trawl_api::ingest_preview::{PreviewEvent, PreviewResponse};
 use trawl_api::investigations::{
-    AppendEntry, AppendResponse, Attach, CreateInvestigation, EntryPayload, FindingStatusUpdate,
-    Investigation, InvestigationList, InvestigationRead, InvestigationStatus, PatchInvestigation,
-    RetentionExtension,
+    Activity, AppendEntry, AppendResponse, Attach, CreateInvestigation, EntryPayload,
+    FindingStatusUpdate, Investigation, InvestigationList, InvestigationRead, InvestigationStatus,
+    LogEntry, PatchInvestigation, PatchResponse, RetentionExtension,
 };
 use trawl_api::results::{
     CONTEXT_SAME_TIME_ROWS, CONTEXT_STATEMENT, CaptureKind, CaptureRequest, CaptureResponse,
@@ -871,6 +872,37 @@ fn the_append_examples_are_three_entries_and_the_finding_answered() {
     assert!(section(heading).contains(&format!("at most {ACTIVITY_LIMIT}")));
 }
 
+/// An overwrite's `activity` against its request's `seen_seq`: present
+/// exactly when the request sent one, and then other keys' entries
+/// changed after it, through at least the entry written.
+fn assert_overwrite_activity(
+    heading: &str,
+    seen_seq: Option<u64>,
+    activity: Option<&Activity>,
+    written: &LogEntry,
+) {
+    assert_eq!(
+        activity.is_some(),
+        seen_seq.is_some(),
+        "{heading:?}: an overwrite carries activity exactly when its request sent seen_seq"
+    );
+    let (Some(seen), Some(activity)) = (seen_seq, activity) else {
+        return;
+    };
+    for entry in &activity.entries {
+        assert!(
+            entry.updated_seq > seen,
+            "{heading:?}: changed after seen_seq"
+        );
+        assert_ne!(
+            entry.actor, written.actor,
+            "{heading:?}: the caller's own entries are left out"
+        );
+    }
+    assert!(!activity.more);
+    assert!(activity.through_seq >= written.seq);
+}
+
 #[test]
 fn the_overwrite_examples_answer_the_sequence_after_the_expected_one() {
     let heading = "Overwrite a title, question, or status";
@@ -886,23 +918,40 @@ fn the_overwrite_examples_answer_the_sequence_after_the_expected_one() {
         1,
         "one field a patch"
     );
-    let after: Investigation = decode_exactly(heading, examples[1]);
-    assert_eq!(after.seq, patch.expected_seq + 1);
-    assert_eq!(Some(after.status), patch.status);
+    let answer: PatchResponse = decode_exactly(heading, examples[1]);
+    assert_eq!(answer.investigation.seq, patch.expected_seq + 1);
+    assert_eq!(
+        answer.entry.seq, answer.investigation.seq,
+        "the investigation is as the write left it"
+    );
+    assert_eq!(Some(answer.investigation.status), patch.status);
+    assert!(matches!(
+        answer.entry.payload,
+        EntryPayload::Status { status } if Some(status) == patch.status
+    ));
+    assert_eq!(answer.entry.actor, answer.investigation.updated_by);
+    assert_overwrite_activity(
+        heading,
+        patch.seen_seq,
+        answer.activity.as_ref(),
+        &answer.entry,
+    );
 
     let heading = "Overwrite a finding's status";
     let examples = self::examples(heading, 2);
     let update: FindingStatusUpdate = decode_exactly(heading, examples[0]);
     let answer: AppendResponse = decode_exactly(heading, examples[1]);
     assert_eq!(answer.entry.seq, update.expected_seq + 1);
-    assert!(
-        answer.activity.is_none(),
-        "an overwrite carries no activity"
-    );
     assert!(matches!(
         answer.entry.payload,
         EntryPayload::FindingStatus { status, .. } if status == update.status
     ));
+    assert_overwrite_activity(
+        heading,
+        update.seen_seq,
+        answer.activity.as_ref(),
+        &answer.entry,
+    );
 
     let heading = "Extend evidence retention";
     let examples = self::examples(heading, 2);

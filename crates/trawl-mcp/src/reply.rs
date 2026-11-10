@@ -1003,7 +1003,8 @@ pub struct InvestigationReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entries: Option<ActivityView>,
     /// The entries other keys changed since this session last saw the
-    /// investigation, for `note`, `finding` and `keep`.
+    /// investigation, for `note`, `finding`, `keep`, `finding_status` and
+    /// `status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<ActivityView>,
     /// What the activity is or is not, in one sentence, when it is absent.

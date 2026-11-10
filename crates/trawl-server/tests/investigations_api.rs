@@ -34,8 +34,8 @@ use common::{MintedKey, TestServer, mint_key};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use trawl_api::investigations::{
-    AppendResponse, EntryKind, EntryPayload, Investigation, InvestigationId, InvestigationList,
-    InvestigationStatus,
+    Activity, AppendResponse, EntryKind, EntryPayload, FindingStatus, Investigation,
+    InvestigationId, InvestigationList, InvestigationStatus, PatchResponse,
 };
 use trawl_api::results::ResultState;
 use trawl_config::CaptureConfig;
@@ -1322,14 +1322,22 @@ async fn overwrites_check_the_sequence_and_a_closed_investigation_takes_only_a_r
 
     let (status, body) = patch(json!({ "expected_seq": 1, "title": "renamed" })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let renamed: Investigation = serde_json::from_value(body).unwrap();
-    assert_eq!((renamed.title.as_str(), renamed.seq), ("renamed", 2));
-    assert_eq!(renamed.updated_by.prefix, keys.agent.prefix);
+    let renamed: PatchResponse = serde_json::from_value(body).unwrap();
+    let header = &renamed.investigation;
+    assert_eq!((header.title.as_str(), header.seq), ("renamed", 2));
+    assert_eq!(header.updated_by.prefix, keys.agent.prefix);
+    assert_eq!(renamed.entry.seq, 2);
+    assert_eq!(
+        renamed.entry.payload,
+        EntryPayload::Title {
+            title: "renamed".into()
+        }
+    );
 
     let (status, body) = patch(json!({ "expected_seq": 2, "status": "closed" })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let closed: Investigation = serde_json::from_value(body).unwrap();
-    assert_eq!(closed.status, InvestigationStatus::Closed);
+    let closed: PatchResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(closed.investigation.status, InvestigationStatus::Closed);
 
     for entry in [
         note("late"),
@@ -1351,8 +1359,9 @@ async fn overwrites_check_the_sequence_and_a_closed_investigation_takes_only_a_r
     }
     let (status, body) = patch(json!({ "expected_seq": 3, "status": "open" })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["status"], "open");
-    assert_eq!(body["seq"], 4);
+    assert_eq!(body["investigation"]["status"], "open");
+    assert_eq!(body["investigation"]["seq"], 4);
+    assert_eq!(body["entry"]["seq"], 4);
 
     // A patch changes exactly one field.
     let (status, body) = patch(json!({ "expected_seq": 4 })).await;
@@ -1444,6 +1453,672 @@ async fn a_finding_status_overwrites_only_a_finding() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// `PATCH` investigation `n` as `key` with `body`.
+async fn patch_as(
+    server: &TestServer,
+    key: &MintedKey,
+    n: u32,
+    body: &Value,
+) -> (StatusCode, Value) {
+    call(
+        server,
+        &key.token,
+        Method::PATCH,
+        &format!("/investigations/{}", id(n)),
+        Some(body),
+    )
+    .await
+}
+
+/// [`patch_as`] that must answer 200.
+async fn patched(server: &TestServer, key: &MintedKey, n: u32, body: &Value) -> PatchResponse {
+    let (status, answer) = patch_as(server, key, n, body).await;
+    assert_eq!(status, StatusCode::OK, "{body}: {answer}");
+    let patched: PatchResponse = serde_json::from_value(answer).expect("a patch response");
+    assert_eq!(
+        patched.investigation.seq, patched.entry.seq,
+        "the header is the write's own"
+    );
+    patched
+}
+
+/// `PUT` the status of the finding at `finding` in investigation `n` as
+/// `key` with `body`.
+async fn finding_status_as(
+    server: &TestServer,
+    key: &MintedKey,
+    n: u32,
+    finding: u64,
+    body: &Value,
+) -> (StatusCode, Value) {
+    call(
+        server,
+        &key.token,
+        Method::PUT,
+        &format!("/investigations/{}/findings/{finding}/status", id(n)),
+        Some(body),
+    )
+    .await
+}
+
+/// The seqs of `activity`'s entries, each of which `key` wrote.
+fn written_by(activity: &Activity, key: &MintedKey) -> Vec<u64> {
+    assert!(
+        activity
+            .entries
+            .iter()
+            .all(|e| e.actor.prefix == key.prefix),
+        "{activity:?}"
+    );
+    activity.entries.iter().map(|e| e.seq).collect()
+}
+
+/// An overwrite with a `seen_seq` answers the other keys' entries since it,
+/// never the caller's own nor the entry it wrote, as an append does: a
+/// title, a question, a finding status, a close and a reopen. One without
+/// answers no `activity` at all. The cursor is bookkeeping: with it, a
+/// stale sequence, a closed investigation, a key without
+/// `investigation_write` and a patch of two fields are refused as before,
+/// and nothing refused is written.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, stated in order
+async fn overwrites_return_activity_without_changing_conflict_rules() {
+    let (server, keys) = boot().await;
+    create(&server, &keys.agent, 1).await;
+    let finding = appended(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "kind": "finding", "statement": "s", "status": "hypothesis", "references": [] }),
+    )
+    .await
+    .entry;
+    assert_eq!(finding.seq, 1);
+
+    // From 0, the window holds the agent's own finding, the operator's
+    // note and the title the agent writes: only the note comes back.
+    appended(&server, &keys.operator, 1, &note("before the title")).await;
+    let titled = patched(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "expected_seq": 2, "seen_seq": 0, "title": "renamed" }),
+    )
+    .await;
+    assert_eq!(titled.entry.seq, 3);
+    assert_eq!(titled.investigation.title, "renamed");
+    let activity = titled.activity.expect("activity");
+    assert_eq!(written_by(&activity, &keys.operator), [2]);
+    assert_eq!((activity.through_seq, activity.more), (3, false));
+
+    appended(&server, &keys.operator, 1, &note("before the question")).await;
+    let asked = patched(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "expected_seq": 4, "seen_seq": 3, "question": "Why?" }),
+    )
+    .await;
+    assert_eq!(asked.entry.seq, 5);
+    let activity = asked.activity.expect("activity");
+    assert_eq!(written_by(&activity, &keys.operator), [4]);
+    assert_eq!((activity.through_seq, activity.more), (5, false));
+
+    appended(&server, &keys.operator, 1, &note("before the finding")).await;
+    let (status, body) = finding_status_as(
+        &server,
+        &keys.agent,
+        1,
+        finding.seq,
+        &json!({ "expected_seq": 6, "seen_seq": 5, "status": "supported" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let supported: AppendResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(
+        (supported.entry.seq, supported.entry.payload),
+        (
+            7,
+            EntryPayload::FindingStatus {
+                finding_seq: 1,
+                status: FindingStatus::Supported
+            }
+        )
+    );
+    let activity = supported.activity.expect("activity");
+    assert_eq!(written_by(&activity, &keys.operator), [6]);
+    assert_eq!((activity.through_seq, activity.more), (7, false));
+
+    // A finding status from 0 also answers only the other key's notes,
+    // never the agent's own finding, title, question or earlier status.
+    appended(&server, &keys.operator, 1, &note("before the unresolved")).await;
+    let (status, body) = finding_status_as(
+        &server,
+        &keys.agent,
+        1,
+        finding.seq,
+        &json!({ "expected_seq": 8, "seen_seq": 0, "status": "unresolved" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let unresolved: AppendResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(unresolved.entry.seq, 9);
+    let activity = unresolved.activity.expect("activity");
+    assert_eq!(written_by(&activity, &keys.operator), [2, 4, 6, 8]);
+    assert_eq!((activity.through_seq, activity.more), (9, false));
+
+    appended(&server, &keys.operator, 1, &note("before the close")).await;
+    let closed = patched(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "expected_seq": 10, "seen_seq": 9, "status": "closed" }),
+    )
+    .await;
+    assert_eq!(closed.entry.seq, 11);
+    assert_eq!(closed.investigation.status, InvestigationStatus::Closed);
+    let activity = closed.activity.expect("activity");
+    assert_eq!(written_by(&activity, &keys.operator), [10]);
+    assert_eq!((activity.through_seq, activity.more), (11, false));
+
+    // The operator reopens, notes and closes; the agent's reopen answers
+    // all three.
+    patched(
+        &server,
+        &keys.operator,
+        1,
+        &json!({ "expected_seq": 11, "status": "open" }),
+    )
+    .await;
+    appended(&server, &keys.operator, 1, &note("before the reopen")).await;
+    patched(
+        &server,
+        &keys.operator,
+        1,
+        &json!({ "expected_seq": 13, "status": "closed" }),
+    )
+    .await;
+    let reopened = patched(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "expected_seq": 14, "seen_seq": 11, "status": "open" }),
+    )
+    .await;
+    assert_eq!(reopened.entry.seq, 15);
+    assert_eq!(reopened.investigation.status, InvestigationStatus::Open);
+    let activity = reopened.activity.expect("activity");
+    assert_eq!(written_by(&activity, &keys.operator), [12, 13, 14]);
+    assert_eq!((activity.through_seq, activity.more), (15, false));
+
+    // Without a `seen_seq`, no overwrite answers activity, whatever the
+    // operator wrote. A closed investigation takes no note before the
+    // reopen.
+    let mut seq = 15;
+    for (body, noted) in [
+        (json!({ "title": "plain" }), true),
+        (json!({ "question": "Plain?" }), true),
+        (json!({ "status": "closed" }), true),
+        (json!({ "status": "open" }), false),
+    ] {
+        if noted {
+            appended(&server, &keys.operator, 1, &note("unseen")).await;
+            seq += 1;
+        }
+        let mut request = body.clone();
+        request["expected_seq"] = json!(seq);
+        let (status, answer) = patch_as(&server, &keys.agent, 1, &request).await;
+        assert_eq!(status, StatusCode::OK, "{request}: {answer}");
+        seq += 1;
+        assert_eq!(answer["entry"]["seq"], seq, "{answer}");
+        assert_eq!(answer["investigation"]["seq"], seq, "{answer}");
+        assert!(answer.get("activity").is_none(), "{request}: {answer}");
+    }
+    appended(&server, &keys.operator, 1, &note("unseen")).await;
+    seq += 1;
+    let (status, answer) = finding_status_as(
+        &server,
+        &keys.agent,
+        1,
+        finding.seq,
+        &json!({ "expected_seq": seq, "status": "refuted" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    seq += 1;
+    assert_eq!(answer["entry"]["seq"], seq, "{answer}");
+    assert!(answer.get("activity").is_none(), "{answer}");
+
+    // A `seen_seq` past the current sequence answers the write with no
+    // entries.
+    let ahead = patched(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "expected_seq": seq, "seen_seq": 999, "title": "ahead" }),
+    )
+    .await;
+    seq += 1;
+    assert_eq!(ahead.entry.seq, seq);
+    let activity = ahead.activity.expect("activity");
+    assert!(activity.entries.is_empty(), "{activity:?}");
+    assert!(!activity.more, "{activity:?}");
+    let (status, answer) = finding_status_as(
+        &server,
+        &keys.agent,
+        1,
+        finding.seq,
+        &json!({ "expected_seq": seq, "seen_seq": 999, "status": "unresolved" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    seq += 1;
+    let ahead: AppendResponse = serde_json::from_value(answer).unwrap();
+    assert_eq!(ahead.entry.seq, seq);
+    let activity = ahead.activity.expect("activity");
+    assert!(activity.entries.is_empty(), "{activity:?}");
+    assert!(!activity.more, "{activity:?}");
+
+    // With a `seen_seq`, every refusal stands as it did without one.
+    let current = seq;
+    let stale = current - 1;
+    let (status, body) = patch_as(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "expected_seq": stale, "seen_seq": current, "title": "stale" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code(&body), "sequence_conflict", "{body}");
+    assert_eq!(
+        body["error"]["conflict"],
+        json!({ "expected": stale, "current": current })
+    );
+    let (status, body) = finding_status_as(
+        &server,
+        &keys.agent,
+        1,
+        finding.seq,
+        &json!({ "expected_seq": stale, "seen_seq": current, "status": "supported" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code(&body), "sequence_conflict", "{body}");
+    assert_eq!(
+        body["error"]["conflict"],
+        json!({ "expected": stale, "current": current })
+    );
+    let (status, body) = patch_as(
+        &server,
+        &keys.human,
+        1,
+        &json!({ "expected_seq": current, "seen_seq": current, "title": "read only" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(code(&body), "forbidden", "{body}");
+    let (status, body) = finding_status_as(
+        &server,
+        &keys.human,
+        1,
+        finding.seq,
+        &json!({ "expected_seq": current, "seen_seq": current, "status": "supported" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(code(&body), "forbidden", "{body}");
+    let (status, body) = patch_as(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "expected_seq": current, "seen_seq": current, "title": "t", "status": "closed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(message(&body).contains("more than one field"), "{body}");
+    let (status, body) = patch_as(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "expected_seq": current, "seen_seq": current }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(message(&body).contains("changes nothing"), "{body}");
+
+    let closed = patched(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "expected_seq": current, "seen_seq": current, "status": "closed" }),
+    )
+    .await;
+    let current = closed.entry.seq;
+    let (status, body) = patch_as(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "expected_seq": current, "seen_seq": current, "title": "closed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code(&body), "investigation_closed", "{body}");
+    let (status, body) = finding_status_as(
+        &server,
+        &keys.agent,
+        1,
+        finding.seq,
+        &json!({ "expected_seq": current, "seen_seq": current, "status": "supported" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code(&body), "investigation_closed", "{body}");
+
+    // The close is the only entry since the refusals began.
+    let page = read(&server, &keys.human, 1, &format!("?since={}", current - 1)).await;
+    assert_eq!(page.investigation.seq, current);
+    let kinds: Vec<_> = page
+        .entries
+        .iter()
+        .map(|e| (e.seq, e.payload.kind()))
+        .collect();
+    assert_eq!(kinds, [(current, EntryKind::Status)]);
+}
+
+/// A router over the fixture's state whose investigation store speaks
+/// through `proxy` on a single session, and a handle on that session's
+/// pool, for its backend's pid.
+async fn proxied(server: &TestServer, proxy: &answer_hold::Proxy) -> (axum::Router, sqlx::PgPool) {
+    let base: sqlx::postgres::PgConnectOptions = server.app_db_url.parse().unwrap();
+    #[allow(clippy::disallowed_methods)] // one session, through the proxy
+    let through = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(proxy.options(&base))
+        .await
+        .unwrap();
+    let mut state = server.state.clone();
+    state.storage.investigations = InvestigationStore::new(through.clone());
+    (server.router_over(state, |_| {}), through)
+}
+
+/// The pid of the backend behind `pool`'s one session.
+async fn backend_pid(pool: &sqlx::PgPool) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// End backend `pid` from a session of its own.
+async fn terminate(server: &TestServer, pid: i32) {
+    use sqlx::Connection as _;
+    let mut probe = sqlx::PgConnection::connect(&server.app_db_url)
+        .await
+        .unwrap();
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1, 10000)")
+        .bind(pid)
+        .fetch_one(&mut probe)
+        .await
+        .unwrap();
+    assert!(terminated, "the held session ended");
+}
+
+/// The status and body `app` answers `request` with, sent from a task of
+/// its own so the test can act while the answer is held.
+fn answer_of(
+    app: &axum::Router,
+    request: axum::http::Request<axum::body::Body>,
+) -> tokio::task::JoinHandle<(StatusCode, Vec<u8>)> {
+    use tower::ServiceExt as _;
+    let app = app.clone();
+    tokio::spawn(async move {
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    })
+}
+
+/// The `investigation_activity_failed` warnings `capture` holds, by
+/// error class. The capture records each field's `Debug`, so a string is
+/// quoted.
+fn activity_failures(capture: &Capture) -> Vec<String> {
+    capture
+        .events()
+        .iter()
+        .filter(|e| {
+            e.fields
+                .get("event_type")
+                .is_some_and(|t| t == "\"investigation_activity_failed\"")
+        })
+        .map(|e| e.field("error_class"))
+        .collect()
+}
+
+/// An overwrite commits before its activity is read, so a read that fails
+/// answers 200 with the written entry, and for a `PATCH` the
+/// investigation, with no activity entries and `more` set through the
+/// caller's `seen_seq`, and a warning: the caller reads the investigation
+/// for the rest and never writes again (ADR-0059). The finding-status
+/// `PUT` first, then a close. Each activity read's session runs through
+/// the answer-holding proxy, which holds Postgres's answer to the activity
+/// statement; the test terminates that session before letting the answer
+/// through.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, stated in order
+async fn an_overwrite_whose_activity_read_fails_stays_acknowledged() {
+    let capture = telemetry();
+    let (server, keys) = boot().await;
+    let created = create(&server, &keys.agent, 1).await;
+    let finding = appended(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "kind": "finding", "statement": "s", "status": "hypothesis", "references": [] }),
+    )
+    .await
+    .entry;
+    let other = appended(&server, &keys.operator, 1, &note("operator")).await;
+    let proxy = answer_hold::Proxy::start(&server.app_db_url.parse().unwrap()).await;
+    let (app, through) = proxied(&server, &proxy).await;
+
+    // Only the activity statement compares the actor's key id.
+    let held = backend_pid(&through).await;
+    proxy.hold_next(b"actor_key_id <> $3");
+    let answer = answer_of(
+        &app,
+        routed(
+            &keys.agent.token,
+            "PUT",
+            &format!("/investigations/{}/findings/{}/status", id(1), finding.seq),
+            Some(&json!({
+                "expected_seq": other.entry.seq,
+                "seen_seq": created.seq,
+                "status": "supported",
+            })),
+        ),
+    );
+    proxy.holding().await;
+    terminate(&server, held).await;
+    proxy.release();
+    let (status, body) = answer.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let supported: AppendResponse = serde_json::from_slice(&body).expect("an append response");
+    assert_eq!(supported.entry.seq, other.entry.seq + 1);
+    assert_eq!(
+        supported.entry.payload,
+        EntryPayload::FindingStatus {
+            finding_seq: finding.seq,
+            status: FindingStatus::Supported
+        }
+    );
+    assert_eq!(
+        supported.activity,
+        Some(Activity {
+            entries: Vec::new(),
+            through_seq: created.seq,
+            more: true,
+        }),
+        "the caller is sent to the read"
+    );
+
+    // The pool opens a fresh session through the proxy for the close.
+    let held = backend_pid(&through).await;
+    proxy.hold_next(b"actor_key_id <> $3");
+    let answer = answer_of(
+        &app,
+        routed(
+            &keys.agent.token,
+            "PATCH",
+            &format!("/investigations/{}", id(1)),
+            Some(&json!({
+                "expected_seq": supported.entry.seq,
+                "seen_seq": created.seq,
+                "status": "closed",
+            })),
+        ),
+    );
+    proxy.holding().await;
+    terminate(&server, held).await;
+    proxy.release();
+    let (status, body) = answer.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let closed: PatchResponse = serde_json::from_slice(&body).expect("a patch response");
+    assert_eq!(closed.entry.seq, supported.entry.seq + 1);
+    assert_eq!(
+        closed.entry.payload,
+        EntryPayload::Status {
+            status: InvestigationStatus::Closed
+        }
+    );
+    assert_eq!(closed.investigation.status, InvestigationStatus::Closed);
+    assert_eq!(closed.investigation.seq, closed.entry.seq);
+    assert_eq!(
+        closed.activity,
+        Some(Activity {
+            entries: Vec::new(),
+            through_seq: created.seq,
+            more: true,
+        }),
+        "the caller is sent to the read"
+    );
+
+    let log = read(&server, &keys.human, 1, "").await;
+    assert_eq!(log.investigation.seq, closed.entry.seq);
+    let kinds: Vec<_> = log
+        .entries
+        .iter()
+        .filter(|e| e.actor.prefix == keys.agent.prefix)
+        .map(|e| (e.seq, e.payload.kind()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (finding.seq, EntryKind::Finding),
+            (supported.entry.seq, EntryKind::FindingStatus),
+            (closed.entry.seq, EntryKind::Status),
+        ],
+        "each overwrite is written once"
+    );
+    assert_eq!(
+        activity_failures(capture),
+        ["\"store\"", "\"store\""],
+        "one warning names each failed read"
+    );
+}
+
+/// An investigation deleted the moment an overwrite commits still answers
+/// 200 with the header and the entry the write's own transaction saw, and
+/// activity through the written entry with nothing more: no read after the
+/// commit can turn the landed write into a 404.
+///
+/// The proxy holds Postgres's answer to the write's `COMMIT`. Postgres has
+/// committed by the time it answers, so while the answer is held the test
+/// reads the written entry and deletes the investigation from sessions of
+/// its own. The handler learns that its commit landed only after the
+/// investigation is gone, so any read it sends after the commit, wherever
+/// in the handler, finds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overwrite_answers_its_header_when_deleted_after_commit() {
+    let capture = telemetry();
+    let (server, keys) = boot().await;
+    let created = create(&server, &keys.agent, 1).await;
+    let other = appended(&server, &keys.operator, 1, &note("operator")).await;
+    let proxy = answer_hold::Proxy::start(&server.app_db_url.parse().unwrap()).await;
+    let (app, _through) = proxied(&server, &proxy).await;
+
+    // `WriteTx::finish` sends `COMMIT` as a simple query, and no statement
+    // of the write before it carries that text. The activity read's own
+    // `COMMIT` comes later, after the proxy has disarmed.
+    proxy.hold_next(b"COMMIT");
+    let answer = answer_of(
+        &app,
+        routed(
+            &keys.agent.token,
+            "PATCH",
+            &format!("/investigations/{}", id(1)),
+            Some(&json!({
+                "expected_seq": other.entry.seq,
+                "seen_seq": created.seq,
+                "status": "closed",
+            })),
+        ),
+    );
+    proxy.holding().await;
+    let log = read(&server, &keys.human, 1, "").await;
+    let written: Vec<_> = log
+        .entries
+        .iter()
+        .filter(|e| e.payload.kind() == EntryKind::Status)
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(written, [other.entry.seq + 1], "the close is written once");
+    // The write's row lock went with its commit, so the delete does not
+    // wait for the held answer.
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        call(
+            &server,
+            &keys.operator.token,
+            Method::DELETE,
+            &format!("/investigations/{}", id(1)),
+            None,
+        ),
+    )
+    .await
+    .expect("the delete waits on no lock of the committed write");
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    proxy.release();
+
+    let (status, body) = answer.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let closed: PatchResponse = serde_json::from_slice(&body).expect("a patch response");
+    assert_eq!(closed.entry.seq, other.entry.seq + 1);
+    assert_eq!(
+        closed.entry.payload,
+        EntryPayload::Status {
+            status: InvestigationStatus::Closed
+        }
+    );
+    assert_eq!(closed.investigation.status, InvestigationStatus::Closed);
+    assert_eq!(closed.investigation.seq, closed.entry.seq);
+    assert_eq!(closed.investigation.updated_by.prefix, keys.agent.prefix);
+    // Only an investigation the read no longer finds answers this: a
+    // failed read would set `more` and stop at the `seen_seq`.
+    assert_eq!(
+        closed.activity,
+        Some(Activity {
+            entries: Vec::new(),
+            through_seq: closed.entry.seq,
+            more: false,
+        })
+    );
+    assert!(activity_failures(capture).is_empty());
 }
 
 // -- retention and deletion -------------------------------------------------------
