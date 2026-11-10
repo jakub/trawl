@@ -145,8 +145,17 @@ pub async fn query(
     // on query_id without carrying the query text. The entry closes with
     // `tracked`: an outcome below, or abandoned if the transport drops this
     // future at an await first.
+    //
+    // `pending` puts the id in the pool's registry before the entry opens,
+    // so a cancel by id reaches the query while it still waits to start
+    // (ADR-0024, Amendment 2026-11-09). Declared first, it drops after
+    // `tracked`.
     let query_id = state.query.pool.allocate_query_id();
     crate::transport::failure::record_query_id(query_id);
+    let pending = state
+        .query
+        .pool
+        .pend(query_id, crate::pool::WorkKind::Query);
     let tracked = state.query.tracker.start(query_id, &verified, &req.query);
 
     // Default-filter lifecycle events carry metadata only — never the raw
@@ -208,16 +217,18 @@ pub async fn query(
     // shows where its time went.
     let checked = {
         let _phase = timing.clock().guard(QueryPhase::DslCheck);
-        crate::admission::admit(&state.query.pool, &req.query, deadline).await
+        crate::admission::admit(&state.query.pool, &req.query, deadline, Some(&pending)).await
     };
     let admitted = match checked {
         Err(refusal) => Err(refusal),
         Ok(query) => {
             timing.clock().enter(QueryPhase::SavedLookup);
-            match deadline
-                .run(try_resolve_from_saved(
-                    &state, &verified, &req.query, &query,
-                ))
+            match pending
+                .wake()
+                .run(
+                    deadline,
+                    try_resolve_from_saved(&state, &verified, &req.query, &query),
+                )
                 .await
             {
                 Ok(Ok(Some(resolved))) => {
@@ -233,12 +244,18 @@ pub async fn query(
                     timing.clock().exit(QueryPhase::SavedLookup);
                     Err(refusal)
                 }
-                Err(crate::deadline::Expired) => {
+                Err(crate::pool::StartRefusal::Expired) => {
                     timing.clock().exit(QueryPhase::SavedLookup);
                     // Refused here, before any work: named where it is made,
                     // like the pool's own capacity refusals.
                     timing.emit_complete(Outcome::CapacityRefused, std::time::Instant::now());
                     Err(ServerError::CapacityNotStarted)
+                }
+                // A cancel by id reached the lookup. The same refusal, and
+                // the account books it as one below.
+                Err(crate::pool::StartRefusal::Cancelled) => {
+                    timing.clock().exit(QueryPhase::SavedLookup);
+                    Err(pending.refuse())
                 }
             }
         }
@@ -280,9 +297,14 @@ pub async fn query(
                 // report run at write time, so a degraded pin the saved query
                 // bound would otherwise go unmentioned.
                 let snapshot = std::sync::Arc::clone(&state.query.degraded_fields.lock());
-                let degraded =
-                    degraded_fields_with_saved(snapshot, &query, &resolved.saved_dsl, deadline)
-                        .await;
+                let degraded = degraded_fields_with_saved(
+                    snapshot,
+                    &query,
+                    &resolved.saved_dsl,
+                    deadline,
+                    pending.wake(),
+                )
+                .await;
                 (
                     state
                         .query
@@ -1598,12 +1620,14 @@ pub(crate) fn degraded_fields_for<'a>(
 /// grammar only, so the parse builds no pattern, and it runs on the
 /// blocking pool, never here, within `deadline`. A notice is not the place
 /// to surface a failure: a text that does not parse, or a parse that did
-/// not finish before `deadline`, contributes nothing.
+/// not finish before `deadline` or before a cancel reached `wake`,
+/// contributes nothing. A cancelled request then refuses at its next wait.
 async fn degraded_fields_with_saved(
     snapshot: std::sync::Arc<crate::state::DegradedSnapshot>,
     query: &trawl_core::ast::Query,
     saved_dsl: &str,
     deadline: crate::deadline::Deadline,
+    wake: &crate::pool::Wake,
 ) -> Vec<String> {
     if snapshot.fields.is_empty() {
         return Vec::new();
@@ -1613,14 +1637,14 @@ async fn degraded_fields_with_saved(
         None
     } else {
         let saved_dsl = saved_dsl.to_owned();
-        deadline
-            .run(tokio::task::spawn_blocking(move || {
-                trawl_core::parser::parse_unbuilt(&saved_dsl)
-            }))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .and_then(Result::ok)
+        wake.run(
+            deadline,
+            tokio::task::spawn_blocking(move || trawl_core::parser::parse_unbuilt(&saved_dsl)),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(Result::ok)
     };
     degraded_in(&snapshot, std::iter::once(query).chain(saved.as_ref()))
 }
@@ -2279,7 +2303,7 @@ pub async fn create_saved(
     // refusing at the one moment a human is there to read the reason.
     let deadline =
         crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
-    crate::admission::admit(&state.query.pool, &req.query, deadline).await?;
+    crate::admission::admit(&state.query.pool, &req.query, deadline, None).await?;
 
     // DuplicateName → 409, InvalidName → 400 via the StoreError table.
     let saved = state
@@ -2309,7 +2333,7 @@ pub async fn update_saved(
     // proves a different thing, under the saved-query row lock.
     let deadline =
         crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
-    crate::admission::admit(&state.query.pool, &req.query, deadline).await?;
+    crate::admission::admit(&state.query.pool, &req.query, deadline, None).await?;
 
     // NotFound → 404, InvalidName → 400, DuplicateName → 409, and a new
     // DSL that contradicts the schedule's window → 400 naming both sides.
@@ -3383,9 +3407,17 @@ pub async fn export(
     let limit = req.limit.unwrap_or(max_export_rows).min(max_export_rows);
 
     // One id keys the whole export lifecycle and the pool's interrupt map,
-    // so the events correlate without carrying the query text.
+    // so the events correlate without carrying the query text. `pending`
+    // puts it in the pool's registry before the entry below opens, so a
+    // cancel by id reaches the export while it still waits to start
+    // (ADR-0024, Amendment 2026-11-09). Declared first, it drops after
+    // `tracked`.
     let query_id = state.query.pool.allocate_query_id();
     crate::transport::failure::record_query_id(query_id);
+    let pending = state
+        .query
+        .pool
+        .pend(query_id, crate::pool::WorkKind::Export);
     // Listed under that id like a query, so `DELETE /queries/{id}` reaches
     // it. `refused` or the ready body takes the entry and closes it once;
     // left in place when the transport drops this future at an await, it
@@ -3446,7 +3478,7 @@ pub async fn export(
     // asking here is what makes all three refuse the same text.
     {
         let _phase = timing.clock().guard(QueryPhase::DslCheck);
-        crate::admission::admit(&state.query.pool, &req.query, deadline).await
+        crate::admission::admit(&state.query.pool, &req.query, deadline, Some(&pending)).await
     }
     .map_err(refused)?;
 
@@ -5013,7 +5045,7 @@ mod tests {
         };
         use crate::deadline::Deadline;
         use crate::error::ServerError;
-        use crate::pool::ExecutorPool;
+        use crate::pool::{ExecutorPool, Wake};
         use crate::prepare::Door;
 
         fn pool(permits: usize) -> ExecutorPool {
@@ -5147,7 +5179,9 @@ mod tests {
             let saved = "zz_cp6a_saved_marker | where zz_saved > 1";
 
             let log = ParseLog::watch("zz_cp6a_saved_marker");
-            let named = degraded_fields_with_saved(degraded(&[]), &query, saved, far()).await;
+            let named =
+                degraded_fields_with_saved(degraded(&[]), &query, saved, far(), &Wake::default())
+                    .await;
             assert!(named.is_empty());
             assert!(log.parses().is_empty(), "a healthy install parses nothing");
 
@@ -5156,6 +5190,7 @@ mod tests {
                 &query,
                 saved,
                 far(),
+                &Wake::default(),
             )
             .await;
             assert_eq!(named, ["zz_saved", "zz_typed"]);
@@ -5176,6 +5211,7 @@ mod tests {
                 &query,
                 &saved,
                 crate::deadline::Deadline::after(std::time::Duration::ZERO),
+                &Wake::default(),
             )
             .await;
             assert_eq!(named, ["zz_typed"]);
@@ -5222,6 +5258,7 @@ mod tests {
                     &query,
                     "zz_saved > 1",
                     crate::deadline::Deadline::after(Duration::from_millis(200)),
+                    &Wake::default(),
                 )
                 .await
             });
@@ -5233,6 +5270,87 @@ mod tests {
 
             assert!(returned_while_held, "the wait outlived its deadline");
             assert_eq!(named, ["zz_typed"]);
+        }
+
+        /// A cancel by id ends the wait for the saved text's parse, long
+        /// before the deadline: with the only blocking thread held, the
+        /// notice returns with the typed stages alone. The request's next
+        /// wait, the pool's permit, then refuses at once although a permit
+        /// is free (ADR-0024, Amendment 2026-11-09).
+        #[test]
+        fn a_cancel_ends_the_wait_for_the_saved_text() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .expect("runtime");
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let (holding, on_holding) = std::sync::mpsc::channel::<()>();
+            let released = Arc::new(AtomicBool::new(false));
+            drop(runtime.spawn_blocking(move || {
+                holding.send(()).expect("the test waits for the hold");
+                // A hang guard: a wait the cancel never ends is released
+                // here, and the assertions below then fail.
+                let _ = held.recv_timeout(Duration::from_secs(10));
+            }));
+            on_holding.recv().expect("the blocking thread is held");
+            let watchdog_released = Arc::clone(&released);
+            let release_late = release.clone();
+            let (done, on_done) = std::sync::mpsc::channel::<()>();
+            let watchdog = std::thread::spawn(move || {
+                if on_done.recv_timeout(Duration::from_secs(5)).is_err() {
+                    watchdog_released.store(true, Ordering::SeqCst);
+                    let _ = release_late.send(());
+                }
+            });
+
+            let query = trawl_core::parser::parse("| from saved daily | where zz_typed > 1")
+                .expect("parses");
+            let (named, cancelled, next_wait) = runtime.block_on(async {
+                let pool = pool(1);
+                let id = pool.allocate_query_id();
+                let pending = pool.pend(id, crate::pool::WorkKind::FromSaved);
+                let (named, cancelled) = tokio::join!(
+                    degraded_fields_with_saved(
+                        degraded(&["zz_typed", "zz_saved"]),
+                        &query,
+                        "zz_saved > 1",
+                        far(),
+                        pending.wake(),
+                    ),
+                    async {
+                        // The parse is dispatched and waiting first.
+                        tokio::task::yield_now().await;
+                        pool.cancel_by_id(id)
+                    },
+                );
+                let next_wait = pool
+                    .execute_with_source(
+                        id,
+                        "| where zz_typed > 1",
+                        "read_parquet('/nonexistent/zz.parquet')",
+                        far(),
+                        false,
+                        crate::pool::WorkContext::system(crate::pool::WorkKind::FromSaved),
+                    )
+                    .await;
+                (named, cancelled, next_wait.result)
+            });
+            let returned_while_held = !released.load(Ordering::SeqCst);
+            let _ = done.send(());
+            let _ = release.send(());
+            runtime.shutdown_timeout(Duration::from_secs(10));
+            drop(watchdog.join());
+
+            assert!(cancelled, "the cancel reached the waiting request");
+            assert!(returned_while_held, "the wait outlived the cancel");
+            assert_eq!(named, ["zz_typed"]);
+            assert!(
+                matches!(next_wait, Err(ServerError::CapacityNotStarted)),
+                "{next_wait:?}"
+            );
         }
 
         /// Live-stream setup parses and compiles in its preparation job.

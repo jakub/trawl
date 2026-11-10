@@ -244,9 +244,10 @@ pub enum ServerError {
     /// Work refused before it started, for want of capacity (ADR-0024):
     /// the request's deadline passed, or its cancellation was latched,
     /// before any of its work ran. 503 `service_unavailable` with
-    /// [`CAPACITY_NOT_STARTED`] and no `Retry-After`. Every producer books
-    /// its timing account as a capacity refusal where it refuses, so
-    /// [`crate::query_timing::Outcome::of_error`] never has to.
+    /// [`CAPACITY_NOT_STARTED`] and no `Retry-After`. Its timing outcome is
+    /// a capacity refusal: the pool books it where it refuses, and
+    /// [`crate::query_timing::Outcome::of_error`] reads it back for a cancel
+    /// that ended a route's own wait.
     #[error("service unavailable: {}", CAPACITY_NOT_STARTED)]
     CapacityNotStarted,
 
@@ -2307,8 +2308,9 @@ mod tests {
     /// The pre-start capacity refusal is a typed variant (ADR-0040,
     /// amended 2026-11-08), and it answers what the string-matched 503 it
     /// replaced answered: 503 `service_unavailable` with the fixed
-    /// sentence and no `Retry-After`, the class `service_unavailable`, no
-    /// cause beneath it, and the same timing outcome.
+    /// sentence and no `Retry-After`, the class `service_unavailable`, and
+    /// no cause beneath it. Read back from the error, its timing outcome is
+    /// the capacity refusal its producers book.
     #[tokio::test]
     async fn typed_capacity_refusal_preserves_protocol() {
         use crate::query_timing::Outcome;
@@ -2323,16 +2325,11 @@ mod tests {
             err.to_string(),
             "service unavailable: server at capacity: the query was not started"
         );
-        // Each producer books `CapacityRefused` where it refuses
-        // (`pool::account_refused`, the expired `from saved` lookup,
-        // capture planning), so `of_error` does not name it. Read back from
-        // the error, the refusal keeps the outcome the old 503 had.
-        let untyped = ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned());
-        assert_eq!(Outcome::of_error(&err), Outcome::of_error(&untyped));
-        assert_eq!(
-            Outcome::of_error(&err),
-            Outcome::Error("service_unavailable")
-        );
+        // The pool, the expired `from saved` lookup and capture planning
+        // book `CapacityRefused` where they refuse. A cancel by id that
+        // ends a request in one of the route's own waits books it only
+        // through `of_error` (ADR-0024, Amendment 2026-11-09).
+        assert_eq!(Outcome::of_error(&err), Outcome::CapacityRefused);
 
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
