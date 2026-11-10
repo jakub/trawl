@@ -260,6 +260,8 @@ fn render_results(
 /// which is the notice for a machine, and a prose line inside a machine
 /// format is a parse error waiting to happen. One sentence, no advice beyond
 /// where to look: the case file holds the evidence and the remedy.
+///
+/// A field name is sender text, so each is sanitized whole.
 fn write_degraded_footer(
     out: &mut impl Write,
     format: OutputFormat,
@@ -268,12 +270,13 @@ fn write_degraded_footer(
     if format != OutputFormat::Table || fields.is_empty() {
         return Ok(());
     }
+    let shown: Vec<String> = fields.iter().map(|f| sanitize_display_text(f)).collect();
     writeln!(
         out,
         "note: results may be incomplete — degraded field(s): {} \
          (see: trawl schema field {})",
-        fields.join(", "),
-        fields[0]
+        shown.join(", "),
+        shown[0]
     )
 }
 
@@ -317,7 +320,11 @@ fn write_valid(
 ) -> std::io::Result<()> {
     writeln!(out, "valid")?;
     if let Some(refusal) = &response.format_error {
-        writeln!(out, "not formatted: {}", refusal.message)?;
+        writeln!(
+            out,
+            "not formatted: {}",
+            sanitize_display_text(&refusal.message)
+        )?;
     }
     Ok(())
 }
@@ -645,13 +652,27 @@ fn write_client_error(
 
 /// Render an `EngineError` with span details for embedded mode.
 pub fn render_engine_error(query: &str, err: &trawl_engine::error::EngineError) {
+    // stderr is the last place to report anything; a failed write has
+    // nowhere to go.
+    let _ = write_engine_error(&mut io::stderr().lock(), query, err);
+}
+
+/// Write `err` for the query `query`, the text that was run.
+///
+/// An error other than a parse error can quote the data the engine read,
+/// so it is sanitized whole, like the details.
+fn write_engine_error(
+    out: &mut impl Write,
+    query: &str,
+    err: &trawl_engine::error::EngineError,
+) -> io::Result<()> {
     match err {
         trawl_engine::error::EngineError::Parse(errors) => {
-            eprintln!("trawl: parse error");
+            writeln!(out, "trawl: parse error")?;
             let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();
-            render_error_details(query, &details);
+            write_error_details(out, query, &details)
         }
-        other => eprintln!("trawl: {other}"),
+        other => writeln!(out, "trawl: {}", sanitize_display_text(&other.to_string())),
     }
 }
 
@@ -1571,5 +1592,69 @@ mod tests {
         let table = String::from_utf8(buf).unwrap();
         assert!(!table.contains('\r'), "{table:?}");
         assert_eq!(cell_lines(&table), ["text", "a", "b", "a", "b"], "{table}");
+    }
+
+    /// Every value a prose line interpolates goes through the sanitize
+    /// rule whole: its ESC, RLO and line break each print U+FFFD, and only
+    /// the line's own layout breaks it.
+    #[test]
+    fn terminal_cli_lines_sanitize_sender_text() {
+        let hostile = "v\u{1b}[2J\u{202e}\nx";
+        let shown = "v\u{FFFD}[2J\u{FFFD}\u{FFFD}x";
+
+        // The degraded footer names the field twice.
+        let mut buf = Vec::new();
+        write_degraded_footer(
+            &mut buf,
+            OutputFormat::Table,
+            &[hostile.to_owned(), "status".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            format!(
+                "note: results may be incomplete — degraded field(s): {shown}, status \
+                 (see: trawl schema field {shown})\n"
+            )
+        );
+
+        // The server's reason for not formatting a valid query.
+        let response = trawl_client::ValidationResponse {
+            valid: true,
+            errors: vec![],
+            formatted: None,
+            format_error: Some(trawl_client::types::FormatErrorDetail {
+                kind: trawl_client::types::FormatErrorKind::TooLong,
+                message: hostile.to_owned(),
+            }),
+        };
+        let mut buf = Vec::new();
+        write_valid(&mut buf, &response).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            format!("valid\nnot formatted: {shown}\n")
+        );
+
+        // An embedded engine error, which can quote the data it read.
+        let refused = trawl_engine::error::EngineError::Refused {
+            message: hostile.to_owned(),
+        };
+        let mut buf = Vec::new();
+        write_engine_error(&mut buf, "q", &refused).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), format!("trawl: {shown}\n"));
+
+        // A parse error keeps its heading and its caret details.
+        let parse = trawl_engine::error::EngineError::Parse(vec![trawl_core::parser::ParseError {
+            message: hostile.to_owned(),
+            span: 0..1,
+            label: None,
+            hint: None,
+        }]);
+        let mut buf = Vec::new();
+        write_engine_error(&mut buf, "q", &parse).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            format!("trawl: parse error\n\n  q\n  ~\n  {shown}\n\n")
+        );
     }
 }
