@@ -10,7 +10,7 @@
 //! [`doctor`], [`preview_ingest`] and [`schema`] are public for exactly
 //! that reason — `config` and `tui` stay private.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Mutex;
@@ -905,7 +905,7 @@ async fn run_driver(socket: &str, cmd: DriverSubcommand) -> Result<(), CliError>
     match cmd {
         DriverSubcommand::Status => {
             let resp = driver_send(&socket_path, &DriverRequest::Status).await?;
-            let json = serde_json::to_string_pretty(&resp.data)
+            let json = terminal::json_pretty(&resp.data, terminal::Destination::stdout())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             println!("{json}");
         }
@@ -1074,17 +1074,15 @@ fn render_driver_data(
     let columns = data.columns.as_deref().unwrap_or_default();
     let rows = data.rows.as_deref().unwrap_or_default();
 
-    let format = format.unwrap_or_else(|| {
-        if io::stdout().is_terminal() {
-            cli::OutputFormat::Table
-        } else {
-            cli::OutputFormat::Json
-        }
+    let destination = terminal::Destination::stdout();
+    let format = format.unwrap_or(match destination {
+        terminal::Destination::Terminal => cli::OutputFormat::Table,
+        terminal::Destination::Data => cli::OutputFormat::Json,
     });
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    cli::render_driver_results(columns, rows, format, &mut out)?;
+    cli::render_driver_results(columns, rows, format, destination, &mut out)?;
     out.flush()?;
     Ok(())
 }

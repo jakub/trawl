@@ -16,6 +16,7 @@ use trawl_client::{CatalogConflictsResponse, CatalogFieldResponse, CatalogFields
 
 use crate::CliError;
 use crate::cli::{ConnectionParams, OutputFormat, render_driver_results};
+use crate::terminal::Destination;
 
 /// Parse a `--last` window like `30m`, `2h`, `7d`, `1w` into seconds.
 pub fn parse_last(input: &str) -> Result<u64, CliError> {
@@ -51,22 +52,25 @@ pub fn parse_window(input: &str, option: &str) -> Result<u64, CliError> {
     Ok(n.saturating_mul(mult))
 }
 
-/// Resolve the output format like `trawl query` does: table on a TTY,
-/// ndjson on a pipe.
-fn resolve_format(format: Option<OutputFormat>) -> Result<OutputFormat, CliError> {
-    let format = format.unwrap_or_else(|| {
-        if io::stdout().is_terminal() {
-            OutputFormat::Table
-        } else {
-            OutputFormat::Json
-        }
+/// Resolve the output format like `trawl query` does, table on a terminal
+/// and ndjson on a pipe, with the [`Destination`] the renderers write for.
+///
+/// Both come from one look at this process's stdout, which is where the
+/// binary points every command's `out`. An in-process caller that passes
+/// its own writer gets whatever its stdout is: under a test harness that
+/// captures it, data.
+fn resolve_format(format: Option<OutputFormat>) -> Result<(OutputFormat, Destination), CliError> {
+    let destination = Destination::stdout();
+    let format = format.unwrap_or(match destination {
+        Destination::Terminal => OutputFormat::Table,
+        Destination::Data => OutputFormat::Json,
     });
     if format == OutputFormat::Parquet {
         return Err(CliError::Usage(
             "parquet output is not supported for schema commands".into(),
         ));
     }
-    Ok(format)
+    Ok((format, destination))
 }
 
 /// `CatalogFieldsResponse` → generic (columns, rows).
@@ -216,8 +220,9 @@ fn render<W: Write>(
     columns: &[String],
     rows: &[Vec<Json>],
     format: OutputFormat,
+    destination: Destination,
 ) -> Result<(), CliError> {
-    render_driver_results(columns, rows, format, out)?;
+    render_driver_results(columns, rows, format, destination, out)?;
     out.flush()?;
     Ok(())
 }
@@ -232,7 +237,7 @@ pub async fn run_fields<W: Write>(
     limit: Option<usize>,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
 
     // Embedded mode: DESCRIBE over local parquet, no server needed.
     if let Some(glob) = data {
@@ -241,7 +246,7 @@ pub async fn run_fields<W: Write>(
             "note: --data lists names and physical types only; catalog metadata \
              (pins, observations, conflicts) requires a server"
         );
-        return render(out, &columns, &rows, format);
+        return render(out, &columns, &rows, format, destination);
     }
 
     let conn = conn.ok_or_else(|| {
@@ -252,7 +257,7 @@ pub async fn run_fields<W: Write>(
     let resp = client.catalog_fields(service, since_secs, limit).await?;
 
     let (columns, rows) = fields_to_rows(&resp);
-    render(out, &columns, &rows, format)?;
+    render(out, &columns, &rows, format, destination)?;
     let degraded = resp.fields.iter().filter(|f| f.verdict.is_some()).count();
     eprintln!(
         "{}/{} pins used{}{}",
@@ -281,7 +286,7 @@ pub async fn run_field<W: Write>(
     after: Option<&str>,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let conn = conn.ok_or_else(|| CliError::Usage("schema field requires a server".into()))?;
     let client = conn.client()?;
     let resp = client.catalog_field(name, limit, after).await?;
@@ -325,7 +330,7 @@ pub async fn run_field<W: Write>(
 
     label(out, human, "\nservices:")?;
     let (columns, rows) = field_services_to_rows(&resp);
-    render(out, &columns, &rows, format)?;
+    render(out, &columns, &rows, format, destination)?;
     if let Some(cursor) = &resp.services_cursor {
         eprintln!("(more services — rerun with --after {cursor})");
     }
@@ -333,7 +338,7 @@ pub async fn run_field<W: Write>(
     if !resp.conflicts.is_empty() {
         label(out, human, "\nrecent conflicts:")?;
         let (columns, rows) = field_conflicts_to_rows(&resp);
-        render(out, &columns, &rows, format)?;
+        render(out, &columns, &rows, format, destination)?;
     }
     Ok(())
 }
@@ -442,7 +447,7 @@ pub async fn run_conflicts<W: Write>(
     limit: Option<usize>,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let conn = conn.ok_or_else(|| CliError::Usage("schema conflicts requires a server".into()))?;
     let since_secs = last.map(parse_last).transpose()?;
     let client = conn.client()?;
@@ -451,7 +456,7 @@ pub async fn run_conflicts<W: Write>(
         .await?;
 
     let (columns, rows) = conflicts_to_rows(&resp);
-    render(out, &columns, &rows, format)?;
+    render(out, &columns, &rows, format, destination)?;
     if resp.truncated {
         eprintln!("(listing truncated — raise --limit)");
     }
@@ -723,7 +728,14 @@ mod tests {
     fn seeded_responses_render_populated_output() {
         let (columns, rows) = fields_to_rows(&sample_fields());
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Table, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Table,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("duration"), "{text}");
         assert!(text.contains("BIGINT"), "{text}");
@@ -731,7 +743,14 @@ mod tests {
 
         let (columns, rows) = conflicts_to_rows(&sample_conflicts());
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let parsed: Json = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(parsed["expected_type"], "BIGINT");
@@ -1213,7 +1232,7 @@ pub async fn run_repin(
     flags: RepinFlags,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     // Refused here as well as server-side, because this one is a typo an
     // operator can fix without spending a job claim: the dialect reads
     // numerals onto the severity ladder, so no other target has anywhere to
@@ -1287,7 +1306,7 @@ pub async fn run_repin(
         writeln!(out, "repin {}: {verdict}", job.field)?;
     }
     let (columns, rows) = repin_job_to_rows(&job, format);
-    render_driver_results(&columns, &rows, format, out)?;
+    render_driver_results(&columns, &rows, format, destination, out)?;
     // The case file goes to stdout for a human and to stderr for a machine
     // format (`label`), so a piped `-f json` stays one parseable record while
     // the operator still reads the evidence.
@@ -1467,13 +1486,13 @@ pub async fn run_repin_status(
     conn: ConnectionParams,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let client = conn.client()?;
     let status = client.schema_repin_status().await?;
     match status.job {
         Some(job) => {
             let (columns, rows) = repin_job_to_rows(&job, format);
-            render_driver_results(&columns, &rows, format, out)?;
+            render_driver_results(&columns, &rows, format, destination, out)?;
             render_repin_case_file(out, format == OutputFormat::Table, &job)?;
         }
         None => writeln!(out, "no repin job has ever run")?,
@@ -1496,7 +1515,7 @@ pub async fn run_repin_cancel(
     conn: ConnectionParams,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let client = conn.client()?;
     let (accepted, receipt) = match client.schema_repin_cancel().await? {
         trawl_client::RepinCancel::Cancelling(r) => (true, r),
@@ -1513,7 +1532,7 @@ pub async fn run_repin_cancel(
         writeln!(out, "repin cancel: {detail}")?;
         if let Some(job) = &receipt.job {
             let (columns, rows) = repin_job_to_rows(job, format);
-            render_driver_results(&columns, &rows, format, out)?;
+            render_driver_results(&columns, &rows, format, destination, out)?;
         }
     } else {
         // One record, one header: the verdict and the job it is about are
@@ -1521,7 +1540,7 @@ pub async fn run_repin_cancel(
         // would put two headers of different widths in one csv stream.
         // The job columns are null when the server attached no row.
         let (columns, rows) = cancel_receipt_to_rows(&receipt, format);
-        render_driver_results(&columns, &rows, format, out)?;
+        render_driver_results(&columns, &rows, format, destination, out)?;
     }
     if accepted {
         return Ok(());
@@ -1613,7 +1632,7 @@ pub async fn run_ack<W: Write>(
     clear: bool,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let human = format == OutputFormat::Table;
     let client = conn.client()?;
 
@@ -1633,7 +1652,7 @@ pub async fn run_ack<W: Write>(
 
     let ack = client.schema_field_ack(field, note).await?;
     let (columns, rows) = ack_to_rows(field, &ack, format);
-    render(out, &columns, &rows, format)?;
+    render(out, &columns, &rows, format, destination)?;
     label(
         out,
         human,
@@ -1667,14 +1686,21 @@ mod ack_tests {
         assert_eq!(rows.len(), 1, "an ack is one record");
         for format in [OutputFormat::Table, OutputFormat::Json, OutputFormat::Csv] {
             let mut out = Vec::new();
-            render_driver_results(&columns, &rows, format, &mut out).unwrap();
+            render_driver_results(&columns, &rows, format, Destination::Data, &mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
             assert!(text.contains("duration"), "{format:?}: {text}");
             assert!(text.contains("tkl_abc123"), "{format:?}: {text}");
         }
 
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["evidence_through"], 7);
@@ -1686,7 +1712,14 @@ mod ack_tests {
         bare.note = None;
         let (columns, rows) = ack_to_rows("duration", &bare, OutputFormat::Json);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["note"], Json::Null);
@@ -1770,13 +1803,20 @@ mod repin_tests {
         let (columns, rows) = repin_job_to_rows(&sample_job(), OutputFormat::Table);
         for format in [OutputFormat::Table, OutputFormat::Json, OutputFormat::Csv] {
             let mut out = Vec::new();
-            render_driver_results(&columns, &rows, format, &mut out).unwrap();
+            render_driver_results(&columns, &rows, format, Destination::Data, &mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
             assert!(text.contains("VARCHAR"), "{format:?}: {text}");
             assert!(text.contains("succeeded"), "{format:?}: {text}");
         }
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["resurrectable"], 25);
@@ -1838,7 +1878,14 @@ mod repin_tests {
         let mut out = Vec::new();
         writeln!(out, "repin {}: dry run", job.field).unwrap();
         let (columns, rows) = repin_job_to_rows(&job, OutputFormat::Table);
-        render_driver_results(&columns, &rows, OutputFormat::Table, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Table,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         render_repin_case_file(&mut out, true, &job).unwrap();
         let text = String::from_utf8(out).unwrap();
 
@@ -1924,7 +1971,7 @@ mod repin_tests {
         let render = |format| {
             let (columns, rows) = repin_job_to_rows(&job, format);
             let mut out = Vec::new();
-            render_driver_results(&columns, &rows, format, &mut out).unwrap();
+            render_driver_results(&columns, &rows, format, Destination::Data, &mut out).unwrap();
             String::from_utf8(out).unwrap()
         };
 
@@ -1956,7 +2003,14 @@ mod repin_tests {
         hostile.unmapped_samples = vec!["=cmd()".into(), "gold".into()];
         let (columns, rows) = repin_job_to_rows(&hostile, OutputFormat::Csv);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Csv, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Csv,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let csv = String::from_utf8(out).unwrap();
         assert!(csv.contains("'=cmd()"), "formula prefix missing: {csv}");
 
@@ -1968,7 +2022,14 @@ mod repin_tests {
         running.requires_force_reason = None;
         let (columns, rows) = repin_job_to_rows(&running, OutputFormat::Json);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["requires_force"], Json::Null);
@@ -2163,7 +2224,14 @@ mod repin_tests {
 
         let (columns, rows) = repin_job_to_rows(&job, OutputFormat::Json);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["accepted_max_nulled_rows"], 22);
@@ -2307,7 +2375,8 @@ mod repin_tests {
             for format in [OutputFormat::Json, OutputFormat::Csv] {
                 let (columns, rows) = cancel_receipt_to_rows(&receipt, format);
                 let mut out = Vec::new();
-                render_driver_results(&columns, &rows, format, &mut out).unwrap();
+                render_driver_results(&columns, &rows, format, Destination::Data, &mut out)
+                    .unwrap();
                 let text = String::from_utf8(out).unwrap();
                 assert!(text.contains(spelling), "{format:?}: {text}");
             }
@@ -2326,7 +2395,14 @@ mod repin_tests {
 
         let (columns, rows) = cancel_receipt_to_rows(&receipt, OutputFormat::Csv);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Csv, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Csv,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let csv = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = csv.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2, "one header, one row: {csv}");
@@ -2345,7 +2421,14 @@ mod repin_tests {
         // json is ndjson: one object carrying both halves.
         let (columns, rows) = cancel_receipt_to_rows(&receipt, OutputFormat::Json);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 1, "one object: {text}");
@@ -2364,7 +2447,14 @@ mod repin_tests {
         let (without_job, rows) = cancel_receipt_to_rows(&bodiless, OutputFormat::Json);
         assert_eq!(with_job, without_job);
         let mut out = Vec::new();
-        render_driver_results(&without_job, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &without_job,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["outcome"], "no_job_running");
@@ -2436,7 +2526,14 @@ mod repin_tests {
         job.error = Some("cancelled by ops during build; the live corpus was never touched".into());
         let (columns, rows) = repin_job_to_rows(&job, OutputFormat::Json);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["status"], "cancelled");
@@ -2558,7 +2655,7 @@ pub async fn run_gc_pins<W: Write>(
     older_than: Option<&str>,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let older_than_secs = older_than
         .map(|s| parse_window(s, "--older-than"))
         .transpose()?;
@@ -2573,7 +2670,7 @@ pub async fn run_gc_pins<W: Write>(
         label(out, human, &line)?;
     }
     let (columns, rows) = gc_candidates_to_rows(&resp);
-    render(out, &columns, &rows, format)?;
+    render(out, &columns, &rows, format, destination)?;
     label(out, human, &gc_outcome_line(&resp))?;
     Ok(())
 }
@@ -2650,7 +2747,14 @@ mod gc_tests {
     fn csv_output_is_one_rectangle() {
         let (columns, rows) = gc_candidates_to_rows(&sample_report(false));
         let mut out = Vec::new();
-        render(&mut out, &columns, &rows, OutputFormat::Csv).unwrap();
+        render(
+            &mut out,
+            &columns,
+            &rows,
+            OutputFormat::Csv,
+            Destination::Data,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 3, "one header + two rows: {text}");
@@ -2685,7 +2789,14 @@ mod gc_tests {
 
         let (columns, rows) = gc_candidates_to_rows(&report);
         let mut out = Vec::new();
-        render(&mut out, &columns, &rows, OutputFormat::Table).unwrap();
+        render(
+            &mut out,
+            &columns,
+            &rows,
+            OutputFormat::Table,
+            Destination::Data,
+        )
+        .unwrap();
         let table = String::from_utf8(out).unwrap();
         assert!(table.contains("retired_counter"), "{table}");
         assert!(table.contains("typo_feild"), "{table}");
@@ -2717,7 +2828,14 @@ mod gc_tests {
     fn json_output_is_one_record_per_candidate() {
         let (columns, rows) = gc_candidates_to_rows(&sample_report(false));
         let mut out = Vec::new();
-        render(&mut out, &columns, &rows, OutputFormat::Json).unwrap();
+        render(
+            &mut out,
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let records: Vec<Json> = text
             .lines()

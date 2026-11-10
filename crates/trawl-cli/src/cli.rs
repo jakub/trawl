@@ -4,7 +4,7 @@
 
 //! CLI mode: query execution, validation, and output formatting.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::Path;
 
 use clap::ValueEnum;
@@ -14,7 +14,7 @@ use trawl_core::text_layout::{caret_layout, locate_span};
 use trawl_engine::value::{QueryResult, Value};
 
 use crate::CliError;
-use crate::terminal::table_cell;
+use crate::terminal::{Destination, table_cell, write_json_line};
 
 /// Output format for CLI query results.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -119,12 +119,10 @@ pub async fn run_query(
     zone: DisplayZone,
     conn: Option<ConnectionParams>,
 ) -> Result<(), CliError> {
-    let format = format.unwrap_or_else(|| {
-        if io::stdout().is_terminal() {
-            OutputFormat::Table
-        } else {
-            OutputFormat::Json
-        }
+    let destination = Destination::stdout();
+    let format = format.unwrap_or(match destination {
+        Destination::Terminal => OutputFormat::Table,
+        Destination::Data => OutputFormat::Json,
     });
     if format == OutputFormat::Parquet {
         return run_parquet_query(query, data, output, conn).await;
@@ -176,6 +174,7 @@ pub async fn run_query(
         zone,
         &degraded,
         &severity_columns,
+        destination,
         &mut stdout.lock(),
         &mut io::stderr(),
     )
@@ -204,6 +203,9 @@ fn embedded_severity_columns(query: &str) -> Vec<String> {
 /// The stream split is the contract: with `-o`, the file is the
 /// deliverable and the footer goes to `err` so it can never
 /// contaminate it; without it, results and footer share `out`.
+///
+/// `destination` is what `out` is. The `-o` file is data even when `out`
+/// is a terminal, so its json and csv carry every value exactly.
 #[allow(clippy::too_many_arguments)]
 fn emit_results(
     result: &mut QueryResult,
@@ -212,16 +214,24 @@ fn emit_results(
     zone: DisplayZone,
     degraded: &[String],
     severity_columns: &[String],
+    destination: Destination,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> Result<(), CliError> {
     if let Some(output_path) = output {
         let mut file = std::fs::File::create(output_path)?;
-        render_results(result, format, zone, severity_columns, &mut file)?;
+        render_results(
+            result,
+            format,
+            zone,
+            severity_columns,
+            Destination::Data,
+            &mut file,
+        )?;
         // The file is the deliverable; the notice belongs on the terminal.
         write_degraded_footer(err, format, degraded)?;
     } else {
-        render_results(result, format, zone, severity_columns, out)?;
+        render_results(result, format, zone, severity_columns, destination, out)?;
         write_degraded_footer(out, format, degraded)?;
     }
 
@@ -237,17 +247,18 @@ fn render_results(
     format: OutputFormat,
     zone: DisplayZone,
     severity_columns: &[String],
+    destination: Destination,
     out: &mut impl Write,
 ) -> io::Result<()> {
     match format {
         OutputFormat::Table => render_table(result, zone, severity_columns, out),
         OutputFormat::Json => {
             trawl_api::zone::apply_zone(result, zone);
-            render_ndjson(result, out)
+            render_ndjson(result, destination, out)
         }
         OutputFormat::Csv => {
             trawl_api::zone::apply_zone(result, zone);
-            render_csv(result, out)
+            render_csv(result, destination, out)
         }
         OutputFormat::Parquet => unreachable!("handled above"),
     }
@@ -485,7 +496,11 @@ fn severity_cell_text(v: &Value) -> String {
     severity_token(v).map_or_else(|| v.to_string(), str::to_owned)
 }
 
-fn render_ndjson(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
+fn render_ndjson(
+    result: &QueryResult,
+    destination: Destination,
+    out: &mut impl Write,
+) -> io::Result<()> {
     for row in &result.rows {
         let mut map = serde_json::Map::new();
         for (col, val) in result.columns.iter().zip(row.iter()) {
@@ -493,22 +508,28 @@ fn render_ndjson(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
             // (ADR-0035, amended 2026-10-22).
             map.insert(col.name.clone(), val.to_plain_json());
         }
-        serde_json::to_writer(&mut *out, &map).map_err(io::Error::other)?;
-        writeln!(out)?;
+        write_json_line(out, &map, destination)?;
     }
     Ok(())
 }
 
-fn render_csv(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
+fn render_csv(
+    result: &QueryResult,
+    destination: Destination,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let headers: Vec<String> = result
         .columns
         .iter()
-        .map(|c| csv_escape_string(&c.name))
+        .map(|c| csv_text(&c.name, destination))
         .collect();
     writeln!(out, "{}", headers.join(","))?;
 
     for row in &result.rows {
-        let cells: Vec<String> = row.iter().map(csv_escape_value).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .map(|v| csv_escape_value(v, destination))
+            .collect();
         writeln!(out, "{}", cells.join(","))?;
     }
     Ok(())
@@ -516,7 +537,7 @@ fn render_csv(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
 
 /// Escape a value for CSV output, applying formula injection protection
 /// only to string values (numeric types are inherently safe).
-fn csv_escape_value(val: &Value) -> String {
+fn csv_escape_value(val: &Value, destination: Destination) -> String {
     match val {
         Value::Null => String::new(),
         Value::Boolean(b) => b.to_string(),
@@ -524,8 +545,20 @@ fn csv_escape_value(val: &Value) -> String {
         Value::UInt(u) => u.to_string(),
         // full precision for data fidelity (TUI display uses 2dp for readability)
         Value::Float(f) => f.to_string(),
-        Value::String(s) => csv_escape_string(s),
-        Value::Array(_) => csv_escape_string(&val.to_plain_json().to_string()),
+        Value::String(s) => csv_text(s, destination),
+        Value::Array(_) => csv_text(&val.to_plain_json().to_string(), destination),
+    }
+}
+
+/// Text as one CSV field for `destination`.
+///
+/// On a terminal each unsafe character, a line break included, becomes
+/// U+FFFD first, so formula protection and quoting see the text the
+/// operator will. Elsewhere the field carries the text exactly.
+fn csv_text(text: &str, destination: Destination) -> String {
+    match destination {
+        Destination::Terminal => csv_escape_string(&sanitize_display_text(text)),
+        Destination::Data => csv_escape_string(text),
     }
 }
 
@@ -685,12 +718,13 @@ pub fn render_driver_results(
     columns: &[String],
     rows: &[Vec<serde_json::Value>],
     format: OutputFormat,
+    destination: Destination,
     out: &mut impl Write,
 ) -> io::Result<()> {
     match format {
         OutputFormat::Table => render_driver_table(columns, rows, out),
-        OutputFormat::Json => render_driver_ndjson(columns, rows, out),
-        OutputFormat::Csv => render_driver_csv(columns, rows, out),
+        OutputFormat::Json => render_driver_ndjson(columns, rows, destination, out),
+        OutputFormat::Csv => render_driver_csv(columns, rows, destination, out),
         OutputFormat::Parquet => {
             writeln!(
                 out,
@@ -732,6 +766,7 @@ fn render_driver_table(
 fn render_driver_ndjson(
     columns: &[String],
     rows: &[Vec<serde_json::Value>],
+    destination: Destination,
     out: &mut impl Write,
 ) -> io::Result<()> {
     for row in rows {
@@ -739,8 +774,7 @@ fn render_driver_ndjson(
         for (col, val) in columns.iter().zip(row.iter()) {
             map.insert(col.clone(), val.clone());
         }
-        serde_json::to_writer(&mut *out, &map).map_err(io::Error::other)?;
-        writeln!(out)?;
+        write_json_line(out, &map, destination)?;
     }
     Ok(())
 }
@@ -748,13 +782,17 @@ fn render_driver_ndjson(
 fn render_driver_csv(
     columns: &[String],
     rows: &[Vec<serde_json::Value>],
+    destination: Destination,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let headers: Vec<String> = columns.iter().map(|c| csv_escape_string(c)).collect();
+    let headers: Vec<String> = columns.iter().map(|c| csv_text(c, destination)).collect();
     writeln!(out, "{}", headers.join(","))?;
 
     for row in rows {
-        let cells: Vec<String> = row.iter().map(csv_escape_json).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .map(|v| csv_escape_json(v, destination))
+            .collect();
         writeln!(out, "{}", cells.join(","))?;
     }
     Ok(())
@@ -773,13 +811,13 @@ fn json_display(v: &serde_json::Value) -> String {
 }
 
 /// CSV-escape a JSON value, applying formula injection protection to strings.
-fn csv_escape_json(v: &serde_json::Value) -> String {
+fn csv_escape_json(v: &serde_json::Value, destination: Destination) -> String {
     match v {
         serde_json::Value::Null => String::new(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => csv_escape_string(s),
-        other => csv_escape_string(&other.to_string()),
+        serde_json::Value::String(s) => csv_text(s, destination),
+        other => csv_text(&other.to_string(), destination),
     }
 }
 
@@ -919,7 +957,7 @@ mod tests {
         assert_eq!(degraded, ["duration"], "degraded_fields must survive");
         assert!(severity.is_empty());
 
-        let emit = |format, output: Option<&Path>| {
+        let emit_with = |result: &QueryResult, format, output: Option<&Path>, destination| {
             let (mut out, mut err) = (Vec::new(), Vec::new());
             emit_results(
                 &mut result.clone(),
@@ -928,6 +966,7 @@ mod tests {
                 DisplayZone::Utc,
                 &degraded,
                 &severity,
+                destination,
                 &mut out,
                 &mut err,
             )
@@ -937,6 +976,8 @@ mod tests {
                 String::from_utf8(err).unwrap(),
             )
         };
+        let emit =
+            |format, output: Option<&Path>| emit_with(&result, format, output, Destination::Data);
 
         // Table to stdout: the footer rides the result stream, stderr silent.
         let (out, err) = emit(OutputFormat::Table, None);
@@ -967,6 +1008,33 @@ mod tests {
         }
         let (csv, _) = emit(OutputFormat::Csv, None);
         assert_eq!(csv, "host\ndb1\n");
+
+        // The file is data even when stdout is a terminal: with sender text
+        // in a row, the `-o` json and csv hold the bytes a pipe gets. Only
+        // the table, a human format, is sanitized in the file.
+        let mut hostile = result.clone();
+        hostile
+            .rows
+            .push(vec![Value::String("x\u{1b}[2J\u{202e}\ny".to_owned())]);
+        for format in [OutputFormat::Json, OutputFormat::Csv] {
+            let (piped, _) = emit_with(&hostile, format, None, Destination::Data);
+            assert!(piped.contains('\u{202e}'), "{format:?}: {piped:?}");
+            let path = dir.path().join("hostile.out");
+            let (out, err) = emit_with(&hostile, format, Some(&path), Destination::Terminal);
+            assert!(out.is_empty(), "{out}");
+            assert!(err.is_empty(), "{err}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), piped, "{format:?}");
+        }
+        let path = dir.path().join("hostile.txt");
+        emit_with(
+            &hostile,
+            OutputFormat::Table,
+            Some(&path),
+            Destination::Terminal,
+        );
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(!file.contains(['\u{1b}', '\u{202e}']), "{file:?}");
+        assert!(file.contains("x\u{FFFD}[2J\u{FFFD}"), "{file}");
     }
 
     /// The table renders the token; json and csv keep the number.
@@ -983,9 +1051,9 @@ mod tests {
             )],
             rows: vec![vec![Value::Integer(17)]],
         };
-        let render = |f: fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>| {
+        let render = |f: fn(&QueryResult, Destination, &mut Vec<u8>) -> io::Result<()>| {
             let mut buf = Vec::new();
-            f(&result, &mut buf).unwrap();
+            f(&result, Destination::Data, &mut buf).unwrap();
             String::from_utf8(buf).unwrap()
         };
         let table = {
@@ -1010,7 +1078,15 @@ mod tests {
         };
         let zone = "+02:00".parse::<DisplayZone>().unwrap();
         let mut buf = Vec::new();
-        render_results(&mut result, OutputFormat::Table, zone, &[], &mut buf).unwrap();
+        render_results(
+            &mut result,
+            OutputFormat::Table,
+            zone,
+            &[],
+            Destination::Data,
+            &mut buf,
+        )
+        .unwrap();
         let table = String::from_utf8(buf).unwrap();
         assert!(table.contains("2026-10-25 02:30:00 +02:00"), "{table}");
     }
@@ -1041,7 +1117,15 @@ mod tests {
         };
         let render = |format, zone| {
             let mut buf = Vec::new();
-            render_results(&mut result.clone(), format, zone, &[], &mut buf).unwrap();
+            render_results(
+                &mut result.clone(),
+                format,
+                zone,
+                &[],
+                Destination::Data,
+                &mut buf,
+            )
+            .unwrap();
             String::from_utf8(buf).unwrap()
         };
 
@@ -1131,11 +1215,11 @@ mod tests {
 
         // Machine formats carry the number in both columns.
         for f in [
-            render_ndjson as fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>,
+            render_ndjson as fn(&QueryResult, Destination, &mut Vec<u8>) -> io::Result<()>,
             render_csv,
         ] {
             let mut buf = Vec::new();
-            f(&result, &mut buf).unwrap();
+            f(&result, Destination::Data, &mut buf).unwrap();
             let text = String::from_utf8(buf).unwrap();
             assert!(!text.contains("error2"), "{text}");
         }
@@ -1156,48 +1240,69 @@ mod tests {
 
     #[test]
     fn csv_negative_number_not_prefixed() {
-        assert_eq!(csv_escape_value(&Value::Integer(-42)), "-42");
+        assert_eq!(
+            csv_escape_value(&Value::Integer(-42), Destination::Data),
+            "-42"
+        );
     }
 
     #[test]
     fn csv_negative_float_not_prefixed() {
-        assert_eq!(csv_escape_value(&Value::Float(-1.5)), "-1.5");
+        assert_eq!(
+            csv_escape_value(&Value::Float(-1.5), Destination::Data),
+            "-1.5"
+        );
     }
 
     #[test]
     fn csv_formula_string_prefixed() {
-        assert_eq!(csv_escape_value(&Value::String("=cmd".into())), "'=cmd");
+        assert_eq!(
+            csv_escape_value(&Value::String("=cmd".into()), Destination::Data),
+            "'=cmd"
+        );
     }
 
     #[test]
     fn csv_tab_prefixed() {
-        assert_eq!(csv_escape_value(&Value::String("\tfoo".into())), "'\tfoo");
+        assert_eq!(
+            csv_escape_value(&Value::String("\tfoo".into()), Destination::Data),
+            "'\tfoo"
+        );
     }
 
     #[test]
     fn csv_at_sign_prefixed() {
-        assert_eq!(csv_escape_value(&Value::String("@sum".into())), "'@sum");
+        assert_eq!(
+            csv_escape_value(&Value::String("@sum".into()), Destination::Data),
+            "'@sum"
+        );
     }
 
     #[test]
     fn csv_pipe_prefixed() {
-        assert_eq!(csv_escape_value(&Value::String("|cmd".into())), "'|cmd");
+        assert_eq!(
+            csv_escape_value(&Value::String("|cmd".into()), Destination::Data),
+            "'|cmd"
+        );
     }
 
     #[test]
     fn csv_null_empty() {
-        assert_eq!(csv_escape_value(&Value::Null), "");
+        assert_eq!(csv_escape_value(&Value::Null, Destination::Data), "");
     }
 
     #[test]
     fn csv_string_with_comma() {
-        assert_eq!(csv_escape_value(&Value::String("a,b".into())), "\"a,b\"");
+        assert_eq!(
+            csv_escape_value(&Value::String("a,b".into()), Destination::Data),
+            "\"a,b\""
+        );
     }
 
     #[test]
     fn csv_string_with_quotes() {
         assert_eq!(
-            csv_escape_value(&Value::String(r#"say "hi""#.into())),
+            csv_escape_value(&Value::String(r#"say "hi""#.into()), Destination::Data),
             r#""say ""hi""""#
         );
     }
@@ -1476,6 +1581,10 @@ mod tests {
     /// output, each becomes one U+FFFD, and a line break stays a line inside
     /// its cell.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "both table renderers share one fixture"
+    )]
     fn terminal_table_sanitizes_sender_text() {
         use trawl_engine::value::{Column, ColumnType};
 
@@ -1546,7 +1655,14 @@ mod tests {
             })
             .collect();
         let mut buf = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Table, &mut buf).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Table,
+            Destination::Data,
+            &mut buf,
+        )
+        .unwrap();
         let table = String::from_utf8(buf).unwrap();
         assert_eq!(unsafe_chars(&table), 0, "{table:?}");
         assert!(table.contains(header_shown), "{table}");
@@ -1586,6 +1702,7 @@ mod tests {
                 vec![serde_json::json!("a\r\nb")],
             ],
             OutputFormat::Table,
+            Destination::Data,
             &mut buf,
         )
         .unwrap();
@@ -1655,6 +1772,355 @@ mod tests {
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             format!("trawl: parse error\n\n  q\n  ~\n  {shown}\n\n")
+        );
+    }
+
+    /// One string per group of characters the sanitize rule names, each
+    /// group whole: every C0 control, DEL and every C1 control, the soft
+    /// hyphen, and each explicit range of bidi, zero-width, joiner and
+    /// separator characters. Together they are every unsafe character.
+    fn every_unsafe_group() -> Vec<String> {
+        use trawl_core::sanitize::is_unsafe_display_char;
+        let groups: Vec<String> = [
+            '\u{0}'..='\u{1f}',
+            '\u{7f}'..='\u{9f}',
+            '\u{ad}'..='\u{ad}',
+            '\u{61c}'..='\u{61c}',
+            '\u{200b}'..='\u{200f}',
+            '\u{2028}'..='\u{202e}',
+            '\u{2060}'..='\u{2060}',
+            '\u{2066}'..='\u{2069}',
+            '\u{feff}'..='\u{feff}',
+        ]
+        .into_iter()
+        .map(Iterator::collect)
+        .collect();
+        let all = groups.concat();
+        assert!(all.chars().all(is_unsafe_display_char), "{all:?}");
+        for c in (0..=0x0010_ffff)
+            .filter_map(char::from_u32)
+            .filter(|&c| is_unsafe_display_char(c))
+        {
+            assert!(all.contains(c), "{c:?} is in no group");
+        }
+        groups.iter().map(|group| format!("<{group}>")).collect()
+    }
+
+    /// The json under test: every unsafe group, then text that must decode
+    /// unchanged (a quote, a literal backslash, the six characters
+    /// `\u202e`, a backslash right before a real RLO, and a safe character
+    /// outside the BMP), then one short value per escape the test reads.
+    fn json_texts() -> Vec<String> {
+        let mut texts = every_unsafe_group();
+        texts.extend(
+            [
+                "q\"t",
+                "b\\s",
+                "\\u202e",
+                "\\\u{202e}",
+                "🦀",
+                "e\u{1b}f",
+                "c\u{9b}d",
+                "r\u{202e}l",
+                "n\nl",
+            ]
+            .map(str::to_owned),
+        );
+        texts
+    }
+
+    /// The data bytes are `serde_json::to_writer` of each map plus a
+    /// newline. The terminal text holds no unsafe character but one
+    /// record-ending newline per row, decodes line by line to the same
+    /// maps, and spells each escape the test names.
+    fn assert_terminal_json(
+        data: &[u8],
+        terminal: &[u8],
+        maps: &[serde_json::Map<String, serde_json::Value>],
+    ) {
+        use trawl_core::sanitize::is_unsafe_display_char;
+        let mut expected = Vec::new();
+        for map in maps {
+            serde_json::to_writer(&mut expected, map).unwrap();
+            expected.push(b'\n');
+        }
+        assert!(data == expected, "data bytes moved: {data:?}");
+
+        let terminal = std::str::from_utf8(terminal).unwrap();
+        assert!(terminal.ends_with('\n'), "{terminal:?}");
+        let lines: Vec<&str> = terminal.split_terminator('\n').collect();
+        assert_eq!(lines.len(), maps.len(), "{terminal:?}");
+        for (line, map) in lines.iter().zip(maps) {
+            assert!(!line.chars().any(is_unsafe_display_char), "{line:?}");
+            let decoded: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(decoded, serde_json::Value::Object(map.clone()), "{line}");
+        }
+        for escaped in [
+            r#""e\u001bf""#,
+            r#""c\u009bd""#,
+            r#""r\u202el""#,
+            r#""n\u000al""#,
+            r#""\\\u202e""#,
+            r#""\\u202e""#,
+            r#""q\"t""#,
+            r#""b\\s""#,
+            "\"🦀\"",
+        ] {
+            assert!(terminal.contains(escaped), "{escaped} missing: {terminal}");
+        }
+    }
+
+    /// `json` on a terminal writes every unsafe character, in a key or a
+    /// value at any depth, as a `\uXXXX` escape, so each line decodes to
+    /// exactly what a pipe gets; in a pipe the bytes are `serde_json`'s own.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the query, driver and status renderers share one fixture"
+    )]
+    fn terminal_json_escapes_without_changing_values() {
+        use serde_json::{Map, Value as Json, json};
+        use trawl_core::sanitize::is_unsafe_display_char;
+        use trawl_engine::value::{Column, ColumnType};
+
+        let texts = json_texts();
+        let scalars = [
+            ("null", Value::Null, Json::Null),
+            ("yes", Value::Boolean(true), json!(true)),
+            ("no", Value::Boolean(false), json!(false)),
+            ("neg", Value::Integer(-1), json!(-1)),
+            ("max", Value::UInt(u64::MAX), json!(u64::MAX)),
+        ];
+        // Every hostile text is a key too.
+        let names: Vec<String> = texts
+            .iter()
+            .map(|t| format!("k{t}"))
+            .chain(scalars.iter().map(|(name, ..)| (*name).to_owned()))
+            .collect();
+
+        // `trawl query`: a row of strings, then a row of nested lists.
+        let result = QueryResult {
+            columns: names
+                .iter()
+                .map(|n| Column::new(n.as_str(), ColumnType::String))
+                .collect(),
+            rows: vec![
+                texts
+                    .iter()
+                    .map(|t| Value::String(t.clone()))
+                    .chain(scalars.iter().map(|(_, v, _)| v.clone()))
+                    .collect(),
+                texts
+                    .iter()
+                    .map(|t| {
+                        let inner = vec![Value::String(t.clone()), Value::Null];
+                        Value::Array(vec![Value::String(t.clone()), Value::Array(inner)])
+                    })
+                    .chain(scalars.iter().map(|(_, v, _)| v.clone()))
+                    .collect(),
+            ],
+        };
+        let maps: Vec<Map<String, Json>> = result
+            .rows
+            .iter()
+            .map(|row| {
+                names
+                    .iter()
+                    .cloned()
+                    .zip(row.iter().map(Value::to_plain_json))
+                    .collect()
+            })
+            .collect();
+        let render = |destination| {
+            let mut buf = Vec::new();
+            render_ndjson(&result, destination, &mut buf).unwrap();
+            buf
+        };
+        assert_terminal_json(
+            &render(Destination::Data),
+            &render(Destination::Terminal),
+            &maps,
+        );
+
+        // The driver renderer: a row of strings, then a row of objects
+        // whose keys at every depth are hostile too.
+        let nested = |t: &str| {
+            let mut inner = Map::new();
+            inner.insert(format!("d{t}"), json!(t));
+            let mut outer = Map::new();
+            outer.insert(format!("n{t}"), json!([t, inner]));
+            Json::Object(outer)
+        };
+        let rows: Vec<Vec<Json>> = vec![
+            texts
+                .iter()
+                .map(|t| json!(t))
+                .chain(scalars.iter().map(|(.., j)| j.clone()))
+                .collect(),
+            texts
+                .iter()
+                .map(|t| nested(t))
+                .chain(scalars.iter().map(|(.., j)| j.clone()))
+                .collect(),
+        ];
+        let maps: Vec<Map<String, Json>> = rows
+            .iter()
+            .map(|row| names.iter().cloned().zip(row.iter().cloned()).collect())
+            .collect();
+        let render = |destination| {
+            let mut buf = Vec::new();
+            render_driver_results(&names, &rows, OutputFormat::Json, destination, &mut buf)
+                .unwrap();
+            buf
+        };
+        assert_terminal_json(
+            &render(Destination::Data),
+            &render(Destination::Terminal),
+            &maps,
+        );
+
+        // `driver status`, pretty-printed: the data text is
+        // `to_string_pretty`'s, and the terminal text has its layout, line
+        // for line and indent for indent, with only string content escaped.
+        let status = crate::tui::driver::DriverData {
+            query: Some(texts.concat()),
+            result_columns: Some(names.clone()),
+            live_mode: Some(true),
+            result_rows: Some(rows.len()),
+            columns: Some(names.clone()),
+            rows: Some(rows.clone()),
+            ..Default::default()
+        };
+        let data = crate::terminal::json_pretty(&status, Destination::Data).unwrap();
+        assert_eq!(data, serde_json::to_string_pretty(&status).unwrap());
+        let shown = crate::terminal::json_pretty(&status, Destination::Terminal).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Json>(&shown).unwrap(),
+            serde_json::to_value(&status).unwrap()
+        );
+        let indents = |text: &str| -> Vec<usize> {
+            text.split('\n')
+                .map(|line| line.len() - line.trim_start_matches(' ').len())
+                .collect()
+        };
+        assert!(data.lines().count() > 1, "{data}");
+        assert_eq!(indents(&shown), indents(&data));
+        for line in shown.split('\n') {
+            assert!(!line.chars().any(is_unsafe_display_char), "{line:?}");
+        }
+    }
+
+    /// `csv` on a terminal writes U+FFFD for each unsafe character, a line
+    /// break included, before formula protection and quoting, so only the
+    /// record separators break lines. A pipe and an `-o` file keep every
+    /// value byte-exact and formula-protected.
+    #[test]
+    fn terminal_csv_replaces_unsafe_characters() {
+        use serde_json::json;
+        use trawl_engine::value::{Column, ColumnType};
+
+        let text = |t: &str| (Value::String(t.to_owned()), json!(t));
+        // Each value as a query cell and as driver JSON, then what a pipe
+        // gets, then what a terminal gets.
+        let cases = [
+            (text("e\u{1b}[2Jx"), "e\u{1b}[2Jx", "e\u{FFFD}[2Jx"),
+            (text("r\u{202e}l"), "r\u{202e}l", "r\u{FFFD}l"),
+            (text("c\u{9b}1m"), "c\u{9b}1m", "c\u{FFFD}1m"),
+            (text("a\nb"), "\"a\nb\"", "a\u{FFFD}b"),
+            (text("a\r\nb"), "\"a\r\nb\"", "a\u{FFFD}\u{FFFD}b"),
+            (text("a\rb"), "\"a\rb\"", "a\u{FFFD}b"),
+            (text("a\tb"), "a\tb", "a\u{FFFD}b"),
+            // A leading tab is a formula trigger in a file, and U+FFFD,
+            // which is none, on a terminal.
+            (text("\tx"), "'\tx", "\u{FFFD}x"),
+            (text("=cmd"), "'=cmd", "'=cmd"),
+            (text("+1"), "'+1", "'+1"),
+            (text("-1"), "'-1", "'-1"),
+            ((Value::Integer(-1), json!(-1)), "-1", "-1"),
+            ((Value::Float(-1.5), json!(-1.5)), "-1.5", "-1.5"),
+            (text("@x"), "'@x", "'@x"),
+            (text("|x"), "'|x", "'|x"),
+            ((Value::Null, json!(null)), "", ""),
+            (text("null"), "null", "null"),
+            ((Value::Boolean(true), json!(true)), "true", "true"),
+            (text("a,\u{202e}"), "\"a,\u{202e}\"", "\"a,\u{FFFD}\""),
+            (
+                (
+                    Value::Array(vec![Value::String("q\u{202e}\"".to_owned())]),
+                    json!(["q\u{202e}\""]),
+                ),
+                "\"[\"\"q\u{202e}\\\"\"\"\"]\"",
+                "\"[\"\"q\u{FFFD}\\\"\"\"\"]\"",
+            ),
+        ];
+        let header = "h\u{1b}[2J\u{202e}";
+        let lines = |head: &str, cells: &mut dyn Iterator<Item = &str>| {
+            let mut text = format!("{head}\n");
+            for cell in cells {
+                text.push_str(cell);
+                text.push('\n');
+            }
+            text
+        };
+        let data = lines(header, &mut cases.iter().map(|c| c.1));
+        let terminal = lines("h\u{FFFD}[2J\u{FFFD}", &mut cases.iter().map(|c| c.2));
+        assert_eq!(unsafe_chars(&terminal), 0, "{terminal:?}");
+        assert_eq!(terminal.matches('\n').count(), cases.len() + 1);
+
+        let result = QueryResult {
+            columns: vec![Column::new(header, ColumnType::String)],
+            rows: cases.iter().map(|c| vec![c.0.0.clone()]).collect(),
+        };
+        let render = |destination| {
+            let mut buf = Vec::new();
+            render_csv(&result, destination, &mut buf).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        assert_eq!(render(Destination::Data), data);
+        assert_eq!(render(Destination::Terminal), terminal);
+
+        // `-o` with a terminal on stdout: the file is data.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        emit_results(
+            &mut result.clone(),
+            OutputFormat::Csv,
+            Some(&path),
+            DisplayZone::Utc,
+            &[],
+            &[],
+            Destination::Terminal,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert!(out.is_empty() && err.is_empty(), "{out:?} {err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), data);
+
+        // The driver renderer: the same values as JSON, and an object.
+        let mut rows: Vec<Vec<serde_json::Value>> =
+            cases.iter().map(|c| vec![c.0.1.clone()]).collect();
+        rows.push(vec![json!({ "k\u{202e}": "v" })]);
+        let render = |destination| {
+            let mut buf = Vec::new();
+            render_driver_results(
+                &[header.to_owned()],
+                &rows,
+                OutputFormat::Csv,
+                destination,
+                &mut buf,
+            )
+            .unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        assert_eq!(
+            render(Destination::Data),
+            format!("{data}\"{{\"\"k\u{202e}\"\":\"\"v\"\"}}\"\n")
+        );
+        assert_eq!(
+            render(Destination::Terminal),
+            format!("{terminal}\"{{\"\"k\u{FFFD}\"\":\"\"v\"\"}}\"\n")
         );
     }
 }
