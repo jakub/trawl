@@ -789,28 +789,17 @@ mod tests {
             ),
             (ors.clone(), ors, true),
         ];
-        let trees = std::thread::Builder::new()
+        // Each pair drops on the small stack once it is compared.
+        std::thread::Builder::new()
             .stack_size(TOKIO_WORKER_STACK)
             .spawn(move || {
-                corpus
-                    .iter()
-                    .map(|(a, b, want)| {
-                        let (qa, qb) = (parsed(a), parsed(b));
-                        assert_eq!(same_query(&qa, &qb), *want, "{a:.40}… vs {b:.40}…");
-                        (qa, qb)
-                    })
-                    .collect::<Vec<_>>()
+                for (a, b, want) in &corpus {
+                    let (qa, qb) = (parsed(a), parsed(b));
+                    assert_eq!(same_query(&qa, &qb), *want, "{a:.40}… vs {b:.40}…");
+                }
             })
             .expect("spawn")
             .join()
-            .expect("the comparison must not overflow a 2 MiB stack");
-        // Dropping a tree this deep recurses in its drop glue, which is
-        // not the walk under test, so it gets a stack it fits in.
-        std::thread::Builder::new()
-            .stack_size(64 * TOKIO_WORKER_STACK)
-            .spawn(move || drop(trees))
-            .expect("spawn")
-            .join()
-            .expect("drop");
+            .expect("the comparison and the drop must not overflow a 2 MiB stack");
     }
 }

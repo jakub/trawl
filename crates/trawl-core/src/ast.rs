@@ -713,6 +713,81 @@ pub enum Expr {
     },
 }
 
+/// Drops a tree with an explicit work list, so its depth costs heap, not
+/// stack.
+///
+/// `MAX_EXPR_DEPTH` bounds nesting, not a flat chain: `1+1+…` folds into a
+/// left-deep tree as deep as the chain is long, and the longest chain
+/// `MAX_QUERY_LEN` admits is tens of thousands of levels. Drop glue would
+/// recurse once a level and overflow a tokio worker's 2 MiB stack, so each
+/// node hands its children that own children to the work list before it
+/// is freed, and no drop runs below the node being dropped. Leaves and
+/// nodes whose children are all leaves free without allocating.
+///
+/// Only the drop has this guarantee: the derived `Clone`, `PartialEq` and
+/// `Debug` still recurse.
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.defer_children(&mut pending);
+        while let Some(mut node) = pending.pop() {
+            node.defer_children(&mut pending);
+            // `node` drops here, its children leaves or placeholders
+        }
+    }
+}
+
+impl Expr {
+    /// Moves every child that owns children of its own onto `pending`,
+    /// leaving a leaf in its place.
+    ///
+    /// No wildcard and no `..`: a new variant or child field does not
+    /// compile until it has a drop decision here.
+    fn defer_children(&mut self, pending: &mut Vec<Self>) {
+        fn defer(child: &mut Spanned<Expr>, pending: &mut Vec<Expr>) {
+            if child.node.owns_children() {
+                pending.push(std::mem::replace(
+                    &mut child.node,
+                    Expr::Literal(LiteralValue::Null),
+                ));
+            }
+        }
+        match self {
+            Self::Binary { lhs, op: _, rhs } => {
+                defer(lhs, pending);
+                defer(rhs, pending);
+            }
+            Self::Unary { op: _, operand } => defer(operand, pending),
+            Self::FunctionCall { name: _, args } => {
+                for arg in args {
+                    defer(arg, pending);
+                }
+            }
+            Self::InList { expr, list } => {
+                defer(expr, pending);
+                for item in list {
+                    defer(item, pending);
+                }
+            }
+            Self::FieldRef(_) | Self::Literal(_) => {}
+        }
+    }
+
+    fn owns_children(&self) -> bool {
+        match self {
+            Self::Binary {
+                lhs: _,
+                op: _,
+                rhs: _,
+            }
+            | Self::Unary { op: _, operand: _ }
+            | Self::InList { expr: _, list: _ } => true,
+            Self::FunctionCall { name: _, args } => !args.is_empty(),
+            Self::FieldRef(_) | Self::Literal(_) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     // arithmetic
@@ -916,5 +991,102 @@ mod tests {
     fn a_query_without_a_time_clause_carries_none() {
         assert_eq!(clause("service=nginx"), None);
         assert_eq!(clause("| stats count()"), None);
+    }
+
+    /// Runs `work` on a thread with the 2 MiB stack of a tokio worker.
+    fn on_worker_stack(case: &str, work: impl FnOnce() + Send + 'static) {
+        const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
+        std::thread::Builder::new()
+            .name(case.to_owned())
+            .stack_size(TOKIO_WORKER_STACK)
+            .spawn(work)
+            .expect("spawn")
+            .join()
+            .unwrap_or_else(|_| panic!("{case}: must parse and drop on a 2 MiB stack"));
+    }
+
+    /// Parses `dsl` and drops the tree, both on a 2 MiB stack.
+    fn parse_and_drop(case: &str, dsl: String) {
+        assert!(dsl.len() <= parser::MAX_QUERY_LEN, "{case}: {}", dsl.len());
+        on_worker_stack(case, move || {
+            let query = parser::parse(&dsl);
+            assert!(query.is_ok(), "parses");
+            drop(query);
+        });
+    }
+
+    /// A tree as deep as the longest chain any query spells drops on a
+    /// tokio worker's 2 MiB stack in a debug build, whatever variants it
+    /// nests, and so does one a panic unwinds through. A recursive drop
+    /// overflows this stack at about 16 000 levels.
+    #[test]
+    fn expression_drop_fits_worker_stack() {
+        const TERMS: usize = 32_000;
+        let chain = || vec!["1"; TERMS].join("+");
+        let prefix = "* | where ";
+
+        parse_and_drop("binary", format!("{prefix}{} > 0", chain()));
+        // `-` repeats with no space between; one byte a level
+        let negations = parser::MAX_QUERY_LEN - prefix.len() - 1;
+        parse_and_drop("neg", format!("{prefix}{}1", "-".repeat(negations)));
+        // four bytes a level: the longest `not` chain, 16 381 levels, fits
+        // this stack even with a recursive drop
+        let nots = (parser::MAX_QUERY_LEN - prefix.len() - 1) / "not ".len();
+        parse_and_drop("not", format!("{prefix}{}a", "not ".repeat(nots)));
+        parse_and_drop("call", format!("* | stats sum({})", chain()));
+        parse_and_drop("in subject", format!("{prefix}{} in (1)", chain()));
+        parse_and_drop("in element", format!("{prefix}a in (1, {})", chain()));
+
+        // The parser drops what it built when the text after the chain
+        // fails to parse.
+        let broken = format!("{prefix}{} | where", chain());
+        on_worker_stack("parse error", move || {
+            let query = parser::parse(&broken);
+            assert!(query.is_err(), "a trailing empty `where` does not parse");
+            drop(query);
+        });
+
+        let dsl = format!("{prefix}{} > 0", chain());
+        on_worker_stack("unwind", move || {
+            let unwound = std::panic::catch_unwind(|| {
+                let _query = parser::parse(&dsl);
+                panic!("unwinding through a live tree");
+            });
+            let payload = unwound.expect_err("the closure panics");
+            assert_eq!(
+                payload.downcast_ref::<&str>(),
+                Some(&"unwinding through a live tree")
+            );
+        });
+
+        // The grammar bounds the nesting of calls and `in` lists, so a
+        // deep tree that nests every child-owning variant is built by hand.
+        on_worker_stack("mixed", || {
+            let leaf = || Spanned::new(Expr::FieldRef("a".to_owned()), 0..1);
+            let mut tree = leaf();
+            for level in 0..4 * TERMS {
+                let node = match level % 4 {
+                    0 => Expr::Binary {
+                        lhs: Box::new(tree),
+                        op: BinaryOp::Add,
+                        rhs: Box::new(leaf()),
+                    },
+                    1 => Expr::Unary {
+                        op: UnaryOp::Neg,
+                        operand: Box::new(tree),
+                    },
+                    2 => Expr::FunctionCall {
+                        name: "f".to_owned(),
+                        args: vec![leaf(), tree],
+                    },
+                    _ => Expr::InList {
+                        expr: Box::new(leaf()),
+                        list: vec![tree, leaf()],
+                    },
+                };
+                tree = Spanned::new(node, 0..1);
+            }
+            drop(tree);
+        });
     }
 }
