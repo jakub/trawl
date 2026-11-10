@@ -116,8 +116,12 @@ enum Command {
 
     /// Control a running TUI via driver socket.
     Driver {
-        /// Path to the driver unix socket.
-        #[arg(long, default_value_t = tui::driver::default_socket_path().display().to_string())]
+        #[arg(
+            long,
+            default_value_t = tui::driver::default_socket_path().display().to_string(),
+            hide_default_value = true,
+            help = socket_help(&tui::driver::default_socket_path())
+        )]
         socket: String,
 
         #[command(subcommand)]
@@ -566,14 +570,23 @@ fn arg_error_text(e: &clap::Error) -> String {
         .join("\n")
 }
 
-/// Report a usage error and exit with clap's status for it. Help and
-/// version text hold nothing but trawl's own words, so clap prints them.
+/// Report a usage error and exit with clap's status for it, whether or
+/// not stderr takes the text. clap prints help and version itself.
 fn exit_on_arg_error(e: &clap::Error) -> ! {
     if !e.use_stderr() {
         e.exit();
     }
-    eprint!("{}", arg_error_text(e));
+    let _ = write!(io::stderr().lock(), "{}", arg_error_text(e));
     process::exit(e.exit_code());
+}
+
+/// The help line of `driver --socket`. The default sits under the
+/// operator's home directory, so its text goes through the sanitize rule.
+fn socket_help(default: &Path) -> String {
+    format!(
+        "Path to the driver unix socket [default: {}]",
+        trawl_core::sanitize::sanitize_display_text(&default.display().to_string())
+    )
 }
 
 /// Report `e` and exit 1.
@@ -1361,5 +1374,25 @@ mod arg_tests {
             text.escape_debug()
         );
         assert!(text.contains("Usage:"), "{}", text.escape_debug());
+    }
+
+    #[test]
+    fn driver_help_sanitizes_the_default_socket_path() {
+        let help = socket_help(Path::new("/home/x\u{202e}y\u{1b}[2J/trawl.sock"));
+        assert_eq!(
+            help,
+            "Path to the driver unix socket [default: /home/x\u{fffd}y\u{fffd}[2J/trawl.sock]"
+        );
+        // clap shows this line and no second, raw default.
+        let rendered = Cli::command()
+            .try_get_matches_from(["trawl", "driver", "--help"])
+            .expect_err("help is an early exit")
+            .render()
+            .to_string();
+        assert_eq!(rendered.matches("[default: ").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains(&socket_help(&tui::driver::default_socket_path())),
+            "{rendered}"
+        );
     }
 }

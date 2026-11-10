@@ -734,6 +734,25 @@ async fn cli_terminal_sinks_reach_no_terminal_control() {
     server.stop().await;
 }
 
+/// A usage error exits 2 even when stderr refuses the text.
+#[test]
+fn a_usage_error_keeps_its_status_when_stderr_is_full() {
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_trawl"))
+        .env_clear()
+        .envs(loader_path())
+        .args(["schema", "field", "--not-a-flag"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(full)
+        .status()
+        .expect("spawn trawl");
+    assert_eq!(status.code(), Some(2));
+}
+
 /// The harness's deadline covers the child's exit, not only its terminal.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_child_past_the_pty_deadline_is_killed_and_reaped() {
