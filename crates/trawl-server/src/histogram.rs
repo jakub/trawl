@@ -95,7 +95,8 @@ pub fn plan(asked: bool, query: &Query, from_saved: bool) -> HistogramPlan {
 /// Two passes over the rows and constant extra memory: the first finds the
 /// bounds and the undated rows, the second fills the bins. Each pass reads
 /// `cancel` at its first row and every [`TAIL_CANCEL_STRIDE`] rows after,
-/// and the walk reads it once more before it answers.
+/// and once more when the pass ends, so a result with no usable time is
+/// not answered past a cancel either.
 ///
 /// # Errors
 /// [`EngineError::Cancelled`] once `cancel` is latched.
@@ -125,6 +126,9 @@ pub fn count(
             Some(t) => bounds = Some(bounds.map_or((t, t), |(lo, hi)| (lo.min(t), hi.max(t)))),
             None => undated += 1,
         }
+    }
+    if cancel.latched() {
+        return Err(EngineError::Cancelled);
     }
     let Some((min, max)) = bounds else {
         return unavailable(HistogramReason::NoUsableTime);
@@ -598,12 +602,12 @@ mod tests {
                 reason: HistogramReason::NoTimeColumn
             })
         ));
-        // Zero rows under a typed `_time`: nothing to walk, nothing to stop.
+        // Zero rows under a typed `_time`: no stride read happens, and the
+        // read that ends the pass still keeps `no_usable_time` from being
+        // answered past a cancel.
         assert!(matches!(
             count(&timed(Vec::new()), false, &latched()),
-            Ok(EventHistogram::Unavailable {
-                reason: HistogramReason::NoUsableTime
-            })
+            Err(EngineError::Cancelled)
         ));
     }
 
