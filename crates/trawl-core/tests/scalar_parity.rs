@@ -1784,6 +1784,121 @@ fn an_if_or_case_condition_takes_duckdbs_boolean_domain() {
     }
 }
 
+/// The value both lanes give `expression`. Both must give a value:
+/// `assert_parity_case` alone passes when `DuckDB` errors and the evaluator
+/// nulls, which would hide a keyword one lane cannot read.
+fn agreed_value(
+    conn: &Connection,
+    event: &Map<String, Value>,
+    label: &str,
+    expression: &str,
+) -> EvalValue {
+    assert_eq!(assert_parity_case(conn, event, label, expression), None);
+    let dsl = format!("* | let x = {expression}");
+    match sql_scalar_result(conn, &dsl, event, now_anchor()) {
+        SqlOutcome::Value(_) => {}
+        SqlOutcome::Errored(message) => panic!("{dsl:?}: DuckDB errored: {message}"),
+        SqlOutcome::Skip(category) => panic!("{dsl:?}: skipped as {category:?}"),
+    }
+    eval_scalar(&dsl, event, now_anchor())
+}
+
+/// Three-valued (Kleene) logic, the expected answer for a truth-table row.
+fn kleene_and(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+fn kleene_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+fn kleene_value(value: Option<bool>) -> EvalValue {
+    value.map_or(EvalValue::Null, EvalValue::Bool)
+}
+
+#[test]
+fn boolean_case_lane_parity() {
+    // `and`, `or` and `not` read the same in lowercase and in capitals, in
+    // both lanes, for true, false and NULL operands, with `not` binding
+    // tighter than `and` and `and` tighter than `or`. Each row is written
+    // all lowercase, all capitals, and with each operator's spelling
+    // chosen on its own.
+    let conn = utc_connection();
+    let event = fixed_event();
+    let operands = [("true", Some(true)), ("false", Some(false)), ("null", None)];
+    let spell = |word: &str, capital: bool| {
+        if capital {
+            word.to_ascii_uppercase()
+        } else {
+            word.to_string()
+        }
+    };
+
+    // (template, expected) with `{not}`, `{and}`, `{or}` standing for the
+    // operator words and `{a}`, `{b}`, `{c}` for the operands.
+    let mut rows: Vec<(String, EvalValue)> = Vec::new();
+    for (a, va) in operands {
+        rows.push((format!("{{not}} {a}"), kleene_value(va.map(|x| !x))));
+        for (b, vb) in operands {
+            rows.push((format!("{a} {{and}} {b}"), kleene_value(kleene_and(va, vb))));
+            rows.push((format!("{a} {{or}} {b}"), kleene_value(kleene_or(va, vb))));
+            for (c, vc) in operands {
+                let not_a = va.map(|x| !x);
+                rows.push((
+                    format!("{{not}} {a} {{or}} {b} {{and}} {c}"),
+                    kleene_value(kleene_or(not_a, kleene_and(vb, vc))),
+                ));
+                rows.push((
+                    format!("{{not}} ({a} {{or}} {b}) {{and}} {c}"),
+                    kleene_value(kleene_and(kleene_or(va, vb).map(|x| !x), vc)),
+                ));
+            }
+        }
+    }
+    // Over the fixture's fields: `status` is 200 and `service` is "nginx".
+    rows.push((
+        r#"{not} status == 200 {or} service == "nginx" {and} null"#.to_string(),
+        EvalValue::Null,
+    ));
+    rows.push((
+        r#"{not} status == 500 {or} service == "nginx" {and} null"#.to_string(),
+        EvalValue::Bool(true),
+    ));
+    rows.push((
+        r#"{not} (status == 200 {or} service == "x") {and} host == "web-1""#.to_string(),
+        EvalValue::Bool(false),
+    ));
+
+    for (index, (template, expected)) in rows.iter().enumerate() {
+        // All lowercase, all capitals, then one mixed choice per row that
+        // walks every combination of the three operators across the rows.
+        let choices = [
+            [false; 3],
+            [true; 3],
+            [index & 1 != 0, index & 2 != 0, index & 4 != 0],
+        ];
+        for [not, and, or] in choices {
+            let expression = template
+                .replace("{not}", &spell("not", not))
+                .replace("{and}", &spell("and", and))
+                .replace("{or}", &spell("or", or));
+            assert_eq!(
+                agreed_value(&conn, &event, "boolean keyword case", &expression),
+                *expected,
+                "{expression}"
+            );
+        }
+    }
+}
+
 #[test]
 fn ceil_floor_and_round_return_duckdbs_argument_driven_shapes() {
     // `CEIL`/`FLOOR` widen a BIGINT argument to DOUBLE while `ROUND` keeps it
