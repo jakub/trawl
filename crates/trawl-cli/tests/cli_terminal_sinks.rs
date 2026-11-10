@@ -734,7 +734,9 @@ async fn cli_terminal_sinks_reach_no_terminal_control() {
     server.stop().await;
 }
 
-/// A usage error exits 2 even when stderr refuses the text.
+/// A usage error exits 2 even when stderr refuses the text. `/dev/full` is
+/// Linux's device for a write that always fails.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_usage_error_keeps_its_status_when_stderr_is_full() {
     let full = std::fs::OpenOptions::new()
