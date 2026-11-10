@@ -155,17 +155,48 @@ pub enum Refusal {
     /// 409 `evidence_budget_exceeded`: the investigation's or the
     /// installation's evidence budget cannot hold the charge.
     EvidenceBudgetExceeded {
-        /// Evidence bytes already kept or reserved in the full scope: every
-        /// kept row once the binding pass has pruned the evidence past its
-        /// retention, or the live kept rows at the pre-check (module docs,
-        /// "Evidence").
+        /// The budget that refused: the investigation's is checked first.
+        scope: EvidenceScope,
+        /// Evidence bytes counted against that budget, kept rows and the
+        /// charges reserved but not yet kept together: every kept row once
+        /// the binding pass has pruned the evidence past its retention, or
+        /// the live kept rows at the pre-check (module docs, "Evidence").
         used: u64,
-        /// That scope's budget, in bytes.
+        /// That budget, in bytes.
         limit: u64,
     },
     /// The metadata store failed while admission read usage. Nothing was
     /// admitted; a server fault, like any other [`StoreError`].
     Store(StoreError),
+}
+
+/// Which evidence budget refused a charge (ADR-0059).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceScope {
+    /// The investigation's `evidence_per_investigation_bytes`.
+    Investigation,
+    /// The installation's `evidence_installation_bytes`.
+    Installation,
+}
+
+impl EvidenceScope {
+    /// The fixed word the `capture_refused` event logs as `scope`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Investigation => "investigation",
+            Self::Installation => "installation",
+        }
+    }
+
+    /// The budget as the refusal's message names it.
+    #[must_use]
+    pub const fn budget(self) -> &'static str {
+        match self {
+            Self::Investigation => "this investigation's evidence budget",
+            Self::Installation => "the installation's evidence budget",
+        }
+    }
 }
 
 /// The evidence budgets a kept result is charged against (ADR-0059):
@@ -1012,11 +1043,13 @@ fn evidence_full(
 ) -> Option<Refusal> {
     if used.saturating_add(bytes) > budget.per_investigation {
         Some(Refusal::EvidenceBudgetExceeded {
+            scope: EvidenceScope::Investigation,
             used,
             limit: budget.per_investigation,
         })
     } else if installation.saturating_add(bytes) > budget.installation {
         Some(Refusal::EvidenceBudgetExceeded {
+            scope: EvidenceScope::Installation,
             used: installation,
             limit: budget.installation,
         })
@@ -1136,6 +1169,37 @@ mod tests {
     use crate::store::{CaptureInsert, NewCapture};
 
     const KEY: i64 = 7;
+
+    /// The refusal names the budget that refused: the investigation's when
+    /// it is full, also when both are, since it is checked first, and the
+    /// installation's when only that one is.
+    #[test]
+    fn evidence_full_names_the_budget_that_refused() {
+        let budget = EvidenceBudget {
+            per_investigation: 100,
+            installation: 1_000,
+        };
+        let scope_of = |used, installation| match evidence_full(used, installation, 10, budget) {
+            Some(Refusal::EvidenceBudgetExceeded { scope, used, limit }) => {
+                Some((scope, used, limit))
+            }
+            Some(other) => panic!("not an evidence refusal: {other:?}"),
+            None => None,
+        };
+        assert_eq!(
+            scope_of(95, 0),
+            Some((EvidenceScope::Investigation, 95, 100))
+        );
+        assert_eq!(
+            scope_of(95, 995),
+            Some((EvidenceScope::Investigation, 95, 100))
+        );
+        assert_eq!(
+            scope_of(0, 995),
+            Some((EvidenceScope::Installation, 995, 1_000))
+        );
+        assert_eq!(scope_of(90, 990), None);
+    }
 
     /// A failed store step of what a reservation retires is logged by the
     /// error's closed class only, under the event of what it retired.
