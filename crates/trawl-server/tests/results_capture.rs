@@ -1242,6 +1242,7 @@ async fn a_queued_capture_is_cancellable_by_its_owner() {
         .exclusive(std::time::Duration::from_secs(30))
         .await
         .expect("hold every permit of an idle pool");
+    let sent = std::time::Instant::now();
     let run = {
         let server = Arc::clone(&server);
         let (token, body) = (server.analyst_token.clone(), body.clone());
@@ -1282,6 +1283,13 @@ async fn a_queued_capture_is_cancellable_by_its_owner() {
         .await
         .expect("answered well before the capture's deadline")
         .expect("the capture task joins");
+    // `sent` is taken before the capture leaves, and its deadline starts
+    // later, in the handler: an answer inside `deadline_secs` since `sent`
+    // cannot be the deadline's own refusal, which says the same thing.
+    assert!(
+        sent.elapsed() < std::time::Duration::from_secs(60),
+        "the capture answered before its deadline"
+    );
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
     assert_eq!(code(&answer), "service_unavailable", "{answer}");
     assert_eq!(

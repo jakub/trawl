@@ -3941,10 +3941,22 @@ async fn listed_id(owner: &HttpClient, dsl: &str) -> u64 {
 /// own capacity refusal, which says the same thing.
 const CANCELLED_ANSWER_BOUND: Duration = Duration::from_secs(common::DEFAULT_TEST_TIMEOUT_SECS / 4);
 
+/// The request answered before its own deadline. `sent` is taken before
+/// the request leaves, and the deadline is stamped at handler entry, so an
+/// answer inside the fixture's timeout since `sent` cannot be the
+/// deadline's own capacity refusal, which says the same thing.
+fn answered_before_its_deadline(sent: std::time::Instant, what: &str) {
+    assert!(
+        sent.elapsed() < Duration::from_secs(common::DEFAULT_TEST_TIMEOUT_SECS),
+        "{what}: answered before its deadline"
+    );
+}
+
 /// What a request a cancel ended while it waited to start answers: the
 /// not-started 503, well before the request's deadline.
 async fn refused_as_not_started<T: std::fmt::Debug>(
     run: tokio::task::JoinHandle<Result<T, trawl_client::ClientError>>,
+    sent: std::time::Instant,
     what: &str,
 ) {
     let answered = tokio::time::timeout(CANCELLED_ANSWER_BOUND, run)
@@ -3953,6 +3965,7 @@ async fn refused_as_not_started<T: std::fmt::Debug>(
             panic!("{what}: still waiting {CANCELLED_ANSWER_BOUND:?} after the cancel")
         })
         .expect("the request task joins");
+    answered_before_its_deadline(sent, what);
     let (status, error) = refused_with(answered, what);
     assert_eq!(status, 503, "{what}");
     assert_eq!(
@@ -4039,13 +4052,7 @@ async fn refused_in_the_permit_wait(
             panic!("{what}: still waiting {CANCELLED_ANSWER_BOUND:?} after the cancel")
         })
         .expect("the request task joins");
-    // The deadline is stamped at handler entry, after `sent`: an answer
-    // inside the timeout since `sent` cannot be the deadline's own
-    // capacity refusal, which says the same thing.
-    assert!(
-        sent.elapsed() < Duration::from_secs(common::DEFAULT_TEST_TIMEOUT_SECS),
-        "{what}: answered before its deadline"
-    );
+    answered_before_its_deadline(sent, what);
     assert_eq!(
         status,
         reqwest::StatusCode::SERVICE_UNAVAILABLE,
@@ -4220,6 +4227,7 @@ async fn a_queued_query_is_not_cancellable_by_a_twin_key() {
     let before = recent_of(&server, DSL).len();
 
     let held = hold_every_permit(&server).await;
+    let sent = std::time::Instant::now();
     let run = {
         let owner = owner.clone();
         tokio::spawn(async move { owner.query_paginated(DSL, None, None).await })
@@ -4251,7 +4259,7 @@ async fn a_queued_query_is_not_cancellable_by_a_twin_key() {
             .cancelled,
         "the owner's cancel still reaches it"
     );
-    refused_as_not_started(run, "the owner-cancelled query").await;
+    refused_as_not_started(run, sent, "the owner-cancelled query").await;
     closed_as_not_started(&server, DSL, before, "the owner-cancelled query");
 
     drop(held);
@@ -4281,6 +4289,7 @@ async fn a_cancel_reaches_a_saved_lookup() {
         .await
         .expect("lock saved_queries");
 
+    let sent = std::time::Instant::now();
     let run = {
         let (url, token) = (server.url.clone(), server.analyst_token.clone());
         tokio::spawn(async move {
@@ -4330,6 +4339,7 @@ async fn a_cancel_reaches_a_saved_lookup() {
         .await
         .expect("answered well before the deadline")
         .expect("the request task joins");
+    answered_before_its_deadline(sent, "the cancelled lookup");
     lock.execute("ROLLBACK").await.expect("release the lock");
 
     assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
