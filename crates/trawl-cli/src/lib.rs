@@ -672,9 +672,12 @@ async fn run_configured(
     match command {
         None => {
             // Before the log file, tracing, and the terminal: a refusal
-            // prints to a normal terminal and leaves nothing behind.
+            // prints to a normal terminal and leaves nothing behind. The
+            // zone first, as `trawl query` reads it: configuration before
+            // the connection.
+            let zone = cli::display_zone(&cfg.ui.timezone)?;
             let conn = required()?;
-            run_tui(&cfg, conn, args.driver).await?;
+            run_tui(&cfg, zone, conn, args.driver).await?;
         }
         Some(Command::Query {
             query,
@@ -734,10 +737,11 @@ async fn run_configured(
     Ok(0)
 }
 
-/// Start the TUI on a connection already resolved. `driver` is `--driver`,
-/// empty for the default socket.
+/// Start the TUI on a display zone and a connection already resolved.
+/// `driver` is `--driver`, empty for the default socket.
 async fn run_tui(
     cfg: &config::Config,
+    zone: trawl_api::zone::DisplayZone,
     conn: cli::ConnectionParams,
     driver: Option<String>,
 ) -> Result<(), CliError> {
@@ -764,7 +768,7 @@ async fn run_tui(
         }
     });
 
-    tui::run(cfg, conn, driver_path.as_deref()).await
+    tui::run(cfg, zone, conn, driver_path.as_deref()).await
 }
 
 impl From<Cli> for doctor::Globals {

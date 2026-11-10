@@ -797,6 +797,10 @@ async fn invalid_display_zone_never_falls_back() {
         !screen.contains("\x1b[?1049h"),
         "the TUI entered the alternate screen:\n{screen:?}"
     );
+    assert!(
+        !dir.join("tui.log").exists(),
+        "the TUI opened its log before refusing the zone"
+    );
 
     let mut mcp = home
         .command(KOLKATA)
@@ -839,6 +843,37 @@ async fn invalid_display_zone_never_falls_back() {
     );
 
     assert_eq!(listener.finish(), 0, "a client connected to the server");
+}
+
+/// The zone is configuration, read before the connection: with no
+/// credential anywhere, the TUI's refusal names the invalid zone, as
+/// `trawl query`'s does, and leaves no `tui.log`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_display_zone_precedes_the_credential_refusal() {
+    const ZONE: &str = "Mars/Olympus";
+    let home = Home::new();
+    let config = home.config("", ZONE);
+
+    let query = home
+        .query(KOLKATA, &config, &[QUERY, "--format", "json"])
+        .await;
+    assert_eq!(query.status.code(), Some(1), "{}", describe(&query));
+    assert!(
+        String::from_utf8_lossy(&query.stderr).contains(ZONE),
+        "trawl query did not name the zone\n{}",
+        describe(&query)
+    );
+
+    let (status, screen) = Tui::spawn(&home, KOLKATA, &config, None).wait().await;
+    assert!(!status.success(), "the TUI ran:\n{screen}");
+    assert!(
+        screen.contains(ZONE),
+        "the TUI did not name the zone:\n{screen}"
+    );
+    assert!(
+        !home.path().join(".config/trawl/tui.log").exists(),
+        "the TUI opened its log before refusing the zone"
+    );
 }
 
 /// json and csv carry the wire spelling in the display zone; Parquet,
