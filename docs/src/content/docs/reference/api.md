@@ -362,7 +362,7 @@ The server captures `execution.started_at` beside its monotonic timer. The durat
 | 409 | `bad_request` | A `from saved` stage selects a run that has columns but no Parquet file. The message names the run route. |
 | 500 | `execution_error` | DuckDB failed or the query was cancelled |
 | 503 | `query_resource_exhausted` | The query went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
-| 503 | `service_unavailable` | The deadline passed before the query started or a cancel reached it, or a cold file moved during the read. Retry. |
+| 503 | `service_unavailable` | The deadline passed before the query started, or a cold file moved during the read. Retry. A cancel that reached the query before it started answers the same way; do not retry that one. |
 | 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
 | 504 | `timeout` | The deadline passed after the query started |
