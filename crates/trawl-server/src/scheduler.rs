@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use fleet_auth::KeyStore;
 
 use crate::config::SchedulerConfig;
-use crate::error::ServerError;
+use crate::error::{CauseKind, ServerError};
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
 use crate::publication::CorpusUnsettled;
@@ -138,9 +138,16 @@ async fn scheduler_loop(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         event_type = "scheduler_retention_error",
                         error = %e,
+                        "failed to clean up old report runs"
+                    );
+                    let fault = ServerError::from(e);
+                    tracing::warn!(
+                        event_type = "scheduler_retention_error",
+                        error_class = fault.error_class(),
+                        cause_kind = fault.cause_kind().as_str(),
                         "failed to clean up old report runs"
                     );
                 }
@@ -221,9 +228,16 @@ pub async fn poll_and_execute(
     let schedules = match schedule_store.list_enabled_schedules().await {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(
+            tracing::debug!(
                 event_type = "scheduler_error",
                 error = %e,
+                "failed to list enabled schedules"
+            );
+            let fault = ServerError::from(e);
+            tracing::error!(
+                event_type = "scheduler_error",
+                error_class = fault.error_class(),
+                cause_kind = fault.cause_kind().as_str(),
                 "failed to list enabled schedules"
             );
             return spawned;
@@ -340,11 +354,25 @@ async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i6
     let live = match key_store.get_live_key_by_id(key_id).await {
         Ok(live) => live,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "scheduler_error",
                 schedule_id,
                 key_id,
                 error = %e,
+                "failed to check key liveness; skipping schedule this tick"
+            );
+            // Classified without `ServerError::from`, which would write an
+            // `auth.backend` event for a failure this tick swallows.
+            let (error_class, cause_kind) = match crate::error::auth_backend_cause(&e) {
+                Some((kind, _, _)) => (ServerError::AuthBackend(kind).error_class(), kind),
+                None => ("internal", CauseKind::Unknown),
+            };
+            tracing::warn!(
+                event_type = "scheduler_error",
+                schedule_id,
+                key_id,
+                error_class,
+                cause_kind = cause_kind.as_str(),
                 "failed to check key liveness; skipping schedule this tick"
             );
             return false;
@@ -956,9 +984,17 @@ pub(crate) fn decode_result_blob(blob: Option<Vec<u8>>) -> Option<trawl_api::val
         .ok()?;
     serde_json::from_slice::<trawl_api::value::QueryResult>(&decompressed)
         .inspect_err(|e| {
-            tracing::warn!(
+            // serde's text can quote the stored result's values, and no
+            // typed cause covers it.
+            tracing::debug!(
                 event_type = "run_result_blob_deserialize_failed",
                 error = %e,
+                "failed to deserialize a report run's result blob"
+            );
+            tracing::warn!(
+                event_type = "run_result_blob_deserialize_failed",
+                error_class = "internal",
+                cause_kind = CauseKind::Unknown.as_str(),
                 "failed to deserialize a report run's result blob"
             );
         })

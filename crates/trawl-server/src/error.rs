@@ -745,7 +745,7 @@ impl CauseKind {
     }
 
     /// The kind of a `DuckDB` driver error, from its variant alone.
-    fn of_duckdb(err: &duckdb::Error) -> Self {
+    pub(crate) fn of_duckdb(err: &duckdb::Error) -> Self {
         use duckdb::Error as E;
         match err {
             E::DuckDBFailure(..) => Self::DuckdbFailure,
@@ -1093,26 +1093,37 @@ impl From<fleet_auth::AuthError> for ServerError {
     /// which trouble it was without quoting it.
     fn from(err: fleet_auth::AuthError) -> Self {
         use fleet_auth::AuthError as E;
+        if let Some((kind, what, source)) = auth_backend_cause(&err) {
+            return Self::auth_backend_fault(kind, what, source);
+        }
         match err {
-            E::Database(e) => {
-                Self::auth_backend_fault(CauseKind::of_sqlx(&e), "fleet auth backend error", &e)
-            }
-            E::Migration(e) => {
-                Self::auth_backend_fault(CauseKind::PgMigrate, "fleet auth migration error", &e)
-            }
-            E::Schema(e) => Self::auth_backend_fault(
-                CauseKind::of_auth_schema(&e),
-                "fleet auth schema error",
-                &e,
-            ),
-            E::Hash(e) | E::TokenGeneration(e) => {
-                Self::auth_backend_fault(CauseKind::AuthWorker, "fleet auth worker error", &e)
-            }
             E::InvalidKey(_) | E::MalformedToken(_) => {
                 Self::Unauthorized("authentication failed".into())
             }
             other => Self::Internal(format!("unexpected fleet-auth error: {other}")),
         }
+    }
+}
+
+/// The backend trouble in a keystore failure, if it is one: the driver's
+/// typed kind, a fixed label, and the inner error whose text belongs at
+/// DEBUG only. `None` for a credential failure or any other variant.
+///
+/// It emits nothing, so a caller that swallows the failure can log its own
+/// event with the class of [`ServerError::AuthBackend`] and this kind,
+/// without the `auth.backend` event the [`From`] conversion writes.
+pub(crate) fn auth_backend_cause(
+    err: &fleet_auth::AuthError,
+) -> Option<(CauseKind, &'static str, &dyn std::fmt::Display)> {
+    use fleet_auth::AuthError as E;
+    match err {
+        E::Database(e) => Some((CauseKind::of_sqlx(e), "fleet auth backend error", e)),
+        E::Migration(e) => Some((CauseKind::PgMigrate, "fleet auth migration error", e)),
+        E::Schema(e) => Some((CauseKind::of_auth_schema(e), "fleet auth schema error", e)),
+        E::Hash(e) | E::TokenGeneration(e) => {
+            Some((CauseKind::AuthWorker, "fleet auth worker error", e))
+        }
+        _ => None,
     }
 }
 
