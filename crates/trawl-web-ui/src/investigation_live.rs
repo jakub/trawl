@@ -95,6 +95,47 @@ impl Connection {
     }
 }
 
+/// Where the board's read after a conflict stands, which the conflict's
+/// notice says as it changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reread {
+    /// A read begun after the conflict landed.
+    Done,
+    /// It runs, or starts once a 429's pause or a failure's backoff ends.
+    Reading,
+    /// It waits for the hidden tab to show.
+    Waiting,
+    /// The board stopped reading before such a read landed.
+    Stopped,
+}
+
+impl Reread {
+    /// The read after a conflict whose mark is `mark`, when the board's
+    /// newest accepted read is `accepted` and its state `connection`.
+    #[must_use]
+    pub fn of(mark: u64, accepted: u64, connection: Connection) -> Self {
+        if accepted > mark {
+            return Self::Done;
+        }
+        match connection {
+            Connection::Paused => Self::Waiting,
+            Connection::Stopped => Self::Stopped,
+            Connection::Checking | Connection::Live | Connection::Retrying => Self::Reading,
+        }
+    }
+
+    /// What the conflict's notice says of it.
+    #[must_use]
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Self::Done => "The board has read it again",
+            Self::Reading => "The board is reading it again",
+            Self::Waiting => "The board reads it again when this tab is shown",
+            Self::Stopped => "The board stopped reading before it read it again",
+        }
+    }
+}
+
 /// How a read of the board ended.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReadEnd {
@@ -555,6 +596,37 @@ mod tests {
         assert_eq!(new_entries_text(0), None);
         assert_eq!(new_entries_text(1).as_deref(), Some("1 new entry."));
         assert_eq!(new_entries_text(3).as_deref(), Some("3 new entries."));
+    }
+
+    #[test]
+    fn reread_prefers_an_accepted_read_over_a_stop() {
+        use Connection::{Checking, Live, Paused, Retrying, Stopped};
+        let all = [Checking, Live, Paused, Retrying, Stopped];
+        // A read begun after the conflict landed: done, whatever the
+        // board did since.
+        for connection in all {
+            assert_eq!(Reread::of(4, 5, connection), Reread::Done, "{connection:?}");
+        }
+        // None has landed yet.
+        for accepted in [3, 4] {
+            for (connection, reread) in [
+                (Checking, Reread::Reading),
+                (Live, Reread::Reading),
+                (Paused, Reread::Waiting),
+                (Retrying, Reread::Reading),
+                (Stopped, Reread::Stopped),
+            ] {
+                assert_eq!(
+                    Reread::of(4, accepted, connection),
+                    reread,
+                    "{connection:?}"
+                );
+            }
+        }
+        assert_eq!(
+            Reread::Stopped.sentence(),
+            "The board stopped reading before it read it again"
+        );
     }
 
     fn section(top: f64, bottom: f64) -> Placed {

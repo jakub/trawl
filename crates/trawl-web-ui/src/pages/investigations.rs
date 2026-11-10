@@ -98,7 +98,7 @@ use crate::auth_return::leaves_for_sign_in;
 use crate::components::evidence_drawer::{EvidenceDrawer, KeepGate, Opened};
 use crate::evidence_queue::{EvidenceQueue, Next, Paced, wait_ms};
 use crate::investigation_live::{
-    Connection, Liveness, Placed, ReadEnd, WriteFailure, announcement, new_entries_text,
+    Connection, Liveness, Placed, ReadEnd, Reread, WriteFailure, announcement, new_entries_text,
     pick_anchor,
 };
 use crate::investigation_log::{
@@ -1484,44 +1484,6 @@ fn status_verb(target: InvestigationStatus) -> &'static str {
     match target {
         InvestigationStatus::Closed => "close",
         InvestigationStatus::Open => "reopen",
-    }
-}
-
-/// Where the board's read after a conflict stands, which the conflict's
-/// notice says as it changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reread {
-    /// A read begun after the conflict landed.
-    Done,
-    /// It runs, or starts once a 429's pause or a failure's backoff ends.
-    Reading,
-    /// It waits for the hidden tab to show.
-    Waiting,
-    /// The board stopped reading before such a read landed.
-    Stopped,
-}
-
-impl Reread {
-    /// The read after a conflict whose mark is `mark`, when the board's
-    /// newest accepted read is `accepted` and its state `connection`.
-    fn of(mark: u64, accepted: u64, connection: Connection) -> Self {
-        if accepted > mark {
-            return Self::Done;
-        }
-        match connection {
-            Connection::Paused => Self::Waiting,
-            Connection::Stopped => Self::Stopped,
-            Connection::Checking | Connection::Live | Connection::Retrying => Self::Reading,
-        }
-    }
-
-    fn sentence(self) -> &'static str {
-        match self {
-            Self::Done => "The board has read it again",
-            Self::Reading => "The board is reading it again",
-            Self::Waiting => "The board reads it again when this tab is shown",
-            Self::Stopped => "The board stopped reading before it read it again",
-        }
     }
 }
 
