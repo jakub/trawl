@@ -668,6 +668,36 @@ async fn assert_schema_labels_on_stderr(client: &Client) {
     );
 }
 
+/// A stored field name may start with `--`. clap refuses it as an option
+/// and quotes it on stderr.
+async fn assert_usage_error_on_stderr(client: &Client) {
+    let option_shaped = "--x\u{202e}\u{9b}31m\u{1b}[2Jname";
+    let run = pty_run(
+        client.command(&["schema", "field", option_shaped]),
+        StdoutTo::Pty,
+        DEADLINE,
+    )
+    .await
+    .expect("the usage error within the deadline");
+    assert_eq!(
+        run.status.code(),
+        Some(2),
+        "{}",
+        run.terminal.escape_debug()
+    );
+    assert!(
+        run.terminal.contains("unexpected argument"),
+        "{}",
+        run.terminal.escape_debug()
+    );
+    assert_no_terminal_control("an option-shaped field name's usage error", &run.terminal);
+    assert!(
+        run.terminal.contains('\u{fffd}'),
+        "{}",
+        run.terminal.escape_debug()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Case
 // ---------------------------------------------------------------------------
@@ -699,6 +729,7 @@ async fn cli_terminal_sinks_reach_no_terminal_control() {
     assert_terminal_schema_fields(&client).await;
     assert_terminal_schema_field(&client).await;
     assert_schema_labels_on_stderr(&client).await;
+    assert_usage_error_on_stderr(&client).await;
 
     server.stop().await;
 }

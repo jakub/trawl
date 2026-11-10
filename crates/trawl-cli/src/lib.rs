@@ -472,7 +472,7 @@ pub async fn main() {
         // a status other than 0.
         Ok(0) => {}
         Ok(status) => process::exit(i32::from(status)),
-        Err(CliError::Arg(e)) => e.exit(),
+        Err(CliError::Arg(e)) => exit_on_arg_error(&e),
         Err(e) => exit_on_error(&e),
     }
 }
@@ -510,7 +510,7 @@ fn parse_cli() -> (Cli, connection::Sources) {
         {
             let sources = connection::Sources::from_matches(&matches);
             return (
-                Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit()),
+                Cli::from_arg_matches(&matches).unwrap_or_else(|e| exit_on_arg_error(&e)),
                 sources,
             );
         }
@@ -525,16 +525,18 @@ fn parse_cli() -> (Cli, connection::Sources) {
                 .skip(1)
                 .any(|arg| ENVLESS.iter().any(|name| arg == name)) =>
         {
-            e.exit()
+            exit_on_arg_error(&e)
         }
         Ok(_) | Err(_) => {}
     }
     // What `Cli::parse_from` does, keeping the matches.
-    let matches = Cli::command().get_matches_from(args);
+    let matches = Cli::command()
+        .try_get_matches_from(args)
+        .unwrap_or_else(|e| exit_on_arg_error(&e));
     let sources = connection::Sources::from_matches(&matches);
     let cli = Cli::from_arg_matches(&matches)
         .map_err(|e| e.format(&mut Cli::command()))
-        .unwrap_or_else(|e| e.exit());
+        .unwrap_or_else(|e| exit_on_arg_error(&e));
     (cli, sources)
 }
 
@@ -550,6 +552,28 @@ fn envless_command() -> clap::Command {
         command = command.mut_arg(id, |arg| arg.env(None));
     }
     command
+}
+
+/// What clap says about `e`, without styling and with each line through
+/// the sanitize rule. clap quotes the offending argument, and a field name
+/// copied from the catalog is sender text. clap's own line breaks stay.
+fn arg_error_text(e: &clap::Error) -> String {
+    e.render()
+        .to_string()
+        .split('\n')
+        .map(trawl_core::sanitize::sanitize_display_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Report a usage error and exit with clap's status for it. Help and
+/// version text hold nothing but trawl's own words, so clap prints them.
+fn exit_on_arg_error(e: &clap::Error) -> ! {
+    if !e.use_stderr() {
+        e.exit();
+    }
+    eprint!("{}", arg_error_text(e));
+    process::exit(e.exit_code());
 }
 
 /// Report `e` and exit 1.
@@ -1310,5 +1334,32 @@ mod arg_tests {
             message: message.to_string(),
         });
         assert_eq!(err.to_string(), message);
+    }
+
+    #[test]
+    fn argument_errors_sanitize_sender_text() {
+        // A stored field name may start with `--`, and clap quotes what it
+        // refuses.
+        let hostile = "--x\u{1b}]0;owned\u{7}\u{202e}\u{9b}31mname";
+        let error = Cli::command()
+            .try_get_matches_from(["trawl", "schema", "field", hostile])
+            .expect_err("an option-shaped field name is refused");
+        let text = arg_error_text(&error);
+        let unsafe_chars: Vec<char> = text
+            .chars()
+            .filter(|c| *c != '\n' && trawl_core::sanitize::is_unsafe_display_char(*c))
+            .collect();
+        assert!(
+            unsafe_chars.is_empty(),
+            "the usage error holds {unsafe_chars:?}: {}",
+            text.escape_debug()
+        );
+        // clap's plain rendering drops the OSC sequence itself.
+        assert!(
+            text.contains("\u{fffd}\u{fffd}31mname"),
+            "{}",
+            text.escape_debug()
+        );
+        assert!(text.contains("Usage:"), "{}", text.escape_debug());
     }
 }
