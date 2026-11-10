@@ -2098,6 +2098,89 @@ mod error_pane_tests {
         }
     }
 
+    /// A span that ends after a base character and before the combining
+    /// mark or variation selector it carries styles the whole cluster, and
+    /// the `x` after it keeps the plain style. The excerpt row is y = 3:
+    /// the border, the message, a blank line. Its text starts at x = 4,
+    /// after the border, the padding and two spaces.
+    #[test]
+    fn excerpt_styles_whole_clusters() {
+        use ratatui::style::Modifier;
+
+        // Query, span, the excerpt row's cells from x = 4 with whether
+        // each is marked, and the caret row's cells from x = 4.
+        type Case = (
+            &'static str,
+            (usize, usize),
+            &'static [(&'static str, bool)],
+            &'static [&'static str],
+        );
+
+        let theme = test_app().theme;
+        let cases: &[Case] = &[
+            (
+                "e\u{301}x",
+                (0, 1),
+                &[("e\u{301}", true), ("x", false), (" ", false)],
+                &["^", " "],
+            ),
+            (
+                "❤\u{FE0F}x",
+                (0, 3),
+                // The cell behind the two-cell glyph is reset, unstyled.
+                &[
+                    ("❤\u{FE0F}", true),
+                    (" ", false),
+                    ("x", false),
+                    (" ", false),
+                ],
+                &["^", "^", " "],
+            ),
+        ];
+        for &(query, span, excerpt, carets) in cases {
+            let mut app = test_app();
+            app.tab.status = TabStatus::Error {
+                message: "parse error: the error".to_owned(),
+                details: vec![trawl_client::ErrorDetail {
+                    message: "the message".to_owned(),
+                    span: Some(trawl_client::ErrorSpan {
+                        start: span.0,
+                        end: span.1,
+                    }),
+                    label: None,
+                    hint: None,
+                }],
+                query: Some(query.to_owned()),
+            };
+            let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("terminal");
+            terminal
+                .draw(|f| super::render(&app, f, f.area()))
+                .expect("render");
+            let buffer = terminal.backend().buffer();
+            for (x, &(symbol, marked)) in (4u16..).zip(excerpt) {
+                let cell = &buffer[(x, 3)];
+                let case = format!("{query:?} {span:?}, cell {x}");
+                assert_eq!(cell.symbol(), symbol, "{case}");
+                assert_eq!(
+                    cell.modifier.contains(Modifier::UNDERLINED),
+                    marked,
+                    "{case}: underline"
+                );
+                if symbol != " " {
+                    let fg = if marked {
+                        theme.status_error
+                    } else {
+                        theme.text_primary
+                    };
+                    assert_eq!(cell.fg, fg, "{case}: colour");
+                }
+            }
+            for (x, symbol) in (4u16..).zip(carets) {
+                assert_eq!(buffer[(x, 4)].symbol(), *symbol, "{query:?} caret {x}");
+            }
+        }
+    }
+
     /// Snapshots of representative rows, drawn whole with their border.
     fn snapshot_rows(name: &str) -> String {
         let case = case(name);
