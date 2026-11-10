@@ -850,7 +850,7 @@ Notes:
 - `poll_interval_secs` is the polling rate only. A schedule fires on its planned boundary, so a slow poll delays a run without shifting the window that run covers.
 - Runs missed while trawld was down coalesce into one window. Past `max_catchup_intervals`, the start clamps forward to `window_end - max_catchup_intervals * interval`, the run row carries `window_truncated: true`, and `trawl_scheduler_window_truncated_total` counts it. A manual run of a `since_last` schedule is clamped and counted the same way. The coverage before the clamp is then missing from the report series.
 - The unit is intervals, not hours, so the default of 24 covers a day of missed hourly runs or 24 days of missed daily ones. There is no switch for "never clamp": spell it as a large number.
-- At most half of `[server] max_concurrent_queries`, and at least 1, scheduled runs are in flight at once. A run counts until its query work ends, also after the run timed out. A due schedule past that cap waits for a later poll, and its missed boundaries coalesce into one run. Manual runs do not count against the cap. There is no key for the cap.
+- The number of scheduled runs in flight is capped at `max(1, max_concurrent_queries / 2)`, rounded down, where `max_concurrent_queries` is the `[server]` setting. A run counts until its query work ends, also after the run timed out. A due schedule past that cap waits for a later poll, and its missed boundaries coalesce into one run. Manual runs do not count against the cap. There is no key for the cap.
 - Window modes, `lag`, and the watermark are per-schedule settings. See [scheduled reports](/architecture/reports-telemetry/#scheduled-reports) and the [schedules API](/reference/api/#schedules).
 
 ### `[capture]`
