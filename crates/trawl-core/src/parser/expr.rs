@@ -279,10 +279,9 @@ pub(crate) fn expr<'src>()
             .boxed();
 
         // --- precedence 3: unary `not` ---
-        let not_expr = keyword("not")
-            .spaced()
-            .repeated()
-            .foldr(comparison, |_kw, operand| {
+        let not_expr = keyword("not").or(keyword("NOT")).spaced().repeated().foldr(
+            comparison,
+            |_kw, operand| {
                 let span = operand.span.clone();
                 Spanned::new(
                     Expr::Unary {
@@ -291,11 +290,16 @@ pub(crate) fn expr<'src>()
                     },
                     span,
                 )
-            });
+            },
+        );
 
         // --- precedence 2: `and` ---
         let and_expr = not_expr.clone().foldl(
-            keyword("and").spaced().ignore_then(not_expr).repeated(),
+            keyword("and")
+                .or(keyword("AND"))
+                .spaced()
+                .ignore_then(not_expr)
+                .repeated(),
             |lhs, rhs| {
                 let span = lhs.span.start..rhs.span.end;
                 Spanned::new(
@@ -311,7 +315,11 @@ pub(crate) fn expr<'src>()
 
         // --- precedence 1: `or` ---
         and_expr.clone().foldl(
-            keyword("or").spaced().ignore_then(and_expr).repeated(),
+            keyword("or")
+                .or(keyword("OR"))
+                .spaced()
+                .ignore_then(and_expr)
+                .repeated(),
             |lhs, rhs| {
                 let span = lhs.span.start..rhs.span.end;
                 Spanned::new(
@@ -708,6 +716,164 @@ mod tests {
                 }
             }
             other => panic!("expected FunctionCall, got {other:?}"),
+        }
+    }
+
+    /// The one expression a single-stage `where` or `let` query carries.
+    fn stage_expr(query: &str) -> Expr {
+        let parsed = crate::parser::parse(query).unwrap_or_else(|e| panic!("{query}: {e:?}"));
+        match &parsed.pipeline[0].node {
+            crate::ast::PipeStage::Where(w) => w.condition.node.clone(),
+            crate::ast::PipeStage::Let(l) => l.assignments[0].1.node.clone(),
+            other => panic!("{query}: expected where or let, got {other:?}"),
+        }
+    }
+
+    /// The three places an expression is read: a `where` condition, a
+    /// `let` value and a `case()` argument.
+    fn expression_contexts(expr: &str) -> [String; 3] {
+        [
+            format!("| where {expr}"),
+            format!("| let x = {expr}"),
+            format!("| let x = case({expr}, 1, 0)"),
+        ]
+    }
+
+    /// `and`, `or` and `not` are read in all lowercase or all capitals,
+    /// with one meaning; a mixed spelling keeps its old reading, and a
+    /// word that only starts with a keyword stays a field.
+    #[test]
+    fn expression_boolean_case_matrix() {
+        let spellings = [
+            ("a == 1 OR b == 2", "a == 1 or b == 2"),
+            ("a == 1 AND b == 2", "a == 1 and b == 2"),
+            ("NOT a == 1", "not a == 1"),
+            (
+                "NOT a == 1 OR b == 2 AND c == 3",
+                "not a == 1 or b == 2 and c == 3",
+            ),
+            (
+                "not a == 1 OR b == 2 and c == 3",
+                "not a == 1 or b == 2 and c == 3",
+            ),
+            ("NOT NOT a == 1", "not not a == 1"),
+        ];
+        for (spelled, lowercase) in spellings {
+            for (query, reference) in expression_contexts(spelled)
+                .into_iter()
+                .zip(expression_contexts(lowercase))
+            {
+                let read = crate::parser::parse(&query)
+                    .unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
+                let expected = crate::parser::parse(&reference).unwrap();
+                assert!(
+                    crate::canonical_form::same_query(&read, &expected),
+                    "{query} must read as {reference}"
+                );
+            }
+        }
+
+        // `not` binds tighter than `and`, and `and` tighter than `or`.
+        let Expr::Binary {
+            lhs,
+            op: BinaryOp::Or,
+            rhs,
+        } = stage_expr("| where NOT a == 1 OR b == 2 AND c == 3")
+        else {
+            panic!("the root must be `or`");
+        };
+        assert!(
+            matches!(
+                &lhs.node,
+                Expr::Unary { op: UnaryOp::Not, operand }
+                    if matches!(&operand.node, Expr::Binary { op: BinaryOp::Eq, lhs, .. }
+                        if lhs.node == Expr::FieldRef("a".to_string()))
+            ),
+            "the left of `or` must be `not (a == 1)`, got {lhs:?}"
+        );
+        assert!(
+            matches!(
+                &rhs.node,
+                Expr::Binary { op: BinaryOp::And, lhs, rhs }
+                    if matches!(&lhs.node, Expr::Binary { op: BinaryOp::Eq, .. })
+                        && matches!(&rhs.node, Expr::Binary { op: BinaryOp::Eq, .. })
+            ),
+            "the right of `or` must be `b == 2 and c == 3`, got {rhs:?}"
+        );
+
+        for mixed in ["a == 1 Or b == 2", "a == 1 And b == 2", "Not a == 1"] {
+            for query in expression_contexts(mixed) {
+                assert!(
+                    crate::parser::parse(&query).is_err(),
+                    "{query} must stay a parse error"
+                );
+            }
+        }
+
+        for (query, field) in [
+            ("| where ORDER == 1", "ORDER"),
+            ("| where ANDROID == 1", "ANDROID"),
+            ("| where NOTE == 1", "NOTE"),
+            ("| where AND.x == 1", "AND.x"),
+            ("| where AND == 1", "AND"),
+            ("| where OR == 1", "OR"),
+        ] {
+            let Expr::Binary { lhs, .. } = stage_expr(query) else {
+                panic!("{query} must be a comparison");
+            };
+            assert_eq!(lhs.node, Expr::FieldRef(field.to_string()), "{query}");
+        }
+        let Expr::Binary { rhs, .. } = stage_expr("| where a == NOT") else {
+            panic!("`a == NOT` must be a comparison");
+        };
+        assert_eq!(rhs.node, Expr::FieldRef("NOT".to_string()));
+    }
+
+    /// `NOT` at the start of an expression operand is the operator, so
+    /// text that read a bare field named `NOT` there now reads otherwise
+    /// (ADR-0061, amendment of 2026-11-09). A backticked name, or `NOT`
+    /// past an operand start, is still the field.
+    #[test]
+    fn a_bare_not_field_is_read_as_the_operator() {
+        for query in ["| where NOT == 1", "| where NOT.x == 1"] {
+            assert!(
+                crate::parser::parse(query).is_err(),
+                "{query} must not parse"
+            );
+        }
+
+        let not_of = |query: &str| match stage_expr(query) {
+            Expr::Unary {
+                op: UnaryOp::Not,
+                operand,
+            } => operand.node,
+            other => panic!("{query} must read as `not`, got {other:?}"),
+        };
+        assert_eq!(not_of("| where NOT(x)"), Expr::FieldRef("x".to_string()));
+        assert!(
+            matches!(
+                not_of("| where NOT in (1, 2)"),
+                Expr::FunctionCall { ref name, ref args } if name == "in" && args.len() == 2
+            ),
+            "`NOT in (1, 2)` must read as `not` over a call named `in`"
+        );
+        assert!(
+            matches!(
+                not_of("| let y = NOT - 1"),
+                Expr::Unary { op: UnaryOp::Neg, ref operand }
+                    if operand.node == Expr::Literal(LiteralValue::Int(1))
+            ),
+            "`NOT - 1` must read as `not (-1)`"
+        );
+
+        for (query, field) in [
+            ("| where `NOT` == 1", "NOT"),
+            ("| where `NOT.x` == 1", "NOT.x"),
+        ] {
+            let Expr::Binary { lhs, .. } = stage_expr(query) else {
+                panic!("{query} must be a comparison");
+            };
+            assert_eq!(lhs.node, Expr::FieldRef(field.to_string()), "{query}");
         }
     }
 }

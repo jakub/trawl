@@ -1764,6 +1764,10 @@ mod tests {
             "in.a",
             "by.x",
             "and.y",
+            "AND.y",
+            "AND",
+            "OR",
+            "NOT",
             "last.z",
             "@x",
             "@x.y",
@@ -1779,6 +1783,10 @@ mod tests {
             "`not.a`",
             "`not`",
             "`and`",
+            "`AND`",
+            "`AND.y`",
+            "`OR.y`",
+            "`NOT.y`",
             "`in`",
             "`matches`",
             "`last`",
@@ -2016,6 +2024,12 @@ mod tests {
             "`a b`",
             "`in`",
             "OR.a",
+            "`AND`",
+            "`OR`",
+            "`NOT`",
+            "`NOT.y`",
+            "AND",
+            "AND.y",
             "1",
             "0",
             "-1",
@@ -2041,8 +2055,8 @@ mod tests {
         ];
 
         const BINARY_OPS: &[&str] = &[
-            "+", "-", "*", "/", "%", "==", "!=", ">", ">=", "<", "<=", "and", "or", "matches",
-            "like", "ilike",
+            "+", "-", "*", "/", "%", "==", "!=", ">", ">=", "<", "<=", "and", "AND", "or", "OR",
+            "matches", "like", "ilike",
         ];
 
         const FUNCTIONS: &[&str] = &["lower", "length", "coalesce", "abs", "if", "isnotnull"];
@@ -2055,6 +2069,7 @@ mod tests {
                     2 => (inner.clone(), pick(BINARY_OPS), inner.clone())
                         .prop_map(|(a, op, b)| format!("({a} {op} {b})")),
                     1 => inner.clone().prop_map(|a| format!("not {a}")),
+                    1 => inner.clone().prop_map(|a| format!("NOT {a}")),
                     1 => inner.clone().prop_map(|a| format!("-{a}")),
                     1 => inner.clone().prop_map(|a| format!("- {a}")),
                     1 => inner.clone().prop_map(|a| format!("({a})")),
@@ -3315,6 +3330,56 @@ mod tests {
         | where not status == 200
         "
         );
+    }
+
+    /// Capital boolean operators print lowercase; a field whose name, or
+    /// first dot segment, a capital keyword claims prints backticked, and
+    /// `AND.x`, which no keyword claims, prints bare. Each reads back as
+    /// the query it came from (ADR-0061).
+    #[test]
+    fn uppercase_operators_format_lowercase() {
+        insta::assert_snapshot!(
+            fmt("* | where NOT a == 1 OR b == 2 AND c == 3"),
+            @r"
+        *
+        | where not a == 1 or b == 2 and c == 3
+        "
+        );
+
+        for (src, field, rendered) in [
+            ("* | where `AND` == 1", "AND", "`AND`"),
+            ("* | where `OR` == 1", "OR", "`OR`"),
+            ("* | where `NOT` == 1", "NOT", "`NOT`"),
+            ("* | where `OR.x` == 1", "OR.x", "`OR.x`"),
+            ("* | where `NOT.x` == 1", "NOT.x", "`NOT.x`"),
+            ("* | where AND.x == 1", "AND.x", "AND.x"),
+        ] {
+            let text = fmt(src);
+            assert_eq!(text, format!("*\n| where {rendered} == 1"), "{src}");
+            let reparsed = crate::parser::parse(&text).unwrap();
+            let PipeStage::Where(crate::ast::WhereStage { condition }) = &reparsed.pipeline[0].node
+            else {
+                panic!("{text} must read as where");
+            };
+            let Expr::Binary { lhs, .. } = &condition.node else {
+                panic!("{text} must read as a comparison");
+            };
+            assert_eq!(lhs.node, Expr::FieldRef(field.to_string()), "{text}");
+        }
+
+        for src in [
+            "* | where NOT a == 1 OR b == 2 AND c == 3",
+            "* | let x = case(a == 1 AND NOT b == 2, 1, 0)",
+            "* | where `AND` == 1 OR `NOT` == 2 AND `OR.x` == 3 OR NOT `NOT.x` == 4",
+            "* | where AND.x == 1",
+        ] {
+            let query = crate::parser::parse(src).unwrap();
+            let reparsed = crate::parser::parse(&format_query(&query)).unwrap();
+            assert!(
+                crate::canonical_form::same_query(&query, &reparsed),
+                "{src} must format to text that reads back as itself"
+            );
+        }
     }
 
     #[test]
