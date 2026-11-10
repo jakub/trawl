@@ -14,11 +14,16 @@
 //! [`selection_bytes`] measures the part of it that can hold the
 //! capture's window.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
 use chrono::{DateTime, NaiveDateTime, Timelike as _, Utc};
-use trawl_core::ast::{FieldFilter, FilterOp, FilterValue, Query, Scalar, SearchToken};
+use trawl_core::ast::{
+    FieldFilter, FilterOp, FilterValue, Query, Scalar, SearchStage, SearchToken, Spanned,
+};
+use trawl_core::compare::{CompareForm, compare_form};
+use trawl_core::schema::{ENVELOPE_TYPES, SERVICE};
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
 use trawl_engine::parquet_stats::{
@@ -49,11 +54,132 @@ const _: () = {
 /// The file pattern that selects every service's file in a directory.
 const ANY_SERVICE: &str = "*.parquet";
 
+/// Which service files a selection reads in each of its directories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Services {
+    /// Every service's file: [`ANY_SERVICE`].
+    Any,
+    /// Only these services' files, `{service}.parquet` each, in name
+    /// order. Empty when the search stage is a contradiction
+    /// (`service=a service=b`), so no stored file can match. Only
+    /// [`service_pins`] builds it.
+    Only(BTreeSet<String>),
+}
+
+impl Services {
+    /// The file pattern of each service file, in the order a source lists
+    /// them within a directory: none for the empty set.
+    fn file_patterns(&self) -> Vec<String> {
+        match self {
+            Self::Any => vec![ANY_SERVICE.to_owned()],
+            Self::Only(services) => services.iter().map(|s| format!("{s}.parquet")).collect(),
+        }
+    }
+}
+
+/// The most distinct services one selection names. The engine probes each
+/// list entry, a `stat` or a `glob()`, in every selected directory, so the
+/// names multiply the probes; a larger set reads every service instead.
+const MAX_PINNED_SERVICES: usize = 32;
+
+/// The services a search stage pins: the service files every event it
+/// matches is stored in.
+///
+/// The SQL filter still decides every row, so a pin only has to name each
+/// file a matching row can be in. `service=a` pins `{a}` and `service=a,b`
+/// pins `{a, b}`. An AND pins what its pinning tokens pin in common, and a
+/// token that pins nothing does not narrow it. An OR pins the union of its
+/// branches when every branch pins. Everything else pins nothing: an AND
+/// with no pinning token (an empty AND, which is true, included), an OR of
+/// no branch, `NOT`, `!=` and every other operator, any other field, a
+/// pattern, and a value that does not compare as text ([`pinned_name`]).
+///
+/// Each name is interpolated verbatim into a single-quoted glob entry, so
+/// the final set, after every intersection and union, must pass the same
+/// `is_valid_service_name` predicate ingest enforces: anything outside the
+/// ingest-side charset (quotes, separators, slashes, dots at the front)
+/// reads every service rather than being allowed to close one path and
+/// open another. A name an intersection removed reaches no path. A final
+/// set over [`MAX_PINNED_SERVICES`] reads every service too.
+fn service_pins(search: &SearchStage) -> Services {
+    match disjunction_pins(&search.groups) {
+        Some(services)
+            if services.len() <= MAX_PINNED_SERVICES
+                && services
+                    .iter()
+                    .all(|s| trawl_config::is_valid_service_name(s)) =>
+        {
+            Services::Only(services.into_iter().map(str::to_owned).collect())
+        }
+        _ => Services::Any,
+    }
+}
+
+/// What an OR of `branches` pins ([`service_pins`]): nothing unless every
+/// branch pins, and nothing for no branch at all.
+fn disjunction_pins(branches: &[Vec<Spanned<SearchToken>>]) -> Option<BTreeSet<&str>> {
+    if branches.is_empty() {
+        return None;
+    }
+    let mut union = BTreeSet::new();
+    for branch in branches {
+        union.extend(conjunction_pins(branch)?);
+    }
+    Some(union)
+}
+
+/// What an AND of `tokens` pins ([`service_pins`]): nothing when no token
+/// pins, an empty AND included.
+fn conjunction_pins(tokens: &[Spanned<SearchToken>]) -> Option<BTreeSet<&str>> {
+    tokens
+        .iter()
+        .filter_map(|token| token_pins(&token.node))
+        .reduce(|common, pinned| common.intersection(&pinned).copied().collect())
+}
+
+/// What one search token pins ([`service_pins`]).
+fn token_pins(token: &SearchToken) -> Option<BTreeSet<&str>> {
+    match token {
+        SearchToken::FieldFilter(FieldFilter {
+            field,
+            op: FilterOp::Eq,
+            value,
+        }) if field == SERVICE => match value {
+            FilterValue::Single(scalar) => pinned_name(scalar).map(|name| BTreeSet::from([name])),
+            // One element that pins nothing makes the list pin nothing.
+            FilterValue::List(scalars) => scalars.iter().map(pinned_name).collect(),
+        },
+        SearchToken::Group(branches) => disjunction_pins(branches),
+        // `NOT`, text and time tokens, and every other filter.
+        _ => None,
+    }
+}
+
+/// The one service whose file holds every row `service=` `scalar` matches:
+/// an exact value the `service` pin compares as text, which only a stored
+/// service of the same bytes matches. A numeric value also matches the
+/// same number spelled another way (`service=1` matches a stored `01`, in
+/// `01.parquet`), and a pattern matches many names, so neither pins.
+fn pinned_name(scalar: &Scalar) -> Option<&str> {
+    let Scalar::Exact(value) = scalar else {
+        return None;
+    };
+    // The envelope's own pin (ADR-0009), which the catalog is seeded with.
+    let pin = ENVELOPE_TYPES
+        .iter()
+        .find_map(|(field, ty)| (*field == SERVICE).then_some(*ty));
+    match compare_form(pin, FilterOp::Eq, value) {
+        Ok(CompareForm::Text(text)) if text == *value => Some(value),
+        _ => None,
+    }
+}
+
 /// Extract an exact value for `field` from the search stage, if present.
 ///
 /// Only returns `Some` for single-group queries with a simple equality
-/// filter (`service=nginx`, `env=prod`). Multi-group (OR) queries can't
-/// be narrowed safely, and glob/regex values are also ignored.
+/// filter (`env=prod`). Multi-group (OR) queries can't be narrowed to one
+/// value safely, and glob/regex values are also ignored. Services are
+/// narrowed to a set instead, by [`service_pins`].
 fn extract_eq_filter<'a>(
     search: &'a trawl_core::ast::SearchStage,
     field_name: &str,
@@ -81,14 +207,14 @@ fn extract_eq_filter<'a>(
 /// day-level `data/{env}/{date}/{service}.parquet` after rollup.
 ///
 /// `env=X` pins the outer directory; otherwise every env directory on
-/// disk is searched. `service=X` narrows the file pattern verbatim (path
-/// encoding is injective by validation, so `api.v2` and `api_v2` are
-/// distinct files and pruning is exact), but only when the literal
-/// satisfies the same `is_valid_service_name` predicate ingest enforces:
-/// a value no on-disk file can carry is also a value that must never be
-/// spliced into the glob list, so it falls back to the wildcard pattern.
-/// A time filter scopes to the relevant date/hour directories; without
-/// one, date-formatted dirs are enumerated per env.
+/// disk is searched. A `service=` filter narrows every directory to the
+/// files of the services the search stage pins ([`service_pins`]): one for
+/// `service=a`, several for `service=a,b` or `service=a OR service=b`, and
+/// none for a contradiction such as `service=a service=b`, which reads no
+/// stored file. Each name is the file's verbatim (path encoding is
+/// injective by validation, so `api.v2` and `api_v2` are distinct files
+/// and pruning is exact). A time filter scopes to the relevant date/hour
+/// directories; without one, date-formatted dirs are enumerated per env.
 ///
 /// Returns a `DuckDB` list literal like
 /// `['data/prod/2026-08-02/14/*.parquet', ...]` when scoping is
@@ -127,12 +253,12 @@ pub(crate) fn select(
     let Ok(ast) = shape(dsl, cancel)? else {
         return Ok(SourceSelection {
             base,
-            file_pattern: ANY_SERVICE.to_owned(),
+            services: Services::Any,
             elements: Vec::new(),
         });
     };
 
-    let Narrowing { file_pattern, envs } = narrowing(&base, &ast);
+    let Narrowing { services, envs } = narrowing(&base, &ast);
     let time_filter = ast.search.time_filter.as_ref().map(|tf| tf.node.duration);
 
     // One clock read for every env, so all of them walk the same hours.
@@ -142,7 +268,7 @@ pub(crate) fn select(
         let env_base = format!("{base}/{env}");
         match time_filter {
             Some(duration) => {
-                let scoped = time_scoped_dirs(&env_base, duration, &file_pattern, now);
+                let scoped = time_scoped_dirs(&env_base, duration, &services, now);
                 if scoped.is_empty() {
                     elements.extend(date_scoped_dirs(&env_base));
                 } else {
@@ -160,15 +286,16 @@ pub(crate) fn select(
     // [`no_match_source`].
     Ok(SourceSelection {
         base,
-        file_pattern,
+        services,
         elements,
     })
 }
 
-/// The env directories a query's source reads, by [`compute_source`]'s
-/// rules, and how many: the one its `env=` pins, none for a value no env
-/// can carry, else every env on disk. Unparseable DSL selects none, as it
-/// reads nothing.
+/// The env directories a query's `env=` filter selects, by
+/// [`compute_source`]'s rules, and how many: the one its `env=` pins, none
+/// for a value no env can carry, else every env on disk. Unparseable DSL
+/// selects none, as it reads nothing. A service contradiction, which reads
+/// no env's files, still selects its envs here: this is the env pin alone.
 ///
 /// Only the first `cap` names in name order are kept. With no pin the envs
 /// come from [`env_dirs::first_env_names`](crate::env_dirs::first_env_names),
@@ -224,29 +351,27 @@ fn shape(
 /// legal env name, so no data directory can ever carry it. The executor
 /// reads "no files" as an empty cold side and the SQL filter keeps hot rows
 /// correct.
-fn no_match_source(base: &str, file_pattern: &str) -> String {
-    format!("{base}/.no-such-env/{file_pattern}")
+fn no_match_source(base: &str) -> String {
+    format!("{base}/.no-such-env/{ANY_SERVICE}")
 }
 
-/// What a query's equality filters pin: the file pattern and the env
+/// What a query's equality filters pin: the service files and the env
 /// directories to search. No envs means nothing on disk can match.
 struct Narrowing {
-    file_pattern: String,
+    services: Services,
     envs: Vec<String>,
 }
 
 /// Read the `service=` and `env=` pins off a parsed query (see
 /// [`compute_source`] for the rules).
 fn narrowing(base: &str, ast: &Query) -> Narrowing {
-    // The literal is interpolated verbatim into single-quoted glob
-    // entries, so anything outside the ingest-side charset (quotes,
-    // separators, slashes, dots at the front) is rejected here rather
-    // than allowed to close one path and open another.
-    let service = extract_eq_filter(&ast.search, "service")
-        .filter(|s| trawl_config::is_valid_service_name(s));
-    let file_pattern = service.map_or_else(|| ANY_SERVICE.to_owned(), |s| format!("{s}.parquet"));
+    let services = service_pins(&ast.search);
 
     let envs: Vec<String> = match env_pin(ast) {
+        // A service contradiction reads no file in any env, and selecting
+        // no env keeps it out of the time walk's fallback to every date
+        // directory.
+        _ if services == Services::Only(BTreeSet::new()) => Vec::new(),
         EnvPin::One(env) => vec![env.to_owned()],
         // The executor treats "no files" as an empty result and the SQL
         // filter keeps hot rows correct.
@@ -257,7 +382,7 @@ fn narrowing(base: &str, ast: &Query) -> Narrowing {
         EnvPin::Every => crate::env_dirs::list_env_names(Path::new(base)),
     };
 
-    Narrowing { file_pattern, envs }
+    Narrowing { services, envs }
 }
 
 /// What a query's `env=` filter selects (see [`compute_source`]).
@@ -285,18 +410,18 @@ fn env_pin(ast: &Query) -> EnvPin<'_> {
 }
 
 /// What one `read_parquet()` source reads: the partition directories and
-/// the one file pattern every directory is read with.
+/// the service files every directory is read for.
 ///
 /// It is structured rather than a source string because a capture needs
 /// two things from it: the `read_parquet()` argument ([`Self::source`]) and
 /// the bytes behind it ([`selection_bytes`]), and the second must expand
-/// exactly the directories and pattern the first names.
+/// exactly the directories and service files the first names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceSelection {
     /// The data root, without a trailing slash.
     base: String,
-    /// `*.parquet`, or `{service}.parquet` for a pinned service.
-    file_pattern: String,
+    /// The service files read in each directory.
+    services: Services,
     /// The directories, in the order the source lists them.
     elements: Vec<Element>,
 }
@@ -339,37 +464,43 @@ impl Element {
 
 impl SourceSelection {
     /// The `read_parquet()` source argument: a `DuckDB` list literal with
-    /// one entry per directory, or [`no_match_source`] when no directory
-    /// was selected.
+    /// one entry per directory and service file, by directory and then by
+    /// service name, or [`no_match_source`] when that is no entry: no
+    /// directory was selected, or no service can match.
     pub(crate) fn source(&self) -> String {
-        if self.elements.is_empty() {
-            return no_match_source(&self.base, &self.file_pattern);
-        }
+        let patterns = self.services.file_patterns();
         let globs: Vec<String> = self
             .elements
             .iter()
-            .map(|element| element.glob(&self.file_pattern))
+            .flat_map(|element| patterns.iter().map(|pattern| element.glob(pattern)))
             .collect();
+        if globs.is_empty() {
+            return no_match_source(&self.base);
+        }
         format!("[{}]", globs.join(", "))
     }
 
-    /// Whether a file name matches the pattern the way `DuckDB`'s `glob()`
-    /// does: `*` matches any run of bytes, including an empty one and a
-    /// leading dot, and the match is case-sensitive.
+    /// Whether a file name matches one of the selection's file patterns
+    /// the way `DuckDB`'s `glob()` does: `*` matches any run of bytes,
+    /// including an empty one and a leading dot, a pinned name matches
+    /// only itself, and the match is case-sensitive.
     fn matches(&self, name: &std::ffi::OsStr) -> bool {
         let name = name.as_encoded_bytes();
-        if self.file_pattern == ANY_SERVICE {
-            name.ends_with(b".parquet")
-        } else {
-            name == self.file_pattern.as_bytes()
+        match &self.services {
+            Services::Any => name.ends_with(b".parquet"),
+            Services::Only(services) => name
+                .strip_suffix(b".parquet")
+                .and_then(|stem| std::str::from_utf8(stem).ok())
+                .is_some_and(|stem| services.contains(stem)),
         }
     }
 }
 
 /// The bytes of parquet `selection` reaches that can hold an event of the
-/// window `[start, end)`: the summed size of every regular file its pattern
-/// matches in its directories, less each file whose footer statistics put
-/// every row group's `_time` outside the window.
+/// window `[start, end)`: the summed size of every regular file one of its
+/// file patterns matches in its directories, less each file whose footer
+/// statistics put every row group's `_time` outside the window. Each
+/// directory is walked once, whatever the number of services.
 ///
 /// Partitions are named by when compaction wrote them and ingest keeps the
 /// `_time` a sender says (`ingest::envelope`), so no directory name bounds
@@ -461,8 +592,8 @@ fn dir_bytes(
         };
         let bytes = if file_type.is_dir() {
             // `**` descends into every directory, a dot-named one or one
-            // whose own name matches the pattern included, and matches
-            // only files.
+            // whose own name matches a pattern included, and matches only
+            // files.
             if !recursive {
                 continue;
             }
@@ -546,7 +677,7 @@ fn micros(sample: &StatVal, ceil: bool) -> Option<i128> {
 fn time_scoped_dirs(
     base: &str,
     duration: trawl_core::ast::TrawlDuration,
-    file_pattern: &str,
+    services: &Services,
     now: DateTime<Utc>,
 ) -> Vec<Element> {
     let total_secs = duration
@@ -563,7 +694,7 @@ fn time_scoped_dirs(
     // Only directories that exist on disk are kept, which avoids sending
     // DuckDB a list of entirely nonexistent paths: that would trigger a
     // "No files found" error before the executor safety net catches it.
-    partition_dirs(base, from, now.naive_utc(), file_pattern)
+    partition_dirs(base, from, now.naive_utc(), services)
         .into_iter()
         .map(Element::hour_or_day)
         .collect()
@@ -582,7 +713,7 @@ fn partition_dirs(
     base: &str,
     from: NaiveDateTime,
     now: NaiveDateTime,
-    file_pattern: &str,
+    services: &Services,
 ) -> Vec<String> {
     let today = now.date();
 
@@ -599,7 +730,7 @@ fn partition_dirs(
             // Today may have day-level consolidated files from a
             // previous server session or an earlier daily rollup.
             // Check once, then list the hours of the time range.
-            if has_day_level_files(base, &day, file_pattern) {
+            if has_day_level_files(base, &day, services) {
                 dirs.push(format!("{base}/{day}"));
             }
             while cursor <= now {
@@ -608,7 +739,7 @@ fn partition_dirs(
                 cursor += chrono::Duration::hours(1);
             }
         } else {
-            let has_day = has_day_level_files(base, &day, file_pattern);
+            let has_day = has_day_level_files(base, &day, services);
             let has_hours = has_hour_dirs(base, &day);
 
             if has_day {
@@ -665,23 +796,28 @@ fn date_scoped_dirs(base: &str) -> Vec<Element> {
 
 /// Check if a date directory has day-level parquet files (consolidated).
 ///
-/// For a known service, does a single `stat()`. For wildcards, checks
-/// if the date directory contains any direct `.parquet` files.
-fn has_day_level_files(base: &str, day: &str, file_pattern: &str) -> bool {
+/// For pinned services, does one `stat()` per service until one has its
+/// day file, and none for the empty set. For every service, checks if the
+/// date directory contains any direct `.parquet` files.
+fn has_day_level_files(base: &str, day: &str, services: &Services) -> bool {
     let day_dir = std::path::Path::new(base).join(day);
 
-    if file_pattern == "*.parquet" {
-        // Wildcard: check if any .parquet files exist directly in date dir.
-        let Ok(entries) = std::fs::read_dir(&day_dir) else {
-            return false;
-        };
-        entries.flatten().any(|e| {
-            let p = e.path();
-            !p.is_dir() && p.extension().is_some_and(|ext| ext == "parquet")
-        })
-    } else {
-        // Known service: single stat() call.
-        day_dir.join(file_pattern).exists()
+    match services {
+        Services::Any => {
+            // Wildcard: check if any .parquet files exist directly in date dir.
+            let Ok(entries) = std::fs::read_dir(&day_dir) else {
+                return false;
+            };
+            entries.flatten().any(|e| {
+                let p = e.path();
+                !p.is_dir() && p.extension().is_some_and(|ext| ext == "parquet")
+            })
+        }
+        // One member's day file is enough: the day directory's entry for
+        // a member without one matches nothing.
+        Services::Only(services) => services
+            .iter()
+            .any(|service| day_dir.join(format!("{service}.parquet")).exists()),
     }
 }
 
@@ -752,15 +888,24 @@ mod tests {
     #[test]
     fn service_filter_narrows_glob() {
         // Exact service filter → narrow to service-specific file.
-        let source = compute_source("/data", "service=nginx", &running()).unwrap();
-        assert_eq!(source, "/data/.no-such-env/nginx.parquet");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        mkdir(tmp.path(), "prod/2026-01-15");
+        let source = compute_source(base, "service=nginx", &running()).unwrap();
+        assert_eq!(
+            source,
+            format!("['{base}/prod/2026-01-15/**/nginx.parquet']")
+        );
     }
 
     #[test]
     fn service_glob_keeps_wildcard() {
         // Glob operator on service → can't narrow, keep *.parquet.
-        let source = compute_source("/data", "service=ng*", &running()).unwrap();
-        assert_eq!(source, "/data/.no-such-env/*.parquet");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        mkdir(tmp.path(), "prod/2026-01-15");
+        let source = compute_source(base, "service=ng*", &running()).unwrap();
+        assert_eq!(source, format!("['{base}/prod/2026-01-15/**/*.parquet']"));
     }
 
     #[test]
@@ -916,16 +1061,20 @@ mod tests {
         std::fs::create_dir_all(&day_dir).unwrap();
         std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
 
-        assert!(has_day_level_files(
-            tmp.path().to_str().unwrap(),
-            "2026-01-15",
-            "nginx.parquet"
-        ));
+        let base = tmp.path().to_str().unwrap();
+        assert!(has_day_level_files(base, "2026-01-15", &only(&["nginx"])));
         assert!(!has_day_level_files(
-            tmp.path().to_str().unwrap(),
+            base,
             "2026-01-15",
-            "postgres.parquet"
+            &only(&["postgres"])
         ));
+        // Any member's day file counts, wherever it sorts.
+        assert!(has_day_level_files(
+            base,
+            "2026-01-15",
+            &only(&["apache", "nginx", "postgres"])
+        ));
+        assert!(!has_day_level_files(base, "2026-01-15", &only::<&str>(&[])));
     }
 
     #[test]
@@ -938,7 +1087,7 @@ mod tests {
         assert!(!has_day_level_files(
             tmp.path().to_str().unwrap(),
             "2026-01-15",
-            "*.parquet"
+            &Services::Any
         ));
 
         // Add a parquet file.
@@ -946,7 +1095,7 @@ mod tests {
         assert!(has_day_level_files(
             tmp.path().to_str().unwrap(),
             "2026-01-15",
-            "*.parquet"
+            &Services::Any
         ));
     }
 
@@ -962,7 +1111,7 @@ mod tests {
         assert!(!has_day_level_files(
             tmp.path().to_str().unwrap(),
             "2026-01-15",
-            "*.parquet"
+            &Services::Any
         ));
     }
 
@@ -1022,9 +1171,13 @@ mod tests {
         // Filenames carry the service verbatim (ADR-0009), so a dotted
         // service prunes to its own file: `api.v2` and `api_v2` are
         // distinct.
-        let source = compute_source("/data", "service=api.v2", &running()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        mkdir(tmp.path(), "prod/2026-01-15");
+        let source = compute_source(base, "service=api.v2", &running()).unwrap();
         assert_eq!(
-            source, "/data/.no-such-env/api.v2.parquet",
+            source,
+            format!("['{base}/prod/2026-01-15/**/api.v2.parquet']"),
             "the file pattern carries the service name verbatim"
         );
     }
@@ -1243,6 +1396,7 @@ mod tests {
     fn verbatim_service_with_time_filter() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
+        mkdir(tmp.path(), "prod/2026-01-15");
         let source = compute_source(base, "service=host.name last=1h", &running()).unwrap();
 
         // Filenames carry the service verbatim (ADR-0009).
@@ -1254,6 +1408,274 @@ mod tests {
             !source.contains("host_name.parquet"),
             "must not sanitize the service name, got: {source}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Service pins: `service_pins`
+    // -----------------------------------------------------------------
+
+    /// The services `dsl`'s search stage pins.
+    fn pins(dsl: &str) -> Services {
+        let query = trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+        service_pins(&query.search)
+    }
+
+    /// A pin of exactly `names`.
+    fn only<S: AsRef<str>>(names: &[S]) -> Services {
+        Services::Only(names.iter().map(|n| n.as_ref().to_owned()).collect())
+    }
+
+    /// An OR pins the union of its branches only when every branch pins;
+    /// an AND intersects what its pinning tokens pin. Anything those rules
+    /// cannot prove reads every service.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn service_pins_boolean_matrix() {
+        let any = Services::Any;
+        for (dsl, expected) in [
+            // One equality, a list, and an OR of them: the union.
+            ("service=a", only(&["a"])),
+            ("service=a,b", only(&["a", "b"])),
+            ("(service=a OR service=b)", only(&["a", "b"])),
+            ("service=a OR service=b", only(&["a", "b"])),
+            ("service=a OR service=b,c", only(&["a", "b", "c"])),
+            ("service=a last=1h OR service=b", only(&["a", "b"])),
+            // An AND intersects the tokens that pin; one that pins
+            // nothing does not narrow it.
+            ("service=a,b service=b,c", only(&["b"])),
+            ("service=a service=b", only::<&str>(&[])),
+            (
+                "service=a _severity=error -debug \"a phrase\"",
+                only(&["a"]),
+            ),
+            ("service=a k8s_pod=b* host!=c NOT env=lab", only(&["a"])),
+            ("service=a last=1h", only(&["a"])),
+            // Nested groups follow the same two rules.
+            ("service=a,b (service=b OR service=c)", only(&["b"])),
+            (
+                "((service=a OR service=b) OR (service=c env=prod))",
+                only(&["a", "b", "c"]),
+            ),
+            ("(service=a OR (service=b OR k8s_pod=x))", any.clone()),
+            (
+                "(service=a OR service=b) (service=c OR k8s_pod=x)",
+                only(&["a", "b"]),
+            ),
+            // One branch that pins nothing reads every service.
+            ("(service=a OR k8s_pod=b*)", any.clone()),
+            ("service=a OR _severity=error", any.clone()),
+            ("service=a OR *", any.clone()),
+            // Negation, other operators and patterns never pin.
+            ("NOT service=a", any.clone()),
+            ("NOT (NOT service=a)", any.clone()),
+            ("NOT (service=a OR service=b)", any.clone()),
+            ("service!=a", any.clone()),
+            ("service!=a,b", any.clone()),
+            ("service>=a", any.clone()),
+            ("service=a*", any.clone()),
+            ("service=/a/", any.clone()),
+            ("service=a,b*", any.clone()),
+            ("service=a,/b/", any.clone()),
+            // Only the field `service`, spelled exactly.
+            ("Service=a", any.clone()),
+            ("SERVICE=a", any.clone()),
+            ("_service=a", any.clone()),
+            ("env=prod", any.clone()),
+            // No token pins, or there is no group at all (`last=1h`).
+            ("*", any.clone()),
+            ("last=1h", any.clone()),
+            ("_severity=error", any.clone()),
+            // A numeric literal also matches a stored service of the same
+            // value (`1` matches `01`, in `01.parquet`), so it pins nothing.
+            ("service=1", any.clone()),
+            ("service=\"1\"", any.clone()),
+            ("service=1,api", any.clone()),
+            ("(service=1 OR service=api)", any.clone()),
+            ("service=1 service=01", any.clone()),
+            ("service=nan", any.clone()),
+            ("service=inf", any.clone()),
+            ("service=1e5", any.clone()),
+            ("service=1 service=api", only(&["api"])),
+            // Names are checked on the final set: one the intersection
+            // removes never reaches a path, one left in reads everything.
+            ("service=a,\".x\"", any.clone()),
+            ("service=\"x', '/etc\"", any.clone()),
+            ("service=a,\".x\" service=a", only(&["a"])),
+            ("service=\"x'\" service=a", only::<&str>(&[])),
+            // A repeated name is one name.
+            ("service=a,a", only(&["a"])),
+            ("service=a OR service=a", only(&["a"])),
+        ] {
+            assert_eq!(pins(dsl), expected, "{dsl}");
+        }
+
+        // At most 32 distinct names, counted on the final set.
+        let names: Vec<String> = (0..34).map(|i| format!("svc{i:02}")).collect();
+        let list = |names: &[String]| names.join(",");
+        assert_eq!(
+            pins(&format!("service={}", list(&names[..32]))),
+            only(&names[..32])
+        );
+        assert_eq!(pins(&format!("service={}", list(&names[..33]))), any);
+        assert_eq!(
+            pins(&format!("service={},svc00", list(&names[..32]))),
+            only(&names[..32]),
+            "a repeat is not a 33rd name"
+        );
+        assert_eq!(
+            pins(&format!("service={} service=svc05", list(&names[..33]))),
+            only(&["svc05"]),
+            "33 names narrowed to one pin that one"
+        );
+        assert_eq!(
+            pins(&format!(
+                "service={} OR service={}",
+                list(&names[..17]),
+                list(&names[17..34])
+            )),
+            any,
+            "two branches of 17 are 34 names"
+        );
+        assert_eq!(
+            pins(&format!(
+                "service={} OR service={}",
+                list(&names[..20]),
+                list(&names[12..32])
+            )),
+            only(&names[..32]),
+            "overlapping branches are their distinct names"
+        );
+
+        // Shapes the parser never builds. An empty AND branch is true, so
+        // `[] OR service=a` matches every event; no branch at all pins
+        // nothing rather than the empty set.
+        let parsed = |dsl: &str| trawl_core::parser::parse(dsl).unwrap().search;
+        let mut search = parsed("service=a");
+        search.groups.insert(0, Vec::new());
+        assert_eq!(service_pins(&search), any, "an empty first group");
+        let mut search = parsed("service=a");
+        search.groups.clear();
+        assert_eq!(service_pins(&search), any, "no group");
+        let no_branch = Spanned::new(SearchToken::Group(Vec::new()), 0..0);
+        let mut search = parsed("service=a");
+        search.groups = vec![vec![no_branch.clone()]];
+        assert_eq!(service_pins(&search), any, "a group of no branch alone");
+        let mut search = parsed("service=a");
+        search.groups[0].insert(0, no_branch.clone());
+        assert_eq!(
+            service_pins(&search),
+            only(&["a"]),
+            "a group of no branch does not narrow an AND"
+        );
+        let mut search = parsed("service=a");
+        search.groups.push(vec![no_branch]);
+        assert_eq!(service_pins(&search), any, "nor does it pin an OR branch");
+    }
+
+    /// Every file `source` reaches: each entry of its list, or the bare
+    /// source, expanded by `DuckDB`'s own `glob()`.
+    fn source_files(source: &str) -> Vec<String> {
+        let entries: Vec<&str> = match source.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            Some(list) => list.split(", ").map(|e| e.trim_matches('\'')).collect(),
+            None => vec![source],
+        };
+        entries.into_iter().flat_map(glob_matches).collect()
+    }
+
+    /// A selection that pins several services names only their files,
+    /// each once, and charges exactly those files, in both layouts a
+    /// selection reads: hour and day directories for `last=`, and each
+    /// date read through `**` otherwise. One day is rolled up for one
+    /// service only, and a pinned service may have no file at all.
+    #[test]
+    fn multi_service_selection_matches_accounting() {
+        use std::collections::BTreeMap;
+        use trawl_core::ast::{TimeUnit, TrawlDuration};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let base = root.to_str().unwrap();
+        // 2026-11-07 rolled up nginx alone; postgres and redis are still
+        // hourly there. 2026-11-08 is hourly for all three.
+        let mut files = vec!["prod/2026-11-07/nginx.parquet".to_owned()];
+        for hh in ["10", "14"] {
+            for service in ["postgres", "redis"] {
+                files.push(format!("prod/2026-11-07/{hh}/{service}.parquet"));
+            }
+        }
+        for hh in ["12", "13"] {
+            for service in ["nginx", "postgres", "redis"] {
+                files.push(format!("prod/2026-11-08/{hh}/{service}.parquet"));
+            }
+        }
+        // A distinct power of two per file, so a total names its files.
+        let sizes: BTreeMap<String, u64> = files
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| {
+                let path = root.join(rel).to_string_lossy().into_owned();
+                (path, write_len(root, rel, 1 << i))
+            })
+            .collect();
+
+        // `last=1d` at 13:37 walks all of 2026-11-07 and today to 13:00.
+        let q = at("2026-11-08T13:37:00Z");
+        let one_day = TrawlDuration {
+            quantity: 1,
+            unit: TimeUnit::Days,
+        };
+        let (earliest, latest) = ("2026-11-07T00:00:00Z", "2026-11-08T13:37:00Z");
+        for (dsl, services) in [
+            ("service=nginx,postgres", &["nginx", "postgres"][..]),
+            (
+                "(service=nginx OR service=postgres)",
+                &["nginx", "postgres"],
+            ),
+            ("service=postgres,redis", &["postgres", "redis"]),
+            ("service=nginx,absent", &["nginx"]),
+            ("service=redis OR service=absent", &["redis"]),
+            ("service=absent,gone", &[]),
+            ("service=nginx service=postgres", &[]),
+            ("*", &["nginx", "postgres", "redis"]),
+        ] {
+            let expected: BTreeSet<&str> = sizes
+                .keys()
+                .filter(|path| {
+                    services
+                        .iter()
+                        .any(|s| path.ends_with(&format!("/{s}.parquet")))
+                })
+                .map(String::as_str)
+                .collect();
+            let charge: u64 = expected.iter().map(|path| sizes[*path]).sum();
+
+            let pinned = service_pins(&trawl_core::parser::parse(dsl).unwrap().search);
+            let time_scoped = SourceSelection {
+                base: base.to_owned(),
+                elements: time_scoped_dirs(&format!("{base}/prod"), one_day, &pinned, q),
+                services: pinned,
+            };
+            assert!(time_scoped.elements.iter().all(|e| !e.recursive));
+            let date_scoped = select(base, &executed(dsl, earliest, latest), &running()).unwrap();
+            assert!(date_scoped.elements.iter().all(|e| e.recursive));
+
+            for (layout, selection) in [("time", &time_scoped), ("date", &date_scoped)] {
+                let source = selection.source();
+                let matched = source_files(&source);
+                let distinct: BTreeSet<&str> = matched.iter().map(String::as_str).collect();
+                assert_eq!(distinct, expected, "{layout} {dsl}: {source}");
+                assert_eq!(
+                    distinct.len(),
+                    matched.len(),
+                    "{layout} {dsl}: a file twice"
+                );
+                assert_eq!(
+                    selection_bytes(selection, at(earliest), at(latest), &running()).unwrap(),
+                    charge,
+                    "{layout} {dsl}: {source}"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1688,8 +2110,29 @@ mod tests {
         let bad_env = select(base, "env=../evil", &running()).unwrap();
         assert!(bad_env.elements.is_empty());
         let bad_service = select(base, r#"service="x', '/etc""#, &running()).unwrap();
-        assert_eq!(bad_service.file_pattern, "*.parquet");
+        assert_eq!(bad_service.services, Services::Any);
         assert!(!bad_service.source().contains("/etc"));
+        // A service contradiction selects no directory, with or without
+        // `last=`: the time walk finds no hour of 2026-10-23 today, and
+        // must not fall back to every date directory.
+        for contradiction in [
+            "service=a service=b",
+            "service=a service=b last=1h",
+            "service=a,b service=c env=prod",
+        ] {
+            let nothing = select(base, contradiction, &running()).unwrap();
+            assert!(nothing.elements.is_empty(), "{contradiction}: {nothing:?}");
+            assert_eq!(
+                nothing.source(),
+                format!("{base}/.no-such-env/*.parquet"),
+                "{contradiction}"
+            );
+            assert!(glob_matches(&nothing.source()).is_empty());
+            assert_eq!(
+                selection_bytes(&nothing, start, end, &running()).unwrap(),
+                0
+            );
+        }
         let unparseable = select(base, "| | broken", &running()).unwrap();
         assert_eq!(
             unparseable.source(),
@@ -1879,14 +2322,17 @@ mod tests {
             write_len(tmp.path(), &format!("{day}/{name}"), 1);
         }
 
-        for dsl in ["*", "service=nginx", "service=absent"] {
+        for dsl in [
+            "*",
+            "service=nginx",
+            "service=absent",
+            "service=nginx,redis",
+            "service=redis OR service=nginx",
+            "service=nginx,absent",
+        ] {
             let selection = select(base, dsl, &running()).unwrap();
             assert_eq!(rel_dirs(&selection, tmp.path()), [day]);
-            let duckdb: usize = selection
-                .elements
-                .iter()
-                .map(|e| glob_matches(&e.glob(&selection.file_pattern).replace('\'', "")).len())
-                .sum();
+            let duckdb = source_files(&selection.source()).len();
             assert_eq!(
                 selection_bytes(
                     &selection,
@@ -1987,9 +2433,9 @@ mod tests {
                     }
                     let base = format!("{}/prod", root.display());
 
-                    for pattern in [ANY_SERVICE, "svc.parquet"] {
-                        let label = format!("Q={q} N={n:?} {layout:?} {pattern}");
-                        let selected = time_scoped_dirs(&base, n, pattern, q);
+                    for services in [Services::Any, only(&["svc"]), only(&["other", "svc"])] {
+                        let label = format!("Q={q} N={n:?} {layout:?} {services:?}");
+                        let selected = time_scoped_dirs(&base, n, &services, q);
                         assert!(selected.iter().all(|e| !e.recursive), "{label}");
                         let dirs: HashSet<&str> = selected.iter().map(|e| e.dir.as_str()).collect();
                         assert_eq!(dirs.len(), selected.len(), "{label}: a directory twice");
@@ -2014,9 +2460,11 @@ mod tests {
                             }
                         }
 
+                        let patterns = services.file_patterns();
                         let matched: Vec<String> = selected
                             .iter()
-                            .flat_map(|e| glob_matches(&format!("{}/{pattern}", e.dir)))
+                            .flat_map(|e| patterns.iter().map(move |p| format!("{}/{p}", e.dir)))
+                            .flat_map(|pattern| glob_matches(&pattern))
                             .collect();
                         let distinct: HashSet<&String> = matched.iter().collect();
                         assert!(!matched.is_empty(), "{label}");
@@ -2038,7 +2486,7 @@ mod tests {
             unit: TimeUnit::Minutes,
         };
         let dirs: Vec<String> =
-            time_scoped_dirs(&base, minute, ANY_SERVICE, at("2026-11-08T13:37:00Z"))
+            time_scoped_dirs(&base, minute, &Services::Any, at("2026-11-08T13:37:00Z"))
                 .into_iter()
                 .map(|e| e.dir)
                 .collect();
