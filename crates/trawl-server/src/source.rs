@@ -82,6 +82,12 @@ impl Services {
 /// names multiply the probes; a larger set reads every service instead.
 const MAX_PINNED_SERVICES: usize = 32;
 
+/// How deep in parenthesised groups a `service=` filter can sit and still
+/// pin. The walk recurses once per level and the parser does not bound the
+/// nesting of search groups, so a deeper group pins nothing instead of
+/// spending the worker's stack.
+const MAX_PIN_NESTING: usize = 32;
+
 /// The services a search stage pins: the service files every event it
 /// matches is stored in.
 ///
@@ -102,7 +108,7 @@ const MAX_PINNED_SERVICES: usize = 32;
 /// open another. A name an intersection removed reaches no path. A final
 /// set over [`MAX_PINNED_SERVICES`] reads every service too.
 fn service_pins(search: &SearchStage) -> Services {
-    match disjunction_pins(&search.groups) {
+    match disjunction_pins(&search.groups, 0) {
         Some(services)
             if services.len() <= MAX_PINNED_SERVICES
                 && services
@@ -120,13 +126,18 @@ fn service_pins(search: &SearchStage) -> Services {
 ///
 /// Each union merges the smaller set into the larger, so a group of one
 /// branch hands its set up unchanged and nesting adds no insertions.
-fn disjunction_pins(branches: &[Vec<Spanned<SearchToken>>]) -> Option<BTreeSet<&str>> {
+///
+/// `nesting` counts the groups around `branches`.
+fn disjunction_pins(
+    branches: &[Vec<Spanned<SearchToken>>],
+    nesting: usize,
+) -> Option<BTreeSet<&str>> {
     if branches.is_empty() {
         return None;
     }
     let mut union = BTreeSet::new();
     for branch in branches {
-        let mut pinned = conjunction_pins(branch)?;
+        let mut pinned = conjunction_pins(branch, nesting)?;
         if pinned.len() > union.len() {
             std::mem::swap(&mut union, &mut pinned);
         }
@@ -140,10 +151,10 @@ fn disjunction_pins(branches: &[Vec<Spanned<SearchToken>>]) -> Option<BTreeSet<&
 ///
 /// Each intersection keeps the smaller set and drops from it what the
 /// larger lacks, so it never copies the larger.
-fn conjunction_pins(tokens: &[Spanned<SearchToken>]) -> Option<BTreeSet<&str>> {
+fn conjunction_pins(tokens: &[Spanned<SearchToken>], nesting: usize) -> Option<BTreeSet<&str>> {
     let mut common: Option<BTreeSet<&str>> = None;
     for token in tokens {
-        let Some(mut pinned) = token_pins(&token.node) else {
+        let Some(mut pinned) = token_pins(&token.node, nesting) else {
             continue;
         };
         if let Some(mut so_far) = common.take() {
@@ -157,8 +168,9 @@ fn conjunction_pins(tokens: &[Spanned<SearchToken>]) -> Option<BTreeSet<&str>> {
     common
 }
 
-/// What one search token pins ([`service_pins`]).
-fn token_pins(token: &SearchToken) -> Option<BTreeSet<&str>> {
+/// What one search token pins ([`service_pins`]). A group nested past
+/// [`MAX_PIN_NESTING`] pins nothing.
+fn token_pins(token: &SearchToken, nesting: usize) -> Option<BTreeSet<&str>> {
     match token {
         SearchToken::FieldFilter(FieldFilter {
             field,
@@ -169,7 +181,9 @@ fn token_pins(token: &SearchToken) -> Option<BTreeSet<&str>> {
             // One element that pins nothing makes the list pin nothing.
             FilterValue::List(scalars) => scalars.iter().map(pinned_name).collect(),
         },
-        SearchToken::Group(branches) => disjunction_pins(branches),
+        SearchToken::Group(branches) if nesting < MAX_PIN_NESTING => {
+            disjunction_pins(branches, nesting + 1)
+        }
         // `NOT`, text and time tokens, and every other filter.
         _ => None,
     }
@@ -1697,6 +1711,28 @@ mod tests {
             elapsed < std::time::Duration::from_millis(500),
             "{elapsed:?}"
         );
+    }
+
+    /// A `service=` filter pins through [`MAX_PIN_NESTING`] groups and no
+    /// deeper. Past the bound the walk stops, so a search nested thousands
+    /// deep, which the parser accepts, reads every service on the 2 MiB
+    /// stack of a blocking worker instead of overflowing it.
+    #[test]
+    fn a_group_nested_past_the_bound_pins_nothing() {
+        let nested = |depth: usize| {
+            let dsl = format!("{}service=a{}", "(".repeat(depth), ")".repeat(depth));
+            std::thread::Builder::new()
+                .stack_size(2 << 20)
+                .spawn(move || service_pins(&trawl_core::parser::parse(&dsl).unwrap().search))
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        let a = Services::Only(BTreeSet::from(["a".to_owned()]));
+        assert_eq!(nested(1), a);
+        assert_eq!(nested(MAX_PIN_NESTING), a);
+        assert_eq!(nested(MAX_PIN_NESTING + 1), Services::Any);
+        assert_eq!(nested(4000), Services::Any);
     }
 
     /// A pin reads only `{name}.parquet`, so it is sound only while every
