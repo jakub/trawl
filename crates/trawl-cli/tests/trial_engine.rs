@@ -392,13 +392,15 @@ fn free_ports<const N: usize>() -> [u16; N] {
 
     let mut rng = rand::thread_rng();
     let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
-        loop {
+        for _ in 0..1_000 {
             let port = rng.gen_range(20_000..32_768);
-            if let Ok(listener) = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            {
-                break listener;
+            match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => return listener,
+                Err(taken) if taken.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(other) => panic!("bind 127.0.0.1:{port}: {other}"),
             }
         }
+        panic!("no free port in 1000 draws from 20000..32768");
     });
     listeners.map(|listener| listener.local_addr().unwrap().port())
 }
