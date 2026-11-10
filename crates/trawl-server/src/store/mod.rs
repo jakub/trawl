@@ -273,9 +273,19 @@ async fn guard_advisory_lock(mut conn: PgConnection, lost_tx: watch::Sender<bool
     loop {
         ticker.tick().await;
         if let Err(e) = sqlx::query("SELECT 1").execute(&mut conn).await {
-            tracing::error!(
+            tracing::debug!(
                 event_type = "storage_lock_lost",
                 error = %e,
+                "sole-writer advisory lock lost: the app-state session died and \
+                 postgres has released the lock; another trawld can now acquire it \
+                 and become a second writer. terminating to preserve the \
+                 single-writer invariant."
+            );
+            let fault = crate::error::ServerError::from(StoreError::from(e));
+            tracing::error!(
+                event_type = "storage_lock_lost",
+                error_class = fault.error_class(),
+                cause_kind = fault.cause_kind().as_str(),
                 "sole-writer advisory lock lost: the app-state session died and \
                  postgres has released the lock; another trawld can now acquire it \
                  and become a second writer. terminating to preserve the \
