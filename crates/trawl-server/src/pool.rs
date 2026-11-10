@@ -2061,13 +2061,6 @@ impl ExecutorPool {
     /// [`Self::begin_slot`] promotes the entry, cancel flag and all, when
     /// the work takes its slot. `kind` is the request's door, named in the
     /// refusal a cancel ends it with.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "#343: the tracked routes take this guard in a later checkpoint"
-        )
-    )]
     pub(crate) fn pend(&self, id: u64, kind: WorkKind) -> Pending {
         let cancelled = Arc::new(AtomicBool::new(false));
         let (wake, receiver) = tokio::sync::watch::channel(false);
