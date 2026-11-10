@@ -212,7 +212,8 @@ the TUI drew it. Messages on stderr always replace these characters with `�`.
 
 Three `trawl schema` values are the exception. An acknowledgement's
 `acked_by` and `note`, and a repin cancel's `detail`, have these characters
-replaced with `�` in every format, in a pipe and in a file too.
+replaced with `�` in every format, in a pipe and in a file too. In a table,
+an acknowledgement's field name also shows a line break as `�`.
 
 To read exact values, send `json` or `csv` to a pipe or to a file with
 `-o, --output`.
