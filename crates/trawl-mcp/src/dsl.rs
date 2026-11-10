@@ -43,6 +43,10 @@ Quote values with spaces: `host=\"db host\"`.
 - Time bounds go in the search stage: `last=15m` (units s, m, h, d, w), or \
 `earliest=\"2026-03-14T03:00:00Z\" latest=\"2026-03-14T04:00:00Z\"`, half-open. \
 Never mix last= with earliest= or latest=.
+- In where, let and eval expressions, a regex test is the matches operator: \
+`last=1h | where message matches /conn.*refused/`. There is no match() function.
+- replace(x, old, new) replaces literal text, never a regex: \
+`last=1h | eval m = replace(message, \"[0-9]\", \"N\")` replaces only the text [0-9].
 - Examples:
   _severity>=error last=1h | stats count() by service | sort -count
   service=nginx status>=500 last=24h | stats count() by host, status
@@ -285,5 +289,17 @@ mod tests {
             ESSENTIALS.lines().count()
         );
         assert!(ESSENTIALS.len() < 2048, "{}", ESSENTIALS.len());
+    }
+
+    /// An agent reading only [`ESSENTIALS`] learns that a regex test is the
+    /// `matches` operator and that `replace` is literal. Whole words, so
+    /// another word that merely contains either one does not count.
+    #[test]
+    fn the_essentials_name_matches_and_literal_replace() {
+        let words: Vec<&str> = ESSENTIALS
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .collect();
+        assert!(words.contains(&"matches"), "{ESSENTIALS}");
+        assert!(words.contains(&"literal"), "{ESSENTIALS}");
     }
 }

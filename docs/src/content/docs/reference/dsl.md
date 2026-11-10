@@ -1027,7 +1027,7 @@ Scalar functions are available in `let`, `eval` and `where` expressions.
 | `lower(x)`, `upper(x)` | Lowercase, uppercase. |
 | `length(x)`, `len(x)` | String length. |
 | `trim(x)`, `ltrim(x)`, `rtrim(x)` | Whitespace trimming. |
-| `replace(x, old, new)` | String replacement. |
+| `replace(x, old, new)` | Literal string replacement: `old` is text, never a pattern. |
 | `substr(x, start[, len])` | Substring, 1-based and character-based. A negative `start` counts from the end, and a negative `len` is a leftward window. |
 | `concat(a, b, ...)` | Concatenation of one or more arguments. |
 | `contains(x, part)` | Whether `part` occurs in `x`. |
