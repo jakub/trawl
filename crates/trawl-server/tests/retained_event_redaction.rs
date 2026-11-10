@@ -375,6 +375,76 @@ async fn history_error_drops_the_store_text() {
     assert_sentinel_retained_nowhere(&sentinel);
 }
 
+// -- ingest_rejections: an unparseable line --------------------------------
+
+/// An unparseable NDJSON line is rejected with `serde_json`'s wording in the
+/// response, where the sender reads it. The `ingest_rejections` warning
+/// keeps its sample, as ADR-0053 says, but the sample is trawl's own words:
+/// the parser's wording reaches no stdout line and no WAL record.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_rejection_samples_drop_the_serde_text() {
+    sinks();
+    let server = common::setup().await;
+    let user = format!("ingest-redaction-{}", sentinel("ingest").to_lowercase());
+    let key = KeyStore::from_pool(server.fleet_pool.clone())
+        .create_key(
+            &user,
+            PrincipalKind::Service,
+            &common::roles(&["trawl-ingest"]),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let response = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .post(format!("{}/api/v1/ingest", server.url))
+        .bearer_auth(key.plaintext_token.to_string())
+        .header("content-type", "application/x-ndjson")
+        .body("{\"service\": \"nginx\", \"message\": \"ok\"}\n{not json\n")
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "one line is accepted: {body}");
+
+    // The injection works: the rejection's message carries the parser's own
+    // wording, which names a position in the line.
+    let message = body["errors"][0]["message"].as_str().unwrap().to_owned();
+    assert_eq!(body["errors"][0]["reason"], "invalid_json", "{body}");
+    let wording = message
+        .strip_prefix("invalid JSON: ")
+        .unwrap_or_else(|| panic!("not the parse rejection: {message}"));
+    assert!(wording.contains(" at line 1 column "), "{wording}");
+
+    let mine: Vec<String> = stdout_lines()
+        .into_iter()
+        .filter(|line| {
+            field(line, "event_type").as_deref() == Some("ingest_rejections")
+                && field(line, "user").as_deref() == Some(&user)
+        })
+        .collect();
+    assert_eq!(mine.len(), 1, "one retained ingest_rejections: {mine:?}");
+    assert_eq!(level(&mine[0]), "WARN", "{}", mine[0]);
+    assert_eq!(
+        field(&mine[0], "samples").as_deref(),
+        Some("invalid JSON"),
+        "{}",
+        mine[0]
+    );
+    assert!(!mine[0].contains(wording), "{}", mine[0]);
+
+    let records: Vec<Value> = wal_records()
+        .into_iter()
+        .filter(|record| record["event_type"] == "ingest_rejections" && record["user"] == user)
+        .collect();
+    assert_eq!(records.len(), 1, "one WAL record: {records:?}");
+    assert_eq!(records[0]["samples"], "invalid JSON", "{}", records[0]);
+    assert!(!records[0].to_string().contains(wording), "{}", records[0]);
+}
+
 // -- catalog_pin_purge_commit_failed: a commit fails ------------------------
 
 /// A pin purge whose `COMMIT` fails, through a deferred constraint trigger,
