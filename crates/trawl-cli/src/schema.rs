@@ -16,6 +16,7 @@ use trawl_client::{CatalogConflictsResponse, CatalogFieldResponse, CatalogFields
 
 use crate::CliError;
 use crate::cli::{ConnectionParams, OutputFormat, render_driver_results};
+use crate::terminal::Destination;
 
 /// Parse a `--last` window like `30m`, `2h`, `7d`, `1w` into seconds.
 pub fn parse_last(input: &str) -> Result<u64, CliError> {
@@ -51,22 +52,25 @@ pub fn parse_window(input: &str, option: &str) -> Result<u64, CliError> {
     Ok(n.saturating_mul(mult))
 }
 
-/// Resolve the output format like `trawl query` does: table on a TTY,
-/// ndjson on a pipe.
-fn resolve_format(format: Option<OutputFormat>) -> Result<OutputFormat, CliError> {
-    let format = format.unwrap_or_else(|| {
-        if io::stdout().is_terminal() {
-            OutputFormat::Table
-        } else {
-            OutputFormat::Json
-        }
+/// Resolve the output format like `trawl query` does, table on a terminal
+/// and ndjson on a pipe, with the [`Destination`] the renderers write for.
+///
+/// Both come from one look at this process's stdout, which is where the
+/// binary points every command's `out`. An in-process caller that passes
+/// its own writer gets whatever its stdout is: under a test harness that
+/// captures it, data.
+fn resolve_format(format: Option<OutputFormat>) -> Result<(OutputFormat, Destination), CliError> {
+    let destination = Destination::stdout();
+    let format = format.unwrap_or(match destination {
+        Destination::Terminal => OutputFormat::Table,
+        Destination::Data => OutputFormat::Json,
     });
     if format == OutputFormat::Parquet {
         return Err(CliError::Usage(
             "parquet output is not supported for schema commands".into(),
         ));
     }
-    Ok(format)
+    Ok((format, destination))
 }
 
 /// `CatalogFieldsResponse` → generic (columns, rows).
@@ -216,8 +220,9 @@ fn render<W: Write>(
     columns: &[String],
     rows: &[Vec<Json>],
     format: OutputFormat,
+    destination: Destination,
 ) -> Result<(), CliError> {
-    render_driver_results(columns, rows, format, out)?;
+    render_driver_results(columns, rows, format, destination, out)?;
     out.flush()?;
     Ok(())
 }
@@ -232,7 +237,7 @@ pub async fn run_fields<W: Write>(
     limit: Option<usize>,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
 
     // Embedded mode: DESCRIBE over local parquet, no server needed.
     if let Some(glob) = data {
@@ -241,7 +246,7 @@ pub async fn run_fields<W: Write>(
             "note: --data lists names and physical types only; catalog metadata \
              (pins, observations, conflicts) requires a server"
         );
-        return render(out, &columns, &rows, format);
+        return render(out, &columns, &rows, format, destination);
     }
 
     let conn = conn.ok_or_else(|| {
@@ -252,7 +257,7 @@ pub async fn run_fields<W: Write>(
     let resp = client.catalog_fields(service, since_secs, limit).await?;
 
     let (columns, rows) = fields_to_rows(&resp);
-    render(out, &columns, &rows, format)?;
+    render(out, &columns, &rows, format, destination)?;
     let degraded = resp.fields.iter().filter(|f| f.verdict.is_some()).count();
     eprintln!(
         "{}/{} pins used{}{}",
@@ -281,23 +286,73 @@ pub async fn run_field<W: Write>(
     after: Option<&str>,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let conn = conn.ok_or_else(|| CliError::Usage("schema field requires a server".into()))?;
     let client = conn.client()?;
     let resp = client.catalog_field(name, limit, after).await?;
 
     let human = format == OutputFormat::Table;
-    label(out, human, &format!("field:       {}", resp.name))?;
-    label(out, human, &format!("type:        {}", resp.data_type))?;
+    write_field_case_file(out, human, &resp)?;
+
+    label(out, human, "\nservices:")?;
+    let (columns, rows) = field_services_to_rows(&resp);
+    render(out, &columns, &rows, format, destination)?;
+    if let Some(cursor) = &resp.services_cursor {
+        eprintln!("{}", more_services_hint(cursor));
+    }
+
+    if !resp.conflicts.is_empty() {
+        label(out, human, "\nrecent conflicts:")?;
+        let (columns, rows) = field_conflicts_to_rows(&resp);
+        render(out, &columns, &rows, format, destination)?;
+    }
+    Ok(())
+}
+
+/// The field detail's prose above its tables, through [`label`]: the pin's
+/// facts, the case file of a degraded pin, and a standing acknowledgement.
+fn write_field_case_file<W: Write>(
+    out: &mut W,
+    human: bool,
+    resp: &CatalogFieldResponse,
+) -> Result<(), CliError> {
+    // Every value here is sender or server text on its way to a terminal,
+    // stdout or stderr alike, so each one is sanitised whole: a `\n` in it
+    // is U+FFFD, and only the labels' own `\n` break lines.
+    label(
+        out,
+        human,
+        &format!(
+            "field:       {}",
+            trawl_core::sanitize::sanitize_display_text(&resp.name)
+        ),
+    )?;
+    label(
+        out,
+        human,
+        &format!(
+            "type:        {}",
+            trawl_core::sanitize::sanitize_display_text(&resp.data_type)
+        ),
+    )?;
     label(
         out,
         human,
         &format!(
             "pinned from: {}",
-            resp.pinned_from.as_deref().unwrap_or("(unknown)")
+            trawl_core::sanitize::sanitize_display_text(
+                resp.pinned_from.as_deref().unwrap_or("(unknown)")
+            )
         ),
     )?;
-    label(out, human, &format!("pinned at:   {}", resp.pinned_at))?;
+    label(
+        out,
+        human,
+        &format!(
+            "pinned at:   {}",
+            trawl_core::sanitize::sanitize_display_text(&resp.pinned_at)
+        ),
+    )?;
 
     if let Some(v) = &resp.verdict {
         render_verdict(out, human, &resp.name, v)?;
@@ -314,7 +369,7 @@ pub async fn run_field<W: Write>(
                 "\nacknowledged: through episode {} by {} at {}{}",
                 ack.evidence_through,
                 trawl_core::sanitize::sanitize_display_text(&ack.acked_by),
-                ack.acked_at,
+                trawl_core::sanitize::sanitize_display_text(&ack.acked_at),
                 match &ack.note {
                     Some(n) => format!(" ({})", trawl_core::sanitize::sanitize_display_text(n)),
                     None => String::new(),
@@ -322,20 +377,16 @@ pub async fn run_field<W: Write>(
             ),
         )?;
     }
-
-    label(out, human, "\nservices:")?;
-    let (columns, rows) = field_services_to_rows(&resp);
-    render(out, &columns, &rows, format)?;
-    if let Some(cursor) = &resp.services_cursor {
-        eprintln!("(more services — rerun with --after {cursor})");
-    }
-
-    if !resp.conflicts.is_empty() {
-        label(out, human, "\nrecent conflicts:")?;
-        let (columns, rows) = field_conflicts_to_rows(&resp);
-        render(out, &columns, &rows, format)?;
-    }
     Ok(())
+}
+
+/// The stderr pointer to the next page of a field's services. The cursor is
+/// server text, so it is shown through the line rule like every other value.
+fn more_services_hint(cursor: &str) -> String {
+    format!(
+        "(more services — rerun with --after {})",
+        trawl_core::sanitize::sanitize_display_text(cursor)
+    )
 }
 
 /// The case file for a degraded pin: the analyzer's facts, the values the
@@ -356,10 +407,20 @@ fn render_verdict<W: Write>(
     // A field name is a client-chosen JSON key that ingest polices for
     // length and case only: a name carrying `;` and a shell command, or a
     // bidi override, is legal, and the last line here is written to be
-    // pasted into a shell. Every rendering of the name is neutralised.
+    // pasted into a shell. Every rendering of the name is neutralised, and
+    // so is every value of the verdict, samples included: the server
+    // sanitises those too, but the client's safety does not lean on that.
     let shown = trawl_core::sanitize::sanitize_display_text(field);
+    let suggested = trawl_core::sanitize::sanitize_display_text(&v.suggested_to);
     label(out, human, "\ndegraded pin:")?;
-    label(out, human, &format!("  since:          {}", v.since))?;
+    label(
+        out,
+        human,
+        &format!(
+            "  since:          {}",
+            trawl_core::sanitize::sanitize_display_text(&v.since)
+        ),
+    )?;
     label(out, human, &format!("  senders:        {}", v.services))?;
     label(out, human, &format!("  episodes:       {}", v.episodes))?;
     label(
@@ -370,10 +431,17 @@ fn render_verdict<W: Write>(
     if !v.samples.is_empty() {
         label(out, human, "  sample values:")?;
         for sample in &v.samples {
-            label(out, human, &format!("    - {sample}"))?;
+            label(
+                out,
+                human,
+                &format!(
+                    "    - {}",
+                    trawl_core::sanitize::sanitize_display_text(sample)
+                ),
+            )?;
         }
     }
-    label(out, human, &format!("  suggested:      {}", v.suggested_to))?;
+    label(out, human, &format!("  suggested:      {suggested}"))?;
 
     // The remedy line is printed only for a name a command line can carry
     // as itself. Two ways it cannot, both reachable because ingest polices
@@ -396,7 +464,7 @@ fn render_verdict<W: Write>(
             &format!(
                 "  trawl schema repin {} --to {} --dry-run",
                 shell_quote(&shown),
-                v.suggested_to.to_ascii_lowercase()
+                suggested.to_ascii_lowercase()
             ),
         )
     } else {
@@ -442,7 +510,7 @@ pub async fn run_conflicts<W: Write>(
     limit: Option<usize>,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let conn = conn.ok_or_else(|| CliError::Usage("schema conflicts requires a server".into()))?;
     let since_secs = last.map(parse_last).transpose()?;
     let client = conn.client()?;
@@ -451,7 +519,7 @@ pub async fn run_conflicts<W: Write>(
         .await?;
 
     let (columns, rows) = conflicts_to_rows(&resp);
-    render(out, &columns, &rows, format)?;
+    render(out, &columns, &rows, format, destination)?;
     if resp.truncated {
         eprintln!("(listing truncated — raise --limit)");
     }
@@ -723,7 +791,14 @@ mod tests {
     fn seeded_responses_render_populated_output() {
         let (columns, rows) = fields_to_rows(&sample_fields());
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Table, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Table,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("duration"), "{text}");
         assert!(text.contains("BIGINT"), "{text}");
@@ -731,7 +806,14 @@ mod tests {
 
         let (columns, rows) = conflicts_to_rows(&sample_conflicts());
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let parsed: Json = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(parsed["expected_type"], "BIGINT");
@@ -773,6 +855,249 @@ mod tests {
         assert!(names.contains(&"duration"), "{names:?}");
         // Every column carries a non-empty physical type.
         assert!(rows.iter().all(|r| !r[1].as_str().unwrap().is_empty()));
+    }
+
+    /// A sender or server value that tries three things at once: ESC opens
+    /// a control sequence, U+202E reverses what follows, and `\n` starts a
+    /// line the value does not own.
+    const HOSTILE: &str = "v\u{1b}[2J\u{202e}\nx";
+    /// [`HOSTILE`] as a prose line shows it: one U+FFFD per unsafe character.
+    const SHOWN: &str = "v\u{fffd}[2J\u{fffd}\u{fffd}x";
+
+    /// Set only in the child process that reads `label`'s stderr routing.
+    const STDERR_CHILD: &str = "TRAWL_SCHEMA_STDERR_CHILD";
+    /// The test that child process runs.
+    const STDERR_CHILD_TEST: &str = "schema::tests::terminal_schema_lines_stderr_child";
+    /// Bracket the child's block, so nothing else on its stderr counts.
+    const STDERR_BEGIN: &str = "--- schema lines begin ---";
+    const STDERR_END: &str = "--- schema lines end ---";
+
+    fn hostile_verdict() -> trawl_client::DegradedVerdict {
+        trawl_client::DegradedVerdict {
+            since: HOSTILE.into(),
+            services: 2,
+            episodes: 7,
+            rows_shelved: 240,
+            samples: vec![HOSTILE.into(), "n/a".into()],
+            suggested_to: HOSTILE.into(),
+        }
+    }
+
+    fn hostile_field() -> CatalogFieldResponse {
+        CatalogFieldResponse {
+            name: HOSTILE.into(),
+            data_type: HOSTILE.into(),
+            pinned_from: Some(HOSTILE.into()),
+            pinned_at: HOSTILE.into(),
+            services: Vec::new(),
+            services_cursor: Some(HOSTILE.into()),
+            conflicts: Vec::new(),
+            verdict: Some(hostile_verdict()),
+            ack: Some(trawl_client::FieldAck {
+                acked_at: HOSTILE.into(),
+                acked_by: HOSTILE.into(),
+                note: Some(HOSTILE.into()),
+                evidence_through: 7,
+            }),
+        }
+    }
+
+    fn hostile_job() -> trawl_client::RepinJobResponse {
+        let mut job = super::repin_tests::sample_job();
+        job.field = HOSTILE.into();
+        job.dialect = Some(HOSTILE.into());
+        job.unmapped_samples = vec![HOSTILE.into(), "gold".into()];
+        job.liveness = Some(trawl_client::RepinLiveness {
+            last_seen: HOSTILE.into(),
+            service: HOSTILE.into(),
+        });
+        job.requires_force = Some(true);
+        job.requires_force_reason = Some(HOSTILE.into());
+        job
+    }
+
+    /// Every block written through [`label`], for one routing.
+    fn write_labelled_blocks(out: &mut Vec<u8>, human: bool) {
+        write_field_case_file(out, human, &hostile_field()).unwrap();
+        // A name that survives sanitising earns the copyable remedy, the
+        // second place the suggested type is printed.
+        render_verdict(out, human, "duration", &hostile_verdict()).unwrap();
+        render_repin_case_file(out, human, &hostile_job()).unwrap();
+    }
+
+    /// What [`write_labelled_blocks`] writes: [`SHOWN`] at every value, and
+    /// each label's own line breaks where the label put them.
+    fn expected_labelled_blocks() -> String {
+        let s = SHOWN;
+        let verdict_facts = [
+            String::new(),
+            "degraded pin:".into(),
+            format!("  since:          {s}"),
+            "  senders:        2".into(),
+            "  episodes:       7".into(),
+            "  rows shelved:   240 (lifetime)".into(),
+            "  sample values:".into(),
+            format!("    - {s}"),
+            "    - n/a".into(),
+            format!("  suggested:      {s}"),
+        ];
+        let mut lines: Vec<String> = vec![
+            format!("field:       {s}"),
+            format!("type:        {s}"),
+            format!("pinned from: {s}"),
+            format!("pinned at:   {s}"),
+        ];
+        lines.extend(verdict_facts.clone());
+        lines.extend([
+            "  this field's name cannot be safely embedded in a command line \
+             (it does not survive display sanitisation, or it begins with `-` \
+             and would be read as a flag), so no repin command is shown — take \
+             the exact name from `trawl schema field <name> -f json` (or GET \
+             /api/v1/schema/field) before running `trawl schema repin`"
+                .into(),
+            String::new(),
+            format!("acknowledged: through episode 7 by {s} at {s} ({s})"),
+        ]);
+        lines.extend(verdict_facts);
+        lines.extend([
+            format!(
+                "  trawl schema repin duration --to {} --dry-run",
+                s.to_ascii_lowercase()
+            ),
+            String::new(),
+            format!("numeral dialect: {s} (words are dialect-free; this reads NUMERALS)"),
+            String::new(),
+            "values the new pin cannot read:".into(),
+            format!("  - {s}"),
+            "  - gold".into(),
+            "  (originals stay findable in _raw, whatever this repin writes)".into(),
+            String::new(),
+            format!(
+                "warning: {s} is STILL being written (last seen {s} by service \
+                 {s}). A repin rewrites HISTORY: after the cutover, live events \
+                 keep taking the INGEST-time reading, so under --dialect syslog a \
+                 historical `3` becomes 17 (err) while the next live `3` conforms \
+                 as OTel 3 (trace3) — one column, two meanings, split at the \
+                 cutover instant. If that sender speaks syslog PRI, declare it in \
+                 [ingest] severity_from (dialect = \"syslog\") so live events read \
+                 the same way, then repin the history."
+            ),
+            String::new(),
+            format!("requires --force: {s}"),
+        ]);
+        let mut text = lines.join("\n");
+        text.push('\n');
+        text
+    }
+
+    /// The only unsafe characters `text` may hold are line breaks.
+    fn assert_only_line_breaks_unsafe(text: &str) {
+        let unsafe_chars: Vec<char> = text
+            .chars()
+            .filter(|&c| c != '\n' && trawl_core::sanitize::is_unsafe_display_char(c))
+            .collect();
+        assert!(unsafe_chars.is_empty(), "{unsafe_chars:?} in {text:?}");
+    }
+
+    /// Every schema prose line shows a sender or server value through the
+    /// line rule, whole: ESC, U+202E and `\n` each become one U+FFFD, and
+    /// the label's own line breaks stay. `label` writes a table's lines to
+    /// stdout and a machine format's to stderr, and both routings are read.
+    #[test]
+    fn terminal_schema_lines_sanitize_sender_text() {
+        // The stdout routing: a table.
+        let mut out = Vec::new();
+        write_labelled_blocks(&mut out, true);
+        let text = String::from_utf8(out).unwrap();
+        assert_only_line_breaks_unsafe(&text);
+        assert_eq!(text, expected_labelled_blocks());
+
+        // The stderr routing: a machine format. `label` writes it with
+        // `eprintln!`, so a child process runs the blocks and this reads its
+        // stderr.
+        let output = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                STDERR_CHILD_TEST,
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(STDERR_CHILD, "1")
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the stderr child failed or did not run; status {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status,
+        );
+        let Some((block, _)) = stderr
+            .split_once(&format!("{STDERR_BEGIN}\n"))
+            .and_then(|(_, rest)| rest.split_once(&format!("{STDERR_END}\n")))
+        else {
+            panic!("no bracketed block in the child's stderr:\n{stderr}");
+        };
+        assert_only_line_breaks_unsafe(block);
+        assert_eq!(block, expected_labelled_blocks());
+
+        // The services cursor, which always goes to stderr.
+        assert_eq!(
+            more_services_hint(HOSTILE),
+            format!("(more services — rerun with --after {SHOWN})")
+        );
+
+        // The heading above a repin job's table.
+        assert_eq!(
+            repin_heading(HOSTILE, "dry run"),
+            format!("repin {SHOWN}: dry run")
+        );
+
+        // The server's decision time above the pin gc candidates.
+        let mut report = super::gc_tests::sample_report(true);
+        report.decided_at = HOSTILE.into();
+        assert_eq!(
+            gc_summary_lines(&report)[0],
+            format!("pin gc (dry run) at {SHOWN}")
+        );
+
+        // The repin job's cells, unmapped samples included, go through the
+        // table's cell rule: `\n` stays a line inside its cell, and ESC and
+        // U+202E are one U+FFFD each in the six cells that hold the value.
+        let (columns, rows) = repin_job_to_rows(&hostile_job(), OutputFormat::Table);
+        let mut out = Vec::new();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Table,
+            Destination::Terminal,
+            &mut out,
+        )
+        .unwrap();
+        let table = String::from_utf8(out).unwrap();
+        assert_only_line_breaks_unsafe(&table);
+        assert_eq!(table.matches('\u{fffd}').count(), 2 * 6, "{table}");
+        assert!(table.contains("x, gold"), "{table}");
+    }
+
+    /// The entry point of the child process the test above reads the stderr
+    /// routing from. Without [`STDERR_CHILD`] it does nothing.
+    #[test]
+    #[ignore = "entry point for the stderr child; terminal_schema_lines_sanitize_sender_text runs it"]
+    fn terminal_schema_lines_stderr_child() {
+        if std::env::var_os(STDERR_CHILD).is_none() {
+            return;
+        }
+        let mut out = Vec::new();
+        eprintln!("{STDERR_BEGIN}");
+        write_labelled_blocks(&mut out, false);
+        eprintln!("{STDERR_END}");
+        assert!(
+            out.is_empty(),
+            "a machine format keeps its labels off stdout: {:?}",
+            String::from_utf8_lossy(&out)
+        );
     }
 }
 
@@ -1071,7 +1396,7 @@ fn render_repin_case_file<W: Write>(
                  \"syslog\") so live events read the same way, then repin the \
                  history.",
                 trawl_core::sanitize::sanitize_display_text(&job.field),
-                live.last_seen
+                trawl_core::sanitize::sanitize_display_text(&live.last_seen)
             ),
         )?;
     }
@@ -1168,7 +1493,8 @@ async fn bind_ceilings(
                     render_repin_case_file(out, human, &job)?;
                     return Err(CliError::Usage(format!(
                         "repin preview did not produce a plan (job {} is {})",
-                        job.id, job.status
+                        job.id,
+                        trawl_core::sanitize::sanitize_display_text(&job.status)
                     )));
                 }
             }
@@ -1213,7 +1539,7 @@ pub async fn run_repin(
     flags: RepinFlags,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     // Refused here as well as server-side, because this one is a typo an
     // operator can fix without spending a job claim: the dialect reads
     // numerals onto the severity ladder, so no other target has anywhere to
@@ -1284,15 +1610,24 @@ pub async fn run_repin(
 
     if format == OutputFormat::Table {
         let verdict = repin_verdict_word(started_as, &job.status, job.force);
-        writeln!(out, "repin {}: {verdict}", job.field)?;
+        writeln!(out, "{}", repin_heading(&job.field, verdict))?;
     }
     let (columns, rows) = repin_job_to_rows(&job, format);
-    render_driver_results(&columns, &rows, format, out)?;
+    render_driver_results(&columns, &rows, format, destination, out)?;
     // The case file goes to stdout for a human and to stderr for a machine
     // format (`label`), so a piped `-f json` stays one parseable record while
     // the operator still reads the evidence.
     render_repin_case_file(out, format == OutputFormat::Table, &job)?;
     repin_completion(&job)
+}
+
+/// The line above a repin job's table: the field, sanitised because a
+/// sender chose it, and the verdict word.
+fn repin_heading(field: &str, verdict: &str) -> String {
+    format!(
+        "repin {}: {verdict}",
+        trawl_core::sanitize::sanitize_display_text(field)
+    )
 }
 
 /// The word the table header prints.
@@ -1467,13 +1802,13 @@ pub async fn run_repin_status(
     conn: ConnectionParams,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let client = conn.client()?;
     let status = client.schema_repin_status().await?;
     match status.job {
         Some(job) => {
             let (columns, rows) = repin_job_to_rows(&job, format);
-            render_driver_results(&columns, &rows, format, out)?;
+            render_driver_results(&columns, &rows, format, destination, out)?;
             render_repin_case_file(out, format == OutputFormat::Table, &job)?;
         }
         None => writeln!(out, "no repin job has ever run")?,
@@ -1496,7 +1831,7 @@ pub async fn run_repin_cancel(
     conn: ConnectionParams,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let client = conn.client()?;
     let (accepted, receipt) = match client.schema_repin_cancel().await? {
         trawl_client::RepinCancel::Cancelling(r) => (true, r),
@@ -1513,7 +1848,7 @@ pub async fn run_repin_cancel(
         writeln!(out, "repin cancel: {detail}")?;
         if let Some(job) = &receipt.job {
             let (columns, rows) = repin_job_to_rows(job, format);
-            render_driver_results(&columns, &rows, format, out)?;
+            render_driver_results(&columns, &rows, format, destination, out)?;
         }
     } else {
         // One record, one header: the verdict and the job it is about are
@@ -1521,7 +1856,7 @@ pub async fn run_repin_cancel(
         // would put two headers of different widths in one csv stream.
         // The job columns are null when the server attached no row.
         let (columns, rows) = cancel_receipt_to_rows(&receipt, format);
-        render_driver_results(&columns, &rows, format, out)?;
+        render_driver_results(&columns, &rows, format, destination, out)?;
     }
     if accepted {
         return Ok(());
@@ -1613,7 +1948,7 @@ pub async fn run_ack<W: Write>(
     clear: bool,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let human = format == OutputFormat::Table;
     let client = conn.client()?;
 
@@ -1633,7 +1968,7 @@ pub async fn run_ack<W: Write>(
 
     let ack = client.schema_field_ack(field, note).await?;
     let (columns, rows) = ack_to_rows(field, &ack, format);
-    render(out, &columns, &rows, format)?;
+    render(out, &columns, &rows, format, destination)?;
     label(
         out,
         human,
@@ -1667,14 +2002,21 @@ mod ack_tests {
         assert_eq!(rows.len(), 1, "an ack is one record");
         for format in [OutputFormat::Table, OutputFormat::Json, OutputFormat::Csv] {
             let mut out = Vec::new();
-            render_driver_results(&columns, &rows, format, &mut out).unwrap();
+            render_driver_results(&columns, &rows, format, Destination::Data, &mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
             assert!(text.contains("duration"), "{format:?}: {text}");
             assert!(text.contains("tkl_abc123"), "{format:?}: {text}");
         }
 
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["evidence_through"], 7);
@@ -1686,7 +2028,14 @@ mod ack_tests {
         bare.note = None;
         let (columns, rows) = ack_to_rows("duration", &bare, OutputFormat::Json);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["note"], Json::Null);
@@ -1726,7 +2075,7 @@ mod ack_tests {
 mod repin_tests {
     use super::*;
 
-    fn sample_job() -> trawl_client::RepinJobResponse {
+    pub(super) fn sample_job() -> trawl_client::RepinJobResponse {
         trawl_client::RepinJobResponse {
             id: 3,
             field: "status".into(),
@@ -1770,13 +2119,20 @@ mod repin_tests {
         let (columns, rows) = repin_job_to_rows(&sample_job(), OutputFormat::Table);
         for format in [OutputFormat::Table, OutputFormat::Json, OutputFormat::Csv] {
             let mut out = Vec::new();
-            render_driver_results(&columns, &rows, format, &mut out).unwrap();
+            render_driver_results(&columns, &rows, format, Destination::Data, &mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
             assert!(text.contains("VARCHAR"), "{format:?}: {text}");
             assert!(text.contains("succeeded"), "{format:?}: {text}");
         }
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["resurrectable"], 25);
@@ -1836,9 +2192,16 @@ mod repin_tests {
         };
 
         let mut out = Vec::new();
-        writeln!(out, "repin {}: dry run", job.field).unwrap();
+        writeln!(out, "{}", repin_heading(&job.field, "dry run")).unwrap();
         let (columns, rows) = repin_job_to_rows(&job, OutputFormat::Table);
-        render_driver_results(&columns, &rows, OutputFormat::Table, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Table,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         render_repin_case_file(&mut out, true, &job).unwrap();
         let text = String::from_utf8(out).unwrap();
 
@@ -1924,7 +2287,7 @@ mod repin_tests {
         let render = |format| {
             let (columns, rows) = repin_job_to_rows(&job, format);
             let mut out = Vec::new();
-            render_driver_results(&columns, &rows, format, &mut out).unwrap();
+            render_driver_results(&columns, &rows, format, Destination::Data, &mut out).unwrap();
             String::from_utf8(out).unwrap()
         };
 
@@ -1956,7 +2319,14 @@ mod repin_tests {
         hostile.unmapped_samples = vec!["=cmd()".into(), "gold".into()];
         let (columns, rows) = repin_job_to_rows(&hostile, OutputFormat::Csv);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Csv, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Csv,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let csv = String::from_utf8(out).unwrap();
         assert!(csv.contains("'=cmd()"), "formula prefix missing: {csv}");
 
@@ -1968,7 +2338,14 @@ mod repin_tests {
         running.requires_force_reason = None;
         let (columns, rows) = repin_job_to_rows(&running, OutputFormat::Json);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["requires_force"], Json::Null);
@@ -2163,7 +2540,14 @@ mod repin_tests {
 
         let (columns, rows) = repin_job_to_rows(&job, OutputFormat::Json);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["accepted_max_nulled_rows"], 22);
@@ -2307,7 +2691,8 @@ mod repin_tests {
             for format in [OutputFormat::Json, OutputFormat::Csv] {
                 let (columns, rows) = cancel_receipt_to_rows(&receipt, format);
                 let mut out = Vec::new();
-                render_driver_results(&columns, &rows, format, &mut out).unwrap();
+                render_driver_results(&columns, &rows, format, Destination::Data, &mut out)
+                    .unwrap();
                 let text = String::from_utf8(out).unwrap();
                 assert!(text.contains(spelling), "{format:?}: {text}");
             }
@@ -2326,7 +2711,14 @@ mod repin_tests {
 
         let (columns, rows) = cancel_receipt_to_rows(&receipt, OutputFormat::Csv);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Csv, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Csv,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let csv = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = csv.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2, "one header, one row: {csv}");
@@ -2345,7 +2737,14 @@ mod repin_tests {
         // json is ndjson: one object carrying both halves.
         let (columns, rows) = cancel_receipt_to_rows(&receipt, OutputFormat::Json);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 1, "one object: {text}");
@@ -2364,7 +2763,14 @@ mod repin_tests {
         let (without_job, rows) = cancel_receipt_to_rows(&bodiless, OutputFormat::Json);
         assert_eq!(with_job, without_job);
         let mut out = Vec::new();
-        render_driver_results(&without_job, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &without_job,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["outcome"], "no_job_running");
@@ -2436,7 +2842,14 @@ mod repin_tests {
         job.error = Some("cancelled by ops during build; the live corpus was never touched".into());
         let (columns, rows) = repin_job_to_rows(&job, OutputFormat::Json);
         let mut out = Vec::new();
-        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        render_driver_results(
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+            &mut out,
+        )
+        .unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["status"], "cancelled");
@@ -2494,7 +2907,7 @@ fn gc_summary_lines(resp: &trawl_client::GcPinsResponse) -> Vec<String> {
         format!(
             "pin gc ({}) at {}",
             if resp.dry_run { "dry run" } else { "executed" },
-            resp.decided_at
+            trawl_core::sanitize::sanitize_display_text(&resp.decided_at)
         ),
         format!(
             "requested window: {} ({}s)",
@@ -2558,7 +2971,7 @@ pub async fn run_gc_pins<W: Write>(
     older_than: Option<&str>,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
-    let format = resolve_format(format)?;
+    let (format, destination) = resolve_format(format)?;
     let older_than_secs = older_than
         .map(|s| parse_window(s, "--older-than"))
         .transpose()?;
@@ -2573,7 +2986,7 @@ pub async fn run_gc_pins<W: Write>(
         label(out, human, &line)?;
     }
     let (columns, rows) = gc_candidates_to_rows(&resp);
-    render(out, &columns, &rows, format)?;
+    render(out, &columns, &rows, format, destination)?;
     label(out, human, &gc_outcome_line(&resp))?;
     Ok(())
 }
@@ -2582,7 +2995,7 @@ pub async fn run_gc_pins<W: Write>(
 mod gc_tests {
     use super::*;
 
-    fn sample_report(dry_run: bool) -> trawl_client::GcPinsResponse {
+    pub(super) fn sample_report(dry_run: bool) -> trawl_client::GcPinsResponse {
         trawl_client::GcPinsResponse {
             dry_run,
             decided_at: "2026-09-04T12:00:00Z".into(),
@@ -2650,7 +3063,14 @@ mod gc_tests {
     fn csv_output_is_one_rectangle() {
         let (columns, rows) = gc_candidates_to_rows(&sample_report(false));
         let mut out = Vec::new();
-        render(&mut out, &columns, &rows, OutputFormat::Csv).unwrap();
+        render(
+            &mut out,
+            &columns,
+            &rows,
+            OutputFormat::Csv,
+            Destination::Data,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 3, "one header + two rows: {text}");
@@ -2685,7 +3105,14 @@ mod gc_tests {
 
         let (columns, rows) = gc_candidates_to_rows(&report);
         let mut out = Vec::new();
-        render(&mut out, &columns, &rows, OutputFormat::Table).unwrap();
+        render(
+            &mut out,
+            &columns,
+            &rows,
+            OutputFormat::Table,
+            Destination::Data,
+        )
+        .unwrap();
         let table = String::from_utf8(out).unwrap();
         assert!(table.contains("retired_counter"), "{table}");
         assert!(table.contains("typo_feild"), "{table}");
@@ -2717,7 +3144,14 @@ mod gc_tests {
     fn json_output_is_one_record_per_candidate() {
         let (columns, rows) = gc_candidates_to_rows(&sample_report(false));
         let mut out = Vec::new();
-        render(&mut out, &columns, &rows, OutputFormat::Json).unwrap();
+        render(
+            &mut out,
+            &columns,
+            &rows,
+            OutputFormat::Json,
+            Destination::Data,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let records: Vec<Json> = text
             .lines()
