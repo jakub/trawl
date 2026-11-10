@@ -21,11 +21,12 @@
 //! continuation its cut needs, first among the proposed calls and measured
 //! with the rest. Every page continuation, the tool's and the fitting's,
 //! sends the `columns` the page was projected to; a cell call names a
-//! captured position and sends none. A continuation always advances: when not one row of the
-//! page fits, it reads the next row alone at [`Budget::HARD`] if that row
-//! fits there, else that row's cells one at a time, and a cell range with
-//! room for none of its bytes is refused with the smallest `max_bytes` that
-//! prints one. When even no rows fit, an attached search's activity
+//! captured position and sends none. A continuation always advances: when
+//! not one row of the page fits, it reads the next row alone at
+//! [`Budget::HARD`] if that row fits there, else that row's cells one at a
+//! time, and a cell range prints at least its first character, its
+//! column's name abbreviated when the whole name leaves no room for one.
+//! When even no rows fit, an attached search's activity
 //! entries go from the end, each count printed with the most rows that
 //! fit it, then the facets, then the
 //! proposed next calls, then the search URL (the reason says why), then
@@ -38,8 +39,10 @@
 //! that, every activity entry of an attached read among it, does the
 //! fitting leave entries off the ends of a sightings block's lists, as
 //! many as it must, and the block counts them. A reply that does
-//! not fit with all of those gone is not sent: the caller gets an error text naming the result id and the
-//! budget, so it can read the result with a larger one.
+//! not fit with all of those gone is not sent: the caller gets an error
+//! text naming the result id and the budget, and the routes that read the
+//! result: below [`Budget::HARD`] a larger budget, and at every budget the
+//! `columns` route and, at the hard cap, `fields` and one cell call.
 //!
 //! A result reply that fits whole is sent as it is. One that does not
 //! first omits every column whose cell is null in every row the call read,

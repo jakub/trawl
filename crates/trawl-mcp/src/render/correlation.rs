@@ -50,8 +50,8 @@ use crate::reply::{
 use super::budget::{self, Fit};
 use super::rows::{json_string, json_text};
 use super::{
-    Budget, MAX_NEXT_ACTIONS, does_not_fit, head_lines, next_action_lines, normalize, one_line,
-    plural_u64, record_read, success, tail_lines, utc_micros,
+    Budget, MAX_NEXT_ACTIONS, Recovery, does_not_fit, head_lines, next_action_lines, normalize,
+    one_line, plural_u64, record_read, success, tail_lines, utc_micros,
 };
 
 /// What every context block says about its rows.
@@ -73,7 +73,7 @@ pub fn correlation(mut reply: CorrelationReply, budget: Budget, page_rows: u64) 
     record_read(&mut reply.result);
     normalize(&mut reply.result);
     reply.next_actions.truncate(MAX_NEXT_ACTIONS);
-    let result_id = reply.result.result_id.clone();
+    let recovery = Recovery::of(&reply.result);
     let tool = match reply.correlation.kind {
         CorrelationKind::Context => crate::tools::schema::CONTEXT,
         CorrelationKind::Sightings => crate::tools::schema::SIGHTINGS,
@@ -81,7 +81,7 @@ pub fn correlation(mut reply: CorrelationReply, budget: Budget, page_rows: u64) 
     };
     match budget::fit(reply, budget, page_rows) {
         Some((text, mirror)) => success(text, mirror),
-        None => does_not_fit(tool, Some(&result_id), budget),
+        None => does_not_fit(tool, Some(&recovery), budget),
     }
 }
 

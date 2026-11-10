@@ -1489,104 +1489,430 @@ async fn a_row_no_budget_can_print_is_proposed_cell_by_cell() {
     );
 }
 
-/// The smallest `max_bytes` a cell refusal names, from its text.
-fn named_max_bytes(text: &str) -> usize {
-    let (_, rest) = text
-        .rsplit_once("the smallest max_bytes that prints part of it is ")
-        .unwrap_or_else(|| panic!("no smallest max_bytes named: {text}"));
-    rest.trim_end_matches('.').parse().unwrap()
+/// The marker a cell reply ends a column name with when it prints the name
+/// abbreviated, for a name of `bytes` bytes.
+fn name_cut_marker(bytes: usize) -> String {
+    format!("…[name cut from {bytes} bytes to fit the response's byte budget]")
+}
+
+/// The backend and the reply of `read` with `action: cell` at `max_bytes`
+/// for row 0, column 0 of a capture whose one column is named `name`; the
+/// cell read answers the first 4096 bytes of a 5002-byte string cell.
+async fn named_cell(name: &str, max_bytes: usize) -> (Fake, CallToolResult) {
+    let wire = format!("\"{}\"", "v".repeat(5000));
+    let captured = captured(
+        "service=api",
+        &[(name, ColumnType::String)],
+        vec![no_values(1)],
+        1,
+        1,
+    );
+    let backend = Fake {
+        result_page: ok(page(&captured, vec![], 0)),
+        capabilities: ok(capabilities(None)),
+        result_cell: ok(trawl_client::ResultCell {
+            ty: ColumnType::String,
+            offset: 0,
+            length: 4096,
+            total_bytes: wire.len() as u64,
+            next_offset: Some(4096),
+            text: wire[..4096].to_owned(),
+        }),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        &trawl_mcp::session::Seen::default(),
+        read_input(json!({
+            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+            "max_bytes": max_bytes,
+        })),
+    )
+    .await;
+    (backend, result)
+}
+
+/// The column name the `cell:` line of `text` prints, decoded.
+fn printed_cell_name(text: &str) -> String {
+    let line = lines_starting(text, "cell: row 0, column 0 ")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no cell line: {text}"));
+    let rest = line.strip_prefix("cell: row 0, column 0 ").unwrap();
+    let mut names = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+    names.next().unwrap().unwrap()
+}
+
+/// Whether a cell reply printed the column's name whole or abbreviated, in
+/// the order a growing name moves it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CellName {
+    Whole,
+    Abbreviated,
+}
+
+/// Check that `result`, the reply of [`named_cell`] for `name` under
+/// `max_bytes`, fits, prints at least the cell's first character with its
+/// row, position, type and byte counts exact, proposes the rest from where
+/// it stopped, and prints the name whole or abbreviated, the same in the
+/// text and the mirror.
+fn printed_cell(result: &CallToolResult, name: &str, max_bytes: usize) -> CellName {
+    let text = text_of(result);
+    let label = format!("{} bytes at {max_bytes}", name.len());
+    assert_ne!(result.is_error, Some(true), "{label}: {text}");
+    assert!(
+        used_bytes(result) <= max_bytes,
+        "{label}: {}",
+        used_bytes(result)
+    );
+    let cell = &result.structured_content.as_ref().unwrap()["cell"];
+    assert_eq!(
+        (
+            &cell["row"],
+            &cell["column"],
+            &cell["type"],
+            &cell["offset"]
+        ),
+        (&json!(0), &json!(0), &json!("string"), &json!(0)),
+        "{label}: {cell}"
+    );
+    assert_eq!(cell["total_bytes"], json!(5002), "{label}");
+    let length = cell["length"].as_u64().unwrap();
+    assert!(length > 0, "{label}: {text}");
+    assert_eq!(
+        cell["text"].as_str().unwrap(),
+        &format!("\"{}", "v".repeat(usize::try_from(length).unwrap() - 1)),
+        "{label}"
+    );
+    assert_eq!(
+        agreed_actions(result),
+        [json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+            "byte_offset": length,
+        }})],
+        "{label}: {text}"
+    );
+    let printed = printed_cell_name(text);
+    assert_eq!(cell["name"], json!(printed), "{label}");
+    if printed == name {
+        return CellName::Whole;
+    }
+    let kept = printed
+        .strip_suffix(&name_cut_marker(name.len()))
+        .unwrap_or_else(|| panic!("{label}: no marker on {printed:?}"));
+    assert!(name.starts_with(kept), "{label}: {kept:?}");
+    let escaped = serde_json::to_string(&printed).unwrap().len();
+    assert!(escaped <= 255, "{label}: {escaped}");
+    CellName::Abbreviated
 }
 
 #[tokio::test]
-async fn a_cell_range_with_no_room_for_a_byte_names_the_budget_that_prints_one() {
+async fn a_cell_reply_abbreviates_a_column_name_that_leaves_no_room_for_the_cell() {
     // A long column name grows the fixed text of a cell reply until, at
-    // max_bytes=4096, no byte of the range fits beside it: a continuation
-    // from byte_offset 0 would be the very call that printed nothing. The
-    // names run from some bytes printed, through none, to a reply that
-    // does not fit at all.
-    let wire = format!("\"{}\"", "v".repeat(5000));
-    let (mut printed, mut refused, mut unfit) = (0, 0, 0);
+    // max_bytes=4096, no byte of the range fits beside it. Up to there the
+    // name prints whole beside the bytes that fit; past it the name prints
+    // abbreviated, at most 255 bytes as a JSON string with the marker, and
+    // the reply prints the cell. No name makes a reply that does not fit or
+    // that prints none of the range. Names whose JSON escapes are longer
+    // than their bytes, and names many times the budget, are cut on a
+    // character boundary within the same bound.
+    let mut names = Vec::new();
     for name_len in 1575..1595 {
         let name = "n".repeat(name_len);
-        let captured = captured(
-            "service=api",
-            &[(name.as_str(), ColumnType::String)],
-            vec![no_values(1)],
-            1,
-            1,
-        );
-        let backend = Fake {
-            result_page: ok(page(&captured, vec![], 0)),
-            capabilities: ok(capabilities(None)),
-            result_cell: ok(trawl_client::ResultCell {
-                ty: ColumnType::String,
-                offset: 0,
-                length: 4096,
-                total_bytes: wire.len() as u64,
-                next_offset: Some(4096),
-                text: wire[..4096].to_owned(),
-            }),
-            ..Fake::default()
-        };
-        let at_budget = |max_bytes: usize| {
-            read_input(json!({
-                "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
-                "max_bytes": max_bytes,
-            }))
-        };
-        let result = read::run(
-            &backend,
-            &trawl_mcp::session::Seen::default(),
-            at_budget(4096),
-        )
-        .await;
-        let text = text_of(&result).to_owned();
-        if result.is_error != Some(true) {
-            let cell = &result.structured_content.as_ref().unwrap()["cell"];
-            assert!(cell["length"].as_u64().unwrap() > 0, "{name_len}: {text}");
-            for action in agreed_actions(&result) {
-                assert!(
-                    action["arguments"]["byte_offset"].as_u64().unwrap() > 0,
-                    "{name_len}: {text}"
-                );
+        let (_, result) = named_cell(&name, 4096).await;
+        names.push(printed_cell(&result, &name, 4096));
+    }
+    assert!(names.is_sorted(), "{names:?}");
+    assert!(
+        names.contains(&CellName::Whole) && names.contains(&CellName::Abbreviated),
+        "{names:?}"
+    );
+    for name in [
+        "n".repeat(5000),
+        "n".repeat(20_000),
+        "\"\\é".repeat(2000),
+        "日".repeat(7000),
+    ] {
+        for max_bytes in [4096, 16_384, 32_768] {
+            let (backend, result) = named_cell(&name, max_bytes).await;
+            let printed = printed_cell(&result, &name, max_bytes);
+            if name.len() >= 16_384 || max_bytes == 4096 {
+                assert_eq!(printed, CellName::Abbreviated, "{}", name.len());
             }
-            printed += 1;
-        } else if text.contains("no room for any byte") {
-            assert!(
-                text.contains(RESULT_ID) && text.contains("row 0, column 0"),
-                "{name_len}: {text}"
+            assert_eq!(
+                backend.calls()[2],
+                format!("result_cell {RESULT_ID} 0 0 None Some({max_bytes})")
             );
-            let needed = named_max_bytes(&text);
-            assert!(needed > 4096, "{name_len}: {text}");
-            let at_needed = read::run(
-                &backend,
-                &trawl_mcp::session::Seen::default(),
-                at_budget(needed),
-            )
-            .await;
-            assert_ne!(at_needed.is_error, Some(true), "{name_len}: {needed}");
-            assert!(used_bytes(&at_needed) <= needed);
-            let cell = &at_needed.structured_content.as_ref().unwrap()["cell"];
-            assert!(cell["length"].as_u64().unwrap() > 0, "{name_len}: {needed}");
-            let below = read::run(
-                &backend,
-                &trawl_mcp::session::Seen::default(),
-                at_budget(needed - 1),
-            )
-            .await;
-            assert_eq!(below.is_error, Some(true), "{name_len}: {needed}");
-            refused += 1;
-        } else {
-            assert!(
-                text.contains("does not fit max_bytes=4096"),
-                "{name_len}: {text}"
-            );
-            unfit += 1;
         }
     }
+}
+
+/// The `read action=cell` call a refusal names, as a `{tool, arguments}`
+/// object [`follow`] makes; `None` when it names none.
+fn named_cell_call(text: &str) -> Option<Json> {
+    let (_, rest) = text.split_once("read action=cell result_id=")?;
+    let mut ids = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+    let result_id = ids.next()?.ok()?;
+    let rest = &rest[ids.byte_offset()..];
+    let rest = rest.strip_prefix(" row=")?;
+    let (row, rest) = rest.split_once(" column=")?;
+    let column: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some(json!({"tool": "read", "arguments": {
+        "action": "cell", "result_id": result_id,
+        "row": row.parse::<u64>().ok()?, "column": column.parse::<u64>().ok()?,
+    }}))
+}
+
+/// Check that `text`, a refusal at the hard cap, offers no larger budget
+/// and names `fields source=result` and the `columns` route for result
+/// [`RESULT_ID`].
+fn names_the_hard_cap_routes(text: &str) {
+    let id = format!("\"{RESULT_ID}\"");
+    assert!(text.len() <= MAX_ERROR_BYTES, "{}", text.len());
+    assert!(!text.contains("larger max_bytes"), "{text}");
     assert!(
-        printed > 0 && refused > 0 && unfit > 0,
-        "printed {printed}, refused {refused}, unfit {unfit}"
+        text.contains(&format!("fields source=result result_id={id}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("read action=page result_id={id} columns=[")),
+        "{text}"
+    );
+    assert!(text.contains("at most 16 names"), "{text}");
+}
+
+/// A 5002-byte string cell's first range of at most 16384 bytes, as the
+/// cell route answers it.
+fn first_range() -> Option<support::Handler<trawl_client::ResultCell>> {
+    let wire = format!("\"{}\"", "v".repeat(5000));
+    ok(trawl_client::ResultCell {
+        ty: ColumnType::String,
+        offset: 0,
+        length: wire.len() as u64,
+        total_bytes: wire.len() as u64,
+        next_offset: None,
+        text: wire,
+    })
+}
+
+#[tokio::test]
+async fn hard_cap_refusal_names_routes_that_work() {
+    the_hard_cap_refusal_names_a_cell_that_prints().await;
+    the_hard_cap_refusal_names_a_cell_under_a_long_alias().await;
+    a_zero_row_refusal_names_no_cell().await;
+    a_refusal_below_the_hard_cap_offers_a_budget_and_columns().await;
+    the_search_refusal_at_the_hard_cap_names_a_cell().await;
+}
+
+/// A capture of 10 rows over 12 columns whose executed text alone
+/// overflows the hard cap.
+fn too_long_to_print() -> trawl_client::CapturedResult {
+    with_long_query(twelve_columns(10), 17_000)
+}
+
+/// A projected page from row 3 whose executed text alone overflows the
+/// hard cap: the refusal names the cell at row 3 and the page's first
+/// captured position, 7, and that call prints it. A cell call sends no
+/// projection.
+async fn the_hard_cap_refusal_names_a_cell_that_prints() {
+    let long = too_long_to_print();
+    let backend = Fake {
+        result_page: ok(projected(
+            &long,
+            &[7, 11],
+            (3..5).map(|row| projected_row(row, 40)).collect(),
+            3,
+        )),
+        capabilities: ok(capabilities(None)),
+        result_cell: first_range(),
+        ..Fake::default()
+    };
+    let refused = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": 3, "rows": 2,
+            "max_bytes": 32768, "columns": PROJECTION,
+        }}),
+        &backend,
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let text = text_of(&refused);
+    names_the_hard_cap_routes(text);
+    let named = named_cell_call(text).unwrap_or_else(|| panic!("no cell call: {text}"));
+    assert_eq!(
+        named,
+        json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 3, "column": 7,
+        }})
+    );
+    let followed = follow(&named, &backend).await;
+    assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
+    assert_eq!(
+        backend.calls()[2..],
+        [
+            "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 3 0 None"),
+            format!("result_cell {RESULT_ID} 3 7 None Some(16384)"),
+        ]
+    );
+    let cell = &followed.structured_content.as_ref().unwrap()["cell"];
+    assert_eq!(cell["name"], json!("c007"));
+    assert_eq!(cell["length"], json!(5002));
+}
+
+/// A first column named by a 20000-byte alias the query created: its name
+/// alone overflows the page at the hard cap, and the named cell call
+/// prints the cell under the name abbreviated.
+async fn the_hard_cap_refusal_names_a_cell_under_a_long_alias() {
+    let alias = "a".repeat(20_000);
+    let mut aliased = captured(
+        "service=api",
+        &[
+            (alias.as_str(), ColumnType::String),
+            ("message", ColumnType::String),
+        ],
+        vec![no_values(1), no_values(1)],
+        1,
+        1,
+    );
+    aliased.executed_query = format!("service=api | eval {alias}=message");
+    let backend = Fake {
+        result_page: ok(page(&aliased, vec![vec![s("x"), s("x")]], 0)),
+        capabilities: ok(capabilities(None)),
+        result_cell: first_range(),
+        ..Fake::default()
+    };
+    let refused = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "max_bytes": 32768,
+        }}),
+        &backend,
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let text = text_of(&refused);
+    names_the_hard_cap_routes(text);
+    let named = named_cell_call(text).unwrap_or_else(|| panic!("no cell call: {text}"));
+    assert_eq!(
+        named,
+        json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+        }})
+    );
+    let followed = follow(&named, &backend).await;
+    let followed_text = text_of(&followed);
+    assert_ne!(followed.is_error, Some(true), "{followed_text}");
+    assert!(used_bytes(&followed) <= 16_384, "{}", used_bytes(&followed));
+    assert_eq!(
+        backend.calls()[2..],
+        [
+            "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 0 0 None"),
+            format!("result_cell {RESULT_ID} 0 0 None Some(16384)"),
+        ]
+    );
+    let cell = &followed.structured_content.as_ref().unwrap()["cell"];
+    let shown = cell["name"].as_str().unwrap();
+    assert!(
+        shown.ends_with(&name_cut_marker(20_000)) && shown.starts_with("aaaa"),
+        "{shown}"
+    );
+    assert_eq!(printed_cell_name(followed_text), shown);
+    assert_eq!(cell["column"], json!(0));
+    assert_eq!(cell["length"], json!(5002));
+    assert!(
+        followed_text.ends_with(&format!(
+            "text: {}",
+            serde_json::to_string(&format!("\"{}\"", "v".repeat(5000))).unwrap()
+        )),
+        "{followed_text}"
+    );
+}
+
+/// A page that read no row names no cell call.
+async fn a_zero_row_refusal_names_no_cell() {
+    let backend = Fake {
+        result_page: ok(page(&too_long_to_print(), vec![], 10)),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let refused = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": 10, "max_bytes": 32768,
+        }}),
+        &backend,
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let text = text_of(&refused);
+    names_the_hard_cap_routes(text);
+    assert!(!text.contains("read action=cell"), "{text}");
+}
+
+/// Below the hard cap the refusal offers a larger `max_bytes` and the
+/// `columns` route.
+async fn a_refusal_below_the_hard_cap_offers_a_budget_and_columns() {
+    let backend = Fake {
+        result_page: ok(page(
+            &with_long_query(twelve_columns(10), 9_000),
+            vec![(0..12).map(|i| s(&format!("c{i:03}"))).collect()],
+            0,
+        )),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let refused = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "max_bytes": 16384,
+        }}),
+        &backend,
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let text = text_of(&refused);
+    assert!(
+        text.contains("a larger max_bytes, at most 32768")
+            && text.contains(&format!(
+                "read action=page result_id=\"{RESULT_ID}\" columns=["
+            )),
+        "{text}"
+    );
+}
+
+/// `search`'s refusal at the hard cap names the first row's first cell too.
+async fn the_search_refusal_at_the_hard_cap_names_a_cell() {
+    let long = too_long_to_print();
+    let backend = Fake {
+        capabilities: ok(capabilities(None)),
+        capture: ok(trawl_client::CaptureResponse {
+            result: long.clone(),
+            execution: None,
+            activity: None,
+            step_seq: None,
+        }),
+        result_page: ok(page(
+            &long,
+            vec![(0..12).map(|i| s(&format!("c{i:03}"))).collect()],
+            0,
+        )),
+        ..Fake::default()
+    };
+    let refused = search::run(
+        &backend,
+        &trawl_mcp::session::Seen::default(),
+        search_input(json!({"mode": "execute", "query": "service=api", "max_bytes": 32768})),
+        now(),
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let text = text_of(&refused);
+    names_the_hard_cap_routes(text);
+    assert_eq!(
+        named_cell_call(text),
+        Some(json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+        }})),
+        "{text}"
     );
 }
 
