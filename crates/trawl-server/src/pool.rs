@@ -28,10 +28,21 @@
 //! Between the request's outcome and that cleanup the work is *retained*:
 //! it still occupies a permit that `pool_active` counts, and
 //! [`retained`](ExecutorPool::retained) is the subset an operator can see.
-//! One [`Registry`] mutex covers the interrupt slots, the retained entries
-//! and the idle executors together, because the invariant that matters is
-//! a cross-map one: an interrupt may only fire while the executor it was
-//! taken from is still out on the query it belongs to.
+//! One [`Registry`] mutex covers the pending entries, the interrupt slots,
+//! the retained entries and the idle executors together, because the
+//! invariants that matter are cross-map ones: an interrupt may only fire
+//! while the executor it was taken from is still out on the query it
+//! belongs to, and a cancel latched while work waited to start is the one
+//! its worker reads.
+//!
+//! # A cancel reaches work that waits to start (ADR-0024, Amendment 2026-11-09)
+//!
+//! A tracked request takes a [`Pending`] guard before its tracker entry
+//! opens. Until its work takes a slot, a cancel by id latches the entry's
+//! flag and wakes every wait the request is in; each wait answers the
+//! capacity refusal and drops what it holds. Promotion into a slot moves
+//! the flag, so a cancel that landed after the last wait is refused by the
+//! worker at its work-start transition.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -44,6 +55,7 @@ use parking_lot::Mutex;
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use trawl_core::cancel::Stop;
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, QueryBudgets, RowCap};
@@ -215,7 +227,9 @@ impl WorkContext {
 ///
 /// The slot exists from registration — before the blocking task runs, let
 /// alone binds — so a cancellation arriving before the handle does is
-/// latched rather than lost, and the worker refuses to start on it.
+/// latched rather than lost, and the worker refuses to start on it. A
+/// tracked request's slot takes the flag of its [`PendingEntry`], so a
+/// cancellation that arrived while the work waited is latched here too.
 struct InterruptSlot {
     /// `DuckDB`'s interrupt handle, once the worker published it.
     handle: Option<Arc<duckdb::InterruptHandle>>,
@@ -223,12 +237,12 @@ struct InterruptSlot {
     /// accepted while the work exists, and an acknowledgement means
     /// requested, not stopped.
     ///
-    /// Written only inside the registry lock, so the decisions that read
-    /// it here — publish the handle, start the work — stay serialized
-    /// against invocation. It is an atomic because the executor reads the
-    /// same flag from its blocking thread at the bind-to-execute boundary
-    /// ([`WorkSlot::cancel_latch`]), where taking the registry lock would
-    /// put a `DuckDB` bind inside it.
+    /// Once the slot exists, written only inside the registry lock, so the
+    /// decisions that read it here — publish the handle, start the work —
+    /// stay serialized against invocation. It is an atomic because the
+    /// executor reads the same flag from its blocking thread at the
+    /// bind-to-execute boundary ([`WorkSlot::cancel_latch`]), where taking
+    /// the registry lock would put a `DuckDB` bind inside it.
     cancelled: Arc<AtomicBool>,
 }
 
@@ -252,14 +266,41 @@ struct RetainedEntry {
     retained_since: Option<Instant>,
 }
 
+/// A tracked request's cancellation state while its work waits to start
+/// (ADR-0024, Amendment 2026-11-09).
+///
+/// It lives from [`ExecutorPool::pend`] until [`ExecutorPool::begin_slot`]
+/// promotes it into an [`InterruptSlot`], or until the request's
+/// [`Pending`] guard drops. It never holds an interrupt handle: nothing
+/// has an executor yet.
+struct PendingEntry {
+    /// The cancel flag. Promotion moves this same `Arc` into the
+    /// [`InterruptSlot`], so a cancel latched while the work waited is the
+    /// one the worker reads at its work-start transition.
+    cancelled: Arc<AtomicBool>,
+    /// Wakes every wait the request is in. A `watch` rather than a
+    /// `Notify`: its value is state, so a wait that starts after the cancel
+    /// still sees it, and every waiter reads it.
+    wake: tokio::sync::watch::Sender<bool>,
+}
+
 /// Everything the pool must decide atomically about work in flight.
 ///
-/// One mutex, not three: the proof that a stale interrupt cannot hit a
+/// One mutex, not four: the proof that a stale interrupt cannot hit a
 /// reused connection is that invocation and deregistration-plus-re-idle
-/// are the same critical section. Split the maps and that ordering
-/// becomes a hope. Critical sections here are map operations only — no
-/// awaits, no query execution.
+/// are the same critical section, and the proof that a cancel latched on
+/// waiting work reaches its worker is that promotion from `pending` to
+/// `interrupts` is one too. Split the maps and either ordering becomes a
+/// hope. Critical sections here are map operations only — no awaits, no
+/// query execution.
+///
+/// An id is in at most one of `pending` and `interrupts`. A tracked id
+/// stays in one of them from [`ExecutorPool::pend`] until its work's slot
+/// is released, or until its guard drops when the work never got a slot.
 struct Registry {
+    /// Tracked requests whose work waits to start: for a preparation slot,
+    /// a permit or the publication guard.
+    pending: HashMap<u64, PendingEntry>,
     interrupts: HashMap<u64, InterruptSlot>,
     retained: HashMap<u64, RetainedEntry>,
     idle: Vec<Executor>,
@@ -267,7 +308,8 @@ struct Registry {
 
 impl Registry {
     /// Latch cancellation for one unit of work and interrupt it if it has
-    /// published a handle.
+    /// published a handle. For a tracked request whose work still waits to
+    /// start, latch its flag and wake every wait it is in.
     ///
     /// The slot is deliberately kept: cancellation is a request, not a
     /// stop, so a repeat cancellation must keep succeeding while the work
@@ -275,14 +317,24 @@ impl Registry {
     /// work-start transition. Only [`WorkSlot::drop`] removes a slot, in
     /// this same critical section — which is why an interrupt can never
     /// reach the next query to take that executor.
+    ///
+    /// A pending entry is kept for the same reasons, and the flag it
+    /// latches is the one promotion hands the worker. It has no handle, so
+    /// nothing is interrupted.
     fn request_cancel(&mut self, id: u64) -> bool {
-        let Some(slot) = self.interrupts.get_mut(&id) else {
+        if let Some(slot) = self.interrupts.get_mut(&id) {
+            slot.cancelled.store(true, Ordering::SeqCst);
+            if let Some(handle) = &slot.handle {
+                handle.interrupt();
+            }
+            return true;
+        }
+        let Some(entry) = self.pending.get(&id) else {
             return false;
         };
-        slot.cancelled.store(true, Ordering::SeqCst);
-        if let Some(handle) = &slot.handle {
-            handle.interrupt();
-        }
+        // The flag before the wake: a wait the wake ends finds it latched.
+        entry.cancelled.store(true, Ordering::SeqCst);
+        entry.wake.send_replace(true);
         true
     }
 
@@ -294,9 +346,10 @@ impl Registry {
     }
 }
 
-/// Why a worker refused to start its physical work.
+/// Why work was refused before it started: by a wait that gave up, or by
+/// the worker at its work-start transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartRefusal {
+pub(crate) enum StartRefusal {
     /// The budget was gone before any work began.
     Expired,
     /// Cancellation was latched before any work began.
@@ -308,6 +361,134 @@ impl StartRefusal {
         match self {
             Self::Expired => "expired",
             Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// What wakes a tracked request's waits when a cancel by id reaches it.
+///
+/// A `watch` receiver reads the current value before it waits, so a cancel
+/// sent before a wait starts ends that wait at once. A channel closed while
+/// its value is still false is not a cancel: promotion or the request's
+/// guard closed it, and the wait goes on under its deadline. The default is
+/// an untracked request's wake, which never fires.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Wake(Option<tokio::sync::watch::Receiver<bool>>);
+
+impl Wake {
+    /// Resolve once a cancel reached the request. Never for an untracked
+    /// request, or for one whose channel closed with no cancel on it.
+    pub(crate) async fn cancelled(&self) {
+        if let Some(receiver) = &self.0 {
+            let mut receiver = receiver.clone();
+            if receiver.wait_for(|cancelled| *cancelled).await.is_ok() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    }
+
+    /// Await `wait` within what is left of `deadline`, unless a cancel
+    /// reaches the request first.
+    ///
+    /// The cancel is polled first, so a cancel already latched beats a
+    /// `wait` that is ready on the same poll: a request that was told
+    /// "cancelled" never takes what it waited for.
+    ///
+    /// # Errors
+    ///
+    /// [`StartRefusal::Cancelled`] when a cancel reached the request, and
+    /// [`StartRefusal::Expired`] when the deadline passed first. Either way
+    /// `wait` is dropped unfinished, so it holds nothing.
+    pub(crate) async fn run<F: std::future::Future>(
+        &self,
+        deadline: Deadline,
+        wait: F,
+    ) -> Result<F::Output, StartRefusal> {
+        tokio::select! {
+            biased;
+            () = self.cancelled() => Err(StartRefusal::Cancelled),
+            out = deadline.run(wait) => {
+                out.map_err(|crate::deadline::Expired| StartRefusal::Expired)
+            }
+        }
+    }
+}
+
+/// A tracked request's place in the registry while its work waits to start
+/// (ADR-0024, Amendment 2026-11-09).
+///
+/// A route takes one with [`ExecutorPool::pend`] right before it opens the
+/// request's tracker entry, and keeps it until the request ends. So a
+/// cancel by id reaches the request from the moment `/queries` can list it:
+/// its waits race [`Pending::wake`], and a preparation job it runs stops on
+/// [`Pending::stop`].
+///
+/// Dropping it removes its pending entry, if the entry is still there.
+/// After [`ExecutorPool::begin_slot`] promoted the entry, the guard owns
+/// nothing in the registry: the registered slot outlives it and stays
+/// cancellable until the work's own cleanup.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "#343: the tracked routes take this guard in a later checkpoint"
+    )
+)]
+pub(crate) struct Pending {
+    registry: Arc<Mutex<Registry>>,
+    id: u64,
+    /// The request's door, for the refusal a cancel ends it with.
+    kind: WorkKind,
+    cancelled: Arc<AtomicBool>,
+    wake: Wake,
+    /// One refusal, told once, however many of the request's waits refuse.
+    refusal: RefusalOnce,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "#343: the tracked routes take this guard in a later checkpoint"
+    )
+)]
+impl Pending {
+    /// What wakes this request's waits when a cancel reaches it.
+    pub(crate) fn wake(&self) -> &Wake {
+        &self.wake
+    }
+
+    /// A stop over this request's cancel flag, for a job that runs while
+    /// the request waits: a cancel by id ends the job at its next check.
+    pub(crate) fn stop(&self) -> Stop {
+        Stop::from_flag(Arc::clone(&self.cancelled))
+    }
+
+    /// Whether a cancel reached this request.
+    pub(crate) fn latched(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// The answer for a request a cancel ended before its work started: the
+    /// capacity refusal, logged once with reason `cancelled`.
+    pub(crate) fn refuse(&self) -> ServerError {
+        self.refusal
+            .refuse(self.id, self.kind, StartRefusal::Cancelled)
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock();
+        // This request's own entry only. After promotion the id is in
+        // `interrupts`, which only the work's slot removes.
+        if registry
+            .pending
+            .get(&self.id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.cancelled, &self.cancelled))
+        {
+            registry.pending.remove(&self.id);
         }
     }
 }
@@ -1218,8 +1399,8 @@ pub struct ExecutorPool {
     /// starting at zero, so the pair (`instance`, `query_id`) is what
     /// identifies a unit of work when several pools are logging at once.
     instance: u64,
-    /// Interrupt slots, retained-work accounting and the idle executors,
-    /// under one lock (see [`Registry`]).
+    /// Pending entries, interrupt slots, retained-work accounting and the
+    /// idle executors, under one lock (see [`Registry`]).
     registry: Arc<Mutex<Registry>>,
     /// Hot buffer for fresh events not yet compacted to parquet.
     hot_buffer: Option<Arc<HotBuffer>>,
@@ -1562,6 +1743,7 @@ impl ExecutorPool {
             next_id: Arc::new(AtomicU64::new(0)),
             instance: NEXT_POOL_INSTANCE.fetch_add(1, Ordering::Relaxed),
             registry: Arc::new(Mutex::new(Registry {
+                pending: HashMap::new(),
                 interrupts: HashMap::new(),
                 retained: HashMap::new(),
                 idle: executors,
@@ -1708,6 +1890,11 @@ impl ExecutorPool {
     /// `work` is taken whole so its holds move into the slot: a hold left
     /// with the request future would be released when the request stops
     /// waiting, while the work may still be running.
+    ///
+    /// A tracked request's pending entry ([`Self::pend`]) is promoted here,
+    /// in the critical section that registers the slot: the slot takes its
+    /// cancel flag, and no cancel can find the id in both maps or in
+    /// neither between the request's waits and its work.
     fn begin_slot(
         &self,
         id: u64,
@@ -1732,7 +1919,14 @@ impl ExecutorPool {
             drop(work);
             return Err(ServerError::Internal("executor pool inconsistent".into()));
         };
-        let cancelled = Arc::new(AtomicBool::new(false));
+        // Promotion, in the critical section that registers the slot: a
+        // tracked request's flag moves into it, so a cancel latched while
+        // the work waited is the one the worker reads at its work-start
+        // transition. Untracked work starts with a fresh flag.
+        let cancelled = registry
+            .pending
+            .remove(&id)
+            .map_or_else(|| Arc::new(AtomicBool::new(false)), |entry| entry.cancelled);
         registry.interrupts.insert(
             id,
             InterruptSlot {
@@ -1869,11 +2063,69 @@ impl ExecutorPool {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Put a tracked request in the registry while its work waits to
+    /// start, so a cancel by id reaches it (ADR-0024, Amendment
+    /// 2026-11-09).
+    ///
+    /// A route calls this right before it opens the request's tracker
+    /// entry, and keeps the guard until the request ends. The request's
+    /// own waits race the guard's [`Wake`]; the pool's waits find it by id.
+    /// [`Self::begin_slot`] promotes the entry, cancel flag and all, when
+    /// the work takes its slot. `kind` is the request's door, named in the
+    /// refusal a cancel ends it with.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "#343: the tracked routes take this guard in a later checkpoint"
+        )
+    )]
+    pub(crate) fn pend(&self, id: u64, kind: WorkKind) -> Pending {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (wake, receiver) = tokio::sync::watch::channel(false);
+        {
+            let mut registry = self.registry.lock();
+            debug_assert!(
+                !registry.pending.contains_key(&id) && !registry.interrupts.contains_key(&id),
+                "query id {id} is already in the registry"
+            );
+            registry.pending.insert(
+                id,
+                PendingEntry {
+                    cancelled: Arc::clone(&cancelled),
+                    wake,
+                },
+            );
+        }
+        Pending {
+            registry: Arc::clone(&self.registry),
+            id,
+            kind,
+            cancelled,
+            wake: Wake(Some(receiver)),
+            refusal: RefusalOnce::new(self.instance),
+        }
+    }
+
+    /// The wake a lane's waits race for `id`: its pending entry's, or one
+    /// that never fires for an untracked lane.
+    fn wake_of(&self, id: u64) -> Wake {
+        Wake(
+            self.registry
+                .lock()
+                .pending
+                .get(&id)
+                .map(|entry| entry.wake.subscribe()),
+        )
+    }
+
     /// Execute a DSL query, blocking on semaphore acquisition if at capacity.
     ///
     /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id);
     /// it keys the interrupt slot [`cancel_by_id`](Self::cancel_by_id) latches
     /// and the lifecycle entry [`retained_work`](Self::retained_work) lists.
+    /// When the request is tracked ([`Self::pend`]), a cancel by id also
+    /// ends the queue and publication waits with a capacity refusal.
     ///
     /// `deadline` is the caller's whole budget, stamped once at handler
     /// entry (ADR-0024). Every wait this lane performs — the queue, the
@@ -1934,6 +2186,8 @@ impl ExecutorPool {
             .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
         // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
+        // A cancel by id ends either wait below ([`Self::pend`]).
+        let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let available = self.semaphore.available_permits();
@@ -1949,11 +2203,11 @@ impl ExecutorPool {
         // (ADR-0024): it used to be measured for the log line only, so a
         // query could sit here for minutes and still be handed a whole
         // fresh timeout to run in. The phase guard books the wait however
-        // it ends, the deadline and a dropped caller included.
+        // it ends, the deadline, a cancel and a dropped caller included.
         let semaphore = Arc::clone(&self.semaphore);
         let acquired = {
             let _wait = clock.guard(QueryPhase::PoolWait);
-            deadline.run(semaphore.acquire_owned()).await
+            wake.run(deadline, semaphore.acquire_owned()).await
         };
         let permit = match acquired {
             Ok(Ok(permit)) => permit,
@@ -1964,16 +2218,17 @@ impl ExecutorPool {
                     severity_columns: Vec::new(),
                 };
             }
-            Err(crate::deadline::Expired) => {
-                let refused = refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
+            Err(refusal) => {
+                let refused = refusal_log.refuse_outcome(query_id, kind, refusal);
                 account_refused(timing.as_ref());
                 return refused;
             }
         };
 
+        // A refusal here drops the permit with this frame: nothing ran.
         let published = {
             let _wait = clock.guard(QueryPhase::PublicationWait);
-            deadline.run(self.publication.read()).await
+            wake.run(deadline, self.publication.read()).await
         };
         let publication = match published {
             Ok(Ok(guard)) => guard,
@@ -1984,8 +2239,8 @@ impl ExecutorPool {
                     severity_columns: Vec::new(),
                 };
             }
-            Err(crate::deadline::Expired) => {
-                let refused = refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
+            Err(refusal) => {
+                let refused = refusal_log.refuse_outcome(query_id, kind, refusal);
                 account_refused(timing.as_ref());
                 return refused;
             }
@@ -2174,6 +2429,8 @@ impl ExecutorPool {
             .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
         // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
+        // A cancel by id ends the wait below ([`Self::pend`]).
+        let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let available = self.semaphore.available_permits();
@@ -2191,7 +2448,7 @@ impl ExecutorPool {
         let semaphore = Arc::clone(&self.semaphore);
         let acquired = {
             let _wait = clock.guard(QueryPhase::PoolWait);
-            deadline.run(semaphore.acquire_owned()).await
+            wake.run(deadline, semaphore.acquire_owned()).await
         };
         let permit = match acquired {
             Ok(Ok(permit)) => permit,
@@ -2202,8 +2459,8 @@ impl ExecutorPool {
                     severity_columns: Vec::new(),
                 };
             }
-            Err(crate::deadline::Expired) => {
-                let refused = refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
+            Err(refusal) => {
+                let refused = refusal_log.refuse_outcome(query_id, kind, refusal);
                 account_refused(timing.as_ref());
                 return refused;
             }
@@ -2401,10 +2658,13 @@ impl ExecutorPool {
     /// Request cancellation of one unit of work by id.
     ///
     /// True means the work exists and cancellation is now latched — not
-    /// that anything has stopped. It stays true for repeat requests while
-    /// the work exists, including after its request already timed out, and
-    /// covers the window before the worker publishes an interrupt handle:
-    /// the latch is what makes that worker refuse to start.
+    /// that anything has stopped. Tracked work exists from its request's
+    /// [`Self::pend`]: while it waits to start, the cancel wakes the wait,
+    /// which answers the capacity refusal. Registered work stays
+    /// cancellable for repeat requests while it exists, including after its
+    /// request already timed out, and the latch covers the window before
+    /// the worker publishes an interrupt handle: it is what makes that
+    /// worker refuse to start.
     pub fn cancel_by_id(&self, query_id: u64) -> bool {
         self.registry.lock().request_cancel(query_id)
     }
@@ -2584,16 +2844,18 @@ impl ExecutorPool {
             .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
         // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
+        // A cancel by id ends either wait below ([`Self::pend`]).
+        let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let semaphore = Arc::clone(&self.semaphore);
         let acquired = {
             let _wait = clock.guard(QueryPhase::PoolWait);
-            deadline.run(semaphore.acquire_owned()).await
+            wake.run(deadline, semaphore.acquire_owned()).await
         };
         let permit = acquired
-            .map_err(|_| {
-                let refused = refusal_log.refuse(query_id, kind, StartRefusal::Expired);
+            .map_err(|refusal| {
+                let refused = refusal_log.refuse(query_id, kind, refusal);
                 account_refused(timing.as_ref());
                 refused
             })?
@@ -2601,10 +2863,10 @@ impl ExecutorPool {
 
         let published = {
             let _wait = clock.guard(QueryPhase::PublicationWait);
-            deadline.run(self.publication.read()).await
+            wake.run(deadline, self.publication.read()).await
         };
-        let publication = published.map_err(|_| {
-            let refused = refusal_log.refuse(query_id, kind, StartRefusal::Expired);
+        let publication = published.map_err(|refusal| {
+            let refused = refusal_log.refuse(query_id, kind, refusal);
             account_refused(timing.as_ref());
             refused
         })??;
@@ -2778,16 +3040,18 @@ impl ExecutorPool {
             .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
         // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
+        // A cancel by id ends either wait below ([`Self::pend`]).
+        let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let semaphore = Arc::clone(&self.semaphore);
         let acquired = {
             let _wait = clock.guard(QueryPhase::PoolWait);
-            deadline.run(semaphore.acquire_owned()).await
+            wake.run(deadline, semaphore.acquire_owned()).await
         };
         let permit = acquired
-            .map_err(|_| {
-                let refused = refusal_log.refuse(query_id, kind, StartRefusal::Expired);
+            .map_err(|refusal| {
+                let refused = refusal_log.refuse(query_id, kind, refusal);
                 account_refused(timing.as_ref());
                 refused
             })?
@@ -2801,10 +3065,10 @@ impl ExecutorPool {
             CaptureSource::Window { .. } => {
                 let published = {
                     let _wait = clock.guard(QueryPhase::PublicationWait);
-                    deadline.run(self.publication.read()).await
+                    wake.run(deadline, self.publication.read()).await
                 };
-                Some(published.map_err(|_| {
-                    let refused = refusal_log.refuse(query_id, kind, StartRefusal::Expired);
+                Some(published.map_err(|refusal| {
+                    let refused = refusal_log.refuse(query_id, kind, refusal);
                     account_refused(timing.as_ref());
                     refused
                 })??)
@@ -2989,10 +3253,13 @@ mod tests {
         pool.registry.lock().idle.len()
     }
 
-    /// Nothing is registered: no interrupt slot, no lifecycle entry.
+    /// Nothing is registered: no pending entry, no interrupt slot, no
+    /// lifecycle entry.
     fn registry_is_empty(pool: &ExecutorPool) -> bool {
         let registry = pool.registry.lock();
-        registry.interrupts.is_empty() && registry.retained.is_empty()
+        registry.pending.is_empty()
+            && registry.interrupts.is_empty()
+            && registry.retained.is_empty()
     }
 
     /// A pool whose queries answer from a one-event hot buffer, so an
@@ -4635,6 +4902,629 @@ mod tests {
             idle_len(&pool) == baseline_idle && pool.available_permits() == 1
         })
         .await;
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A deadline far past every bound the tests below assert: a request
+    /// that answers before it was ended by its cancel, not its budget.
+    fn far() -> Deadline {
+        Deadline::after(Duration::from_secs(60))
+    }
+
+    /// Which of the registry's two maps hold `id`: (pending, registered).
+    fn maps(pool: &ExecutorPool, id: u64) -> (bool, bool) {
+        let registry = pool.registry.lock();
+        (
+            registry.pending.contains_key(&id),
+            registry.interrupts.contains_key(&id),
+        )
+    }
+
+    /// Take a permit and promote `id` into a slot, as a lane does once its
+    /// last wait is over: there is no seam between that wait and
+    /// `begin_slot`, so the tests drive the promotion directly.
+    async fn promote(pool: &ExecutorPool, id: u64) -> WorkSlot {
+        let permit = Arc::clone(&pool.semaphore)
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
+        pool.begin_slot(id, TEST_WORK, Some("*"), permit, None)
+            .expect("an idle executor is behind the permit")
+    }
+
+    /// A query queued behind a held permit is reached by a cancel by id
+    /// (#343). One cancel answers true, the request answers the capacity
+    /// refusal at once, far before its deadline and while the blocker still
+    /// holds the permit, and the worker never sees the query.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_reaches_a_query_queued_for_a_permit() {
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let seams = pool.seams();
+        let entry = seams.watch(Seam::Entry);
+        let idle_before = idle_len(&pool);
+        let held = pool
+            .exclusive(Duration::from_secs(1))
+            .await
+            .expect("the idle pool grants exclusivity at once");
+        let id = pool.allocate_query_id();
+        let (timing, request_id) = timed(&pool, id);
+        let log = capture::of_timed(&pool, id, &request_id).await;
+        let pending = pool.pend(id, WorkKind::Query);
+        assert_eq!(maps(&pool, id), (true, false), "pending, not registered");
+
+        let deadline = far();
+        let start = tokio::time::Instant::now();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(id, "*", deadline, false, TEST_WORK.with_timing(timing))
+                .await
+        });
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!request.is_finished(), "the query is queued for the permit");
+
+        assert!(pool.cancel_by_id(id), "a queued query is cancellable by id");
+        let outcome = request.await.expect("the request joins");
+        assert!(
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
+            "a cancelled wait is a capacity refusal: {:?}",
+            outcome.result
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(1),
+            "the cancel ended the wait, not the deadline"
+        );
+        assert!(!deadline.expired());
+        assert_eq!(
+            pool.available_permits(),
+            0,
+            "the blocker still holds the pool's permit"
+        );
+
+        let refusals = log.of_type("query_not_started");
+        assert_eq!(refusals.len(), 1, "one refusal: {refusals:?}");
+        assert_eq!(value(&refusals[0], "reason"), Some("cancelled"));
+        assert_eq!(value(&refusals[0], "kind"), Some("query"));
+        let timings = log.of_type("query_timing");
+        assert_eq!(timings.len(), 1, "one account: {timings:?}");
+        assert_eq!(value(&timings[0], "outcome"), Some("capacity_refused"));
+        assert_eq!(value(&timings[0], "work_started"), Some("false"));
+        drop(log);
+
+        drop(held);
+        settle().await;
+        assert_eq!(
+            entry.arrivals(),
+            0,
+            "the cancelled query never reached the worker, even once the permit freed"
+        );
+        assert_eq!(idle_len(&pool), idle_before, "it took no executor");
+        assert_eq!(pool.available_permits(), pool.capacity());
+        assert!(
+            pool.cancel_by_id(id),
+            "the request still holds its guard, so a repeat cancel answers true"
+        );
+        drop(pending);
+        assert!(!pool.cancel_by_id(id));
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A query that holds the permit and waits for the publication guard
+    /// is reached by a cancel by id (#343): it ends, and the permit is back
+    /// while the cutover's writer still holds the guard.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_during_the_publication_wait_returns_the_permit() {
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let seams = pool.seams();
+        let entry = seams.watch(Seam::Entry);
+        let idle_before = idle_len(&pool);
+        let writer = pool.publication.write().await;
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+
+        let deadline = far();
+        let start = tokio::time::Instant::now();
+        let submitted = pool.clone();
+        let request =
+            tokio::spawn(
+                async move { submitted.execute(id, "*", deadline, false, TEST_WORK).await },
+            );
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!request.is_finished(), "the query waits for the guard");
+        assert_eq!(
+            pool.available_permits(),
+            0,
+            "it holds the permit while it waits"
+        );
+
+        assert!(pool.cancel_by_id(id));
+        let outcome = request.await.expect("the request joins");
+        assert!(
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(!deadline.expired());
+        assert_eq!(
+            pool.available_permits(),
+            pool.capacity(),
+            "the permit is back while the writer still holds the guard"
+        );
+        assert_eq!(idle_len(&pool), idle_before);
+
+        drop(writer);
+        settle().await;
+        assert_eq!(entry.arrivals(), 0, "the worker never saw the query");
+        drop(pending);
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A cancel sent after `pend` and before any wait starts ends the first
+    /// wait at once, even with a free permit ready on the first poll: the
+    /// wake reads the latched value before it waits, and it is polled
+    /// first.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_before_the_wait_is_seen_by_the_wait() {
+        let pool = hot_pool(1);
+        let seams = pool.seams();
+        let entry = seams.watch(Seam::Entry);
+        let idle_before = idle_len(&pool);
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+        assert!(pool.cancel_by_id(id), "a pending request is cancellable");
+        assert!(pool.cancel_by_id(id), "and a repeat cancel answers true");
+        assert!(pending.latched());
+
+        let start = tokio::time::Instant::now();
+        let deadline = far();
+        let outcome = pool.execute(id, "*", deadline, false, TEST_WORK).await;
+        assert!(
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the first wait ended at once"
+        );
+        assert_eq!(
+            entry.arrivals(),
+            0,
+            "the wait refused it: the worker never ran to refuse it"
+        );
+        assert_eq!(pool.available_permits(), pool.capacity());
+        assert_eq!(idle_len(&pool), idle_before);
+        drop(pending);
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A pending guard reads its request's cancel: its stop is requested
+    /// once a cancel by id reaches it, so a preparation job running on it
+    /// ends at its next check, and the refusal it answers with is logged
+    /// once with reason `cancelled`, however often it is asked.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_guard_stops_and_refuses_on_its_cancel() {
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let id = pool.allocate_query_id();
+        let log = capture::of_query(&pool, id).await;
+        let pending = pool.pend(id, WorkKind::Export);
+        let stop = pending.stop();
+        assert!(!stop.requested());
+        assert!(pool.cancel_by_id(id));
+        assert!(stop.requested(), "the stop reads the pending flag");
+        assert!(pending.stop().requested());
+        for _ in 0..2 {
+            assert!(matches!(pending.refuse(), ServerError::CapacityNotStarted));
+        }
+        let refusals = log.of_type("query_not_started");
+        assert_eq!(refusals.len(), 1, "told once: {refusals:?}");
+        assert_eq!(value(&refusals[0], "reason"), Some("cancelled"));
+        assert_eq!(value(&refusals[0], "kind"), Some("export"));
+        drop(log);
+        drop(pending);
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A cancel latched while the work waited survives its promotion: the
+    /// flag moves into the interrupt slot with its identity, and the worker
+    /// refuses at its work-start transition. The id is in exactly one map
+    /// at every step, in both orders of cancel and promotion, and the
+    /// executor both slots used answers the next query normally.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_cancel_survives_promotion() {
+        let pool = hot_pool(1);
+
+        // Cancel, then promote.
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+        assert_eq!(maps(&pool, id), (true, false));
+        assert!(pool.cancel_by_id(id));
+        let slot = promote(&pool, id).await;
+        assert_eq!(
+            maps(&pool, id),
+            (false, true),
+            "promotion moves the id in one critical section"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &pool.registry.lock().interrupts[&id].cancelled,
+                &pending.cancelled
+            ),
+            "the flag keeps its identity across promotion"
+        );
+        assert!(
+            !slot.publish_interrupt(slot.executor().interrupt_handle()),
+            "the worker finds the cancel latched"
+        );
+        assert_eq!(slot.begin_work(far()), Err(StartRefusal::Cancelled));
+        assert!(pool.cancel_by_id(id), "a repeat cancel reaches the slot");
+        drop(pending);
+        assert_eq!(
+            maps(&pool, id),
+            (false, true),
+            "the request's guard leaves the registered slot alone"
+        );
+        drop(slot);
+        assert_eq!(maps(&pool, id), (false, false));
+        assert!(registry_is_empty(&pool));
+
+        // Promote, then cancel: the registered path, on the same flag.
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+        let slot = promote(&pool, id).await;
+        assert_eq!(maps(&pool, id), (false, true));
+        assert!(!pending.latched());
+        assert!(pool.cancel_by_id(id));
+        assert!(
+            pending.latched(),
+            "the guard reads the flag the registered slot latched"
+        );
+        assert!(!slot.publish_interrupt(slot.executor().interrupt_handle()));
+        drop(slot);
+        assert_eq!(maps(&pool, id), (false, false), "worker cleanup first");
+        drop(pending);
+        assert!(registry_is_empty(&pool));
+
+        let outcome = pool
+            .execute(pool.allocate_query_id(), "*", far(), false, TEST_WORK)
+            .await;
+        assert!(
+            outcome.result.is_ok(),
+            "no cancel reaches the reused executor: {:?}",
+            outcome.result
+        );
+    }
+
+    /// A pending entry lives exactly as long as its request's guard, and
+    /// promotion hands its id to the slot: a dropped `Pending` leaves
+    /// nothing to cancel, a request refused at its deadline stays
+    /// cancellable until its guard drops, and a guard dropped after
+    /// promotion leaves the work cancellable until its slot drops.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_entry_leaves_with_its_request() {
+        let pool = hot_pool(1);
+
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+        assert_eq!(maps(&pool, id), (true, false));
+        drop(pending);
+        assert_eq!(maps(&pool, id), (false, false));
+        assert!(!pool.cancel_by_id(id), "nothing is left to cancel");
+        assert!(registry_is_empty(&pool));
+
+        let held = pool
+            .exclusive(Duration::from_secs(1))
+            .await
+            .expect("the idle pool grants exclusivity at once");
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+        let outcome = pool
+            .execute(
+                id,
+                "*",
+                Deadline::after(Duration::from_secs(5)),
+                false,
+                TEST_WORK,
+            )
+            .await;
+        assert!(
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(
+            maps(&pool, id),
+            (true, false),
+            "the wait ended and the request has not"
+        );
+        assert!(pool.cancel_by_id(id));
+        drop(pending);
+        assert!(!pool.cancel_by_id(id));
+        drop(held);
+
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+        let slot = promote(&pool, id).await;
+        drop(pending);
+        assert_eq!(maps(&pool, id), (false, true));
+        assert!(
+            pool.cancel_by_id(id),
+            "a guard dropped after promotion leaves the work cancellable"
+        );
+        drop(slot);
+        assert!(!pool.cancel_by_id(id));
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A wake whose channel closed with no cancel on it never fires:
+    /// promotion and a dropped guard both close it, and neither is a
+    /// cancel. One closed after a cancel still fires, and an untracked
+    /// request's never does.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_wake_is_not_a_cancel() {
+        let pool = hot_pool(1);
+        let soon = || Deadline::after(Duration::from_secs(1));
+
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+        let wake = pending.wake().clone();
+        let slot = promote(&pool, id).await;
+        assert_eq!(
+            wake.run(soon(), std::future::pending::<()>()).await,
+            Err(StartRefusal::Expired)
+        );
+        drop(slot);
+        drop(pending);
+        assert_eq!(
+            wake.run(soon(), std::future::pending::<()>()).await,
+            Err(StartRefusal::Expired)
+        );
+
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+        let wake = pending.wake().clone();
+        assert!(pool.cancel_by_id(id));
+        let slot = promote(&pool, id).await;
+        assert_eq!(
+            wake.run(far(), std::future::pending::<()>()).await,
+            Err(StartRefusal::Cancelled)
+        );
+        drop(slot);
+        drop(pending);
+
+        assert_eq!(
+            Wake::default()
+                .run(soon(), std::future::pending::<()>())
+                .await,
+            Err(StartRefusal::Expired)
+        );
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// The resolved-source lane's one wait, the permit, refuses on a
+    /// cancel by id like the corpus lane's.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_reaches_a_resolved_source_query_queued_for_a_permit() {
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let seams = pool.seams();
+        let entry = seams.watch(Seam::Entry);
+        let held = pool
+            .exclusive(Duration::from_secs(1))
+            .await
+            .expect("the idle pool grants exclusivity at once");
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Query);
+
+        let deadline = far();
+        let start = tokio::time::Instant::now();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute_with_source(
+                    id,
+                    "*",
+                    "'/nonexistent/saved.parquet'",
+                    deadline,
+                    false,
+                    WorkContext::key(WorkKind::FromSaved, 7),
+                )
+                .await
+        });
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!request.is_finished(), "queued for the permit");
+        assert!(pool.cancel_by_id(id));
+        let outcome = request.await.expect("the request joins");
+        assert!(
+            matches!(&outcome.result, Err(ServerError::CapacityNotStarted)),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(!deadline.expired());
+
+        drop(held);
+        settle().await;
+        assert_eq!(entry.arrivals(), 0);
+        assert_eq!(pool.available_permits(), pool.capacity());
+        drop(pending);
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A Parquet export is reached by a cancel by id at both of its waits:
+    /// queued for the permit, and holding it while it waits for the
+    /// publication guard.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_reaches_a_parquet_export_at_either_wait() {
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let seams = pool.seams();
+        let entry = seams.watch(Seam::Entry);
+        let export = |id: u64, deadline: Deadline| {
+            let submitted = pool.clone();
+            tokio::spawn(async move {
+                submitted
+                    .export_parquet(
+                        id,
+                        "*",
+                        100,
+                        deadline,
+                        WorkContext::key(WorkKind::Export, 7),
+                    )
+                    .await
+            })
+        };
+
+        let held = pool
+            .exclusive(Duration::from_secs(1))
+            .await
+            .expect("the idle pool grants exclusivity at once");
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Export);
+        let deadline = far();
+        let start = tokio::time::Instant::now();
+        let request = export(id, deadline);
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!request.is_finished(), "queued for the permit");
+        assert!(pool.cancel_by_id(id));
+        let answer = request.await.expect("the request joins");
+        assert!(
+            matches!(&answer, Err(ServerError::CapacityNotStarted)),
+            "{answer:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(!deadline.expired());
+        drop(held);
+        drop(pending);
+
+        let writer = pool.publication.write().await;
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Export);
+        let deadline = far();
+        let start = tokio::time::Instant::now();
+        let request = export(id, deadline);
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!request.is_finished(), "waiting for the guard");
+        assert_eq!(pool.available_permits(), 0, "holding the permit");
+        assert!(pool.cancel_by_id(id));
+        let answer = request.await.expect("the request joins");
+        assert!(
+            matches!(&answer, Err(ServerError::CapacityNotStarted)),
+            "{answer:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(!deadline.expired());
+        assert_eq!(
+            pool.available_permits(),
+            pool.capacity(),
+            "the permit is back while the writer still holds the guard"
+        );
+        drop(writer);
+        drop(pending);
+
+        settle().await;
+        assert_eq!(entry.arrivals(), 0, "neither export reached the worker");
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A window capture is reached by a cancel by id at both of its waits,
+    /// the permit and the window's publication guard. Each refusal drops
+    /// the capture's charge with the work that never started, and `finish`
+    /// never runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_reaches_a_window_capture_at_either_wait() {
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let seams = pool.seams();
+        let entry = seams.watch(Seam::Entry);
+        let finished = Arc::new(AtomicBool::new(false));
+        let capture = |id: u64, deadline: Deadline, work: WorkContext| {
+            let submitted = pool.clone();
+            let finished = Arc::clone(&finished);
+            tokio::spawn(async move {
+                submitted
+                    .capture(
+                        id,
+                        "*",
+                        window(),
+                        RowCap::Refuse(100),
+                        deadline,
+                        work,
+                        Box::new(move |_: CaptureInput<'_>| {
+                            finished.store(true, Ordering::SeqCst);
+                            Ok(())
+                        }),
+                    )
+                    .await
+            })
+        };
+
+        let held = pool
+            .exclusive(Duration::from_secs(1))
+            .await
+            .expect("the idle pool grants exclusivity at once");
+        let (work, released) = charged(&pool, 7);
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Capture);
+        let deadline = far();
+        let start = tokio::time::Instant::now();
+        let request = capture(id, deadline, work);
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!request.is_finished(), "queued for the permit");
+        assert!(
+            released.lock().is_none(),
+            "the waiting capture holds its charge"
+        );
+        assert!(pool.cancel_by_id(id));
+        let answer = request.await.expect("the request joins");
+        assert!(
+            matches!(&answer, Err(ServerError::CapacityNotStarted)),
+            "{answer:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(!deadline.expired());
+        assert!(released.lock().is_some(), "the refusal dropped the charge");
+        drop(held);
+        drop(pending);
+
+        let writer = pool.publication.write().await;
+        let (work, released) = charged(&pool, 7);
+        let id = pool.allocate_query_id();
+        let pending = pool.pend(id, WorkKind::Capture);
+        let deadline = far();
+        let start = tokio::time::Instant::now();
+        let request = capture(id, deadline, work);
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!request.is_finished(), "waiting for the window's guard");
+        assert_eq!(pool.available_permits(), 0, "holding the permit");
+        assert!(pool.cancel_by_id(id));
+        let answer = request.await.expect("the request joins");
+        assert!(
+            matches!(&answer, Err(ServerError::CapacityNotStarted)),
+            "{answer:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(!deadline.expired());
+        let released = released.lock().expect("the refusal dropped the charge");
+        assert_eq!(
+            released.available_permits,
+            pool.capacity(),
+            "the permit was back before the charge dropped"
+        );
+        assert_eq!(released.registered, 0);
+        drop(writer);
+        drop(pending);
+
+        settle().await;
+        assert_eq!(entry.arrivals(), 0, "neither capture reached the worker");
+        assert!(!finished.load(Ordering::SeqCst), "finish never ran");
         assert!(registry_is_empty(&pool));
     }
 
