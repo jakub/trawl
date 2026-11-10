@@ -199,7 +199,7 @@ The results area has these presentations:
 
 - **Quick start** appears in both results tabs before a snapshot query runs. It has four examples, sender and reserved field references, and severity bands. Each example's **Run** executes it with the selected range and filters, then opens **Events**.
 - **View** offers **Inline** or **Inspector** for event details, and **Compact** or **Message first** for rows. Inline expands details in the table. Inspector opens an event panel. Message first leads with time, severity and a wide message column, with service, host and latency below the message when present. Other fields remain in the event details. Without a `message` or `msg` column, the table stays compact. Inline and Compact are the defaults. These choices apply to snapshot events only, not live or aggregate results.
-- The histogram above snapshot events groups the current page's rows over their own time span. It does not count all matches in the selected range or measure ingest volume. It is absent for live and aggregate results.
+- The histogram above snapshot events counts every event in the result, not only the rows on the current page. trawld counts them in the same query that returns the page. The bars run from the first event to the last in 48 equal UTC bins. Each page runs the query again and shows the counts of its own run, so the counts change between pages only when the result does. The caption gives the total and the width of one bin. Events without a usable `_time` are counted in the caption but not drawn. After `head`, `tail` or `dedup`, the histogram counts only the events those stages kept, and a line under the key says so. A sampled result, rows read with `from saved`, and a result without a usable `_time` show a sentence that says why there is no histogram. The histogram does not measure ingest volume. It is absent for live and aggregate results.
 - For a snapshot aggregate, **Events** shows an exact table of group and metric columns, without row expansion. Only grouped fields offer a search action. A `stats` result with one group column and one numeric metric also has a chart with one bar per group beside the table. Other aggregate shapes show the table alone.
 
 ### Sharing search links
@@ -450,10 +450,14 @@ waits for the tab. The evidence waits too: a cited row, a row **Refresh** asks
 for again, and a page of the evidence viewer, including one whose 429
 `Retry-After` passed while the tab was hidden. A board opened in a hidden tab
 shows **Paused** and loads when the tab shows. When the tab shows again, it
-reads at once and then every 5 seconds. A read that waited for the tab also
-waits out a 429's `Retry-After` that is still running, however often the tab
-hides and shows, and a 403 or a 404 drops it. **Refresh** in a visible tab does
-not wait for a `Retry-After`.
+reads at once and then every 5 seconds.
+
+Every board read waits out a 429's `Retry-After`, in a visible tab too. This
+includes **Refresh**, **Load more entries**, the read after a close, a reopen,
+or a keep, and the reads that follow a short read. The reads asked for during
+the wait join into one read, which starts when the wait ends. While a read
+waits, the board says so. The wait holds however often the tab hides and
+shows. A 403 or a 404 drops a read that waits.
 
 The header's badge names the connection state:
 
@@ -463,7 +467,7 @@ The header's badge names the connection state:
 | **Live** | The last read was accepted |
 | **Paused** | The tab is hidden, so the board reads nothing |
 | **Retrying** | The last read failed. The next read waits 5 seconds after the first failure, then 10, 20, 40, and at most 60. A 429 waits at least its `Retry-After` |
-| **Stopped** | The server refused a read with 403, or no longer holds the investigation. The board reads nothing more on this visit and drops its write controls |
+| **Stopped** | The server refused a read with 403, or no longer holds the investigation. The board reads nothing more on this visit. It drops its write controls and every control that would read it: **Refresh**, **Refresh the board**, and **Load more entries**. Reload the page to start a new visit |
 
 **checked** gives the time of the last read the board accepted, including a
 read that brought nothing new. A failed read changes neither the board nor that

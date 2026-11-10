@@ -1,0 +1,15 @@
+{
+  "columns": [
+    { "name": "_time", "type": "timestamp" },
+    { "name": "host", "type": "string" },
+    { "name": "status", "type": "integer" },
+    { "name": "message", "type": "string" }
+  ],
+  "rows": [],
+  "pagination": { "limit": 50, "offset": 0, "returned": 0, "total": 0 },
+  "execution": { "started_at": "2026-09-15T12:34:56Z", "duration_ms": 125 },
+  "histogram": {
+    "state": "unavailable",
+    "reason": "no_usable_time"
+  }
+}

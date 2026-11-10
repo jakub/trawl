@@ -326,6 +326,10 @@ pub struct QueryRequest {
     /// Optional offset for pagination (defaults to 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<usize>,
+    /// Ask for the whole result's [`EventHistogram`]. `/api/v1/query` only;
+    /// absent from the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub histogram: bool,
 }
 
 /// Request body for creating a saved query (`POST /api/v1/saved`).
@@ -474,6 +478,120 @@ pub struct QueryResponse {
     /// arithmetic consumer is untouched. Absent from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub severity_columns: Vec<String>,
+    /// The whole result counted by `_time`, answered only to a request
+    /// that asked for it with `histogram` and only for a raw-event query.
+    /// Absent from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub histogram: Option<EventHistogram>,
+}
+
+/// The number of bins in a ready [`EventHistogram`].
+pub const HISTOGRAM_BUCKETS: usize = 48;
+
+/// The shortest span a ready [`EventHistogram`] draws, in microseconds. A
+/// result whose usable times lie closer together than this still spans it.
+pub const HISTOGRAM_MIN_SPAN_MICROS: i64 = 1_000_000;
+
+/// Every row of one execution counted by `_time` into
+/// [`HISTOGRAM_BUCKETS`] half-open bins, or why it was not counted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EventHistogram {
+    /// The counts. Bin `i` holds the rows whose `_time` is in
+    /// `[start + i × width, start + (i + 1) × width)`, where `width` is
+    /// `(end - start) / 48` microseconds.
+    Ready {
+        /// The minimum usable `_time` of the result, a wire instant at UTC.
+        start: String,
+        /// `start` plus 48 bin widths, a wire instant at UTC. It is past the
+        /// maximum usable `_time`.
+        end: String,
+        /// Exactly [`HISTOGRAM_BUCKETS`] bins, oldest first.
+        buckets: Vec<HistogramBucket>,
+        /// Rows without a usable `_time`, which no bin holds.
+        undated: u64,
+        /// Whether the result has a `_severity` column. When false, every
+        /// bin's `errors` is 0.
+        severity: bool,
+        /// Whether the query has a `head`, `limit`, `tail` or `dedup` stage,
+        /// so the result holds only the rows that stage kept.
+        kept_some: bool,
+    },
+    /// The result was not counted.
+    Unavailable { reason: HistogramReason },
+}
+
+/// One bin of a ready [`EventHistogram`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistogramBucket {
+    /// Rows whose `_time` is in the bin.
+    pub events: u64,
+    /// Those of them whose `_severity` is in the error band or above.
+    pub errors: u64,
+}
+
+/// Why an [`EventHistogram`] is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistogramReason {
+    /// The query has a `sample` stage, so its rows are not the whole result.
+    Sample,
+    /// The rows were read from a stored run (`from saved`).
+    StoredResult,
+    /// The result has no `_time` column typed `timestamp`.
+    NoTimeColumn,
+    /// No row of the result has a usable `_time`.
+    NoUsableTime,
+}
+
+impl EventHistogram {
+    /// Whether this histogram can describe a result of `total` rows.
+    ///
+    /// An unavailable one always can. A ready one needs exactly
+    /// [`HISTOGRAM_BUCKETS`] bins; finite bounds that [`zone::wire_micros`]
+    /// reads, with `start < end`, a span divisible by the bin count and a
+    /// bin width of at least [`HISTOGRAM_MIN_SPAN_MICROS`] / 48 rounded up;
+    /// `errors <= events` in every bin; no errors without `severity`; at
+    /// least one dated row; and bin events plus `undated` equal to `total`.
+    #[must_use]
+    pub fn consistent_with(&self, total: usize) -> bool {
+        let Self::Ready {
+            start,
+            end,
+            buckets,
+            undated,
+            severity,
+            kept_some: _,
+        } = self
+        else {
+            return true;
+        };
+        if buckets.len() != HISTOGRAM_BUCKETS {
+            return false;
+        }
+        let finite = |text: &str| {
+            zone::wire_micros(text).filter(|&micros| {
+                micros != zone::TIMESTAMP_INFINITY && micros != zone::TIMESTAMP_NEG_INFINITY
+            })
+        };
+        let (Some(start), Some(end)) = (finite(start), finite(end)) else {
+            return false;
+        };
+        let bins = i128::try_from(HISTOGRAM_BUCKETS).expect("48 fits i128");
+        let span = i128::from(end) - i128::from(start);
+        let min_width = (i128::from(HISTOGRAM_MIN_SPAN_MICROS) + bins - 1) / bins;
+        if span <= 0 || span % bins != 0 || span / bins < min_width {
+            return false;
+        }
+        let mut dated: u128 = 0;
+        for bucket in buckets {
+            if bucket.errors > bucket.events || (!severity && bucket.errors != 0) {
+                return false;
+            }
+            dated += u128::from(bucket.events);
+        }
+        dated > 0 && u128::try_from(total).is_ok_and(|total| dated + u128::from(*undated) == total)
+    }
 }
 
 /// Pagination metadata for query responses.
@@ -2917,6 +3035,7 @@ mod tests {
             query: "_severity=error | stats count()".into(),
             limit: Some(100),
             offset: None,
+            histogram: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         // skip_serializing_if means offset should be absent
@@ -2934,6 +3053,315 @@ mod tests {
         assert_eq!(req.query, "*");
         assert_eq!(req.limit, None);
         assert_eq!(req.offset, None);
+        assert!(!req.histogram, "a missing flag decodes false");
+    }
+
+    /// The histogram flag is on the wire only when it is true.
+    #[test]
+    fn query_request_histogram_flag_is_sent_only_when_true() {
+        let mut req = QueryRequest {
+            query: "*".into(),
+            limit: None,
+            offset: None,
+            histogram: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({"query": "*"})
+        );
+        req.histogram = true;
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire, serde_json::json!({"query": "*", "histogram": true}));
+        let back: QueryRequest = serde_json::from_value(wire).unwrap();
+        assert!(back.histogram);
+        let off: QueryRequest =
+            serde_json::from_value(serde_json::json!({"query": "*", "histogram": false})).unwrap();
+        assert!(!off.histogram);
+    }
+
+    /// A UTC wire instant `micros` past the epoch.
+    fn instant(micros: i64) -> String {
+        zone::wire_timestamp(micros, chrono::FixedOffset::east_opt(0).unwrap())
+    }
+
+    /// A ready histogram over `[0, 48 × 20_834)` µs: three events (one an
+    /// error) in the first bin, two in the last, one undated. Six rows.
+    fn ready() -> EventHistogram {
+        let mut buckets = vec![
+            HistogramBucket {
+                events: 0,
+                errors: 0
+            };
+            HISTOGRAM_BUCKETS
+        ];
+        buckets[0] = HistogramBucket {
+            events: 3,
+            errors: 1,
+        };
+        buckets[47] = HistogramBucket {
+            events: 2,
+            errors: 0,
+        };
+        EventHistogram::Ready {
+            start: instant(0),
+            end: instant(48 * 20_834),
+            buckets,
+            undated: 1,
+            severity: true,
+            kept_some: false,
+        }
+    }
+
+    /// `ready()` with `edit` applied to its fields.
+    fn ready_with(
+        edit: impl FnOnce(&mut String, &mut String, &mut Vec<HistogramBucket>, &mut u64, &mut bool),
+    ) -> EventHistogram {
+        let mut histogram = ready();
+        if let EventHistogram::Ready {
+            start,
+            end,
+            buckets,
+            undated,
+            severity,
+            ..
+        } = &mut histogram
+        {
+            edit(start, end, buckets, undated, severity);
+        }
+        histogram
+    }
+
+    /// Both states round-trip under the `state` tag, and every reason has
+    /// its `snake_case` spelling. A response carries the histogram only when
+    /// it has one.
+    #[test]
+    fn event_histogram_round_trips_with_the_state_tag() {
+        let ready = ready();
+        let wire = serde_json::to_value(&ready).unwrap();
+        assert_eq!(wire["state"], "ready");
+        assert_eq!(wire["start"], "1970-01-01T00:00:00.000000Z");
+        assert_eq!(wire["end"], "1970-01-01T00:00:01.000032Z");
+        assert_eq!(
+            wire["buckets"][0],
+            serde_json::json!({"events": 3, "errors": 1})
+        );
+        assert_eq!(wire["buckets"].as_array().unwrap().len(), 48);
+        assert_eq!(wire["undated"], 1);
+        assert_eq!(wire["severity"], true);
+        assert_eq!(wire["kept_some"], false);
+        assert_eq!(wire.as_object().unwrap().len(), 7, "{wire}");
+        assert_eq!(
+            serde_json::from_value::<EventHistogram>(wire).unwrap(),
+            ready
+        );
+
+        for (reason, spelled) in [
+            (HistogramReason::Sample, "sample"),
+            (HistogramReason::StoredResult, "stored_result"),
+            (HistogramReason::NoTimeColumn, "no_time_column"),
+            (HistogramReason::NoUsableTime, "no_usable_time"),
+        ] {
+            let unavailable = EventHistogram::Unavailable { reason };
+            let wire = serde_json::to_value(unavailable.clone()).unwrap();
+            assert_eq!(
+                wire,
+                serde_json::json!({"state": "unavailable", "reason": spelled})
+            );
+            assert_eq!(
+                serde_json::from_value::<EventHistogram>(wire).unwrap(),
+                unavailable
+            );
+        }
+
+        let page = serde_json::json!({"columns": [], "rows": [],
+            "pagination": {"limit": 10, "offset": 0, "returned": 0, "total": 0}});
+        let mut response: QueryResponse = serde_json::from_value(page.clone()).unwrap();
+        assert_eq!(response.histogram, None, "a missing field decodes None");
+        assert_eq!(serde_json::to_value(&response).unwrap(), page);
+        response.histogram = Some(EventHistogram::Unavailable {
+            reason: HistogramReason::NoUsableTime,
+        });
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            wire["histogram"],
+            serde_json::json!({"state": "unavailable", "reason": "no_usable_time"})
+        );
+        let back: QueryResponse = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.histogram, response.histogram);
+    }
+
+    /// `consistent_with`, one row per rule, each beside the case it breaks.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table
+    fn event_histogram_consistency_truth_table() {
+        let unavailable = EventHistogram::Unavailable {
+            reason: HistogramReason::Sample,
+        };
+        let w = 20_834_i64;
+        let cases: Vec<(&str, EventHistogram, usize, bool)> = vec![
+            ("the baseline", ready(), 6, true),
+            ("unavailable over no rows", unavailable.clone(), 0, true),
+            ("unavailable over rows", unavailable, 5, true),
+            (
+                "kept_some does not matter",
+                match ready() {
+                    EventHistogram::Ready {
+                        start,
+                        end,
+                        buckets,
+                        undated,
+                        severity,
+                        ..
+                    } => EventHistogram::Ready {
+                        start,
+                        end,
+                        buckets,
+                        undated,
+                        severity,
+                        kept_some: true,
+                    },
+                    EventHistogram::Unavailable { .. } => unreachable!(),
+                },
+                6,
+                true,
+            ),
+            (
+                "47 bins",
+                ready_with(|_, _, b, _, _| {
+                    b.pop();
+                }),
+                6,
+                false,
+            ),
+            (
+                "49 bins",
+                ready_with(|_, _, b, _, _| {
+                    b.push(HistogramBucket {
+                        events: 0,
+                        errors: 0,
+                    });
+                }),
+                6,
+                false,
+            ),
+            (
+                "an unreadable start",
+                ready_with(|s, _, _, _, _| *s = "nope".into()),
+                6,
+                false,
+            ),
+            (
+                "an unreadable end",
+                ready_with(|_, e, _, _, _| *e = "2026-13-01T00:00:00Z".into()),
+                6,
+                false,
+            ),
+            (
+                "an infinite end",
+                ready_with(|_, e, _, _, _| *e = "infinity".into()),
+                6,
+                false,
+            ),
+            (
+                "an infinite start",
+                ready_with(|s, _, _, _, _| *s = "-infinity".into()),
+                6,
+                false,
+            ),
+            (
+                "start equals end",
+                ready_with(|s, e, _, _, _| *e = s.clone()),
+                6,
+                false,
+            ),
+            (
+                "start after end",
+                ready_with(|s, e, _, _, _| std::mem::swap(s, e)),
+                6,
+                false,
+            ),
+            (
+                "a span one microsecond off a multiple of 48",
+                ready_with(|_, e, _, _, _| *e = instant(48 * w + 1)),
+                6,
+                false,
+            ),
+            (
+                "a bin narrower than 20,834 µs",
+                ready_with(|_, e, _, _, _| *e = instant(48 * (w - 1))),
+                6,
+                false,
+            ),
+            (
+                "wide bins at negative epochs",
+                ready_with(|s, e, _, _, _| {
+                    *s = instant(-96 * w);
+                    *e = instant(-48 * w);
+                }),
+                6,
+                true,
+            ),
+            (
+                "more errors than events in a bin",
+                ready_with(|_, _, b, _, _| b[47].errors = 3),
+                6,
+                false,
+            ),
+            (
+                "errors without severity",
+                ready_with(|_, _, _, _, sev| *sev = false),
+                6,
+                false,
+            ),
+            (
+                "no severity and no errors",
+                ready_with(|_, _, b, _, sev| {
+                    *sev = false;
+                    b[0].errors = 0;
+                }),
+                6,
+                true,
+            ),
+            (
+                "no dated row",
+                ready_with(|_, _, b, u, _| {
+                    b[0] = HistogramBucket {
+                        events: 0,
+                        errors: 0,
+                    };
+                    b[47] = HistogramBucket {
+                        events: 0,
+                        errors: 0,
+                    };
+                    *u = 6;
+                }),
+                6,
+                false,
+            ),
+            ("one row short of the total", ready(), 7, false),
+            ("one row past the total", ready(), 5, false),
+            (
+                "counts that overflow u64 when summed",
+                ready_with(|_, _, b, u, _| {
+                    for bucket in b.iter_mut() {
+                        *bucket = HistogramBucket {
+                            events: u64::MAX,
+                            errors: u64::MAX,
+                        };
+                    }
+                    *u = u64::MAX;
+                }),
+                usize::MAX,
+                false,
+            ),
+        ];
+        for (label, histogram, total, consistent) in cases {
+            assert_eq!(
+                histogram.consistent_with(total),
+                consistent,
+                "{label}: {histogram:?} over {total}"
+            );
+        }
     }
 
     #[test]

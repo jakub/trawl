@@ -3011,6 +3011,7 @@ fi"#,
             },
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),
+            histogram: None,
         })
         .unwrap();
         let posts = Arc::new(AtomicUsize::new(0));

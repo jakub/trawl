@@ -464,6 +464,7 @@ async fn query_rows(server: &common::TestServer, dsl: &str) -> Vec<Row> {
             query: dsl.to_owned(),
             limit: Some(10_000),
             offset: None,
+            histogram: false,
         })
         .send()
         .await
