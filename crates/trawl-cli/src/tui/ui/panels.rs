@@ -18,6 +18,8 @@ use ratatui::widgets::{
 use crate::tui::App;
 use crate::tui::state::{Focus, LoadedRun, MainTab, SavedFocus, SchemaBrowser};
 use crate::tui::theme::Theme;
+use trawl_api::zone::{DisplayZone, Presented, present, present_human};
+use trawl_core::sanitize::sanitize_display_text;
 use trawl_core::text_layout::{cells, fit_cells, pad_cells};
 
 /// Render panel content based on the active `MainTab`.
@@ -545,41 +547,43 @@ fn format_relative_time(iso_timestamp: &str) -> String {
     format!("{label:>4}")
 }
 
-/// Render a report run's covered window as `[start .. end)` in UTC.
+/// Render a report run's covered window as `[start .. end)` in `zone`.
 ///
-/// Bounds are half-open, so the closing bracket is deliberate. Both bounds are
-/// rendered with seconds and any fractional part, since schedule edits can
-/// re-anchor a boundary between minutes. When both bounds share a UTC day the end
-/// bound drops its date, which is the common case for a tiled window.
-///
-/// A bound that does not parse is passed through verbatim rather than guessed
-/// at, so an unexpected wire value is visible instead of silently formatted.
-fn format_run_window(start: &str, end: &str) -> String {
-    use chrono::{DateTime, Utc};
-
-    let (Ok(from), Ok(to)) = (start.parse::<DateTime<Utc>>(), end.parse::<DateTime<Utc>>()) else {
-        return format!("[{start} .. {end})");
+/// Bounds are half-open, so the closing bracket is deliberate. Each bound is
+/// a [`format_instant`], with its own offset, seconds and any fractional
+/// part, since schedule edits can re-anchor a boundary between minutes. When
+/// both bounds converted and show the same date, the end drops its date,
+/// which is the common case for a tiled window; its offset stays, so nothing
+/// is hidden.
+fn format_run_window(start: &str, end: &str, zone: DisplayZone) -> String {
+    let from = format_instant(start, zone);
+    let to = format_instant(end, zone);
+    let to = match (
+        converted_date(start, &from, zone),
+        converted_date(end, &to, zone),
+    ) {
+        (Some((from_date, _)), Some((to_date, to_rest))) if from_date == to_date => to_rest,
+        _ => &to,
     };
-
-    let from_text = from.format("%Y-%m-%d %H:%M:%S%.f").to_string();
-    let to_text = if from.date_naive() == to.date_naive() {
-        to.format("%H:%M:%S%.f").to_string()
-    } else {
-        to.format("%Y-%m-%d %H:%M:%S%.f").to_string()
-    };
-
-    format!("[{from_text} .. {to_text})")
+    format!("[{from} .. {to})")
 }
 
-/// Render an RFC 3339 instant in UTC, preserving seconds and fractions. A value that
-/// does not parse is passed through so an unexpected wire shape is visible.
-fn format_instant_utc(iso: &str) -> String {
-    use chrono::{DateTime, Utc};
+/// `shown`, the [`format_instant`] reading of `wire`, split into its date and
+/// the rest, or `None` unless `zone` converted `wire`: text passed through,
+/// an infinity and an instant the zone could not place keep their whole
+/// reading.
+fn converted_date<'a>(wire: &str, shown: &'a str, zone: DisplayZone) -> Option<(&'a str, &'a str)> {
+    matches!(present(wire, zone), Some(Presented::Converted(_)))
+        .then(|| shown.split_once(' '))
+        .flatten()
+}
 
-    iso.parse::<DateTime<Utc>>().map_or_else(
-        |_| iso.to_owned(),
-        |t| format!("{} UTC", t.format("%Y-%m-%d %H:%M:%S%.f")),
-    )
+/// A wire timestamp in `zone`, with its offset, seconds and any fraction.
+/// Text that is not a wire timestamp shows as sent, sanitized, rather than
+/// guessed at, so an unexpected wire value is visible and cannot drive the
+/// terminal.
+fn format_instant(wire: &str, zone: DisplayZone) -> String {
+    present_human(wire, zone).unwrap_or_else(|| sanitize_display_text(wire))
 }
 
 /// The schedule's window mode as a badge suffix for the saved-query list:
@@ -599,8 +603,11 @@ fn format_schedule_badge(sched: &trawl_api::ScheduleResponse) -> String {
 /// A zero lag is left out: it is the default and printing `lag 0s` would spend
 /// a line saying nothing. `covered through` is the `since_last` watermark, so
 /// it is absent for a fixed window and for a schedule that has not yet had a
-/// successful run.
-fn format_schedule_window(sched: &trawl_api::ScheduleResponse) -> Option<String> {
+/// successful run; when present it reads in `zone`.
+fn format_schedule_window(
+    sched: &trawl_api::ScheduleResponse,
+    zone: DisplayZone,
+) -> Option<String> {
     let window = sched.window.as_deref()?;
     let mut parts = vec![format!("window {window}")];
 
@@ -611,7 +618,7 @@ fn format_schedule_window(sched: &trawl_api::ScheduleResponse) -> Option<String>
     }
 
     if let Some(covered) = sched.covered_through.as_deref() {
-        parts.push(format!("covered through {}", format_instant_utc(covered)));
+        parts.push(format!("covered through {}", format_instant(covered, zone)));
     }
 
     Some(parts.join(", "))
@@ -843,7 +850,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
         ]));
         // Continuation lines under the `sched` label: what the scheduler owns
         // of the report window, then the fire cursor every schedule has.
-        if let Some(window) = format_schedule_window(sched) {
+        if let Some(window) = format_schedule_window(sched, app.display_zone) {
             lines.push(Line::from(vec![
                 Span::styled("       ", label_style),
                 Span::styled(window, value_style),
@@ -852,7 +859,10 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
         lines.push(Line::from(vec![
             Span::styled("       ", label_style),
             Span::styled(
-                format!("next fire {}", format_instant_utc(&sched.next_fire_at)),
+                format!(
+                    "next fire {}",
+                    format_instant(&sched.next_fire_at, app.display_zone)
+                ),
                 value_style,
             ),
         ]));
@@ -975,7 +985,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
             }
             if let (Some(start), Some(end)) = (&run.window_start, &run.window_end) {
                 spans.push(Span::styled(
-                    format!(" {}", format_run_window(start, end)),
+                    format!(" {}", format_run_window(start, end, app.display_zone)),
                     Style::default().fg(theme.text_muted),
                 ));
             }
@@ -1212,53 +1222,156 @@ mod tests {
         assert_eq!(format_relative_time("garbage"), "????");
     }
 
+    fn zone(text: &str) -> DisplayZone {
+        text.parse().unwrap()
+    }
+
     #[test]
     fn run_window_same_day_drops_the_end_date() {
         assert_eq!(
-            format_run_window("2026-03-14T02:00:00Z", "2026-03-14T03:00:00Z"),
-            "[2026-03-14 02:00:00 .. 03:00:00)"
+            format_run_window("2026-03-14T02:00:00Z", "2026-03-14T03:00:00Z", zone("UTC")),
+            "[2026-03-14 02:00:00 +00:00 .. 03:00:00 +00:00)"
         );
     }
 
     #[test]
     fn run_window_across_midnight_keeps_the_end_date() {
         assert_eq!(
-            format_run_window("2026-03-14T23:30:00Z", "2026-03-15T00:30:00Z"),
-            "[2026-03-14 23:30:00 .. 2026-03-15 00:30:00)"
+            format_run_window("2026-03-14T23:30:00Z", "2026-03-15T00:30:00Z", zone("UTC")),
+            "[2026-03-14 23:30:00 +00:00 .. 2026-03-15 00:30:00 +00:00)"
         );
     }
 
-    /// An offset-bearing bound is read as the instant it names and rendered in
-    /// UTC, so two runs are always comparable on the same clock.
+    /// One UTC day, but midnight at `+05:30` falls inside it: the dates as
+    /// displayed differ, so the end keeps its date.
     #[test]
-    fn run_window_normalizes_an_offset_to_utc() {
+    fn run_window_crossing_midnight_in_the_display_zone_keeps_both_dates() {
         assert_eq!(
-            format_run_window("2026-03-14T09:00:00+05:30", "2026-03-14T10:00:00+05:30"),
-            "[2026-03-14 03:30:00 .. 04:30:00)"
+            format_run_window(
+                "2026-03-14T18:00:00Z",
+                "2026-03-14T19:00:00Z",
+                zone("+05:30")
+            ),
+            "[2026-03-14 23:30:00 +05:30 .. 2026-03-15 00:30:00 +05:30)"
+        );
+    }
+
+    /// A window inside one displayed day drops the end's date and keeps
+    /// both offsets.
+    #[test]
+    fn run_window_on_one_displayed_day_drops_the_end_date() {
+        assert_eq!(
+            format_run_window(
+                "2026-03-14T02:00:00Z",
+                "2026-03-14T03:00:00Z",
+                zone("+05:30")
+            ),
+            "[2026-03-14 07:30:00 +05:30 .. 08:30:00 +05:30)"
+        );
+    }
+
+    /// An offset-bearing bound is read as the instant it names and shown in
+    /// the display zone, so two runs are always read on the same clock.
+    #[test]
+    fn run_window_shows_an_offset_bound_in_the_display_zone() {
+        assert_eq!(
+            format_run_window(
+                "2026-03-14T09:00:00+05:30",
+                "2026-03-14T10:00:00+05:30",
+                zone("UTC")
+            ),
+            "[2026-03-14 03:30:00 +00:00 .. 04:30:00 +00:00)"
         );
     }
 
     #[test]
     fn schedule_bounds_preserve_subminute_precision() {
         assert_eq!(
-            format_run_window("2026-03-14T02:00:17.123456Z", "2026-03-14T03:00:17.123457Z"),
-            "[2026-03-14 02:00:17.123456 .. 03:00:17.123457)"
+            format_run_window(
+                "2026-03-14T02:00:17.123456Z",
+                "2026-03-14T03:00:17.123457Z",
+                zone("+05:30")
+            ),
+            "[2026-03-14 07:30:17.123456 +05:30 .. 08:30:17.123457 +05:30)"
         );
         assert_eq!(
-            format_instant_utc("2026-03-14T04:00:17.123456+01:00"),
-            "2026-03-14 03:00:17.123456 UTC"
+            format_instant("2026-03-14T04:00:17.123456+01:00", zone("+05:30")),
+            "2026-03-14 08:30:17.123456 +05:30"
         );
     }
 
+    /// A bound that is not a wire timestamp shows as sent, sanitized, and the
+    /// other bound keeps its date: no guessed instant, no shared day.
     #[test]
     fn run_window_passes_through_an_unparseable_bound() {
         assert_eq!(
-            format_run_window("garbage", "2026-03-14T03:00:00Z"),
-            "[garbage .. 2026-03-14T03:00:00Z)"
+            format_run_window("garbage", "2026-03-14T03:00:00Z", zone("UTC")),
+            "[garbage .. 2026-03-14 03:00:00 +00:00)"
         );
         assert_eq!(
-            format_run_window("2026-03-14T02:00:00Z", ""),
-            "[2026-03-14T02:00:00Z .. )"
+            format_run_window("2026-03-14T02:00:00Z", "", zone("UTC")),
+            "[2026-03-14 02:00:00 +00:00 .. )"
+        );
+        // Text that only looks like a reading on the same day keeps its
+        // date beside a converted bound.
+        assert_eq!(
+            format_run_window("2026-03-14T02:00:00Z", "2026-03-14 later", zone("UTC")),
+            "[2026-03-14 02:00:00 +00:00 .. 2026-03-14 later)"
+        );
+        assert_eq!(
+            format_run_window("2026-03-14\u{202E}T02", "2026-03-14T03:00:00Z", zone("UTC")),
+            "[2026-03-14\u{FFFD}T02 .. 2026-03-14 03:00:00 +00:00)"
+        );
+        assert_eq!(
+            format_run_window("2026-03-14T02:00:00Z", "\u{202E}soon", zone("UTC")),
+            "[2026-03-14 02:00:00 +00:00 .. \u{FFFD}soon)"
+        );
+    }
+
+    /// Set only in the child process, which reads the run window under the
+    /// `TZ` the parent chose.
+    const BERLIN_CHILD: &str = "TRAWL_PANELS_BERLIN_CHILD";
+
+    /// Under `TZ=Europe/Berlin` with the display zone `local`, a window over
+    /// the fall-back night keeps each bound's own offset, and since both
+    /// read 2026-10-25 the end drops only its date. The machine zone is per
+    /// process, so this test binary re-runs itself with the ignored
+    /// [`tui_instants_dst_child_under_berlin`] selected and `TZ` set. The
+    /// parent fails if the child fails or never ran.
+    #[test]
+    fn tui_instants_keep_their_dst_offsets() {
+        const CHILD: &str = "tui::ui::panels::tests::tui_instants_dst_child_under_berlin";
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("locate this test binary"))
+                .args([CHILD, "--exact", "--ignored", "--test-threads=1"])
+                .env("TZ", "Europe/Berlin")
+                .env(BERLIN_CHILD, "1")
+                .output()
+                .expect("run the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the Berlin child failed or did not run; status {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status,
+        );
+    }
+
+    /// The subprocess entry point. Without [`BERLIN_CHILD`] it does nothing,
+    /// so a run with `--run-ignored` passes it untouched.
+    #[test]
+    #[ignore = "entry point for the Berlin child process; the test above runs it"]
+    fn tui_instants_dst_child_under_berlin() {
+        if std::env::var_os(BERLIN_CHILD).is_none() {
+            return;
+        }
+        assert_eq!(
+            format_run_window(
+                "2026-10-25T00:30:00Z",
+                "2026-10-25T01:30:00Z",
+                DisplayZone::Local
+            ),
+            "[2026-10-25 02:30:00 +02:00 .. 02:30:00 +01:00)"
         );
     }
 
@@ -1297,8 +1410,8 @@ mod tests {
             Some("2026-03-14T03:00:00Z"),
         );
         assert_eq!(
-            format_schedule_window(&sched).unwrap(),
-            "window since_last, lag 5m, covered through 2026-03-14 03:00:00 UTC"
+            format_schedule_window(&sched, zone("+05:30")).unwrap(),
+            "window since_last, lag 5m, covered through 2026-03-14 08:30:00 +05:30"
         );
     }
 
@@ -1306,19 +1419,25 @@ mod tests {
     #[test]
     fn schedule_window_omits_a_zero_lag() {
         let sched = schedule(Some("2h"), Some(("0s", 0)), None);
-        assert_eq!(format_schedule_window(&sched).unwrap(), "window 2h");
+        assert_eq!(
+            format_schedule_window(&sched, zone("UTC")).unwrap(),
+            "window 2h"
+        );
     }
 
     /// A fixed window keeps no watermark, so there is nothing to print.
     #[test]
     fn schedule_window_omits_an_absent_watermark() {
         let sched = schedule(Some("2h"), Some(("5m", 300)), None);
-        assert_eq!(format_schedule_window(&sched).unwrap(), "window 2h, lag 5m");
+        assert_eq!(
+            format_schedule_window(&sched, zone("UTC")).unwrap(),
+            "window 2h, lag 5m"
+        );
     }
 
     #[test]
     fn schedule_window_is_none_in_query_mode() {
-        assert!(format_schedule_window(&schedule(None, None, None)).is_none());
+        assert!(format_schedule_window(&schedule(None, None, None), zone("UTC")).is_none());
     }
 
     #[test]
@@ -1335,12 +1454,16 @@ mod tests {
     }
 
     #[test]
-    fn instant_utc_passes_through_an_unparseable_value() {
+    fn instant_passes_through_an_unparseable_value() {
         assert_eq!(
-            format_instant_utc("2026-03-14T04:00:00Z"),
-            "2026-03-14 04:00:00 UTC"
+            format_instant("2026-03-14T04:00:00Z", zone("+05:30")),
+            "2026-03-14 09:30:00 +05:30"
         );
-        assert_eq!(format_instant_utc("soon"), "soon");
+        assert_eq!(format_instant("soon", zone("+05:30")), "soon");
+        assert_eq!(
+            format_instant("\u{202E}soon", zone("+05:30")),
+            "\u{FFFD}soon"
+        );
     }
 
     #[test]

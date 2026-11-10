@@ -358,9 +358,12 @@ mod tests {
             Some(make_schedule(None, None)),
             vec![normal, truncated, query_text],
         );
+        // At +05:30 the truncated window starts and ends on 2026-03-14, so
+        // its end drops the date its UTC reading would keep.
+        app.display_zone = "+05:30".parse().unwrap();
         // Wide enough that the whole run line lands: the window trails the
         // row, so a narrower pane cuts the bounds and then the marker.
-        let backend = TestBackend::new(160, 20);
+        let backend = TestBackend::new(180, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
@@ -435,10 +438,68 @@ mod tests {
             Some(make_schedule(Some("since_last"), Some(("5m", 300)))),
             vec![run],
         );
+        app.display_zone = "+05:30".parse().unwrap();
         let backend = TestBackend::new(160, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// At `+05:30` the history `executed` line and every instant of the saved
+    /// detail (next fire, covered through, the run window) read at
+    /// `+05:30`, and none says ` UTC`.
+    #[test]
+    fn tui_metadata_uses_the_display_zone() {
+        use crate::tui::state::MainTab;
+
+        let draw = |app: &mut crate::tui::App| {
+            let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+            terminal.draw(|f| super::render(app, f)).unwrap();
+            terminal.backend().to_string()
+        };
+
+        let mut app = test_app();
+        app.display_zone = "+05:30".parse().unwrap();
+        app.main_tab = MainTab::History;
+        app.history_cache = Some(trawl_api::HistoryResponse {
+            entries: vec![trawl_api::HistoryEntryResponse {
+                id: 1,
+                query: "service=api".to_owned(),
+                executed_at: "2026-03-18T14:30:00.123456Z".to_owned(),
+                duration_ms: 12,
+                row_count: 3,
+                status: trawl_client::QueryStatus::Success,
+            }],
+            total: 1,
+        });
+        let history = draw(&mut app);
+        assert!(
+            history.contains("2026-03-18 20:00:00.123456 +05:30"),
+            "the executed line is not at +05:30:\n{history}"
+        );
+        assert!(!history.contains(" UTC"), "{history}");
+
+        let run = windowed_run(
+            41,
+            45,
+            "since_last",
+            "2026-03-14T02:00:00Z",
+            "2026-03-14T03:00:00Z",
+        );
+        let mut app = saved_app(
+            Some(make_schedule(Some("since_last"), Some(("5m", 300)))),
+            vec![run],
+        );
+        app.display_zone = "+05:30".parse().unwrap();
+        let saved = draw(&mut app);
+        for reading in [
+            "covered through 2026-03-14 08:30:00 +05:30",
+            "next fire 2026-03-14 09:30:00 +05:30",
+            "[2026-03-14 07:30:00 +05:30 .. 08:30:00 +05:30)",
+        ] {
+            assert!(saved.contains(reading), "{reading} missing:\n{saved}");
+        }
+        assert!(!saved.contains(" UTC"), "{saved}");
     }
 
     /// A fixed trailing window with no lag: no `lag 0s`, and no watermark,

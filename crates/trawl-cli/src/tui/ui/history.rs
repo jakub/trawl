@@ -11,6 +11,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use trawl_api::zone::{DisplayZone, present_human};
+use trawl_core::sanitize::sanitize_display_text;
 
 use crate::tui::App;
 use crate::tui::highlight::Highlighter;
@@ -64,7 +66,10 @@ pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("executed   ", label_style),
-        Span::styled(format_full_timestamp(&entry.executed_at), value_style),
+        Span::styled(
+            format_full_timestamp(&entry.executed_at, app.display_zone),
+            value_style,
+        ),
     ]));
 
     lines.push(Line::default());
@@ -89,14 +94,10 @@ fn format_duration_ms(ms: u64) -> String {
     }
 }
 
-/// Format an ISO 8601 timestamp for display.
-fn format_full_timestamp(iso: &str) -> String {
-    use chrono::{DateTime, Utc};
-    if let Ok(dt) = iso.parse::<DateTime<Utc>>() {
-        dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
-    } else {
-        iso.to_owned()
-    }
+/// A wire timestamp in `zone`, with its offset and any fraction. Text that is
+/// not a wire timestamp shows as sent, sanitized, rather than guessed at.
+fn format_full_timestamp(wire: &str, zone: DisplayZone) -> String {
+    present_human(wire, zone).unwrap_or_else(|| sanitize_display_text(wire))
 }
 
 #[cfg(test)]
@@ -124,20 +125,43 @@ mod tests {
         assert_eq!(format_duration_ms(150_000), "2m 30s");
     }
 
+    fn zone(text: &str) -> DisplayZone {
+        text.parse().unwrap()
+    }
+
     #[test]
     fn full_timestamp_valid() {
-        let result = format_full_timestamp("2026-03-18T14:30:00Z");
-        assert_eq!(result, "2026-03-18 14:30:00 UTC");
+        assert_eq!(
+            format_full_timestamp("2026-03-18T14:30:00Z", zone("UTC")),
+            "2026-03-18 14:30:00 +00:00"
+        );
+        assert_eq!(
+            format_full_timestamp("2026-03-18T14:30:00Z", zone("+05:30")),
+            "2026-03-18 20:00:00 +05:30"
+        );
     }
 
     #[test]
     fn full_timestamp_with_fractional() {
-        let result = format_full_timestamp("2026-03-18T14:30:00.123456Z");
-        assert_eq!(result, "2026-03-18 14:30:00 UTC");
+        let wire = "2026-03-18T14:30:00.123456Z";
+        assert_eq!(
+            format_full_timestamp(wire, zone("+05:30")),
+            "2026-03-18 20:00:00.123456 +05:30"
+        );
+        assert_eq!(
+            format_full_timestamp(wire, zone("UTC")),
+            "2026-03-18 14:30:00.123456 +00:00"
+        );
     }
 
+    /// Text that is not a wire timestamp shows as sent, with no guessed
+    /// instant, and cannot drive the terminal.
     #[test]
     fn full_timestamp_malformed_fallback() {
-        assert_eq!(format_full_timestamp("garbage"), "garbage");
+        assert_eq!(format_full_timestamp("garbage", zone("+05:30")), "garbage");
+        assert_eq!(
+            format_full_timestamp("2026-03-18\u{202E}Z", zone("UTC")),
+            "2026-03-18\u{FFFD}Z"
+        );
     }
 }
