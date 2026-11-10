@@ -191,8 +191,9 @@ pub enum ErrorCode {
     /// executor permit was taken.
     CaptureQuotaExceeded,
     /// The capture's selected cold input is larger than the capture source
-    /// budget (400, ADR-0057). Refused before scanning; narrowing the time
-    /// range is what helps.
+    /// budget (400, ADR-0057). Refused before scanning. For a window, a
+    /// narrower time range or a `service=` filter that pins the services
+    /// helps; for a `from saved` run's stored input, only a narrower window.
     CaptureSourceTooLarge,
     /// A `context` focus row lacks `_time`, or a key its scope names
     /// (400, ADR-0058). The message names the missing field; the read is
