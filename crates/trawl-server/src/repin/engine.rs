@@ -1981,15 +1981,19 @@ impl RepinEngine {
             .stage_cutover_input(job_id, staged_totals, &staged_tallies)
             .await
             .map_err(|e| {
-                // The full error stays server-side: the abort message is
+                // The full error goes to DEBUG: the abort message is
                 // persisted on the job row and served to SchemaRead via the
                 // status route, and a StoreError's Display can carry raw
                 // postgres diagnostics the wire contract redacts.
-                tracing::error!(
-                    event_type = "repin_store_error",
-                    job_id,
-                    error = %e,
-                    "staging the cutover tallies failed; aborting before the marker"
+                log_store_fault(
+                    Loudness::Error,
+                    StoreFault {
+                        event_type: "repin_store_error",
+                        job_id: Some(job_id),
+                        ..StoreFault::default()
+                    },
+                    e,
+                    "staging the cutover tallies failed; aborting before the marker",
                 );
                 JobAbort::Failed(
                     "could not stage the cutover tallies (app-state store \
@@ -2130,10 +2134,22 @@ impl RepinEngine {
             // its exclusion guards here would serve the silently-promoting
             // mixed corpus the whole design exists to prevent — so die
             // crash-consistent and let the marker replay finish the swap.
-            tracing::error!(
+            //
+            // The swap's text names host paths and I/O errors, and no typed
+            // cause comes with it, so it goes to DEBUG only.
+            tracing::debug!(
                 event_type = "repin_cutover_fatal",
                 job_id,
                 error = %e,
+                "per-env swap failed mid-cutover; terminating so the boot \
+                 marker replay completes it rather than serving a \
+                 mixed-type corpus"
+            );
+            tracing::error!(
+                event_type = "repin_cutover_fatal",
+                job_id,
+                error_class = "internal",
+                cause_kind = crate::error::CauseKind::Unknown.as_str(),
                 "per-env swap failed mid-cutover; terminating so the boot \
                  marker replay completes it rather than serving a \
                  mixed-type corpus"
@@ -2175,22 +2191,30 @@ impl RepinEngine {
                     break;
                 }
                 Err(e) if attempt < FLIP_ATTEMPTS => {
-                    tracing::warn!(
-                        event_type = "repin_flip_retry",
-                        job_id,
-                        attempt,
-                        error = %e,
-                        "pin flip failed; retrying"
+                    log_store_fault(
+                        Loudness::Warn,
+                        StoreFault {
+                            event_type: "repin_flip_retry",
+                            job_id: Some(job_id),
+                            attempt: Some(attempt),
+                            ..StoreFault::default()
+                        },
+                        e,
+                        "pin flip failed; retrying",
                     );
                     tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
                 }
                 Err(e) => {
-                    tracing::error!(
-                        event_type = "repin_cutover_fatal",
-                        job_id,
-                        error = %e,
+                    log_store_fault(
+                        Loudness::Error,
+                        StoreFault {
+                            event_type: "repin_cutover_fatal",
+                            job_id: Some(job_id),
+                            ..StoreFault::default()
+                        },
+                        e,
                         "pin flip unreachable after the swap; terminating so \
-                         the boot marker replay completes it"
+                         the boot marker replay completes it",
                     );
                 }
             }
@@ -2288,7 +2312,16 @@ impl RepinEngine {
     async fn publish_progress(&self, job_id: i64, state: &BuildState) {
         let totals = state.totals();
         if let Err(e) = self.store.record_progress(job_id, job_totals(totals)).await {
-            tracing::warn!(event_type = "repin_store_error", job_id, error = %e, "progress write failed");
+            log_store_fault(
+                Loudness::Warn,
+                StoreFault {
+                    event_type: "repin_store_error",
+                    job_id: Some(job_id),
+                    ..StoreFault::default()
+                },
+                e,
+                "progress write failed",
+            );
         }
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_DONE).set(totals.files_done as f64);
