@@ -30,6 +30,7 @@ use trawl_engine::value::Value;
 use crate::tui::App;
 use crate::tui::state::{ChartView, ColumnConfig, Focus, TabStatus};
 use crate::tui::theme::Theme;
+use crate::tui::ui::common::span_advancing;
 
 /// Build the results pane frame title from the current tab status.
 fn pane_title(status: &TabStatus, theme: &Theme) -> Line<'static> {
@@ -1030,29 +1031,37 @@ fn render_bar_chart(
         })
         .collect();
 
-    // Compute fixed label width: max(name_len) + space + max(value_len) + separator
-    let max_name_len = entries.iter().map(|(l, _, _)| l.len()).max().unwrap_or(0);
+    // Every label line is the widest name, two spaces, the widest value
+    // right-aligned and a separator, in the cells it draws in. A value's
+    // digits are ASCII, so its length is its cells.
+    let max_name_cells = entries.iter().map(|(l, _, _)| cells(l)).max().unwrap_or(0);
     let max_value_len = entries
         .iter()
         .map(|(_, v, _)| format!("{v}").len())
         .max()
         .unwrap_or(0);
+    let label_cells = max_name_cells + 2 + max_value_len + 1;
 
     let bars: Vec<Bar<'_>> = entries
         .iter()
         .map(|(label, value, idx)| {
             // Pad name to max width, right-align value — creates a uniform "y-axis" edge
             let value_str = format!("{value}");
-            let name_pad = max_name_len.saturating_sub(label.len());
+            let name_pad = max_name_cells.saturating_sub(cells(label));
             let val_pad = max_value_len.saturating_sub(value_str.len());
             let padded = format!(
                 "{label}{}{}{value_str} ",
                 " ".repeat(name_pad),
                 " ".repeat(val_pad + 2),
             );
+            // The chart sizes its label column by the widest `Line::width`,
+            // which can be less than the cells a line draws in (`لا` draws
+            // in two and has a width of one), and clips each line there.
+            // Every line asks for the whole column by that measure; the
+            // chart clips the extra spaces.
             Bar::default()
                 .value(*value)
-                .label(Line::from(padded))
+                .label(Line::from(span_advancing(padded, label_cells)))
                 .text_value(String::new()) // hide value text inside the bar
                 .style(Style::default().fg(colors[idx % colors.len()]))
         })
@@ -1163,9 +1172,7 @@ fn render_sparkline(
         // Render x-axis time labels (first and last time, properly spaced)
         if let Some((start, end, _)) = time_info {
             let available_width = sparkline_area.width as usize;
-            let start_len = start.len();
-            let end_len = end.len();
-            let padding = available_width.saturating_sub(start_len + end_len);
+            let padding = available_width.saturating_sub(cells(&start) + cells(&end));
 
             let x_axis_text = format!("{start}{}{end}", " ".repeat(padding));
             let x_axis_label =
@@ -1357,9 +1364,7 @@ fn render_stacked_sparklines(
     // Render x-axis time labels (1 row at bottom)
     if let Some((start, end, _)) = time_info {
         let sparkline_width = inner.width.saturating_sub(label_width) as usize;
-        let start_len = start.len();
-        let end_len = end.len();
-        let padding = sparkline_width.saturating_sub(start_len + end_len);
+        let padding = sparkline_width.saturating_sub(cells(&start) + cells(&end));
 
         let x_axis_text = format!("{start}{}{end}", " ".repeat(padding));
         let x_axis_label = Paragraph::new(x_axis_text).style(Style::default().fg(theme.text_muted));
@@ -2477,5 +2482,208 @@ mod sender_text_tests {
         let screen = terminal.backend().to_string();
         assert!(screen.contains("error: unknown field"), "{screen}");
         assert_sanitized("status bar", &screen);
+    }
+}
+
+#[cfg(test)]
+mod cell_alignment_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_engine::value::{Column, ColumnType, QueryResult, Value};
+
+    use crate::tui::App;
+    use crate::tui::state::{ChartView, TabStatus};
+    use crate::tui::tests::test_app;
+
+    fn with_result(result: QueryResult, view: ChartView) -> App {
+        let mut app = test_app();
+        let returned = result.rows.len();
+        app.tab.result = Some(trawl_client::QueryResponse {
+            execution: None,
+            result,
+            pagination: trawl_client::PaginationMeta {
+                limit: 10_000,
+                offset: 0,
+                returned,
+                total: returned,
+            },
+            degraded_fields: Vec::new(),
+            severity_columns: Vec::new(),
+        });
+        app.tab.status = TabStatus::Success { duration_ms: 1 };
+        app.tab.chart_view = view;
+        app
+    }
+
+    /// The results pane drawn alone on a fresh terminal: a reused one
+    /// keeps stale cells behind two-cell glyphs.
+    fn draw(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|f| super::render(app, f, f.area()))
+            .expect("render");
+        terminal
+    }
+
+    /// Row `y`'s cell symbols. A cell hidden behind a two-cell glyph
+    /// reads as a space.
+    fn row(terminal: &Terminal<TestBackend>, y: u16) -> Vec<&str> {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    /// `head`, then `n` copies of `cell`, then `tail`.
+    fn cells_of<'a>(head: &[&'a str], cell: &'a str, n: usize, tail: &[&'a str]) -> Vec<&'a str> {
+        head.iter()
+            .copied()
+            .chain(std::iter::repeat_n(cell, n))
+            .chain(tail.iter().copied())
+            .collect()
+    }
+
+    fn bars(labels: &[(&str, i64)]) -> QueryResult {
+        QueryResult {
+            columns: vec![
+                Column::new("host", ColumnType::String),
+                Column::new("count", ColumnType::Integer),
+            ],
+            rows: labels
+                .iter()
+                .map(|(label, n)| vec![Value::String((*label).into()), Value::Integer(*n)])
+                .collect(),
+        }
+    }
+
+    /// ratatui's bar chart sizes its label column by the widest label's
+    /// unicode-width, and `لا` has a width of one but draws in two cells.
+    /// With every label made of `لا` (here two groups of one name, so no
+    /// label is padded past another), the column still holds the whole
+    /// label line: name, two spaces, the value's digits, a space.
+    #[test]
+    fn bar_labels_of_lam_alef_keep_their_values() {
+        let app = with_result(bars(&[("لالالا", 12), ("لالالا", 3)]), ChartView::BarChart);
+        let terminal = draw(&app, 30, 4);
+        let name = ["│", "ل", "ا", "ل", "ا", "ل", "ا"];
+        // 1 + 11 label cells + 1 margin, then 16 bar cells.
+        let top = [&name[..], &[" ", " ", "1", "2", " ", " "]].concat();
+        let bottom = [&name[..], &[" ", " ", " ", "3", " ", " "]].concat();
+        assert_eq!(row(&terminal, 1), cells_of(&top, "█", 16, &["│"]));
+        assert_eq!(
+            row(&terminal, 2),
+            [
+                cells_of(&bottom, "█", 4, &[]),
+                cells_of(&[], " ", 12, &["│"])
+            ]
+            .concat()
+        );
+    }
+
+    /// ASCII, CJK, Arabic and combining labels: every value's last digit
+    /// sits in the same cell, and every bar starts in the same cell.
+    #[test]
+    fn bar_labels_align_by_cells() {
+        let app = with_result(
+            bars(&[
+                ("web", 100),
+                ("日本", 3),
+                ("لا", 7),
+                ("e\u{301}e\u{301}", 50),
+            ]),
+            ChartView::BarChart,
+        );
+        let terminal = draw(&app, 30, 6);
+        // 1 + 10 label cells + 1 margin, then 17 bar cells.
+        let want: [Vec<&str>; 4] = [
+            cells_of(
+                &["│", "w", "e", "b", " ", " ", " ", "1", "0", "0", " ", " "],
+                "█",
+                17,
+                &["│"],
+            ),
+            cells_of(
+                &["│", "日", " ", "本", " ", " ", " ", " ", " ", "3", " ", " "],
+                " ",
+                17,
+                &["│"],
+            ),
+            [
+                cells_of(
+                    &["│", "ل", "ا", " ", " ", " ", " ", " ", " ", "7", " ", " "],
+                    "█",
+                    1,
+                    &[],
+                ),
+                cells_of(&[], " ", 16, &["│"]),
+            ]
+            .concat(),
+            [
+                cells_of(
+                    &[
+                        "│", "e\u{301}", "e\u{301}", " ", " ", " ", " ", " ", "5", "0", " ", " ",
+                    ],
+                    "█",
+                    8,
+                    &[],
+                ),
+                cells_of(&[], " ", 9, &["│"]),
+            ]
+            .concat(),
+        ];
+        for (y, want) in (1u16..).zip(want) {
+            assert_eq!(row(&terminal, y), want, "row {y}");
+        }
+    }
+
+    /// The time axis puts the first `_time` at the plot's left edge and
+    /// the last at its right edge, measured in cells: `日本` is six bytes
+    /// and four cells.
+    #[test]
+    fn sparkline_time_axes_end_on_the_plot_edge() {
+        let time = |t: &str| Value::String(t.into());
+        let single = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("count", ColumnType::Integer),
+            ],
+            rows: vec![
+                vec![time("日本"), Value::Integer(1)],
+                vec![time("ab"), Value::Integer(2)],
+            ],
+        };
+        // Inside the border and padding from x = 2, the 8-cell value axis,
+        // then the 18-cell plot from x = 10 to x = 27.
+        let terminal = draw(&with_result(single, ChartView::Sparkline), 30, 6);
+        let axis = cells_of(&["│", " "], " ", 8, &["日", " ", "本", " "]);
+        assert_eq!(
+            row(&terminal, 4),
+            [axis, cells_of(&[], " ", 12, &["a", "b", " ", "│"])].concat()
+        );
+
+        let grouped = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("host", ColumnType::String),
+                Column::new("count", ColumnType::Integer),
+            ],
+            rows: vec![
+                vec![time("日本"), Value::String("a".into()), Value::Integer(1)],
+                vec![time("日本"), Value::String("b".into()), Value::Integer(1)],
+                vec![time("ab"), Value::String("a".into()), Value::Integer(2)],
+                vec![time("ab"), Value::String("b".into()), Value::Integer(2)],
+            ],
+        };
+        // The plot runs from x = 2 to x = 17, then the 20-cell label
+        // column.
+        let terminal = draw(&with_result(grouped, ChartView::Sparkline), 40, 12);
+        let axis = ["│", " ", "日", " ", "本", " "];
+        assert_eq!(
+            row(&terminal, 10),
+            cells_of(&axis, " ", 10, &["a", "b"])
+                .into_iter()
+                .chain(cells_of(&[], " ", 21, &["│"]))
+                .collect::<Vec<_>>()
+        );
     }
 }
