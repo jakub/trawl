@@ -210,6 +210,64 @@ test('a conflict notice says the board is reading the investigation again until 
   expect(await writes(request)).toHaveLength(1);
 });
 
+test('a conflict whose reread gets 403 says the board stopped reading', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  await freezeClock(page);
+  const main = await openBoard(page);
+  await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+  // The agent writes while the board still holds sequence 9.
+  await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'note', text: 'Pool back to 64 on gw-2.' } }]);
+
+  // The close reaches the server and its 409 is held on the way back,
+  // while the grant to read is revoked: the read after it answers 403.
+  let patches = 0;
+  page.on('request', (r) => { if (r.method() === 'PATCH') patches += 1; });
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  let answered = false;
+  await page.route((url) => url.pathname === `/api/v1/investigations/${ID}`, async (route) => {
+    if (route.request().method() !== 'PATCH') {
+      await route.fallback();
+      return;
+    }
+    const response = await route.fetch();
+    answered = true;
+    await released;
+    await route.fulfill({ response });
+  });
+  await main.getByRole('button', { name: 'Close investigation' }).click();
+  await expect.poll(() => answered).toBe(true);
+  await request.post('/__ctl/investigation/fail', { data: { count: 1, status: 403 } });
+  release();
+
+  const note = main.locator('.inv-write-note [role="status"]');
+  await expect(note).toContainText('The board stopped reading before it read it again');
+  await expect(note).toHaveText(
+    'The investigation changed before your close reached it, so nothing changed. The board stopped reading before it read it again.',
+  );
+  await expect(main.locator('.inv-live')).toContainText('Stopped');
+  await expect(main.locator('.inv-stale')).toContainText(NOT_PERMITTED);
+  // No write control stays on a board that stopped reading.
+  await expect(main.getByRole('button', { name: 'Close investigation' })).toHaveCount(0);
+  await expect(main.getByRole('button', { name: 'Reopen investigation' })).toHaveCount(0);
+  expect(await boardReads(request)).toEqual([0, 9]);
+  const sent = await writes(request);
+  expect(sent).toEqual([{ method: 'PATCH', id: ID, body: { expected_seq: 9, status: 'closed' } }]);
+  expect(sent[0].body).not.toHaveProperty('seen_seq');
+
+  // Neither the tab hiding and showing nor time passing reads or writes.
+  await setHidden(page, true);
+  await page.clock.fastForward(60_000);
+  await setHidden(page, false);
+  await page.waitForTimeout(300);
+  await page.clock.fastForward(60_000);
+  await page.waitForTimeout(300);
+  expect(await boardReads(request)).toEqual([0, 9]);
+  expect(await writes(request)).toHaveLength(1);
+  expect(patches).toBe(1);
+  await expect(note).toContainText('The board stopped reading before it read it again');
+});
+
 test('a stale reopen shows the conflict and leaves the board open, as someone else reopened it', async ({ page, request }) => {
   await as(request, 'investigations-writer');
   await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:43:00.000000Z', payload: { kind: 'status', status: 'closed' } }]);
