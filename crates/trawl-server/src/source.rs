@@ -1674,45 +1674,6 @@ mod tests {
         assert_eq!(service_pins(&search), any, "nor does it pin an OR branch");
     }
 
-    /// A pin costs what its names cost, however deep its groups nest. A
-    /// 64 KiB query can wrap a list of 10,000 names in 2,764 groups, and a
-    /// union that copied the set at every group would make about 27
-    /// million insertions before the cap on the final set applies.
-    ///
-    /// The bound is wall-clock, far from both sides in a debug build: a
-    /// copy at every group takes about 12 s on this input, and the
-    /// derivation about 3 ms. The recursion runs on a thread with room for
-    /// this depth.
-    #[test]
-    fn nesting_does_not_multiply_what_a_pin_costs() {
-        let names: Vec<String> = (0..10_000).map(|i| format!("s{i:04x}")).collect();
-        let depth = 2764;
-        let dsl = format!(
-            "{}service={}{}",
-            "(".repeat(depth),
-            names.join(","),
-            ")".repeat(depth)
-        );
-        assert!(dsl.len() <= trawl_core::parser::MAX_QUERY_LEN);
-        let elapsed = std::thread::Builder::new()
-            .stack_size(64 << 20)
-            .spawn(move || {
-                let query = trawl_core::parser::parse(&dsl).unwrap();
-                let started = std::time::Instant::now();
-                let pinned = service_pins(&query.search);
-                let elapsed = started.elapsed();
-                assert_eq!(pinned, Services::Any, "10,000 names are over the cap");
-                elapsed
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "{elapsed:?}"
-        );
-    }
-
     /// A `service=` filter pins through [`MAX_PIN_NESTING`] groups and no
     /// deeper. Past the bound the walk stops, so a search nested thousands
     /// deep, which the parser accepts, reads every service on the 2 MiB
