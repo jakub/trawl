@@ -384,7 +384,8 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
         )
         .await
         .unwrap();
-    assert_eq!(titled.actor, wire(&agent()));
+    assert_eq!(titled.entry.actor, wire(&agent()));
+    assert_eq!(titled.investigation.updated_by, agent());
 
     // Finding status.
     let status = store
@@ -657,7 +658,7 @@ async fn a_stale_overwrite_conflicts_with_expected_and_current(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(
-        (closed.seq, closed.payload),
+        (closed.entry.seq, closed.entry.payload),
         (
             2,
             EntryPayload::Status {
@@ -665,11 +666,14 @@ async fn a_stale_overwrite_conflicts_with_expected_and_current(pool: PgPool) {
             }
         )
     );
+    // The overwrite answers the investigation as its own transaction left
+    // it: the committed row, at the entry's sequence.
     let row = store.get(&id).await.unwrap().unwrap();
     assert_eq!(
-        (row.seq, row.status, row.updated_by),
-        (2, InvestigationStatus::Closed, agent())
+        (row.seq, row.status, &row.updated_by),
+        (2, InvestigationStatus::Closed, &agent())
     );
+    assert_eq!(closed.investigation, row);
 
     store
         .overwrite(
@@ -946,7 +950,7 @@ async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(poo
         )
         .await
         .unwrap();
-    assert_eq!(reopened.seq, 5);
+    assert_eq!(reopened.entry.seq, 5);
     let closed = store
         .overwrite(
             &id,
@@ -958,10 +962,12 @@ async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(poo
         )
         .await
         .unwrap();
-    assert_eq!(closed.seq, 6);
+    assert_eq!(closed.entry.seq, 6);
     let row = store.get(&id).await.unwrap().expect("the investigation");
     assert_eq!(row.status, InvestigationStatus::Closed);
     assert_eq!(row.retain_until, later + RULE.idle);
+    // The answered header already carries the slid clock.
+    assert_eq!(closed.investigation, row);
 }
 
 // -- reads -------------------------------------------------------------------

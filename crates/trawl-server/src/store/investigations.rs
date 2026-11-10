@@ -363,6 +363,16 @@ pub struct Appended {
     pub pruned: Vec<ExpiredFile>,
 }
 
+/// What [`InvestigationStore::overwrite`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overwritten {
+    /// The new entry.
+    pub entry: LogEntry,
+    /// The investigation as the write's own transaction left it, read
+    /// after the sequence advanced: its `seq` is the entry's.
+    pub investigation: InvestigationRow,
+}
+
 /// Postgres-backed storage for investigations. Cheap to clone (shared
 /// pool).
 #[derive(Debug, Clone)]
@@ -743,6 +753,10 @@ impl InvestigationStore {
     /// matching entry. A closed investigation takes only a reopen: another
     /// close, like any other change, is [`StoreError::InvestigationClosed`]
     /// and records nothing.
+    ///
+    /// The investigation comes back from inside the same transaction, so
+    /// no read after the commit can fail, or find it deleted, for a write
+    /// that landed (ADR-0059).
     pub async fn overwrite(
         &self,
         id: &InvestigationId,
@@ -751,7 +765,7 @@ impl InvestigationStore {
         change: &Overwrite,
         now: DateTime<Utc>,
         retention: RetentionRule,
-    ) -> Result<LogEntry, StoreError> {
+    ) -> Result<Overwritten, StoreError> {
         let payload = match change {
             Overwrite::Title(title) => EntryPayload::Title {
                 title: title.clone(),
@@ -795,16 +809,27 @@ impl InvestigationStore {
             })
             .await?;
             advance(&mut tx, id, seq, actor, now, Some(retention)).await?;
-            Ok(seq)
+            let row = tx
+                .run(async |tx| {
+                    sqlx::query(select_investigation!("WHERE id = $1"))
+                        .bind(id.as_str())
+                        .fetch_one(tx)
+                        .await
+                })
+                .await?;
+            Ok((seq, decode_investigation(&row)?))
         }
         .await;
-        let seq = tx.finish(written).await?;
-        Ok(LogEntry {
-            seq,
-            updated_seq: seq,
-            actor: actor.to_wire(),
-            at: wire_time(now),
-            payload,
+        let (seq, investigation) = tx.finish(written).await?;
+        Ok(Overwritten {
+            entry: LogEntry {
+                seq,
+                updated_seq: seq,
+                actor: actor.to_wire(),
+                at: wire_time(now),
+                payload,
+            },
+            investigation,
         })
     }
 

@@ -65,7 +65,8 @@ use crate::state::AppState;
 use crate::store::investigations::MAX_LIST;
 use crate::store::{
     Appended, CaptureRow, Citing, CreateOutcome, DeleteOutcome, ExpiredFile, InvestigationRow,
-    InvestigationStore, NewInvestigation, Overwrite, RetentionRule, StoreActor, StoreError,
+    InvestigationStore, NewInvestigation, Overwrite, Overwritten, RetentionRule, StoreActor,
+    StoreError,
 };
 use crate::transport::request_limit;
 
@@ -965,9 +966,12 @@ pub async fn patch(
             ));
         }
     };
-    let store = &state.storage.investigations;
     let now = state.results.clock.now();
-    store
+    // The header comes from the write's own transaction: nothing read
+    // after the commit can answer a landed write as a failure.
+    let Overwritten { investigation, .. } = state
+        .storage
+        .investigations
         .overwrite(
             &id,
             req.expected_seq,
@@ -977,12 +981,7 @@ pub async fn patch(
             retention(state),
         )
         .await?;
-    // A delete between the overwrite and this read leaves nothing to show.
-    store
-        .get(&id)
-        .await?
-        .map(|row| row.to_wire())
-        .ok_or(ServerError::Store(StoreError::InvestigationNotFound))
+    Ok(investigation.to_wire())
 }
 
 /// Overwrite the status of the finding whose entry is `finding_seq` in
