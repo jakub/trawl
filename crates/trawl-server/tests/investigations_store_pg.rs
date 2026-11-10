@@ -28,7 +28,7 @@ use trawl_api::value::ColumnType;
 use trawl_server::config::CaptureConfig;
 use trawl_server::deadline::Deadline;
 use trawl_server::results::ResultsClock;
-use trawl_server::results::charge::{CaptureGate, EvidenceBudget, Refusal};
+use trawl_server::results::charge::{CaptureGate, EvidenceBudget, EvidenceScope, Refusal};
 use trawl_server::results::root::ResultsRoot;
 use trawl_server::store::{
     CaptureInsert, Citing, CreateOutcome, DeleteOutcome, FactsDocument, InvestigationStore,
@@ -2952,6 +2952,210 @@ async fn the_binding_pass_never_waits_on_a_due_investigation_with_nothing_left_t
     );
     drop(second);
     held.rollback().await.unwrap();
+}
+
+/// The text `refuse_evidence_prune` raises when a prune tries to mark
+/// kept evidence pruned: what no event at INFO or above may carry.
+const PRUNE_FAULT: &str = "trawl-411-evidence-prune-fault-sentinel";
+
+/// One event a capture saw: its level and every field as text, the
+/// message among them.
+#[derive(Debug)]
+struct SeenEvent {
+    level: tracing::Level,
+    fields: Vec<(String, String)>,
+}
+
+impl SeenEvent {
+    fn field(&self, name: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A layer that records every event at every level and target, scoped to
+/// the futures [`EventCapture::dispatch`] is attached to.
+#[derive(Clone, Default)]
+struct EventCapture(Arc<std::sync::Mutex<Vec<SeenEvent>>>);
+
+impl EventCapture {
+    fn dispatch(&self) -> tracing::Dispatch {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        tracing::Dispatch::new(tracing_subscriber::registry().with(self.clone()))
+    }
+
+    fn take(&self) -> Vec<SeenEvent> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+struct FieldText<'a>(&'a mut Vec<(String, String)>);
+
+impl tracing::field::Visit for FieldText<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.push((field.name().to_owned(), value.to_owned()));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push((field.name().to_owned(), format!("{value:?}")));
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = Vec::new();
+        event.record(&mut FieldText(&mut fields));
+        self.0.lock().unwrap().push(SeenEvent {
+            level: *event.metadata().level(),
+            fields,
+        });
+    }
+}
+
+/// With a trigger refusing every prune of kept evidence, a reservation of
+/// 100 bytes for `reserving` is refused by `scope`'s budget of 150 with
+/// `due`'s 100 bytes counted: `due` stays kept, the failure is logged once
+/// by class, and the trigger's text reaches no event at INFO or above.
+/// Without the trigger, the same reservation prunes `due` and is admitted.
+async fn a_failed_prune_counts_in_full(
+    pool: &PgPool,
+    gate: &CaptureGate,
+    reserving: &InvestigationId,
+    due: &NewCapture,
+    budget: EvidenceBudget,
+    scope: EvidenceScope,
+) {
+    use tracing::instrument::WithSubscriber as _;
+
+    let holder = due.investigation_id.clone().expect("kept evidence");
+    let held = kept_bytes(pool, &holder).await;
+    sqlx::query(
+        "CREATE TRIGGER refuse_evidence_prune BEFORE UPDATE ON captured_results
+         FOR EACH ROW WHEN (OLD.state = 'kept' AND NEW.state = 'pruned')
+         EXECUTE FUNCTION refuse_evidence_prune()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let capture = EventCapture::default();
+    let refused = gate
+        .reserve_evidence(reserving, &[], 100, budget, patience())
+        .with_subscriber(capture.dispatch())
+        .await;
+    match refused {
+        Err(Refusal::EvidenceBudgetExceeded {
+            scope: refused_by,
+            used,
+            limit,
+        }) => assert_eq!((refused_by, used, limit), (scope, 100, 150)),
+        other => panic!("the {scope:?} budget refuses with every kept byte counted: {other:?}"),
+    }
+    let seen = capture.take();
+    let failures: Vec<_> = seen
+        .iter()
+        .filter(|event| {
+            event.field("event_type") == Some("results_evidence_prune_at_reservation_error")
+        })
+        .collect();
+    assert_eq!(failures.len(), 1, "{seen:#?}");
+    assert_eq!(failures[0].level, tracing::Level::WARN);
+    assert_eq!(
+        failures[0].field("error_class"),
+        Some("unavailable_database")
+    );
+    let leaked: Vec<_> = seen
+        .iter()
+        .filter(|event| {
+            event.level <= tracing::Level::INFO
+                && event
+                    .fields
+                    .iter()
+                    .any(|(_, value)| value.contains(PRUNE_FAULT))
+        })
+        .collect();
+    assert!(leaked.is_empty(), "{leaked:#?}");
+    assert_eq!(state_of(pool, &due.id).await.0, "kept");
+    assert_eq!(kept_bytes(pool, &holder).await, held);
+
+    sqlx::query("DROP TRIGGER refuse_evidence_prune ON captured_results")
+        .execute(pool)
+        .await
+        .unwrap();
+    let admitted = gate
+        .reserve_evidence(reserving, &[], 100, budget, patience())
+        .await
+        .expect("the pass prunes, then counts");
+    assert_eq!(state_of(pool, &due.id).await.0, "pruned");
+    drop(admitted);
+}
+
+/// A binding pass whose prune the store fails, for a reason other than a
+/// lock wait reaching its deadline, prunes nothing and counts every kept
+/// row, so it refuses a charge that pruning would have let fit: against
+/// the investigation's budget when the due evidence is its own, and
+/// against the installation's when it is another investigation's. The
+/// usage reads after the failed prune still answer, so the refusal is the
+/// budget's, never a store fault. Once the prune succeeds, the same charge
+/// is admitted.
+#[sqlx::test]
+async fn the_binding_pass_counts_every_kept_byte_when_pruning_fails(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    sqlx::query(
+        "CREATE FUNCTION refuse_evidence_prune() RETURNS trigger LANGUAGE plpgsql
+         AS $$ BEGIN RAISE EXCEPTION 'trawl-411-evidence-prune-fault-sentinel'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (gate, _root) = gate_at(&results, deadline());
+
+    let a = create(&store, 1).await;
+    let a_old = NewCapture {
+        investigation_id: Some(a.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    insert(&results, &a_old).await;
+    a_failed_prune_counts_in_full(
+        &pool,
+        &gate,
+        &a,
+        &a_old,
+        EvidenceBudget {
+            per_investigation: 150,
+            installation: 10_000,
+        },
+        EvidenceScope::Investigation,
+    )
+    .await;
+
+    // A holds nothing kept now; another due investigation holds the bytes.
+    let b = create(&store, 2).await;
+    let b_old = NewCapture {
+        investigation_id: Some(b.clone()),
+        ..capture(2, 7, Duration::zero(), 100)
+    };
+    insert(&results, &b_old).await;
+    assert_eq!(kept_bytes(&pool, &a).await, 0);
+    a_failed_prune_counts_in_full(
+        &pool,
+        &gate,
+        &a,
+        &b_old,
+        EvidenceBudget {
+            per_investigation: 10_000,
+            installation: 150,
+        },
+        EvidenceScope::Installation,
+    )
+    .await;
 }
 
 /// Capture `n` of key 7 kept by `investigation`, a sightings read's: a
