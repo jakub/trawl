@@ -945,6 +945,7 @@ mod tests {
             },
             degraded_fields: vec!["duration".to_owned()],
             severity_columns: Vec::new(),
+            histogram: None,
         }
     }
 

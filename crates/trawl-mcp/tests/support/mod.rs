@@ -498,6 +498,7 @@ pub fn query_response(columns: Vec<Column>, rows: Vec<Vec<Value>>, total: usize)
         },
         degraded_fields: vec![],
         severity_columns: vec![],
+        histogram: None,
     }
 }
 

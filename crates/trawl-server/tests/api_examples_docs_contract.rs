@@ -17,6 +17,9 @@
 //! run" and "Stream live events" decode through the typed result codec
 //! (ADR-0035, amended 2026-10-22), so an untyped column, a JSON-number
 //! integer or a cell that disagrees with its column's type fails here.
+//! The histogram example under "Run a query" holds the invariants
+//! `EventHistogram::consistent_with` checks, and its reason table names
+//! every `HistogramReason` (#197).
 //!
 //! Captured results: the request and response examples under "Capture a
 //! result", "List captured results", "Read a page of a captured result"
@@ -70,8 +73,8 @@ use trawl_api::results::{
 use trawl_api::stream::SnapshotFrame;
 use trawl_api::value::{Column, ColumnType, QueryResult, Value as Cell, land_cell};
 use trawl_api::{
-    ErrorCode, ErrorResponse, IngestResponse, ListSavedResponse, QueryResponse, ReportRunResponse,
-    RunsStatsResponse, ScheduleResponse,
+    ErrorCode, ErrorResponse, EventHistogram, HISTOGRAM_BUCKETS, HistogramReason, IngestResponse,
+    ListSavedResponse, QueryResponse, ReportRunResponse, RunsStatsResponse, ScheduleResponse,
 };
 use trawl_server::error::ServerError;
 use trawl_server::ingest::envelope::{RejectReason, RepairCode};
@@ -236,7 +239,11 @@ fn the_result_column_example_is_a_typed_column() {
 fn the_query_response_example_carries_typed_big_integers() {
     let heading = "Run a query";
     let examples = json_blocks(section(heading));
-    assert_eq!(examples.len(), 1, "one response example under {heading:?}");
+    assert_eq!(
+        examples.len(),
+        2,
+        "a response and a histogram response under {heading:?}"
+    );
     let response: QueryResponse = decode_exactly(heading, examples[0]);
     assert_eq!(
         response.result.columns,
@@ -257,6 +264,96 @@ fn the_query_response_example_carries_typed_big_integers() {
         "and one past 2^53"
     );
     assert_eq!(response.pagination.returned, response.result.rows.len());
+}
+
+/// The second example under "Run a query" is a raw-event page that asked
+/// for its histogram (#197). It decodes exactly as `QueryResponse`, its
+/// histogram is consistent with the page's `total`, and it counts errors
+/// the page does not hold. The reason table names every reason the wire
+/// has, in the order the server decides them.
+#[test]
+fn the_query_histogram_example_is_the_wire_type() {
+    let heading = "Run a query";
+    let text = section(heading);
+    let examples = json_blocks(text);
+    assert_eq!(
+        examples.len(),
+        2,
+        "a response and a histogram response under {heading:?}"
+    );
+    let response: QueryResponse = decode_exactly(heading, examples[1]);
+    let histogram = response
+        .histogram
+        .as_ref()
+        .expect("the second example carries a histogram");
+    assert!(
+        histogram.consistent_with(response.pagination.total),
+        "{heading:?} example's histogram disagrees with its total: {histogram:?}"
+    );
+    let EventHistogram::Ready {
+        buckets,
+        severity,
+        kept_some,
+        ..
+    } = histogram
+    else {
+        panic!("{heading:?} example shows a ready histogram: {histogram:?}");
+    };
+    assert_eq!(buckets.len(), HISTOGRAM_BUCKETS);
+    assert!(*severity && !kept_some, "{histogram:?}");
+    assert_eq!(response.pagination.returned, response.result.rows.len());
+    assert!(
+        response.pagination.total > response.pagination.returned,
+        "the example is one page of a larger result"
+    );
+    let severity_at = response
+        .result
+        .columns
+        .iter()
+        .position(|c| c.name == "_severity")
+        .expect("the example's page has `_severity`");
+    let page_errors = response
+        .result
+        .rows
+        .iter()
+        .filter(|row| matches!(row[severity_at], Cell::Integer(n) if n >= 17))
+        .count();
+    let counted_errors: u64 = buckets.iter().map(|b| b.errors).sum();
+    assert_eq!(page_errors, 0, "the page holds no error");
+    assert!(
+        counted_errors > 0,
+        "the histogram counts errors past the page"
+    );
+
+    // Every reason, in the order the server decides them. A new reason
+    // stops this match from compiling.
+    let reasons = [
+        HistogramReason::StoredResult,
+        HistogramReason::Sample,
+        HistogramReason::NoTimeColumn,
+        HistogramReason::NoUsableTime,
+    ];
+    for reason in reasons {
+        match reason {
+            HistogramReason::StoredResult
+            | HistogramReason::Sample
+            | HistogramReason::NoTimeColumn
+            | HistogramReason::NoUsableTime => {}
+        }
+    }
+    let rows: Vec<usize> = reasons
+        .iter()
+        .map(|reason| {
+            let spelled = serde_json::to_value(reason).unwrap();
+            let row = format!("\n| `{}` |", spelled.as_str().unwrap());
+            text.find(&row)
+                .unwrap_or_else(|| panic!("{heading:?} names the reason {spelled}"))
+        })
+        .collect();
+    assert!(
+        rows.is_sorted(),
+        "{heading:?} lists the reasons in the order the first match wins"
+    );
 }
 
 #[test]

@@ -4,10 +4,11 @@
 
 //! Severity presentation, keyed off `_severity` alone (ADR-0013 §9).
 //!
-//! Data-in / data-out, and ungated, so the two decisions that are easy to
-//! get subtly wrong are table-testable natively rather than only in a
-//! browser: which text a `_severity` cell shows, and which rows the
-//! histogram paints as errors.
+//! Data-in / data-out, and ungated, so the decisions that are easy to get
+//! subtly wrong are table-testable natively rather than only in a
+//! browser: which columns render as severity, and which text a
+//! `_severity` cell shows. The histogram's error counts come from trawld,
+//! which reads `_severity` by the same rule.
 //!
 //! Two rules, both load-bearing:
 //!
@@ -27,28 +28,11 @@
 
 use trawl_api::value::Value;
 
-/// Which result column presentation reads severity from: `_severity`,
-/// and nothing else.
-///
-/// Both SPA call sites — the results table's cell rendering and the
-/// histogram's error bars — go through this one lookup, so "reads
-/// `_severity` only" is decided in a natively-tested function rather
-/// than twice in wasm-gated component code.
-#[must_use]
-pub fn severity_column<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<usize> {
-    names
-        .into_iter()
-        .position(|name| name == trawl_core::schema::SEVERITY)
-}
-
 /// Which result columns render as severity tokens: `_severity`, plus the
 /// columns the response declared (`sev()` output, ADR-0013 ruling 9).
 ///
 /// The membership rule is `trawl_core::severity::renders_as_severity`,
 /// the one every renderer asks; only the index collection is local.
-/// Distinct from [`severity_column`], which stays `_severity`-only
-/// because the histogram's error bucketing is a statement about the
-/// event's severity, not about any column a query happened to compute.
 #[must_use]
 pub fn severity_columns<'a>(
     names: impl IntoIterator<Item = &'a str>,
@@ -145,16 +129,6 @@ pub fn severity_class(v: &Value) -> &'static str {
         Some("debug" | "trace") => "lvl lvl-debug",
         _ => "lvl",
     }
-}
-
-/// Whether a row sits at or above the `OTel` error band (17), read off
-/// `_severity` alone.
-#[must_use]
-pub fn row_is_error(row: &[Value], severity_idx: Option<usize>) -> bool {
-    matches!(
-        severity_idx.and_then(|i| row.get(i)),
-        Some(Value::Integer(n)) if *n >= 17
-    )
 }
 
 #[cfg(test)]
@@ -307,44 +281,5 @@ mod tests {
             Vec::<usize>::new(),
             "a declared name the result does not carry matches nothing"
         );
-    }
-
-    /// The column both SPA surfaces read is `_severity` and nothing
-    /// else: a bare `severity`, or a sender's own `severity_text`, is
-    /// ordinary data and may not be mistaken for the slot.
-    #[test]
-    fn presentation_binds_the_derived_column_alone() {
-        let cols = ["_time", "severity_text", "severity", "_severity", "message"];
-        assert_eq!(severity_column(cols), Some(3));
-
-        // Same row set without the derived slot: no column, so nothing
-        // is colored and no bar is painted red.
-        assert_eq!(
-            severity_column(["_time", "severity_text", "severity", "message"]),
-            None
-        );
-        assert_eq!(severity_column(["_severity"]), Some(0));
-        assert_eq!(severity_column(std::iter::empty()), None);
-    }
-
-    /// Bucketing reads `_severity` only: a bare `severity` column is
-    /// ordinary sender data and colors nothing.
-    #[test]
-    fn error_bucketing_keys_off_the_derived_slot_alone() {
-        let row = vec![Value::String("t".into()), Value::Integer(17)];
-        assert!(row_is_error(&row, Some(1)));
-        assert!(
-            !row_is_error(&row, Some(0)),
-            "a non-integer cell is not an error"
-        );
-        assert!(
-            !row_is_error(&row, None),
-            "no `_severity` column, no error bar"
-        );
-
-        for (n, expected) in [(16, false), (17, true), (24, true), (9, false)] {
-            let row = vec![Value::Integer(n)];
-            assert_eq!(row_is_error(&row, Some(0)), expected, "severity {n}");
-        }
     }
 }

@@ -5545,6 +5545,72 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
     );
 }
 
+/// A `from saved` read asked for its histogram answers `stored_result`
+/// (#197): a stored run's rows are not events, so nothing is counted,
+/// even when the run kept a timestamp `_time`. A `sample` after it does
+/// not change the reason, an aggregation over it carries no histogram,
+/// and a read of a saved query that does not exist keeps its 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn from_saved_histogram_is_stored_result() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let saved = client
+        .create_saved("histogram_report", "service=nginx | table _time, service")
+        .await
+        .unwrap();
+    client
+        .set_schedule(saved.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+    client.trigger_run(saved.id).await.unwrap();
+    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    assert_eq!(runs[0].status, "success", "{:?}", runs[0]);
+    assert!(runs[0].row_count.unwrap_or(0) > 0, "{:?}", runs[0]);
+
+    let post = |dsl: &'static str| {
+        let server = &server;
+        async move {
+            let response = common::harness_client_builder()
+                .build()
+                .unwrap()
+                .post(format!("{}/api/v1/query", server.url))
+                .bearer_auth(&server.analyst_token)
+                .json(&serde_json::json!({"query": dsl, "histogram": true}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let body: serde_json::Value = response.json().await.unwrap();
+            (status, body)
+        }
+    };
+
+    for dsl in [
+        "| from saved histogram_report",
+        "| from saved histogram_report run=latest | sample 2",
+    ] {
+        let (status, body) = post(dsl).await;
+        assert_eq!(status, 200, "{dsl}: {body}");
+        assert!(
+            body["pagination"]["total"].as_u64().unwrap() > 0,
+            "{dsl}: {body}"
+        );
+        assert_eq!(
+            body["histogram"],
+            serde_json::json!({"state": "unavailable", "reason": "stored_result"}),
+            "{dsl}"
+        );
+    }
+
+    let (status, body) = post("| from saved histogram_report | stats count()").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("histogram").is_none(), "{body}");
+
+    let (status, body) = post("| from saved no_such_histogram_report").await;
+    assert_eq!(status, 404, "{body}");
+    assert!(body.get("histogram").is_none(), "{body}");
+}
+
 /// A `from saved` read whose run file sits below a dangling link is an
 /// error. `DuckDB` answers "no files" for a path it cannot resolve, which
 /// reads as an empty result, and the file is not established as gone, so

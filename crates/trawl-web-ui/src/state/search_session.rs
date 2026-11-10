@@ -222,5 +222,6 @@ fn empty_response() -> QueryResponse {
         // and no columns to render as anything.
         degraded_fields: Vec::new(),
         severity_columns: Vec::new(),
+        histogram: None,
     }
 }
