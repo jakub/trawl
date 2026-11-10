@@ -67,19 +67,20 @@ use serde_json::Value as Json;
 use trawl_client::ValidationResponse;
 use trawl_client::types::FormatErrorKind;
 use trawl_core::sanitize::is_unsafe_display_char;
+use trawl_core::schema::MAX_FIELD_NAME_BYTES;
 
 use crate::reply::{
-    CellView, CorrelationView, DslEffects, FormatRefusal, FormatRefusalKind, NextAction,
+    CellView, CorrelationView, DslEffects, FormatRefusal, FormatRefusalKind, NextAction, PageRead,
     ReadAction, ReadReply, ResultView, SearchReply, ValidationView,
 };
-use crate::tools::schema::{MAX_ROWS, READ, SEARCH};
+use crate::tools::schema::{MAX_ROWS, PAGE_MAX_COLUMNS, READ, SEARCH};
 
 pub use budget::Budget;
 use budget::{Fit, keep_rows};
 pub use correlation::correlation;
 pub use fields::fields;
 pub use orient::orient;
-use rows::{columns_line, floor_char_boundary, json_string, json_text, mirror, row_line};
+use rows::{columns_line, floor_char_boundary, json_string, json_text, row_line};
 
 /// The most facets a result prints.
 pub const MAX_FACETS: usize = 3;
@@ -99,13 +100,14 @@ pub const MAX_NEXT_ACTIONS: usize = 2;
 #[must_use]
 pub fn search(mut reply: SearchReply, budget: Budget, page_rows: u64) -> CallToolResult {
     if let Some(view) = reply.result.as_mut() {
+        record_read(view);
         normalize(view);
     }
     reply.next_actions.truncate(MAX_NEXT_ACTIONS);
-    let result_id = reply.result.as_ref().map(|view| view.result_id.clone());
+    let recovery = reply.result.as_ref().map(Recovery::of);
     match budget::fit(reply, budget, page_rows) {
         Some((text, mirror)) => success(text, mirror),
-        None => does_not_fit(SEARCH, result_id.as_deref(), budget),
+        None => does_not_fit(SEARCH, recovery.as_ref(), budget),
     }
 }
 
@@ -115,9 +117,9 @@ pub fn search(mut reply: SearchReply, budget: Budget, page_rows: u64) -> CallToo
 /// `rows` argument, and its outcome line is the [`page_outcome`] of the
 /// rows it prints. A cell range is fitted by printing fewer of its bytes,
 /// cut on a character boundary, with its `length` and `next_offset` saying
-/// where the rest starts and a continuation proposed from there; a range
-/// with room for none of its bytes is an error naming the smallest
-/// `max_bytes` that prints part of it. An investigation's entries are
+/// where the rest starts and a continuation proposed from there; when the
+/// column's name leaves no room for the range's first character, the name
+/// prints abbreviated ([`fit_cell`]). An investigation's entries are
 /// fitted as [`activity`] fits a board.
 #[must_use]
 pub fn read(mut reply: ReadReply, budget: Budget, page_rows: u64) -> CallToolResult {
@@ -125,19 +127,20 @@ pub fn read(mut reply: ReadReply, budget: Budget, page_rows: u64) -> CallToolRes
         return activity::fit_entries(reply, budget, READ);
     }
     if let Some(view) = reply.result.as_mut() {
+        record_read(view);
         normalize(view);
     }
     reply.next_actions.truncate(MAX_NEXT_ACTIONS);
     if let Some(cell) = &reply.cell {
         return match fit_cell(&reply, cell, budget) {
-            Ok((text, mirror)) => success(text, mirror),
-            Err(refused) => refused,
+            Some((text, mirror)) => success(text, mirror),
+            None => does_not_fit(READ, Some(&Recovery::of_cell(cell)), budget),
         };
     }
-    let result_id = reply.result.as_ref().map(|view| view.result_id.clone());
+    let recovery = reply.result.as_ref().map(Recovery::of);
     match budget::fit(reply, budget, page_rows) {
         Some((text, mirror)) => success(text, mirror),
-        None => does_not_fit(READ, result_id.as_deref(), budget),
+        None => does_not_fit(READ, recovery.as_ref(), budget),
     }
 }
 
@@ -305,22 +308,118 @@ fn success(text: String, mirror: Json) -> CallToolResult {
     result
 }
 
+/// What the refusal of a reply that does not fit names, so the caller can
+/// still read the result: taken from the reply before the fitting
+/// consumes it.
+#[derive(Debug, Clone)]
+pub(crate) struct Recovery {
+    /// The result's id.
+    result_id: String,
+    /// The captured row the page read first, and the page's first captured
+    /// column position; `None` when the page read no row, or the call read
+    /// a cell.
+    cell: Option<(u64, u64)>,
+}
+
+impl Recovery {
+    /// The recovery of the page `view`, recorded before it was fitted.
+    pub(crate) fn of(view: &ResultView) -> Self {
+        Self {
+            result_id: view.result_id.clone(),
+            cell: (!view.rows.is_empty() && view.read.columns > 0)
+                .then_some((view.offset, view.read.first_position)),
+        }
+    }
+
+    /// The recovery of a cell read, which names no cell call: the call
+    /// that does not fit was one.
+    fn of_cell(cell: &CellView) -> Self {
+        Self {
+            result_id: cell.result_id.clone(),
+            cell: None,
+        }
+    }
+}
+
 /// The error a reply gets when it does not fit `budget` with every
-/// droppable part gone.
-fn does_not_fit(tool: &str, result_id: Option<&str>, budget: Budget) -> CallToolResult {
+/// droppable part gone, naming the routes `recovery` leaves.
+///
+/// Below [`Budget::HARD`] a kept result is read with a larger
+/// `max_bytes`, or with `read action=page` and `columns`. At the hard cap
+/// no budget is larger: the error names `fields source=result`, which
+/// describes the columns, the `columns` route, and, when the page read a
+/// row, the `read action=cell` call for that row's cell at the page's
+/// first captured column, which prints neither the executed query nor the
+/// columns line, so no width or query length stops it. The cell call comes
+/// right after the fixed first sentence, where the error's cap at
+/// [`refusal::MAX_ERROR_BYTES`] cannot cut it.
+fn does_not_fit(tool: &str, recovery: Option<&Recovery>, budget: Budget) -> CallToolResult {
     let bytes = budget.bytes();
-    let tail = match result_id {
-        Some(id) => format!(
-            " The result {} is kept: read it with a larger max_bytes, at most {}.",
-            json_string(id),
-            Budget::HARD.bytes()
-        ),
-        None => " Send a shorter query, or a larger max_bytes.".to_owned(),
+    let unfit = "even without rows, facets, hints, next calls or the search URL.";
+    let Some(recovery) = recovery else {
+        return refusal::error_result(format!(
+            "{tool} answered, but its reply does not fit max_bytes={bytes} {unfit} Send a \
+             shorter query, or a larger max_bytes."
+        ));
     };
-    refusal::error_result(format!(
-        "{tool} answered, but its reply does not fit max_bytes={bytes} even without rows, \
-         facets, hints, next calls or the search URL.{tail}"
-    ))
+    let id = json_string(&recovery.result_id);
+    if budget != Budget::HARD {
+        return refusal::error_result(format!(
+            "{tool} answered, but its reply does not fit max_bytes={bytes} {unfit} The result \
+             {id} is kept: read it with a larger max_bytes, at most {}, or print only the \
+             columns you name with read action=page result_id={id} columns=[…], at most \
+             {PAGE_MAX_COLUMNS} names of the columns fields source=result result_id={id} \
+             describes.",
+            Budget::HARD.bytes()
+        ));
+    }
+    let mut text = format!(
+        "{tool} answered, but its reply does not fit max_bytes={bytes}, the most one response \
+         holds, {unfit}"
+    );
+    if let Some((row, column)) = recovery.cell {
+        let _ = write!(
+            text,
+            " read action=cell result_id={id} row={row} column={column} prints row {row}'s cell \
+             at captured column {column}, the page's first; a cell reply prints neither the \
+             executed query nor the columns line, and the same call with another column reads \
+             the row's other cells."
+        );
+    }
+    let _ = write!(
+        text,
+        " The result {id} is kept: fields source=result result_id={id} describes its columns, \
+         and read action=page result_id={id} columns=[…], at most {PAGE_MAX_COLUMNS} names, \
+         prints only the columns it names."
+    );
+    refusal::error_result(text)
+}
+
+/// Record in `view` what the call read, before the renderer caps or fits
+/// anything: which columns were null in every row read, by index (a
+/// column's name need not be unique), how many columns the page carried
+/// and trawld's projection left out, and the page's first captured
+/// position. A cell is null only when it is JSON `null`. The projection
+/// the tool recorded stays.
+fn record_read(view: &mut ResultView) {
+    let null_columns = if view.rows.is_empty() {
+        Vec::new()
+    } else {
+        (0..view.columns.len())
+            .map(|index| {
+                view.rows
+                    .iter()
+                    .all(|row| row.get(index).is_some_and(Json::is_null))
+            })
+            .collect()
+    };
+    view.read = PageRead {
+        projection: view.read.projection.take(),
+        null_columns,
+        columns: rows::as_u64(view.columns.len()),
+        projected_out: view.presentation.columns_omitted,
+        first_position: view.columns.first().map_or(0, |column| column.position),
+    };
 }
 
 /// Hold `view` to the limits the text contract states, and recount its
@@ -351,23 +450,52 @@ fn utc_micros(text: &str) -> String {
     )
 }
 
+/// The longest a cell reply prints a column name it abbreviates, as a JSON
+/// string with its marker: the longest name a stored field may have.
+const ABBREVIATED_NAME_BYTES: usize = MAX_FIELD_NAME_BYTES;
+
 /// The reply for `cell`, the range `reply` holds, printing the most bytes
 /// of the range that fit `budget`, its continuation moved to, or created
-/// at, where the printed bytes end; or the error to answer instead.
+/// at, where the printed bytes end; `None` when no reply fits.
 ///
-/// A cut that prints none of a range's bytes would propose the very call
-/// that made it, so it is never sent: the error names the smallest
-/// `max_bytes` that prints the range's first character. That happens only
-/// when the fixed text alone nearly fills the budget, which a long column
-/// name can make it do.
-fn fit_cell(
+/// A cut that prints none of a non-empty range's bytes would propose the
+/// very call that made it, so it is never sent. The column's name prints
+/// whole when the range's first character fits beside it. When it does
+/// not, which a long name a query created can make happen, the name prints
+/// abbreviated, in the text and the mirror alike: cut on a character
+/// boundary to at most [`ABBREVIATED_NAME_BYTES`] as a JSON string, marker
+/// included, and when that still leaves no room, to the marker alone,
+/// when the marker prints shorter than the name. The row, the position,
+/// the type and the byte counts stay exact.
+fn fit_cell(reply: &ReadReply, cell: &CellView, budget: Budget) -> Option<(String, Json)> {
+    let whole = json_string(&cell.name).len();
+    let mut names = vec![cell.name.clone()];
+    if whole > ABBREVIATED_NAME_BYTES {
+        names.push(abbreviated_name(&cell.name, ABBREVIATED_NAME_BYTES));
+    }
+    let marker = abbreviated_name(&cell.name, 0);
+    if json_string(&marker).len() < whole {
+        names.push(marker);
+    }
+    names
+        .iter()
+        .find_map(|name| most_cell_bytes(reply, cell, name, budget))
+}
+
+/// The reply for `cell` printing the column's name as `name` and the most
+/// bytes of the range that fit `budget`: all of them, or at least the
+/// range's first character; `None` when not even that fits, or when an
+/// empty range does not.
+fn most_cell_bytes(
     reply: &ReadReply,
     cell: &CellView,
+    name: &str,
     budget: Budget,
-) -> Result<(String, Json), CallToolResult> {
+) -> Option<(String, Json)> {
     let keeping = |kept: usize| {
         let mut candidate = reply.clone();
         if let Some(cut) = candidate.cell.as_mut() {
+            name.clone_into(&mut cut.name);
             keep_cell_bytes(cut, kept);
         }
         budget::follow_cell_cut(&mut candidate, cell.next_offset);
@@ -376,12 +504,11 @@ fn fit_cell(
     let attempt = |kept: usize| budget::fitted(&keeping(kept), budget);
     let whole = cell.text.len();
     if let Some(all) = attempt(whole) {
-        return Ok(all);
+        return Some(all);
     }
-    let Some(mut best) = attempt(0) else {
-        return Err(does_not_fit(READ, Some(&cell.result_id), budget));
-    };
-    let (mut fits, mut does_not) = (0, whole);
+    let first = cell.text.chars().next()?.len_utf8();
+    let mut best = attempt(first)?;
+    let (mut fits, mut does_not) = (first, whole);
     while does_not - fits > 1 {
         let mid = fits + (does_not - fits) / 2;
         if let Some(fitted) = attempt(mid) {
@@ -391,38 +518,30 @@ fn fit_cell(
             does_not = mid;
         }
     }
-    if floor_char_boundary(&cell.text, fits) == 0 {
-        let first = cell.text.chars().next().map_or(0, char::len_utf8);
-        let smallest = keeping(first);
-        let needed = mirror(&smallest).map_or(usize::MAX, |mirror| {
-            budget::measure(&smallest.text(budget), &mirror)
-        });
-        return Err(no_room_for_the_cell(cell, budget, needed));
-    }
-    Ok(best)
+    Some(best)
 }
 
-/// The error a cell range gets when `budget` leaves room for none of its
-/// bytes; `needed` is the smallest budget that prints part of it.
-fn no_room_for_the_cell(cell: &CellView, budget: Budget, needed: usize) -> CallToolResult {
-    let hard = Budget::HARD.bytes();
-    let tail = if needed <= hard {
-        format!("the smallest max_bytes that prints part of it is {needed}.")
-    } else {
-        format!(
-            "printing part of it needs {needed} bytes, more than the hard cap of {hard}, so no \
-             read prints it."
-        )
-    };
-    refusal::error_result(format!(
-        "read answered, but at max_bytes={} its reply has no room for any byte of the cell at \
-         row {}, column {} of result {} from byte_offset {}; {tail}",
-        budget.bytes(),
-        cell.row,
-        cell.column,
-        json_string(&cell.result_id),
-        cell.offset
-    ))
+/// `name` cut on a character boundary and ended with a marker saying so,
+/// printing as a JSON string of at most `bound` bytes; the marker alone
+/// when not one character fits beside it. A character's JSON escape does
+/// not depend on its neighbours, so the bound is met one character at a
+/// time.
+fn abbreviated_name(name: &str, bound: usize) -> String {
+    let marker = format!(
+        "…[name cut from {} bytes to fit the response's byte budget]",
+        name.len()
+    );
+    let mut room = bound.saturating_sub(json_string(&marker).len());
+    let mut end = 0;
+    for (at, c) in name.char_indices() {
+        let escaped = json_string(c.encode_utf8(&mut [0; 4])).len() - 2;
+        if escaped > room {
+            break;
+        }
+        room -= escaped;
+        end = at + c.len_utf8();
+    }
+    format!("{}{marker}", &name[..end])
 }
 
 /// Keep at most `kept` bytes of the cell range's text, cut on a character
@@ -599,7 +718,9 @@ fn dsl_fact(effects: DslEffects) -> String {
 }
 
 /// Truncation fact 4: what this response printed, abbreviated, omitted
-/// and dropped to fit its budget.
+/// and dropped to fit its budget. When the fitting omitted columns of the
+/// page, it says how many of the omitted were null in every row read, and
+/// that `fields` describes the omitted columns.
 fn presentation_fact(view: &ResultView, budget: Budget) -> String {
     let p = view.presentation;
     let printed = view.rows.len();
@@ -617,11 +738,25 @@ fn presentation_fact(view: &ResultView, budget: Budget) -> String {
     };
     let _ = write!(
         fact,
-        ", abbreviates {} {} and omits {} {}; {} captured {} {}.",
+        ", abbreviates {} {} and omits {} {}",
         p.cells_abbreviated,
         plural_u64(p.cells_abbreviated, "cell", "cells"),
         p.columns_omitted,
         plural_u64(p.columns_omitted, "column", "columns"),
+    );
+    let fitted_out = view
+        .read
+        .columns
+        .saturating_sub(rows::as_u64(view.columns.len()));
+    if fitted_out > 0 {
+        if p.null_columns_omitted > 0 {
+            let _ = write!(fact, " ({} null in every row read)", p.null_columns_omitted);
+        }
+        fact.push_str("; fields source=result describes them");
+    }
+    let _ = write!(
+        fact,
+        "; {} captured {} {}.",
         p.rows_omitted,
         plural_u64(p.rows_omitted, "row", "rows"),
         if p.rows_omitted == 1 {

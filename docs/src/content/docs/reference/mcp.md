@@ -196,6 +196,7 @@ out or an operator deletes an investigation.
 | `since` | integer | For `investigation`. Print the entries changed after this sequence. Default 0, from the start |
 | `offset` | integer | For `page`. The first captured row to print, counted from 0. Default 0 |
 | `rows` | integer, 1 to 200 | For `page`. Rows to print. Default 50 |
+| `columns` | array of 1 to 16 strings | For `page`. Print only the columns with these names. Each name is 1 to 255 bytes and holds no comma. A name selects every column of that name, in stored order. Every page continuation of the reply sends the same `columns`; a `cell` call sends none. The other actions ignore it. Default: every column |
 | `row` | integer | For `cell`. The captured row, counted from 0 |
 | `column` | integer | For `cell`. The column position, counted from 0 |
 | `byte_offset` | integer | For `cell`. The byte of the cell's text to continue from. Default 0 |
@@ -207,6 +208,20 @@ evidence. A page prints no search URL: the reason line says the search that
 captured the result printed it. A `cell` call prints the whole cell, or as many
 bytes as the budget holds. The reply names the `byte_offset` where the rest
 starts, and proposes the call that reads it.
+
+`read` refuses a `columns` list before it calls trawld when the list is empty,
+holds more than 16 names, or holds a name that is empty, longer than 255
+bytes, or holds a comma. trawld splits `columns` on commas, so a column whose
+name holds a comma is read with `read action=cell` at its position, which
+`fields source=result` gives. A printed column keeps its captured position.
+
+A `cell` reply prints at least the first character of a non-empty range. When
+the column's name leaves no room for it, the reply prints the name abbreviated,
+in the text and the mirror alike: cut on a character boundary to at most 255
+bytes as a JSON string, ending with the marker
+`…[name cut from N bytes to fit the response's byte budget]`, or the marker
+alone when that still leaves no room. The row, the column position, the type,
+and the byte counts stay exact.
 
 A page of a result that `context`, `sightings`, or `compare` captured prints
 that tool's [block](#correlation-tools) on every page, between the truncation
@@ -578,9 +593,18 @@ Four sentences tell the reader what the rows are not. They use fixed wording.
    names the stages that did: `sample`, `limit` or `tail`, and `dedup`. The
    server reads these from the executed query's pipe stages.
 4. `This response prints N rows from captured row R, abbreviates N cells and
-   omits N columns; N captured rows follow.` When the budget dropped anything,
-   a last clause lists what: rows, the facets, the hints, the proposed next
-   calls.
+   omits N columns; N captured rows follow.` When the budget omitted columns,
+   the sentence says `omits N columns (M null in every row read); fields
+   source=result describes them; N captured rows follow.` The `(M null in
+   every row read)` clause appears only when M is not 0. When the budget
+   dropped anything, a last clause lists what: rows, the facets, the hints,
+   the proposed next calls.
+
+The mirror's `columns_omitted` counts every column the response did not print:
+those a `columns` projection left out, and those the budget omitted.
+`null_columns_omitted` counts the columns the budget omitted because their cell
+was null in every row the call read, and is absent when it is 0. A column the
+projection left out is not counted there: its cells were not read.
 
 ### Facets
 
@@ -594,9 +618,10 @@ metadata such as `_raw` and `_ingested`, and columns with a value longer than
 
 A result proposes at most 2 next calls. After a page they are the next page
 and, when a cell was abbreviated, the call that reads the first such cell.
-After `sightings`, its follow-up queries come after the next page. After
-a valid `validate` it is the call that runs the query. Each call's arguments
-are valid under that tool's input schema.
+That cell call stays proposed when the budget omits the cell's column. After
+`sightings`, its follow-up queries come after the next page. After a valid
+`validate` it is the call that runs the query. Each call's arguments are valid
+under that tool's input schema.
 
 ### The search URL
 
@@ -697,6 +722,12 @@ trawld said more entries follow. On a `read action=investigation` board the
 proposed call is the matching `read` call. The continuation lives in the
 activity block, so it stays when the budget drops the other next calls.
 
+In the mirror, an activity block or a board says `trawld_holds_more` when
+trawld holds entries past its `through_seq`, and counts in
+`entries_dropped_to_fit` the entries the budget dropped. Its `continuation` is
+present when `trawld_holds_more` is true or `entries_dropped_to_fit` is not 0,
+and absent otherwise.
+
 A write that trawld accepted is acknowledged at every `max_bytes`, from 4096
 to 32768. The outcome line of every `create`, `note`, `finding`, `keep`,
 `finding_status`, and `status` answer names the investigation id, and every
@@ -741,9 +772,12 @@ The hard budget of 32 KiB stays under the 50,000 characters at which Claude
 Code spills a result to a file, even if a client counts the text and the
 mirror together. The server counts both against `max_bytes`.
 
-When a reply is over its budget, the server fits it in this order. It drops
-whole rows from the end of the page, never cutting a row or a cell, and says
-how many. The outcome line of a `read` page names the rows the response
+A reply that fits its budget is sent as it is. When a result reply is over its
+budget, the server first omits every column whose cell is null in every row
+the call read, not only the rows it prints, in the columns line, the rows, and
+the mirror together. A page that read no row omits no column this way. Then
+the server fits the reply in this order. It drops whole rows from the end of
+the page, never cutting a row or a cell, and says how many. The outcome line of a `read` page names the rows the response
 prints, not the rows it read; when it prints none, the line says that the row
 at the offset does not fit. If no rows fit, it also drops the facets, then the next calls, then
 the search URL (and `no search URL:` says so), then the hints, and prints the
@@ -756,13 +790,27 @@ server page was the last one. When not even one row fits, the rows block says
 `no row fits max_bytes N; see next actions`, and the proposed call reads that
 row alone at the hard cap, or, when no budget prints the row, reads its cells
 one at a time. A cell range cut the same way proposes the rest from the byte
-where printing stopped; a range with no room for a single byte is an `isError`
-result that names the smallest `max_bytes` that prints one.
+where printing stopped.
+
+When not one row fits even with every droppable part gone, the server omits
+the fewest columns from the end, in stored order, that let one row print, and
+fits the reply again in the same order, keeping at least one row. Printed
+columns keep their captured positions, and each row array holds only the
+printed columns. `read action=cell` reads any omitted cell by its position.
+
 If the reply does not fit with all of those gone, the call is an `isError`
-result that names the result id and `max_bytes`. The result is kept, so a
-`read` with a larger `max_bytes` returns it. `orient` and `fields` fit their
-replies the same way, dropping inventory rows or fields from the end before
-their other parts.
+result that names the result id and `max_bytes`. The result is kept. Below `max_bytes=32768`
+the text names a larger `max_bytes`, at most 32768, and
+`read action=page result_id=ID columns=[…]` with at most 16 names of the
+columns that `fields source=result result_id=ID` describes. At 32768, the most
+one response holds, it names no larger budget. When the page read a row, it
+first names `read action=cell result_id=ID row=R column=C`, the row's cell at
+the page's first captured column: a cell reply prints neither the executed
+query nor the columns line. It then names `fields source=result result_id=ID`
+and `read action=page result_id=ID columns=[…]` with at most 16 names. A reply
+with no result id names a shorter query or a larger `max_bytes`. `orient` and
+`fields` fit their replies the same way, dropping inventory rows or fields from
+the end before their other parts.
 
 ## Refused calls
 

@@ -19,11 +19,14 @@
 //! to where the printed bytes end. When the tool proposed none, because
 //! the server's page or range was the last, the fitting creates the
 //! continuation its cut needs, first among the proposed calls and measured
-//! with the rest. A continuation always advances: when not one row of the
-//! page fits, it reads the next row alone at [`Budget::HARD`] if that row
-//! fits there, else that row's cells one at a time, and a cell range with
-//! room for none of its bytes is refused with the smallest `max_bytes` that
-//! prints one. When even no rows fit, an attached search's activity
+//! with the rest. Every page continuation, the tool's and the fitting's,
+//! sends the `columns` the page was projected to; a cell call names a
+//! captured position and sends none. A continuation always advances: when
+//! not one row of the page fits, it reads the next row alone at
+//! [`Budget::HARD`] if that row fits there, else that row's cells one at a
+//! time, and a cell range prints at least its first character, its
+//! column's name abbreviated when the whole name leaves no room for one.
+//! When even no rows fit, an attached search's activity
 //! entries go from the end, each count printed with the most rows that
 //! fit it, then the facets, then the
 //! proposed next calls, then the search URL (the reason says why), then
@@ -36,11 +39,26 @@
 //! that, every activity entry of an attached read among it, does the
 //! fitting leave entries off the ends of a sightings block's lists, as
 //! many as it must, and the block counts them. A reply that does
-//! not fit with all of those gone is not sent: the caller gets an error text naming the result id and the
-//! budget, so it can read the result with a larger one.
+//! not fit with all of those gone is not sent: the caller gets an error
+//! text naming the result id and the budget, and the routes that read the
+//! result: below [`Budget::HARD`] a larger budget, and at every budget the
+//! `columns` route and, at the hard cap, `fields` and one cell call.
+//!
+//! A result reply that fits whole is sent as it is. One that does not
+//! first omits every column whose cell is null in every row the call read,
+//! all of them and not only the rows it prints, in the columns line, the
+//! rows and the mirror together, and then fits as above. When that finds
+//! no reply printing a row, even with every droppable part gone, it omits
+//! the fewest columns from the end, in stored order, that let one row
+//! print with every droppable part gone, and fits again from the start,
+//! now only to replies that print a row. Printed columns keep their
+//! captured positions, so `read` with `action: cell` names any omitted
+//! cell. A page that read no row omits no column.
+
+use std::collections::HashSet;
 
 use serde::Serialize;
-use serde_json::{Value as Json, json};
+use serde_json::{Map, Value as Json, json};
 
 use crate::reply::{
     ActivityView, CorrelationView, NextAction, ReadReply, ResultView, ValidationView,
@@ -58,10 +76,15 @@ pub(crate) const PAGE_CONTINUATION: &str =
 /// Why a cell continuation is proposed, whether a tool or the fitting
 /// proposes it.
 pub(crate) const CELL_CONTINUATION: &str = "print the rest of the cell";
-/// Why the fitting proposes a row's first cell: a page printed none of its
-/// rows, and the next does not fit a page even at [`Budget::HARD`].
-pub(crate) const ROW_BY_CELLS: &str =
-    "the row does not fit a page at any max_bytes; read its cells one at a time, from column 0";
+/// Why the fitting proposes a row's cell at captured column `column`, the
+/// page's first: a page printed none of its rows, and the next does not
+/// fit a page even at [`Budget::HARD`].
+pub(crate) fn row_by_cells(column: u64) -> String {
+    format!(
+        "the row does not fit a page at any max_bytes; read its cells one at a time, from \
+         column {column}"
+    )
+}
 
 /// The bytes one response may use, text block and mirror together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,8 +187,58 @@ pub const DIAGNOSTIC_TEXT_SHARE: usize = 16;
 /// `page_rows` is the call's `rows` argument, which a page continuation
 /// the fitting creates asks for. Once the proposed next calls are dropped
 /// it creates none, and a cut that needed one says the calls were dropped.
+///
+/// A reply that fits whole is returned as it is. Otherwise its null
+/// columns go and [`ladder`] fits it; when that prints no row and not even
+/// one row fits with every droppable part gone, [`widest_prefix`] keeps the
+/// most columns with which one does, and the ladder fits again at that
+/// width, to replies that print a row. When no width prints one, the
+/// reply is the ladder's at the width before the cut.
 pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget, page_rows: u64) -> Option<(String, Json)> {
     let rows = reply.view_mut().map_or(0, |view| view.rows.len());
+    if let Some(whole) = fitted(&whole(&reply, rows, page_rows), budget) {
+        return Some(whole);
+    }
+    omit_null_columns(&mut reply);
+    let laddered = ladder(&reply, rows, budget, page_rows, 0);
+    if rows == 0
+        || laddered
+            .as_ref()
+            .is_some_and(|(_, mirror)| prints_a_row(mirror))
+        || row_fits_stripped(&reply, rows, budget)
+    {
+        return laddered;
+    }
+    let Some(width) = widest_prefix(&reply, rows, budget) else {
+        return laddered;
+    };
+    ladder(&with_width(&reply, width), rows, budget, page_rows, 1).or(laddered)
+}
+
+/// `reply` with every row and every activity entry it holds, as the
+/// fitting's first candidate renders it.
+fn whole<R: Fit>(reply: &R, rows: usize, page_rows: u64) -> R {
+    let mut candidate = reply.clone();
+    if let Some(view) = candidate.activity_mut() {
+        let total = view.entries.len();
+        super::activity::keep_entries(view, total, total, super::activity::Continue::Investigation);
+    }
+    keeping(&candidate, rows, rows, Some(page_rows))
+}
+
+/// `reply` fitted under `budget` by giving up, in order, rows, an attached
+/// call's activity entries, the facets, the proposed next calls, the
+/// search URL, the hints and the diagnostics' text, then diagnostics and
+/// sightings list entries; `None` when it does not fit with all of them
+/// gone. Every candidate prints at least `least` rows, 0 or 1.
+fn ladder<R: Fit>(
+    reply: &R,
+    rows: usize,
+    budget: Budget,
+    page_rows: u64,
+    least: usize,
+) -> Option<(String, Json)> {
+    let mut reply = reply.clone();
     let mut page_rows = Some(page_rows);
     for drop in [
         Drop::Nothing,
@@ -179,12 +252,153 @@ pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget, page_rows: u64) -> Optio
         if matches!(drop, Drop::NextActions) {
             page_rows = None;
         }
-        if let Some(fitted) = most_activity(&reply, rows, budget, page_rows) {
+        if let Some(fitted) = most_activity(&reply, rows, budget, page_rows, least) {
             return Some(fitted);
         }
     }
-    most_diagnostics(&reply, rows, budget, page_rows)
-        .or_else(|| most_entries(&reply, rows, budget, page_rows))
+    most_diagnostics(&reply, rows, budget, page_rows, least)
+        .or_else(|| most_entries(&reply, rows, budget, page_rows, least))
+}
+
+/// Whether the fitted reply whose mirror is `mirror` prints a row of its
+/// result: the mirror is the fitted reply, so it holds what the text
+/// printed.
+fn prints_a_row(mirror: &Json) -> bool {
+    mirror
+        .get("result")
+        .and_then(|view| view.get("rows"))
+        .and_then(Json::as_array)
+        .is_some_and(|rows| !rows.is_empty())
+}
+
+/// `reply` with every part the fitting may give up gone: the facets, the
+/// proposed next calls, the search URL, the hints, the diagnostics' text
+/// and all but the first diagnostic, every activity entry, and every
+/// sightings list entry.
+fn stripped<R: Fit>(reply: &R, budget: Budget) -> R {
+    let mut stripped = reply.clone();
+    for drop in [
+        Drop::Facets,
+        Drop::NextActions,
+        Drop::Link,
+        Drop::Hints,
+        Drop::DiagnosticText,
+    ] {
+        apply(drop, &mut stripped, budget);
+    }
+    if let Some(view) = stripped.activity_mut() {
+        let total = view.entries.len();
+        super::activity::keep_entries(view, 0, total, super::activity::Continue::Investigation);
+    }
+    if let Some(validation) = stripped.validation_mut() {
+        let total = validation.errors.len();
+        if total > 1 {
+            validation.errors.truncate(1);
+            validation.diagnostics_dropped_to_fit = as_u64(total - 1);
+        }
+    }
+    if let Some(correlation) = stripped.correlation_mut() {
+        super::correlation::keep_entries(correlation, 0);
+    }
+    stripped
+}
+
+/// Whether the first of the `rows` rows of `reply` fits `budget` with
+/// every droppable part gone, at the columns `reply` prints.
+fn row_fits_stripped<R: Fit>(reply: &R, rows: usize, budget: Budget) -> bool {
+    rows > 0 && fitted(&keeping(&stripped(reply, budget), 1, rows, None), budget).is_some()
+}
+
+/// `reply` printing only the first `width` of the columns it prints.
+fn with_width<R: Fit>(reply: &R, width: usize) -> R {
+    let mut cut = reply.clone();
+    if let Some(view) = cut.view_mut() {
+        keep_columns(view, width);
+    }
+    cut
+}
+
+/// The most of the columns `reply` prints, from the first in stored order
+/// and at least one, with which the first of its `rows` rows fits `budget`
+/// with every droppable part gone; `None` when not even one column lets
+/// it fit. Called when all of them do not.
+///
+/// A binary search over the width, then a step up while one more column
+/// still fits, so the width returned was measured.
+fn widest_prefix<R: Fit>(reply: &R, rows: usize, budget: Budget) -> Option<usize> {
+    let printed = reply
+        .clone()
+        .view_mut()
+        .map_or(0, |view| view.columns.len());
+    let fits = |width: usize| row_fits_stripped(&with_width(reply, width), rows, budget);
+    if printed < 2 || !fits(1) {
+        return None;
+    }
+    let (mut wide, mut too_wide) = (1, printed);
+    while too_wide - wide > 1 {
+        let mid = wide + (too_wide - wide) / 2;
+        if fits(mid) {
+            wide = mid;
+        } else {
+            too_wide = mid;
+        }
+    }
+    while wide + 1 < printed && fits(wide + 1) {
+        wide += 1;
+    }
+    Some(wide)
+}
+
+/// Whether [`fit`] under `budget` prints the first of the `rows` rows of
+/// `reply` by omitting a suffix of its columns: one row does not fit with
+/// every droppable part gone at the columns `reply` prints, and fits so
+/// with fewer of them.
+fn prints_with_a_suffix_cut<R: Fit>(reply: &R, rows: usize, budget: Budget) -> bool {
+    !row_fits_stripped(reply, rows, budget) && widest_prefix(reply, rows, budget).is_some()
+}
+
+/// Omit every column of `reply` whose cell was null in every row the call
+/// read, and count them.
+fn omit_null_columns<R: Fit>(reply: &mut R) {
+    let Some(view) = reply.view_mut() else {
+        return;
+    };
+    let null = view.read.null_columns.clone();
+    let omitted = null.iter().filter(|&&null| null).count();
+    if omitted == 0 {
+        return;
+    }
+    omit_columns(view, |index| null.get(index).copied().unwrap_or(false));
+    view.presentation.null_columns_omitted = as_u64(omitted);
+}
+
+/// Print only the first `width` of the columns `view` prints.
+fn keep_columns(view: &mut ResultView, width: usize) {
+    omit_columns(view, |index| index >= width);
+}
+
+/// Omit every column of `view` at a printed index `omit` holds for: from
+/// the columns, from every row, and from the abbreviated cells, whose
+/// records name a captured position. Every kept column keeps its captured
+/// position. `columns_omitted` becomes the columns trawld's projection
+/// left out plus every column of the page this view no longer prints.
+pub(crate) fn omit_columns(view: &mut ResultView, omit: impl Fn(usize) -> bool) {
+    let keep: Vec<bool> = (0..view.columns.len()).map(|index| !omit(index)).collect();
+    let mut kept = keep.iter();
+    view.columns
+        .retain(|_| kept.next().copied().unwrap_or(false));
+    for row in &mut view.rows {
+        let mut kept = keep.iter();
+        row.retain(|_| kept.next().copied().unwrap_or(false));
+    }
+    let printed: HashSet<u64> = view.columns.iter().map(|column| column.position).collect();
+    view.abbreviated
+        .retain(|cell| printed.contains(&cell.column));
+    view.presentation.cells_abbreviated = as_u64(view.abbreviated.len());
+    view.presentation.columns_omitted = view
+        .read
+        .projected_out
+        .saturating_add(view.read.columns.saturating_sub(as_u64(view.columns.len())));
 }
 
 /// The reply with the most entries of each sightings list that fit, the
@@ -199,6 +413,7 @@ fn most_entries<R: Fit>(
     rows: usize,
     budget: Budget,
     page_rows: Option<u64>,
+    least: usize,
 ) -> Option<(String, Json)> {
     let longest = super::correlation::longest_list(reply.clone().correlation_mut()?);
     if longest == 0 {
@@ -212,7 +427,7 @@ fn most_entries<R: Fit>(
     let attempt = |kept: usize| -> Option<(String, Json)> {
         let mut candidate = reply.clone();
         super::correlation::keep_entries(candidate.correlation_mut()?, kept);
-        most_rows(&candidate, rows, budget, page_rows)
+        most_rows(&candidate, rows, budget, page_rows, least)
     };
     let mut best = attempt(0)?;
     let (mut fits, mut does_not) = (0, longest);
@@ -241,9 +456,10 @@ fn most_activity<R: Fit>(
     rows: usize,
     budget: Budget,
     page_rows: Option<u64>,
+    least: usize,
 ) -> Option<(String, Json)> {
     let Some(total) = reply.clone().activity_mut().map(|view| view.entries.len()) else {
-        return most_rows(reply, rows, budget, page_rows);
+        return most_rows(reply, rows, budget, page_rows, least);
     };
     let attempt = |kept: usize| {
         let mut candidate = reply.clone();
@@ -255,7 +471,7 @@ fn most_activity<R: Fit>(
                 super::activity::Continue::Investigation,
             );
         }
-        most_rows(&candidate, rows, budget, page_rows)
+        most_rows(&candidate, rows, budget, page_rows, least)
     };
     if let Some(all) = attempt(total) {
         return Some(all);
@@ -284,6 +500,7 @@ fn most_diagnostics<R: Fit>(
     rows: usize,
     budget: Budget,
     page_rows: Option<u64>,
+    least: usize,
 ) -> Option<(String, Json)> {
     let total = reply.clone().validation_mut()?.errors.len();
     if total < 2 {
@@ -294,7 +511,7 @@ fn most_diagnostics<R: Fit>(
         let validation = candidate.validation_mut()?;
         validation.errors.truncate(kept);
         validation.diagnostics_dropped_to_fit = as_u64(total - kept);
-        most_rows(&candidate, rows, budget, page_rows)
+        most_rows(&candidate, rows, budget, page_rows, least)
     };
     let mut best = attempt(1)?;
     let (mut fits, mut does_not) = (1, total);
@@ -375,20 +592,22 @@ fn apply<R: Fit>(drop: Drop, reply: &mut R, budget: Budget) {
 }
 
 /// The reply with the most of its first `rows` rows that fit, rendered,
-/// or `None` when no count of them fits, not even zero.
+/// or `None` when no count of them fits, not even zero, or not even one
+/// when `least` is 1.
 ///
 /// A binary search over the positive row counts, from one; every answer
 /// it returns was measured, so it fits even where dropping a row grows a
 /// count's digits. The reply that keeps no row is tried only when not
-/// even one row fits, because it is not the smallest: its outcome line
-/// can be longer than one naming a printed range, and it proposes a
-/// continuation that advances. Each candidate carries the continuation
-/// [`keeping`] gives it.
+/// even one row fits and `least` is 0, because it is not the smallest: its
+/// outcome line can be longer than one naming a printed range, and it
+/// proposes a continuation that advances. Each candidate carries the
+/// continuation [`keeping`] gives it.
 fn most_rows<R: Fit>(
     reply: &R,
     rows: usize,
     budget: Budget,
     page_rows: Option<u64>,
+    least: usize,
 ) -> Option<(String, Json)> {
     let attempt = |kept: usize| fitted(&keeping(reply, kept, rows, page_rows), budget);
     if let Some(all) = attempt(rows) {
@@ -398,7 +617,7 @@ fn most_rows<R: Fit>(
         return None;
     }
     let Some(mut best) = (rows > 1).then(|| attempt(1)).flatten() else {
-        return attempt(0);
+        return if least == 0 { attempt(0) } else { None };
     };
     let (mut fits, mut does_not) = (1, rows);
     while does_not - fits > 1 {
@@ -422,13 +641,20 @@ fn most_rows<R: Fit>(
 /// A candidate that keeps none of the rows it read would continue with the
 /// very call that made it, so its continuation must advance: the next row
 /// alone at [`Budget::HARD`] when a one-row candidate of `reply` fits
-/// there, else that row's cells one at a time from column 0. Either one
-/// leads the proposed calls in place of the tool's page continuation.
+/// there, or the fitting there prints it by omitting a suffix of its
+/// columns, else that row's cells one at a time from the page's first
+/// captured column. Either one leads the proposed calls in place of
+/// the tool's page continuation.
 fn keeping<R: Fit>(reply: &R, kept: usize, rows: usize, page_rows: Option<u64>) -> R {
     let mut candidate = reply.clone();
-    let Some((result_id, offset)) = candidate.view_mut().map(|view| {
+    let Some((result_id, offset, first_column, projection)) = candidate.view_mut().map(|view| {
         keep_rows(view, kept, rows);
-        (view.result_id.clone(), view.offset)
+        (
+            view.result_id.clone(),
+            view.offset,
+            view.read.first_position,
+            view.read.projection.clone(),
+        )
     }) else {
         return candidate;
     };
@@ -451,41 +677,78 @@ fn keeping<R: Fit>(reply: &R, kept: usize, rows: usize, page_rows: Option<u64>) 
                 actions,
                 NextAction {
                     tool: READ.to_owned(),
-                    arguments: object(json!({
-                        "action": "page",
-                        "result_id": result_id,
-                        "offset": kept_end,
-                        "rows": page_rows,
-                    })),
+                    arguments: projected(
+                        object(json!({
+                            "action": "page",
+                            "result_id": result_id,
+                            "offset": kept_end,
+                            "rows": page_rows,
+                        })),
+                        projection.as_deref(),
+                    ),
                     reason: PAGE_CONTINUATION.to_owned(),
                 },
             );
         }
         Some(page_rows) => {
-            let next_row_fits =
-                fitted(&keeping(reply, 1, rows, Some(page_rows)), Budget::HARD).is_some();
+            let next_row_fits = fitted(&keeping(reply, 1, rows, Some(page_rows)), Budget::HARD)
+                .is_some()
+                || prints_with_a_suffix_cut(reply, rows, Budget::HARD);
             let actions = candidate.next_actions_mut();
             actions.retain(|proposed| !reads_from(proposed, ("page", "offset"), read_end));
-            lead_with(actions, advance(&result_id, offset, next_row_fits));
+            lead_with(
+                actions,
+                advance(
+                    &result_id,
+                    offset,
+                    next_row_fits,
+                    first_column,
+                    projection.as_deref(),
+                ),
+            );
         }
     }
     candidate
 }
 
+/// The arguments of a `read` page call, with the `columns` of
+/// `projection`, the call's own, when it projected the page: a page
+/// continuation reads the columns the page it continues read.
+pub(crate) fn projected(
+    mut arguments: Map<String, Json>,
+    projection: Option<&[String]>,
+) -> Map<String, Json> {
+    if let Some(columns) = projection {
+        arguments.insert("columns".to_owned(), json!(columns));
+    }
+    arguments
+}
+
 /// The continuation of a page that printed none of its rows, from
-/// captured row `offset`: that row alone at [`Budget::HARD`] when it fits
-/// there, else its cells one at a time.
-fn advance(result_id: &str, offset: u64, next_row_fits: bool) -> NextAction {
+/// captured row `offset`: that row alone at [`Budget::HARD`], with the
+/// page's `projection`, when it fits there, else its cells one at a time
+/// from captured column `first_column`, the page's first. A cell call
+/// names a captured position, so it sends no projection.
+fn advance(
+    result_id: &str,
+    offset: u64,
+    next_row_fits: bool,
+    first_column: u64,
+    projection: Option<&[String]>,
+) -> NextAction {
     if next_row_fits {
         NextAction {
             tool: READ.to_owned(),
-            arguments: object(json!({
-                "action": "page",
-                "result_id": result_id,
-                "offset": offset,
-                "rows": 1,
-                "max_bytes": HARD_MAX_BYTES,
-            })),
+            arguments: projected(
+                object(json!({
+                    "action": "page",
+                    "result_id": result_id,
+                    "offset": offset,
+                    "rows": 1,
+                    "max_bytes": HARD_MAX_BYTES,
+                })),
+                projection,
+            ),
             reason: format!(
                 "the next row does not fit this call's max_bytes; read it alone at \
                  max_bytes={HARD_MAX_BYTES}, the hard cap"
@@ -498,9 +761,9 @@ fn advance(result_id: &str, offset: u64, next_row_fits: bool) -> NextAction {
                 "action": "cell",
                 "result_id": result_id,
                 "row": offset,
-                "column": 0,
+                "column": first_column,
             })),
-            reason: ROW_BY_CELLS.to_owned(),
+            reason: row_by_cells(first_column),
         }
     }
 }

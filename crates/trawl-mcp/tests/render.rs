@@ -18,8 +18,8 @@ use trawl_mcp::render::refusal::{self, MAX_ERROR_BYTES};
 use trawl_mcp::render::rows::{ABBREVIATE_OVER_BYTES, encode_page, json_text};
 use trawl_mcp::render::{self, Budget};
 use trawl_mcp::reply::{
-    Bounds, CellView, DslEffects, Facet, FacetValue, Link, NextAction, Presentation, ReadAction,
-    ReadReply, ResultView, SearchMode, SearchReply,
+    Bounds, CellView, DslEffects, Facet, FacetValue, Link, NextAction, PageRead, Presentation,
+    ReadAction, ReadReply, ResultView, SearchMode, SearchReply,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -47,6 +47,7 @@ fn presentation() -> Presentation {
     Presentation {
         cells_abbreviated: 0,
         columns_omitted: 0,
+        null_columns_omitted: 0,
         rows_omitted: 0,
         rows_dropped_to_fit: 0,
         facets_dropped_to_fit: false,
@@ -90,6 +91,7 @@ fn reply_over(page: &QueryResult, rows_captured: u64) -> SearchReply {
             offset: 0,
             rows: encoded.rows,
             abbreviated: encoded.abbreviated,
+            read: PageRead::default(),
         }),
         investigation: None,
         hints: vec![],
@@ -601,6 +603,280 @@ fn a_reply_that_cannot_fit_is_an_error_naming_the_result() {
         text.contains(RESULT_ID) && text.contains("max_bytes=4096"),
         "{text}"
     );
+}
+
+// -- wide results -------------------------------------------------------------------
+
+/// Columns of the page of [`sparse_page`]: a capture of 750 columns whose
+/// first trawld's projection left out, so page column `i` is captured
+/// column `i + 1`.
+const WIDE_COLUMNS: usize = 749;
+/// Rows the wide page read.
+const WIDE_ROWS: usize = 40;
+/// The page indices of the columns holding a value in some row, in stored
+/// order: the first holds one only in the last row, the second shares its
+/// name with [`DUPLICATE_OF_SECOND`], and the rest carry hostile names.
+const NON_NULL: [usize; 10] = [2, 9, 40, 41, 100, 230, 231, 400, 600, 748];
+/// A column null in every row, named as `NON_NULL[1]` is.
+const DUPLICATE_OF_SECOND: usize = 10;
+/// Name prefixes that must stay data: bidi and zero-width controls, a line
+/// break, a quote that would close the JSON string, an emoji, a combining
+/// mark, wide characters and a BOM.
+const HOSTILE: [&str; 8] = [
+    "\u{202e}evil",
+    "zero\u{200b}width",
+    "line\nbreak",
+    "quote\"],[\"forged",
+    "🦀crab",
+    "cafe\u{301}",
+    "日本語",
+    "\u{feff}bom",
+];
+
+/// The name of wide page column `index`: long for every non-null column.
+fn wide_name(index: usize) -> String {
+    let long = |prefix: &str| format!("{prefix}{}", "n".repeat(170));
+    match NON_NULL.iter().position(|&non_null| non_null == index) {
+        Some(0) => long("late"),
+        Some(1) => long("dup"),
+        Some(k) => long(HOSTILE[k - 2]),
+        None if index == DUPLICATE_OF_SECOND => long("dup"),
+        None => format!("null{index:03}"),
+    }
+}
+
+/// The cell of wide page row `row` at column `index`: `NON_NULL[0]` holds a
+/// value only in the last row; each other non-null column holds one in
+/// every ninth row; every other cell is null.
+fn wide_cell(row: usize, index: usize) -> Value {
+    let holds = match NON_NULL.iter().position(|&non_null| non_null == index) {
+        Some(0) => row == WIDE_ROWS - 1,
+        Some(k) => row % 9 == k - 1,
+        None => false,
+    };
+    if holds {
+        Value::String(format!("r{row:02}c{index:03} {}", "v".repeat(440)))
+    } else {
+        Value::Null
+    }
+}
+
+/// A sparse page of [`WIDE_COLUMNS`] string columns and [`WIDE_ROWS`] rows,
+/// with each cell `cell(row, index)` returns.
+fn sparse_page(cell: impl Fn(usize, usize) -> Value) -> QueryResult {
+    QueryResult {
+        columns: (0..WIDE_COLUMNS)
+            .map(|index| ApiColumn::new(wide_name(index), ColumnType::String))
+            .collect(),
+        rows: (0..WIDE_ROWS)
+            .map(|row| (0..WIDE_COLUMNS).map(|index| cell(row, index)).collect())
+            .collect(),
+    }
+}
+
+/// A search reply over the wide `page`, encoded at captured positions 1 to
+/// 749 with the one column trawld's projection left out counted.
+fn wide_reply(page: &QueryResult) -> SearchReply {
+    let positions: Vec<usize> = (1..=page.columns.len()).collect();
+    let encoded = encode_page(page, &positions, 0).expect("the page encodes");
+    let mut reply = reply_over(page, WIDE_ROWS as u64);
+    let view = reply.result.as_mut().unwrap();
+    view.columns = encoded.columns;
+    view.rows = encoded.rows;
+    view.abbreviated = encoded.abbreviated;
+    view.presentation.columns_omitted = 1;
+    reply
+}
+
+/// The page indices of the columns the fitted `result` prints, in printed
+/// order, after checking each against the page: its captured position is
+/// its index plus one, its name and type are the page column's, every
+/// printed row is as long as the printed columns, and every printed cell
+/// is the page's cell at that captured position.
+fn printed_columns(result: &CallToolResult, page: &QueryResult) -> Vec<usize> {
+    let view = &result.structured_content.as_ref().unwrap()["result"];
+    let printed: Vec<usize> = view["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|column| {
+            let index = usize::try_from(column["position"].as_u64().unwrap() - 1).unwrap();
+            let stored = &page.columns[index];
+            assert_eq!(column["name"], mirrored(json!(stored.name)), "{column}");
+            assert_eq!(column["type"], json!(stored.ty.to_string()), "{column}");
+            index
+        })
+        .collect();
+    for (row, cells) in view["rows"].as_array().unwrap().iter().enumerate() {
+        let cells = cells.as_array().unwrap();
+        assert_eq!(cells.len(), printed.len(), "row {row}");
+        for (cell, &index) in cells.iter().zip(&printed) {
+            let column = &page.columns[index];
+            let wire = wire_cell_text(&column.name, &column.ty, &page.rows[row][index]).unwrap();
+            let stored = serde_json::from_str::<Json>(&wire).unwrap();
+            assert_eq!(cell, &mirrored(stored), "row {row}, column {index}");
+        }
+    }
+    printed
+}
+
+/// #373: a page of 749 columns, most of them null, prints rows at every
+/// budget. The null columns go first, decided over every row read; at
+/// 4096 bytes the ten that hold values still do not fit beside one row,
+/// so the reply keeps the longest prefix of them, in stored order, with
+/// which a row prints, and one more column would print none.
+#[test]
+fn wide_result_omits_null_columns_then_a_suffix() {
+    let page = sparse_page(wide_cell);
+    let nulls = (0..WIDE_COLUMNS)
+        .filter(|&index| page.rows.iter().all(|row| row[index] == Value::Null))
+        .count();
+    assert_eq!(nulls, WIDE_COLUMNS - NON_NULL.len());
+    let mut cut_at_4096 = None;
+    for max_bytes in [4096_u32, 16_384, 32_768] {
+        let label = format!("max_bytes={max_bytes}");
+        let result = render::search(wide_reply(&page), Budget::new(Some(max_bytes)), ROWS);
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "{label}: {}",
+            text_of(&result)
+        );
+        assert!(used_bytes(&result) <= max_bytes as usize, "{label}");
+        let mirror = result.structured_content.as_ref().unwrap();
+        let view = &mirror["result"];
+        let rows = view["rows"].as_array().unwrap().len();
+        assert!(rows >= 1, "{label}: {}", text_of(&result));
+        let printed = printed_columns(&result, &page);
+        // The printed columns are a prefix of the non-null ones: the
+        // duplicate name's null column is gone, its non-null twin is not.
+        assert!(!printed.is_empty(), "{label}");
+        assert_eq!(printed, NON_NULL[..printed.len()], "{label}");
+        let omitted = 1 + WIDE_COLUMNS - printed.len();
+        assert_eq!(
+            view["presentation"]["columns_omitted"],
+            json!(omitted),
+            "{label}"
+        );
+        assert_eq!(
+            view["presentation"]["null_columns_omitted"],
+            json!(nulls),
+            "{label}"
+        );
+        // The column holding a value only in the last row stays printed
+        // where the budget dropped that row.
+        assert_eq!(printed[0], NON_NULL[0], "{label}");
+        if max_bytes < 32_768 {
+            assert!(rows < WIDE_ROWS, "{label}: the last row is dropped");
+        }
+        let text = text_of(&result);
+        assert!(
+            text.contains(&format!(
+                "omits {omitted} columns ({nulls} null in every row read); fields source=result \
+                 describes them;"
+            )),
+            "{label}: {text}"
+        );
+        // Hostile names print escaped, as JSON strings, in the text block.
+        assert!(
+            !text
+                .chars()
+                .any(|c| c != '\n' && trawl_core::sanitize::is_unsafe_display_char(c)),
+            "{label}"
+        );
+        let columns = text
+            .lines()
+            .find(|line| line.starts_with("columns (position name type): "))
+            .unwrap();
+        for &index in &printed {
+            let listed = format!(
+                "{} {} string",
+                index + 1,
+                json_text(&page.columns[index].name)
+            );
+            assert!(columns.contains(&listed), "{label}: {listed} in {columns}");
+        }
+        if max_bytes == 4096 {
+            cut_at_4096 = Some(printed.len());
+        } else {
+            assert_eq!(printed.len(), NON_NULL.len(), "{label}");
+        }
+    }
+
+    // At 4096 the suffix was cut: one more column of the non-null prefix
+    // prints no row. The same page with every later non-null column null
+    // offers that prefix whole, and the reply still cuts it.
+    let kept = cut_at_4096.unwrap();
+    assert!(kept < NON_NULL.len(), "4096 bytes cut a suffix");
+    let longer = &NON_NULL[..=kept];
+    let narrowed = sparse_page(|row, index| {
+        if longer.contains(&index) {
+            wide_cell(row, index)
+        } else {
+            Value::Null
+        }
+    });
+    let result = render::search(wide_reply(&narrowed), Budget::MIN, ROWS);
+    assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+    let printed = printed_columns(&result, &narrowed);
+    assert!(printed.len() < longer.len(), "{printed:?}");
+    assert!(
+        !result.structured_content.as_ref().unwrap()["result"]["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// #373: a page that read no row omits no column for being null: every
+/// column is null in zero rows, which says nothing of its cells. The reply
+/// drops its other parts to fit, and a page too wide to fit is refused
+/// rather than cut.
+#[test]
+fn an_empty_page_omits_no_null_column() {
+    let page = QueryResult {
+        columns: (0..5)
+            .map(|i| ApiColumn::new(format!("c{i}"), ColumnType::String))
+            .collect(),
+        rows: vec![],
+    };
+    let mut reply = reply_over(&page, 0);
+    let view = reply.result.as_mut().unwrap();
+    view.facets = (0..3)
+        .map(|f| Facet {
+            field: format!("f{f}"),
+            values: (0..5)
+                .map(|v| FacetValue {
+                    value: json!(format!("{v}{}", "v".repeat(120))),
+                    count: 1,
+                })
+                .collect(),
+            captured_rows: 0,
+        })
+        .collect();
+    view.executed_query = "q".repeat(900);
+    let result = render::search(reply, Budget::MIN, ROWS);
+    assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+    assert!(used_bytes(&result) <= Budget::MIN.bytes());
+    let view = &result.structured_content.as_ref().unwrap()["result"];
+    assert_eq!(view["presentation"]["facets_dropped_to_fit"], json!(true));
+    assert_eq!(view["columns"].as_array().unwrap().len(), 5);
+    assert_eq!(view["presentation"]["columns_omitted"], json!(0));
+    assert!(
+        view["presentation"].get("null_columns_omitted").is_none(),
+        "{view}"
+    );
+    let text = text_of(&result);
+    assert!(!text.contains("null in every row read"), "{text}");
+    assert!(!text.contains("describes them"), "{text}");
+
+    let wide = sparse_page(|_, _| Value::Null);
+    let wide = QueryResult {
+        rows: vec![],
+        ..wide
+    };
+    let result = render::search(wide_reply(&wide), Budget::HARD, ROWS);
+    assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
 }
 
 #[test]
@@ -1196,10 +1472,47 @@ proptest! {
         let rows = mirror["result"]["rows"].as_array().unwrap();
         prop_assert!(rows.len() <= 200);
         let abbreviated = mirror["result"]["abbreviated"].as_array().unwrap();
+        // The printed columns keep their captured positions, in stored
+        // order. A column the fitting left out is null in every row read,
+        // or comes after the last printed column; the counts say so.
+        let positions = mirror["result"]["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|column| usize::try_from(column["position"].as_u64().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        prop_assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{:?}", positions);
+        let null_in_every_row = |c: usize| page.rows.iter().all(|row| row[c] == Value::Null);
+        for c in (0..page.columns.len()).filter(|c| !positions.contains(c)) {
+            prop_assert!(
+                null_in_every_row(c) || positions.last().is_some_and(|&last| c > last),
+                "column {} is omitted from {:?}",
+                c,
+                positions
+            );
+        }
+        let presentation = &mirror["result"]["presentation"];
+        prop_assert_eq!(
+            presentation["columns_omitted"].as_u64(),
+            Some((page.columns.len() - positions.len()) as u64)
+        );
+        let null_omitted = (0..page.columns.len())
+            .filter(|&c| !positions.contains(&c) && null_in_every_row(c))
+            .count() as u64;
+        prop_assert_eq!(
+            presentation.get("null_columns_omitted").and_then(Json::as_u64).unwrap_or(0),
+            null_omitted
+        );
+        for entry in abbreviated {
+            let column = usize::try_from(entry["column"].as_u64().unwrap()).unwrap();
+            prop_assert!(positions.contains(&column), "{}", entry);
+        }
         for (r, printed) in rows.iter().enumerate() {
-            for (c, (column, value)) in page.columns.iter().zip(&page.rows[r]).enumerate() {
+            let printed = printed.as_array().unwrap();
+            prop_assert_eq!(printed.len(), positions.len());
+            for (shown, &c) in printed.iter().zip(&positions) {
+                let (column, value) = (&page.columns[c], &page.rows[r][c]);
                 let wire = wire_cell_text(&column.name, &column.ty, value).unwrap();
-                let shown = &printed[c];
                 if wire.len() > ABBREVIATE_OVER_BYTES {
                     let text = shown.as_str().unwrap();
                     let marker = format!("read action=cell row={r} column={c}]");
