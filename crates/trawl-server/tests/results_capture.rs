@@ -571,6 +571,7 @@ async fn query(server: &TestServer, dsl: &str) -> trawl_api::value::QueryResult 
             query: dsl.to_owned(),
             limit: Some(10_000),
             offset: None,
+            histogram: false,
         })
         .send()
         .await

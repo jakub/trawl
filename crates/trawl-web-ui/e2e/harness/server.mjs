@@ -512,10 +512,16 @@ function hasCorpus() {
 const aggregate = { buckets: 12, groups: 5, hosts: 2, total: null };
 
 // Only the pagination scenario uses these counts and held reads.
+// `holdQueryNumber` is one query number or a list of them: each of those
+// queries waits in `heldQueries` until `/__ctl/pagination/query-release`.
+// `histogramFixtures` is a list of `[substring, wire name]` pairs: a query
+// whose text contains the substring is answered from that fixture, its
+// rows cut to the requested window and its `pagination.total` and canned
+// `histogram` kept. The first pair that matches wins.
 const pagination = {
   historyTotal: 103, runsTotal: 3, queryTotal: 53,
   holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
-  holdQueryNumber: null, heldQuery: null,
+  holdQueryNumber: null, heldQueries: [], histogramFixtures: [],
 };
 function paginationSlice(total, offset, limit, row) {
   return Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, i) => row(offset + i));
@@ -531,8 +537,24 @@ function paginationRuns(offset, limit) {
   return { total: pagination.runsTotal, runs: paginationSlice(pagination.runsTotal, offset, limit,
     i => ({ ...source.runs[i % source.runs.length], id: 501 + i })) };
 }
+/** A raw query's canned `histogram` goes back only to a request that
+ * asked for it, the way trawld answers. The stub counts nothing: the
+ * fixture's histogram is the answer, whatever rows go with it. */
+function histogramAsked(request, body) {
+  if (request.histogram !== true) delete body.histogram;
+  return body;
+}
 function paginationQuery(offset, limit, query) {
+  const match = pagination.histogramFixtures.find(([needle]) => query.includes(needle));
+  if (match) {
+    const fixture = wire(match[1]);
+    fixture.rows = fixture.rows.slice(offset, offset + limit);
+    fixture.pagination = { offset, limit, returned: fixture.rows.length, total: fixture.pagination.total };
+    return fixture;
+  }
   const response = wire('query-rows');
+  // Its canned histogram counts its own eight rows, not these.
+  delete response.histogram;
   response.rows = typedResult(response.columns, paginationSlice(pagination.queryTotal, offset, limit,
     i => [response.rows[0][0], 'web-01', 200, `query-row-${i + 1} ${query}`])).rows;
   // `total` is what the execution produced, measured before the window
@@ -600,11 +622,11 @@ let unhandledQueries = [];
 
 function resetState() {
   if (pagination.held) pagination.held.res.destroy();
-  if (pagination.heldQuery) pagination.heldQuery.res.destroy();
+  for (const held of pagination.heldQueries) held.res.destroy();
   Object.assign(pagination, {
     historyTotal: 103, runsTotal: 3, queryTotal: 53,
     holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
-    holdQueryNumber: null, heldQuery: null,
+    holdQueryNumber: null, heldQueries: [], histogramFixtures: [],
   });
   Object.assign(aggregate, { buckets: 12, groups: 5, hosts: 2, total: null });
   healthHits = {};
@@ -818,7 +840,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       scenario = parsed.scenario || 'default';
       resetState();
       if (scenario === 'pagination' && parsed.pagination) {
-        for (const key of ['historyTotal', 'runsTotal', 'queryTotal', 'holdHistoryOffset', 'holdQueryNumber']) {
+        for (const key of ['historyTotal', 'runsTotal', 'queryTotal', 'holdHistoryOffset', 'holdQueryNumber', 'histogramFixtures']) {
           if (key in parsed.pagination) pagination[key] = parsed.pagination[key];
         }
       }
@@ -867,7 +889,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           terminalPending: dashboard.terminalPending.size,
         },
         pagination: { history: pagination.history, runs: pagination.runs,
-          held: pagination.held !== null, queryHeld: pagination.heldQuery !== null, completed: pagination.completed },
+          held: pagination.held !== null, queryHeld: pagination.heldQueries.length > 0,
+          heldQueryNumbers: pagination.heldQueries.map(held => held.number), completed: pagination.completed },
         healthHits,
         history: { offsets: history.offsets, requests: history.requests, deletes: history.deletes, pending: !!history.pending,
           loadPending: history.loadPending.length > 0, pendingRequests: history.loadPending.map(({ id, filter, offset, limit }) => ({ id, filter, offset, limit })) },
@@ -995,14 +1018,22 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, { ok: true });
       return;
     }
+    // Answers the oldest held query, or the one `number` names. A
+    // `status` other than 200 answers it with the stub's query failure.
     if (p === '/__ctl/pagination/query-release' && req.method === 'POST') {
-      const held = pagination.heldQuery;
+      const text = await readBody(req);
+      let options = {};
+      try { options = text ? JSON.parse(text) : {}; } catch { /* release the oldest */ }
+      const index = options.number == null ? 0
+        : pagination.heldQueries.findIndex(held => held.number === options.number);
+      const held = index < 0 ? undefined : pagination.heldQueries[index];
       if (scenario !== 'pagination' || !held || held.res.destroyed) {
         sendJson(res, 409, { ok: false });
         return;
       }
-      pagination.heldQuery = null;
-      sendJson(held.res, 200, held.body);
+      pagination.heldQueries.splice(index, 1);
+      const status = options.status ?? 200;
+      sendJson(held.res, status, status === 200 ? held.body : errorEnvelope('stub query failure'));
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -1326,9 +1357,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       queries.push(parsedBody);
       if (scenario === 'pagination') {
-        const body = paginationQuery(parsedBody.offset ?? 0, parsedBody.limit ?? 50, parsedBody.query ?? '');
-        if (queries.length === pagination.holdQueryNumber) {
-          pagination.heldQuery = { res, body };
+        const body = histogramAsked(parsedBody,
+          paginationQuery(parsedBody.offset ?? 0, parsedBody.limit ?? 50, parsedBody.query ?? ''));
+        if ([pagination.holdQueryNumber].flat().includes(queries.length)) {
+          pagination.heldQueries.push({ number: queries.length, res, body });
           return;
         }
         sendJson(res, 200, body);
@@ -1410,7 +1442,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           sendJson(res, 500, errorEnvelope(`no corpus fixture for this pipeline shape: ${dsl}`));
           return;
         }
-        sendJson(res, 200, corpusQueryRowsResponse());
+        sendJson(res, 200, histogramAsked(parsedBody, corpusQueryRowsResponse()));
         return;
       }
       if (investigation.search) {
@@ -1794,9 +1826,9 @@ function shutdown() {
   // A parked pagination read has not written headers, so close() waits
   // for its socket unless teardown destroys it explicitly.
   if (pagination.held) pagination.held.res.destroy();
-  if (pagination.heldQuery) pagination.heldQuery.res.destroy();
+  for (const held of pagination.heldQueries) held.res.destroy();
   pagination.held = null;
-  pagination.heldQuery = null;
+  pagination.heldQueries = [];
   for (const res of dashboard.responses) res.end();
   for (const res of dashboard.pending) res.destroy();
   for (const res of dashboard.terminalPending) res.destroy();

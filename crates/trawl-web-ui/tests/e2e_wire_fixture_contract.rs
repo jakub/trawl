@@ -163,6 +163,10 @@ mod drawer_query;
 #[path = "../src/histogram.rs"]
 mod histogram;
 
+/// The exact-count formatter `histogram` prints its counts with.
+#[path = "../src/service_card_fmt.rs"]
+mod service_card_fmt;
+
 /// The rows every `corpus` spec reads. Their CONTENT is the contract: a
 /// spec asserts on a host name, counts facet values, and tells one sort
 /// order from another by the first row, so a re-shuffled fixture would
@@ -2524,4 +2528,149 @@ fn the_capabilities_fixture_is_the_wire_type_at_the_capture_defaults() {
         )),
         "the stub pages captured results by the size it advertises"
     );
+}
+
+/// Every canned `histogram` the stub and the specs serve decodes as part
+/// of a `QueryResponse` and meets the invariants against that response's
+/// `pagination.total`, the check the strip makes before it draws. The
+/// stub counts nothing, so a fixture whose count could not come from
+/// trawld would test a strip trawld never sends.
+///
+/// A fixture that carries its whole result (`total` equal to its rows) is
+/// also counted again here by the server's rule: integer microsecond
+/// bins of `ceil(max(1 s, max - min + 1 µs) / 48)` from the earliest
+/// usable `_time`, errors at `_severity` 17 or above. So the batch5
+/// tooltip tests and the paged spec read bins their own rows land in.
+#[test]
+fn every_canned_histogram_meets_its_invariants() {
+    use trawl_api::EventHistogram;
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("e2e/harness/wire");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the wire directory")
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter_map(|file| file.strip_suffix(".json").map(str::to_owned))
+        .collect();
+    names.sort();
+
+    let mut checked = Vec::new();
+    for name in &names {
+        let text = std::fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if body.get("histogram").is_none() {
+            continue;
+        }
+        let response: QueryResponse = decode(&format!("{name}.json"), &text);
+        let histogram = response
+            .histogram
+            .as_ref()
+            .expect("a histogram key decodes");
+        let total = response.pagination.total;
+        assert!(
+            histogram.consistent_with(total),
+            "{name}.json: its histogram cannot describe a result of {total} rows"
+        );
+        // A fixture counts what JSON.parse in the stub reads back exactly.
+        if let EventHistogram::Ready {
+            buckets, undated, ..
+        } = histogram
+        {
+            for count in buckets
+                .iter()
+                .flat_map(|b| [b.events, b.errors])
+                .chain([*undated])
+            {
+                assert!(
+                    count < 1 << 53,
+                    "{name}.json: {count} is past the JS safe range"
+                );
+            }
+        }
+        checked.push(name.as_str());
+
+        let EventHistogram::Ready { kept_some, .. } = histogram else {
+            continue;
+        };
+        if total != response.result.rows.len() {
+            continue;
+        }
+        let recounted = recount(&response, *kept_some);
+        assert_eq!(
+            histogram, &recounted,
+            "{name}.json: its histogram is not the count of its own rows"
+        );
+    }
+    for expected in [
+        "query-histogram-empty",
+        "query-histogram-kept",
+        "query-histogram-no-time-column",
+        "query-histogram-no-usable-time",
+        "query-histogram-paged",
+        "query-histogram-sample",
+        "query-histogram-stored-result",
+        "query-histogram-subsecond",
+        "query-histogram-three-errors",
+        "query-histogram-two-errors",
+        "query-rows",
+    ] {
+        assert!(
+            checked.contains(&expected),
+            "{expected}.json carries no histogram"
+        );
+    }
+}
+
+/// A ready histogram counted from `response`'s own rows by trawld's rule.
+fn recount(response: &QueryResponse, kept_some: bool) -> trawl_api::EventHistogram {
+    use trawl_api::value::Value;
+    use trawl_api::{EventHistogram, HISTOGRAM_BUCKETS, HistogramBucket, zone};
+
+    let utc = chrono::FixedOffset::east_opt(0).expect("UTC");
+    let column = |wanted: &str| {
+        response
+            .result
+            .columns
+            .iter()
+            .position(|c| c.name == wanted)
+    };
+    let time = column("_time").expect("a ready histogram reads _time");
+    let severity = column("_severity");
+    let times: Vec<Option<i64>> = response
+        .result
+        .rows
+        .iter()
+        .map(|row| match &row[time] {
+            Value::String(text) => zone::wire_micros(text),
+            _ => None,
+        })
+        .collect();
+    let (min, max) = (
+        times.iter().flatten().min().copied().expect("a dated row"),
+        times.iter().flatten().max().copied().expect("a dated row"),
+    );
+    let bins = i64::try_from(HISTOGRAM_BUCKETS).unwrap();
+    let width = (1_000_000_i64.max(max - min + 1) + bins - 1) / bins;
+    let mut counted = vec![
+        HistogramBucket {
+            events: 0,
+            errors: 0
+        };
+        HISTOGRAM_BUCKETS
+    ];
+    for (row, at) in response.result.rows.iter().zip(&times) {
+        let Some(at) = at else { continue };
+        let bin = &mut counted[usize::try_from((at - min) / width).unwrap()];
+        bin.events += 1;
+        if severity.is_some_and(|i| matches!(row[i], Value::Integer(n) if n >= 17)) {
+            bin.errors += 1;
+        }
+    }
+    EventHistogram::Ready {
+        start: zone::wire_timestamp(min, utc),
+        end: zone::wire_timestamp(min + bins * width, utc),
+        buckets: counted,
+        undated: times.iter().filter(|t| t.is_none()).count() as u64,
+        severity: severity.is_some(),
+        kept_some,
+    }
 }

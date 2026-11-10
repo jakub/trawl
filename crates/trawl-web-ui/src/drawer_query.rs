@@ -270,6 +270,7 @@ mod tests {
             },
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),
+            histogram: None,
         }
     }
 

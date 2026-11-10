@@ -2,31 +2,37 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Histogram/>` — 80px strip rendering a stacked ok/err bar chart
-//! over the current page's results.
+//! `<Histogram/>` — 80px strip rendering a stacked ok/err bar chart of
+//! every event in the result, above the snapshot table of a raw-event
+//! query.
+//!
+//! The strip's input is the count trawld answers in the same response as
+//! the page (`QueryResponse::histogram`): 48 half-open UTC bins from the
+//! first usable `_time` of the whole result to past its last, with each
+//! bin's errors (`_severity` at 17 or above, ADR-0013 §9). The browser
+//! never buckets rows. Each page shows its own execution's count, so a
+//! page turn redraws the strip from the response that answered it.
+//!
+//! What it shows, in order:
+//!
+//! 1. While the page's request is pending (the page's whole `loading`
+//!    test, not only the transport flag), the shared loading hint, with no
+//!    bars and no caption. A retained earlier response is never drawn.
+//! 2. A failed request: the quiet `—`. The results table reports it.
+//! 3. A result with no rows collapses the strip; the table says so.
+//! 4. Otherwise `crate::histogram::strip` decides: no histogram is the
+//!    `—`, an unavailable one says why, a ready one that breaks an
+//!    invariant is the `—`, and anything else draws.
 //!
 //! A drawn chart carries a one-line key above the bars: what they count
-//! (this page's events), how long one bucket is (the `Series` width,
-//! never the query range), that the axis labels are UTC, and what the
-//! two colours mean. Its copy restates `build_series` and the error test
-//! below, so it changes when they do.
+//! (every event in the result, and those without a usable time), how long
+//! one bucket is, that the bins are UTC, and what the colours mean. A
+//! result without `_severity` gets one swatch. When the query kept only
+//! some events (`head`, `tail`, `dedup`), a second line says so, and the
+//! strip grows by that line. `crate::histogram` builds every string.
 //!
-//! Time bucketing leans on `crate::histogram::bucketize_series`, which
-//! also carries the bounds the bars were laid out over: the axis
-//! labels and the bar tooltips measure
-//! from that one `Series`, so none of them can disagree about where a
-//! bucket starts. Timestamps come from a `_time` / `time` / `timestamp`
-//! / `@timestamp` column; with none of them there is nothing to bucket
-//! and the strip says so. A settled page with no rows at all collapses
-//! the strip instead: the results table below already says the page is
-//! empty, and a blank band above it would only push that notice down.
-//!
-//! "is error" is `_severity >= 17` (the `OTel` error band and above,
-//! ADR-0013 §9); a page carrying no `_severity` column draws every bar
-//! as ok.
-//!
-//! The x axis reads real timestamps off the data: round UTC clock times
-//! inside the bucketed extent, each placed at its own position
+//! The x axis reads the bins' integer bounds: round UTC clock times
+//! inside the series, each placed at its own position
 //! (`crate::histogram::clock_ticks`). The tick step depends on how wide
 //! the axis is, so the axis width is measured after the bars render and
 //! whenever the strip resizes, and only the axis re-renders when it
@@ -43,17 +49,15 @@
 
 use fleet_ui::{LoadState, Loaded};
 use leptos::prelude::*;
-use trawl_api::QueryResponse;
-use trawl_api::value::Value;
 
 use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
 
 use crate::histogram::{
-    Series, TickAlign, bucket_time, bucket_width_label, bucketize_series, clock_ticks, tip_shift,
+    Drawn, ERROR_KEY, NO_SEVERITY_KEY, OTHER_KEY, Series, Strip, TickAlign, clock_ticks, pct,
+    scale_top, strip as strip_for, tip_shift,
 };
-
-const N_BUCKETS: usize = 48;
+use crate::state::search_session::{ExecutedFailure, ExecutedResponse};
 
 /// Pixels a shifted tip keeps clear of each strip edge. Offsets are whole
 /// pixels but the flex layout is fractional: the bar's left and width,
@@ -64,12 +68,11 @@ const TIP_EDGE: i32 = 3;
 
 #[component]
 pub fn Histogram(
-    rows: LocalResource<
-        Result<
-            crate::state::search_session::ExecutedResponse,
-            crate::state::search_session::ExecutedFailure,
-        >,
-    >,
+    rows: LocalResource<Result<ExecutedResponse, ExecutedFailure>>,
+    /// The page's `loading` test: true until the response on screen
+    /// answers the request the page shows.
+    #[prop(into)]
+    pending: Signal<bool>,
 ) -> impl IntoView {
     let strip = NodeRef::<leptos::html::Div>::new();
     // The x axis's measured width in pixels; `None` until it is laid out.
@@ -83,106 +86,134 @@ pub fn Histogram(
             measure_axis(&strip, axis_width);
         }
     });
+    // One state for the render branch and both classes, so they can
+    // never disagree: pending wins before the retained response is read,
+    // so an earlier response, an empty one included, is never drawn.
+    let state = Memo::new(move |_| {
+        if pending.get() {
+            return LoadState::Loading;
+        }
+        rows.with(|r| match r {
+            None => LoadState::Loading,
+            Some(Err(failure)) => LoadState::Error(failure.to_string()),
+            Some(Ok(resp)) => {
+                LoadState::Ready(strip_for(resp.pagination.total, resp.histogram.as_ref()))
+            }
+        })
+    });
     view! {
         <div
             class="histo"
-            // Only a settled, row-less response collapses the strip; a
-            // pending, failed or never-run search keeps its band.
-            class:histo-empty=move || {
-                rows.with(|r| matches!(r, Some(Ok(resp)) if resp.result.rows.is_empty()))
+            // Only an accepted, empty result collapses the strip; a
+            // pending, failed or never-run search keeps its band, and a
+            // page past the end of a non-empty result keeps its bars.
+            class:histo-empty=move || state.with(|s| matches!(s, LoadState::Ready(Strip::Collapsed)))
+            class:histo-kept=move || {
+                state.with(|s| {
+                    matches!(s, LoadState::Ready(Strip::Drawn(Drawn { kept_some: Some(_), .. })))
+                })
             }
             node_ref=strip
         >
             <Loaded
-                state=Signal::derive(move || LoadState::from_resource(rows.get()))
+                state=state
                 // Deliberate quiet-error override: the results table
                 // already reports the query failure.
                 error=Box::new(|_| view! { <div class="histo-hint">"—"</div> }.into_any())
-                render=Box::new(move |resp: crate::state::search_session::ExecutedResponse| {
-                    // A page with no rows draws nothing: the strip is
-                    // collapsed and the table carries the empty notice.
-                    if resp.result.rows.is_empty() {
-                        return ().into_any();
-                    }
-                    let Some(series) = build_series(&resp) else {
-                        return view! {
-                            <div class="histo-hint">"No usable timestamps in shown events."</div>
-                        }.into_any();
-                    };
-                    let max = series.buckets.iter().map(|b| b.ok + b.err).max().unwrap_or(1).max(1);
-                    let top = scale_top(max);
-                    let axis_series = series.clone();
-                    let width = series.bucket_width();
-                    let min = series.min_secs;
-                    let scope = format!(
-                        "Events on this page · {} per bucket · UTC",
-                        bucket_width_label(width)
-                    );
-                    // New buckets or labels replace every bar, and the
-                    // strip keeps its size, so the observer stays quiet.
-                    // Place the new tips and measure the new axis once
-                    // they are laid out. Nothing
-                    // cancels the frame, and switching tab or leaving the
-                    // page can dispose the strip before it runs; a
-                    // disposed ref reads as `None` and the frame does
-                    // nothing.
-                    request_animation_frame(move || {
-                        if let Some(strip) = strip.try_get_untracked().flatten() {
-                            place_all_tips(&strip);
-                            measure_axis(&strip, axis_width);
-                        }
-                    });
-                    view! {
-                        <div class="histo-key">
-                            <span class="histo-scope">{scope}</span>
-                            <span class="histo-swatch">
-                                <span class="ok" aria-hidden="true"></span>
-                                "Other"
-                            </span>
-                            <span class="histo-swatch">
-                                <span class="err" aria-hidden="true"></span>
-                                "Error or fatal"
-                            </span>
-                        </div>
-                        <div class="yax">
-                            <span class="y-top">{top}</span>
-                            {(top >= 2).then(|| view! { <span class="y-mid">{top / 2}</span> })}
-                            <span class="y-zero">"0"</span>
-                        </div>
-                        <div class="bars">
-                            {series.buckets.into_iter().enumerate().map(|(i, b)| {
-                                let total = b.ok + b.err;
-                                let ok_h = pct(b.ok, top);
-                                let err_h = pct(b.err, top);
-                                let start = bucket_start(min, width, i);
-                                let tip = format!(
-                                    "{} – {} · {total} events{}",
-                                    bucket_time(start, false),
-                                    bucket_time(start + width, true),
-                                    if b.err > 0 { format!(" · {} errors", b.err) } else { String::new() }
-                                );
-                                view! {
-                                    <div
-                                        class="bar"
-                                        tabindex="0"
-                                        role="img"
-                                        aria-label=tip
-                                        on:mouseenter=move |ev| place_tip(&ev)
-                                        on:focus=move |ev| place_tip(&ev)
-                                    >
-                                        <div class="tip" aria-hidden="true">{tip.clone()}</div>
-                                        <div class="ok" style=format!("height:{ok_h:.1}%")></div>
-                                        <div class="err" style=format!("height:{err_h:.1}%")></div>
-                                    </div>
-                                }
-                            }).collect::<Vec<_>>()}
-                        </div>
-                        <div class="xax">
-                            {move || axis_width.get().map(|width| axis_ticks(&axis_series, width))}
-                        </div>
-                    }.into_any()
+                render=Box::new(move |view: Strip| match view {
+                    Strip::Collapsed => ().into_any(),
+                    Strip::Dash => view! { <div class="histo-hint">"—"</div> }.into_any(),
+                    Strip::Reason(copy) => view! { <div class="histo-hint">{copy}</div> }.into_any(),
+                    Strip::Drawn(drawn) => bars(drawn, strip, axis_width).into_any(),
                 })
             />
+        </div>
+    }
+}
+
+/// The key, the scale, the bars and the axis of a drawn strip.
+fn bars(
+    drawn: Drawn,
+    strip: NodeRef<leptos::html::Div>,
+    axis_width: RwSignal<Option<f64>>,
+) -> impl IntoView {
+    let Drawn {
+        series,
+        caption,
+        severity,
+        kept_some,
+    } = drawn;
+    let top = scale_top(series.tallest());
+    let axis_series = series.clone();
+    // New buckets or labels replace every bar, and the strip keeps its
+    // size, so the observer stays quiet. Place the new tips and measure
+    // the new axis once they are laid out. Nothing cancels the frame, and
+    // switching tab or leaving the page can dispose the strip before it
+    // runs; a disposed ref reads as `None` and the frame does nothing.
+    request_animation_frame(move || {
+        if let Some(strip) = strip.try_get_untracked().flatten() {
+            place_all_tips(&strip);
+            measure_axis(&strip, axis_width);
+        }
+    });
+    let key = if severity {
+        view! {
+            <span class="histo-swatch">
+                <span class="ok" aria-hidden="true"></span>
+                {OTHER_KEY}
+            </span>
+            <span class="histo-swatch">
+                <span class="err" aria-hidden="true"></span>
+                {ERROR_KEY}
+            </span>
+        }
+        .into_any()
+    } else {
+        view! {
+            <span class="histo-swatch">
+                <span class="ok" aria-hidden="true"></span>
+                {NO_SEVERITY_KEY}
+            </span>
+        }
+        .into_any()
+    };
+    let bars = (0..series.buckets.len())
+        .map(|i| {
+            let b = series.buckets[i];
+            let ok_h = pct(b.ok, top);
+            let err_h = pct(b.err, top);
+            let tip = series.tip(i);
+            let label = tip.clone();
+            view! {
+                <div
+                    class="bar"
+                    tabindex="0"
+                    role="img"
+                    aria-label=label
+                    on:mouseenter=move |ev| place_tip(&ev)
+                    on:focus=move |ev| place_tip(&ev)
+                >
+                    <div class="tip" aria-hidden="true">{tip}</div>
+                    <div class="ok" style=format!("height:{ok_h:.1}%")></div>
+                    <div class="err" style=format!("height:{err_h:.1}%")></div>
+                </div>
+            }
+        })
+        .collect::<Vec<_>>();
+    view! {
+        <div class="histo-key">
+            <span class="histo-scope">{caption}</span>
+            {key}
+        </div>
+        {kept_some.map(|line| view! { <div class="histo-note">{line}</div> })}
+        <div class="yax">
+            <span class="y-top">{top}</span>
+            {(top >= 2).then(|| view! { <span class="y-mid">{top / 2}</span> })}
+            <span class="y-zero">"0"</span>
+        </div>
+        <div class="bars">{bars}</div>
+        <div class="xax">
+            {move || axis_width.get().map(|width| axis_ticks(&axis_series, width))}
         </div>
     }
 }
@@ -295,65 +326,4 @@ fn place_bar_tip(bar: &HtmlElement, strip: &web_sys::Element) {
         room,
     );
     let _ = style.set_property("--tip-shift", &format!("{shift}px"));
-}
-
-#[allow(clippy::cast_precision_loss)] // bucket index is at most N_BUCKETS
-fn bucket_start(min_secs: f64, width: f64, index: usize) -> f64 {
-    min_secs + width * index as f64
-}
-
-fn build_series(resp: &QueryResponse) -> Option<Series> {
-    let cols = &resp.result.columns;
-    let time_idx = cols.iter().position(|c| {
-        matches!(
-            c.name.as_str(),
-            "_time" | "time" | "timestamp" | "@timestamp"
-        )
-    });
-    // `_severity` only (ADR-0013 §9): the derived slot nothing can
-    // shadow. A bare `severity` column is ordinary sender data.
-    let severity_idx = crate::severity_cell::severity_column(cols.iter().map(|c| c.name.as_str()));
-    let ti = time_idx?;
-
-    let mut events = Vec::with_capacity(resp.result.rows.len());
-    for row in &resp.result.rows {
-        let Some(t) = row.get(ti).and_then(value_to_seconds) else {
-            continue;
-        };
-        let is_err = crate::severity_cell::row_is_error(row, severity_idx);
-        if t.is_finite() {
-            events.push((t, is_err));
-        }
-    }
-    bucketize_series(&events, N_BUCKETS)
-}
-
-#[allow(clippy::cast_precision_loss)] // bucket math tolerates 52-bit precision
-fn value_to_seconds(v: &Value) -> Option<f64> {
-    match v {
-        Value::Integer(n) => Some(*n as f64),
-        Value::UInt(u) => Some(*u as f64),
-        Value::Float(f) => Some(*f),
-        Value::String(s) => {
-            // Accept seconds as a numeric string, or an RFC3339-ish
-            // timestamp parseable by chrono.
-            if let Ok(n) = s.parse::<f64>() {
-                return Some(n);
-            }
-            fleet_ui::time::parse_timestamp(s).map(|dt| {
-                dt.timestamp() as f64 + f64::from(dt.timestamp_subsec_nanos()) / 1_000_000_000.0
-            })
-        }
-        _ => None,
-    }
-}
-
-/// The y scale's top: the tallest bar rounded up to an even count, so
-/// the label on the midpoint gridline is a whole number of events.
-fn scale_top(max: u32) -> u32 {
-    if max <= 1 { 1 } else { max + max % 2 }
-}
-
-fn pct(n: u32, max: u32) -> f64 {
-    (f64::from(n) / f64::from(max)) * 100.0
 }

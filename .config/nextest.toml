@@ -63,7 +63,7 @@ filter = '''
     | binary(gc_pins) | binary(hot_query) | binary(http_api)
     | binary(ingest_publication) | binary(repin) | binary(store_pg) | binary(schema_pg) | binary(startup_pg)
     | binary(scheduler_windows) | binary(span_context) | binary(http_failure) | binary(timestamp_repair) | binary(unavailable_run_result)
-    | binary(admission_stall) | binary(ingest_admission) | binary(ingest_repair_logging) | binary(restart_overhang) | binary(query_timing_roundtrip)
+    | binary(admission_stall) | binary(ingest_admission) | binary(ingest_repair_logging) | binary(restart_overhang) | binary(query_timing_roundtrip) | binary(query_histogram)
     | binary(results_store_pg) | binary(investigations_store_pg) | binary(/^investigations_(api|attach|evidence|retention)$/) | binary(results_sweep) | binary(results_capture) | binary(results_read)
     | binary(results_cap) | binary(results_stable) | binary(results_lifecycle) | binary(results_admission) | binary(results_abort)
     | binary(results_context) | binary(results_sightings) | binary(results_compare)
