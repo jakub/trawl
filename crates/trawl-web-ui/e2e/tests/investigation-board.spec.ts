@@ -707,6 +707,13 @@ test('a 403 stop removes every read control and sends no read', async ({ page, r
   for (const name of ['Refresh', 'Refresh the board', 'Load more entries']) {
     await expect(page.getByRole('button', { name, exact: true, includeHidden: true }), name).toHaveCount(0);
   }
+  // Both notices stay, and neither names a control that is gone.
+  await expect(main.locator('.inv-write-note [role="status"]')).toHaveText(
+    "The answer to your close was lost, so it may or may not have taken effect. The board stopped reading, so reload the page to see the investigation's status.",
+  );
+  await expect(viewer.locator('.inv-write-note [role="status"]')).toHaveText(
+    'The answer to your keep of row 0 was lost, so it may or may not have been kept. The board stopped reading, so reload the page and look for it in the activity before you keep it again.',
+  );
   // Neither the tab showing again nor time passing reads it.
   await setHidden(page, true);
   await page.clock.fastForward(60_000);

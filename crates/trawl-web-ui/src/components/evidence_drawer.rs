@@ -116,13 +116,22 @@ enum KeepNote {
 }
 
 impl KeepNote {
-    fn text(&self) -> String {
+    /// The notice's words. `reading` is whether the board still reads: a
+    /// stopped board has no refresh to point at.
+    fn text(&self, reading: bool) -> String {
         match self {
             Self::Kept(row) => format!("Kept row {row}. The board shows it in the activity."),
-            Self::Unknown(row, _) => format!(
-                "The answer to your keep of row {row} was lost, so it may or may not have been \
-                 kept. Refresh the board and look for it in the activity before you keep it again."
-            ),
+            Self::Unknown(row, _) => {
+                let next = if reading {
+                    "Refresh the board"
+                } else {
+                    "The board stopped reading, so reload the page"
+                };
+                format!(
+                    "The answer to your keep of row {row} was lost, so it may or may not have \
+                     been kept. {next} and look for it in the activity before you keep it again."
+                )
+            }
             Self::Closed(row) => format!(
                 "The investigation was closed before your keep of row {row} reached it, so \
                  nothing was kept."
@@ -656,7 +665,7 @@ fn KeepForm(keeping: Keeping) -> impl IntoView {
     view! {
         {move || k.note.get().map(|note| view! {
             <div class="inv-write-note" class:inv-write-warn=!matches!(note, KeepNote::Kept(_))>
-                <p role="status">{note.text()}</p>
+                <p role="status">{note.text(k.gate.reading.get())}</p>
                 {(unknown() && k.gate.reading.get()).then(|| view! {
                     <Btn variant=Variant::Secondary size=Size::Xs on_click=k.gate.refresh>"Refresh the board"</Btn>
                 })}

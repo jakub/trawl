@@ -1583,11 +1583,18 @@ impl StatusNote {
                 };
                 format!("{what}, so nothing changed. {}{again}.", reread.sentence())
             }
-            Self::Unknown(target, _) => format!(
-                "The answer to your {} was lost, so it may or may not have taken effect. \
-                 Refresh to see the investigation's status before you act again.",
-                status_verb(*target)
-            ),
+            Self::Unknown(target, _) => {
+                // A stopped board has no Refresh to point at.
+                let next = if connection == Connection::Stopped {
+                    "The board stopped reading, so reload the page to see the investigation's status."
+                } else {
+                    "Refresh to see the investigation's status before you act again."
+                };
+                format!(
+                    "The answer to your {} was lost, so it may or may not have taken effect. {next}",
+                    status_verb(*target)
+                )
+            }
             Self::Refused(target, message) => {
                 format!(
                     "Could not {} the investigation. {message}",
