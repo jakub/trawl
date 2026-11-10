@@ -26,6 +26,7 @@
 #![allow(dead_code)] // each test binary uses a subset of these items
 
 pub mod mcp;
+pub mod tui;
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};

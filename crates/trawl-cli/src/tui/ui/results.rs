@@ -155,7 +155,7 @@ fn render_search_bar(
     let line = Line::from(vec![
         Span::styled("/", Style::default().fg(theme.search_match_active)),
         Span::styled(
-            format!("{}{cursor}", search.query),
+            format!("{}{cursor}", sanitize_display_text(&search.query)),
             Style::default().fg(theme.text_primary),
         ),
         Span::styled(match_info, Style::default().fg(theme.text_muted)),
@@ -573,7 +573,7 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     let dim = Style::default().fg(theme.text_muted);
     let client_version = trawl_core::version::PKG_VERSION;
-    let server_version = app.server_version.as_deref().unwrap_or("\u{2014}");
+    let server_version = sanitize_display_text(app.server_version.as_deref().unwrap_or("\u{2014}"));
 
     // Pad every label out to the longest one ("Command Palette", 15 chars)
     // so all the colons line up in one column. The block is then centered on
@@ -614,7 +614,7 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::from(Span::styled(label("Docs", "https://trawl.sh"), dim)),
         Line::from(""),
         Line::from(Span::styled(label("Client", client_version), dim)),
-        Line::from(Span::styled(label("Server", server_version), dim)),
+        Line::from(Span::styled(label("Server", &server_version), dim)),
     ];
 
     // Vertically center by prepending empty lines.
