@@ -1,0 +1,174 @@
+# Every line in non-test crates/trawl-server/src code that builds a String or an
+# error from an error with {e}, {err} or {error}, and where that text ends up.
+# These are sources, not log events: `enumerate.py --hits` lists them.
+# Line numbers describe commit:
+# sha: cb5ef2a2a7f613d5a61a8d54fd8aee2577348339
+# Classes:
+#   IO-ONLY     std::io::Error text that reaches an INFO-or-above retained event (the D2b rows, issue #413)
+#   REDACTED    reaches an INFO-or-above event only as error_class and cause_kind or fixed words; the text is at DEBUG
+#   NOT-LOGGED  reaches no tracing event (stderr at boot, an HTTP response, a stored row, or dropped)
+#   DEBUG-ONLY  reaches tracing at DEBUG or TRACE only
+# This is a record made by reading the code once. No script regenerates it.
+file	line	class	source	sink
+boot.rs	124	NOT-LOGGED	HydrateError (trawl's fixed text)	prepare_corpus Err, then main.rs:475 ?, then stderr
+boot.rs	126	NOT-LOGGED	NotStarting (trawl)	stderr at boot
+boot.rs	139	NOT-LOGGED	StoreError	stderr at boot
+boot.rs	161	NOT-LOGGED	StoreError	stderr at boot
+catalog/conform.rs	213	NOT-LOGGED	StoreError	hydrate, then ensure_conformance, then boot stderr
+catalog/conform.rs	266	NOT-LOGGED	StoreError	verify_archive_identity, then boot.rs:175, then stderr
+catalog/conform.rs	410	NOT-LOGGED	StoreError	boot stderr
+catalog/conform.rs	414	NOT-LOGGED	StoreError	boot stderr
+catalog/conform.rs	441	NOT-LOGGED	StoreError	boot stderr
+catalog/conform.rs	479	NOT-LOGGED	StoreError	boot stderr
+catalog/conform.rs	511	NOT-LOGGED	StoreError	boot stderr
+catalog/conform.rs	571	NOT-LOGGED	StoreError	publish_completion, then boot stderr
+catalog/conform.rs	690	NOT-LOGGED	io	publish_marker, then boot stderr
+catalog/conform.rs	706	REDACTED	duckdb	open_bounded_connection: boot stderr; repin build engine.rs:2815 to JobAbort::Failed to repin_abandoned WARN 1831 class/cause (text DEBUG and job row); repin scan plan.rs:104 to engine.rs:1166 to internal_error error.rs:1680
+catalog/conform.rs	711	REDACTED	duckdb	same as :706
+catalog/conform.rs	716	REDACTED	duckdb	same as :706
+catalog/conform.rs	718	REDACTED	duckdb	same as :706
+catalog/conform.rs	1293	REDACTED	io	StatementFailure::from(String, Unknown), then skip_failed, then catalog_conform_skip WARN 613 class/cause
+catalog/conform.rs	1294	REDACTED	io	same as :1293
+config_check.rs	242	NOT-LOGGED	io	validate_file_log_config main.rs:256 / FileLog::open main.rs:973, then stderr; --check-config eprintln; doctor (no subscriber)
+config_check.rs	254	NOT-LOGGED	io	same as :242
+config_check.rs	296	NOT-LOGGED	io	validate_log_identity main.rs:984 / boot, then stderr
+epoch.rs	59	NOT-LOGGED	io	ensure_current_epoch, then prepare_data_root main.rs:717, then stderr
+epoch.rs	157	NOT-LOGGED	io (RootFault E)	into_boot_message, then boot stderr
+epoch.rs	163	NOT-LOGGED	io	boot stderr
+epoch.rs	170	NOT-LOGGED	io	boot stderr
+epoch.rs	172	NOT-LOGGED	io	boot stderr
+epoch.rs	175	NOT-LOGGED	io	boot stderr
+epoch.rs	368	NOT-LOGGED	io	boot stderr
+epoch.rs	381	NOT-LOGGED	io	boot stderr
+epoch.rs	483	NOT-LOGGED	io	publish_epoch, then boot stderr
+epoch.rs	486	NOT-LOGGED	io	boot stderr
+epoch.rs	488	NOT-LOGGED	io	boot stderr
+epoch.rs	543	REDACTED	io (io::Error with context)	publish_marker_durable(_with): publication write_marker to publish_output to compaction_error ERROR 941 class/cause; rollup_io publish_marker to compaction.rs:2614 to rollup_error 1559
+epoch.rs	595	REDACTED	io	publish_marker_staged: conform marker (boot stderr); repin write_marker to JobAbort::Failed / Commit::Failed to 1831, and cleanup write to 2264 DEBUG / 2266 WARN class
+epoch.rs	598	REDACTED	io	same as :595
+epoch.rs	602	REDACTED	io	same as :595
+handlers.rs	2891	NOT-LOGGED	StoreError (parse_interval validation, fixed text)	BadRequest, then HTTP 400 body (log_fault ignores BadRequest; the failure record takes the class only)
+handlers.rs	2906	NOT-LOGGED	StoreError (parse_interval)	HTTP 400 body
+ingest/body.rs	159	NOT-LOGGED	Utf8Error	ServerError::Ingest, then HTTP 400 body
+ingest/body.rs	179	NOT-LOGGED	serde_json	ServerError::Ingest, then HTTP 400 body
+ingest/body.rs	213	REDACTED	serde_json	ingest/handler.rs log_rejections: the invalid_json sample is the fixed words since the fix that followed this trace; the wording goes to DEBUG and to the HTTP response
+ingest/compaction.rs	792	IO-ONLY	io	compact_pass Err to compaction_error ERROR 541 error (D2b)
+ingest/compaction.rs	1389	IO-ONLY	io	rollup_env_once to rollup_once to rollup_error ERROR 1005 (D2b)
+ingest/compaction.rs	1744	REDACTED	io	identify (only called from rollup_day_inner:2514/2518) to rollup_error DEBUG 1554 / ERROR 1559 class
+ingest/compaction.rs	1746	REDACTED	io	same as :1744
+ingest/compaction.rs	1760	IO-ONLY	io	sync_rollup_chain in recovery (Promote) to rollup_error 1487 and compaction_error 541 via recover_pending_rollups (D2b); merge path redacted
+ingest/compaction.rs	1792	IO-ONLY	io	retire_rollup_inputs in recovery to 1487/541 (D2b); merge redacted
+ingest/compaction.rs	1813	IO-ONLY	io	remove_rollup_marker in recovery to 1487/541 (D2b); merge redacted
+ingest/compaction.rs	1820	IO-ONLY	io (RemovalSync::settle io::Result)	same as :1813
+ingest/compaction.rs	1889	IO-ONLY	io	recover_rollup_markers_coordinated to 1487/541 (D2b); boot recover_rollups_at_boot drops the text
+ingest/compaction.rs	1911	IO-ONLY	io	same as :1889
+ingest/compaction.rs	1968	IO-ONLY	io	same as :1889
+ingest/compaction.rs	1985	IO-ONLY	io	same as :1889
+ingest/compaction.rs	1987	IO-ONLY	io	same as :1889
+ingest/compaction.rs	2017	IO-ONLY	io	remove_leftover_tmp to 1487/541 (D2b)
+ingest/compaction.rs	2200	IO-ONLY	io	quarantine_target to quarantine_file inspect_err ERROR 2241 {event_type} error (D2b), then returned to the redacted chunk/rollup path
+ingest/compaction.rs	2283	REDACTED	io	quarantine_file Err to compaction_error 941 / rollup_error 1559 (the raw io::Error is logged separately at 2276, D2b)
+ingest/compaction.rs	2318	IO-ONLY	io	retire_merged_input: PublishIncomplete to compaction_error ERROR 913 (D2b); recover_published to log_outcome 982 (D2b); rollup recovery to 1487 (D2b); merge redacted
+ingest/compaction.rs	2412	REDACTED	duckdb	rollup_day_inner to rollup_error 1554 DEBUG / 1559
+ingest/compaction.rs	2420	REDACTED	duckdb	same as :2412
+ingest/compaction.rs	2427	REDACTED	duckdb	same as :2412
+ingest/compaction.rs	2431	REDACTED	duckdb	same as :2412
+ingest/compaction.rs	2587	REDACTED	io	rollup to 1559
+ingest/compaction.rs	2589	REDACTED	parquet (inside io::Error from rollup_io.rs:174)	rollup to 1559
+ingest/compaction.rs	2591	REDACTED	io	rollup to 1559
+ingest/compaction.rs	2593	REDACTED	io	rollup to 1559
+ingest/compaction.rs	2596	REDACTED	RollupMarker::new validation String (trawl)	rollup to 1559
+ingest/compaction.rs	2614	REDACTED	io	rollup to 1559
+ingest/compaction.rs	2619	REDACTED	io	rollup to 1559
+ingest/compaction.rs	2621	REDACTED	io	rollup to 1559
+ingest/compaction.rs	2798	REDACTED	StoreError	CompactOutcome Err to compaction_error DEBUG 933 / ERROR 941 class
+ingest/compaction.rs	3250	REDACTED	DuckDB (StatementFailure/String)	prepare_service_batch to 941
+ingest/compaction.rs	3506	REDACTED	duckdb	structured_errors: compaction 941, rollup 1559, conform boot stderr, repin 1831/1166
+ingest/compaction.rs	3859	REDACTED	duckdb	prepare_service_batch to 941
+ingest/compaction.rs	3867	REDACTED	duckdb	941
+ingest/compaction.rs	3876	REDACTED	duckdb	941
+ingest/compaction.rs	3882	REDACTED	duckdb	941
+ingest/compaction.rs	4806	REDACTED	serde_json	capture_samples to catalog_sample_capture_failed DEBUG + WARN 4626 class; repin rewrite.rs:445 to PassStop::Failed to 1831 / 1166
+ingest/compaction.rs	4882	NOT-LOGGED	io	inside #[cfg(test)] fn conform_and_write (test code; the hit list includes it by mistake)
+ingest/compaction.rs	4941	REDACTED	TryFromIntError (std fixed text)	write_output to 941
+ingest/compaction.rs	4945	REDACTED	io	write_output to 941
+ingest/compaction.rs	5075	REDACTED	io	publish_output pre-incomplete ? to 941
+ingest/compaction.rs	5088	IO-ONLY	io	PublishIncomplete to compaction_error ERROR 913 (D2b)
+ingest/compaction.rs	5110	IO-ONLY	io	PublishIncomplete to 913 (D2b)
+ingest/compaction.rs	5151	REDACTED	io	durable_marker_for to 941
+ingest/compaction.rs	5153	REDACTED	io	durable_marker_for to 941
+ingest/compaction.rs	5170	REDACTED	io	durable_marker_for to 941
+ingest/publication_marker.rs	425	IO-ONLY	io	MarkerError::Io to recover_one Err to log_outcome publication_recovery_failed ERROR 982 (D2b); scan_claims ignores it
+ingest/publication_marker.rs	513	IO-ONLY	io	remove_marker_durably: recovery 982 (D2b); publish_output step 5 to 913 (D2b); roll_back_unpublished to 941 redacted
+ingest/publication_marker.rs	519	IO-ONLY	io	same as :513
+ingest/publication_marker.rs	544	IO-ONLY	io	list_wal_envs: recover Err to compaction.rs:1103 publication_recovery_failed + 541; boot main.rs:778 stderr; scan_claims Err to rollup_error 1011, 541, catalog_conform_claims_unreadable 768, repin_publication_claims_unreadable 2496, retention 533/808 (all D2b)
+ingest/publication_marker.rs	919	IO-ONLY	io	publication_recovery_failed ERROR 920 (D2b)
+ingest/publication_marker.rs	1006	IO-ONLY	io	inspect to log_outcome 982 (D2b)
+ingest/publication_marker.rs	1040	IO-ONLY	io (identity_of io::Result)	982 (D2b)
+ingest/publication_marker.rs	1077	IO-ONLY	io	982 (D2b)
+ingest/publication_marker.rs	1087	IO-ONLY	io	982 (D2b)
+ingest/publication_marker.rs	1110	IO-ONLY	io	recover_unpublished to 982 (D2b); roll_back_unpublished to 941 redacted
+ingest/rollup_io.rs	174	REDACTED	parquet (trawl_engine::parquet_stats::check_footer)	only caller compaction.rs:2588 to rollup_error 1559
+ingest/rollup_marker.rs	355	NOT-LOGGED	io	ReadError Display is never logged: compaction.rs:1952-1956 maps it to a Proof label; doctor/storage.rs:1472 has no subscriber
+ingest/rollup_marker.rs	423	NOT-LOGGED	serde_json	Malformed to Proof::MarkerMalformed label only
+ingest/rollup_marker.rs	432	NOT-LOGGED	serde_json	same as :423
+main.rs	109	NOT-LOGGED	config load error	eprintln, stderr (--check-config)
+main.rs	248	NOT-LOGGED	config load error	eprintln before the subscriber exists
+main.rs	275	NOT-LOGGED	Derivation resolve	eprintln
+main.rs	284	NOT-LOGGED	SyslogPeers resolve	eprintln
+main.rs	455	NOT-LOGGED	io	async_main ?, stderr
+main.rs	778	NOT-LOGGED	io (recover Err)	async_main ?, stderr
+main.rs	872	NOT-LOGGED	io	create_wal_dir to spawn_ingest_pipeline main.rs:495 ?, stderr
+owner_only.rs	801	REDACTED	io inside OwnerOnlyError	main close_storage_roots (stderr); repin swap_envs to repin_cutover_fatal DEBUG 2164 / ERROR 2171 class; prepare_shadow_root to 1831; recover.rs:131 boot stderr
+owner_only.rs	805	REDACTED	io	same as :801
+owner_only.rs	810	REDACTED	io	same as :801
+owner_only.rs	813	REDACTED	io	same as :801
+pool.rs	3060	REDACTED	io	ServerError::Internal to export HTTP response to internal_error error.rs:1680 class/cause (text DEBUG 1686)
+query_log.rs	146	IO-ONLY	io (chmod) inside io::Error	rollover reopen to query_log.rs:237 WARN error and :287 ERROR reopen_error (D2b); QueryLog::open at boot to stderr
+repin/cutover.rs	32	REDACTED	io	swap_envs: engine.rs:2160 to repin_cutover_fatal DEBUG 2164 / ERROR 2171 class; recover.rs:131 to boot stderr
+repin/cutover.rs	35	REDACTED	io	same as :32
+repin/cutover.rs	44	REDACTED	io	same as :32
+repin/cutover.rs	56	REDACTED	io	same as :32
+repin/cutover.rs	65	REDACTED	io	same as :32
+repin/cutover.rs	215	REDACTED	io	prepare_shadow_root to engine.rs:1910 JobAbort::Failed to 1831 (text DEBUG and job row)
+repin/engine.rs	1166	REDACTED	scan text: DuckDB, serde (decode_misfit_samples), io	ServerError::Internal to schema_repin handler to internal_error 1680 (dropped if past the bound); raw text also to the job row via settle_pre_cutover
+repin/marker.rs	386	REDACTED	io	read_marker: engine.rs:960 to repin_staging_unreadable DEBUG / ERROR 982 class; recover_filesystem to boot stderr
+repin/marker.rs	390	REDACTED	serde_json	same as :386
+repin/marker.rs	406	REDACTED	serde_json (serialize)	write_marker to 1831 / Commit::Failed / 2264-2266 redacted
+repin/marker.rs	419	IO-ONLY	io	remove_marker to repin_marker_error WARN engine.rs:1868 and cutover.rs:277 (D2b); recover.rs:241 boot stderr
+repin/recover.rs	185	NOT-LOGGED	StoreError	reconcile_store to main.rs:432 ?, stderr
+repin/recover.rs	200	NOT-LOGGED	StoreError	stderr
+repin/recover.rs	224	NOT-LOGGED	StoreError	stderr
+repin/recover.rs	254	NOT-LOGGED	StoreError	stderr
+repin/rewrite.rs	59	REDACTED	io	snapshot_env_files: build to PassStop::Failed to 1831; scan plan.rs to 1166 to internal_error; job row
+repin/rewrite.rs	72	REDACTED	io	same as :59
+repin/rewrite.rs	74	REDACTED	io	same as :59
+repin/rewrite.rs	81	REDACTED	io	same as :59
+repin/rewrite.rs	98	REDACTED	StripPrefixError (std fixed text)	same as :59
+repin/rewrite.rs	166	REDACTED	io	process_file to 1831
+repin/rewrite.rs	171	REDACTED	io	1831
+repin/rewrite.rs	178	REDACTED	io	1831
+repin/rewrite.rs	281	REDACTED	io	1831
+repin/rewrite.rs	283	REDACTED	io	1831
+results/service.rs	1585	REDACTED	serde_json	ServerError::Internal; only callers are results/routes.rs:53,159 (HTTP), so internal_error 1680
+results/sweep.rs	118	NOT-LOGGED	io / StoreError	reconcile_at_boot to boot.rs:68 to stderr
+retention.rs	678	IO-ONLY	io (fs4)	retention_tick Err to retention_error ERROR 234 (D2b)
+retention.rs	852	IO-ONLY	io	sweep to 234 (D2b)
+retention.rs	895	IO-ONLY	io	delete_date_dir to retention_error 601/733 (D2b)
+scheduler.rs	1034	NOT-LOGGED	serde_json	zstd_fallback to fail_unpersisted_run to run row error (finish_run, served by get_report_run); WARN scheduled_query_failed 637 carries a fixed error_class only
+scheduler.rs	1036	NOT-LOGGED	zstd (io::Error)	same as :1034
+shape.rs	41	NOT-LOGGED	axum extractor rejection (serde/JSON/path)	BadRequest to HTTP 400 body
+state.rs	707	NOT-LOGGED	fleet_auth::AuthError	ServiceUnavailable to connect_backends to async_main ?, stderr
+state.rs	712	NOT-LOGGED	fleet_auth::AuthError	stderr
+state.rs	819	NOT-LOGGED	StoreError	from_parts ?, stderr
+state.rs	880	NOT-LOGGED	engine/duckdb	stderr
+state.rs	889	NOT-LOGGED	engine	stderr
+telemetry.rs	1555	NOT-LOGGED	WAL write error	eprintln
+transport/http.rs	423	REDACTED	TlsError (rustls/X.509/PEM/io)	serve: monitor mode main.rs:645 DEBUG / 644 ERROR lifecycle class/cause; non-monitor main.rs:664 ?, stderr
+transport/http.rs	514	REDACTED	io	same as :423
+transport/http.rs	520	REDACTED	io	same as :423
+transport/http.rs	630	NOT-LOGGED	TlsError	inside serve_with_listener_h2_for_tests, #[cfg(any(test, feature = "test-support"))]
+transport/http.rs	651	NOT-LOGGED	io	same test-support fn
+transport/http.rs	746	NOT-LOGGED	io	adopt_listener, called only by serve_with_listener*, whose only callers are tests/common; the Err returns to the caller
+transport/http.rs	754	NOT-LOGGED	io	same as :746
+transport/http.rs	756	NOT-LOGGED	io	same as :746

@@ -23,6 +23,12 @@ python3 -I docs/evidence/issue-412/enumerate.py --hits    # search hits outside 
 python3 -I docs/evidence/issue-412/enumerate.py --helpers # candidate logging helpers
 ```
 
+`--hits` prints each line that matches the search but sits outside every row
+and every DEBUG event. Those lines build a `String` or an error from an error.
+They are sources, not log events, so the list is not empty.
+`string-builders.tsv` records where each one's text ends up, as read at
+`cb5ef2a2`.
+
 `--check` compares every line except the `# sha:` line. The script exits
 non-zero and names the row when a site has no disposition, when a disposition
 has no site, or when a disposition is blank or not one of the three forms.

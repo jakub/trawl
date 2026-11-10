@@ -2,7 +2,7 @@
 # plus one row per call of a logging helper that takes an error value from its
 # caller (source type names the helper), and one per macro_rules expansion.
 # Paths are relative to crates/trawl-server/src. Rows describe commit:
-# sha: 7f08851fbb2cbe5ea0ac57f1e2b943bbded46ed7
+# sha: 0cdeb2aba15be70e5e004342e9642badd99530a5
 # Search command (a help, not the list: it misses shorthand fields, plain string
 # fields and dynamic messages):
 #   rg -n --type rust '(error|err|reason|cause|source|detail)\s*=\s*[%?]|\{(e|err|error)\}' crates/trawl-server/src
@@ -148,10 +148,10 @@ ingest/compaction.rs	5196	compaction_complete	trawl_server::ingest::compaction	I
 ingest/compaction.rs	5229	catalog_pin_deferred	trawl_server::ingest::compaction	INFO	column names (ingest data, not error text)	unchanged: no error text
 ingest/compaction.rs	5394	compaction_error	trawl_server::ingest::compaction	ERROR	io::Error from scan_wal_files	D2b
 ingest/handler.rs	624	wal_write_failed	trawl_server::ingest::handler	WARN	WalWriteError: io::Error, or sync and withdraw io::Errors	D2b
-ingest/handler.rs	702	ingest_rejections	trawl_server::ingest::handler	WARN	Rejection messages: bounded client values, fixed reasons, serde_json parse wording (ingest/body.rs:213)	unchanged: decided: ADR-0053 keeps the rejection samples
-ingest/handler.rs	722	ingest_repairs	trawl_server::ingest::handler	WARN	RepairDetail text: trawl's repair codes with sender service names and counts	unchanged: fixed text trawl wrote
-ingest/handler.rs	750	ingest_complete	trawl_server::ingest::handler	INFO	RepairDetail text: trawl's repair codes with sender service names and counts	unchanged: fixed text trawl wrote
-ingest/handler.rs	818	ingest_body_too_large	trawl_server::ingest::handler	WARN	none	unchanged: no error text
+ingest/handler.rs	708	ingest_repairs	trawl_server::ingest::handler	WARN	RepairDetail text: trawl's repair codes with sender service names and counts	unchanged: fixed text trawl wrote
+ingest/handler.rs	736	ingest_complete	trawl_server::ingest::handler	INFO	RepairDetail text: trawl's repair codes with sender service names and counts	unchanged: fixed text trawl wrote
+ingest/handler.rs	804	ingest_body_too_large	trawl_server::ingest::handler	WARN	none	unchanged: no error text
+ingest/handler.rs	846	ingest_rejections	trawl_server::ingest::handler	WARN	Rejection messages: bounded client values and fixed reasons (ADR-0053 keeps them); an invalid_json sample is the fixed words, serde_json's wording at DEBUG	changed
 ingest/hydration/mod.rs	174	boot_hydration	trawl_server::ingest::hydration	INFO	none	unchanged: no error text
 ingest/pipeline.rs	198	pipeline_wal_write_failed	trawl_server::ingest::pipeline	WARN	via record_discarded_group: WalWriteError (io only)	D2b
 ingest/pipeline.rs	214	pipeline_wal_write_failed	trawl_server::ingest::pipeline	WARN	helper record_discarded_group: WalWriteError (io only)	D2b
@@ -181,30 +181,30 @@ live.rs	221	stream_missing_prepared_pattern	trawl_server::live	ERROR	via log_mis
 live.rs	530	stream_lagged	trawl_server::live	WARN	none	unchanged: no error text
 live.rs	547	stream_missing_prepared_pattern	trawl_server::live	ERROR	helper log_missing_prepared_pattern: PatternError fixed sentences; Syntax arises only at preparation	unchanged: fixed text trawl wrote
 live.rs	629	stream_frame_unencodable	trawl_server::live	ERROR	serde_json::Error; ed3e6907 logs class/cause, text at DEBUG	changed
-main.rs	299	config_warning	trawld	WARN	RUST_LOG parse error; ed3e6907 keeps a fixed sentence, parse error at DEBUG	changed
-main.rs	302	crash_dump	trawld	INFO/WARN	via log_crash_dump: trawl_crashdump Status, closed enums and a path	unchanged: closed enum
-main.rs	304	lifecycle	trawld	INFO	none	unchanged: no error text
-main.rs	307	config_warning	trawld	WARN	config.warnings(): four fixed literals	unchanged: fixed text trawl wrote
-main.rs	310	lifecycle	trawld	INFO	none	unchanged: no error text
-main.rs	395	lifecycle	trawld	ERROR	none	unchanged: no error text
-main.rs	414	epoch_gate	trawld	INFO	epoch::Outcome enum (Debug)	unchanged: closed enum
-main.rs	456	query_log_enabled	trawld	WARN	configured path and size	unchanged: no error text
-main.rs	491	lifecycle	trawld	INFO	none	unchanged: no error text
-main.rs	519	lifecycle	trawld	INFO	none	unchanged: no error text
-main.rs	644	lifecycle	trawld	ERROR	ServerError from http::serve (rustls/PEM text in Internal); ed3e6907 logs class/cause, text at DEBUG	changed
-main.rs	658	lifecycle	trawld	ERROR	io::Error from monitor::run	D2b
-main.rs	681	task_panic	trawld	WARN	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
-main.rs	780	publication_recovery	trawld	INFO	none	unchanged: no error text
-main.rs	795	task_panic	trawld	WARN	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
-main.rs	811	lifecycle	trawld	INFO	none	unchanged: no error text
-main.rs	825	lifecycle	trawld	INFO	none	unchanged: no error text
-main.rs	932	env_not_in_allowlist	trawld	WARN	none	unchanged: no error text
-main.rs	951	retention_env_without_dir	trawld	WARN	none	unchanged: no error text
-main.rs	1193	crash_dump	trawld	INFO	helper log_crash_dump (emit! info): readiness and FailureReason closed enums, dump dir path, fixed message	unchanged: closed enum
-main.rs	1194	crash_dump	trawld	WARN	helper log_crash_dump (emit! warn): readiness and FailureReason closed enums, dump dir path, fixed message	unchanged: closed enum
-main.rs	1211	lifecycle	trawld	INFO	none	unchanged: no error text
-main.rs	1224	lifecycle	trawld	INFO	none	unchanged: no error text
-main.rs	1230	config_warning	trawld	WARN	rustix Errno from setrlimit (an OS errno)	D2b
+main.rs	301	config_warning	trawld	WARN	RUST_LOG parse error; ed3e6907 keeps a fixed sentence, parse error on stderr	changed
+main.rs	304	crash_dump	trawld	INFO/WARN	via log_crash_dump: trawl_crashdump Status, closed enums and a path	unchanged: closed enum
+main.rs	306	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	309	config_warning	trawld	WARN	config.warnings(): four fixed literals	unchanged: fixed text trawl wrote
+main.rs	312	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	397	lifecycle	trawld	ERROR	none	unchanged: no error text
+main.rs	416	epoch_gate	trawld	INFO	epoch::Outcome enum (Debug)	unchanged: closed enum
+main.rs	458	query_log_enabled	trawld	WARN	configured path and size	unchanged: no error text
+main.rs	493	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	521	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	646	lifecycle	trawld	ERROR	ServerError from http::serve (rustls/PEM text in Internal); ed3e6907 logs class/cause, text at DEBUG	changed
+main.rs	660	lifecycle	trawld	ERROR	io::Error from monitor::run	D2b
+main.rs	683	task_panic	trawld	WARN	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+main.rs	782	publication_recovery	trawld	INFO	none	unchanged: no error text
+main.rs	797	task_panic	trawld	WARN	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+main.rs	813	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	827	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	934	env_not_in_allowlist	trawld	WARN	none	unchanged: no error text
+main.rs	953	retention_env_without_dir	trawld	WARN	none	unchanged: no error text
+main.rs	1195	crash_dump	trawld	INFO	helper log_crash_dump (emit! info): readiness and FailureReason closed enums, dump dir path, fixed message	unchanged: closed enum
+main.rs	1196	crash_dump	trawld	WARN	helper log_crash_dump (emit! warn): readiness and FailureReason closed enums, dump dir path, fixed message	unchanged: closed enum
+main.rs	1213	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	1226	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	1232	config_warning	trawld	WARN	rustix Errno from setrlimit (an OS errno)	D2b
 monitor/mod.rs	91	monitor_schedule_count_error	trawl_server::monitor	WARN	StoreError; e4c1d44d logs class/cause, text at DEBUG	changed
 owner_only.rs	597	storage_root_closed	trawl_server::owner_only	WARN	root kind, path and octal modes	unchanged: no error text
 policy.rs	202	-	trawl_server::policy	WARN	role permission string from the keystore (config data, not error text)	unchanged: no error text

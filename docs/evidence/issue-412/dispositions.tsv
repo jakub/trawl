@@ -142,7 +142,7 @@ ingest/compaction.rs	compaction_complete	info	site	1	none	unchanged: no error te
 ingest/compaction.rs	catalog_pin_deferred	info	site	1	column names (ingest data, not error text)	unchanged: no error text
 ingest/compaction.rs	compaction_error	error	site	4	io::Error from scan_wal_files	D2b
 ingest/handler.rs	wal_write_failed	warn	site	1	WalWriteError: io::Error, or sync and withdraw io::Errors	D2b
-ingest/handler.rs	ingest_rejections	warn	site	1	Rejection messages: bounded client values, fixed reasons, serde_json parse wording (ingest/body.rs:213)	unchanged: decided: ADR-0053 keeps the rejection samples
+ingest/handler.rs	ingest_rejections	warn	site	1	Rejection messages: bounded client values and fixed reasons (ADR-0053 keeps them); an invalid_json sample is the fixed words, serde_json's wording at DEBUG	changed
 ingest/handler.rs	ingest_repairs	warn	site	1	RepairDetail text: trawl's repair codes with sender service names and counts	unchanged: fixed text trawl wrote
 ingest/handler.rs	ingest_complete	info	site	1	RepairDetail text: trawl's repair codes with sender service names and counts	unchanged: fixed text trawl wrote
 ingest/handler.rs	ingest_body_too_large	warn	site	1	none	unchanged: no error text
@@ -175,7 +175,7 @@ live.rs	stream_missing_prepared_pattern	error	call:log_missing_prepared_pattern	
 live.rs	stream_lagged	warn	site	1	none	unchanged: no error text
 live.rs	stream_missing_prepared_pattern	error	site	1	helper log_missing_prepared_pattern: PatternError fixed sentences; Syntax arises only at preparation	unchanged: fixed text trawl wrote
 live.rs	stream_frame_unencodable	error	site	1	serde_json::Error; ed3e6907 logs class/cause, text at DEBUG	changed
-main.rs	config_warning	warn	site	1	RUST_LOG parse error; ed3e6907 keeps a fixed sentence, parse error at DEBUG	changed
+main.rs	config_warning	warn	site	1	RUST_LOG parse error; ed3e6907 keeps a fixed sentence, parse error on stderr	changed
 main.rs	crash_dump	info/warn	call:log_crash_dump	1	via log_crash_dump: trawl_crashdump Status, closed enums and a path	unchanged: closed enum
 main.rs	lifecycle	info	site	1	none	unchanged: no error text
 main.rs	config_warning	warn	site	2	config.warnings(): four fixed literals	unchanged: fixed text trawl wrote
