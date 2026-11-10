@@ -4182,6 +4182,26 @@ async fn a_cancel_reaches_a_saved_lookup() {
         })
     };
     let id = listed_id(&analyst, DSL).await;
+    // The listing shows the request from before its preparation. Cancel
+    // only once the lookup itself waits on the lock, or the cancel can end
+    // the preparation wait and no lookup phase is booked.
+    tokio::time::timeout(CANCELLED_ANSWER_BOUND, async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+                 WHERE c.relname = 'saved_queries' AND NOT l.granted",
+            )
+            .fetch_one(&mut lock)
+            .await
+            .expect("read pg_locks");
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the lookup waits on the lock");
     assert!(
         analyst
             .cancel_query(id)
