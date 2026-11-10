@@ -928,12 +928,23 @@ async fn compact_pass(
                         CompactionOperation::Chunk.record_failure();
                         chunk_failures += 1;
                         // Leave remaining WAL files for retry on next tick.
-                        tracing::error!(
+                        // The text mixes DuckDB, store and I/O wording and
+                        // keeps no typed source, so it goes to DEBUG only.
+                        tracing::debug!(
                             event_type = "compaction_error",
                             compact_service = %service,
                             chunk = chunk_idx + 1,
                             total_chunks,
                             error = %e,
+                            "compaction chunk failed, will retry next tick"
+                        );
+                        tracing::error!(
+                            event_type = "compaction_error",
+                            compact_service = %service,
+                            chunk = chunk_idx + 1,
+                            total_chunks,
+                            error_class = "internal",
+                            cause_kind = CauseKind::Unknown.as_str(),
                             "compaction chunk failed, will retry next tick"
                         );
                         break;
@@ -1417,6 +1428,7 @@ fn historical_rollup_date(path: &Path, today: &str) -> Option<String> {
 /// A `(date, service)` with any hourly output a publication marker claims
 /// is skipped: rolling it up would delete the canonical file whose identity
 /// recovery checks, and the marker would then read as a contradiction.
+#[allow(clippy::too_many_lines)] // keep recovery and every gated merge of a day together
 async fn rollup_env_once(
     env: &str,
     data_dir: &Path,
@@ -1536,10 +1548,19 @@ async fn rollup_env_once(
             if let Err(e) = outcome.result {
                 CompactionOperation::DailyRollupUnit.record_failure();
                 failures += 1;
-                tracing::error!(
+                // The text mixes DuckDB and I/O wording and keeps no typed
+                // source, so it goes to DEBUG only.
+                tracing::debug!(
                     event_type = "rollup_error",
                     compact_service = %service,
                     error = %e,
+                    "rollup failed for service, will retry next tick"
+                );
+                tracing::error!(
+                    event_type = "rollup_error",
+                    compact_service = %service,
+                    error_class = "internal",
+                    cause_kind = CauseKind::Unknown.as_str(),
                     "rollup failed for service, will retry next tick"
                 );
             }
@@ -2538,11 +2559,18 @@ fn rollup_day_inner(
             // invariant says trawl cannot have written. No amount of retrying
             // repairs either — surface it distinctly at error level so the rare
             // forever-retry is visible on the dashboard rather than buried in
-            // the count.
-            tracing::error!(
+            // the count. The driver text goes to DEBUG only.
+            tracing::debug!(
                 event_type = "rollup_unreadable",
                 compact_service = %service,
                 error = %failure,
+                "rollup inputs unreadable or nonconformant (foreign parquet?); will retry indefinitely"
+            );
+            tracing::error!(
+                event_type = "rollup_unreadable",
+                compact_service = %service,
+                error_class = failure.error_class(),
+                cause_kind = failure.cause_kind().as_str(),
                 "rollup inputs unreadable or nonconformant (foreign parquet?); will retry indefinitely"
             );
         }
@@ -2997,12 +3025,22 @@ where
             return;
         };
         if n == BOOKKEEPING_ATTEMPTS {
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "catalog_bookkeeping_error",
                 compact_service = %service,
                 write = write.table(),
                 attempts = n,
                 error = %e,
+                "catalog bookkeeping write failed and was given up on"
+            );
+            let fault = crate::error::ServerError::from(e);
+            tracing::warn!(
+                event_type = "catalog_bookkeeping_error",
+                compact_service = %service,
+                write = write.table(),
+                attempts = n,
+                error_class = fault.error_class(),
+                cause_kind = fault.cause_kind().as_str(),
                 "catalog bookkeeping write failed and was given up on"
             );
             return;
@@ -3166,10 +3204,19 @@ fn read_wal_to_table(
             // A non-"Duplicate name" read error means at least one file is
             // malformed-but-textual. Without isolation that one file fails
             // the whole batch and wedges the service forever. Isolate it.
-            tracing::warn!(
+            // The driver text can quote the WAL's values, so it goes to
+            // DEBUG only.
+            tracing::debug!(
                 event_type = "compaction_isolation",
                 compact_service = %service,
                 error = %e,
+                "multi-file WAL read failed; isolating corrupt files"
+            );
+            tracing::warn!(
+                event_type = "compaction_isolation",
+                compact_service = %service,
+                error_class = e.error_class(),
+                cause_kind = e.cause_kind().as_str(),
                 "multi-file WAL read failed; isolating corrupt files"
             );
         }
@@ -3368,10 +3415,20 @@ fn build_wal_batch(
     let read_with_depth_ladder = |prov_col: &str| match auto_read(prov_col, 2) {
         Ok(()) => Ok(()),
         Err(e) if is_duplicate_name(&e) => {
-            tracing::warn!(
+            // The driver text quotes the colliding keys, so it goes to
+            // DEBUG only.
+            tracing::debug!(
                 event_type = "compaction_depth_fallback",
                 compact_service = %service,
                 error = %trawl_engine::error::render_duckdb_error(&e),
+                "nested keys collide at depth 2 (legacy pre-stringification \
+                 WAL); retrying at maximum_depth=1 — no columns dropped"
+            );
+            tracing::warn!(
+                event_type = "compaction_depth_fallback",
+                compact_service = %service,
+                error_class = "database",
+                cause_kind = CauseKind::of_duckdb(&e).as_str(),
                 "nested keys collide at depth 2 (legacy pre-stringification \
                  WAL); retrying at maximum_depth=1 — no columns dropped"
             );
@@ -3386,10 +3443,17 @@ fn build_wal_batch(
         Err(e) if is_filename_collision(&e) => {
             // Randomized so the data itself cannot collide with it too.
             let alt = format!("{WAL_FILE_COL}_{:08x}", rand::random::<u32>());
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "compaction_provenance_rename",
                 compact_service = %service,
                 error = %trawl_engine::error::render_duckdb_error(&e),
+                "WAL data carries the provenance column name; retrying under a renamed column"
+            );
+            tracing::warn!(
+                event_type = "compaction_provenance_rename",
+                compact_service = %service,
+                error_class = "database",
+                cause_kind = CauseKind::of_duckdb(&e).as_str(),
                 "WAL data carries the provenance column name; retrying under a renamed column"
             );
             let _ = conn.execute_batch("DROP TABLE IF EXISTS wal_batch");
@@ -3496,9 +3560,18 @@ impl StatementFailure {
         };
         if out_of_memory {
             metrics::counter!(crate::metrics::MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL).increment(1);
-            tracing::error!(
+            tracing::debug!(
                 event_type = "maintenance_resource_exhausted",
                 error = %text,
+                "maintenance work ran out of ingest.compaction_memory_limit; its \
+                 inputs are kept, and it fails the same way until the limit is \
+                 raised or the input shrinks; see the operation's own outcome \
+                 for whether it is retried"
+            );
+            tracing::error!(
+                event_type = "maintenance_resource_exhausted",
+                error_class = "service_unavailable",
+                cause_kind = cause.as_str(),
                 "maintenance work ran out of ingest.compaction_memory_limit; its \
                  inputs are kept, and it fails the same way until the limit is \
                  raised or the input shrinks; see the operation's own outcome \
@@ -3631,11 +3704,21 @@ fn merge_with_existing(
         // Running out of memory is not a nonconformant file, and the
         // failure is already reported as a resource failure.
         if !failure.is_out_of_memory() {
-            tracing::error!(
+            tracing::debug!(
                 event_type = "catalog_invariant_violation",
                 compact_service = %service,
                 path = %canonical_path.display(),
                 error = %failure,
+                "merge with existing parquet failed — write-time conformance makes this \
+                 impossible for trawl-written files (foreign parquet at this path?); \
+                 WAL retained, batch retried next tick"
+            );
+            tracing::error!(
+                event_type = "catalog_invariant_violation",
+                compact_service = %service,
+                path = %canonical_path.display(),
+                error_class = failure.error_class(),
+                cause_kind = failure.cause_kind().as_str(),
                 "merge with existing parquet failed — write-time conformance makes this \
                  impossible for trawl-written files (foreign parquet at this path?); \
                  WAL retained, batch retried next tick"
@@ -4532,14 +4615,19 @@ impl ConformPlan {
             Err(e) => {
                 metrics::counter!(crate::metrics::CATALOG_SAMPLE_CAPTURE_FAILURES_TOTAL)
                     .increment(1);
-                // The error text can name a column, like every other DuckDB
-                // error this module logs; it can never carry a value — the
-                // capture expression embeds no literals, the misfits are
-                // data.
-                tracing::warn!(
+                // The error text is DuckDB's or serde's wording, which can
+                // name a column or quote a value, so it goes to DEBUG only.
+                tracing::debug!(
                     event_type = "catalog_sample_capture_failed",
                     columns = lossy.len(),
                     error = %e,
+                    "misfit sample capture failed; conflicts are recorded without samples"
+                );
+                tracing::warn!(
+                    event_type = "catalog_sample_capture_failed",
+                    columns = lossy.len(),
+                    error_class = e.error_class(),
+                    cause_kind = e.cause_kind().as_str(),
                     "misfit sample capture failed; conflicts are recorded without samples"
                 );
                 HashMap::new()
@@ -8443,6 +8531,17 @@ mod tests {
         );
         assert_eq!(exhausted, 1, "{logs}");
         assert!(logs.contains("maintenance_resource_exhausted"), "{logs}");
+        // The event carries the class and the cause; `DuckDB`'s text stays
+        // at DEBUG, below what this capture keeps.
+        assert!(
+            logs.contains("error_class=\"service_unavailable\""),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("cause_kind=\"duckdb_resource_exhausted\""),
+            "{logs}"
+        );
+        assert!(!logs.contains("Out of Memory Error"), "{logs}");
         for wrong in ["compaction_quarantine", "compaction_isolation"] {
             assert!(!logs.contains(wrong), "{wrong}: {logs}");
         }
