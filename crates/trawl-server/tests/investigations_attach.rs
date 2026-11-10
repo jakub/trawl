@@ -256,6 +256,110 @@ async fn an_attached_capture_appends_its_step_at_admission_and_records_success()
     assert_eq!(query_starts(query_id), 1);
 }
 
+/// The step of an attached capture keeps two counts: the rows the result
+/// holds and the rows the execution produced before the capture cut, the
+/// same total the committed result reads with. A capture cut by the row
+/// cap keeps fewer than its total, a whole one keeps all of them, and one
+/// that matches nothing keeps 0 of 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_attached_capture_records_kept_and_total_rows() {
+    let (server, keys) = boot_unmetered_with(CaptureConfig {
+        max_rows: 4,
+        page_max_rows: 4,
+        ..CaptureConfig::default()
+    })
+    .await;
+    create(&server, &keys.agent, 1).await;
+
+    let cases = [
+        (corpus_query(), 4, captured::ROWS as u64),
+        (format!("{} | head 3", corpus_query()), 3, 3),
+        ("service=nosuchservice".to_owned(), 0, 0),
+    ];
+    for (query, rows, total) in cases {
+        let answer =
+            captured::captured(&server, &keys.agent.token, &attached(&query, 1, &json!({}))).await;
+        let seq = answer.step_seq.expect("an attached capture names its step");
+        let step = settled(&server, &keys.human, 1, seq).await;
+        let recorded = outcome(&step).unwrap();
+        assert_eq!(recorded.outcome, StepOutcomeKind::Success, "{query}");
+        assert_eq!(
+            recorded.result_id.as_deref(),
+            Some(answer.result.id.as_str())
+        );
+        assert_eq!(
+            (recorded.rows, recorded.total_rows),
+            (Some(rows), Some(total)),
+            "{query}"
+        );
+        let (status, _, page) =
+            captured::page(&server, &keys.human.token, &answer.result.id, "").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(
+            (
+                page["result"]["captured_rows"].as_u64(),
+                page["result"]["total_rows"].as_u64(),
+            ),
+            (recorded.rows, recorded.total_rows),
+            "the step's counts are the committed result's: {page}"
+        );
+    }
+}
+
+/// A step's counts live in its log entry, not in the evidence: once the
+/// investigation's retention ends and the sweep prunes the kept result,
+/// the result reads gone and the step still reads its kept and total rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn step_counts_survive_evidence_pruning() {
+    let (server, keys) = boot(CaptureConfig {
+        max_rows: 4,
+        page_max_rows: 4,
+        ..CaptureConfig::default()
+    })
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let result = captured::captured(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await
+    .result
+    .id;
+    let before = outcome(&settled(&server, &keys.human, 1, 1).await)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (before.rows, before.total_rows),
+        (Some(4), Some(captured::ROWS as u64))
+    );
+
+    let retain_until = at(&read(&server, &keys.human, 1, "")
+        .await
+        .investigation
+        .retain_until);
+    let past = retain_until + chrono::TimeDelta::seconds(1);
+    server.results_clock.set(past);
+    let swept = trawl_server::results::sweep::sweep(&server.state.results, past).await;
+    assert_eq!((swept.evidence_pruned, swept.unlinked), (1, 1), "{swept:?}");
+    let (status, _, body) = captured::page(&server, &keys.human.token, &result, "").await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    assert_eq!(code(&body), "result_gone", "{body}");
+    assert_eq!(
+        message(&body),
+        trawl_server::results::service::GoneReason::RetentionEnded.message(),
+        "{body}"
+    );
+
+    let after = settled(&server, &keys.human, 1, 1).await;
+    let after = outcome(&after).unwrap();
+    assert_eq!(after, &before, "pruning left the step as it was");
+    assert_eq!(
+        (after.rows, after.total_rows),
+        (Some(4), Some(captured::ROWS as u64))
+    );
+}
+
 /// A capture refused at admission still has its step, and the step reads
 /// `refused` with the refusal's code: the installation's one running slot
 /// is the human's, so the agent's attached capture is 429 `capture_busy`.
@@ -379,6 +483,7 @@ async fn an_attached_capture_whose_client_goes_away_records_aborted() {
     let recorded = outcome(&step).unwrap();
     assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
     assert_eq!(recorded.result_id, None);
+    assert_eq!(recorded.total_rows, None);
     wait_until("the abandoned work to stop", || pool.retained() == 0).await;
     assert!(
         captured::listed(&server, &keys.agent.token)

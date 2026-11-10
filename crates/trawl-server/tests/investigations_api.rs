@@ -1570,6 +1570,7 @@ async fn a_delete_unlinks_the_evidence_and_waits_for_running_work() {
         code: None,
         result_id: None,
         rows: None,
+        total_rows: None,
         duration_ms: None,
     };
     assert!(
