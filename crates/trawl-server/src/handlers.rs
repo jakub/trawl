@@ -61,8 +61,9 @@ use trawl_engine::timing::QueryPhase;
 /// as a success with NO columns at all — a shape no SELECT can otherwise
 /// produce, since every projection has at least one column. An engine error
 /// is the other way that window can show itself. In both cases the files are
-/// asked about once more, and only a `NotFound` turns the outcome into the
-/// named 409; anything still on disk keeps the answer it earned.
+/// asked about once more: a confirmed absence turns the outcome into the
+/// named 409, and a file whose absence cannot be established into a redacted
+/// I/O error; anything still on disk keeps the answer it earned.
 fn guard_vanished_run_result(
     mut outcome: crate::pool::ExecuteOutcome,
     run_files: &[crate::from_saved::RunFile],
@@ -237,9 +238,9 @@ pub async fn query(
             run_files = std::mem::take(&mut resolved.run_files);
             // Absence is an answer, not an empty result (ADR-0035): a
             // stored path that no longer resolves refuses here, naming the
-            // run, before any of it reaches `DuckDB` — where a missing file
-            // is substituted with an empty relation and would read as "the
-            // report found nothing".
+            // run when it is confirmed absent, before any of it reaches
+            // `DuckDB` — where a file it cannot resolve is substituted with
+            // an empty relation and would read as "the report found nothing".
             if let Some(conflict) = crate::from_saved::unavailable_run_conflict(&run_files) {
                 (
                     crate::pool::ExecuteOutcome {
@@ -4871,6 +4872,68 @@ mod tests {
                 "with no run files the outcome is returned as it came"
             ),
             other => panic!("expected the outcome to pass through, got: {other:?}"),
+        }
+    }
+
+    /// A run file whose absence cannot be established, below a dangling
+    /// link or below a regular file, is a redacted 500 from the recheck,
+    /// whichever suspect shape the read came back with: never the empty
+    /// success `DuckDB` makes of a path it cannot resolve, and never the
+    /// 409 that says the file is gone.
+    #[cfg(unix)]
+    #[test]
+    fn the_recheck_turns_an_unresolved_run_file_into_an_error() {
+        use axum::response::IntoResponse as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_owned();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("link")).unwrap();
+        std::fs::write(dir.path().join("file"), b"not a directory").unwrap();
+        let outcome = |result: Result<QueryResult, ServerError>| crate::pool::ExecuteOutcome {
+            result,
+            debug: None,
+            severity_columns: vec![],
+        };
+
+        for (case, parent) in [("dangling link", "link"), ("regular file", "file")] {
+            let run_file = crate::from_saved::RunFile {
+                run_id: 7,
+                absolute_path: dir.path().join(parent).join("run_7.parquet"),
+            };
+            let suspects = [
+                ("no columns", outcome(Ok(QueryResult::empty()))),
+                (
+                    "engine error",
+                    outcome(Err(ServerError::Engine(
+                        trawl_engine::error::EngineError::ColdDataUnread,
+                    ))),
+                ),
+            ];
+            for (shape, suspect) in suspects {
+                let guarded = guard_vanished_run_result(suspect, std::slice::from_ref(&run_file));
+                let err = match guarded.result {
+                    Err(err @ ServerError::Engine(trawl_engine::error::EngineError::Io(_))) => err,
+                    other => panic!("{case}, {shape}: expected the redacted error, got: {other:?}"),
+                };
+                for text in [format!("{err:?}"), err.to_string(), err.safe_message()] {
+                    assert!(!text.contains(&root), "{case}, {shape}: {text}");
+                }
+                assert_eq!(
+                    err.safe_message(),
+                    "query execution failed",
+                    "{case}, {shape}"
+                );
+                assert_eq!(
+                    err.code(),
+                    trawl_api::ErrorCode::ExecutionError,
+                    "{case}, {shape}"
+                );
+                assert_eq!(
+                    err.into_response().status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{case}, {shape}"
+                );
+            }
         }
     }
 
