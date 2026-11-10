@@ -47,7 +47,8 @@
 //! the draft that was sent, so a reason begun or edited while the keep
 //! was in flight, for another row or for the same one, stays as it is. A keep whose answer was lost says
 //! its outcome is unknown, keeps the reason, and offers a refresh of the
-//! board, which it waits for before it sends again.
+//! board, which it waits for before it sends again. A board that stopped
+//! reading offers no refresh.
 //!
 //! The drawer is fixed over the page, so nothing it reads moves the
 //! board under the reader.
@@ -97,6 +98,9 @@ pub struct KeepGate {
     pub landed: Callback<()>,
     /// The person's own refresh of the board.
     pub refresh: Callback<()>,
+    /// Whether the board still reads on this visit: once a read was
+    /// refused for want of a grant, nothing here offers its refresh.
+    pub reading: Signal<bool>,
 }
 
 /// What became of the person's last keep.
@@ -653,7 +657,7 @@ fn KeepForm(keeping: Keeping) -> impl IntoView {
         {move || k.note.get().map(|note| view! {
             <div class="inv-write-note" class:inv-write-warn=!matches!(note, KeepNote::Kept(_))>
                 <p role="status">{note.text()}</p>
-                {unknown().then(|| view! {
+                {(unknown() && k.gate.reading.get()).then(|| view! {
                     <Btn variant=Variant::Secondary size=Size::Xs on_click=k.gate.refresh>"Refresh the board"</Btn>
                 })}
             </div>

@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-web-ui/src/pages/investigations.rs b/crates/trawl-web-ui/src/pages/investigations.rs
+--- a/crates/trawl-web-ui/src/pages/investigations.rs
++++ b/crates/trawl-web-ui/src/pages/investigations.rs
+@@ -871,7 +871,7 @@
+     fn defer(self, ask: Ask) -> bool {
+         let visible = tab_visible();
+         let held = self.held();
+-        if visible && !held {
++        if visible {
+             return false;
+         }
+         let _ = self

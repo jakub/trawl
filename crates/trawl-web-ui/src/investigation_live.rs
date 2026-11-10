@@ -9,8 +9,9 @@
 //! nothing; when the tab shows again it reads at once, then every
 //! [`POLL_MS`] again. A read that fails is tried again after a delay that
 //! doubles from [`POLL_MS`] up to [`BACKOFF_MAX_MS`], and a 429 waits at
-//! least the `Retry-After` it carried, as does a read the board owes
-//! from its hidden tab ([`Liveness::hold_ms`]). A read the server refuses
+//! least the `Retry-After` it carried. Every read waits out that pause,
+//! the poll and every read a person or a write asks for, in a visible tab
+//! as in a hidden one ([`Liveness::hold_ms`]). A read the server refuses
 //! for want of a grant stops the board's reading for good.
 //!
 //! [`Liveness`] holds that schedule and what the page says about it: the
