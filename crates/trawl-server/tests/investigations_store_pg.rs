@@ -3018,10 +3018,34 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
     }
 }
 
+/// Every record the `log` facade carried in this process, at any level.
+/// `trawld` bridges `log` into its subscriber. No test here does, so a
+/// record written through `log` reaches no [`EventCapture`], and
+/// [`LogCapture`] holds it instead.
+static LOG_RECORDS: std::sync::Mutex<Vec<(log::Level, String)>> = std::sync::Mutex::new(Vec::new());
+
+struct LogCapture;
+
+impl log::Log for LogCapture {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        LOG_RECORDS
+            .lock()
+            .unwrap()
+            .push((record.level(), record.args().to_string()));
+    }
+
+    fn flush(&self) {}
+}
+
 /// With a trigger refusing every prune of kept evidence, a reservation of
 /// 100 bytes for `reserving` is refused by `scope`'s budget of 150 with
 /// `due`'s 100 bytes counted: `due` stays kept, the failure is logged once
-/// by class, and the trigger's text reaches no event at INFO or above.
+/// by class, and the trigger's text reaches no event or `log` record at
+/// INFO or above. [`LogCapture`] must be this process's logger.
 /// Without the trigger, the same reservation prunes `due` and is admitted.
 async fn a_failed_prune_counts_in_full(
     pool: &PgPool,
@@ -3045,6 +3069,8 @@ async fn a_failed_prune_counts_in_full(
     .unwrap();
 
     let capture = EventCapture::default();
+    LOG_RECORDS.lock().unwrap().clear();
+    log::info!("the log capture is live");
     let refused = gate
         .reserve_evidence(reserving, &[], 100, budget, patience())
         .with_subscriber(capture.dispatch())
@@ -3079,6 +3105,16 @@ async fn a_failed_prune_counts_in_full(
                     .iter()
                     .any(|(_, value)| value.contains(PRUNE_FAULT))
         })
+        .collect();
+    assert!(leaked.is_empty(), "{leaked:#?}");
+    let logged = std::mem::take(&mut *LOG_RECORDS.lock().unwrap());
+    assert!(
+        logged.contains(&(log::Level::Info, "the log capture is live".into())),
+        "{logged:#?}"
+    );
+    let leaked: Vec<_> = logged
+        .iter()
+        .filter(|(level, text)| *level <= log::Level::Info && text.contains(PRUNE_FAULT))
         .collect();
     assert!(leaked.is_empty(), "{leaked:#?}");
     assert_eq!(state_of(pool, &due.id).await.0, "kept");
@@ -3116,6 +3152,8 @@ async fn the_binding_pass_counts_every_kept_byte_when_pruning_fails(pool: PgPool
     .await
     .unwrap();
     let (gate, _root) = gate_at(&results, deadline());
+    log::set_logger(&LogCapture).expect("no other test in this binary installs a logger");
+    log::set_max_level(log::LevelFilter::Trace);
 
     let a = create(&store, 1).await;
     let a_old = NewCapture {
