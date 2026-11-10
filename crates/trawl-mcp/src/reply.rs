@@ -908,10 +908,11 @@ pub struct ActivityView {
     pub entries: Vec<EntryView>,
     /// The `updated_seq` trawld's answer reached.
     pub through_seq: u64,
-    /// Whether trawld holds entries past `through_seq`.
-    pub more: bool,
+    /// Whether trawld holds entries past `through_seq`: trawld's paging,
+    /// apart from what this response dropped.
+    pub trawld_holds_more: bool,
     /// Entries trawld sent that this response dropped from the end to fit
-    /// its byte budget.
+    /// its byte budget, apart from trawld's paging.
     pub entries_dropped_to_fit: u64,
     /// Printed entries abbreviated to their header line.
     pub entries_abbreviated: u64,
@@ -919,8 +920,9 @@ pub struct ActivityView {
     /// printed. This session counts the entries through it as seen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub printed_through: Option<u64>,
-    /// The call that prints the entries after the printed ones, when trawld
-    /// holds more or this response dropped some.
+    /// The call that prints the entries after the printed ones: present
+    /// when `trawld_holds_more` is true or `entries_dropped_to_fit` is not
+    /// zero, absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<NextAction>,
 }
