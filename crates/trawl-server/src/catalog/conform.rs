@@ -578,6 +578,8 @@ async fn publish_completion(
 /// declines to touch what it cannot read. Renaming an operator's file at boot
 /// would be a destructive surprise on a path (foreign parquet dropped into
 /// the tree) where the honest answer is "not mine".
+///
+/// `error` is a fixed reason trawl wrote, or the walk's I/O error.
 fn skip_file(path: &Path, phase: &str, error: &str) {
     metrics::counter!(crate::metrics::CATALOG_CONFORM_SKIPPED_TOTAL).increment(1);
     tracing::warn!(
@@ -585,6 +587,34 @@ fn skip_file(path: &Path, phase: &str, error: &str) {
         file = %path.display(),
         phase,
         error,
+        "unreadable, foreign, publication-claimed or rollup-deferred path \
+         skipped by the boot conformance pass; it is left untouched and \
+         remains outside the catalog invariant"
+    );
+}
+
+/// [`skip_file`] for a path whose scan or rewrite statement failed.
+///
+/// The failure's text is `DuckDB`'s driver wording, which can quote the
+/// generated SQL and the file's values, so it goes to DEBUG only (ADR-0040,
+/// amended 2026-11-09). The warning carries the failure's class and cause.
+fn skip_failed(path: &Path, phase: &str, failure: &StatementFailure) {
+    metrics::counter!(crate::metrics::CATALOG_CONFORM_SKIPPED_TOTAL).increment(1);
+    tracing::debug!(
+        event_type = "catalog_conform_skip",
+        file = %path.display(),
+        phase,
+        error = %failure,
+        "unreadable, foreign, publication-claimed or rollup-deferred path \
+         skipped by the boot conformance pass; it is left untouched and \
+         remains outside the catalog invariant"
+    );
+    tracing::warn!(
+        event_type = "catalog_conform_skip",
+        file = %path.display(),
+        phase,
+        error_class = failure.error_class(),
+        cause_kind = failure.cause_kind().as_str(),
         "unreadable, foreign, publication-claimed or rollup-deferred path \
          skipped by the boot conformance pass; it is left untouched and \
          remains outside the catalog invariant"
@@ -600,9 +630,16 @@ async fn record_boot_conflicts(store: &CatalogStore, conflicts: &[FieldConflict]
         return;
     }
     if let Err(e) = store.record_conflicts(conflicts).await {
-        tracing::warn!(
+        tracing::debug!(
             event_type = "catalog_bookkeeping_error",
             error = %e,
+            "boot pass failed to record field_conflicts rows"
+        );
+        let fault = crate::error::ServerError::from(e);
+        tracing::warn!(
+            event_type = "catalog_bookkeeping_error",
+            error_class = fault.error_class(),
+            cause_kind = fault.cause_kind().as_str(),
             "boot pass failed to record field_conflicts rows"
         );
     }
@@ -693,6 +730,7 @@ pub(crate) fn open_bounded_connection(
 /// directories deferred behind a rollup ([`rollup_deferred_days`]). An `Err`
 /// in either means those markers could not be read, so every file may be
 /// claimed and none is scanned.
+#[allow(clippy::too_many_lines)] // keep every per-file gate in the order the walk applies it
 fn scan_corpus(
     data_dir: &Path,
     memory_limit: &str,
@@ -812,6 +850,19 @@ fn scan_corpus(
             progress.tick();
             continue;
         }
+        // The cheap catch for a truncated or non-parquet file, before
+        // `DuckDB` reads it. Its reason is fixed text, so it is logged as
+        // one, not as a failed statement.
+        if !is_valid_parquet(&path) {
+            skipped += 1;
+            skip_file(
+                &path,
+                "scan",
+                "not a parquet file (magic-byte sniff failed)",
+            );
+            progress.tick();
+            continue;
+        }
         match scan_file(&conn, path.clone(), &layout, pinned) {
             Ok(scan) => out.push(scan),
             // Not proven conformant, so it counts against completion, but
@@ -820,7 +871,7 @@ fn scan_corpus(
             Err(e) if e.is_out_of_memory() => skipped += 1,
             Err(e) => {
                 skipped += 1;
-                skip_file(&path, "scan", &e.to_string());
+                skip_failed(&path, "scan", &e);
             }
         }
         progress.tick();
@@ -870,9 +921,9 @@ fn publication_claimed(claims: &PublicationClaims, layout: &LayoutPath) -> bool 
     })
 }
 
-/// Describe one parquet file: magic-byte sniff first (the cheap catch for a
-/// truncated or non-parquet file), then the schema, then — only if some
-/// column still needs a pin vote — that column's non-null count.
+/// Describe one parquet file that passed the magic-byte sniff: the schema,
+/// then — only if some column still needs a pin vote — that column's
+/// non-null count.
 ///
 /// One `count(<col>)` per voting column rather than a single `count(*)`: the
 /// counts weight the pin vote, and a column's weight must be the rows that
@@ -883,11 +934,6 @@ fn scan_file(
     layout: &LayoutPath,
     pinned: &HashMap<String, CanonicalType>,
 ) -> Result<FileScan, StatementFailure> {
-    if !is_valid_parquet(&path) {
-        return Err("not a parquet file (magic-byte sniff failed)"
-            .to_owned()
-            .into());
-    }
     let safe = path.to_string_lossy().replace('\'', "''");
     let schema = describe_source(conn, &format!("SELECT * FROM read_parquet('{safe}')"))?;
     // Footer-only (never a `count(*)` scan), and via the pure-Rust reader
@@ -1158,7 +1204,7 @@ fn rewrite_nonconforming(
                 // Out of memory leaves the file unconformed, not unreadable,
                 // and is already reported as a resource failure.
                 if !e.is_out_of_memory() {
-                    skip_file(&file.path, "rewrite", &e.to_string());
+                    skip_failed(&file.path, "rewrite", &e);
                 }
             }
         }
@@ -1650,5 +1696,181 @@ mod tests {
         .unwrap();
         assert!(scanned.is_empty());
         assert_eq!(skipped, 2);
+    }
+
+    /// Run `f` under the production subscriber and the default filter
+    /// ([`crate::telemetry::DEFAULT_LOG_FILTER`]), scoped to this thread,
+    /// with a stdout capture and a telemetry WAL layer under `wal_dir`.
+    /// Returns every stdout line and every record the WAL holds after a
+    /// flush.
+    fn under_default_filter(
+        wal_dir: &std::path::Path,
+        f: impl FnOnce(),
+    ) -> (Vec<String>, Vec<serde_json::Value>) {
+        use crate::ingest::producer::Derivation;
+        use crate::ingest::wal::WalWriter;
+        use crate::telemetry::{self, LogSinks, WalHandle, WalLayer};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Stdout(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Stdout {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Stdout {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        const ENV: &str = "default";
+        let handle = WalHandle::new();
+        handle.set(Arc::new(WalWriter::new(wal_dir.to_path_buf())), ENV);
+        let wal = WalLayer::new_with_buffer_cap(
+            handle,
+            &[ENV.to_owned()],
+            ENV,
+            Arc::new(Derivation::defaults()),
+            trawl_config::DEFAULT_TELEMETRY_BUFFER_MAX_BYTES,
+        );
+        let stdout = Stdout::default();
+        let (dispatch, _) = telemetry::build_subscriber(
+            telemetry::DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout_ansi: false,
+                stdout: Some(stdout.clone()),
+                wal: Some(wal.clone()),
+                file_log: false,
+            },
+        );
+        tracing::dispatcher::with_default(&dispatch, f);
+        wal.flush();
+
+        let lines = String::from_utf8(stdout.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let records = std::fs::read_dir(wal_dir.join(ENV))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "ndjson"))
+            .flat_map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        (lines, records)
+    }
+
+    /// A scan or rewrite failure that is not an I/O error keeps `DuckDB`'s
+    /// driver text out of default stdout and out of the telemetry WAL: the
+    /// skip warning carries the failure's phase, class and cause, and the
+    /// text goes to DEBUG, which the default filter drops (ADR-0040, amended
+    /// 2026-11-09). A fixed skip reason still reaches WARN.
+    ///
+    /// The driver error is real, and its text carries a sentinel. The fixed
+    /// reason comes from the real scan, over a file in trawl's layout that
+    /// is not parquet.
+    #[test]
+    fn conform_skip_logs_the_class_not_the_driver_text() {
+        use crate::ingest::compaction::StatementFailure;
+        use crate::ingest::publication_marker::PublicationClaims;
+
+        let sentinel = format!(
+            "SENTINEL_conform_{}_{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let error = duckdb::Connection::open_in_memory()
+            .unwrap()
+            .query_row(&format!("SELECT error('{sentinel}')"), [], |_| Ok(()))
+            .unwrap_err();
+        let failure = StatementFailure::duckdb("conform rewrite failed", &error);
+        assert!(failure.to_string().contains(&sentinel), "{failure}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let rewritten = standing_parquet(&data, "prod/2026-01-15/10/api.parquet");
+        let not_parquet = data.join("prod/2026-01-15/11/api.parquet");
+        std::fs::create_dir_all(not_parquet.parent().unwrap()).unwrap();
+        std::fs::write(&not_parquet, b"not a parquet file").unwrap();
+
+        let (lines, records) = under_default_filter(&tmp.path().join("telemetry"), || {
+            super::skip_failed(&rewritten, "rewrite", &failure);
+            let (scanned, skipped) = super::scan_corpus(
+                &data,
+                "256MB",
+                &HashMap::new(),
+                Ok(&PublicationClaims::default()),
+                Ok(&HashSet::new()),
+            )
+            .unwrap();
+            let scanned: Vec<PathBuf> = scanned.into_iter().map(|scan| scan.path).collect();
+            assert_eq!(scanned, vec![rewritten.clone()]);
+            assert_eq!(skipped, 1, "the file that is not parquet is skipped");
+        });
+        let skips = |phase: &str| -> (Vec<String>, Vec<serde_json::Value>) {
+            let stdout = lines
+                .iter()
+                .filter(|line| line.contains("event_type=\"catalog_conform_skip\""))
+                .filter(|line| line.contains(&format!("phase=\"{phase}\"")))
+                .cloned()
+                .collect();
+            let persisted = records
+                .iter()
+                .filter(|record| record["event_type"] == "catalog_conform_skip")
+                .filter(|record| record["phase"] == phase)
+                .cloned()
+                .collect();
+            (stdout, persisted)
+        };
+
+        let (failed, failed_records) = skips("rewrite");
+        assert_eq!(failed.len(), 1, "{lines:#?}");
+        assert_eq!(failed_records.len(), 1, "{records:#?}");
+        let (line, record) = (&failed[0], &failed_records[0]);
+        assert!(line.contains(" WARN "), "{line}");
+        assert!(line.contains("error_class=\"database\""), "{line}");
+        assert!(line.contains("cause_kind=\"duckdb_failure\""), "{line}");
+        assert!(!line.contains("error="), "{line}");
+        assert_eq!(record["level"], "warn", "{record}");
+        assert_eq!(record["error_class"], "database", "{record}");
+        assert_eq!(record["cause_kind"], "duckdb_failure", "{record}");
+        assert!(record.get("error").is_none(), "{record}");
+
+        let (sniffed, sniffed_records) = skips("scan");
+        assert_eq!(sniffed.len(), 1, "{lines:#?}");
+        assert_eq!(sniffed_records.len(), 1, "{records:#?}");
+        assert!(sniffed[0].contains(" WARN "), "{}", sniffed[0]);
+        assert_eq!(sniffed_records[0]["level"], "warn");
+        assert_eq!(
+            sniffed_records[0]["error"],
+            "not a parquet file (magic-byte sniff failed)"
+        );
+
+        let leaked: Vec<&String> = lines.iter().filter(|l| l.contains(&sentinel)).collect();
+        assert!(
+            leaked.is_empty(),
+            "the driver text reached stdout: {leaked:#?}"
+        );
+        let persisted: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r.to_string().contains(&sentinel))
+            .collect();
+        assert!(
+            persisted.is_empty(),
+            "the driver text was persisted: {persisted:#?}"
+        );
     }
 }

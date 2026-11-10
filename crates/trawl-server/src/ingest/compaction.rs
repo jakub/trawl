@@ -23,6 +23,7 @@ use crate::env_dirs::{
     daily_file, date_name, hour_dir, hourly_file, list_env_dirs, parse_date, parse_hour,
     try_list_env_dirs_observed,
 };
+use crate::error::CauseKind;
 use crate::hot_buffer::{AdmissionState, HotBuffer};
 use crate::ingest::coverage_proof;
 use crate::ingest::no_follow;
@@ -3465,11 +3466,17 @@ pub(crate) fn structured_errors(conn: &duckdb::Connection) -> Result<(), String>
 ///
 /// The text is `DuckDB`'s own wording behind the caller's context, as the
 /// connection would word it without `errors_as_json`. Every other failure,
-/// from `DuckDB` or not, is carried as text.
+/// from `DuckDB` or not, is carried as text. That text can quote the
+/// generated SQL and the values a statement choked on, so it belongs at
+/// DEBUG only (ADR-0040, amended 2026-11-09): a retained event logs
+/// [`Self::error_class`] and [`Self::cause_kind`] instead.
 #[derive(Debug)]
 pub(crate) struct StatementFailure {
     text: String,
-    out_of_memory: bool,
+    /// Read off the `DuckDB` error's variant, or
+    /// [`CauseKind::DuckdbResourceExhausted`] when it ran out of memory.
+    /// Text with no typed source is [`CauseKind::Unknown`].
+    cause: CauseKind,
 }
 
 impl StatementFailure {
@@ -3482,6 +3489,11 @@ impl StatementFailure {
             trawl_engine::error::render_duckdb_error(error)
         );
         let out_of_memory = trawl_engine::error::is_out_of_memory(error);
+        let cause = if out_of_memory {
+            CauseKind::DuckdbResourceExhausted
+        } else {
+            CauseKind::of_duckdb(error)
+        };
         if out_of_memory {
             metrics::counter!(crate::metrics::MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL).increment(1);
             tracing::error!(
@@ -3493,16 +3505,32 @@ impl StatementFailure {
                  for whether it is retried"
             );
         }
-        Self {
-            text,
-            out_of_memory,
-        }
+        Self { text, cause }
     }
 
     /// Whether `DuckDB` ran out of memory: the inputs are sound, and the
     /// statement needs more memory than the limit allows.
     pub(crate) fn is_out_of_memory(&self) -> bool {
-        self.out_of_memory
+        self.cause == CauseKind::DuckdbResourceExhausted
+    }
+
+    /// What the failure came from, read off its typed source.
+    pub(crate) fn cause_kind(&self) -> CauseKind {
+        self.cause
+    }
+
+    /// The class a query failing the same way gets
+    /// ([`crate::error::ServerError::error_class`]): `database` for a
+    /// `DuckDB` refusal, `service_unavailable` for running out of memory,
+    /// and `internal` for text with no typed source.
+    pub(crate) fn error_class(&self) -> &'static str {
+        match self.cause {
+            CauseKind::DuckdbResourceExhausted => "service_unavailable",
+            CauseKind::DuckdbFailure | CauseKind::DuckdbConversion | CauseKind::DuckdbOther => {
+                "database"
+            }
+            _ => "internal",
+        }
     }
 }
 
@@ -3516,7 +3544,7 @@ impl From<String> for StatementFailure {
     fn from(text: String) -> Self {
         Self {
             text,
-            out_of_memory: false,
+            cause: CauseKind::Unknown,
         }
     }
 }
