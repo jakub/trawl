@@ -84,6 +84,7 @@ async fn histogram_reads_a_rust_tail_result() {
             query: "* | extract kv".to_owned(),
             limit: Some(1_000),
             offset: None,
+            histogram: false,
         },
     )
     .await;

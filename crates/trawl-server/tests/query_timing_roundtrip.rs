@@ -75,6 +75,7 @@ async fn query(server: &TestServer, dsl: &str) -> (String, Vec<Row>) {
             query: dsl.to_owned(),
             limit: Some(10_000),
             offset: None,
+            histogram: false,
         })
         .send()
         .await

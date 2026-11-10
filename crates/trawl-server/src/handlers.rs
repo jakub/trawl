@@ -477,6 +477,7 @@ pub async fn query(
                 },
                 degraded_fields,
                 severity_columns,
+                histogram: None,
             }))
         }
         Err(ServerError::Timeout) => {

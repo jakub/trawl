@@ -341,6 +341,7 @@ pub async fn query(q: &str, plan: FetchPlan) -> Result<QueryResponse, ApiError> 
         query: q.to_owned(),
         limit: Some(limit),
         offset: Some(offset),
+        histogram: false,
     };
     // A refusal of the query text arrives as the whole envelope, spans
     // and all, for the query error notice (ADR-0039).
