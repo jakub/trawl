@@ -31,8 +31,11 @@
 # wants it to lie. It refuses to run when a tracked file differs from
 # HEAD, so the commit it prints is the code it ran.
 #
-# Usage, from any directory of a clean checkout:
-#   DATABASE_URL=postgres://... docs/evidence/issue-410/mutation.sh > docs/evidence/issue-410/mutation.txt
+# Usage, from any directory of a clean checkout. Write the transcript
+# outside the tracked files first: a redirect into mutation.txt would
+# change that file before the script checks the tree.
+#   DATABASE_URL=postgres://... docs/evidence/issue-410/mutation.sh > /path/outside/the/checkout/mutation.txt
+#   cp /path/outside/the/checkout/mutation.txt docs/evidence/issue-410/mutation.txt
 
 set -euo pipefail
 
