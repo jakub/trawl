@@ -18,6 +18,7 @@ use ratatui::widgets::{
 use crate::tui::App;
 use crate::tui::state::{Focus, LoadedRun, MainTab, SavedFocus, SchemaBrowser};
 use crate::tui::theme::Theme;
+use crate::tui::ui::common::span_advancing;
 use trawl_api::zone::{DisplayZone, Presented, present, present_human};
 use trawl_core::sanitize::sanitize_display_text;
 use trawl_core::text_layout::{cells, fit_cells, pad_cells};
@@ -372,12 +373,14 @@ fn tree_line(node: &TreeNode<'_>, theme: &Theme, width: usize) -> Line<'static> 
             let trailing = 1usize; // padding before detail pane border
             let overhead = indent + 1 + type_width + 1 + cov_width + trailing;
             let max_name = width.saturating_sub(overhead);
-            let type_cell = pad_cells(&type_str, type_width);
+            // Both columns advance by their budget, whatever the cells the
+            // fitted text draws in, so the columns after them line up.
+            let type_cell = span_advancing(fit_cells(&type_str, type_width), type_width);
 
             let mut spans = vec![
                 Span::raw(" ".repeat(indent)),
                 Span::styled(
-                    pad_cells(name, max_name),
+                    span_advancing(fit_cells(name, max_name), max_name),
                     Style::default().fg(theme.text_accent),
                 ),
                 Span::raw(" "),
@@ -1991,5 +1994,83 @@ mod unicode_tests {
         let starts: Vec<usize> = ["N", "A", "B", "C"].into_iter().map(start_of).collect();
         // `ﾊﾟﾊﾟﾊﾟﾊﾟﾊﾟ` is ten cells, then the two-cell gap.
         assert_eq!(starts, [12, 12, 12, 12], "{buffer:?}");
+    }
+
+    /// The schema tree draws through a ratatui `List`, which advances each
+    /// span by its unicode-width, not by the cells its clusters draw in.
+    /// With `ｶﾞ`, `لا`, a combining accent and an emoji selector in a field
+    /// name, the type column still starts on the `host` row's cell, and
+    /// each name's glyphs end before it, at a width where every name fits
+    /// and at one where they are cut, on every row selected and not.
+    #[test]
+    fn list_rows_keep_column_alignment() {
+        const NAMES: [&str; 5] = ["host", "ｶﾞｶﾞ", "لالا", "e\u{301}e\u{301}", "❤\u{FE0F}x"];
+        let column = |name: &str| trawl_api::ServiceColumnStats {
+            name: name.to_owned(),
+            data_type: "VARCHAR".to_owned(),
+            null_count: 1,
+            total_count: 4,
+            min_value: None,
+            max_value: None,
+            compressed_bytes: 0,
+        };
+        let mut schema = SchemaBrowser::new(vec![trawl_api::ServiceSchema {
+            name: "svc".to_owned(),
+            columns: NAMES.iter().map(|name| column(name)).collect(),
+            earliest_date: None,
+            latest_date: None,
+            file_count: 1,
+            total_bytes: 1,
+            total_events: 4,
+            daily_event_counts: Vec::new(),
+            degraded_fields: Vec::new(),
+        }]);
+        schema.common_fields = Vec::new();
+        schema.expanded = HashSet::from(["svc".to_owned()]);
+        let theme = test_app().theme;
+
+        // Each field row's cells from x = 3, where the name starts: the
+        // name column, then ` `, the type column `STR `, ` ` and ` 75%`.
+        // A cell hidden behind a two-cell glyph reads as a space.
+        let tail = [" ", "S", "T", "R", " ", " ", " ", "7", "5", "%", " "];
+        // 20 cells: a six-cell name column, so the type starts at x = 10.
+        let fits: [&[&str]; 5] = [
+            &["h", "o", "s", "t", " ", " "],
+            &["ｶﾞ", " ", "ｶﾞ", " ", " ", " "],
+            &["ل", "ا", "ل", "ا", " ", " "],
+            &["e\u{301}", "e\u{301}", " ", " ", " ", " "],
+            &["❤\u{FE0F}", " ", "x", " ", " ", " "],
+        ];
+        // 16 cells: a two-cell name column, so the type starts at x = 6.
+        let cut: [&[&str]; 5] = [
+            &["h", "…"],
+            &["…", " "],
+            &["ل", "…"],
+            &["e\u{301}", "e\u{301}"],
+            &["…", " "],
+        ];
+        for (width, names, type_x) in [(20u16, fits, 10u16), (16, cut, 6)] {
+            for selected in 0..=NAMES.len() {
+                schema.selected = selected;
+                let terminal = draw(width, 6, |frame| {
+                    render_schema_tree(&schema, &theme, frame, frame.area());
+                });
+                let buffer = terminal.backend().buffer();
+                for (row, name) in (1u16..).zip(names) {
+                    let want: Vec<&str> = std::iter::repeat_n(" ", 3)
+                        .chain(name.iter().copied())
+                        .chain(tail)
+                        .collect();
+                    let got: Vec<&str> = (0..width).map(|x| buffer[(x, row)].symbol()).collect();
+                    let case = format!("width {width}, row {row}, selected {selected}");
+                    assert_eq!(
+                        buffer[(type_x, row)].symbol(),
+                        "S",
+                        "{case}: type column\n{got:?}"
+                    );
+                    assert_eq!(got, want, "{case}");
+                }
+            }
+        }
     }
 }
