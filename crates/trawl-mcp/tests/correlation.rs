@@ -1383,20 +1383,33 @@ async fn a_later_page_states_the_attribution_restriction_of_the_capture() {
 
 // -- continuation progress ----------------------------------------------------
 
-#[tokio::test]
-async fn a_correlation_row_the_budget_cannot_print_is_proposed_alone_at_the_hard_cap() {
-    // One row of 25 cells of 400 bytes, the result's only row: the default
-    // budget prints it nowhere, so the continuation reads it alone at the
-    // hard cap, and that read prints it beside the block.
-    let names: Vec<String> = (0..25).map(|i| format!("c{i:02}")).collect();
-    let columns: Vec<(&str, ColumnType)> = names
-        .iter()
-        .map(|name| (name.as_str(), ColumnType::String))
-        .collect();
-    let result = correlated(CaptureKind::Context, &context_facts(), &columns, 1, 1);
-    let row: Vec<Value> = (0..25)
-        .map(|i| s(&format!("{i:02}{}", "w".repeat(398))))
-        .collect();
+/// What a `context` answer over one row printed and proposed, in the
+/// order a growing fixed part moves it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OneRowAnswer {
+    /// It printed the row.
+    Printed,
+    /// It printed no row and proposed calls that read on.
+    Advanced,
+    /// It printed no row and proposed no call, or did not fit at all.
+    Stuck,
+}
+
+/// The one cell of [`wide_context`]'s row: 500 bytes, which no page
+/// abbreviates.
+fn wide_cell() -> String {
+    "w".repeat(500)
+}
+
+/// The backend and the `context` answer, at the default budget, over a
+/// one-row capture of one column holding [`wide_cell`] whose executed
+/// query ends in a comment of `comment` bytes. The query prints in the
+/// text and the mirror, and no fitting gives it up.
+async fn wide_context(comment: usize) -> (Fake, CallToolResult) {
+    let columns = [("message", ColumnType::String)];
+    let mut result = correlated(CaptureKind::Context, &context_facts(), &columns, 1, 1);
+    result.executed_query = format!("\"10.0.4.17\" # {}", "q".repeat(comment));
+    let row = vec![s(&wide_cell())];
     let backend = Fake {
         capabilities: ok(capabilities(None)),
         context: ok(response(&result)),
@@ -1409,44 +1422,90 @@ async fn a_correlation_row_the_budget_cannot_print_is_proposed_alone_at_the_hard
         input::<ContextInput>(json!({"result_id": RESULT_ID, "row": 3})),
     )
     .await;
-    assert_ne!(answer.is_error, Some(true), "{}", text_of(&answer));
-    assert!(used_bytes(&answer) <= 16_384, "{}", used_bytes(&answer));
-    assert_eq!(mirror(&answer)["result"]["rows"], json!([]));
-    let text = text_of(&answer);
+    (backend, answer)
+}
+
+/// Check that `answer`, which printed none of its one row at the default
+/// budget, proposes that row alone at the hard cap, and that following the
+/// call prints the row beside the block there.
+async fn proposes_the_correlation_row_at_the_hard_cap(backend: &Fake, answer: &CallToolResult) {
+    let text = text_of(answer);
+    assert_eq!(mirror(answer)["result"]["rows"], json!([]));
     assert_eq!(
         lines_starting(text, "no row fits "),
         ["no row fits max_bytes 16384; see next actions"],
         "{text}"
     );
     assert_eq!(lines_starting(text, NO_ORDER), [NO_ORDER]);
-    let action = &mirror(&answer)["next_actions"][0];
+    let action = &mirror(answer)["next_actions"][0];
     assert_eq!(
         json!({"tool": action["tool"], "arguments": action["arguments"]}),
         json!({"tool": "read", "arguments": {
             "action": "page", "result_id": CORRELATED_ID, "offset": 0, "rows": 1,
             "max_bytes": 32768,
-        }})
+        }}),
+        "{text}"
     );
 
     let followed = trawl_mcp::tools::dispatch(
         "read",
         action["arguments"].as_object().cloned(),
-        &backend,
+        backend,
         DisplayZone::Utc,
         &Seen::default(),
     )
     .await
     .unwrap();
-    assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
+    let text = text_of(&followed);
+    assert_ne!(followed.is_error, Some(true), "{text}");
     assert!(used_bytes(&followed) <= 32_768, "{}", used_bytes(&followed));
-    assert_eq!(
-        mirror(&followed)["result"]["rows"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
+    let view = &mirror(&followed)["result"];
+    let rows = view["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{text}");
+    assert_eq!(rows[0], json!([wide_cell()]), "{text}");
+    assert_eq!(lines_starting(text, NO_ORDER), [NO_ORDER]);
+}
+
+#[tokio::test]
+async fn a_correlation_row_the_budget_cannot_print_is_proposed_alone_at_the_hard_cap() {
+    // The result's only row, beside a block that is never dropped and a
+    // long executed query: the default budget has room for an answer that
+    // prints no row, and none for the row. The continuation reads it alone
+    // at the hard cap, and that read prints it beside the block. As the
+    // query grows, the answers go from printing the row, through proposing
+    // it, to neither.
+    let mut answers = Vec::new();
+    for comment in (3_000..8_600).step_by(20) {
+        let (backend, answer) = wide_context(comment).await;
+        let class = if answer.is_error == Some(true) {
+            OneRowAnswer::Stuck
+        } else {
+            assert!(used_bytes(&answer) <= 16_384, "{}", used_bytes(&answer));
+            let next_actions = mirror(&answer)["next_actions"].as_array().unwrap();
+            if !mirror(&answer)["result"]["rows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+            {
+                OneRowAnswer::Printed
+            } else if next_actions.is_empty() {
+                OneRowAnswer::Stuck
+            } else {
+                OneRowAnswer::Advanced
+            }
+        };
+        if class == OneRowAnswer::Advanced {
+            proposes_the_correlation_row_at_the_hard_cap(&backend, &answer).await;
+        }
+        answers.push(class);
+    }
+    assert!(answers.is_sorted(), "{answers:?}");
+    assert!(
+        answers.contains(&OneRowAnswer::Printed)
+            && answers.contains(&OneRowAnswer::Advanced)
+            && answers.contains(&OneRowAnswer::Stuck),
+        "{answers:?}"
     );
-    assert_eq!(lines_starting(text_of(&followed), NO_ORDER), [NO_ORDER]);
 }
 
 #[tokio::test]

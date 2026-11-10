@@ -50,8 +50,8 @@ use crate::render::link::search_link;
 use crate::render::rows::{ABBREVIATE_OVER_BYTES, EncodedPage, encode_page, json_string};
 use crate::render::{self, Budget, MAX_FACET_VALUES, refusal};
 use crate::reply::{
-    Bounds, CorrelationReply, DslEffects, Facet, FacetValue, Link, NextAction, Presentation,
-    ResultView,
+    Bounds, CorrelationReply, DslEffects, Facet, FacetValue, Link, NextAction, PageRead,
+    Presentation, ResultView,
 };
 use crate::session::Seen;
 use schema::{
@@ -213,6 +213,7 @@ pub(crate) async fn result_view(
         presentation: Presentation {
             cells_abbreviated: 0,
             columns_omitted: crate::render::rows::as_u64(columns_omitted),
+            null_columns_omitted: 0,
             rows_omitted: 0,
             rows_dropped_to_fit: 0,
             facets_dropped_to_fit: false,
@@ -225,6 +226,7 @@ pub(crate) async fn result_view(
         offset,
         rows: page.rows,
         abbreviated: page.abbreviated,
+        read: PageRead::default(),
     }
 }
 

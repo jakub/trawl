@@ -69,7 +69,7 @@ use trawl_client::types::FormatErrorKind;
 use trawl_core::sanitize::is_unsafe_display_char;
 
 use crate::reply::{
-    CellView, CorrelationView, DslEffects, FormatRefusal, FormatRefusalKind, NextAction,
+    CellView, CorrelationView, DslEffects, FormatRefusal, FormatRefusalKind, NextAction, PageRead,
     ReadAction, ReadReply, ResultView, SearchReply, ValidationView,
 };
 use crate::tools::schema::{MAX_ROWS, READ, SEARCH};
@@ -99,6 +99,7 @@ pub const MAX_NEXT_ACTIONS: usize = 2;
 #[must_use]
 pub fn search(mut reply: SearchReply, budget: Budget, page_rows: u64) -> CallToolResult {
     if let Some(view) = reply.result.as_mut() {
+        record_read(view);
         normalize(view);
     }
     reply.next_actions.truncate(MAX_NEXT_ACTIONS);
@@ -125,6 +126,7 @@ pub fn read(mut reply: ReadReply, budget: Budget, page_rows: u64) -> CallToolRes
         return activity::fit_entries(reply, budget, READ);
     }
     if let Some(view) = reply.result.as_mut() {
+        record_read(view);
         normalize(view);
     }
     reply.next_actions.truncate(MAX_NEXT_ACTIONS);
@@ -321,6 +323,31 @@ fn does_not_fit(tool: &str, result_id: Option<&str>, budget: Budget) -> CallTool
         "{tool} answered, but its reply does not fit max_bytes={bytes} even without rows, \
          facets, hints, next calls or the search URL.{tail}"
     ))
+}
+
+/// Record in `view` what the call read, before the renderer caps or fits
+/// anything: which columns were null in every row read, by index (a
+/// column's name need not be unique), how many columns the page carried
+/// and trawld's projection left out, and the page's first captured
+/// position. A cell is null only when it is JSON `null`.
+fn record_read(view: &mut ResultView) {
+    let null_columns = if view.rows.is_empty() {
+        Vec::new()
+    } else {
+        (0..view.columns.len())
+            .map(|index| {
+                view.rows
+                    .iter()
+                    .all(|row| row.get(index).is_some_and(Json::is_null))
+            })
+            .collect()
+    };
+    view.read = PageRead {
+        null_columns,
+        columns: rows::as_u64(view.columns.len()),
+        projected_out: view.presentation.columns_omitted,
+        first_position: view.columns.first().map_or(0, |column| column.position),
+    };
 }
 
 /// Hold `view` to the limits the text contract states, and recount its
@@ -599,7 +626,9 @@ fn dsl_fact(effects: DslEffects) -> String {
 }
 
 /// Truncation fact 4: what this response printed, abbreviated, omitted
-/// and dropped to fit its budget.
+/// and dropped to fit its budget. When the fitting omitted columns of the
+/// page, it says how many of the omitted were null in every row read, and
+/// that `fields` describes the omitted columns.
 fn presentation_fact(view: &ResultView, budget: Budget) -> String {
     let p = view.presentation;
     let printed = view.rows.len();
@@ -617,11 +646,25 @@ fn presentation_fact(view: &ResultView, budget: Budget) -> String {
     };
     let _ = write!(
         fact,
-        ", abbreviates {} {} and omits {} {}; {} captured {} {}.",
+        ", abbreviates {} {} and omits {} {}",
         p.cells_abbreviated,
         plural_u64(p.cells_abbreviated, "cell", "cells"),
         p.columns_omitted,
         plural_u64(p.columns_omitted, "column", "columns"),
+    );
+    let fitted_out = view
+        .read
+        .columns
+        .saturating_sub(rows::as_u64(view.columns.len()));
+    if fitted_out > 0 {
+        if p.null_columns_omitted > 0 {
+            let _ = write!(fact, " ({} null in every row read)", p.null_columns_omitted);
+        }
+        fact.push_str("; fields source=result describes them");
+    }
+    let _ = write!(
+        fact,
+        "; {} captured {} {}.",
         p.rows_omitted,
         plural_u64(p.rows_omitted, "row", "rows"),
         if p.rows_omitted == 1 {
