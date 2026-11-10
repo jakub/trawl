@@ -335,13 +335,17 @@ fn encode(raw: &str) -> String {
 /// [`PAGE_SIZE`] page, an aggregation reads the whole result once. This
 /// transport does none of its own, so there is a single place where a
 /// page number becomes a `(limit, offset)` pair.
+///
+/// A page of a raw-event query also asks for the whole result's
+/// histogram, which the strip above the table draws. An aggregation's
+/// `Whole` read asks for none, so its request carries no key.
 pub async fn query(q: &str, plan: FetchPlan) -> Result<QueryResponse, ApiError> {
     let (limit, offset) = plan.window();
     let body = QueryRequest {
         query: q.to_owned(),
         limit: Some(limit),
         offset: Some(offset),
-        histogram: false,
+        histogram: matches!(plan, FetchPlan::Page { .. }),
     };
     // A refusal of the query text arrives as the whole envelope, spans
     // and all, for the query error notice (ADR-0039).

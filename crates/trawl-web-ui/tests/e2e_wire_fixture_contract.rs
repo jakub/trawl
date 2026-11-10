@@ -163,6 +163,10 @@ mod drawer_query;
 #[path = "../src/histogram.rs"]
 mod histogram;
 
+/// The exact-count formatter `histogram` prints its counts with.
+#[path = "../src/service_card_fmt.rs"]
+mod service_card_fmt;
+
 /// The rows every `corpus` spec reads. Their CONTENT is the contract: a
 /// spec asserts on a host name, counts facet values, and tells one sort
 /// order from another by the first row, so a re-shuffled fixture would
