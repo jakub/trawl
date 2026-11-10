@@ -55,8 +55,10 @@ use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 ///
 /// `pins` is the pin scope stamped at the kv split
 /// (`EmittedQuery::rust_stage_pins`), so the tail's `where`/`let` evaluate
-/// under the same interpretation the SQL prefix used. The tail compiles in
-/// one walk of that scope, which a `sort` or a `dedup` leaves unchanged.
+/// under the same interpretation the SQL prefix used, plus a Timestamp pin
+/// for each column the SQL step returned as a TIMESTAMP that the split
+/// scope leaves unpinned. The tail compiles in one walk of that scope,
+/// which a `sort` or a `dedup` leaves unchanged.
 ///
 /// `anchor` is the statement's `now()` instant (`EmittedQuery::anchor`,
 /// ADR-0017 §3). Every row — pre-stage, accumulator feed, snapshot,
