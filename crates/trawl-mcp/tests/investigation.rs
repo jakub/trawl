@@ -18,7 +18,7 @@ use serde_json::{Value as Json, json};
 use trawl_api::investigations::{
     Activity, AppendResponse, EntryPayload, EvidenceRef, FindingStatus, InvestigationId,
     InvestigationList, InvestigationRead, InvestigationStatus, InvestigationSummary, LogEntry,
-    SequenceConflict, StepBounds, StepOutcome, StepOutcomeKind,
+    PatchResponse, SequenceConflict, StepBounds, StepOutcome, StepOutcomeKind,
 };
 use trawl_client::{ClientError, ErrorCode, ErrorEnvelope};
 use trawl_mcp::render::activity::ENTRY_ALLOWANCE_BYTES;
@@ -61,6 +61,21 @@ fn sent(call: &str) -> Json {
 
 fn appended(entry: LogEntry, activity: Option<Activity>) -> AppendResponse {
     AppendResponse { entry, activity }
+}
+
+/// trawld's answer to a `PATCH` that left the investigation at `header`:
+/// the agent's status entry at the header's seq, and `activity`.
+fn patched(header: Investigation, activity: Option<Activity>) -> PatchResponse {
+    PatchResponse {
+        entry: LogEntry {
+            payload: EntryPayload::Status {
+                status: header.status,
+            },
+            ..note(header.seq, agent(), "")
+        },
+        investigation: header,
+        activity,
+    }
 }
 
 /// trawld's answers to the appends, in order.
@@ -299,12 +314,15 @@ async fn every_write_sends_its_request_and_the_sessions_seen_seq() {
                 },
                 ..note(4, agent(), "")
             },
-            None,
+            Some(activity(vec![], false)),
         )]),
-        patch_investigation: ok(Investigation {
-            status: InvestigationStatus::Closed,
-            ..investigation(5)
-        }),
+        patch_investigation: ok(patched(
+            Investigation {
+                status: InvestigationStatus::Closed,
+                ..investigation(5)
+            },
+            Some(activity(vec![], false)),
+        )),
         ..Fake::default()
     };
     let seen = Seen::default();
@@ -344,12 +362,13 @@ async fn every_write_sends_its_request_and_the_sessions_seen_seq() {
     assert!(calls[3].starts_with(&format!("set_finding_status {INVESTIGATION_ID} 3 ")));
     assert_eq!(
         sent(&calls[3]),
-        json!({"expected_seq": 3, "status": "refuted"})
+        json!({"expected_seq": 3, "seen_seq": 1, "status": "refuted"})
     );
-    // PATCH carries status alone: one field per request.
+    // PATCH changes status alone, one field per request; seen_seq is
+    // bookkeeping beside it.
     assert_eq!(
         sent(&calls[4]),
-        json!({"expected_seq": 4, "status": "closed"})
+        json!({"expected_seq": 4, "seen_seq": 1, "status": "closed"})
     );
     // Nothing other keys wrote was printed, so seen stays at the first
     // touch.
@@ -559,6 +578,281 @@ async fn a_refused_write_moves_nothing() {
     .await;
     assert_eq!(refused.is_error, Some(true));
     assert_eq!(seen.lock().await.get(&id()), Some(1));
+}
+
+/// The `seq` of every entry by the other key that `result`'s text printed,
+/// in the order printed.
+fn theirs_printed(result: &CallToolResult) -> Vec<u64> {
+    text_of(result)
+        .lines()
+        .filter(|line| line.contains(" by Zy9x8w7v "))
+        .filter_map(|line| line.strip_prefix('#'))
+        .map(|line| line[..line.find(' ').unwrap()].parse().unwrap())
+        .collect()
+}
+
+/// #319: `status` and `finding_status` carry the session's `seen_seq` and
+/// print what other keys wrote since, each entry once. The first touch
+/// starts at the entry the call wrote, never at the investigation's
+/// header. After that, `seen` moves only through the activity a fitted
+/// reply printed. An empty activity, an answer without activity, the
+/// budget's drops, a 409 and a transport error leave the rest unseen, and
+/// the next write prints exactly that rest.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one session's writes, each step asserted in order
+async fn overwrites_print_unseen_activity_once() {
+    let header = |seq: u64, status: InvestigationStatus| Investigation {
+        status,
+        ..investigation(seq)
+    };
+    let status_entry = |seq: u64, actor: Actor, status: InvestigationStatus| LogEntry {
+        payload: EntryPayload::Status { status },
+        ..note(seq, actor, "")
+    };
+    let finding_status = |seq: u64, status: FindingStatus| LogEntry {
+        payload: EntryPayload::FindingStatus {
+            finding_seq: 3,
+            status,
+        },
+        ..note(seq, agent(), "")
+    };
+    // The other key writes #6 and #7, reopens at #11, then writes ten
+    // notes, more than the minimum budget prints beside a write.
+    let early = vec![note(6, human(), "theirs 6"), note(7, human(), "theirs 7")];
+    let mut late = vec![status_entry(11, human(), InvestigationStatus::Open)];
+    late.extend(human_notes(12, 21, 300));
+    let timeout = || {
+        ClientError::Network(trawl_client::NetworkError::new(
+            trawl_client::NetworkKind::Timeout,
+            "timed out",
+        ))
+    };
+    let backend = Fake {
+        patch_investigation: each(vec![
+            // The reopen that first touches the investigation writes #5.
+            // The header says #6: whatever a header says, the session
+            // counts from the entry the call wrote, so it cannot skip #6.
+            Ok(PatchResponse {
+                investigation: Investigation {
+                    updated_by: human(),
+                    ..header(6, InvestigationStatus::Open)
+                },
+                entry: status_entry(5, agent(), InvestigationStatus::Open),
+                activity: None,
+            }),
+            // The close: nothing new from other keys since #7.
+            Ok(patched(
+                header(10, InvestigationStatus::Closed),
+                Some(Activity {
+                    entries: vec![],
+                    through_seq: 10,
+                    more: false,
+                }),
+            )),
+            // A reopen against #10, after the other key reopened at #11.
+            Err(conflict(10, 11)),
+        ]),
+        set_finding_status: each(vec![
+            Ok(appended(
+                finding_status(8, FindingStatus::Supported),
+                Some(activity(early.clone(), false)),
+            )),
+            // An answer that carries no activity, though the call sent
+            // seen_seq.
+            Ok(appended(finding_status(9, FindingStatus::Refuted), None)),
+            Err(timeout()),
+            Ok(appended(
+                finding_status(22, FindingStatus::Supported),
+                Some(activity(late.clone(), false)),
+            )),
+        ]),
+        ..Fake::default()
+    };
+    let seen = Seen::default();
+    let seen_now = async || seen.lock().await.get(&id());
+    let mut fitted = Vec::new();
+
+    // 1. The first touch: no seen_seq, the first-touch note, and seen
+    // starts at the entry written.
+    let reopened = call(
+        &backend,
+        &seen,
+        json!({"action": "status", "id": INVESTIGATION_ID, "status": "open",
+               "expected_seq": 4}),
+    )
+    .await;
+    assert_ok(&reopened);
+    assert!(
+        text_of(&reopened).contains(
+            "activity: this session starts following this investigation at #5; what other \
+             keys wrote before it is on the board"
+        ),
+        "{}",
+        text_of(&reopened)
+    );
+    assert_eq!(seen_now().await, Some(5));
+    fitted.push(reopened);
+
+    // 2. A finding_status prints the other key's #6 and #7.
+    let supported = call(
+        &backend,
+        &seen,
+        json!({"action": "finding_status", "id": INVESTIGATION_ID, "finding_seq": 3,
+               "status": "supported", "expected_seq": 7}),
+    )
+    .await;
+    assert_ok(&supported);
+    assert!(
+        text_of(&supported).contains("activity by other keys since #5, in change order: 2 entries"),
+        "{}",
+        text_of(&supported)
+    );
+    assert_eq!(theirs_printed(&supported), [6, 7]);
+    assert_eq!(seen_now().await, Some(7));
+    fitted.push(supported);
+
+    // 3. An answer without activity says so and moves nothing.
+    let refuted = call(
+        &backend,
+        &seen,
+        json!({"action": "finding_status", "id": INVESTIGATION_ID, "finding_seq": 3,
+               "status": "refuted", "expected_seq": 8}),
+    )
+    .await;
+    assert_ok(&refuted);
+    assert!(
+        text_of(&refuted).contains("activity: trawld sent no activity with this write"),
+        "{}",
+        text_of(&refuted)
+    );
+    assert_eq!(seen_now().await, Some(7));
+    fitted.push(refuted);
+
+    // 4. A close with an empty activity prints none and moves nothing,
+    // not even to the activity's through_seq.
+    let closed = call(
+        &backend,
+        &seen,
+        json!({"action": "status", "id": INVESTIGATION_ID, "status": "closed",
+               "expected_seq": 9}),
+    )
+    .await;
+    assert_ok(&closed);
+    assert!(
+        text_of(&closed).contains("activity by other keys since #7, in change order: none."),
+        "{}",
+        text_of(&closed)
+    );
+    assert_eq!(seen_now().await, Some(7));
+    fitted.push(closed);
+
+    // 5. A 409 and 6. a transport error move nothing.
+    let stale = call(
+        &backend,
+        &seen,
+        json!({"action": "status", "id": INVESTIGATION_ID, "status": "open",
+               "expected_seq": 10}),
+    )
+    .await;
+    assert_eq!(stale.is_error, Some(true));
+    assert!(
+        text_of(&stale).contains("sequence_conflict (HTTP 409)"),
+        "{}",
+        text_of(&stale)
+    );
+    assert_eq!(seen_now().await, Some(7));
+    let lost = call(
+        &backend,
+        &seen,
+        json!({"action": "finding_status", "id": INVESTIGATION_ID, "finding_seq": 3,
+               "status": "supported", "expected_seq": 11}),
+    )
+    .await;
+    assert_eq!(lost.is_error, Some(true));
+    assert_eq!(seen_now().await, Some(7));
+
+    // 7. At the minimum budget the activity prints its first entries and
+    // drops the rest; seen moves through the last one printed and no
+    // further.
+    let cut = call(
+        &backend,
+        &seen,
+        json!({"action": "finding_status", "id": INVESTIGATION_ID, "finding_seq": 3,
+               "status": "supported", "expected_seq": 21, "max_bytes": 4096}),
+    )
+    .await;
+    assert_ok(&cut);
+    assert!(used_bytes(&cut) <= 4096, "{}", used_bytes(&cut));
+    let view = block(&cut, "activity");
+    let printed_through = view["printed_through"].as_u64().unwrap();
+    assert!(
+        (11..21).contains(&printed_through),
+        "{printed_through}: {view}"
+    );
+    assert!(
+        view["entries_dropped_to_fit"].as_u64().unwrap() > 0,
+        "{view}"
+    );
+    assert_eq!(
+        theirs_printed(&cut),
+        (11..=printed_through).collect::<Vec<_>>()
+    );
+    assert_eq!(seen_now().await, Some(printed_through));
+    fitted.push(cut);
+
+    // Each overwrite sent the session's seen_seq as it stood when the
+    // call began, and the first touch sent none.
+    let calls = backend.calls();
+    assert_eq!(
+        calls.iter().map(|call| sent(call)).collect::<Vec<_>>(),
+        [
+            json!({"expected_seq": 4, "status": "open"}),
+            json!({"expected_seq": 7, "seen_seq": 5, "status": "supported"}),
+            json!({"expected_seq": 8, "seen_seq": 7, "status": "refuted"}),
+            json!({"expected_seq": 9, "seen_seq": 7, "status": "closed"}),
+            json!({"expected_seq": 10, "seen_seq": 7, "status": "open"}),
+            json!({"expected_seq": 11, "seen_seq": 7, "status": "supported"}),
+            json!({"expected_seq": 21, "seen_seq": 7, "status": "supported"}),
+        ],
+        "{calls:?}"
+    );
+
+    // 8. The next append prints exactly the entries still unseen.
+    let unseen: Vec<LogEntry> = late
+        .iter()
+        .filter(|entry| entry.updated_seq > printed_through)
+        .cloned()
+        .collect();
+    let appends = Fake {
+        append_entry: ok(appended(
+            note(23, agent(), "mine"),
+            Some(activity(unseen, false)),
+        )),
+        ..Fake::default()
+    };
+    let noted = call(
+        &appends,
+        &seen,
+        json!({"action": "note", "id": INVESTIGATION_ID, "text": "mine"}),
+    )
+    .await;
+    assert_ok(&noted);
+    assert_eq!(
+        sent(&appends.calls()[0])["seen_seq"],
+        json!(printed_through)
+    );
+    assert_eq!(
+        block(&noted, "activity")["entries_dropped_to_fit"],
+        json!(0)
+    );
+    assert_eq!(seen_now().await, Some(21));
+    fitted.push(noted);
+
+    // Across every reply, each of the other key's entries printed once,
+    // in change order.
+    let printed: Vec<u64> = fitted.iter().flat_map(theirs_printed).collect();
+    let expected: Vec<u64> = [6, 7].into_iter().chain(11..=21).collect();
+    assert_eq!(printed, expected);
 }
 
 // -- refusals ---------------------------------------------------------------------
@@ -1650,19 +1944,23 @@ fn mine(payload: EntryPayload) -> LogEntry {
     }
 }
 
-/// A backend that appends `entry`, answering two other keys' entries as
-/// long as a note may be, each byte `fill`.
-fn appends(entry: LogEntry, fill: char) -> Fake {
+/// Two of the other key's entries as long as a note may be, each byte
+/// `fill`.
+fn maximal_activity(fill: char) -> Activity {
     use trawl_api::investigations::NOTE_MAX_BYTES;
-    let theirs = activity(
+    activity(
         vec![
             note(2, human(), &filled(fill, NOTE_MAX_BYTES)),
             note(3, human(), &filled(fill, NOTE_MAX_BYTES)),
         ],
         false,
-    );
+    )
+}
+
+/// A backend that appends `entry`, answering [`maximal_activity`].
+fn appends(entry: LogEntry, fill: char) -> Fake {
     Fake {
-        append_entry: ok(appended(entry, Some(theirs))),
+        append_entry: ok(appended(entry, Some(maximal_activity(fill)))),
         ..Fake::default()
     }
 }
@@ -1736,7 +2034,7 @@ fn maximal_writes(fill: char) -> Vec<(Json, Fake, u64)> {
                         finding_seq: 3,
                         status: FindingStatus::Refuted,
                     }),
-                    None,
+                    Some(maximal_activity(fill)),
                 )),
                 ..Fake::default()
             },
@@ -1746,10 +2044,13 @@ fn maximal_writes(fill: char) -> Vec<(Json, Fake, u64)> {
             json!({"action": "status", "id": INVESTIGATION_ID, "status": "closed",
                    "expected_seq": 3}),
             Fake {
-                patch_investigation: ok(Investigation {
-                    status: InvestigationStatus::Closed,
-                    ..maximal_investigation(fill, 4)
-                }),
+                patch_investigation: ok(patched(
+                    Investigation {
+                        status: InvestigationStatus::Closed,
+                        ..maximal_investigation(fill, 4)
+                    },
+                    Some(maximal_activity(fill)),
+                )),
                 ..Fake::default()
             },
             4,
@@ -1990,7 +2291,7 @@ async fn the_read_an_abbreviated_echo_names_prints_the_entry_at_every_budget() {
 /// R3: the session's bookkeeping moves only on a fitted success. A reply
 /// that cannot fit, here because trawld names an actor longer than any
 /// response, is an error that names the accepted write and leaves `seen`
-/// where it was.
+/// where it was: unset on a first touch, and at its cursor after one.
 #[tokio::test]
 async fn seen_moves_only_after_a_fitted_success() {
     let huge = Actor {
@@ -2009,7 +2310,7 @@ async fn seen_moves_only_after_a_fitted_success() {
                 ..unprintable.clone()
             },
         )),
-        patch_investigation: ok(unprintable),
+        patch_investigation: ok(patched(unprintable, None)),
         set_finding_status: ok(appended(
             LogEntry {
                 actor: huge.clone(),
@@ -2034,25 +2335,33 @@ async fn seen_moves_only_after_a_fitted_success() {
                "status": "refuted", "expected_seq": 3}),
         json!({"action": "note", "id": INVESTIGATION_ID, "text": "a"}),
     ] {
-        let seen = Seen::default();
-        let result = call(&backend, &seen, arguments.clone()).await;
-        assert_eq!(result.is_error, Some(true), "{arguments}");
-        let text = text_of(&result);
-        assert!(text.contains(INVESTIGATION_ID), "{arguments}: {text}");
-        if arguments["max_bytes"] == json!(32768) {
-            // No larger budget exists to suggest.
-            assert!(
-                !text.contains("send a larger max_bytes"),
-                "{arguments}: {text}"
-            );
+        let create = arguments["action"] == json!("create");
+        // A create never moves an existing cursor, so it runs untouched.
+        let cursors: &[Option<u64>] = if create { &[None] } else { &[None, Some(1)] };
+        for &cursor in cursors {
+            let seen = Seen::default();
+            if let Some(cursor) = cursor {
+                seen.lock().await.touch(&id(), cursor);
+            }
+            let result = call(&backend, &seen, arguments.clone()).await;
+            assert_eq!(result.is_error, Some(true), "{arguments} {cursor:?}");
+            let text = text_of(&result);
+            assert!(text.contains(INVESTIGATION_ID), "{arguments}: {text}");
+            if arguments["max_bytes"] == json!(32768) {
+                // No larger budget exists to suggest.
+                assert!(
+                    !text.contains("send a larger max_bytes"),
+                    "{arguments}: {text}"
+                );
+            }
+            if create {
+                assert!(
+                    text.contains(&format!("send the same create with id={INVESTIGATION_ID}")),
+                    "{arguments}: {text}"
+                );
+            }
+            assert_eq!(seen.lock().await.get(&id()), cursor, "{arguments}");
         }
-        if arguments["action"] == json!("create") {
-            assert!(
-                text.contains(&format!("send the same create with id={INVESTIGATION_ID}")),
-                "{arguments}: {text}"
-            );
-        }
-        assert_eq!(seen.lock().await.get(&id()), None, "{arguments}");
     }
     // The same create with printable fields fits, and only then moves seen.
     let backend = Fake {

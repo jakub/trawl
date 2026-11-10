@@ -5,8 +5,8 @@
 //! What one MCP session has seen of each investigation (ADR-0059).
 //!
 //! The live board is pull, both ways: the MCP server holds a `seen_seq`
-//! per investigation per session and sends it with every attached call
-//! and every append, and trawld answers with the entries other keys
+//! per investigation per session and sends it with every attached call,
+//! append and overwrite, and trawld answers with the entries other keys
 //! changed after it. One stdio session is one process, so the map lives in
 //! [`crate::TrawlServer`]. Nothing here is stored at trawld: two sessions
 //! on one key each see every entry once.
