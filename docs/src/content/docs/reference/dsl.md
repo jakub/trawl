@@ -31,7 +31,7 @@ Each pattern is checked where it is written: a search-stage glob or `/regex/`, a
 3. The class rule. A regex body may not nest a class in a class, as in `[a[bc]]`, or use the class set operators `&&`, `--` and `~~`. The batch engine reads each of them as plain characters, so the same body would match different text there. Either returns `nested character classes and the class set operators &&, -- and ~~ are not supported`. Write the class flat, as `[abc]` or `[a-df-z]`. An escaped `[`, `]`, `&`, `-` or `~`, as in `[a\&b]`, and a POSIX class such as `[[:alpha:]]` are allowed. A glob, `like` or `ilike` operand has no class rule, because the batch engine never reads one as a regex.
 4. The repeat budget. One pattern may expand to 64 positions. Each character, class or `.` is one position. So is each anchor (`^`, `$`, `\A`, `\z`), each word boundary (`\b`, `\B` and their other forms), each capture group, named or not, and each `|`. An alternation branch or a repeated group that holds no position counts one, so `a|b` is three positions and `(?:a|)` is three. A counted repeat multiplies the positions inside it by its upper bound, and `+` and `*` multiply them by their lower bound plus one. Every repeat also counts at least one more than it holds, so `x?`, `x*` and `x{1}` are two positions, and each repeat nested around another adds one. Flags such as `(?i)`, a `(?:…)` group itself, and `(?x)` whitespace and comments count nothing. So `\w{20}` is 20 positions, `[0-9a-f]{64}` is 64 and `\w+` is 2, and `[A-Za-z]{1000}` and a 65-character literal are refused. Over the budget returns `pattern repeats too much (N positions, max 64)`. Write `+` or `*` for a long run, and `(?:…)` for a group you do not need to capture. To match long plain text, use `contains(field, "text")`, which has no position limit.
 
-A glob, `like` or `ilike` pattern takes the repeat budget and the checks below on the regex it stands for. Its length is the operand's. That regex is anchored at both ends, and the two anchors are positions. Every character of a `like` or `ilike` operand is a position too, so one holds at most 62 characters. A `%`, or a glob's `*`, stands for `.*`, which is two positions, so an operand holds one character fewer for each. A glob's `[…]` class is one position however many characters it lists.
+A glob, `like` or `ilike` pattern takes the repeat budget and the checks below on the regex it stands for. Its length is the operand's. That regex is anchored at both ends, and the two anchors are positions. Every character of a `like` or `ilike` operand is a position too, so one holds at most 62 characters. A glob counts bytes, not characters: each byte it matches as itself is a position, so `é` is two. A `%`, or a glob's `*`, stands for `.*`, which is two positions, so an operand holds one character fewer for each. A glob's `[…]` class is one position however many characters it lists.
 
 Once the whole query parses, three checks cover the query:
 
@@ -117,6 +117,26 @@ host="db host"
 ```
 
 A quoted value is never a pattern, so `host="a*"` matches the text `a*`. Globs and regexes take `=` and `!=` only, and are case-sensitive.
+
+A glob matches the whole value. It reads the value byte by byte, as the batch engine's `GLOB` does:
+
+- `*` matches any run of bytes, including an empty run and line breaks.
+- `?` matches one byte. A character outside ASCII is two to four bytes, so `é` needs `??` and `€` needs `???`.
+- `[…]` matches one byte from a set. `[abc]` lists bytes and `[a-z]` is a range. A `]` right after the `[` is a member, so `[]a]` holds `]` and `a`. A character outside ASCII adds each of its bytes to the set, so `[é]` does not match `é`. Keep range ends ASCII: a range with an end outside ASCII compares bytes as the batch engine's platform does.
+- `[!…]` matches one byte that is not in the set. `^` is a plain member, so `[^4]` matches `^` or `4`.
+- Outside a class, `\` makes the next byte plain, so `\*` matches `*`. Inside a class, `\` is a plain member.
+- A malformed glob matches no value. That is a class that does not close, as in `a[b*`, an empty `[]`, a class that holds no byte, as in `[z-a]*`, or a trailing `\`. So `host!=a[b*` matches every event.
+
+A class alone does not make a value a glob. The value needs `*` or `?`, so `host=[ab]` is exact and matches the text `[ab]`.
+
+A glob has no quoted form, so it cannot hold a character that ends or breaks a bare value: ASCII whitespace, `|`, `,`, `(`, `)`, a backtick, `#`, or a `"` at the start. Write the match as a `where` stage instead. `like` uses `%` for any run and `_` for one character, not one byte:
+
+```
+# a glob that would need a space
+* | where host like "a b%"
+```
+
+A regex works too: `* | where host matches /^a b/`.
 
 A value that opens with `"` must be a complete quoted string. `host="*` returns `a value that opens with '"' must be a complete quoted string`, with the hint `close the quote`. The same holds for a list element, as in `f=a,"b`.
 

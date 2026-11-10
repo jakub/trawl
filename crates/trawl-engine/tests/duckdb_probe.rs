@@ -1323,6 +1323,135 @@ fn re2_reads_class_set_syntax_as_plain_characters() {
     assert!(trawl_core::parser::parse(r"msg=/[a\&&b][\[]/").is_ok());
 }
 
+/// Rule (ADR-0001's amendment of 2026-11-09): a search-stage glob matches
+/// in the live lane and the kv batch tail exactly as `DuckDB`'s `GLOB`
+/// matches it in batch SQL. `GLOB` reads bytes: `?` is one byte, a class
+/// is a set of bytes, `[!` negates and `^` is a member, `\` escapes the
+/// next byte outside a class and is a member inside one, and a malformed
+/// glob matches nothing. A range compares C `char` values, signed on
+/// `x86_64`, so `[Ã-a]` holds `Z`.
+///
+/// Each row states `DuckDB`'s answer, checks it against the bundled engine
+/// (`SELECT ? GLOB ?`, the shape the batch lane emits), then builds the
+/// glob through the pattern owner and checks the live `is_match` against
+/// it. Every glob must build: a malformed one builds as a pattern that
+/// matches nothing, never as a syntax error.
+#[test]
+fn glob_lane_semantics_probe() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let duckdb_glob = |subject: &str, glob: &str| -> bool {
+        conn.query_row("SELECT ? GLOB ?", [subject, glob], |row| row.get(0))
+            .unwrap_or_else(|e| panic!("{subject:?} GLOB {glob:?}: {e}"))
+    };
+    let live_glob = |subject: &str, glob: &str| -> bool {
+        trawl_core::pattern::Preparer::new()
+            .build(trawl_core::pattern::PatternKind::Glob, glob)
+            .unwrap_or_else(|e| panic!("{glob:?} builds: {e}"))
+            .is_match(subject)
+            .unwrap_or_else(|e| panic!("{subject:?} against {glob:?}: {e}"))
+    };
+    let rows: &[(&str, &str, bool)] = &[
+        // The issue's table.
+        ("4", "[^4]", true),
+        ("é", "?", false),
+        ("é", "??", true),
+        ("é", "[é]", false),
+        ("a", r"\a", true),
+        (r"\", r"[\]", true),
+        ("1", r"[\d]", false),
+        ("&", "[a&&b]", true),
+        ("a", "[[:alpha:]]", false),
+        ("-", "[a-]", false),
+        ("[", "[", false),
+        ("x", "[]", false),
+        ("b", "[!a]", true),
+        // `?` and `[!…]` over a newline, an empty value, and two-, three-
+        // and four-byte characters.
+        ("\n", "?", true),
+        ("\n", "[!a]", true),
+        ("", "?", false),
+        ("", "[!a]", false),
+        ("é", "[!a]", false),
+        ("é", "[!a][!a]", true),
+        ("€", "?", false),
+        ("€", "??", false),
+        ("€", "???", true),
+        ("€", "????", false),
+        ("€", "[!a]", false),
+        ("€", "[!a][!a][!a]", true),
+        ("😀", "???", false),
+        ("😀", "????", true),
+        ("😀", "?????", false),
+        ("😀", "[!a]", false),
+        ("😀", "[!a][!a][!a][!a]", true),
+        ("😀", "*", true),
+        ("😀x", "*x", true),
+        // A range compares C `char`s. `[Ã-a]` is the member 0xC3 and the
+        // range 0x83..`a`, which as signed bytes holds 0x00-0x61 and
+        // 0x83-0xFF.
+        ("Z", "[Ã-a]", true),
+        ("a", "[é-a]", true),
+        ("a", "[a-é]", false),
+        // A trailing `\` escapes nothing, so the glob matches nothing.
+        ("x", "x\\", false),
+        ("x\\", "x\\", false),
+        // A member followed by `-` takes the next byte as the range end,
+        // even `]`: `[a-]]` is the reversed range a..], an empty set.
+        ("-", "[a-]]", false),
+        ("]", "[a-]]", false),
+        ("a", "[a-]]", false),
+        // `]` as the first member is a member.
+        ("]", "[]]", true),
+        ("x", "[]]", false),
+        ("x", "[!]]", true),
+        ("]", "[!]]", false),
+        ("x", "[!]", false),
+        ("!", "[!", false),
+        ("^", "[]-a]", true),
+        ("a", "[]-a]", true),
+        ("b", "[]-a]", false),
+        // A leading `-` is a member.
+        ("-", "[-a]", true),
+        ("a", "[-a]", true),
+        // A reversed range adds nothing.
+        ("x", "[z-a]*", false),
+        ("", "[z-a]*", false),
+        ("x", "[!z-a]", true),
+        ("é", "[!z-a]", false),
+        ("q", "[z-aq]", true),
+        ("z", "[z-aq]", false),
+        // An unterminated class anywhere makes the whole glob match nothing.
+        ("a", "*[", false),
+        ("[", "*[", false),
+        // Inside a class, `*` is a member.
+        ("*", "[*]", true),
+        ("a", "[*]", false),
+        // Outside a class, `\` escapes the next byte.
+        ("*", r"\*", true),
+        ("a", r"\*", false),
+        ("?", r"\?", true),
+        ("a", r"\?", false),
+        ("[", r"\[", true),
+        ("é", r"\é", true),
+        (r"\", r"\\", true),
+        // The empty glob matches only the empty value.
+        ("", "", true),
+        ("a", "", false),
+        // `?` takes a NUL byte.
+        ("\0", "?", true),
+        ("a\0b", "a?b", true),
+    ];
+    for &(subject, glob, stated) in rows {
+        let batch = duckdb_glob(subject, glob);
+        assert_eq!(batch, stated, "DuckDB: {subject:?} GLOB {glob:?}");
+        assert_eq!(
+            live_glob(subject, glob),
+            batch,
+            "live against DuckDB: {subject:?} GLOB {glob:?}"
+        );
+    }
+}
+
 /// Rule: typed pins glob/regex via `CAST(col AS VARCHAR)` — both match
 /// the text form of BIGINT values, explicitly.
 #[test]
