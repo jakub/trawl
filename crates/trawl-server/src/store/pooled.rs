@@ -33,6 +33,15 @@
 //! transaction cut short so ends by that close, never by a later
 //! `ROLLBACK`: the connection would first have to read the answer the
 //! bound stopped awaiting. A `COMMIT` already sent is never cut short.
+//! A raw `pool.begin()` on the storage pool is allowed for a transaction
+//! that no client-side bound cuts short. A caller cancelled while its
+//! `BEGIN` is in flight returns the connection inside a transaction, and
+//! the return check closes it: one reconnect, and one
+//! `pool_connection_returned_in_transaction` event when the check finds
+//! the transaction open. The check keeps that transaction from reaching
+//! another caller. It does not close the session while Postgres withholds
+//! an answer, it promises no reconnect latency, and it does not help
+//! during a database outage.
 
 use std::ops::{Deref, DerefMut};
 
