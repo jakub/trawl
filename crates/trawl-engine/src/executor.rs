@@ -35,9 +35,21 @@ use crate::value::{
     Column, ColumnType, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64,
 };
 
-/// Names of the result columns `DuckDB` returned as TIMESTAMP, or as a
-/// list of them at any depth ([`holds_timestamps`]).
-type TimestampColumns = Vec<String>;
+/// The result columns that hold stored timestamps, named from the
+/// statement's logical types before its first row is read, so a zero-row
+/// result names the same columns.
+#[derive(Debug, Default)]
+struct TimestampColumns {
+    /// Every column `DuckDB` returned as a timestamp type, or as a list of
+    /// them at any depth ([`holds_timestamps`]): the tail's output renders
+    /// these as the wire's text.
+    rendered: Vec<String>,
+    /// The scalar columns whose logical type is exactly TIMESTAMP: the
+    /// tail compares these as instants where no pin names them. The other
+    /// timestamp types are left out, because the all-SQL lane compares
+    /// them differently from a Timestamp pin.
+    instants: Vec<String>,
+}
 
 /// How many statements the query and export lanes handed `DuckDB` to bind.
 ///
@@ -1190,11 +1202,11 @@ impl Executor {
     }
 
     /// [`Self::execute_emitted`], additionally reporting which result
-    /// columns `DuckDB` returned as TIMESTAMP or a list of them.
+    /// columns hold stored timestamps ([`TimestampColumns`]).
     ///
-    /// Only the Rust-tail lane needs that: it reads `DuckDB`'s cast text
-    /// and renders the wire's text afterwards
-    /// ([`render_tracked_timestamps`]).
+    /// Only the Rust-tail lane needs that: it compares the exact TIMESTAMP
+    /// columns as instants, reads `DuckDB`'s cast text, and renders the
+    /// wire's text afterwards ([`render_tracked_timestamps`]).
     fn execute_emitted_tracked(
         &self,
         query: &EmittedQuery,
@@ -1221,7 +1233,7 @@ impl Executor {
         let mut stmt = match prepared {
             Ok(s) => s,
             Err(e) if is_no_files_error(&e) => {
-                return Ok((QueryResult::empty(), TimestampColumns::new()));
+                return Ok((QueryResult::empty(), TimestampColumns::default()));
             }
             Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
             Err(e) => return Err(e.into()),
@@ -1245,7 +1257,7 @@ impl Executor {
         let mut result_rows = match stmt.query(param_refs.as_slice()) {
             Ok(r) => r,
             Err(e) if is_no_files_error(&e) => {
-                return Ok((QueryResult::empty(), TimestampColumns::new()));
+                return Ok((QueryResult::empty(), TimestampColumns::default()));
             }
             Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
             Err(e) => return Err(e.into()),
@@ -1260,6 +1272,7 @@ impl Executor {
         // Typed before the first row is read, so a zero-row or all-NULL
         // column is typed from execution too.
         let columns = typed_columns(stmt_ref);
+        let instants = exact_timestamp_columns(stmt_ref);
         let col_count = columns.len();
 
         let mut rows = Vec::new();
@@ -1280,11 +1293,14 @@ impl Executor {
             rows.push(cells);
         }
 
-        let timestamp_columns: TimestampColumns = columns
-            .iter()
-            .filter(|col| holds_timestamps(&col.ty))
-            .map(|col| col.name.clone())
-            .collect();
+        let timestamp_columns = TimestampColumns {
+            rendered: columns
+                .iter()
+                .filter(|col| holds_timestamps(&col.ty))
+                .map(|col| col.name.clone())
+                .collect(),
+            instants,
+        };
 
         Ok((QueryResult { columns, rows }, timestamp_columns))
     }
@@ -2602,6 +2618,10 @@ impl SqlRead {
     /// wire rendering of their timestamp columns, the cap's cut, and the
     /// column reorder — the engine's share of `post` (ADR-0046).
     ///
+    /// The Rust stages run under the split-point pins plus a Timestamp pin
+    /// for each exact TIMESTAMP column of the SQL step that those pins
+    /// leave unpinned (ADR-0011, amended 2026-11-09). A caller's pin wins.
+    ///
     /// The Rust stages prepare their patterns through `ledger`, the
     /// query's, so they share its cap with the statement's RE2 allowance.
     fn finish(
@@ -2617,16 +2637,21 @@ impl SqlRead {
             timestamp_columns,
         } = self;
         if !emitted.rust_stages.is_empty() {
+            let mut pins = emitted.rust_stage_pins.clone();
+            pins.fill_unpinned(
+                timestamp_columns.instants.iter().map(String::as_str),
+                CanonicalType::Timestamp,
+            );
             result = crate::post_process::apply_rust_stages(
                 result,
                 &emitted.rust_stages,
-                &emitted.rust_stage_pins,
+                &pins,
                 emitted.anchor,
                 ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
                 ledger,
                 cancel,
             )?;
-            let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
+            let tracked = tail_timestamp_scope(&timestamp_columns.rendered, &emitted.rust_stages);
             render_tracked_timestamps(&mut result, &tracked, cancel)?;
         }
         cap.trim(&mut result);
@@ -3353,6 +3378,18 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
         .collect()
 }
 
+/// The names of a statement's scalar result columns whose `DuckDB` logical
+/// type is exactly TIMESTAMP. Read, like [`typed_columns`], before the
+/// first row.
+fn exact_timestamp_columns(stmt: &duckdb::Statement<'_>) -> Vec<String> {
+    stmt.column_names()
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| stmt.column_logical_type(*idx).id() == LogicalTypeId::Timestamp)
+        .map(|(_, name)| name)
+        .collect()
+}
+
 /// A statement's result columns, each typed from its `DuckDB` logical
 /// type ([`column_type`]). Read once the statement has run and before its
 /// first row, so a zero-row result is typed too.
@@ -3772,8 +3809,10 @@ fn parse_cast_timestamp(text: &str) -> Option<i64> {
 ///
 /// The wire's RFC 3339 in UTC, unless a Rust tail follows,
 /// because that tail is a second evaluator, not a printer. Its `| where`
-/// and `| let` are pin-aware (ADR-0011) and read a TIMESTAMP cell's text
-/// as the stored instant through `compare::conformed_timestamp`, and its
+/// and `| let` are pin-aware (ADR-0011). Its scope carries the split-point
+/// pins plus a Timestamp pin for each of the SQL step's unpinned TIMESTAMP
+/// columns ([`SqlRead::finish`]), so they read a TIMESTAMP cell's text as
+/// the stored instant through `compare::conformed_timestamp`, and its
 /// string functions read that text where the all-SQL lane reads
 /// `CAST(ts AS VARCHAR)`. So the tail gets `DuckDB`'s own cast text in UTC,
 /// the text the SQL lane compares and prints, and

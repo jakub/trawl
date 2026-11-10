@@ -188,7 +188,7 @@ On a server, every stored field carries a type pin in the field catalog. The env
 
 What is stored is the value's reading under the pin, when that reading is value-preserving. A cast that would alter the value shelves it instead: the column holds NULL, `trawl schema conflicts` records the disagreement, and the original text stays in `_raw`. Spelling drift is not alteration, so `"0404"` under a BIGINT pin stores as `404` while `"1.5"` shelves rather than rounding to `2`.
 
-What matches is decided by the pin, not by the shape of the query literal. Batch SQL, live tail and the kv batch tail answer identically. The hot buffer conforms through the same expression compaction writes with. Embedded `--data` has no catalog and no pins, so every comparison there is literal-driven.
+What matches is decided by the pin, not by the shape of the query literal. Batch SQL, live tail and the kv batch tail answer identically. The hot buffer conforms through the same expression compaction writes with. Embedded `--data` has no catalog and no pins, so every comparison there is literal-driven, except that the kv batch tail compares a TIMESTAMP column as an instant.
 
 ##### The numeric reading
 
@@ -310,7 +310,7 @@ Which pin applies follows the pipeline, not a flat name lookup.
 
 Inside one `let`, a reference to a sibling target resolves the way the SQL does: an existing column of that name wins, so `let a = 1, b = a` gives `b` the original `a`, and only a name the row does not carry reads the sibling's fresh value, so `let ms = 1000, total = ms * 2` gives `total = 2000`. Pins stay pre-stage, so `let a = status, b = a` gives `b` no pin.
 
-Timestamps in the kv batch tail compare as stored instants. The result carries them in UTC, and the client shows every `timestamp` column in your display zone. `rename _time as t`, the bare alias `let t2 = _time`, and a function that returns a timestamp, such as `let d = date_trunc("day", _time)`, give `timestamp` columns, so they show in your zone. The tail reads a timestamp as UTC text with no offset, such as `2026-01-01 05:30:00`. An expression that passes that value through, such as `let t = coalesce(_time, x)`, gives a `string` column, and the client shows that text unchanged.
+Timestamps in the kv batch tail compare as stored instants, in every mode. A column that the SQL step returns as a TIMESTAMP compares as an instant unless a pin for its name says otherwise. The result carries them in UTC, and the client shows every `timestamp` column in your display zone. `rename _time as t`, the bare alias `let t2 = _time`, and a function that returns a timestamp, such as `let d = date_trunc("day", _time)`, give `timestamp` columns, so they show in your zone. The tail reads a timestamp as UTC text with no offset, such as `2026-01-01 05:30:00`. An expression that passes that value through, such as `let t = coalesce(_time, x)`, gives a `string` column, and the client shows that text unchanged.
 
 ### The two namespaces
 
@@ -414,7 +414,7 @@ trawl derives `_severity` at ingest and never accepts it from a sender. The pack
 - Literals must be quoted. A bare `error` in a pipe stage is a field reference.
 - The subject must be `sev(<field>)` directly. `sev(lower(x))` still computes the reading, but the comparison around it falls back to the literal-driven path, so `sev(lower(x)) == "error"` compares against the string: a `Conversion Error` in batch, and a filter that never matches on live tail. Bind it first with `| let s = sev(lower(level)) | where s == "error"`.
 - `dialect` governs numbers only. Words always read the one token table. `sev(x, "syslog")` inverts 0 to 7, so `3` is `err`, which is 17. An unknown dialect is a query error naming `otel` and `syslog`.
-- `sev()` works in embedded `--data`, where nothing else is pin-aware. The function declares the type.
+- `sev()` works in embedded `--data`, where there is no field catalog. The function declares the type.
 
 #### Putting the field itself on the ladder
 
@@ -1194,7 +1194,7 @@ Four lanes answer a query: batch SQL, the live stream (SSE), the kv batch tail b
 - A live stream admits one aggregation stage, and so do the stages after `extract kv`. A second one is refused with `only one aggregation stage is supported in streaming mode`, even with a `sort` between the two.
 - A live stream and the kv batch tail run only aggregates in an aggregation slot. A scalar head, such as `stats lower(x)`, is refused with `lower() is not an aggregate; a scalar head in an aggregation slot runs only in SQL`. A scalar around an aggregate is a scalar head too, so `stats coalesce(sum(x), 0)` is refused there and runs in batch SQL.
 - Where batch SQL raises a per-value error, the streaming lane yields `null` instead. This covers an integer overflow and an unreadable `if()` or `case()` condition. A live tail cannot raise a per-event error without ending the subscription.
-- Embedded `--data` has no field catalog, so every comparison there is literal-driven. `sev()` still declares its own type.
+- Embedded `--data` has no field catalog, so every comparison there is literal-driven, except that the kv batch tail compares a TIMESTAMP column as an instant. `sev()` still declares its own type.
 
 ## Examples
 
