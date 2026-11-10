@@ -2375,3 +2375,15 @@ fn only_a_string_literal_is_a_pattern_operand() {
     );
     assert_eq!(PatternKind::of_operator(crate::ast::BinaryOp::Eq), None);
 }
+
+#[test]
+fn capture_names_lists_named_groups_in_order() {
+    let before = thread_builds();
+    assert_eq!(
+        capture_names(r"(?P<code>\d+) (\w+) (?<path>/\S*)"),
+        Some(vec!["code".to_owned(), "path".to_owned()])
+    );
+    assert_eq!(capture_names(r"(\d+)-(\d+)"), Some(Vec::new()));
+    assert_eq!(capture_names(r"(?P<code>\d+"), None);
+    assert_eq!(thread_builds(), before, "capture_names built a regex");
+}

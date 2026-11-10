@@ -384,6 +384,141 @@ async fn hints_read_stored_text_with_patterns() {
     assert_eq!(backend.calls().len(), 2, "{:?}", backend.calls());
 }
 
+/// The fields `never_observed` asked the catalog about, in order, over a
+/// catalog that holds no pin at all. Every query must parse under the
+/// parser the hints use, so a parse failure cannot pass a test vacuously,
+/// and no hint may say "absent".
+async fn checked(query: &str) -> Vec<String> {
+    trawl_core::parser::parse_unbuilt(query)
+        .unwrap_or_else(|errors| panic!("{query} does not parse: {errors:?}"));
+    let backend = Fake::default();
+    let found = hints::never_observed(&backend, query).await;
+    assert!(
+        found.iter().all(|hint| !hint.contains("absent")),
+        "{found:?}"
+    );
+    backend
+        .calls()
+        .iter()
+        .map(|call| {
+            call.strip_prefix("catalog_field ")
+                .and_then(|rest| rest.strip_suffix(" Some(100) None"))
+                .unwrap_or_else(|| panic!("an unexpected call: {call}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_field_a_stage_reads_is_checked() {
+    let mut backend = Fake::default();
+    backend
+        .catalog_field
+        .insert("usr".to_owned(), observed_in(&["db"]));
+    let found = hints::never_observed(&backend, "service=api | stats dc(usr)").await;
+    assert_eq!(
+        found,
+        [
+            r#"the catalog has no observation of field "usr" in service "api"; it has observations of it in 1 other service"#
+        ]
+    );
+    assert!(found.iter().all(|hint| !hint.contains("absent")));
+    assert_eq!(backend.calls(), ["catalog_field usr Some(100) None"]);
+}
+
+#[tokio::test]
+async fn a_name_a_stage_made_or_removed_is_not_checked() {
+    let stages = [
+        "let a = 1, b = a",
+        "eval x = len(message) | where x > 3",
+        r#"rename host as h | where h == "x""#,
+        "stats count() as n | where n > 1",
+        "drop f | where isnull(f)",
+        "pivot count() on host by service | where web1 > 0",
+        r#"extract kv | where k == "v""#,
+        r#"extract "(?P<code>\d+)" | where code == "5""#,
+    ];
+    for stage in stages {
+        let query = format!("service=api | {stage}");
+        assert_eq!(checked(&query).await, Vec::<String>::new(), "{query}");
+    }
+    let query = "| from saved daily_errors | where f == 1";
+    assert_eq!(checked(query).await, Vec::<String>::new(), "{query}");
+}
+
+#[tokio::test]
+async fn a_stage_read_of_a_source_field_is_checked() {
+    assert_eq!(checked("service=api | rename usr as u").await, ["usr"]);
+    assert_eq!(
+        checked("service=api | let a = usr + 1, b = 2").await,
+        ["usr"]
+    );
+}
+
+#[tokio::test]
+async fn stage_checks_share_the_four_field_bound() {
+    // Sorted, the stage fields would come first: the order proves the
+    // search-stage fields are checked first, not that names are sorted.
+    let query = "zy=1 zz=1 | where aa > 1 | sort ab | dedup ac";
+    assert_eq!(checked(query).await, ["zy", "zz", "aa", "ab"]);
+}
+
+#[tokio::test]
+async fn every_source_of_one_rename_is_read_before_any_is_made() {
+    assert_eq!(
+        checked("service=api | rename a as b, b as c").await,
+        ["a", "b"]
+    );
+}
+
+#[tokio::test]
+async fn a_name_a_let_made_is_not_checked_in_a_stage_that_ends_the_walk() {
+    assert_eq!(
+        checked("service=api | let s = lower(level) | stats count() by s").await,
+        ["level"]
+    );
+}
+
+#[tokio::test]
+async fn a_later_stage_does_not_take_back_an_earlier_read() {
+    assert_eq!(
+        checked("service=api | where usr > 0 | let usr = 1").await,
+        ["usr"]
+    );
+}
+
+#[tokio::test]
+async fn reads_inside_one_expression_keep_their_source_order() {
+    assert_eq!(
+        checked("service=api | where zz > 1 and aa > 1").await,
+        ["zz", "aa"]
+    );
+}
+
+#[tokio::test]
+async fn eventstats_reads_its_arguments_and_makes_its_outputs() {
+    assert_eq!(
+        checked("service=api | eventstats avg(dur) as m by grp | where m > 1 and later > 1").await,
+        ["dur", "grp", "later"]
+    );
+}
+
+#[tokio::test]
+async fn table_is_read_and_ends_the_walk() {
+    assert_eq!(
+        checked("service=api | table usr | where other == 1").await,
+        ["usr"]
+    );
+}
+
+#[tokio::test]
+async fn a_made_name_matches_under_the_ascii_case_fold() {
+    assert_eq!(
+        checked("service=api | let Foo = 1 | where foo > 1 and FOO < 3").await,
+        Vec::<String>::new()
+    );
+}
+
 // -- nearest bounds -----------------------------------------------------------
 
 fn nearest_answer() -> trawl_client::QueryResponse {
