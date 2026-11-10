@@ -764,6 +764,9 @@ pub struct ScheduleForm {
     /// Whether the schedule in force is enabled. Kept like `max_runs`, so an
     /// edit does not resume a paused schedule.
     pub enabled: bool,
+    /// Whether the form was opened on a schedule in force. Without it, an
+    /// unlimited enabled schedule and no schedule look the same.
+    pub schedule_loaded: bool,
     /// Which of the three rows takes typed keys.
     pub focus: ScheduleField,
 }
@@ -809,6 +812,7 @@ impl ScheduleForm {
             lag,
             max_runs,
             enabled,
+            schedule_loaded: schedule.is_some(),
             focus: ScheduleField::default(),
         }
     }
