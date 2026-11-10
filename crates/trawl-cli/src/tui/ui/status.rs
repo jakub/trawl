@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use trawl_core::sanitize::sanitize_display_text;
+use trawl_core::text_layout::cells;
 
 use crate::tui::App;
 use crate::tui::state::{Focus, MainTab, TabStatus};
@@ -64,10 +65,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     let hints = get_context_hints(app, width);
 
-    let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
-
-    #[allow(clippy::cast_possible_truncation)] // Terminal width is always < u16::MAX
-    let padding_len = area.width.saturating_sub((left_len + hints.len()) as u16) as usize;
+    // The hints end on the bar's last cell: the padding is what the cells
+    // of the left side and of the hints leave.
+    let left_cells: usize = spans.iter().map(|s| cells(&s.content)).sum();
+    let padding_len = width.saturating_sub(left_cells + cells(&hints));
 
     spans.push(Span::raw(" ".repeat(padding_len)));
     spans.push(Span::styled(hints, Style::default().fg(theme.text_muted)));

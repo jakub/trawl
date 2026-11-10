@@ -247,15 +247,18 @@ The tests that pin the pages are in
   line, `Warning: no stdin data received in 3s, proceeding without it.`,
   because `transcripts.sh` runs `claude -p` without a stdin redirect. The
   stderr logs are not committed.
-- `transcripts.sh` passes `--setting-sources user`, so the sessions ran with
-  the recording machine's user settings. Neither prompt asks for lower case,
-  and both final answers are in it.
-- The #308 and #309 recipes build with `cargo build -p trawl-server --bin
-  trawld -p trawl-cli --bin trawl -p fleet-admin`. With `--bin` flags, cargo
-  builds only the named binaries, so `fleet-admin` is not rebuilt. A stale
-  `fleet-admin` migrates the Fleet database only as far as the migrations it
-  embeds, and the new trawld refuses to start with `PendingMigration`. The
-  recipe below builds `fleet-admin` in its own command.
+- The committed sessions ran with the recording machine's user settings,
+  because `transcripts.sh` then passed `--setting-sources user`. Neither
+  prompt asks for lower case, and both final answers are in it. The recipe
+  now passes `--setting-sources ''`, which loads no user, project or local
+  settings (`docs/evidence/issue-414/settings-probe.txt`).
+- When these sessions were recorded, the #308 and #309 recipes built with
+  `cargo build -p trawl-server --bin trawld -p trawl-cli --bin trawl -p
+  fleet-admin`. With `--bin` flags, cargo builds only the named binaries, so
+  `fleet-admin` was not rebuilt. A stale `fleet-admin` migrates the Fleet
+  database only as far as the migrations it embeds, and the new trawld
+  refuses to start with `PendingMigration`. Every recipe now builds
+  `fleet-admin` in its own `cargo build`.
 
 ## Privacy
 

@@ -16,6 +16,7 @@ use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Paragraph, Wrap};
 use trawl_core::sanitize::sanitize_display_text;
+use trawl_core::text_layout::cells;
 
 use crate::tui::state::SchemaBrowser;
 use crate::tui::theme::Theme;
@@ -462,14 +463,14 @@ fn trim_timestamp(s: &str) -> &str {
 
 /// Render a range value across one or two lines.
 ///
-/// If `min – max` fits on one line after the label, render inline.
-/// Otherwise split across two lines with the continuation indented. The
-/// split reads the raw values; what is drawn is sanitized.
+/// If `min – max` draws in at most 40 cells after the label, render
+/// inline. Otherwise split across two lines with the continuation
+/// indented. What is drawn, and measured, is sanitized.
 fn push_range_lines(lines: &mut Vec<Line<'_>>, min_v: &str, max_v: &str) {
     let min_t = trim_timestamp(min_v);
     let max_t = trim_timestamp(max_v);
     let inline = format!("{min_t} \u{2013} {max_t}");
-    if inline.len() <= 40 {
+    if cells(&inline) <= 40 {
         lines.push(Line::from(format!(
             "range:      {}",
             sanitize_display_text(&inline)

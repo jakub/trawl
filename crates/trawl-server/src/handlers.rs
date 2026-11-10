@@ -3268,6 +3268,9 @@ pub async fn trigger_run(
             &query,
             &query_name,
             timeout_secs,
+            // A manual run takes no scheduled-run lease: it passed HTTP
+            // admission (ADR-0018, amended 2026-11-09).
+            None,
         )
         .await;
     });
