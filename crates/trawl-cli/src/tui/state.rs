@@ -757,6 +757,13 @@ pub struct ScheduleForm {
     pub window: SimpleEditor,
     /// The late-arrival allowance. Empty is `0s`.
     pub lag: SimpleEditor,
+    /// The run cap of the schedule in force, `None` for unlimited. The form
+    /// shows it but does not edit it, and sends it back unchanged, because
+    /// the PUT replaces the whole schedule.
+    pub max_runs: Option<u64>,
+    /// Whether the schedule in force is enabled. Kept like `max_runs`, so an
+    /// edit does not resume a paused schedule.
+    pub enabled: bool,
     /// Which of the three rows takes typed keys.
     pub focus: ScheduleField,
 }
@@ -767,6 +774,8 @@ impl ScheduleForm {
     /// the interval must not silently drop the window the schedule covers.
     ///
     /// A zero lag prefills as empty, because an empty row already means `0s`.
+    /// With no schedule, the cap is unlimited and the schedule enabled, as a
+    /// new schedule starts.
     pub fn new(
         saved_id: i64,
         name: String,
@@ -775,8 +784,12 @@ impl ScheduleForm {
         let mut interval = SimpleEditor::new_single_line();
         let mut window = SimpleEditor::new_single_line();
         let mut lag = SimpleEditor::new_single_line();
+        let mut max_runs = None;
+        let mut enabled = true;
 
         if let Some(sched) = schedule {
+            max_runs = sched.max_runs;
+            enabled = sched.enabled;
             interval.insert_text(&sched.interval);
             if let Some(ref w) = sched.window {
                 window.insert_text(w);
@@ -794,6 +807,8 @@ impl ScheduleForm {
             interval,
             window,
             lag,
+            max_runs,
+            enabled,
             focus: ScheduleField::default(),
         }
     }
@@ -807,9 +822,10 @@ impl ScheduleForm {
         }
     }
 
-    /// Read the form as the request it will be sent as: `(interval, window,
-    /// lag)`, each trimmed, with an empty window or lag becoming `None` —
-    /// which is what puts a schedule in query mode, or leaves the lag at `0s`.
+    /// Read the form as the request it will be sent as. Interval, window and
+    /// lag are trimmed, and an empty window or lag becomes `None`, which puts
+    /// a schedule in query mode or leaves the lag at `0s`. The cap and the
+    /// enabled state are the ones the form loaded.
     ///
     /// `None` when the interval is empty, the one field the TUI insists on
     /// before it calls the server. The window/lag pair is deliberately NOT
@@ -817,7 +833,7 @@ impl ScheduleForm {
     /// combination with a 400 naming both sides, so a lag typed without a
     /// window is sent and the operator reads the server's own sentence
     /// instead of a second opinion from the client.
-    pub fn submission(&self) -> Option<(String, Option<String>, Option<String>)> {
+    pub fn submission(&self) -> Option<trawl_api::SetScheduleRequest> {
         let interval = self.interval.text().trim().to_owned();
         if interval.is_empty() {
             return None;
@@ -828,7 +844,13 @@ impl ScheduleForm {
             (!text.is_empty()).then_some(text)
         };
 
-        Some((interval, optional(&self.window), optional(&self.lag)))
+        Some(trawl_api::SetScheduleRequest {
+            interval,
+            max_runs: self.max_runs,
+            enabled: self.enabled,
+            window: optional(&self.window),
+            lag: optional(&self.lag),
+        })
     }
 }
 

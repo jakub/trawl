@@ -1532,10 +1532,10 @@ mod tests {
             app.handle_key(key(KeyCode::Char(ch)));
         }
 
-        assert_eq!(
-            schedule_form(&app).submission(),
-            Some(("1h".to_owned(), None, Some("5m".to_owned())))
-        );
+        let request = schedule_form(&app).submission().expect("a request");
+        assert_eq!(request.interval, "1h");
+        assert_eq!(request.window, None);
+        assert_eq!(request.lag.as_deref(), Some("5m"));
     }
 
     /// An empty interval is the one thing the popup refuses to send: there is
@@ -1556,14 +1556,10 @@ mod tests {
         assert_eq!(form.interval.text(), "1h");
         assert_eq!(form.window.text(), "since_last");
         assert_eq!(form.lag.text(), "5m");
-        assert_eq!(
-            form.submission(),
-            Some((
-                "1h".to_owned(),
-                Some("since_last".to_owned()),
-                Some("5m".to_owned())
-            ))
-        );
+        let request = form.submission().expect("a request");
+        assert_eq!(request.interval, "1h");
+        assert_eq!(request.window.as_deref(), Some("since_last"));
+        assert_eq!(request.lag.as_deref(), Some("5m"));
     }
 
     /// A zero lag prefills as an empty row: empty already means `0s`, and a
@@ -1580,6 +1576,123 @@ mod tests {
         let mut app = schedule_popup(None);
         app.handle_key(key(KeyCode::Esc));
         assert!(app.popup.is_none());
+    }
+
+    /// A schedule with a run cap and a paused state under the test's control.
+    fn budget_schedule(max_runs: Option<u64>, enabled: bool) -> trawl_api::ScheduleResponse {
+        trawl_api::ScheduleResponse {
+            max_runs,
+            enabled,
+            ..test_schedule(Some("since_last"), Some(("5m", 300)))
+        }
+    }
+
+    /// Replace the focused row's text through the key path, as an operator
+    /// would: delete what is there, then type `text`.
+    fn retype_focused(app: &mut App, text: &str) {
+        for _ in 0..16 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        for ch in text.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    /// The popup edits only interval, window and lag, but the PUT replaces
+    /// the whole schedule. The form sends back the cap and the paused state
+    /// it loaded, so an interval edit neither lifts a spent budget nor
+    /// resumes a paused net. With no schedule, it sends unlimited and
+    /// enabled, as a new schedule starts.
+    #[test]
+    fn schedule_popup_keeps_max_runs_and_enabled() {
+        let cases = [
+            (Some(budget_schedule(Some(60), false)), Some(60), false),
+            (Some(budget_schedule(None, true)), None, true),
+            (Some(budget_schedule(Some(0), true)), Some(0), true),
+            (Some(budget_schedule(None, false)), None, false),
+            (None, None, true),
+        ];
+        for (schedule, max_runs, enabled) in cases {
+            let mut app = schedule_popup(schedule.as_ref());
+            let loaded = schedule_form(&app).submission();
+            if schedule.is_some() {
+                let loaded = loaded.expect("a prefilled interval");
+                assert_eq!(loaded.max_runs, max_runs, "loaded from {schedule:?}");
+                assert_eq!(loaded.enabled, enabled, "loaded from {schedule:?}");
+            }
+
+            retype_focused(&mut app, "15m");
+            let request = schedule_form(&app).submission().expect("a request");
+            assert_eq!(request.interval, "15m");
+            assert_eq!(request.max_runs, max_runs, "after an edit of {schedule:?}");
+            assert_eq!(request.enabled, enabled, "after an edit of {schedule:?}");
+        }
+    }
+
+    /// A schedule endpoint for saved query `saved_id` that answers every PUT
+    /// with `answer` and sends each JSON body it receives on the returned
+    /// receiver.
+    async fn recording_schedule_server(
+        saved_id: i64,
+        answer: trawl_api::ScheduleResponse,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    ) {
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let route = axum::routing::put(move |body: axum::body::Bytes| {
+            let seen_tx = seen_tx.clone();
+            let answer = answer.clone();
+            async move {
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).expect("a JSON body");
+                let _ = seen_tx.send(request);
+                axum::Json(answer)
+            }
+        });
+        let app = axum::Router::new().route(&format!("/api/v1/saved/{saved_id}/schedule"), route);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, seen_rx)
+    }
+
+    /// Enter on the popup of a net capped at 60 and paused, after an
+    /// interval edit, sends a PUT that keeps the cap and the pause.
+    #[tokio::test]
+    async fn schedule_popup_sends_the_kept_budget() {
+        let sched = trawl_api::ScheduleResponse {
+            saved_query_id: 7,
+            ..budget_schedule(Some(60), false)
+        };
+        let (url, mut seen) = recording_schedule_server(7, sched.clone()).await;
+        let client = HttpClient::new_insecure(&url, "flt_test_not_real").expect("client");
+        let mut app = App::new(client, DisplayZone::Utc);
+        app.saved_cache = Some(ListSavedResponse {
+            queries: vec![SavedQueryResponse {
+                schedule: Some(sched),
+                ..saved_entry(7, "net")
+            }],
+        });
+        app.switch_to_main_tab(MainTab::Saved);
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(schedule_form(&app).saved_id, 7);
+
+        retype_focused(&mut app, "15m");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.popup.is_none(), "Enter submits and closes the popup");
+
+        let body = tokio::time::timeout(Duration::from_secs(10), seen.recv())
+            .await
+            .expect("the PUT reaches the server")
+            .expect("a body");
+        assert_eq!(body["interval"], "15m", "{body}");
+        assert_eq!(body["max_runs"], 60, "{body}");
+        assert_eq!(body["enabled"], false, "{body}");
+        assert_eq!(body["window"], "since_last", "{body}");
+        assert_eq!(body["lag"], "5m", "{body}");
     }
 
     #[test]
