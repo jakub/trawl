@@ -345,7 +345,7 @@ Backticks are accepted in every field position: search-stage filters, expression
 
 A backtick also ends an unquoted value and an unquoted word, so text containing one is written double-quoted, as in `` host="a`b" `` and `` "er`ror" ``. Backticks are not value quotes, so `` service=`nginx` `` is a parse error, and `-` cannot negate a quoted name, so write ``NOT `http-status`=500``. `NOT-` directly before a backtick is a parse error too, also with non-ASCII whitespace such as a no-break space between `NOT` and `-`: ``NOT-`http-status`=500`` returns `'NOT-' cannot sit directly before a backticked name`, with the hint `put a space after NOT to negate the field, or quote "NOT-" to search for the text`.
 
-The search stage reads `last=`, `earliest=` and `latest=` before anything else, and backticks reach fields with those names. Inside `| where`, `| let` and aggregation arguments, the words an expression is made of are read before a field reference is tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`, `in`, `matches`, `like` and `ilike` are operators. ``| where `true` == 1`` filters on the column named `true`.
+The search stage reads `last=`, `earliest=` and `latest=` before anything else, and backticks reach fields with those names. Inside `| where`, `| let` and aggregation arguments, the words an expression is made of are read before a field reference is tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`, `in`, `matches`, `like` and `ilike` are operators. ``| where `true` == 1`` filters on the column named `true`. `and`, `or` and `not` may also be written `AND`, `OR` and `NOT`. Only all lowercase or all capitals is an operator, so `Or` is not. `NOT` is read where an expression operand starts. There, a field named `NOT`, or one whose first dot segment is `NOT`, needs backticks: `` `NOT` `` or `` `NOT.x` ``. The formatter also backticks a field named `AND` or `OR`.
 
 A `#` inside backticks is part of the name. See [Comments](#comments).
 
@@ -515,7 +515,7 @@ a b OR c d
 (service=nginx OR service=apache) status>=400
 ```
 
-`OR` may be spelled `OR` or `or`. `NOT` is uppercase only, and a lowercase `not` in the search stage is a bare search term. Whitespace binds tighter than `OR`. Parentheses group tokens and may nest. A group holds at least one search term or filter, so `()` and `(OR)` are parse errors. `(OR)` returns `a group needs a search term or filter, not only OR`, with the hint `put a search term or filter inside the group, or remove it`. A time keyword inside a group is a parse error; see [Time filters](#time-filters).
+`OR` may be spelled `OR` or `or`. `NOT` is uppercase only, and a lowercase `not` in the search stage is a bare search term. Inside an [expression](#expressions), `not` and `NOT` are both the operator. Whitespace binds tighter than `OR`. Parentheses group tokens and may nest. A group holds at least one search term or filter, so `()` and `(OR)` are parse errors. `(OR)` returns `a group needs a search term or filter, not only OR`, with the hint `put a search term or filter inside the group, or remove it`. A time keyword inside a group is a parse error; see [Time filters](#time-filters).
 
 ## Pipe stages
 
@@ -980,12 +980,14 @@ Expressions appear in `where`, `let` and aggregation arguments.
 | Field references | `host`, `host.name`, `@timestamp`, `` `request id` `` |
 | Arithmetic | `+`, `-`, `*`, `/`, `%`, unary `-` |
 | Comparison | `==`, `!=`, `>`, `>=`, `<`, `<=` |
-| Logical | `and`, `or`, `not` |
+| Logical | `and`, `or`, `not`, also written `AND`, `OR`, `NOT` |
 | Pattern | `matches`, `like`, `ilike` |
 | Membership | `x in (1, 2, 3)` |
 | Grouping | `(count + 1) * 2` |
 
 Precedence runs from lowest to highest: `or`, `and`, `not`, the comparison and pattern operators, `+` and `-`, `*` and `/` and `%`, then unary `-`.
+
+`and`, `or` and `not` mean the same in all lowercase and in all capitals. A mixed spelling such as `And` is not an operator. The formatter prints them in lowercase.
 
 `matches` takes a `/regex/` or a quoted string on its right. `like` and `ilike` take a quoted SQL pattern, where `%` matches any run and `_` matches one character. The right side is always literal text in the query: a field or a computed value there is a parse error, so `where "x" matches f` is refused. Each pattern takes the [pattern limits](#pattern-limits).
 
