@@ -1,6 +1,6 @@
 # Formatting never changes what a query means
 
-status: accepted (2026-11-02), prep record for the format round-trip fix; human rulings of 2026-11-02 recorded below; amended (2026-11-08), see the Amendment
+status: accepted (2026-11-02), prep record for the format round-trip fix; human rulings of 2026-11-02 recorded below; amended (2026-11-08), see the Amendment; amended (2026-11-09): expressions accept `AND`, `OR` and `NOT` in capitals, see the Amendment of that date
 
 Trawl rewrites query text in several places. The web and TUI editors' Format button writes the formatted text back into the buffer. `/api/v1/validate` returns it as `formatted`, and the CLI client and the MCP server print it. `Composed::new` formats the compare and sightings queries it builds. The MCP server offers formatted queries as suggestions. ADR-0014 ruling 6, as amended by ADR-0060, promises that `format → reparse` gives the same query, proven by a property over generated ASTs.
 
@@ -98,3 +98,18 @@ Considered, not adopted:
 
 - **Leave the combination refusal in the emitter and add a mirror to the stream compiler.** A second hand mirror is the defect class D12 names (`crates/trawl-core/src/stream.rs:72-90`). One check before both lanes cannot drift.
 - **Make the refusal an unspanned validation error.** `EmitError` carries no span (`crates/trawl-core/src/emitter/mod.rs:212-232`). A caret over the clause is what ruling 2 already gives the other time-clause errors.
+
+## Amendment (2026-11-09): expressions accept `AND`, `OR` and `NOT` in capitals (#404 prep)
+
+The search stage reads its group separator as `OR` or `or` (`parser/search.rs:639`). An expression in `where`, `let` or a `case()` argument reads only `and`, `or` and `not` (`parser/expr.rs:282`, `:298`, `:314`). So `| where status == 500 OR status == 502` is a parse error, and agents that wrote the search stage's spelling inside an expression met it. The human ruled on 2026-11-09: "AND, OR, NOT in capitals too (Recommended)".
+
+**An expression reads each boolean keyword in all lowercase or all capitals.** `and` and `AND`, `or` and `OR`, `not` and `NOT` mean the same operator, with the same precedence and associativity. A mixed spelling such as `Or` keeps its current reading. No other keyword changes case rules. The formatter prints the boolean operators in lowercase, so a formatted query has one spelling, and the checked renderer still proves that the reparse has the same canonical form.
+
+`NOT` is now read where an expression operand starts, so a bare field named `NOT` there no longer parses as a field. `AND` and `OR` are read only after a left operand, so they claim no new field-start position. The formatter backticks a field named `AND`, as it already backticks `OR` and `NOT`, so a rendered name always reads back as a field.
+
+Stored query text that names a bare field `NOT` in an expression stops parsing on upgrade, under the rule above: restoring the old behaviour means restoring the Postgres database and `[server] results_dir` together, taken with trawld stopped.
+
+Considered, not adopted:
+
+- **Keep lowercase and name it in the error.** One rule for the whole language is easier to remember than a hint that corrects it.
+- **Make every keyword case-insensitive.** It changes how far more stored text reads, and nobody asked for it.

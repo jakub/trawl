@@ -2,7 +2,7 @@
 
 Status: accepted 2026-09-05, amended 2026-09-07 after re-prep of
 [#150](https://github.com/jakub/trawl/issues/150), amended 2026-10-17 by
-ADR-0056 (the ping no longer takes a permit), amended (2026-11-08): an export is tracked like a query, see the Amendment.
+ADR-0056 (the ping no longer takes a permit), amended (2026-11-08): an export is tracked like a query, see the Amendment; amended (2026-11-09): a sort or dedup stage names at most 64 fields, and cancel by id reaches work that waits to start, see the two Amendments of that date.
 
 A short query can spend seconds in DuckDB binding before reading a row.
 In a single SELECT list, DuckDB copies an earlier alias's original
@@ -262,3 +262,30 @@ The untangle prep of 2026-11-08 (defect D15) found that `POST /api/v1/export` ru
 - `trawl-engine/src/executor.rs:1850-1908`: Parquet export stages its bounded result in `__trawl_export` before `COPY`.
 - `pool.rs:4996-5005`: `every_lane_registers_its_kind_and_owner` already parks `export_parquet` at `Seam::Started`.
 - `results/service.rs:931-965`: captures already increment `trawl_queries_total`.
+
+## Amendment (2026-11-09): a sort or dedup stage names at most 64 fields (#370 prep)
+
+The admission check above charges nothing for the fields a `sort` or a `dedup` names (`complexity.rs:1024`, `:1030`). `MAX_QUERY_LEN` allows about 21 000 copies of one short name. The kv batch tail keeps one key slot per written dedup field for each distinct key, and the live lane keeps 10 000 such keys. A sort comparator binds every field again on each comparison (`post_process.rs:742-767`).
+
+Asked how many fields one `sort` or `dedup` stage may name, the human ruled on 2026-11-09: "64 (Recommended)". Every written field counts, repeats included. A third fixed limit joins the two above: one `sort` or named `dedup` stage names at most 64 fields. It is not configurable. `check_pipeline_complexity` checks it, so every door that runs that check refuses the same text with one sentence: query, export, the live stream, `/validate`, saved-query writes and scheduled attempts. A bare `dedup` names no field and keeps its whole-row key. A stored query over the limit fails its next validation or scheduled attempt with the diagnostic, and its schedule is not disabled, as for the other two limits. ADR-0061 names the backup pair that restores the old behaviour.
+
+Counting written occurrences bounds the list directly. Folding repeats into one key would leave the count free but would need every lane, the SQL emitter included, to fold the same way. Nobody writes one field 65 times.
+
+The kv batch tail's sort binds each key once per row, not once per comparison, and reads the cancel latch while it binds. The order, the NULL placement and the stability stay as ADR-0064 records them.
+
+The limit bounds how many fields a stage names. It does not bound what dedup holds: wide cell values and a bare dedup's whole-row key still cost memory in proportion to the rows.
+
+## Amendment (2026-11-09): cancel by id reaches work that waits to start (#343 prep)
+
+The amendment of 2026-11-08 says a cancel that arrives before the pool registers the work returns false (`pool.rs:278-280`), and that the gap belongs to the pool. The gap is wider than the prep of #343 measured. `/query` opens its tracker entry at `handlers.rs:124`, and the pool registers the work at `begin_slot` (`pool.rs:1736`). Between the two the request waits for a preparation slot, runs its preparation, reads a `from saved` source, waits for an executor permit (`pool.rs:1956`) and waits for the publication guard (`pool.rs:1976`). Each wait spends the one request deadline, `[query] timeout_secs`, 30 s by default. A capture waits for its permit and its publication guard the same way after its tracker entry opens (`results/service.rs:696`, `pool.rs:2786-2815`), within `[capture] deadline_secs`. So a person who cancels a queued query sees `cancelled: false`, and the query still runs when a permit frees.
+
+The human was asked again on 2026-11-09, with the corrected bound (up to the query timeout, 30 s by default, and captures too), and ruled: "Fix it (Recommended)".
+
+**A cancel by id reaches every tracked request from the moment its tracker entry opens.** The pool's registry holds a pending entry for the request's query id, under the same mutex as the registered work. The pending entry owns the cancel flag that `begin_slot` later moves into the registered work. A cancel latches that flag and answers `cancelled: true`. A request that waits for a preparation slot, a `from saved` read, a permit or the publication guard ends at once with the outcome that a cancel latched before the work starts gives today: 503 `service_unavailable` with the fixed capacity text, because nothing ran. A preparation job reads the same flag between its phases. Promotion to registered work and removal of a pending entry each happen in one critical section of the registry, so an id is never absent from both maps while its request lives. A waiter sees a cancel that arrives before it starts to wait, because the wake is state that the waiter reads, not an event it must catch. The routes that open a tracker entry are `/query`, export and capture, and all three are covered.
+
+An acknowledgement still means requested, not stopped. A cancel during a preparation phase takes effect at the next cancellation point, and a cancel during CSV or NDJSON rendering still has nothing to interrupt. Live-tail setup and scheduled runs open no tracker entry and are unchanged.
+
+### Considered, not adopted
+
+- **Document the gap and keep `cancelled: false`.** The human first chose this when the gap looked like at most 0.85 s of preparation. The wait lasts up to the deadline, so the ruling was asked again and changed.
+- **A second map for pending entries, or a lock of its own.** The proof that a stale interrupt never reaches a reused executor rests on one critical section. A second lock would make promotion a race.

@@ -1,6 +1,6 @@
 # The web UI shows instants in a chosen zone and computes in UTC
 
-status: accepted (2026-10-02), prep record for #201; implementation blocked by #214; amended (2026-11-08), see the Amendment
+status: accepted (2026-10-02), prep record for #201; implementation blocked by #214; amended (2026-11-08) and (2026-11-09), see the Amendments
 
 Every time in the web UI shows as UTC. An operator comparing logs with an incident report written in local time converts in their head. Trawl stores, compares and buckets in UTC (ADR-0008, ADR-0017), and the browser reads `_time` text back as UTC instants in five places: the context window, the Visualization series, both histogram paths, and facets. The query API's `timezone` field cannot serve the browser. It applies one fixed offset to result text, it reads `local` as the server's zone, and the browser's instant parsers would read the shifted text as UTC. This record adds a display zone that changes only what the browser prints.
 
@@ -105,3 +105,15 @@ Considered, not adopted:
 - **Switch `--format json` to UTC as a machine format.** It changes script output in a display fix. Exports already give UTC.
 
 Premise checks at `b71f9e6e`: `cli.rs:323-329` and `tui/mod.rs:282-289` send the raw value; `config.rs:383-385` defaults it to `local`; `handlers.rs:116-128` and `timezone.rs:20-55` resolve on the server with one offset and a loose component parse; `tui/live.rs:52-54` falls back to UTC; `orient.rs:367-390` is a second grammar; `crates/trawl-api/src/lib.rs:310-326` holds the field and has no `deny_unknown_fields`; `crates/trawl-mcp/Cargo.toml` has no trawl-engine dependency, so the grammar's home is trawl-api.
+
+## Amendment (2026-11-09): trawld counts the search histogram in UTC
+
+This amendment records the #197 prep of 2026-11-09. The search histogram no longer buckets the shown page in the browser. trawld counts every row of the execution in 48 equal-duration bins, computed in UTC microseconds from the result's first event to its last, and sends the bins with their UTC bounds in the same response as the page. The human ruled the axis on 2026-11-09: first event to last event.
+
+Three sentences above change:
+
+- The opening paragraph counts "both histogram paths" among the browser's readers of `_time` text. The search histogram is no longer one of them. It reads two wire bounds and 48 counts, and it reads no row's `_time`. The service ingest chart keeps its own path.
+- Under "These stay UTC and say so", the histogram line now reads: the histogram's caption says its bins are equal-duration UTC bins from the first event in the result to the last.
+- Under "Considered options", bucketing in the display zone stays rejected. It still needs server-side IANA support in query execution. #197 no longer waits on it: trawld bins in UTC, and a display zone can change only how the bounds print.
+
+"Histogram labels" stays on the list of surfaces that show the display zone. That is #201's work, and this amendment does not change when it lands or what it does. The bins and their bounds do not move when the zone changes, and a zone change sends no request.

@@ -1,6 +1,6 @@
 # Every server failure names its request and its stage; unmetered failures persist under a fixed cap
 
-status: accepted (2026-09-22) — prep ruling record for #235; amended (2026-11-08): one public message for the wire and every record, see the Amendment
+status: accepted (2026-09-22) — prep ruling record for #235; amended (2026-11-08): one public message for the wire and every record; amended (2026-11-09): every retained event logs foreign error text at DEBUG only, see the Amendments
 
 On 2026-09-21 a plain query on the homelab returned 500 once. The only
 trace was `http_failure` with a status and a latency: no request id, no
@@ -192,3 +192,57 @@ already did.
   `format!("result persistence failed: {err}")` from a `StoreError`.
 - `handlers.rs:486`, `handlers.rs:3507`, `results/service.rs:963` and
   `repin/engine.rs:148` are the current `safe_message()` consumers.
+
+## Amendment (2026-11-09): every retained event logs foreign error text at DEBUG only
+
+The 2026-11-08 amendment moved error `Display` text to DEBUG for
+`log_fault` and for the scheduler and pin gc events that change touched.
+The prep of 2026-11-09 found more retained events that still log such
+text at WARN or ERROR: 16 that log a store, database driver, auth or
+path-bearing error, and about 80 that log an `io::Error`. The human ruled
+on 2026-11-09 that the rule covers every retained event, in two pull
+requests: #412 for the 16, and #413 for the I/O errors.
+
+**The rule.** An event is retained when its level is INFO or above and
+its target passes `telemetry::is_persisted_target`, so the default filter
+can put it in the `service=trawld` corpus. A retained event never carries
+error text that trawl did not write, in any field or in its message. That
+text is the `Display` or `Debug` output of a store, database driver,
+auth, engine, DuckDB or I/O error, a string built from one, and any
+absolute host path, generated SQL or panic payload such a string holds.
+The event keeps its level and carries the closed `error_class` and
+`cause_kind` instead, or `cause_kind` alone where the site has no class.
+The text moves to a DEBUG event with the same `event_type` and target.
+The rule follows what the event carries, not what it is called: a warning
+that reports an error follows it as a fault event does.
+
+**Provenance decides, as it does for public messages.** Fixed text that
+trawl wrote may stay. The manual run's cursor event
+(`store/schedule.rs:2363`) logs a `PlanError`, whose two variants each
+have a fixed message, so it keeps that text. An error with no typed
+cause, such as the `String` the cutover swap returns, logs
+`error_class=internal` and `cause_kind=unknown`. Context fields that are
+not error text, such as ids, counts and attempts, are outside this rule.
+A cause comes only from a typed source, never from matching an error's
+text.
+
+**Unchanged.** An operator who enables DEBUG still persists the text,
+the posture the Decision above accepts. Records written before the change
+keep what they hold: neither the upgrade nor a revert rewrites them.
+
+**Why.** Every key with `query` can read `service=trawld`. A Postgres
+diagnostic can quote row values and the query text, and an `io::Error`
+built into a message can carry an absolute path. A rule limited to events
+named as faults, or to a list of sites, fails open on the next event:
+the sites from #319 were found one by one after the first sweep.
+
+### Considered, not adopted
+
+- **A lint that bans `error = %` outside `debug!`.** Rejected: a text
+  pattern cannot decide provenance. It would refuse the fixed `PlanError`
+  text and miss error text interpolated into a message.
+- **One logging helper per site.** Rejected: it refactors about 100 call
+  sites to fix what each event carries.
+- **A typed error for the cutover swap.** Not adopted here: the boot
+  replay runs the swap again and stops boot with the same text on stderr
+  (`repin/recover.rs:131`), and the type change is larger than the fix.

@@ -165,6 +165,21 @@ A link whose structured state does not parse is shown, not run.**
   for. A range-free export from a live page would pull the whole corpus,
   the door the empty-query rule above guards.*
 
+  *Amended 2026-11-09 (#197 prep, the histogram counts the whole result):
+  a raw-event snapshot asks for its page with `histogram: true`, and
+  trawld answers the page and a histogram of every row of that execution
+  in the same response. The histogram never posts a query of its own, so
+  exactly one query is still posted per state change, and the DSL
+  sequence above is unchanged. A second request would be a second
+  execution: under `last=` it resolves "now" again, and its counts can
+  disagree with the page beside them. Each page turn on a raw-event query
+  is a new execution, and its histogram is that execution's. An
+  aggregation-shaped query does not ask for one. This supersedes the
+  2026-09-12 sentence for the histogram only: while live, the histogram
+  is absent, because it counts a snapshot execution and live runs none.
+  Status, counts and the filter rail still read only the active result
+  source.*
+
 ## Consequences
 
 - `state/query.rs` splits into a pure, natively tested URL module and a
@@ -214,6 +229,16 @@ does not substitute the browser's request latency or current clock.
 Existing malformed-link refusal and repair behavior, unreadable-filter
 notice and guarded chip removal remain in force. No query ID is added
 by this decision.
+
+*Amended 2026-11-09 (#197 prep): the histogram's counts and bounds are
+execution facts of the response that carried them, and they follow the
+rules above. While a request is pending, the strip shows no bins and no
+caption, because the resource keeps the previous response during a
+reload, and that response's counts beside a new query would be a claim
+about a query that did not produce them. A failed request, a malformed
+link and a superseded response show no histogram counts. The strip
+collapses when the execution produced no rows (`pagination.total` is 0),
+not when one page is empty.*
 
 ## Amendment: display zone, 2026-10-02
 

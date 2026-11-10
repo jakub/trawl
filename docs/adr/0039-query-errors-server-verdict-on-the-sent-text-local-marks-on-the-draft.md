@@ -1,6 +1,6 @@
 # A query error shows the server's verdict on the text it received; the local parser marks the draft
 
-status: accepted (2026-09-22) — prep ruling record for #233; amended (2026-11-08), see the Amendment
+status: accepted (2026-09-22) — prep ruling record for #233; amended (2026-11-08), see the Amendment; amended twice (2026-11-09): every terminal sink shows sender text through the sanitize rule, and terminal text is measured by grapheme
 
 The Search page sends the server the effective query, which is the
 executed query with the structured state merged in: filter clauses and
@@ -88,3 +88,41 @@ Considered, not adopted:
 - **Record nothing, because the TUI fix only conforms to the sentence above.** The sentence was written for the browser, and nothing said the terminal clients were bound by it or that a bad span must not be clamped. Two terminal renderers drifted for exactly that reason.
 - **Convert spans to character offsets on the wire.** Every consumer already holds the text, and a byte offset is what the parser produces. Changing the wire unit would touch every client for no gain.
 - **One shared caret renderer for the terminal and the browser.** Terminal spaces cannot replace the browser's hidden prefix, which keeps wide and combining glyphs placed by the browser's own layout.
+
+## Amendment (2026-11-09, prep of #397 and #409): every terminal sink shows sender text through the sanitize rule
+
+The 2026-11-08 amendment shows the caret excerpt "with unsafe characters shown as the existing `trawl_core::sanitize` replacement". That sentence covers the excerpt only, and no record sets the rule for any other terminal sink. PR #394 sanitized the sites #384 named. The prep of 2026-11-09 found more that print sender text raw: `trawl query`'s table headers and cells, the `trawl schema` labels and tables, an embedded engine error, and in the TUI the schema detail, the event popup, the error popup, the query editor, the history pane, the palette and `trawl-dashboard`. ratatui drops control characters, but it draws the bidi, zero-width and soft-hyphen characters that `trawl_core::sanitize` names, so ratatui alone does not keep a terminal safe.
+
+**Text that trawl did not write reaches a terminal only through `sanitize_display_text`, or through `fit_cells` or `pad_cells`, which apply it.** Such text is event values, field names, catalog values, server messages, and the query text of other principals. The rule binds every line the CLI writes to stdout or stderr, every table header and cell, and every TUI span, title and cell. It also binds `trawl-dashboard`, which both the TUI and `trawld monitor` draw.
+
+**A table cell keeps its line breaks.** `\r\n` and `\n` stay line breaks inside a cell, and each line is sanitized, so a tab, a lone `\r`, ESC, a C1 control or a bidi character shows as U+FFFD. comfy-table draws the column borders on every line of a cell, so a line break cannot leave its cell. In a prose line and in a TUI span, a line break is U+FFFD, because there it would start a line that the sender wrote.
+
+**Machine formats stay data.** In a pipe and in an `-o` file, `json` and `csv` are byte-exact. On a terminal, `json` writes every unsafe character as a `\uXXXX` escape, which decodes to the same value, and `csv` writes U+FFFD in place of every unsafe character. The human ruled the `csv` case on 2026-11-09: "Replace unsafe characters", on a terminal only.
+
+**Sanitizing changes what is drawn, never what is kept.** The editor buffer, a submitted query, a cached response and a palette action keep the text as it came. `json` and `csv` written to a pipe or a file keep their data as it is today. Table output is a human format, so it is sanitized even when it is written to a file.
+
+The rule stops a sender from moving the cursor, clearing or retitling the terminal, setting its clipboard, and reordering or hiding text. It does not stop printable text that only looks misleading, such as a confusable letter or a printable `│`.
+
+Considered, not adopted:
+
+- **A sanitizing writer around stdout and stderr.** It cannot tell a table from `json` data on the same stream, and it cannot serve the TUI, where crossterm must write escapes.
+- **Refusing `csv` on a terminal.** The human chose replacement. A refusal keeps every value exact but sends the operator to a pipe for a quick look.
+- **One-line table cells.** A stack trace in one cell would become one long line, and the borders already contain a line break.
+- **A lint that bans `Span::raw` and `Line::from(String)`.** Fixed labels use those constructors everywhere, so the ban would need hundreds of exceptions and would still miss other conversions.
+
+## Amendment (2026-11-09, prep of #398): terminal text is measured by grapheme, as ratatui draws it
+
+The 2026-11-08 amendment measures carets "with `unicode-width` on the kept string", the whole-string measure in `trawl_core::text_layout`. On 2026-11-09, during #384's run, the human kept that measure and declined a segmentation dependency, and #398 recorded the gap. The prep of the same day reopened it, and the human ruled "Count by grapheme" on 2026-11-09. That ruling reverses the earlier one, for three reasons:
+
+- **The old measure can draw at twice its budget.** unicode-width counts lam-alef (`لا`) as one cell, and ratatui draws each grapheme, two cells. Nine pairs measure 9 cells and draw 18, so `fit_cells` returns text that overruns its column.
+- **The proposed bound is not a bound.** The larger of the whole-string width and the per-character sum gives 3 cells for `❤\u{FE0F}لا`, which draws in 4.
+- **The dependency adds no crate.** `unicode-segmentation` is an unconditional dependency of chumsky 0.13, which trawl-core already uses, so a direct dependency changes no build graph, the wasm and fuzz builds included.
+
+**The CLI and the TUI measure sanitized text per extended grapheme cluster.** Each cluster takes its unicode-width, plus one cell for each U+FF9E or U+FF9F. That is the cell width ratatui-core 0.1.2 draws. A cut falls between clusters. A span whose end lies inside a cluster marks every cell of that cluster. The rule that decides whether a span is valid does not change.
+
+The sentence "The terminal clients and `trawl-mcp` place the caret by display cells, measured with `unicode-width` on the kept string" now reads: the CLI and the TUI place the caret by display cells, measured per grapheme cluster on the kept string. `trawl-mcp` keeps its own measure, its byte window and its tab handling (`crates/trawl-mcp/src/render/refusal.rs`). The measure describes the pinned ratatui model, not the glyph shaping of every terminal and font.
+
+Considered, not adopted:
+
+- **Keep the whole-string measure and fix only the sites that count bytes.** The overrun above stays.
+- **The larger of the two cheap measures as an upper bound.** It is not one.

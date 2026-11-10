@@ -2,7 +2,8 @@
 
 **Status:** Accepted; amended 2026-10-17 (#304): aggregation caps are reported
 live and refused in batch, see the Amendment; amended (2026-11-08), see the
-Amendment (2026-11-08)
+Amendment (2026-11-08); amended (2026-11-09): globs and regex classes match
+as DuckDB matches them in every lane, see the Amendment (2026-11-09)
 
 trawl has two expression evaluators that must produce the same answer for the
 same DSL: the **batch path** (`emitter/` → DuckDB SQL → DuckDB) used by
@@ -163,3 +164,18 @@ Considered, not adopted:
 - **A full function registry that also owns SQL rendering, result pins and cost profiles.** It is larger than the defect and is not needed to close either divergence.
 
 Premise checks at `b71f9e6e`: `stream.rs:2073-2108` (string descriptor, wildcard `Count(0)`); `stream.rs:1211-1214` (name and arity only); `eval.rs:340-342` (unhandled call is NULL); `emitter/expr.rs:23` and `emitter/functions.rs:287-298` (the general translator emits any known aggregate wherever it appears); `emitter/mod.rs:2989-2998` (`sev_is_not_an_aggregate`); `post_process.rs:209` (the kv tail calls `compile_stream_plan_with`). The DuckDB binder's answer to `where count(x) > 1` was not reproduced; the refusal no longer depends on it.
+
+## Amendment (2026-11-09): globs and regex classes match as DuckDB matches them (#330 and #406 prep)
+
+Two pattern differences between the lanes predate this amendment. Batch SQL runs DuckDB's `GLOB` and RE2. The live lane and the kv batch tail run the `regex` crate on a translation of the same text (`pattern/mod.rs:1144`). The prep confirmed both with the DuckDB 1.5.6 CLI, the version the engine bundles:
+
+- **Globs.** DuckDB's `GLOB` reads bytes. `?` is one byte, so `'é' GLOB '?'` is false and `'é' GLOB '??'` is true. A class is a set of bytes, so `'é' GLOB '[é]'` is false. Only `[!` negates, so `'4' GLOB '[^4]'` is true. `\` escapes the next character outside a class and is a literal inside one. `&&` and `[[:alpha:]]` are plain characters, and `[a-]` does not match `-`. An unterminated `[` and `[]` match nothing. The live translation reads characters and copies a class into regex syntax, so it differs on each of these.
+- **Regex classes.** RE2 reads `\d`, `\w` and `\s` as ASCII classes and `\b` and `\B` as ASCII word boundaries. The `regex` crate reads them as Unicode. So `'٣'` matches `\d` live and not in batch, and `'é'` matches `^\w$` live and not in batch. Case folding already agrees: under `(?i)`, `k` and `\w` match the Kelvin sign in both, and `s` matches the long s.
+
+ADR-0063 kept the regex class difference out of its scope. On 2026-11-09 the human was offered to accept and document it, and did not choose that, so it is fixed. The prep decided to fix the glob difference too: this decision defines live evaluation as a faithful reimplementation of the batch path, and a byte translation stays on the build path ADR-0063 already prices.
+
+**A glob matches in every lane as DuckDB's `GLOB` matches it, byte for byte.** The live lane and the kv batch tail translate a glob into a regex over bytes that follows DuckDB's own glob reading at the bundled version. A malformed glob matches nothing. It never becomes a regex syntax error.
+
+**A regex reads `\d`, `\w`, `\s`, `\b` and `\B` in every lane as RE2 reads them.** The program the live lane and the kv batch tail run is built from the body with those five rewritten to their RE2 ASCII meanings, the view that ADR-0063 already measures. That covers search-stage regexes, `matches` operands and `extract` bodies. Capture names and indices stay as written.
+
+Syntax that RE2 refuses is still reported by DuckDB when the batch query runs. A glob that needs quoting (it holds `"`, `#` or whitespace) still has no spelling. Its workaround is `like` or `matches` in a `where` stage, and the DSL reference says so.

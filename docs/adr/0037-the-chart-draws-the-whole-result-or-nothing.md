@@ -3,7 +3,8 @@
 status: accepted (2026-09-20) — prep ruling record for the Visualization
 pagination defect. Amended 2026-09-21 by ADR-0038: the chart's x axis is
 now the bucket instant, and grouped results draw. The coverage rule and
-its place last in the ladder are unchanged.
+its place last in the ladder are unchanged. Amended 2026-11-09 (#197
+prep): the raw-event Histogram counts the whole result; see Consequences.
 
 `api::query` sends `limit: PAGE_SIZE` with `offset: page * PAGE_SIZE` for
 every snapshot query (`crates/trawl-web-ui/src/api/mod.rs:408-417`), and
@@ -112,6 +113,21 @@ fetched.
 - The raw-event **Histogram** is untouched. It buckets its own page's
   rows and says so in the glossary. Covering the whole search window is
   #197, and it needs a companion aggregation this change does not.
+  *Amended 2026-11-09 (#197 prep): superseded. The raw-event Histogram
+  now counts every row of the execution that produced the page. trawld
+  counts the rows it already holds before it cuts the page, and sends 48
+  equal-duration UTC bins in the same response. No companion
+  aggregation runs, and the browser buckets no rows. The bins span the
+  result's first event to its last event. The human ruled the axis on
+  2026-11-09: first event to last event, not the searched range. An axis
+  over the searched range needs the engine to report the bounds it
+  filtered on, and it reports none today. The histogram counts the final
+  result, so after `head`, `tail` or `dedup` it counts the rows those
+  stages kept. It refuses a sampled result, because a sample is not
+  every event, and rows read with `from saved`, because a stored run's
+  rows can be aggregate output. A result refused for `max_result_rows` has no
+  page and no histogram. The coverage rule for Visualization is
+  unchanged.*
 - The raw results table keeps `PageTotal::Probe`. `total` now makes
   `Known` possible there, which would change every pagination summary
   the specs pin; that is a visible change of its own and is not this

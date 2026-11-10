@@ -2,7 +2,8 @@
 
 status: accepted (2026-08-05), amended (2026-08-10) after the slice-A
 implementation review and (2026-08-12) as slice B shipped — see
-Amendments
+Amendments; amended (2026-11-09): the kv batch tail reads a SQL TIMESTAMP
+column as an instant in embedded mode too
 
 ADR-0009 made the field catalog the install-wide write-time type authority:
 one pinned type per field name, decided at first typed sight, permanent. That
@@ -46,6 +47,9 @@ first-typed-sight pinning tenable at multi-team scale.
 - Unpinned fields and embedded mode (`--data`, no catalog) keep today's
   literal-driven behavior, documented. Embedded mode is explicitly out of
   scope for pin-awareness.
+  **[Narrowed by the Amendment (2026-11-09): at the kv batch tail, a
+  scalar column that the SQL step returns as TIMESTAMP compares as an
+  instant in every mode, embedded included.]**
 - Because emission adapts to the pin, a repin changes no query's meaning.
   This property is what makes one-click (and eventually automatic) repin
   safe, and is why slice A must merge before the engine. **[Corrected by
@@ -723,3 +727,16 @@ Rejected: keeping the database slot through the sweep, because the row
 would need a non-terminal state after the pin flip, which ADR-0022 rulings
 1 and 4 forbid. Rejected: per-job staging paths, because every recovery
 path, `in_flight_evidence`, retention and pin gc assume the fixed ones.
+
+## Amendment (2026-11-09): the kv batch tail reads a SQL TIMESTAMP column as an instant (#408 prep)
+
+Embedded `trawl query --data` passes no field types (`crates/trawl-cli/src/cli.rs:382-392`). Behind `extract kv`, the SQL step hands the Rust tail each TIMESTAMP cell as DuckDB's cast text in UTC, and with no pin the tail holds it as a string. `where _time > "2026-11-01T06:00:00Z"` then compares two strings (`eval.rs:882-890`), and `"2026-11-01 06:30:00"` sorts below the bound because a space sorts below `T`. So the query keeps no rows. The same query with no Rust tail, or against trawld, where `_time` is pinned, keeps the later rows. `client_zone.rs` spells its embedded bound as cast text to avoid the defect.
+
+**At the kv batch tail, every scalar column that the SQL step returns with the physical type TIMESTAMP compares as an instant, in every mode.** The type comes from the SQL result, not from the name and not from the text. A caller's pin for the same name wins, so a pinned column such as `_time` compares in trawld as it does today. An unpinned TIMESTAMP column, such as `t` after `let t = date_trunc("hour", _time)` before `extract kv`, now compares there as the all-SQL lane compares it. A list of timestamps is not a scalar and stays as it is. A VARCHAR column named `_time` stays literal-driven. Rename and a bare alias carry the typing, and a computed value drops it, by the same lineage rules that already decide how the tail renders those columns. Comparison never reads the client's display zone (ADR-0051).
+
+The rule narrows the slice-A sentence above for one boundary only. Embedded mode still has no catalog. Its SQL comparisons stay literal-driven, as DuckDB itself types them, and no stored field gains a pin.
+
+Considered, not adopted:
+
+- **Pin `_time` by name in embedded mode.** A foreign file can carry a VARCHAR `_time`, and a renamed timestamp column would keep the defect.
+- **Document the text comparison as a caveat.** The two embedded lanes would still answer the same query differently.

@@ -1,6 +1,6 @@
 # Retention and report windows: age is per-env policy, pressure is survival, the schedule owns its window
 
-status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class; amended (2026-10-23): the capture sweep without the scheduler; amended (2026-11-06): stale runs at boot, retention of terminal runs only, and a lifetime run budget; amended (2026-11-08): ruling 8's pruning claim, see the Amendment
+status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class; amended (2026-10-23): the capture sweep without the scheduler; amended (2026-11-06): stale runs at boot, retention of terminal runs only, and a lifetime run budget; amended (2026-11-08): ruling 8's pruning claim, see the Amendment; amended (2026-11-09): scheduled runs in flight are capped at half the executor permits, see the Amendment
 
 Two parked halves of PR #58, one subject: who owns time. Retention is one
 install-wide `max_age_days`, so keeping `prod` a year forces keeping the
@@ -165,3 +165,23 @@ because a `_ingested` window would still disagree with interactive queries.
 Retention keeps deleting by directory date. With the bound, no row has a `_time`
 more than 15 minutes past the end of its directory's hour, so age-based expiry never
 deletes a row before its own `_time` has nearly reached the age limit.
+
+## Amendment: scheduled runs in flight are capped at half the executor permits, 2026-11-09
+
+Prep record for the prep of 2026-11-09 (#407, from #343). Each scheduler tick claims every due schedule it can and spawns one task for each claim (`scheduler.rs:221-299`). Each task holds its resolved query text while it waits for a preparation slot and then an executor permit. Nothing bounds how many wait at once except the number of schedules, and the preparation allowance is first come, first served (ADR-0063), so a person's search queues behind every due run. The tick also reads every enabled schedule with its saved query text (`store/schedule.rs:999-1015`) before it claims anything.
+
+The human ruled on 2026-11-09: "Half the executor permits (Recommended)", at least 1.
+
+**At most `max(1, executor permits / 2)` scheduled runs are in flight.** The scheduler takes a lease before it claims a due run and claims nothing when no lease is free. A claim that does not start a run gives its lease back. A run keeps its lease until its physical work ends, not until its task ends: a preparation job or executor work that outlives a timed-out request (ADR-0024, ADR-0063) still holds it. On a pool of 4 permits, 2 scheduled runs run at once, and interactive work can still take the other 2. Manual runs keep their HTTP admission and take no lease.
+
+**A run the cap defers is a missed run, and ruling 9 already covers it.** The scheduler leaves the deferred schedule's fire cursor, watermark, run table and `runs_claimed` as they are. A later tick claims it, and its missed boundaries coalesce into one window under `max_catchup_intervals`, as after any other missed run.
+
+**The tick reads schedules oldest due first, in bounded pages, without query text.** A page holds schedule ids and the fields the tick needs before a claim, ordered by fire cursor and then id, so a full cap cannot starve the schedules with the highest ids. Every value a run depends on is still read again under the claim's row locks.
+
+The cap bounds automatic work in flight. It does not cap how many schedules exist, and it does not give interactive work strict priority. The cap counts executor permits, not preparation slots, so where the preparation allowance equals the cap, as on a 4-core host with 4 permits and 2 slots, scheduled runs can still hold every slot for the length of their preparations. On a pool of one permit the one lease and the one permit are the same capacity.
+
+Considered, not adopted:
+
+- **One fewer than the preparation slots.** It keeps a slot free for interactive work on hosts with two or more slots, but it allows only one scheduled run on a host with two slots. The human chose the executor basis.
+- **Reserve preparation slots for interactive work, or cap the schedule count.** Each needs its own policy and neither bounds the tasks the scheduler holds.
+- **Release the lease when the task ends.** A timed-out run's physical work would keep its permit while a replacement starts, so the cap would leak.

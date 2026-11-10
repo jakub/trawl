@@ -83,7 +83,7 @@ A field whose value in this row is NULL: the event did not carry it, carried an 
 _Avoid_: empty field, absent field, missing field (each claims one of the three causes)
 
 **Histogram**:
-The strip above the snapshot table: the page's rows bucketed over their own time span. Absent in live. Neither ingest volume nor the full distribution of matches.
+The strip above the snapshot table of a raw-event query: every event in the result, counted by trawld from the same execution as the page, in 48 equal-duration UTC bins from the first event to the last. Each page shows its own execution's strip. After `head`, `tail` or `dedup` it counts the events those stages kept, and says so. Events without a usable time are counted and named, never drawn. It says why it is unavailable for a sampled result, for rows read with `from saved`, and for a result without a usable `_time`. Absent in live and for aggregation shapes. Neither ingest volume nor the events of a query refused as too large.
 _Avoid_: timeline, chart (that is Visualization)
 
 **Reading mode**:
@@ -119,7 +119,7 @@ One line on a Line chart: a metric column of an ungrouped `timechart`, or one gr
 _Avoid_: line (that is the chart type), trace, group (a group value names a series; the series is the line)
 
 **Count**:
-The Events tab shows rows on screen. For an aggregation that is the rows fetched, and the pager under the exact table names the slice on screen. The footer names its source: Last (rows the last snapshot returned), Received (events delivered since the stream opened), Updates (aggregation frames since the stream opened).
+The Events tab shows rows on screen. For an aggregation that is the rows fetched, and the pager under the exact table names the slice on screen. The histogram's caption is the one count of every event in the result, taken from the same response as the page. It never changes what the table, the pager or the footer count. The footer names its source: Last (rows the last snapshot returned), Received (events delivered since the stream opened), Updates (aggregation frames since the stream opened).
 _Avoid_: total, matches, hits
 
 **Quick start**:
