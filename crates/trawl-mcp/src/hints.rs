@@ -13,10 +13,12 @@
 //! - [`lag`]: a sender whose `_ingested` runs more than
 //!   [`LAG_THRESHOLD_SECS`] ahead of `_time`, over the rows the response
 //!   read.
-//! - [`never_observed`]: a field the query names that the catalog holds
-//!   no observation of in the service the query names, or no pin for at
-//!   all. The catalog evicts pins and observations, so the hint states
-//!   what it holds now, not what was ever sent.
+//! - [`never_observed`]: a field the search stage names, or a pipe stage
+//!   reads from the events before any stage made or removed that name,
+//!   that the catalog holds no observation of in the service the query
+//!   names, or no pin for at all. The catalog evicts pins and
+//!   observations, so the hint states what it holds now, not what was
+//!   ever sent.
 //! - [`nearest_bounds`]: for a capture with no rows whose query is a plain
 //!   search stage, the last event before and the first event after its
 //!   bounds that match the same search, within [`NEAREST_REACH_DAYS`]
@@ -30,7 +32,7 @@
 //! patterns, so it parses with [`parse_unbuilt`] and builds no regex from
 //! the stored text. trawld builds them when it runs the widened query.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, TimeDelta, Utc};
@@ -38,10 +40,16 @@ use trawl_api::value::{
     QueryResult, TRAILING_LOG_FIELDS, Value, WELL_KNOWN_LOG_FIELDS, wire_cell_text,
 };
 use trawl_client::{CapturedResult, ErrorCode};
-use trawl_core::ast::{FilterOp, FilterValue, Query, Scalar, SearchToken, Spanned, TimeBound};
+use trawl_core::ast::{
+    AggExpr, Expr, ExtractMode, FilterOp, FilterValue, PipeStage, Query, Scalar, SearchToken,
+    Spanned, TimeBound,
+};
 use trawl_core::field_refs::referenced_fields;
 use trawl_core::format::checked_format_query;
 use trawl_core::parser::parse_unbuilt;
+use trawl_core::pattern::capture_names;
+use trawl_core::projection::agg_output_name;
+use trawl_core::schema::catalog_key;
 
 use crate::backend::Backend;
 use crate::blocking::parse_work;
@@ -193,9 +201,11 @@ fn instant(cell: &Value) -> Option<DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
-/// Hints for fields the query names in its search stage that are not in
-/// the catalog: with no observation in the one service the search stage
-/// names with `service=<value>`, or with no pin when it names none or the
+/// Hints for fields the query reads that are not in the catalog: the
+/// fields its search stage names, then the fields its pipe stages read
+/// from the events before any stage made or removed that name. A field is
+/// named with no observation in the one service the search stage names
+/// with `service=<value>`, or with no pin when it names none or the
 /// catalog has no pin for the field.
 ///
 /// The hint states what the catalog holds now. Pins and observations are
@@ -258,13 +268,18 @@ async fn check_fields<B: Backend>(
 }
 
 /// The service `query`'s search stage names and the fields
-/// [`never_observed`] checks; `None` when `query` does not parse.
+/// [`never_observed`] checks: the search stage's fields in key order, then
+/// [`stage_reads`] in pipeline order, each once under the DSL's field
+/// fold. `None` when `query` does not parse.
 fn fields_to_check(query: &str) -> Option<(Option<String>, Vec<String>)> {
     let mut parsed = parse_unbuilt(query).ok()?;
     let service = named_service(&parsed);
-    parsed.pipeline.clear();
+    let pipeline = std::mem::take(&mut parsed.pipeline);
+    let mut seen = BTreeSet::new();
     let fields = referenced_fields(&parsed)
         .into_iter()
+        .chain(stage_reads(&pipeline))
+        .filter(|field| seen.insert(field.clone()))
         .filter(|field| {
             !field.starts_with('_')
                 && !WELL_KNOWN_LOG_FIELDS.contains(&field.as_str())
@@ -273,6 +288,174 @@ fn fields_to_check(query: &str) -> Option<(Option<String>, Vec<String>)> {
         .take(MAX_FIELD_CHECKS)
         .collect();
     Some((service, fields))
+}
+
+/// The fields `pipeline` reads from the events, folded, in pipeline order
+/// and source order within a stage, possibly repeated.
+///
+/// A name an earlier stage made or removed is not a read: `made` holds
+/// those, so a computed name is never checked. The walk stops after a
+/// stage that replaces the relation, since every later name is its
+/// output, and after an `extract` whose outputs it cannot name. A
+/// pipeline with `from saved` reads a recorded run, not the events, and
+/// gives nothing.
+fn stage_reads(pipeline: &[Spanned<PipeStage>]) -> Vec<String> {
+    let mut reads = Vec::new();
+    if pipeline
+        .iter()
+        .any(|stage| matches!(stage.node, PipeStage::FromSaved(_)))
+    {
+        return reads;
+    }
+    let mut made = BTreeSet::new();
+    for stage in pipeline {
+        if !stage_read(&stage.node, &mut made, &mut reads) {
+            break;
+        }
+    }
+    reads
+}
+
+/// Push the reads of one stage that `made` does not hold, and add the
+/// names it makes or removes to `made`. False when the walk stops here.
+fn stage_read(stage: &PipeStage, made: &mut BTreeSet<String>, reads: &mut Vec<String>) -> bool {
+    // Exhaustive on purpose: a new stage states its rule here.
+    match stage {
+        PipeStage::Where(s) => read(expr_reads(&s.condition.node), made, reads),
+        PipeStage::Sort(s) => read(s.fields.iter().map(|f| f.field.as_str()), made, reads),
+        PipeStage::Dedup(s) => read(fields(&s.fields), made, reads),
+        PipeStage::Let(s) => {
+            // A later assignment's read of an earlier target may be the
+            // alias, so it is not a read of the events.
+            for (target, expr) in &s.assignments {
+                read(expr_reads(&expr.node), made, reads);
+                made.insert(catalog_key(target));
+            }
+        }
+        PipeStage::Rename(s) => {
+            // Every pair renames in parallel, so each source is read
+            // against the names as they stood before the stage.
+            read(s.renames.iter().map(|(from, _)| from.as_str()), made, reads);
+            for (from, to) in &s.renames {
+                made.insert(catalog_key(from));
+                made.insert(catalog_key(to));
+            }
+        }
+        PipeStage::Drop(s) => made.extend(s.fields.iter().map(|name| catalog_key(name))),
+        PipeStage::Extract(s) => {
+            read(s.source_field.as_deref(), made, reads);
+            // A kv extract's outputs are named by the data.
+            let ExtractMode::Regex(body) = &s.mode else {
+                return false;
+            };
+            let Some(names) = capture_names(body) else {
+                return false;
+            };
+            made.extend(names.iter().map(|name| catalog_key(name)));
+        }
+        PipeStage::EventStats(s) => {
+            read(aggs_reads(&s.aggregations), made, reads);
+            read(fields(&s.group_by), made, reads);
+            made.extend(
+                s.aggregations
+                    .iter()
+                    .map(|agg| catalog_key(&agg_output_name(agg))),
+            );
+        }
+        PipeStage::Stats(s) => {
+            read(aggs_reads(&s.aggregations), made, reads);
+            read(fields(&s.group_by), made, reads);
+            return false;
+        }
+        PipeStage::Timechart(s) => {
+            read(s.on.as_deref(), made, reads);
+            read(aggs_reads(&s.aggregations), made, reads);
+            read(fields(&s.group_by), made, reads);
+            return false;
+        }
+        PipeStage::Top(s) => {
+            read([s.field.as_str()], made, reads);
+            read(fields(&s.by), made, reads);
+            return false;
+        }
+        PipeStage::Rare(s) => {
+            read([s.field.as_str()], made, reads);
+            read(fields(&s.by), made, reads);
+            return false;
+        }
+        PipeStage::Pivot(s) => {
+            read(
+                aggs_reads(std::slice::from_ref(&s.aggregation)),
+                made,
+                reads,
+            );
+            read([s.on_field.as_str()], made, reads);
+            read(fields(&s.by), made, reads);
+            return false;
+        }
+        PipeStage::Table(s) => {
+            read(fields(&s.fields), made, reads);
+            return false;
+        }
+        PipeStage::Limit(_) | PipeStage::Tail(_) | PipeStage::Sample(_) => {}
+        PipeStage::FromSaved(_) => return false,
+    }
+    true
+}
+
+/// `names` as string slices.
+fn fields(names: &[String]) -> impl Iterator<Item = &str> {
+    names.iter().map(String::as_str)
+}
+
+/// Push each of `names`, folded, that `made` does not hold.
+fn read<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    made: &BTreeSet<String>,
+    reads: &mut Vec<String>,
+) {
+    reads.extend(
+        names
+            .into_iter()
+            .map(catalog_key)
+            .filter(|key| !made.contains(key)),
+    );
+}
+
+/// The field reads of every argument of `aggs`, in source order.
+fn aggs_reads(aggs: &[AggExpr]) -> impl Iterator<Item = &str> {
+    aggs.iter()
+        .flat_map(|agg| &agg.args)
+        .flat_map(|arg| expr_reads(&arg.node))
+}
+
+/// The field reads of `expr`, in source order.
+fn expr_reads(expr: &Expr) -> Vec<&str> {
+    fn walk<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
+        match expr {
+            Expr::FieldRef(name) => out.push(name),
+            Expr::Binary { lhs, rhs, .. } => {
+                walk(&lhs.node, out);
+                walk(&rhs.node, out);
+            }
+            Expr::Unary { operand, .. } => walk(&operand.node, out),
+            Expr::FunctionCall { args, .. } => {
+                for arg in args {
+                    walk(&arg.node, out);
+                }
+            }
+            Expr::InList { expr, list } => {
+                walk(&expr.node, out);
+                for item in list {
+                    walk(&item.node, out);
+                }
+            }
+            Expr::Literal(_) => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(expr, &mut out);
+    out
 }
 
 /// The service a search stage names with one top-level `service=<value>`,
