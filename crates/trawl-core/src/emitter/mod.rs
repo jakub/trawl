@@ -306,6 +306,9 @@ impl EmitError {
     /// Produce a user-facing hint string, if applicable.
     pub fn hint(&self) -> Option<String> {
         match self {
+            Self::UnknownFunction { name, .. } if name.eq_ignore_ascii_case("match") => Some(
+                "matches is an operator, not a function: where message matches /re/".to_string(),
+            ),
             Self::UnknownFunction {
                 suggestion: Some(s),
                 ..
@@ -3879,5 +3882,50 @@ mod tests {
             retried(2).map(|_| ()),
             counter_refusal(MAX_REGEX_PARAMS + 1, 3 * (MAX_REGEX_PARAMS - 2) + 3)
         );
+    }
+
+    /// `match(` is the function an agent writes when it means the `matches`
+    /// operator, and no known function is near enough to `match` for a
+    /// `did you mean` suggestion: the hint names the operator instead, in
+    /// any ASCII case. Other unknown names keep their suggestion, and
+    /// `regex(` gets no hint, because it could mean extraction as well as a
+    /// test.
+    #[test]
+    fn unknown_match_hints_the_matches_operator() {
+        fn refusal(input: &str) -> EmitError {
+            let query = parser::parse(input).expect("parse should succeed");
+            emit(&query, SRC, anchor()).expect_err("emit should fail")
+        }
+        const HINT: &str = "matches is an operator, not a function: where message matches /re/";
+        for (input, name) in [
+            (r#"last=1h | where match(message, "x")"#, "match"),
+            (r#"last=1h | where MATCH(message, "x")"#, "MATCH"),
+        ] {
+            let err = refusal(input);
+            assert!(
+                matches!(&err, EmitError::UnknownFunction { name: n, .. } if n == name),
+                "{input}: {err:?}"
+            );
+            assert_eq!(err.hint().as_deref(), Some(HINT), "{input}");
+            assert_eq!(
+                err.to_string(),
+                format!("unknown function: {name} ({HINT})"),
+                "{input}"
+            );
+        }
+
+        let countt = refusal("last=1h | where countt(message) > 1");
+        assert!(
+            matches!(&countt, EmitError::UnknownFunction { .. }),
+            "{countt:?}"
+        );
+        assert_eq!(countt.hint().as_deref(), Some("did you mean 'count'?"));
+
+        let regex = refusal(r#"last=1h | where regex(message, "x")"#);
+        assert!(
+            matches!(&regex, EmitError::UnknownFunction { .. }),
+            "{regex:?}"
+        );
+        assert_eq!(regex.hint(), None);
     }
 }

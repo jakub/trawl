@@ -9,15 +9,17 @@
 //! No schema has a root `anyOf` or `oneOf`, and every property name stays
 //! within `[A-Za-z0-9_.-]`, because Claude Code drops a tool that breaks
 //! either rule. Schemas are generated as JSON Schema 2020-12 by rmcp's
-//! `schema_for_input` and `schema_for_output`; `tests/schemas.rs` holds
-//! them to those rules. An optional field without a default skips
-//! `None`, so its schema carries no `"default": null` its type refuses.
+//! `schema_for_input` and `schema_for_output`, and `tool` then drops every
+//! `format` that 2020-12 does not define; `tests/schemas.rs` holds them to
+//! those rules. An optional field without a default skips `None`, so its
+//! schema carries no `"default": null` its type refuses.
 
 use std::sync::Arc;
 
 use rmcp::handler::server::tool::{schema_for_input, schema_for_output};
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
-use schemars::JsonSchema;
+use schemars::transform::{RecursiveTransform, Transform};
+use schemars::{JsonSchema, Schema};
 use serde::Deserialize;
 
 use trawl_api::results::{
@@ -636,8 +638,106 @@ where
     let input: Arc<JsonObject> = schema_for_input::<I>()
         .unwrap_or_else(|error| panic!("the {name} input schema is not an object: {error}"));
     let title = annotations.title.clone().unwrap_or_default();
-    Tool::new(name, description, input)
+    Tool::new(name, description, standard_formats_only(&input))
         .with_title(title)
-        .with_raw_output_schema(schema_for_output::<O>())
+        .with_raw_output_schema(standard_formats_only(&schema_for_output::<O>()))
         .with_annotations(annotations)
+}
+
+/// The format names JSON Schema 2020-12 defines. Any other `format`, such
+/// as schemars' `uint64`, is one a client does not know: Claude Code warns
+/// once per field on every tool load.
+const STANDARD_FORMATS: [&str; 19] = [
+    "date-time",
+    "date",
+    "time",
+    "duration",
+    "email",
+    "idn-email",
+    "hostname",
+    "idn-hostname",
+    "ipv4",
+    "ipv6",
+    "uri",
+    "uri-reference",
+    "iri",
+    "iri-reference",
+    "uuid",
+    "uri-template",
+    "json-pointer",
+    "relative-json-pointer",
+    "regex",
+];
+
+/// A copy of `schema` without the `format` keyword of any schema object,
+/// at any depth, whose format is not one of [`STANDARD_FORMATS`].
+///
+/// The walk is schemars' own: it visits subschema positions only, so a
+/// property named `format` and a `format` key inside `default`, `enum`,
+/// `const` or `examples` data stay. It works on a copy, because rmcp hands
+/// out schemas its cache shares.
+fn standard_formats_only(schema: &JsonObject) -> Arc<JsonObject> {
+    let mut schema = Schema::from(schema.clone());
+    RecursiveTransform(|schema: &mut Schema| {
+        if schema.get("format").is_some_and(|format| {
+            !format
+                .as_str()
+                .is_some_and(|f| STANDARD_FORMATS.contains(&f))
+        }) {
+            schema.remove("format");
+        }
+    })
+    .transform(&mut schema);
+    match schema.to_value() {
+        serde_json::Value::Object(object) => Arc::new(object),
+        _ => unreachable!("a schema built from an object stays an object"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// The walk visits schema positions only: a property named `format` is
+    /// a key under `properties`, and the data in `default` and `enum` is
+    /// not a schema, so a `format` key inside either stays.
+    #[test]
+    fn a_property_named_format_is_not_a_keyword() {
+        let data = json!({ "format": "uint64", "x": 1 });
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "format": { "type": "integer", "format": "uint32", "minimum": 0 },
+                "at": { "type": "string", "format": "date-time" },
+                "choice": { "enum": [data.clone()] },
+                "settings": { "$ref": "#/$defs/Settings", "default": data.clone() }
+            },
+            "$defs": {
+                "Settings": { "type": "integer", "format": "uint64", "minimum": 0 }
+            }
+        });
+        let serde_json::Value::Object(schema) = schema else {
+            unreachable!()
+        };
+
+        let walked = serde_json::Value::Object((*standard_formats_only(&schema)).clone());
+
+        assert_eq!(
+            walked,
+            json!({
+                "type": "object",
+                "properties": {
+                    "format": { "type": "integer", "minimum": 0 },
+                    "at": { "type": "string", "format": "date-time" },
+                    "choice": { "enum": [data.clone()] },
+                    "settings": { "$ref": "#/$defs/Settings", "default": data }
+                },
+                "$defs": {
+                    "Settings": { "type": "integer", "minimum": 0 }
+                }
+            })
+        );
+    }
 }
