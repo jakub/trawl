@@ -519,8 +519,8 @@ async fn append_promoting(
         .reserve_evidence(id, &promoted_ids(promotions), bytes, budget, deadline)
         .await
         .map_err(|refusal| match refusal {
-            Refusal::EvidenceBudgetExceeded { used, limit } => {
-                ServerError::EvidenceBudgetExceeded { used, limit }
+            Refusal::EvidenceBudgetExceeded { scope, used, limit } => {
+                ServerError::EvidenceBudgetExceeded { scope, used, limit }
             }
             Refusal::Busy { retry_after_secs } | Refusal::QuotaExceeded { retry_after_secs } => {
                 ServerError::CaptureBusy { retry_after_secs }

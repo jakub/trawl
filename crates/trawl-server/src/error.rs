@@ -12,6 +12,7 @@ use crate::hot_buffer::Charge;
 use crate::publication::CorpusUnsettled;
 use crate::report_window::{MaterializeError, PlanError, WindowPolicyError};
 use crate::results::bounds::BoundsError;
+use crate::results::charge::EvidenceScope;
 use crate::results::service::{CaptureOverflow, GoneReason};
 use crate::store::StoreError;
 use crate::transport::request_limit::Allowance;
@@ -426,16 +427,21 @@ pub enum ServerError {
     /// `evidence_budget_exceeded`, ADR-0059). Refused before any executor
     /// permit. Not a 429: evidence frees only as it ages out or an operator
     /// deletes an investigation, so a retry soon after would fail again.
-    /// The message gives both counts and nothing else.
+    /// The message names the budget and gives both counts, and nothing
+    /// else.
     #[error(
-        "keeping this result would exceed the evidence budget: {used} of {limit} bytes are \
-         already kept; evidence frees as it ages out, or when an operator with server_manage \
-         deletes an investigation"
+        "keeping this result would exceed {budget}: {used} of {limit} bytes are counted \
+         against it, kept evidence and reservations together; evidence frees as it ages out, \
+         or when an operator with server_manage deletes an investigation",
+        budget = .scope.budget()
     )]
     EvidenceBudgetExceeded {
-        /// Evidence bytes already kept or reserved in the budget's scope.
+        /// The budget that refused.
+        scope: EvidenceScope,
+        /// Evidence bytes counted against that budget: kept evidence and
+        /// the reservations not yet kept, together.
         used: u64,
-        /// The budget, in bytes.
+        /// That budget, in bytes.
         limit: u64,
     },
 
@@ -2352,6 +2358,38 @@ mod tests {
     fn safe_message_redacts_internal_errors() {
         let err = ServerError::Internal("db connection string leaked".into());
         assert_eq!(err.safe_message(), "internal server error");
+
+        // An evidence refusal is a domain fact, not an internal error: its
+        // safe message is its whole text, which names the budget and calls
+        // the count what it is.
+        for (scope, budget) in [
+            (
+                EvidenceScope::Investigation,
+                "this investigation's evidence budget",
+            ),
+            (
+                EvidenceScope::Installation,
+                "the installation's evidence budget",
+            ),
+        ] {
+            let err = ServerError::EvidenceBudgetExceeded {
+                scope,
+                used: 10,
+                limit: 20,
+            };
+            let message = err.safe_message();
+            assert_eq!(
+                message,
+                format!(
+                    "keeping this result would exceed {budget}: 10 of 20 bytes are counted \
+                     against it, kept evidence and reservations together; evidence frees as it \
+                     ages out, or when an operator with server_manage deletes an investigation"
+                )
+            );
+            assert!(!message.contains("already kept"), "{message}");
+            assert_eq!(err.error_class(), "evidence_budget_exceeded");
+            assert_eq!(err.into_response().status(), StatusCode::CONFLICT);
+        }
     }
 
     /// A conflict is the state, not the request: 409 with the message
@@ -2785,6 +2823,7 @@ mod tests {
             (ServerError::InvestigationClosed, "investigation_closed"),
             (
                 ServerError::EvidenceBudgetExceeded {
+                    scope: EvidenceScope::Installation,
                     used: 1_073_000_000,
                     limit: 1_073_741_824,
                 },
@@ -2824,6 +2863,7 @@ mod tests {
             }
         }
         let budget = ServerError::EvidenceBudgetExceeded {
+            scope: EvidenceScope::Investigation,
             used: 10,
             limit: 20,
         }
@@ -3436,7 +3476,11 @@ mod tests {
             ServerError::InvestigationExists => ServerError::InvestigationExists,
             ServerError::InvestigationClosed => ServerError::InvestigationClosed,
             ServerError::EvidenceBudgetExceeded { .. } => {
-                ServerError::EvidenceBudgetExceeded { used: 10, limit: 20 }
+                ServerError::EvidenceBudgetExceeded {
+                    scope: EvidenceScope::Investigation,
+                    used: 10,
+                    limit: 20,
+                }
             },
             ServerError::UnsupportedEncoding => ServerError::UnsupportedEncoding,
             ServerError::CorpusRecovering(_) => {
@@ -3815,14 +3859,29 @@ mod tests {
             ),
             fact(
                 ServerError::EvidenceBudgetExceeded {
+                    scope: EvidenceScope::Investigation,
                     used: 10,
                     limit: 20,
                 },
                 StatusCode::CONFLICT,
                 "evidence_budget_exceeded",
-                "keeping this result would exceed the evidence budget: 10 of 20 bytes are \
-                 already kept; evidence frees as it ages out, or when an operator with \
-                 server_manage deletes an investigation",
+                "keeping this result would exceed this investigation's evidence budget: 10 of 20 \
+                 bytes are counted against it, kept evidence and reservations together; evidence \
+                 frees as it ages out, or when an operator with server_manage deletes an \
+                 investigation",
+            ),
+            fact(
+                ServerError::EvidenceBudgetExceeded {
+                    scope: EvidenceScope::Installation,
+                    used: 10,
+                    limit: 20,
+                },
+                StatusCode::CONFLICT,
+                "evidence_budget_exceeded",
+                "keeping this result would exceed the installation's evidence budget: 10 of 20 \
+                 bytes are counted against it, kept evidence and reservations together; evidence \
+                 frees as it ages out, or when an operator with server_manage deletes an \
+                 investigation",
             ),
             Fact {
                 conflict: Some(json!({"expected": 4, "current": 6})),
@@ -3951,6 +4010,9 @@ mod tests {
         for fact in facts {
             let label = format!("{:?}", fact.error);
             assert_eq!(fact.error.safe_message(), fact.message, "{label}");
+            if fact.code == "evidence_budget_exceeded" {
+                assert!(!fact.message.contains("already kept"), "{label}");
+            }
             let (status, headers, body) = answer(fact.error).await;
             assert_eq!(status, fact.status, "{label}");
             let error = &body["error"];
