@@ -2843,3 +2843,29 @@ fn regex_class_view_capture_premise() {
         mismatches.join("\n")
     );
 }
+
+/// The accepted empty `\B` difference also reaches a capture. RE2 takes
+/// the empty alternative between the bytes of the character, so the named
+/// group takes no part. The view cannot match there, so it goes on and
+/// captures `y`. The reference documents this row.
+#[test]
+fn regex_class_view_capture_differs_on_an_empty_non_boundary() {
+    let body = r"(?:\B|(?P<n>y))";
+    let subject = "x\u{e9}y";
+    let batch = batch_extract(body).expect("the body parses");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    let duck: Option<String> = conn
+        .query_row(
+            "SELECT nullif(struct_extract(x, 'g1'), '') \
+             FROM (SELECT regexp_extract(?::VARCHAR, ?, ?::VARCHAR[]) AS x)",
+            duckdb::params![subject, batch.regex, "[g1]"],
+            |row| row.get(0),
+        )
+        .expect("DuckDB extracts");
+    assert_eq!(duck, None, "DuckDB {}", duckdb_version(&conn));
+    let (_, regex) = premise_view_program(body).expect("the view compiles");
+    assert_eq!(
+        premise_view_captures(&regex, &batch, subject),
+        Ok(vec![Some("y".to_owned())])
+    );
+}
