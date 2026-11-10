@@ -33,9 +33,10 @@ use trawl_client::{
     ContextRequest, CorrelationResponse, CreateInvestigation, DashboardSnapshot, EntryPayload,
     ErrorCode, ErrorEnvelope, FieldValuesResponse, FindingStatusUpdate, HealthResponse,
     Investigation, InvestigationId, InvestigationList, InvestigationRead, InvestigationStatus,
-    LogEntry, PaginationMeta, PatchInvestigation, QueryResponse, ResultCell, ResultColumn,
-    ResultList, ResultPage, ResultShape, ResultSource, ResultState, RetentionExtension,
-    SchemaResponse, SightingsRequest, StoredAs, ValidationResponse, WhoAmIResponse,
+    LogEntry, PaginationMeta, PatchInvestigation, PatchResponse, QueryResponse, ResultCell,
+    ResultColumn, ResultList, ResultPage, ResultShape, ResultSource, ResultState,
+    RetentionExtension, SchemaResponse, SightingsRequest, StoredAs, ValidationResponse,
+    WhoAmIResponse,
 };
 use trawl_mcp::Backend;
 
@@ -68,7 +69,7 @@ pub struct Fake {
     pub create_investigation: Option<Handler<(bool, Investigation)>>,
     pub read_investigation: Option<Handler<InvestigationRead>>,
     pub append_entry: Option<Handler<AppendResponse>>,
-    pub patch_investigation: Option<Handler<Investigation>>,
+    pub patch_investigation: Option<Handler<PatchResponse>>,
     pub set_finding_status: Option<Handler<AppendResponse>>,
     /// When set, `capture` records its call, then waits for a permit of
     /// this semaphore before it answers: a test holds a capture open by
@@ -348,7 +349,7 @@ impl Backend for Fake {
         &self,
         id: &str,
         request: &PatchInvestigation,
-    ) -> Result<Investigation, ClientError> {
+    ) -> Result<PatchResponse, ClientError> {
         self.record(format!(
             "patch_investigation {id} {}",
             serde_json::to_string(request).unwrap()

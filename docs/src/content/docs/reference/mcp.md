@@ -484,7 +484,8 @@ with the printed id. A failed `create` prints the id it sent for this reason.
 a call. `keep` keeps the named rows, and when they are rows of the key's own
 temporary result, it keeps the whole result as evidence. `finding_status` and
 `status` overwrite, so they carry `expected_seq`. `status` sends the status
-alone, one field a request. When the investigation changed after
+alone, one field a request. Every write prints the [activity](#activity) since
+this session last saw the investigation. When the investigation changed after
 `expected_seq`, trawld answers `sequence_conflict`, and the text prints the sequence the call
 expected, the current one, and the `read` call that prints what changed.
 
@@ -652,21 +653,21 @@ last saw it. One `trawl mcp` process is one session. For each investigation,
 the session remembers the last sequence it printed, and it prints each entry
 that another key changed once, at most, in that session.
 
-- `note`, `finding`, `keep`, and every attached call, a `search`, `context`,
-  `sightings`, or `compare` that names an investigation, send the session's
-  sequence to trawld as `seen_seq`. So every attached call carries activity.
-  trawld answers with the entries that other keys changed after it, at most 50,
-  and says when more follow. The answer prints them under
+- `note`, `finding`, `keep`, `finding_status`, `status`, and every attached
+  call, a `search`, `context`, `sightings`, or `compare` that names an
+  investigation, send the session's sequence to trawld as `seen_seq`. So every
+  write and every attached call carries activity. trawld answers with the
+  entries that other keys changed after it, at most 50, and says when more
+  follow. The answer prints them under
   `activity by other keys since #N, in change order`.
 - The first call that touches an investigation in a session sends no
   `seen_seq`, and its answer prints no activity. Its `activity:` line says that
   the session starts to follow the investigation there, and names the `read`
-  call that prints the board. After a `create`, a write, or a status change,
-  the session starts at that sequence. trawld's answer to an attached call
-  names the sequence of the step it appended, `step_seq`, and the session
-  starts at that step once the answer fits its budget.
-- `finding_status` and `status` answer with no activity. The next `note`,
-  `finding`, `keep`, or attached call prints it.
+  call that prints the board. After a `create`, the session starts at the
+  investigation's sequence. After a write, it starts at the entry the write
+  wrote. trawld's answer to an attached call names the sequence of the step
+  it appended, `step_seq`, and the session starts at that step once the answer
+  fits its budget.
 - A board that `read` prints counts as seen, unless its `since` is past the
   session's sequence. Such a board leaves a gap, so the session keeps its
   sequence. A board that prints every entry trawld sent, with none to follow,

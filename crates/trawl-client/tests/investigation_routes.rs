@@ -24,8 +24,8 @@ use trawl_client::{
     Activity, Actor, AppendEntry, AppendResponse, ClientError, CreateInvestigation, EntryPayload,
     ErrorCode, ErrorEnvelope, ErrorResponse, FindingStatus, FindingStatusUpdate, HttpClient,
     Investigation, InvestigationId, InvestigationList, InvestigationRead, InvestigationStatus,
-    InvestigationSummary, LogEntry, PatchInvestigation, RetentionExtension, SequenceConflict,
-    TlsTrust,
+    InvestigationSummary, LogEntry, PatchInvestigation, PatchResponse, RetentionExtension,
+    SequenceConflict, TlsTrust,
 };
 
 const TOKEN: &str = "flt_investigationroutestesttoken";
@@ -329,17 +329,43 @@ async fn append_posts_the_tagged_entry_and_reads_the_activity() {
     assert_eq!(decoded.unwrap(), answer);
 }
 
-/// `patch_investigation` patches the investigation with the one field and
-/// the expected sequence.
+/// A `PATCH` answer: the investigation closed at seq 5, the entry
+/// written, and `activity`.
+fn closed_at_5(activity: Option<Activity>) -> PatchResponse {
+    PatchResponse {
+        investigation: Investigation {
+            status: InvestigationStatus::Closed,
+            seq: 5,
+            ..investigation()
+        },
+        entry: LogEntry {
+            payload: EntryPayload::Status {
+                status: InvestigationStatus::Closed,
+            },
+            ..note(5, "")
+        },
+        activity,
+    }
+}
+
+/// `patch_investigation` patches the investigation with the one field,
+/// the expected sequence and the `seen_seq`, and decodes the header, the
+/// entry written and the activity.
 #[tokio::test]
 async fn patch_sends_the_expected_sequence_and_one_field() {
     let request = PatchInvestigation {
         expected_seq: 4,
+        seen_seq: Some(3),
         title: None,
         question: None,
         status: Some(InvestigationStatus::Closed),
     };
-    let (client, served) = serve_ok(&investigation()).await;
+    let answer = closed_at_5(Some(Activity {
+        entries: vec![note(4, "theirs")],
+        through_seq: 5,
+        more: false,
+    }));
+    let (client, served) = serve_ok(&answer).await;
     let (decoded, seen) = exchange(client.patch_investigation(ID, &request), served).await;
     assert_eq!(
         seen.request_line(),
@@ -347,12 +373,37 @@ async fn patch_sends_the_expected_sequence_and_one_field() {
     );
     assert_eq!(
         seen.json(),
-        serde_json::json!({"expected_seq": 4, "status": "closed"})
+        serde_json::json!({"expected_seq": 4, "seen_seq": 3, "status": "closed"})
     );
-    assert_eq!(decoded.unwrap(), investigation());
+    assert_eq!(decoded.unwrap(), answer);
 }
 
-/// `set_finding_status` addresses the finding by its sequence in the path.
+/// A `PATCH` answer with the full allowance of activity is far past an
+/// investigation's own cap of 64 KiB, and still decodes: an overwrite that
+/// committed never reads as too large.
+#[tokio::test]
+async fn a_patch_answer_with_full_activity_past_64_kib_decodes() {
+    let answer = closed_at_5(Some(Activity {
+        entries: (0..50).map(|n| note(n, &"x".repeat(2048))).collect(),
+        through_seq: 49,
+        more: true,
+    }));
+    let body = serde_json::to_vec(&answer).unwrap();
+    assert!(body.len() > 64 * 1024, "{} bytes", body.len());
+    let request = PatchInvestigation {
+        expected_seq: 4,
+        seen_seq: Some(0),
+        title: None,
+        question: None,
+        status: Some(InvestigationStatus::Closed),
+    };
+    let (client, served) = serve_one("200 OK", "", body).await;
+    let (decoded, _) = exchange(client.patch_investigation(ID, &request), served).await;
+    assert_eq!(decoded.unwrap(), answer);
+}
+
+/// `set_finding_status` addresses the finding by its sequence in the path,
+/// sends the `seen_seq`, and decodes the activity.
 #[tokio::test]
 async fn finding_status_addresses_the_finding_by_its_sequence() {
     let answer = AppendResponse {
@@ -363,10 +414,15 @@ async fn finding_status_addresses_the_finding_by_its_sequence() {
             },
             ..note(7, "")
         },
-        activity: None,
+        activity: Some(Activity {
+            entries: vec![note(6, "theirs")],
+            through_seq: 7,
+            more: false,
+        }),
     };
     let request = FindingStatusUpdate {
         expected_seq: 6,
+        seen_seq: Some(5),
         status: FindingStatus::Refuted,
     };
     let (client, served) = serve_ok(&answer).await;
@@ -377,7 +433,7 @@ async fn finding_status_addresses_the_finding_by_its_sequence() {
     );
     assert_eq!(
         seen.json(),
-        serde_json::json!({"expected_seq": 6, "status": "refuted"})
+        serde_json::json!({"expected_seq": 6, "seen_seq": 5, "status": "refuted"})
     );
     assert_eq!(decoded.unwrap(), answer);
 }
@@ -430,6 +486,7 @@ async fn a_sequence_conflict_carries_expected_and_current() {
     };
     let request = PatchInvestigation {
         expected_seq: 4,
+        seen_seq: None,
         title: None,
         question: None,
         status: Some(InvestigationStatus::Closed),
@@ -497,12 +554,14 @@ async fn a_malformed_id_is_refused_before_any_connection() {
     };
     let patch = PatchInvestigation {
         expected_seq: 0,
+        seen_seq: None,
         title: None,
         question: None,
         status: Some(InvestigationStatus::Closed),
     };
     let finding = FindingStatusUpdate {
         expected_seq: 0,
+        seen_seq: None,
         status: FindingStatus::Supported,
     };
     let extension = RetentionExtension {
