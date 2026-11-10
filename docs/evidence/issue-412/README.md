@@ -37,7 +37,7 @@ removes an emission, add or remove its key in `dispositions.tsv` first.
 
 The dispositions follow these rules:
 
-- `changed`: a commit in `84d6bf79..746047a8` changed the emission. It now
+- `changed`: a commit of this pull request changed the emission. It now
   logs `error_class` and `cause_kind`, a fixed sentence or
   `join_failure_text`, and puts the error text in a DEBUG event.
 - `D2b`: the error text comes only from `std::io::Error`, directly or through
