@@ -1,0 +1,143 @@
+# issue #410 stress run (the Rust acceptance criterion)
+script:        docs/evidence/issue-410/stress.sh
+commit:        8b4b839b93fb0ba3c60973e3bb04131816734b81
+started:       2026-11-10T17:37:26Z
+uid:           1000
+nextest:       cargo-nextest 0.9.149
+rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
+cpus:          16
+tempdir fs:    btrfs (/home/jakub/.cache/agent-tmp/s410/tmp)
+load:          16 CPU spinners, 4 dd oflag=dsync writers in the tempdir filesystem
+selections:    default and no-default-features, at once; no-default flags: --no-default-features --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
+per selection: --stress-count 50 --retries 0 --no-fail-fast --no-tests=fail --test-threads 8
+reporter:      --color never --show-progress none --status-level pass --final-status-level fail --failure-output immediate --success-output never
+listed tests:  52
+load average before the load: 6.32 10.65 19.84
+
+default: builds, and lists exactly its 52 expected tests
+no-default-features: builds, and lists exactly its 52 expected tests
+
+load started:  2026-11-10T17:42:11Z, load average after 60 s: 25.05 21.25 22.23
+filter:        (binary_id(=fleet-auth::migration_pg) & test(=cases::cancelled_lock_wait_does_not_recycle_a_locked_connection)) | (binary_id(=trawl-server::schema_pg) & test(=cases::cancelled_lock_wait_does_not_recycle_a_locked_connection)) | (binary_id(=trawl-client) & test(=client::tests::refused_connection_is_connect_kind)) | (binary_id(=trawl-engine::query_budgets) & test(=spill_cap_refuses_a_low_fixed_cap)) | (binary_id(=trawl-engine::query_budgets) & test(=spill_stays_within_budget_plus_class_slack)) | (binary_id(=trawl-server) & test(=investigations::step::pg_tests::a_stalled_rollback_does_not_stop_the_writer)) | (binary_id(=trawl-server::investigations_attach) & test(=a_step_admission_spends_one_deadline_across_statements)) | (binary_id(=trawl-server::investigations_attach) & test(=a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_deadline)) | (binary_id(=trawl-server::publication_consistency) & test(=aborting_request_keeps_running_reader_protected)) | (binary_id(=trawl-server::publication_consistency) & test(=query_timeout_keeps_publication_guard_until_duckdb_task_finishes)) | (binary_id(=trawl-web) & test(=routes::proxy::tests::proxy_body_budget_bounds_buffered_bodies_at_an_8_mib_limit)) | (binary_id(=trawl-web) & test(=routes::proxy::tests::proxy_body_budget_charges_the_declared_length_until_the_body_is_sent_and_answered)) | (binary_id(=trawl-web) & test(=routes::proxy::tests::proxy_body_budget_is_held_while_the_sent_body_is_still_queued)) | (binary_id(=trawl-web) & test(=routes::proxy::tests::proxy_body_budget_never_refuses_before_the_count_at_the_default_limit)) | (binary_id(=trawl-web) & test(=routes::proxy::tests::proxy_stalled_logins_release_the_whole_count_at_the_deadline)) | (binary_id(=trawl-server) & test(=test_timing::tests::frozen_keeps_the_paused_clock_across_a_blocking_sleep)) | (binary_id(=trawl-server) & test(=test_timing::tests::frozen_keeps_the_paused_clock_across_a_loopback_round_trip)) | (binary_id(=trawl-server) & test(=test_timing::tests::frozen_moves_the_clock_only_by_an_explicit_advance)) | (binary_id(=trawl-server) & test(=test_timing::tests::until_leaves_the_paused_clock_alone)) | (binary_id(=trawl-server) & test(=test_timing::tests::until_polling_reports_which_side_came_first)) | (binary_id(=trawl-web) & test(=test_timing::tests::frozen_keeps_the_paused_clock_across_a_blocking_sleep)) | (binary_id(=trawl-web) & test(=test_timing::tests::frozen_keeps_the_paused_clock_across_a_loopback_round_trip)) | (binary_id(=trawl-web) & test(=test_timing::tests::frozen_moves_the_clock_only_by_an_explicit_advance)) | (binary_id(=trawl-web) & test(=test_timing::tests::until_leaves_the_paused_clock_alone)) | (binary_id(=trawl-web) & test(=test_timing::tests::until_polling_reports_which_side_came_first)) | (binary_id(=trawl-cli::doctor) & test(=other_commands_still_read_the_environment)) | (binary_id(=trawl-cli::doctor) & test(=doctor_url_key_sources)) | (binary_id(=trawl-cli::doctor) & test(=doctor_missing_profile_fails_without_contact)) | (binary_id(=trawl-cli::doctor_web) & test(=doctor_web_origin_accepted)) | (binary_id(=trawl-cli::doctor_web) & test(=doctor_web_origin_rejected)) | (binary_id(=trawl-cli::doctor_web) & test(=doctor_web_foreign_endpoint)) | (binary_id(=trawl-cli::doctor_web) & test(=doctor_web_truncated_body_is_too_large)) | (binary_id(=trawl-cli::doctor_web) & test(=doctor_web_body_cut_short_is_broken)) | (binary_id(=trawl-cli::doctor_web) & test(=doctor_web_health_rate_limited)) | (binary_id(=trawl-cli::mcp_stdio) & test(=ambient_variables_are_refused_by_name)) | (binary_id(=trawl-cli::mcp_stdio) & test(=flags_that_move_the_target_are_refused)) | (binary_id(=trawl-cli::mcp_stdio) & test(=the_key_comes_from_exactly_one_source)) | (binary_id(=trawl-cli::mcp_stdio) & test(=stdout_carries_protocol_messages_only)) | (binary_id(=trawl-cli::mcp_stdio) & test(=a_key_file_serves_a_profile_without_a_token)) | (binary_id(=trawl-cli::mcp_stdio) & test(=a_broken_stdout_after_initialize_exits_one)) | (binary_id(=trawl-cli::mcp_stdio) & test(=a_hostile_request_id_cannot_forge_stderr_lines)) | (binary_id(=trawl-cli::trial_engine) & test(=up_refuses_port_zero)) | (binary_id(=trawl-cli::trial_engine) & test(=a_denied_create_response_goes_on_when_the_claim_is_ours)) | (binary_id(=trawl-cli::trial_engine) & test(=a_denied_create_response_and_a_failed_inspect_keep_the_state)) | (binary_id(=trawl-cli::trial_engine) & test(=a_foreign_claim_removes_the_new_state)) | (binary_id(=trawl-cli::trial_engine) & test(=a_refused_create_keeps_the_state_and_a_rerun_creates_the_claim)) | (binary_id(=trawl-cli::trial_engine) & test(=a_dropped_create_keeps_the_state)) | (binary_id(=trawl-cli::trial_engine) & test(=down_removes_a_kept_state_that_owns_nothing)) | (binary_id(=trawl-cli::trial_engine) & test(=a_foreign_claim_keeps_files_the_new_state_did_not_write)) | (binary_id(=trawl-cli::trial_engine) & test(=trial_teardown_interruptions)) | (binary_id(=trawl-cli::trial_engine) & test(=trial_resume_storage_matrix)) | (binary_id(=trawl-cli::trial_engine) & test(=up_on_another_engine_names_the_engines_before_the_volumes))
+
+## run
+started:       2026-11-10T17:42:11Z, load average 25.05 21.25 22.23
+finished:      2026-11-10T18:13:39Z, load average 31.33 34.31 35.04
+exit:          default 0, no-default-features 0
+
+## default
+nextest: Summary [1657.521s] 50/50 stress run iterations: 50 passed
+  50 passed  -              fleet-auth::migration_pg cases::cancelled_lock_wait_does_not_recycle_a_locked_connection
+  50 passed  -              trawl-cli::doctor doctor_missing_profile_fails_without_contact
+  50 passed  -              trawl-cli::doctor doctor_url_key_sources
+  50 passed  -              trawl-cli::doctor other_commands_still_read_the_environment
+  50 passed  -              trawl-cli::doctor_web doctor_web_body_cut_short_is_broken
+  50 passed  -              trawl-cli::doctor_web doctor_web_foreign_endpoint
+  50 passed  -              trawl-cli::doctor_web doctor_web_health_rate_limited
+  50 passed  -              trawl-cli::doctor_web doctor_web_origin_accepted
+  50 passed  -              trawl-cli::doctor_web doctor_web_origin_rejected
+  50 passed  -              trawl-cli::doctor_web doctor_web_truncated_body_is_too_large
+  50 passed  -              trawl-client client::tests::refused_connection_is_connect_kind
+  50 passed  -              trawl-cli::mcp_stdio a_broken_stdout_after_initialize_exits_one
+  50 passed  -              trawl-cli::mcp_stdio a_hostile_request_id_cannot_forge_stderr_lines
+  50 passed  -              trawl-cli::mcp_stdio a_key_file_serves_a_profile_without_a_token
+  50 passed  -              trawl-cli::mcp_stdio ambient_variables_are_refused_by_name
+  50 passed  -              trawl-cli::mcp_stdio flags_that_move_the_target_are_refused
+  50 passed  -              trawl-cli::mcp_stdio stdout_carries_protocol_messages_only
+  50 passed  -              trawl-cli::mcp_stdio the_key_comes_from_exactly_one_source
+  50 passed  -              trawl-cli::trial_engine a_denied_create_response_and_a_failed_inspect_keep_the_state
+  50 passed  -              trawl-cli::trial_engine a_denied_create_response_goes_on_when_the_claim_is_ours
+  50 passed  -              trawl-cli::trial_engine a_dropped_create_keeps_the_state
+  50 passed  -              trawl-cli::trial_engine a_foreign_claim_keeps_files_the_new_state_did_not_write
+  50 passed  -              trawl-cli::trial_engine a_foreign_claim_removes_the_new_state
+  50 passed  -              trawl-cli::trial_engine a_refused_create_keeps_the_state_and_a_rerun_creates_the_claim
+  50 passed  -              trawl-cli::trial_engine down_removes_a_kept_state_that_owns_nothing
+  50 passed  -              trawl-cli::trial_engine trial_resume_storage_matrix
+  50 passed  -              trawl-cli::trial_engine trial_teardown_interruptions
+  50 passed  -              trawl-cli::trial_engine up_on_another_engine_names_the_engines_before_the_volumes
+  50 passed  -              trawl-cli::trial_engine up_refuses_port_zero
+  50 passed  -              trawl-engine::query_budgets spill_cap_refuses_a_low_fixed_cap
+  50 passed  -              trawl-engine::query_budgets spill_stays_within_budget_plus_class_slack
+  50 passed  -              trawl-server::investigations_attach a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_deadline
+  50 passed  -              trawl-server::investigations_attach a_step_admission_spends_one_deadline_across_statements
+  50 passed  -              trawl-server investigations::step::pg_tests::a_stalled_rollback_does_not_stop_the_writer
+  50 passed  -              trawl-server::publication_consistency aborting_request_keeps_running_reader_protected
+  50 passed  -              trawl-server::publication_consistency query_timeout_keeps_publication_guard_until_duckdb_task_finishes
+  50 passed  -              trawl-server::schema_pg cases::cancelled_lock_wait_does_not_recycle_a_locked_connection
+  50 passed  -              trawl-server test_timing::tests::frozen_keeps_the_paused_clock_across_a_blocking_sleep
+  50 passed  -              trawl-server test_timing::tests::frozen_keeps_the_paused_clock_across_a_loopback_round_trip
+  50 passed  -              trawl-server test_timing::tests::frozen_moves_the_clock_only_by_an_explicit_advance
+  50 passed  -              trawl-server test_timing::tests::until_leaves_the_paused_clock_alone
+  50 passed  -              trawl-server test_timing::tests::until_polling_reports_which_side_came_first
+  50 passed  -              trawl-web routes::proxy::tests::proxy_body_budget_bounds_buffered_bodies_at_an_8_mib_limit
+  50 passed  -              trawl-web routes::proxy::tests::proxy_body_budget_charges_the_declared_length_until_the_body_is_sent_and_answered
+  50 passed  -              trawl-web routes::proxy::tests::proxy_body_budget_is_held_while_the_sent_body_is_still_queued
+  50 passed  -              trawl-web routes::proxy::tests::proxy_body_budget_never_refuses_before_the_count_at_the_default_limit
+  50 passed  -              trawl-web routes::proxy::tests::proxy_stalled_logins_release_the_whole_count_at_the_deadline
+  50 passed  -              trawl-web test_timing::tests::frozen_keeps_the_paused_clock_across_a_blocking_sleep
+  50 passed  -              trawl-web test_timing::tests::frozen_keeps_the_paused_clock_across_a_loopback_round_trip
+  50 passed  -              trawl-web test_timing::tests::frozen_moves_the_clock_only_by_an_explicit_advance
+  50 passed  -              trawl-web test_timing::tests::until_leaves_the_paused_clock_alone
+  50 passed  -              trawl-web test_timing::tests::until_polling_reports_which_side_came_first
+default: met (exit 0, every expected test passed 50 of 50)
+
+## no-default-features
+nextest: Summary [1587.315s] 50/50 stress run iterations: 50 passed
+  50 passed  -              fleet-auth::migration_pg cases::cancelled_lock_wait_does_not_recycle_a_locked_connection
+  50 passed  -              trawl-cli::doctor doctor_missing_profile_fails_without_contact
+  50 passed  -              trawl-cli::doctor doctor_url_key_sources
+  50 passed  -              trawl-cli::doctor other_commands_still_read_the_environment
+  50 passed  -              trawl-cli::doctor_web doctor_web_body_cut_short_is_broken
+  50 passed  -              trawl-cli::doctor_web doctor_web_foreign_endpoint
+  50 passed  -              trawl-cli::doctor_web doctor_web_health_rate_limited
+  50 passed  -              trawl-cli::doctor_web doctor_web_origin_accepted
+  50 passed  -              trawl-cli::doctor_web doctor_web_origin_rejected
+  50 passed  -              trawl-cli::doctor_web doctor_web_truncated_body_is_too_large
+  50 passed  -              trawl-client client::tests::refused_connection_is_connect_kind
+  50 passed  -              trawl-cli::mcp_stdio a_broken_stdout_after_initialize_exits_one
+  50 passed  -              trawl-cli::mcp_stdio a_hostile_request_id_cannot_forge_stderr_lines
+  50 passed  -              trawl-cli::mcp_stdio a_key_file_serves_a_profile_without_a_token
+  50 passed  -              trawl-cli::mcp_stdio ambient_variables_are_refused_by_name
+  50 passed  -              trawl-cli::mcp_stdio flags_that_move_the_target_are_refused
+  50 passed  -              trawl-cli::mcp_stdio stdout_carries_protocol_messages_only
+  50 passed  -              trawl-cli::mcp_stdio the_key_comes_from_exactly_one_source
+  50 passed  -              trawl-cli::trial_engine a_denied_create_response_and_a_failed_inspect_keep_the_state
+  50 passed  -              trawl-cli::trial_engine a_denied_create_response_goes_on_when_the_claim_is_ours
+  50 passed  -              trawl-cli::trial_engine a_dropped_create_keeps_the_state
+  50 passed  -              trawl-cli::trial_engine a_foreign_claim_keeps_files_the_new_state_did_not_write
+  50 passed  -              trawl-cli::trial_engine a_foreign_claim_removes_the_new_state
+  50 passed  -              trawl-cli::trial_engine a_refused_create_keeps_the_state_and_a_rerun_creates_the_claim
+  50 passed  -              trawl-cli::trial_engine down_removes_a_kept_state_that_owns_nothing
+  50 passed  -              trawl-cli::trial_engine trial_resume_storage_matrix
+  50 passed  -              trawl-cli::trial_engine trial_teardown_interruptions
+  50 passed  -              trawl-cli::trial_engine up_on_another_engine_names_the_engines_before_the_volumes
+  50 passed  -              trawl-cli::trial_engine up_refuses_port_zero
+  50 passed  -              trawl-engine::query_budgets spill_cap_refuses_a_low_fixed_cap
+  50 passed  -              trawl-engine::query_budgets spill_stays_within_budget_plus_class_slack
+  50 passed  -              trawl-server::investigations_attach a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_deadline
+  50 passed  -              trawl-server::investigations_attach a_step_admission_spends_one_deadline_across_statements
+  50 passed  -              trawl-server investigations::step::pg_tests::a_stalled_rollback_does_not_stop_the_writer
+  50 passed  -              trawl-server::publication_consistency aborting_request_keeps_running_reader_protected
+  50 passed  -              trawl-server::publication_consistency query_timeout_keeps_publication_guard_until_duckdb_task_finishes
+  50 passed  -              trawl-server::schema_pg cases::cancelled_lock_wait_does_not_recycle_a_locked_connection
+  50 passed  -              trawl-server test_timing::tests::frozen_keeps_the_paused_clock_across_a_blocking_sleep
+  50 passed  -              trawl-server test_timing::tests::frozen_keeps_the_paused_clock_across_a_loopback_round_trip
+  50 passed  -              trawl-server test_timing::tests::frozen_moves_the_clock_only_by_an_explicit_advance
+  50 passed  -              trawl-server test_timing::tests::until_leaves_the_paused_clock_alone
+  50 passed  -              trawl-server test_timing::tests::until_polling_reports_which_side_came_first
+  50 passed  -              trawl-web routes::proxy::tests::proxy_body_budget_bounds_buffered_bodies_at_an_8_mib_limit
+  50 passed  -              trawl-web routes::proxy::tests::proxy_body_budget_charges_the_declared_length_until_the_body_is_sent_and_answered
+  50 passed  -              trawl-web routes::proxy::tests::proxy_body_budget_is_held_while_the_sent_body_is_still_queued
+  50 passed  -              trawl-web routes::proxy::tests::proxy_body_budget_never_refuses_before_the_count_at_the_default_limit
+  50 passed  -              trawl-web routes::proxy::tests::proxy_stalled_logins_release_the_whole_count_at_the_deadline
+  50 passed  -              trawl-web test_timing::tests::frozen_keeps_the_paused_clock_across_a_blocking_sleep
+  50 passed  -              trawl-web test_timing::tests::frozen_keeps_the_paused_clock_across_a_loopback_round_trip
+  50 passed  -              trawl-web test_timing::tests::frozen_moves_the_clock_only_by_an_explicit_advance
+  50 passed  -              trawl-web test_timing::tests::until_leaves_the_paused_clock_alone
+  50 passed  -              trawl-web test_timing::tests::until_polling_reports_which_side_came_first
+no-default-features: met (exit 0, every expected test passed 50 of 50)
+
+## summary
+every listed test passed 50 of 50 in both selections: met
+finished:      2026-11-10T18:13:41Z
+load average after the load stopped: 31.33 34.31 35.04
