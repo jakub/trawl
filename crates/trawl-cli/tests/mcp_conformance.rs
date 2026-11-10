@@ -509,14 +509,25 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
             tight.text
         );
     }
-    for row in rows {
+    // The cut row holds the same cells, at the same positions, as the row
+    // the full-width reply printed.
+    let full_rows = small_view["rows"].as_array().unwrap();
+    for (row, full) in rows.iter().zip(full_rows) {
+        let cells = row.as_array().unwrap();
+        assert_eq!(cells.len(), columns.len(), "{case}: {}", tight.text);
         assert_eq!(
-            row.as_array().unwrap().len(),
-            columns.len(),
+            cells[..],
+            full.as_array().unwrap()[..columns.len()],
+            "{case}: {}",
+            tight.text
+        );
+        assert!(
+            cells.iter().any(|cell| !cell.is_null()),
             "{case}: {}",
             tight.text
         );
     }
+    assert!(rows.len() <= full_rows.len(), "{case}: {}", tight.text);
     let presentation = &tight_view["presentation"];
     assert_eq!(
         presentation["columns_omitted"],
