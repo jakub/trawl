@@ -1060,7 +1060,7 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
     )));
 
     // -- column headers --
-    let col_widths = run_result_widths(result);
+    let col_widths = run_result_widths(result, app.display_zone);
     let header_spans: Vec<Span<'static>> = result
         .columns
         .iter()
@@ -1095,10 +1095,11 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
     for row in &result.rows[start..end] {
         let row_spans: Vec<Span<'static>> = row
             .iter()
+            .zip(&result.columns)
             .zip(&col_widths)
-            .map(|(val, &width)| {
+            .map(|((val, column), &width)| {
                 Span::styled(
-                    run_result_cell(&format_value(val), width),
+                    run_result_cell(&run_result_text(column, val, app.display_zone), width),
                     Style::default().fg(theme.text_primary),
                 )
             })
@@ -1129,23 +1130,39 @@ const RUN_RESULT_COLUMN_CAP: usize = 30;
 /// Display-cell widths of the run result columns.
 ///
 /// Widths sample the header and the first 100 rows, so a wider value further
-/// down renders cut. Each sample is measured as it would render at the cap.
-fn run_result_widths(result: &trawl_api::value::QueryResult) -> Vec<usize> {
+/// down renders cut. Each sample is measured as it would render at the cap,
+/// except in a timestamp column, where an instant is measured whole: its
+/// offset is at the end, and a cut there would hide the zone it reads in.
+fn run_result_widths(result: &trawl_api::value::QueryResult, zone: DisplayZone) -> Vec<usize> {
     let fitted = |text: &str| cells(&fit_cells(text, RUN_RESULT_COLUMN_CAP));
     result
         .columns
         .iter()
         .enumerate()
         .map(|(i, column)| {
+            let whole = column.ty == trawl_api::value::ColumnType::Timestamp;
             result
                 .rows
                 .iter()
                 .take(100)
                 .filter_map(|row| row.get(i))
-                .map(|val| fitted(&format_value(val)))
+                .map(|val| {
+                    let text = run_result_text(column, val, zone);
+                    if whole { cells(&text) } else { fitted(&text) }
+                })
                 .fold(fitted(&column.name), usize::max)
         })
         .collect()
+}
+
+/// A run result cell as the table shows it: an instant in `zone` with its
+/// own offset, any other cell through [`format_value`].
+fn run_result_text(
+    column: &trawl_api::value::Column,
+    val: &trawl_api::value::Value,
+    zone: DisplayZone,
+) -> String {
+    trawl_api::zone::present_cell(&column.ty, val, zone).unwrap_or_else(|| format_value(val))
 }
 
 /// One run result cell: `text` cut and padded to `width` display cells, then
@@ -1811,7 +1828,7 @@ mod unicode_tests {
             .as_ref()
             .unwrap()
             .result;
-        let widths = run_result_widths(result);
+        let widths = run_result_widths(result, DisplayZone::Utc);
         assert!(
             widths.iter().all(|&w| w <= RUN_RESULT_COLUMN_CAP),
             "{widths:?}"

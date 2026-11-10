@@ -502,6 +502,47 @@ mod tests {
         assert!(!saved.contains(" UTC"), "{saved}");
     }
 
+    /// A saved run's result table shows a timestamp cell in the display zone
+    /// with its offset, whole even with a fraction, and leaves a string cell
+    /// that only looks like an instant as it was sent.
+    #[test]
+    fn saved_run_results_draw_instants_in_the_display_zone() {
+        use crate::tui::state::{LoadedRun, SavedFocus};
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+
+        let run = windowed_run(
+            41,
+            45,
+            "since_last",
+            "2026-03-14T02:00:00Z",
+            "2026-03-14T03:00:00Z",
+        );
+        let mut app = saved_app(None, vec![run]);
+        app.display_zone = "+05:30".parse().unwrap();
+        app.panel.saved_focus = SavedFocus::RunResults;
+        app.panel.saved_detail.as_mut().unwrap().result = Some(LoadedRun {
+            run_id: 41,
+            result: QueryResult {
+                columns: vec![
+                    Column::new("_time", ColumnType::Timestamp),
+                    Column::new("message", ColumnType::String),
+                ],
+                rows: vec![vec![
+                    Value::String("2026-03-14T02:00:00.123456Z".to_owned()),
+                    Value::String("2026-03-14T02:00:00.000000Z".to_owned()),
+                ]],
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        let drawn = terminal.backend().to_string();
+        assert!(
+            drawn.contains("2026-03-14 07:30:00.123456 +05:30  2026-03-14T02:00:00.000000Z"),
+            "{drawn}"
+        );
+    }
+
     /// A fixed trailing window with no lag: no `lag 0s`, and no watermark,
     /// because a fixed window keeps none.
     #[test]
