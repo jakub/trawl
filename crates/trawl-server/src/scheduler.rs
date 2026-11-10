@@ -25,7 +25,7 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
-use crate::pool::ExecutorPool;
+use crate::pool::{ExecutorPool, ScheduledLease};
 use crate::publication::CorpusUnsettled;
 use crate::query_timing::{Outcome, TimingGuard};
 use crate::report_window::{ReportWindow, format_window_bound, truncate_to_micros};
@@ -294,6 +294,7 @@ pub async fn poll_and_execute(
                 &resolved_query,
                 &query_name,
                 timeout_secs,
+                None,
             )
             .await;
         }));
@@ -364,6 +365,14 @@ async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i6
     usable
 }
 
+/// Execute one claimed run and record its outcome on its run row.
+///
+/// `lease` is the run's place among the scheduled runs in flight, or
+/// `None` for a manual run, which takes none (ADR-0018, amended
+/// 2026-11-09). This frame keeps it to its last statement, and the run's
+/// preparation job and its executor work each keep it until they stop,
+/// so the lease returns when the last of the three ends: a run that timed
+/// out still holds it while its work runs.
 pub(crate) async fn execute_scheduled_query(
     schedule_store: ScheduleStore,
     pool: ExecutorPool,
@@ -371,7 +380,9 @@ pub(crate) async fn execute_scheduled_query(
     query: &str,
     _query_name: &str,
     timeout_secs: u64,
+    lease: Option<ScheduledLease>,
 ) {
+    let lease = lease.map(ScheduledLease::into_hold);
     let start = std::time::Instant::now();
     // One budget for this attempt, stamped before the first pool wait
     // (ADR-0024): a scheduled run that spends its whole timeout queueing
@@ -391,28 +402,28 @@ pub(crate) async fn execute_scheduled_query(
     // the operator repairs the saved DSL rather than re-enabling a
     // schedule the server disabled behind their back. The check runs on
     // the blocking pool behind the preparation allowance, and its wait for
-    // a slot spends this attempt's deadline (ADR-0063).
+    // a slot spends this attempt's deadline (ADR-0063). Its job keeps the
+    // lease until it ends.
     let checked = {
         let _check = timing
             .clock()
             .guard(trawl_engine::timing::QueryPhase::DslCheck);
-        crate::admission::admit(&pool, query, deadline, None).await
+        crate::admission::admit_holding(&pool, query, deadline, None, lease.clone()).await
     };
-    let result = match checked {
-        Err(refusal) => Err(refusal),
+    let result = if let Err(refusal) = checked {
+        Err(refusal)
+    } else {
         // Execute the query on the pool (no debug capture, UTC timestamps).
-        Ok(_) => {
-            pool.execute(
-                query_id,
-                query,
-                deadline,
-                false,
-                crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled)
-                    .with_timing(timing.timing().clone()),
-            )
+        // The work keeps the lease until it stops.
+        let work = crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled)
+            .with_timing(timing.timing().clone());
+        let work = match &lease {
+            Some(hold) => work.holding(Arc::clone(hold)),
+            None => work,
+        };
+        pool.execute(query_id, query, deadline, false, work)
             .await
             .result
-        }
     };
 
     // The account closes here, before the result is persisted: the window
@@ -1421,6 +1432,7 @@ mod off_reactor_tests {
                 "zz_cp6b_scheduled_run | where message matches /zz_(a|b)+/",
                 "prepared",
                 30,
+                None,
             ),
         )
         .await;
@@ -1733,6 +1745,7 @@ mod tests {
             "* | head 1",
             "timed_ok",
             30,
+            None,
         )
         .await;
         super::execute_scheduled_query(
@@ -1742,6 +1755,7 @@ mod tests {
             "* | stats zz_sched_needle()",
             "timed_failure",
             30,
+            None,
         )
         .await;
         drop(capturing);
@@ -1803,6 +1817,60 @@ mod tests {
                 .is_some_and(|m| m.contains("zz_sched_needle")),
             "the run row stores the public message, which names the emit error's function: {run:?}"
         );
+    }
+
+    /// A scheduled run whose request timed out while its preparation job
+    /// still ran keeps its lease until the job ends (ADR-0018, amended
+    /// 2026-11-09). The job is parked twice: before its work runs, and
+    /// after its work returned, when everything the work captured has
+    /// dropped and only the job is left holding its slot. On a pool of two
+    /// permits the one lease is the run's, so no other lease is free until
+    /// the job lets it go.
+    #[sqlx::test]
+    async fn a_preparation_job_holds_its_lease(pool: sqlx::PgPool) {
+        use crate::pool::seam::Seam;
+        use crate::store::RunStatus;
+
+        for seam in [Seam::Preparing, Seam::Prepared] {
+            let data = tempfile::tempdir().unwrap();
+            let executors = crate::pool::ExecutorPool::for_test(
+                data.path().to_str().unwrap().into(),
+                2,
+                100_000,
+                None,
+            )
+            .unwrap();
+            let seams = executors.seams();
+            let parked = seams.hold(seam);
+            let (store, _, run_id) =
+                super::pg_tests::seed_run(&pool, &format!("held_{seam:?}")).await;
+            let lease = executors.try_lease_scheduled().expect("a free lease");
+
+            super::execute_scheduled_query(
+                store.clone(),
+                executors.clone(),
+                run_id,
+                "* | head 1",
+                "held",
+                1,
+                Some(lease),
+            )
+            .await;
+            let run = store.get_run(run_id, 1).await.unwrap().unwrap();
+            assert_eq!(run.status, RunStatus::Timeout, "{seam:?}: {run:?}");
+            crate::test_timing::until("the job parks", || parked.arrivals() == 1).await;
+            assert!(
+                executors.try_lease_scheduled().is_none(),
+                "{seam:?}: the parked job keeps the run's lease"
+            );
+
+            parked.release();
+            crate::test_timing::until("the job gives the lease back", || {
+                executors.scheduled_leases_available() == 1
+            })
+            .await;
+            assert_eq!(executors.preparation().in_use(), 0, "{seam:?}");
+        }
     }
 
     /// The blob is the typed wire, and decodes back to the same result.
