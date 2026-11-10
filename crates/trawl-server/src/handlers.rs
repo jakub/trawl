@@ -82,6 +82,31 @@ fn guard_vanished_run_result(
     outcome
 }
 
+/// Ask whether a `from saved` read's stored files are still there before
+/// any of them reaches `DuckDB`, and say what that leaves for
+/// [`guard_vanished_run_result`] to ask again after execution.
+///
+/// A refusal here is the read's outcome, returned as one, and leaves
+/// nothing to ask again: no file was opened, so no delete can land between
+/// this check and an open, and asking again would only log the same
+/// refusal twice.
+fn check_run_files_before_execution(
+    run_files: &[crate::from_saved::RunFile],
+) -> (
+    Option<crate::pool::ExecuteOutcome>,
+    &[crate::from_saved::RunFile],
+) {
+    let refused = crate::from_saved::unavailable_run_conflict(run_files).map(|conflict| {
+        crate::pool::ExecuteOutcome {
+            result: Err(conflict),
+            debug: None,
+            severity_columns: Vec::new(),
+        }
+    });
+    let recheck = if refused.is_some() { &[] } else { run_files };
+    (refused, recheck)
+}
+
 /// `POST /api/v1/query` — execute a DSL query against the configured data source.
 ///
 /// Requires a valid bearer token (injected by auth middleware).
@@ -224,6 +249,9 @@ pub async fn query(
     // [`guard_vanished_run_result`]). Empty for every query that is not a
     // `from saved` read of a run with a file.
     let mut run_files: Vec<crate::from_saved::RunFile> = Vec::new();
+    // What the guard asks about again: the run files, unless the check
+    // before execution already refused.
+    let mut recheck: &[crate::from_saved::RunFile] = &[];
 
     let (outcome, degraded_fields) = match admitted {
         Err(refusal) => (
@@ -241,15 +269,10 @@ pub async fn query(
             // run when it is confirmed absent, before any of it reaches
             // `DuckDB` — where a file it cannot resolve is substituted with
             // an empty relation and would read as "the report found nothing".
-            if let Some(conflict) = crate::from_saved::unavailable_run_conflict(&run_files) {
-                (
-                    crate::pool::ExecuteOutcome {
-                        result: Err(conflict),
-                        debug: None,
-                        severity_columns: Vec::new(),
-                    },
-                    Vec::new(),
-                )
+            let (refused, files) = check_run_files_before_execution(&run_files);
+            recheck = files;
+            if let Some(refused) = refused {
+                (refused, Vec::new())
             } else {
                 // Both halves of what the caller is actually reading: the
                 // stages they typed, and the saved query whose recorded run
@@ -311,10 +334,10 @@ pub async fn query(
     // a capacity refusal) is closed, and its worker may still be inside a
     // phase: nothing more is booked on it.
     let outcome = if run_files.is_empty() || timing.emitted() {
-        guard_vanished_run_result(outcome, &run_files)
+        guard_vanished_run_result(outcome, recheck)
     } else {
         timing.clock().time(QueryPhase::Post, || {
-            guard_vanished_run_result(outcome, &run_files)
+            guard_vanished_run_result(outcome, recheck)
         })
     };
 
@@ -4873,6 +4896,43 @@ mod tests {
             ),
             other => panic!("expected the outcome to pass through, got: {other:?}"),
         }
+    }
+
+    /// A `/query` the check before execution refuses for a run file below a
+    /// dangling link logs that refusal once: the guard after execution does
+    /// not stat the files again and repeat the WARN.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_before_execution_warns_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("link")).unwrap();
+        let run_files = [crate::from_saved::RunFile {
+            run_id: 7,
+            absolute_path: dir.path().join("link").join("run_7.parquet"),
+        }];
+
+        let events = crate::test_events::events_of(|| {
+            let (refused, recheck) = check_run_files_before_execution(&run_files);
+            let refused = refused.expect("a run file below a dangling link is refused");
+            let guarded = guard_vanished_run_result(refused, recheck);
+            assert!(
+                matches!(
+                    guarded.result,
+                    Err(ServerError::Engine(trawl_engine::error::EngineError::Io(_)))
+                ),
+                "the answer is still the check's own redacted error: {:?}",
+                guarded.result
+            );
+        });
+        let warned = events
+            .iter()
+            .filter(|e| {
+                e.is_default_level()
+                    && e.fields.get("event_type").map(String::as_str)
+                        == Some("from_saved_run_file_unresolved")
+            })
+            .count();
+        assert_eq!(warned, 1, "one refusal, one WARN: {events:?}");
     }
 
     /// A run file whose absence cannot be established, below a dangling
