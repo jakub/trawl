@@ -762,28 +762,27 @@ async fn a_selection_over_the_source_budget_is_refused_before_work_starts() {
 /// A capture that pins two of three services in one window is measured
 /// over those two files only (#374): it fits a budget the whole window
 /// does not, and the unpinned window is refused with the service hint.
+/// The third service's file is not parquet, so a capture that opened it
+/// would fail: the pinned capture read only its services' files.
 #[tokio::test(flavor = "multi_thread")]
 async fn multi_service_capture_reads_only_its_services() {
     let tmp = tempfile::tempdir().unwrap();
     let data = common::seed_data_root(tmp.path());
-    captured::seed_hour(
-        &data,
-        "redis",
-        &[captured::Event {
-            time: at("2024-01-15T10:00:03Z"),
-            host: "cache01".into(),
-            message: "background save".into(),
-        }],
-    );
     let hour = Path::new(&data).join("prod/2024-01-15/10");
+    std::fs::write(
+        hour.join("redis.parquet"),
+        b"these bytes are not a parquet file",
+    )
+    .unwrap();
     let size = |service: &str| {
         std::fs::metadata(hour.join(format!("{service}.parquet")))
             .unwrap()
             .len()
     };
-    // The two pinned files fit together; all three do not.
+    // The two pinned files fit together; all three do not, because the
+    // measure charges a file whose footer it cannot read whole.
     let budget = size("nginx") + size("postgres");
-    assert!(size("nginx") + size("postgres") <= budget);
+    assert!(size("redis") > 0);
     assert!(size("nginx") + size("postgres") + size("redis") > budget);
     let server = common::setup_with_capture(
         tmp.path(),
