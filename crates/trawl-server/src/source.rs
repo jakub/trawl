@@ -600,9 +600,11 @@ impl SourceSelection {
 /// publication read guard, before the engine runs, so no canonical Parquet
 /// publication in this process lands between the measurement and the read.
 /// Retention takes no such guard: a directory that is gone, or a file that
-/// vanishes between the listing and its footer, counts as zero. Any other
-/// IO error is returned, so the caller cannot mistake an unreadable
-/// directory for an empty one.
+/// vanishes between the listing and its footer, counts as zero.
+/// [`crate::env_dirs::is_absent`] is not asked here, because `DuckDB` reads
+/// nothing at a path that is gone or dangles, so zero is the read's own
+/// answer for a budget estimate. Any other IO error is returned, so the
+/// caller cannot mistake an unreadable directory for an empty one.
 ///
 /// Symlinks are not followed and count as zero. `DuckDB` would read
 /// through a live link to a file, but trawld never writes a symlink into
