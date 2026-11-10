@@ -231,18 +231,16 @@ mod tests {
     /// finishes on a 2 MiB thread.
     ///
     /// The parser cannot produce the chain (a query is at most 64 KiB),
-    /// so the AST is built by hand. Building and dropping it happen on a
-    /// thread with a large stack, because `Drop` of a nested `Box` chain
-    /// recurses (#330). Only `validate_pipeline` runs on the small
-    /// thread, and over a `where` it walks nothing but
-    /// [`super::check_positions`]: the complexity budget and the
-    /// projection check have nothing to do there.
+    /// so the AST is built by hand. Building, validating and dropping it
+    /// all happen on the small thread. Over a `where`, `validate_pipeline`
+    /// walks nothing but [`super::check_positions`]: the complexity budget
+    /// and the projection check have nothing to do there.
     #[test]
     fn flat_expression_validation_is_bounded() {
         const TERMS: usize = 100_000;
         let leaf = || Spanned::new(Expr::FieldRef("x".to_owned()), 0..1);
-        let big = std::thread::Builder::new()
-            .stack_size(1 << 30)
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
             .spawn(move || {
                 let mut chain = leaf();
                 for _ in 1..TERMS {
@@ -270,22 +268,11 @@ mod tests {
                     PipeStage::Where(WhereStage { condition }),
                     0..1,
                 )];
-
-                let (stages, verdict) = std::thread::Builder::new()
-                    .stack_size(2 << 20)
-                    .spawn(move || {
-                        let verdict = crate::emitter::validate_pipeline(&stages);
-                        (stages, verdict)
-                    })
-                    .expect("spawn the 2 MiB thread")
-                    .join()
-                    .expect("validation finishes on 2 MiB");
-                drop(stages);
-                verdict
+                crate::emitter::validate_pipeline(&stages)
             })
-            .expect("spawn the big-stack thread");
-        big.join()
-            .expect("the big-stack thread builds and drops the chain")
+            .expect("spawn the 2 MiB thread")
+            .join()
+            .expect("the chain builds, validates and drops on 2 MiB")
             .expect("a flat chain of plain field reads is valid");
     }
 }

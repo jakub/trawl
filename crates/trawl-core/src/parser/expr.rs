@@ -774,11 +774,12 @@ mod tests {
         }
 
         // `not` binds tighter than `and`, and `and` tighter than `or`.
+        let root = stage_expr("| where NOT a == 1 OR b == 2 AND c == 3");
         let Expr::Binary {
             lhs,
             op: BinaryOp::Or,
             rhs,
-        } = stage_expr("| where NOT a == 1 OR b == 2 AND c == 3")
+        } = &root
         else {
             panic!("the root must be `or`");
         };
@@ -818,12 +819,12 @@ mod tests {
             ("| where AND == 1", "AND"),
             ("| where OR == 1", "OR"),
         ] {
-            let Expr::Binary { lhs, .. } = stage_expr(query) else {
+            let Expr::Binary { ref lhs, .. } = stage_expr(query) else {
                 panic!("{query} must be a comparison");
             };
             assert_eq!(lhs.node, Expr::FieldRef(field.to_string()), "{query}");
         }
-        let Expr::Binary { rhs, .. } = stage_expr("| where a == NOT") else {
+        let Expr::Binary { ref rhs, .. } = stage_expr("| where a == NOT") else {
             panic!("`a == NOT` must be a comparison");
         };
         assert_eq!(rhs.node, Expr::FieldRef("NOT".to_string()));
@@ -842,11 +843,11 @@ mod tests {
             );
         }
 
-        let not_of = |query: &str| match stage_expr(query) {
+        let not_of = |query: &str| match &mut stage_expr(query) {
             Expr::Unary {
                 op: UnaryOp::Not,
                 operand,
-            } => operand.node,
+            } => std::mem::replace(&mut operand.node, Expr::Literal(LiteralValue::Null)),
             other => panic!("{query} must read as `not`, got {other:?}"),
         };
         assert_eq!(not_of("| where NOT(x)"), Expr::FieldRef("x".to_string()));
@@ -870,7 +871,7 @@ mod tests {
             ("| where `NOT` == 1", "NOT"),
             ("| where `NOT.x` == 1", "NOT.x"),
         ] {
-            let Expr::Binary { lhs, .. } = stage_expr(query) else {
+            let Expr::Binary { ref lhs, .. } = stage_expr(query) else {
                 panic!("{query} must be a comparison");
             };
             assert_eq!(lhs.node, Expr::FieldRef(field.to_string()), "{query}");
