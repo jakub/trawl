@@ -372,10 +372,19 @@ fn status_warns_only_about_variables_that_move_commands() {
     }
 }
 
-/// A free loopback port, for `up`'s bind test.
-fn free_port() -> String {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.local_addr().unwrap().port().to_string()
+/// `N` distinct free loopback ports, for a child whose preflight binds
+/// them itself. Every listener stays bound until all `N` ports are chosen,
+/// so no two ports match; they are dropped on return, which a caller does
+/// right before the spawn.
+///
+/// Residual exposure: between that drop and the child's own bind another
+/// process can take a port. The child must bind the port itself, so no
+/// test can hold it across the spawn.
+fn free_ports<const N: usize>() -> [u16; N] {
+    let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap()
+    });
+    listeners.map(|listener| listener.local_addr().unwrap().port())
 }
 
 /// Another trial's id.
@@ -436,7 +445,9 @@ impl Engine {
         let out = if self.state().is_some() {
             self.trawl(&["up", "--no-sample-data"])
         } else {
-            let (api, web) = (free_port(), free_port());
+            // Chosen right before the spawn; `free_ports` names the race
+            // that remains until the child binds them.
+            let [api, web] = free_ports::<2>().map(|port| port.to_string());
             self.trawl(&[
                 "up",
                 "--api-port",
@@ -460,7 +471,9 @@ impl Engine {
 fn up_refuses_port_zero() {
     for (zero, other) in [("--api-port", "--web-port"), ("--web-port", "--api-port")] {
         let engine = Engine::new("engine-a");
-        let out = engine.trawl(&["up", zero, "0", other, &free_port(), "--no-sample-data"]);
+        // The parser refuses before any bind, so the other port is never
+        // bound: any nonzero port distinct from the zero one serves.
+        let out = engine.trawl(&["up", zero, "0", other, "18089", "--no-sample-data"]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{zero}: {stderr}");
         assert!(
@@ -760,11 +773,13 @@ impl Engine {
     /// images the stub answers with, the claim, and the phases `phases`.
     fn resumable(&self, phases: &serde_json::Value) -> PathBuf {
         self.put("claim.id", TRIAL_ID);
+        // Two distinct ports from one call. They are written into the state
+        // here, long before the test's `up` resumes and binds them, so the
+        // race `free_ports` names has a wider window than in `up`'s first
+        // run: anything that binds one of them meanwhile fails the resume.
+        let [api, web] = free_ports::<2>();
         self.trial_with("engine-a", |state| {
-            state["ports"] = serde_json::json!({
-                "api": free_port().parse::<u16>().unwrap(),
-                "web": free_port().parse::<u16>().unwrap(),
-            });
+            state["ports"] = serde_json::json!({ "api": api, "web": web });
             state["images"]["postgres"]["id"] = "sha256:aaaa".into();
             state["phases"] = phases.clone();
         })

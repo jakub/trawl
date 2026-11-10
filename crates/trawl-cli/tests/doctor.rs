@@ -183,10 +183,23 @@ impl Sandbox {
     }
 }
 
-/// A port with nothing listening on it.
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
+/// A loopback port bound by this test and never listening: a connect to it
+/// is refused, and no other process can bind it while the guard lives.
+/// Keep the guard in a named binding until every child that uses the port
+/// has exited; reading the port off a dropped guard frees the port again.
+struct ClosedPort(tokio::net::TcpSocket);
+
+impl ClosedPort {
+    fn port(&self) -> u16 {
+        self.0.local_addr().expect("addr").port()
+    }
+}
+
+/// A port with nothing listening on it, held for as long as the guard lives.
+fn closed_port() -> ClosedPort {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.bind(([127, 0, 0, 1], 0).into()).expect("bind");
+    ClosedPort(socket)
 }
 
 // ── TLS material ─────────────────────────────────────────────────────────
@@ -618,7 +631,8 @@ fn help_never_prints_environment_values() {
 #[test]
 fn other_commands_still_read_the_environment() {
     let home = Sandbox::new();
-    let port = closed_port();
+    let closed = closed_port();
+    let port = closed.port();
     let output = home.trawl(
         &["query", "* | head 1"],
         &[
@@ -929,7 +943,8 @@ fn doctor_url_key_sources() {
     let url = recorder.url("https");
     // A run whose key resolves goes on to contact its target, so those runs
     // aim at a port with nothing on it and the recorder sees only failures.
-    let closed = format!("https://127.0.0.1:{}", closed_port());
+    let closed_guard = closed_port();
+    let closed = format!("https://127.0.0.1:{}", closed_guard.port());
     let good = home.file("good.key", "flt_keyfilevalue\n");
     let empty = home.file("empty.key", "\n");
     let absent = home.home.join("absent.key");
@@ -1066,7 +1081,8 @@ fn doctor_missing_profile_fails_without_contact() {
 
     // `lab` resolves and goes on to contact its own url, a closed port, so
     // the recorder at `[server].url` still sees nothing.
-    let lab = format!("https://127.0.0.1:{}", closed_port());
+    let lab_guard = closed_port();
+    let lab = format!("https://127.0.0.1:{}", lab_guard.port());
     home.default_config(&format!(
         "[server]\nurl = \"{url}\"\ntoken = \"{SAVED_TOKEN}\"\n\n\
          [profiles.lab]\nurl = \"{lab}\"\n\n[profiles.nourl]\ninsecure = false\n"
