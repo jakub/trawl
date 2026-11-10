@@ -24,6 +24,7 @@ pub mod doctor;
 mod mcp;
 pub mod preview_ingest;
 pub mod schema;
+mod terminal;
 mod trial;
 mod tui;
 

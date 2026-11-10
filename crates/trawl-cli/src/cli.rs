@@ -14,6 +14,7 @@ use trawl_core::text_layout::{caret_layout, locate_span};
 use trawl_engine::value::{QueryResult, Value};
 
 use crate::CliError;
+use crate::terminal::table_cell;
 
 /// Output format for CLI query results.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -411,7 +412,7 @@ fn render_table(
         .apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS)
         .set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
 
-    let headers: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    let headers: Vec<String> = result.columns.iter().map(|c| table_cell(&c.name)).collect();
     table.set_header(headers);
 
     // A severity column displays its OTel token (ADR-0013 §6): `17` reads
@@ -436,13 +437,14 @@ fn render_table(
                     .columns
                     .get(i)
                     .and_then(|c| trawl_api::zone::present_cell(&c.ty, v, zone));
-                match presented {
+                let text = match presented {
                     Some(text) => text,
                     None if severity_cells.get(i).copied().unwrap_or(false) => {
                         severity_cell_text(v)
                     }
                     None => v.to_string(),
-                }
+                };
+                table_cell(&text)
             })
             .collect();
         table.add_row(cells);
@@ -693,11 +695,11 @@ fn render_driver_table(
         .apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS)
         .set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
 
-    let headers: Vec<&str> = columns.iter().map(String::as_str).collect();
+    let headers: Vec<String> = columns.iter().map(|c| table_cell(c)).collect();
     table.set_header(headers);
 
     for row in rows {
-        let cells: Vec<String> = row.iter().map(json_display).collect();
+        let cells: Vec<String> = row.iter().map(|v| table_cell(&json_display(v))).collect();
         table.add_row(cells);
     }
 
@@ -1413,5 +1415,161 @@ mod tests {
             String::from_utf8(buf).unwrap(),
             "  bad\u{FFFD}[2J\u{FFFD}x\n  hint: try\u{FFFD}\u{FFFD}this\n\n"
         );
+    }
+
+    /// Sender text a table draws, each with what the cell rule makes of it:
+    /// an OSC 52 clipboard write (ESC and BEL), a screen clear, a C1 CSI,
+    /// an RLO, a zero-width space, a soft hyphen, a tab and a lone CR.
+    const HOSTILE_CELLS: [(&str, &str); 8] = [
+        ("o\u{1b}]52;c;aGk=\u{7}k", "o\u{FFFD}]52;c;aGk=\u{FFFD}k"),
+        ("c\u{1b}[2Jl", "c\u{FFFD}[2Jl"),
+        ("c\u{9b}1m", "c\u{FFFD}1m"),
+        ("r\u{202e}lo", "r\u{FFFD}lo"),
+        ("z\u{200b}w", "z\u{FFFD}w"),
+        ("s\u{ad}hy", "s\u{FFFD}hy"),
+        ("t\tab", "t\u{FFFD}ab"),
+        ("c\rr", "c\u{FFFD}r"),
+    ];
+
+    /// The unsafe characters in `text` that are not a line break.
+    fn unsafe_chars(text: &str) -> usize {
+        text.chars()
+            .filter(|&c| c != '\n' && trawl_core::sanitize::is_unsafe_display_char(c))
+            .count()
+    }
+
+    /// The text of every cell line a table draws, left to right and top
+    /// to bottom: what sits between its borders (`│` outside, `┆` between
+    /// columns), with the padding spaces (only those) trimmed.
+    fn cell_lines(table: &str) -> Vec<&str> {
+        table
+            .lines()
+            .filter_map(|line| line.strip_prefix('│')?.strip_suffix('│'))
+            .flat_map(|line| line.split('┆'))
+            .map(|cell| cell.trim_matches(' '))
+            .collect()
+    }
+
+    /// Both comfy-table renderers draw every header and cell through the
+    /// cell rule, after value presentation: no unsafe character reaches the
+    /// output, each becomes one U+FFFD, and a line break stays a line inside
+    /// its cell.
+    #[test]
+    fn terminal_table_sanitizes_sender_text() {
+        use trawl_engine::value::{Column, ColumnType};
+
+        let header = "n\u{1b}[2J\u{202e}\u{9b}";
+        let header_shown = "n\u{FFFD}[2J\u{FFFD}\u{FFFD}";
+
+        // `trawl query`: a string column under a hostile name, a list, a
+        // `_severity` column whose text has no token (the fallback), and a
+        // timestamp column whose text does not parse (present_cell's
+        // fallback).
+        let result = QueryResult {
+            columns: vec![
+                Column::new(header, ColumnType::String),
+                Column::new("list", ColumnType::list(ColumnType::String)),
+                Column::new("_severity", ColumnType::String),
+                Column::new("_time", ColumnType::Timestamp),
+            ],
+            rows: HOSTILE_CELLS
+                .iter()
+                .map(|(text, _)| {
+                    vec![
+                        Value::String((*text).to_owned()),
+                        Value::Array(vec![
+                            Value::String((*text).to_owned()),
+                            Value::String("日本語".to_owned()),
+                        ]),
+                        Value::String((*text).to_owned()),
+                        Value::String((*text).to_owned()),
+                    ]
+                })
+                .collect(),
+        };
+        let mut buf = Vec::new();
+        render_table(&result, DisplayZone::Utc, &[], &mut buf).unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert_eq!(unsafe_chars(&table), 0, "{table:?}");
+        assert!(table.contains(header_shown), "{table}");
+        let cells = cell_lines(&table);
+        for (_, shown) in HOSTILE_CELLS {
+            // The string, the severity fallback and the timestamp fallback.
+            let whole = cells.iter().filter(|cell| **cell == shown).count();
+            assert_eq!(whole, 3, "{shown:?}: {table}");
+            assert!(
+                cells.contains(&format!("[{shown}, 日本語]").as_str()),
+                "{table}"
+            );
+        }
+        let sent: usize = unsafe_chars(header)
+            + HOSTILE_CELLS
+                .iter()
+                .map(|(text, _)| 4 * unsafe_chars(text))
+                .sum::<usize>();
+        assert_eq!(table.matches('\u{FFFD}').count(), sent, "{table}");
+
+        // The driver table (`schema`, `driver query`, `get-results`): a
+        // hostile header, a string, and an object whose keys and values are
+        // hostile. json_display spells the object as compact JSON, which
+        // escapes C0 controls but leaves C1, bidi and format characters raw.
+        let columns = vec![header.to_owned(), "text".to_owned(), "obj".to_owned()];
+        let rows: Vec<Vec<serde_json::Value>> = HOSTILE_CELLS
+            .iter()
+            .map(|(text, _)| {
+                vec![
+                    serde_json::json!("résumé"),
+                    serde_json::json!(text),
+                    serde_json::json!({ "k\u{202e}\u{9b}": text, "n": [text] }),
+                ]
+            })
+            .collect();
+        let mut buf = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Table, &mut buf).unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert_eq!(unsafe_chars(&table), 0, "{table:?}");
+        assert!(table.contains(header_shown), "{table}");
+        assert!(table.contains("résumé"), "{table}");
+        assert!(table.contains("\"k\u{FFFD}\u{FFFD}\":"), "{table}");
+        let cells = cell_lines(&table);
+        for (_, shown) in HOSTILE_CELLS {
+            assert!(cells.contains(&shown), "{shown:?}: {table}");
+        }
+        let sent: usize = unsafe_chars(header)
+            + rows
+                .iter()
+                .flatten()
+                .map(|v| unsafe_chars(&json_display(v)))
+                .sum::<usize>();
+        assert_eq!(table.matches('\u{FFFD}').count(), sent, "{table}");
+
+        // A line break, LF or CRLF, is a second line inside the same cell.
+        let broken = QueryResult {
+            columns: vec![Column::new("text", ColumnType::String)],
+            rows: vec![
+                vec![Value::String("a\nb".to_owned())],
+                vec![Value::String("a\r\nb".to_owned())],
+            ],
+        };
+        let mut buf = Vec::new();
+        render_table(&broken, DisplayZone::Utc, &[], &mut buf).unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert!(!table.contains('\r'), "{table:?}");
+        assert_eq!(cell_lines(&table), ["text", "a", "b", "a", "b"], "{table}");
+
+        let mut buf = Vec::new();
+        render_driver_results(
+            &["text".to_owned()],
+            &[
+                vec![serde_json::json!("a\nb")],
+                vec![serde_json::json!("a\r\nb")],
+            ],
+            OutputFormat::Table,
+            &mut buf,
+        )
+        .unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert!(!table.contains('\r'), "{table:?}");
+        assert_eq!(cell_lines(&table), ["text", "a", "b", "a", "b"], "{table}");
     }
 }
