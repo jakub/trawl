@@ -1752,6 +1752,394 @@ async fn an_expired_result_is_a_tool_error_naming_result_gone() {
     assert_eq!(backend.methods(), ["capabilities", "result_page"]);
 }
 
+// -- the columns projection -----------------------------------------------------
+
+/// The names a projected read asks for: two of a 12-column capture, in
+/// the reverse of their stored order.
+const PROJECTION: [&str; 2] = ["c011", "c007"];
+
+/// How the Fake records a page call that sent [`PROJECTION`]: the slice
+/// `read` passes to the backend, which trawl-client joins as
+/// `columns=c011,c007` on the wire.
+fn projected_call(offset: u64, rows: u64) -> String {
+    format!("result_page {RESULT_ID} {offset} {rows} Some([\"c011\", \"c007\"])")
+}
+
+/// A capture of `captured_rows` rows over the 12 string columns `c000` to
+/// `c011`.
+fn twelve_columns(captured_rows: u64) -> trawl_client::CapturedResult {
+    let names: Vec<String> = (0..12).map(|i| format!("c{i:03}")).collect();
+    let typed: Vec<(&str, ColumnType)> = names
+        .iter()
+        .map(|name| (name.as_str(), ColumnType::String))
+        .collect();
+    captured(
+        "service=api",
+        &typed,
+        (0..12).map(|_| no_values(captured_rows)).collect(),
+        captured_rows,
+        captured_rows,
+    )
+}
+
+/// The page of `captured` from `offset` holding `rows`, projected to
+/// captured `positions`, as trawld answers a `columns` read: the selected
+/// columns in stored order, each with its position.
+fn projected(
+    captured: &trawl_client::CapturedResult,
+    positions: &[usize],
+    rows: Vec<Vec<Value>>,
+    offset: u64,
+) -> trawl_client::ResultPage {
+    let mut fetched = page(captured, rows, offset);
+    fetched.positions = positions.to_vec();
+    fetched.page.columns = positions
+        .iter()
+        .map(|&position| Column::new(format!("c{position:03}"), ColumnType::String))
+        .collect();
+    fetched
+}
+
+/// The two cells of row `row` of a page projected to positions 7 and 11,
+/// each `bytes` bytes.
+fn projected_row(row: u64, bytes: usize) -> Vec<Value> {
+    [7, 11]
+        .iter()
+        .map(|position| s(&format!("{row:04}c{position:03}{}", "p".repeat(bytes - 8))))
+        .collect()
+}
+
+/// The captured positions `result`'s mirror prints, in printed order.
+fn printed_positions(result: &CallToolResult) -> Vec<u64> {
+    result.structured_content.as_ref().unwrap()["result"]["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|column| column["position"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn read_page_projects_columns_and_keeps_them_in_continuations() {
+    the_tools_continuation_sends_the_columns().await;
+    the_fits_continuation_sends_the_columns().await;
+    the_hard_cap_page_sends_the_columns().await;
+    columns_trawld_cannot_select_are_refused_before_any_call().await;
+}
+
+/// The tool's continuation: the page reads 2 of 40 rows and fits whole.
+async fn the_tools_continuation_sends_the_columns() {
+    let captured = twelve_columns(40);
+    let backend = Fake {
+        result_page: ok(projected(
+            &captured,
+            &[7, 11],
+            (0..2).map(|row| projected_row(row, 40)).collect(),
+            0,
+        )),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let result = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "rows": 2, "columns": PROJECTION,
+        }}),
+        &backend,
+    )
+    .await;
+    let text = text_of(&result);
+    assert_ne!(result.is_error, Some(true), "{text}");
+    assert_eq!(
+        backend.calls(),
+        ["capabilities".to_owned(), projected_call(0, 2)]
+    );
+    assert_eq!(printed_positions(&result), [7, 11], "{text}");
+    let mirror = result.structured_content.as_ref().unwrap();
+    assert_eq!(
+        mirror["result"]["presentation"]["columns_omitted"],
+        json!(10)
+    );
+    let proposed = agreed_actions(&result);
+    assert_eq!(
+        proposed,
+        [json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": 2, "rows": 2,
+            "columns": PROJECTION,
+        }})],
+        "{text}"
+    );
+    follow(&proposed[0], &backend).await;
+    assert_eq!(backend.calls()[3], projected_call(2, 2));
+}
+
+/// The fit's continuation: the final page reads 30 rows the default
+/// budget cannot print, so the fitting creates the continuation.
+async fn the_fits_continuation_sends_the_columns() {
+    let captured = twelve_columns(30);
+    let backend = Fake {
+        result_page: ok(projected(
+            &captured,
+            &[7, 11],
+            (0..30).map(|row| projected_row(row, 400)).collect(),
+            0,
+        )),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let result = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "rows": 50, "columns": PROJECTION,
+        }}),
+        &backend,
+    )
+    .await;
+    let text = text_of(&result);
+    assert_ne!(result.is_error, Some(true), "{text}");
+    assert!(used_bytes(&result) <= 16_384, "{}", used_bytes(&result));
+    let printed = result.structured_content.as_ref().unwrap()["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(printed > 0 && printed < 30, "{printed}: {text}");
+    assert_eq!(printed_positions(&result), [7, 11], "{text}");
+    let proposed = agreed_actions(&result);
+    assert_eq!(
+        proposed,
+        [json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": printed, "rows": 50,
+            "columns": PROJECTION,
+        }})],
+        "{text}"
+    );
+    follow(&proposed[0], &backend).await;
+    assert_eq!(
+        backend.calls(),
+        [
+            "capabilities".to_owned(),
+            projected_call(0, 50),
+            "capabilities".to_owned(),
+            projected_call(printed as u64, 50),
+        ]
+    );
+}
+
+/// The fit's one-row page at the hard cap: a long executed query leaves
+/// the call's budget room for a reply printing no row, and none for the
+/// row at even its first printed column.
+async fn the_hard_cap_page_sends_the_columns() {
+    let mut advanced = 0;
+    for comment in (4_000..8_600).step_by(40) {
+        let captured = with_long_query(twelve_columns(1), comment);
+        let backend = Fake {
+            result_page: ok(projected(
+                &captured,
+                &[7, 11],
+                vec![projected_row(0, 400)],
+                0,
+            )),
+            capabilities: ok(capabilities(None)),
+            ..Fake::default()
+        };
+        let result = follow(
+            &json!({"tool": "read", "arguments": {
+                "action": "page", "result_id": RESULT_ID, "columns": PROJECTION,
+                "max_bytes": 16_384,
+            }}),
+            &backend,
+        )
+        .await;
+        if one_row_reply(&result, 16_384) != OneRowReply::Advanced {
+            continue;
+        }
+        let text = text_of(&result);
+        let proposed = agreed_actions(&result);
+        assert_eq!(
+            proposed,
+            [json!({"tool": "read", "arguments": {
+                "action": "page", "result_id": RESULT_ID, "offset": 0, "rows": 1,
+                "max_bytes": 32768, "columns": PROJECTION,
+            }})],
+            "{text}"
+        );
+        let followed = follow(&proposed[0], &backend).await;
+        assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
+        assert_eq!(
+            backend.calls(),
+            [
+                "capabilities".to_owned(),
+                projected_call(0, 50),
+                "capabilities".to_owned(),
+                projected_call(0, 1),
+            ]
+        );
+        advanced += 1;
+    }
+    assert!(
+        advanced > 0,
+        "no query length proposed the row at the hard cap"
+    );
+}
+
+/// Each list trawld cannot select is refused before the capabilities read
+/// and the page: an empty list, 17 names, a 256-byte name, an empty name,
+/// a 128-character name of 256 bytes, and a name trawld would split at its
+/// comma. 16 names, one of them 255 bytes, reach trawld.
+async fn columns_trawld_cannot_select_are_refused_before_any_call() {
+    let seventeen: Vec<String> = (0..17).map(|i| format!("c{i:03}")).collect();
+    let cases = [
+        (json!([]), "read: columns names no column"),
+        (
+            json!(seventeen),
+            "read: columns names 17 columns; at most 16",
+        ),
+        (
+            json!(["c007", "n".repeat(256)]),
+            "read: columns[1] is 256 bytes; columns takes names of 1 to 255 bytes",
+        ),
+        (
+            json!(["c007", ""]),
+            "read: columns[1] is empty; columns takes names of 1 to 255 bytes",
+        ),
+        (
+            json!(["é".repeat(128)]),
+            "read: columns[0] is 256 bytes; columns takes names of 1 to 255 bytes",
+        ),
+        (
+            json!(["c011", "c007,c011"]),
+            "read: columns[1] holds a comma",
+        ),
+    ];
+    for (columns, says) in cases {
+        let backend = Fake::default();
+        let result = follow(
+            &json!({"tool": "read", "arguments": {
+                "action": "page", "result_id": RESULT_ID, "columns": columns,
+            }}),
+            &backend,
+        )
+        .await;
+        let text = text_of(&result);
+        assert_eq!(result.is_error, Some(true), "{columns}: {text}");
+        assert!(text.starts_with(says), "{columns}: {text}");
+        assert!(
+            backend.calls().is_empty(),
+            "{columns}: {:?}",
+            backend.calls()
+        );
+    }
+
+    // 16 names, one of them 255 bytes, reach trawld as sent: in order,
+    // with nothing trimmed, folded or merged.
+    let mut sixteen: Vec<String> = (0..15).rev().map(|i| format!("c{i:03}")).collect();
+    sixteen.push(format!("{}n", "é".repeat(127)));
+    let captured = twelve_columns(1);
+    let backend = Fake {
+        result_page: ok(projected(
+            &captured,
+            &[7, 11],
+            vec![projected_row(0, 40)],
+            0,
+        )),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let result = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "rows": 1, "columns": sixteen,
+        }}),
+        &backend,
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let sent: Vec<&str> = sixteen.iter().map(String::as_str).collect();
+    assert_eq!(
+        backend.calls(),
+        [
+            "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 0 1 {:?}", Some(sent.as_slice())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn projected_columns_do_not_count_as_null() {
+    // Column 3 is null in rows 0 to 9 and not in rows 10 to 19; column 5
+    // is null in every row. Ten rows of 400-byte cells do not fit the
+    // default budget whole, so every reply omits its null columns. Read
+    // at full width, column 3 counts as null in the first range only. A
+    // projection that leaves it out reads none of its cells, so neither
+    // range counts it, and both count column 5 alone.
+    let captured = twelve_columns(20);
+    let cell = |row: u64, position: usize| -> Value {
+        if position == 5 || (position == 3 && row < 10) {
+            Value::Null
+        } else {
+            s(&format!("{row:04}c{position:03}{}", "q".repeat(392)))
+        }
+    };
+    let wide = |offset: u64| -> Vec<Vec<Value>> {
+        (offset..offset + 10)
+            .map(|row| (0..12).map(|position| cell(row, position)).collect())
+            .collect()
+    };
+    let narrow = |offset: u64| -> Vec<Vec<Value>> {
+        (offset..offset + 10)
+            .map(|row| {
+                [5, 7, 11]
+                    .iter()
+                    .map(|&position| cell(row, position))
+                    .collect()
+            })
+            .collect()
+    };
+    for offset in [0, 10] {
+        let full = Fake {
+            result_page: ok(page(&captured, wide(offset), offset)),
+            capabilities: ok(capabilities(None)),
+            ..Fake::default()
+        };
+        let result = follow(
+            &json!({"tool": "read", "arguments": {
+                "action": "page", "result_id": RESULT_ID, "offset": offset, "rows": 10,
+            }}),
+            &full,
+        )
+        .await;
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true), "{text}");
+        let presentation = &result.structured_content.as_ref().unwrap()["result"]["presentation"];
+        let nulls = if offset == 0 { 2 } else { 1 };
+        assert_eq!(presentation["null_columns_omitted"], json!(nulls), "{text}");
+        assert_eq!(presentation["columns_omitted"], json!(nulls), "{text}");
+
+        let backend = Fake {
+            result_page: ok(projected(&captured, &[5, 7, 11], narrow(offset), offset)),
+            capabilities: ok(capabilities(None)),
+            ..Fake::default()
+        };
+        let result = follow(
+            &json!({"tool": "read", "arguments": {
+                "action": "page", "result_id": RESULT_ID, "offset": offset, "rows": 10,
+                "columns": ["c011", "c007", "c005"],
+            }}),
+            &backend,
+        )
+        .await;
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true), "{text}");
+        assert_eq!(printed_positions(&result), [7, 11], "{text}");
+        let presentation = &result.structured_content.as_ref().unwrap()["result"]["presentation"];
+        assert_eq!(presentation["null_columns_omitted"], json!(1), "{text}");
+        assert_eq!(presentation["columns_omitted"], json!(10), "{text}");
+        assert!(
+            text.contains(
+                "omits 10 columns (1 null in every row read); fields source=result describes them"
+            ),
+            "{text}"
+        );
+    }
+}
+
 // -- the page limit -------------------------------------------------------------
 
 /// Capabilities whose `[capture] page_max_rows` is `rows`.

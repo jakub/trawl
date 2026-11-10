@@ -286,9 +286,13 @@ pub struct ResultView {
 
 /// What the renderer records about a page before it fits the reply: the
 /// mirror says what the reply printed, and this says what the call read.
-/// The renderer fills it; a tool leaves it at its default.
+/// The renderer fills it, but for `projection`, which the tool sets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PageRead {
+    /// The `columns` the call projected the page to, as the caller sent
+    /// them; every page continuation of the reply sends them again.
+    /// `None` for a page of every column.
+    pub(crate) projection: Option<Vec<String>>,
     /// For each column of the page, by index, whether its cell was JSON
     /// null in every row read; empty when the page read no row.
     pub(crate) null_columns: Vec<bool>,

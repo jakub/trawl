@@ -329,7 +329,8 @@ fn does_not_fit(tool: &str, result_id: Option<&str>, budget: Budget) -> CallTool
 /// anything: which columns were null in every row read, by index (a
 /// column's name need not be unique), how many columns the page carried
 /// and trawld's projection left out, and the page's first captured
-/// position. A cell is null only when it is JSON `null`.
+/// position. A cell is null only when it is JSON `null`. The projection
+/// the tool recorded stays.
 fn record_read(view: &mut ResultView) {
     let null_columns = if view.rows.is_empty() {
         Vec::new()
@@ -343,6 +344,7 @@ fn record_read(view: &mut ResultView) {
             .collect()
     };
     view.read = PageRead {
+        projection: view.read.projection.take(),
         null_columns,
         columns: rows::as_u64(view.columns.len()),
         projected_out: view.presentation.columns_omitted,

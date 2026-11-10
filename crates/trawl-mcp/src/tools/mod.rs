@@ -234,7 +234,8 @@ pub(crate) async fn result_view(
 /// follow the rows read, and the first abbreviated cell whole.
 ///
 /// The page continuation's `offset` is the end of the rows the view
-/// holds, the shape the renderer moves when its budget prints fewer.
+/// holds, the shape the renderer moves when its budget prints fewer, and
+/// it sends the `columns` the view's page was projected to.
 pub(crate) fn continuations(view: &ResultView) -> Vec<NextAction> {
     let mut actions = Vec::new();
     let read = crate::render::rows::as_u64(view.rows.len());
@@ -242,12 +243,15 @@ pub(crate) fn continuations(view: &ResultView) -> Vec<NextAction> {
     if read > 0 && end < view.rows_captured {
         actions.push(NextAction {
             tool: schema::READ.to_owned(),
-            arguments: orient::object(json!({
-                "action": "page",
-                "result_id": view.result_id,
-                "offset": end,
-                "rows": read,
-            })),
+            arguments: crate::render::budget::projected(
+                orient::object(json!({
+                    "action": "page",
+                    "result_id": view.result_id,
+                    "offset": end,
+                    "rows": read,
+                })),
+                view.read.projection.as_deref(),
+            ),
             reason: crate::render::budget::PAGE_CONTINUATION.to_owned(),
         });
     }

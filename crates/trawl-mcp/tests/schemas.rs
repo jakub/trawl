@@ -428,6 +428,21 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
     assert!(read.is_valid(&json!({
         "action": "investigation", "investigation_id": "a", "since": 4
     })));
+    let names = |count: usize| -> Vec<String> { (0..count).map(|i| format!("c{i:03}")).collect() };
+    assert!(read.is_valid(&json!({"action": "page", "result_id": "a", "columns": names(1)})));
+    assert!(read.is_valid(&json!({"action": "page", "result_id": "a", "columns": names(16)})));
+    assert!(read.is_valid(&json!({
+        "action": "page", "result_id": "a", "columns": ["n".repeat(255)]
+    })));
+    for refused in [
+        json!({"action": "page", "result_id": "a", "columns": []}),
+        json!({"action": "page", "result_id": "a", "columns": names(17)}),
+        json!({"action": "page", "result_id": "a", "columns": [""]}),
+        json!({"action": "page", "result_id": "a", "columns": ["n".repeat(256)]}),
+        json!({"action": "page", "result_id": "a", "columns": "c000"}),
+    ] {
+        assert!(!read.is_valid(&refused), "read accepted {refused}");
+    }
 
     let fields = validator("fields", "input");
     assert!(fields.is_valid(&json!({"source": "service", "service": "nginx"})));
@@ -474,6 +489,31 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
             "sightings accepted {refused}"
         );
     }
+}
+
+/// `read`'s `columns` states the bounds the tool holds a call to at run
+/// time: 1 to 16 names, each 1 to 255 long. JSON Schema counts a string's
+/// length in characters, so only the run-time check bounds a name's bytes.
+#[test]
+fn the_read_input_bounds_columns_to_sixteen_names() {
+    let tool = tools()
+        .into_iter()
+        .find(|tool| tool.name == "read")
+        .expect("read exists");
+    let input = schema_value(&tool.input_schema);
+    let columns = &input["properties"]["columns"];
+    assert_eq!(columns["type"], json!("array"), "{columns}");
+    assert_eq!(columns["minItems"], json!(1), "{columns}");
+    assert_eq!(columns["maxItems"], json!(16), "{columns}");
+    assert_eq!(columns["items"]["type"], json!("string"), "{columns}");
+    assert_eq!(columns["items"]["minLength"], json!(1), "{columns}");
+    assert_eq!(columns["items"]["maxLength"], json!(255), "{columns}");
+    assert!(
+        !input["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("columns"))),
+        "{input}"
+    );
 }
 
 /// `context`, `sightings` and `compare` attach as `search` does: a flat

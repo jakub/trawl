@@ -19,7 +19,9 @@
 //! to where the printed bytes end. When the tool proposed none, because
 //! the server's page or range was the last, the fitting creates the
 //! continuation its cut needs, first among the proposed calls and measured
-//! with the rest. A continuation always advances: when not one row of the
+//! with the rest. Every page continuation, the tool's and the fitting's,
+//! sends the `columns` the page was projected to; a cell call names a
+//! captured position and sends none. A continuation always advances: when not one row of the
 //! page fits, it reads the next row alone at [`Budget::HARD`] if that row
 //! fits there, else that row's cells one at a time, and a cell range with
 //! room for none of its bytes is refused with the smallest `max_bytes` that
@@ -53,7 +55,7 @@
 use std::collections::HashSet;
 
 use serde::Serialize;
-use serde_json::{Value as Json, json};
+use serde_json::{Map, Value as Json, json};
 
 use crate::reply::{
     ActivityView, CorrelationView, NextAction, ReadReply, ResultView, ValidationView,
@@ -642,12 +644,13 @@ fn most_rows<R: Fit>(
 /// the tool's page continuation.
 fn keeping<R: Fit>(reply: &R, kept: usize, rows: usize, page_rows: Option<u64>) -> R {
     let mut candidate = reply.clone();
-    let Some((result_id, offset, first_column)) = candidate.view_mut().map(|view| {
+    let Some((result_id, offset, first_column, projection)) = candidate.view_mut().map(|view| {
         keep_rows(view, kept, rows);
         (
             view.result_id.clone(),
             view.offset,
             view.read.first_position,
+            view.read.projection.clone(),
         )
     }) else {
         return candidate;
@@ -671,12 +674,15 @@ fn keeping<R: Fit>(reply: &R, kept: usize, rows: usize, page_rows: Option<u64>) 
                 actions,
                 NextAction {
                     tool: READ.to_owned(),
-                    arguments: object(json!({
-                        "action": "page",
-                        "result_id": result_id,
-                        "offset": kept_end,
-                        "rows": page_rows,
-                    })),
+                    arguments: projected(
+                        object(json!({
+                            "action": "page",
+                            "result_id": result_id,
+                            "offset": kept_end,
+                            "rows": page_rows,
+                        })),
+                        projection.as_deref(),
+                    ),
                     reason: PAGE_CONTINUATION.to_owned(),
                 },
             );
@@ -689,28 +695,57 @@ fn keeping<R: Fit>(reply: &R, kept: usize, rows: usize, page_rows: Option<u64>) 
             actions.retain(|proposed| !reads_from(proposed, ("page", "offset"), read_end));
             lead_with(
                 actions,
-                advance(&result_id, offset, next_row_fits, first_column),
+                advance(
+                    &result_id,
+                    offset,
+                    next_row_fits,
+                    first_column,
+                    projection.as_deref(),
+                ),
             );
         }
     }
     candidate
 }
 
+/// The arguments of a `read` page call, with the `columns` of
+/// `projection`, the call's own, when it projected the page: a page
+/// continuation reads the columns the page it continues read.
+pub(crate) fn projected(
+    mut arguments: Map<String, Json>,
+    projection: Option<&[String]>,
+) -> Map<String, Json> {
+    if let Some(columns) = projection {
+        arguments.insert("columns".to_owned(), json!(columns));
+    }
+    arguments
+}
+
 /// The continuation of a page that printed none of its rows, from
-/// captured row `offset`: that row alone at [`Budget::HARD`] when it fits
-/// there, else its cells one at a time from captured column
-/// `first_column`, the page's first.
-fn advance(result_id: &str, offset: u64, next_row_fits: bool, first_column: u64) -> NextAction {
+/// captured row `offset`: that row alone at [`Budget::HARD`], with the
+/// page's `projection`, when it fits there, else its cells one at a time
+/// from captured column `first_column`, the page's first. A cell call
+/// names a captured position, so it sends no projection.
+fn advance(
+    result_id: &str,
+    offset: u64,
+    next_row_fits: bool,
+    first_column: u64,
+    projection: Option<&[String]>,
+) -> NextAction {
     if next_row_fits {
         NextAction {
             tool: READ.to_owned(),
-            arguments: object(json!({
-                "action": "page",
-                "result_id": result_id,
-                "offset": offset,
-                "rows": 1,
-                "max_bytes": HARD_MAX_BYTES,
-            })),
+            arguments: projected(
+                object(json!({
+                    "action": "page",
+                    "result_id": result_id,
+                    "offset": offset,
+                    "rows": 1,
+                    "max_bytes": HARD_MAX_BYTES,
+                })),
+                projection,
+            ),
             reason: format!(
                 "the next row does not fit this call's max_bytes; read it alone at \
                  max_bytes={HARD_MAX_BYTES}, the hard cap"
