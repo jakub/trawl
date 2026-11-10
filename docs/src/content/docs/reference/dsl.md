@@ -188,7 +188,7 @@ On a server, every stored field carries a type pin in the field catalog. The env
 
 What is stored is the value's reading under the pin, when that reading is value-preserving. A cast that would alter the value shelves it instead: the column holds NULL, `trawl schema conflicts` records the disagreement, and the original text stays in `_raw`. Spelling drift is not alteration, so `"0404"` under a BIGINT pin stores as `404` while `"1.5"` shelves rather than rounding to `2`.
 
-What matches is decided by the pin, not by the shape of the query literal. Batch SQL, live tail and the kv batch tail answer identically. The hot buffer conforms through the same expression compaction writes with. Embedded `--data` has no catalog and no pins, so every comparison there is literal-driven.
+What matches is decided by the pin, not by the shape of the query literal. Batch SQL, live tail and the kv batch tail answer identically. The hot buffer conforms through the same expression compaction writes with. Embedded `--data` has no catalog and no pins, so every comparison there is literal-driven, except that the kv batch tail compares a TIMESTAMP column as an instant.
 
 ##### The numeric reading
 
@@ -252,7 +252,7 @@ A field the current stage's input does not carry reads as NULL. This holds when 
 - In the search stage, `f!=x`, `f!=*`, `f!=a*`, `f!=/re/` and `f!=a,b` match every event. Every other comparison on `f` is unknown, so it matches nothing.
 - `OR` and `AND` keep three-valued logic, so an absent field never removes a sibling's matches: `host=web1 OR nosuch=x` returns the `web1` events.
 - `where` stays strict: `where f != "x"` matches nothing, and `where isnull(f)` matches every row.
-- `count(f)` and `dc(f)` are 0. `sum(f)`, `avg(f)`, `min(f)` and `max(f)` are NULL.
+- `count(f)` and `dc(f)` are 0. `sum(f)`, `avg(f)`, `min(f)` and `max(f)` are NULL. A zero from `dc` does not tell an absent field from a field with no non-null values.
 - `stats ... by f`, `top f`, `rare f`, `timechart ... by f` and `dedup f` put absent and explicit null in one null group. That group is apart from the empty string and from the text `null`.
 
 A misspelled name reads as absent too: `levle=debug` returns nothing, and `levle!=debug` returns every event. No notice reports an absent name.
@@ -310,7 +310,7 @@ Which pin applies follows the pipeline, not a flat name lookup.
 
 Inside one `let`, a reference to a sibling target resolves the way the SQL does: an existing column of that name wins, so `let a = 1, b = a` gives `b` the original `a`, and only a name the row does not carry reads the sibling's fresh value, so `let ms = 1000, total = ms * 2` gives `total = 2000`. Pins stay pre-stage, so `let a = status, b = a` gives `b` no pin.
 
-Timestamps in the kv batch tail compare as stored instants. The result carries them in UTC, and the client shows every `timestamp` column in your display zone. `rename _time as t`, the bare alias `let t2 = _time`, and a function that returns a timestamp, such as `let d = date_trunc("day", _time)`, give `timestamp` columns, so they show in your zone. The tail reads a timestamp as UTC text with no offset, such as `2026-01-01 05:30:00`. An expression that passes that value through, such as `let t = coalesce(_time, x)`, gives a `string` column, and the client shows that text unchanged.
+Timestamps in the kv batch tail compare as stored instants, in every mode. A column that the SQL step returns as a TIMESTAMP compares as an instant unless a pin for its name says otherwise. The result carries them in UTC, and the client shows every `timestamp` column in your display zone. `rename _time as t`, the bare alias `let t2 = _time`, and a function that returns a timestamp, such as `let d = date_trunc("day", _time)`, give `timestamp` columns, so they show in your zone. The tail reads a timestamp as UTC text with no offset, such as `2026-01-01 05:30:00`. An expression that passes that value through, such as `let t = coalesce(_time, x)`, gives a `string` column, and the client shows that text unchanged.
 
 ### The two namespaces
 
@@ -345,7 +345,7 @@ Backticks are accepted in every field position: search-stage filters, expression
 
 A backtick also ends an unquoted value and an unquoted word, so text containing one is written double-quoted, as in `` host="a`b" `` and `` "er`ror" ``. Backticks are not value quotes, so `` service=`nginx` `` is a parse error, and `-` cannot negate a quoted name, so write ``NOT `http-status`=500``. `NOT-` directly before a backtick is a parse error too, also with non-ASCII whitespace such as a no-break space between `NOT` and `-`: ``NOT-`http-status`=500`` returns `'NOT-' cannot sit directly before a backticked name`, with the hint `put a space after NOT to negate the field, or quote "NOT-" to search for the text`.
 
-The search stage reads `last=`, `earliest=` and `latest=` before anything else, and backticks reach fields with those names. Inside `| where`, `| let` and aggregation arguments, the words an expression is made of are read before a field reference is tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`, `in`, `matches`, `like` and `ilike` are operators. ``| where `true` == 1`` filters on the column named `true`.
+The search stage reads `last=`, `earliest=` and `latest=` before anything else, and backticks reach fields with those names. Inside `| where`, `| let` and aggregation arguments, the words an expression is made of are read before a field reference is tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`, `in`, `matches`, `like` and `ilike` are operators. ``| where `true` == 1`` filters on the column named `true`. `and`, `or` and `not` may also be written `AND`, `OR` and `NOT`. Only all lowercase or all capitals is an operator, so `Or` is not. `NOT` is read where an expression operand starts. There, a field named `NOT`, or one whose first dot segment is `NOT`, needs backticks: `` `NOT` `` or `` `NOT.x` ``. The formatter also backticks a field named `AND` or `OR`.
 
 A `#` inside backticks is part of the name. See [Comments](#comments).
 
@@ -414,7 +414,7 @@ trawl derives `_severity` at ingest and never accepts it from a sender. The pack
 - Literals must be quoted. A bare `error` in a pipe stage is a field reference.
 - The subject must be `sev(<field>)` directly. `sev(lower(x))` still computes the reading, but the comparison around it falls back to the literal-driven path, so `sev(lower(x)) == "error"` compares against the string: a `Conversion Error` in batch, and a filter that never matches on live tail. Bind it first with `| let s = sev(lower(level)) | where s == "error"`.
 - `dialect` governs numbers only. Words always read the one token table. `sev(x, "syslog")` inverts 0 to 7, so `3` is `err`, which is 17. An unknown dialect is a query error naming `otel` and `syslog`.
-- `sev()` works in embedded `--data`, where nothing else is pin-aware. The function declares the type.
+- `sev()` works in embedded `--data`, where there is no field catalog. The function declares the type.
 
 #### Putting the field itself on the ladder
 
@@ -515,7 +515,7 @@ a b OR c d
 (service=nginx OR service=apache) status>=400
 ```
 
-`OR` may be spelled `OR` or `or`. `NOT` is uppercase only, and a lowercase `not` in the search stage is a bare search term. Whitespace binds tighter than `OR`. Parentheses group tokens and may nest. A group holds at least one search term or filter, so `()` and `(OR)` are parse errors. `(OR)` returns `a group needs a search term or filter, not only OR`, with the hint `put a search term or filter inside the group, or remove it`. A time keyword inside a group is a parse error; see [Time filters](#time-filters).
+`OR` may be spelled `OR` or `or`. `NOT` is uppercase only, and a lowercase `not` in the search stage is a bare search term. Inside an [expression](#expressions), `not` and `NOT` are both the operator. Whitespace binds tighter than `OR`. Parentheses group tokens and may nest. A group holds at least one search term or filter, so `()` and `(OR)` are parse errors. `(OR)` returns `a group needs a search term or filter, not only OR`, with the hint `put a search term or filter inside the group, or remove it`. A time keyword inside a group is a parse error; see [Time filters](#time-filters).
 
 ## Pipe stages
 
@@ -980,12 +980,14 @@ Expressions appear in `where`, `let` and aggregation arguments.
 | Field references | `host`, `host.name`, `@timestamp`, `` `request id` `` |
 | Arithmetic | `+`, `-`, `*`, `/`, `%`, unary `-` |
 | Comparison | `==`, `!=`, `>`, `>=`, `<`, `<=` |
-| Logical | `and`, `or`, `not` |
+| Logical | `and`, `or`, `not`, also written `AND`, `OR`, `NOT` |
 | Pattern | `matches`, `like`, `ilike` |
 | Membership | `x in (1, 2, 3)` |
 | Grouping | `(count + 1) * 2` |
 
 Precedence runs from lowest to highest: `or`, `and`, `not`, the comparison and pattern operators, `+` and `-`, `*` and `/` and `%`, then unary `-`.
+
+`and`, `or` and `not` mean the same in all lowercase and in all capitals. A mixed spelling such as `And` is not an operator. The formatter prints them in lowercase.
 
 `matches` takes a `/regex/` or a quoted string on its right. `like` and `ilike` take a quoted SQL pattern, where `%` matches any run and `_` matches one character. The right side is always literal text in the query: a field or a computed value there is a parse error, so `where "x" matches f` is refused. Each pattern takes the [pattern limits](#pattern-limits).
 
@@ -1192,7 +1194,7 @@ Four lanes answer a query: batch SQL, the live stream (SSE), the kv batch tail b
 - A live stream admits one aggregation stage, and so do the stages after `extract kv`. A second one is refused with `only one aggregation stage is supported in streaming mode`, even with a `sort` between the two.
 - A live stream and the kv batch tail run only aggregates in an aggregation slot. A scalar head, such as `stats lower(x)`, is refused with `lower() is not an aggregate; a scalar head in an aggregation slot runs only in SQL`. A scalar around an aggregate is a scalar head too, so `stats coalesce(sum(x), 0)` is refused there and runs in batch SQL.
 - Where batch SQL raises a per-value error, the streaming lane yields `null` instead. This covers an integer overflow and an unreadable `if()` or `case()` condition. A live tail cannot raise a per-event error without ending the subscription.
-- Embedded `--data` has no field catalog, so every comparison there is literal-driven. `sev()` still declares its own type.
+- Embedded `--data` has no field catalog, so every comparison there is literal-driven, except that the kv batch tail compares a TIMESTAMP column as an instant. `sev()` still declares its own type.
 
 ## Examples
 

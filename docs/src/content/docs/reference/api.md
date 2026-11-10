@@ -1604,7 +1604,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" \
         "request_id": "01JBA5W2Q7Z3N8M4K6P0R9T1V2",
         "query_id": 2214,
         "purpose": "Check whether shop-api logs errors after the deploy",
-        "outcome": { "outcome": "success", "result_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "rows": 12, "duration_ms": 318 }
+        "outcome": { "outcome": "success", "result_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "rows": 12, "total_rows": 12, "duration_ms": 318 }
       }
     },
     {
@@ -1670,7 +1670,10 @@ A step's `outcome` has these members:
 | `code` | string | The [error code](#error-envelope) the work ended with. Absent for `success`, `aborted`, and `interrupted` |
 | `result_id` | string | For `success`, the kept result |
 | `rows` | integer | For `success`, the rows the result holds |
+| `total_rows` | integer | For `success`, the rows the execution produced before the capture cut. The same number as the kept result's `total_rows`. Greater than `rows` when the capture was cut. Absent on steps written before it was recorded |
 | `duration_ms` | integer | How long the work ran, when it ran |
+
+A request refused before its step is appended leaves no step, so failed steps count admitted work, not every request.
 
 **Errors**
 

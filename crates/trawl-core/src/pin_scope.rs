@@ -62,6 +62,25 @@ impl PinScope {
         Self::default()
     }
 
+    /// Pin each of `names` as `ty` where the scope has no pin for it. A
+    /// pin already in scope wins, whatever its type.
+    ///
+    /// The kv batch tail uses this to type the SQL step's unpinned
+    /// TIMESTAMP columns as instants. The engine supplies the names; the
+    /// scope only keeps them under their [`catalog_key`], so a mixed-case
+    /// name is found the way [`Self::pin_for`] looks it up.
+    pub fn fill_unpinned<'a>(
+        &mut self,
+        names: impl IntoIterator<Item = &'a str>,
+        ty: CanonicalType,
+    ) {
+        for name in names {
+            if self.pin_for(name).is_none() {
+                self.pins.insert(&catalog_key(name), ty);
+            }
+        }
+    }
+
     /// Whether the scope holds no pins — the pin-blind fast path.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -741,6 +760,54 @@ mod tests {
     }
 
     const SEVERITY_ROOT: &[(&str, CT)] = &[("_severity", CT::Severity), ("message", CT::Varchar)];
+
+    // ── fill-if-absent ────────────────────────────────────────────────
+
+    #[test]
+    fn fill_unpinned_pins_a_name_the_scope_leaves_open() {
+        let mut scope = PinScope::root(&pins(ROOT));
+        scope.fill_unpinned(["bucket"], CT::Timestamp);
+        assert_eq!(scope.pin_for("bucket"), Some(CT::Timestamp));
+        assert_eq!(scope.pin_for("status"), Some(CT::Varchar));
+    }
+
+    #[test]
+    fn fill_unpinned_keeps_an_existing_pin() {
+        let mut scope = PinScope::root(&pins(ROOT));
+        scope.fill_unpinned(["status", "dur"], CT::Timestamp);
+        assert_eq!(scope.pin_for("status"), Some(CT::Varchar));
+        assert_eq!(scope.pin_for("dur"), Some(CT::BigInt));
+        assert_eq!(scope, PinScope::root(&pins(ROOT)));
+    }
+
+    #[test]
+    fn fill_unpinned_folds_a_mixed_case_name() {
+        let mut scope = PinScope::unpinned();
+        scope.fill_unpinned(["Time"], CT::Timestamp);
+        assert_eq!(scope.pin_for("Time"), Some(CT::Timestamp));
+        assert_eq!(scope.pin_for("time"), Some(CT::Timestamp));
+        // A pin held under the folded key wins over a mixed-case fill.
+        let mut scope = PinScope::root(&pins(&[("time", CT::Varchar)]));
+        scope.fill_unpinned(["TIME"], CT::Timestamp);
+        assert_eq!(scope.pin_for("Time"), Some(CT::Varchar));
+    }
+
+    #[test]
+    fn fill_unpinned_with_no_names_leaves_the_scope_equal() {
+        let mut scope = PinScope::root(&pins(ROOT));
+        scope.fill_unpinned(std::iter::empty(), CT::Timestamp);
+        assert_eq!(scope, PinScope::root(&pins(ROOT)));
+    }
+
+    #[test]
+    fn fill_unpinned_on_a_clone_leaves_the_source_alone() {
+        let source = PinScope::root(&pins(ROOT));
+        let mut filled = source.clone();
+        filled.fill_unpinned(["bucket"], CT::Timestamp);
+        assert_eq!(filled.pin_for("bucket"), Some(CT::Timestamp));
+        assert_eq!(source.pin_for("bucket"), None);
+        assert_eq!(source, PinScope::root(&pins(ROOT)));
+    }
 
     #[test]
     fn unpinned_scope_stays_empty_and_cheap() {
