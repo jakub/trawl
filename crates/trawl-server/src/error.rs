@@ -291,16 +291,20 @@ pub enum ServerError {
     /// `[capture] source_max_bytes` (400, code `capture_source_too_large`,
     /// ADR-0057). It is measured from the protected selection before the
     /// engine runs, so nothing was scanned. The message gives both counts
-    /// and nothing else: no path, no partition, no query text.
+    /// and a fixed remedy chosen by `kind`, and nothing else: no path, no
+    /// partition, no query text, no service name. The `a` and `b` in the
+    /// window remedy are fixed example text.
     #[error(
         "the window selects {selected_bytes} bytes of stored data, above the capture limit \
-         of {max_bytes} bytes; narrow the window"
+         of {max_bytes} bytes; {kind}"
     )]
     CaptureSourceTooLarge {
         /// The bytes the window's selection measured.
         selected_bytes: u64,
         /// `[capture] source_max_bytes`.
         max_bytes: u64,
+        /// What the measured bytes came from, which picks the remedy.
+        kind: CaptureSourceKind,
     },
 
     /// A capture's bounds could not be resolved (400, code `bad_request`,
@@ -494,6 +498,26 @@ pub enum ServerError {
     /// with [`ServerError::from_join`].
     #[error("{0} panicked")]
     Panicked(&'static str),
+}
+
+/// What a [`ServerError::CaptureSourceTooLarge`] measured. A closed set,
+/// so its remedy is fixed text and never describes the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureSourceKind {
+    /// The stored files a capture's window selects. A `service=` filter
+    /// narrows that selection, so the remedy names it.
+    Window,
+    /// A `from saved` capture's stored run. Only a narrower window helps.
+    StoredRun,
+}
+
+impl std::fmt::Display for CaptureSourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Window => "narrow the window, or pin the services with service=a or service=a,b",
+            Self::StoredRun => "narrow the window",
+        })
+    }
 }
 
 /// What sat underneath a server failure, read off a typed source.
@@ -2678,31 +2702,69 @@ mod tests {
 
     /// A capture refused for its source budget (ADR-0057): 400 with its own
     /// code and no `Retry-After`, a message giving both counts and the fix,
-    /// and no cause beneath it.
+    /// and no cause beneath it. A window's fix names the service filter; a
+    /// stored run's does not, since a filter cannot shrink it. Neither
+    /// message holds a path, a service name or query text.
     #[tokio::test]
     async fn a_capture_source_refusal_is_a_400_naming_both_counts() {
-        let too_large = ServerError::CaptureSourceTooLarge {
-            selected_bytes: 2_147_483_648,
-            max_bytes: 1_073_741_824,
-        };
-        assert_eq!(too_large.error_class(), "capture_source_too_large");
-        assert_eq!(too_large.cause_kind(), CauseKind::None);
-        assert_eq!(too_large.safe_message(), too_large.to_string());
-        let response = too_large.into_response();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            response
-                .headers()
-                .get(axum::http::header::RETRY_AFTER)
-                .is_none()
-        );
-        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
-        assert_eq!(body["error"]["code"], "capture_source_too_large");
-        assert_eq!(
-            body["error"]["message"],
-            "the window selects 2147483648 bytes of stored data, above the capture limit of \
-             1073741824 bytes; narrow the window"
-        );
+        const HINT: &str = "pin the services with service=a or service=a,b";
+        let cases = [
+            (
+                CaptureSourceKind::Window,
+                "the window selects 2147483648 bytes of stored data, above the capture limit of \
+                 1073741824 bytes; narrow the window, or pin the services with service=a or \
+                 service=a,b",
+            ),
+            (
+                CaptureSourceKind::StoredRun,
+                "the window selects 2147483648 bytes of stored data, above the capture limit of \
+                 1073741824 bytes; narrow the window",
+            ),
+        ];
+        for (kind, expected) in cases {
+            let too_large = ServerError::CaptureSourceTooLarge {
+                selected_bytes: 2_147_483_648,
+                max_bytes: 1_073_741_824,
+                kind,
+            };
+            assert_eq!(too_large.error_class(), "capture_source_too_large");
+            assert_eq!(too_large.cause_kind(), CauseKind::None);
+            assert_eq!(too_large.safe_message(), too_large.to_string());
+            let response = too_large.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{kind:?}");
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "{kind:?}"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(
+                body["error"]["code"], "capture_source_too_large",
+                "{kind:?}"
+            );
+            let message = body["error"]["message"].as_str().unwrap();
+            assert_eq!(message, expected, "{kind:?}");
+            assert!(message.contains("2147483648"), "{kind:?}");
+            assert!(message.contains("1073741824"), "{kind:?}");
+            assert_eq!(
+                message.contains(HINT),
+                kind == CaptureSourceKind::Window,
+                "{kind:?}"
+            );
+            assert!(
+                !message.contains('/') && !message.contains('\\'),
+                "{kind:?} carries no path separator"
+            );
+            for query_text in ["last=", "from saved", "SELECT", "parquet"] {
+                assert!(
+                    !message.contains(query_text),
+                    "{kind:?} carries {query_text}"
+                );
+            }
+        }
     }
 
     /// Every investigation answer (ADR-0059) is a 409 with its own code and
@@ -3339,6 +3401,7 @@ mod tests {
             ServerError::CaptureSourceTooLarge { .. } => ServerError::CaptureSourceTooLarge {
                 selected_bytes: 20,
                 max_bytes: 10,
+                kind: CaptureSourceKind::Window,
             },
             ServerError::CaptureBounds(_) => ServerError::CaptureBounds(BoundsError::LatestAlone),
             ServerError::CaptureTooLarge(_) => ServerError::CaptureTooLarge(CaptureOverflow::Rows {
@@ -3732,6 +3795,18 @@ mod tests {
                 ServerError::CaptureSourceTooLarge {
                     selected_bytes: 20,
                     max_bytes: 10,
+                    kind: CaptureSourceKind::Window,
+                },
+                StatusCode::BAD_REQUEST,
+                "capture_source_too_large",
+                "the window selects 20 bytes of stored data, above the capture limit of 10 \
+                 bytes; narrow the window, or pin the services with service=a or service=a,b",
+            ),
+            fact(
+                ServerError::CaptureSourceTooLarge {
+                    selected_bytes: 20,
+                    max_bytes: 10,
+                    kind: CaptureSourceKind::StoredRun,
                 },
                 StatusCode::BAD_REQUEST,
                 "capture_source_too_large",

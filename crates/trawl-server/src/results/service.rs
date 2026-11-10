@@ -265,7 +265,7 @@ use super::charge::{EvidenceBudget, Refusal, Reservation};
 use super::root::{self, Published, ResultsRoot, Verified};
 use super::{Entered, InFlight, ResultsState};
 use crate::deadline::{Deadline, Expired};
-use crate::error::ServerError;
+use crate::error::{CaptureSourceKind, ServerError};
 use crate::from_saved::RunFile;
 use crate::investigations::service::{activity, unlink_evidence};
 use crate::investigations::step::{self, StepCompletion};
@@ -1149,6 +1149,7 @@ async fn plan(
                 return Err(ServerError::CaptureSourceTooLarge {
                     selected_bytes,
                     max_bytes: capture.source_max_bytes,
+                    kind: CaptureSourceKind::StoredRun,
                 });
             }
             Ok(Plan {
