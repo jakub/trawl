@@ -1606,17 +1606,18 @@ fn calibration_bodies() -> impl Iterator<Item = &'static str> {
         .copied()
 }
 
-/// A twin of `body`'s program at `capacity`, with the lazy DFA off.
+/// A twin of the program `body` runs at `capacity`, with the lazy DFA
+/// off: the program of its batch-engine view.
 #[expect(
     clippy::disallowed_methods,
     reason = "a twin with the lazy DFA off, built only to tell whether the owner's build kept it on"
 )]
 fn without_lazy_dfa(body: &str, capacity: usize) -> meta::Regex {
-    let hir = parse_hir(body, PatternKind::Regex).expect("the body parses");
+    let hir = parse_hir(&batch_view(body), PatternKind::Regex).expect("the view parses");
     meta::Builder::new()
         .configure(meta_config(MAX_REGEX_COMPILED_BYTES, capacity).hybrid(false))
         .build_from_hir(&hir)
-        .expect("the body compiles under 1 MiB")
+        .expect("the view compiles under 1 MiB")
 }
 
 /// Every pattern of the corpus and the Unicode table builds with its lazy
@@ -1646,12 +1647,22 @@ fn lazy_dfa_stays_enabled() {
     }
 }
 
-/// Four distinct bodies of the `\w{20}` class, each near the 1 MiB
-/// compiled-size limit and each charging about 7.3 MiB.
-const HEAVY: [&str; 4] = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w", r"\w\w{19}"];
+/// Seven distinct bodies of the `(\pL{12})` class, each its own batch-engine
+/// view, near the 512 KiB batch compiled-size limit, and each charging
+/// about 4.3 MiB (4 474 264 bytes on the reference host). Six fit one
+/// query's budget beside a build transient, and the seventh does not.
+const HEAVY: [&str; 7] = [
+    r"(\pL{12})0",
+    r"(\pL{12})1",
+    r"(\pL{12})2",
+    r"(\pL{12})3",
+    r"(\pL{12})4",
+    r"(\pL{12})5",
+    r"(\pL{12})6",
+];
 
-/// The whole corpus fits one query at the shipped budget, and four
-/// [`HEAVY`] bodies do not: the fourth is refused.
+/// The whole corpus fits one query at the shipped budget, and the
+/// [`HEAVY`] bodies do not: the last is refused.
 ///
 /// A query whose patterns charge exactly the budget, less one build
 /// transient, is admitted. One byte less of budget refuses it at the
@@ -1684,14 +1695,16 @@ fn query_budget_exact_and_one_over() {
     assert_eq!(shipped.charged(), sum);
 
     let refused = PatternError::Resources(RegexRefusal::Budget);
+    let (over, under) = HEAVY.split_last().expect("HEAVY has bodies");
     let mut heavy = preparer();
-    for body in &HEAVY[..3] {
+    for body in under {
+        assert_eq!(batch_view(body), *body, "a heavy body runs as written");
         assert!(heavy.build(PatternKind::Regex, body).is_ok(), "{body}");
     }
     assert_eq!(
-        heavy.build(PatternKind::Regex, HEAVY[3]).err(),
+        heavy.build(PatternKind::Regex, over).err(),
         Some(refused.clone()),
-        "the fourth heavy body is over the budget"
+        "the last heavy body is over the budget"
     );
 
     let mut exact = preparer();
@@ -1743,12 +1756,13 @@ fn check_mode_meters_nothing() {
     use crate::filter::CompiledFilter;
     use crate::schema::FieldTypes;
 
+    let (over, under) = HEAVY.split_last().expect("HEAVY has bodies");
     let mut metered = preparer();
-    for body in &HEAVY[..3] {
+    for body in under {
         assert!(metered.build(PatternKind::Regex, body).is_ok(), "{body}");
     }
     assert_eq!(
-        metered.build(PatternKind::Regex, HEAVY[3]).err(),
+        metered.build(PatternKind::Regex, over).err(),
         Some(PatternError::Resources(RegexRefusal::Budget))
     );
     let mut check = Preparer::check();
@@ -1804,14 +1818,15 @@ fn check_mode_meters_nothing() {
 
 /// The most any pattern of the corpus or the Unicode table may charge for
 /// its program, in bytes. The largest on the reference host is
-/// `\w{20}`'s, 1 129 304 bytes. A prefilter is a small part of any
+/// `\pL{12}`'s, 590 160 bytes. A prefilter is a small part of any
 /// program here, so another CPU's choice of one stays well under the
 /// ceiling, and a change that makes programs grow does not.
 const PROGRAM_CEILING: usize = 3 << 19;
 
 /// What each pattern of the corpus and the Unicode table charges for its
 /// caches and scratch, in bytes, term by term, with the lazy-DFA capacity
-/// it builds with and the forward minimum that capacity comes from. A
+/// it builds with and the forward minimum that capacity comes from, both
+/// read from the program that runs: its batch-engine view's. A
 /// dependency bump or a changed constant that moves one shows here as a
 /// diff.
 ///
@@ -1832,10 +1847,10 @@ fn corpus_charges() {
             .expect("one pattern fits a query");
         let charge = pattern.0.charge;
         let (_, profile) = compile(
-            &parse_hir(body, PatternKind::Regex).expect("the body parses"),
-            MAX_REGEX_COMPILED_BYTES,
+            &parse_hir(&batch_view(body), PatternKind::Regex).expect("the view parses"),
+            MAX_BATCH_COMPILED_BYTES,
         )
-        .expect("the body compiles");
+        .expect("the view compiles");
         writeln!(
             table,
             "{:>8} {:>8} {:>8} {:>7} {:>8}  {body}",
@@ -2016,10 +2031,17 @@ fn a_refused_build_leaves_the_reservation_where_it_started() {
     );
     assert_eq!((pool.reserved(), pool.holds()), (0, 0));
 
-    // The transient fits and the charge does not: `\w{20}` charges more.
+    // The transient fits and the charge does not: `(\pL{12})` charges more.
+    let heavy = r"(\pL{12})";
+    let charge = unmetered()
+        .build(PatternKind::Regex, heavy)
+        .expect("builds")
+        .charge()
+        .total();
+    assert!(charge > BUILD_TRANSIENT, "{heavy} charges {charge}");
     let (mut ledger, pool) = reserving(transient);
     assert_eq!(
-        ledger.build(PatternKind::Regex, r"\w{20}").err(),
+        ledger.build(PatternKind::Regex, heavy).err(),
         Some(reservation.clone())
     );
     assert_eq!((ledger.builds(), ledger.charged()), (1, 0));
@@ -2111,6 +2133,70 @@ fn one_ledger_holds_a_shared_pattern_once() {
     drop((filter, plan));
     assert_eq!(pool.reserved(), 0);
     assert_eq!((pool.holds(), pool.releases()), (2, 2));
+}
+
+/// A regex body whose batch-engine view differs from it runs the view's
+/// program and is charged for that program alone: `\w{20}` charges what a
+/// build of its view text charges, less than the program of the body as
+/// written would. The ledger holds that charge once however often the
+/// body is asked for, a build cancelled before it starts holds nothing,
+/// and once the ledger and every returned pattern drop, the reservation
+/// is back where it started.
+#[test]
+fn regex_class_resource_ownership() {
+    let body = r"\w{20}";
+    let view = batch_view(body);
+    assert_ne!(view, body);
+    let charge = unmetered()
+        .build(PatternKind::Regex, body)
+        .expect("builds")
+        .charge();
+    let of_view = unmetered()
+        .build(PatternKind::Regex, &view)
+        .expect("the view builds")
+        .charge();
+    assert_eq!(charge, of_view, "the body charges for its view's program");
+    let (regex, profile) = compile(
+        &parse_hir(body, PatternKind::Regex).expect("the body parses"),
+        MAX_REGEX_COMPILED_BYTES,
+    )
+    .expect("the body compiles under 1 MiB");
+    let as_written = Charge::new(&profile, regex.memory_usage());
+    drop(regex);
+    assert!(
+        charge.total() < as_written.total(),
+        "the view charges {} bytes, the body as written {}",
+        charge.total(),
+        as_written.total()
+    );
+
+    let (mut ledger, pool) = reserving(u64::MAX);
+    let start = pool.reserved();
+    let first = ledger.build(PatternKind::Regex, body).expect("builds");
+    let again = ledger.build(PatternKind::Regex, body).expect("held");
+    assert_eq!(ledger.builds(), 1, "one build for the shared body");
+    assert_eq!(ledger.charged(), charge.total());
+    assert_eq!(pool.reserved(), start + bytes(charge.total()));
+    assert_eq!(pool.holds(), 1);
+    drop((ledger, first, again));
+    assert_eq!(pool.reserved(), start);
+    assert_eq!((pool.holds(), pool.releases()), (1, 1));
+
+    let (ledger, pool) = reserving(u64::MAX);
+    let stop = crate::cancel::Stop::new();
+    stop.request();
+    let mut ledger = ledger.with_stop(stop);
+    let before = thread_builds();
+    assert_eq!(
+        ledger.build(PatternKind::Regex, body).err(),
+        Some(PatternError::Cancelled)
+    );
+    assert_eq!(
+        (ledger.builds(), thread_builds()),
+        (0, before),
+        "no build ran"
+    );
+    assert_eq!((pool.reserved(), pool.holds()), (0, 0), "nothing held");
 }
 
 /// A paused reservation parks a metered build once its pattern's charge

@@ -1232,12 +1232,20 @@ fn timechart_on_refused_in_batch_tail() {
 
 /// A tail whose patterns need more regex memory than one query holds is
 /// refused before it matches a row, typed as the capacity refusal it is,
-/// with a sentence that quotes none of its patterns. Four bodies of the
-/// `\w{20}` class charge past the budget at the fourth (ADR-0063).
+/// with a sentence that quotes none of its patterns. Seven bodies of the
+/// `(\pL{12})` class charge past the budget at the seventh (ADR-0063).
 #[cfg(test)]
 #[test]
 fn a_tail_over_the_regex_budget_is_a_typed_refusal() {
-    let heavy = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w", r"\w\w{19}"];
+    let heavy = [
+        r"(\pL{12})0",
+        r"(\pL{12})1",
+        r"(\pL{12})2",
+        r"(\pL{12})3",
+        r"(\pL{12})4",
+        r"(\pL{12})5",
+        r"(\pL{12})6",
+    ];
     let stages = heavy.iter().fold(String::new(), |mut stages, body| {
         stages.push_str(" | where message matches /");
         stages.push_str(body);
@@ -1266,7 +1274,7 @@ fn a_tail_over_the_regex_budget_is_a_typed_refusal() {
         &mut ledger(),
         &CancelLatch::never(),
     )
-    .expect_err("the fourth heavy pattern is over the budget");
+    .expect_err("the seventh heavy pattern is over the budget");
     assert!(
         matches!(
             err,
