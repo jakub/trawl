@@ -725,6 +725,7 @@ async fn the_kept_insert_writes_nothing_once_its_step_has_an_outcome() {
         code: None,
         result_id: Some(again.id.clone()),
         rows: Some(0),
+        total_rows: None,
         duration_ms: Some(1),
     };
     let step = KeptStep {

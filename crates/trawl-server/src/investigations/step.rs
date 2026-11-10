@@ -282,18 +282,26 @@ pub(crate) fn outcome_of(error: &ServerError, duration_ms: Option<u64>) -> StepO
         code: Some(error.code()),
         result_id: None,
         rows: None,
+        total_rows: None,
         duration_ms,
     }
 }
 
-/// The outcome of work that kept result `result_id` with `rows` rows.
+/// The outcome of work that kept result `result_id` with `rows` rows of the
+/// `total_rows` its execution produced before the capture cut.
 #[must_use]
-pub(crate) fn success(result_id: &str, rows: u64, duration_ms: u64) -> StepOutcome {
+pub(crate) fn success(
+    result_id: &str,
+    rows: u64,
+    total_rows: u64,
+    duration_ms: u64,
+) -> StepOutcome {
     StepOutcome {
         outcome: StepOutcomeKind::Success,
         code: None,
         result_id: Some(result_id.to_owned()),
         rows: Some(rows),
+        total_rows: Some(total_rows),
         duration_ms: Some(duration_ms),
     }
 }
@@ -514,6 +522,7 @@ impl Inner {
                 code: None,
                 result_id: None,
                 rows: None,
+                total_rows: None,
                 duration_ms: Some(
                     u64::try_from(self.began.elapsed().as_millis()).unwrap_or(u64::MAX),
                 ),
@@ -1357,6 +1366,14 @@ mod tests {
         let failed = outcome_of(&ServerError::Internal("x".into()), Some(3));
         assert_eq!(failed.outcome, StepOutcomeKind::Failed);
         assert_eq!(failed.code, Some(ErrorCode::InternalError));
+        for ending in [
+            timeout,
+            outcome_of(&busy, None),
+            outcome_of(&budget, None),
+            failed,
+        ] {
+            assert_eq!(ending.total_rows, None, "{ending:?}");
+        }
     }
 
     #[test]

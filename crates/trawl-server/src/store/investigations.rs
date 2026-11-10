@@ -973,6 +973,7 @@ impl InvestigationStore {
             code: None,
             result_id: None,
             rows: None,
+            total_rows: None,
             duration_ms: None,
         };
         let mut changed = 0;
