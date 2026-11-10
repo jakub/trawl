@@ -1,5 +1,5 @@
 #410 mutation check: a_step_admission_spends_one_deadline_across_statements
-commit:  4332ac19b3cff168f0115464340811e2b48b9f0f
+commit:  1039fa0f356e0a7dcc1ba374985055c7e5ee2af6
 patch:   2f1674cbd902705c2c53b923b0bab6eeee7d2d0685b28ad9a8b801e452fbd6de  docs/evidence/issue-410/mutation.patch
 rustc:   rustc 1.98.0 (88d9e12ae 2026-08-18)
 nextest: cargo-nextest 0.9.149
@@ -22,9 +22,9 @@ index d88b2f10..59f62231 100644
 
 === patched: the log insert is sent with a fresh 5 s budget ===
 ────────────
- Nextest run ID a07ee46e-1ca4-42bd-b7e0-f2b03a7d2602 with nextest profile: default
+ Nextest run ID bbf80033-a11f-4f4c-a376-53bd3921eee8 with nextest profile: default
     Starting 1 test across 1 binary (35 tests skipped)
-        FAIL [   1.027s] trawl-server::investigations_attach a_step_admission_spends_one_deadline_across_statements
+        FAIL [   0.938s] trawl-server::investigations_attach a_step_admission_spends_one_deadline_across_statements
   stdout ───
 
     running 1 test
@@ -35,35 +35,35 @@ index d88b2f10..59f62231 100644
     failures:
         a_step_admission_spends_one_deadline_across_statements
 
-    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 35 filtered out; finished in 1.02s
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.93s
 
   stderr ───
 
-    thread 'a_step_admission_spends_one_deadline_across_statements' (733144) panicked at crates/trawl-server/tests/investigations_attach.rs:1171:5:
+    thread 'a_step_admission_spends_one_deadline_across_statements' (4106998) panicked at crates/trawl-server/tests/investigations_attach.rs:1217:5:
     the log insert, 3 s into the 5 s deadline, was not bounded by the 2 s that remained: [5000, 5000, 5000, 5000]
     note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
     --- fixture facts ---
-      app database:   trawl_app_test_a07ee46e1ca4_733142_fhhricbfpzgc
-      fleet database: trawl_fleet_test_a07ee46e1ca4_733142_jzeywpyxdtcc
-      bound addr:     127.0.0.1:40503
+      app database:   trawl_app_test_bbf80033a11f_4106997_kyardnpyxneq
+      fleet database: trawl_fleet_test_bbf80033a11f_4106997_goyzgepkrhok
+      bound addr:     127.0.0.1:44533
       pool ceilings:  fleet=3 app=3 worst-shape=10
     --- pg_stat_activity ---
-      trawl_app_test_a07ee46e1ca4_733142_fhhricbfpzgc client backend state=idle wait=Client/ClientRead count=3
-      trawl_fleet_test_a07ee46e1ca4_733142_jzeywpyxdtcc client backend state=idle wait=Client/ClientRead count=2
+      trawl_app_test_bbf80033a11f_4106997_kyardnpyxneq client backend state=idle wait=Client/ClientRead count=3
+      trawl_fleet_test_bbf80033a11f_4106997_goyzgepkrhok client backend state=idle wait=Client/ClientRead count=2
 
 ────────────
-     Summary [   1.028s] 1 test run: 0 passed, 1 failed, 35 skipped
-        FAIL [   1.027s] trawl-server::investigations_attach a_step_admission_spends_one_deadline_across_statements
+     Summary [   0.940s] 1 test run: 0 passed, 1 failed, 35 skipped
+        FAIL [   0.938s] trawl-server::investigations_attach a_step_admission_spends_one_deadline_across_statements
 error: test run failed
 nextest exit: 100
 
 === unpatched: the log insert is sent with what remains ===
 ────────────
- Nextest run ID 805110f7-5bcb-4683-b106-a6701d30c126 with nextest profile: default
+ Nextest run ID 92bf00dc-b517-4f1d-bc7b-aed525bdf65e with nextest profile: default
     Starting 1 test across 1 binary (35 tests skipped)
-        PASS [   0.955s] trawl-server::investigations_attach a_step_admission_spends_one_deadline_across_statements
+        PASS [   0.880s] trawl-server::investigations_attach a_step_admission_spends_one_deadline_across_statements
 ────────────
-     Summary [   0.956s] 1 test run: 1 passed, 35 skipped
+     Summary [   0.881s] 1 test run: 1 passed, 35 skipped
 nextest exit: 0
 
 === result ===
