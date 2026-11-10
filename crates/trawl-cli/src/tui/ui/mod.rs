@@ -1195,4 +1195,1147 @@ mod tests {
         terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
     }
+
+    // -- sender text sink sweep ----------------------------------------------
+
+    use ratatui::Frame;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::{Constraint, Layout, Margin, Rect};
+
+    use crate::tui::App;
+    use crate::tui::palette::{PaletteAction, PaletteCategory, PaletteItem, refilter};
+    use crate::tui::state::{MainTab, SavedFocus};
+
+    /// What no sink may draw: a bidi override, a zero-width space and a soft
+    /// hyphen. ratatui drops control characters by itself, so ESC would
+    /// prove nothing.
+    const FORBIDDEN: [char; 3] = ['\u{202e}', '\u{200b}', '\u{00ad}'];
+
+    /// Sender text for one field: a two-letter tag, then U+202E, U+200B,
+    /// U+00AD and a line feed, each followed by a digit.
+    fn hostile(tag: &str) -> String {
+        format!("{tag}\u{202e}1\u{200b}2\u{00ad}3\n4")
+    }
+
+    /// [`hostile`] text drawn on one line: U+FFFD in place of all four.
+    fn drawn(tag: &str) -> String {
+        format!("{tag}\u{fffd}1\u{fffd}2\u{fffd}3\u{fffd}4")
+    }
+
+    /// [`hostile`] query text drawn where its line feed folds to a space.
+    fn drawn_folded(tag: &str) -> String {
+        format!("{tag}\u{fffd}1\u{fffd}2\u{fffd}3 4")
+    }
+
+    /// The first drawn line of [`hostile`] query text where its line feed
+    /// breaks the line.
+    fn drawn_first_line(tag: &str) -> String {
+        format!("{tag}\u{fffd}1\u{fffd}2\u{fffd}3")
+    }
+
+    /// Where a sub-sink draws. A fragment is looked for there only, so the
+    /// already sanitized copy of the same text elsewhere on screen (the
+    /// grid behind a popup, the tree beside a detail pane) cannot stand in
+    /// for it.
+    #[derive(Debug, Clone, Copy)]
+    enum Region {
+        Screen,
+        Popup,
+        Editor,
+        Results,
+        /// The panel of a non-Query tab, or the dashboard content.
+        Panel,
+        /// The left column of a split panel whose left column takes this
+        /// percentage.
+        PanelLeft(u16),
+        /// The right column of the same split.
+        PanelRight(u16),
+    }
+
+    impl Region {
+        fn rect(self, app: &App, screen: Rect) -> Rect {
+            let panel = || app.layout.panel.expect("the panel is laid out");
+            let columns = |left: u16| {
+                let inner = panel().inner(Margin::new(1, 1));
+                Layout::horizontal([
+                    Constraint::Percentage(left),
+                    Constraint::Percentage(100 - left),
+                ])
+                .areas::<2>(inner)
+            };
+            match self {
+                Self::Screen => screen,
+                Self::Popup => app.layout.popup.expect("a popup is open"),
+                Self::Editor => app.layout.editor.expect("the editor is laid out"),
+                Self::Results => app.layout.results.expect("the results are laid out"),
+                Self::Panel => panel(),
+                Self::PanelLeft(left) => columns(left)[0],
+                Self::PanelRight(left) => columns(left)[1],
+            }
+        }
+    }
+
+    /// The symbols of `rect`, row after row.
+    fn region_text(buffer: &Buffer, rect: Rect) -> String {
+        (rect.top()..rect.bottom())
+            .map(|y| {
+                (rect.left()..rect.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Everything a draw must leave as it was built: the caches, the popup
+    /// (palette items and their actions, popup text), the schedule popup's
+    /// submission, and the editor buffer, ghost and validation text.
+    fn sender_state(app: &App) -> String {
+        let submission = match app.popup {
+            Some(Popup::SetSchedule(ref form)) => format!("{:?}", form.submission()),
+            _ => String::new(),
+        };
+        format!(
+            "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{submission}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+            app.saved_cache,
+            app.history_cache,
+            app.schema_cache,
+            app.panel.schema,
+            app.panel.saved_detail,
+            app.dashboard.cache,
+            app.dashboard.last_error,
+            app.popup,
+            app.tab.result,
+            app.tab.editor.text(),
+            app.tab.ghost,
+            app.tab.validation_errors,
+            app.results_search.as_ref().map(|s| &s.query),
+            app.server_version,
+        )
+    }
+
+    type DrawFn = fn(&mut App, &mut Frame<'_>);
+
+    /// One sweep case: how to build its app, how to draw it, and the
+    /// literal each poisoned sub-sink must draw at 120x40.
+    struct SinkCase {
+        /// The surface and the branch drawn.
+        name: &'static str,
+        build: Box<dyn Fn() -> App>,
+        draw: DrawFn,
+        /// Sub-sink (with its row in the sink table), region, fragment.
+        expect: Vec<(&'static str, Region, String)>,
+    }
+
+    impl SinkCase {
+        /// A case drawn through the whole UI.
+        fn new(
+            name: &'static str,
+            build: impl Fn() -> App + 'static,
+            expect: Vec<(&'static str, Region, String)>,
+        ) -> Self {
+            Self {
+                name,
+                build: Box::new(build),
+                draw: super::render,
+                expect,
+            }
+        }
+    }
+
+    /// Draw `case` at 120x40 and at 40x12. Neither may draw a forbidden
+    /// character or change the data behind the screen; 120x40 must draw
+    /// every expected fragment in its region. Each failure names the case,
+    /// the sub-sink and the size.
+    fn sweep_case(case: &SinkCase) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (width, height) in [(120, 40), (40, 12)] {
+            let size = format!("{width}x{height}");
+            let mut app = (case.build)();
+            let built = sender_state(&app);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal.draw(|f| (case.draw)(&mut app, f)).expect("render");
+            let buffer = terminal.backend().buffer();
+            let screen = region_text(buffer, buffer.area);
+            for forbidden in FORBIDDEN {
+                if screen.contains(forbidden) {
+                    failures.push(format!(
+                        "{}, {size}: U+{:04X} drawn:\n{screen}",
+                        case.name,
+                        u32::from(forbidden)
+                    ));
+                }
+            }
+            if sender_state(&app) != built {
+                failures.push(format!(
+                    "{}, {size}: drawing changed the data behind the screen",
+                    case.name
+                ));
+            }
+            if width == 120 {
+                for (sub_sink, region, fragment) in &case.expect {
+                    let text = region_text(buffer, region.rect(&app, buffer.area));
+                    if !text.contains(fragment.as_str()) {
+                        failures.push(format!(
+                            "{}, {sub_sink}, {size}: {fragment:?} not drawn in {region:?}:\n{text}",
+                            case.name
+                        ));
+                    }
+                }
+            }
+        }
+        failures
+    }
+
+    /// The Schema tab over two services. `sa` holds a common field `cf` and
+    /// a unique field `uf`, and is expanded; `beta` shares `cf`. So the tree
+    /// reads: 0 common header, 1 `cf`, 2 `sa`, 3 `uf`, 4 `beta`.
+    fn schema_app(selected: usize) -> App {
+        use crate::tui::state::SchemaBrowser;
+        use trawl_api::{DailyCount, ServiceColumnStats, ServiceSchema};
+
+        let column =
+            |name: String, data_type: String, range: Option<(String, String)>| ServiceColumnStats {
+                name,
+                data_type,
+                null_count: 0,
+                total_count: 10,
+                min_value: range.as_ref().map(|r| r.0.clone()),
+                max_value: range.map(|r| r.1),
+                compressed_bytes: 64,
+            };
+        // The unique field's range is longer than 40 bytes, so it takes the
+        // two-line branch; the common field's takes the one-line branch.
+        let sa = ServiceSchema {
+            name: hostile("sa"),
+            columns: vec![
+                column(
+                    hostile("cf"),
+                    hostile("ct"),
+                    Some((hostile("cn"), hostile("cx"))),
+                ),
+                column(
+                    hostile("uf"),
+                    hostile("ut"),
+                    Some((hostile("un") + "-tail-tail", hostile("ux") + "-tail-tail")),
+                ),
+            ],
+            earliest_date: Some(hostile("ea")),
+            latest_date: Some(hostile("la")),
+            file_count: 1,
+            total_bytes: 128,
+            total_events: 10,
+            daily_event_counts: vec![
+                DailyCount {
+                    date: hostile("fa"),
+                    count: 4,
+                },
+                DailyCount {
+                    date: hostile("lz"),
+                    count: 6,
+                },
+            ],
+            degraded_fields: Vec::new(),
+        };
+        let beta = ServiceSchema {
+            name: "beta".to_owned(),
+            columns: vec![column(hostile("cf"), "VARCHAR".to_owned(), None)],
+            earliest_date: None,
+            latest_date: None,
+            file_count: 1,
+            total_bytes: 64,
+            total_events: 5,
+            daily_event_counts: Vec::new(),
+            degraded_fields: Vec::new(),
+        };
+        let mut browser = SchemaBrowser::new(vec![sa, beta]);
+        assert_eq!(browser.common_fields.len(), 1, "only cf is common");
+        browser.expanded.insert(hostile("sa"));
+        browser.selected = selected;
+        let mut app = test_app();
+        app.main_tab = MainTab::Schema;
+        app.panel.schema = Some(browser);
+        app
+    }
+
+    /// Rows 1, 2, 3 and 13a: the schema detail pane at every selection
+    /// kind, and the filter bar.
+    #[allow(clippy::too_many_lines)] // a table of cases, one sub-sink per entry
+    fn schema_cases() -> Vec<SinkCase> {
+        let detail = Region::PanelRight(55);
+        vec![
+            SinkCase::new(
+                "schema detail, common header selected",
+                || schema_app(0),
+                vec![
+                    ("row 1 common field name", detail, drawn("cf")),
+                    (
+                        "row 1 common field type",
+                        detail,
+                        format!("({})", drawn("ct")),
+                    ),
+                ],
+            ),
+            SinkCase::new(
+                "schema detail, common field selected",
+                || schema_app(1),
+                vec![
+                    ("row 2 field title", detail, drawn("cf")),
+                    (
+                        "row 2 common field type",
+                        detail,
+                        format!("type:       {}", drawn("ct")),
+                    ),
+                    (
+                        "row 3 range min, one line",
+                        detail,
+                        format!("range:      {}", drawn("cn")),
+                    ),
+                    (
+                        "row 3 range max, one line",
+                        detail,
+                        format!("\u{2013} {}", drawn("cx")),
+                    ),
+                ],
+            ),
+            SinkCase::new(
+                "schema detail, service selected",
+                || schema_app(2),
+                vec![
+                    ("row 1 service title", detail, drawn("sa")),
+                    (
+                        "row 13a earliest date",
+                        detail,
+                        format!("data:      {}", drawn("ea")),
+                    ),
+                    (
+                        "row 13a latest date",
+                        detail,
+                        format!("\u{2192} {}", drawn("la")),
+                    ),
+                    (
+                        "row 1 common list",
+                        detail,
+                        format!("common: {}", drawn("cf")),
+                    ),
+                    (
+                        "row 1 unique list",
+                        detail,
+                        format!("unique: {}", drawn("uf")),
+                    ),
+                    ("row 2 chart first date", detail, drawn("fa")),
+                    ("row 2 chart last date", detail, drawn("lz")),
+                ],
+            ),
+            SinkCase::new(
+                "schema detail, service field selected",
+                || schema_app(3),
+                vec![
+                    ("row 2 field title", detail, drawn("uf")),
+                    (
+                        "row 2 field type",
+                        detail,
+                        format!("type:       {}", drawn("ut")),
+                    ),
+                    (
+                        "row 2 in service",
+                        detail,
+                        format!("in:         {}", drawn("sa")),
+                    ),
+                    (
+                        "row 3 range min, two lines",
+                        detail,
+                        format!("range:      {}-tail-tail \u{2013}", drawn("un")),
+                    ),
+                    (
+                        "row 3 range max, two lines",
+                        detail,
+                        format!("            {}-tail-tail", drawn("ux")),
+                    ),
+                ],
+            ),
+            SinkCase::new(
+                "schema filter, active",
+                || {
+                    let mut app = schema_app(0);
+                    let schema = app.panel.schema.as_mut().unwrap();
+                    schema.filter = hostile("sf");
+                    schema.filter_active = true;
+                    app
+                },
+                vec![(
+                    "filter input",
+                    Region::PanelLeft(55),
+                    format!("/ {}\u{2588}", drawn("sf")),
+                )],
+            ),
+            SinkCase::new(
+                "schema filter, inactive",
+                || {
+                    let mut app = schema_app(0);
+                    app.panel.schema.as_mut().unwrap().filter = hostile("sg");
+                    app
+                },
+                vec![(
+                    "filter input",
+                    Region::PanelLeft(55),
+                    format!("/ {}", drawn("sg")),
+                )],
+            ),
+        ]
+    }
+
+    /// The Saved tab over two poisoned saved queries: the first scheduled
+    /// with a window and a lag and one run, the second unscheduled with a
+    /// name too long for the list.
+    fn hostile_saved_app(focus: SavedFocus) -> App {
+        let mut sched = make_schedule(Some("since_last"), Some(("5m", 300)));
+        sched.interval = hostile("iv");
+        sched.window = Some(hostile("wn"));
+        sched.lag = Some(hostile("lg"));
+        sched.covered_through = None;
+        let mut run = make_run(41, 45);
+        run.window_kind = Some(hostile("wk"));
+        let mut app = saved_app(Some(sched), vec![run]);
+        let queries = &mut app.saved_cache.as_mut().unwrap().queries;
+        queries[0].name = hostile("sn");
+        queries[0].query = hostile("sq");
+        let mut long = make_saved(None);
+        long.id = 8;
+        long.name = format!("{}{}", hostile("sl"), "x".repeat(80));
+        queries.push(long);
+        app.panel.saved_focus = focus;
+        app
+    }
+
+    /// Rows 8 and 13b: the saved list, its detail and a run's results.
+    fn saved_cases() -> Vec<SinkCase> {
+        use crate::tui::state::LoadedRun;
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+
+        let list = Region::PanelLeft(45);
+        let detail = Region::PanelRight(45);
+        vec![
+            SinkCase::new(
+                "saved list",
+                || hostile_saved_app(SavedFocus::List),
+                vec![
+                    ("row 13b saved name, fits", list, drawn("sn")),
+                    (
+                        "row 13b saved name, clipped",
+                        list,
+                        format!("{}x", drawn("sl")),
+                    ),
+                    ("row 13b badge interval", list, format!("[{}", drawn("iv"))),
+                    (
+                        "row 13b badge window",
+                        list,
+                        format!("window {}]", drawn("wn")),
+                    ),
+                ],
+            ),
+            SinkCase::new(
+                "saved detail",
+                || hostile_saved_app(SavedFocus::Detail),
+                vec![
+                    ("row 8 saved name", detail, drawn("sn")),
+                    (
+                        "row 8 saved query",
+                        detail,
+                        format!("query  {}", drawn_folded("sq")),
+                    ),
+                    (
+                        "row 8 schedule interval",
+                        detail,
+                        format!("every {}", drawn("iv")),
+                    ),
+                    (
+                        "row 8 schedule window",
+                        detail,
+                        format!("window {}", drawn("wn")),
+                    ),
+                    ("row 8 schedule lag", detail, format!("lag {}", drawn("lg"))),
+                    ("row 8 run window kind", detail, drawn("wk")),
+                ],
+            ),
+            SinkCase::new(
+                "saved run results",
+                || {
+                    let mut app = hostile_saved_app(SavedFocus::RunResults);
+                    app.panel.saved_detail.as_mut().unwrap().result = Some(LoadedRun {
+                        run_id: 41,
+                        result: QueryResult {
+                            columns: vec![Column::new(hostile("rh"), ColumnType::String)],
+                            rows: vec![vec![Value::String(hostile("rv"))]],
+                        },
+                    });
+                    app
+                },
+                vec![
+                    ("run result header", detail, drawn("rh")),
+                    ("run result cell", detail, drawn("rv")),
+                ],
+            ),
+        ]
+    }
+
+    /// Rows 9 to 12 and the result search: the Query tab and the history
+    /// detail pane.
+    #[allow(clippy::too_many_lines)] // a table of cases, one sub-sink per entry
+    fn query_cases() -> Vec<SinkCase> {
+        vec![
+            SinkCase::new(
+                "query tab, no result",
+                || {
+                    let mut app = test_app();
+                    app.server_version = Some(hostile("vr"));
+                    app
+                },
+                vec![("row 9 server version", Region::Results, drawn("vr"))],
+            ),
+            SinkCase::new(
+                "query editor",
+                || {
+                    let mut app = test_app();
+                    app.tab.editor.insert_text(&hostile("ed"));
+                    app
+                },
+                vec![(
+                    "row 10 highlighted query",
+                    Region::Editor,
+                    drawn_first_line("ed"),
+                )],
+            ),
+            SinkCase::new(
+                "query editor, ghost inside the line",
+                || {
+                    let mut app = test_app();
+                    app.tab.editor.insert_text("abc");
+                    app.tab.editor.cursor = (0, 1);
+                    app.tab.ghost = Some(crate::tui::autocomplete::Completion {
+                        ghost_text: hostile("gm"),
+                        insert_text: String::new(),
+                        replace_len: 0,
+                        cursor_offset: None,
+                    });
+                    app
+                },
+                vec![(
+                    "row 11 ghost text",
+                    Region::Editor,
+                    format!("a{}bc", drawn("gm")),
+                )],
+            ),
+            SinkCase::new(
+                "query editor, ghost on an empty line",
+                || {
+                    let mut app = test_app();
+                    app.tab.ghost = Some(crate::tui::autocomplete::Completion {
+                        ghost_text: hostile("ga"),
+                        insert_text: String::new(),
+                        replace_len: 0,
+                        cursor_offset: None,
+                    });
+                    app
+                },
+                vec![("row 11 ghost text", Region::Editor, drawn("ga"))],
+            ),
+            SinkCase::new(
+                "query editor, validation hint",
+                || {
+                    let mut app = test_app();
+                    app.tab.editor.insert_text("abc");
+                    app.tab.validation_errors = vec![trawl_core::parser::ParseError {
+                        message: hostile("vm"),
+                        span: 0..1,
+                        label: None,
+                        hint: Some(hostile("vh")),
+                    }];
+                    app
+                },
+                vec![
+                    ("row 12 validation message", Region::Screen, drawn("vm")),
+                    (
+                        "row 12 validation hint",
+                        Region::Screen,
+                        format!("({})", drawn("vh")),
+                    ),
+                ],
+            ),
+            SinkCase::new(
+                "result search bar",
+                || {
+                    let mut app = test_app();
+                    let mut search = crate::tui::state::ResultsSearch::new();
+                    search.query = hostile("rq");
+                    search.input_active = true;
+                    app.results_search = Some(search);
+                    app
+                },
+                vec![("search input", Region::Results, format!("/{}", drawn("rq")))],
+            ),
+            SinkCase::new(
+                "history tab",
+                || {
+                    let mut app = test_app();
+                    app.main_tab = MainTab::History;
+                    app.history_cache = Some(trawl_api::HistoryResponse {
+                        entries: vec![trawl_api::HistoryEntryResponse {
+                            id: 1,
+                            query: hostile("hq"),
+                            executed_at: "2026-03-18T14:30:00Z".to_owned(),
+                            duration_ms: 3,
+                            row_count: 0,
+                            status: trawl_client::QueryStatus::Success,
+                        }],
+                        total: 1,
+                    });
+                    app
+                },
+                vec![(
+                    "row 10 history detail query",
+                    Region::PanelRight(55),
+                    drawn_first_line("hq"),
+                )],
+            ),
+        ]
+    }
+
+    /// The Query tab holding one row: a well-known `message` field and a
+    /// field whose name is poisoned. Both values are poisoned.
+    fn event_app() -> App {
+        let mut app = test_app();
+        let name = hostile("en");
+        app.tab.result = Some(make_query_response(
+            vec!["message", &name],
+            vec![vec![
+                Value::String(hostile("mv")),
+                Value::String(hostile("ev")),
+            ]],
+        ));
+        app.tab.status = TabStatus::Success { duration_ms: 1 };
+        app
+    }
+
+    /// The schedule popup open on a saved query whose name and schedule the
+    /// server sent poisoned.
+    fn hostile_schedule_app() -> App {
+        use crate::tui::state::ScheduleForm;
+
+        let mut sched = make_schedule(Some("since_last"), Some(("5m", 300)));
+        sched.interval = hostile("pi");
+        sched.window = Some(hostile("pw"));
+        sched.lag = Some(hostile("pl"));
+        let mut app = test_app();
+        app.popup = Some(Popup::SetSchedule(Box::new(ScheduleForm::new(
+            7,
+            hostile("st"),
+            Some(&sched),
+        ))));
+        app
+    }
+
+    /// Rows 4 to 7 and 13c, the save-name input, and help: every popup
+    /// variant but the palette.
+    fn popup_cases() -> Vec<SinkCase> {
+        use crate::tui::state::{ColumnConfig, SimpleEditor};
+
+        let popup = Region::Popup;
+        vec![
+            SinkCase::new(
+                "event detail popup",
+                || {
+                    let mut app = event_app();
+                    app.popup = Some(Popup::EventDetail {
+                        row_index: 0,
+                        scroll: 0,
+                    });
+                    app
+                },
+                vec![
+                    ("row 4 well-known value", popup, drawn("mv")),
+                    ("row 4 field name", popup, drawn("en")),
+                    ("row 4 field value", popup, drawn("ev")),
+                ],
+            ),
+            SinkCase::new(
+                "column picker popup",
+                || {
+                    let mut app = test_app();
+                    let name = hostile("cp");
+                    let response =
+                        make_query_response(vec![&name], vec![vec![Value::String("x".into())]]);
+                    app.tab.column_config = Some(ColumnConfig::init(&response.result.columns));
+                    app.tab.result = Some(response);
+                    app.tab.status = TabStatus::Success { duration_ms: 1 };
+                    app.popup = Some(Popup::ColumnPicker {
+                        selected: 0,
+                        scroll: 0,
+                    });
+                    app
+                },
+                vec![("row 5 column label", popup, format!("[x] {}", drawn("cp")))],
+            ),
+            SinkCase::new(
+                "error popup",
+                || {
+                    let mut app = test_app();
+                    app.popup = Some(Popup::Error {
+                        message: hostile("er"),
+                    });
+                    app
+                },
+                vec![("row 6 error message", popup, drawn("er"))],
+            ),
+            SinkCase::new(
+                "confirm-delete popup",
+                || {
+                    let mut app = test_app();
+                    app.popup = Some(Popup::ConfirmDelete {
+                        saved_id: 7,
+                        name: hostile("dn"),
+                    });
+                    app
+                },
+                vec![("row 7 saved name", popup, drawn("dn"))],
+            ),
+            SinkCase::new(
+                "schedule popup, loaded from the server",
+                hostile_schedule_app,
+                vec![
+                    ("row 7 schedule title", popup, drawn("st")),
+                    ("row 13c interval row", popup, drawn("pi")),
+                    ("row 13c window row", popup, drawn("pw")),
+                    ("row 13c lag row", popup, drawn("pl")),
+                ],
+            ),
+            SinkCase::new(
+                "save-query popup",
+                || {
+                    let mut app = test_app();
+                    let mut editor = SimpleEditor::new_single_line();
+                    editor.insert_text(&hostile("nv"));
+                    app.popup = Some(Popup::SaveQuery { editor });
+                    app
+                },
+                vec![("save-name input", popup, format!("> {}", drawn("nv")))],
+            ),
+            // Fixed text only; drawn so that every popup variant goes
+            // through the sweep's no-forbidden-character check.
+            SinkCase::new(
+                "help popup",
+                || {
+                    let mut app = test_app();
+                    app.popup = Some(Popup::Help { scroll: 0 });
+                    app
+                },
+                Vec::new(),
+            ),
+        ]
+    }
+
+    /// A saved query, a history entry and a service, each with a poisoned
+    /// label. The labels start with `k`, which no detail holds, so input
+    /// `k` matches the labels alone and every label takes the matched
+    /// branch.
+    fn palette_items() -> Vec<PaletteItem> {
+        vec![
+            PaletteItem {
+                label: hostile("kl"),
+                detail: Some(hostile("pd")),
+                category: PaletteCategory::SavedQuery,
+                shortcut: None,
+                action: PaletteAction::LoadQuery(hostile("pd")),
+            },
+            PaletteItem {
+                label: hostile("kh"),
+                detail: Some("3ms, 1 rows".to_owned()),
+                category: PaletteCategory::History,
+                shortcut: None,
+                action: PaletteAction::LoadQuery(hostile("kh")),
+            },
+            PaletteItem {
+                label: hostile("ks"),
+                detail: Some(hostile("pt")),
+                category: PaletteCategory::Service,
+                shortcut: None,
+                action: PaletteAction::DrillService(hostile("ks")),
+            },
+        ]
+    }
+
+    /// The palette open over the Query tab, filtered for `input`, with the
+    /// item labelled `selected` selected, or the first when none is.
+    fn palette_app(
+        input: &str,
+        items: Vec<PaletteItem>,
+        selected: &str,
+        ghost: Option<String>,
+    ) -> App {
+        // Column mode filters on the text after the dot.
+        let filter = input.split_once('.').map_or(input, |(_, after)| after);
+        let filtered = refilter(filter, &items);
+        let selected = filtered
+            .iter()
+            .position(|f| items[f.item_index].label == selected)
+            .unwrap_or(0);
+        let mut app = test_app();
+        app.popup = Some(Popup::CommandPalette {
+            input: input.to_owned(),
+            cursor: input.chars().count(),
+            selected,
+            scroll: 0,
+            items,
+            filtered,
+            ghost,
+        });
+        app
+    }
+
+    /// [`palette_items`] filtered for `k`, which matches every label, so
+    /// every label is drawn on the matched branch.
+    fn matched_palette_app(selected: &str) -> App {
+        let app = palette_app("k", palette_items(), selected, None);
+        let Some(Popup::CommandPalette { ref filtered, .. }) = app.popup else {
+            unreachable!("palette_app opens the palette");
+        };
+        assert!(
+            filtered.len() == 3 && filtered.iter().all(|f| !f.match_positions.is_empty()),
+            "every label matches k: {filtered:?}"
+        );
+        app
+    }
+
+    /// Rows 13 and 13d, and the palette input and its ghost.
+    #[allow(clippy::too_many_lines)] // a table of cases, one sub-sink per entry
+    fn palette_cases() -> Vec<SinkCase> {
+        let popup = Region::Popup;
+        let column_items = || {
+            vec![PaletteItem {
+                label: hostile("cl"),
+                detail: Some(hostile("cd")),
+                category: PaletteCategory::Service,
+                shortcut: None,
+                action: PaletteAction::InsertAtCursor(hostile("cl")),
+            }]
+        };
+        vec![
+            SinkCase::new(
+                "palette, grouped, saved query selected",
+                || palette_app("", palette_items(), &hostile("kl"), None),
+                vec![
+                    (
+                        "row 13 saved label, unmatched, selected",
+                        popup,
+                        drawn("kl"),
+                    ),
+                    ("row 13 saved detail line", popup, drawn_folded("pd")),
+                    (
+                        "row 13 history label, unmatched, unselected",
+                        popup,
+                        drawn("kh"),
+                    ),
+                    (
+                        "row 13 service label, unmatched, unselected",
+                        popup,
+                        drawn("ks"),
+                    ),
+                    ("row 13 service hint, unselected", popup, drawn("pt")),
+                ],
+            ),
+            SinkCase::new(
+                "palette, grouped, service selected",
+                || palette_app("", palette_items(), &hostile("ks"), None),
+                vec![
+                    (
+                        "row 13 saved label, unmatched, unselected",
+                        popup,
+                        drawn("kl"),
+                    ),
+                    (
+                        "row 13 service label, unmatched, selected",
+                        popup,
+                        drawn("ks"),
+                    ),
+                    ("row 13 service hint, selected", popup, drawn("pt")),
+                ],
+            ),
+            SinkCase::new(
+                "palette, matched, saved query selected",
+                || matched_palette_app(&hostile("kl")),
+                vec![
+                    ("row 13 saved label, matched, selected", popup, drawn("kl")),
+                    ("row 13 saved detail line", popup, drawn_folded("pd")),
+                    (
+                        "row 13 history label, matched, unselected",
+                        popup,
+                        drawn("kh"),
+                    ),
+                    (
+                        "row 13 service label, matched, unselected",
+                        popup,
+                        drawn("ks"),
+                    ),
+                    ("row 13 service hint, unselected", popup, drawn("pt")),
+                ],
+            ),
+            SinkCase::new(
+                "palette, matched, history selected",
+                || matched_palette_app(&hostile("kh")),
+                vec![
+                    (
+                        "row 13 history label, matched, selected",
+                        popup,
+                        drawn("kh"),
+                    ),
+                    (
+                        "row 13 saved label, matched, unselected",
+                        popup,
+                        drawn("kl"),
+                    ),
+                    (
+                        "row 13 service label, matched, unselected",
+                        popup,
+                        drawn("ks"),
+                    ),
+                ],
+            ),
+            SinkCase::new(
+                "palette, column mode",
+                move || {
+                    palette_app(
+                        &format!("{}.", hostile("cs")),
+                        column_items(),
+                        &hostile("cl"),
+                        None,
+                    )
+                },
+                vec![
+                    (
+                        "row 13d service header",
+                        popup,
+                        format!("{} \u{2014} Columns", drawn("cs")),
+                    ),
+                    (
+                        "row 13 column label, unmatched, selected",
+                        popup,
+                        drawn("cl"),
+                    ),
+                    ("row 13 column hint, selected", popup, drawn("cd")),
+                    ("palette input", popup, format!("> {}.", drawn("cs"))),
+                ],
+            ),
+            SinkCase::new(
+                "palette, input with ghost",
+                || palette_app(&hostile("ip"), palette_items(), "", Some(hostile("gp"))),
+                vec![
+                    ("palette input", popup, format!("> {}", drawn("ip"))),
+                    ("palette ghost", popup, drawn("gp")),
+                ],
+            ),
+        ]
+    }
+
+    /// A dashboard snapshot whose drawn remote strings are poisoned.
+    fn hostile_dashboard() -> trawl_client::DashboardSnapshot {
+        use trawl_api::{
+            Capacity, HeadroomReading, PressureEvidence, StorageMeasurement,
+            StorageMeasurementStatus,
+        };
+        let measured = StorageMeasurement {
+            status: StorageMeasurementStatus::Complete,
+            sample_age_secs: Some(2),
+        };
+        trawl_client::DashboardSnapshot {
+            hostname: hostile("dh"),
+            listen_addr: hostile("da"),
+            uptime_secs: 60,
+            version: hostile("dv"),
+            healthy: true,
+            pool_capacity: 4,
+            pool_active: 1,
+            pool_retained: 0,
+            hot_buffer_events: 10,
+            hot_buffer_max_events: 100,
+            hot_buffer_bytes: 10,
+            hot_buffer_max_bytes: 100,
+            hot_buffer_batches: 1,
+            total_queries: 2,
+            query_rate: 0.0,
+            query_errors: 0,
+            query_timeouts: 0,
+            ingest_events: 0,
+            ingest_rate: 0.0,
+            ingest_rejected: 0,
+            syslog_enabled: false,
+            syslog_events_udp: 0,
+            syslog_events_tcp: 0,
+            syslog_rate: 0.0,
+            syslog_parse_errors: 0,
+            syslog_dropped: 0,
+            syslog_tcp_connections: 0,
+            wal_files: 0,
+            wal_bytes: 0,
+            wal_measurement: measured,
+            last_compaction_secs: None,
+            compaction_runs: 0,
+            compaction_errors: 0,
+            parquet_files: 0,
+            parquet_bytes: 0,
+            parquet_measurement: measured,
+            capacity: Capacity {
+                headroom: HeadroomReading {
+                    measurement: measured,
+                    filesystems: Vec::new(),
+                },
+                pressure: PressureEvidence {
+                    removals_age: 0,
+                    removals_disk_pressure: 0,
+                    pressure_attempts: 0,
+                    last_sweep: None,
+                },
+                environments: Vec::new(),
+                growth_excluded: Vec::new(),
+            },
+            sse_active: 0,
+            sse_max: 8,
+            scheduler_enabled: false,
+            scheduler_schedules: 0,
+            recent_queries: vec![trawl_client::CompletedQuerySnapshot {
+                id: 2,
+                user: "admin".to_owned(),
+                query: hostile("dc"),
+                duration_ms: 3,
+                rows: Some(1),
+                error: None,
+                timed_out: false,
+            }],
+            active_queries: vec![trawl_client::ActiveQuerySnapshot {
+                id: 3,
+                user: hostile("du"),
+                role: "admin".to_owned(),
+                query: hostile("dq"),
+                running_ms: 40,
+            }],
+        }
+    }
+
+    /// The Dashboard tab with `cache` and `last_error`.
+    fn dashboard_app(
+        cache: Option<trawl_client::DashboardSnapshot>,
+        last_error: Option<String>,
+    ) -> App {
+        let mut app = test_app();
+        app.main_tab = MainTab::Dashboard;
+        app.dashboard.is_admin = true;
+        app.dashboard.cache = cache;
+        app.dashboard.last_error = last_error;
+        app
+    }
+
+    /// Rows 14 and 15: the dashboard fresh, stale and failed.
+    fn dashboard_cases() -> Vec<SinkCase> {
+        let panel = Region::Panel;
+        vec![
+            SinkCase::new(
+                "dashboard, fresh",
+                || dashboard_app(Some(hostile_dashboard()), None),
+                vec![
+                    ("row 15 version", panel, format!("v{}", drawn("dv"))),
+                    ("row 15 hostname", panel, drawn("dh")),
+                    ("row 15 listen address", panel, drawn("da")),
+                    ("row 15 active user", panel, drawn("du")),
+                    ("row 15 active query", panel, drawn_folded("dq")),
+                    ("row 15 completed query", panel, drawn_folded("dc")),
+                ],
+            ),
+            SinkCase::new(
+                "dashboard, stale",
+                || dashboard_app(Some(hostile_dashboard()), Some(hostile("df"))),
+                vec![(
+                    "row 14 stale footer",
+                    panel,
+                    format!("[stale] {}", drawn("df")),
+                )],
+            ),
+            SinkCase::new(
+                "dashboard, error without a snapshot",
+                || dashboard_app(None, Some(hostile("de"))),
+                vec![(
+                    "row 14 error line",
+                    panel,
+                    format!("Error: {}", drawn("de")),
+                )],
+            ),
+        ]
+    }
+
+    /// Every sink the TUI draws sender text through, at 120x40 and 40x12:
+    /// no U+202E, U+200B or U+00AD anywhere on screen, each poisoned
+    /// sub-sink's own U+FFFD fragment in its own region at 120x40, and the
+    /// data behind the screen as it was built.
+    #[test]
+    fn terminal_tui_sender_sink_matrix() {
+        let mut cases = Vec::new();
+        cases.extend(schema_cases());
+        cases.extend(saved_cases());
+        cases.extend(query_cases());
+        cases.extend(popup_cases());
+        cases.extend(palette_cases());
+        cases.extend(dashboard_cases());
+        // The overlay has no caller, so it is drawn directly.
+        cases.push(SinkCase {
+            name: "saved overlay, drawn directly",
+            build: Box::new(|| {
+                let mut app = test_app();
+                let mut saved = make_saved(None);
+                saved.name = hostile("on");
+                saved.query = hostile("oq");
+                app.saved_cache = Some(trawl_api::ListSavedResponse {
+                    queries: vec![saved],
+                });
+                app
+            }),
+            draw: |app, frame| super::saved::render(app, frame),
+            expect: vec![
+                ("overlay name", Region::Screen, drawn("on")),
+                ("overlay query", Region::Screen, drawn("oq")),
+            ],
+        });
+
+        let failures: Vec<String> = cases.iter().flat_map(sweep_case).collect();
+        assert!(
+            failures.is_empty(),
+            "{} failure(s) over {} cases:\n\n{}",
+            failures.len(),
+            cases.len(),
+            failures.join("\n\n")
+        );
+
+        // What was put in comes back byte for byte: the schedule popup's
+        // submission and the palette's action arguments.
+        let mut app = hostile_schedule_app();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal
+            .draw(|f| super::render(&mut app, f))
+            .expect("render");
+        let Some(Popup::SetSchedule(ref form)) = app.popup else {
+            panic!("the schedule popup is open");
+        };
+        let sent = form.submission().expect("an interval");
+        assert_eq!(
+            (sent.interval, sent.window, sent.lag),
+            (hostile("pi"), Some(hostile("pw")), Some(hostile("pl"))),
+            "the schedule popup sends the loaded text"
+        );
+        let mut app = matched_palette_app(&hostile("kl"));
+        terminal
+            .draw(|f| super::render(&mut app, f))
+            .expect("render");
+        let Some(Popup::CommandPalette { ref items, .. }) = app.popup else {
+            panic!("the palette is open");
+        };
+        assert!(matches!(&items[0].action, PaletteAction::LoadQuery(q) if *q == hostile("pd")));
+        assert!(matches!(&items[2].action, PaletteAction::DrillService(s) if *s == hostile("ks")));
+    }
 }
