@@ -396,7 +396,7 @@ pub(crate) async fn execute_scheduled_query(
         let _check = timing
             .clock()
             .guard(trawl_engine::timing::QueryPhase::DslCheck);
-        crate::admission::admit(&pool, query, deadline).await
+        crate::admission::admit(&pool, query, deadline, None).await
     };
     let result = match checked {
         Err(refusal) => Err(refusal),

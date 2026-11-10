@@ -428,13 +428,6 @@ impl Wake {
 /// After [`ExecutorPool::begin_slot`] promoted the entry, the guard owns
 /// nothing in the registry: the registered slot outlives it and stays
 /// cancellable until the work's own cleanup.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "#343: the tracked routes take this guard in a later checkpoint"
-    )
-)]
 pub(crate) struct Pending {
     registry: Arc<Mutex<Registry>>,
     id: u64,
@@ -446,13 +439,6 @@ pub(crate) struct Pending {
     refusal: RefusalOnce,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "#343: the tracked routes take this guard in a later checkpoint"
-    )
-)]
 impl Pending {
     /// What wakes this request's waits when a cancel reaches it.
     pub(crate) fn wake(&self) -> &Wake {
@@ -465,7 +451,9 @@ impl Pending {
         Stop::from_flag(Arc::clone(&self.cancelled))
     }
 
-    /// Whether a cancel reached this request.
+    /// Whether the request's cancel flag is latched: by a cancel by id, or
+    /// by a preparation the request stopped waiting on, which asks its job
+    /// to stop through the same flag.
     pub(crate) fn latched(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }

@@ -182,7 +182,7 @@ pub async fn query(
     // shows where its time went.
     let checked = {
         let _phase = timing.clock().guard(QueryPhase::DslCheck);
-        crate::admission::admit(&state.query.pool, &req.query, deadline).await
+        crate::admission::admit(&state.query.pool, &req.query, deadline, None).await
     };
     let admitted = match checked {
         Err(refusal) => Err(refusal),
@@ -2255,7 +2255,7 @@ pub async fn create_saved(
     // refusing at the one moment a human is there to read the reason.
     let deadline =
         crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
-    crate::admission::admit(&state.query.pool, &req.query, deadline).await?;
+    crate::admission::admit(&state.query.pool, &req.query, deadline, None).await?;
 
     // DuplicateName → 409, InvalidName → 400 via the StoreError table.
     let saved = state
@@ -2285,7 +2285,7 @@ pub async fn update_saved(
     // proves a different thing, under the saved-query row lock.
     let deadline =
         crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
-    crate::admission::admit(&state.query.pool, &req.query, deadline).await?;
+    crate::admission::admit(&state.query.pool, &req.query, deadline, None).await?;
 
     // NotFound → 404, InvalidName → 400, DuplicateName → 409, and a new
     // DSL that contradicts the schedule's window → 400 naming both sides.
@@ -3422,7 +3422,7 @@ pub async fn export(
     // asking here is what makes all three refuse the same text.
     {
         let _phase = timing.clock().guard(QueryPhase::DslCheck);
-        crate::admission::admit(&state.query.pool, &req.query, deadline).await
+        crate::admission::admit(&state.query.pool, &req.query, deadline, None).await
     }
     .map_err(refused)?;
 
