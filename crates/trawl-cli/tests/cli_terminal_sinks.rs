@@ -12,11 +12,12 @@
 //! temp `HOME` and XDG dirs, the fixture's config and the fixture's token,
 //! so no saved profile or `TRAWL_*` variable can address another server.
 //!
-//! The terminal is a PTY: `trawl` sees a TTY on stdout and stderr, and the
-//! test reads the master until the last slave end closes, then reaps the
-//! child. Nothing sleeps or polls; the timeout is a hang guard only.
-//! Captured text reaches an assertion message escaped, so a failing run
-//! cannot drive the terminal that shows it.
+//! The terminal is a PTY: `trawl` sees a TTY on stderr, and on stdout
+//! unless the case pipes it. The test reads the master until the last
+//! slave end closes, drains a piped stdout on its own thread meanwhile,
+//! then reaps the child. Nothing sleeps or polls; the timeout is a hang
+//! guard only. Captured text reaches an assertion message escaped, so a
+//! failing run cannot drive the terminal that shows it.
 
 mod common;
 
@@ -29,6 +30,7 @@ use nix::errno::Errno;
 use nix::pty::Winsize;
 use serde_json::{Map, Value};
 use trawl_api::IngestResponse;
+use trawl_core::sanitize::is_unsafe_display_char;
 
 use common::Server;
 use common::mcp::loader_path;
@@ -47,10 +49,18 @@ const QUERY: &str = "service=term_probe";
 const VALUE_FIELD: &str = "term_payload";
 const HOSTILE_VALUE: &str = "pre\u{1b}]52;c;aGk=\u{7}mid\u{1b}[2J\u{9b}31m\u{202e}post";
 
-/// A field name a sender chose, as sent and as the catalog stores it.
+/// [`HOSTILE_VALUE`] as a table cell and a terminal csv field show it:
+/// U+FFFD for each control and the bidi override, one for one.
+const HOSTILE_VALUE_SHOWN: &str =
+    "pre\u{fffd}]52;c;aGk=\u{fffd}mid\u{fffd}[2J\u{fffd}31m\u{fffd}post";
+
+/// A field name a sender chose: as sent, as the catalog stores it, and as
+/// a terminal shows it.
+#[derive(Clone, Copy)]
 struct HostileName {
     sent: &'static str,
     stored: &'static str,
+    shown: &'static str,
 }
 
 /// Ingest folds a name's ASCII uppercase to lowercase and keeps every
@@ -59,18 +69,22 @@ const HOSTILE_NAMES: [HostileName; 4] = [
     HostileName {
         sent: "esc\u{1b}[2Jname",
         stored: "esc\u{1b}[2jname",
+        shown: "esc\u{fffd}[2jname",
     },
     HostileName {
         sent: "bidi\u{202e}name",
         stored: "bidi\u{202e}name",
+        shown: "bidi\u{fffd}name",
     },
     HostileName {
         sent: "esc\u{1b}[8mname",
         stored: "esc\u{1b}[8mname",
+        shown: "esc\u{fffd}[8mname",
     },
     HostileName {
         sent: "osc\u{1b}]0;x\u{7}name",
         stored: "osc\u{1b}]0;x\u{7}name",
+        shown: "osc\u{fffd}]0;x\u{fffd}name",
     },
 ];
 
@@ -78,7 +92,7 @@ const HOSTILE_NAMES: [HostileName; 4] = [
 const NAMED_VALUE: &str = "named field";
 
 /// The hostile name `trawl schema field` looks up.
-const LOOKED_UP: &str = HOSTILE_NAMES[2].stored;
+const LOOKED_UP: HostileName = HOSTILE_NAMES[2];
 
 // ---------------------------------------------------------------------------
 // The client
@@ -132,23 +146,31 @@ impl Client {
             .expect("spawn trawl")
     }
 
+    /// `args` with stderr on a PTY and stdout where `stdout` says, to a
+    /// successful exit.
+    async fn run_on_pty(&self, args: &[&str], stdout: StdoutTo) -> PtyRun {
+        let cmd = self.command(args);
+        let run = tokio::time::timeout(
+            DEADLINE,
+            tokio::task::spawn_blocking(move || on_pty(cmd, stdout)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("trawl {args:?} on a PTY did not finish within {DEADLINE:?}"))
+        .expect("the PTY task");
+        assert!(
+            run.status.success(),
+            "trawl {args:?} on a PTY exited {}:\nterminal:\n{}\npiped stdout:\n{}",
+            run.status,
+            run.terminal.escape_debug(),
+            String::from_utf8_lossy(&run.stdout).escape_debug()
+        );
+        run
+    }
+
     /// `args` with stdout and stderr on a PTY; the terminal's text once
     /// the run succeeded.
     async fn on_pty(&self, args: &[&str]) -> String {
-        let cmd = self.command(args);
-        let (status, text) =
-            tokio::time::timeout(DEADLINE, tokio::task::spawn_blocking(move || on_pty(cmd)))
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("trawl {args:?} on a PTY did not finish within {DEADLINE:?}")
-                })
-                .expect("the PTY task");
-        assert!(
-            status.success(),
-            "trawl {args:?} on a PTY exited {status}:\n{}",
-            text.escape_debug()
-        );
-        text
+        self.run_on_pty(args, StdoutTo::Pty).await.terminal
     }
 
     async fn query_on_pty(&self, format: &str) -> String {
@@ -162,13 +184,37 @@ impl Client {
     async fn schema_field_on_pty(&self, name: &str) -> String {
         self.on_pty(&["schema", "field", name]).await
     }
+
+    /// `schema field <name> -f json` with stdout on a pipe, so its labels
+    /// go to stderr, which stays on the PTY.
+    async fn schema_field_json_labels_on_pty(&self, name: &str) -> PtyRun {
+        self.run_on_pty(&["schema", "field", name, "-f", "json"], StdoutTo::Pipe)
+            .await
+    }
 }
 
-/// Run `cmd` with stdout and stderr on the slave side of a fresh PTY, read
-/// the master to EOF, then reap the child. Returns the exit status and the
-/// output, with the `\r\n` the line discipline's ONLCR writes for each
-/// `\n` folded back.
-fn on_pty(mut cmd: std::process::Command) -> (ExitStatus, String) {
+/// Where a PTY run sends the child's stdout. Its stderr is always the PTY.
+#[derive(Clone, Copy)]
+enum StdoutTo {
+    Pty,
+    Pipe,
+}
+
+/// A finished PTY run.
+struct PtyRun {
+    status: ExitStatus,
+    /// What the PTY showed, with the `\r\n` the line discipline's ONLCR
+    /// writes for each `\n` folded back.
+    terminal: String,
+    /// A piped stdout's bytes; empty when stdout was the PTY.
+    stdout: Vec<u8>,
+}
+
+/// Run `cmd` with stderr, and stdout unless `stdout` pipes it, on the slave
+/// side of a fresh PTY. Read the master to EOF while a piped stdout drains
+/// on its own thread, so neither stream can fill and stall the child, then
+/// reap the child.
+fn on_pty(mut cmd: std::process::Command, stdout: StdoutTo) -> PtyRun {
     let size = Winsize {
         ws_row: 50,
         ws_col: 400,
@@ -177,16 +223,26 @@ fn on_pty(mut cmd: std::process::Command) -> (ExitStatus, String) {
     };
     let pty = nix::pty::openpty(Some(&size), None).expect("open a PTY");
     // openpty's descriptors are inheritable and their duplicates are
-    // close-on-exec, so the child gets the slave as stdout and stderr and
-    // no other end of the PTY.
+    // close-on-exec, so the child gets the slave as its terminal streams
+    // and no other end of the PTY.
     let mut master = std::fs::File::from(pty.master.try_clone().expect("dup the master"));
-    cmd.stdout(Stdio::from(pty.slave.try_clone().expect("dup the slave")))
-        .stderr(Stdio::from(pty.slave.try_clone().expect("dup the slave")));
+    let slave = || Stdio::from(pty.slave.try_clone().expect("dup the slave"));
+    match stdout {
+        StdoutTo::Pty => cmd.stdout(slave()),
+        StdoutTo::Pipe => cmd.stdout(Stdio::piped()),
+    };
+    cmd.stderr(slave());
     drop(pty);
     let mut child = cmd.spawn().expect("spawn trawl");
     // The command holds the parent's slave ends; the master reads EOF only
     // once the child's are the last ones.
     drop(cmd);
+    let piped = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).map(|_| bytes)
+        })
+    });
     let mut bytes = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -199,6 +255,12 @@ fn on_pty(mut cmd: std::process::Command) -> (ExitStatus, String) {
             Err(e) => panic!("read the PTY master: {e}"),
         }
     }
+    let stdout = piped.map_or_else(Vec::new, |reader| {
+        reader
+            .join()
+            .expect("the stdout reader")
+            .expect("read trawl's stdout")
+    });
     let status = child.wait().expect("reap trawl");
     let text = String::from_utf8(bytes).unwrap_or_else(|e| {
         panic!(
@@ -206,7 +268,11 @@ fn on_pty(mut cmd: std::process::Command) -> (ExitStatus, String) {
             String::from_utf8_lossy(e.as_bytes()).escape_debug()
         )
     });
-    (status, text.replace("\r\n", "\n"))
+    PtyRun {
+        status,
+        terminal: text.replace("\r\n", "\n"),
+        stdout,
+    }
 }
 
 fn describe(output: &Output) -> String {
@@ -276,6 +342,48 @@ fn csv_records(text: &str) -> Vec<Vec<String>> {
     records
 }
 
+/// The cells of each row of a drawn table, the header first.
+///
+/// A row is the run of lines that open with the table's left border, and
+/// a cell is the text between two vertical lines. comfy-table sizes the
+/// table to the terminal it finds, which is the developer's own when the
+/// test runs from one, so a cell may wrap: its pieces are joined without
+/// their padding. That restores any text without spaces, which is all
+/// this test compares.
+fn table_rows(text: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        let Some(inner) = line
+            .strip_prefix('│')
+            .and_then(|line| line.strip_suffix('│'))
+        else {
+            if !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+            }
+            continue;
+        };
+        for (i, piece) in inner.split(['│', '┆']).enumerate() {
+            if i == row.len() {
+                row.push(String::new());
+            }
+            row[i].push_str(piece.trim());
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// The index of the column `header` names.
+fn column(header: &[String], name: &str) -> usize {
+    header
+        .iter()
+        .position(|column| column == name)
+        .unwrap_or_else(|| panic!("no {name:?} column in {header:?}"))
+}
+
 // ---------------------------------------------------------------------------
 // Checks
 // ---------------------------------------------------------------------------
@@ -307,7 +415,8 @@ async fn assert_names_stored(client: &Client, ingest: &IngestResponse) {
 }
 
 /// In a pipe, `-f json` decodes to the stored names and the sent values.
-async fn assert_pipe_json_exact(client: &Client) {
+/// Returns its rows.
+async fn assert_pipe_json_exact(client: &Client) -> Vec<Map<String, Value>> {
     let output = client.piped(&["query", QUERY, "-f", "json"]).await;
     assert!(output.status.success(), "{}", describe(&output));
     let rows = ndjson_rows(&output.stdout);
@@ -326,32 +435,28 @@ async fn assert_pipe_json_exact(client: &Client) {
             name.stored
         );
     }
+    rows
 }
 
 /// `-f csv -o <file>` with stdout on a PTY writes the hostile names and
 /// value bare: none holds a character CSV quotes, and none starts with a
-/// formula trigger.
+/// formula trigger. The file is data, and the terminal gets no control.
 async fn assert_csv_file_exact(client: &Client) {
     let path = client.home.path().join("out.csv");
     let path_arg = path.to_str().expect("utf-8 path");
-    client
+    let terminal = client
         .on_pty(&["query", QUERY, "-f", "csv", "-o", path_arg])
         .await;
+    assert_no_terminal_control("query -f csv -o", &terminal);
     let text =
         String::from_utf8(std::fs::read(&path).expect("read the CSV file")).expect("utf-8 CSV");
     assert!(text.contains(HOSTILE_VALUE), "{}", text.escape_debug());
     let records = csv_records(&text);
     assert_eq!(records.len(), 2, "{}", text.escape_debug());
     let (header, row) = (&records[0], &records[1]);
-    let at = |name: &str| {
-        header
-            .iter()
-            .position(|column| column == name)
-            .unwrap_or_else(|| panic!("no {name:?} column in {header:?}"))
-    };
-    assert_eq!(row[at(VALUE_FIELD)], HOSTILE_VALUE, "{row:?}");
+    assert_eq!(row[column(header, VALUE_FIELD)], HOSTILE_VALUE, "{row:?}");
     for name in &HOSTILE_NAMES {
-        assert_eq!(row[at(name.stored)], NAMED_VALUE, "{row:?}");
+        assert_eq!(row[column(header, name.stored)], NAMED_VALUE, "{row:?}");
     }
 }
 
@@ -363,13 +468,184 @@ fn assert_mentions(what: &str, text: &str, marker: &str) {
     );
 }
 
+/// Whether `c` can drive or rewrite a terminal: every C0 and C1 control
+/// (ESC, BEL and the C1 CSI among them), the bidi override, and the rest
+/// of what the sanitize rule names. The first two are spelled out so the
+/// check does not rest on the rule it checks.
+fn is_terminal_control(c: char) -> bool {
+    c.is_control() || c == '\u{202e}' || is_unsafe_display_char(c)
+}
+
+/// `text`, as a PTY showed it, holds no terminal control but the line
+/// breaks the command writes as framing: table and prose lines, csv and
+/// ndjson record ends. It is read as characters, because 0x9B, the C1 CSI
+/// as a byte, is also a UTF-8 continuation byte.
+fn assert_no_terminal_control(what: &str, text: &str) {
+    let found: Vec<String> = text
+        .split('\n')
+        .enumerate()
+        .flat_map(|(n, line)| {
+            line.chars()
+                .filter(|&c| is_terminal_control(c))
+                .map(move |c| format!("{c:?} on line {}: {}", n + 1, line.escape_debug()))
+        })
+        .collect();
+    assert!(
+        found.is_empty(),
+        "{what} on a PTY wrote terminal control:\n{}",
+        found.join("\n")
+    );
+}
+
+/// The terminal shows `name` through the `schema field` label, U+FFFD in
+/// place of its controls.
+fn assert_field_label(what: &str, text: &str, name: HostileName) {
+    assert!(
+        text.split('\n').any(|line| line
+            .strip_prefix("field:")
+            .is_some_and(|rest| rest.trim() == name.shown)),
+        "{what} on a PTY has no `field:` label showing {:?}:\n{}",
+        name.shown,
+        text.escape_debug()
+    );
+}
+
+/// The table holds U+FFFD for each control: in the header, every hostile
+/// name, and in the payload cell, the value.
+async fn assert_terminal_table(client: &Client) {
+    let text = client.query_on_pty("table").await;
+    assert_no_terminal_control("query -f table", &text);
+    assert_mentions("query -f table", &text, "1 row(s)");
+    let rows = table_rows(&text);
+    let [header, row] = rows.as_slice() else {
+        panic!(
+            "query -f table on a PTY drew {} rows, not a header and one row:\n{}",
+            rows.len(),
+            text.escape_debug()
+        );
+    };
+    assert_eq!(
+        row[column(header, VALUE_FIELD)],
+        HOSTILE_VALUE_SHOWN,
+        "{row:?}"
+    );
+    for name in &HOSTILE_NAMES {
+        assert!(
+            header.iter().any(|column| column == name.shown),
+            "query -f table on a PTY has no {:?} column: {header:?}",
+            name.shown
+        );
+    }
+}
+
+/// Terminal json escapes each control instead of replacing it, so every
+/// line decodes to the piped rows: the stored names as keys, the sent value
+/// unchanged.
+async fn assert_terminal_json(client: &Client, piped: &[Map<String, Value>]) {
+    let text = client.query_on_pty("json").await;
+    assert_no_terminal_control("query -f json", &text);
+    for escape in [r"\u001b", r"\u0007", r"\u009b", r"\u202e"] {
+        assert_mentions("query -f json", &text, escape);
+    }
+    assert_eq!(
+        ndjson_rows(text.as_bytes()),
+        piped,
+        "query -f json on a PTY decodes to other rows than in a pipe"
+    );
+}
+
+/// Terminal csv holds U+FFFD for each control, in the header names and the
+/// payload field.
+async fn assert_terminal_csv(client: &Client) {
+    let text = client.query_on_pty("csv").await;
+    assert_no_terminal_control("query -f csv", &text);
+    let records = csv_records(&text);
+    assert_eq!(records.len(), 2, "{}", text.escape_debug());
+    let (header, row) = (&records[0], &records[1]);
+    assert_eq!(row[column(header, "service")], SERVICE, "{row:?}");
+    assert_eq!(
+        row[column(header, VALUE_FIELD)],
+        HOSTILE_VALUE_SHOWN,
+        "{row:?}"
+    );
+    for name in &HOSTILE_NAMES {
+        assert_eq!(row[column(header, name.shown)], NAMED_VALUE, "{row:?}");
+    }
+}
+
+/// The `schema fields` table lists every hostile name with U+FFFD for each
+/// control.
+async fn assert_terminal_schema_fields(client: &Client) {
+    let text = client.schema_fields_on_pty().await;
+    assert_no_terminal_control("schema fields", &text);
+    assert_mentions("schema fields", &text, "pins used");
+    let rows = table_rows(&text);
+    let (header, rows) = rows.split_first().unwrap_or_else(|| {
+        panic!(
+            "schema fields on a PTY drew no table:\n{}",
+            text.escape_debug()
+        )
+    });
+    let at = column(header, "field");
+    let listed: Vec<&str> = rows.iter().map(|row| row[at].as_str()).collect();
+    for name in &HOSTILE_NAMES {
+        assert!(
+            listed.contains(&name.shown),
+            "schema fields on a PTY does not list {:?}: {listed:?}",
+            name.shown
+        );
+    }
+    assert!(listed.contains(&VALUE_FIELD), "{listed:?}");
+}
+
+/// `schema field <name>` shows the name in its label on stdout and lists
+/// the service that sent it.
+async fn assert_terminal_schema_field(client: &Client) {
+    let text = client.schema_field_on_pty(LOOKED_UP.stored).await;
+    assert_no_terminal_control("schema field", &text);
+    assert_field_label("schema field", &text, LOOKED_UP);
+    let rows = table_rows(&text);
+    let (header, rows) = rows.split_first().unwrap_or_else(|| {
+        panic!(
+            "schema field on a PTY drew no services table:\n{}",
+            text.escape_debug()
+        )
+    });
+    let at = column(header, "service");
+    assert!(
+        rows.iter().any(|row| row[at] == SERVICE),
+        "schema field on a PTY does not list service {SERVICE:?}: {rows:?}"
+    );
+}
+
+/// With `-f json` and stdout on a pipe, `schema field` writes its labels to
+/// stderr, which stays on the PTY: the name shows there with U+FFFD for
+/// each control, and the services go to the pipe.
+async fn assert_schema_labels_on_stderr(client: &Client) {
+    let run = client
+        .schema_field_json_labels_on_pty(LOOKED_UP.stored)
+        .await;
+    let what = "schema field -f json's stderr";
+    assert_no_terminal_control(what, &run.terminal);
+    assert_field_label(what, &run.terminal, LOOKED_UP);
+    let services = ndjson_rows(&run.stdout);
+    assert!(
+        services
+            .iter()
+            .any(|row| row.get("service").and_then(Value::as_str) == Some(SERVICE)),
+        "schema field -f json piped no {SERVICE:?} row: {services:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Case
 // ---------------------------------------------------------------------------
 
-/// A sender's hostile field names and value reach the catalog, the data
-/// formats keep them exact in a pipe and in a file, and every terminal
-/// command that shows them runs to success on a PTY.
+/// A sender's hostile field names and value reach the catalog, and the
+/// data formats keep them exact in a pipe and in a file. On a PTY, `query`
+/// in every format and both `schema` views write no terminal control: the
+/// table, csv and schema views show U+FFFD in its place, and json escapes
+/// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_terminal_sinks_reach_no_terminal_control() {
     let server = Server::start(true).await;
@@ -383,19 +659,15 @@ async fn cli_terminal_sinks_reach_no_terminal_control() {
     let client = Client::new(&server);
 
     assert_names_stored(&client, &ingest).await;
-    assert_pipe_json_exact(&client).await;
+    let piped = assert_pipe_json_exact(&client).await;
     assert_csv_file_exact(&client).await;
 
-    let table = client.query_on_pty("table").await;
-    assert_mentions("query -f table", &table, "1 row(s)");
-    let json = client.query_on_pty("json").await;
-    assert_mentions("query -f json", &json, SERVICE);
-    let csv = client.query_on_pty("csv").await;
-    assert_mentions("query -f csv", &csv, SERVICE);
-    let fields = client.schema_fields_on_pty().await;
-    assert_mentions("schema fields", &fields, "pins used");
-    let field = client.schema_field_on_pty(LOOKED_UP).await;
-    assert_mentions("schema field", &field, SERVICE);
+    assert_terminal_table(&client).await;
+    assert_terminal_json(&client, &piped).await;
+    assert_terminal_csv(&client).await;
+    assert_terminal_schema_fields(&client).await;
+    assert_terminal_schema_field(&client).await;
+    assert_schema_labels_on_stderr(&client).await;
 
     server.stop().await;
 }
