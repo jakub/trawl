@@ -705,7 +705,13 @@ impl CaptureGate {
                     errors,
                     "due results retired at a capture reservation"
                 ),
-                Err(error) => warn_retire(what, "unlinking retired results' files", &error),
+                // A panicked task's JoinError quotes the panic's payload in
+                // its Display; the fixed text drops it unread.
+                Err(error) => warn_retire(
+                    what,
+                    "unlinking retired results' files",
+                    &crate::error::join_failure_text("results retire unlink", error),
+                ),
             }
         });
     }

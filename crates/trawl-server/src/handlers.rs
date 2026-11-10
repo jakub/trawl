@@ -3360,17 +3360,27 @@ pub async fn get_report_run(
                 );
             }
             Ok(Err(e)) => {
-                tracing::warn!(
+                // The engine's text can quote DuckDB's diagnostics.
+                tracing::debug!(
                     event_type = "report_run_parquet_read_failed",
                     run_id,
                     path = %file.absolute_path.display(),
                     error = %e,
                     "failed to read the stored parquet result"
                 );
+                let err = ServerError::Engine(e);
+                tracing::warn!(
+                    event_type = "report_run_parquet_read_failed",
+                    run_id,
+                    path = %file.absolute_path.display(),
+                    error_class = err.error_class(),
+                    cause_kind = err.cause_kind().as_str(),
+                    "failed to read the stored parquet result"
+                );
                 // The delete may have landed while the read was in flight.
                 return Err(
                     crate::from_saved::unavailable_run_conflict(std::slice::from_ref(&file))
-                        .unwrap_or(ServerError::Engine(e)),
+                        .unwrap_or(err),
                 );
             }
             Err(e) => {

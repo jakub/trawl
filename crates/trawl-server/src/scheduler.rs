@@ -975,9 +975,17 @@ pub(crate) fn decode_result_blob(blob: Option<Vec<u8>>) -> Option<trawl_api::val
     let compressed = blob?;
     let decompressed = zstd::decode_all(compressed.as_slice())
         .inspect_err(|e| {
-            tracing::warn!(
+            // The io::Error carries zstd's codec wording, not an I/O
+            // failure, so no io cause covers it.
+            tracing::debug!(
                 event_type = "run_result_blob_zstd_decode_failed",
                 error = %e,
+                "failed to zstd-decode a report run's result blob"
+            );
+            tracing::warn!(
+                event_type = "run_result_blob_zstd_decode_failed",
+                error_class = "internal",
+                cause_kind = CauseKind::Unknown.as_str(),
                 "failed to zstd-decode a report run's result blob"
             );
         })
