@@ -6727,6 +6727,7 @@ dependencies = [
  "trawl-mcp",
  "trawl-server",
  "trawl-web",
+ "unicode-segmentation",
  "unicode-width",
  "url",
  "x509-parser",

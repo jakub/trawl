@@ -4,6 +4,8 @@
 
 //! Command palette overlay rendering.
 
+use std::collections::HashSet;
+
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Modifier, Style};
@@ -18,6 +20,7 @@ use crate::tui::state::Popup;
 use crate::tui::theme::Theme;
 use trawl_core::sanitize::sanitize_display_text;
 use trawl_core::text_layout::{cells, fit_cells};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::common::centered_rect;
 
@@ -282,24 +285,27 @@ fn render_item_line<'a>(
 
     spans.push(Span::raw("  "));
 
-    // Label with match highlighting. The replacement is one character for
-    // one, so a match position indexes the drawn label as it did the raw one.
+    // Label with match highlighting, one span per grapheme cluster, so a
+    // combining mark stays with its base. The replacement is one character
+    // for one, so a character index into the raw label indexes the drawn one.
     let label = sanitize_display_text(&item.label);
     let label_cells = cells(&label);
     if match_positions.is_empty() {
         spans.push(Span::styled(label, Style::default().fg(theme.text_primary)));
     } else {
-        for (i, ch) in label.chars().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
-            let is_match = match_positions.contains(&(i as u32));
-            let style = if is_match {
+        let matched = matched_chars(&item.label, match_positions);
+        let mut start = 0;
+        for cluster in label.graphemes(true) {
+            let end = start + cluster.chars().count();
+            let style = if (start..end).any(|i| matched.contains(&i)) {
                 Style::default()
                     .fg(theme.text_accent)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.text_primary)
             };
-            spans.push(Span::styled(String::from(ch), style));
+            spans.push(Span::styled(cluster.to_owned(), style));
+            start = end;
         }
     }
 
@@ -324,6 +330,32 @@ fn render_item_line<'a>(
     }
 
     Line::from(spans)
+}
+
+/// The character indices of the raw `label` that the matcher's
+/// `positions` matched.
+///
+/// nucleo-matcher 0.3.1 does not report character indices. It matches an
+/// ASCII label byte by byte, so a position there is a byte, which is a
+/// character. Any other label it matches one extended grapheme cluster at
+/// a time, so a position is a cluster's index, and every character of that
+/// cluster is matched.
+fn matched_chars(label: &str, positions: &[u32]) -> HashSet<usize> {
+    let positions = positions.iter().filter_map(|&p| usize::try_from(p).ok());
+    if label.is_ascii() {
+        return positions.collect();
+    }
+    let positions: HashSet<usize> = positions.collect();
+    let mut matched = HashSet::new();
+    let mut start = 0;
+    for (index, cluster) in label.graphemes(true).enumerate() {
+        let end = start + cluster.chars().count();
+        if positions.contains(&index) {
+            matched.extend(start..end);
+        }
+        start = end;
+    }
+    matched
 }
 
 /// Render a detail line (indented, dimmed), fitted to `width` display cells.
@@ -467,8 +499,8 @@ mod sender_text_tests {
         let items = hostile_items();
         let before = format!("{items:?}");
 
-        // Matched: the label is drawn one span per character, and the
-        // positions index the raw label.
+        // Matched: the label is drawn one span per grapheme cluster, and
+        // the positions index the raw label.
         let filtered = refilter("pqlab", &items);
         assert_eq!(filtered.len(), 1, "{filtered:?}");
         assert_eq!(filtered[0].item_index, 0);
@@ -687,5 +719,98 @@ mod unicode_tests {
         for row in detail_rows {
             assert!(row.contains(MARKER), "{row:?} lost its marker:\n{screen}");
         }
+    }
+
+    /// Draw `label` matched against `query` as the palette draws a matched
+    /// item, and return each of the first eight cells' symbol and whether
+    /// it carries the match style.
+    fn marks(label: &str, query: &str) -> Vec<(String, bool)> {
+        let item = PaletteItem {
+            label: label.to_owned(),
+            detail: None,
+            category: PaletteCategory::Action,
+            shortcut: None,
+            action: PaletteAction::LoadQuery(String::new()),
+        };
+        let filtered = crate::tui::palette::refilter(query, std::slice::from_ref(&item));
+        assert_eq!(filtered.len(), 1, "{query:?} matches {label:?}");
+        let theme = test_app().theme;
+        let line = render_item_line(&item, &filtered[0].match_positions, &theme, 8);
+        let mut terminal = Terminal::new(TestBackend::new(8, 1)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(line), frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..8)
+            .map(|x| {
+                let cell = &buffer[(x, 0)];
+                let marked = cell.fg == theme.text_accent && cell.modifier.contains(Modifier::BOLD);
+                (cell.symbol().to_owned(), marked)
+            })
+            .collect()
+    }
+
+    /// `symbols` with their marks, then unmarked spaces to eight cells.
+    fn padded(symbols: &[(&str, bool)]) -> Vec<(String, bool)> {
+        let mut row: Vec<(String, bool)> =
+            symbols.iter().map(|&(s, m)| (s.to_owned(), m)).collect();
+        row.resize(8, (" ".to_owned(), false));
+        row
+    }
+
+    /// nucleo-matcher reports a non-ASCII label's match positions by
+    /// grapheme cluster, so the `x` of `e\u{301}x` is position 1, which
+    /// is the accent's character index. The `x` is marked, the accent's
+    /// cluster is not.
+    #[test]
+    fn palette_marks_the_cluster_after_a_combining_mark() {
+        assert_eq!(
+            marks("e\u{301}x", "x"),
+            padded(&[(" ", false), (" ", false), ("e\u{301}", false), ("x", true)])
+        );
+    }
+
+    /// A match on `e\u{301}` styles the whole cluster in one cell, and the
+    /// next cell keeps the plain style.
+    #[test]
+    fn palette_marks_a_matched_cluster_whole() {
+        assert_eq!(
+            marks("e\u{301}x", "e"),
+            padded(&[(" ", false), (" ", false), ("e\u{301}", true), ("x", false)])
+        );
+    }
+
+    /// An ASCII label's positions are its bytes.
+    #[test]
+    fn palette_marks_ascii_matches() {
+        assert_eq!(
+            marks("abc", "b"),
+            padded(&[
+                (" ", false),
+                (" ", false),
+                ("a", false),
+                ("b", true),
+                ("c", false)
+            ])
+        );
+    }
+
+    /// U+200D extends the cluster of the `a` before it in the raw label,
+    /// so the matcher counts `a\u{200d}` as one position. It draws as
+    /// U+FFFD, a cluster of its own, and the marks after it stay on the
+    /// characters that matched.
+    #[test]
+    fn palette_marks_stay_put_after_a_replaced_character() {
+        assert_eq!(
+            marks("a\u{200d}bc", "c"),
+            padded(&[
+                (" ", false),
+                (" ", false),
+                ("a", false),
+                ("\u{fffd}", false),
+                ("b", false),
+                ("c", true),
+            ])
+        );
     }
 }
