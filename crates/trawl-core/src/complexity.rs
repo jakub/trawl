@@ -100,6 +100,12 @@
 //! emitter charges that copy ([`pivot_aggregate_regex`]) when the fill
 //! takes its first name.
 //!
+//! # Field lists
+//!
+//! A `sort` or `dedup` stage has no output sequence, but the kv tail keys
+//! and compares one slot per field it names, so [`MAX_STAGE_FIELDS`] caps
+//! how many names one such stage may write.
+//!
 //! # What it does not bound
 //!
 //! Multiplication that no alias reference feeds — `x in (1,…,1000)` over an
@@ -141,6 +147,15 @@ pub const MAX_LATERAL_EXPANSION: u64 = 512;
 /// the executor later peels off to run in Rust — the search stage is not a
 /// pipeline stage and carries no same-stage aliases.
 pub const MAX_PIPELINE_STAGES: usize = 128;
+
+/// The most fields one `sort` or `dedup` stage may name (ADR-0024,
+/// Amendment 2026-11-09).
+///
+/// Every written name counts, repeats included: the kv tail's exact dedup
+/// keeps one key slot per written field for each distinct key, and its
+/// sort compares every written field, so a repeated name costs what a new
+/// one does. A bare `dedup` names none.
+pub const MAX_STAGE_FIELDS: usize = 64;
 
 /// The most times `DuckDB` binds a `pivot`'s aggregate for its values:
 /// `DuckDB`'s default `pivot_filter_threshold`, which trawl never sets. A
@@ -784,6 +799,8 @@ pub enum Limit {
     Lateral,
     /// [`MAX_PIPELINE_STAGES`], with the stage count the query carried.
     Stages(usize),
+    /// [`MAX_STAGE_FIELDS`], with the field count the stage wrote.
+    Fields(usize),
 }
 
 /// A query the expansion budget refuses, and the one sentence that says so.
@@ -833,6 +850,13 @@ impl fmt::Display for ComplexityRefusal {
                 "this query has {count} pipeline stages, over the limit of \
                  {MAX_PIPELINE_STAGES}; shorten the pipeline, or save part of it and read it \
                  back with `from saved`"
+            ),
+            Limit::Fields(count) => write!(
+                f,
+                "pipeline stage {} (`{}`) names {count} fields, over the limit of \
+                 {MAX_STAGE_FIELDS} for one `sort` or `dedup` stage",
+                self.stage_index + 1,
+                self.stage
             ),
             Limit::Lateral => {
                 let stage = self.stage;
@@ -908,8 +932,10 @@ pub struct CheckStats {
 /// # Errors
 ///
 /// [`ComplexityRefusal`] when the pipeline carries more than
-/// [`MAX_PIPELINE_STAGES`] stages, or when its assignment deltas sum past
-/// [`MAX_LATERAL_EXPANSION`].
+/// [`MAX_PIPELINE_STAGES`] stages, when one `sort` or `dedup` stage names
+/// more than [`MAX_STAGE_FIELDS`] fields, or when its assignment deltas
+/// sum past [`MAX_LATERAL_EXPANSION`]. After the stage cap, the first
+/// offending stage decides which.
 pub fn check_pipeline_complexity(stages: &[Spanned<PipeStage>]) -> Result<(), ComplexityRefusal> {
     check_pipeline_complexity_with_stats(stages).0
 }
@@ -956,7 +982,8 @@ pub fn check_pipeline_complexity_with_stats(
 /// alias — one node, nothing substituted.
 type Memo = HashMap<String, Weight>;
 
-/// Walk one stage's ordered outputs, charging each one's delta.
+/// Walk one stage's ordered outputs, charging each one's delta, and
+/// hold a `sort` or `dedup` field list to [`MAX_STAGE_FIELDS`].
 ///
 /// The match is exhaustive with no wildcard arm: a new stage variant must
 /// state whether it has a recursive output-alias sequence before it can
@@ -1020,17 +1047,37 @@ fn score_stage(
             // One fixed source for the whole stage.
             ExtractMode::KeyValue { .. } => {}
         },
+        // No output sequence, but a field list the kv tail keys and
+        // compares once per written name.
+        PipeStage::Sort(s) => check_field_list(index, keyword, s.fields.len())?,
+        PipeStage::Dedup(d) => check_field_list(index, keyword, d.fields.len())?,
         PipeStage::Where(_)
-        | PipeStage::Sort(_)
         | PipeStage::Limit(_)
         | PipeStage::Table(_)
         | PipeStage::Top(_)
         | PipeStage::Rare(_)
         | PipeStage::Drop(_)
-        | PipeStage::Dedup(_)
         | PipeStage::Tail(_)
         | PipeStage::Sample(_)
         | PipeStage::FromSaved(_) => {}
+    }
+    Ok(())
+}
+
+/// Refuse a `sort` or `dedup` stage that names more than
+/// [`MAX_STAGE_FIELDS`] fields.
+fn check_field_list(
+    index: usize,
+    keyword: &'static str,
+    count: usize,
+) -> Result<(), ComplexityRefusal> {
+    if count > MAX_STAGE_FIELDS {
+        return Err(ComplexityRefusal {
+            stage_index: index,
+            stage: keyword,
+            target: None,
+            limit: Limit::Fields(count),
+        });
     }
     Ok(())
 }
@@ -1945,6 +1992,108 @@ mod tests {
     fn from_saved_counts_toward_the_stage_cap() {
         let dsl = format!("| from saved daily{}", " | head 1".repeat(128));
         assert!(matches!(refusal(&dsl).limit, Limit::Stages(129)));
+    }
+
+    // ── the field-list width ──────────────────────────────────────────
+
+    /// `count` written field names, distinct or all one name.
+    fn field_list(count: usize, distinct: bool) -> String {
+        (0..count)
+            .map(|i| {
+                if distinct {
+                    format!("f{i}")
+                } else {
+                    "f".to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The SQL door's refusal text, without the emitter's own prefix.
+    fn sql_door(dsl: &str) -> Result<(), String> {
+        crate::emitter::validate_pipeline(&pipeline(dsl)).map_err(|e| {
+            e.to_string()
+                .strip_prefix("unsupported operation: ")
+                .unwrap_or_else(|| panic!("{dsl}: the emitter's prefix is missing"))
+                .to_string()
+        })
+    }
+
+    fn stream_door(dsl: &str) -> Result<(), crate::stream::StreamPlanError> {
+        crate::stream::compile_stream_plan(
+            &pipeline(dsl),
+            &crate::pin_scope::PinScope::unpinned(),
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// One `sort` or `dedup` stage names at most [`MAX_STAGE_FIELDS`]
+    /// fields, every written name counted, and both doors carry the one
+    /// sentence. The stream door refuses every `sort` for being a sort,
+    /// so an admitted wide sort there gets that refusal, never this one.
+    #[test]
+    fn field_list_width_is_shared_admission() {
+        use crate::stream::StreamPlanError;
+
+        for distinct in [true, false] {
+            for prefix in ["*", "* | extract kv"] {
+                let n = if prefix == "*" { 1 } else { 2 };
+                for stage in ["sort", "dedup"] {
+                    let at = format!("{prefix} | {stage} {}", field_list(64, distinct));
+                    check(&at).unwrap_or_else(|r| panic!("{at}: {r}"));
+                    sql_door(&at).unwrap_or_else(|r| panic!("{at}: {r}"));
+                    match stream_door(&at) {
+                        Ok(()) => assert_eq!(stage, "dedup", "{at}: sort streamed"),
+                        Err(StreamPlanError::UnsupportedStage { stage: s, .. }) => {
+                            assert_eq!(s, "sort", "{at}");
+                        }
+                        Err(other) => panic!("{at}: {other}"),
+                    }
+
+                    let over = format!("{prefix} | {stage} {}", field_list(65, distinct));
+                    let refused = refusal(&over);
+                    assert_eq!(refused.limit, Limit::Fields(65), "{over}");
+                    assert_eq!(refused.stage, stage, "{over}");
+                    assert_eq!(refused.target, None, "{over}");
+                    let sentence = refused.to_string();
+                    assert_eq!(
+                        sentence,
+                        format!(
+                            "pipeline stage {n} (`{stage}`) names 65 fields, over the limit \
+                             of 64 for one `sort` or `dedup` stage"
+                        )
+                    );
+                    assert_eq!(sql_door(&over), Err(sentence.clone()), "{over}");
+                    match stream_door(&over) {
+                        Err(StreamPlanError::TooComplex(text)) => {
+                            assert_eq!(text, sentence, "{over}");
+                        }
+                        other => panic!("{over}: {other:?}"),
+                    }
+                }
+            }
+        }
+
+        // A bare dedup names no field.
+        check("* | dedup").expect("bare dedup is admitted");
+        sql_door("* | dedup").expect("bare dedup is admitted by the SQL door");
+        stream_door("* | dedup").expect("bare dedup streams");
+
+        let wide = format!("* | dedup {}", field_list(65, true));
+        // The stage cap wins over a wide first stage.
+        let long = format!("{wide}{}", " | head 1".repeat(MAX_PIPELINE_STAGES));
+        assert!(matches!(refusal(&long).limit, Limit::Stages(129)));
+        // Otherwise the first offending stage wins, whichever limit it is.
+        let lateral = format!(
+            "* | let x = abs(y), z = coalesce({})",
+            vec!["x"; 513].join(", ")
+        );
+        let lateral_first = format!("{lateral}{}", wide.trim_start_matches('*'));
+        assert_eq!(refusal(&lateral_first).limit, Limit::Lateral);
+        let wide_first = format!("{wide}{}", lateral.trim_start_matches('*'));
+        assert_eq!(refusal(&wide_first).limit, Limit::Fields(65));
     }
 
     // ── the alias table ───────────────────────────────────────────────
