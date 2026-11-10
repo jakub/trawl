@@ -1591,19 +1591,37 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
     assert_eq!(written_by(&activity, &keys.operator), [6]);
     assert_eq!((activity.through_seq, activity.more), (7, false));
 
+    // A finding status from 0 also answers only the other key's notes,
+    // never the agent's own finding, title, question or earlier status.
+    appended(&server, &keys.operator, 1, &note("before the unresolved")).await;
+    let (status, body) = finding_status_as(
+        &server,
+        &keys.agent,
+        1,
+        finding.seq,
+        &json!({ "expected_seq": 8, "seen_seq": 0, "status": "unresolved" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let unresolved: AppendResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(unresolved.entry.seq, 9);
+    let activity = unresolved.activity.expect("activity");
+    assert_eq!(written_by(&activity, &keys.operator), [2, 4, 6, 8]);
+    assert_eq!((activity.through_seq, activity.more), (9, false));
+
     appended(&server, &keys.operator, 1, &note("before the close")).await;
     let closed = patched(
         &server,
         &keys.agent,
         1,
-        &json!({ "expected_seq": 8, "seen_seq": 7, "status": "closed" }),
+        &json!({ "expected_seq": 10, "seen_seq": 9, "status": "closed" }),
     )
     .await;
-    assert_eq!(closed.entry.seq, 9);
+    assert_eq!(closed.entry.seq, 11);
     assert_eq!(closed.investigation.status, InvestigationStatus::Closed);
     let activity = closed.activity.expect("activity");
-    assert_eq!(written_by(&activity, &keys.operator), [8]);
-    assert_eq!((activity.through_seq, activity.more), (9, false));
+    assert_eq!(written_by(&activity, &keys.operator), [10]);
+    assert_eq!((activity.through_seq, activity.more), (11, false));
 
     // The operator reopens, notes and closes; the agent's reopen answers
     // all three.
@@ -1611,7 +1629,7 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
         &server,
         &keys.operator,
         1,
-        &json!({ "expected_seq": 9, "status": "open" }),
+        &json!({ "expected_seq": 11, "status": "open" }),
     )
     .await;
     appended(&server, &keys.operator, 1, &note("before the reopen")).await;
@@ -1619,26 +1637,26 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
         &server,
         &keys.operator,
         1,
-        &json!({ "expected_seq": 11, "status": "closed" }),
+        &json!({ "expected_seq": 13, "status": "closed" }),
     )
     .await;
     let reopened = patched(
         &server,
         &keys.agent,
         1,
-        &json!({ "expected_seq": 12, "seen_seq": 9, "status": "open" }),
+        &json!({ "expected_seq": 14, "seen_seq": 11, "status": "open" }),
     )
     .await;
-    assert_eq!(reopened.entry.seq, 13);
+    assert_eq!(reopened.entry.seq, 15);
     assert_eq!(reopened.investigation.status, InvestigationStatus::Open);
     let activity = reopened.activity.expect("activity");
-    assert_eq!(written_by(&activity, &keys.operator), [10, 11, 12]);
-    assert_eq!((activity.through_seq, activity.more), (13, false));
+    assert_eq!(written_by(&activity, &keys.operator), [12, 13, 14]);
+    assert_eq!((activity.through_seq, activity.more), (15, false));
 
     // Without a `seen_seq`, no overwrite answers activity, whatever the
     // operator wrote. A closed investigation takes no note before the
     // reopen.
-    let mut seq = 13;
+    let mut seq = 15;
     for (body, noted) in [
         (json!({ "title": "plain" }), true),
         (json!({ "question": "Plain?" }), true),
