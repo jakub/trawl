@@ -2311,6 +2311,37 @@ fn glob_conversion_escapes_every_byte() {
     assert_eq!(glob_to_regex(""), "(?s-u:^$)");
 }
 
+/// A glob is priced and limited in byte mode as any pattern is. The
+/// repeat walk counts a glob's bytes: `é` is two positions, so 30 of them
+/// and a `*` are `^`, 60 bytes, `.*` and `$`, 64 positions, at the budget,
+/// and 31 are 66, over it. Read as characters, 31 would be 35 and pass.
+/// An admitted glob and a malformed one each build with a charge.
+#[test]
+fn glob_byte_mode_is_priced() {
+    let at = format!("{}*", "é".repeat(30));
+    let over = format!("{}*", "é".repeat(31));
+    assert!(parser::parse(&format!("f={at}")).is_ok(), "{at}");
+    let errors = parser::parse(&format!("f={over}")).expect_err("over the budget");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        format!("{MSG_REPEAT_BUDGET} (66 positions, max 64)")
+    );
+    // One byte past `at` is one position past the budget.
+    let errors = parser::parse(&format!("f={at}a")).expect_err("one past the budget");
+    assert_eq!(
+        errors[0].message,
+        format!("{MSG_REPEAT_BUDGET} (65 positions, max 64)")
+    );
+
+    for glob in ["[!4]*", "[*"] {
+        let pattern = preparer()
+            .build(PatternKind::Glob, glob)
+            .unwrap_or_else(|e| panic!("{glob} builds: {e}"));
+        assert!(pattern.charge().total() > 0, "{glob}");
+    }
+}
+
 /// A malformed glob, or one whose class holds no byte, is the one regex
 /// that matches nothing.
 #[test]
