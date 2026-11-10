@@ -105,6 +105,7 @@ declare -A SPEC_FOR=(
   [35-board-write-gate.patch]="investigation-writes.spec.ts"
   [36-send-window-merged-text.patch]="send-to-investigation.spec.ts"
   [37-board-read-while-hidden.patch]="investigation-writes.spec.ts"
+  [38-board-read-inside-pause.patch]="investigation-board.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -151,6 +152,7 @@ declare -A CONTROL_FOR=(
   [35-board-write-gate.patch]="routing.spec.ts"
   [36-send-window-merged-text.patch]="routing.spec.ts"
   [37-board-read-while-hidden.patch]="routing.spec.ts"
+  [38-board-read-inside-pause.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -194,6 +196,7 @@ else
     35-board-write-gate.patch
     36-send-window-merged-text.patch
     37-board-read-while-hidden.patch
+    38-board-read-inside-pause.patch
   )
 fi
 

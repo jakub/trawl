@@ -29,6 +29,11 @@
 //! not a cited row, not a page of the evidence viewer. A read asked for
 //! then waits until the tab shows, and a board opened in a hidden tab
 //! says Paused until then ([`crate::investigation_live`], [`BoardReads`]).
+//! Every read of the investigation also waits out a 429's pause, in a
+//! visible tab as in a hidden one: the reads asked for meanwhile join
+//! into one, which starts when the pause ends, and the page says a read
+//! waits. Once a read is refused for want of a grant, the board reads no
+//! more on this visit and shows no control that would read it.
 //! Each of the page's three kinds of read has one gate that holds it,
 //! and the board's one visibility listener opens all three when the tab
 //! shows: [`BoardReads::defer`] for the investigation,
@@ -44,11 +49,11 @@
 //! open. A change the reader did not ask for, a poll or a cited row
 //! landing, leaves what they read where it was on screen, however much
 //! grew above it. A read a person asked for that leaves entries unread is
-//! followed at once, up to
+//! followed at once, unless a 429's pause holds it, up to
 //! [`AUTO_PAGES`](crate::investigation_log::AUTO_PAGES) reads. Until the
 //! log is whole the latest finding and the findings say the page is
 //! still reading; when it stops short they name the entry they are as
-//! of, and Load more reads on.
+//! of, and Load more reads on while the board still reads.
 //!
 //! A cited row is read through the captured-result page route, once per
 //! row per page visit, paced so a board that cites many rows stays
@@ -70,15 +75,16 @@
 //! Close or Reopen is one PATCH carrying the sequence the board holds
 //! when it is pressed, with no confirmation, sent once and never retried
 //! ([`StatusControl`]). A 409, stale or closed, leaves a notice and reads
-//! the board at once, or once its hidden tab shows and any 429 pause has
-//! run out, keeping the reader's place, so the next press acts on the
+//! the board as soon as its tab is visible and no 429's pause runs,
+//! keeping the reader's place, so the next press acts on the
 //! status that stands. Until a read begun after the 409 lands, the
 //! notice says the board is reading it again, or that it reads it when
 //! the tab shows. A success stays acknowledged whatever the
 //! read after it does, and the board's cursor moves only with a read it
 //! accepted ([`BoardReads::after_write`]). A write whose answer was lost
 //! says its outcome is unknown and holds its control until a read begun
-//! after it lands ([`BoardReads::mark`]); the notice offers that read.
+//! after it lands ([`BoardReads::mark`]); the notice offers that read
+//! while the board still reads.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
@@ -98,7 +104,7 @@ use crate::auth_return::leaves_for_sign_in;
 use crate::components::evidence_drawer::{EvidenceDrawer, KeepGate, Opened};
 use crate::evidence_queue::{EvidenceQueue, Next, Paced, wait_ms};
 use crate::investigation_live::{
-    Connection, Liveness, Placed, ReadEnd, WriteFailure, announcement, new_entries_text,
+    Connection, Liveness, Placed, ReadEnd, Reread, WriteFailure, announcement, new_entries_text,
     pick_anchor,
 };
 use crate::investigation_log::{
@@ -112,6 +118,9 @@ use fleet_ui::{Badge, Btn, LoadMore, LoadState, Loaded, Pager, Size, Variant, Wh
 
 /// What a session without the grants reads in place of either page.
 const NOT_PERMITTED: &str = "You do not have permission to read investigations.";
+
+/// What the board says while a read waits for a 429's pause to end.
+const WAITING: &str = "The server asked the board to wait. It reads again when the wait ends.";
 
 /// Whether the signed-in session may read investigations. The shell
 /// mounts pages only once `/me` has answered.
@@ -575,7 +584,7 @@ fn tab_visible() -> bool {
 }
 
 /// A read of the board someone asked for, which waits while the tab is
-/// hidden ([`BoardReads::defer`]).
+/// hidden or a 429's pause runs ([`BoardReads::defer`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ask {
     /// A person's read, `pages` reads into its run: none for mount,
@@ -628,8 +637,9 @@ enum Reader {
 ///
 /// No other read starts in a hidden tab either. Every read a person or a
 /// write asks for passes one gate, [`Self::defer`], which while the tab
-/// is hidden starts nothing and records the read as `owed` instead, and
-/// so does the page that would follow a short read. When the tab shows,
+/// is hidden or a 429's pause runs starts nothing and records the read as
+/// `owed` instead, and so does the page that would follow a short read.
+/// When the tab shows,
 /// [`Self::visibility_changed`] starts the owed read at once in place of
 /// the poll, replacing any read still in flight, which began before it
 /// was asked for. That holds before there is a board too: a board opened
@@ -640,15 +650,19 @@ enum Reader {
 /// answer was lost stays held until that read lands, and a read that
 /// began before the write never releases it ([`Self::mark`]).
 ///
-/// An owed read waits for a 429's pause too. Shown while the pause runs,
-/// the board arms its one timer for the pause's end, however often the
-/// tab hides and shows meanwhile, and starts the owed read then as the
-/// read it is, a person's with its follow-up pages, not as a poll
-/// ([`Self::due`]). A person's own read in a visible tab, Refresh or Load
-/// more, does not wait for the pause, and it settles the read owed when
-/// it reads at least as far ([`Ask::and`]). A refusal that ends the
-/// visit's reads drops the read owed: a 403 or a 404 stops the board, and
-/// after a 401 it begins no read at all ([`Self::unauthorized`]).
+/// Every board read waits out a 429's pause, in a visible tab as in a
+/// hidden one: Refresh, Load more, the read after a write and the page
+/// that follows a short read. The reads asked for meanwhile join into
+/// one ([`Ask::and`]), and the page says a read waits. While the tab is
+/// visible, or once it shows, the board arms its one timer for the
+/// pause's end, however often the tab hides and shows meanwhile, and
+/// starts the owed read then as the read it is, a person's with its
+/// follow-up pages, not as a poll ([`Self::due`]). The poll checks the
+/// pause too, so no timer armed early reads inside it. A refusal that
+/// ends the visit's reads drops every read, the one owed and any asked
+/// for later: a 403 or a 404 stops the board, and after a 401 it begins
+/// no read at all ([`Self::unauthorized`]). A stopped board shows no
+/// control that would read it.
 ///
 /// The board's listener is the page's only one. It keeps `visible`,
 /// which the board lends to its evidence reads, whose gates hold every
@@ -686,9 +700,10 @@ struct BoardReads {
     /// The generation of the newest read the board accepted.
     accepted: RwSignal<u64>,
     in_flight: StoredValue<Option<Reader>>,
-    /// The read asked for while the tab was hidden, which starts when it
-    /// shows, or when a 429's pause ends.
-    owed: StoredValue<Option<Ask>>,
+    /// The read asked for while the tab was hidden or a 429's pause ran,
+    /// which starts when the tab shows and the pause has ended. The page
+    /// says a read waits while this is set in a visible tab.
+    owed: RwSignal<Option<Ask>>,
     /// A read was answered 401: the page is on its way to sign-in.
     signed_out: StoredValue<bool>,
     abort: StoredValue<Option<web_sys::AbortController>, LocalStorage>,
@@ -711,7 +726,7 @@ impl BoardReads {
             generation: StoredValue::new(0),
             accepted: RwSignal::new(0),
             in_flight: StoredValue::new(None),
-            owed: StoredValue::new(None),
+            owed: RwSignal::new(None),
             signed_out: StoredValue::new(false),
             abort: StoredValue::new_local(None),
             timer: StoredValue::new_local(None),
@@ -811,22 +826,28 @@ impl BoardReads {
         added
     }
 
-    /// A read the board was asked for: at once while the tab is visible,
-    /// else when it shows ([`Self::defer`]). A write's read is dropped
-    /// when there is no board or it stopped reading. A read that starts
-    /// reading at least as far as the one owed does its work, so that one
-    /// is owed no more.
+    /// A read the board was asked for: at once while the tab is visible
+    /// and no 429's pause runs, else once the tab shows and the pause has
+    /// ended ([`Self::defer`]). Every read is dropped once the board
+    /// stopped reading, or the page is gone; a write's read also when
+    /// there is no board. A read that starts reading at least as far as
+    /// the one owed does its work, so that one is owed no more.
     fn read(self, ask: Ask) {
+        if self.live.try_with_untracked(Liveness::stopped) != Some(false) {
+            return;
+        }
         if ask == Ask::Write && !self.readable() {
             return;
         }
         if self.defer(ask) {
             return;
         }
-        let _ = self.owed.try_update_value(|owed| {
-            if owed.is_some_and(|o| o.and(ask) == ask) {
+        let _ = self.owed.try_maybe_update(|owed| {
+            let done = owed.is_some_and(|o| o.and(ask) == ask);
+            if done {
                 *owed = None;
             }
+            (done, ())
         });
         match ask {
             Ask::Person { pages } => self.person(pages),
@@ -841,18 +862,35 @@ impl BoardReads {
         }
     }
 
-    /// The gate every read but the poll passes, the poll being armed only
-    /// in a visible tab: while the tab is hidden it starts nothing, owes
-    /// `ask` for when the tab shows and any 429 pause has run out, says
-    /// the board is paused, and answers `true`.
+    /// The gate every read but the poll passes: while the tab is hidden
+    /// or a 429's pause runs it starts nothing, owes `ask`, joined with
+    /// any read already owed, for when the tab shows and the pause has
+    /// ended, and answers `true`. A hidden tab says the board is paused;
+    /// a visible one arms the timer for the pause's end. The poll checks
+    /// the pause itself ([`Self::poll`]).
     fn defer(self, ask: Ask) -> bool {
-        if tab_visible() {
+        let visible = tab_visible();
+        let held = self.held();
+        if visible && !held {
             return false;
         }
-        self.owed
-            .try_update_value(|owed| *owed = Some(owed.map_or(ask, |o| o.and(ask))));
-        let _ = self.live.try_update(Liveness::hidden);
+        let _ = self
+            .owed
+            .try_update(|owed| *owed = Some(owed.map_or(ask, |o| o.and(ask))));
+        if visible {
+            self.schedule();
+        } else {
+            let _ = self.live.try_update(Liveness::hidden);
+        }
         true
+    }
+
+    /// Whether a 429's pause still holds the board's reads.
+    fn held(self) -> bool {
+        let now = js_sys::Date::now();
+        self.live
+            .try_with_untracked(|live| live.hold_ms(now) > 0)
+            .unwrap_or(false)
     }
 
     /// Whether a quiet read has a board to read into.
@@ -865,7 +903,8 @@ impl BoardReads {
     /// Refresh, Load more and Retry from the start. A read that leaves
     /// entries unread is followed at once, up to
     /// [`AUTO_PAGES`](crate::investigation_log::AUTO_PAGES) reads; a page
-    /// that falls due in a hidden tab is owed instead.
+    /// that falls due in a hidden tab, or inside a 429's pause, is owed
+    /// instead.
     fn person(self, pages: u32) {
         let mut since = self.since();
         let Some(id) = self.id.try_get_value() else {
@@ -922,7 +961,8 @@ impl BoardReads {
 
     /// The board's own read, when one is due: skipped while another read
     /// runs, while the tab is hidden, before the board exists and once it
-    /// stopped reading.
+    /// stopped reading. Inside a 429's pause it is scheduled again for
+    /// the pause's end, whatever armed the timer.
     fn poll(self) {
         // Gone with the page, or another read runs.
         if self.in_flight.try_get_value() != Some(None) {
@@ -931,13 +971,18 @@ impl BoardReads {
         if !self.readable() || !tab_visible() {
             return;
         }
+        if self.held() {
+            self.schedule();
+            return;
+        }
         self.quiet();
     }
 
     /// The read after a write of the person's landed, or was refused
     /// because the board was behind: at once, whatever read was running,
     /// since that one started before the write, or as soon as a hidden
-    /// tab shows. It is quiet like a poll and keeps the reader's place,
+    /// tab shows and any 429's pause has ended, joined with the reads
+    /// owed meanwhile. It is quiet like a poll and keeps the reader's place,
     /// because the person is acting in the viewer or the header, not
     /// reading the log.
     ///
@@ -1069,10 +1114,10 @@ impl BoardReads {
             return;
         };
         if stopped {
-            let _ = self.owed.try_set_value(None);
+            self.drop_owed();
             return;
         }
-        let owes = self.owed.try_with_value(Option::is_some) == Some(true);
+        let owes = self.owed.try_with_untracked(Option::is_some) == Some(true);
         if !owes && self.board.try_with_untracked(Option::is_none) != Some(false) {
             return;
         }
@@ -1108,7 +1153,7 @@ impl BoardReads {
     /// out: the read it owes starts, as the read it was asked as, else
     /// the poll.
     fn due(self) {
-        match self.owed.try_update_value(Option::take).flatten() {
+        match self.owed.try_update(Option::take).flatten() {
             Some(ask) => self.read(ask),
             None => self.poll(),
         }
@@ -1133,9 +1178,7 @@ impl BoardReads {
             return;
         };
         match wait {
-            None => {
-                let _ = self.owed.try_set_value(None);
-            }
+            None => self.drop_owed(),
             Some(0) => self.due(),
             Some(ms) => self.arm(ms),
         }
@@ -1146,8 +1189,15 @@ impl BoardReads {
     /// more ([`Self::begin`]).
     fn unauthorized(self) {
         let _ = self.timer.try_set_value(None);
-        let _ = self.owed.try_set_value(None);
+        self.drop_owed();
         let _ = self.signed_out.try_set_value(true);
+    }
+
+    /// Forget the read owed, if any.
+    fn drop_owed(self) {
+        let _ = self
+            .owed
+            .try_maybe_update(|owed| (owed.take().is_some(), ()));
     }
 }
 
@@ -1187,6 +1237,12 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         }) && !live.with(Liveness::stopped)
     });
     let accepted: Signal<u64> = reads.accepted.into();
+    // Whether the board still reads on this visit. Once it stopped, no
+    // control that would read it stays.
+    let can_read = Memo::new(move |_| !live.with(Liveness::stopped));
+    // A read the person or a write asked for waits for a 429's pause.
+    let owed = reads.owed;
+    let waiting = Signal::derive(move || visible.get() && owed.with(Option::is_some));
     let keep = KeepGate {
         investigation: reads.id,
         open: Signal::derive(move || {
@@ -1200,6 +1256,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         mark: Callback::new(move |()| reads.mark()),
         landed: Callback::new(move |()| reads.after_write()),
         refresh: read,
+        reading: can_read.into(),
     };
     read.run(());
 
@@ -1323,10 +1380,16 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
             FirstRead::Missing => view! { <Missing/> }.into_any(),
             FirstRead::Forbidden => view! { <NotPermitted/> }.into_any(),
             // A first read owed to a hidden tab: paused, not loading.
+            // A first read waiting for a 429's pause says so.
             FirstRead::Pending => view! {
                 <div class="page inv-page">
                     <Show when=move || connection.get() == Connection::Paused
-                        fallback=|| view! { <p role="status">"Loading investigation…"</p> }>
+                        fallback=move || view! {
+                            <Show when=move || waiting.get()
+                                fallback=|| view! { <p role="status">"Loading investigation…"</p> }>
+                                <p class="inv-wait" role="status">{WAITING}</p>
+                            </Show>
+                        }>
                         <p class="inv-live"><Badge tone=Connection::Paused.tone()>{Connection::Paused.label()}</Badge></p>
                         <p role="status">"The investigation loads when this tab is shown."</p>
                     </Show>
@@ -1374,9 +1437,14 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                     <StatusNoteView note=status_note accepted=accepted connection=Signal::from(connection) refresh=refresh/>
                 </div>
                 <div class="actions">
-                    <Btn variant=Variant::Secondary size=Size::Sm on_click=refresh>"Refresh"</Btn>
+                    <Show when=move || can_read.get()>
+                        <Btn variant=Variant::Secondary size=Size::Sm on_click=refresh>"Refresh"</Btn>
+                    </Show>
                 </div>
             </div>
+            <Show when=move || waiting.get()>
+                <p class="inv-wait" role="status">{WAITING}</p>
+            </Show>
             {move || stale.get().map(|message| view! {
                 <p class="inv-stale" role="status">"Refresh failed. Showing what was read before. " {message}</p>
             })}
@@ -1410,9 +1478,13 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                         view! { <ActivityLine seq=seq item=item/> }
                     }/>
                 </ol>
-                <LoadMore has_more=more busy=busy on_load=read
-                    empty=Signal::derive(move || activity_seqs.with(Vec::is_empty))
-                    label="Load more entries" end_text="Every entry is loaded." empty_text="Nothing recorded yet."/>
+                // A stopped board offers no Load more, and claims nothing
+                // about what it did not read.
+                <Show when=move || can_read.get() || !more.get()>
+                    <LoadMore has_more=more busy=busy on_load=read
+                        empty=Signal::derive(move || activity_seqs.with(Vec::is_empty))
+                        label="Load more entries" end_text="Every entry is loaded." empty_text="Nothing recorded yet."/>
+                </Show>
             </section>
 
             <section class="inv-sec" data-anchor="findings" aria-labelledby="inv-findings-h">
@@ -1487,44 +1559,6 @@ fn status_verb(target: InvestigationStatus) -> &'static str {
     }
 }
 
-/// Where the board's read after a conflict stands, which the conflict's
-/// notice says as it changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reread {
-    /// A read begun after the conflict landed.
-    Done,
-    /// It runs, or starts once a 429's pause or a failure's backoff ends.
-    Reading,
-    /// It waits for the hidden tab to show.
-    Waiting,
-    /// The board stopped reading before such a read landed.
-    Stopped,
-}
-
-impl Reread {
-    /// The read after a conflict whose mark is `mark`, when the board's
-    /// newest accepted read is `accepted` and its state `connection`.
-    fn of(mark: u64, accepted: u64, connection: Connection) -> Self {
-        if accepted > mark {
-            return Self::Done;
-        }
-        match connection {
-            Connection::Paused => Self::Waiting,
-            Connection::Stopped => Self::Stopped,
-            Connection::Checking | Connection::Live | Connection::Retrying => Self::Reading,
-        }
-    }
-
-    fn sentence(self) -> &'static str {
-        match self {
-            Self::Done => "The board has read it again",
-            Self::Reading => "The board is reading it again",
-            Self::Waiting => "The board reads it again when this tab is shown",
-            Self::Stopped => "The board stopped reading before it read it again",
-        }
-    }
-}
-
 impl StatusNote {
     /// The notice's words, when the board's newest accepted read is
     /// `accepted` and its state `connection`; none while sending.
@@ -1549,11 +1583,18 @@ impl StatusNote {
                 };
                 format!("{what}, so nothing changed. {}{again}.", reread.sentence())
             }
-            Self::Unknown(target, _) => format!(
-                "The answer to your {} was lost, so it may or may not have taken effect. \
-                 Refresh to see the investigation's status before you act again.",
-                status_verb(*target)
-            ),
+            Self::Unknown(target, _) => {
+                // A stopped board has no Refresh to point at.
+                let next = if connection == Connection::Stopped {
+                    "The board stopped reading, so reload the page to see the investigation's status."
+                } else {
+                    "Refresh to see the investigation's status before you act again."
+                };
+                format!(
+                    "The answer to your {} was lost, so it may or may not have taken effect. {next}",
+                    status_verb(*target)
+                )
+            }
             Self::Refused(target, message) => {
                 format!(
                     "Could not {} the investigation. {message}",
@@ -1566,10 +1607,11 @@ impl StatusNote {
 
 /// Close or Reopen, at the end of the status line: one PATCH with the sequence the
 /// board holds when it is pressed, never sent twice and never retried.
-/// A 409 of either kind leaves a notice and reads the board again at
-/// once, so the control the person presses next is for the status that
-/// stands; the notice says the board is reading it, or reads it when the
-/// hidden tab shows, until a read begun after the 409 lands ([`Reread`]).
+/// A 409 of either kind leaves a notice and reads the board again as soon
+/// as the tab is visible and no 429's pause runs, so the control the
+/// person presses next is for the status that stands; the notice says the
+/// board is reading it, or reads it when the hidden tab shows, until a
+/// read begun after the 409 lands ([`Reread`]).
 /// A lost answer disables the control until a read lands after it.
 #[component]
 fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl IntoView {
@@ -1641,10 +1683,10 @@ fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl 
 }
 
 /// The notice of the person's last close or reopen, with a Refresh when
-/// its outcome is unknown. Its words follow the board's reads, so a
-/// conflict's notice changes in place, and is announced, when the read
-/// after it lands; a read that changes nothing it says leaves it as it
-/// was.
+/// its outcome is unknown and the board still reads. Its words follow the
+/// board's reads, so a conflict's notice changes in place, and is
+/// announced, when the read after it lands; a read that changes nothing
+/// it says leaves it as it was.
 #[component]
 fn StatusNoteView(
     note: RwSignal<Option<StatusNote>>,
@@ -1670,7 +1712,7 @@ fn StatusNoteView(
         note.with(|n| match n {
             Some(StatusNote::Unknown(_, mark)) => accepted.get() <= *mark,
             _ => false,
-        })
+        }) && connection.get() != Connection::Stopped
     };
     view! {
         <Show when=move || text.with(Option::is_some)>
