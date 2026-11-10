@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
+use trawl_core::sanitize::sanitize_display_text;
 
 use crate::tui::App;
 use crate::tui::highlight::Highlighter;
@@ -69,7 +70,11 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
 
     let cursor_row = tab.editor.cursor.0;
     let cursor_col = tab.editor.cursor.1;
-    let ghost_text = tab.ghost.as_ref().map(|g| g.ghost_text.clone());
+    // Sanitized once here; both build paths splice this copy.
+    let ghost_text = tab
+        .ghost
+        .as_ref()
+        .map(|g| sanitize_display_text(&g.ghost_text));
 
     // Build visual lines from logical lines using the wrap map.
     let visual_lines: Vec<Line<'static>> = if let Some(ref wm) = tab.editor.wrap_map {
@@ -596,12 +601,15 @@ pub fn render_validation_hint(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     .fg(theme.status_error)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(&error.message, Style::default().fg(theme.text_muted)),
+            Span::styled(
+                sanitize_display_text(&error.message),
+                Style::default().fg(theme.text_muted),
+            ),
         ];
 
         if let Some(ref hint) = error.hint {
             spans.push(Span::styled(
-                format!("  ({hint})"),
+                format!("  ({})", sanitize_display_text(hint)),
                 Style::default().fg(theme.status_warning),
             ));
         }

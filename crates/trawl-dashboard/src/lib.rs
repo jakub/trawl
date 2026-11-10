@@ -22,6 +22,7 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Row, Table};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use trawl_api::DashboardSnapshot;
+use trawl_core::sanitize::sanitize_display_text;
 
 /// Rendering options for the dashboard.
 #[derive(Debug, Clone)]
@@ -80,7 +81,7 @@ pub fn render_dashboard(
 fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let [title_row, info_row] = vertical![==1, ==1].areas(area);
 
-    let title = format!(" trawld v{} ", snapshot.version);
+    let title = format!(" trawld v{} ", sanitize_display_text(&snapshot.version));
     let title_line = line![Span::styled(
         title,
         Style::default()
@@ -98,9 +99,15 @@ fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
 
     let info = line![
         Span::raw(" host: "),
-        Span::styled(&snapshot.hostname, Style::default().fg(Color::White)),
+        Span::styled(
+            sanitize_display_text(&snapshot.hostname),
+            Style::default().fg(Color::White),
+        ),
         Span::raw("  addr: "),
-        Span::styled(&snapshot.listen_addr, Style::default().fg(Color::White)),
+        Span::styled(
+            sanitize_display_text(&snapshot.listen_addr),
+            Style::default().fg(Color::White),
+        ),
         Span::raw("  uptime: "),
         Span::styled(
             format_duration(Duration::from_secs(snapshot.uptime_secs)),
@@ -609,7 +616,7 @@ fn render_active_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, ar
             let query_text = truncate_query(&q.query, max_query_width);
             Row::new(vec![
                 format!("#{}", q.id),
-                q.user.clone(),
+                sanitize_display_text(&q.user),
                 format!("running {elapsed}"),
                 query_text,
             ])
@@ -632,7 +639,10 @@ fn render_active_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, ar
 
 /// Footer: help text.
 fn render_footer(text: &str, frame: &mut Frame<'_>, area: Rect) {
-    let footer = line![Span::styled(text, Style::default().fg(Color::DarkGray),)];
+    let footer = line![Span::styled(
+        sanitize_display_text(text),
+        Style::default().fg(Color::DarkGray),
+    )];
     frame.render_widget(Paragraph::new(footer), area);
 }
 
@@ -700,8 +710,10 @@ pub fn format_bytes(bytes: u64) -> String {
 
 /// Truncate a query string to fit within `max_width` display columns,
 /// appending "..." if needed. Uses unicode display width, not byte length.
+/// Whitespace runs collapse to one space, then the text is sanitized before
+/// it is measured, so each replaced character counts as the cell it takes.
 pub fn truncate_query(query: &str, max_width: usize) -> String {
-    let collapsed: String = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = sanitize_display_text(&query.split_whitespace().collect::<Vec<_>>().join(" "));
     if UnicodeWidthStr::width(collapsed.as_str()) <= max_width {
         return collapsed;
     }
@@ -1253,5 +1265,57 @@ mod tests {
     #[test]
     fn truncate_query_zero_width() {
         assert_eq!(truncate_query("abc", 0), "");
+    }
+
+    /// Every string the dashboard draws that trawl did not write goes
+    /// through the sanitize rule. Each field has its own marker, so one
+    /// field's U+FFFD cannot stand in for another's.
+    #[test]
+    fn dashboard_sanitizes_remote_text() {
+        let mut snapshot = test_snapshot();
+        snapshot.version = "ver\u{202e}va".into();
+        snapshot.hostname = "hst\u{200b}hb\nhc".into();
+        snapshot.listen_addr = "adr\u{00ad}ac".into();
+        snapshot.active_queries[0].user = "usr\u{202e}ud".into();
+        snapshot.active_queries[0].query = "aqy\u{200b}ae".into();
+        snapshot.recent_queries[0].query = "cqy\u{00ad}cf".into();
+        let options = DashboardOptions {
+            footer_text: Some("ftr\u{202e}fg".into()),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(&snapshot, frame, frame.area(), &options))
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        for forbidden in ['\u{202e}', '\u{200b}', '\u{00ad}'] {
+            assert!(
+                !rendered.contains(forbidden),
+                "U+{:04X} drawn: {rendered}",
+                u32::from(forbidden)
+            );
+        }
+        for (field, fragment) in [
+            ("version", "ver\u{fffd}va"),
+            ("hostname", "hst\u{fffd}hb\u{fffd}hc"),
+            ("listen_addr", "adr\u{fffd}ac"),
+            ("active user", "usr\u{fffd}ud"),
+            ("active query", "aqy\u{fffd}ae"),
+            ("completed query", "cqy\u{fffd}cf"),
+            ("footer_text", "ftr\u{fffd}fg"),
+        ] {
+            assert!(
+                rendered.contains(fragment),
+                "{field} not drawn as {fragment:?}: {rendered}"
+            );
+        }
+    }
+
+    /// The query is sanitized before it is measured, so U+FFFD counts as
+    /// the one cell it takes, on both the fitting and the clipping path.
+    #[test]
+    fn truncate_query_sanitizes_before_width() {
+        assert_eq!(truncate_query("a\u{202e}b", 10), "a\u{fffd}b");
+        assert_eq!(truncate_query("ab\u{200b}cdefgh", 6), "ab\u{fffd}...");
+        assert_eq!(truncate_query("abc\u{00ad}", 3), "abc");
     }
 }

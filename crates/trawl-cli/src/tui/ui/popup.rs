@@ -9,6 +9,7 @@ use ratatui::layout::Alignment;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use trawl_core::sanitize::sanitize_display_text;
 
 use crate::tui::App;
 use crate::tui::state::{Popup, ScheduleField, ScheduleForm};
@@ -69,7 +70,7 @@ fn render_confirm_delete(frame: &mut Frame<'_>, theme: &Theme, name: &str) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            name,
+            sanitize_display_text(name),
             Style::default()
                 .fg(theme.status_warning)
                 .add_modifier(Modifier::BOLD),
@@ -120,7 +121,7 @@ fn render_save_query(
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("> {input}\u{2588}"),
+            format!("> {}\u{2588}", sanitize_display_text(&input)),
             Style::default()
                 .fg(theme.text_accent)
                 .add_modifier(Modifier::BOLD),
@@ -264,12 +265,12 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
 fn field_line<'a>(name: &str, value: &str, max_name_len: usize, theme: &Theme) -> Line<'a> {
     Line::from(vec![
         Span::styled(
-            format!("{name:>max_name_len$}  "),
+            format!("{:>max_name_len$}  ", sanitize_display_text(name)),
             Style::default()
                 .fg(theme.text_accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(value.to_owned()),
+        Span::raw(sanitize_display_text(value)),
     ])
 }
 
@@ -287,7 +288,7 @@ fn render_error(frame: &mut Frame<'_>, theme: &Theme, message: &str) {
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
-            message,
+            sanitize_display_text(message),
             Style::default().fg(theme.status_error),
         )),
         Line::from(""),
@@ -338,7 +339,10 @@ fn render_set_schedule(frame: &mut Frame<'_>, theme: &Theme, form: &ScheduleForm
                 Style::default().fg(theme.text_muted),
             ));
         } else {
-            spans.push(Span::styled(text, Style::default().fg(theme.text_primary)));
+            spans.push(Span::styled(
+                sanitize_display_text(&text),
+                Style::default().fg(theme.text_primary),
+            ));
         }
         if focused {
             spans.push(Span::styled(
@@ -372,7 +376,7 @@ fn render_set_schedule(frame: &mut Frame<'_>, theme: &Theme, form: &ScheduleForm
 
     let text = vec![
         Line::from(Span::styled(
-            form.name.clone(),
+            sanitize_display_text(&form.name),
             Style::default()
                 .fg(theme.status_warning)
                 .add_modifier(Modifier::BOLD),
@@ -463,7 +467,7 @@ fn render_column_picker(app: &App, frame: &mut Frame<'_>, selected: usize, scrol
 
         let checkbox = if entry.hidden { "[ ]" } else { "[x]" };
         let pin_label = if entry.pinned { "  (pinned)" } else { "" };
-        let label = format!(" {checkbox} {name}{pin_label}");
+        let label = format!(" {checkbox} {}{pin_label}", sanitize_display_text(name));
 
         let style = if i == selected {
             Style::default()

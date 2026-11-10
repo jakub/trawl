@@ -16,6 +16,7 @@ use crate::tui::App;
 use crate::tui::palette::{FilteredItem, PaletteCategory, PaletteItem};
 use crate::tui::state::Popup;
 use crate::tui::theme::Theme;
+use trawl_core::sanitize::sanitize_display_text;
 use trawl_core::text_layout::fit_cells;
 
 use super::common::centered_rect;
@@ -62,9 +63,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     // -- input line with ghost text --
     let input_line = Line::from(vec![
         Span::styled("> ", Style::default().fg(theme.text_accent)),
-        Span::raw(input),
+        Span::raw(sanitize_display_text(input)),
         Span::styled(
-            ghost.as_deref().unwrap_or(""),
+            sanitize_display_text(ghost.as_deref().unwrap_or("")),
             Style::default().fg(theme.text_muted),
         ),
     ]);
@@ -177,7 +178,7 @@ fn build_display_lines<'a>(
     if let Some(service_name) = column_mode_service {
         lines.push(DisplayLine {
             line: Line::from(Span::styled(
-                format!("  {service_name} — Columns"),
+                format!("  {} — Columns", sanitize_display_text(service_name)),
                 Style::default()
                     .fg(theme.table_header)
                     .add_modifier(Modifier::BOLD),
@@ -281,15 +282,14 @@ fn render_item_line<'a>(
 
     spans.push(Span::raw("  "));
 
-    // Label with match highlighting.
-    let label_len = item.label.chars().count();
+    // Label with match highlighting. The replacement is one character for
+    // one, so a match position indexes the drawn label as it did the raw one.
+    let label = sanitize_display_text(&item.label);
+    let label_len = label.chars().count();
     if match_positions.is_empty() {
-        spans.push(Span::styled(
-            item.label.as_str(),
-            Style::default().fg(theme.text_primary),
-        ));
+        spans.push(Span::styled(label, Style::default().fg(theme.text_primary)));
     } else {
-        for (i, ch) in item.label.chars().enumerate() {
+        for (i, ch) in label.chars().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
             let is_match = match_positions.contains(&(i as u32));
             let style = if is_match {
@@ -321,7 +321,7 @@ fn render_item_line<'a>(
             spans.push(Span::raw(" ".repeat(pad)));
         }
         spans.push(Span::styled(
-            hint_text.to_string(),
+            sanitize_display_text(hint_text),
             Style::default().fg(theme.text_muted),
         ));
     }
@@ -360,6 +360,205 @@ fn compute_scroll(selected_line: usize, visible_height: usize, total_lines: usiz
     let half = visible_height / 2;
     let max_scroll = total_lines.saturating_sub(visible_height);
     selected_line.saturating_sub(half).min(max_scroll)
+}
+
+#[cfg(test)]
+mod sender_text_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    use super::*;
+    use crate::tui::palette::{PaletteAction, refilter};
+    use crate::tui::tests::test_app;
+
+    const FORBIDDEN: [char; 3] = ['\u{202e}', '\u{200b}', '\u{00ad}'];
+
+    /// A saved query whose name holds U+202E and a newline, and a service
+    /// whose label and hint hold U+00AD and U+200B.
+    fn hostile_items() -> Vec<PaletteItem> {
+        vec![
+            PaletteItem {
+                label: "pq\u{202e}lab\nlz".to_owned(),
+                detail: Some("service=web".to_owned()),
+                category: PaletteCategory::SavedQuery,
+                shortcut: None,
+                action: PaletteAction::LoadQuery("sq\u{202e}run".to_owned()),
+            },
+            PaletteItem {
+                label: "sv\u{00ad}sz".to_owned(),
+                detail: Some("hn\u{200b}hz".to_owned()),
+                category: PaletteCategory::Service,
+                shortcut: None,
+                action: PaletteAction::DrillService("sv\u{00ad}sz".to_owned()),
+            },
+        ]
+    }
+
+    /// Draw the palette at 120x40 and return its buffer.
+    fn draw(
+        input: &str,
+        items: Vec<PaletteItem>,
+        filtered: Vec<FilteredItem>,
+        selected: usize,
+        ghost: Option<&str>,
+    ) -> (crate::tui::App, Buffer) {
+        let mut app = test_app();
+        app.popup = Some(Popup::CommandPalette {
+            input: input.to_owned(),
+            cursor: input.chars().count(),
+            selected,
+            scroll: 0,
+            items,
+            filtered,
+            ghost: ghost.map(str::to_owned),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (app, buffer)
+    }
+
+    /// Every cell's symbol, row after row, with a newline between rows.
+    fn screen(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The cell at which `fragment` starts, one character per cell.
+    fn find(buffer: &Buffer, fragment: &str) -> Option<(u16, u16)> {
+        let wanted: Vec<char> = fragment.chars().collect();
+        (0..buffer.area.height).find_map(|y| {
+            let row: Vec<char> = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            row.windows(wanted.len())
+                .position(|cells| cells == wanted.as_slice())
+                .map(|x| (u16::try_from(x).unwrap(), y))
+        })
+    }
+
+    fn assert_drawn(buffer: &Buffer, case: &str, fragments: &[(&str, &str)]) {
+        let screen = screen(buffer);
+        for forbidden in FORBIDDEN {
+            assert!(
+                !screen.contains(forbidden),
+                "{case}: U+{:04X} drawn:\n{screen}",
+                u32::from(forbidden)
+            );
+        }
+        for (surface, fragment) in fragments {
+            assert!(
+                screen.contains(fragment),
+                "{case}: {surface} not drawn as {fragment:?}:\n{screen}"
+            );
+        }
+    }
+
+    /// Labels, hints, the input, its ghost and the column-mode header draw
+    /// through the sanitize rule. The items, their actions and the match
+    /// positions stay as they were, and each match position still marks
+    /// the character it matched.
+    #[test]
+    fn palette_sender_text_keeps_actions_and_match_positions() {
+        let items = hostile_items();
+        let before = format!("{items:?}");
+
+        // Matched: the label is drawn one span per character, and the
+        // positions index the raw label.
+        let filtered = refilter("pqlab", &items);
+        assert_eq!(filtered.len(), 1, "{filtered:?}");
+        assert_eq!(filtered[0].item_index, 0);
+        assert_eq!(filtered[0].match_positions, vec![0, 1, 3, 4, 5]);
+        let (app, buffer) = draw("pqlab", items, filtered, 0, None);
+        assert_drawn(
+            &buffer,
+            "matched, selected",
+            &[("label", "pq\u{fffd}lab\u{fffd}lz")],
+        );
+        let (x, y) = find(&buffer, "pq\u{fffd}lab").expect("the label is drawn");
+        let accent = app.theme.text_accent;
+        for (offset, matched) in [
+            (0, true),
+            (1, true),
+            (2, false),
+            (3, true),
+            (4, true),
+            (5, true),
+        ] {
+            let fg = buffer[(x + offset, y)].fg;
+            assert_eq!(
+                fg == accent,
+                matched,
+                "cell {offset} of the label is marked {}",
+                if matched { "matched" } else { "unmatched" }
+            );
+        }
+        let Some(Popup::CommandPalette {
+            items, filtered, ..
+        }) = app.popup
+        else {
+            panic!("the palette is open");
+        };
+        assert_eq!(format!("{items:?}"), before, "drawing leaves the items");
+        assert_eq!(filtered[0].match_positions, vec![0, 1, 3, 4, 5]);
+
+        // Unmatched and grouped: the label is drawn whole, and the service
+        // hint is drawn at the right. The label is not selected.
+        let filtered = refilter("", &items);
+        let (app, buffer) = draw("", items, filtered, 1, None);
+        assert_drawn(
+            &buffer,
+            "unmatched, unselected",
+            &[
+                ("saved label", "pq\u{fffd}lab\u{fffd}lz"),
+                ("service label", "sv\u{fffd}sz"),
+                ("service hint", "hn\u{fffd}hz"),
+            ],
+        );
+        let Some(Popup::CommandPalette { items, .. }) = app.popup else {
+            panic!("the palette is open");
+        };
+        assert_eq!(format!("{items:?}"), before, "drawing leaves the items");
+
+        // The input and its ghost.
+        let (app, buffer) = draw("in\u{200b}iz", items, Vec::new(), 0, Some("gh\u{00ad}gz"));
+        assert_drawn(
+            &buffer,
+            "input and ghost",
+            &[("input and ghost", "> in\u{fffd}izgh\u{fffd}gz")],
+        );
+        let Some(Popup::CommandPalette {
+            input,
+            ghost,
+            items,
+            ..
+        }) = app.popup
+        else {
+            panic!("the palette is open");
+        };
+        assert_eq!(input, "in\u{200b}iz");
+        assert_eq!(ghost.as_deref(), Some("gh\u{00ad}gz"));
+
+        // Column mode names the service from the input.
+        let filtered = vec![FilteredItem {
+            item_index: 1,
+            score: 0,
+            match_positions: Vec::new(),
+        }];
+        let (_, buffer) = draw("cs\u{202e}cx.", items, filtered, 0, None);
+        assert_drawn(
+            &buffer,
+            "column mode",
+            &[("service header", "cs\u{fffd}cx — Columns")],
+        );
+    }
 }
 
 #[cfg(test)]

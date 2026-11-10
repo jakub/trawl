@@ -8,6 +8,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use trawl_client::SchemaResponse;
+use trawl_core::sanitize::sanitize_display_text;
 
 use crate::tui::theme::SyntaxColors;
 
@@ -58,6 +59,10 @@ impl<'a> Highlighter<'a> {
     }
 
     /// Highlight a single line of DSL query text.
+    ///
+    /// Each token's style comes from its raw text; only the drawn text is
+    /// sanitized. The replacement is one character for one, so character
+    /// indexes into `text` still index the spans.
     pub fn highlight_line(&self, text: &str) -> Line<'static> {
         let mut tokens = Self::tokenize(text);
 
@@ -94,7 +99,7 @@ impl<'a> Highlighter<'a> {
                         .add_modifier(Modifier::ITALIC),
                     TokenType::Whitespace => Style::default(),
                 };
-                Span::styled(text.clone(), style)
+                Span::styled(sanitize_display_text(&text), style)
             })
             .collect();
 
@@ -391,5 +396,55 @@ mod tests {
     #[test]
     fn slashes_are_not_a_comment() {
         assert_eq!(comment_text("url=https://example.com/x"), None);
+    }
+
+    /// The style comes from the raw token and only the drawn text is
+    /// sanitized: a known field whose name holds U+200B keeps its
+    /// known-field colour, which a lookup by the sanitized text would miss.
+    #[test]
+    fn highlighted_tokens_preserve_raw_classification() {
+        use trawl_client::{SchemaColumnResponse, SchemaResponse};
+
+        let schema = SchemaResponse {
+            columns: vec![SchemaColumnResponse {
+                name: "fk\u{200b}na".into(),
+                data_type: "VARCHAR".into(),
+            }],
+            file_count: 0,
+            cached: false,
+            earliest_date: None,
+            latest_date: None,
+            total_bytes: None,
+            services: None,
+            hot_buffer_events: None,
+            hot_buffer_bytes: None,
+        };
+        let colors = crate::tui::theme::dark().syntax;
+        let highlighter = Highlighter::new(Some(&schema), &colors);
+        let line =
+            highlighter.highlight_line("fk\u{200b}na \"sv\u{202e}x\u{00ad}y\" unk\u{202e}uz");
+
+        let span = |text: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content == text)
+                .unwrap_or_else(|| panic!("no span {text:?} in {:?}", line.spans))
+        };
+        assert_eq!(span("fk\u{fffd}na").style.fg, Some(colors.field_known));
+        assert_eq!(
+            span("\"sv\u{fffd}x\u{fffd}y\"").style.fg,
+            Some(colors.string)
+        );
+        assert_eq!(span("unk\u{fffd}uz").style.fg, Some(colors.field_unknown));
+        for span in &line.spans {
+            for forbidden in ['\u{202e}', '\u{200b}', '\u{00ad}'] {
+                assert!(
+                    !span.content.contains(forbidden),
+                    "U+{:04X} in span {:?}",
+                    u32::from(forbidden),
+                    span.content
+                );
+            }
+        }
     }
 }

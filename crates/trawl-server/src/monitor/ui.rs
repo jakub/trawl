@@ -250,4 +250,54 @@ mod tests {
         terminal.draw(|f| render(&snapshot, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
     }
+
+    /// `trawld monitor` draws other principals' text through the sanitize
+    /// rule, while the snapshot it converts keeps that text exact.
+    #[test]
+    fn monitor_dashboard_sanitizes_remote_text() {
+        let mut monitor = test_snapshot();
+        monitor.version = "ver\u{202e}va";
+        monitor.hostname = "hst\u{200b}hb\nhc".into();
+        monitor.listen_addr = "adr\u{00ad}ac".into();
+        monitor.active_queries[0].user = "usr\u{202e}ud".into();
+        monitor.active_queries[0].query = "aqy\u{200b}ae".into();
+        monitor.recent_queries[0].query = "cqy\u{00ad}cf".into();
+        let wire = monitor.to_dashboard_snapshot();
+        assert_eq!(wire.version, "ver\u{202e}va");
+        assert_eq!(wire.hostname, "hst\u{200b}hb\nhc");
+        assert_eq!(wire.listen_addr, "adr\u{00ad}ac");
+        assert_eq!(wire.active_queries[0].user, "usr\u{202e}ud");
+        assert_eq!(wire.active_queries[0].query, "aqy\u{200b}ae");
+        assert_eq!(wire.recent_queries[0].query, "cqy\u{00ad}cf");
+
+        let options = DashboardOptions {
+            footer_text: Some("ftr\u{202e}fg".into()),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| trawl_dashboard::render_dashboard(&wire, f, f.area(), &options))
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        for forbidden in ['\u{202e}', '\u{200b}', '\u{00ad}'] {
+            assert!(
+                !rendered.contains(forbidden),
+                "U+{:04X} drawn: {rendered}",
+                u32::from(forbidden)
+            );
+        }
+        for (field, fragment) in [
+            ("version", "ver\u{fffd}va"),
+            ("hostname", "hst\u{fffd}hb\u{fffd}hc"),
+            ("listen_addr", "adr\u{fffd}ac"),
+            ("active user", "usr\u{fffd}ud"),
+            ("active query", "aqy\u{fffd}ae"),
+            ("completed query", "cqy\u{fffd}cf"),
+            ("footer_text", "ftr\u{fffd}fg"),
+        ] {
+            assert!(
+                rendered.contains(fragment),
+                "{field} not drawn as {fragment:?}: {rendered}"
+            );
+        }
+    }
 }

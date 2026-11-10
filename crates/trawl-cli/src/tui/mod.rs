@@ -2370,6 +2370,193 @@ mod tests {
         );
     }
 
+    /// The text of every cell in row `y` of `buffer`, one symbol per cell.
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16) -> Vec<String> {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_owned())
+            .collect()
+    }
+
+    /// The first cell (x, y) at which `fragment` starts, one character per
+    /// cell, or `None` when no row holds it.
+    fn find_cells(buffer: &ratatui::buffer::Buffer, fragment: &str) -> Option<(u16, u16)> {
+        let wanted: Vec<String> = fragment.chars().map(String::from).collect();
+        (0..buffer.area.height).find_map(|y| {
+            let row = buffer_row(buffer, y);
+            row.windows(wanted.len())
+                .position(|cells| cells == wanted.as_slice())
+                .map(|x| (u16::try_from(x).expect("a column"), y))
+        })
+    }
+
+    /// Every symbol in `buffer`, row after row.
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| buffer_row(buffer, y).concat())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A saved query is another principal's text. Loaded through the
+    /// palette, it draws through the sanitize rule in the editor and the
+    /// history pane, while the editor buffer and the query a run sends stay
+    /// exact.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one load, four drawn surfaces, one run
+    async fn terminal_loaded_query_keeps_raw_text() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // An unclosed group does not parse, so the run sends the text as
+        // typed: the formatter never rewrites it. No outer whitespace and
+        // no CR, which the run trims and the editor drops.
+        const HOSTILE: &str =
+            "msg=\"ab\u{202e}cd\u{200b}ef\u{00ad}gh\" | stats count( by host\n| head 5";
+        const DRAWN: &str = "ab\u{fffd}cd\u{fffd}ef\u{fffd}gh";
+        const FORBIDDEN: [char; 3] = ['\u{202e}', '\u{200b}', '\u{00ad}'];
+        assert!(trawl_core::parser::parse(HOSTILE).is_err());
+        assert_eq!(HOSTILE.trim(), HOSTILE);
+        let assert_clean = |screen: &str, surface: &str| {
+            for forbidden in FORBIDDEN {
+                assert!(
+                    !screen.contains(forbidden),
+                    "{surface}: U+{:04X} drawn:\n{screen}",
+                    u32::from(forbidden)
+                );
+            }
+        };
+
+        let (url, mut seen, release) = held_parse_error_server((0, 1)).await;
+        let client = HttpClient::new_insecure(&url, "flt_test_not_real").expect("client");
+        let mut app = App::new(client, DisplayZone::Utc);
+        let mut shared = saved_entry(7, "qxzv");
+        shared.query = HOSTILE.to_owned();
+        app.saved_cache = Some(ListSavedResponse {
+            queries: vec![shared],
+        });
+
+        // Load it through the palette, as a person would.
+        app.handle_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        for ch in "qxzv".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        {
+            let Some(Popup::CommandPalette {
+                ref filtered,
+                ref items,
+                selected,
+                ..
+            }) = app.popup
+            else {
+                panic!("the palette is open");
+            };
+            let action = &items[filtered[selected].item_index].action;
+            assert!(
+                matches!(action, palette::PaletteAction::LoadQuery(q) if q == HOSTILE),
+                "the palette selects the saved query: {action:?}"
+            );
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.popup.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(
+            app.tab.editor.text(),
+            HOSTILE,
+            "the buffer holds the saved text"
+        );
+
+        // The cursor sits right after the U+202E, ASCII before it, with no
+        // wrap, ghost or selection on the line.
+        app.tab.editor.cursor = (0, 8);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal
+            .draw(|f| crate::tui::ui::render(&mut app, f))
+            .expect("render");
+        let buffer = terminal.backend().buffer().clone();
+        let screen = buffer_text(&buffer);
+        assert_clean(&screen, "editor");
+        let (start, row) = find_cells(&buffer, DRAWN)
+            .unwrap_or_else(|| panic!("editor does not draw {DRAWN:?}:\n{screen}"));
+        let editor = app.layout.editor.expect("the editor is laid out");
+        assert!(
+            editor.contains(ratatui::layout::Position::new(start, row)),
+            "the fragment is in the editor {editor:?}, at ({start}, {row}):\n{screen}"
+        );
+        let replacement = start + 2;
+        assert_eq!(buffer[(replacement, row)].symbol(), "\u{fffd}");
+        assert_eq!(
+            terminal.get_cursor_position().expect("cursor"),
+            ratatui::layout::Position::new(replacement + 1, row),
+            "the cursor is the cell right after the drawn U+FFFD:\n{screen}"
+        );
+        assert_eq!(app.tab.editor.text(), HOSTILE, "drawing leaves the buffer");
+
+        // The history pane draws the same text through the highlighter.
+        app.history_cache = Some(trawl_api::HistoryResponse {
+            entries: vec![trawl_api::HistoryEntryResponse {
+                id: 1,
+                query: HOSTILE.to_owned(),
+                executed_at: "2026-03-18T14:30:00Z".to_owned(),
+                duration_ms: 3,
+                row_count: 0,
+                status: trawl_client::QueryStatus::Success,
+            }],
+            total: 1,
+        });
+        app.panel.history_selected = 0;
+        let mut pane = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+        pane.draw(|f| crate::tui::ui::history::render_detail_pane(&app, f, f.area()))
+            .expect("render");
+        let history = buffer_text(pane.backend().buffer());
+        assert_clean(&history, "history pane");
+        assert!(
+            history.contains(DRAWN),
+            "history pane does not draw {DRAWN:?}:\n{history}"
+        );
+
+        // Ghost text, the validation message and its hint, each its own
+        // marker.
+        app.tab.editor.cursor = (1, 8);
+        app.tab.ghost = Some(autocomplete::Completion {
+            ghost_text: "gq\u{202e}gz".to_owned(),
+            insert_text: String::new(),
+            replace_len: 0,
+            cursor_offset: None,
+        });
+        app.tab.validation_errors = vec![trawl_core::parser::ParseError {
+            message: "mq\u{200b}mz".to_owned(),
+            span: 0..1,
+            label: None,
+            hint: Some("hq\u{00ad}hz".to_owned()),
+        }];
+        terminal
+            .draw(|f| crate::tui::ui::render(&mut app, f))
+            .expect("render");
+        let screen = buffer_text(terminal.backend().buffer());
+        assert_clean(&screen, "ghost and validation");
+        for (surface, fragment) in [
+            ("ghost text", "gq\u{fffd}gz"),
+            ("validation message", "mq\u{fffd}mz"),
+            ("validation hint", "hq\u{fffd}hz"),
+        ] {
+            assert!(
+                screen.contains(fragment),
+                "{surface} does not draw {fragment:?}:\n{screen}"
+            );
+        }
+        assert_eq!(app.tab.editor.text(), HOSTILE, "drawing leaves the buffer");
+
+        app.tab.ghost = None;
+        app.tab.validation_errors.clear();
+        app.execute_query();
+        let received = tokio::time::timeout(Duration::from_secs(10), seen.recv())
+            .await
+            .expect("the query reaches the server")
+            .expect("a query");
+        assert_eq!(received, HOSTILE, "the run sends the saved text");
+        release.notify_one();
+    }
+
     #[tokio::test]
     async fn poll_query_result_resets_scroll() {
         let mut app = test_app();
