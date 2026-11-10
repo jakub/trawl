@@ -17,6 +17,8 @@ The scheduler fires on a planned cursor, not on time elapsed since the last run.
 
 Coalescing has a limit, because a week of downtime would otherwise produce one week-wide query. A gap wider than `max_catchup_intervals` clamps the window start forward, and the run records `window_truncated: true` and increments `trawl_scheduler_window_truncated_total`. A manual run of a `since_last` schedule is clamped and counted the same way, so the counter sees scheduled and manual runs alike. Alert on that counter. A truncated run leaves part of the catch-up outside any report, though those events stay in the corpus.
 
+Scheduled runs cannot take every executor permit. At most half of `max_concurrent_queries`, and at least 1, are in flight at once, so on a pool of 4 permits two scheduled runs leave two for interactive queries. A run counts until its work ends, also after it timed out, because work that outlives its request still holds its permit. A due schedule past the cap waits for a later poll, which takes the oldest due schedules first, and its missed boundaries coalesce like those of any other missed run. Manual runs do not count against the cap.
+
 ### Why lag delays coverage
 
 Reports measure `_time`, the sender's own timestamp. That is what makes a report agree with an interactive query over the same interval, and it lets the partition layout prune the read. It also means an event can arrive after its window has closed.
