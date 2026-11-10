@@ -1713,23 +1713,21 @@ mod tests {
             format!("* | let x = {chain}"),
             format!("* | stats sum({chain})"),
         ];
+        // Each tree drops on the small stack as soon as it is parsed.
         let parsed = std::thread::Builder::new()
             .stack_size(TOKIO_WORKER_STACK)
-            .spawn(move || corpus.iter().map(|body| parse(body)).collect::<Vec<_>>())
+            .spawn(move || {
+                corpus
+                    .iter()
+                    .map(|body| parse(body).map(drop))
+                    .collect::<Vec<_>>()
+            })
             .expect("spawn")
             .join()
-            .expect("the pattern count must not overflow a 2 MiB stack");
+            .expect("the pattern count and the drop must not overflow a 2 MiB stack");
         for result in &parsed {
             assert!(result.is_ok(), "{result:.80?}");
         }
-        // Dropping a tree this deep recurses in its drop glue, which is
-        // not the walk under test, so it gets a stack it fits in.
-        std::thread::Builder::new()
-            .stack_size(64 * TOKIO_WORKER_STACK)
-            .spawn(move || drop(parsed))
-            .expect("spawn")
-            .join()
-            .expect("drop");
     }
 
     /// The walk counts in text order inside a chain, so the span is the
