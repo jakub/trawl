@@ -2726,8 +2726,7 @@ mod tests {
     fn flat_chains_format_on_a_worker_stack() {
         const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
         // A recursive renderer overflows this stack at about 5 000 terms
-        // in a debug build. Dropping a reparsed tree still recurses
-        // (#330), and that fits this stack up to about 16 000.
+        // in a debug build.
         const TERMS: usize = 12_000;
 
         let sum = vec!["1"; TERMS].join(" + ");
@@ -2740,9 +2739,8 @@ mod tests {
         // 30 000 terms, each two bytes as written and four once spaced
         let too_long = format!("* | let x = {}", vec!["1"; 30_000].join("+"));
 
-        // The thread reports what it saw and asserts nothing: a panic
-        // there would drop these trees on the small stack as it unwinds.
-        let (trees, outcomes, refusal) = std::thread::Builder::new()
+        // Every tree drops on the small stack too, before the thread ends.
+        let (outcomes, refusal) = std::thread::Builder::new()
             .stack_size(TOKIO_WORKER_STACK)
             .spawn(move || {
                 let mut trees = Vec::new();
@@ -2760,19 +2758,12 @@ mod tests {
                 let query = crate::parser::parse(&too_long).expect("parses");
                 let refusal = checked_format_query(&query);
                 trees.push(query);
-                (trees, outcomes, refusal)
+                drop(trees);
+                (outcomes, refusal)
             })
             .expect("spawn")
             .join()
-            .expect("formatting must not overflow a 2 MiB stack");
-        // Dropping a tree this deep recurses in its drop glue, which is
-        // not the walk under test, so it gets a stack it fits in.
-        std::thread::Builder::new()
-            .stack_size(64 * TOKIO_WORKER_STACK)
-            .spawn(move || drop(trees))
-            .expect("spawn")
-            .join()
-            .expect("drop");
+            .expect("formatting and dropping must not overflow a 2 MiB stack");
         for (dsl, same) in outcomes {
             assert!(same, "{dsl}… must format and read back the same");
         }
