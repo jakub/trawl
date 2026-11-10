@@ -95,16 +95,28 @@ async fn one_present_one_missing_reads_the_present_rows() {
 }
 
 /// A value that reads as a number pins nothing, so `service=1,nginx` reads
-/// every file and its SQL filter still keeps the nginx rows. No junk here:
+/// every file and its SQL filter still keeps the nginx rows. `service=1`
+/// also matches a stored service `01`, which sits in `01.parquet`, so a
+/// pin of `1.parquet` and `nginx.parquet` would lose its row. No junk here:
 /// this read opens every file in the directory.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_numeric_looking_name_reads_every_file_and_keeps_the_rows() {
     let tmp = tempfile::tempdir().unwrap();
-    let server = boot(tmp.path(), false).await;
+    let data = common::seed_data_root(tmp.path());
+    common::captured::seed_hour(
+        &data,
+        "01",
+        &[common::captured::Event {
+            time: common::captured::at("2024-01-15T10:00:03Z"),
+            host: "batch01".into(),
+            message: "job one".into(),
+        }],
+    );
+    let server = common::setup_in_dir_with_data(tmp.path(), data, RateLimitConfig::default()).await;
 
     assert_eq!(
         services(&server, "service=1,nginx").await,
-        ["nginx", "nginx"]
+        ["01", "nginx", "nginx"]
     );
 }
 
