@@ -422,6 +422,7 @@ dependencies = [
  "regex-syntax",
  "serde_json",
  "tracing",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
