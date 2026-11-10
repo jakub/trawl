@@ -3980,32 +3980,135 @@ fn closed_as_not_started(server: &common::TestServer, dsl: &str, before: usize, 
     assert_eq!(closed.rows, None, "{what}");
 }
 
+/// Wait until a request reached `queued` ([`Seam::Queued`]): its lane
+/// subscribed to its cancel, and the permit wait is what it does next.
+/// `GET /queries` lists a request from before its preparation, so a cancel
+/// sent on "listed" alone can end the preparation wait instead.
+///
+/// [`Seam::Queued`]: trawl_server::pool::seam::Seam::Queued
+async fn reached_the_permit_wait(queued: &trawl_server::pool::seam::Gate, what: &str) {
+    tokio::time::timeout(CANCELLED_ANSWER_BOUND, async {
+        while queued.arrivals() == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: never reached the permit wait"));
+}
+
+/// POST `body` to `path` as the analyst, on its own task: the status, the
+/// request's id and the JSON body.
+fn post_as_analyst(
+    server: &common::TestServer,
+    path: &'static str,
+    body: serde_json::Value,
+) -> tokio::task::JoinHandle<(reqwest::StatusCode, String, serde_json::Value)> {
+    let (url, token) = (server.url.clone(), server.analyst_token.clone());
+    tokio::spawn(async move {
+        let response = raw_client()
+            .post(format!("{url}{path}"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .expect("the request");
+        let status = response.status();
+        let request_id = request_id_of(&response);
+        let body = response.json().await.expect("a JSON body");
+        (status, request_id, body)
+    })
+}
+
+/// What a request a cancel ended in the pool's permit wait answers and
+/// accounts: the not-started 503, before its own deadline could fire, and
+/// one `query_timing` that booked the permit wait, refused for capacity
+/// with no work started. A cancel that ended the request's preparation
+/// instead books no permit wait.
+async fn refused_in_the_permit_wait(
+    capture: &telemetry::TimingCapture,
+    run: tokio::task::JoinHandle<(reqwest::StatusCode, String, serde_json::Value)>,
+    sent: std::time::Instant,
+    what: &str,
+) -> telemetry::Fields {
+    use timing::{flag, phases, text};
+    use trawl_engine::timing::QueryPhase;
+
+    let (status, request_id, body) = tokio::time::timeout(CANCELLED_ANSWER_BOUND, run)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{what}: still waiting {CANCELLED_ANSWER_BOUND:?} after the cancel")
+        })
+        .expect("the request task joins");
+    // The deadline is stamped at handler entry, after `sent`: an answer
+    // inside the timeout since `sent` cannot be the deadline's own
+    // capacity refusal, which says the same thing.
+    assert!(
+        sent.elapsed() < Duration::from_secs(common::DEFAULT_TEST_TIMEOUT_SECS),
+        "{what}: answered before its deadline"
+    );
+    assert_eq!(
+        status,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "{what}: {body}"
+    );
+    assert_eq!(
+        body["error"]["code"], "service_unavailable",
+        "{what}: {body}"
+    );
+    assert_eq!(
+        body["error"]["message"],
+        trawl_server::error::CAPACITY_NOT_STARTED,
+        "{what}: {body}"
+    );
+
+    let event = timing::only(capture, &request_id);
+    assert_eq!(text(&event, "outcome"), Some("capacity_refused"), "{what}");
+    assert_eq!(flag(&event, "work_started"), Some(false), "{what}");
+    let booked = phases(&event);
+    assert!(
+        booked.contains_key(QueryPhase::PoolWait.as_str()),
+        "{what}: the cancel ended the permit wait: {event:?}"
+    );
+    assert!(
+        !booked.contains_key(QueryPhase::PublicationWait.as_str()),
+        "{what}: it never held a permit: {event:?}"
+    );
+    timing::assert_sums(&event);
+    event
+}
+
 /// A `/query` that waits for a permit is cancelled by its owner's first
-/// `DELETE /queries/{id}` (ADR-0024, Amendment 2026-11-09). It answers the
-/// not-started 503 while every permit is still held, long before its
-/// deadline; its tracker entry closes once with that text and writes no
-/// history row; and it never reaches the worker, so the pool is idle once
-/// the permits come back.
+/// `DELETE /queries/{id}` (ADR-0024, Amendment 2026-11-09). The cancel is
+/// sent once the request reached the permit wait, and its account shows
+/// the permit wait is what it ended. It answers the not-started 503 while
+/// every permit is still held, long before its deadline; its tracker entry
+/// closes once with that text and writes no history row; and it never
+/// reaches the worker, so the pool is idle once the permits come back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_query_is_cancellable_by_its_owner() {
     use trawl_server::pool::seam::Seam;
 
     const DSL: &str = "service=nginx | head 343";
 
+    let (capture, _turn) = telemetry::timing().await;
     let server = setup_with_rate_limit(permissive()).await;
-    let (owner, _) = twin_keys(&server).await;
+    let owner = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let seams = server.state.query.pool.seams();
+    let queued = seams.watch(Seam::Queued);
     let entry = seams.watch(Seam::Entry);
     let before = recent_of(&server, DSL).len();
     let history = history_rows(&server).await;
     let metrics = Outcomes::scrape(&server).await;
 
     let held = hold_every_permit(&server).await;
-    let run = {
-        let owner = owner.clone();
-        tokio::spawn(async move { owner.query_paginated(DSL, None, None).await })
-    };
+    let sent = std::time::Instant::now();
+    let run = post_as_analyst(
+        &server,
+        "/api/v1/query",
+        serde_json::json!({ "query": DSL }),
+    );
     let id = listed_id(&owner, DSL).await;
+    reached_the_permit_wait(&queued, "the query").await;
     assert!(!run.is_finished(), "the query waits for a permit");
 
     let cancel = owner
@@ -4014,7 +4117,7 @@ async fn a_queued_query_is_cancellable_by_its_owner() {
         .expect("the owner may cancel its query");
     assert!(cancel.cancelled, "one cancel reaches the queued query");
     assert_eq!(cancel.query_id, id);
-    refused_as_not_started(run, "the cancelled query").await;
+    refused_in_the_permit_wait(capture, run, sent, "the cancelled query").await;
     assert_eq!(
         server.state.query.pool.available_permits(),
         0,
@@ -4028,6 +4131,7 @@ async fn a_queued_query_is_cancellable_by_its_owner() {
 
     drop(held);
     pool_idle(&server).await;
+    assert_eq!(queued.arrivals(), 1, "one request queued");
     assert_eq!(entry.arrivals(), 0, "the worker never took the query");
     assert_eq!(history_rows(&server).await, history, "no history row");
     assert_eq!(
@@ -4042,32 +4146,35 @@ async fn a_queued_query_is_cancellable_by_its_owner() {
 }
 
 /// A Parquet export that waits for a permit is cancelled by its owner the
-/// way a queued query is: the first `DELETE` answers true, and the export
-/// answers the not-started 503 while every permit is still held, closes its
-/// tracker entry once with that text and writes no history row.
+/// way a queued query is: the first `DELETE`, sent once the export reached
+/// the permit wait, answers true and ends that wait. The export answers the
+/// not-started 503 while every permit is still held, closes its tracker
+/// entry once with that text and writes no history row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_export_is_cancellable_by_its_owner() {
+    use timing::text;
     use trawl_server::pool::seam::Seam;
 
     const DSL: &str = "service=nginx | head 344";
 
+    let (capture, _turn) = telemetry::timing().await;
     let server = setup_with_rate_limit(permissive()).await;
-    let (owner, _) = twin_keys(&server).await;
+    let owner = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let seams = server.state.query.pool.seams();
+    let queued = seams.watch(Seam::Queued);
     let entry = seams.watch(Seam::Entry);
     let before = recent_of(&server, DSL).len();
     let history = history_rows(&server).await;
 
     let held = hold_every_permit(&server).await;
-    let run = {
-        let owner = owner.clone();
-        tokio::spawn(async move {
-            owner
-                .export(DSL, trawl_api::ExportFormat::Parquet, None)
-                .await
-        })
-    };
+    let sent = std::time::Instant::now();
+    let run = post_as_analyst(
+        &server,
+        "/api/v1/export?format=parquet",
+        serde_json::json!({ "query": DSL }),
+    );
     let id = listed_id(&owner, DSL).await;
+    reached_the_permit_wait(&queued, "the export").await;
     assert!(!run.is_finished(), "the export waits for a permit");
 
     let cancel = owner
@@ -4075,7 +4182,9 @@ async fn a_queued_export_is_cancellable_by_its_owner() {
         .await
         .expect("the owner may cancel its export");
     assert!(cancel.cancelled, "one cancel reaches the queued export");
-    refused_as_not_started(run, "the cancelled export").await;
+    let event = refused_in_the_permit_wait(capture, run, sent, "the cancelled export").await;
+    assert_eq!(text(&event, "kind"), Some("export"));
+    assert_eq!(text(&event, "format"), Some("parquet"));
     assert_eq!(
         server.state.query.pool.available_permits(),
         0,
@@ -4089,19 +4198,25 @@ async fn a_queued_export_is_cancellable_by_its_owner() {
 
     drop(held);
     pool_idle(&server).await;
+    assert_eq!(queued.arrivals(), 1, "one request queued");
     assert_eq!(entry.arrivals(), 0, "the worker never took the export");
     assert_eq!(history_rows(&server).await, history, "no history row");
 }
 
 /// A queued query is not cancellable by a key that shares its owner's
 /// display name: the twin gets the 403 a non-owner gets for running work,
-/// and the query stays queued and listed. The owner's cancel after it
-/// still answers true and ends the query.
+/// and the query stays queued and listed. The twin's cancel is sent once
+/// the query waits for a permit, so "queued" is where it is. The owner's
+/// cancel after it still answers true and ends the query.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_query_is_not_cancellable_by_a_twin_key() {
+    use trawl_server::pool::seam::Seam;
+
     const DSL: &str = "service=nginx | head 345";
     let server = setup_with_rate_limit(permissive()).await;
     let (owner, twin) = twin_keys(&server).await;
+    let seams = server.state.query.pool.seams();
+    let queued = seams.watch(Seam::Queued);
     let before = recent_of(&server, DSL).len();
 
     let held = hold_every_permit(&server).await;
@@ -4110,6 +4225,7 @@ async fn a_queued_query_is_not_cancellable_by_a_twin_key() {
         tokio::spawn(async move { owner.query_paginated(DSL, None, None).await })
     };
     let id = listed_id(&owner, DSL).await;
+    reached_the_permit_wait(&queued, "the query").await;
 
     let (status, error) = refused_with(twin.cancel_query(id).await, "the twin's cancel");
     assert_eq!(status, 403, "the twin may not cancel the owner's query");

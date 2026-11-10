@@ -945,6 +945,14 @@ pub mod seam {
     /// A point in the blocking worker a test can hold or fail.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum Seam {
+        /// On the request's own task, once a lane subscribed to its
+        /// request's cancel and before it waits for an executor permit:
+        /// the query, export and capture lanes. The permit wait races a
+        /// cancel that is already latched, so a cancel sent after this
+        /// arrival ends the request in the pool's waits, never in its
+        /// preparation. A test may watch this seam and must never hold
+        /// it: a hold parks a runtime thread, not a blocking worker.
+        Queued,
         /// First statement of the worker, before the interrupt handle is
         /// published and before the work-start transition.
         Entry,
@@ -2171,6 +2179,7 @@ impl ExecutorPool {
         let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
+        worker_seam!(seams, Queued);
         let available = self.semaphore.available_permits();
         if available == 0 {
             tracing::warn!(
@@ -2414,6 +2423,7 @@ impl ExecutorPool {
         let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
+        worker_seam!(seams, Queued);
         let available = self.semaphore.available_permits();
         if available == 0 {
             tracing::warn!(
@@ -2829,6 +2839,7 @@ impl ExecutorPool {
         let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
+        worker_seam!(seams, Queued);
         let semaphore = Arc::clone(&self.semaphore);
         let acquired = {
             let _wait = clock.guard(QueryPhase::PoolWait);
@@ -3025,6 +3036,7 @@ impl ExecutorPool {
         let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
+        worker_seam!(seams, Queued);
         let semaphore = Arc::clone(&self.semaphore);
         let acquired = {
             let _wait = clock.guard(QueryPhase::PoolWait);
