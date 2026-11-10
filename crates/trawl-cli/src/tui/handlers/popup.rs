@@ -249,7 +249,7 @@ impl App {
                     return;
                 };
                 let saved_id = form.saved_id;
-                let Some((interval, window, lag)) = form.submission() else {
+                let Some(request) = form.submission() else {
                     return;
                 };
 
@@ -260,11 +260,11 @@ impl App {
                     let result = match client
                         .set_schedule(
                             saved_id,
-                            &interval,
-                            None,
-                            true,
-                            window.as_deref(),
-                            lag.as_deref(),
+                            &request.interval,
+                            request.max_runs,
+                            request.enabled,
+                            request.window.as_deref(),
+                            request.lag.as_deref(),
                         )
                         .await
                     {
