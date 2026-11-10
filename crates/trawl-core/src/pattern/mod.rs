@@ -977,7 +977,9 @@ fn reservation_bytes(bytes: usize) -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
-/// What one build makes: a program and what it charges.
+/// What one build makes: the program that runs and what it charges. For a
+/// regex body whose batch-engine view differs from it, that program is the
+/// view's ([`prepare`]).
 struct Program {
     regex: meta::Regex,
     charge: Charge,
@@ -988,9 +990,12 @@ struct Program {
 /// `view` under [`MAX_BATCH_COMPILED_BYTES`].
 ///
 /// A view that differs from the program compiles after it, so a program
-/// over 1 MiB reports that limit. A view the same as the program is one
-/// compile at the smaller limit, which checks both, and only a program
-/// over it compiles again, to tell which limit it passed.
+/// over 1 MiB reports that limit. The program of `source` only admits the
+/// body: it is dropped before the view compiles, and the view's program is
+/// the one kept, with its own profile and charge. A view the same as the
+/// program is one compile at the smaller limit, which checks both and is
+/// kept, and only a program over it compiles again, to tell which limit it
+/// passed.
 ///
 /// It reads `stop` after each translation and between compiles, and ends
 /// with [`PatternError::Cancelled`] at the first that finds it requested.
@@ -1013,16 +1018,16 @@ fn prepare(
             built => built?,
         },
         Some(view) => {
-            let program = compile(&hir, MAX_REGEX_COMPILED_BYTES)?;
+            drop(compile(&hir, MAX_REGEX_COMPILED_BYTES)?);
+            drop(hir);
             stop.check()?;
             let view = parse_hir(view, PatternKind::Regex).and_then(|view| {
                 stop.check()?;
                 compile(&view, MAX_BATCH_COMPILED_BYTES)
             });
             match view {
-                Ok(_) => program,
                 Err(PatternError::CompiledSize) => return Err(PatternError::BatchCompiledSize),
-                Err(other) => return Err(other),
+                view => view?,
             }
         }
     };
