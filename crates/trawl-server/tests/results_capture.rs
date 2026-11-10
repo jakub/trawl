@@ -759,6 +759,86 @@ async fn a_selection_over_the_source_budget_is_refused_before_work_starts() {
     assert_eq!(started.arrivals(), 1);
 }
 
+/// A capture that pins two of three services in one window is measured
+/// over those two files only (#374): it fits a budget the whole window
+/// does not, and the unpinned window is refused with the service hint.
+/// The third service's file is not parquet, so a capture that opened it
+/// would fail: the pinned capture read only its services' files.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_service_capture_reads_only_its_services() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = common::seed_data_root(tmp.path());
+    let hour = Path::new(&data).join("prod/2024-01-15/10");
+    std::fs::write(
+        hour.join("redis.parquet"),
+        b"these bytes are not a parquet file",
+    )
+    .unwrap();
+    let size = |service: &str| {
+        std::fs::metadata(hour.join(format!("{service}.parquet")))
+            .unwrap()
+            .len()
+    };
+    // The two pinned files fit together; all three do not, because the
+    // measure charges a file whose footer it cannot read whole.
+    let budget = size("nginx") + size("postgres");
+    assert!(size("redis") > 0);
+    assert!(size("nginx") + size("postgres") + size("redis") > budget);
+    let server = common::setup_with_capture(
+        tmp.path(),
+        data,
+        RateLimitConfig::default(),
+        CaptureConfig {
+            source_max_bytes: budget,
+            ..CaptureConfig::default()
+        },
+    )
+    .await;
+    std::mem::forget(tmp);
+    server.results_clock.set(at("2024-01-15T10:30:00Z"));
+    let seams = server.state.query.pool.seams();
+    let started = seams.watch(Seam::Started);
+    let before = permits(&server);
+
+    let body = json!({ "query": "service=nginx,postgres", "window": { "last": "1h" } });
+    let result = captured::captured(&server, &server.analyst_token, &body)
+        .await
+        .result;
+    assert_eq!(
+        result.captured_rows, 3,
+        "two nginx rows and one postgres row"
+    );
+    let (status, _, page) = captured::page(&server, &server.analyst_token, &result.id, "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let page: ResultPage = serde_json::from_value(page).unwrap();
+    let mut services: Vec<String> = common::result_rows(&page.page)
+        .iter()
+        .map(|row| row["service"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    services.sort();
+    assert_eq!(services, ["nginx", "nginx", "postgres"]);
+    assert_eq!(started.arrivals(), 1);
+
+    let before_refusal = permits(&server);
+    assert_eq!(before_refusal, before, "the capture gave its permit back");
+    let body = json!({ "query": "*", "window": { "last": "1h" } });
+    let (status, _, answer) = captured::capture(&server, &server.analyst_token, &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(code(&answer), "capture_source_too_large", "{answer}");
+    let message = answer["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.ends_with("narrow the window, or pin the services with service=a or service=a,b"),
+        "{message}"
+    );
+    assert_eq!(started.arrivals(), 1, "the refused work never started");
+    captured::assert_nothing_held(
+        &server,
+        before_refusal,
+        "an unpinned capture over its budget",
+    )
+    .await;
+}
+
 /// The page of a capture of `window`, and what `/query` answers for its
 /// recorded text right after.
 async fn captured_and_live(
