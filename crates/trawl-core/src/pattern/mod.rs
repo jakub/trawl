@@ -193,6 +193,15 @@ pub fn literal_operand(rhs: &Expr) -> Result<&str, PatternError> {
     }
 }
 
+/// The named capture groups of an `extract` regex body, in pattern
+/// order; `None` when the body's syntax does not parse. It reads the
+/// syntax tree only and builds no regex.
+#[must_use]
+pub fn capture_names(body: &str) -> Option<Vec<String>> {
+    let captures = price::captures(body).ok()?;
+    Some(captures.into_iter().map(|capture| capture.name).collect())
+}
+
 /// An `extract` body as the batch lane binds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BatchExtract {
