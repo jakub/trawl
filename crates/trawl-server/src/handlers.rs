@@ -101,6 +101,7 @@ fn check_run_files_before_execution(
             result: Err(conflict),
             debug: None,
             severity_columns: Vec::new(),
+            histogram: None,
         }
     });
     let recheck = if refused.is_some() { &[] } else { run_files };
@@ -261,6 +262,14 @@ pub async fn query(
         }
     };
 
+    // Steps 1-4 of the histogram's eligibility rule, read off the parse
+    // admission made: no second parse. A refused request answers its error
+    // and no histogram.
+    let histogram_plan = match &admitted {
+        Ok((query, saved)) => crate::histogram::plan(req.histogram, query, saved.is_some()),
+        Err(_) => crate::histogram::HistogramPlan::Absent,
+    };
+
     // The stored result files this read depends on, kept past resolution so
     // their presence can be asked again after execution (see
     // [`guard_vanished_run_result`]). Empty for every query that is not a
@@ -276,6 +285,7 @@ pub async fn query(
                 result: Err(refusal),
                 debug: None,
                 severity_columns: Vec::new(),
+                histogram: None,
             },
             Vec::new(),
         ),
@@ -329,19 +339,17 @@ pub async fn query(
         }
         Ok((query, None)) => {
             let degraded = degraded_fields_for(&state, [&query]);
+            let mut work = crate::pool::WorkContext::key(crate::pool::WorkKind::Query, verified.id)
+                .with_user(&verified.name)
+                .with_timing(timing.timing().clone());
+            if let crate::histogram::HistogramPlan::Count { kept_some } = histogram_plan {
+                work = work.with_histogram(crate::histogram::HistogramAsk { kept_some });
+            }
             (
                 state
                     .query
                     .pool
-                    .execute(
-                        query_id,
-                        &req.query,
-                        deadline,
-                        capture_debug,
-                        crate::pool::WorkContext::key(crate::pool::WorkKind::Query, verified.id)
-                            .with_user(&verified.name)
-                            .with_timing(timing.timing().clone()),
-                    )
+                    .execute(query_id, &req.query, deadline, capture_debug, work)
                     .await,
                 degraded,
             )
@@ -386,12 +394,22 @@ pub async fn query(
     // pool, never here on a reactor thread (see
     // `crate::pool::severity_columns_for`).
     let severity_columns = outcome.severity_columns;
+    let counted = outcome.histogram;
 
     match outcome.result {
         Ok(qr) => {
             let total = qr.row_count();
             let paginated = qr.paginate(offset, limit);
             let returned = paginated.row_count();
+            // A successful execution answers what the plan decided: no
+            // field, a reason, or the worker's count of the whole result.
+            let histogram = match histogram_plan {
+                crate::histogram::HistogramPlan::Absent => None,
+                crate::histogram::HistogramPlan::Refuse(reason) => {
+                    Some(trawl_api::EventHistogram::Unavailable { reason })
+                }
+                crate::histogram::HistogramPlan::Count { .. } => counted,
+            };
 
             tracked.complete(total);
 
@@ -477,7 +495,7 @@ pub async fn query(
                 },
                 degraded_fields,
                 severity_columns,
-                histogram: None,
+                histogram,
             }))
         }
         Err(ServerError::Timeout) => {
@@ -4835,6 +4853,7 @@ mod tests {
             result,
             debug: None,
             severity_columns: vec![],
+            histogram: None,
         };
         let one_column = || QueryResult {
             columns: vec![trawl_engine::value::Column::new(
@@ -4986,6 +5005,7 @@ mod tests {
             result,
             debug: None,
             severity_columns: vec![],
+            histogram: None,
         };
 
         for (case, parent) in [("dangling link", "link"), ("regular file", "file")] {

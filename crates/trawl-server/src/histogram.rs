@@ -54,6 +54,13 @@ pub enum HistogramPlan {
     Count { kept_some: bool },
 }
 
+/// The worker's half of [`HistogramPlan::Count`]: count the final result,
+/// and answer `kept_some` with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistogramAsk {
+    pub kept_some: bool,
+}
+
 /// Steps 1-4 of the eligibility rule, read off the admitted parse. The
 /// first match wins: the flag is false, the query aggregates, the rows are
 /// a stored run's (`from_saved`), the query samples. Otherwise the worker

@@ -55,6 +55,7 @@ use parking_lot::Mutex;
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use trawl_api::EventHistogram;
 use trawl_core::cancel::Stop;
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
@@ -65,6 +66,7 @@ use trawl_engine::value::QueryResult;
 
 use crate::deadline::Deadline;
 use crate::error::{CaptureSourceKind, ServerError};
+use crate::histogram::HistogramAsk;
 use crate::hot_buffer::{HotBuffer, HotSnapshot};
 use crate::query_timing::{Outcome, PhysicalOutcome, QueryTiming, Reclaim, emit_reclaimed};
 use crate::source::{compute_source, select, selection_bytes};
@@ -164,6 +166,8 @@ pub struct WorkContext {
     /// the work stops ([`Self::holding`]). Opaque to the pool, which only
     /// drops it.
     holds: Option<Arc<dyn Any + Send + Sync>>,
+    /// Count the final result into a histogram ([`Self::with_histogram`]).
+    histogram: Option<HistogramAsk>,
 }
 
 impl WorkContext {
@@ -176,6 +180,7 @@ impl WorkContext {
             user: None,
             timing: None,
             holds: None,
+            histogram: None,
         }
     }
 
@@ -188,6 +193,7 @@ impl WorkContext {
             user: None,
             timing: None,
             holds: None,
+            histogram: None,
         }
     }
 
@@ -202,6 +208,17 @@ impl WorkContext {
     #[must_use]
     pub fn with_timing(mut self, timing: QueryTiming) -> Self {
         self.timing = Some(timing);
+        self
+    }
+
+    /// Count the final result by `_time` ([`crate::histogram::count`]) in
+    /// the worker, under the post phase and the work's cancel latch, and
+    /// answer it on [`ExecuteOutcome::histogram`]. Only
+    /// [`ExecutorPool::execute`] and [`ExecutorPool::execute_capped`] read
+    /// it.
+    #[must_use]
+    pub fn with_histogram(mut self, ask: HistogramAsk) -> Self {
+        self.histogram = Some(ask);
         self
     }
 
@@ -909,6 +926,7 @@ impl RefusalOnce {
             result: Err(self.refuse(id, kind, refusal)),
             debug: None,
             severity_columns: Vec::new(),
+            histogram: None,
         }
     }
 
@@ -975,6 +993,11 @@ pub mod seam {
         /// Inside a capture's `finish`, once its file is staged and before
         /// it is written. The capture lane only.
         Writing,
+        /// In the query lane, once the engine returned its rows and before
+        /// the post phase walks them for presentation: a cancel latched
+        /// here is one the presentation walks read. Not the recorded-source
+        /// lane.
+        Presenting,
         /// After the work produced its answer, before cleanup.
         Finished,
         /// After cleanup released everything the work held, before the
@@ -1239,6 +1262,12 @@ pub struct ExecuteOutcome {
     /// `SEVERITY` pin produced. Empty for a failed, timed-out or
     /// never-started run: there are no rows to present.
     pub severity_columns: Vec<String>,
+    /// The final result counted by `_time`, when the work asked
+    /// ([`WorkContext::with_histogram`]). Computed beside
+    /// `severity_columns`, inside the permit-holding blocking task under
+    /// the post phase, before the page is cut. `None` for work that did not
+    /// ask, and for a failed, timed-out or never-started run.
+    pub histogram: Option<EventHistogram>,
 }
 
 /// What a capture reads its stored events from (ADR-0057).
@@ -1351,21 +1380,34 @@ pub(crate) fn severity_columns_for(
 
 /// A finished run's answer beside its severity columns
 /// ([`severity_columns_for`]), walked under `pins`, the snapshot the run
-/// executed with. A failed run has no rows to present, and a walk the
-/// latch cancels turns the answer into that cancellation.
+/// executed with, and its histogram when `histogram` asks for one
+/// ([`crate::histogram::count`]). A failed run has no rows to present, and
+/// a walk the latch cancels turns the answer into that cancellation.
 fn present(
     result: Result<QueryResult, ServerError>,
     pins: &trawl_core::schema::FieldTypes,
     dsl: &str,
+    histogram: Option<HistogramAsk>,
     cancel: &CancelLatch,
     clock: &PhaseClock,
-) -> (Result<QueryResult, ServerError>, Vec<String>) {
+) -> (
+    Result<QueryResult, ServerError>,
+    Vec<String>,
+    Option<EventHistogram>,
+) {
     let Ok(rows) = result else {
-        return (result, Vec::new());
+        return (result, Vec::new(), None);
     };
-    match clock.time(QueryPhase::Post, || severity_columns_for(pins, dsl, cancel)) {
-        Ok(columns) => (Ok(rows), columns),
-        Err(error) => (Err(error.into()), Vec::new()),
+    let presented = clock.time(QueryPhase::Post, || {
+        let columns = severity_columns_for(pins, dsl, cancel)?;
+        let histogram = histogram
+            .map(|ask| crate::histogram::count(&rows, ask.kept_some, cancel))
+            .transpose()?;
+        Ok::<_, EngineError>((columns, histogram))
+    });
+    match presented {
+        Ok((columns, histogram)) => (Ok(rows), columns, histogram),
+        Err(error) => (Err(error.into()), Vec::new(), None),
     }
 }
 
@@ -2169,6 +2211,7 @@ impl ExecutorPool {
         work: WorkContext,
     ) -> ExecuteOutcome {
         let kind = work.kind;
+        let histogram = work.histogram;
         let timing = work.timing.clone();
         let clock = timing
             .as_ref()
@@ -2206,6 +2249,7 @@ impl ExecutorPool {
                     result: Err(ServerError::Internal("executor pool shut down".into())),
                     debug: None,
                     severity_columns: Vec::new(),
+                    histogram: None,
                 };
             }
             Err(refusal) => {
@@ -2227,6 +2271,7 @@ impl ExecutorPool {
                     result: Err(error),
                     debug: None,
                     severity_columns: Vec::new(),
+                    histogram: None,
                 };
             }
             Err(refusal) => {
@@ -2246,6 +2291,7 @@ impl ExecutorPool {
                     result: Err(error),
                     debug: None,
                     severity_columns: Vec::new(),
+                    histogram: None,
                 };
             }
         };
@@ -2297,7 +2343,7 @@ impl ExecutorPool {
                     let source = clock.time(QueryPhase::Source, || {
                         compute_source(&base_dir, &dsl, &cancel)
                     });
-                    let (result, debug, severity_columns) = match source {
+                    let (result, debug, severity_columns, histogram) = match source {
                         Ok(source) => {
                             let file_globs: usize = if source.starts_with('[') {
                                 source.matches(',').count() + 1
@@ -2328,23 +2374,26 @@ impl ExecutorPool {
                                 capture_debug,
                                 || {},
                             );
-                            let (result, severity_columns) =
-                                present(result, &pins, &dsl, &cancel, clock);
-                            (result, debug, severity_columns)
+                            worker_seam!(seams, Presenting);
+                            let (result, severity_columns, histogram) =
+                                present(result, &pins, &dsl, histogram, &cancel, clock);
+                            (result, debug, severity_columns, histogram)
                         }
-                        Err(error) => (Err(error.into()), None, Vec::new()),
+                        Err(error) => (Err(error.into()), None, Vec::new(), None),
                     };
                     worker_seam!(seams, Finished);
                     ExecuteOutcome {
                         result,
                         debug,
                         severity_columns,
+                        histogram,
                     }
                 }));
                 let outcome = outcome.unwrap_or_else(|_payload| ExecuteOutcome {
                     result: Err(ServerError::Panicked("query worker")),
                     debug: None,
                     severity_columns: Vec::new(),
+                    histogram: None,
                 });
                 slot.finish(&outcome.result);
                 // Interrupt deregistered, executor re-idled, publication and
@@ -2376,6 +2425,7 @@ impl ExecutorPool {
                         result: Err(ServerError::from_join("query", e)),
                         debug: None,
                         severity_columns: Vec::new(),
+                        histogram: None,
                     },
                 }
             }
@@ -2389,7 +2439,7 @@ impl ExecutorPool {
                 } else {
                     Err(refusal_log.refuse(query_id, kind, StartRefusal::Expired))
                 };
-                ExecuteOutcome { result, debug: None, severity_columns: Vec::new() }
+                ExecuteOutcome { result, debug: None, severity_columns: Vec::new(), histogram: None }
             }
         }
     }
@@ -2448,6 +2498,7 @@ impl ExecutorPool {
                     result: Err(ServerError::Internal("executor pool shut down".into())),
                     debug: None,
                     severity_columns: Vec::new(),
+                    histogram: None,
                 };
             }
             Err(refusal) => {
@@ -2464,6 +2515,7 @@ impl ExecutorPool {
                     result: Err(error),
                     debug: None,
                     severity_columns: Vec::new(),
+                    histogram: None,
                 };
             }
         };
@@ -2528,10 +2580,13 @@ impl ExecutorPool {
                     // what this corpus happens to pin now. The comparison pins above
                     // keep the live snapshot for the names the run carries; a field
                     // it does not carry takes none (`ReadInput::Recorded`).
-                    let (result, severity_columns) = present(
+                    // A stored run's rows are not events: the handler
+                    // answers `stored_result` and asks for no count.
+                    let (result, severity_columns, _) = present(
                         result,
                         &trawl_core::schema::FieldTypes::new(),
                         &dsl,
+                        None,
                         &cancel,
                         clock,
                     );
@@ -2540,12 +2595,14 @@ impl ExecutorPool {
                         result,
                         debug,
                         severity_columns,
+                        histogram: None,
                     }
                 }));
                 let outcome = outcome.unwrap_or_else(|_payload| ExecuteOutcome {
                     result: Err(ServerError::Panicked("query worker")),
                     debug: None,
                     severity_columns: Vec::new(),
+                    histogram: None,
                 });
                 slot.finish(&outcome.result);
                 drop(slot);
@@ -2569,6 +2626,7 @@ impl ExecutorPool {
                         result: Err(ServerError::from_join("query", e)),
                         debug: None,
                         severity_columns: Vec::new(),
+                        histogram: None,
                     },
                 }
             }
@@ -2578,7 +2636,7 @@ impl ExecutorPool {
                 } else {
                     Err(refusal_log.refuse(query_id, kind, StartRefusal::Expired))
                 };
-                ExecuteOutcome { result, debug: None, severity_columns: Vec::new() }
+                ExecuteOutcome { result, debug: None, severity_columns: Vec::new(), histogram: None }
             }
         }
     }
@@ -3233,6 +3291,7 @@ mod tests {
         user: None,
         timing: None,
         holds: None,
+        histogram: None,
     };
     const TEST_SAMPLE_WORK: WorkContext = WorkContext {
         kind: WorkKind::Sample,
@@ -3240,6 +3299,7 @@ mod tests {
         user: None,
         timing: None,
         holds: None,
+        histogram: None,
     };
 
     fn idle_len(pool: &ExecutorPool) -> usize {
@@ -3673,6 +3733,128 @@ mod tests {
             outcome.severity_columns.is_empty(),
             "a repinned field stops being presented as a severity"
         );
+    }
+
+    /// The histogram rides back on `ExecuteOutcome` from the worker, which
+    /// counts while it still holds the permit: parked just before its
+    /// presentation walks, the work has the pool's only permit. Work that
+    /// did not ask, and a run that failed, carry none.
+    #[tokio::test(start_paused = true)]
+    async fn execute_carries_the_histogram_from_the_worker() {
+        use crate::histogram::HistogramAsk;
+
+        let pool = hot_pool(1);
+        let seams = pool.seams();
+        let presenting = seams.hold(Seam::Presenting);
+        let id = pool.allocate_query_id();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "* | head 1",
+                    Deadline::after(Duration::from_secs(60)),
+                    false,
+                    TEST_WORK.with_histogram(HistogramAsk { kept_some: true }),
+                )
+                .await
+        });
+        until("the worker reaches its presentation", || {
+            presenting.arrivals() == 1
+        })
+        .await;
+        assert_eq!(pool.available_permits(), 0, "the worker holds the permit");
+        presenting.release();
+        let outcome = request.await.expect("the request joins");
+        let rows = outcome
+            .result
+            .as_ref()
+            .expect("the run succeeds")
+            .row_count();
+        assert_eq!(rows, 1);
+        let histogram = outcome.histogram.expect("the worker counted");
+        assert!(histogram.consistent_with(rows), "{histogram:?}");
+        let trawl_api::EventHistogram::Ready {
+            start,
+            buckets,
+            kept_some,
+            ..
+        } = histogram
+        else {
+            panic!("the hot event has a usable `_time`: {histogram:?}");
+        };
+        assert_eq!(start, "2026-01-03T00:05:00.000000Z");
+        assert_eq!(buckets[0].events, 1);
+        assert!(kept_some, "the ask's flag is the answer's");
+
+        let unasked = pool
+            .execute(
+                pool.allocate_query_id(),
+                "*",
+                Deadline::after(Duration::from_secs(60)),
+                false,
+                TEST_WORK,
+            )
+            .await;
+        assert!(unasked.result.is_ok(), "{:?}", unasked.result);
+        assert_eq!(unasked.histogram, None, "work that did not ask");
+
+        let failed = pool
+            .execute(
+                pool.allocate_query_id(),
+                "* | stats",
+                Deadline::after(Duration::from_secs(60)),
+                false,
+                TEST_WORK.with_histogram(HistogramAsk { kept_some: false }),
+            )
+            .await;
+        assert!(failed.result.is_err(), "{:?}", failed.result);
+        assert_eq!(failed.histogram, None, "a failed run has no rows to count");
+    }
+
+    /// A cancel by id that lands once the engine returned, while the
+    /// worker presents, is read by the histogram walk: the answer is the
+    /// engine's cancellation, not the pre-start refusal of a cancel that
+    /// arrives while the work waits, and it carries no histogram. The DSL
+    /// has no `|`, so the severity walk reads no latch: the histogram walk
+    /// is what stops.
+    #[tokio::test(start_paused = true)]
+    async fn histogram_walk_stops_on_a_latched_cancel() {
+        use crate::histogram::HistogramAsk;
+
+        let pool = hot_pool(1);
+        let seams = pool.seams();
+        let presenting = seams.hold(Seam::Presenting);
+        let id = pool.allocate_query_id();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(60)),
+                    false,
+                    TEST_WORK.with_histogram(HistogramAsk { kept_some: false }),
+                )
+                .await
+        });
+        until("the worker reaches its presentation", || {
+            presenting.arrivals() == 1
+        })
+        .await;
+        assert!(pool.cancel_by_id(id), "the work is still registered");
+        presenting.release();
+        let outcome = request.await.expect("the request joins");
+        assert!(
+            matches!(
+                outcome.result,
+                Err(ServerError::Engine(EngineError::Cancelled))
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.histogram, None);
+        assert!(outcome.severity_columns.is_empty());
     }
 
     /// An engine refusal crosses the pool intact, sentence and all.
