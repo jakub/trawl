@@ -210,6 +210,10 @@ characters to a terminal.
 status that `trawl driver` prints. `trawl driver capture` prints the screen as
 the TUI drew it. Messages on stderr always replace these characters with `�`.
 
+Three `trawl schema` values are the exception. An acknowledgement's
+`acked_by` and `note`, and a repin cancel's `detail`, have these characters
+replaced with `�` in every format, in a pipe and in a file too.
+
 To read exact values, send `json` or `csv` to a pipe or to a file with
 `-o, --output`.
 
