@@ -58,7 +58,7 @@ clipboard = ["dep:arboard"]
 [dev-dependencies]
 axum = { workspace = true }
 # `tests/common` boots a real trawld in-process for the suites that need
-# one (`preview_ingest`, `mcp_conformance`), as
+# one (the trawl-cli binaries of the `postgres` nextest group), as
 # trawl-server's own fixture does: the server crate, its keystore, its
 # postgres driver and its metrics recorder. All four are already in the
 # workspace graph through trawl-server. `fast-hash` is fleet-auth's
@@ -70,8 +70,10 @@ insta = { workspace = true }
 # schema tests do.
 jsonschema = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
-# `tests/client_zone.rs` runs the TUI on a PTY: crossterm needs a real
-# terminal. `openpty` is behind nix's `term` feature.
+# `tests/client_zone.rs` runs the TUI on a PTY, because crossterm needs a
+# real terminal, and `tests/cli_terminal_sinks.rs` runs `trawl query` and
+# `trawl schema` on one to read what reaches a terminal. `openpty` is
+# behind nix's `term` feature.
 nix = { workspace = true, features = ["term"] }
 rustls = { workspace = true }
 sqlx = { workspace = true }
