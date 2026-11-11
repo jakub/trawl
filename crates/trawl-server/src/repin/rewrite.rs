@@ -15,9 +15,9 @@ use trawl_core::schema::CanonicalType;
 
 use crate::env_dirs::{LayoutPath, layout_path};
 use crate::ingest::compaction::{
-    ColInfo, ConformPlan, ConformPolicy, RepinReading, bounded_misfit_samples_sql,
-    decode_misfit_samples, describe_source, is_valid_parquet, quote_ident, repin_count_exprs,
-    statement_failed,
+    ColInfo, ConformPlan, ConformPolicy, RepinReading, StatementFailure,
+    bounded_misfit_samples_sql, decode_misfit_samples, describe_source, is_valid_parquet,
+    quote_ident, repin_count_exprs, statement_failed,
 };
 
 /// Identity of one source file, for the additive catch-up diff. A
@@ -360,9 +360,18 @@ pub(crate) fn count_repin_effect_sampled(
     match measure(conn, source, schema, field, reading, true) {
         Ok(measured) => Ok(measured),
         Err(e) => {
-            tracing::warn!(
+            // DuckDB's or serde's wording can quote the file's values, so
+            // the text goes to DEBUG only.
+            tracing::debug!(
                 event_type = "repin_sample_failed",
                 error = %e,
+                "could not sample the values this repin cannot read; \
+                 continuing with counts only"
+            );
+            tracing::warn!(
+                event_type = "repin_sample_failed",
+                error_class = e.error_class(),
+                cause_kind = e.cause_kind().as_str(),
                 "could not sample the values this repin cannot read; \
                  continuing with counts only"
             );
@@ -383,7 +392,7 @@ fn measure(
     field: &str,
     reading: RepinReading,
     sampled: bool,
-) -> Result<(RepinEffect, Vec<String>), String> {
+) -> Result<(RepinEffect, Vec<String>), StatementFailure> {
     let stored = schema
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case(field))
@@ -424,7 +433,7 @@ fn measure(
                 if sampled { row.get(5)? } else { None },
             ))
         })
-        .map_err(|e| statement_failed("repin count failed", &e))?;
+        .map_err(|e| StatementFailure::duckdb("repin count failed", &e))?;
     Ok((
         RepinEffect {
             rows: u64::try_from(rows).unwrap_or(0),

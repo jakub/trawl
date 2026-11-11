@@ -33,6 +33,9 @@
 //! and a validation failure is `EngineError::Emit` (400, the sentence).
 //! Nothing here formats a message of its own.
 
+use std::any::Any;
+use std::sync::Arc;
+
 use trawl_core::ast::Query;
 use trawl_core::cancel::Stop;
 use trawl_engine::error::EngineError;
@@ -67,9 +70,27 @@ pub(crate) async fn admit(
     deadline: Deadline,
     pending: Option<&Pending>,
 ) -> Result<Query, ServerError> {
+    admit_holding(pool, dsl, deadline, pending, None).await
+}
+
+/// [`admit`] for a caller whose charge must stay charged while the check
+/// runs: a scheduled run passes its lease, which the preparation job keeps
+/// until it ends, also after the run stopped waiting (ADR-0018, amended
+/// 2026-11-09; [`crate::prepare::Preparation::run_with_holding`]).
+///
+/// # Errors
+///
+/// As [`admit`].
+pub(crate) async fn admit_holding(
+    pool: &ExecutorPool,
+    dsl: &str,
+    deadline: Deadline,
+    pending: Option<&Pending>,
+    hold: Option<Arc<dyn Any + Send + Sync>>,
+) -> Result<Query, ServerError> {
     let dsl = dsl.to_owned();
     pool.preparation()
-        .run_with(deadline, Door::Admission, pending, move |stop| {
+        .run_with_holding(deadline, Door::Admission, pending, hold, move |stop| {
             check_dsl_with(&dsl, stop)
         })
         .await?

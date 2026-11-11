@@ -4437,7 +4437,7 @@ trawld gives a database connection back to its pool only outside a transaction. 
 
 | Series | Type | Measurement |
 | --- | --- | --- |
-| `trawl_pool_connections_returned_in_transaction_total{pool}` | counter | Connections that came back to the app-state pool inside a transaction and were closed instead of reused. `pool` is `storage`. trawld logs `pool_connection_returned_in_transaction` for each. Starts at zero |
+| `trawl_pool_connections_returned_in_transaction_total{pool}` | counter | Connections that came back to the app-state pool inside a transaction and were closed instead of reused. `pool` is `storage`. trawld logs `pool_connection_returned_in_transaction` for each. A request cancelled while a raw transaction's `BEGIN` is in flight can add one when the return check closes it. A steady rise means a code path returns connections inside a transaction. Starts at zero |
 
 The fleet keystore pool closes such a session too and logs the same event with `pool=keystore`. It publishes no series.
 

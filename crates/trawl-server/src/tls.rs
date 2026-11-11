@@ -105,6 +105,20 @@ pub enum TlsError {
     Unsafe { path: PathBuf, reason: UnsafeReason },
 }
 
+impl TlsError {
+    /// Whether this error's text may stand in a retained event: a path
+    /// with an I/O error, or a refusal in trawl's own words. The other
+    /// variants carry the PEM parser's, `rustls`'s or `rcgen`'s wording
+    /// (`Config` can also hold a sentence of trawl's, but nothing records
+    /// which), so their text goes to DEBUG only.
+    pub(crate) fn text_is_retainable(&self) -> bool {
+        matches!(
+            self,
+            Self::ReadCert { .. } | Self::ReadKey { .. } | Self::Write(_) | Self::Unsafe { .. }
+        )
+    }
+}
+
 /// Where the listener's certificate and key come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsSource<'a> {
@@ -235,23 +249,15 @@ fn load_pem_files(cert_path: &Path, key_path: &Path) -> Result<(Vec<u8>, Vec<u8>
 /// Parses the PEM-encoded certificate and emits a `tls_cert_details` event.
 /// Failures are logged as warnings rather than propagated, since cert
 /// details are informational — the actual TLS handshake will catch
-/// genuinely broken certs.
+/// genuinely broken certs. A parser's own wording goes to DEBUG only.
 fn log_cert_details(pem_bytes: &[u8]) {
     match x509_parser::pem::parse_x509_pem(pem_bytes) {
         Ok((_, pem)) => match pem.parse_x509() {
             Ok(cert) => {
                 let subject = cert.subject().to_string();
                 let issuer = cert.issuer().to_string();
-                let not_before = cert
-                    .validity()
-                    .not_before
-                    .to_rfc2822()
-                    .unwrap_or_else(|e| format!("(invalid: {e})"));
-                let not_after = cert
-                    .validity()
-                    .not_after
-                    .to_rfc2822()
-                    .unwrap_or_else(|e| format!("(invalid: {e})"));
+                let not_before = validity_bound(cert.validity().not_before, "not_before");
+                let not_after = validity_bound(cert.validity().not_after, "not_after");
                 tracing::info!(
                     event_type = "tls_cert_details",
                     subject = %subject,
@@ -261,22 +267,36 @@ fn log_cert_details(pem_bytes: &[u8]) {
                     "TLS certificate details"
                 );
             }
-            Err(e) => {
-                tracing::warn!(
-                    event_type = "tls_cert_details",
-                    error = %e,
-                    "failed to parse X.509 certificate"
-                );
-            }
+            Err(e) => cert_details_unparsed(&e, "failed to parse X.509 certificate"),
         },
-        Err(e) => {
-            tracing::warn!(
-                event_type = "tls_cert_details",
-                error = %e,
-                "failed to parse PEM certificate"
-            );
-        }
+        Err(e) => cert_details_unparsed(&e, "failed to parse PEM certificate"),
     }
+}
+
+/// A certificate validity bound in RFC 2822, or `(invalid)` when it does
+/// not format as one. The formatter's wording goes to DEBUG only.
+fn validity_bound(time: x509_parser::time::ASN1Time, bound: &'static str) -> String {
+    time.to_rfc2822().unwrap_or_else(|e| {
+        tracing::debug!(
+            event_type = "tls_cert_details",
+            bound,
+            error = %e,
+            "a certificate validity bound does not format as RFC 2822"
+        );
+        "(invalid)".to_owned()
+    })
+}
+
+/// The `tls_cert_details` warning for a certificate the parser refused:
+/// its class at WARN, the parser's wording at DEBUG.
+fn cert_details_unparsed(error: &dyn std::fmt::Display, what: &'static str) {
+    tracing::debug!(event_type = "tls_cert_details", error = %error, "{what}");
+    tracing::warn!(
+        event_type = "tls_cert_details",
+        error_class = "internal",
+        cause_kind = crate::error::CauseKind::Unknown.as_str(),
+        "{what}"
+    );
 }
 
 /// Load existing default certs or generate new self-signed ones.
@@ -1201,8 +1221,17 @@ pub async fn cert_reload_task(
                     "TLS certificate reloaded successfully"
                 );
             }
-            Err(e) => {
+            Err(e) if e.text_is_retainable() => {
                 tracing::error!(event_type = "tls_reload_error", error = %e, "failed to reload TLS certificate, keeping current");
+            }
+            Err(e) => {
+                tracing::debug!(event_type = "tls_reload_error", error = %e, "failed to reload TLS certificate, keeping current");
+                tracing::error!(
+                    event_type = "tls_reload_error",
+                    error_class = "internal",
+                    cause_kind = crate::error::CauseKind::Unknown.as_str(),
+                    "failed to reload TLS certificate, keeping current"
+                );
             }
         }
     }

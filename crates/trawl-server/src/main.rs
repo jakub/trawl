@@ -293,6 +293,9 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         Arc::clone(&derivation),
     );
     if let Some(warning) = &log_filter.warning {
+        if let Some(parse_error) = &log_filter.parse_error {
+            tracing::debug!(event_type = "config_warning", error = %parse_error, "{warning}");
+        }
         tracing::warn!(event_type = "config_warning", "{warning}");
     }
 
@@ -635,7 +638,15 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             )
             .await
             {
-                tracing::error!(event_type = "lifecycle", error = %e, "HTTP server error");
+                // An internal error's text can carry rustls's or the PEM
+                // parser's wording from the listener's TLS setup.
+                tracing::debug!(event_type = "lifecycle", error = %e, "HTTP server error");
+                tracing::error!(
+                    event_type = "lifecycle",
+                    error_class = e.error_class(),
+                    cause_kind = e.cause_kind().as_str(),
+                    "HTTP server error"
+                );
             }
         });
 

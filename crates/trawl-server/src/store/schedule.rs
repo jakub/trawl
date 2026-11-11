@@ -60,7 +60,6 @@ use sqlx::{AssertSqlSafe, PgPool, Row as _};
 
 use super::error::{PgViolation, StoreError, WindowWriteError, classify_violation};
 use super::history::{bind_u64, bind_usize};
-use super::saved::{SavedQuery, row_to_saved_query_at};
 use super::status::{RunOrigin, RunStatus, decode_origin, decode_status};
 use crate::report_window::{
     Due, ManualPlan, MaterializeError, PlanError, PlanInput, ReportWindow, ScheduleWindow,
@@ -109,6 +108,21 @@ pub struct Schedule {
     pub next_fire_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The most rows one page of [`ScheduleStore::list_due_schedule_page`]
+/// holds.
+pub const DUE_SCHEDULE_PAGE: usize = 64;
+
+/// A due schedule as the scheduler tick lists it: the fields the tick
+/// needs before a claim, and no query text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DueSchedule {
+    pub id: i64,
+    /// The owning key, whose liveness the tick checks before the claim.
+    pub key_id: i64,
+    /// The fire cursor, which orders the listing and is its page key.
+    pub next_fire_at: DateTime<Utc>,
 }
 
 impl Schedule {
@@ -199,9 +213,9 @@ pub enum ManualRunClaim {
 ///
 /// The text comes from the saved-query row the claim locked, never from a
 /// snapshot the handler read a moment earlier, for the reason
-/// [`ClaimedRun`] gives about the scheduler's enumeration: what a run
-/// executes and what `report_runs.query` stores are one string, and reading
-/// it outside the lock lets an edit land in between.
+/// [`ClaimedRun`] gives: what a run executes and what `report_runs.query`
+/// stores are one string, and reading it outside the lock lets an edit land
+/// in between.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedManualRun {
     /// The `report_runs` row id.
@@ -252,11 +266,10 @@ pub enum DueClaim {
 /// The run a due claim created, with everything executing it needs.
 ///
 /// `resolved_query` is what the run executes AND what `report_runs.query`
-/// stores. It is deliberately not the saved DSL the enumeration handed the
-/// scheduler: the saved text is read inside the claim transaction, under
-/// the saved-query row lock, and a window is spliced onto it there (ADR-0018
-/// ruling 11). Executing the enumeration's copy would run text nobody
-/// recorded.
+/// stores. The saved text is read inside the claim transaction, under the
+/// saved-query row lock, and a window is spliced onto it there (ADR-0018
+/// ruling 11). The tick's listing carries no query text, so there is no
+/// other copy to execute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedRun {
     /// The `report_runs` row id.
@@ -994,31 +1007,49 @@ impl ScheduleStore {
         Ok(Some((schedule, latest_run)))
     }
 
-    /// List all enabled schedules with their associated saved queries.
-    /// Used by the scheduler — no ownership check (internal/cross-user).
-    pub async fn list_enabled_schedules(&self) -> Result<Vec<(Schedule, SavedQuery)>, StoreError> {
-        let rows = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {cols},
-                    sq.id         AS sq_id,
-                    sq.key_id     AS sq_key_id,
-                    sq.name       AS sq_name,
-                    sq.query      AS sq_query,
-                    sq.created_at AS sq_created_at,
-                    sq.updated_at AS sq_updated_at
-             FROM schedules s
-             JOIN saved_queries sq ON sq.id = s.saved_query_id
-             WHERE s.enabled = TRUE
-             ORDER BY s.id",
-            cols = schedule_cols("s.")
-        )))
+    /// One page of the schedules due at `now`, for the scheduler tick:
+    /// enabled, with `next_fire_at <= now`, oldest fire cursor first and
+    /// then by id (ADR-0018, amended 2026-11-09). A page holds at most
+    /// `limit` rows and never more than [`DUE_SCHEDULE_PAGE`]. `after` is
+    /// the `(next_fire_at, id)` of the last row of the previous page, and
+    /// the page starts strictly after it.
+    ///
+    /// No ownership check: the scheduler runs every key's schedules. No
+    /// query text: [`Self::claim_due_run`] reads every value a run depends
+    /// on again under its row locks.
+    pub async fn list_due_schedule_page(
+        &self,
+        now: DateTime<Utc>,
+        after: Option<(DateTime<Utc>, i64)>,
+        limit: usize,
+    ) -> Result<Vec<DueSchedule>, StoreError> {
+        let (after_fire, after_id) = after.unzip();
+        let rows = sqlx::query(
+            "SELECT id, key_id, next_fire_at
+             FROM schedules
+             WHERE enabled
+               AND next_fire_at <= $1
+               AND ($2::timestamptz IS NULL OR (next_fire_at, id) > ($2::timestamptz, $3::bigint))
+             ORDER BY next_fire_at, id
+             LIMIT $4",
+        )
+        .bind(now)
+        .bind(after_fire)
+        .bind(after_id)
+        .bind(bind_usize(limit.min(DUE_SCHEDULE_PAGE)))
         .fetch_all(&self.pool)
         .await?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            out.push((row_to_schedule(row)?, row_to_saved_query_at(row, "sq_")?));
-        }
-        Ok(out)
+        let page = rows
+            .iter()
+            .map(|row| {
+                Ok(DueSchedule {
+                    id: row.try_get("id")?,
+                    key_id: row.try_get("key_id")?,
+                    next_fire_at: row.try_get("next_fire_at")?,
+                })
+            })
+            .collect::<Result<_, sqlx::Error>>()?;
+        Ok(page)
     }
 
     /// Count enabled schedules (dashboard/monitor).
@@ -2071,9 +2102,9 @@ struct LockedSchedule {
 ///
 /// `saved_queries` FOR UPDATE, then `schedules` FOR UPDATE: the order every
 /// multi-row path in this module takes, extended one level up. Both rows are
-/// re-read here rather than trusted from the caller's enumeration snapshot,
-/// because an operator can edit the DSL, disable the schedule or delete
-/// either one between the list and the claim.
+/// read here rather than trusted from the tick's listing, because an
+/// operator can edit the DSL, disable the schedule or delete either one
+/// between the listing and the claim.
 ///
 /// `None` means there is nothing to run — the schedule or its saved query
 /// was deleted, or the schedule is disabled — and the caller answers

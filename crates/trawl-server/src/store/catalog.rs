@@ -412,13 +412,25 @@ async fn commit_or_detach(tx: PooledTransaction, purged: usize) -> Result<(), St
         result = &mut commit => match result {
             Ok(()) => Ok(()),
             Err(e) => {
-                // The pg diagnostics stay here, on the backend target, and
+                // `storage.backend` is retained, so the pg diagnostics go to
+                // DEBUG, the event carries the class and the cause kind, and
                 // the caller gets the outcome word only.
-                tracing::warn!(
+                tracing::debug!(
                     target: "storage.backend",
                     event_type = "catalog_pin_purge_commit_failed",
                     fields = purged,
                     error = %e,
+                    "a field-catalog pin purge's commit returned an error; postgres \
+                     may have applied it anyway, so whether those pins are gone is \
+                     unknown"
+                );
+                let fault = crate::error::ServerError::from(StoreError::from(e));
+                tracing::warn!(
+                    target: "storage.backend",
+                    event_type = "catalog_pin_purge_commit_failed",
+                    fields = purged,
+                    error_class = fault.error_class(),
+                    cause_kind = fault.cause_kind().as_str(),
                     "a field-catalog pin purge's commit returned an error; postgres \
                      may have applied it anyway, so whether those pins are gone is \
                      unknown"
@@ -436,15 +448,30 @@ async fn commit_or_detach(tx: PooledTransaction, purged: usize) -> Result<(), St
                         "a field-catalog pin purge committed after its caller stopped \
                          waiting; those pins are gone"
                     ),
-                    Err(e) => tracing::warn!(
-                        target: "storage.backend",
-                        event_type = "catalog_pin_purge_commit_late_failed",
-                        fields = purged,
-                        after_secs = PURGE_COMMIT_BOUND.as_secs(),
-                        error = %e,
-                        "a field-catalog pin purge's commit reported an error after its \
-                         caller stopped waiting; whether those pins are gone is unknown"
-                    ),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "storage.backend",
+                            event_type = "catalog_pin_purge_commit_late_failed",
+                            fields = purged,
+                            after_secs = PURGE_COMMIT_BOUND.as_secs(),
+                            error = %e,
+                            "a field-catalog pin purge's commit reported an error after \
+                             its caller stopped waiting; whether those pins are gone is \
+                             unknown"
+                        );
+                        let fault = crate::error::ServerError::from(StoreError::from(e));
+                        tracing::warn!(
+                            target: "storage.backend",
+                            event_type = "catalog_pin_purge_commit_late_failed",
+                            fields = purged,
+                            after_secs = PURGE_COMMIT_BOUND.as_secs(),
+                            error_class = fault.error_class(),
+                            cause_kind = fault.cause_kind().as_str(),
+                            "a field-catalog pin purge's commit reported an error after \
+                             its caller stopped waiting; whether those pins are gone is \
+                             unknown"
+                        );
+                    }
                 }
             });
             Err(StoreError::PurgeCommitUnknown)

@@ -203,7 +203,13 @@ impl QueryLog {
         let line = match serde_json::to_string(entry) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(error = %e, "failed to serialize query log entry");
+                // serde's wording can quote the entry's query text.
+                tracing::debug!(error = %e, "failed to serialize query log entry");
+                tracing::warn!(
+                    error_class = "internal",
+                    cause_kind = crate::error::CauseKind::Unknown.as_str(),
+                    "failed to serialize query log entry"
+                );
                 return;
             }
         };

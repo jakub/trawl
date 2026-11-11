@@ -151,9 +151,16 @@ pub async fn refresh_degraded_fields(state: &AppState) {
     let (degraded, pairs) = match state.storage.catalog.degraded_snapshot(&visible).await {
         Ok(generation) => generation,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "degraded_refresh_error",
                 error = %e,
+                "degraded-field refresh failed; keeping the previous snapshot"
+            );
+            let fault = crate::error::ServerError::from(e);
+            tracing::warn!(
+                event_type = "degraded_refresh_error",
+                error_class = fault.error_class(),
+                cause_kind = fault.cause_kind().as_str(),
                 "degraded-field refresh failed; keeping the previous snapshot"
             );
             return;
@@ -306,11 +313,27 @@ fn build_service_schema(
             Err(e) => {
                 // Log once per break (the file wasn't already on the warned
                 // list), so a persistently-broken file doesn't spam every tick.
+                //
+                // A footer error quotes the parquet crate's text, so the
+                // text goes to DEBUG; only an open failure has a typed cause.
                 if !prev_warned.contains(&f.path) {
-                    tracing::warn!(
+                    tracing::debug!(
                         event_type = "schema_refresh_file_skip",
                         file = %f.path.display(),
                         error = %e,
+                        "unreadable parquet file; skipping this pass, will retry next refresh"
+                    );
+                    let (error_class, cause_kind) = match &e {
+                        parquet_stats::ParquetStatsError::Open { source, .. } => {
+                            ("io", crate::error::CauseKind::of_io(source))
+                        }
+                        _ => ("internal", crate::error::CauseKind::Unknown),
+                    };
+                    tracing::warn!(
+                        event_type = "schema_refresh_file_skip",
+                        file = %f.path.display(),
+                        error_class,
+                        cause_kind = cause_kind.as_str(),
                         "unreadable parquet file; skipping this pass, will retry next refresh"
                     );
                 }
