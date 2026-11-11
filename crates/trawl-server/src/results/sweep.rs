@@ -318,7 +318,7 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
     // capture is not in the snapshot had its insert decided, or given its
     // grace, before the rows are read: its row is there, or it has none.
     match on_root(&results.root, ResultsRoot::list_ids).await {
-        Err(e) => outcome.errors += warn("listing the results root", &e, CauseKind::of_io(&e)),
+        Err(e) => outcome.errors += warn("listing the results root", &e, cause_of(&e)),
         Ok(files) => match (results.in_flight.snapshot(), store.live_ids().await) {
             (_, Err(e)) => outcome.errors += warn_store("reading the live captures", &e),
             (in_flight, Ok(live)) => {
@@ -456,7 +456,39 @@ async fn on_root<T: Send + 'static>(
     let root = Arc::clone(root);
     tokio::task::spawn_blocking(move || work(&root))
         .await
-        .map_err(|e| io::Error::other(join_failure_text("results root work", e)))?
+        .map_err(join_failure)?
+}
+
+/// A blocking task on the root that panicked or was cancelled, carried
+/// inside an [`io::Error`] as its own type, so [`cause_of`] can tell it
+/// from a filesystem error by type and never by text. It displays
+/// [`join_failure_text`]'s fixed words.
+#[derive(Debug)]
+struct JoinFailure(String);
+
+impl std::fmt::Display for JoinFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for JoinFailure {}
+
+fn join_failure(error: tokio::task::JoinError) -> io::Error {
+    io::Error::other(JoinFailure(join_failure_text("results root work", error)))
+}
+
+/// The closed cause of an [`on_root`] error: `unknown` for a task that
+/// failed to join, which is no filesystem fault, else the I/O kind.
+fn cause_of(error: &io::Error) -> CauseKind {
+    if error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<JoinFailure>)
+    {
+        CauseKind::Unknown
+    } else {
+        CauseKind::of_io(error)
+    }
 }
 
 /// Unlink every file in `ids`, stopping at the first failure. Returns how
@@ -576,6 +608,27 @@ mod tests {
             "{logged}"
         );
         assert_eq!(counted, 1);
+    }
+
+    /// A listing task that panics is not an I/O fault: its warning names
+    /// no I/O kind (#413 review), while a real filesystem error keeps its
+    /// own.
+    #[tokio::test]
+    async fn a_root_task_that_fails_to_join_has_no_io_cause() {
+        let joined = tokio::task::spawn_blocking(|| panic!("listing task panicked"))
+            .await
+            .unwrap_err();
+        let error = join_failure(joined);
+        assert_eq!(cause_of(&error), CauseKind::Unknown);
+        assert!(
+            !error.to_string().contains("listing task panicked"),
+            "{error}"
+        );
+        assert_eq!(
+            cause_of(&io::Error::from(io::ErrorKind::NotFound)),
+            CauseKind::IoNotFound
+        );
+        assert_eq!(cause_of(&io::Error::other("other")), CauseKind::IoOther);
     }
 
     #[test]
