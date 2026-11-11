@@ -211,13 +211,21 @@ impl PipelineWriter {
     ) {
         metrics::counter!(crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL)
             .increment(event_count as u64);
+        tracing::debug!(
+            event_type = "pipeline_wal_write_failed",
+            batch_env = %env,
+            batch_service = %svc,
+            error = %e,
+            "WAL write failed for batch"
+        );
         tracing::warn!(
             event_type = "pipeline_wal_write_failed",
             batch_env = %env,
             batch_service = %svc,
             events_lost = event_count,
             left_visible = e.left_visible(),
-            error = %e,
+            cause_kind = e.cause_kind().as_str(),
+            withdraw_cause_kind = e.withdraw_cause_kind().map(crate::error::CauseKind::as_str),
             "WAL write failed for batch"
         );
     }

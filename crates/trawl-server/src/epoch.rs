@@ -765,10 +765,16 @@ pub(crate) mod fail_dir_fsync {
 /// re-runs the same decision on the next boot.
 pub(crate) fn fsync_dir_best_effort(dir: &Path) {
     if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
-        tracing::warn!(
+        tracing::debug!(
             event_type = "epoch_dir_fsync_failed",
             dir = %dir.display(),
             error = %e,
+            "directory fsync failed"
+        );
+        tracing::warn!(
+            event_type = "epoch_dir_fsync_failed",
+            dir = %dir.display(),
+            cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
             "directory fsync failed; the epoch marker is in place but the \
              rename entry may not survive a crash (safe: the boot gate is \
              idempotent and would re-run)"

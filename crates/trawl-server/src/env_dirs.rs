@@ -355,9 +355,14 @@ pub(crate) fn list_env_dirs(root: &Path) -> Vec<(String, PathBuf)> {
 
 /// Log a root the listings that treat "cannot tell" as empty could not read.
 fn warn_unlisted(root: &Path, error: &std::io::Error) {
-    tracing::warn!(
+    tracing::debug!(
         dir = %root.display(),
         error = %error,
+        "failed to list env directories, treating as empty"
+    );
+    tracing::warn!(
+        dir = %root.display(),
+        cause_kind = crate::error::CauseKind::of_io(error).as_str(),
         "failed to list env directories, treating as empty"
     );
 }

@@ -17,6 +17,7 @@ use std::time::SystemTime;
 use parking_lot::Mutex;
 
 use super::publication_marker;
+use crate::error::CauseKind;
 
 /// How many names one write tries before it gives up. A name is taken
 /// when an entry already holds it or a pending publication marker claims
@@ -61,6 +62,23 @@ impl WalWriteError {
     /// visible now, or a power loss may restore it.
     pub fn left_visible(&self) -> bool {
         matches!(self, Self::LeftVisible { .. })
+    }
+
+    /// The closed kind of the failed operation's I/O error: the write's own
+    /// error, or the directory fsync that left the file visible.
+    pub fn cause_kind(&self) -> CauseKind {
+        match self {
+            Self::NotPublished(e) | Self::LeftVisible { sync: e, .. } => CauseKind::of_io(e),
+        }
+    }
+
+    /// The closed kind of the failed withdrawal, when the file was left
+    /// visible.
+    pub fn withdraw_cause_kind(&self) -> Option<CauseKind> {
+        match self {
+            Self::NotPublished(_) => None,
+            Self::LeftVisible { withdraw, .. } => Some(CauseKind::of_io(withdraw)),
+        }
     }
 }
 
@@ -273,10 +291,16 @@ impl WalWriter {
         // The final name holds the batch now, and the directory sync below
         // covers this unlink too.
         if let Err(e) = self.unlink_tmp(&tmp_path) {
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "wal_tmp_unlink_failed",
                 path = %tmp_path.display(),
                 error = %e,
+                "WAL staging file could not be removed after its link"
+            );
+            tracing::warn!(
+                event_type = "wal_tmp_unlink_failed",
+                path = %tmp_path.display(),
+                cause_kind = CauseKind::of_io(&e).as_str(),
                 "WAL staging file could not be removed after its link; it stays \
                  behind, and no WAL scan reads it"
             );
@@ -299,19 +323,29 @@ impl WalWriter {
             if let Some(Err(_)) = withdrawal_sync {
                 Self::count_directory_sync_failure();
             }
+            let withdrawal_sync_error = withdrawal_sync.as_ref().and_then(|r| r.as_ref().err());
+            tracing::debug!(
+                event_type = "wal_dir_fsync_failed",
+                dir = %env_dir.display(),
+                error = %sync,
+                withdraw_error = withdrawn.as_ref().err().map(tracing::field::display),
+                withdrawal_sync_error = withdrawal_sync_error.map(tracing::field::display),
+                "WAL directory fsync failed; the write is rejected"
+            );
             // `withdrawn = false` means compaction can still merge the file.
             // `withdrawal_durable = false` means a power loss may restore it.
             tracing::warn!(
                 event_type = "wal_dir_fsync_failed",
                 dir = %env_dir.display(),
-                error = %sync,
+                cause_kind = CauseKind::of_io(&sync).as_str(),
                 withdrawn = withdrawn.is_ok(),
-                withdraw_error = withdrawn.as_ref().err().map(tracing::field::display),
-                withdrawal_durable = matches!(withdrawal_sync, Some(Ok(()))),
-                withdrawal_sync_error = withdrawal_sync
+                withdraw_cause_kind = withdrawn
                     .as_ref()
-                    .and_then(|r| r.as_ref().err())
-                    .map(tracing::field::display),
+                    .err()
+                    .map(|e| CauseKind::of_io(e).as_str()),
+                withdrawal_durable = matches!(withdrawal_sync, Some(Ok(()))),
+                withdrawal_sync_cause_kind =
+                    withdrawal_sync_error.map(|e| CauseKind::of_io(e).as_str()),
                 "WAL directory fsync failed; the write is rejected"
             );
             // Without a withdrawal sync, the withdrawal itself failed.
@@ -471,10 +505,16 @@ impl WalWriter {
         };
         if let Err(e) = self.sync_directory(&self.wal_dir) {
             Self::count_directory_sync_failure();
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "wal_dir_fsync_failed",
                 dir = %self.wal_dir.display(),
                 error = %e,
+                "WAL directory fsync failed before the first write into this environment"
+            );
+            tracing::warn!(
+                event_type = "wal_dir_fsync_failed",
+                dir = %self.wal_dir.display(),
+                cause_kind = CauseKind::of_io(&e).as_str(),
                 "WAL directory fsync failed before the first write into this \
                  environment; the write is rejected"
             );
@@ -495,10 +535,16 @@ impl WalWriter {
     fn sync_or_count(&self, dir: &Path) -> std::io::Result<()> {
         self.sync_directory(dir).inspect_err(|e| {
             Self::count_directory_sync_failure();
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "wal_dir_fsync_failed",
                 dir = %dir.display(),
                 error = %e,
+                "WAL directory fsync failed on the path to the WAL root"
+            );
+            tracing::warn!(
+                event_type = "wal_dir_fsync_failed",
+                dir = %dir.display(),
+                cause_kind = CauseKind::of_io(e).as_str(),
                 "WAL directory fsync failed on the path to the WAL root; \
                  nothing is acknowledged into the directories below it"
             );

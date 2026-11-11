@@ -101,7 +101,16 @@ pub fn spawn_syslog(
             )
             .await
             {
-                tracing::error!(event_type = "syslog_udp_error", error = %e, "UDP syslog listener failed");
+                tracing::debug!(
+                    event_type = "syslog_udp_error",
+                    error = %e,
+                    "UDP syslog listener failed"
+                );
+                tracing::error!(
+                    event_type = "syslog_udp_error",
+                    cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
+                    "UDP syslog listener failed"
+                );
             }
         }));
     }
@@ -124,7 +133,16 @@ pub fn spawn_syslog(
             )
             .await
             {
-                tracing::error!(event_type = "syslog_tcp_error", error = %e, "TCP syslog listener failed");
+                tracing::debug!(
+                    event_type = "syslog_tcp_error",
+                    error = %e,
+                    "TCP syslog listener failed"
+                );
+                tracing::error!(
+                    event_type = "syslog_tcp_error",
+                    cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
+                    "TCP syslog listener failed"
+                );
             }
         }));
     }

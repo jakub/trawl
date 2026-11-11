@@ -22,7 +22,7 @@ use axum::http::request::Parts;
 use fleet_auth::VerifiedKey;
 use indexmap::IndexMap;
 
-use crate::error::ServerError;
+use crate::error::{CauseKind, ServerError};
 use crate::hot_buffer::{Charge, Refusal, Reservation};
 use crate::ingest::body::{EventOutcome, EventReport, HttpRequestContext, visit_events};
 use crate::ingest::envelope::{EnvelopeContext, RejectReason, RepairClass, RepairCode};
@@ -492,8 +492,9 @@ pub async fn ingest(
         drop(reservation);
         if wal_failed {
             // A failed group was never acknowledged, so the request fails
-            // as a whole and the sender retries it. The filesystem error
-            // stays in the `wal_write_failed` log, never in the response.
+            // as a whole and the sender retries it. The filesystem error's
+            // text is only in the DEBUG `wal_write_failed` event, never in
+            // the response; the retained WARN names its kind.
             return Err(ServerError::Internal("WAL write failed".into()));
         }
         Ok(response)
@@ -621,18 +622,27 @@ fn write_wal_batches(
         match wal_writer.write(env, svc, &batch.ndjson) {
             Ok(path) => wal_paths.push((key.clone(), path)),
             Err(e) => {
+                tracing::debug!(
+                    event_type = "wal_write_failed",
+                    batch_env = %env,
+                    batch_service = %svc,
+                    error = %e,
+                    "WAL write failed for service group"
+                );
                 tracing::warn!(
                     event_type = "wal_write_failed",
                     batch_env = %env,
                     batch_service = %svc,
                     events_lost = batch.maps.len(),
                     left_visible = e.left_visible(),
-                    error = %e,
+                    cause_kind = e.cause_kind().as_str(),
+                    withdraw_cause_kind = e.withdraw_cause_kind().map(CauseKind::as_str),
                     "WAL write failed for service group"
                 );
                 let event_count = batch.maps.len();
-                // The filesystem error stays in the log line above: this
-                // message is client-facing text and names no path.
+                // The filesystem error's text is only in the DEBUG event
+                // above: this message is client-facing text and names no
+                // path.
                 parsed.errors.push(event_error(
                     0,
                     RejectReason::WalFailure,
