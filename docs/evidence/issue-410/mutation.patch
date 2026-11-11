@@ -1,0 +1,14 @@
+diff --git a/crates/trawl-server/src/store/investigations.rs b/crates/trawl-server/src/store/investigations.rs
+index d88b2f10..59f62231 100644
+--- a/crates/trawl-server/src/store/investigations.rs
++++ b/crates/trawl-server/src/store/investigations.rs
+@@ -1839,6 +1839,9 @@ async fn insert_entry(
+     kind: EntryKind,
+     payload: &str,
+ ) -> Result<(), StoreError> {
++    if let LockWait::Until(_) = tx.wait {
++        tx.wait = LockWait::Until(Deadline::after(std::time::Duration::from_secs(5)));
++    }
+     tx.run(async |tx| {
+         sqlx::query(
+             "INSERT INTO investigation_log (

@@ -109,10 +109,24 @@ fn loader_path() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
     .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
 }
 
-/// A port with nothing listening on it.
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
+/// A loopback port bound by this test and never listening: a connect to it
+/// is refused, and no other process can bind it while the guard lives.
+/// Keep the guard in a named binding until every child and session that
+/// uses the port has exited; reading the port off a dropped guard frees the
+/// port again.
+struct ClosedPort(tokio::net::TcpSocket);
+
+impl ClosedPort {
+    fn port(&self) -> u16 {
+        self.0.local_addr().expect("addr").port()
+    }
+}
+
+/// A port with nothing listening on it, held for as long as the guard lives.
+fn closed_port() -> ClosedPort {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.bind(([127, 0, 0, 1], 0).into()).expect("bind");
+    ClosedPort(socket)
 }
 
 /// A config with `[profiles.home]` at `url`, with or without a token, and
@@ -164,8 +178,9 @@ fn assert_refused(output: &Output, needles: &[&str], case: &str) {
 #[test]
 fn ambient_variables_are_refused_by_name() {
     let home = Sandbox::new();
+    let closed = closed_port();
     home.default_config(&profile_config(
-        &format!("http://127.0.0.1:{}", closed_port()),
+        &format!("http://127.0.0.1:{}", closed.port()),
         true,
     ));
     for name in REFUSED {
@@ -194,7 +209,8 @@ fn ambient_variables_are_refused_by_name() {
 #[test]
 fn flags_that_move_the_target_are_refused() {
     let home = Sandbox::new();
-    let url = format!("http://127.0.0.1:{}", closed_port());
+    let closed = closed_port();
+    let url = format!("http://127.0.0.1:{}", closed.port());
     home.default_config(&profile_config(&url, true));
     for (flag, args) in [
         (
@@ -221,7 +237,8 @@ fn flags_that_move_the_target_are_refused() {
 #[test]
 fn the_key_comes_from_exactly_one_source() {
     let home = Sandbox::new();
-    let url = format!("http://127.0.0.1:{}", closed_port());
+    let closed = closed_port();
+    let url = format!("http://127.0.0.1:{}", closed.port());
     let key_file = home.file("key", &format!("{SENTINEL}\n"));
     let key_file = key_file.to_str().unwrap();
 
@@ -487,8 +504,9 @@ fn assert_pure(session: &Session, case: &str) {
 #[test]
 fn stdout_carries_protocol_messages_only() {
     let home = Sandbox::new();
+    let closed = closed_port();
     home.default_config(&profile_config(
-        &format!("http://127.0.0.1:{}", closed_port()),
+        &format!("http://127.0.0.1:{}", closed.port()),
         true,
     ));
     let quiet = session(&home, &["mcp", "--profile", "home"], &[]);
@@ -508,8 +526,9 @@ fn stdout_carries_protocol_messages_only() {
 #[test]
 fn a_key_file_serves_a_profile_without_a_token() {
     let home = Sandbox::new();
+    let closed = closed_port();
     home.default_config(&profile_config(
-        &format!("http://127.0.0.1:{}", closed_port()),
+        &format!("http://127.0.0.1:{}", closed.port()),
         false,
     ));
     let key_file = home.file("key", &format!("{PROFILE_TOKEN}\n"));
@@ -592,8 +611,9 @@ fn startup_contacts_no_server() {
 #[test]
 fn a_broken_stdout_after_initialize_exits_one() {
     let home = Sandbox::new();
+    let closed = closed_port();
     home.default_config(&profile_config(
-        &format!("http://127.0.0.1:{}", closed_port()),
+        &format!("http://127.0.0.1:{}", closed.port()),
         true,
     ));
     let mut child = home
@@ -720,8 +740,9 @@ fn a_hostile_request_id_cannot_forge_stderr_lines() {
     const HOSTILE_ID: &str =
         "id\nforged-line\u{1b}[2J\u{2028}forged-separator\u{2029}forged-paragraph";
     let home = Sandbox::new();
+    let closed = closed_port();
     home.default_config(&profile_config(
-        &format!("http://127.0.0.1:{}", closed_port()),
+        &format!("http://127.0.0.1:{}", closed.port()),
         true,
     ));
     // RUST_LOG stays unset: the default level is the one under test.

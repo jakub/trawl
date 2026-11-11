@@ -189,6 +189,13 @@ fn random_strings_parquet(dir: &Path, rows: usize) -> PathBuf {
 
 /// The largest byte totals the spill directory reached across samples:
 /// the sum of the files' lengths and of their allocated blocks.
+///
+/// The directory bound is on `length`, the bytes `DuckDB` wrote and
+/// counts. `allocated` is printed with each run's result and is not
+/// bounded: a
+/// filesystem that allocates ahead of a growing file's end (XFS does)
+/// holds blocks `DuckDB` never asked for, up to 113 MiB of them at these
+/// caps (ADR-0056, amendment of 2026-11-10).
 #[derive(Debug, Default, Clone, Copy)]
 struct Peak {
     length: u64,
@@ -477,25 +484,66 @@ fn duckdb_format_bytes_cuts_like_duckdb() {
 /// as a percentage of the natural peak.
 const TOP_PERCENT: u64 = 96;
 
-/// AC4's engine half (ADR-0056): a query that spills past the cap fails as
-/// [`EngineError::ResourceExhausted`], the usage `DuckDB` accounts never
-/// passes the cap, and the spill directory never holds more than the cap
-/// plus [`CLASS_SLACK`].
+/// The checks on a capped run that the spill cap refused: `DuckDB` names
+/// the spill cap, not memory, reports the configured cap, accounts no more
+/// than it, and the directory held no more than the cap plus
+/// [`CLASS_SLACK`]. `run` names the run in each failure.
+fn assert_refused_by_the_spill_cap(run: &str, cap: u64, outcome: &str, peak: Peak) {
+    let message = outcome
+        .strip_prefix("err resource_exhausted ")
+        .unwrap_or_else(|| panic!("{run}: {outcome}"));
+    assert!(
+        message.contains("failed to offload data block")
+            && message.contains("max_temp_directory_size"),
+        "{run}: the spill cap, not memory, stopped the sort: {message}"
+    );
+    let (used, accounted_cap, cap_text) = accounted_usage(message)
+        .unwrap_or_else(|| panic!("{run}: no accounted usage in {message}"));
+    assert_eq!(
+        cap_text,
+        duckdb_format_bytes(cap),
+        "{run}: DuckDB reports a different cap"
+    );
+    assert!(
+        used <= accounted_cap,
+        "{run}: DuckDB accounted {used} past its cap {accounted_cap}"
+    );
+    let held = peak.length;
+    assert!(
+        held <= cap + CLASS_SLACK,
+        "{run}: the spill directory held {held} bytes, {} past the cap ({peak:?})",
+        held - cap
+    );
+}
+
+/// AC4's engine half (ADR-0056): whether a capped spill completes or is
+/// refused, the spill directory never holds more than the cap plus
+/// [`CLASS_SLACK`]; and a refused run fails as
+/// [`EngineError::ResourceExhausted`] through the spill cap, with the
+/// usage `DuckDB` accounts never past the cap.
 ///
 /// The shape is a full sort over a million poorly compressible strings at
 /// 128 MiB of memory and two threads, so it spills about 240 MiB with no
 /// cap. The caps sweep from 40% to 96% of that natural peak: below about
-/// half the sort fails while its runs are still growing, and above it
-/// the merge frees and rewrites blocks, which is where the slack appears
+/// half the sort usually fails while its runs are still growing, and above
+/// it the merge frees and rewrites blocks, which is where the slack appears
 /// (the probe's worst cases sat at 52%, 68% and 76%).
+///
+/// The sort's real peak varies with thread timing, and the natural peak is
+/// only the largest spill one run's samples saw, so any capped run may sit
+/// above its own real peak and complete. ADR-0056 promises the budget, not
+/// a repeatable peak: a completed run keeps the directory bound, and a
+/// refused run keeps every refusal check. When every step completes, this
+/// test checks no refusal; [`spill_cap_refuses_a_low_fixed_cap`] always
+/// does.
 ///
 /// The directory is sampled with the query's process stopped
 /// ([`spill_under`]): one `read_dir` pass over files that other threads
 /// are growing and truncating is not one state of the directory, and its
 /// sum can count a block twice. A stopped process gives a consistent sum,
-/// so the assertion cannot fail on a sampling artefact. Sampling can miss
-/// a peak between two samples, which weakens the check but never makes it
-/// fail falsely.
+/// so the assertion cannot fail on a sampling artefact. Residual exposure:
+/// sampling can miss a peak between two samples, which weakens the check
+/// but never makes it fail falsely.
 #[test]
 fn spill_stays_within_budget_plus_class_slack() {
     let data = tempfile::tempdir().expect("data");
@@ -510,53 +558,63 @@ fn spill_stays_within_budget_plus_class_slack() {
         "the uncapped sort must spill well past the smallest cap: {natural:?}"
     );
 
-    let mut worst = i128::MIN;
+    let (mut completed, mut refused) = (0u32, 0u32);
+    let mut worst: Option<i128> = None;
+    let mut worst_allocated: Option<i128> = None;
     for percent in (40..=TOP_PERCENT).step_by(4) {
         let cap = natural.length * percent / 100;
         let (outcome, peak) = spill_under(&sql, &budgets(cap, memory, 2));
-        // The natural peak is the largest spill the samples saw, and the sort's
-        // real peak varies with thread timing. A cap in the last step can sit
-        // above this run's real peak, and then the sort completes: correct
-        // behaviour, so it keeps the directory bound and skips the message
-        // checks. Every lower cap must stop the sort.
-        if percent == TOP_PERCENT && outcome == "ok 1" {
-            let held = peak.length.max(peak.allocated);
+        let run = format!("cap {cap} ({percent}%)");
+        let held = peak.length;
+        if outcome == "ok 1" {
             assert!(
                 held <= cap + CLASS_SLACK,
-                "cap {cap} ({percent}%): the completed sort held {held} bytes ({peak:?})"
+                "{run}: the completed sort held {held} bytes ({peak:?})"
             );
-            continue;
+            completed += 1;
+        } else {
+            assert_refused_by_the_spill_cap(&run, cap, &outcome, peak);
+            refused += 1;
         }
-        let message = outcome
-            .strip_prefix("err resource_exhausted ")
-            .unwrap_or_else(|| panic!("cap {cap} ({percent}%): {outcome}"));
-        assert!(
-            message.contains("failed to offload data block")
-                && message.contains("max_temp_directory_size"),
-            "cap {cap} ({percent}%): the spill cap, not memory, stopped the sort: {message}"
-        );
-        let (used, accounted_cap, cap_text) = accounted_usage(message)
-            .unwrap_or_else(|| panic!("cap {cap} ({percent}%): no accounted usage in {message}"));
-        assert_eq!(
-            cap_text,
-            duckdb_format_bytes(cap),
-            "cap {cap} ({percent}%): DuckDB reports a different cap"
-        );
-        assert!(
-            used <= accounted_cap,
-            "cap {cap} ({percent}%): DuckDB accounted {used} past its cap {accounted_cap}"
-        );
-        let held = peak.length.max(peak.allocated);
-        assert!(
-            held <= cap + CLASS_SLACK,
-            "cap {cap} ({percent}%): the spill directory held {held} bytes, {} past the cap \
-             ({peak:?})",
-            held - cap
-        );
-        worst = worst.max(i128::from(held) - i128::from(cap));
+        let over = i128::from(held) - i128::from(cap);
+        worst = Some(worst.map_or(over, |worst| worst.max(over)));
+        let ahead = i128::from(peak.allocated) - i128::from(cap);
+        worst_allocated = Some(worst_allocated.map_or(ahead, |worst| worst.max(ahead)));
     }
+    let worst = worst.expect("the sweep runs at least one cap");
+    let worst_allocated = worst_allocated.expect("the sweep runs at least one cap");
     eprintln!(
-        "natural spill {} bytes; worst overshoot past the cap {worst} bytes (block {BLOCK})",
+        "natural spill {} bytes; {refused} caps refused, {completed} completed; worst overshoot \
+         past the cap {worst} bytes by length (block {BLOCK}), {worst_allocated} bytes by \
+         allocated blocks",
         natural.length,
     );
+}
+
+/// The spill cap in [`spill_cap_refuses_a_low_fixed_cap`]: a few blocks,
+/// far below the fixture's natural spill of about 240 MiB.
+const LOW_CAP: u64 = MIB;
+
+/// The fixture of [`spill_stays_within_budget_plus_class_slack`] under a
+/// fixed cap far below its natural spill must be refused by the spill cap
+/// (ADR-0056), not by memory. This is the refusal check the sweep cannot
+/// guarantee, since any sweep step may complete.
+///
+/// The refusal does not depend on a sample. A cap this low is refused
+/// within a few blocks, so under load the samples can all fall before the
+/// first block or after the refusal removed the files, and a parent that
+/// runs late can take none. The peak is printed as evidence of the run.
+///
+/// Residual exposure: the directory bound is checked only at the samples
+/// taken, as in the sweep.
+#[test]
+fn spill_cap_refuses_a_low_fixed_cap() {
+    let data = tempfile::tempdir().expect("data");
+    let source = random_strings_parquet(data.path(), 1_000_000);
+    let sql = window_sort(&source);
+
+    let (outcome, peak) = spill_under(&sql, &budgets(LOW_CAP, 128 * MIB, 2));
+    let run = format!("fixed cap {LOW_CAP}");
+    eprintln!("{run}: {peak:?}");
+    assert_refused_by_the_spill_cap(&run, LOW_CAP, &outcome, peak);
 }

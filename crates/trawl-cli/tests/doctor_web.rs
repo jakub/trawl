@@ -114,6 +114,9 @@ const REJECTED: &str =
 struct Origin {
     url: String,
     log: Log,
+    /// The closed port a `trawl-web` origin names as its upstream, held for
+    /// as long as the origin serves.
+    _closed_upstream: Option<ClosedPort>,
 }
 
 impl Origin {
@@ -138,21 +141,30 @@ impl Origin {
                 axum::serve(listener, app).await.expect("serve");
             });
         });
-        Self { url, log }
+        Self {
+            url,
+            log,
+            _closed_upstream: None,
+        }
     }
 
     /// A real `trawl-web` whose `public_origins` is `origins(url)`.
     fn trawl_web(origins: impl FnOnce(&str) -> Vec<String>) -> Self {
-        Self::serve(|url| {
+        let upstream = closed_port();
+        let origin = Self::serve(|url| {
             let web = WebConfig {
-                upstream_url: Some(format!("https://127.0.0.1:{}", closed_port())),
+                upstream_url: Some(format!("https://127.0.0.1:{}", upstream.port())),
                 allow_insecure_cookies: true,
                 public_origins: origins(url),
                 ..WebConfig::default()
             };
             let config = ResolvedConfig::from_parsed(&web, None).expect("trawl-web config");
             trawl_web::routes::build(AppState::from_config(config).expect("trawl-web state"))
-        })
+        });
+        Self {
+            _closed_upstream: Some(upstream),
+            ..origin
+        }
     }
 
     /// Something that is not `trawl-web`, answering its two paths.
@@ -212,10 +224,24 @@ impl Origin {
     }
 }
 
-/// A port with nothing listening on it.
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
+/// A loopback port bound by this test and never listening: a connect to it
+/// is refused, and no other process can bind it while the guard lives.
+/// Keep the guard in a named binding (or a fixture field) until every child
+/// that uses the port has exited; reading the port off a dropped guard frees
+/// the port again.
+struct ClosedPort(tokio::net::TcpSocket);
+
+impl ClosedPort {
+    fn port(&self) -> u16 {
+        self.0.local_addr().expect("addr").port()
+    }
+}
+
+/// A port with nothing listening on it, held for as long as the guard lives.
+fn closed_port() -> ClosedPort {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.bind(([127, 0, 0, 1], 0).into()).expect("bind");
+    ClosedPort(socket)
 }
 
 /// Run `trawl doctor --url <closed> --token-file <canary> --web-url <web>
@@ -231,7 +257,8 @@ fn doctor(web: &str) -> (Output, serde_json::Value) {
             cmd.env_remove(key);
         }
     }
-    let api = format!("https://127.0.0.1:{}", closed_port());
+    let api_guard = closed_port();
+    let api = format!("https://127.0.0.1:{}", api_guard.port());
     let output = cmd
         .env_remove("SSL_CERT_FILE")
         .env_remove("SSL_CERT_DIR")
@@ -622,7 +649,11 @@ fn cut_short_origin(cut_healthz: bool) -> Origin {
             let _ = tcp.flush();
         }
     });
-    Origin { url, log }
+    Origin {
+        url,
+        log,
+        _closed_upstream: None,
+    }
 }
 
 /// A web answer the origin cuts short after its headers is an observed

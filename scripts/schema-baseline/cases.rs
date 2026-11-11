@@ -307,19 +307,82 @@ async fn fresh_restart_preserves_history_and_forward_migrations_work(pool: PgPoo
     assert_eq!(count, 1);
 }
 
+/// How long a wait in [`cancelled_lock_wait_does_not_recycle_a_locked_connection`]
+/// may take before it fails as a hang. That test runs on tokio's live
+/// clock, so this is real time.
+const HANG_GUARD: Duration = Duration::from_secs(120);
+
+/// Poll `probe` every 10 ms until it answers, failing as a hang after
+/// [`HANG_GUARD`] of real time.
+async fn until_live<T>(what: &str, mut probe: impl AsyncFnMut() -> Option<T>) -> T {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(found) = probe().await {
+            return found;
+        }
+        assert!(
+            start.elapsed() < HANG_GUARD,
+            "{what}: still waiting after {HANG_GUARD:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A migration cancelled while it waits on the advisory lock never hands its
+/// lock-holding connection back: once its backend has exited, a retry
+/// migrates.
+///
+/// The migration is cancelled only after `pg_locks` shows its backend
+/// waiting, so the cancel always lands inside the lock wait. A backend
+/// blocked in `pg_advisory_lock` does not notice its client's close until
+/// the lock is granted: it stays in `pg_stat_activity` while the blocker
+/// holds the lock, then takes the lock and exits. So the blocker is released
+/// first, and the test then waits for that backend to leave. A cancelled
+/// connection that went back to a pool, still holding the lock, would never
+/// leave.
+///
+/// Residual exposure: each wait ends at [`HANG_GUARD`] of real time.
 #[sqlx::test(migrations = false)]
 async fn cancelled_lock_wait_does_not_recycle_a_locked_connection(pool: PgPool) {
+    let mut observer = pool.acquire().await.unwrap();
     let mut blocker = pool.acquire().await.unwrap().detach();
     blocker.lock().await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), migrate(&pool))
-            .await
-            .is_err()
-    );
-    blocker.close().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), migrate(&pool))
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut blocker)
         .await
-        .expect("cancelled connection released lock")
+        .unwrap();
+    let pending = tokio::spawn({
+        let pool = pool.clone();
+        async move { migrate(&pool).await }
+    });
+    let waiter: i32 = until_live("the migration waits on the advisory lock", async || {
+        sqlx::query_scalar(
+            "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND pid <> $1
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .bind(blocker_pid)
+        .fetch_optional(&mut *observer)
+        .await
+        .unwrap()
+    })
+    .await;
+    pending.abort();
+    let joined = pending.await.expect_err("the migration was cancelled");
+    assert!(joined.is_cancelled(), "{joined}");
+    blocker.close().await.unwrap();
+    until_live("the cancelled migration's backend exits", async || {
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
+                .bind(waiter)
+                .fetch_one(&mut *observer)
+                .await
+                .unwrap();
+        (sessions == 0).then_some(())
+    })
+    .await;
+    tokio::time::timeout(HANG_GUARD, migrate(&pool))
+        .await
+        .expect("the retry migrates within the hang guard")
         .unwrap();
 }
 
