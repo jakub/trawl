@@ -40,6 +40,8 @@ use std::time::SystemTime;
 
 use trawl_engine::scratch::{HeldRoot, OwnedRoot, RootRole, ScratchError};
 
+use crate::error::CauseKind;
+
 /// Suffix of a published result's file name, after its id.
 const RESULT_SUFFIX: &str = ".parquet";
 
@@ -174,10 +176,16 @@ impl Drop for StagedFile {
             return;
         }
         if let Err(error) = sys::unlink(&self.dir, &self.name) {
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "results_stage_unlink_failed",
                 path = %self.path.display(),
                 error = %error,
+                "could not remove an unpublished capture file; the next start removes it"
+            );
+            tracing::warn!(
+                event_type = "results_stage_unlink_failed",
+                path = %self.path.display(),
+                cause_kind = CauseKind::of_io(&error).as_str(),
                 "could not remove an unpublished capture file; the next start removes it"
             );
         }

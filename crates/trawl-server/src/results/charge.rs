@@ -133,6 +133,7 @@ use super::ResultsClock;
 use super::root::ResultsRoot;
 use crate::config::{CaptureConfig, InvestigationConfig};
 use crate::deadline::{Deadline, Expired};
+use crate::error::CauseKind;
 use crate::store::{ExpiredFile, InvestigationStore, ResultsStore, StoreError, Usage};
 
 /// Why a capture was not admitted.
@@ -690,7 +691,11 @@ impl CaptureGate {
                         Ok(false) => {}
                         Err(error) => {
                             outcome.1 += 1;
-                            warn_retire(what, "unlinking a retired result's file", &error);
+                            warn_retire(
+                                what,
+                                "unlinking a retired result's file",
+                                RetireFailure::Io(&error),
+                            );
                         }
                     }
                 }
@@ -710,7 +715,10 @@ impl CaptureGate {
                 Err(error) => warn_retire(
                     what,
                     "unlinking retired results' files",
-                    &crate::error::join_failure_text("results retire unlink", error),
+                    RetireFailure::Join(&crate::error::join_failure_text(
+                        "results retire unlink",
+                        error,
+                    )),
                 ),
             }
         });
@@ -1135,14 +1143,41 @@ impl Retired {
     }
 }
 
+/// Why a filesystem step of a reservation's retire failed.
+#[derive(Clone, Copy)]
+enum RetireFailure<'a> {
+    /// The unlink's own error: the OS's text, logged at DEBUG only.
+    Io(&'a std::io::Error),
+    /// [`crate::error::join_failure_text`]'s fixed words.
+    Join(&'a str),
+}
+
 /// Log a failed filesystem step of `what` a reservation retired at warn.
-fn warn_retire(what: Retired, step: &str, error: &dyn std::fmt::Display) {
-    tracing::warn!(
-        event_type = what.error_event(),
-        step,
-        error = %error,
-        "retiring due results at a reservation failed; the next sweep retries it"
-    );
+/// An I/O failure's warning carries its closed cause, and its text goes to
+/// DEBUG only (ADR-0040, amended 2026-11-09).
+fn warn_retire(what: Retired, step: &str, failure: RetireFailure<'_>) {
+    match failure {
+        RetireFailure::Io(error) => {
+            tracing::debug!(
+                event_type = what.error_event(),
+                step,
+                error = %error,
+                "retiring due results at a reservation failed; the next sweep retries it"
+            );
+            tracing::warn!(
+                event_type = what.error_event(),
+                step,
+                cause_kind = CauseKind::of_io(error).as_str(),
+                "retiring due results at a reservation failed; the next sweep retries it"
+            );
+        }
+        RetireFailure::Join(text) => tracing::warn!(
+            event_type = what.error_event(),
+            step,
+            error = %text,
+            "retiring due results at a reservation failed; the next sweep retries it"
+        ),
+    }
 }
 
 /// Log a failed store step of `what` a reservation retired at warn, the

@@ -54,7 +54,7 @@ use trawl_api::investigations::{
 use trawl_api::results::ResultState;
 
 use crate::deadline::Deadline;
-use crate::error::ServerError;
+use crate::error::{CauseKind, ServerError};
 use crate::policy::{Needs as _, needs};
 use crate::report_window::truncate_to_micros;
 use crate::results::ResultsState;
@@ -1152,9 +1152,14 @@ pub(crate) async fn unlink_evidence(root: &Arc<ResultsRoot>, files: Vec<ExpiredF
     let unlinked = tokio::task::spawn_blocking(move || {
         for id in &ids {
             if let Err(error) = root.unlink(id) {
-                tracing::warn!(
+                tracing::debug!(
                     event_type = "results_unlink_failed",
                     error = %error,
+                    "could not unlink a pruned evidence file; the sweep removes it"
+                );
+                tracing::warn!(
+                    event_type = "results_unlink_failed",
+                    cause_kind = CauseKind::of_io(&error).as_str(),
                     "could not unlink a pruned evidence file; the sweep removes it"
                 );
             }
