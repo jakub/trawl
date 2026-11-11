@@ -105,20 +105,6 @@ pub enum TlsError {
     Unsafe { path: PathBuf, reason: UnsafeReason },
 }
 
-impl TlsError {
-    /// Whether this error's text may stand in a retained event: a path
-    /// with an I/O error, or a refusal in trawl's own words. The other
-    /// variants carry the PEM parser's, `rustls`'s or `rcgen`'s wording
-    /// (`Config` can also hold a sentence of trawl's, but nothing records
-    /// which), so their text goes to DEBUG only.
-    pub(crate) fn text_is_retainable(&self) -> bool {
-        matches!(
-            self,
-            Self::ReadCert { .. } | Self::ReadKey { .. } | Self::Write(_) | Self::Unsafe { .. }
-        )
-    }
-}
-
 /// Where the listener's certificate and key come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsSource<'a> {
@@ -1221,15 +1207,25 @@ pub async fn cert_reload_task(
                     "TLS certificate reloaded successfully"
                 );
             }
-            Err(e) if e.text_is_retainable() => {
+            // A refusal in trawl's own words: its text may stand.
+            Err(e @ TlsError::Unsafe { .. }) => {
                 tracing::error!(event_type = "tls_reload_error", error = %e, "failed to reload TLS certificate, keeping current");
             }
+            // Every other variant carries an I/O error's text, or the PEM
+            // parser's, `rustls`'s or `rcgen`'s wording: DEBUG only. An I/O
+            // error keeps its kind.
             Err(e) => {
                 tracing::debug!(event_type = "tls_reload_error", error = %e, "failed to reload TLS certificate, keeping current");
+                let (error_class, cause_kind) = match &e {
+                    TlsError::ReadCert { source, .. }
+                    | TlsError::ReadKey { source, .. }
+                    | TlsError::Write(source) => ("io", crate::error::CauseKind::of_io(source)),
+                    _ => ("internal", crate::error::CauseKind::Unknown),
+                };
                 tracing::error!(
                     event_type = "tls_reload_error",
-                    error_class = "internal",
-                    cause_kind = crate::error::CauseKind::Unknown.as_str(),
+                    error_class,
+                    cause_kind = cause_kind.as_str(),
                     "failed to reload TLS certificate, keeping current"
                 );
             }

@@ -944,16 +944,24 @@ impl RepinEngine {
     /// to a restart or an operator. Run inline and under the permit, as
     /// pin gc's own check is: three stats and a small marker read.
     ///
-    /// The refusals name no path. The details go to the server log.
+    /// The refusals name no path. The retained event names the failure's
+    /// class and kind; its text goes only to a DEBUG event.
     fn refuse_leftover_staging(&self) -> Result<(), ServerError> {
         let unreadable = || ServerError::ServiceUnavailable(STAGING_UNREADABLE.to_owned());
         let found = staging_evidence(&self.data_dir).map_err(|e| {
-            tracing::error!(
+            let refusal = unreadable();
+            tracing::debug!(
                 event_type = "repin_staging_unreadable",
                 error = %e,
                 "the repin staging state could not be read; refusing the repin"
             );
-            unreadable()
+            tracing::error!(
+                event_type = "repin_staging_unreadable",
+                error_class = refusal.error_class(),
+                cause_kind = CauseKind::of_io(&e).as_str(),
+                "the repin staging state could not be read; refusing the repin"
+            );
+            refusal
         })?;
         match found {
             None => Ok(()),
@@ -1865,7 +1873,13 @@ impl RepinEngine {
             });
         if swept {
             if let Err(e) = remove_marker(&self.data_dir) {
-                tracing::warn!(event_type = "repin_marker_error", error = %e, "marker removal failed");
+                // `remove_marker` hands back text, so the kind is unknown here.
+                tracing::debug!(event_type = "repin_marker_error", error = %e, "marker removal failed");
+                tracing::warn!(
+                    event_type = "repin_marker_error",
+                    cause_kind = CauseKind::Unknown.as_str(),
+                    "marker removal failed"
+                );
             }
         } else {
             tracing::warn!(
@@ -2482,7 +2496,7 @@ impl RepinEngine {
     /// contradiction, which the next compaction tick or an operator resolves.
     /// Markers that cannot be read count as pending. The returned text is
     /// stored on the job row and served to schema readers, so it names the
-    /// reason without paths or error text; the log carries those.
+    /// reason without paths or error text; only a DEBUG event carries those.
     async fn pending_publication(&self, job_id: i64) -> Option<String> {
         let wal_dir = self.wal_dir.clone();
         let scan = on_blocking_pool("repin publication claims", move || {
@@ -2493,10 +2507,17 @@ impl RepinEngine {
             Ok(Ok(claims)) if !claims.any() => return None,
             Ok(Ok(_)) => "publication_marker_pending",
             Ok(Err(e)) => {
-                tracing::error!(
+                // `scan_claims` hands back text, so the kind is unknown here.
+                tracing::debug!(
                     event_type = "repin_publication_claims_unreadable",
                     job_id,
                     error = %e,
+                    "cannot read publication markers at cutover"
+                );
+                tracing::error!(
+                    event_type = "repin_publication_claims_unreadable",
+                    job_id,
+                    cause_kind = CauseKind::Unknown.as_str(),
                     "cannot read publication markers at cutover"
                 );
                 "publication_markers_unreadable"

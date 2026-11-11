@@ -231,9 +231,14 @@ pub fn spawn_retention(
 
                     match result {
                         Ok(Err(e)) => {
-                            tracing::error!(
+                            tracing::debug!(
                                 event_type = "retention_error",
                                 error = %e,
+                                "retention tick failed"
+                            );
+                            tracing::error!(
+                                event_type = "retention_error",
+                                cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
                                 "retention tick failed"
                             );
                         }
@@ -408,7 +413,7 @@ fn retention_tick(
     config: &RetentionConfig,
     evidence: &RetentionEvidence,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
-) -> Result<(), String> {
+) -> std::io::Result<()> {
     let today = chrono::Utc::now().date_naive();
     retention_tick_at(
         data_dir,
@@ -441,8 +446,8 @@ fn retention_tick_at(
     evidence: &RetentionEvidence,
     today: NaiveDate,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
-    delete_fn: impl Fn(&Path) -> Result<u64, String>,
-) -> Result<(), String> {
+    delete_fn: impl Fn(&Path) -> std::io::Result<u64>,
+) -> std::io::Result<()> {
     let mut tick = TickRecord::default();
     let result = sweep(
         data_dir,
@@ -474,8 +479,8 @@ fn sweep(
     tick: &mut TickRecord,
     today: NaiveDate,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
-    delete_fn: impl Fn(&Path) -> Result<u64, String>,
-) -> Result<(), String> {
+    delete_fn: impl Fn(&Path) -> std::io::Result<u64>,
+) -> std::io::Result<()> {
     // A repin in flight — marker, shadow sibling, or aside sibling —
     // suppresses both sweeps, not just pressure (ADR-0011). Age deletion
     // would remove affected files out from under the shadow build (the
@@ -530,9 +535,15 @@ fn sweep(
         Ok(claims) => claims,
         Err(e) => {
             metrics::gauge!(crate::metrics::RETENTION_SUPPRESSED).set(1.0);
-            tracing::warn!(
+            // `scan_claims` hands back text, so the kind is unknown here.
+            tracing::debug!(
                 event_type = "retention_publication_claims_unreadable",
                 error = %e,
+                "could not read the publication markers under the WAL root"
+            );
+            tracing::warn!(
+                event_type = "retention_publication_claims_unreadable",
+                cause_kind = crate::error::CauseKind::Unknown.as_str(),
                 "could not read the publication markers under the WAL root; \
                  suppressing this sweep rather than deleting files a marker \
                  may claim"
@@ -598,10 +609,16 @@ fn sweep(
                 total_dirs_deleted += 1;
             }
             Err(e) => {
-                tracing::error!(
+                tracing::debug!(
                     event_type = "retention_error",
                     path = %dir.path.display(),
                     error = %e,
+                    "failed to delete date directory"
+                );
+                tracing::error!(
+                    event_type = "retention_error",
+                    path = %dir.path.display(),
+                    cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
                     "failed to delete date directory"
                 );
                 tick.delete_failed = true;
@@ -656,8 +673,8 @@ fn disk_pressure_sweep(
     mut candidates: Vec<DateDir>,
     today: NaiveDate,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
-    delete_fn: impl Fn(&Path) -> Result<u64, String>,
-) -> Result<(u64, u64), String> {
+    delete_fn: impl Fn(&Path) -> std::io::Result<u64>,
+) -> std::io::Result<(u64, u64)> {
     let mut total_bytes_freed: u64 = 0;
     let mut total_dirs_deleted: u64 = 0;
 
@@ -674,8 +691,9 @@ fn disk_pressure_sweep(
 
     let mut attempted = false;
     loop {
-        let available =
-            free_space_fn(data_dir).map_err(|e| format!("failed to check free disk space: {e}"))?;
+        let available = free_space_fn(data_dir).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to check free disk space: {e}"))
+        })?;
 
         if available >= config.min_free_disk_bytes {
             break;
@@ -730,10 +748,16 @@ fn disk_pressure_sweep(
                 total_dirs_deleted += 1;
             }
             Err(e) => {
-                tracing::error!(
+                tracing::debug!(
                     event_type = "retention_error",
                     path = %dir.path.display(),
                     error = %e,
+                    "failed to delete date directory under disk pressure"
+                );
+                tracing::error!(
+                    event_type = "retention_error",
+                    path = %dir.path.display(),
+                    cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
                     "failed to delete date directory under disk pressure"
                 );
                 tick.delete_failed = true;
@@ -805,9 +829,15 @@ fn publication_claimed_mid_sweep(wal_dir: &Path, dir: &DateDir) -> MidSweepClaim
         Ok(_) => MidSweepClaim::None,
         Err(e) => {
             metrics::gauge!(crate::metrics::RETENTION_SUPPRESSED).set(1.0);
-            tracing::warn!(
+            // `scan_claims` hands back text, so the kind is unknown here.
+            tracing::debug!(
                 event_type = "retention_publication_claims_unreadable",
                 error = %e,
+                "could not re-read the publication markers under the WAL root"
+            );
+            tracing::warn!(
+                event_type = "retention_publication_claims_unreadable",
+                cause_kind = crate::error::CauseKind::Unknown.as_str(),
                 "could not re-read the publication markers under the WAL \
                  root before a deletion; suppressing the rest of this sweep \
                  rather than deleting files a marker may claim"
@@ -826,9 +856,14 @@ fn publication_claimed_mid_sweep(wal_dir: &Path, dir: &DateDir) -> MidSweepClaim
 /// the same directory anyway.
 fn repin_in_flight(data_dir: &Path) -> Option<&'static str> {
     crate::repin::in_flight_evidence(data_dir).unwrap_or_else(|e| {
-        tracing::warn!(
+        tracing::debug!(
             event_type = "retention_repin_evidence_unreadable",
             error = %e,
+            "could not tell whether a repin owns the data root"
+        );
+        tracing::warn!(
+            event_type = "retention_repin_evidence_unreadable",
+            cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
             "could not tell whether a repin owns the data root; suppressing \
              this sweep rather than deleting under a job that may exist"
         );
@@ -847,9 +882,13 @@ fn repin_in_flight(data_dir: &Path) -> Option<&'static str> {
 /// deterministic base order for phase 1, which deletes in it, and for
 /// phase 2, which re-sorts by expiry ratio with these two as tie-breaks.
 /// Deleting one env's date dir stays O(1) and never touches other envs.
-fn enumerate_date_dirs(data_dir: &Path, today: NaiveDate) -> Result<Vec<DateDir>, String> {
-    let entries = std::fs::read_dir(data_dir)
-        .map_err(|e| format!("failed to read data directory {}: {e}", data_dir.display()))?;
+fn enumerate_date_dirs(data_dir: &Path, today: NaiveDate) -> std::io::Result<Vec<DateDir>> {
+    let entries = std::fs::read_dir(data_dir).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("failed to read data directory {}: {e}", data_dir.display()),
+        )
+    })?;
 
     let mut dirs: Vec<DateDir> = Vec::new();
     for env_entry in entries.flatten() {
@@ -889,10 +928,9 @@ fn enumerate_date_dirs(data_dir: &Path, today: NaiveDate) -> Result<Vec<DateDir>
 }
 
 /// Delete a date directory and return the bytes freed.
-fn delete_date_dir(path: &Path) -> Result<u64, String> {
+fn delete_date_dir(path: &Path) -> std::io::Result<u64> {
     let size = dir_size(path);
-    std::fs::remove_dir_all(path)
-        .map_err(|e| format!("remove_dir_all failed for {}: {e}", path.display()))?;
+    std::fs::remove_dir_all(path)?;
     Ok(size)
 }
 
@@ -995,7 +1033,7 @@ mod tests {
     }
 
     /// A deletion that records the order in which the sweep asked for it.
-    fn recording_delete(log: &Mutex<Vec<PathBuf>>) -> impl Fn(&Path) -> Result<u64, String> {
+    fn recording_delete(log: &Mutex<Vec<PathBuf>>) -> impl Fn(&Path) -> std::io::Result<u64> {
         move |path| {
             log.lock().unwrap().push(path.to_path_buf());
             delete_date_dir(path)
@@ -2712,7 +2750,7 @@ mod tests {
         let refuse = |refused: PathBuf| {
             move |path: &Path| {
                 if path == refused {
-                    Err("injected removal failure".to_owned())
+                    Err(std::io::Error::other("injected removal failure"))
                 } else {
                     delete_date_dir(path)
                 }
@@ -2780,7 +2818,7 @@ mod tests {
             |path: &Path| {
                 std::fs::write(data_dir.join("REPIN"), b"{}").unwrap();
                 if path == refused {
-                    Err("injected removal failure".to_owned())
+                    Err(std::io::Error::other("injected removal failure"))
                 } else {
                     delete_date_dir(path)
                 }

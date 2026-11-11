@@ -87,9 +87,14 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
                     });
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         event_type = "schema_refresh_error",
                         error = %e,
+                        "service schema refresh failed"
+                    );
+                    tracing::warn!(
+                        event_type = "schema_refresh_error",
+                        cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
                         "service schema refresh failed"
                     );
                 }
@@ -191,7 +196,7 @@ fn refresh_service_schema(
     warned: &Mutex<HashSet<PathBuf>>,
     warned_unpinned: &Mutex<HashSet<String>>,
     catalog: &FieldCatalog,
-) -> Result<Vec<ServiceSchema>, Box<dyn std::error::Error + Send + Sync>> {
+) -> std::io::Result<Vec<ServiceSchema>> {
     if !base.is_dir() {
         return Ok(Vec::new());
     }
