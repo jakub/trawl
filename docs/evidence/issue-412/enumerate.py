@@ -36,8 +36,8 @@ The human columns (source type, disposition) live in dispositions.tsv,
 keyed by file, event_type, level, kind and the ordinal of that key in the
 file. A line shift does not change a key. The script exits non-zero, naming
 the row, when a site has no disposition, a disposition has no site, a
-disposition cell is blank, or a disposition is not one of `changed`,
-`unchanged: <reason>` or `D2b`.
+disposition cell is blank, or a disposition is not `changed` or
+`unchanged: <reason>`.
 
 Known limits:
 - The default target is the module path the file sits at, plus any inline
@@ -654,7 +654,7 @@ def keyed(rows):
     return out
 
 
-DISPOSITION = re.compile(r"changed|D2b|unchanged: \S.*")
+DISPOSITION = re.compile(r"changed|unchanged: \S.*")
 
 
 def load_dispositions():
@@ -673,7 +673,7 @@ def load_dispositions():
             if any(not c.strip() for c in cells):
                 raise Failure("dispositions.tsv:%d: blank cell in %s" % (n, "\t".join(key)))
             if not DISPOSITION.fullmatch(cells[6]):
-                raise Failure("dispositions.tsv:%d: disposition %r is not changed, D2b or unchanged: <reason>" % (n, cells[6]))
+                raise Failure("dispositions.tsv:%d: disposition %r is not changed or unchanged: <reason>" % (n, cells[6]))
             if key in table:
                 raise Failure("dispositions.tsv:%d: duplicate key %s" % (n, "\t".join(key)))
             table[key] = (cells[5], cells[6])
