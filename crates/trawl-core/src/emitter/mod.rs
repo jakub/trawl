@@ -26,11 +26,8 @@ use state::EmitterState;
 
 pub use columns::{ColdColumns, HotColumns, InputColumns};
 pub(crate) use fields::coerce_filter_value;
+pub(crate) use functions::check_call;
 pub use functions::{DATE_PART_UNITS, DATE_UNITS};
-pub(crate) use functions::{
-    check_call, format_literal_position, unit_literal_positions, validate_format_literal,
-    validate_function_arity, validate_unit_literal,
-};
 pub use functions::{function_result_pin, is_aggregate_function};
 pub use regex_calls::{is_re2_function, macro_copies, regex_calls};
 pub use state::{

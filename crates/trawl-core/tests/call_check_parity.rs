@@ -16,6 +16,9 @@ use trawl_core::context::EvalContext;
 use trawl_core::emitter::{EmitError, emit, validate_pipeline};
 use trawl_core::parser;
 use trawl_core::parser::suggest::KNOWN_FUNCTIONS;
+use trawl_core::pin_scope::PinScope;
+use trawl_core::schema::{CanonicalType, FieldTypes};
+use trawl_core::stream::{StreamPlanError, compile_stream_plan};
 
 const SOURCE: &str = "/data/*.parquet";
 
@@ -251,7 +254,13 @@ const VALID_CALLS: &[(&str, &[&str])] = &[
             "* | eventstats avg(dur) as mean",
         ],
     ),
-    ("sum", &["* | stats sum(bytes) by count"]),
+    (
+        "sum",
+        &[
+            "* | stats sum(bytes) by count",
+            "* | stats coalesce(sum(bytes), 0)",
+        ],
+    ),
     ("min", &["* | stats min(dur)"]),
     ("max", &["* | stats max(dur) as worst by host"]),
     ("dc", &["* | stats dc(host)"]),
@@ -278,7 +287,13 @@ const VALID_CALLS: &[(&str, &[&str])] = &[
     ),
     ("upper", &["* | let x = upper(trim(message))"]),
     ("length", &["* | where length(message) > 0"]),
-    ("len", &["* | let n = len(message) + 1"]),
+    (
+        "len",
+        &[
+            "* | let n = len(message) + 1",
+            "* | stats max(len(message))",
+        ],
+    ),
     (
         "coalesce",
         &[
@@ -423,9 +438,58 @@ fn every_known_function_has_a_valid_call() {
             if let Err(err) = emit(&ast, SOURCE, anchor()) {
                 panic!("{query}: emit refused: {err}");
             }
+            let live = compile_stream_plan(&ast.pipeline, &PinScope::unpinned(), None);
+            match LIVE_REFUSED.iter().find(|(refused, _)| refused == query) {
+                Some((_, sentence)) => match live {
+                    Err(err @ StreamPlanError::UnsupportedStage { .. }) => {
+                        assert_eq!(err.to_string(), *sentence, "{query}");
+                    }
+                    other => panic!("{query}: live must refuse the stage: {other:?}"),
+                },
+                None => {
+                    if let Err(err) = live {
+                        panic!("{query}: live refused: {err}");
+                    }
+                }
+            }
         }
     }
+    for (query, _) in LIVE_REFUSED {
+        assert!(
+            VALID_CALLS
+                .iter()
+                .any(|(_, queries)| queries.contains(query)),
+            "{query}: names no fixture"
+        );
+    }
 }
+
+/// The valid fixtures live refuses, and why: never for a call, always for
+/// a stage it cannot stream. A scalar aggregation head and a computed
+/// aggregation operand run only in SQL, and `eventstats` and `pivot` do
+/// not stream at all.
+const LIVE_REFUSED: &[(&str, &str)] = &[
+    (
+        "* | stats coalesce(sum(bytes), 0)",
+        "stats is not supported in streaming mode: coalesce() is not an aggregate; a scalar \
+         head in an aggregation slot runs only in SQL",
+    ),
+    (
+        "* | stats max(len(message))",
+        "stats is not supported in streaming mode: max(…) over a computed argument is not \
+         supported in streaming mode; aggregate a bare field",
+    ),
+    (
+        "* | eventstats avg(dur) as mean",
+        "eventstats is not supported in streaming mode: window functions require the full \
+         dataset",
+    ),
+    (
+        "* | pivot p99(dur) on status by host",
+        "pivot is not supported in streaming mode: dynamic column structure breaks \
+         progressive rendering",
+    ),
+];
 
 /// The baseline pin for one PC-1 query.
 fn pin(query: &str) -> &'static Refusal {
@@ -463,6 +527,23 @@ fn batch_refusal(query: &str) -> Seen {
     let emitted = Seen::from(&emit_refusal(query));
     assert_eq!(validated, emitted, "{query}: validate and emit disagree");
     validated
+}
+
+/// The stream lane's error for `query` under `scope`.
+fn live_error(query: &str, scope: &PinScope) -> StreamPlanError {
+    match compile_stream_plan(&pipeline(query), scope, None) {
+        Ok(_) => panic!("{query}: live accepted it"),
+        Err(err) => err,
+    }
+}
+
+/// The stream lane's refusal of `query`, compiled pin-blind: the
+/// emitter's sentence, verbatim, as [`StreamPlanError::InvalidFunction`].
+fn live_refusal(query: &str) -> String {
+    match compile_stream_plan(&pipeline(query), &PinScope::unpinned(), None) {
+        Err(StreamPlanError::InvalidFunction(sentence)) => sentence,
+        other => panic!("{query}: live must refuse the call: {other:?}"),
+    }
 }
 
 /// Each rule: a bad call, and the PC-1 query whose pin it must reproduce.
@@ -529,6 +610,13 @@ fn every_call_rule_refuses_in_every_position() {
         for (label, template) in POSITIONS {
             let query = template.replace("{}", call);
             assert_eq!(batch_refusal(&query), expected, "{label}: {query}");
+            // Live carries no hint field: the hint rides inside the
+            // sentence, said once.
+            let live = live_refusal(&query);
+            assert_eq!(live, expected.display, "live, {label}: {query}");
+            if let Some(hint) = &expected.hint {
+                assert_eq!(live.matches(hint.as_str()).count(), 1, "{label}: {query}");
+            }
         }
     }
 }
@@ -555,6 +643,7 @@ const KV_TAIL: &[(&str, &str)] = &[
 fn bad_calls_after_extract_kv_are_refused() {
     for (query, display) in KV_TAIL {
         assert_eq!(batch_refusal(query).display, *display, "{query}");
+        assert_eq!(live_refusal(query), *display, "live: {query}");
     }
 }
 
@@ -609,6 +698,7 @@ fn over_budget_with_a_bad_call() -> String {
 fn the_phase_and_call_order_is_shared() {
     for (query, display) in ORDER {
         assert_eq!(batch_refusal(query).display, *display, "{query}");
+        assert_eq!(live_refusal(query), *display, "live: {query}");
     }
 
     // The expansion budget runs before every other phase. Each lane keeps
@@ -621,4 +711,47 @@ fn the_phase_and_call_order_is_shared() {
         batch_refusal(&query).display,
         format!("unsupported operation: {budget}"),
     );
+    assert_eq!(
+        live_error(&query, &PinScope::unpinned()),
+        StreamPlanError::TooComplex(budget),
+    );
+
+    // Live, a pinned comparison is refused while its stage compiles,
+    // after the call phase: a later stage's bad call is reported first.
+    let mut pins = FieldTypes::new();
+    pins.insert("level", CanonicalType::Severity);
+    let scope = PinScope::root(&pins);
+    let pinned = r#"* | where level == "bogus""#;
+    assert!(
+        matches!(
+            live_error(pinned, &scope),
+            StreamPlanError::InvalidComparison(_)
+        ),
+        "{pinned}: the pinned comparison alone is refused"
+    );
+    let query = format!("{pinned} | let r = nosuchfn(x)");
+    assert_eq!(
+        live_error(&query, &scope),
+        StreamPlanError::InvalidFunction("unknown function: nosuchfn".to_owned()),
+    );
+}
+
+/// Live and the `extract kv` tail refuse an integer position that is not
+/// an integer literal, as batch does: a field, a string, a float, and a
+/// negation (`-1` is not a literal).
+#[test]
+fn live_refuses_non_literal_integer_positions() {
+    const ROUND: &str = "invalid aggregation: round() argument 2 must be an integer literal";
+    for (query, display) in [
+        ("* | let r = round(x, p)", ROUND),
+        (r#"* | let r = round(5, "bad")"#, ROUND),
+        ("* | let r = round(12.3, -1)", ROUND),
+        (
+            r#"* | extract kv | let r = split(a, ",", i)"#,
+            "invalid aggregation: split() argument 3 must be an integer literal",
+        ),
+    ] {
+        assert_eq!(batch_refusal(query).display, display, "{query}");
+        assert_eq!(live_refusal(query), display, "live: {query}");
+    }
 }

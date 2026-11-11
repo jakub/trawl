@@ -19,14 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::aggregate::Aggregate;
 use crate::ast::{
     AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
-    LiteralValue, PipeStage, RenameStage, Spanned, TableStage, TrawlDuration, WhereStage,
+    PipeStage, RenameStage, Spanned, TableStage, TrawlDuration, WhereStage,
 };
 use crate::cancel::{Cancelled, Stop};
 use crate::context::EvalContext;
-use crate::emitter::{
-    format_literal_position, unit_literal_positions, validate_format_literal,
-    validate_function_arity, validate_unit_literal,
-};
 use crate::eval::{EvalValue, bind_event_key, eval_expr_with_pins};
 use crate::pattern::table::PatternTable;
 use crate::pattern::{PatternError, PatternKind, Preparer};
@@ -67,18 +63,16 @@ pub enum StreamPlanError {
     /// reservation refuses, [`PatternError::Resources`] (ADR-0063). Never
     /// [`PatternError::Cancelled`], which is [`Self::Cancelled`].
     Pattern(PatternError),
-    /// A date/time unit argument is invalid (non-literal or not allowlisted).
-    InvalidUnit(String),
-    /// A `strftime`/`strptime` format string literal contains an invalid code.
-    InvalidFormat(String),
-    /// A function call the emitter's own tables refuse — an unknown name
-    /// or the wrong argument count — or an aggregate written where
-    /// neither lane can run it ([`crate::aggregate::check_positions`]).
-    /// This compiler does not call `validate_pipeline` (`/api/v1/stream`
-    /// runs it in admission, before the compile), so it runs the checks
-    /// itself: otherwise a plan compiled without admission would turn
-    /// `let s = sev()` into a live-looking stream that can only ever
-    /// evaluate to NULL while `/api/v1/query` 400s on the same text.
+    /// A call that breaks its function's rule — an unknown name, the
+    /// wrong argument count, or a unit, format or integer-literal argument
+    /// the function refuses ([`crate::calls`]) — or an aggregate written
+    /// where neither lane can run it ([`crate::aggregate::check_positions`]).
+    /// The emitter's sentence, verbatim. This compiler does not call
+    /// `validate_pipeline` (`/api/v1/stream` runs it in admission, before
+    /// the compile), so it runs both shared checks itself: otherwise a plan
+    /// compiled without admission would turn `let s = sev()` into a
+    /// live-looking stream that can only ever evaluate to NULL while
+    /// `/api/v1/query` 400s on the same text.
     InvalidFunction(String),
     /// A pinned comparison the shared rule table refuses — an unknown
     /// severity value against a `SEVERITY`-pinned field (ADR-0013). The
@@ -117,8 +111,6 @@ impl fmt::Display for StreamPlanError {
             // regex-syntax's own text, framed as the parser frames it.
             Self::Pattern(PatternError::Syntax(msg)) => write!(f, "invalid regex: {msg}"),
             Self::Pattern(refusal) => write!(f, "{refusal}"),
-            Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
-            Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
             // Verbatim: the emitter (InvalidFunction) and the shared
             // projection check (ProjectionCollision) own their whole
             // sentence.
@@ -213,6 +205,11 @@ pub fn compile_stream_plan_with(
     // point `validate_pipeline` checks it too (ADR-0001, Amendment
     // 2026-11-08): eval would answer NULL for `where count(x) > 1`.
     crate::aggregate::check_positions(pipeline)
+        .map_err(|e| StreamPlanError::InvalidFunction(e.to_string()))?;
+
+    // Then every call, at the point `validate_pipeline` checks them too
+    // (ADR-0001, Amendment 2026-11-11), with the emitter's sentence.
+    crate::calls::check_calls(pipeline)
         .map_err(|e| StreamPlanError::InvalidFunction(e.to_string()))?;
 
     // The shared projection-name check runs next, over every stage —
@@ -1200,50 +1197,20 @@ fn compile_let(
     })
 }
 
-/// Walk an expression tree and validate function names and arity,
-/// closed-vocabulary literals, and pinned comparisons.
+/// Walk an expression tree and validate its pinned comparisons.
 ///
-/// These are the checks `emit_expr` performs on the batch path, so an
-/// unsupported `date_part` unit, an unknown `sev()` dialect, an invalid
-/// `strftime`/`strptime` format literal, or an unknown severity token
-/// against a `SEVERITY`-pinned field is rejected at `compile_stream_plan`
-/// time rather than silently evaluating to `Null` in live tail while
-/// batch 400s on the same text.
+/// The SQL emitter refuses an unknown severity token against a
+/// `SEVERITY`-pinned field, so the stream refuses it at
+/// `compile_stream_plan` time rather than silently evaluating to `Null` in
+/// live tail. Calls are checked once for the whole pipeline by
+/// [`crate::calls::check_calls`]; their arguments are walked here, because
+/// a pinned comparison can sit inside one (`if(level = "bogus", 1, 0)`).
 fn validate_expr(
     expr: &Spanned<crate::ast::Expr>,
     scope: &PinScope,
 ) -> Result<(), StreamPlanError> {
     match &expr.node {
-        Expr::FunctionCall { name, args } => {
-            // Arity and name, from the emitter's single source of truth,
-            // for every function and not just the ones with literal
-            // positions: a wrong-arity call is a 400 in batch, and a
-            // stream that silently nulls instead is the divergence this
-            // check exists to prevent.
-            validate_function_arity(name, args.len())
-                .map_err(|e| StreamPlanError::InvalidFunction(e.to_string()))?;
-            let unit_positions = unit_literal_positions(name);
-            for (idx, allowlist) in unit_positions {
-                let arg = args.get(*idx);
-                let raw = arg.and_then(|a| match &a.node {
-                    Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
-                    _ => None,
-                });
-                // An absent position is an optional argument (`sev(x)`
-                // with no dialect); a wrong arity was refused above.
-                if arg.is_some() {
-                    validate_unit_literal(name, *idx, allowlist, raw)
-                        .map_err(|e| StreamPlanError::InvalidUnit(e.to_string()))?;
-                }
-            }
-            // strftime/strptime format literal: reject invalid codes up front. A
-            // non-literal format keeps its runtime behaviour (eval nulls).
-            if let Some(idx) = format_literal_position(name)
-                && let Some(Expr::Literal(LiteralValue::String(s))) = args.get(idx).map(|a| &a.node)
-            {
-                validate_format_literal(name, s)
-                    .map_err(|e| StreamPlanError::InvalidFormat(e.to_string()))?;
-            }
+        Expr::FunctionCall { args, .. } => {
             for arg in args {
                 validate_expr(arg, scope)?;
             }
@@ -2121,12 +2088,8 @@ fn new_acc_state(acc: &CompiledAcc) -> AccState {
 }
 
 fn compile_agg_expr(agg: &AggExpr, stage: &str) -> Result<CompiledAcc, StreamPlanError> {
-    // The head's name and arity first, from the emitter's own table, so
-    // an unknown or misspelt head is refused with the sentence batch
-    // returns.
-    validate_function_arity(&agg.function, agg.args.len())
-        .map_err(|e| StreamPlanError::InvalidFunction(e.to_string()))?;
-    // A scalar head is legal in batch, where it projects (ADR-0024). The
+    // The head's name and arity were checked with every other call
+    // (`crate::calls::check_calls`). A scalar head is legal in batch, where it projects (ADR-0024). The
     // accumulators have nothing to run for one, so it is refused here,
     // before its operand is read, rather than counted (ADR-0001,
     // Amendment 2026-11-08). The batch tail behind `extract kv` compiles
@@ -3820,8 +3783,9 @@ mod tests {
     }
 
     /// Arity is the emitter's table in both lanes, word for word: the
-    /// compiler does not call `validate_pipeline`, so without the mirror
-    /// a plan compiled without admission accepts `sev()` and
+    /// compiler does not call `validate_pipeline`, so without its own run
+    /// of the shared call check a plan compiled without admission accepts
+    /// `sev()` and
     /// `sev(a, b, c)` — a live-looking stream that can only evaluate to
     /// NULL — while `/api/v1/query` 400s on the same text.
     #[test]
@@ -4999,8 +4963,8 @@ mod tests {
         }
     }
 
-    /// An aggregation slot's head goes through the emitter's name and
-    /// arity table live, so an unknown or misspelt head is the sentence
+    /// An aggregation slot's head goes through the shared call check
+    /// live, so an unknown or misspelt head is the sentence
     /// `validate_pipeline` returns, not a row count.
     #[test]
     fn live_slot_heads_share_the_batch_name_and_arity_check() {
@@ -5212,9 +5176,13 @@ mod tests {
     fn stream_date_part_rejects_unknown_unit() {
         let pipeline = vec![make_date_part_stage("nanosecond")];
         let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
-        assert!(
-            matches!(err, StreamPlanError::InvalidUnit(ref msg) if msg.contains("nanosecond")),
-            "unexpected error: {err}"
+        assert_eq!(
+            err,
+            StreamPlanError::InvalidFunction(
+                "unsupported operation: date_part() unit \"nanosecond\" is not in the allowed \
+                 set: year, quarter, month, week, day, hour, minute, second, dow, doy, epoch"
+                    .to_string()
+            )
         );
     }
 
@@ -5223,9 +5191,13 @@ mod tests {
         // dow is in DATE_PART_UNITS but not in DATE_UNITS (date_trunc allowlist)
         let pipeline = vec![make_date_trunc_stage("dow")];
         let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
-        assert!(
-            matches!(err, StreamPlanError::InvalidUnit(_)),
-            "unexpected: {err}"
+        assert_eq!(
+            err,
+            StreamPlanError::InvalidFunction(
+                "unsupported operation: date_trunc() unit \"dow\" is not in the allowed set: \
+                 year, quarter, month, week, day, hour, minute, second"
+                    .to_string()
+            )
         );
     }
 
@@ -5248,15 +5220,19 @@ mod tests {
             keyword: "let",
         }))];
         let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
-        assert!(
-            matches!(err, StreamPlanError::InvalidUnit(ref msg) if msg.contains("literal")),
-            "unexpected: {err}"
+        assert_eq!(
+            err,
+            StreamPlanError::InvalidFunction(
+                "unsupported operation: date_diff() argument 1 must be a string literal unit \
+                 name, not an expression"
+                    .to_string()
+            )
         );
     }
 
     #[test]
     fn stream_where_date_part_rejects_unknown_unit() {
-        // validate_expr should also fire inside where conditions
+        // The call check walks where conditions too.
         let condition = span(Expr::Binary {
             lhs: Box::new(span(Expr::FunctionCall {
                 name: "date_part".into(),
@@ -5270,7 +5246,14 @@ mod tests {
         });
         let pipeline = vec![span(PipeStage::Where(WhereStage { condition }))];
         let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
-        assert!(matches!(err, StreamPlanError::InvalidUnit(_)));
+        assert_eq!(
+            err,
+            StreamPlanError::InvalidFunction(
+                "unsupported operation: date_part() unit \"century\" is not in the allowed \
+                 set: year, quarter, month, week, day, hour, minute, second, dow, doy, epoch"
+                    .to_string()
+            )
+        );
     }
 
     // ── format-literal validation (streaming path) ──────────────────
@@ -5317,9 +5300,11 @@ mod tests {
     fn stream_strftime_rejects_invalid_format() {
         let pipeline = vec![make_strftime_stage("%Q")];
         let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
-        assert!(
-            matches!(err, StreamPlanError::InvalidFormat(ref msg) if msg.contains("%Q")),
-            "unexpected error: {err}"
+        assert_eq!(
+            err,
+            StreamPlanError::InvalidFunction(
+                "strftime(): invalid format string \"%Q\"".to_string()
+            )
         );
     }
 
@@ -5327,12 +5312,17 @@ mod tests {
     fn stream_strptime_rejects_invalid_format() {
         let pipeline = vec![make_strptime_stage("%Q")];
         let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
-        assert!(matches!(err, StreamPlanError::InvalidFormat(_)), "{err}");
+        assert_eq!(
+            err,
+            StreamPlanError::InvalidFunction(
+                "strptime(): invalid format string \"%Q\"".to_string()
+            )
+        );
     }
 
     #[test]
     fn stream_where_strftime_rejects_invalid_format() {
-        // validate_expr should also fire inside where conditions
+        // The call check walks where conditions too.
         let condition = span(Expr::Binary {
             lhs: Box::new(span(Expr::FunctionCall {
                 name: "strftime".into(),
@@ -5346,7 +5336,12 @@ mod tests {
         });
         let pipeline = vec![span(PipeStage::Where(WhereStage { condition }))];
         let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
-        assert!(matches!(err, StreamPlanError::InvalidFormat(_)), "{err}");
+        assert_eq!(
+            err,
+            StreamPlanError::InvalidFunction(
+                "strftime(): invalid format string \"%Q\"".to_string()
+            )
+        );
     }
 
     // ── aggregation caps (ADR-0001 amendment, #304) ─────────────

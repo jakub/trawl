@@ -48,7 +48,8 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
     // both lanes.
     crate::aggregate::check_positions(stages)?;
     // Then every call, in every stage, the stages after `extract kv`
-    // included (ADR-0001, Amendment 2026-11-11).
+    // included (ADR-0001, Amendment 2026-11-11). The stream compiler runs
+    // the same walk at the same point.
     crate::calls::check_calls(stages)?;
 
     for (i, stage) in stages.iter().enumerate() {
