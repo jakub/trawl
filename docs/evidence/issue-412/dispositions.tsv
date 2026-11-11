@@ -175,7 +175,7 @@ live.rs	stream_missing_prepared_pattern	error	call:log_missing_prepared_pattern	
 live.rs	stream_lagged	warn	site	1	none	unchanged: no error text
 live.rs	stream_missing_prepared_pattern	error	site	1	helper log_missing_prepared_pattern: PatternError fixed sentences; Syntax arises only at preparation	unchanged: fixed text trawl wrote
 live.rs	stream_frame_unencodable	error	site	1	serde_json::Error; ed3e6907 logs class/cause, text at DEBUG	changed
-main.rs	config_warning	warn	site	1	RUST_LOG parse error; ed3e6907 keeps a fixed sentence, parse error on stderr	changed
+main.rs	config_warning	warn	site	1	RUST_LOG parse error; ed3e6907 keeps a fixed sentence, parse error at DEBUG	changed
 main.rs	crash_dump	info/warn	call:log_crash_dump	1	via log_crash_dump: trawl_crashdump Status, closed enums and a path	unchanged: closed enum
 main.rs	lifecycle	info	site	1	none	unchanged: no error text
 main.rs	config_warning	warn	site	2	config.warnings(): four fixed literals	unchanged: fixed text trawl wrote

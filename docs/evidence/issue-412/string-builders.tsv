@@ -8,6 +8,11 @@
 #   REDACTED    reaches an INFO-or-above event only as error_class and cause_kind or fixed words; the text is at DEBUG
 #   NOT-LOGGED  reaches no tracing event (stderr at boot, an HTTP response, a stored row, or dropped)
 #   DEBUG-ONLY  reaches tracing at DEBUG or TRACE only
+# NOT-LOGGED does not mean unreadable. A collector that ships the trawld journal
+# back into the same Trawl, as the packaged Debian Vector configuration does,
+# stores stderr and stdout lines as `service=trawld _producer=http`. A boot
+# failure's stderr text reaches the corpus that way. That path is a sender's,
+# not a trawld log event, so it is outside issue #412's rule.
 # This is a record made by reading the code once. No script regenerates it.
 file	line	class	source	sink
 boot.rs	124	NOT-LOGGED	HydrateError (trawl's fixed text)	prepare_corpus Err, then main.rs:475 ?, then stderr
