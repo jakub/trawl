@@ -35,6 +35,11 @@ use crate::store::{
     ClaimedRun, DUE_SCHEDULE_PAGE, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore,
 };
 
+/// How long a run's claim may take, from its first statement to its
+/// commit. A manual run's estimated end, from which a refused press
+/// derives its advisory `Retry-After`, is this plus the query timeout.
+pub const CLAIM_WAIT: Duration = Duration::from_secs(5);
+
 /// Spawn the scheduler background task.
 ///
 /// The task exits on the first change to `shutdown_rx`, or when its sender
@@ -327,7 +332,7 @@ pub async fn poll_and_execute(
                     &resolved_query,
                     &query_name,
                     timeout_secs,
-                    Some(lease),
+                    lease,
                 )
                 .await;
             }));
@@ -457,12 +462,12 @@ async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i6
 
 /// Execute one claimed run and record its outcome on its run row.
 ///
-/// `lease` is the run's place among the scheduled runs in flight, or
-/// `None` for a manual run, which takes none (ADR-0018, amended
-/// 2026-11-09). This frame keeps it to its last statement, and the run's
-/// preparation job and its executor work each keep it until they stop,
-/// so the lease returns when the last of the three ends: a run that timed
-/// out still holds it while its work runs.
+/// `lease` is the run's place among the scheduled or the manual runs in
+/// flight (ADR-0018, amended 2026-11-09 and 2026-11-11). This frame keeps
+/// it to its last statement, through writing the result and finishing the
+/// run row, and the run's preparation job and its executor work each keep
+/// it until they stop, so the lease returns when the last of the three
+/// ends: a run that timed out still holds it while its work runs.
 pub(crate) async fn execute_scheduled_query(
     schedule_store: ScheduleStore,
     pool: ExecutorPool,
@@ -470,9 +475,9 @@ pub(crate) async fn execute_scheduled_query(
     query: &str,
     _query_name: &str,
     timeout_secs: u64,
-    lease: Option<RunLease>,
+    lease: RunLease,
 ) {
-    let lease = lease.map(RunLease::into_hold);
+    let lease = lease.into_hold();
     let start = std::time::Instant::now();
     // One budget for this attempt, stamped before the first pool wait
     // (ADR-0024): a scheduled run that spends its whole timeout queueing
@@ -498,7 +503,8 @@ pub(crate) async fn execute_scheduled_query(
         let _check = timing
             .clock()
             .guard(trawl_engine::timing::QueryPhase::DslCheck);
-        crate::admission::admit_holding(&pool, query, deadline, None, lease.clone()).await
+        crate::admission::admit_holding(&pool, query, deadline, None, Some(Arc::clone(&lease)))
+            .await
     };
     let result = if let Err(refusal) = checked {
         Err(refusal)
@@ -506,11 +512,8 @@ pub(crate) async fn execute_scheduled_query(
         // Execute the query on the pool (no debug capture, UTC timestamps).
         // The work keeps the lease until it stops.
         let work = crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled)
-            .with_timing(timing.timing().clone());
-        let work = match &lease {
-            Some(hold) => work.holding(Arc::clone(hold)),
-            None => work,
-        };
+            .with_timing(timing.timing().clone())
+            .holding(Arc::clone(&lease));
         pool.execute(query_id, query, deadline, false, work)
             .await
             .result
@@ -1529,6 +1532,7 @@ mod off_reactor_tests {
         )
         .unwrap();
         let (store, _, run_id) = super::pg_tests::seed_run(&pool, "prepared").await;
+        let lease = executors.try_lease_scheduled().expect("a free lease");
         parsed_off_the_reactor(
             "zz_cp6b_scheduled_run",
             super::execute_scheduled_query(
@@ -1538,7 +1542,7 @@ mod off_reactor_tests {
                 "zz_cp6b_scheduled_run | where message matches /zz_(a|b)+/",
                 "prepared",
                 30,
-                None,
+                lease,
             ),
         )
         .await;
@@ -1851,7 +1855,7 @@ mod tests {
             "* | head 1",
             "timed_ok",
             30,
-            None,
+            executors.try_lease_scheduled().expect("a free lease"),
         )
         .await;
         super::execute_scheduled_query(
@@ -1861,7 +1865,7 @@ mod tests {
             "* | stats zz_sched_needle()",
             "timed_failure",
             30,
-            None,
+            executors.try_lease_scheduled().expect("a free lease"),
         )
         .await;
         drop(capturing);
@@ -1959,7 +1963,7 @@ mod tests {
                 "* | head 1",
                 "held",
                 1,
-                Some(lease),
+                lease,
             )
             .await;
             let run = store.get_run(run_id, 1).await.unwrap().unwrap();

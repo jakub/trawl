@@ -750,7 +750,7 @@ async fn query_timing_from_saved_skips_publication() {
         .await
         .unwrap();
     client.trigger_run(saved.id).await.unwrap();
-    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    let runs = wait_for_finished_runs(&server, &client, saved.id, 1).await;
     assert_eq!(runs[0].status, "success", "{:?}", runs[0]);
 
     let (status, request_id, body) = post_query(
@@ -5075,7 +5075,7 @@ async fn trigger_run_rejects_when_max_runs_reached() {
 
     // The one run the cap allows is itself a manual one.
     client.trigger_run(saved.id).await.unwrap();
-    wait_for_finished_runs(&client, saved.id, 1).await;
+    wait_for_finished_runs(&server, &client, saved.id, 1).await;
 
     let (status, message) = refusal(client.trigger_run(saved.id).await);
     assert_eq!(status, 409, "{message}");
@@ -5417,12 +5417,17 @@ async fn trigger_run_rejects_when_already_running() {
     assert!(message.contains("already in progress"), "{message}");
 }
 
-/// Poll until `saved_id` has `n` finished runs, returning them newest first.
+/// Poll until `saved_id` has `n` finished runs and `server`'s manual-run
+/// gate has drained, returning the runs newest first.
 ///
 /// `trigger_run` returns as soon as the run row exists; the execution is a
 /// spawned task. Polling beats a fixed sleep: a slow machine gets more time,
-/// a fast one does not pay for it.
+/// a fast one does not pay for it. A run row turns terminal before the run
+/// lets go of its manual-run lease (ADR-0018, amended 2026-11-11), so a
+/// test that presses Run now again with the same key needs both, or it
+/// races its own 429.
 async fn wait_for_finished_runs(
+    server: &common::TestServer,
     client: &HttpClient,
     saved_id: i64,
     n: usize,
@@ -5433,12 +5438,18 @@ async fn wait_for_finished_runs(
             .await
             .unwrap()
             .runs;
-        if runs.len() >= n && runs.iter().all(|r| r.status != "running") {
+        if runs.len() >= n
+            && runs.iter().all(|r| r.status != "running")
+            && server.state.query.pool.manual_leases_in_use() == 0
+        {
             return runs;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("{n} finished runs never appeared for saved query {saved_id}");
+    panic!(
+        "{n} finished runs and a drained manual-run gate never appeared for saved query \
+         {saved_id}"
+    );
 }
 
 /// The status of a refused client call, or a panic naming what came back.
@@ -5470,7 +5481,7 @@ async fn saved_query_only_cannot_run_or_read_results() {
     let querier_client = HttpClient::new_insecure(&server.url, &querier.token).unwrap();
     let runner_client = HttpClient::new_insecure(&server.url, &runner.token).unwrap();
 
-    let (runner_net, run) = run_and_read(&runner_client).await;
+    let (runner_net, run) = run_and_read(&server, &runner_client).await;
 
     // `saved_query` alone: nets, schedules and run metadata stay open.
     let editor_net = editor_client
@@ -5574,6 +5585,7 @@ async fn saved_query_only_cannot_run_or_read_results() {
 /// A key holding `query` and `saved_query` creates a net, runs it now,
 /// waits for the run to finish and reads its rows: all 200.
 async fn run_and_read(
+    server: &common::TestServer,
     client: &HttpClient,
 ) -> (trawl_api::SavedQueryResponse, trawl_api::ReportRunSummary) {
     let net = client
@@ -5588,7 +5600,7 @@ async fn run_and_read(
         .trigger_run(net.id)
         .await
         .expect("a key with query and saved_query runs its net now");
-    let mut runs = wait_for_finished_runs(client, net.id, 1).await;
+    let mut runs = wait_for_finished_runs(server, client, net.id, 1).await;
     let run = runs.remove(0);
     assert_eq!(run.id, started.id);
     assert_eq!(run.status, "success", "{run:?}");
@@ -5693,7 +5705,7 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
         .await
         .unwrap();
     client.trigger_run(saved.id).await.unwrap();
-    let first = wait_for_finished_runs(&client, saved.id, 1).await;
+    let first = wait_for_finished_runs(&server, &client, saved.id, 1).await;
     assert_eq!(first[0].status, "success");
     assert!(
         first[0].row_count.unwrap_or(0) > 0,
@@ -5714,7 +5726,7 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
         .await
         .unwrap();
     client.trigger_run(saved.id).await.unwrap();
-    let runs = wait_for_finished_runs(&client, saved.id, 2).await;
+    let runs = wait_for_finished_runs(&server, &client, saved.id, 2).await;
     let newest = &runs[0];
     assert_eq!(newest.status, "success", "{newest:?}");
     assert_eq!(newest.row_count, Some(0), "{newest:?}");
@@ -5792,7 +5804,7 @@ async fn from_saved_histogram_is_stored_result() {
         .await
         .unwrap();
     client.trigger_run(saved.id).await.unwrap();
-    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    let runs = wait_for_finished_runs(&server, &client, saved.id, 1).await;
     assert_eq!(runs[0].status, "success", "{:?}", runs[0]);
     assert!(runs[0].row_count.unwrap_or(0) > 0, "{:?}", runs[0]);
 
@@ -5859,7 +5871,7 @@ async fn a_from_saved_read_below_a_dangling_link_is_an_error() {
         .await
         .unwrap();
     client.trigger_run(saved.id).await.unwrap();
-    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    let runs = wait_for_finished_runs(&server, &client, saved.id, 1).await;
     let run = &runs[0];
     assert_eq!(run.status, "success", "{run:?}");
     assert!(run.row_count.unwrap_or(0) > 0, "{run:?}");
@@ -6581,11 +6593,12 @@ async fn trigger_at(
 /// The listed run a trigger started, once it has finished, checked to be
 /// the row the trigger's summary described.
 async fn finished(
+    server: &common::TestServer,
     client: &HttpClient,
     saved_id: i64,
     summary: &trawl_api::ReportRunSummary,
 ) -> trawl_api::ReportRunSummary {
-    let runs = wait_for_finished_runs(client, saved_id, 1).await;
+    let runs = wait_for_finished_runs(server, client, saved_id, 1).await;
     let run = runs
         .iter()
         .find(|r| r.id == summary.id)
@@ -6647,7 +6660,7 @@ async fn manual_run_of_since_last_schedule_covers_from_watermark() {
         "the saved text runs with the claimed bounds spliced on"
     );
 
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
     assert_eq!(
         client.get_schedule(saved.id).await.unwrap().covered_through,
@@ -6684,7 +6697,7 @@ async fn manual_run_of_fixed_schedule_covers_trailing_span() {
     assert_eq!(summary.window_end.as_deref(), Some(bound(end).as_str()));
     assert_eq!(summary.window_truncated, Some(false));
 
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
     assert_eq!(
         stored_covered_through(&server, schedule.id).await,
@@ -6725,7 +6738,7 @@ async fn manual_run_clamps_and_flags_truncated() {
     );
     assert_eq!(summary.window_end.as_deref(), Some(bound(t).as_str()));
 
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
     assert_eq!(
         stored_covered_through(&server, schedule.id).await,
@@ -6760,7 +6773,7 @@ async fn manual_run_without_predecessor_covers_one_interval() {
     assert_eq!(summary.window_end.as_deref(), Some(bound(end).as_str()));
     assert_eq!(summary.window_truncated, Some(false));
 
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
 }
 
@@ -6885,7 +6898,7 @@ async fn successful_manual_run_consumes_overdue_tick() {
         set_next_fire_at(&server, schedule.id, overdue).await;
 
         let (summary, t) = trigger_at(&client, saved.id).await;
-        let run = finished(&client, saved.id, &summary).await;
+        let run = finished(&server, &client, saved.id, &summary).await;
         assert_eq!(run.status, "success", "{mode}: {run:?}");
 
         let cursor = stored_next_fire_at(&server, schedule.id).await;
@@ -6941,7 +6954,7 @@ async fn manual_run_leaves_future_fire_cursor() {
     set_next_fire_at(&server, schedule.id, future).await;
 
     let (summary, _t) = trigger_at(&client, saved.id).await;
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
 
     assert_eq!(stored_next_fire_at(&server, schedule.id).await, future);
@@ -7257,7 +7270,7 @@ async fn manual_run_of_disabled_schedule_runs_and_resume_skips_consumed_boundary
     set_next_fire_at(&server, schedule.id, overdue).await;
 
     let (summary, _t) = trigger_at(&client, saved.id).await;
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
     let paused = client.get_schedule(saved.id).await.unwrap();
     assert!(!paused.enabled, "a manual run leaves the schedule disabled");
@@ -7307,7 +7320,7 @@ async fn manual_run_of_a_query_mode_schedule_still_starts() {
     assert_eq!(summary.window_kind, None);
     assert_eq!(summary.origin.as_deref(), Some("manual"));
 
-    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    let runs = wait_for_finished_runs(&server, &client, saved.id, 1).await;
     assert_eq!(runs.len(), 1);
     let run = &runs[0];
     assert_eq!(run.status, "success");

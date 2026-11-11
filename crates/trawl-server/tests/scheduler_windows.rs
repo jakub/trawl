@@ -1654,9 +1654,9 @@ async fn a_timed_out_run_keeps_its_lease_until_its_work_ends() {
     assert!(h.runs(newer).await.is_empty(), "the newer cursor waits");
 }
 
-/// A manual run takes no lease: with every scheduled-run lease of the
-/// server's pool held, a run triggered over HTTP still starts its work,
-/// and finishes.
+/// A manual run takes no scheduled-run lease: with every scheduled-run
+/// lease of the server's pool held, a run triggered over HTTP still starts
+/// its work under its own manual-run lease, and finishes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_manual_run_takes_no_lease() {
     let server = common::setup().await;
@@ -1713,4 +1713,667 @@ async fn a_manual_run_takes_no_lease() {
         [(manual.id, "success".to_owned(), true, None)]
     );
     drop(leases);
+}
+
+// ---------------------------------------------------------------------------
+// the manual-run gate (ADR-0018, amended 2026-11-11)
+// ---------------------------------------------------------------------------
+
+/// The fixed text of a busy refusal: it names no setting and no count.
+const MANUAL_RUN_BUSY: &str =
+    "a manual run is already running; retry after the Retry-After interval";
+
+/// The DSL every manual-run net over the shared fixture runs.
+const NGINX_DSL: &str = "service=nginx | stats count()";
+
+/// A net of `key_id` on `server` over [`NGINX_DSL`]: its hourly schedule
+/// fires a day out, so no tick claims it. Returns the saved-query and
+/// schedule ids.
+async fn server_net(
+    server: &common::TestServer,
+    key_id: i64,
+    name: &str,
+    window: Option<ScheduleWindow>,
+    max_runs: Option<u64>,
+) -> (i64, i64) {
+    let storage = &server.state.storage;
+    let saved = storage
+        .saved
+        .create(key_id, name, NGINX_DSL)
+        .await
+        .expect("create the net");
+    let schedule = storage
+        .schedule
+        .create_schedule(
+            saved.id,
+            key_id,
+            3600,
+            max_runs,
+            window,
+            0,
+            Utc::now() + Duration::days(1),
+        )
+        .await
+        .expect("schedule the net");
+    (saved.id, schedule.id)
+}
+
+/// What a manual claim moves or spends, and what it writes: the fire
+/// cursor, the watermark, the run budget spent and the run rows' ids.
+type ClaimSnapshot = (DateTime<Utc>, Option<DateTime<Utc>>, u64, Vec<i64>);
+
+async fn claim_snapshot(
+    server: &common::TestServer,
+    db: &PgPool,
+    key_id: i64,
+    saved_id: i64,
+) -> ClaimSnapshot {
+    let schedule = server
+        .state
+        .storage
+        .schedule
+        .get_schedule_for_saved_query(saved_id, key_id)
+        .await
+        .expect("read the schedule")
+        .expect("the schedule exists");
+    let runs = runs_of(db, saved_id).await.iter().map(|r| r.0).collect();
+    (
+        schedule.next_fire_at,
+        schedule.covered_through,
+        schedule.runs_claimed,
+        runs,
+    )
+}
+
+/// The 429 `manual_run_busy` a refused press answers, with its fixed text
+/// and a numeric `Retry-After` of at least 1 s. Returns the Retry-After.
+fn assert_busy(
+    what: &str,
+    outcome: Result<trawl_api::ReportRunSummary, trawl_client::ClientError>,
+) -> u32 {
+    match outcome {
+        Err(trawl_client::ClientError::Server {
+            status: 429,
+            error,
+            retry_after_secs,
+            ..
+        }) => {
+            assert_eq!(error.code, trawl_api::ErrorCode::ManualRunBusy, "{what}");
+            assert_eq!(error.message, MANUAL_RUN_BUSY, "{what}");
+            let retry = retry_after_secs
+                .unwrap_or_else(|| panic!("{what}: a busy refusal carries a numeric Retry-After"));
+            assert!(retry >= 1, "{what}: Retry-After {retry}");
+            retry
+        }
+        other => panic!("{what}: expected 429 manual_run_busy, got {other:?}"),
+    }
+}
+
+/// The status and message of a refused press that is no busy refusal.
+fn refused(
+    what: &str,
+    outcome: Result<trawl_api::ReportRunSummary, trawl_client::ClientError>,
+) -> (u16, String) {
+    match outcome {
+        Err(trawl_client::ClientError::Server { status, error, .. }) => {
+            assert_ne!(status, 429, "{what}: {}", error.message);
+            (status, error.message)
+        }
+        other => panic!("{what}: expected a refusal, got {other:?}"),
+    }
+}
+
+/// Wait until `server`'s manual-run gate holds no lease.
+async fn gate_drained(server: &common::TestServer) {
+    until("the manual-run gate drained", || async {
+        server.state.query.pool.manual_leases_in_use() == 0
+    })
+    .await;
+}
+
+/// Wait until every run of `saved_id` finished and the gate drained, and
+/// answer the runs.
+async fn settled_runs(
+    server: &common::TestServer,
+    db: &PgPool,
+    saved_id: i64,
+) -> Vec<(i64, String, bool, Option<String>)> {
+    until("the net's runs finished", || async {
+        runs_of(db, saved_id)
+            .await
+            .iter()
+            .all(|run| run.1 != "running")
+    })
+    .await;
+    gate_drained(server).await;
+    runs_of(db, saved_id).await
+}
+
+/// How many backends of the app-state database wait on a lock.
+async fn lock_waiters(db: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_stat_activity
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+/// A refused press is refused before the claim: while a key's first
+/// manual run is held at `Seam::Started`, its press on another net answers
+/// 429 `manual_run_busy`, and so does its press on the running net itself,
+/// never a 409. Neither moves a cursor or a watermark, spends budget, or
+/// writes a run row.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_run_refusal_is_preclaim() {
+    let server = common::setup().await;
+    let key_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let db = common::fixture_pool(&server.app_db_url, 1).await;
+    let (first, _) = server_net(&server, key_id, "preclaim_first", None, Some(5)).await;
+    let (second, second_schedule) = server_net(
+        &server,
+        key_id,
+        "preclaim_second",
+        Some(ScheduleWindow::SinceLast),
+        Some(5),
+    )
+    .await;
+    // A watermark with a value, so "unchanged" can tell it from none.
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(truncate_to_micros(Utc::now() - hours(2)))
+        .bind(second_schedule)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let pool = &server.state.query.pool;
+    let client =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let seams = pool.seams();
+    let started = seams.hold(trawl_server::pool::seam::Seam::Started);
+    let running = client
+        .trigger_run(first)
+        .await
+        .expect("the first manual run is accepted");
+    until("the first run's work started", || async {
+        started.arrivals() == 1
+    })
+    .await;
+    assert_eq!(pool.manual_leases_in_use(), 1);
+
+    let first_before = claim_snapshot(&server, &db, key_id, first).await;
+    let second_before = claim_snapshot(&server, &db, key_id, second).await;
+    assert_eq!(first_before.2, 1, "the first run spent one budget unit");
+    assert_eq!(first_before.3, [running.id]);
+    assert!(second_before.1.is_some());
+    assert!(second_before.3.is_empty());
+
+    let retry = assert_busy("another net", client.trigger_run(second).await);
+    let limit = trawl_server::scheduler::CLAIM_WAIT.as_secs() + common::DEFAULT_TEST_TIMEOUT_SECS;
+    assert!(
+        u64::from(retry) <= limit,
+        "Retry-After {retry} is past the holder's estimated end"
+    );
+    assert_busy("the running net", client.trigger_run(first).await);
+
+    assert_eq!(
+        claim_snapshot(&server, &db, key_id, second).await,
+        second_before,
+        "the refusal claimed nothing on the other net"
+    );
+    assert_eq!(
+        claim_snapshot(&server, &db, key_id, first).await,
+        first_before,
+        "the refusal claimed nothing on the running net"
+    );
+    assert_eq!(started.arrivals(), 1, "no second run reached its work");
+
+    started.release();
+    assert_eq!(
+        settled_runs(&server, &db, first).await,
+        [(running.id, "success".to_owned(), true, None)]
+    );
+    assert!(runs_of(&db, second).await.is_empty());
+}
+
+/// The installation-wide cap: at 4 permits a quarter is one place, so
+/// while one key holds it, another key's press is refused before its
+/// claim. Once the first run ends, the second key's press starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_runs_installation_wide_are_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = common::setup_with_query_knobs(
+        dir.path(),
+        common::seed_data_root(dir.path()),
+        common::DEFAULT_TEST_TIMEOUT_SECS,
+        common::QueryKnobs {
+            max_concurrent_queries: 4,
+            ..common::QueryKnobs::DEFAULT
+        },
+    )
+    .await;
+    let pool = &server.state.query.pool;
+    assert_eq!(pool.manual_lease_limit(), 1, "max(1, 4/4)");
+    let db = common::fixture_pool(&server.app_db_url, 1).await;
+
+    let holder_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let other = common::mint_key(
+        &server.fleet_pool,
+        "second-runner",
+        &["query", "saved_query"],
+    )
+    .await;
+    let other_id = common::captured::key_id(&server, &other.token).await;
+    let (held, _) = server_net(&server, holder_id, "capped_holder", None, None).await;
+    let (refused_net, _) = server_net(&server, other_id, "capped_other", None, None).await;
+    let holder =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let second = trawl_client::HttpClient::new_insecure(&server.url, &other.token).unwrap();
+
+    let seams = pool.seams();
+    let started = seams.hold(trawl_server::pool::seam::Seam::Started);
+    let running = holder
+        .trigger_run(held)
+        .await
+        .expect("the holder's run is accepted");
+    until("the holder's work started", || async {
+        started.arrivals() == 1
+    })
+    .await;
+
+    let before = claim_snapshot(&server, &db, other_id, refused_net).await;
+    assert_busy("a second key", second.trigger_run(refused_net).await);
+    assert_eq!(
+        claim_snapshot(&server, &db, other_id, refused_net).await,
+        before,
+        "the refused key claimed nothing"
+    );
+    assert_eq!(pool.manual_leases_in_use(), 1);
+
+    started.release();
+    assert_eq!(
+        settled_runs(&server, &db, held).await,
+        [(running.id, "success".to_owned(), true, None)]
+    );
+    let admitted = second
+        .trigger_run(refused_net)
+        .await
+        .expect("with the place free the second key runs");
+    assert_eq!(
+        settled_runs(&server, &db, refused_net).await,
+        [(admitted.id, "success".to_owned(), true, None)]
+    );
+}
+
+/// The scheduled and the manual gate are separate: with every scheduled
+/// lease held, a manual run starts; with the manual gate full, the tick
+/// still claims and starts a due schedule.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_run_gates_do_not_block_each_other() {
+    let server = common::setup().await;
+    let key_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let storage = &server.state.storage;
+    let db = common::fixture_pool(&server.app_db_url, 1).await;
+    let (manual, _) = server_net(&server, key_id, "gates_manual", None, None).await;
+    let due = storage
+        .saved
+        .create(key_id, "gates_due", NGINX_DSL)
+        .await
+        .unwrap();
+    storage
+        .schedule
+        .create_schedule(due.id, key_id, 3600, None, None, 0, Utc::now() - hours(1))
+        .await
+        .unwrap();
+
+    let pool = &server.state.query.pool;
+    let leases: Vec<_> = std::iter::from_fn(|| pool.try_lease_scheduled()).collect();
+    assert_eq!(pool.scheduled_leases_available(), 0, "every lease is held");
+
+    let seams = pool.seams();
+    let started = seams.hold(trawl_server::pool::seam::Seam::Started);
+    let run = trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token)
+        .unwrap()
+        .trigger_run(manual)
+        .await
+        .expect("a full scheduled gate does not refuse Run now");
+    until("the manual run's work started", || async {
+        started.arrivals() == 1
+    })
+    .await;
+    assert_eq!(pool.manual_leases_in_use(), pool.manual_lease_limit());
+
+    // The manual gate is full; give the tick its lease back.
+    drop(leases);
+    let handles = poll_and_execute(
+        &storage.schedule,
+        &KeyStore::from_pool(server.fleet_pool.clone()),
+        pool,
+        &SchedulerConfig::default(),
+        common::DEFAULT_TEST_TIMEOUT_SECS,
+        truncate_to_micros(Utc::now()),
+    )
+    .await;
+    assert_eq!(
+        handles.len(),
+        1,
+        "a full manual gate does not defer the tick"
+    );
+    until("the scheduled run's work started", || async {
+        started.arrivals() == 2
+    })
+    .await;
+    let scheduled = runs_of(&db, due.id).await;
+    assert_eq!(scheduled.len(), 1, "{scheduled:?}");
+    assert_eq!(scheduled[0].1, "running", "{scheduled:?}");
+
+    started.release();
+    for handle in handles {
+        handle.await.expect("a scheduled execution must not panic");
+    }
+    assert_eq!(runs_of(&db, due.id).await[0].1, "success");
+    assert_eq!(
+        settled_runs(&server, &db, manual).await,
+        [(run.id, "success".to_owned(), true, None)]
+    );
+}
+
+/// A request dropped while its claim is in flight leaves no orphan: the
+/// claim is parked on a fixture's `saved_queries` row lock, the request is
+/// dropped, and the lock goes. The claim commits and its run executes and
+/// finishes under the same lease, with no `running` row left behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_request_after_claim_still_runs() {
+    use tower::ServiceExt as _;
+
+    let server = common::setup().await;
+    let key_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let (saved, _) = server_net(&server, key_id, "dropped_request", None, None).await;
+    let db = common::fixture_pool(&server.app_db_url, 2).await;
+
+    let mut lock = db.begin().await.unwrap();
+    sqlx::query("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(saved)
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap();
+
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/saved/{saved}/run"))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", server.analyst_token),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(std::net::SocketAddr::from(([127, 0, 0, 1], 40_444)));
+    let app = server.router_with(|_| {});
+    let pending = tokio::spawn(async move { app.oneshot(request).await });
+
+    until("the claim waits on the saved query's row lock", || async {
+        lock_waiters(&db).await == 1
+    })
+    .await;
+    let pool = &server.state.query.pool;
+    assert_eq!(pool.manual_leases_in_use(), 1, "the claim holds the lease");
+
+    pending.abort();
+    let dropped = pending
+        .await
+        .expect_err("the request was dropped before it answered");
+    assert!(dropped.is_cancelled(), "{dropped:?}");
+    assert!(
+        runs_of(&db, saved).await.is_empty(),
+        "nothing committed yet"
+    );
+
+    lock.rollback().await.unwrap();
+    let runs = settled_runs(&server, &db, saved).await;
+    assert_eq!(runs.len(), 1, "the committed claim ran: {runs:?}");
+    assert_eq!(runs[0].1, "success", "{runs:?}");
+    assert!(runs[0].2, "{runs:?}");
+}
+
+/// Every claim that starts no run gives the lease back before it answers:
+/// right after each refusal the gate is empty, and the same key's next
+/// press answers 200. The refusals are no schedule (400), a run already in
+/// progress (409), a spent budget (409), an empty window (409) and a
+/// window the claim cannot resolve (400).
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_claim_refusals_return_the_lease() {
+    let server = common::setup().await;
+    let key_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let storage = &server.state.storage;
+    let pool = &server.state.query.pool;
+    let db = common::fixture_pool(&server.app_db_url, 1).await;
+    let client =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let (good, _) = server_net(&server, key_id, "refusals_good", None, None).await;
+
+    let unscheduled = storage
+        .saved
+        .create(key_id, "refusals_unscheduled", NGINX_DSL)
+        .await
+        .unwrap()
+        .id;
+
+    let (busy, busy_schedule) = server_net(&server, key_id, "refusals_running", None, None).await;
+    let seeded = storage
+        .schedule
+        .claim_run(busy_schedule, busy, NGINX_DSL, None)
+        .await
+        .unwrap();
+    assert!(matches!(seeded, RunClaim::Started(_)), "{seeded:?}");
+
+    let (spent, _) = server_net(&server, key_id, "refusals_spent", None, Some(0)).await;
+
+    let (empty, empty_schedule) = server_net(
+        &server,
+        key_id,
+        "refusals_empty",
+        Some(ScheduleWindow::SinceLast),
+        None,
+    )
+    .await;
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(truncate_to_micros(Utc::now() + hours(1)))
+        .bind(empty_schedule)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let (conflicted, conflicted_schedule) = server_net(
+        &server,
+        key_id,
+        "refusals_conflicted",
+        Some(ScheduleWindow::SinceLast),
+        None,
+    )
+    .await;
+    // A windowed net with a window to read, whose stored DSL carries its
+    // own time clause, past the write-time gate: the claim cannot resolve
+    // its window.
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(truncate_to_micros(Utc::now() - hours(1)))
+        .bind(conflicted_schedule)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE saved_queries SET query = $1 WHERE id = $2")
+        .bind("service=nginx last=1h | stats count()")
+        .bind(conflicted)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    for (what, net, status, says) in [
+        ("no schedule", unscheduled, 400, "attach a schedule"),
+        ("already running", busy, 409, "already in progress"),
+        ("spent budget", spent, 409, "max runs reached"),
+        ("empty window", empty, 409, "nothing new to read"),
+        ("window resolution", conflicted, 400, ""),
+    ] {
+        let (got, message) = refused(what, client.trigger_run(net).await);
+        assert_eq!(got, status, "{what}: {message}");
+        assert!(message.contains(says), "{what}: {message}");
+        assert_eq!(
+            pool.manual_leases_in_use(),
+            0,
+            "{what}: the lease was back before the refusal answered"
+        );
+
+        let next = client
+            .trigger_run(good)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: the key's next run is refused: {e:?}"));
+        let runs = settled_runs(&server, &db, good).await;
+        assert!(
+            runs.iter()
+                .any(|run| run.0 == next.id && run.1 == "success"),
+            "{what}: {runs:?}"
+        );
+    }
+    assert!(runs_of(&db, unscheduled).await.is_empty());
+    assert!(runs_of(&db, spent).await.is_empty());
+    assert!(runs_of(&db, empty).await.is_empty());
+    assert!(runs_of(&db, conflicted).await.is_empty());
+    assert_eq!(runs_of(&db, busy).await.len(), 1, "only the seeded run");
+}
+
+/// A manual run's lease lasts as long as its physical work, not as long as
+/// its request or its run row: on a server whose runs time out after 1 s,
+/// a run parked in its preparation (`Preparing`, `Prepared`) or in its
+/// executor work (`Started`) records `timeout`, and its lease still holds
+/// the gate, so the key's press on another net is refused. Deleting and
+/// re-creating the net frees nothing. On a second server, a run parked in
+/// finishing its row (behind a fixture lock on its schedule row, which
+/// `finish_run` takes) holds it too. Each lease returns once its last work
+/// ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_run_lease_outlives_its_request() {
+    use trawl_server::pool::seam::Seam;
+
+    let server =
+        common::setup_with_query_timeout(trawl_server::config::RateLimitConfig::default(), 1).await;
+    let key_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let pool = &server.state.query.pool;
+    let db = common::fixture_pool(&server.app_db_url, 1).await;
+    let client =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    for seam in [Seam::Preparing, Seam::Prepared, Seam::Started] {
+        let name = format!("outlives_{seam:?}");
+        let (saved, _) = server_net(&server, key_id, &name, None, None).await;
+        let (other, _) = server_net(&server, key_id, &format!("{name}_other"), None, None).await;
+
+        let seams = pool.seams();
+        let parked = seams.hold(seam);
+        let run = client
+            .trigger_run(saved)
+            .await
+            .unwrap_or_else(|e| panic!("{seam:?}: the run is refused: {e:?}"));
+        until("the run's work parked", || async { parked.arrivals() >= 1 }).await;
+        until("the run timed out", || async {
+            runs_of(&db, saved).await[0].1 == "timeout"
+        })
+        .await;
+        assert_busy(
+            &format!("{seam:?}: another net"),
+            client.trigger_run(other).await,
+        );
+        assert_eq!(
+            pool.manual_leases_in_use(),
+            1,
+            "{seam:?}: the parked work holds run {}'s lease",
+            run.id
+        );
+
+        if seam == Seam::Started {
+            client
+                .delete_saved(saved)
+                .await
+                .expect("delete the running net");
+            let again = client
+                .create_saved(&name, NGINX_DSL)
+                .await
+                .expect("re-create the net");
+            client
+                .set_schedule(again.id, "1h", None, true, None, None)
+                .await
+                .expect("schedule the re-created net");
+            assert_busy("the re-created net", client.trigger_run(again.id).await);
+            assert_eq!(pool.manual_leases_in_use(), 1);
+        }
+
+        parked.release();
+        drop(seams);
+        gate_drained(&server).await;
+        assert!(
+            runs_of(&db, other).await.is_empty(),
+            "{seam:?}: the refused press claimed nothing"
+        );
+    }
+
+    finishing_keeps_the_lease().await;
+}
+
+/// The finishing phase of [`manual_run_lease_outlives_its_request`]: the
+/// run's row is still `running` while its frame waits to finish it, and
+/// the frame keeps the lease.
+async fn finishing_keeps_the_lease() {
+    use trawl_server::pool::seam::Seam;
+
+    let server = common::setup().await;
+    let key_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let pool = &server.state.query.pool;
+    let db = common::fixture_pool(&server.app_db_url, 2).await;
+    let client =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let (saved, schedule) = server_net(&server, key_id, "outlives_finishing", None, None).await;
+    let (other, _) = server_net(&server, key_id, "outlives_finishing_other", None, None).await;
+
+    // Park the work until the claim, which locks the schedule row too, has
+    // committed; only then lock the row the finish needs.
+    let seams = pool.seams();
+    let started = seams.hold(Seam::Started);
+    let run = client
+        .trigger_run(saved)
+        .await
+        .expect("the finishing run is accepted");
+    until("the run's work started", || async {
+        started.arrivals() == 1
+    })
+    .await;
+    let mut lock = db.begin().await.unwrap();
+    sqlx::query("SELECT id FROM schedules WHERE id = $1 FOR UPDATE")
+        .bind(schedule)
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap();
+    started.release();
+    until("the finish waits on the schedule's row lock", || async {
+        lock_waiters(&db).await == 1
+    })
+    .await;
+    assert_eq!(
+        runs_of(&db, saved).await,
+        [(run.id, "running".to_owned(), false, None)]
+    );
+    assert_busy("finishing: another net", client.trigger_run(other).await);
+    assert_eq!(
+        pool.manual_leases_in_use(),
+        1,
+        "the finishing frame holds it"
+    );
+
+    lock.rollback().await.unwrap();
+    assert_eq!(
+        settled_runs(&server, &db, saved).await,
+        [(run.id, "success".to_owned(), true, None)]
+    );
+    assert!(runs_of(&db, other).await.is_empty());
 }
