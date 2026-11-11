@@ -317,6 +317,80 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
     assert!(excerpt.contains('^'), "{case}: {excerpt}");
     assert!(invalid.text.contains('^'), "{case}: {}", invalid.text);
 
+    // A call the run would refuse is invalid here too: the verdict names
+    // it, prints its hint once, proposes no execute, and runs nothing.
+    let before = executions(server).await;
+    for (query, message, hint) in [
+        (
+            r#"last=1h | where match(message, "x")"#,
+            "unknown function: match",
+            Some("matches is an operator, not a function: where message matches /re/"),
+        ),
+        (
+            "last=1h | let y = lowerr(message)",
+            "unknown function: lowerr",
+            Some("did you mean 'lower'?"),
+        ),
+        (
+            "last=1h | where length() > 0",
+            "invalid aggregation: length() requires exactly one argument",
+            None,
+        ),
+    ] {
+        let refused = mcp
+            .call("search", json!({"mode": "validate", "query": query}))
+            .await;
+        assert!(
+            !refused.is_error,
+            "{case}: {query}: a failed validation is a successful call: {}",
+            refused.text
+        );
+        let reply = refused.structured.as_ref().unwrap();
+        let verdict = &reply["validation"];
+        assert_eq!(verdict["valid"], false, "{case}: {query}: {}", refused.text);
+        assert_eq!(
+            verdict["errors"][0]["message"], message,
+            "{case}: {query}: {}",
+            refused.text
+        );
+        assert!(
+            refused.text.contains(&format!("error: {message}")),
+            "{case}: {query}: {}",
+            refused.text
+        );
+        match hint {
+            Some(hint) => {
+                assert_eq!(
+                    verdict["errors"][0]["hint"], hint,
+                    "{case}: {query}: {}",
+                    refused.text
+                );
+                assert_eq!(
+                    refused.text.matches(hint).count(),
+                    1,
+                    "{case}: {query}: the hint is printed once: {}",
+                    refused.text
+                );
+            }
+            None => assert!(
+                !refused.text.contains("hint: "),
+                "{case}: {query}: {}",
+                refused.text
+            ),
+        }
+        assert_eq!(
+            reply["next_actions"],
+            json!([]),
+            "{case}: {query}: no execute is proposed: {}",
+            refused.text
+        );
+    }
+    assert_eq!(
+        executions(server).await,
+        before,
+        "{case}: validation ran nothing and captured nothing"
+    );
+
     // execute over everything: rows, facets, the search URL, and the
     // dominant service named over the captured rows.
     let all = mcp

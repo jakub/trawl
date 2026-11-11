@@ -57,6 +57,12 @@ impl NetSort {
 pub fn NetsPage() -> impl IntoView {
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     let bus = expect_context::<ToastBus>();
+    let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
+    // Run now needs `query` beside `saved_query`; a session without it is
+    // offered none, on any row.
+    let offered = move |n: &SavedQueryResponse| {
+        me.with(|m| run_now_offered(n, m.as_ref().map(|m| m.permissions.as_slice())))
+    };
     let qm = use_query_map();
     let net_selected: Memo<Option<i64>> =
         Memo::new(move |_| qm.get().get("net").and_then(|s| s.parse::<i64>().ok()));
@@ -339,7 +345,7 @@ pub fn NetsPage() -> impl IntoView {
                                                         ev.stop_propagation();
                                                         run(net.get_untracked().query);
                                                     }>"Open in search"</button>
-                                                <Show when=move || run_now_offered(&net.get())>
+                                                <Show when=move || offered(&net.get())>
                                                     <button type="button" class="btn-sec btn-xs net-run-now"
                                                         title=move || if run_now_spent(&net.get()) { RUN_NOW_SPENT_REASON } else { RUN_NOW }
                                                         aria-describedby=move || run_now_spent(&net.get()).then(|| format!("netRunNowSpent{id}"))
@@ -347,10 +353,10 @@ pub fn NetsPage() -> impl IntoView {
                                                         on:click=move |ev| {
                                                             ev.stop_propagation();
                                                             let current = net.get_untracked();
-                                                            // Recheck the saved state on activation: a
-                                                            // schedule removed or spent since render has
-                                                            // nothing left to fire.
-                                                            if run_now_offered(&current) && !run_now_spent(&current) && !run_in_flight.get_untracked() {
+                                                            // Recheck the saved state and the session on
+                                                            // activation: a schedule removed or spent since
+                                                            // render has nothing left to fire.
+                                                            if offered(&current) && !run_now_spent(&current) && !run_in_flight.get_untracked() {
                                                                 on_run_now(id, current.name, run_in_flight);
                                                             }
                                                         }>{RUN_NOW}</button>

@@ -8,6 +8,9 @@
 //! - Query + Schedule: inline-editable DSL, schedule controls with
 //!   interval chips + custom input, enabled toggle, max-runs.
 //! - Runs: paginated run history with expandable inline result previews.
+//!   The previews and Run now need `query` beside `saved_query`; without
+//!   it the history lists and nothing expands (ADR-0018 as amended on
+//!   2026-11-11).
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -24,9 +27,9 @@ use fleet_ui::{
 };
 
 use crate::schedule_edit::{
-    RUN_NOT_STARTED, RUN_NOW, RUN_NOW_SPENT_REASON, VIEW_RUN, WindowDraft, WindowMode, preview_cap,
-    run_budget_label, run_now_form_line, run_now_offered, run_now_spent, run_started_toast,
-    schedule_sentence, validate_max_runs,
+    RUN_NOT_STARTED, RUN_NOW, RUN_NOW_SPENT_REASON, VIEW_RUN, WindowDraft, WindowMode,
+    may_run_saved, preview_cap, run_budget_label, run_now_form_line, run_now_offered,
+    run_now_spent, run_started_toast, schedule_sentence, validate_max_runs,
 };
 
 use crate::api::RUNS_PAGE_SIZE;
@@ -55,6 +58,7 @@ pub fn NetDrawer(
     docked: Signal<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
+    let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
     let alive = StoredValue::new(true);
     on_cleanup(move || alive.set_value(false));
     let net_for_query = net.clone();
@@ -76,8 +80,12 @@ pub fn NetDrawer(
     // splices the next window onto it. A query-mode net has no window,
     // so its text runs verbatim, as a scheduled run of it would. The
     // offer follows the SAVED state, never an unsaved draft of it: what
-    // fires is the schedule the server holds.
-    let run_now_allowed = move || saved.get().is_some_and(|n| run_now_offered(&n));
+    // fires is the schedule the server holds. A session without `query`
+    // is offered no Run now at all.
+    let offered = move |n: &SavedQueryResponse| {
+        me.with(|m| run_now_offered(n, m.as_ref().map(|m| m.permissions.as_slice())))
+    };
+    let run_now_allowed = move || saved.get().is_some_and(|n| offered(&n));
     // A spent run budget keeps Run now on screen, disabled, with the
     // spend and the reason beside it: the server would refuse the run.
     let run_now_spent_label = Signal::derive(move || {
@@ -212,7 +220,7 @@ pub fn NetDrawer(
         }
         let Some(current) = saved
             .get_untracked()
-            .filter(|n| run_now_offered(n) && !run_now_spent(n))
+            .filter(|n| offered(n) && !run_now_spent(n))
         else {
             return;
         };
@@ -947,6 +955,12 @@ fn RunsPane(
     active: Signal<bool>,
 ) -> impl IntoView {
     let table_viewport = NodeRef::<leptos::html::Div>::new();
+    let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
+    // Reading a run's rows needs `query`; the history does not. Without
+    // it a row is not a control and no preview is built.
+    let rows_readable = Signal::derive(move || {
+        me.with(|m| may_run_saved(m.as_ref().map(|m| m.permissions.as_slice())))
+    });
     let page = RwSignal::new(0usize);
     let expanded_run: RwSignal<Option<i64>> = RwSignal::new(None);
     let expanded_read = RwSignal::new(None::<RunRead>);
@@ -1044,10 +1058,11 @@ fn RunsPane(
                         let run_id = initial.id;
                         let run = Signal::derive(move || runs.get().and_then(Result::ok)
                             .and_then(|(_, r)| r.runs.into_iter().find(|r| r.id == run_id)).or_else(|| expanded_summary.get().filter(|r| r.id == run_id)).unwrap_or_else(|| initial.clone()));
-                        let is_expanded = move || expanded_run.get() == Some(run_id);
+                        let is_expanded = move || rows_readable.get() && expanded_run.get() == Some(run_id);
+                        let started = move || time_ago(&run.get().started_at, now.get());
                         view! {
                             <tr class="tbl-row">
-                                <td class="mono"><button type="button" class="row-stretch"
+                                <td class="mono">{move || if rows_readable.get() { view! { <button type="button" class="row-stretch"
                                     aria-expanded=move || is_expanded().to_string()
                                     on:click=move |_| {
                                         // The read belongs to the expansion it
@@ -1057,7 +1072,7 @@ fn RunsPane(
                                         expanded_read.set(None);
                                         expanded_run.update(|v| *v = if *v == Some(run_id) { None } else { Some(run_id) });
                                     }
-                                >{move || time_ago(&run.get().started_at, now.get())}</button>
+                                >{started}</button> }.into_any() } else { view! { <span>{started}</span> }.into_any() }}
                                     {move || (is_expanded() && runs.get().and_then(Result::ok).is_some_and(|(_, r)| !r.runs.iter().any(|r| r.id == run_id)))
                                         .then_some("Expanded run outside this page")}
                                 </td>

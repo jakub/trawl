@@ -834,3 +834,22 @@ stopped.
 Resolution means the gauge read 0 for both reasons. Searches answer again
 from the moment the state clears, and the next scheduler poll claims the
 windows that waited.
+
+## Net run caps full
+
+The pack ships no rule for the report-run caps, and Trawl sets no default
+alert duration for them. A full cap is ordinary load, not a failure. To watch
+saturation, compare `trawl_net_run_leases_in_use{origin}` with
+`trawl_net_run_lease_limit{origin}` and choose a duration that fits your
+schedules.
+
+- `origin="scheduled"` at its limit: due schedules wait for a later poll, and
+  their missed boundaries coalesce into one run.
+- `origin="manual"` at its limit: Run now answers 429 `manual_run_busy` until
+  a manual run's work ends.
+
+A run holds its place until its work ends, also after it timed out, so a cap
+that stays full while no run row reads `running` points to retained work. Read
+`trawl_query_permits_retained` and the
+[retained work listing](/reference/api/#active-recent-and-retained-work). See
+[run a saved query now](/reference/api/#run-a-saved-query-now) for the limits.

@@ -334,6 +334,18 @@ pub enum ServerError {
         retry_after_secs: u64,
     },
 
+    /// The caller's key already holds a manual run, or the installation
+    /// runs as many manual runs as it may (429 with `Retry-After`, code
+    /// `manual_run_busy`, ADR-0018). Refused before the claim, so no budget,
+    /// run row, cursor or watermark moved. The message names no setting and
+    /// no count.
+    #[error("a manual run is already running; retry after the Retry-After interval")]
+    ManualRunBusy {
+        /// Whole seconds until the earliest holder's estimated end, at
+        /// least 1. Advisory.
+        retry_after_secs: u64,
+    },
+
     /// The key's or the installation's capture quota cannot take one more
     /// result (429 with `Retry-After`, code `capture_quota_exceeded`,
     /// ADR-0057). Refused before any executor permit.
@@ -903,6 +915,7 @@ impl ServerError {
             Self::CaptureSourceTooLarge { .. } => "capture_source_too_large",
             Self::CaptureBounds(_) => "capture_bounds",
             Self::CaptureBusy { .. } => "capture_busy",
+            Self::ManualRunBusy { .. } => "manual_run_busy",
             Self::CaptureQuotaExceeded { .. } => "capture_quota_exceeded",
             Self::ResultGone { .. } => "result_gone",
             Self::ResultUnavailable => "result_unavailable",
@@ -974,6 +987,7 @@ impl ServerError {
             | Self::CaptureBounds(_)
             | Self::CaptureTooLarge(_)
             | Self::CaptureBusy { .. }
+            | Self::ManualRunBusy { .. }
             | Self::CaptureQuotaExceeded { .. }
             | Self::ResultGone { .. }
             | Self::ResultUnavailable
@@ -1536,6 +1550,11 @@ impl ServerError {
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorEnvelope::simple(ErrorCode::CaptureBusy, self.to_string()),
             ),
+            // `Retry-After` is added below, from the variant.
+            Self::ManualRunBusy { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorEnvelope::simple(ErrorCode::ManualRunBusy, self.to_string()),
+            ),
             Self::CaptureQuotaExceeded { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorEnvelope::simple(ErrorCode::CaptureQuotaExceeded, self.to_string()),
@@ -1729,6 +1748,7 @@ impl IntoResponse for ServerError {
             Self::HotBufferFull { retry_after_secs }
             | Self::RateLimited { retry_after_secs }
             | Self::CaptureBusy { retry_after_secs }
+            | Self::ManualRunBusy { retry_after_secs }
             | Self::CaptureQuotaExceeded { retry_after_secs } => {
                 response.headers_mut().insert(
                     axum::http::header::RETRY_AFTER,
@@ -2993,6 +3013,52 @@ mod tests {
         );
     }
 
+    /// A manual-run refusal (ADR-0018): 429 with `Retry-After`, its own
+    /// code and class, no cause beneath it, no `Cache-Control`, and a fixed
+    /// message that names no setting and no count.
+    #[tokio::test]
+    async fn a_manual_run_refusal_is_429_with_retry_after_and_no_cause() {
+        let busy = ServerError::ManualRunBusy {
+            retry_after_secs: 42,
+        };
+        assert_eq!(busy.error_class(), "manual_run_busy");
+        assert_eq!(busy.cause_kind(), CauseKind::None);
+        assert_eq!(busy.code(), trawl_api::ErrorCode::ManualRunBusy);
+        let message = busy.to_string();
+        assert_eq!(busy.safe_message(), message);
+        assert_eq!(
+            message,
+            ServerError::ManualRunBusy {
+                retry_after_secs: 1
+            }
+            .to_string(),
+            "the message does not depend on the delay"
+        );
+        assert!(!message.chars().any(|c| c.is_ascii_digit()), "{message}");
+        assert!(!message.contains('['), "{message}");
+        assert!(!message.contains('_'), "{message}");
+        let response = busy.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap().to_owned())
+                .as_deref(),
+            Some("42")
+        );
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .is_none(),
+            "a manual-run refusal is not a request-limit refusal"
+        );
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "manual_run_busy");
+        assert_eq!(body["error"]["message"], message);
+    }
+
     /// A body-limit refusal: 413 with its own code, a message naming the
     /// setting and the number it enforced, and no cause beneath it.
     #[tokio::test]
@@ -3458,6 +3524,9 @@ mod tests {
                 max_rows: 5000,
             }),
             ServerError::CaptureBusy { .. } => ServerError::CaptureBusy { retry_after_secs: 7 },
+            ServerError::ManualRunBusy { .. } => {
+                ServerError::ManualRunBusy { retry_after_secs: 3 }
+            },
             ServerError::CaptureQuotaExceeded { .. } => {
                 ServerError::CaptureQuotaExceeded { retry_after_secs: 900 }
             },

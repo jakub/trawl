@@ -585,19 +585,28 @@ appears under **Save schedule** in the server's own words, and the form keeps
 what you entered.
 
 **Run now** appears in the net's row and in its drawer header whenever the
-saved net has a schedule, in any mode, including a paused schedule. A net with
-no schedule does not show it. The button is disabled while its request is in
+saved net has a schedule, in any mode, including a paused schedule, and the
+session holds `query` beside `saved_query`. A net with no schedule does not
+show it, and neither does a session without `query` or one whose permissions
+have not loaded yet. The button is disabled while its request is in
 flight. A started run raises a toast with the window the server claimed, in
 UTC, and a **View run** link to the run. Query text mode shows **Run started**
-with no window. A refused run raises a toast with the server's message, for
-example when a run is already in progress or there is nothing new to read.
+with no window. A refused run raises a **Run not started** toast with the
+server's message, for example when a run is already in progress, there is
+nothing new to read, or the key or the installation is at its limit of manual
+runs (429 `manual_run_busy`).
 Below the window choice, the form says what **Run now** reads in each windowed
 mode.
 
 Run history, in the drawer's **Runs** tab and on the **Runs** page, marks a
 manual run **Manual**.
 
-Expanding a run in **Runs** shows the stored result 20 rows to a page, with a
+Reading a run's result rows needs `query` too. Without it, run history stays,
+but a run in the drawer's **Runs** tab is not a control and does not expand,
+and a run opened on the **Runs** page shows its receipt from the listing and
+`Reading a run's rows needs the query and saved_query permissions.` in place of the rows.
+
+With `query`, expanding a run in **Runs** shows the stored result 20 rows to a page, with a
 pager under the table. Paging works on the rows the response carried and issues
 no further request. When the run stored more rows than the response carried, a
 line under the pager gives both counts. See

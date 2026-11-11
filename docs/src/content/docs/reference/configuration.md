@@ -850,8 +850,17 @@ Notes:
 - `poll_interval_secs` is the polling rate only. A schedule fires on its planned boundary, so a slow poll delays a run without shifting the window that run covers.
 - Runs missed while trawld was down coalesce into one window. Past `max_catchup_intervals`, the start clamps forward to `window_end - max_catchup_intervals * interval`, the run row carries `window_truncated: true`, and `trawl_scheduler_window_truncated_total` counts it. A manual run of a `since_last` schedule is clamped and counted the same way. The coverage before the clamp is then missing from the report series.
 - The unit is intervals, not hours, so the default of 24 covers a day of missed hourly runs or 24 days of missed daily ones. There is no switch for "never clamp": spell it as a large number.
-- The number of scheduled runs in flight is capped at `max(1, max_concurrent_queries / 2)`, rounded down, where `max_concurrent_queries` is the `[server]` setting. A run counts until its query work ends, also after the run timed out. A due schedule past that cap waits for a later poll, and its missed boundaries coalesce into one run. Manual runs do not count against the cap. There is no key for the cap.
+- The number of scheduled runs in flight is capped at `max(1, max_concurrent_queries / 2)`, rounded down, where `max_concurrent_queries` is the `[server]` setting. A run counts until its query work ends, also after the run timed out. A due schedule past that cap waits for a later poll, and its missed boundaries coalesce into one run. There is no key for the cap.
+- Manual runs have their own limits and do not count against the scheduled cap: one per key, and `max(1, max_concurrent_queries / 4)` across the installation. A manual run counts until its work ends, like a scheduled one. Past either limit, Run now answers 429 `manual_run_busy`. There is no key for these limits. See [run a saved query now](/reference/api/#run-a-saved-query-now).
+- A claim, scheduled or manual, waits at most 5 s for its database locks, and so does each page of the due-schedule listing. A scheduled claim that runs out gives back its place once any window resolution it started ends, and the poll moves on to the next due schedule. A listing that runs out ends the poll. A manual claim that runs out answers 503 `service_unavailable`. Nothing is claimed in any of these cases. The wait has no key.
 - Window modes, `lag`, and the watermark are per-schedule settings. See [scheduled reports](/architecture/reports-telemetry/#scheduled-reports) and the [schedules API](/reference/api/#schedules).
+
+`/metrics` reports both caps with a label `origin` of `scheduled` or `manual`:
+
+| Metric | Meaning |
+|--------|---------|
+| `trawl_net_run_leases_in_use{origin}` | Runs holding a place now, counted until their work ends |
+| `trawl_net_run_lease_limit{origin}` | The cap: `max(1, max_concurrent_queries / 2)` for `scheduled`, `max(1, max_concurrent_queries / 4)` for `manual` |
 
 ### `[capture]`
 

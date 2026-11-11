@@ -27,6 +27,7 @@ use crate::api::{self, RUNS_PAGE_SIZE};
 use crate::components::net_drawer::RunResultPreview;
 use crate::components::sort_th::table_sort_th;
 use crate::run_read::RunRead;
+use crate::schedule_edit::may_run_saved;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
@@ -430,6 +431,14 @@ fn RunDetail(
     docked: Signal<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
+    let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
+    // Reading a run's rows needs `query` beside `saved_query` (ADR-0018 as
+    // amended on 2026-11-11). Without both no preview is built, and the
+    // receipt stands on the list's record of the run alone.
+    let rows_readable = Signal::derive(move || {
+        me.with(|m| may_run_saved(m.as_ref().map(|m| m.permissions.as_slice())))
+    });
+    let rows_withheld = move || me.with(Option::is_some) && !rows_readable.get();
     // What the preview's last read of this run said, whatever it said:
     // the two of them share one `get_run` response rather than asking
     // twice. `None` until a read lands, which is why the receipt can
@@ -456,7 +465,13 @@ fn RunDetail(
     //
     // Until a read has landed there is nothing the server has confirmed,
     // and the receipt says so by staying empty.
-    let shown = Signal::derive(move || read.get().and_then(|r| r.settle(known_listing.get())));
+    let shown = Signal::derive(move || {
+        if rows_readable.get() {
+            read.get().and_then(|r| r.settle(known_listing.get()))
+        } else {
+            known_listing.get()
+        }
+    });
     let title = move || known_name.get().unwrap_or_else(|| format!("Run {run_id}"));
     // The dialog's name is the run and its net, never the status badge
     // the title slot carries beside the heading.
@@ -502,14 +517,19 @@ fn RunDetail(
         >
             <div class="result-grid">
                 <div class="data-area">
-                    <RunResultPreview
-                        active=Signal::stored(true)
-                        read=read
-                        net_id=net_id
-                        run_id=run_id
-                        bus=bus
-                        on_search=on_search
-                    />
+                    <Show when=move || rows_readable.get()>
+                        <RunResultPreview
+                            active=Signal::stored(true)
+                            read=read
+                            net_id=net_id
+                            run_id=run_id
+                            bus=bus
+                            on_search=on_search
+                        />
+                    </Show>
+                    {move || rows_withheld().then(|| view! {
+                        <p role="status">"Reading a run's rows needs the query and saved_query permissions."</p>
+                    })}
                 </div>
                 <aside class="receipt" aria-labelledby="receipt-title">
                     <h3 id="receipt-title">"Execution receipt"</h3>
@@ -522,9 +542,11 @@ fn RunDetail(
                             {move || shown.get().map_or_else(|| "—".to_string(), |s| s.query)}
                         </dd></div>
                     </dl>
-                    <p class="small">
-                        "Rerunning uses the recorded query against data available now. It will not replace this result."
-                    </p>
+                    <Show when=move || rows_readable.get()>
+                        <p class="small">
+                            "Rerunning uses the recorded query against data available now. It will not replace this result."
+                        </p>
+                    </Show>
                 </aside>
             </div>
         </Drawer>

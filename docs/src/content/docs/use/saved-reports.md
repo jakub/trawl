@@ -7,7 +7,8 @@ A saved query stores a name and query text. A scheduled run stores one
 execution's result. Saving does not freeze today's rows, and editing the text
 does not change earlier runs. The browser calls a saved query a net. **Nets**
 at `/jobs/nets` lists them and **Runs** at `/jobs/runs` lists recent runs.
-Your key needs the `saved_query` permission.
+Your key needs the `saved_query` permission. To run a net now or read a run's
+result rows, it also needs `query`.
 
 ## Save a query
 
@@ -63,7 +64,8 @@ instead of a backlog.
 
 To run a net without waiting for its next boundary, select **Run now** in its
 row or in its drawer header. Any net with a saved schedule offers it, including
-a paused one. A net with no schedule does not.
+a paused one. A net with no schedule does not, and neither does a session
+without the `query` permission.
 
 **Run now** fires the schedule's next window early. The server picks the window
 when it accepts the run, and the toast shows it:
@@ -80,9 +82,13 @@ due, so the scheduler does not repeat an older window after it. A failed manual
 run changes nothing, and the due run still fires. Manual runs count toward
 **Keep schedule running for**.
 
-The server refuses a manual run when a run is already in progress, when the
-run count is used up, or when a **Since last run** schedule has nothing new to
-read. The toast shows the server's reason.
+The server refuses a manual run when a scheduled run of the net is in
+progress, when the run count is used up, or when a **Since last run** schedule
+has nothing new to read. It also refuses one while your key already has a
+manual run in progress, on this net or another, and while the installation
+runs as many manual runs as it may. A run keeps its place until its work ends,
+even after it timed out. That refusal says to retry later. Nothing is spent or
+moved. The toast shows the server's reason.
 
 Switching a windowed schedule back to **Query text** removes the window and the
 lag. The form says so before you save and, when the schedule reports one, names the point coverage stops at.
@@ -103,7 +109,9 @@ either way. History marks a run started with **Run now** as **Manual**. Select
 **Run now** only when you want a new run. It changes the server, not only your
 screen.
 
-Expanding a run shows its stored result 20 rows to a page. Paging reads the
+With `query`, expanding a run shows its stored result 20 rows to a page.
+Without it, the run history still lists every run with its status and
+timings, but shows no result rows. Paging reads the
 rows the browser already has and sends no further request. A run that stored
 more rows than the server returned says how many of each under the pager, so a
 short preview reads as a capped fetch rather than a short run.

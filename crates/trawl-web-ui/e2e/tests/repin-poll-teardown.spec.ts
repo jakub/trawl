@@ -25,7 +25,7 @@
 //      release that reports the read was still pending, which is also
 //      the proof the client never abandoned it.
 //
-// The e2e identity holds `['query']` alone, so the repin modal is never
+// The e2e identity holds no `schema_write`, so the repin modal is never
 // offered and the mount-time status probe is the ONLY way a poll can
 // start here. That is exactly the entry point under test.
 

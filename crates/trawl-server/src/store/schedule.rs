@@ -51,8 +51,20 @@
 //! retention sort by that column, and a remote Postgres with a skewed clock
 //! would otherwise order manual runs against scheduled ones wrongly.
 //! Age-based retention compares it against the same application clock.
+//!
+//! The scheduler's reads and both run claims wait a bounded time
+//! (ADR-0018, amended 2026-11-11). [`ScheduleStore::list_due_schedule_page`],
+//! [`ScheduleStore::claim_due_run`] and [`ScheduleStore::claim_manual_run`]
+//! each stamp one deadline, [`CLAIM_WAIT`] out, at entry, and run in a
+//! [`WriteTx`] under it: the connection, the `BEGIN`, every statement (each
+//! one its own [`WriteTx::run`], so each refreshes `statement_timeout` from
+//! what remains), a claim's window resolution and the rollback all end
+//! there, as [`StoreError::WaitExpired`], with nothing written. A `COMMIT`
+//! already sent is awaited past it, never cut. The lock order above is the
+//! same statement for statement; only the waits are bounded.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
@@ -60,7 +72,10 @@ use sqlx::{AssertSqlSafe, PgPool, Row as _};
 
 use super::error::{PgViolation, StoreError, WindowWriteError, classify_violation};
 use super::history::{bind_u64, bind_usize};
+use super::investigations::{LockWait, WriteTx};
 use super::status::{RunOrigin, RunStatus, decode_origin, decode_status};
+use crate::deadline::{Deadline, Expired};
+use crate::pool::RunLease;
 use crate::report_window::{
     Due, ManualPlan, MaterializeError, PlanError, PlanInput, ReportWindow, ScheduleWindow,
     WindowKind, WindowPolicyError, check_window_compatibility, fire_boundaries, materialize_window,
@@ -110,9 +125,46 @@ pub struct Schedule {
     pub updated_at: DateTime<Utc>,
 }
 
+/// How long a run's claim, or one page of the due listing, may wait on the
+/// database: [`ScheduleStore::claim_due_run`],
+/// [`ScheduleStore::claim_manual_run`] and
+/// [`ScheduleStore::list_due_schedule_page`] each stamp one deadline this
+/// far out at entry (ADR-0018, amended 2026-11-11). It bounds the wait for
+/// a connection, every statement with its lock waits, a claim's window
+/// resolution and the rollback; a `COMMIT` already sent is awaited past it.
+/// A manual run's estimated end, from which a refused press derives its
+/// advisory `Retry-After`, is this plus the query timeout. No setting
+/// changes it.
+pub const CLAIM_WAIT: Duration = Duration::from_secs(5);
+
 /// The most rows one page of [`ScheduleStore::list_due_schedule_page`]
 /// holds.
 pub const DUE_SCHEDULE_PAGE: usize = 64;
+
+/// The first page of the due listing: `$1` is `now`, `$2` the page size.
+/// Its predicate is `schedules_due_idx`'s, so the planner reads that index
+/// in `(next_fire_at, id)` order and never sorts (ADR-0018 amended
+/// 2026-11-11). `due_listing_uses_ordered_seek` pins the plan.
+pub const DUE_FIRST_PAGE: &str = "SELECT id, key_id, next_fire_at
+     FROM schedules
+     WHERE enabled
+       AND (max_runs IS NULL OR runs_claimed < max_runs)
+       AND next_fire_at <= $1
+     ORDER BY next_fire_at, id
+     LIMIT $2";
+
+/// A resumed page of the due listing: [`DUE_FIRST_PAGE`] that starts
+/// strictly after `($2, $3)`, the `(next_fire_at, id)` of the previous
+/// page's last row; `$4` is the page size. The row comparison is the
+/// index seek.
+pub const DUE_RESUMED_PAGE: &str = "SELECT id, key_id, next_fire_at
+     FROM schedules
+     WHERE enabled
+       AND (max_runs IS NULL OR runs_claimed < max_runs)
+       AND next_fire_at <= $1
+       AND (next_fire_at, id) > ($2, $3)
+     ORDER BY next_fire_at, id
+     LIMIT $4";
 
 /// A due schedule as the scheduler tick lists it: the fields the tick
 /// needs before a claim, and no query text.
@@ -1008,48 +1060,51 @@ impl ScheduleStore {
     }
 
     /// One page of the schedules due at `now`, for the scheduler tick:
-    /// enabled, with `next_fire_at <= now`, oldest fire cursor first and
-    /// then by id (ADR-0018, amended 2026-11-09). A page holds at most
-    /// `limit` rows and never more than [`DUE_SCHEDULE_PAGE`]. `after` is
-    /// the `(next_fire_at, id)` of the last row of the previous page, and
-    /// the page starts strictly after it.
+    /// enabled, with run budget left, with `next_fire_at <= now`, oldest
+    /// fire cursor first and then by id (ADR-0018, amended 2026-11-09 and
+    /// 2026-11-11). A page holds at most `limit` rows and never more than
+    /// [`DUE_SCHEDULE_PAGE`]. `after` is the `(next_fire_at, id)` of the
+    /// last row of the previous page, and the page starts strictly after
+    /// it.
     ///
     /// No ownership check: the scheduler runs every key's schedules. No
     /// query text: [`Self::claim_due_run`] reads every value a run depends
-    /// on again under its row locks.
+    /// on again under its row locks, the budget among them, so a cap
+    /// lowered after this read still refuses the claim.
+    ///
+    /// The page is one `SELECT` in a transaction under a deadline
+    /// [`CLAIM_WAIT`] out (module docs), ended by its bounded rollback. A
+    /// page that runs out is [`StoreError::WaitExpired`], and the tick ends
+    /// there.
     pub async fn list_due_schedule_page(
         &self,
         now: DateTime<Utc>,
         after: Option<(DateTime<Utc>, i64)>,
         limit: usize,
     ) -> Result<Vec<DueSchedule>, StoreError> {
-        let (after_fire, after_id) = after.unzip();
-        let rows = sqlx::query(
-            "SELECT id, key_id, next_fire_at
-             FROM schedules
-             WHERE enabled
-               AND next_fire_at <= $1
-               AND ($2::timestamptz IS NULL OR (next_fire_at, id) > ($2::timestamptz, $3::bigint))
-             ORDER BY next_fire_at, id
-             LIMIT $4",
-        )
-        .bind(now)
-        .bind(after_fire)
-        .bind(after_id)
-        .bind(bind_usize(limit.min(DUE_SCHEDULE_PAGE)))
-        .fetch_all(&self.pool)
-        .await?;
-        let page = rows
-            .iter()
-            .map(|row| {
-                Ok(DueSchedule {
-                    id: row.try_get("id")?,
-                    key_id: row.try_get("key_id")?,
-                    next_fire_at: row.try_get("next_fire_at")?,
-                })
+        let deadline = Deadline::after(CLAIM_WAIT);
+        let limit = bind_usize(limit.min(DUE_SCHEDULE_PAGE));
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Until(deadline)).await?;
+        let page = tx
+            .run(async |c| {
+                let page = match after {
+                    None => sqlx::query(DUE_FIRST_PAGE).bind(now).bind(limit),
+                    Some((after_fire, after_id)) => sqlx::query(DUE_RESUMED_PAGE)
+                        .bind(now)
+                        .bind(after_fire)
+                        .bind(after_id)
+                        .bind(limit),
+                };
+                page.fetch_all(c).await?.iter().map(decode_due).collect()
             })
-            .collect::<Result<_, sqlx::Error>>()?;
-        Ok(page)
+            .await;
+        match page {
+            Ok(page) => {
+                tx.rollback().await?;
+                Ok(page)
+            }
+            Err(e) => Err(tx.end(e).await),
+        }
     }
 
     /// Count enabled schedules (dashboard/monitor).
@@ -1207,128 +1262,45 @@ impl ScheduleStore {
     /// the same rule [`ClaimedRun`] states: the text this run executes and
     /// the text `report_runs.query` stores are one string, so a concurrent
     /// edit lands entirely before the claim or waits for it.
-    #[allow(clippy::too_many_lines)] // one transaction, read top to bottom in lock order
+    ///
+    /// The claim waits on the database no longer than [`CLAIM_WAIT`]
+    /// (module docs). Each of its statements is bounded on its own, in the
+    /// lock order above, and the window resolution's await is bounded by
+    /// the same deadline. A claim that runs out is [`StoreError::WaitExpired`]
+    /// and wrote nothing. The resolution's parses, which cannot be stopped,
+    /// keep a clone of `lease`, the run's place among the manual runs in
+    /// flight, until they return, whether or not the claim still waits for
+    /// them (ADR-0018, amended 2026-11-11).
     pub async fn claim_manual_run(
         &self,
         saved_query_id: i64,
         key_id: i64,
         max_catchup_intervals: u32,
+        lease: &RunLease,
     ) -> Result<ManualRunClaim, DueClaimError> {
-        let mut tx = self.pool.begin().await?;
-
-        // Level 1. The lock, the ownership check and the DSL read are one
-        // statement.
-        let saved = sqlx::query(
-            "SELECT name, query FROM saved_queries WHERE id = $1 AND key_id = $2 FOR UPDATE",
-        )
-        .bind(saved_query_id)
-        .bind(key_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(saved) = saved else {
-            tx.rollback().await?;
-            return Err(StoreError::NotFound {
-                id: saved_query_id,
-                resource: "saved query",
-            }
-            .into());
-        };
-        let query_name: String = saved.try_get("name")?;
-        let dsl: String = saved.try_get("query")?;
-
-        // Level 2.
-        let locked = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {SCHEDULE_COLS} FROM schedules
-             WHERE saved_query_id = $1 AND key_id = $2 FOR UPDATE"
-        )))
-        .bind(saved_query_id)
-        .bind(key_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(locked) = locked else {
-            tx.rollback().await?;
-            return Ok(ManualRunClaim::NoSchedule);
-        };
-        let schedule = row_to_schedule(&locked)?;
-
-        let t = truncate_to_micros(Utc::now());
-
-        if let Some(refusal) = spend_manual_run_budget(&mut tx, schedule.id).await? {
-            tx.rollback().await?;
-            return Ok(refusal);
-        }
-
-        let window = match plan_manual_run(&plan_input(&schedule, t, max_catchup_intervals)) {
-            Ok(ManualPlan::Run(window)) => window,
-            Ok(ManualPlan::Covered {
-                covered_through,
-                end,
-            }) => {
-                tx.rollback().await?;
-                return Ok(ManualRunClaim::EmptyWindow {
-                    covered_through,
-                    window_end: end,
-                });
-            }
-            Err(e) => {
-                tx.rollback().await?;
-                return Err(e.into());
-            }
-        };
-
-        // Ruling 11: what the run executes is what it stores.
-        let query = match window {
-            Some(window) => match resolve_window_text(schedule.window, &dsl, &window).await {
-                Ok(text) => text,
-                Err(e) => {
-                    tx.rollback().await?;
-                    return Err(e);
-                }
-            },
-            None => dsl,
-        };
-
-        // Level 3.
-        match insert_running_run(
+        let deadline = Deadline::after(CLAIM_WAIT);
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Until(deadline)).await?;
+        let decided = manual_claim_in(
             &mut tx,
-            schedule.id,
             saved_query_id,
-            &query,
-            window.as_ref(),
-            RunOrigin::Manual,
-            t,
+            key_id,
+            max_catchup_intervals,
+            lease,
+            deadline,
         )
-        .await
-        {
-            Ok(run_id) => {
-                tx.commit().await?;
-                tracing::info!(
-                    event_type = "report_run_started",
-                    run_id,
-                    schedule_id = schedule.id,
-                    saved_query_id,
-                    origin = RunOrigin::Manual.as_str(),
-                    "Report run started"
-                );
-                Ok(ManualRunClaim::Started(ClaimedManualRun {
-                    run_id,
-                    schedule_id: schedule.id,
-                    query,
-                    query_name,
-                    window,
-                    claimed_at: t,
-                }))
-            }
-            Err(e) => {
-                tx.rollback().await?;
-                // Backstop: the explicit check above already answered this
-                // under the schedule lock.
-                match classify_violation(&e) {
-                    Some(PgViolation::RunAlreadyRunning) => Ok(ManualRunClaim::AlreadyRunning),
-                    _ => Err(StoreError::from(e).into()),
-                }
-            }
+        .await;
+        let claim = settle(tx, decided).await?;
+        if let ManualRunClaim::Started(claimed) = &claim {
+            tracing::info!(
+                event_type = "report_run_started",
+                run_id = claimed.run_id,
+                schedule_id = claimed.schedule_id,
+                saved_query_id,
+                origin = RunOrigin::Manual.as_str(),
+                "Report run started"
+            );
         }
+        Ok(claim)
     }
 
     /// Plan, materialize and claim one schedule's due run in a single
@@ -1378,114 +1350,49 @@ impl ScheduleStore {
     /// [`DueClaim::Advanced`] commit, which claims no run and so spends
     /// none. The schedule lock is held between the two, so they cannot
     /// disagree; an insert that fails rolls the spend back.
+    ///
+    /// The claim waits on the database no longer than [`CLAIM_WAIT`]
+    /// (module docs): each statement is its own bounded statement, in the
+    /// same lock order, and the window resolution's await is bounded by
+    /// the same deadline. A claim that runs out is [`StoreError::WaitExpired`]
+    /// and leaves the cursor, the watermark and the budget where they were.
+    /// The resolution's parses keep a clone of `lease`, the run's place
+    /// among the scheduled runs in flight, until they return.
     pub async fn claim_due_run(
         &self,
         schedule_id: i64,
         now: DateTime<Utc>,
         max_catchup_intervals: u32,
+        lease: &RunLease,
     ) -> Result<DueClaim, DueClaimError> {
-        let mut tx = self.pool.begin().await?;
-
-        let Some(locked) = lock_for_claim(&mut tx, schedule_id).await? else {
-            tx.rollback().await?;
-            return Ok(DueClaim::NotDue);
-        };
-        let LockedSchedule {
-            saved_query_id,
-            query_name,
-            dsl,
-            schedule,
-        } = locked;
-
-        if schedule.exhausted() {
-            tx.rollback().await?;
-            return Ok(DueClaim::MaxRunsReached);
-        }
-
-        let plan = match plan_due_run(&plan_input(&schedule, now, max_catchup_intervals)) {
-            Ok(Due::NotYet) => {
-                tx.rollback().await?;
-                return Ok(DueClaim::NotDue);
-            }
-            Ok(Due::Advance { next_fire_at }) => {
-                set_next_fire_at(&mut tx, schedule_id, next_fire_at).await?;
-                tx.commit().await?;
-                tracing::info!(
-                    event_type = "schedule_cursor_advanced",
-                    schedule_id,
-                    "fire cursor advanced over a window the watermark already covers"
-                );
-                return Ok(DueClaim::Advanced);
-            }
-            Ok(Due::Run(plan)) => plan,
-            Err(e) => {
-                tx.rollback().await?;
-                return Err(e.into());
-            }
-        };
-
-        // Ruling 11: what the run executes is what it stores. A window
-        // failure rolls back with the cursor untouched, so the schedule is
-        // refused again on the next poll instead of quietly skipping a
-        // boundary.
-        let resolved_query = match plan.window {
-            Some(window) => match resolve_window_text(schedule.window, &dsl, &window).await {
-                Ok(text) => text,
-                Err(e) => {
-                    tx.rollback().await?;
-                    return Err(e);
-                }
-            },
-            None => dsl,
-        };
-
-        if !spend_run_budget(&mut tx, schedule_id).await? {
-            tx.rollback().await?;
-            return Ok(DueClaim::MaxRunsReached);
-        }
-
-        // Level 3: the run row. Its start is a clock reading taken now,
-        // with every lock held, not the tick's planning instant: `now` is
-        // shared by every schedule in the poll, and the run starts later.
-        let run_id = match insert_running_run(
+        let deadline = Deadline::after(CLAIM_WAIT);
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Until(deadline)).await?;
+        let decided = due_claim_in(
             &mut tx,
             schedule_id,
-            saved_query_id,
-            &resolved_query,
-            plan.window.as_ref(),
-            RunOrigin::Scheduled,
-            truncate_to_micros(Utc::now()),
+            now,
+            max_catchup_intervals,
+            lease,
+            deadline,
         )
-        .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                tx.rollback().await?;
-                return match classify_violation(&e) {
-                    Some(PgViolation::RunAlreadyRunning) => Ok(DueClaim::AlreadyRunning),
-                    _ => Err(StoreError::from(e).into()),
-                };
-            }
-        };
-
-        set_next_fire_at(&mut tx, schedule_id, plan.next_fire_at).await?;
-        tx.commit().await?;
-
-        tracing::info!(
-            event_type = "report_run_started",
-            run_id,
-            schedule_id,
-            saved_query_id,
-            "Report run started"
-        );
-
-        Ok(DueClaim::Started(ClaimedRun {
-            run_id,
-            saved_query_id,
-            query_name,
-            resolved_query,
-            window: plan.window,
-        }))
+        .await;
+        let claim = settle(tx, decided).await?;
+        match &claim {
+            DueClaim::Advanced => tracing::info!(
+                event_type = "schedule_cursor_advanced",
+                schedule_id,
+                "fire cursor advanced over a window the watermark already covers"
+            ),
+            DueClaim::Started(claimed) => tracing::info!(
+                event_type = "report_run_started",
+                run_id = claimed.run_id,
+                schedule_id,
+                saved_query_id = claimed.saved_query_id,
+                "Report run started"
+            ),
+            DueClaim::NotDue | DueClaim::AlreadyRunning | DueClaim::MaxRunsReached => {}
+        }
+        Ok(claim)
     }
 
     /// Finish a run with status, timing, and optional result path or blob.
@@ -2087,6 +1994,15 @@ impl ScheduleStore {
     }
 }
 
+/// One row of the due listing.
+fn decode_due(row: &PgRow) -> Result<DueSchedule, sqlx::Error> {
+    Ok(DueSchedule {
+        id: row.try_get("id")?,
+        key_id: row.try_get("key_id")?,
+        next_fire_at: row.try_get("next_fire_at")?,
+    })
+}
+
 /// The rows one due-run claim reads before it decides anything.
 struct LockedSchedule {
     saved_query_id: i64,
@@ -2098,51 +2014,297 @@ struct LockedSchedule {
     schedule: Schedule,
 }
 
+/// What a bounded claim decided, and so how its transaction ends.
+enum Decided<T> {
+    /// The claim wrote what it answers: commit, then answer.
+    Commit(T),
+    /// The claim refused: roll back whatever it wrote, the budget spend
+    /// included, then answer.
+    RollBack(T),
+}
+
+/// End a bounded claim's transaction as `decided` says, and answer.
+///
+/// A store error ends it through [`WriteTx::end`], the one place where a
+/// statement Postgres stopped at its timeout (57014), a lock wait
+/// `lock_timeout` ended (55P03) or a wait the client cut at the deadline
+/// becomes [`StoreError::WaitExpired`]. A refusal, and a window error,
+/// roll back and keep their own answer, unless the rollback itself runs
+/// out. A commit is never cut once sent ([`WriteTx::commit`]).
+async fn settle<T>(
+    tx: WriteTx,
+    decided: Result<Decided<T>, DueClaimError>,
+) -> Result<T, DueClaimError> {
+    match decided {
+        Ok(Decided::Commit(answer)) => {
+            tx.commit().await?;
+            Ok(answer)
+        }
+        Ok(Decided::RollBack(answer)) => {
+            tx.rollback().await?;
+            Ok(answer)
+        }
+        Err(DueClaimError::Store(e)) => Err(tx.end(e).await.into()),
+        Err(e) => {
+            tx.rollback().await?;
+            Err(e)
+        }
+    }
+}
+
+/// [`ScheduleStore::claim_manual_run`]'s decision inside `tx`, statement by
+/// statement in lock order. Every exit, an error included, leaves `tx` for
+/// [`settle`] to end.
+async fn manual_claim_in(
+    tx: &mut WriteTx,
+    saved_query_id: i64,
+    key_id: i64,
+    max_catchup_intervals: u32,
+    lease: &RunLease,
+    deadline: Deadline,
+) -> Result<Decided<ManualRunClaim>, DueClaimError> {
+    // Level 1. The lock, the ownership check and the DSL read are one
+    // statement.
+    let saved = tx
+        .run(async |c| {
+            sqlx::query(
+                "SELECT name, query FROM saved_queries WHERE id = $1 AND key_id = $2 FOR UPDATE",
+            )
+            .bind(saved_query_id)
+            .bind(key_id)
+            .fetch_optional(c)
+            .await
+        })
+        .await?;
+    let Some(saved) = saved else {
+        return Err(StoreError::NotFound {
+            id: saved_query_id,
+            resource: "saved query",
+        }
+        .into());
+    };
+    let query_name: String = saved.try_get("name")?;
+    let dsl: String = saved.try_get("query")?;
+
+    // Level 2.
+    let locked = tx
+        .run(async |c| {
+            sqlx::query(AssertSqlSafe(format!(
+                "SELECT {SCHEDULE_COLS} FROM schedules
+                 WHERE saved_query_id = $1 AND key_id = $2 FOR UPDATE"
+            )))
+            .bind(saved_query_id)
+            .bind(key_id)
+            .fetch_optional(c)
+            .await
+        })
+        .await?;
+    let Some(locked) = locked else {
+        return Ok(Decided::RollBack(ManualRunClaim::NoSchedule));
+    };
+    let schedule = row_to_schedule(&locked)?;
+
+    let t = truncate_to_micros(Utc::now());
+
+    if let Some(refusal) = spend_manual_run_budget(tx, schedule.id).await? {
+        return Ok(Decided::RollBack(refusal));
+    }
+
+    let window = match plan_manual_run(&plan_input(&schedule, t, max_catchup_intervals))? {
+        ManualPlan::Run(window) => window,
+        ManualPlan::Covered {
+            covered_through,
+            end,
+        } => {
+            return Ok(Decided::RollBack(ManualRunClaim::EmptyWindow {
+                covered_through,
+                window_end: end,
+            }));
+        }
+    };
+
+    // Ruling 11: what the run executes is what it stores.
+    let query = match window {
+        Some(window) => {
+            resolve_window_text(schedule.window, &dsl, &window, lease, deadline).await?
+        }
+        None => dsl,
+    };
+
+    // Level 3. Backstop: the explicit check above already answered a run
+    // in progress under the schedule lock.
+    let inserted = tx
+        .run(async |c| {
+            insert_unless_running(
+                c,
+                schedule.id,
+                saved_query_id,
+                &query,
+                window.as_ref(),
+                RunOrigin::Manual,
+                t,
+            )
+            .await
+        })
+        .await?;
+    let Some(run_id) = inserted else {
+        return Ok(Decided::RollBack(ManualRunClaim::AlreadyRunning));
+    };
+    Ok(Decided::Commit(ManualRunClaim::Started(ClaimedManualRun {
+        run_id,
+        schedule_id: schedule.id,
+        query,
+        query_name,
+        window,
+        claimed_at: t,
+    })))
+}
+
+/// [`ScheduleStore::claim_due_run`]'s decision inside `tx`, statement by
+/// statement in lock order. Every exit, an error included, leaves `tx` for
+/// [`settle`] to end.
+async fn due_claim_in(
+    tx: &mut WriteTx,
+    schedule_id: i64,
+    now: DateTime<Utc>,
+    max_catchup_intervals: u32,
+    lease: &RunLease,
+    deadline: Deadline,
+) -> Result<Decided<DueClaim>, DueClaimError> {
+    let Some(locked) = lock_for_claim(tx, schedule_id).await? else {
+        return Ok(Decided::RollBack(DueClaim::NotDue));
+    };
+    let LockedSchedule {
+        saved_query_id,
+        query_name,
+        dsl,
+        schedule,
+    } = locked;
+
+    if schedule.exhausted() {
+        return Ok(Decided::RollBack(DueClaim::MaxRunsReached));
+    }
+
+    let plan = match plan_due_run(&plan_input(&schedule, now, max_catchup_intervals))? {
+        Due::NotYet => return Ok(Decided::RollBack(DueClaim::NotDue)),
+        Due::Advance { next_fire_at } => {
+            tx.run(async |c| set_next_fire_at(c, schedule_id, next_fire_at).await)
+                .await?;
+            return Ok(Decided::Commit(DueClaim::Advanced));
+        }
+        Due::Run(plan) => plan,
+    };
+
+    // Ruling 11: what the run executes is what it stores. A window
+    // failure rolls back with the cursor untouched, so the schedule is
+    // refused again on the next poll instead of quietly skipping a
+    // boundary.
+    let resolved_query = match plan.window {
+        Some(window) => {
+            resolve_window_text(schedule.window, &dsl, &window, lease, deadline).await?
+        }
+        None => dsl,
+    };
+
+    if !tx
+        .run(async |c| spend_run_budget(c, schedule_id).await)
+        .await?
+    {
+        return Ok(Decided::RollBack(DueClaim::MaxRunsReached));
+    }
+
+    // Level 3: the run row. Its start is a clock reading taken now, with
+    // every lock held, not the tick's planning instant: `now` is shared by
+    // every schedule in the poll, and the run starts later.
+    let started_at = truncate_to_micros(Utc::now());
+    let inserted = tx
+        .run(async |c| {
+            insert_unless_running(
+                c,
+                schedule_id,
+                saved_query_id,
+                &resolved_query,
+                plan.window.as_ref(),
+                RunOrigin::Scheduled,
+                started_at,
+            )
+            .await
+        })
+        .await?;
+    let Some(run_id) = inserted else {
+        return Ok(Decided::RollBack(DueClaim::AlreadyRunning));
+    };
+
+    tx.run(async |c| set_next_fire_at(c, schedule_id, plan.next_fire_at).await)
+        .await?;
+
+    Ok(Decided::Commit(DueClaim::Started(ClaimedRun {
+        run_id,
+        saved_query_id,
+        query_name,
+        resolved_query,
+        window: plan.window,
+    })))
+}
+
 /// Take the claim's locks in order and read what the plan needs.
 ///
 /// `saved_queries` FOR UPDATE, then `schedules` FOR UPDATE: the order every
 /// multi-row path in this module takes, extended one level up. Both rows are
 /// read here rather than trusted from the tick's listing, because an
 /// operator can edit the DSL, disable the schedule or delete either one
-/// between the listing and the claim.
+/// between the listing and the claim. Each of the three statements is its
+/// own bounded statement of `tx` ([`WriteTx::run`]), so each lock wait
+/// gets only what remains of the claim's deadline.
 ///
 /// `None` means there is nothing to run — the schedule or its saved query
 /// was deleted, or the schedule is disabled — and the caller answers
 /// [`DueClaim::NotDue`] for all three.
 async fn lock_for_claim(
-    conn: &mut sqlx::PgConnection,
+    tx: &mut WriteTx,
     schedule_id: i64,
 ) -> Result<Option<LockedSchedule>, DueClaimError> {
     // Which saved query to lock. Unlocked on purpose: it is the lookup that
     // decides which row the FIRST lock is taken on, and a schedule never
     // changes its saved query (the pair is created together and
     // `schedules_saved_query_unique` keeps it 1:1).
-    let saved_query_id: Option<i64> =
-        sqlx::query_scalar("SELECT saved_query_id FROM schedules WHERE id = $1")
-            .bind(schedule_id)
-            .fetch_optional(&mut *conn)
-            .await?;
+    let saved_query_id = tx
+        .run(async |c| {
+            sqlx::query_scalar::<_, i64>("SELECT saved_query_id FROM schedules WHERE id = $1")
+                .bind(schedule_id)
+                .fetch_optional(c)
+                .await
+        })
+        .await?;
     let Some(saved_query_id) = saved_query_id else {
         return Ok(None);
     };
 
     // Level 1: the saved query. The lock and the DSL read are one statement
     // — the text this returns is the text the run executes and stores.
-    let saved = sqlx::query("SELECT name, query FROM saved_queries WHERE id = $1 FOR UPDATE")
-        .bind(saved_query_id)
-        .fetch_optional(&mut *conn)
+    let saved = tx
+        .run(async |c| {
+            sqlx::query("SELECT name, query FROM saved_queries WHERE id = $1 FOR UPDATE")
+                .bind(saved_query_id)
+                .fetch_optional(c)
+                .await
+        })
         .await?;
     let Some(saved) = saved else {
         return Ok(None);
     };
 
     // Level 2: the schedule.
-    let locked = sqlx::query(AssertSqlSafe(format!(
-        "SELECT {SCHEDULE_COLS} FROM schedules WHERE id = $1 FOR UPDATE"
-    )))
-    .bind(schedule_id)
-    .fetch_optional(&mut *conn)
-    .await?;
+    let locked = tx
+        .run(async |c| {
+            sqlx::query(AssertSqlSafe(format!(
+                "SELECT {SCHEDULE_COLS} FROM schedules WHERE id = $1 FOR UPDATE"
+            )))
+            .bind(schedule_id)
+            .fetch_optional(c)
+            .await
+        })
+        .await?;
     let Some(locked) = locked else {
         return Ok(None);
     };
@@ -2413,24 +2575,32 @@ impl ManualCursorMove {
 /// The caller holds the schedule lock. Every claimant takes that lock
 /// before spending or inserting, so neither answer can change before the
 /// caller's insert, and concurrent triggers serialize on it: each one sees
-/// the winner's committed spend.
+/// the winner's committed spend. The check and the spend are two bounded
+/// statements of the caller's `tx`.
 async fn spend_manual_run_budget(
-    conn: &mut sqlx::PgConnection,
+    tx: &mut WriteTx,
     schedule_id: i64,
-) -> Result<Option<ManualRunClaim>, sqlx::Error> {
-    let running: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM report_runs WHERE schedule_id = $1 AND status = 'running'
-         )",
-    )
-    .bind(schedule_id)
-    .fetch_one(&mut *conn)
-    .await?;
+) -> Result<Option<ManualRunClaim>, StoreError> {
+    let running = tx
+        .run(async |c| {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (
+                     SELECT 1 FROM report_runs WHERE schedule_id = $1 AND status = 'running'
+                 )",
+            )
+            .bind(schedule_id)
+            .fetch_one(c)
+            .await
+        })
+        .await?;
     if running {
         return Ok(Some(ManualRunClaim::AlreadyRunning));
     }
 
-    if !spend_run_budget(conn, schedule_id).await? {
+    if !tx
+        .run(async |c| spend_run_budget(c, schedule_id).await)
+        .await?
+    {
         return Ok(Some(ManualRunClaim::MaxRunsReached));
     }
     Ok(None)
@@ -2534,6 +2704,38 @@ async fn insert_running_run(
     .await
 }
 
+/// [`insert_running_run`] for a bounded claim: `None` is the
+/// `report_runs_one_running` 23505, the claim's already-running answer.
+/// It is classified here, on the statement's own error, because
+/// [`WriteTx::run`] turns every database error into a store fault.
+async fn insert_unless_running(
+    conn: &mut sqlx::PgConnection,
+    schedule_id: i64,
+    saved_query_id: i64,
+    query: &str,
+    window: Option<&ReportWindow>,
+    origin: RunOrigin,
+    started_at: DateTime<Utc>,
+) -> Result<Option<i64>, sqlx::Error> {
+    match insert_running_run(
+        conn,
+        schedule_id,
+        saved_query_id,
+        query,
+        window,
+        origin,
+        started_at,
+    )
+    .await
+    {
+        Ok(run_id) => Ok(Some(run_id)),
+        Err(e) if matches!(classify_violation(&e), Some(PgViolation::RunAlreadyRunning)) => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Move a schedule's fire cursor.
 ///
 /// `updated_at` is deliberately not touched: it records operator edits, and
@@ -2560,19 +2762,36 @@ async fn set_next_fire_at(
 /// own `last=` silently overrides the window the run row claims to cover.
 ///
 /// The parses run on the blocking pool with no preparation slot, since the
-/// caller holds the claim's row locks (ADR-0063).
+/// caller holds the claim's row locks (ADR-0063). The claim waits for them
+/// no later than its `deadline`, and one that stops waiting answers
+/// [`StoreError::WaitExpired`] and inserts nothing. The parses cannot be
+/// stopped, so they own a clone of the run's `lease` and keep its place
+/// until they return, whether or not anyone still waits for their answer
+/// (ADR-0018, amended 2026-11-11).
 async fn resolve_window_text(
     mode: Option<ScheduleWindow>,
     dsl: &str,
     window: &ReportWindow,
+    lease: &RunLease,
+    deadline: Deadline,
 ) -> Result<String, DueClaimError> {
     let dsl = dsl.to_owned();
     let window = *window;
-    off_reactor(move || {
-        validate_window_compatibility(mode, &dsl)?;
-        Ok(materialize_window(&dsl, &window)?)
-    })
-    .await
+    let hold = lease.clone();
+    let resolving = off_reactor(move || {
+        #[cfg(any(test, feature = "test-support"))]
+        hold.reach(crate::pool::seam::Seam::Resolving);
+        let text = validate_window_compatibility(mode, &dsl)
+            .map_err(DueClaimError::from)
+            .and_then(|()| Ok(materialize_window(&dsl, &window)?));
+        // The place goes back only once the parses are done.
+        drop(hold);
+        text
+    });
+    match deadline.run(resolving).await {
+        Ok(text) => text,
+        Err(Expired) => Err(StoreError::WaitExpired.into()),
+    }
 }
 
 /// Build a prefixed run column list (e.g. `r.id, r.schedule_id, …`).

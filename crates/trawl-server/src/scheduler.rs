@@ -14,6 +14,7 @@
 //! results ([`crate::results::sweep::sweep`], ADR-0018 as amended by
 //! ADR-0057).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::error::{CauseKind, ServerError};
 use crate::policy::{Permission, TrawlAuthz as _};
-use crate::pool::{ExecutorPool, ScheduledLease};
+use crate::pool::{ExecutorPool, RunLease};
 use crate::publication::CorpusUnsettled;
 use crate::query_timing::{Outcome, TimingGuard};
 use crate::report_window::{ReportWindow, format_window_bound, truncate_to_micros};
@@ -213,7 +214,15 @@ impl CorpusWatch {
 /// a lease ([`ExecutorPool::try_lease_scheduled`]) before each claim. When
 /// no lease is free the tick ends. A schedule it did not reach keeps its
 /// cursor, watermark, run rows and run budget, is among the oldest due at
-/// a later tick, and its missed boundaries coalesce there (ruling 9).
+/// a later tick, and its missed boundaries coalesce there (ruling 9). A
+/// page of the listing that waits [`crate::store::CLAIM_WAIT`] on the
+/// database and gives up ends the tick the same way (ADR-0018, amended
+/// 2026-11-11).
+///
+/// Each schedule's owning key is checked before its claim. A key found
+/// unusable is remembered for the rest of the tick and logged once, as one
+/// `scheduler_skip` counting the schedules the tick skipped for it. A key
+/// found usable is checked again at its next claim.
 ///
 /// While the corpus is unsettled (ADR-0041) the poll claims nothing. A
 /// claim moves the fire cursor in the transaction that plans the window,
@@ -231,16 +240,60 @@ pub async fn poll_and_execute(
     timeout_secs: u64,
     now: DateTime<Utc>,
 ) -> Vec<JoinHandle<()>> {
-    let mut spawned = Vec::new();
+    let mut tick = Tick::default();
+    claim_due(
+        schedule_store,
+        key_store,
+        pool,
+        config,
+        timeout_secs,
+        now,
+        &mut tick,
+    )
+    .await;
+    // Every exit of the claim pass, an early one included, comes back here,
+    // so each unusable key is logged once per tick whichever way it ended.
+    for (&key_id, &schedules) in &tick.unusable {
+        tracing::info!(
+            event_type = "scheduler_skip",
+            key_id,
+            schedules,
+            "skipped this key's due schedules: it is revoked, expired, or lacks query/saved-query permission"
+        );
+    }
+    tick.spawned
+}
 
+/// What one tick did, for [`poll_and_execute`] to hand back and log.
+#[derive(Default)]
+struct Tick {
+    /// The executions the tick spawned.
+    spawned: Vec<JoinHandle<()>>,
+    /// Each owning key the tick found unusable, with how many of the
+    /// schedules it listed were skipped for that key. Only an unusable
+    /// answer is remembered, and only for this tick.
+    unusable: BTreeMap<i64, u64>,
+}
+
+/// The claim pass of [`poll_and_execute`], recording into `tick`. Every
+/// return here is a tick exit; the caller logs `tick` after any of them.
+async fn claim_due(
+    schedule_store: &ScheduleStore,
+    key_store: &KeyStore,
+    pool: &ExecutorPool,
+    config: &SchedulerConfig,
+    timeout_secs: u64,
+    now: DateTime<Utc>,
+    tick: &mut Tick,
+) {
     if pool.publication().unsettled().is_some() {
-        return spawned;
+        return;
     }
 
     // With no lease free the tick could claim nothing, so it lists
     // nothing. Only an observation: each claim below takes its own lease.
     if pool.scheduled_leases_available() == 0 {
-        return spawned;
+        return;
     }
 
     // Each page starts after the last row the previous page LISTED. No
@@ -268,7 +321,7 @@ pub async fn poll_and_execute(
                     cause_kind = fault.cause_kind().as_str(),
                     "failed to list due schedules"
                 );
-                return spawned;
+                return;
             }
         };
         let last_page = page.len() < DUE_SCHEDULE_PAGE;
@@ -281,15 +334,31 @@ pub async fn poll_and_execute(
             // schedule covers the whole outage in one window once the key is
             // usable again, instead of losing every boundary that passed
             // while it was not.
-            if !owning_key_is_usable(key_store, due.id, due.key_id).await {
+            //
+            // An unusable answer holds for the rest of the tick, so a key
+            // with many due schedules is looked up once. A usable answer is
+            // never remembered: each claim asks again, so a key revoked
+            // between two claims of one tick refuses the second.
+            if let Some(skipped) = tick.unusable.get_mut(&due.key_id) {
+                *skipped += 1;
                 continue;
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            pool.reach(crate::pool::seam::Seam::KeyChecked);
+            match owning_key(key_store, due.id, due.key_id).await {
+                KeyCheck::Usable => {}
+                KeyCheck::Unusable => {
+                    tick.unusable.insert(due.key_id, 1);
+                    continue;
+                }
+                KeyCheck::LookupFailed => continue,
             }
 
             // The lease comes before the claim too: a claim moves the cursor
             // and starts a run row, which needs a lease to run under. No
             // free lease ends the tick.
             let Some(lease) = pool.try_lease_scheduled() else {
-                return spawned;
+                return;
             };
             let Some((claimed, lease)) = claim_leased(
                 schedule_store,
@@ -319,7 +388,7 @@ pub async fn poll_and_execute(
             let store = schedule_store.clone();
             let pool = pool.clone();
 
-            spawned.push(tokio::spawn(async move {
+            tick.spawned.push(tokio::spawn(async move {
                 execute_scheduled_query(
                     store,
                     pool,
@@ -327,14 +396,14 @@ pub async fn poll_and_execute(
                     &resolved_query,
                     &query_name,
                     timeout_secs,
-                    Some(lease),
+                    lease,
                 )
                 .await;
             }));
         }
 
         if last_page {
-            return spawned;
+            return;
         }
     }
 }
@@ -345,16 +414,18 @@ pub async fn poll_and_execute(
 ///
 /// A started run comes back with the lease, for its task to keep. Every
 /// other outcome, a failed claim included, starts no run and drops the
-/// lease here, before the tick asks the next schedule.
+/// lease here, before the tick asks the next schedule. That includes a
+/// claim that waited [`crate::store::CLAIM_WAIT`] on the database and gave
+/// up, as `wait_expired`: the tick goes on to the next schedule.
 async fn claim_leased(
     schedule_store: &ScheduleStore,
     schedule_id: i64,
     now: DateTime<Utc>,
     max_catchup_intervals: u32,
-    lease: ScheduledLease,
-) -> Option<(ClaimedRun, ScheduledLease)> {
+    lease: RunLease,
+) -> Option<(ClaimedRun, RunLease)> {
     match schedule_store
-        .claim_due_run(schedule_id, now, max_catchup_intervals)
+        .claim_due_run(schedule_id, now, max_catchup_intervals, &lease)
         .await
     {
         Ok(DueClaim::Started(claimed)) => Some((claimed, lease)),
@@ -404,6 +475,20 @@ pub(crate) fn note_truncated_window(schedule_id: i64, run_id: i64, window: &Repo
     );
 }
 
+/// What a tick learned about a schedule's owning key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCheck {
+    /// Live, with both permissions: the claim may go ahead. Never
+    /// remembered, so the next claim of the same key asks again.
+    Usable,
+    /// Revoked, expired, gone, or short of a permission. Remembered for
+    /// the rest of the tick and logged once per key when the tick ends.
+    Unusable,
+    /// The keystore could not answer. Logged for each schedule and never
+    /// remembered: an outage is no proof that the key is gone.
+    LookupFailed,
+}
+
 /// Whether the schedule's owning key may still run scheduled queries.
 ///
 /// It must be live in the fleet keystore (active and unexpired) and its
@@ -412,8 +497,9 @@ pub(crate) fn note_truncated_window(schedule_id: i64, run_id: i64, window: &Repo
 /// run exercises. Revocation, expiry and role changes (analyst to
 /// reader/ingest) therefore all stop scheduled execution: a key that
 /// cannot create or run saved queries interactively must not keep running
-/// them on a schedule. Lookup failures skip conservatively.
-async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i64) -> bool {
+/// them on a schedule. Lookup failures skip conservatively, as
+/// [`KeyCheck::LookupFailed`].
+async fn owning_key(key_store: &KeyStore, schedule_id: i64, key_id: i64) -> KeyCheck {
     let live = match key_store.get_live_key_by_id(key_id).await {
         Ok(live) => live,
         Err(e) => {
@@ -438,31 +524,26 @@ async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i6
                 cause_kind = cause_kind.as_str(),
                 "failed to check key liveness; skipping schedule this tick"
             );
-            return false;
+            return KeyCheck::LookupFailed;
         }
     };
-    let usable = live.is_some_and(|k| {
+    if live.is_some_and(|k| {
         k.has_permission(Permission::Query) && k.has_permission(Permission::SavedQuery)
-    });
-    if !usable {
-        tracing::info!(
-            event_type = "scheduler_skip",
-            schedule_id,
-            key_id,
-            "skipping schedule: owning key is revoked, expired, or lacks query/saved-query permission"
-        );
+    }) {
+        KeyCheck::Usable
+    } else {
+        KeyCheck::Unusable
     }
-    usable
 }
 
 /// Execute one claimed run and record its outcome on its run row.
 ///
-/// `lease` is the run's place among the scheduled runs in flight, or
-/// `None` for a manual run, which takes none (ADR-0018, amended
-/// 2026-11-09). This frame keeps it to its last statement, and the run's
-/// preparation job and its executor work each keep it until they stop,
-/// so the lease returns when the last of the three ends: a run that timed
-/// out still holds it while its work runs.
+/// `lease` is the run's place among the scheduled or the manual runs in
+/// flight (ADR-0018, amended 2026-11-09 and 2026-11-11). This frame keeps
+/// it to its last statement, through writing the result and finishing the
+/// run row, and the run's preparation job and its executor work each keep
+/// it until they stop, so the lease returns when the last of the three
+/// ends: a run that timed out still holds it while its work runs.
 pub(crate) async fn execute_scheduled_query(
     schedule_store: ScheduleStore,
     pool: ExecutorPool,
@@ -470,9 +551,9 @@ pub(crate) async fn execute_scheduled_query(
     query: &str,
     _query_name: &str,
     timeout_secs: u64,
-    lease: Option<ScheduledLease>,
+    lease: RunLease,
 ) {
-    let lease = lease.map(ScheduledLease::into_hold);
+    let lease = lease.into_hold();
     let start = std::time::Instant::now();
     // One budget for this attempt, stamped before the first pool wait
     // (ADR-0024): a scheduled run that spends its whole timeout queueing
@@ -498,7 +579,8 @@ pub(crate) async fn execute_scheduled_query(
         let _check = timing
             .clock()
             .guard(trawl_engine::timing::QueryPhase::DslCheck);
-        crate::admission::admit_holding(&pool, query, deadline, None, lease.clone()).await
+        crate::admission::admit_holding(&pool, query, deadline, None, Some(Arc::clone(&lease)))
+            .await
     };
     let result = if let Err(refusal) = checked {
         Err(refusal)
@@ -506,11 +588,8 @@ pub(crate) async fn execute_scheduled_query(
         // Execute the query on the pool (no debug capture, UTC timestamps).
         // The work keeps the lease until it stops.
         let work = crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled)
-            .with_timing(timing.timing().clone());
-        let work = match &lease {
-            Some(hold) => work.holding(Arc::clone(hold)),
-            None => work,
-        };
+            .with_timing(timing.timing().clone())
+            .holding(Arc::clone(&lease));
         pool.execute(query_id, query, deadline, false, work)
             .await
             .result
@@ -532,6 +611,9 @@ pub(crate) async fn execute_scheduled_query(
     match result {
         Ok(query_result) => {
             let row_count = query_result.rows.len();
+
+            #[cfg(any(test, feature = "test-support"))]
+            reach_run_writing(&pool);
 
             // Write result as parquet file.
             let (result_path, result_data) =
@@ -587,6 +669,22 @@ pub(crate) async fn execute_scheduled_query(
                 "scheduled query failed"
             );
         }
+    }
+}
+
+/// The run frame's side of [`crate::pool::seam::Seam::RunWriting`]. A hold
+/// parks the thread, and the frame runs on a runtime worker, so on a
+/// multi-thread runtime it parks inside `block_in_place`: the worker's
+/// other tasks move to another thread instead of waiting behind the hold.
+#[cfg(any(test, feature = "test-support"))]
+fn reach_run_writing(pool: &ExecutorPool) {
+    let reach = || pool.reach(crate::pool::seam::Seam::RunWriting);
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(reach);
+    } else {
+        reach();
     }
 }
 
@@ -1529,6 +1627,7 @@ mod off_reactor_tests {
         )
         .unwrap();
         let (store, _, run_id) = super::pg_tests::seed_run(&pool, "prepared").await;
+        let lease = executors.try_lease_scheduled().expect("a free lease");
         parsed_off_the_reactor(
             "zz_cp6b_scheduled_run",
             super::execute_scheduled_query(
@@ -1538,7 +1637,7 @@ mod off_reactor_tests {
                 "zz_cp6b_scheduled_run | where message matches /zz_(a|b)+/",
                 "prepared",
                 30,
-                None,
+                lease,
             ),
         )
         .await;
@@ -1589,9 +1688,10 @@ mod off_reactor_tests {
     async fn a_due_claim_materializes_off_the_reactor(pool: PgPool) {
         let (schedules, _, schedule_id) =
             windowed(&pool, "due_claim", "zz_cp6b_due_claim error").await;
+        let lease = crate::pool::RunLease::unattached();
         let claimed = parsed_off_the_reactor(
             "zz_cp6b_due_claim",
-            schedules.claim_due_run(schedule_id, Utc::now(), 24),
+            Box::pin(schedules.claim_due_run(schedule_id, Utc::now(), 24, &lease)),
         )
         .await
         .unwrap();
@@ -1602,9 +1702,10 @@ mod off_reactor_tests {
     async fn a_manual_claim_materializes_off_the_reactor(pool: PgPool) {
         let (schedules, saved_id, _) =
             windowed(&pool, "manual_claim", "zz_cp6b_manual_claim error").await;
+        let lease = crate::pool::RunLease::unattached();
         let claimed = parsed_off_the_reactor(
             "zz_cp6b_manual_claim",
-            schedules.claim_manual_run(saved_id, 1, 24),
+            Box::pin(schedules.claim_manual_run(saved_id, 1, 24, &lease)),
         )
         .await
         .unwrap();
@@ -1851,7 +1952,7 @@ mod tests {
             "* | head 1",
             "timed_ok",
             30,
-            None,
+            executors.try_lease_scheduled().expect("a free lease"),
         )
         .await;
         super::execute_scheduled_query(
@@ -1861,7 +1962,7 @@ mod tests {
             "* | stats zz_sched_needle()",
             "timed_failure",
             30,
-            None,
+            executors.try_lease_scheduled().expect("a free lease"),
         )
         .await;
         drop(capturing);
@@ -1959,7 +2060,7 @@ mod tests {
                 "* | head 1",
                 "held",
                 1,
-                Some(lease),
+                lease,
             )
             .await;
             let run = store.get_run(run_id, 1).await.unwrap().unwrap();
@@ -2128,15 +2229,23 @@ mod tests {
             (running, DueClaim::AlreadyRunning),
             (capped, DueClaim::MaxRunsReached),
         ] {
+            let lease = executors.try_lease_scheduled().expect("the lease is free");
             assert_eq!(
                 store
-                    .claim_due_run(schedule_id, now, CATCHUP)
+                    .claim_due_run(schedule_id, now, CATCHUP, &lease)
                     .await
                     .unwrap(),
                 outcome
             );
         }
-        assert!(store.claim_due_run(failing, now, CATCHUP).await.is_err());
+        let lease = executors.try_lease_scheduled().expect("the lease is free");
+        assert!(
+            store
+                .claim_due_run(failing, now, CATCHUP, &lease)
+                .await
+                .is_err()
+        );
+        drop(lease);
         let advanced_cursor: DateTime<Utc> =
             sqlx::query_scalar("SELECT next_fire_at FROM schedules WHERE id = $1")
                 .bind(advanced)

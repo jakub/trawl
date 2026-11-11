@@ -1,0 +1,33 @@
+diff --git a/crates/trawl-server/src/scheduler.rs b/crates/trawl-server/src/scheduler.rs
+index 8e27d52f..85a3a6d0 100644
+--- a/crates/trawl-server/src/scheduler.rs
++++ b/crates/trawl-server/src/scheduler.rs
+@@ -477,7 +477,7 @@ pub(crate) async fn execute_scheduled_query(
+     timeout_secs: u64,
+     lease: RunLease,
+ ) {
+-    let lease = lease.into_hold();
++    let _lease = lease.into_hold();
+     let start = std::time::Instant::now();
+     // One budget for this attempt, stamped before the first pool wait
+     // (ADR-0024): a scheduled run that spends its whole timeout queueing
+@@ -503,8 +503,7 @@ pub(crate) async fn execute_scheduled_query(
+         let _check = timing
+             .clock()
+             .guard(trawl_engine::timing::QueryPhase::DslCheck);
+-        crate::admission::admit_holding(&pool, query, deadline, None, Some(Arc::clone(&lease)))
+-            .await
++        crate::admission::admit_holding(&pool, query, deadline, None, None).await
+     };
+     let result = if let Err(refusal) = checked {
+         Err(refusal)
+@@ -512,8 +511,7 @@ pub(crate) async fn execute_scheduled_query(
+         // Execute the query on the pool (no debug capture, UTC timestamps).
+         // The work keeps the lease until it stops.
+         let work = crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled)
+-            .with_timing(timing.timing().clone())
+-            .holding(Arc::clone(&lease));
++            .with_timing(timing.timing().clone());
+         pool.execute(query_id, query, deadline, false, work)
+             .await
+             .result

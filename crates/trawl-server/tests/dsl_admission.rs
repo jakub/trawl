@@ -9,10 +9,12 @@
 //! same over-budget text is
 //! refused with the same sentence whether it arrives as a query, an
 //! export, a live tail, a validation call or a saved-query write, and a
-//! refused write leaves the store exactly as it was. The last test covers
-//! the row that is already out there — a saved query stored before this
-//! door existed, which the scheduler must refuse per attempt without
-//! turning the schedule off.
+//! refused write leaves the store exactly as it was. A call that emit
+//! would refuse (an unknown name, a wrong argument count, a bad literal
+//! argument) reaches the same doors, with its hint as a detail. The last
+//! tests cover the row that is already out there — a saved query stored
+//! before this door existed, which the scheduler must refuse per attempt
+//! without turning the schedule off.
 
 mod common;
 
@@ -38,6 +40,14 @@ fn over_budget_dsl() -> String {
 
 /// The part of `trawl-core`'s refusal every door must be saying.
 const SENTENCE: &str = "alias-expansion budget";
+
+/// A call to `match`, which is an operator: the shared call check refuses
+/// it in every stage, with the hint that names the operator.
+const MATCH_CALL_DSL: &str = r#"last=1h | where match(message, "x")"#;
+
+/// The sentence and the hint `trawl-core` refuses [`MATCH_CALL_DSL`] with.
+const MATCH_CALL_SENTENCE: &str = "unknown function: match";
+const MATCH_CALL_HINT: &str = "matches is an operator, not a function: where message matches /re/";
 
 /// A `dedup` naming one field over the field-list limit of 64.
 fn wide_dedup_dsl() -> String {
@@ -74,13 +84,13 @@ fn envelope_message(body: &str) -> String {
 /// refuse the same text, and every one of them says the same thing.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_entry_point_refuses_the_same_over_budget_dsl() {
-    every_entry_point_refuses(&over_budget_dsl(), SENTENCE).await;
+    every_entry_point_refuses(&over_budget_dsl(), SENTENCE, None).await;
 }
 
 /// The field-list limit reaches the same doors, with its whole sentence.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_entry_point_refuses_a_wide_field_list() {
-    every_entry_point_refuses(&wide_dedup_dsl(), WIDE_SENTENCE).await;
+    every_entry_point_refuses(&wide_dedup_dsl(), WIDE_SENTENCE, None).await;
 }
 
 /// `GET /api/v1/stream?query=<dsl>`, encoded by hand.
@@ -103,17 +113,71 @@ fn stream_url(base: &str, dsl: &str) -> String {
     url
 }
 
-/// Send `dsl` to every door and require `sentence` in each refusal. Each
-/// refusing door's JSON body is returned beside its name, then
-/// `/validate`'s answer under `"validate"`.
-async fn every_entry_point_refuses(
-    dsl: &str,
-    sentence: &str,
-) -> Vec<(&'static str, serde_json::Value)> {
+/// A call the run would refuse is refused before it runs, at every door
+/// (#435). `match` is refused everywhere, with its hint as a detail. A
+/// wrong argument count and a bad call after `extract kv`, which once
+/// passed validation and failed only when the run compiled, are invalid
+/// at `/validate`.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_entry_point_refuses_an_invalid_call() {
+    every_entry_point_refuses(MATCH_CALL_DSL, MATCH_CALL_SENTENCE, Some(MATCH_CALL_HINT)).await;
+
     let server = common::setup().await;
-    every_entry_point_refuses_on(&server, dsl, sentence).await
+    let http = raw_client();
+    for (dsl, sentence) in [
+        (
+            "last=1h | where length() > 0",
+            "invalid aggregation: length() requires exactly one argument",
+        ),
+        (
+            "last=1h | extract kv | let r = nosuchfn(a)",
+            "unknown function: nosuchfn",
+        ),
+    ] {
+        assert_validate_refuses(
+            &http,
+            &server.url,
+            &server.analyst_token,
+            dsl,
+            sentence,
+            None,
+        )
+        .await;
+    }
 }
 
+/// Send `dsl` to every door and require each to refuse it as a
+/// `validation_error` that carries `sentence` and, as a detail, `hint`.
+async fn every_entry_point_refuses(dsl: &str, sentence: &str, hint: Option<&str>) {
+    let server = common::setup().await;
+    for (door, body) in every_entry_point_refuses_on(&server, dsl, sentence).await {
+        let error = &body["error"];
+        assert_eq!(error["code"], "validation_error", "{door}: {body}");
+        assert_eq!(
+            error["details"][0]["hint"].as_str(),
+            hint,
+            "{door} carries the hint as a detail: {body}"
+        );
+    }
+
+    // Validation reports the same refusal as its own successful answer:
+    // being told the query is invalid is what a client asked this route
+    // for, so it is a 200 whose body says no.
+    let http = raw_client();
+    assert_validate_refuses(
+        &http,
+        &server.url,
+        &server.analyst_token,
+        dsl,
+        sentence,
+        hint,
+    )
+    .await;
+}
+
+/// Send `dsl` to every door but `/validate` and require each to refuse it
+/// with 400 and `sentence`. Each door's JSON body is returned beside its
+/// name.
 async fn every_entry_point_refuses_on(
     server: &common::TestServer,
     dsl: &str,
@@ -201,28 +265,44 @@ async fn every_entry_point_refuses_on(
         );
         answers.push((door, serde_json::from_str(&body).expect("a JSON body")));
     }
+    answers
+}
 
-    // Validation reports the same refusal as its own successful answer:
-    // being told the query is invalid is what a client asked this route
-    // for, so it is a 200 whose body says no.
-    let validation: serde_json::Value = http
-        .post(format!("{}/api/v1/validate", server.url))
+/// `/validate` answers `dsl` with HTTP 200, `valid: false` and one error
+/// that carries `sentence` and, as its own field, `hint`. The answer is
+/// returned.
+async fn assert_validate_refuses(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    dsl: &str,
+    sentence: &str,
+    hint: Option<&str>,
+) -> serde_json::Value {
+    let response = http
+        .post(format!("{url}/api/v1/validate"))
         .bearer_auth(token)
         .json(&serde_json::json!({ "query": dsl }))
         .send()
         .await
-        .expect("validate request")
-        .json()
-        .await
-        .expect("validation response");
-    assert_eq!(validation["valid"], serde_json::json!(false));
-    let detail = serde_json::to_string(&validation["errors"]).expect("errors render");
+        .expect("validate request");
+    let status = response.status();
+    let validation: serde_json::Value = response.json().await.expect("validation response");
+    assert_eq!(status, 200, "{dsl}: validate answers 200: {validation}");
+    assert_eq!(validation["valid"], serde_json::json!(false), "{dsl}");
+    let errors = validation["errors"].as_array().expect("an errors array");
+    assert_eq!(errors.len(), 1, "{dsl}: one refusal: {validation}");
+    let message = errors[0]["message"].as_str().expect("an error message");
     assert!(
-        detail.contains(sentence),
-        "validate carries the shared sentence, got: {detail}"
+        message.contains(sentence),
+        "{dsl}: validate carries the shared sentence, got: {message}"
     );
-    answers.push(("validate", validation));
-    answers
+    assert_eq!(
+        errors[0]["hint"].as_str(),
+        hint,
+        "{dsl}: validate carries the hint apart: {validation}"
+    );
+    validation
 }
 
 /// A time clause neither lane can hold is a parse error over that clause
@@ -346,6 +426,13 @@ async fn a_refused_saved_write_leaves_the_store_untouched() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_wide_saved_write_leaves_the_store_untouched() {
     refused_saved_write_leaves_the_store_untouched(&wide_dedup_dsl()).await;
+}
+
+/// A saved write whose text calls a function the run would refuse is
+/// refused before it is stored (#435).
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_call_writes_leave_saved_queries_unchanged() {
+    refused_saved_write_leaves_the_store_untouched(MATCH_CALL_DSL).await;
 }
 
 /// Create and update a saved query with `dsl`, which the door refuses,
@@ -491,6 +578,14 @@ async fn a_stored_wide_query_fails_its_attempt_and_keeps_its_schedule() {
     stored_query_fails_its_attempt_and_keeps_its_schedule(&wide_dedup_dsl(), WIDE_SENTENCE).await;
 }
 
+/// A saved query stored before the call check existed calls `match`. Its
+/// next attempt fails with the diagnostic, and its schedule survives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_invalid_call_fails_its_attempt_and_keeps_its_schedule() {
+    stored_query_fails_its_attempt_and_keeps_its_schedule(MATCH_CALL_DSL, MATCH_CALL_SENTENCE)
+        .await;
+}
+
 /// Store `dsl` behind the write-time door, schedule it, run one tick, and
 /// require a failed run carrying `sentence` and a schedule still enabled.
 async fn stored_query_fails_its_attempt_and_keeps_its_schedule(dsl: &str, sentence: &str) {
@@ -503,7 +598,7 @@ async fn stored_query_fails_its_attempt_and_keeps_its_schedule(dsl: &str, senten
         .saved
         .create(h.key_id, "legacy", dsl)
         .await
-        .expect("store the over-budget saved query");
+        .expect("store the refused saved query");
     h.schedules
         .create_schedule(saved.id, h.key_id, 3600, None, None, 0, t0)
         .await
@@ -620,14 +715,13 @@ async fn every_entry_point_refuses_deep_query_trees() {
         )
         .await;
         assert_eq!(status, 400, "{head}…: capture refuses: {capture}");
-        answers.insert(answers.len() - 1, ("capture", capture));
+        answers.push(("capture", capture));
 
-        let (validate, refusals) = answers.split_last().expect("validate answered last");
-        let (_, query) = &refusals[0];
+        let (_, query) = &answers[0];
         let detail = &query["error"]["details"][0];
         assert_eq!(detail["message"], message, "{head}…: {query}");
         assert!(detail["hint"].is_string(), "{head}…: a hint names the fix");
-        for (door, body) in refusals {
+        for (door, body) in &answers {
             let error = &body["error"];
             assert_eq!(error["code"], "parse_error", "{head}…: {door}: {body}");
             assert_eq!(error["message"], message, "{head}…: {door}: {body}");
@@ -637,9 +731,17 @@ async fn every_entry_point_refuses_deep_query_trees() {
                 "{head}…: {door} carries the one detail /query does"
             );
         }
-        assert_eq!(validate.1["valid"], false, "{head}…");
+        let validation = assert_validate_refuses(
+            &raw_client(),
+            &server.url,
+            &server.analyst_token,
+            &dsl,
+            message,
+            detail["hint"].as_str(),
+        )
+        .await;
         assert_eq!(
-            validate.1["errors"],
+            validation["errors"],
             serde_json::json!([detail]),
             "{head}…: /validate reports the same detail"
         );

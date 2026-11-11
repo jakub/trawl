@@ -51,6 +51,10 @@
 //! activity exactly when its request sent `seen_seq`, and a read reaches
 //! the investigation's own `seq`. The limits and the fixed texts
 //! the pages quote are the server's constants and messages.
+//!
+//! Manual runs: the examples under "Run a saved query now" are the
+//! `manual_run_busy` refusal, whose message is the server's own, and a
+//! run summary (ADR-0018, amended 2026-11-11).
 
 use std::collections::BTreeMap;
 
@@ -74,7 +78,8 @@ use trawl_api::stream::SnapshotFrame;
 use trawl_api::value::{Column, ColumnType, QueryResult, Value as Cell, land_cell};
 use trawl_api::{
     ErrorCode, ErrorResponse, EventHistogram, HISTOGRAM_BUCKETS, HistogramReason, IngestResponse,
-    ListSavedResponse, QueryResponse, ReportRunResponse, RunsStatsResponse, ScheduleResponse,
+    ListSavedResponse, QueryResponse, ReportRunResponse, ReportRunSummary, RunsStatsResponse,
+    ScheduleResponse,
 };
 use trawl_server::error::ServerError;
 use trawl_server::ingest::envelope::{RejectReason, RepairCode};
@@ -800,6 +805,27 @@ fn the_set_a_schedule_example_is_the_wire_type_with_its_run_budget() {
             .max_runs
             .is_some_and(|max| schedule.total_runs >= max),
         "{heading:?} example's exhausted disagrees with its counts"
+    );
+}
+
+/// Run now refuses before the claim with the fixed `manual_run_busy`
+/// envelope, or answers a running manual run's summary.
+#[test]
+fn the_run_now_examples_are_a_summary_and_the_busy_refusal() {
+    let heading = "Run a saved query now";
+    let examples = examples(heading, 2);
+    let busy: ErrorResponse = decode_exactly(heading, examples[0]);
+    let started: ReportRunSummary = decode_exactly(heading, examples[1]);
+    assert_eq!(started.status, "running", "run now answers at once");
+    assert_eq!(started.origin.as_deref(), Some("manual"));
+    assert_eq!(busy.error.code, ErrorCode::ManualRunBusy);
+    assert_eq!(
+        busy.error.message,
+        ServerError::ManualRunBusy {
+            retry_after_secs: 1
+        }
+        .to_string(),
+        "the documented message is the server's"
     );
 }
 

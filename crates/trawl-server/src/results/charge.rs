@@ -1100,7 +1100,7 @@ fn busy() -> Refusal {
 }
 
 /// `span` in whole seconds, rounded up, at least 1.
-fn ceil_secs(span: Duration) -> u64 {
+pub(crate) fn ceil_secs(span: Duration) -> u64 {
     (span.as_secs() + u64::from(span.subsec_nanos() > 0)).max(1)
 }
 

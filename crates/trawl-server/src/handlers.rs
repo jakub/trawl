@@ -44,8 +44,9 @@ use crate::scheduler::execute_scheduled_query;
 use crate::shape::shaped;
 use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
-    HistoryEntry, ManualRunClaim, ReportRun, RunOrigin, RunStatus, SavedQuery, Schedule,
-    ScheduleWithStats, StoreError, format_interval, parse_duration_secs, parse_interval,
+    CLAIM_WAIT, ClaimedManualRun, HistoryEntry, ManualRunClaim, ReportRun, RunOrigin, RunStatus,
+    SavedQuery, Schedule, ScheduleWithStats, StoreError, format_interval, parse_duration_secs,
+    parse_interval,
 };
 use crate::transport::http::RequestId;
 use trawl_engine::timing::QueryPhase;
@@ -1246,8 +1247,10 @@ pub async fn cancel_query(
 
 /// `POST /api/v1/validate` — validate a DSL query without executing it.
 ///
-/// Performs syntax and semantic validation (function names, arity, regex patterns)
-/// but does not check field existence (which would require schema introspection).
+/// Parses the text and checks every function call in every stage: its name,
+/// its argument count and its literal arguments (units, formats and integer
+/// positions). It also checks `extract` regex patterns. It does not check
+/// fields against the schema, or that every lane can run the query.
 ///
 /// This route runs the two halves [`crate::admission::admit`] runs, in the
 /// same order and from the same owners — so an over-budget pipeline
@@ -3155,20 +3158,35 @@ pub async fn runs_stats(
 /// row records. Returns the run summary immediately with status "running";
 /// execution continues in the background.
 ///
-/// No schedule is a 400: there is nothing to record a run under. A run in
-/// progress, a reached `max_runs` and an empty `since_last` window are 409s:
-/// the request is well formed, and the schedule's state refuses it. A saved
+/// The caller needs both `query` and `saved_query`: the run executes the
+/// saved text, so a key that may only edit nets must not run one. A saved
 /// query that does not exist or that another key owns is a 404, whatever
 /// the corpus state. An unsettled corpus is then a 503
 /// `corpus_recovering`, answered before the claim, so it creates no run.
+///
+/// The run then takes a manual-run lease, or the request is a 429
+/// `manual_run_busy` that claimed nothing (ADR-0018, amended 2026-11-11):
+/// one manual run per caller key, [`crate::pool::manual_cap`] across the
+/// installation. The lease never waits, and it comes before the claim, so
+/// a refusal spends no budget, writes no run row and moves no cursor. A
+/// key pressing Run now again on its own running net is refused here too.
+///
+/// No schedule is a 400: there is nothing to record a run under. A run in
+/// progress, a reached `max_runs` and an empty `since_last` window are 409s:
+/// the request is well formed, and the schedule's state refuses it. Each
+/// gives the lease back before it answers.
+///
+/// The claim and the execution are one spawned task, which owns the lease
+/// from before the claim's first statement; this handler only awaits the
+/// claim's answer. A request dropped while the claim commits therefore
+/// cannot leave a `running` row nothing executes: the task runs what it
+/// claimed whether or not anyone hears the answer. The lease lasts until
+/// the run's physical work ends, not until this request does.
 pub async fn trigger_run(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::RunSavedQuery>,
     saved_id: Result<Path<i64>, PathRejection>,
 ) -> Result<Json<ReportRunSummary>, ServerError> {
-    if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
     let Path(saved_id) = shaped("saved query id", saved_id)?;
 
     let key_id = verified.id;
@@ -3192,90 +3210,115 @@ pub async fn trigger_run(
         return Err(ServerError::CorpusRecovering(reason));
     }
 
-    // One transaction: lock the saved query and read the DSL from it, lock
-    // the schedule, refuse or plan, claim the run. The ownership check
-    // rides the first lock, so this handler takes no snapshot of its own:
-    // what the run executes is what the claim recorded.
-    let claimed = match state
-        .storage
-        .schedule
-        .claim_manual_run(saved_id, key_id, state.query.max_catchup_intervals)
-        .await?
-    {
-        ManualRunClaim::Started(claimed) => claimed,
-        ManualRunClaim::NoSchedule => {
-            return Err(ServerError::BadRequest(
-                "attach a schedule before triggering a run".into(),
-            ));
-        }
-        ManualRunClaim::AlreadyRunning => {
-            return Err(ServerError::Conflict(
-                "a run is already in progress for this net".into(),
-            ));
-        }
-        ManualRunClaim::MaxRunsReached => {
-            return Err(ServerError::Conflict(
-                "max runs reached for this net".into(),
-            ));
-        }
-        ManualRunClaim::EmptyWindow {
-            covered_through,
-            window_end,
-        } => {
-            return Err(ServerError::Conflict(format!(
-                "nothing new to read: coverage already reaches {}, and a run now would end \
-                 at {}",
-                format_window_bound(covered_through),
-                format_window_bound(window_end),
-            )));
-        }
-    };
+    // Before the claim too, and never waiting: a refusal has nothing to
+    // undo. The estimate covers the claim and the run's timeout, and only
+    // shapes a later refusal's advisory Retry-After.
+    let lease = state
+        .query
+        .pool
+        .try_lease_manual(
+            key_id,
+            CLAIM_WAIT + std::time::Duration::from_secs(state.query.timeout_secs),
+        )
+        .map_err(|busy| ServerError::ManualRunBusy {
+            retry_after_secs: busy.retry_after_secs,
+        })?;
 
-    if let Some(window) = &claimed.window {
-        crate::scheduler::note_truncated_window(claimed.schedule_id, claimed.run_id, window);
-    }
-
-    // Return the summary immediately, execute in background.
-    let summary = ReportRunSummary {
-        id: claimed.run_id,
-        query: claimed.query.clone(),
-        status: RunStatus::Running.as_str().to_string(),
-        started_at: claimed.claimed_at.to_rfc3339(),
-        finished_at: None,
-        duration_ms: None,
-        row_count: None,
-        error_message: None,
-        result_path: None,
-        window_start: claimed.window.map(|w| format_window_bound(w.start)),
-        window_end: claimed.window.map(|w| format_window_bound(w.end)),
-        window_truncated: claimed.window.map(|w| w.truncated),
-        window_kind: claimed.window.map(|w| w.kind.as_str().to_owned()),
-        origin: Some(RunOrigin::Manual.as_str().to_owned()),
-    };
-
+    let (answer, answered) = tokio::sync::oneshot::channel();
     let schedule_store = state.storage.schedule.clone();
     let pool = state.query.pool.clone();
-    let run_id = claimed.run_id;
-    let query = claimed.query;
-    let query_name = claimed.query_name;
+    let max_catchup_intervals = state.query.max_catchup_intervals;
     let timeout_secs = state.query.timeout_secs;
 
+    // The task owns the lease before its first await. Every answer that
+    // starts no run drops the lease first and answers second, so a client
+    // that hears a refusal can press again at once.
     tokio::spawn(async move {
+        // One transaction: lock the saved query and read the DSL from it,
+        // lock the schedule, refuse or plan, claim the run. The ownership
+        // check rides the first lock, so this handler takes no snapshot of
+        // its own: what the run executes is what the claim recorded.
+        let claim = schedule_store
+            .claim_manual_run(saved_id, key_id, max_catchup_intervals, &lease)
+            .await;
+        let claimed = match started_manual_run(claim) {
+            Ok(claimed) => claimed,
+            Err(refusal) => {
+                drop(lease);
+                let _ = answer.send(Err(refusal));
+                return;
+            }
+        };
+
+        if let Some(window) = &claimed.window {
+            crate::scheduler::note_truncated_window(claimed.schedule_id, claimed.run_id, window);
+        }
+
+        let summary = ReportRunSummary {
+            id: claimed.run_id,
+            query: claimed.query.clone(),
+            status: RunStatus::Running.as_str().to_string(),
+            started_at: claimed.claimed_at.to_rfc3339(),
+            finished_at: None,
+            duration_ms: None,
+            row_count: None,
+            error_message: None,
+            result_path: None,
+            window_start: claimed.window.map(|w| format_window_bound(w.start)),
+            window_end: claimed.window.map(|w| format_window_bound(w.end)),
+            window_truncated: claimed.window.map(|w| w.truncated),
+            window_kind: claimed.window.map(|w| w.kind.as_str().to_owned()),
+            origin: Some(RunOrigin::Manual.as_str().to_owned()),
+        };
+        // A request that went away no longer hears the answer. The claim
+        // committed all the same, so the run executes regardless.
+        let _ = answer.send(Ok(summary));
+
         execute_scheduled_query(
             schedule_store,
             pool,
-            run_id,
-            &query,
-            &query_name,
+            claimed.run_id,
+            &claimed.query,
+            &claimed.query_name,
             timeout_secs,
-            // A manual run takes no scheduled-run lease: it passed HTTP
-            // admission (ADR-0018, amended 2026-11-09).
-            None,
+            lease,
         )
         .await;
     });
 
-    Ok(Json(summary))
+    match answered.await {
+        Ok(summary) => summary.map(Json),
+        // The task ended without answering: it panicked.
+        Err(_) => Err(ServerError::Internal(
+            "the manual run's claim ended without an answer".into(),
+        )),
+    }
+}
+
+/// The run a manual claim started, or the answer to one that started none.
+fn started_manual_run(
+    claim: Result<ManualRunClaim, crate::store::DueClaimError>,
+) -> Result<ClaimedManualRun, ServerError> {
+    match claim? {
+        ManualRunClaim::Started(claimed) => Ok(claimed),
+        ManualRunClaim::NoSchedule => Err(ServerError::BadRequest(
+            "attach a schedule before triggering a run".into(),
+        )),
+        ManualRunClaim::AlreadyRunning => Err(ServerError::Conflict(
+            "a run is already in progress for this net".into(),
+        )),
+        ManualRunClaim::MaxRunsReached => Err(ServerError::Conflict(
+            "max runs reached for this net".into(),
+        )),
+        ManualRunClaim::EmptyWindow {
+            covered_through,
+            window_end,
+        } => Err(ServerError::Conflict(format!(
+            "nothing new to read: coverage already reaches {}, and a run now would end at {}",
+            format_window_bound(covered_through),
+            format_window_bound(window_end),
+        ))),
+    }
 }
 
 /// `GET /api/v1/saved/{id}/runs/{run_id}` — get a single report run with result data.
@@ -3294,12 +3337,9 @@ pub async fn trigger_run(
 /// to describe as "no result data" for a run that succeeded.
 pub async fn get_report_run(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::RunSavedQuery>,
     path: Result<Path<(i64, i64)>, PathRejection>,
 ) -> Result<Json<ReportRunResponse>, ServerError> {
-    if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
     let Path((saved_id, run_id)) = shaped("saved query and run ids", path)?;
 
     let key_id = verified.id;
