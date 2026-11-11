@@ -759,15 +759,44 @@ fn live_refuses_non_literal_integer_positions() {
     }
 }
 
-/// Whether `example` covers `candidate`.
-fn covers(example: &doc_examples::Example, candidate: &doc_examples::Candidate) -> bool {
+/// The candidates `example` covers, by index. A fenced row covers each run
+/// of candidates that holds its excerpt's lines contiguous and in order
+/// inside one fenced block, so a query whose lines were dropped, reordered
+/// or split across blocks covers nothing. A shell row covers each command
+/// that passes its argument, and an inline row each span equal to it.
+fn covered(example: &doc_examples::Example, candidates: &[doc_examples::Candidate]) -> Vec<usize> {
     use doc_examples::Site;
+    let matching = |keep: &dyn Fn(&doc_examples::Candidate) -> bool| {
+        (0..candidates.len())
+            .filter(|&i| keep(&candidates[i]))
+            .collect()
+    };
     match example.site {
         Site::Fenced => {
-            !candidate.span && example.excerpt.lines().any(|line| line == candidate.text)
+            let lines: Vec<&str> = example.excerpt.lines().collect();
+            assert!(!lines.is_empty(), "a fenced row has at least one line");
+            let mut blocks = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+            for (i, candidate) in candidates.iter().enumerate() {
+                if let (false, Some(block)) = (candidate.span, candidate.block) {
+                    blocks.entry(block).or_default().push(i);
+                }
+            }
+            let mut runs = Vec::new();
+            for block in blocks.values() {
+                for run in block.windows(lines.len()) {
+                    if run
+                        .iter()
+                        .zip(&lines)
+                        .all(|(&i, line)| candidates[i].text == *line)
+                    {
+                        runs.extend_from_slice(run);
+                    }
+                }
+            }
+            runs
         }
-        Site::Shell => !candidate.span && candidate.text.contains(example.excerpt),
-        Site::Inline => candidate.span && candidate.text == example.excerpt,
+        Site::Shell => matching(&|c| !c.span && c.text.contains(example.excerpt)),
+        Site::Inline => matching(&|c| c.span && c.text == example.excerpt),
     }
 }
 
@@ -786,18 +815,24 @@ fn documented_examples_validate() {
         let exclusions: Vec<_> = EXCLUSIONS.iter().filter(|x| x.source == source).collect();
         assert!(!examples.is_empty(), "{path}: no example rows");
         let candidates = doc_examples::candidates(source);
+        let coverage: Vec<Vec<usize>> = examples
+            .iter()
+            .map(|example| covered(example, &candidates))
+            .collect();
 
         // Each row is anchored in the source as it stands.
-        for example in &examples {
+        for (example, rows) in examples.iter().zip(&coverage) {
             let excerpt = example.excerpt;
             let anchored = match example.site {
-                Site::Fenced => excerpt
-                    .lines()
-                    .all(|line| text.lines().any(|source_line| source_line.trim() == line)),
+                Site::Fenced => !rows.is_empty(),
                 Site::Shell => text.contains(excerpt),
                 Site::Inline => text.contains(&format!("`{excerpt}`")),
             };
-            assert!(anchored, "{path}: the excerpt {excerpt:?} is gone");
+            assert!(
+                anchored,
+                "{path}: the excerpt {excerpt:?} is gone (a fenced excerpt must be \
+                 contiguous lines, in order, of one fenced block)"
+            );
             let derived = match example.site {
                 Site::Shell => doc_examples::unquote(excerpt) == example.query,
                 Site::Fenced | Site::Inline => {
@@ -813,10 +848,14 @@ fn documented_examples_validate() {
             // written; a prose span need only be present.
             if source == Source::Essentials || example.site != Site::Inline {
                 assert!(
-                    candidates.iter().any(|c| covers(example, c)),
+                    !rows.is_empty(),
                     "{path}: the row {excerpt:?} covers no candidate"
                 );
             }
+        }
+        let mut accounted = vec![false; candidates.len()];
+        for &i in coverage.iter().flatten() {
+            accounted[i] = true;
         }
 
         for exclusion in &exclusions {
@@ -834,10 +873,7 @@ fn documented_examples_validate() {
         }
 
         // Every candidate is a row or an exclusion.
-        for candidate in &candidates {
-            if examples.iter().any(|e| covers(e, candidate)) {
-                continue;
-            }
+        for (candidate, _) in candidates.iter().zip(&accounted).filter(|(_, a)| !**a) {
             let excluded = exclusions.iter().any(|x| match candidate.block {
                 Some(block) => candidates
                     .iter()
