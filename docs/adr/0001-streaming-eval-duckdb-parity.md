@@ -3,7 +3,9 @@
 **Status:** Accepted; amended 2026-10-17 (#304): aggregation caps are reported
 live and refused in batch, see the Amendment; amended (2026-11-08), see the
 Amendment (2026-11-08); amended (2026-11-09): globs and regex classes match
-as DuckDB matches them in every lane, see the Amendment (2026-11-09)
+as DuckDB matches them in every lane, see the Amendment (2026-11-09);
+amended (2026-11-11): every call is checked once, before either lane runs,
+see the Amendment (2026-11-11)
 
 trawl has two expression evaluators that must produce the same answer for the
 same DSL: the **batch path** (`emitter/` → DuckDB SQL → DuckDB) used by
@@ -179,3 +181,40 @@ ADR-0063 kept the regex class difference out of its scope. On 2026-11-09 the hum
 **A regex reads `\d`, `\w`, `\s`, `\b` and `\B` in every lane as RE2 reads them.** The program the live lane and the kv batch tail run is built from the body with those five rewritten to their RE2 ASCII meanings, the view that ADR-0063 already measures. That covers search-stage regexes, `matches` operands and `extract` bodies. Capture names and indices stay as written.
 
 Syntax that RE2 refuses is still reported by DuckDB when the batch query runs. A glob that needs quoting (it holds `"`, `#` or whitespace) still has no spelling. Its workaround is `like` or `matches` in a `where` stage, and the DSL reference says so.
+
+## Amendment (2026-11-11): every call is checked once, before either lane runs (#435 prep)
+
+`/api/v1/validate` and MCP `search mode=validate` answered `valid` for queries that the run then refused. `validate_pipeline` checked the name and argument count of an aggregation head and nothing else about calls (`emitter/validate.rs:94`), so `where match(message, "x")`, `let x = nosuchfn(message)`, `where length() > 0`, `let x = round(1, message)`, `eval x = date_part("nanosecond", _time)`, `let x = strftime(_time, "%Q")` and `stats count(nosuchfn(message))` were all valid and all failed at emit. A call after `extract kv` passed validation and emit and failed only when the tail compiled. The live lane ran its own copy of the name, argument count, unit and format checks (`stream.rs:1212-1270`) and had no integer-literal check, so it ran `round(x, p)` with a field as the precision, which batch refuses. The 2026-11-08 amendment above named one lane-neutral check as the destination and left it for its own change. This is that change.
+
+The human ruled on 2026-11-11, asked whether validation covers unknown names only (the issue's words) or every call rule: "Every call rule (Recommended)".
+
+**Every call in a query is checked once, by one check that both doors run.** `validate_pipeline` and `compile_stream_plan_with` run it after the aggregate-position check and before the projection check. It covers every call in a row-scalar position, every aggregation head and every call inside an aggregation operand, at any depth, in every stage, including the stages after `extract kv`. For each call it checks:
+
+- the name is a known function, with the existing suggestion, or the `matches` operator hint for `match`;
+- the argument count;
+- a unit argument is in its closed vocabulary;
+- a literal format argument is valid;
+- an argument in an integer position is written as an integer literal.
+
+These rules are the ones emit already enforced. Their sentences are emit's sentences, and the existing function tables own them. The check uses an explicit work stack (ADR-0061; ADR-0024, Amendment 2026-11-11). The live compiler keeps only its pinned-comparison checks, which need the pin scope, and its existing refusals of a scalar aggregation head and a computed aggregation operand.
+
+**One order decides which refusal a query gets, in every lane.** The phases run in this order: the parser, including the tree-depth limit; lateral expansion; aggregate positions; calls; then projection, alias, `extract` and the lane's own compile. Inside the call phase, stages, assignments and slots run in written order. A call is checked (name, then argument count, then its literal arguments in position order) before its arguments are visited. So `foo(bar(x))` reports `foo`, and `split(nosuch(x), ",", i)` reports `split`'s integer position. Emit used to report the innermost call first. Its own checks stay as preconditions, but a refusal from them can no longer reach a caller, because emit runs `validate_pipeline` first.
+
+Consequences:
+
+- The live lane and the kv batch tail refuse an integer position that is not written as an integer literal: `round(x, p)`, `round(5, "bad")`, `round(12.3, -1)`, `split(a, ",", i)`. The DSL reference already required an integer literal there (`reference/dsl.md`, `split` and `round`), and batch already refused these.
+- A live-tail refusal for a bad call is now a `validation_error` from admission with its hint as a detail, where it was a `bad_request` from the plan compile. The web UI reads `validation_error` as a query error and `bad_request` as a server error.
+- A bad call after `extract kv` gets the same sentence as anywhere else, without the `post-processing:` wrapper the tail added.
+- A saved query whose text breaks one of these rules can no longer be saved or updated. A stored one fails its next scheduled or manual attempt with the diagnostic, and its schedule stays enabled. Nothing persisted changes format. Running the previous binary accepts the same text again.
+
+Out of scope: checks that need the catalog (pinned comparisons, source paths), totals emit counts (regex copies), the `eventstats` refusal of `dc`, `values` and `list` (a stage limit, not a call rule), precise spans on these refusals, and the web UI's live notice, which reads only the local parser.
+
+Considered, not adopted:
+
+- **Unknown names only.** Wrong argument counts, units, formats and integer positions would stay valid until run, and the validate handler already promises function names and arity.
+- **A second walker in `validate_pipeline` while the live lane keeps its own.** That is two hand copies of one rule set, the defect class the 2026-11-08 amendment removes. The missing integer check in the live copy shows how the copies drift.
+- **Run emit inside validation.** Emit needs a source, pins and the catalog, and it never compiles the kv tail.
+- **Emit's innermost-first order.** It disagrees with the written order of the heads and with the aggregate-position check.
+- **A recursive walker.** ADR-0061 and ADR-0024 require an explicit stack for a new whole-tree walk.
+
+Premise checks at `4dd30bf2`: `emitter/validate.rs:46-94` (only aggregation heads are checked); `emitter/functions.rs:19-40,228-269,474` (one name and arity table, the unit and format checks, the unknown-function refusal); `emitter/expr.rs:47-49,102-107` (emit refuses arguments before the head, and refuses a non-literal integer position); `stream.rs:1212-1270` (live checks without integer literals); `eval.rs:1001-1014,1470-1488` (live evaluates field-valued precision and index); `emitter/mod.rs:480,493` (emit runs `validate_pipeline` first and splits off the kv tail); `trawl-engine/src/post_process.rs:211-226` (the tail compiles through the stream plan and wraps its error); `handlers.rs:4093-4106` and `error.rs:1188-1201` (the live compile refusal is `bad_request`, admission's is `validation_error` with a hint).

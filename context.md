@@ -235,7 +235,7 @@ A glob, a regex, or a `like` or `ilike` pattern in a query. A pattern is always 
 _Avoid_: computed pattern (refused), matcher, expression (that is the larger tree a pattern sits in)
 
 **Row-scalar position**:
-An expression evaluated once per row: a `where` condition or a `let` assignment, at any depth. An aggregate call there is refused in both lanes. A scalar call's argument takes the position of the call: in a row-scalar position it is row-scalar, and in an aggregation slot it is part of the slot. So `stats coalesce(sum(x), 0)` is legal, and `where lower(count(x)) == "a"` is refused.
+An expression evaluated once per row: a `where` condition or a `let` assignment, at any depth. An aggregate call there is refused in both lanes. A scalar call's argument takes the position of the call: in a row-scalar position it is row-scalar, and in an aggregation slot it is part of the slot. So `stats coalesce(sum(x), 0)` is legal, and `where lower(count(x)) == "a"` is refused. Every call there and in an aggregation slot is checked against the function table in both lanes before either runs: its name, its argument count and its literal arguments.
 
 **Aggregation slot**:
 The head of a `stats`, `timechart`, `eventstats` or `pivot` aggregation. It names an aggregate; batch also takes a scalar head there, and the live lane refuses one.
@@ -349,6 +349,14 @@ _Avoid_: trigger run, ad-hoc run (that is a search), side run
 **Run budget**:
 The number of runs a schedule may claim over its life, set by `max_runs` and spent one claim at a time, scheduled or manual, failures included. Editing the schedule keeps what was spent; only a new schedule starts a new budget. A schedule with no runs left is spent, which the API reports as `exhausted`, and claims nothing until its cap is raised.
 _Avoid_: retained runs (that is what retention keeps), quota, run limit, exhausted flag (nothing is stored)
+
+**Due schedule**:
+An enabled schedule whose fire time has come and whose run budget is not spent. The scheduler lists due schedules oldest first. One it cannot start, because its key cannot run it or its window fails to resolve, stays due with its coverage untouched, so it resumes once the cause is fixed.
+_Avoid_: pending schedule, ready job, overdue (a due schedule may be on time)
+
+**Run lease**:
+A hold on one place in a run gate, taken before a run is claimed and kept until the last of that run's work stops, however the run ended. Scheduled runs and manual runs take leases from separate gates. A run that gets no lease is not claimed: it spends no budget, writes no run and moves no coverage.
+_Avoid_: slot (that is a declared envelope field), permit (that is the executor pool), request in progress, in-flight count
 
 ### Tables and analyses
 

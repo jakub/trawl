@@ -2,7 +2,7 @@
 
 Status: accepted 2026-09-05, amended 2026-09-07 after re-prep of
 [#150](https://github.com/jakub/trawl/issues/150), amended 2026-10-17 by
-ADR-0056 (the ping no longer takes a permit), amended (2026-11-08): an export is tracked like a query, see the Amendment; amended (2026-11-09): a sort or dedup stage names at most 64 fields, and cancel by id reaches work that waits to start, see the two Amendments of that date.
+ADR-0056 (the ping no longer takes a permit), amended (2026-11-08): an export is tracked like a query, see the Amendment; amended (2026-11-09): a sort or dedup stage names at most 64 fields, and cancel by id reaches work that waits to start, see the two Amendments of that date; amended (2026-11-11): one expression or search is at most 64 levels deep, see the Amendment, and both doors check every call after aggregate positions (ADR-0001, Amendment 2026-11-11).
 
 A short query can spend seconds in DuckDB binding before reading a row.
 In a single SELECT list, DuckDB copies an earlier alias's original
@@ -26,9 +26,9 @@ conservative lateral expansion above `MAX_LATERAL_EXPANSION = 512`, or
 more than `MAX_PIPELINE_STAGES = 128` pipeline stages. Neither limit is
 configurable. Both doors run this check first. Each then runs
 `aggregate::check_positions` (ADR-0001, Amendment 2026-11-08), so one
-query gets one first refusal from both lanes. `validate_pipeline` then
-checks the name and arity of every aggregation slot, `eventstats`
-included.
+query gets one first refusal from both lanes. Both doors then check
+every call, aggregation slots and `eventstats` included, against the
+function table (ADR-0001, Amendment 2026-11-11).
 
 The original substituted-DSL-node calculation admits a chain starting
 with `a0 = _severity + _severity`, followed by eight assignments of this

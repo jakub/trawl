@@ -1,6 +1,6 @@
 # Retention and report windows: age is per-env policy, pressure is survival, the schedule owns its window
 
-status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class; amended (2026-10-23): the capture sweep without the scheduler; amended (2026-11-06): stale runs at boot, retention of terminal runs only, and a lifetime run budget; amended (2026-11-08): ruling 8's pruning claim, see the Amendment; amended (2026-11-09): scheduled runs in flight are capped at half the executor permits, see the Amendment
+status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class; amended (2026-10-23): the capture sweep without the scheduler; amended (2026-11-06): stale runs at boot, retention of terminal runs only, and a lifetime run budget; amended (2026-11-08): ruling 8's pruning claim, see the Amendment; amended (2026-11-09): scheduled runs in flight are capped at half the executor permits, see the Amendment; amended (2026-11-11): manual runs are capped too, running a net now needs `query`, and the tick lists only due schedules under a deadline, see the Amendment
 
 Two parked halves of PR #58, one subject: who owns time. Retention is one
 install-wide `max_age_days`, so keeping `prod` a year forces keeping the
@@ -185,3 +185,53 @@ Considered, not adopted:
 - **One fewer than the preparation slots.** It keeps a slot free for interactive work on hosts with two or more slots, but it allows only one scheduled run on a host with two slots. The human chose the executor basis.
 - **Reserve preparation slots for interactive work, or cap the schedule count.** Each needs its own policy and neither bounds the tasks the scheduler holds.
 - **Release the lease when the task ends.** A timed-out run's physical work would keep its permit while a replacement starts, so the cap would leak.
+
+## Amendment: manual runs are capped, running a net now needs `query`, and the tick lists only due schedules under a deadline, 2026-11-11
+
+Prep record for #444, the follow-up the human accepted from #407's security review on 2026-11-10. The 2026-11-09 amendment left manual runs out of the cap: "Manual runs keep their HTTP admission and take no lease." That admission ends at the response head (ADR-0054), while the run goes on detached (`handlers.rs:3263-3278`). A key may own any number of nets, and only one run per schedule is guarded (`report_runs_one_running`), so one key could press Run now on every net it owns and hold every preparation slot and executor permit. The tick also listed spent schedules and schedules whose key cannot run them on every poll, through a scan and a sort of the due set per 64 rows, because the only index on `schedules` is on `enabled`. And `trigger_run` and `get_report_run` checked only `saved_query`, while a scheduled run needs `query` and `saved_query` (`scheduler.rs:405-445`). So a role with `saved_query` alone could save any query, run it now, and read its rows.
+
+The human ruled on 2026-11-11:
+- the grant gap: "Fix it in #444 (Recommended)";
+- the manual cap: "Separate gate (Recommended)";
+- one change, not two: "One PR";
+- the limits below that remain: "Accept, note them (Recommended)".
+
+**A manual run takes a run lease from its own gate before it is claimed.** The gate has two limits: one manual run per key, counted on the caller's key, and `max(1, executor permits / 4)` manual runs across the installation. It is separate from the scheduled cap, so Run now never defers a schedule and a busy scheduler never refuses Run now. `trigger_run` checks the grant, then ownership (404), then the corpus gate (503), then tries the gate, and only then claims. It never waits. A refused run answers 429 `manual_run_busy` with an advisory `Retry-After` of at least one second. It spends no budget, writes no run row and moves no cursor. A claim that starts no run (400 or 409) gives its lease back. While a key's own manual run is running, pressing Run now on the same net answers 429, not the 409 for a run already in progress.
+
+**A run lease lasts until the last of its run's work stops.** That covers the window resolution at claim time, the preparation job, the executor work and the run's own result writing and finishing, as the scheduled lease already did. A timed-out or abandoned run keeps its lease while any of that work survives. The claim and the run share one task: the request waits for the claim's answer, and a request dropped after the claim commits does not leave a running row with nothing to run it.
+
+On P executor permits the two gates hold at most `max(1, P/2) + max(1, P/4)` runs: 2 runs on 1, 2 or 3 permits, 3 on 4, and 6 on 8. Interactive work keeps the rest. On 4 permits that is 1 permit, where the 2026-11-09 amendment gave it 2. On 2 permits or fewer the runs can hold every permit. Preparation slots are still not reserved.
+
+The lane counts the caller's key, not the schedule's key. ADR-0035 runs a manual run as the caller, so the 1.1 automation key does not rekey this lane.
+
+**Running a net now and reading a run's rows need `query` as well as `saved_query`.** `saved_query` alone still creates, edits and deletes nets, sets and removes schedules, and lists runs with their metadata. Saving text runs nothing. Under ADR-0025, Run now and the run rows view are absent in the web UI for a key without `query`.
+
+**The tick lists only schedules that can still claim, oldest first, through an index.** A due schedule is enabled, its fire time has come, and its run budget is not spent. The listing's predicate and a partial index on `(next_fire_at, id)` carry the same budget condition. Exhaustion stays derived and is never stored, so raising `max_runs` lists the schedule again at the next tick. A schedule whose key cannot run it, or whose window fails to resolve, stays due with its cursor and watermark untouched (ruling 9). The tick remembers an unusable key for the rest of that tick and logs one skip per key with a count of its schedules. It does not remember a usable answer: every claim checks its key live, so a revocation takes effect at the next claim.
+
+**Listing a page and each claim run under a 5-second deadline before commit.** Every statement takes its timeout from what is left of that deadline. On expiry the call writes nothing: the cursor, the watermark, `runs_claimed` and the run table stay as they are.
+- A scheduled claim that expires gives its lease back, and the tick goes on to the next schedule.
+- A listing that expires ends that tick.
+- A manual claim that expires answers 503 `service_unavailable` and gives its lease back.
+
+A COMMIT already sent is awaited, never cut: a lost answer is not proof of a rollback. The value is fixed, with no setting.
+
+**Two gauges per origin show how full each gate is:** run leases in use and the lease limit, labelled `scheduled` or `manual`, read at scrape time. No log line is written per tick.
+
+The human accepted these limits that remain:
+- A COMMIT already sent can still stall the tick, and a lost commit answer holds its lease until it resolves.
+- Schedules whose key cannot run them still cost one indexed page read per 64 and one key check per distinct key on every tick.
+- Nothing bounds a whole tick. That needs a design for settling an unknown commit and a fair way to resume, and this amendment provides neither.
+
+The listing index is persisted state. A binary older than its migration refuses to start against the upgraded database (`store/migrations.rs:195-209`). To go back, restore the app-state database backup taken before the upgrade, with its matching `data/scheduled` tree.
+
+Considered, not adopted:
+
+- **Share the scheduled cap with manual runs.** It keeps the total at `max(1, P/2)`, but a busy scheduler then refuses Run now, and a few keys that keep pressing Run now defer every schedule with no signal. The human chose separate gates.
+- **Hold the HTTP request count for the run's life.** ADR-0054 keeps independent work out of that count, and the count returns at its deadline while physical work can outlive it.
+- **Wait for a place.** It holds the request open, or it queues detached tasks again.
+- **Store an exhausted flag, or move a never-startable schedule's cursor.** Exhaustion is derived (the 2026-11-06 amendment), and moving the cursor breaks ruling 9.
+- **Remember a usable key across the tick.** It delays a revocation past later claims in the same tick.
+- **A separate lock timeout, a config key for either limit or the deadline, and a log line when the cap is full.** Nobody asked for them, and the gauges answer the question without writing to the corpus every tick.
+- **Cap how many schedules a key may own.** It needs its own policy, as in the 2026-11-09 amendment.
+
+Premise checks at `4dd30bf2`: `handlers.rs:3169,3300` (both routes check only `saved_query`); `scheduler.rs:405-445` (a scheduled run needs both grants); `handlers.rs:3199-3278` (claim, then spawn with no lease, then answer); `pool.rs:247-268,2777-2787` (the scheduled cap, its lease and its try); `store/schedule.rs:1020-1041,1387-1403,2412-2460` (the listing has no budget term; an exhausted claim rolls back); `migrations/20260913000001_initial_schema.sql:35-40,278,286-287` (indexes on `schedules`, one running run per schedule); `store/investigations.rs:1403-1624` (the `WriteTx` deadline, its commit rule, and lock and statement timeouts mapped to `WaitExpired`); `store/migrations.rs:195-209` (an older binary refuses a newer ledger); `web-ui perms.rs:65` (`can_query`).
