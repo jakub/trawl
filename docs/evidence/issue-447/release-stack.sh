@@ -4,13 +4,13 @@
 # Builds `trawl` in release from a clean detached checkout of SHA (default:
 # HEAD of the repo this script lives in), then runs `trawl query --data` on
 # a one-row parquet under `ulimit -s 2048` for:
-#   - every shape the first premise checkpoint names, at depth 64 (a row,
-#     or a semantic refusal the CLI gives today, marked) and at depth 65
-#     (the depth refusal);
-#   - the longest texts MAX_QUERY_LEN admits, which end in a refusal or an
-#     engine error and never in a signal.
-# One line per case. The script exits non-zero if any case dies of a signal.
-# A refusal or a DuckDB error is not a failure. arm64 is not measured.
+#   - every shape the first premise checkpoint names, at depth 64 (its one
+#     row, with the value the shape computes) and at depth 65 (the depth
+#     refusal);
+#   - the longest texts MAX_QUERY_LEN admits, which end in the depth
+#     refusal, a grammar error or an engine error, and never in a signal.
+# One line per case. The script exits non-zero if any case dies of a signal
+# or misses its expected outcome. arm64 is not measured.
 #
 # Needs: git, cargo, and the duckdb CLI (it writes the one-row parquet).
 # CARGO_TARGET_DIR overrides the build directory, which defaults to
@@ -59,14 +59,18 @@ MAX_QUERY_LEN=$(sed -n 's/^pub const MAX_QUERY_LEN: usize = \([0-9_]*\);.*/\1/p'
   "$CHECKOUT/crates/trawl-core/src/parser/mod.rs" | tr -d _)
 MAX_TREE_DEPTH=$(sed -n 's/^pub const MAX_TREE_DEPTH: usize = \([0-9_]*\);.*/\1/p' \
   "$CHECKOUT/crates/trawl-core/src/parser/mod.rs" | tr -d _)
+MAX_SEARCH_PRESCAN=$(sed -n 's/^pub const MAX_SEARCH_PRESCAN: usize = \([0-9_]*\);.*/\1/p' \
+  "$CHECKOUT/crates/trawl-core/src/parser/mod.rs" | tr -d _)
 : "${MAX_QUERY_LEN:?MAX_QUERY_LEN not found}" "${MAX_TREE_DEPTH:?MAX_TREE_DEPTH not found}"
+: "${MAX_SEARCH_PRESCAN:?MAX_SEARCH_PRESCAN not found}"
 
-# One row: the base columns, a message `extract kv` splits into a=1, and a
-# BIGINT column `a` of 1. Every runnable case below is built to return it.
+# One row: the base columns, a message `extract kv` splits into k=1, and a
+# BIGINT column `a` of 1. `k` is in no column, so only the kv tail reads it.
+# Every runnable case below is built to return the row.
 PARQUET=$WORK/one.parquet
 duckdb :memory: "COPY (SELECT TIMESTAMP '2026-03-14 03:00:00' AS _time, \
   TIMESTAMP '2026-03-14 03:00:00' AS _ingested, \
-  'web-1' AS host, 'nginx' AS service, 'a=1' AS message, 'a=1' AS _raw, \
+  'web-1' AS host, 'nginx' AS service, 'k=1' AS message, 'k=1' AS _raw, \
   CAST(1 AS BIGINT) AS a) TO '$PARQUET' (FORMAT PARQUET)" >&2
 
 # ---- query text builders ---------------------------------------------------
@@ -92,6 +96,14 @@ ors() {
   done
 }
 ands() { printf 'a == 1'; rep ' and a == 1' $(($1 - 1)); }
+# kv_ors N: the or chain over the kv field k.
+kv_ors() {
+  local i
+  for ((i = 0; i < $1; i++)); do
+    ((i == 0)) || printf ' or '
+    printf 'k == %d' "$i"
+  done
+}
 # calls FN N BODY: BODY inside N nested calls to FN.
 calls() { rep "$1(" "$2"; printf '%s' "$3"; rep ')' "$2"; }
 # parity-correct operand of a not run of N: true after N nots.
@@ -124,12 +136,26 @@ shape_text() {
   "timechart") printf '* | timechart span=1m sum(%s)' "$(chain $((d + 1)))" ;;
   "eventstats") printf '* | eventstats sum(%s) as x' "$(chain $((d + 1)))" ;;
   "pivot") printf '* | pivot sum(%s) on a' "$(chain $((d + 1)))" ;;
-  "where after extract kv") printf '* | extract kv | where %s' "$(ors "$d")" ;;
+  "where after extract kv") printf '* | extract kv | where %s' "$(kv_ors "$d")" ;;
   "search NOT run") printf '%sa=1' "$(rep 'NOT ' "$d")" ;;
   "search brackets") printf '%sa=1%s' "$(rep '(' "$d")" "$(rep ' )' "$d")" ;;
   "search NOT and brackets")
     printf '%s%sa=1%s' "$( ((d % 2 == 1)) && printf 'NOT ')" "$(rep 'NOT (' $((d / 2)))" "$(rep ' )' $((d / 2)))"
     ;;
+  esac
+}
+
+# shape_row NAME D: what the one row of shape NAME at depth D must hold, as
+# the CLI's compact JSON spells it.
+shape_row() {
+  local d=$2
+  case $1 in
+  "chain as call argument" | "chain under pass-through calls") printf '"x":%d' $((d - 15)) ;;
+  "let" | "eventstats") printf '"x":%d' $((d + 1)) ;;
+  "stats" | "timechart") printf '"sum":%d' $((d + 1)) ;;
+  "pivot") printf '{"1":%d}' $((d + 1)) ;;
+  "where after extract kv") printf '"k":1' ;;
+  *) printf '"a":1' ;;
   esac
 }
 
@@ -173,11 +199,12 @@ error_line() {
   printf '%s' "$line"
 }
 
-# run_case NAME DEPTH EXPECT TEXT
-# EXPECT is "row" (a row, or a semantic refusal, which is marked),
-# "depth" (the depth refusal) or "any" (a refusal or an engine error).
+# run_case NAME DEPTH EXPECT TEXT [ROW]
+# EXPECT is "row" (exactly one row, holding ROW), "depth" (the depth
+# refusal), "grammar" (a parse error other than the depth refusal) or "any"
+# (a refusal or an engine error).
 run_case() {
-  local name=$1 depth=$2 expect=$3 text=$4 status=0 outcome mark=
+  local name=$1 depth=$2 expect=$3 text=$4 want=${5:-} status=0 outcome mark= rows
   # the limit applies to the trawl process only, not to the builder above
   (ulimit -s "$STACK_KB" && "$TRAWL" query --data "$PARQUET" --format json -- "$text") \
     >"$OUT" 2>"$ERR" || status=$?
@@ -185,25 +212,30 @@ run_case() {
     outcome="ABORT signal $((status - 128))"
     mark=" [ABORT]"
     ABORTS=$((ABORTS + 1))
-  elif ((status == 0)) && [[ -s $OUT ]]; then
-    outcome=row
   elif ((status == 0)); then
-    outcome="no row (exit 0, empty output)"
-    mark=" [UNEXPECTED: the row did not come back]"
-    UNEXPECTED=$((UNEXPECTED + 1))
+    rows=$(grep -c . "$OUT" || true)
+    if ((rows == 1)) && grep -qF -- "$want" "$OUT"; then
+      outcome=row
+    else
+      outcome="$rows row(s): $(head -c 100 "$OUT" | head -n 1)"
+    fi
   else
     outcome="refused: $(error_line "$ERR")"
   fi
   case ${mark:+marked}$expect in
   row)
-    if [[ $outcome == "row" ]]; then :
-    elif [[ $outcome == *"deeper than $MAX_TREE_DEPTH levels"* ]]; then
-      mark=" [UNEXPECTED: depth refusal at the limit]"
+    if [[ $outcome != "row" ]]; then
+      mark=" [UNEXPECTED: not the one row holding $want]"
       UNEXPECTED=$((UNEXPECTED + 1))
-    else mark=" [semantic refusal]"; fi ;;
+    fi ;;
   depth)
     if [[ $outcome != *"deeper than $MAX_TREE_DEPTH levels"* ]]; then
       mark=" [UNEXPECTED: not the depth refusal]"
+      UNEXPECTED=$((UNEXPECTED + 1))
+    fi ;;
+  grammar)
+    if [[ $outcome != "refused: trawl: parse error: "* || $outcome == *"deeper than"* ]]; then
+      mark=" [UNEXPECTED: not a grammar error]"
       UNEXPECTED=$((UNEXPECTED + 1))
     fi ;;
   esac
@@ -225,9 +257,10 @@ echo "date:     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # ---- cases -----------------------------------------------------------------
 
 echo
-echo "== every shape at depth $MAX_TREE_DEPTH: a row, or a marked semantic refusal =="
+echo "== every shape at depth $MAX_TREE_DEPTH: its one row =="
 for shape in "${SHAPES[@]}"; do
-  run_case "$shape" "$MAX_TREE_DEPTH" row "$(shape_text "$shape" "$MAX_TREE_DEPTH")"
+  run_case "$shape" "$MAX_TREE_DEPTH" row "$(shape_text "$shape" "$MAX_TREE_DEPTH")" \
+    "$(shape_row "$shape" "$MAX_TREE_DEPTH")"
 done
 
 echo
@@ -249,8 +282,10 @@ run_case "brackets, longest" max depth "$(longest_brackets a)"
 run_case "chain as in subject, longest" max depth "$(longest '* | where ' '1+' 1 ' in (1)')"
 run_case "chain as in element, longest" max depth "$(longest '* | where a in (1, ' '1+' 1 ')')"
 run_case "chain as call argument, longest" max depth "$(longest '* | let x = abs(' '1+' 1 ')')"
-run_case "deep expression, grammar error" 32000 any "* | where $(compact 32000) > 0 | where"
-run_case "deep search, grammar error" 30000 any "$(rep '(' 30000)a=1$(rep ')' 30000) | where"
+run_case "deep expression, grammar error" 32000 grammar "* | where $(compact 32000) > 0 | where"
+# the deepest search the pre-scan lets reach the grammar
+run_case "deep search, grammar error" "$MAX_SEARCH_PRESCAN" grammar \
+  "$(rep '(' "$MAX_SEARCH_PRESCAN")a=1$(rep ')' "$MAX_SEARCH_PRESCAN") | where"
 # a0 = 1, a1 = a0, ...: each value one name, so no level deep. DuckDB's own
 # binder limit (1000) may answer; that error is the outcome, not a failure.
 aliases=$(
@@ -263,7 +298,7 @@ echo
 echo "summary: aborts=$ABORTS unexpected=$UNEXPECTED"
 echo "arm64 was not measured; this capture is $(uname -m) only."
 
-if ((ABORTS > 0)); then
-  echo "FAIL: $ABORTS case(s) ended in a signal" >&2
+if ((ABORTS > 0 || UNEXPECTED > 0)); then
+  echo "FAIL: $ABORTS case(s) ended in a signal, $UNEXPECTED missed their outcome" >&2
   exit 1
 fi
