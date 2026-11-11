@@ -1246,8 +1246,10 @@ pub async fn cancel_query(
 
 /// `POST /api/v1/validate` — validate a DSL query without executing it.
 ///
-/// Performs syntax and semantic validation (function names, arity, regex patterns)
-/// but does not check field existence (which would require schema introspection).
+/// Parses the text and checks every function call in every stage: its name,
+/// its argument count and its literal arguments (units, formats and integer
+/// positions). It also checks `extract` regex patterns. It does not check
+/// fields against the schema, or that every lane can run the query.
 ///
 /// This route runs the two halves [`crate::admission::admit`] runs, in the
 /// same order and from the same owners — so an over-budget pipeline

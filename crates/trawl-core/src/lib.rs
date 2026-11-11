@@ -17,6 +17,9 @@ pub mod parser;
 /// The closed set of aggregate functions both lanes implement.
 pub mod aggregate;
 
+/// The one call check both validation doors run (ADR-0001).
+pub(crate) mod calls;
+
 /// The stop cancellable work reads between its steps (ADR-0063).
 pub mod cancel;
 

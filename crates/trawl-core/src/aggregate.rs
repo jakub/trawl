@@ -233,8 +233,9 @@ mod tests {
     /// The parser cannot produce the chain (a query is at most 64 KiB),
     /// so the AST is built by hand. Building, validating and dropping it
     /// all happen on the small thread. Over a `where`, `validate_pipeline`
-    /// walks nothing but [`super::check_positions`]: the complexity budget
-    /// and the projection check have nothing to do there.
+    /// walks the chain in [`super::check_positions`] and in the call
+    /// check: the complexity budget and the projection check have nothing
+    /// to do there.
     #[test]
     fn flat_expression_validation_is_bounded() {
         const TERMS: usize = 100_000;
