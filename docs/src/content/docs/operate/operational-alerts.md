@@ -514,16 +514,18 @@ Each lane then follows its own failure path:
 - Telemetry counts the attempt under `TrawlTelemetryWalWriteFailure`. It
   retains the batch for retry, unless the removal failed or was not durable.
 
-1. Find `wal_dir_fsync_failed` and the filesystem error it carries. The
-   `withdrawn` field says whether the new file was removed.
-2. If `withdrawn` is `false`, `withdraw_error` carries the removal error. The
+1. Find `wal_dir_fsync_failed` and its `cause_kind`, the kind of the
+   filesystem error. The `withdrawn` field says whether the new file was
+   removed. The error text is at DEBUG only. See
+   [read the error text of a failure](/operate/health/#read-the-error-text-of-a-failure).
+2. If `withdrawn` is `false`, `withdraw_cause_kind` names the kind of the removal error. The
    file stays in the WAL, and compaction merges it, although the write was
    rejected. A sender that retries that batch duplicates it. Telemetry does
    not retry such a batch.
 3. If `withdrawn` is `true`, read `withdrawal_durable`. The writer syncs the
    directory again after it removes the file. `true` means that the removal
    is durable. `false` means that the second sync failed too, and
-   `withdrawal_sync_error` carries its error. The file is gone now, but a
+   `withdrawal_sync_cause_kind` names its kind. The file is gone now, but a
    power loss before the next successful sync of that directory can restore
    it. The next boot then hydrates it, and compaction merges a batch whose
    write was rejected. Telemetry does not retry such a batch either. That
@@ -548,7 +550,9 @@ the existing processing path.
 
 1. Match the operation label to `compaction_error`, `rollup_error`, recovery,
    or consumed-WAL removal messages for the affected target.
-2. Inspect the reported path, storage error, and retained WAL or rollup sources.
+2. Inspect the reported path, the `cause_kind` of the storage error, and the
+   retained WAL or rollup sources. The error text is at DEBUG only. See
+   [read the error text of a failure](/operate/health/#read-the-error-text-of-a-failure).
 3. Correct the reported permission, filesystem, or data problem while retaining
    evidence. For a latched publication-scan failure, review
    [marker recovery](/architecture/recovery/#daily-rollup) before a planned
@@ -634,16 +638,18 @@ retry. A contradictory marker that is valid does not refuse ingest.
 1. Find `publication_recovery_failed` in the daemon log. An event about one
    marker names the environment, the service, and the marker path. A
    contradiction carries a `reason`: `invalid_marker`, `not_regular_file`,
-   `output_missing`, or `output_mismatch`. A failure carries the filesystem
-   error. Recovery can also fail before it reaches a marker. If recovery
+   `output_missing`, or `output_mismatch`. A failure carries
+   `cause_kind=unknown`, and the filesystem error text is at DEBUG only (see
+   [read the error text of a failure](/operate/health/#read-the-error-text-of-a-failure)).
+   Recovery can also fail before it reaches a marker. If recovery
    cannot list an environment's WAL directory, the event carries only the
-   environment and the error, and every service in that environment stays
+   environment and the error's `cause_kind`, and every service in that environment stays
    blocked. This case does not count toward this alert; compaction counts
    it under `wal_environment_scan`. A compaction tick lists the WAL root
    before recovery runs. If that first listing fails, compaction counts it
    under `wal_root_scan` and the tick stops before recovery. If the first
    listing succeeds and recovery's own listing of the root then fails, the
-   event carries only the error and counts as `failed`.
+   event carries only `cause_kind=unknown` and counts as `failed`.
 2. For a failure, correct the reported permission or storage problem. When
    the event has no service or marker path, investigate the directory that
    its error names. The next tick completes the marker, and the service

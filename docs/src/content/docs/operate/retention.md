@@ -173,7 +173,7 @@ first one in this table wins:
 
 | Outcome | Meaning | What to do |
 | --- | --- | --- |
-| `failed` | The sweep returned an error, its task panicked, or at least one date directory failed to delete. One failed deletion makes the whole sweep `failed`, even when every other deletion succeeded. | Search the journal for `retention_error`, which names the path and the error. Fix the permission or storage error. |
+| `failed` | The sweep returned an error, its task panicked, or at least one date directory failed to delete. One failed deletion makes the whole sweep `failed`, even when every other deletion succeeded. | Search the journal for `retention_error`, which names the path and the error's `cause_kind`. Fix the permission or storage error. The error text is at DEBUG only. See [read the error text of a failure](/operate/health/#read-the-error-text-of-a-failure). |
 | `suppressed` | A repin marker or staging directory, or publication markers that cannot be read, stopped the sweep before it started or while it ran. | Follow [Clear suppressed retention](#clear-suppressed-retention). |
 | `exhausted_below_floor` | Pressure deletion deleted every date directory it was allowed to delete, and free space is still below the floor. | Follow the steps in [Free disk space](#free-disk-space). Something other than deletable date directories holds the space. |
 | `completed` | Every step ran, and every deletion that the sweep tried succeeded. A sweep that deleted nothing is also `completed`. | Nothing. |
@@ -243,8 +243,10 @@ Retention resumes on the tick after the job or its boot recovery finishes.
 `trawl_catalog_repin_running` can be 0 while `trawl_retention_suppressed` is
 1. An abandoned staging directory suppresses retention without a running job.
 So does a WAL root that trawld cannot read: search the journal for
-`retention_publication_claims_unreadable`, then correct the reported
-permission or storage error.
+`retention_publication_claims_unreadable`, then correct the permission or
+storage error. The event's `cause_kind` is `unknown`, because the claims scan
+keeps no typed cause. The error text is at DEBUG only. See
+[read the error text of a failure](/operate/health/#read-the-error-text-of-a-failure).
 
 ## Dates kept for a pending publish
 
