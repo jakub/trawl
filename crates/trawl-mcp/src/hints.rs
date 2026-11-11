@@ -778,4 +778,99 @@ mod tests {
         assert!(checks.is_some_and(|(_, fields)| fields.contains(&"path".to_owned())));
         assert!(plan.is_some());
     }
+
+    /// A quarter of a worker's 2 MiB stack.
+    const QUARTER_STACK: usize = 512 * 1024;
+
+    /// The tree depth limit #447 sets.
+    const LIMIT: usize = 64;
+
+    /// `n` terms joined by `+`: an operator chain `n - 1` levels deep.
+    fn chain(n: usize) -> String {
+        vec!["1"; n].join(" + ")
+    }
+
+    /// `a == 0 <op> a == 1 …`: `n` comparisons, `n` levels deep.
+    fn comparisons(n: usize, op: &str) -> String {
+        (0..n)
+            .map(|i| format!("a == {i}"))
+            .collect::<Vec<_>>()
+            .join(&format!(" {op} "))
+    }
+
+    /// `body` wrapped in `n` nested calls to `function`.
+    fn calls(function: &str, n: usize, body: &str) -> String {
+        format!(
+            "{}{body}{}",
+            format!("{function}(").repeat(n),
+            ")".repeat(n)
+        )
+    }
+
+    /// The hints' recursive walks fit a quarter of a worker's stack at
+    /// #447's 64-level tree depth limit: `expr_reads`' walk through
+    /// [`fields_to_check`] on every expression shape, and `search_terms`
+    /// and `unspanned` through [`NearestPlan::of`] on every search shape.
+    /// The shapes are those of `trawl-core/tests/tree_depth_stack.rs`,
+    /// which counts their depth. The hints parse on `parse_work`'s pool
+    /// threads, whose stacks are 2 MiB.
+    ///
+    /// `where` after `extract kv` is parsed, but `stage_reads` stops at
+    /// the kv extract, whose outputs the data names, so `expr_reads` does
+    /// not walk that condition.
+    #[test]
+    fn hint_walks_at_the_tree_depth_limit_fit_a_quarter_stack() {
+        let expressions = [
+            format!("* | where {} > 0", chain(LIMIT)),
+            format!("* | where {}", comparisons(LIMIT, "or")),
+            format!("* | where {}", comparisons(LIMIT, "and")),
+            format!("* | where {}a < 2", "-".repeat(LIMIT - 1)),
+            format!("* | where {}a == 1", "not ".repeat(LIMIT - 1)),
+            format!("* | where {} in (64)", chain(LIMIT)),
+            format!("* | where a in (1, {})", chain(LIMIT)),
+            format!("* | let x = {}", calls("abs", 16, &chain(LIMIT - 15))),
+            format!("* | let x = {}", calls("coalesce", 16, &chain(LIMIT - 15))),
+            format!(
+                "* | where {} > 0",
+                calls("coalesce", 16, &chain(LIMIT - 16))
+            ),
+            format!("* | let x = {}", chain(LIMIT + 1)),
+            format!("* | stats sum({})", chain(LIMIT + 1)),
+            format!("* | timechart span=1m sum({})", chain(LIMIT + 1)),
+            format!("* | eventstats sum({}) as x", chain(LIMIT + 1)),
+            format!("* | pivot sum({}) on a", chain(LIMIT + 1)),
+            format!("* | extract kv | where {}", comparisons(LIMIT, "or")),
+        ];
+        let searches = [
+            format!("{}a=1", "NOT ".repeat(LIMIT)),
+            format!("{}a=1{}", "(".repeat(LIMIT), " )".repeat(LIMIT)),
+            format!("{}a=1{}", "NOT (".repeat(LIMIT / 2), " )".repeat(LIMIT / 2)),
+        ];
+        let now: DateTime<Utc> = "2026-03-14T10:00:00Z".parse().expect("an instant");
+
+        std::thread::Builder::new()
+            .name("quarter-stack".to_owned())
+            .stack_size(QUARTER_STACK)
+            .spawn(move || {
+                for dsl in &expressions {
+                    eprintln!("fields_to_check: {dsl}");
+                    assert!(fields_to_check(dsl).is_some(), "{dsl} must parse");
+                }
+                for dsl in &searches {
+                    eprintln!("NearestPlan::of: {dsl}");
+                    let plan = NearestPlan::of(
+                        dsl,
+                        Some("2026-03-14T03:00:00Z"),
+                        Some("2026-03-14T04:00:00Z"),
+                        now,
+                    );
+                    // A plan exists only once the formatted text reparsed
+                    // and compared equal through `search_terms`.
+                    assert!(plan.is_some(), "{dsl} must build a plan");
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("every hint walk must fit 512 KiB at depth 64");
+    }
 }

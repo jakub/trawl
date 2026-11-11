@@ -123,7 +123,8 @@ fn shapes() -> Vec<(&'static str, String)> {
         ),
         (
             "eventstats",
-            format!("* | eventstats sum({})", chain(LIMIT + 1)),
+            // named, so the stages that refuse an unnamed one walk it
+            format!("* | eventstats sum({}) as x", chain(LIMIT + 1)),
         ),
         ("pivot", format!("* | pivot sum({}) on a", chain(LIMIT + 1))),
         (
