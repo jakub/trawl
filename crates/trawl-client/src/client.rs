@@ -391,8 +391,9 @@ impl HttpClient {
 
     /// Validate a DSL query without executing it.
     ///
-    /// Checks syntax and semantic rules (function names, arity, regex patterns)
-    /// but not field existence.
+    /// The server parses the text and checks every function call: its name,
+    /// its argument count and its literal arguments. It does not check
+    /// fields against the schema, or that every lane can run the query.
     pub async fn validate(&self, dsl: &str) -> Result<ValidationResponse, ClientError> {
         let url = self.endpoint("/api/v1/validate");
         let body = ValidateRequest { query: dsl };

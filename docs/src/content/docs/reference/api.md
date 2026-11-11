@@ -73,7 +73,7 @@ Every error that trawld itself produces has this body:
 | Code | Status | Meaning |
 |------|--------|---------|
 | `parse_error` | 400 | The DSL does not parse |
-| `validation_error` | 400 | The DSL parses but fails semantic checks: unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
+| `validation_error` | 400 | The DSL parses but fails semantic checks: an unknown function, a wrong argument count, a bad literal argument, or a pipeline over the expression budget or stage cap |
 | `result_too_large` | 400 | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at a cap. The message names the cap and its limit. See [stream live events](#stream-live-events) for the caps. A capture also answers it when a whole result does not fit the capture's caps. See [shapes and caps](#shapes-and-caps) |
 | `bad_request` | 400 | Malformed input. Also the code on a 409 that has no code of its own. |
 | `invalid_name` | 400 | A saved query's `name` is blank or contains control or unsafe invisible formatting characters |
@@ -433,7 +433,7 @@ An `unavailable` histogram has `state` set to `unavailable` and a `reason`, for 
 | Status | Code | When |
 |--------|------|------|
 | 400 | `parse_error` | The DSL does not parse |
-| 400 | `validation_error` | Unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
+| 400 | `validation_error` | Unknown function, wrong argument count, bad literal argument, or a pipeline over the expression budget or stage cap |
 | 400 | `bad_request` | `offset + limit` exceeds `max_result_rows` |
 | 400 | `result_too_large` | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at its group, distinct-value or exact-value cap. The message names the cap and its limit. |
 | 400 | `execution_error` | A result cell is an integer outside the signed and unsigned 64-bit range. The message names the column. |
@@ -454,7 +454,7 @@ An `unavailable` histogram has `state` set to `unavailable` and a `reason`, for 
 
 Permission: `validate`
 
-Parses and checks a DSL query without running it. Field names are not checked against the schema.
+Parses and checks a DSL query without running it. Validation checks function names, argument counts and literal arguments. It does not check fields against the schema, or that every lane can run the query.
 
 **Parameters**
 
@@ -498,7 +498,7 @@ A valid query whose formatting is refused carries no `formatted` text:
 | `format_error.kind` | string | `too_long`: the formatted text would pass the 65,536-byte query limit, for example because escaping grew a quoted string. `unfaithful`: the formatter could not write text that reads back as the same query. |
 | `format_error.message` | string | The reason, for a person |
 
-An invalid query is a 200 with `valid: false`. A pipeline over the expression budget reports as invalid here rather than as a 400. A format refusal is not an error: the query is still valid and runs, and the refusal never appears in `errors`.
+An invalid query is a 200 with `valid: false`. An invalid function call, or a pipeline over the expression budget, reports as invalid here rather than as a 400. A valid answer covers function names, argument counts and literal arguments. It does not check fields against the schema, or that every lane can run the query. A format refusal is not an error: the query is still valid and runs, and the refusal never appears in `errors`.
 
 **Errors**
 
@@ -752,7 +752,7 @@ A capture writes its file to the [results root](/reference/configuration/#the-re
 | Status | Code | When |
 |--------|------|------|
 | 400 | `parse_error` | The query does not parse. The spans point into the text as sent |
-| 400 | `validation_error` | Unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
+| 400 | `validation_error` | Unknown function, wrong argument count, bad literal argument, or a pipeline over the expression budget or stage cap |
 | 400 | `bad_request` | A [bounds](#bounds) refusal: a window and a time clause together, `latest=` alone, an empty window, a span over `max_span_secs`, a value that names no instant, a time value over 128 bytes, a nested time clause, or a window or time clause on `from saved`. Also an `events` query of 128 stages, which leaves no stage for the [imposed order](#shapes-and-caps) |
 | 400 | `result_too_large` | The result exceeded `max_result_rows`, a `whole` result exceeded `max_rows` or `max_wire_bytes`, or the file exceeded `max_file_bytes` |
 | 400 | `capture_source_too_large` | The window, or the `from saved` run, selects more than `source_max_bytes` of stored data. For a window, narrow the window or pin the services with `service=a` or `service=a,b`. For a `from saved` run, narrow the window |
