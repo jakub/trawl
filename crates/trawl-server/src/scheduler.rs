@@ -35,11 +35,6 @@ use crate::store::{
     ClaimedRun, DUE_SCHEDULE_PAGE, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore,
 };
 
-/// How long a run's claim may take, from its first statement to its
-/// commit. A manual run's estimated end, from which a refused press
-/// derives its advisory `Retry-After`, is this plus the query timeout.
-pub const CLAIM_WAIT: Duration = Duration::from_secs(5);
-
 /// Spawn the scheduler background task.
 ///
 /// The task exits on the first change to `shutdown_rx`, or when its sender
@@ -218,7 +213,10 @@ impl CorpusWatch {
 /// a lease ([`ExecutorPool::try_lease_scheduled`]) before each claim. When
 /// no lease is free the tick ends. A schedule it did not reach keeps its
 /// cursor, watermark, run rows and run budget, is among the oldest due at
-/// a later tick, and its missed boundaries coalesce there (ruling 9).
+/// a later tick, and its missed boundaries coalesce there (ruling 9). A
+/// page of the listing that waits [`crate::store::CLAIM_WAIT`] on the
+/// database and gives up ends the tick the same way (ADR-0018, amended
+/// 2026-11-11).
 ///
 /// While the corpus is unsettled (ADR-0041) the poll claims nothing. A
 /// claim moves the fire cursor in the transaction that plans the window,
@@ -350,7 +348,9 @@ pub async fn poll_and_execute(
 ///
 /// A started run comes back with the lease, for its task to keep. Every
 /// other outcome, a failed claim included, starts no run and drops the
-/// lease here, before the tick asks the next schedule.
+/// lease here, before the tick asks the next schedule. That includes a
+/// claim that waited [`crate::store::CLAIM_WAIT`] on the database and gave
+/// up, as `wait_expired`: the tick goes on to the next schedule.
 async fn claim_leased(
     schedule_store: &ScheduleStore,
     schedule_id: i64,
@@ -359,7 +359,7 @@ async fn claim_leased(
     lease: RunLease,
 ) -> Option<(ClaimedRun, RunLease)> {
     match schedule_store
-        .claim_due_run(schedule_id, now, max_catchup_intervals)
+        .claim_due_run(schedule_id, now, max_catchup_intervals, &lease)
         .await
     {
         Ok(DueClaim::Started(claimed)) => Some((claimed, lease)),
@@ -1593,9 +1593,10 @@ mod off_reactor_tests {
     async fn a_due_claim_materializes_off_the_reactor(pool: PgPool) {
         let (schedules, _, schedule_id) =
             windowed(&pool, "due_claim", "zz_cp6b_due_claim error").await;
+        let lease = crate::pool::RunLease::unattached();
         let claimed = parsed_off_the_reactor(
             "zz_cp6b_due_claim",
-            schedules.claim_due_run(schedule_id, Utc::now(), 24),
+            Box::pin(schedules.claim_due_run(schedule_id, Utc::now(), 24, &lease)),
         )
         .await
         .unwrap();
@@ -1606,9 +1607,10 @@ mod off_reactor_tests {
     async fn a_manual_claim_materializes_off_the_reactor(pool: PgPool) {
         let (schedules, saved_id, _) =
             windowed(&pool, "manual_claim", "zz_cp6b_manual_claim error").await;
+        let lease = crate::pool::RunLease::unattached();
         let claimed = parsed_off_the_reactor(
             "zz_cp6b_manual_claim",
-            schedules.claim_manual_run(saved_id, 1, 24),
+            Box::pin(schedules.claim_manual_run(saved_id, 1, 24, &lease)),
         )
         .await
         .unwrap();
@@ -2132,15 +2134,22 @@ mod tests {
             (running, DueClaim::AlreadyRunning),
             (capped, DueClaim::MaxRunsReached),
         ] {
+            let lease = executors.try_lease_scheduled().expect("the lease is free");
             assert_eq!(
                 store
-                    .claim_due_run(schedule_id, now, CATCHUP)
+                    .claim_due_run(schedule_id, now, CATCHUP, &lease)
                     .await
                     .unwrap(),
                 outcome
             );
         }
-        assert!(store.claim_due_run(failing, now, CATCHUP).await.is_err());
+        let lease = executors.try_lease_scheduled().expect("the lease is free");
+        assert!(
+            store
+                .claim_due_run(failing, now, CATCHUP, &lease)
+                .await
+                .is_err()
+        );
         let advanced_cursor: DateTime<Utc> =
             sqlx::query_scalar("SELECT next_fire_at FROM schedules WHERE id = $1")
                 .bind(advanced)

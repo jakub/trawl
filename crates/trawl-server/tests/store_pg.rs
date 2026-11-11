@@ -21,11 +21,12 @@
 mod common;
 
 use sqlx::{PgPool, Row};
+use trawl_server::pool::RunLease;
 use trawl_server::report_window::{ReportWindow, ScheduleWindow, WindowKind, truncate_to_micros};
 use trawl_server::store::schedule::{DUE_FIRST_PAGE, DUE_RESUMED_PAGE};
 use trawl_server::store::{
-    DUE_SCHEDULE_PAGE, DueClaim, DueClaimError, DueSchedule, FinishOutcome, FlipOutcome,
-    HistoryStore, ManualRunClaim, RunClaim, RunStatus, SavedQueryStore, ScheduleStore,
+    CLAIM_WAIT, DUE_SCHEDULE_PAGE, DueClaim, DueClaimError, DueSchedule, FinishOutcome,
+    FlipOutcome, HistoryStore, ManualRunClaim, RunClaim, RunStatus, SavedQueryStore, ScheduleStore,
     StorageState, StoreError, WindowWriteError,
 };
 
@@ -1572,7 +1573,7 @@ async fn claim_due_run_is_not_due_before_the_cursor(pool: PgPool) {
     let a_second_early = now - chrono::Duration::seconds(1);
     assert_eq!(
         store
-            .claim_due_run(sched.id, a_second_early, CATCHUP)
+            .claim_due_run(sched.id, a_second_early, CATCHUP, &RunLease::unattached())
             .await
             .unwrap(),
         DueClaim::NotDue
@@ -1586,7 +1587,10 @@ async fn claim_due_run_is_not_due_before_the_cursor(pool: PgPool) {
 
     // The cursor instant itself IS due: a schedule created at T fires at T.
     assert!(matches!(
-        store.claim_due_run(sched.id, now, CATCHUP).await.unwrap(),
+        store
+            .claim_due_run(sched.id, now, CATCHUP, &RunLease::unattached())
+            .await
+            .unwrap(),
         DueClaim::Started(_)
     ));
 }
@@ -1621,7 +1625,10 @@ async fn claim_due_run_advances_over_ground_the_watermark_covers(pool: PgPool) {
         .unwrap();
 
     assert_eq!(
-        store.claim_due_run(sched.id, now, CATCHUP).await.unwrap(),
+        store
+            .claim_due_run(sched.id, now, CATCHUP, &RunLease::unattached())
+            .await
+            .unwrap(),
         DueClaim::Advanced
     );
     assert_eq!(store.count_runs(sched.id).await.unwrap(), 0);
@@ -1659,7 +1666,10 @@ async fn claim_due_run_leaves_the_cursor_while_a_run_is_in_flight(pool: PgPool) 
         .unwrap();
 
     assert!(matches!(
-        store.claim_due_run(sched.id, now, CATCHUP).await.unwrap(),
+        store
+            .claim_due_run(sched.id, now, CATCHUP, &RunLease::unattached())
+            .await
+            .unwrap(),
         DueClaim::Started(_)
     ));
     let after_first = reread(&store, sq_id).await.next_fire_at;
@@ -1668,7 +1678,7 @@ async fn claim_due_run_leaves_the_cursor_while_a_run_is_in_flight(pool: PgPool) 
     // The first run never finishes; the next boundary arrives anyway.
     assert_eq!(
         store
-            .claim_due_run(sched.id, after_first, CATCHUP)
+            .claim_due_run(sched.id, after_first, CATCHUP, &RunLease::unattached())
             .await
             .unwrap(),
         DueClaim::AlreadyRunning
@@ -1694,7 +1704,10 @@ async fn claim_due_run_leaves_the_cursor_at_the_max_runs_cap(pool: PgPool) {
         .await
         .unwrap();
 
-    let DueClaim::Started(first) = store.claim_due_run(sched.id, now, CATCHUP).await.unwrap()
+    let DueClaim::Started(first) = store
+        .claim_due_run(sched.id, now, CATCHUP, &RunLease::unattached())
+        .await
+        .unwrap()
     else {
         panic!("the first run is under the cap");
     };
@@ -1714,7 +1727,7 @@ async fn claim_due_run_leaves_the_cursor_at_the_max_runs_cap(pool: PgPool) {
 
     assert_eq!(
         store
-            .claim_due_run(sched.id, after_first, CATCHUP)
+            .claim_due_run(sched.id, after_first, CATCHUP, &RunLease::unattached())
             .await
             .unwrap(),
         DueClaim::MaxRunsReached
@@ -1741,7 +1754,10 @@ async fn claim_due_run_is_not_due_when_disabled_or_deleted(pool: PgPool) {
 
     let later = now + chrono::Duration::hours(5);
     assert_eq!(
-        store.claim_due_run(sched.id, later, CATCHUP).await.unwrap(),
+        store
+            .claim_due_run(sched.id, later, CATCHUP, &RunLease::unattached())
+            .await
+            .unwrap(),
         DueClaim::NotDue,
         "a disabled schedule owes nothing"
     );
@@ -1753,7 +1769,10 @@ async fn claim_due_run_is_not_due_when_disabled_or_deleted(pool: PgPool) {
 
     store.delete_schedule(sq_id, 1).await.unwrap();
     assert_eq!(
-        store.claim_due_run(sched.id, later, CATCHUP).await.unwrap(),
+        store
+            .claim_due_run(sched.id, later, CATCHUP, &RunLease::unattached())
+            .await
+            .unwrap(),
         DueClaim::NotDue,
         "a deleted schedule is not an error, just nothing to do"
     );
@@ -1784,7 +1803,10 @@ async fn claim_due_run_stores_the_resolved_query_it_returns(pool: PgPool) {
         .await
         .unwrap();
 
-    let DueClaim::Started(claimed) = store.claim_due_run(sched.id, now, CATCHUP).await.unwrap()
+    let DueClaim::Started(claimed) = store
+        .claim_due_run(sched.id, now, CATCHUP, &RunLease::unattached())
+        .await
+        .unwrap()
     else {
         panic!("the schedule is due at its own creation instant");
     };
@@ -1863,7 +1885,7 @@ async fn claim_due_run_refuses_a_query_that_owns_its_own_window(pool: PgPool) {
         .unwrap();
 
     let err = store
-        .claim_due_run(sched.id, now, CATCHUP)
+        .claim_due_run(sched.id, now, CATCHUP, &RunLease::unattached())
         .await
         .expect_err("a windowed schedule cannot execute a query that owns its own window");
     assert!(
@@ -1932,7 +1954,12 @@ async fn claim_via(
     let schedule = reread(store, sq_id).await;
     match claimant {
         Claimant::Due => match store
-            .claim_due_run(schedule.id, schedule.next_fire_at, CATCHUP)
+            .claim_due_run(
+                schedule.id,
+                schedule.next_fire_at,
+                CATCHUP,
+                &RunLease::unattached(),
+            )
             .await
         {
             Ok(DueClaim::Started(claimed)) => Ok(Claimed::Started(claimed.run_id)),
@@ -1941,7 +1968,10 @@ async fn claim_via(
             Ok(other) => Ok(Claimed::Other(format!("{other:?}"))),
             Err(e) => Err(format!("{e:?}")),
         },
-        Claimant::Manual => match store.claim_manual_run(sq_id, 1, CATCHUP).await {
+        Claimant::Manual => match store
+            .claim_manual_run(sq_id, 1, CATCHUP, &RunLease::unattached())
+            .await
+        {
             Ok(ManualRunClaim::Started(claimed)) => Ok(Claimed::Started(claimed.run_id)),
             Ok(ManualRunClaim::AlreadyRunning) => Ok(Claimed::AlreadyRunning),
             Ok(ManualRunClaim::MaxRunsReached) => Ok(Claimed::MaxRunsReached),
@@ -2140,7 +2170,7 @@ async fn refused_claims_spend_no_budget(pool: PgPool) {
     assert!(
         matches!(
             store
-                .claim_manual_run(covered_sq, 1, CATCHUP)
+                .claim_manual_run(covered_sq, 1, CATCHUP, &RunLease::unattached())
                 .await
                 .unwrap(),
             ManualRunClaim::EmptyWindow { .. }
@@ -3065,7 +3095,11 @@ async fn due_schedule_pages_order_and_resume(pool: PgPool) {
         .await
         .unwrap();
     let racer = schedules(&pool);
-    let claim = tokio::spawn(async move { racer.claim_due_run(raced.id, now, CATCHUP).await });
+    let claim = tokio::spawn(async move {
+        racer
+            .claim_due_run(raced.id, now, CATCHUP, &RunLease::unattached())
+            .await
+    });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let waiting: bool = sqlx::query_scalar(
@@ -3105,6 +3139,87 @@ async fn due_schedule_pages_order_and_resume(pool: PgPool) {
     .unwrap();
     assert_eq!((runs_claimed, runs), (4, 0), "nothing spent, nothing run");
     assert_eq!(list_all_due(&store, now).await.0, expected, "spent: gone");
+}
+
+/// A claim's `statement_timeout` ends with its transaction (ADR-0018,
+/// amended 2026-11-11). On a store pool of one connection, the connection
+/// the next caller gets reads the session's own timeout after a claim that
+/// started a run, after one that was refused, and after one that ran out
+/// at its deadline on a fixture's row lock.
+#[tokio::test]
+async fn claim_deadline_does_not_leak_to_the_pool() {
+    let url = common::create_app_database().await;
+    let _storage = StorageState::from_pool(common::fixture_pool(&url, 2).await)
+        .await
+        .expect("boot the app-state database");
+    let pool = common::fixture_pool(&url, 2).await;
+    let one = common::fixture_pool(&url, 1).await;
+    let session_timeout = async || -> String {
+        sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&one)
+            .await
+            .unwrap()
+    };
+    let baseline = session_timeout().await;
+    let store = schedules(&one);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq = seed_saved(&pool, 1, "deadline-leak").await;
+    let sched = store
+        .create_schedule(
+            sq,
+            1,
+            3600,
+            None,
+            None,
+            0,
+            now - chrono::Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+
+    let started = store
+        .claim_due_run(sched.id, now, CATCHUP, &RunLease::unattached())
+        .await
+        .unwrap();
+    assert!(matches!(started, DueClaim::Started(_)), "{started:?}");
+    assert_eq!(session_timeout().await, baseline, "after a commit");
+
+    // The claim moved the cursor past `now`.
+    assert_eq!(
+        store
+            .claim_due_run(sched.id, now, CATCHUP, &RunLease::unattached())
+            .await
+            .unwrap(),
+        DueClaim::NotDue
+    );
+    assert_eq!(session_timeout().await, baseline, "after a rollback");
+
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(sq)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let later = now + chrono::Duration::hours(2);
+    let waited = std::time::Instant::now();
+    let expired = tokio::time::timeout(
+        3 * CLAIM_WAIT,
+        store.claim_due_run(sched.id, later, CATCHUP, &RunLease::unattached()),
+    )
+    .await
+    .expect("the claim ends at its deadline");
+    let waited = waited.elapsed();
+    lock.rollback().await.unwrap();
+    assert!(
+        matches!(expired, Err(DueClaimError::Store(StoreError::WaitExpired))),
+        "{expired:?}"
+    );
+    assert!(waited >= CLAIM_WAIT, "{waited:?}");
+    assert_eq!(
+        session_timeout().await,
+        baseline,
+        "after a claim that ran out"
+    );
 }
 
 /// The fixed instant [`due_listing_uses_ordered_seek`] lists at.
@@ -8704,7 +8819,11 @@ async fn manual_claim_and_schedule_write_do_not_deadlock(pool: PgPool) {
 
     let claimant = sched_store.clone();
     let sq_id = sq.id;
-    let claim = tokio::spawn(async move { claimant.claim_manual_run(sq_id, 1, 24).await });
+    let claim = tokio::spawn(async move {
+        claimant
+            .claim_manual_run(sq_id, 1, 24, &RunLease::unattached())
+            .await
+    });
 
     // Let the claim reach whatever it blocks on.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;

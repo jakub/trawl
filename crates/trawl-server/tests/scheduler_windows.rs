@@ -37,8 +37,8 @@ use trawl_server::report_window::{
 };
 use trawl_server::scheduler::poll_and_execute;
 use trawl_server::store::{
-    FinishOutcome, ReportRun, RunClaim, RunOrigin, RunStatus, SavedQueryStore, ScheduleStore,
-    StorageState,
+    CLAIM_WAIT, FinishOutcome, ReportRun, RunClaim, RunOrigin, RunStatus, SavedQueryStore,
+    ScheduleStore, StorageState,
 };
 
 /// The saved DSL every windowed schedule here runs.
@@ -1910,7 +1910,7 @@ async fn manual_run_refusal_is_preclaim() {
     assert!(second_before.3.is_empty());
 
     let retry = assert_busy("another net", client.trigger_run(second).await);
-    let limit = trawl_server::scheduler::CLAIM_WAIT.as_secs() + common::DEFAULT_TEST_TIMEOUT_SECS;
+    let limit = CLAIM_WAIT.as_secs() + common::DEFAULT_TEST_TIMEOUT_SECS;
     assert!(
         u64::from(retry) <= limit,
         "Retry-After {retry} is past the holder's estimated end"
@@ -2141,8 +2141,9 @@ async fn a_dropped_request_after_claim_still_runs() {
 /// Every claim that starts no run gives the lease back before it answers:
 /// right after each refusal the gate is empty, and the same key's next
 /// press answers 200. The refusals are no schedule (400), a run already in
-/// progress (409), a spent budget (409), an empty window (409) and a
-/// window the claim cannot resolve (400).
+/// progress (409), a spent budget (409), an empty window (409), a window
+/// the claim cannot resolve (400), and a claim the store fails (503): its
+/// connection ends while it waits on a fixture's row lock.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_claim_refusals_return_the_lease() {
     let server = common::setup().await;
@@ -2226,33 +2227,92 @@ async fn manual_claim_refusals_return_the_lease() {
             "{what}: the lease was back before the refusal answered"
         );
 
-        let next = client
-            .trigger_run(good)
-            .await
-            .unwrap_or_else(|e| panic!("{what}: the key's next run is refused: {e:?}"));
-        let runs = settled_runs(&server, &db, good).await;
-        assert!(
-            runs.iter()
-                .any(|run| run.0 == next.id && run.1 == "success"),
-            "{what}: {runs:?}"
-        );
+        next_press_runs(what, &server, &db, &client, good).await;
     }
+
+    let failed = claim_error_returns_the_lease(&server, key_id, &db).await;
+    next_press_runs("a claim error", &server, &db, &client, good).await;
+
     assert!(runs_of(&db, unscheduled).await.is_empty());
     assert!(runs_of(&db, spent).await.is_empty());
     assert!(runs_of(&db, empty).await.is_empty());
     assert!(runs_of(&db, conflicted).await.is_empty());
+    assert!(runs_of(&db, failed).await.is_empty());
     assert_eq!(runs_of(&db, busy).await.len(), 1, "only the seeded run");
+}
+
+/// The key's next press on `good` answers 200, and its run succeeds.
+async fn next_press_runs(
+    what: &str,
+    server: &common::TestServer,
+    db: &PgPool,
+    client: &trawl_client::HttpClient,
+    good: i64,
+) {
+    let next = client
+        .trigger_run(good)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: the key's next run is refused: {e:?}"));
+    let runs = settled_runs(server, db, good).await;
+    assert!(
+        runs.iter()
+            .any(|run| run.0 == next.id && run.1 == "success"),
+        "{what}: {runs:?}"
+    );
+}
+
+/// The claim-error case of [`manual_claim_refusals_return_the_lease`]: a
+/// claim waiting on a fixture's row lock loses its connection, answers 503,
+/// and its lease is back before the answer. Returns the net's id.
+async fn claim_error_returns_the_lease(
+    server: &common::TestServer,
+    key_id: i64,
+    db: &PgPool,
+) -> i64 {
+    let (failed, _) = server_net(server, key_id, "refusals_store", None, None).await;
+    let locker = common::fixture_pool(&server.app_db_url, 1).await;
+    let mut lock = locker.begin().await.unwrap();
+    sqlx::query("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(failed)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let presser =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let pending = tokio::spawn(async move { presser.trigger_run(failed).await });
+    until("the claim waits on the saved query's row lock", || async {
+        lock_waiters(db).await == 1
+    })
+    .await;
+    let ended: bool = sqlx::query_scalar(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert!(ended, "the claim's connection ended");
+    let (got, message) = refused("a claim error", pending.await.unwrap());
+    lock.rollback().await.unwrap();
+    assert_eq!(got, 503, "a claim error: {message}");
+    assert_eq!(
+        server.state.query.pool.manual_leases_in_use(),
+        0,
+        "a claim error: the lease was back before the refusal answered"
+    );
+    failed
 }
 
 /// A manual run's lease lasts as long as its physical work, not as long as
 /// its request or its run row: on a server whose runs time out after 1 s,
-/// a run parked in its preparation (`Preparing`, `Prepared`) or in its
-/// executor work (`Started`) records `timeout`, and its lease still holds
-/// the gate, so the key's press on another net is refused. Deleting and
-/// re-creating the net frees nothing. On a second server, a run parked in
-/// finishing its row (behind a fixture lock on its schedule row, which
-/// `finish_run` takes) holds it too. Each lease returns once its last work
-/// ends.
+/// a claim whose window resolution is parked (`Resolving`) answers 503 at
+/// its deadline and the parked resolution still holds the gate. A run
+/// parked in its preparation (`Preparing`, `Prepared`) or in its executor
+/// work (`Started`) records `timeout`, and its lease still holds the gate,
+/// so the key's press on another net is refused. Deleting and re-creating
+/// the net frees nothing. On a second server, a run parked in finishing
+/// its row (behind a fixture lock on its schedule row, which `finish_run`
+/// takes) holds it too. Each lease returns once its last work ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_lease_outlives_its_request() {
     use trawl_server::pool::seam::Seam;
@@ -2264,6 +2324,8 @@ async fn manual_run_lease_outlives_its_request() {
     let db = common::fixture_pool(&server.app_db_url, 1).await;
     let client =
         trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    resolution_keeps_the_lease(&server, key_id, &db, &client).await;
 
     for seam in [Seam::Preparing, Seam::Prepared, Seam::Started] {
         let name = format!("outlives_{seam:?}");
@@ -2321,6 +2383,74 @@ async fn manual_run_lease_outlives_its_request() {
     finishing_keeps_the_lease().await;
 }
 
+/// The window-resolution phase of [`manual_run_lease_outlives_its_request`]:
+/// a claim whose resolution is parked at `Seam::Resolving` stops waiting at
+/// its deadline and answers 503, with nothing claimed. The parked
+/// resolution keeps the run's lease past that deadline and past the
+/// request, so the key's press on another net is refused, until it ends.
+async fn resolution_keeps_the_lease(
+    server: &common::TestServer,
+    key_id: i64,
+    db: &PgPool,
+    client: &trawl_client::HttpClient,
+) {
+    use trawl_server::pool::seam::Seam;
+
+    let pool = &server.state.query.pool;
+    let (saved, schedule) = server_net(
+        server,
+        key_id,
+        "outlives_resolving",
+        Some(ScheduleWindow::SinceLast),
+        None,
+    )
+    .await;
+    let (other, _) = server_net(server, key_id, "outlives_resolving_other", None, None).await;
+    // A watermark behind now, so the claim has a window to resolve.
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(truncate_to_micros(Utc::now() - hours(1)))
+        .bind(schedule)
+        .execute(db)
+        .await
+        .unwrap();
+    let before = claim_snapshot(server, db, key_id, saved).await;
+
+    let seams = pool.seams();
+    let resolving = seams.hold(Seam::Resolving);
+    let pressed = std::time::Instant::now();
+    let outcome = tokio::time::timeout(3 * CLAIM_WAIT, client.trigger_run(saved))
+        .await
+        .expect("the claim stops waiting at its deadline");
+    let waited = pressed.elapsed();
+    match outcome {
+        Err(trawl_client::ClientError::Server {
+            status: 503, error, ..
+        }) => assert_eq!(error.code, trawl_api::ErrorCode::ServiceUnavailable),
+        other => panic!("Resolving: expected 503 service_unavailable, got {other:?}"),
+    }
+    assert!(
+        waited >= CLAIM_WAIT,
+        "Resolving: the claim waited {waited:?}"
+    );
+    assert_eq!(resolving.arrivals(), 1);
+    assert_eq!(
+        pool.manual_leases_in_use(),
+        1,
+        "Resolving: the parked resolution holds the lease past its claim and its request"
+    );
+    assert_busy("Resolving: another net", client.trigger_run(other).await);
+
+    resolving.release();
+    drop(seams);
+    gate_drained(server).await;
+    assert_eq!(
+        claim_snapshot(server, db, key_id, saved).await,
+        before,
+        "Resolving: the claim that ran out claimed nothing"
+    );
+    assert!(runs_of(db, other).await.is_empty());
+}
+
 /// The finishing phase of [`manual_run_lease_outlives_its_request`]: the
 /// run's row is still `running` while its frame waits to finish it, and
 /// the frame keeps the lease.
@@ -2376,4 +2506,191 @@ async fn finishing_keeps_the_lease() {
         [(run.id, "success".to_owned(), true, None)]
     );
     assert!(runs_of(&db, other).await.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// claim deadlines (ADR-0018, amended 2026-11-11)
+// ---------------------------------------------------------------------------
+
+/// The events this binary's code logs, captured process-wide.
+///
+/// The tick logs on the test's task, but a server logs from its workers
+/// too, so the capture is the global subscriber, and a process has one:
+/// under nextest each test is a process of its own, while under `cargo
+/// test` this binary's tests share it. Each test reads only the events
+/// naming a schedule or a key it created ([`logged`]).
+fn tick_log() -> &'static common::audit_capture::Capture {
+    static CAPTURE: std::sync::OnceLock<common::audit_capture::Capture> =
+        std::sync::OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        use tracing_subscriber::prelude::*;
+
+        let capture = common::audit_capture::Capture::default();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(
+                capture
+                    .clone()
+                    .with_filter(tracing_subscriber::EnvFilter::new("trawl_server=info")),
+            ),
+        )
+        .expect("this binary installs its one global subscriber here");
+        capture
+    })
+}
+
+/// Every captured `event_type` event whose `field` is exactly `value`.
+fn logged(event_type: &str, field: &str, value: i64) -> Vec<common::audit_capture::Captured> {
+    let event_type = format!("{event_type:?}");
+    let value = value.to_string();
+    tick_log()
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.fields.get("event_type") == Some(&event_type) && e.fields.get(field) == Some(&value)
+        })
+        .collect()
+}
+
+/// A claim stuck on a row lock ends at its deadline. With the oldest due
+/// schedule's saved query held `FOR UPDATE` by a fixture, its claim ends
+/// after [`CLAIM_WAIT`] as `wait_expired`, leaves its cursor, watermark
+/// and run budget, and gives its lease back: on a pool with one scheduled
+/// lease, the same tick starts the next due schedule under it. A listing
+/// that runs out, behind a fixture's `ACCESS EXCLUSIVE` lock on
+/// `schedules`, ends the tick with nothing claimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_stuck_on_a_row_lock_ends_at_its_deadline() {
+    tick_log();
+    let h = harness_with(2).await;
+    // Equal cursors: the listing's tie-break, the id, puts `stuck` first.
+    let stuck = h
+        .schedule("stuck", DSL, Some(ScheduleWindow::SinceLast), 3600, 0)
+        .await;
+    let next = h
+        .schedule("next", DSL, Some(ScheduleWindow::SinceLast), 3600, 0)
+        .await;
+    let stuck_schedule = h
+        .schedules
+        .get_schedule_for_saved_query(stuck, h.key_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let now = at(Duration::seconds(3));
+    let before = h.claim_state(stuck).await;
+    assert!(before.1.is_some(), "a since_last schedule has a watermark");
+
+    let mut lock = h.app_pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(stuck)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let ticked = std::time::Instant::now();
+    let handles = tokio::time::timeout(3 * CLAIM_WAIT, h.spawn_tick(TIMEOUT_SECS, now))
+        .await
+        .expect("the stuck claim ends at its deadline");
+    let waited = ticked.elapsed();
+    lock.rollback().await.unwrap();
+
+    assert!(waited >= CLAIM_WAIT, "the claim waited {waited:?}");
+    assert_eq!(
+        handles.len(),
+        1,
+        "the stuck claim gave the one lease back, and the next schedule started under it"
+    );
+    for handle in handles {
+        handle.await.expect("a scheduled execution must not panic");
+    }
+    let expired = logged("scheduler_error", "schedule_id", stuck_schedule);
+    assert_eq!(expired.len(), 1, "{expired:?}");
+    assert_eq!(expired[0].field("error_class"), "\"wait_expired\"");
+    assert!(h.runs(stuck).await.is_empty());
+    assert_eq!(
+        h.claim_state(stuck).await,
+        before,
+        "cursor, watermark and run budget"
+    );
+    let runs = h.runs(next).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].status, RunStatus::Success, "{runs:?}");
+    until("every lease is back", || async {
+        h.pool.scheduled_leases_available() == 1
+    })
+    .await;
+
+    // A listing that runs out ends the tick: `stuck` is still due.
+    let mut lock = h.app_pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE schedules IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let ticked = std::time::Instant::now();
+    let handles = tokio::time::timeout(3 * CLAIM_WAIT, h.spawn_tick(TIMEOUT_SECS, now))
+        .await
+        .expect("the listing ends at its deadline");
+    let waited = ticked.elapsed();
+    lock.rollback().await.unwrap();
+    assert!(waited >= CLAIM_WAIT, "the listing waited {waited:?}");
+    assert!(handles.is_empty(), "the tick ended at its listing");
+    assert!(h.runs(stuck).await.is_empty());
+    assert_eq!(h.claim_state(stuck).await, before);
+
+    // Nothing else held it back: with the lock gone, the next tick runs it.
+    h.tick(now).await;
+    let runs = h.runs(stuck).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].status, RunStatus::Success, "{runs:?}");
+}
+
+/// A manual claim stuck on a row lock answers 503 `service_unavailable`
+/// at its deadline, having claimed nothing, and its lease is back before
+/// the answer: once the lock goes, the key's next press answers 200.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_claim_stuck_on_a_row_lock_answers_503() {
+    let server = common::setup().await;
+    let key_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let (saved, _) = server_net(&server, key_id, "stuck_manual", None, None).await;
+    let db = common::fixture_pool(&server.app_db_url, 2).await;
+    let pool = &server.state.query.pool;
+    let client =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let before = claim_snapshot(&server, &db, key_id, saved).await;
+
+    let mut lock = db.begin().await.unwrap();
+    sqlx::query("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(saved)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let pressed = std::time::Instant::now();
+    let outcome = tokio::time::timeout(3 * CLAIM_WAIT, client.trigger_run(saved))
+        .await
+        .expect("the stuck claim ends at its deadline");
+    let waited = pressed.elapsed();
+    let held = pool.manual_leases_in_use();
+    lock.rollback().await.unwrap();
+
+    match outcome {
+        Err(trawl_client::ClientError::Server {
+            status: 503, error, ..
+        }) => assert_eq!(error.code, trawl_api::ErrorCode::ServiceUnavailable),
+        other => panic!("expected 503 service_unavailable, got {other:?}"),
+    }
+    assert!(waited >= CLAIM_WAIT, "the claim waited {waited:?}");
+    assert_eq!(held, 0, "the lease was back before the 503 answered");
+    assert_eq!(
+        claim_snapshot(&server, &db, key_id, saved).await,
+        before,
+        "the claim that ran out claimed nothing"
+    );
+
+    let run = client
+        .trigger_run(saved)
+        .await
+        .expect("with the lock gone the key's next press runs");
+    assert_eq!(
+        settled_runs(&server, &db, saved).await,
+        [(run.id, "success".to_owned(), true, None)]
+    );
 }

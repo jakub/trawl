@@ -40,12 +40,13 @@ use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
 use crate::query_timing::{ExportFormat, Outcome, TimingGuard, TimingKind};
 use crate::report_window::{ScheduleWindow, format_window_bound};
-use crate::scheduler::{CLAIM_WAIT, execute_scheduled_query};
+use crate::scheduler::execute_scheduled_query;
 use crate::shape::shaped;
 use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
-    ClaimedManualRun, HistoryEntry, ManualRunClaim, ReportRun, RunOrigin, RunStatus, SavedQuery,
-    Schedule, ScheduleWithStats, StoreError, format_interval, parse_duration_secs, parse_interval,
+    CLAIM_WAIT, ClaimedManualRun, HistoryEntry, ManualRunClaim, ReportRun, RunOrigin, RunStatus,
+    SavedQuery, Schedule, ScheduleWithStats, StoreError, format_interval, parse_duration_secs,
+    parse_interval,
 };
 use crate::transport::http::RequestId;
 use trawl_engine::timing::QueryPhase;
@@ -3236,7 +3237,7 @@ pub async fn trigger_run(
         // check rides the first lock, so this handler takes no snapshot of
         // its own: what the run executes is what the claim recorded.
         let claim = schedule_store
-            .claim_manual_run(saved_id, key_id, max_catchup_intervals)
+            .claim_manual_run(saved_id, key_id, max_catchup_intervals, &lease)
             .await;
         let claimed = match started_manual_run(claim) {
             Ok(claimed) => claimed,

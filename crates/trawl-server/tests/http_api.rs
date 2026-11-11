@@ -17,6 +17,7 @@ use common::{roles, setup, setup_with_query_timeout, setup_with_rate_limit};
 use fleet_auth::{KeyStore, PrincipalKind};
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::pool::RunLease;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn health_returns_ok() {
@@ -6862,7 +6863,7 @@ async fn tick(
 ) -> trawl_server::store::DueClaim {
     tick_store(server)
         .await
-        .claim_due_run(schedule_id, now, 24)
+        .claim_due_run(schedule_id, now, 24, &RunLease::unattached())
         .await
         .unwrap()
 }
@@ -7003,8 +7004,10 @@ async fn failed_manual_run_leaves_overdue_tick_claimable() {
 
         // The store's own claim, so the run's outcome is the test's choice
         // rather than whatever the corpus makes of the query.
-        let ManualRunClaim::Started(claimed) =
-            store.claim_manual_run(saved.id, key_id, 24).await.unwrap()
+        let ManualRunClaim::Started(claimed) = store
+            .claim_manual_run(saved.id, key_id, 24, &RunLease::unattached())
+            .await
+            .unwrap()
         else {
             panic!("{name}: the manual claim must start");
         };
@@ -7063,8 +7066,10 @@ async fn a_second_finish_of_a_terminal_manual_run_moves_no_cursor() {
         .await
         .unwrap();
 
-    let ManualRunClaim::Started(claimed) =
-        store.claim_manual_run(saved.id, key_id, 24).await.unwrap()
+    let ManualRunClaim::Started(claimed) = store
+        .claim_manual_run(saved.id, key_id, 24, &RunLease::unattached())
+        .await
+        .unwrap()
     else {
         panic!("the manual claim must start");
     };
@@ -7179,8 +7184,11 @@ async fn every_claim_stamps_started_at_from_the_app_clock_after_its_locks() {
     // a clock reading, not the tick's planning instant.
     let tick_now = overdue + minutes(30);
     let claimant = store.clone();
-    let claim =
-        tokio::spawn(async move { claimant.claim_due_run(schedule.id, tick_now, 24).await });
+    let claim = tokio::spawn(async move {
+        claimant
+            .claim_due_run(schedule.id, tick_now, 24, &RunLease::unattached())
+            .await
+    });
 
     // Barrier: the claim is queued on the held row, so its transaction
     // (and with it the database's `now()`) has already begun.
@@ -7214,8 +7222,10 @@ async fn every_claim_stamps_started_at_from_the_app_clock_after_its_locks() {
 
     // The manual run claimed next is the latest by the same clock.
     let before_manual = now_micros();
-    let ManualRunClaim::Started(manual) =
-        store.claim_manual_run(saved.id, key_id, 24).await.unwrap()
+    let ManualRunClaim::Started(manual) = store
+        .claim_manual_run(saved.id, key_id, 24, &RunLease::unattached())
+        .await
+        .unwrap()
     else {
         panic!("the manual claim must start");
     };

@@ -25,6 +25,7 @@ use trawl_server::bus::{EventBus as _, EventSubscriber as _, LocalSubscriber};
 use trawl_server::config::{CaptureConfig, RateLimitConfig};
 use trawl_server::ingest::publication_marker::{OutputIdentity, identity_of};
 use trawl_server::ingest::rollup_marker::{RollupMarker, marker_file_name};
+use trawl_server::pool::RunLease;
 use trawl_server::publication::CorpusUnsettled;
 use trawl_server::report_window::ScheduleWindow;
 use trawl_server::state::AppState;
@@ -388,7 +389,7 @@ async fn plant_running(server: &TestServer, saved_id: i64) -> i64 {
         .state
         .storage
         .schedule
-        .claim_manual_run(saved_id, key_id, 24)
+        .claim_manual_run(saved_id, key_id, 24, &RunLease::unattached())
         .await
         .unwrap()
     {

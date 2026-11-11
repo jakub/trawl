@@ -16,6 +16,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 use common::userns::Userns;
 use sqlx::{Connection as _, Executor as _, PgConnection, PgPool};
+use trawl_server::pool::RunLease;
 use trawl_server::repin::marker::{RepinMarker, RepinPhase, write_marker};
 
 const LOCK_KEY: i64 = 0x0074_7261_776c_2131;
@@ -815,7 +816,7 @@ async fn stale_report_run_recovery_failure_refuses_before_listening() {
         .await
         .unwrap();
     let trawl_server::store::ManualRunClaim::Started(planted) = schedules
-        .claim_manual_run(saved.id, key_id, 24)
+        .claim_manual_run(saved.id, key_id, 24, &RunLease::unattached())
         .await
         .unwrap()
     else {
