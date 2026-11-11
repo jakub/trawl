@@ -214,7 +214,7 @@ async fn harness_with(permits: usize) -> Harness {
     let fleet_pool = common::fleet_pool(&fleet_db_url).await;
     let key_store = common::fleet_keystore(&fleet_pool).await;
     // trawl-analyst resolves both `query` and `saved_query`, the two
-    // permissions `owning_key_is_usable` demands of a schedule's owner.
+    // permissions the tick's key check demands of a schedule's owner.
     let key = key_store
         .create_key(
             "scheduler-key",
@@ -2518,7 +2518,9 @@ async fn finishing_keeps_the_lease() {
 /// too, so the capture is the global subscriber, and a process has one:
 /// under nextest each test is a process of its own, while under `cargo
 /// test` this binary's tests share it. Each test reads only the events
-/// naming a schedule or a key it created ([`logged`]).
+/// naming a schedule or a key it created ([`logged`]). Those ids are local
+/// to each test's databases, so the filter is exact only in a process of
+/// one test, as nextest runs them.
 fn tick_log() -> &'static common::audit_capture::Capture {
     static CAPTURE: std::sync::OnceLock<common::audit_capture::Capture> =
         std::sync::OnceLock::new();
@@ -2693,4 +2695,161 @@ async fn a_manual_claim_stuck_on_a_row_lock_answers_503() {
         settled_runs(&server, &db, saved).await,
         [(run.id, "success".to_owned(), true, None)]
     );
+}
+
+// ---------------------------------------------------------------------------
+// the key memo (ADR-0018, amended 2026-11-11)
+// ---------------------------------------------------------------------------
+
+/// Mint a key that can run scheduled queries and give it one hourly
+/// schedule per name, each with its fire cursor at [`t0`], in that order.
+/// Returns the key and the saved-query ids.
+async fn key_with_schedules(
+    h: &Harness,
+    key: &str,
+    names: &[&str],
+) -> (fleet_auth::CreatedKey, Vec<i64>) {
+    let key = h
+        .key_store
+        .create_key(
+            key,
+            PrincipalKind::Service,
+            &common::roles(&["trawl-analyst"]),
+            None,
+        )
+        .await
+        .expect("mint the schedules' owning key");
+    let mut saved_ids = Vec::new();
+    for name in names {
+        let saved = h
+            .saved
+            .create(key.info.id, name, DSL)
+            .await
+            .expect("create saved query");
+        h.schedules
+            .create_schedule(saved.id, key.info.id, 3600, None, None, 0, t0())
+            .await
+            .expect("create schedule");
+        saved_ids.push(saved.id);
+    }
+    (key, saved_ids)
+}
+
+/// A schedule's fire cursor and its runs, as a skipped claim leaves them.
+async fn untouched(h: &Harness, saved_id: i64, key_id: i64) -> (DateTime<Utc>, usize) {
+    let schedule = h
+        .schedules
+        .get_schedule_for_saved_query(saved_id, key_id)
+        .await
+        .expect("read schedule")
+        .expect("schedule exists");
+    let runs = h
+        .schedules
+        .list_runs(saved_id, key_id, 100, 0)
+        .await
+        .expect("list runs");
+    (schedule.next_fire_at, runs.len())
+}
+
+/// An unusable key is checked once per tick. Three due schedules of one
+/// revoked key cost the tick one key lookup and one `scheduler_skip`
+/// naming the key with `schedules = 3`, and none of them is claimed. The
+/// next tick remembers nothing of this one: it looks the key up again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unusable_key_is_checked_once_per_tick() {
+    tick_log();
+    let h = harness().await;
+    let (key, saved_ids) = key_with_schedules(&h, "revoked-owner", &["one", "two", "three"]).await;
+    h.key_store
+        .revoke_key(&key.info.prefix)
+        .await
+        .expect("revoke the owning key");
+    let seams = h.pool.seams();
+    let checked = seams.watch(trawl_server::pool::seam::Seam::KeyChecked);
+    let now = at(Duration::seconds(3));
+
+    let handles = h.spawn_tick(TIMEOUT_SECS, now).await;
+    assert!(
+        handles.is_empty(),
+        "a revoked key's schedules start nothing"
+    );
+    assert_eq!(
+        checked.arrivals(),
+        1,
+        "one lookup for the key's three schedules"
+    );
+    let skips = logged("scheduler_skip", "key_id", key.info.id);
+    assert_eq!(skips.len(), 1, "{skips:?}");
+    assert_eq!(skips[0].field("schedules"), "3", "{skips:?}");
+    for saved_id in &saved_ids {
+        assert_eq!(untouched(&h, *saved_id, key.info.id).await, (t0(), 0));
+    }
+
+    let handles = h.spawn_tick(TIMEOUT_SECS, now).await;
+    assert!(handles.is_empty());
+    assert_eq!(
+        checked.arrivals(),
+        2,
+        "the next tick looks the key up again"
+    );
+    assert_eq!(logged("scheduler_skip", "key_id", key.info.id).len(), 2);
+}
+
+/// A usable key is checked at every claim. Two due schedules of one key
+/// share a tick; the first claim waits on a fixture's row lock on its
+/// saved query while the key is revoked. The first claim, checked before
+/// the revocation, runs. The second is checked again, after it, and is
+/// refused: its cursor stays, it has no run, and the tick logs one
+/// `scheduler_skip` for the key with `schedules = 1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_usable_key_is_checked_at_every_claim() {
+    tick_log();
+    // Two scheduled leases, so a free lease never ends the tick early.
+    let h = harness_with(4).await;
+    let (key, saved_ids) = key_with_schedules(&h, "revoked-mid-tick", &["first", "second"]).await;
+    let (first, second) = (saved_ids[0], saved_ids[1]);
+    let seams = h.pool.seams();
+    let checked = seams.watch(trawl_server::pool::seam::Seam::KeyChecked);
+    let now = at(Duration::seconds(3));
+
+    let mut lock = h.app_pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(first)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let revoke_mid_claim = async {
+        until("the first claim waits on its row lock", || async {
+            lock_waiters(&h.app_pool).await == 1
+        })
+        .await;
+        assert_eq!(
+            checked.arrivals(),
+            1,
+            "only the first claim was checked so far"
+        );
+        h.key_store
+            .revoke_key(&key.info.prefix)
+            .await
+            .expect("revoke the owning key");
+        lock.rollback().await.unwrap();
+    };
+    let (handles, ()) = tokio::join!(h.spawn_tick(TIMEOUT_SECS, now), revoke_mid_claim);
+
+    assert_eq!(handles.len(), 1, "only the first claim started");
+    for handle in handles {
+        handle.await.expect("a scheduled execution must not panic");
+    }
+    assert_eq!(checked.arrivals(), 2, "each claim looked the key up");
+    let runs = h
+        .schedules
+        .list_runs(first, key.info.id, 100, 0)
+        .await
+        .expect("list runs");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].status, RunStatus::Success, "{runs:?}");
+    assert_eq!(untouched(&h, second, key.info.id).await, (t0(), 0));
+    let skips = logged("scheduler_skip", "key_id", key.info.id);
+    assert_eq!(skips.len(), 1, "{skips:?}");
+    assert_eq!(skips[0].field("schedules"), "1", "{skips:?}");
 }

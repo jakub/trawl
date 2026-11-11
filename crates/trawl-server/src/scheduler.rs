@@ -14,6 +14,7 @@
 //! results ([`crate::results::sweep::sweep`], ADR-0018 as amended by
 //! ADR-0057).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -218,6 +219,11 @@ impl CorpusWatch {
 /// database and gives up ends the tick the same way (ADR-0018, amended
 /// 2026-11-11).
 ///
+/// Each schedule's owning key is checked before its claim. A key found
+/// unusable is remembered for the rest of the tick and logged once, as one
+/// `scheduler_skip` counting the schedules the tick skipped for it. A key
+/// found usable is checked again at its next claim.
+///
 /// While the corpus is unsettled (ADR-0041) the poll claims nothing. A
 /// claim moves the fire cursor in the transaction that plans the window,
 /// so a run the corpus gate refused afterwards would lose that window. The
@@ -234,16 +240,60 @@ pub async fn poll_and_execute(
     timeout_secs: u64,
     now: DateTime<Utc>,
 ) -> Vec<JoinHandle<()>> {
-    let mut spawned = Vec::new();
+    let mut tick = Tick::default();
+    claim_due(
+        schedule_store,
+        key_store,
+        pool,
+        config,
+        timeout_secs,
+        now,
+        &mut tick,
+    )
+    .await;
+    // Every exit of the claim pass, an early one included, comes back here,
+    // so each unusable key is logged once per tick whichever way it ended.
+    for (&key_id, &schedules) in &tick.unusable {
+        tracing::info!(
+            event_type = "scheduler_skip",
+            key_id,
+            schedules,
+            "skipped this key's due schedules: it is revoked, expired, or lacks query/saved-query permission"
+        );
+    }
+    tick.spawned
+}
 
+/// What one tick did, for [`poll_and_execute`] to hand back and log.
+#[derive(Default)]
+struct Tick {
+    /// The executions the tick spawned.
+    spawned: Vec<JoinHandle<()>>,
+    /// Each owning key the tick found unusable, with how many of the
+    /// schedules it listed were skipped for that key. Only an unusable
+    /// answer is remembered, and only for this tick.
+    unusable: BTreeMap<i64, u64>,
+}
+
+/// The claim pass of [`poll_and_execute`], recording into `tick`. Every
+/// return here is a tick exit; the caller logs `tick` after any of them.
+async fn claim_due(
+    schedule_store: &ScheduleStore,
+    key_store: &KeyStore,
+    pool: &ExecutorPool,
+    config: &SchedulerConfig,
+    timeout_secs: u64,
+    now: DateTime<Utc>,
+    tick: &mut Tick,
+) {
     if pool.publication().unsettled().is_some() {
-        return spawned;
+        return;
     }
 
     // With no lease free the tick could claim nothing, so it lists
     // nothing. Only an observation: each claim below takes its own lease.
     if pool.scheduled_leases_available() == 0 {
-        return spawned;
+        return;
     }
 
     // Each page starts after the last row the previous page LISTED. No
@@ -271,7 +321,7 @@ pub async fn poll_and_execute(
                     cause_kind = fault.cause_kind().as_str(),
                     "failed to list due schedules"
                 );
-                return spawned;
+                return;
             }
         };
         let last_page = page.len() < DUE_SCHEDULE_PAGE;
@@ -284,15 +334,31 @@ pub async fn poll_and_execute(
             // schedule covers the whole outage in one window once the key is
             // usable again, instead of losing every boundary that passed
             // while it was not.
-            if !owning_key_is_usable(key_store, due.id, due.key_id).await {
+            //
+            // An unusable answer holds for the rest of the tick, so a key
+            // with many due schedules is looked up once. A usable answer is
+            // never remembered: each claim asks again, so a key revoked
+            // between two claims of one tick refuses the second.
+            if let Some(skipped) = tick.unusable.get_mut(&due.key_id) {
+                *skipped += 1;
                 continue;
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            pool.reach(crate::pool::seam::Seam::KeyChecked);
+            match owning_key(key_store, due.id, due.key_id).await {
+                KeyCheck::Usable => {}
+                KeyCheck::Unusable => {
+                    tick.unusable.insert(due.key_id, 1);
+                    continue;
+                }
+                KeyCheck::LookupFailed => continue,
             }
 
             // The lease comes before the claim too: a claim moves the cursor
             // and starts a run row, which needs a lease to run under. No
             // free lease ends the tick.
             let Some(lease) = pool.try_lease_scheduled() else {
-                return spawned;
+                return;
             };
             let Some((claimed, lease)) = claim_leased(
                 schedule_store,
@@ -322,7 +388,7 @@ pub async fn poll_and_execute(
             let store = schedule_store.clone();
             let pool = pool.clone();
 
-            spawned.push(tokio::spawn(async move {
+            tick.spawned.push(tokio::spawn(async move {
                 execute_scheduled_query(
                     store,
                     pool,
@@ -337,7 +403,7 @@ pub async fn poll_and_execute(
         }
 
         if last_page {
-            return spawned;
+            return;
         }
     }
 }
@@ -409,6 +475,20 @@ pub(crate) fn note_truncated_window(schedule_id: i64, run_id: i64, window: &Repo
     );
 }
 
+/// What a tick learned about a schedule's owning key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCheck {
+    /// Live, with both permissions: the claim may go ahead. Never
+    /// remembered, so the next claim of the same key asks again.
+    Usable,
+    /// Revoked, expired, gone, or short of a permission. Remembered for
+    /// the rest of the tick and logged once per key when the tick ends.
+    Unusable,
+    /// The keystore could not answer. Logged for each schedule and never
+    /// remembered: an outage is no proof that the key is gone.
+    LookupFailed,
+}
+
 /// Whether the schedule's owning key may still run scheduled queries.
 ///
 /// It must be live in the fleet keystore (active and unexpired) and its
@@ -417,8 +497,9 @@ pub(crate) fn note_truncated_window(schedule_id: i64, run_id: i64, window: &Repo
 /// run exercises. Revocation, expiry and role changes (analyst to
 /// reader/ingest) therefore all stop scheduled execution: a key that
 /// cannot create or run saved queries interactively must not keep running
-/// them on a schedule. Lookup failures skip conservatively.
-async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i64) -> bool {
+/// them on a schedule. Lookup failures skip conservatively, as
+/// [`KeyCheck::LookupFailed`].
+async fn owning_key(key_store: &KeyStore, schedule_id: i64, key_id: i64) -> KeyCheck {
     let live = match key_store.get_live_key_by_id(key_id).await {
         Ok(live) => live,
         Err(e) => {
@@ -443,21 +524,16 @@ async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i6
                 cause_kind = cause_kind.as_str(),
                 "failed to check key liveness; skipping schedule this tick"
             );
-            return false;
+            return KeyCheck::LookupFailed;
         }
     };
-    let usable = live.is_some_and(|k| {
+    if live.is_some_and(|k| {
         k.has_permission(Permission::Query) && k.has_permission(Permission::SavedQuery)
-    });
-    if !usable {
-        tracing::info!(
-            event_type = "scheduler_skip",
-            schedule_id,
-            key_id,
-            "skipping schedule: owning key is revoked, expired, or lacks query/saved-query permission"
-        );
+    }) {
+        KeyCheck::Usable
+    } else {
+        KeyCheck::Unusable
     }
-    usable
 }
 
 /// Execute one claimed run and record its outcome on its run row.
