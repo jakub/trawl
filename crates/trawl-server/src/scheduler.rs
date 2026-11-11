@@ -26,7 +26,7 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::error::{CauseKind, ServerError};
 use crate::policy::{Permission, TrawlAuthz as _};
-use crate::pool::{ExecutorPool, ScheduledLease};
+use crate::pool::{ExecutorPool, RunLease};
 use crate::publication::CorpusUnsettled;
 use crate::query_timing::{Outcome, TimingGuard};
 use crate::report_window::{ReportWindow, format_window_bound, truncate_to_micros};
@@ -351,8 +351,8 @@ async fn claim_leased(
     schedule_id: i64,
     now: DateTime<Utc>,
     max_catchup_intervals: u32,
-    lease: ScheduledLease,
-) -> Option<(ClaimedRun, ScheduledLease)> {
+    lease: RunLease,
+) -> Option<(ClaimedRun, RunLease)> {
     match schedule_store
         .claim_due_run(schedule_id, now, max_catchup_intervals)
         .await
@@ -470,9 +470,9 @@ pub(crate) async fn execute_scheduled_query(
     query: &str,
     _query_name: &str,
     timeout_secs: u64,
-    lease: Option<ScheduledLease>,
+    lease: Option<RunLease>,
 ) {
-    let lease = lease.map(ScheduledLease::into_hold);
+    let lease = lease.map(RunLease::into_hold);
     let start = std::time::Instant::now();
     // One budget for this attempt, stamped before the first pool wait
     // (ADR-0024): a scheduled run that spends its whole timeout queueing

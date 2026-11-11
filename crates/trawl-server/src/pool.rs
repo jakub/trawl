@@ -248,24 +248,57 @@ pub(crate) fn scheduled_cap(permits: usize) -> usize {
     (permits / 2).max(1)
 }
 
-/// One scheduled run's place in the cap on scheduled runs in flight
+/// One run's place in a cap on runs in flight: a scheduled run's
 /// ([`ExecutorPool::try_lease_scheduled`]).
 ///
-/// Clones share one permit, which returns when the last clone drops. A
-/// run's place lasts until its physical work ends, not until its request
-/// does: the run, its preparation job and its executor work each keep a
-/// clone, so a run that timed out keeps its place while its work still
-/// runs.
-#[derive(Debug, Clone)]
-pub struct ScheduledLease(Arc<OwnedSemaphorePermit>);
+/// Clones share one charge, which returns its place when the last clone
+/// drops. A run's place lasts until its physical work ends, not until its
+/// request does: the run, its preparation job and its executor work each
+/// keep a clone, so a run that timed out keeps its place while its work
+/// still runs.
+#[derive(Clone)]
+pub struct RunLease {
+    /// The place itself, returned when the last clone of it drops.
+    charge: Arc<dyn Any + Send + Sync>,
+    /// The seams of the pool that granted this lease, for work that has no
+    /// slot to carry them (see [`seam`]).
+    #[cfg(any(test, feature = "test-support"))]
+    seams: Arc<seam::Table>,
+}
 
-impl ScheduledLease {
+impl std::fmt::Debug for RunLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunLease").finish_non_exhaustive()
+    }
+}
+
+impl RunLease {
     /// This lease as a charge that work keeps until it stops
-    /// ([`WorkContext::holding`]): the same shared permit, never a second
+    /// ([`WorkContext::holding`]): the same shared place, never a second
     /// one.
     #[must_use]
     pub fn into_hold(self) -> Arc<dyn Any + Send + Sync> {
-        self.0
+        self.charge
+    }
+
+    /// A lease that holds no place in any cap, with seams of its own, for
+    /// store-level tests that claim a run with no pool. Never a stand-in
+    /// for a real lease in production code.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn unattached() -> Self {
+        Self {
+            charge: Arc::new(()),
+            seams: Arc::new(seam::Table::default()),
+        }
+    }
+
+    /// The worker's side of the granting pool's seams, for run work that
+    /// has no slot to carry them: a claim's window resolution
+    /// ([`seam::Seam::Resolving`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reach(&self, seam: seam::Seam) {
+        self.seams.reach(seam);
     }
 }
 
@@ -1048,6 +1081,15 @@ pub mod seam {
         /// it sends its answer: the job still holds its slot. The
         /// preparation allowance only.
         Prepared,
+        /// In a run claim's window resolution on the blocking pool, while
+        /// the resolution holds a clone of the run's lease. Reached
+        /// through [`super::RunLease::reach`].
+        Resolving,
+        /// On the scheduler tick's task, before each live lookup of a
+        /// schedule's owning key. A test may watch this seam to count the
+        /// lookups and must never hold it: a hold parks a runtime thread,
+        /// not a blocking worker.
+        KeyChecked,
     }
 
     /// A held (or merely watched) worker seam.
@@ -1487,7 +1529,7 @@ pub struct ExecutorPool {
     /// cores and this pool's permits.
     preparation: crate::prepare::Preparation,
     /// The cap on scheduled runs in flight ([`scheduled_cap`]), one
-    /// permit per [`ScheduledLease`].
+    /// permit per scheduled [`RunLease`].
     scheduled: Arc<Semaphore>,
     /// The query scratch directory: the query database spills into it, and
     /// hot-buffer snapshots and export staging files are made in it
@@ -2774,11 +2816,15 @@ impl ExecutorPool {
     /// one: the scheduler claims a due run only while it holds a lease
     /// (ADR-0018, amended 2026-11-09).
     #[must_use]
-    pub fn try_lease_scheduled(&self) -> Option<ScheduledLease> {
+    pub fn try_lease_scheduled(&self) -> Option<RunLease> {
         Arc::clone(&self.scheduled)
             .try_acquire_owned()
             .ok()
-            .map(|permit| ScheduledLease(Arc::new(permit)))
+            .map(|permit| RunLease {
+                charge: Arc::new(permit),
+                #[cfg(any(test, feature = "test-support"))]
+                seams: Arc::clone(&self.seams),
+            })
     }
 
     /// How many scheduled-run leases are free right now.
