@@ -382,6 +382,10 @@ pub struct InvestigationStore {
     /// results store this one was made from.
     #[cfg(any(test, feature = "test-support"))]
     faults: std::sync::Arc<super::results::fault::Faults>,
+    /// The bounded statements' budgets a test reads, this store's own and
+    /// shared by its clones ([`StatementRecord`]).
+    #[cfg(any(test, feature = "test-support"))]
+    statements: std::sync::Arc<StatementRecord>,
 }
 
 impl InvestigationStore {
@@ -392,6 +396,8 @@ impl InvestigationStore {
             pool,
             #[cfg(any(test, feature = "test-support"))]
             faults: std::sync::Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            statements: std::sync::Arc::default(),
         }
     }
 
@@ -405,7 +411,19 @@ impl InvestigationStore {
         pool: PgPool,
         faults: std::sync::Arc<super::results::fault::Faults>,
     ) -> Self {
-        Self { pool, faults }
+        Self {
+            pool,
+            faults,
+            statements: std::sync::Arc::default(),
+        }
+    }
+
+    /// This store's [`StatementRecord`], shared by its clones.
+    /// Test-support code.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn statement_record(&self) -> &StatementRecord {
+        &self.statements
     }
 
     /// Create the investigation unless its id is taken.
@@ -694,6 +712,8 @@ impl InvestigationStore {
     ) -> Result<Citing, StoreError> {
         let text = encode_payload(payload)?;
         let mut tx = WriteTx::begin(&self.pool, LockWait::Until(deadline)).await?;
+        #[cfg(any(test, feature = "test-support"))]
+        tx.record_in(&self.statements, "append_citing");
         let cited = citing_in(&mut tx, id, actor, payload, &text, promote, now, retention).await;
         let cited = match cited {
             Ok(cited) => cited,
@@ -730,6 +750,8 @@ impl InvestigationStore {
         }
         let text = encode_payload(payload)?;
         let mut tx = WriteTx::begin(&self.pool, LockWait::Until(deadline)).await?;
+        #[cfg(any(test, feature = "test-support"))]
+        tx.record_in(&self.statements, "begin_step");
         let appended = append_open_in(&mut tx, id, actor, payload, &text, now, retention).await;
         tx.finish(appended).await
     }
@@ -958,6 +980,8 @@ impl InvestigationStore {
         wait: LockWait,
     ) -> Result<bool, StoreError> {
         let mut tx = WriteTx::begin(&self.pool, wait).await?;
+        #[cfg(any(test, feature = "test-support"))]
+        tx.record_in(&self.statements, "complete_step_until");
         let filled = match lock_for_write(&mut tx, id, now).await {
             Ok((locked, _)) => {
                 fill_step_in(&mut tx, id, locked, step_seq, outcome, now, slide).await
@@ -1296,6 +1320,57 @@ pub(crate) enum LockWait {
     Until(Deadline),
 }
 
+/// The `statement_timeout` each statement of a store's bounded
+/// investigation writes was given, for a test to read. Test-support code.
+///
+/// Once armed, it holds one entry per write transaction under
+/// [`LockWait::Until`], in the order the transactions began, named by the
+/// store method that began it (`begin_step`, `append_citing` or
+/// `complete_step_until`). Each entry lists, in milliseconds and in order,
+/// the timeout [`WriteTx::run`] set before each statement, recorded once
+/// Postgres accepted the setting and before the statement was sent. Each
+/// [`InvestigationStore`] owns its record, shared by its clones, so a test
+/// reads only its own server's writes; nothing is recorded until the test
+/// arms it.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct StatementRecord(parking_lot::Mutex<Option<Vec<(&'static str, Budgets)>>>);
+
+/// One recorded transaction's timeouts, shared by the record and the
+/// transaction's [`WriteTx`].
+#[cfg(any(test, feature = "test-support"))]
+type Budgets = std::sync::Arc<parking_lot::Mutex<Vec<u128>>>;
+
+#[cfg(any(test, feature = "test-support"))]
+impl StatementRecord {
+    /// Record from now on, from an empty record.
+    pub fn arm(&self) {
+        *self.0.lock() = Some(Vec::new());
+    }
+
+    /// Every write transaction recorded since [`Self::arm`], named, with
+    /// its statements' timeouts in milliseconds; empty while unarmed.
+    #[must_use]
+    pub fn writes(&self) -> Vec<(&'static str, Vec<u128>)> {
+        self.0
+            .lock()
+            .iter()
+            .flatten()
+            .map(|(write, budgets)| (*write, budgets.lock().clone()))
+            .collect()
+    }
+
+    /// A new entry for a transaction of `write`, while armed.
+    fn open(&self, write: &'static str) -> Option<Budgets> {
+        let budgets = Budgets::default();
+        self.0
+            .lock()
+            .as_mut()?
+            .push((write, std::sync::Arc::clone(&budgets)));
+        Some(budgets)
+    }
+}
+
 /// The transaction of an investigation write (module docs). Its
 /// connection is reachable only through [`Self::run`], one statement at a
 /// time, so under [`LockWait::Until`] no statement of the write waits past
@@ -1310,6 +1385,10 @@ pub(crate) struct WriteTx {
     /// session, never by a rollback that would first have to read that
     /// answer ([`PooledTransaction`]).
     cut: bool,
+    /// Where [`Self::run`] records each statement's timeout, for a
+    /// transaction a test's armed [`StatementRecord`] watches.
+    #[cfg(any(test, feature = "test-support"))]
+    budgets: Option<Budgets>,
 }
 
 impl WriteTx {
@@ -1339,6 +1418,8 @@ impl WriteTx {
             tx,
             wait,
             cut: false,
+            #[cfg(any(test, feature = "test-support"))]
+            budgets: None,
         };
         match wait {
             LockWait::Until(deadline) if deadline.expired() => {
@@ -1377,11 +1458,27 @@ impl WriteTx {
         let Some(millis) = timeout_millis(deadline.remaining()) else {
             return Err(StoreError::WaitExpired);
         };
+        #[cfg(any(test, feature = "test-support"))]
+        let budgets = self.budgets.clone();
         self.within(deadline, async move |tx| {
             statement_timeout(tx, &format!("{millis}ms")).await?;
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(budgets) = budgets {
+                budgets.lock().push(millis);
+            }
             Ok(statement(tx).await?)
         })
         .await
+    }
+
+    /// Record each statement's timeout in `record`, as a transaction of
+    /// `write`, when `record` is armed and the transaction runs under a
+    /// deadline. Test-support code.
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_in(&mut self, record: &StatementRecord, write: &'static str) {
+        if matches!(self.wait, LockWait::Until(_)) {
+            self.budgets = record.open(write);
+        }
     }
 
     /// Await `io` on the connection no later than `deadline`. Cut short,

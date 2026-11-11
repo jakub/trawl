@@ -372,10 +372,37 @@ fn status_warns_only_about_variables_that_move_commands() {
     }
 }
 
-/// A free loopback port, for `up`'s bind test.
-fn free_port() -> String {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.local_addr().unwrap().port().to_string()
+/// `N` distinct free loopback ports, for a child whose preflight binds
+/// them itself. Every listener stays bound until all `N` ports are chosen,
+/// so no two ports match; they are dropped on return, which a caller does
+/// right before the spawn.
+///
+/// The ports come from below the kernel's ephemeral range (it starts at
+/// 32768 on Linux and at 49152 on macOS). The kernel never gives such a
+/// port to a bind to port 0 or to an outgoing connection, which is what
+/// every other test on a busy machine asks for.
+///
+/// Residual exposure: between that drop and the child's own bind, a
+/// process that asks for one of these ports by number can still take it:
+/// a service with a fixed port, or another call of this helper that draws
+/// the same number. The child must bind the port itself, so no test can
+/// hold it across the spawn.
+fn free_ports<const N: usize>() -> [u16; N] {
+    use rand::Rng as _;
+
+    let mut rng = rand::thread_rng();
+    let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
+        for _ in 0..1_000 {
+            let port = rng.gen_range(20_000..32_768);
+            match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => return listener,
+                Err(taken) if taken.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(other) => panic!("bind 127.0.0.1:{port}: {other}"),
+            }
+        }
+        panic!("no free port in 1000 draws from 20000..32768");
+    });
+    listeners.map(|listener| listener.local_addr().unwrap().port())
 }
 
 /// Another trial's id.
@@ -436,7 +463,9 @@ impl Engine {
         let out = if self.state().is_some() {
             self.trawl(&["up", "--no-sample-data"])
         } else {
-            let (api, web) = (free_port(), free_port());
+            // Chosen right before the spawn; `free_ports` names the race
+            // that remains until the child binds them.
+            let [api, web] = free_ports::<2>().map(|port| port.to_string());
             self.trawl(&[
                 "up",
                 "--api-port",
@@ -460,7 +489,9 @@ impl Engine {
 fn up_refuses_port_zero() {
     for (zero, other) in [("--api-port", "--web-port"), ("--web-port", "--api-port")] {
         let engine = Engine::new("engine-a");
-        let out = engine.trawl(&["up", zero, "0", other, &free_port(), "--no-sample-data"]);
+        // The parser refuses before any bind, so the other port is never
+        // bound: any nonzero port distinct from the zero one serves.
+        let out = engine.trawl(&["up", zero, "0", other, "18089", "--no-sample-data"]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{zero}: {stderr}");
         assert!(
@@ -760,11 +791,13 @@ impl Engine {
     /// images the stub answers with, the claim, and the phases `phases`.
     fn resumable(&self, phases: &serde_json::Value) -> PathBuf {
         self.put("claim.id", TRIAL_ID);
+        // Two distinct ports from one call. They are written into the state
+        // here, long before the test's `up` resumes and binds them, so the
+        // race `free_ports` names has a wider window than in `up`'s first
+        // run: anything that binds one of them meanwhile fails the resume.
+        let [api, web] = free_ports::<2>();
         self.trial_with("engine-a", |state| {
-            state["ports"] = serde_json::json!({
-                "api": free_port().parse::<u16>().unwrap(),
-                "web": free_port().parse::<u16>().unwrap(),
-            });
+            state["ports"] = serde_json::json!({ "api": api, "web": web });
             state["images"]["postgres"]["id"] = "sha256:aaaa".into();
             state["phases"] = phases.clone();
         })

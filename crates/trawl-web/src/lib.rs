@@ -36,3 +36,9 @@ pub mod upstream;
 
 #[cfg(test)]
 mod test_support;
+
+/// Real-clock waits and the paused-clock driver, shared with trawl-server's
+/// tests.
+#[cfg(test)]
+#[path = "../../trawl-server/src/test_timing.rs"]
+mod test_timing;

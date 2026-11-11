@@ -58,7 +58,8 @@ A test that measures time passes on a quiet machine and fails on a busy one.
 The pre-push hook runs two suites at once, so a busy machine is the normal
 case. Follow these rules in any test that waits on a thread, a socket, a timer,
 or a background task. `trawl_server::test_timing` holds the helpers:
-`HANG_GUARD`, `until`, and `until_polling`.
+`HANG_GUARD`, `until`, `until_polling`, and `frozen`. trawl-web's unit tests
+include the same file.
 
 1. **Order steps by events.** Establish "A happened before I check B" with
    something the code publishes: a seam arrival, a test-only record, a task
@@ -85,7 +86,8 @@ or a background task. `trawl_server::test_timing` holds the helpers:
    releases the hold on drop, so a failing test still frees the job.
 7. **Keep paused tokio time fixed.** Paused time is fine on a `current_thread`
    runtime if the test keeps the runtime runnable. Wait with `until` or
-   `until_polling`, which yield instead of sleeping. An idle tokio sleep or
+   `until_polling`, which yield instead of sleeping, and await real I/O inside
+   `frozen`. An idle tokio sleep or
    timeout in a paused test lets the clock jump ahead on its own. This also
    applies to your own polling helpers.
 8. **Do not mask a flaky test.** Do not add retries, a known-flakes entry, or
@@ -106,8 +108,11 @@ until("the worker finished", || worker.is_finished()).await;
 `HANG_GUARD`. When the test owns a future it must keep polling while it waits,
 such as a connection driver or an HTTP request, use `until_polling(what, fut,
 cond)`. It returns `Some(output)` if the future completes first and `None` once
-`cond` holds while the future is still pending. Put a comment on each wait that
-names the event it waits for.
+`cond` holds while the future is still pending. In a paused test, run each await
+on real I/O, such as a TLS request, a Postgres query, or a thread's answer, as
+`frozen(what, op)`. It drives `op` the way `until_polling` does, so the clock
+moves only when `op` calls `tokio::time::advance`. Put a comment on each wait
+that names the event it waits for.
 
 ## Run the browser suite
 

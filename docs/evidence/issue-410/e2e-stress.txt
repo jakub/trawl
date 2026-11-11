@@ -1,0 +1,146 @@
+## premise run: 200 repetitions of 1 test(s)
+commit:        9995586b939c82ef753e51f3b281078f739ce716
+subject:       test(e2e): add a loaded repeat-each stress script for the issue #410 browser rows
+started:       2026-11-10T15:53:07Z
+playwright:    Version 1.62.1
+spa build:     trunk build (dev), dist/index.html sha256 2fb2d5e65dc9e7fdc1fd4c02b1e2522fd936f01933e919687ec73766a25c95ce
+cpus:          16
+load:          16 CPU spinners, 4 dd oflag=dsync writers on xfs (target/issue-410-e2e/load-20261110T155300Z-premise)
+load average before the load: 11.83 10.14 13.16
+load average after 30 s of load: 15.53 11.19 13.41
+command:       (cd crates/trawl-web-ui/e2e && E2E_PORT=47310 npx playwright test tests/facets.spec.ts --grep Enter\ and\ Space\ on\ the\ rail\ summary\ open\ and\ close\ the\ rail --repeat-each 200 --retries 0 --workers 4 --trace retain-on-failure --global-timeout 0 --output <repo>/target/issue-410-e2e/20261110T155300Z-premise/output --reporter list\,json )
+load average at the end of the run: 33.54 20.51 16.59
+playwright exit: 1
+attempts:      200
+passes:        195
+failures:      5
+   195 passed    5 failed   0 other  facets.spec.ts › Enter and Space on the rail summary open and close the rail
+
+failure: facets.spec.ts › Enter and Space on the rail summary open and close the rail (failed)
+  at:    facets.spec.ts:323
+  trace: target/issue-410-e2e/20261110T155300Z-premise/output/facets-Enter-and-Space-on--16dc5-ary-open-and-close-the-rail-chromium-repeat70/trace.zip
+  | Error: expect(received).toBe(expected) // Object.is equality
+  | 
+  | Expected: 2
+  | Received: 1
+  | 
+  |   321 |     await expectRail(page, true);
+  |   322 |     pressed += 2;
+  | > 323 |     expect(await toggles()).toBe(pressed);
+  |       |                             ^
+  |   324 |   }
+  |   325 |   await expectFocusRing(summary);
+  |   326 | });
+
+failure: facets.spec.ts › Enter and Space on the rail summary open and close the rail (failed)
+  at:    facets.spec.ts:323
+  trace: target/issue-410-e2e/20261110T155300Z-premise/output/facets-Enter-and-Space-on--16dc5-ary-open-and-close-the-rail-chromium-repeat98/trace.zip
+  | Error: expect(received).toBe(expected) // Object.is equality
+  | 
+  | Expected: 2
+  | Received: 1
+  | 
+  |   321 |     await expectRail(page, true);
+  |   322 |     pressed += 2;
+  | > 323 |     expect(await toggles()).toBe(pressed);
+  |       |                             ^
+  |   324 |   }
+  |   325 |   await expectFocusRing(summary);
+  |   326 | });
+
+failure: facets.spec.ts › Enter and Space on the rail summary open and close the rail (failed)
+  at:    facets.spec.ts:323
+  trace: target/issue-410-e2e/20261110T155300Z-premise/output/facets-Enter-and-Space-on--16dc5-ary-open-and-close-the-rail-chromium-repeat128/trace.zip
+  | Error: expect(received).toBe(expected) // Object.is equality
+  | 
+  | Expected: 2
+  | Received: 1
+  | 
+  |   321 |     await expectRail(page, true);
+  |   322 |     pressed += 2;
+  | > 323 |     expect(await toggles()).toBe(pressed);
+  |       |                             ^
+  |   324 |   }
+  |   325 |   await expectFocusRing(summary);
+  |   326 | });
+
+failure: facets.spec.ts › Enter and Space on the rail summary open and close the rail (failed)
+  at:    facets.spec.ts:323
+  trace: target/issue-410-e2e/20261110T155300Z-premise/output/facets-Enter-and-Space-on--16dc5-ary-open-and-close-the-rail-chromium-repeat131/trace.zip
+  | Error: expect(received).toBe(expected) // Object.is equality
+  | 
+  | Expected: 4
+  | Received: 3
+  | 
+  |   321 |     await expectRail(page, true);
+  |   322 |     pressed += 2;
+  | > 323 |     expect(await toggles()).toBe(pressed);
+  |       |                             ^
+  |   324 |   }
+  |   325 |   await expectFocusRing(summary);
+  |   326 | });
+
+failure: facets.spec.ts › Enter and Space on the rail summary open and close the rail (failed)
+  at:    facets.spec.ts:323
+  trace: target/issue-410-e2e/20261110T155300Z-premise/output/facets-Enter-and-Space-on--16dc5-ary-open-and-close-the-rail-chromium-repeat139/trace.zip
+  | Error: expect(received).toBe(expected) // Object.is equality
+  | 
+  | Expected: 2
+  | Received: 1
+  | 
+  |   321 |     await expectRail(page, true);
+  |   322 |     pressed += 2;
+  | > 323 |     expect(await toggles()).toBe(pressed);
+  |       |                             ^
+  |   324 |   }
+  |   325 |   await expectFocusRing(summary);
+  |   326 | });
+finished:      2026-11-10T15:55:58Z
+load average after the load stopped: 33.54 20.51 16.59
+log:           target/issue-410-e2e/20261110T155300Z-premise/playwright.log
+verdict:       reproduced: 5 failed repetition(s); see the failures above
+
+## accept run: 20 repetitions of 1 test(s)
+commit:        a083ba32e9880ca5c2b038431854142cbd0b76ac
+subject:       test(e2e): wait for each rail toggle before the next key press
+started:       2026-11-10T15:59:17Z
+playwright:    Version 1.62.1
+spa build:     trunk build (dev), dist/index.html sha256 b7322e5254e9013f423baf026178e832453cd255f7b1c5022ccf3ffff1e2cc9e
+cpus:          16
+load:          16 CPU spinners, 4 dd oflag=dsync writers on xfs (target/issue-410-e2e/load-20261110T155907Z-accept)
+load average before the load: 6.80 13.98 14.78
+load average after 30 s of load: 12.33 14.64 14.97
+command:       (cd crates/trawl-web-ui/e2e && E2E_PORT=47310 npx playwright test tests/facets.spec.ts --grep Enter\ and\ Space\ on\ the\ rail\ summary\ open\ and\ close\ the\ rail --repeat-each 20 --retries 0 --workers 4 --trace retain-on-failure --global-timeout 0 --output <repo>/target/issue-410-e2e/20261110T155907Z-accept/output --reporter list\,json )
+load average at the end of the run: 15.37 15.20 15.15
+playwright exit: 0
+attempts:      20
+passes:        20
+failures:      0
+    20 passed    0 failed   0 other  facets.spec.ts › Enter and Space on the rail summary open and close the rail
+finished:      2026-11-10T16:00:02Z
+load average after the load stopped: 15.37 15.20 15.15
+log:           target/issue-410-e2e/20261110T155907Z-accept/playwright.log
+verdict:       all 20 repetitions of each test passed
+
+## accept run: 20 repetitions of 2 test(s)
+commit:        a083ba32e9880ca5c2b038431854142cbd0b76ac
+subject:       test(e2e): wait for each rail toggle before the next key press
+started:       2026-11-10T16:00:05Z
+playwright:    Version 1.62.1
+spa build:     trunk build (dev), dist/index.html sha256 4c09574d1c48ea37a7dd98b207c4a2dae7f8a732fb52c2eaab901779a849dde7
+cpus:          16
+load:          16 CPU spinners, 4 dd oflag=dsync writers on xfs (target/issue-410-e2e/load-20261110T160002Z-accept)
+load average before the load: 14.46 15.01 15.09
+load average after 30 s of load: 18.14 15.81 15.36
+command:       (cd crates/trawl-web-ui/e2e && E2E_PORT=47310 npx playwright test tests/login-return.spec.ts --grep explicit\ logout\ wins\ over\ a\ late\ Jobs\ 401\ with --repeat-each 20 --retries 0 --workers 4 --trace retain-on-failure --global-timeout 0 --output <repo>/target/issue-410-e2e/20261110T160002Z-accept/output --reporter list\,json )
+load average at the end of the run: 38.46 22.20 17.59
+playwright exit: 0
+attempts:      40
+passes:        40
+failures:      0
+    20 passed    0 failed   0 other  login-return.spec.ts › explicit logout wins over a late Jobs 401 with login document pending
+    20 passed    0 failed   0 other  login-return.spec.ts › explicit logout wins over a late Jobs 401 with logout response pending
+finished:      2026-11-10T16:01:42Z
+load average after the load stopped: 38.46 22.20 17.59
+log:           target/issue-410-e2e/20261110T160002Z-accept/playwright.log
+verdict:       all 20 repetitions of each test passed

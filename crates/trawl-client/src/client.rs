@@ -2327,9 +2327,12 @@ mod tests {
     #[tokio::test]
     async fn refused_connection_is_connect_kind() {
         init();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        // Bound and never listening, held until the request ends: the
+        // port stays ours, so no other process can take it and answer, and
+        // a connect to it is refused.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = socket.local_addr().unwrap();
         let client = HttpClient::with_trust_timeout(
             format!("http://{address}"),
             "tok",
@@ -2347,6 +2350,7 @@ mod tests {
             error.to_string(),
             format!("network error: connection failed for API http://{address}")
         );
+        drop(socket);
     }
 
     /// `with_trust_timeout` bounds each request by its own timeout.

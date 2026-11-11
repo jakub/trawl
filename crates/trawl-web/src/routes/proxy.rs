@@ -385,6 +385,7 @@ mod tests {
     use crate::middleware::request_count::{PROXY_MAX_REQUESTS, RequestCount};
     use crate::routes;
     use crate::test_support::{HandUpstream, TlsUpstream, wedge_body_bytes, wedge_body_bytes_for};
+    use crate::test_timing::{frozen, until};
 
     /// The browser origin these fixtures answer on. The CSRF tests below
     /// send it verbatim; anything else is a foreign origin by definition,
@@ -1273,42 +1274,44 @@ mod tests {
     /// the request after them is served. No token is needed to send a
     /// login, so without the deadline this is a pre-authentication
     /// lockout of every route but `/healthz`.
-    #[tokio::test(flavor = "multi_thread")]
+    ///
+    /// The clock is paused, so every login holds its count until the test
+    /// advances past the deadline, however slowly the 64 tasks start. The
+    /// request after the deadline crosses real loopback TLS inside
+    /// `frozen`, so the clock cannot jump while it waits. Residual
+    /// exposure: the real-clock hang guard on each wait.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn proxy_stalled_logins_release_the_whole_count_at_the_deadline() {
+        const DEADLINE: Duration = Duration::from_millis(500);
         let upstream = HandUpstream::start().await;
         let count = RequestCount::new(PROXY_MAX_REQUESTS);
         let app = limited_app_under(&upstream, count.clone(), |cfg| {
-            cfg.limits.body_read_timeout = Duration::from_millis(500);
+            cfg.limits.body_read_timeout = DEADLINE;
         });
 
         let stalled: Vec<_> = (0..PROXY_MAX_REQUESTS)
             .map(|_| tokio::spawn(app.clone().oneshot(stalled_login())))
             .collect();
-        let started = std::time::Instant::now();
-        while count.available() > 0 {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "{} of the stalled logins never took a count",
-                count.available()
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // Every stalled login has taken a count.
+        until("every stalled login took a count", || {
+            count.available() == 0
+        })
+        .await;
 
         // Full: the next request is refused at once, not queued.
-        let refused = tokio::time::timeout(
-            Duration::from_secs(5),
+        let refused = frozen(
+            "the refusal",
             app.clone().oneshot(bearer_get("/api/v1/schema")),
         )
         .await
-        .expect("the refusal is immediate")
         .unwrap();
         assert_proxy_request_limit_refusal(refused).await;
 
         // The deadline answers every stalled login and frees its count.
+        tokio::time::advance(DEADLINE + Duration::from_millis(10)).await;
         for login in stalled {
-            let resp = tokio::time::timeout(Duration::from_secs(5), login)
+            let resp = frozen("the deadline answered the stalled login", login)
                 .await
-                .expect("the deadline answered the stalled login")
                 .unwrap()
                 .unwrap();
             assert_envelope_refusal(
@@ -1326,12 +1329,11 @@ mod tests {
             "a stalled login kept its count"
         );
 
-        let next = tokio::time::timeout(
-            Duration::from_secs(5),
+        let next = frozen(
+            "the request after the stalled logins",
             app.oneshot(bearer_get("/api/v1/schema")),
         )
         .await
-        .expect("the request after the stalled logins was answered")
         .unwrap();
         assert_eq!(next.status(), StatusCode::OK, "the count was not released");
     }
@@ -1344,16 +1346,23 @@ mod tests {
     /// request with no body reserves nothing and is served while the
     /// budget is full. At the deadline the stalled bodies give the
     /// budget back whole.
-    #[tokio::test(flavor = "multi_thread")]
+    ///
+    /// The clock is paused, so no stalled body reaches its deadline until
+    /// the test advances past it. The bodiless request and the request
+    /// after the deadline cross real loopback TLS inside `frozen`, so the
+    /// clock cannot jump while they wait. Residual exposure: that real
+    /// loopback TLS, under the real-clock hang guard.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn proxy_body_budget_bounds_buffered_bodies_at_an_8_mib_limit() {
         const LIMIT: usize = 8 * 1024 * 1024;
         const ADMITTED: usize = PROXY_BODY_BUDGET / LIMIT;
+        const DEADLINE: Duration = Duration::from_millis(500);
         assert_eq!(ADMITTED, 16);
         let upstream = HandUpstream::start().await;
         let count = RequestCount::new(PROXY_MAX_REQUESTS);
         let state = limited_state(&upstream, |cfg| {
             cfg.limits.request_body_bytes = LIMIT;
-            cfg.limits.body_read_timeout = Duration::from_millis(500);
+            cfg.limits.body_read_timeout = DEADLINE;
         });
         let budget = state.body_budget().clone();
         let app = routes::build_with_count(state, count.clone());
@@ -1361,15 +1370,11 @@ mod tests {
         let stalled: Vec<_> = (0..ADMITTED)
             .map(|_| tokio::spawn(app.clone().oneshot(stalled_post("/api/v1/search"))))
             .collect();
-        let started = std::time::Instant::now();
-        while budget.available() > 0 {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "{} bytes of the budget were never reserved",
-                budget.available()
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // Every stalled body has reserved its share of the budget.
+        until("every stalled body reserved the limit", || {
+            budget.available() == 0
+        })
+        .await;
         assert_eq!(
             count.available(),
             PROXY_MAX_REQUESTS - ADMITTED,
@@ -1382,20 +1387,17 @@ mod tests {
             stalled_post("/api/v1/search"),
             bearer_post("/api/v1/search", Body::from("{}")),
         ] {
-            let refused =
-                tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(request))
-                    .await
-                    .expect("the refusal is immediate")
-                    .unwrap();
+            let refused = frozen("the refusal", app.clone().oneshot(request))
+                .await
+                .unwrap();
             assert_proxy_request_limit_refusal(refused).await;
         }
         // A request without a body reserves nothing.
-        let bodiless = tokio::time::timeout(
-            Duration::from_secs(5),
+        let bodiless = frozen(
+            "the bodiless request",
             app.clone().oneshot(bearer_get("/api/v1/schema")),
         )
         .await
-        .expect("the bodiless request was answered")
         .unwrap();
         assert_eq!(
             bodiless.status(),
@@ -1404,10 +1406,10 @@ mod tests {
         );
 
         // The deadline answers every stalled body and frees its reservation.
+        tokio::time::advance(DEADLINE + Duration::from_millis(10)).await;
         for post in stalled {
-            let resp = tokio::time::timeout(Duration::from_secs(5), post)
+            let resp = frozen("the deadline answered the stalled body", post)
                 .await
-                .expect("the deadline answered the stalled body")
                 .unwrap()
                 .unwrap();
             assert_envelope_refusal(
@@ -1425,13 +1427,15 @@ mod tests {
         );
         assert_eq!(count.available(), PROXY_MAX_REQUESTS);
 
-        let next = app
-            .oneshot(bearer_post(
+        let next = frozen(
+            "the request after the deadline",
+            app.oneshot(bearer_post(
                 "/api/v1/search",
                 Body::from(vec![b'x'; 1024 * 1024]),
-            ))
-            .await
-            .unwrap();
+            )),
+        )
+        .await
+        .unwrap();
         assert_eq!(next.status(), StatusCode::OK, "the budget was not released");
         assert_eq!(
             upstream.seen(),
@@ -1445,6 +1449,10 @@ mod tests {
     /// budget held by a body trawld has not answered, a 500-byte body is
     /// refused at once and a 400-byte one is admitted. Both reservations
     /// return when trawld answers, since it read both bodies first.
+    ///
+    /// It waits on the requests trawld has seen and on the held answer,
+    /// never on elapsed time. Residual exposure: real sockets, under
+    /// real-clock hang guards.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_body_budget_charges_the_declared_length_until_the_body_is_sent_and_answered() {
         let upstream = HandUpstream::start().await;
@@ -1541,6 +1549,12 @@ mod tests {
     /// ([`wedge_body_bytes`]), can never be absorbed. After the head the budget still shows the
     /// body charged: a second body the remainder cannot cover is refused
     /// at once and never reaches trawld, and one it covers is served.
+    ///
+    /// The wedge is real kernel socket buffering
+    /// ([`crate::test_support::NARROW_SOCKET_BUFFER`] on the fixture's
+    /// sockets), which no virtual clock controls, so the test runs on real
+    /// time. Residual exposure: kernel buffering and real time, under
+    /// real-clock hang guards.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_body_budget_is_held_while_the_sent_body_is_still_queued() {
         let size = wedge_body_bytes();
@@ -1700,12 +1714,19 @@ mod tests {
     /// stalled bodies take the whole count and an eighth of the budget,
     /// and the sixty-fifth request is the count's refusal. The defaults
     /// behave as they did before the budget.
-    #[tokio::test(flavor = "multi_thread")]
+    ///
+    /// The count middleware takes a count before the body reserves the
+    /// budget, so the test waits on the budget itself. The clock is
+    /// paused, so no stalled body reaches its deadline until the test
+    /// advances past it. Residual exposure: the real-clock hang guard on
+    /// each wait.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn proxy_body_budget_never_refuses_before_the_count_at_the_default_limit() {
+        const DEADLINE: Duration = Duration::from_millis(500);
         let upstream = HandUpstream::start().await;
         let count = RequestCount::new(PROXY_MAX_REQUESTS);
         let state = limited_state(&upstream, |cfg| {
-            cfg.limits.body_read_timeout = Duration::from_millis(500);
+            cfg.limits.body_read_timeout = DEADLINE;
         });
         let limit = state.limits().request_body_bytes;
         assert_eq!(limit, trawl_config::DEFAULT_MAX_REQUEST_BODY_BYTES);
@@ -1720,34 +1741,25 @@ mod tests {
         let stalled: Vec<_> = (0..PROXY_MAX_REQUESTS)
             .map(|_| tokio::spawn(app.clone().oneshot(stalled_post("/api/v1/search"))))
             .collect();
-        let started = std::time::Instant::now();
-        while count.available() > 0 {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "{} of the stalled bodies never took a count",
-                count.available()
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(
-            budget.available(),
-            PROXY_BODY_BUDGET - PROXY_MAX_REQUESTS * limit,
-            "each body of unknown length reserved the limit"
-        );
+        // Each body of unknown length has reserved the limit.
+        until("every stalled body reserved the limit", || {
+            budget.available() == PROXY_BODY_BUDGET - PROXY_MAX_REQUESTS * limit
+        })
+        .await;
+        assert_eq!(count.available(), 0, "a stalled body took no count");
 
-        let refused = tokio::time::timeout(
-            Duration::from_secs(5),
+        let refused = frozen(
+            "the refusal",
             app.clone().oneshot(bearer_get("/api/v1/schema")),
         )
         .await
-        .expect("the refusal is immediate")
         .unwrap();
         assert_proxy_request_limit_refusal(refused).await;
 
+        tokio::time::advance(DEADLINE + Duration::from_millis(10)).await;
         for post in stalled {
-            let resp = tokio::time::timeout(Duration::from_secs(5), post)
+            let resp = frozen("the deadline answered the stalled body", post)
                 .await
-                .expect("the deadline answered the stalled body")
                 .unwrap()
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);

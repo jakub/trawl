@@ -385,6 +385,11 @@ test('inner malformed Search filters, relative range and URL-shaped data remain 
 });
 
 for (const phase of ['login document pending', 'logout response pending'] as const) {
+  // Every wait here is on an event: a rendered net row, a parked route, a
+  // delivered response, a document request. Residual exposure: the expect
+  // timeouts (5 s, playwright.config.ts) bound each of those waits, and
+  // the absence of a second /login attempt is only checked across the
+  // 250 ms quiet window after the late 401 reaches the browser.
   test(`explicit logout wins over a late Jobs 401 with ${phase}`, async ({ page, request }) => {
     await resetScenario(request, 'corpus');
     await page.clock.install();

@@ -683,8 +683,13 @@ struct Peak {
 }
 
 impl Peak {
+    /// The bytes the spill cap bounds: the files' lengths, which `DuckDB`
+    /// writes and counts. `allocated` is sampled for a failing run's
+    /// message and is not bounded: a filesystem that allocates ahead of
+    /// a growing file's end holds blocks `DuckDB` never asked for
+    /// (ADR-0056, amendment of 2026-11-10).
     fn held(self) -> u64 {
-        self.length.max(self.allocated)
+        self.length
     }
 }
 
