@@ -24,8 +24,11 @@ mod unavailable_run_result {
     use trawl_server::config::RateLimitConfig;
     use trawl_server::store::{RunClaim, RunStatus};
 
-    /// Finished runs for a saved query, newest first.
+    /// Finished runs for a saved query, newest first, once the manual-run
+    /// gate has drained too: a run's lease goes back after its terminal
+    /// row is written, and the key's next press before then answers 429.
     async fn finished_runs(
+        server: &TestServer,
         client: &HttpClient,
         saved_id: i64,
         n: usize,
@@ -36,12 +39,18 @@ mod unavailable_run_result {
                 .await
                 .expect("the runs list answers")
                 .runs;
-            if runs.len() >= n && runs.iter().all(|r| r.status != "running") {
+            if runs.len() >= n
+                && runs.iter().all(|r| r.status != "running")
+                && server.state.query.pool.manual_leases_in_use() == 0
+            {
                 return runs;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("{n} finished runs never appeared for saved query {saved_id}");
+        panic!(
+            "{n} finished runs and a drained manual-run gate never appeared for saved query \
+             {saved_id}"
+        );
     }
 
     /// The absolute path a run's stored result sits at, under this
@@ -113,7 +122,7 @@ mod unavailable_run_result {
         let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
         let saved_id = net(&client, "gone_by_id", "service=nginx | table service").await;
         record_run(&client, saved_id).await;
-        let runs = finished_runs(&client, saved_id, 1).await;
+        let runs = finished_runs(&server, &client, saved_id, 1).await;
         let run = &runs[0];
         assert_eq!(run.status, "success");
         assert!(run.row_count.unwrap_or(0) > 0, "{run:?}");
@@ -157,9 +166,9 @@ mod unavailable_run_result {
         let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
         let saved_id = net(&client, "gone_latest", "service=nginx | table service").await;
         record_run(&client, saved_id).await;
-        finished_runs(&client, saved_id, 1).await;
+        finished_runs(&server, &client, saved_id, 1).await;
         record_run(&client, saved_id).await;
-        let runs = finished_runs(&client, saved_id, 2).await;
+        let runs = finished_runs(&server, &client, saved_id, 2).await;
         let newer = &runs[0];
         let older = &runs[1];
         assert_ne!(newer.id, older.id);
@@ -202,7 +211,7 @@ mod unavailable_run_result {
         let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
         let saved_id = net(&client, "gone_endpoint", "service=nginx | table service").await;
         record_run(&client, saved_id).await;
-        let runs = finished_runs(&client, saved_id, 1).await;
+        let runs = finished_runs(&server, &client, saved_id, 1).await;
         let run = &runs[0];
 
         let answered = client
@@ -228,9 +237,9 @@ mod unavailable_run_result {
         let saved_id = net(&client, "gone_member", "service=nginx | table service").await;
         for n in 1..=3 {
             record_run(&client, saved_id).await;
-            finished_runs(&client, saved_id, n).await;
+            finished_runs(&server, &client, saved_id, n).await;
         }
-        let runs = finished_runs(&client, saved_id, 3).await;
+        let runs = finished_runs(&server, &client, saved_id, 3).await;
         // Newest first, so the middle run is the middle entry either way.
         let middle = &runs[1];
 
@@ -287,7 +296,7 @@ mod unavailable_run_result {
         )
         .await;
         record_run(&client, saved_id).await;
-        let runs = finished_runs(&client, saved_id, 1).await;
+        let runs = finished_runs(&server, &client, saved_id, 1).await;
         let empty = &runs[0];
         assert_eq!(empty.row_count, Some(0), "{empty:?}");
         assert!(empty.result_path.is_some(), "{empty:?}");
@@ -315,7 +324,7 @@ mod unavailable_run_result {
         // refusal predates this work and keeps its own wording.
         let blob_id = net(&client, "blob_only", "service=nginx | table service").await;
         record_run(&client, blob_id).await;
-        let blob_runs = finished_runs(&client, blob_id, 1).await;
+        let blob_runs = finished_runs(&server, &client, blob_id, 1).await;
         let blob_run = &blob_runs[0];
         let stored = stored_path(&server, blob_run);
         // Move the rows into the blob, exactly as a failed parquet write
@@ -378,7 +387,7 @@ mod unavailable_run_result {
         let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
         let saved_id = net(&client, "unreadable", "service=nginx | table service").await;
         record_run(&client, saved_id).await;
-        let runs = finished_runs(&client, saved_id, 1).await;
+        let runs = finished_runs(&server, &client, saved_id, 1).await;
         let run = &runs[0];
         let path = stored_path(&server, run);
 

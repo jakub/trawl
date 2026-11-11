@@ -261,7 +261,8 @@ pub fn kept_as(code: &ErrorCode) -> Kept {
         | ErrorCode::InvestigationClosed
         | ErrorCode::EvidenceBudgetExceeded
         | ErrorCode::InvalidName
-        | ErrorCode::DuplicateName => Kept::Server,
+        | ErrorCode::DuplicateName
+        | ErrorCode::ManualRunBusy => Kept::Server,
     }
 }
 
@@ -349,7 +350,7 @@ mod tests {
     /// Every wire code, spelled out. The match in `kept_as` has no
     /// wildcard, so a new code already fails to compile there; this list
     /// makes the test say how each existing code is kept.
-    const EVERY_CODE: [(ErrorCode, Kept); 38] = [
+    const EVERY_CODE: [(ErrorCode, Kept); 39] = [
         (ErrorCode::ParseError, Kept::Query),
         (ErrorCode::ValidationError, Kept::Query),
         (ErrorCode::ExecutionError, Kept::Server),
@@ -388,6 +389,7 @@ mod tests {
         (ErrorCode::EvidenceBudgetExceeded, Kept::Server),
         (ErrorCode::InvalidName, Kept::Server),
         (ErrorCode::DuplicateName, Kept::Server),
+        (ErrorCode::ManualRunBusy, Kept::Server),
     ];
 
     #[test]
@@ -717,6 +719,24 @@ mod tests {
             assert!(matches!(err, ApiError::Status(500)), "{body:?}: {err:?}");
             assert_eq!(err.to_string(), "server returned 500");
         }
+    }
+
+    /// A busy manual-run refusal is about the server, not the query: it
+    /// is a server error that shows trawld's own sentence, which is what
+    /// the "Run not started" toast reads through `to_string`.
+    #[test]
+    fn manual_run_busy_is_a_server_refusal() {
+        let message = "a manual run is already running; retry after the Retry-After interval";
+        let body = format!(r#"{{"error":{{"code":"manual_run_busy","message":"{message}"}}}}"#);
+        let err = http_failure(429, Some(&body));
+        assert!(
+            matches!(&err, ApiError::Server { status: 429, .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.code(), Some(&ErrorCode::ManualRunBusy));
+        assert_eq!(err.http_status(), Some(429));
+        assert!(err.query_error().is_none());
+        assert_eq!(err.to_string(), message);
     }
 
     fn refusal(status: u16, code: ErrorCode, message: &str) -> ApiError {

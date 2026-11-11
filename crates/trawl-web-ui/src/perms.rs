@@ -66,6 +66,13 @@ pub fn can_query(permissions: &[String]) -> bool {
     permissions.iter().any(|p| p == "query")
 }
 
+/// Whether the session may run a saved query now and read a run's stored
+/// rows. The server requires `query` beside `saved_query` for both
+/// (ADR-0018 as amended on 2026-11-11).
+pub fn can_run_saved(permissions: &[String]) -> bool {
+    can_query(permissions) && permissions.iter().any(|p| p == "saved_query")
+}
+
 /// Whether the session may list and read investigations. The server
 /// requires `query` as well, because kept evidence is event data, so the
 /// pages and their navigation entry appear only for both (ADR-0059).

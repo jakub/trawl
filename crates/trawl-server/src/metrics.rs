@@ -95,6 +95,14 @@ pub const QUERY_PREPARATION_SLOTS: &str = "trawl_query_preparation_slots";
 /// whose request already answered (ADR-0063). Label-free, like the permit
 /// counts.
 pub const QUERY_PREPARATION_IN_USE: &str = "trawl_query_preparation_in_use";
+/// Net run leases held right now, labelled by `origin` (`scheduled` or
+/// `manual`, ADR-0018 amended 2026-11-11). A lease lasts until its run's
+/// physical work ends, so a run that timed out while its work is retained
+/// still counts. Read off the pool at scrape, never from run rows.
+pub const NET_RUN_LEASES_IN_USE: &str = "trawl_net_run_leases_in_use";
+/// The cap on net run leases, labelled by `origin`: `max(1, permits / 2)`
+/// for `scheduled`, `max(1, permits / 4)` for `manual`.
+pub const NET_RUN_LEASE_LIMIT: &str = "trawl_net_run_lease_limit";
 /// Seconds since the engine sample's latest probe started, or since the
 /// sampler started before its first (ADR-0056). It cycles under the sample
 /// interval while the sampler runs, and keeps growing while a probe is
@@ -579,6 +587,16 @@ pub fn describe_metrics() {
         QUERY_PREPARATION_IN_USE,
         "Query preparation slots held right now, by preparations a request \
          waits on and by preparations whose request already answered"
+    );
+    describe_gauge!(
+        NET_RUN_LEASES_IN_USE,
+        "Net run leases held right now, by origin (scheduled or manual); \
+         a lease lasts until its run's work ends, past a timeout"
+    );
+    describe_gauge!(
+        NET_RUN_LEASE_LIMIT,
+        "Cap on net run leases, by origin: max(1, permits / 2) scheduled, \
+         max(1, permits / 4) manual"
     );
     describe_gauge!(
         ENGINE_SAMPLE_AGE_SECONDS,
@@ -1208,6 +1226,14 @@ pub struct QueryGauges {
     pub preparation_slots: usize,
     /// Preparation slots held right now ([`QUERY_PREPARATION_IN_USE`]).
     pub preparation_in_use: usize,
+    /// Scheduled-run leases held right now ([`NET_RUN_LEASES_IN_USE`]).
+    pub scheduled_leases_in_use: usize,
+    /// The cap on scheduled-run leases ([`NET_RUN_LEASE_LIMIT`]).
+    pub scheduled_lease_limit: usize,
+    /// Manual-run leases held right now ([`NET_RUN_LEASES_IN_USE`]).
+    pub manual_leases_in_use: usize,
+    /// The cap on manual-run leases ([`NET_RUN_LEASE_LIMIT`]).
+    pub manual_lease_limit: usize,
 }
 
 impl QueryGauges {
@@ -1226,6 +1252,10 @@ impl QueryGauges {
             engine_sample_age: sample.age(),
             preparation_slots: pool.preparation().size(),
             preparation_in_use: pool.preparation().in_use(),
+            scheduled_leases_in_use: pool.scheduled_leases_in_use(),
+            scheduled_lease_limit: pool.scheduled_lease_limit(),
+            manual_leases_in_use: pool.manual_leases_in_use(),
+            manual_lease_limit: pool.manual_lease_limit(),
         }
     }
 }
@@ -1257,6 +1287,21 @@ pub fn collect_gauges(
     metrics::gauge!(ENGINE_SAMPLE_AGE_SECONDS).set(query.engine_sample_age.as_secs_f64());
     metrics::gauge!(QUERY_PREPARATION_SLOTS).set(query.preparation_slots as f64);
     metrics::gauge!(QUERY_PREPARATION_IN_USE).set(query.preparation_in_use as f64);
+    for (origin, in_use, limit) in [
+        (
+            "scheduled",
+            query.scheduled_leases_in_use,
+            query.scheduled_lease_limit,
+        ),
+        (
+            "manual",
+            query.manual_leases_in_use,
+            query.manual_lease_limit,
+        ),
+    ] {
+        metrics::gauge!(NET_RUN_LEASES_IN_USE, "origin" => origin).set(in_use as f64);
+        metrics::gauge!(NET_RUN_LEASE_LIMIT, "origin" => origin).set(limit as f64);
+    }
 
     // Read from the gate now, never cached: each reason's series is its own
     // 0/1, so a switch from one reason to the other shows in both.
@@ -3374,6 +3419,120 @@ mod tests {
         assert_eq!(gauges.preparation_in_use, 1);
         parked.release();
         job.await.unwrap().unwrap();
+        sample.stop_and_wait_for_test();
+    }
+
+    /// The run lease gauges count leases a run physically holds, read off
+    /// the pool at scrape (ADR-0018, amended 2026-11-11): for each origin,
+    /// zero at start, the limit when full, still full while a timed-out
+    /// run's executor work is retained, and zero once the last holder ends.
+    #[tokio::test(start_paused = true)]
+    async fn run_lease_gauges_follow_physical_ownership() {
+        use crate::deadline::Deadline;
+        use crate::pool::{ExecutorPool, WorkContext, WorkKind, seam::Seam};
+        use std::time::Duration;
+
+        // Four permits: two scheduled places, one manual place.
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 4, 100, None).unwrap();
+        let sample = crate::engine_sample::EngineSample::start(&pool).unwrap();
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        let scrape = |pool: &ExecutorPool| {
+            let gauges = QueryGauges::read(pool, &sample);
+            metrics::with_local_recorder(&recorder, || {
+                describe_metrics();
+                collect_gauges(
+                    None,
+                    &PublicationGate::new(),
+                    Path::new("/nonexistent/path"),
+                    None,
+                    Path::new("/nonexistent/scratch"),
+                    gauges,
+                    &crate::repin::JobGeneration::default(),
+                );
+            });
+            let rendered = handle.render();
+            ["scheduled", "manual"].map(|origin| {
+                let series = |name: &str| format!("{name}{{origin=\"{origin}\"}}");
+                (
+                    gauge_value(&rendered, &series(NET_RUN_LEASES_IN_USE)).to_owned(),
+                    gauge_value(&rendered, &series(NET_RUN_LEASE_LIMIT)).to_owned(),
+                )
+            })
+        };
+        let pair = |in_use: &str, limit: &str| (in_use.to_owned(), limit.to_owned());
+
+        assert_eq!(
+            scrape(&pool),
+            [pair("0", "2"), pair("0", "1")],
+            "both origins publish, at zero, before any run"
+        );
+
+        let leases = [
+            pool.try_lease_scheduled().expect("a free scheduled lease"),
+            pool.try_lease_scheduled()
+                .expect("a second scheduled lease"),
+            pool.try_lease_manual(1, Duration::from_secs(60))
+                .expect("a free manual lease"),
+        ];
+        assert_eq!(scrape(&pool), [pair("2", "2"), pair("1", "1")], "full");
+
+        // Each lease goes into executor work parked once it started, then
+        // the work's request runs out of time: the run timed out, its work
+        // is retained, and the work keeps its run's place.
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
+        let requests = leases.map(|lease| {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                pool.execute(
+                    pool.allocate_query_id(),
+                    "service:test",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    WorkContext::key(WorkKind::Query, 1).holding(lease.into_hold()),
+                )
+                .await
+            })
+        });
+        let start = std::time::Instant::now();
+        while started.arrivals() < 3 {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "work never started"
+            );
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(6)).await;
+        for request in requests {
+            let outcome = request.await.expect("the request joins");
+            assert!(
+                matches!(outcome.result, Err(crate::error::ServerError::Timeout)),
+                "the run timed out, got {:?}",
+                outcome.result
+            );
+        }
+        assert_eq!(pool.retained(), 3, "every run's work outlived its request");
+        assert_eq!(
+            scrape(&pool),
+            [pair("2", "2"), pair("1", "1")],
+            "retained work keeps its run's place"
+        );
+
+        started.release();
+        let start = std::time::Instant::now();
+        while pool.scheduled_leases_in_use() + pool.manual_leases_in_use() > 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "work never ended"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            scrape(&pool),
+            [pair("0", "2"), pair("0", "1")],
+            "the places return when the last holder ends"
+        );
         sample.stop_and_wait_for_test();
     }
 

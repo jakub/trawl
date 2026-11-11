@@ -233,13 +233,25 @@ pub const RUN_NOW_SINCE_LAST_LINE: &str =
 pub const RUN_NOW_FIXED_LINE: &str =
     "Run now reads the span ending now; results can overlap earlier runs.";
 
-/// Whether a net offers Run now: exactly when its SAVED state has a
-/// schedule, in any mode and enabled or paused. A net with no schedule
-/// has nothing to fire, and the server refuses it with a 400, so the
-/// control would not work (ADR-0025).
+/// Whether the session may run a net now and read a run's stored rows.
+/// The server needs `query` beside `saved_query` for both (ADR-0018 as
+/// amended on 2026-11-11), so without either Run now and the run rows
+/// view are absent, not disabled (ADR-0025). The run history stays:
+/// listing runs needs `saved_query` alone. `None` is a session not read
+/// yet, which offers neither until it is.
 #[must_use]
-pub fn run_now_offered(saved: &SavedQueryResponse) -> bool {
-    saved.schedule.is_some()
+pub fn may_run_saved(permissions: Option<&[String]>) -> bool {
+    permissions.is_some_and(crate::perms::can_run_saved)
+}
+
+/// Whether a net offers Run now: exactly when the session
+/// [may run it](may_run_saved) and its SAVED state has a schedule, in any
+/// mode and enabled or paused. A net with no schedule has nothing to
+/// fire, and the server refuses it with a 400, so the control would not
+/// work (ADR-0025).
+#[must_use]
+pub fn run_now_offered(saved: &SavedQueryResponse, permissions: Option<&[String]>) -> bool {
+    may_run_saved(permissions) && saved.schedule.is_some()
 }
 
 /// Why Run now is disabled on a net whose run budget is spent, said
@@ -555,17 +567,45 @@ mod tests {
         }
     }
 
+    /// A session's permissions as `/me` lists them.
+    fn permissions(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
     /// Run now is offered for every saved schedule, whatever its mode or
     /// enabled state, and never for a net with no schedule to fire.
     #[test]
     fn run_now_is_offered_exactly_when_a_schedule_is_saved() {
-        assert!(!run_now_offered(&net(None)));
+        let runner = permissions(&["query", "saved_query"]);
+        let runner = Some(runner.as_slice());
+        assert!(!run_now_offered(&net(None), runner));
         for window in [None, Some("since_last"), Some("15m")] {
-            assert!(run_now_offered(&net(Some(schedule(window, None)))));
+            assert!(run_now_offered(&net(Some(schedule(window, None))), runner));
         }
         let mut paused = schedule(Some("since_last"), None);
         paused.enabled = false;
-        assert!(run_now_offered(&net(Some(paused))));
+        assert!(run_now_offered(&net(Some(paused)), runner));
+    }
+
+    /// Without `query` and `saved_query` both, the session offers neither
+    /// Run now nor the run rows view, whatever the net's schedule; a
+    /// session not read yet counts as without. With both, both are there.
+    #[test]
+    fn run_now_is_absent_without_query() {
+        let scheduled = net(Some(schedule(Some("since_last"), None)));
+        let editor = permissions(&["saved_query"]);
+        let searcher = permissions(&["query"]);
+        let runner = permissions(&["query", "saved_query"]);
+        for (who, session) in [
+            ("not read yet", None),
+            ("saved_query alone", Some(editor.as_slice())),
+            ("query alone", Some(searcher.as_slice())),
+        ] {
+            assert!(!run_now_offered(&scheduled, session), "{who}");
+            assert!(!may_run_saved(session), "{who}");
+        }
+        assert!(run_now_offered(&scheduled, Some(runner.as_slice())));
+        assert!(may_run_saved(Some(runner.as_slice())));
     }
 
     /// Run now stays offered on a spent schedule but is disabled, and the
@@ -584,7 +624,8 @@ mod tests {
         spent.total_runs = 5;
         spent.exhausted = true;
         let spent_net = net(Some(spent.clone()));
-        assert!(run_now_offered(&spent_net));
+        let runner = permissions(&["query", "saved_query"]);
+        assert!(run_now_offered(&spent_net, Some(runner.as_slice())));
         assert!(run_now_spent(&spent_net));
         assert_eq!(run_budget_label(&spent).as_deref(), Some("spent 5/3"));
 

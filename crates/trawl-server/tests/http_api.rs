@@ -17,6 +17,7 @@ use common::{roles, setup, setup_with_query_timeout, setup_with_rate_limit};
 use fleet_auth::{KeyStore, PrincipalKind};
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::pool::RunLease;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn health_returns_ok() {
@@ -750,7 +751,7 @@ async fn query_timing_from_saved_skips_publication() {
         .await
         .unwrap();
     client.trigger_run(saved.id).await.unwrap();
-    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    let runs = wait_for_finished_runs(&server, &client, saved.id, 1).await;
     assert_eq!(runs[0].status, "success", "{:?}", runs[0]);
 
     let (status, request_id, body) = post_query(
@@ -5075,7 +5076,7 @@ async fn trigger_run_rejects_when_max_runs_reached() {
 
     // The one run the cap allows is itself a manual one.
     client.trigger_run(saved.id).await.unwrap();
-    wait_for_finished_runs(&client, saved.id, 1).await;
+    wait_for_finished_runs(&server, &client, saved.id, 1).await;
 
     let (status, message) = refusal(client.trigger_run(saved.id).await);
     assert_eq!(status, 409, "{message}");
@@ -5417,12 +5418,17 @@ async fn trigger_run_rejects_when_already_running() {
     assert!(message.contains("already in progress"), "{message}");
 }
 
-/// Poll until `saved_id` has `n` finished runs, returning them newest first.
+/// Poll until `saved_id` has `n` finished runs and `server`'s manual-run
+/// gate has drained, returning the runs newest first.
 ///
 /// `trigger_run` returns as soon as the run row exists; the execution is a
 /// spawned task. Polling beats a fixed sleep: a slow machine gets more time,
-/// a fast one does not pay for it.
+/// a fast one does not pay for it. A run row turns terminal before the run
+/// lets go of its manual-run lease (ADR-0018, amended 2026-11-11), so a
+/// test that presses Run now again with the same key needs both, or it
+/// races its own 429.
 async fn wait_for_finished_runs(
+    server: &common::TestServer,
     client: &HttpClient,
     saved_id: i64,
     n: usize,
@@ -5433,12 +5439,248 @@ async fn wait_for_finished_runs(
             .await
             .unwrap()
             .runs;
-        if runs.len() >= n && runs.iter().all(|r| r.status != "running") {
+        if runs.len() >= n
+            && runs.iter().all(|r| r.status != "running")
+            && server.state.query.pool.manual_leases_in_use() == 0
+        {
             return runs;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("{n} finished runs never appeared for saved query {saved_id}");
+    panic!(
+        "{n} finished runs and a drained manual-run gate never appeared for saved query \
+         {saved_id}"
+    );
+}
+
+/// The status of a refused client call, or a panic naming what came back.
+fn refused_status<T: std::fmt::Debug>(
+    what: &str,
+    outcome: Result<T, trawl_client::ClientError>,
+) -> u16 {
+    match outcome {
+        Err(trawl_client::ClientError::Server { status, .. }) => status,
+        other => panic!("{what}: expected a refusal, got {other:?}"),
+    }
+}
+
+/// Running a net now and reading a run's rows need `query` and
+/// `saved_query` (ADR-0018, amended 2026-11-11), judged on real custom
+/// roles. `saved_query` alone still edits nets and lists run metadata.
+/// Each 403 comes before the handler's own work: a key without the grant
+/// is refused on an id that does not exist (no lookup), and on a run whose
+/// stored file is gone, which a key holding both answers 409 (no
+/// result-file read).
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_query_only_cannot_run_or_read_results() {
+    let server = setup().await;
+    let editor = common::mint_key(&server.fleet_pool, "net-editor", &["saved_query"]).await;
+    let querier = common::mint_key(&server.fleet_pool, "net-querier", &["query"]).await;
+    let runner =
+        common::mint_key(&server.fleet_pool, "net-runner", &["query", "saved_query"]).await;
+    let editor_client = HttpClient::new_insecure(&server.url, &editor.token).unwrap();
+    let querier_client = HttpClient::new_insecure(&server.url, &querier.token).unwrap();
+    let runner_client = HttpClient::new_insecure(&server.url, &runner.token).unwrap();
+
+    let (runner_net, run) = run_and_read(&server, &runner_client).await;
+
+    // `saved_query` alone: nets, schedules and run metadata stay open.
+    let editor_net = editor_client
+        .create_saved("editor_net", "service=nginx | table service")
+        .await
+        .expect("saved_query alone creates a net");
+    editor_client
+        .update_saved(editor_net.id, "service=nginx | table service, host")
+        .await
+        .expect("saved_query alone updates a net");
+    editor_client
+        .set_schedule(editor_net.id, "1h", None, true, None, None)
+        .await
+        .expect("saved_query alone sets a schedule");
+    let listed = editor_client
+        .list_report_runs(editor_net.id, None, None)
+        .await
+        .expect("saved_query alone lists a net's runs");
+    assert!(listed.runs.is_empty(), "{:?}", listed.runs);
+    editor_client
+        .list_all_runs(None, None)
+        .await
+        .expect("saved_query alone lists every run");
+    editor_client
+        .runs_stats()
+        .await
+        .expect("saved_query alone reads run stats");
+
+    // ...but neither runs now nor reads rows, and is refused before the
+    // lookup: a foreign or missing id is a 403, not a 404.
+    for (what, saved_id) in [
+        ("its own net", editor_net.id),
+        ("a foreign net", runner_net.id),
+        ("a missing net", i64::from(i32::MAX)),
+    ] {
+        assert_eq!(
+            refused_status(what, editor_client.trigger_run(saved_id).await),
+            403,
+            "saved_query alone runs {what} now"
+        );
+    }
+    assert_eq!(
+        refused_status(
+            "foreign run",
+            editor_client.get_report_run(runner_net.id, run.id).await
+        ),
+        403,
+        "saved_query alone reads a foreign run's rows"
+    );
+    assert_eq!(
+        refused_status(
+            "missing run",
+            editor_client
+                .get_report_run(editor_net.id, i64::from(i32::MAX))
+                .await
+        ),
+        403,
+        "saved_query alone reads a missing run's rows"
+    );
+
+    // `query` alone gets neither.
+    assert_eq!(
+        refused_status(
+            "query alone",
+            querier_client.trigger_run(runner_net.id).await
+        ),
+        403
+    );
+    assert_eq!(
+        refused_status(
+            "query alone",
+            querier_client.get_report_run(runner_net.id, run.id).await
+        ),
+        403
+    );
+
+    // Both permissions on another key's net: the lookup decides, 404.
+    assert_eq!(
+        refused_status(
+            "foreign net",
+            runner_client.trigger_run(editor_net.id).await
+        ),
+        404
+    );
+    assert_eq!(
+        refused_status(
+            "foreign run",
+            runner_client.get_report_run(editor_net.id, run.id).await
+        ),
+        404
+    );
+
+    editor_client
+        .delete_saved(editor_net.id)
+        .await
+        .expect("saved_query alone deletes a net");
+
+    downgrade_refuses_before_the_file(&server, &runner_client, runner_net.id, &run).await;
+}
+
+/// A key holding `query` and `saved_query` creates a net, runs it now,
+/// waits for the run to finish and reads its rows: all 200.
+async fn run_and_read(
+    server: &common::TestServer,
+    client: &HttpClient,
+) -> (trawl_api::SavedQueryResponse, trawl_api::ReportRunSummary) {
+    let net = client
+        .create_saved("runner_net", "service=nginx | table service")
+        .await
+        .expect("the runner creates its net");
+    client
+        .set_schedule(net.id, "1h", None, true, None, None)
+        .await
+        .expect("the runner schedules its net");
+    let started = client
+        .trigger_run(net.id)
+        .await
+        .expect("a key with query and saved_query runs its net now");
+    let mut runs = wait_for_finished_runs(server, client, net.id, 1).await;
+    let run = runs.remove(0);
+    assert_eq!(run.id, started.id);
+    assert_eq!(run.status, "success", "{run:?}");
+    let read = client
+        .get_report_run(net.id, run.id)
+        .await
+        .expect("a key with query and saved_query reads its run");
+    assert!(read.result.is_some(), "the run's rows are served");
+    (net, run)
+}
+
+/// The runner's role loses `query` between its run and the read: run-now
+/// and the read answer 403, run metadata still lists, and the refusal
+/// comes before the stored file is read. With `query` back, the same read
+/// reaches the deleted file and answers 409.
+async fn downgrade_refuses_before_the_file(
+    server: &common::TestServer,
+    runner_client: &HttpClient,
+    saved_id: i64,
+    run: &trawl_api::ReportRunSummary,
+) {
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+    let removed = store
+        .remove_role_permissions("role-net-runner", &common::trawl_perms(&["query"]))
+        .await
+        .expect("remove query from the runner's role");
+    assert_eq!(removed, 1);
+    let listed = runner_client
+        .list_report_runs(saved_id, None, None)
+        .await
+        .expect("the downgraded key still lists its runs");
+    assert_eq!(
+        listed.runs.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![run.id]
+    );
+    assert_eq!(
+        refused_status(
+            "downgraded read",
+            runner_client.get_report_run(saved_id, run.id).await
+        ),
+        403,
+        "a key that lost query reads the run's rows"
+    );
+    assert_eq!(
+        refused_status("downgraded run", runner_client.trigger_run(saved_id).await),
+        403,
+        "a key that lost query runs its net now"
+    );
+
+    // With the stored file gone the grant still answers first; restored,
+    // the same read reaches the file and finds it missing.
+    let relative = run
+        .result_path
+        .as_deref()
+        .unwrap_or_else(|| panic!("the run has a parquet result: {run:?}"));
+    std::fs::remove_file(format!(
+        "{}/{relative}",
+        server.state.query.pool.base_dir().trim_end_matches('/')
+    ))
+    .expect("delete the stored result");
+    assert_eq!(
+        refused_status(
+            "downgraded read, file gone",
+            runner_client.get_report_run(saved_id, run.id).await
+        ),
+        403
+    );
+    store
+        .add_role_permissions("role-net-runner", &common::trawl_perms(&["query"]))
+        .await
+        .expect("give query back to the runner's role");
+    assert_eq!(
+        refused_status(
+            "restored read, file gone",
+            runner_client.get_report_run(saved_id, run.id).await
+        ),
+        409,
+        "with the grant back, the read reaches the missing file"
+    );
 }
 
 /// ADR-0018 ruling 13, end to end: a report run that finds nothing is
@@ -5464,7 +5706,7 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
         .await
         .unwrap();
     client.trigger_run(saved.id).await.unwrap();
-    let first = wait_for_finished_runs(&client, saved.id, 1).await;
+    let first = wait_for_finished_runs(&server, &client, saved.id, 1).await;
     assert_eq!(first[0].status, "success");
     assert!(
         first[0].row_count.unwrap_or(0) > 0,
@@ -5485,7 +5727,7 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
         .await
         .unwrap();
     client.trigger_run(saved.id).await.unwrap();
-    let runs = wait_for_finished_runs(&client, saved.id, 2).await;
+    let runs = wait_for_finished_runs(&server, &client, saved.id, 2).await;
     let newest = &runs[0];
     assert_eq!(newest.status, "success", "{newest:?}");
     assert_eq!(newest.row_count, Some(0), "{newest:?}");
@@ -5563,7 +5805,7 @@ async fn from_saved_histogram_is_stored_result() {
         .await
         .unwrap();
     client.trigger_run(saved.id).await.unwrap();
-    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    let runs = wait_for_finished_runs(&server, &client, saved.id, 1).await;
     assert_eq!(runs[0].status, "success", "{:?}", runs[0]);
     assert!(runs[0].row_count.unwrap_or(0) > 0, "{:?}", runs[0]);
 
@@ -5630,7 +5872,7 @@ async fn a_from_saved_read_below_a_dangling_link_is_an_error() {
         .await
         .unwrap();
     client.trigger_run(saved.id).await.unwrap();
-    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    let runs = wait_for_finished_runs(&server, &client, saved.id, 1).await;
     let run = &runs[0];
     assert_eq!(run.status, "success", "{run:?}");
     assert!(run.row_count.unwrap_or(0) > 0, "{run:?}");
@@ -6352,11 +6594,12 @@ async fn trigger_at(
 /// The listed run a trigger started, once it has finished, checked to be
 /// the row the trigger's summary described.
 async fn finished(
+    server: &common::TestServer,
     client: &HttpClient,
     saved_id: i64,
     summary: &trawl_api::ReportRunSummary,
 ) -> trawl_api::ReportRunSummary {
-    let runs = wait_for_finished_runs(client, saved_id, 1).await;
+    let runs = wait_for_finished_runs(server, client, saved_id, 1).await;
     let run = runs
         .iter()
         .find(|r| r.id == summary.id)
@@ -6418,7 +6661,7 @@ async fn manual_run_of_since_last_schedule_covers_from_watermark() {
         "the saved text runs with the claimed bounds spliced on"
     );
 
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
     assert_eq!(
         client.get_schedule(saved.id).await.unwrap().covered_through,
@@ -6455,7 +6698,7 @@ async fn manual_run_of_fixed_schedule_covers_trailing_span() {
     assert_eq!(summary.window_end.as_deref(), Some(bound(end).as_str()));
     assert_eq!(summary.window_truncated, Some(false));
 
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
     assert_eq!(
         stored_covered_through(&server, schedule.id).await,
@@ -6496,7 +6739,7 @@ async fn manual_run_clamps_and_flags_truncated() {
     );
     assert_eq!(summary.window_end.as_deref(), Some(bound(t).as_str()));
 
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
     assert_eq!(
         stored_covered_through(&server, schedule.id).await,
@@ -6531,7 +6774,7 @@ async fn manual_run_without_predecessor_covers_one_interval() {
     assert_eq!(summary.window_end.as_deref(), Some(bound(end).as_str()));
     assert_eq!(summary.window_truncated, Some(false));
 
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
 }
 
@@ -6620,7 +6863,7 @@ async fn tick(
 ) -> trawl_server::store::DueClaim {
     tick_store(server)
         .await
-        .claim_due_run(schedule_id, now, 24)
+        .claim_due_run(schedule_id, now, 24, &RunLease::unattached())
         .await
         .unwrap()
 }
@@ -6656,7 +6899,7 @@ async fn successful_manual_run_consumes_overdue_tick() {
         set_next_fire_at(&server, schedule.id, overdue).await;
 
         let (summary, t) = trigger_at(&client, saved.id).await;
-        let run = finished(&client, saved.id, &summary).await;
+        let run = finished(&server, &client, saved.id, &summary).await;
         assert_eq!(run.status, "success", "{mode}: {run:?}");
 
         let cursor = stored_next_fire_at(&server, schedule.id).await;
@@ -6712,7 +6955,7 @@ async fn manual_run_leaves_future_fire_cursor() {
     set_next_fire_at(&server, schedule.id, future).await;
 
     let (summary, _t) = trigger_at(&client, saved.id).await;
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
 
     assert_eq!(stored_next_fire_at(&server, schedule.id).await, future);
@@ -6761,8 +7004,10 @@ async fn failed_manual_run_leaves_overdue_tick_claimable() {
 
         // The store's own claim, so the run's outcome is the test's choice
         // rather than whatever the corpus makes of the query.
-        let ManualRunClaim::Started(claimed) =
-            store.claim_manual_run(saved.id, key_id, 24).await.unwrap()
+        let ManualRunClaim::Started(claimed) = store
+            .claim_manual_run(saved.id, key_id, 24, &RunLease::unattached())
+            .await
+            .unwrap()
         else {
             panic!("{name}: the manual claim must start");
         };
@@ -6821,8 +7066,10 @@ async fn a_second_finish_of_a_terminal_manual_run_moves_no_cursor() {
         .await
         .unwrap();
 
-    let ManualRunClaim::Started(claimed) =
-        store.claim_manual_run(saved.id, key_id, 24).await.unwrap()
+    let ManualRunClaim::Started(claimed) = store
+        .claim_manual_run(saved.id, key_id, 24, &RunLease::unattached())
+        .await
+        .unwrap()
     else {
         panic!("the manual claim must start");
     };
@@ -6937,8 +7184,11 @@ async fn every_claim_stamps_started_at_from_the_app_clock_after_its_locks() {
     // a clock reading, not the tick's planning instant.
     let tick_now = overdue + minutes(30);
     let claimant = store.clone();
-    let claim =
-        tokio::spawn(async move { claimant.claim_due_run(schedule.id, tick_now, 24).await });
+    let claim = tokio::spawn(async move {
+        claimant
+            .claim_due_run(schedule.id, tick_now, 24, &RunLease::unattached())
+            .await
+    });
 
     // Barrier: the claim is queued on the held row, so its transaction
     // (and with it the database's `now()`) has already begun.
@@ -6972,8 +7222,10 @@ async fn every_claim_stamps_started_at_from_the_app_clock_after_its_locks() {
 
     // The manual run claimed next is the latest by the same clock.
     let before_manual = now_micros();
-    let ManualRunClaim::Started(manual) =
-        store.claim_manual_run(saved.id, key_id, 24).await.unwrap()
+    let ManualRunClaim::Started(manual) = store
+        .claim_manual_run(saved.id, key_id, 24, &RunLease::unattached())
+        .await
+        .unwrap()
     else {
         panic!("the manual claim must start");
     };
@@ -7028,7 +7280,7 @@ async fn manual_run_of_disabled_schedule_runs_and_resume_skips_consumed_boundary
     set_next_fire_at(&server, schedule.id, overdue).await;
 
     let (summary, _t) = trigger_at(&client, saved.id).await;
-    let run = finished(&client, saved.id, &summary).await;
+    let run = finished(&server, &client, saved.id, &summary).await;
     assert_eq!(run.status, "success", "{run:?}");
     let paused = client.get_schedule(saved.id).await.unwrap();
     assert!(!paused.enabled, "a manual run leaves the schedule disabled");
@@ -7078,7 +7330,7 @@ async fn manual_run_of_a_query_mode_schedule_still_starts() {
     assert_eq!(summary.window_kind, None);
     assert_eq!(summary.origin.as_deref(), Some("manual"));
 
-    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    let runs = wait_for_finished_runs(&server, &client, saved.id, 1).await;
     assert_eq!(runs.len(), 1);
     let run = &runs[0];
     assert_eq!(run.status, "success");
@@ -7910,7 +8162,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "POST /saved/{id}/run",
             method: Method::POST,
             needs: &["saved_query"],
-            also: &[],
+            also: &["query"],
             body: None,
             bad: vec![("/saved/abc/run", None), ("/saved/%FF/run", None)],
         },
@@ -7918,7 +8170,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "GET /saved/{id}/runs/{run_id}",
             method: Method::GET,
             needs: &["saved_query"],
-            also: &[],
+            also: &["query"],
             body: None,
             bad: vec![
                 ("/saved/abc/runs/1", None),

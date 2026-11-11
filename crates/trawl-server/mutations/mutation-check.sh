@@ -152,6 +152,16 @@ filter_for() {
     33-removal-retry-ignores-deleted-day.patch)
       FILTER=(--lib rollup_unlink_sync_retry_ends_when_retention_deletes_the_day)
       ;;
+    # The manual-run gate of #444. A lease taken after the claim lets a
+    # refused press claim first: the same net answers 409, not 429.
+    34-manual-lease-after-claim.patch)
+      FILTER=(--test scheduler_windows manual_run_refusal_is_preclaim)
+      ;;
+    # A hold the run's work does not keep frees the gate at the run's
+    # timeout while its preparation job is still parked.
+    35-manual-lease-dropped-at-timeout.patch)
+      FILTER=(--test scheduler_windows manual_run_lease_outlives_its_request)
+      ;;
     *) return 1 ;;
   esac
 }

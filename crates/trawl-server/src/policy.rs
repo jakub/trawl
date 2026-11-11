@@ -278,6 +278,16 @@ pub mod needs {
         const PERMISSIONS: &'static [Permission] = &[Permission::ServerManage];
     }
 
+    /// Running a saved query now and reading a run's result rows
+    /// (ADR-0018): `query` and `saved_query`. Either alone would let a
+    /// `saved_query`-only key execute any query, or a `query`-only key run
+    /// another key's saved text.
+    #[derive(Debug)]
+    pub struct RunSavedQuery;
+    impl Needs for RunSavedQuery {
+        const PERMISSIONS: &'static [Permission] = &[Permission::Query, Permission::SavedQuery];
+    }
+
     /// Reading investigations and their kept evidence (ADR-0059): `query`
     /// and `investigation_read`.
     #[derive(Debug)]
@@ -989,6 +999,22 @@ mod tests {
             "investigation_read",
             "server_manage"
         ])));
+    }
+
+    /// Running a saved query needs both `query` and `saved_query`.
+    #[test]
+    fn run_saved_query_needs_query_and_saved_query() {
+        let key = |perms: &[&str]| {
+            let perms: Vec<(&str, &str)> = perms.iter().map(|p| ("trawl", *p)).collect();
+            key_with(vec![role("r", &perms)])
+        };
+        assert!(needs::RunSavedQuery::admits(&key(&[
+            "query",
+            "saved_query"
+        ])));
+        assert!(!needs::RunSavedQuery::admits(&key(&["saved_query"])));
+        assert!(!needs::RunSavedQuery::admits(&key(&["query"])));
+        assert!(!needs::RunSavedQuery::admits(&key(&[])));
     }
 
     /// Simulated bearer shell: short-circuits with a fleet-auth-flat body.

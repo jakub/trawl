@@ -127,6 +127,8 @@ ALTER TABLE captured_results
 ALTER TABLE schedules
     ADD COLUMN runs_claimed BIGINT NOT NULL DEFAULT 0
         CONSTRAINT schedules_runs_claimed_nonneg CHECK (runs_claimed >= 0);
+CREATE INDEX schedules_due_idx ON schedules (next_fire_at, id)
+    WHERE enabled AND (max_runs IS NULL OR runs_claimed < max_runs);
 ";
 /// The migration that adds `schedules.runs_claimed` and seeds it.
 const RUNS_CLAIMED_MIGRATION: &str = "20261106000001_schedule_runs_claimed.sql";
@@ -139,24 +141,27 @@ mod cases;
 
 /// The upgrade seeds each schedule's run budget from the runs it still has,
 /// whatever their status (ADR-0018 amended 2026-11-06). The database stands
-/// one migration behind, as an installation upgrading in place does, and
-/// boot's own runner applies the rest.
+/// at the migration before it, as an installation upgrading in place does,
+/// and boot's own runner applies it and every later one.
 #[sqlx::test(migrations = false)]
 async fn runs_claimed_backfill_counts_retained_runs(pool: PgPool) {
     let previous = tempfile::tempdir().unwrap();
-    let mut copied = 0;
+    let mut found = false;
     for entry in std::fs::read_dir(NEW_DIR).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap();
-        if name == RUNS_CLAIMED_MIGRATION {
-            continue;
+        // Fixed-width version prefixes: name order is version order. A later
+        // migration may read the column this one adds, so it stays out too.
+        match name.cmp(RUNS_CLAIMED_MIGRATION.as_ref()) {
+            std::cmp::Ordering::Less => {
+                std::fs::copy(&path, previous.path().join(name)).unwrap();
+            }
+            std::cmp::Ordering::Equal => found = true,
+            std::cmp::Ordering::Greater => {}
         }
-        std::fs::copy(&path, previous.path().join(name)).unwrap();
-        copied += 1;
     }
-    assert_eq!(
-        copied + 1,
-        std::fs::read_dir(NEW_DIR).unwrap().count(),
+    assert!(
+        found,
         "{RUNS_CLAIMED_MIGRATION} is one of the embedded migrations"
     );
     sqlx::migrate::Migrator::new(previous.path())
