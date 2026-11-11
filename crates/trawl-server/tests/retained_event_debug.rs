@@ -290,3 +290,85 @@ async fn retained_event_text_is_debug_only() {
     assert_eq!(field(&warn[0], "error_class").as_deref(), Some("store"));
     assert_eq!(field(&warn[0], "cause_kind").as_deref(), Some("pg_server"));
 }
+
+/// The `pipeline_wal_write_failed` fault of `retained_event_redaction`
+/// (a WAL root that is a regular file, so the env directory's `create_dir`
+/// fails with `ENOTDIR`), under the raised filter: the operating system's
+/// text is on a DEBUG `pipeline_wal_write_failed` line with the same target
+/// and `batch_service`, the one WARN carries only the closed cause, and
+/// every stdout line or WAL record holding `(os error` is DEBUG.
+#[test]
+fn io_failure_text_is_debug_only() {
+    sinks();
+    let service = format!("io-debug-{:016x}", rand::random::<u64>());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wal");
+    std::fs::write(&root, b"a regular file where the WAL root should be").unwrap();
+    let writer = Arc::new(WalWriter::new(root));
+    // The fault is real: the raw writer's error is the operating system's.
+    let raw = match writer.write(ENV, "fault-proof", b"{}\n") {
+        Err(trawl_server::ingest::wal::WalWriteError::NotPublished(raw)) => raw,
+        other => panic!("not the unpublished filesystem fault: {other:?}"),
+    };
+    assert_eq!(raw.kind(), std::io::ErrorKind::NotADirectory, "{raw:?}");
+    assert!(raw.to_string().contains("(os error"), "{raw}");
+
+    let pipeline = trawl_server::ingest::pipeline::PipelineWriter::new(writer, None, None);
+    let mut batch = trawl_server::ingest::pipeline::ServiceBatch::default();
+    batch.push(
+        serde_json::json!({"env": ENV, "service": service, "message": "lost"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let mut batches = indexmap::IndexMap::new();
+    batches.insert((ENV.to_owned(), service.clone()), batch);
+    assert_eq!(pipeline.write(pipeline.admit_for_test(batches)), 0);
+
+    let mine = |line: &String| {
+        field(line, "event_type").as_deref() == Some("pipeline_wal_write_failed")
+            && field(line, "batch_service").as_deref() == Some(service.as_str())
+    };
+    let debug: Vec<String> = stdout_lines()
+        .into_iter()
+        .filter(|line| mine(line) && level(line) == "DEBUG")
+        .collect();
+    assert!(
+        debug.iter().any(|line| line.contains("(os error")
+            && line.contains(&raw.to_string())
+            && on_target(line, "trawl_server::ingest::pipeline")),
+        "a DEBUG pipeline_wal_write_failed carries the OS text: {debug:#?}"
+    );
+
+    let warn: Vec<String> = stdout_lines()
+        .into_iter()
+        .filter(|line| mine(line) && level(line) == "WARN")
+        .collect();
+    assert_eq!(warn.len(), 1, "{warn:#?}");
+    assert!(
+        on_target(&warn[0], "trawl_server::ingest::pipeline"),
+        "{}",
+        warn[0]
+    );
+    assert_eq!(
+        field(&warn[0], "cause_kind").as_deref(),
+        Some("io_other"),
+        "{}",
+        warn[0]
+    );
+    assert_eq!(field(&warn[0], "error"), None, "{}", warn[0]);
+    assert!(!warn[0].contains("(os error"), "{}", warn[0]);
+
+    for line in stdout_lines()
+        .iter()
+        .filter(|line| line.contains("(os error"))
+    {
+        assert_eq!(level(line), "DEBUG", "{line}");
+    }
+    for record in wal_records()
+        .iter()
+        .filter(|record| record.to_string().contains("(os error"))
+    {
+        assert_eq!(record["level"], "debug", "{record}");
+    }
+}

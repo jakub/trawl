@@ -667,3 +667,137 @@ async fn owning_key_lookup_failure_drops_the_auth_text() {
         .expect("the schedule still exists");
     assert_eq!(after.next_fire_at, schedule.next_fire_at);
 }
+
+// -- pipeline_wal_write_failed: a WAL write fails on the filesystem --------
+
+/// A pipeline over a WAL root that is a regular file: every write fails at
+/// `create_dir` of the env directory with `ENOTDIR`, whatever the test's
+/// uid. Before it returns, the fault is proven on the raw writer: its error
+/// is `NotADirectory` and its text is the operating system's, with
+/// `(os error`. The raw writer logs nothing on this path.
+fn failing_wal_pipeline(
+    root: &Path,
+) -> (
+    trawl_server::ingest::pipeline::PipelineWriter,
+    std::io::Error,
+) {
+    std::fs::write(root, b"a regular file where the WAL root should be").unwrap();
+    let writer = Arc::new(WalWriter::new(root.to_path_buf()));
+    let raw = match writer.write(ENV, "fault-proof", b"{}\n") {
+        Err(trawl_server::ingest::wal::WalWriteError::NotPublished(raw)) => raw,
+        other => panic!("not the unpublished filesystem fault: {other:?}"),
+    };
+    assert_eq!(raw.kind(), std::io::ErrorKind::NotADirectory, "{raw:?}");
+    assert!(raw.to_string().contains("(os error"), "{raw}");
+    (
+        trawl_server::ingest::pipeline::PipelineWriter::new(writer, None, None),
+        raw,
+    )
+}
+
+/// One admitted group of one event for `service`.
+fn one_event_group(
+    pipeline: &trawl_server::ingest::pipeline::PipelineWriter,
+    service: &str,
+) -> Vec<trawl_server::ingest::pipeline::AdmittedGroup> {
+    let mut batch = trawl_server::ingest::pipeline::ServiceBatch::default();
+    batch.push(
+        serde_json::json!({"env": ENV, "service": service, "message": "lost"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let mut batches = indexmap::IndexMap::new();
+    batches.insert((ENV.to_owned(), service.to_owned()), batch);
+    pipeline.admit_for_test(batches)
+}
+
+/// A WAL write the filesystem refuses leaves one WARN
+/// `pipeline_wal_write_failed` with the closed cause and no `error` field,
+/// and the operating system's text on no stdout line at INFO or above and
+/// in no WAL record.
+///
+/// The site is `ingest/pipeline.rs` `record_discarded_group`, the
+/// inventory's `ingest/pipeline.rs` rows 198 (the call) and 214 (the
+/// emission) in `docs/evidence/issue-412/retained-events.tsv`. The fault is
+/// `ENOTDIR`, which `CauseKind::of_io` names `io_other`.
+#[test]
+fn io_failure_event_drops_the_os_text() {
+    sinks();
+    let service = format!("io-redaction-{:016x}", rand::random::<u64>());
+    let dir = tempfile::tempdir().unwrap();
+    let (pipeline, _raw) = failing_wal_pipeline(&dir.path().join("wal"));
+
+    let written = pipeline.write(one_event_group(&pipeline, &service));
+    assert_eq!(written, 0, "the refused write publishes nothing");
+
+    let lines: Vec<String> = stdout_lines()
+        .into_iter()
+        .filter(|line| {
+            field(line, "event_type").as_deref() == Some("pipeline_wal_write_failed")
+                && field(line, "batch_service").as_deref() == Some(service.as_str())
+        })
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "pipeline_wal_write_failed on stdout: {lines:#?}"
+    );
+    let line = &lines[0];
+    assert_eq!(level(line), "WARN", "{line}");
+    assert!(on_target(line, "trawl_server::ingest::pipeline"), "{line}");
+    assert_eq!(
+        field(line, "cause_kind").as_deref(),
+        Some("io_other"),
+        "{line}"
+    );
+    assert_eq!(field(line, "events_lost").as_deref(), Some("1"), "{line}");
+    assert_eq!(
+        field(line, "left_visible").as_deref(),
+        Some("false"),
+        "{line}"
+    );
+    assert_eq!(field(line, "error"), None, "no error field: {line}");
+
+    let records: Vec<Value> = wal_records()
+        .into_iter()
+        .filter(|record| {
+            record["event_type"] == "pipeline_wal_write_failed"
+                && record["batch_service"] == service.as_str()
+        })
+        .collect();
+    assert_eq!(
+        records.len(),
+        1,
+        "pipeline_wal_write_failed persisted: {records:#?}"
+    );
+    let record = &records[0];
+    assert_eq!(record["level"], "warn", "{record}");
+    assert_eq!(
+        record["target"], "trawl_server::ingest::pipeline",
+        "{record}"
+    );
+    assert_eq!(record["cause_kind"], "io_other", "{record}");
+    assert_eq!(record["events_lost"], 1, "{record}");
+    assert_eq!(record["left_visible"], false, "{record}");
+    assert!(record.get("error").is_none(), "no error field: {record}");
+
+    let leaked: Vec<String> = stdout_lines()
+        .into_iter()
+        .filter(|line| {
+            line.contains("(os error") && level(line) != "DEBUG" && level(line) != "TRACE"
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "OS error text reached stdout at INFO or above: {leaked:#?}"
+    );
+    let persisted: Vec<Value> = wal_records()
+        .into_iter()
+        .filter(|record| record.to_string().contains("(os error"))
+        .collect();
+    assert!(
+        persisted.is_empty(),
+        "OS error text reached the WAL: {persisted:#?}"
+    );
+}
