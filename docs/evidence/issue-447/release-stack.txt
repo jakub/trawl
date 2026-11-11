@@ -1,11 +1,11 @@
 release-stack.sh for #447, tree depth limit
-sha:      b1b03b7ba8d537733746943735c67d499706cb21
+sha:      7e001f0da314f9413e04457cb8e44e1a746b2f8b
 rustc:    rustc 1.98.0 (88d9e12ae 2026-08-18)
 arch:     x86_64
 ulimit -s: 2048 KiB
 profile:  release (evidence-447/release/trawl)
 limits:   MAX_TREE_DEPTH=64 MAX_QUERY_LEN=65536
-date:     2026-11-11T20:26:26Z
+date:     2026-11-11T20:31:10Z
 
 == every shape at depth 64: its one row ==
 plus chain                       depth=64     bytes=267    exit=0   row
