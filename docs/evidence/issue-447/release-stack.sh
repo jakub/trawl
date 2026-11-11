@@ -8,7 +8,9 @@
 #     row, with the value the shape computes) and at depth 65 (the depth
 #     refusal);
 #   - the longest texts MAX_QUERY_LEN admits, which end in the depth
-#     refusal, a grammar error or an engine error, and never in a signal.
+#     refusal or a grammar error, and never in a signal;
+#   - an alias chain DuckDB may refuse or run, which only must not end in
+#     a signal.
 # One line per case. The script exits non-zero if any case dies of a signal
 # or misses its expected outcome. arm64 is not measured.
 #
@@ -203,7 +205,7 @@ error_line() {
 # run_case NAME DEPTH EXPECT TEXT [ROW]
 # EXPECT is "row" (exactly one row, holding ROW), "depth" (the depth
 # refusal), "grammar" (a parse error other than the depth refusal) or "any"
-# (a refusal or an engine error).
+# (any outcome but a signal).
 run_case() {
   local name=$1 depth=$2 expect=$3 text=$4 want=${5:-} status=0 outcome mark= rows line
   # the limit applies to the trawl process only, not to the builder above
@@ -289,7 +291,8 @@ run_case "deep expression, grammar error" 32000 grammar "* | where $(compact 320
 run_case "deep search, grammar error" "$MAX_SEARCH_PRESCAN" grammar \
   "$(rep '(' "$MAX_SEARCH_PRESCAN")a=1$(rep ')' "$MAX_SEARCH_PRESCAN") | where"
 # a0 = 1, a1 = a0, ...: each value one name, so no level deep. DuckDB's own
-# binder limit (1000) may answer; that error is the outcome, not a failure.
+# binder limit (1000) may answer, or a later DuckDB may run it. Either is
+# the outcome; only a signal fails.
 aliases=$(
   printf '* | let a0 = 1'
   for ((i = 1; i < 4000; i++)); do printf ', a%d = a%d' "$i" "$((i - 1))"; done
