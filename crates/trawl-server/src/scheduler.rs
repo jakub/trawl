@@ -2226,6 +2226,7 @@ mod tests {
                 .await
                 .is_err()
         );
+        drop(lease);
         let advanced_cursor: DateTime<Utc> =
             sqlx::query_scalar("SELECT next_fire_at FROM schedules WHERE id = $1")
                 .bind(advanced)
