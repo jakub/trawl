@@ -9,14 +9,17 @@
 //! must answer. [`candidates`] scans each source for the places a query
 //! can be written: every line of a fenced block that is not a shell
 //! block, every `trawl query`, `trawl validate` or `trawl tail` command in
-//! a shell block or in prose, and, in `dsl::ESSENTIALS`, every backticked
-//! span and every indented example line. Each candidate must be accounted
-//! for by a row or by an [`Exclusion`] that says why it is not a query, so
-//! a new example cannot appear unaccounted.
+//! a shell block or in prose, every backticked prose span that
+//! [`is_query_shaped`], and, in `dsl::ESSENTIALS`, every backticked span
+//! and every indented example line. Each candidate must be accounted for
+//! by a row or by an [`Exclusion`] that says why it is not a query, so a
+//! new example cannot appear unaccounted.
 //!
 //! `dsl::ESSENTIALS` lives in `trawl-mcp`, which depends on this crate, so
 //! the rows carry copies anchored in that file's text through
 //! [`essentials`], which decodes the string literal's escapes explicitly.
+
+use trawl_core::parser::suggest::KNOWN_PIPE_STAGES;
 
 /// A document that shows queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +124,10 @@ pub enum Excluded {
     Transcript,
     /// An operator token named in prose.
     Operator,
+    /// Part of a query, such as a stage name or a clause, named in prose.
+    Fragment,
+    /// A query shape with placeholders such as `<expr>` or `...`.
+    Placeholder,
 }
 
 /// A candidate that is not a query. In a fenced block, the excerpt is one
@@ -138,7 +145,7 @@ pub struct Exclusion {
 pub struct Candidate {
     /// The fenced block it sits in, by index; `None` outside fences.
     pub block: Option<usize>,
-    /// A backticked span (in `ESSENTIALS`).
+    /// A backticked prose span.
     pub span: bool,
     /// The trimmed line, or a shell command with its continuations
     /// joined.
@@ -191,27 +198,140 @@ fn is_prose_query_command(line: &str) -> bool {
             .any(|word| line.contains(&format!("{word} '")) || line.contains(&format!("{word} \"")))
 }
 
+/// Whether a backticked prose span is written like a query, and so must
+/// be a row or an exclusion: it starts with `|`, it starts with a pipe
+/// stage keyword and a space, or it holds ` | `. This is deliberately
+/// broad; a fragment or placeholder it catches is excluded by name.
+pub fn is_query_shaped(span: &str) -> bool {
+    span.starts_with('|')
+        || span.contains(" | ")
+        || KNOWN_PIPE_STAGES.iter().any(|stage| {
+            span.strip_prefix(stage)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
+}
+
+/// The backticked spans of `source`'s prose. In a Markdown page these are
+/// the code spans outside fenced blocks; in `ESSENTIALS`, the text between
+/// paired backticks on a line.
+pub fn spans(source: Source) -> Vec<String> {
+    let text = source.text();
+    if source == Source::Essentials {
+        return text
+            .lines()
+            .filter(|line| !line.starts_with("  "))
+            .flat_map(|line| line.split('`').skip(1).step_by(2).map(str::to_owned))
+            .collect();
+    }
+    let mut found = Vec::new();
+    let mut paragraph = String::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if fenced {
+            fenced = trimmed != "```";
+            continue;
+        }
+        // A span never crosses a blank line, a fence, a heading, a table
+        // row or a list item, so each of these ends the text it is read
+        // from.
+        let table_row = trimmed.starts_with('|');
+        let starts_block = trimmed.is_empty()
+            || trimmed.starts_with("```")
+            || trimmed.starts_with('#')
+            || table_row
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed
+                .split_once(". ")
+                .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if starts_block {
+            code_spans(&paragraph, &mut found);
+            paragraph.clear();
+        }
+        if trimmed.starts_with("```") {
+            fenced = true;
+        } else if table_row {
+            // A table cell writes a literal pipe as `\|`, also in a span.
+            code_spans(&trimmed.replace("\\|", "|"), &mut found);
+        } else {
+            paragraph.push_str(trimmed);
+            paragraph.push('\n');
+        }
+    }
+    code_spans(&paragraph, &mut found);
+    found
+}
+
+/// The code spans of one Markdown block, as the Markdown spec reads them:
+/// a run of n backticks opens a span that the next run of exactly n
+/// closes, a line break inside a span reads as a space, and one space is
+/// stripped from each end when both ends have one. An opening run with no
+/// closing run is literal text, and so is a backslash-escaped backtick.
+fn code_spans(block: &str, found: &mut Vec<String>) {
+    let bytes = block.as_bytes();
+    let run_end = |mut i: usize| {
+        while bytes.get(i) == Some(&b'`') {
+            i += 1;
+        }
+        i
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if bytes.get(i + 1) == Some(&b'`') => i += 2,
+            b'`' => {
+                let open = run_end(i);
+                let width = open - i;
+                let mut j = open;
+                let mut close = None;
+                while j < bytes.len() {
+                    if bytes[j] == b'`' {
+                        let end = run_end(j);
+                        if end - j == width {
+                            close = Some((j, end));
+                            break;
+                        }
+                        j = end;
+                    } else {
+                        j += 1;
+                    }
+                }
+                let Some((start, end)) = close else {
+                    i = open;
+                    continue;
+                };
+                let content = block[open..start].replace('\n', " ");
+                let content = match content.strip_prefix(' ').and_then(|c| c.strip_suffix(' ')) {
+                    Some(inner) if !content.trim().is_empty() => inner.to_owned(),
+                    _ => content,
+                };
+                found.push(content);
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
 /// Every place `source` can write a query.
 pub fn candidates(source: Source) -> Vec<Candidate> {
     let text = source.text();
+    let prose = spans(source).into_iter();
     if source == Source::Essentials {
-        let mut found = Vec::new();
-        for line in text.lines() {
-            if let Some(example) = line.strip_prefix("  ") {
-                found.push(Candidate {
-                    block: Some(0),
-                    span: false,
-                    text: example.trim().to_owned(),
-                });
-            } else {
-                found.extend(line.split('`').skip(1).step_by(2).map(|span| Candidate {
-                    block: None,
-                    span: true,
-                    text: span.to_owned(),
-                }));
-            }
-        }
-        return found;
+        let examples = text.lines().filter_map(|line| line.strip_prefix("  "));
+        return examples
+            .map(|example| Candidate {
+                block: Some(0),
+                span: false,
+                text: example.trim().to_owned(),
+            })
+            .chain(prose.map(|text| Candidate {
+                block: None,
+                span: true,
+                text,
+            }))
+            .collect();
     }
 
     let mut found = Vec::new();
@@ -262,6 +382,15 @@ pub fn candidates(source: Source) -> Vec<Candidate> {
         }
         block += 1;
     }
+    found.extend(
+        prose
+            .filter(|span| is_query_shaped(span))
+            .map(|text| Candidate {
+                block: None,
+                span: true,
+                text,
+            }),
+    );
     found
 }
 
@@ -1259,6 +1388,325 @@ pub const EXAMPLES: &[Example] = &[
         query: "status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10",
         expect: Expect::Valid,
     },
+    // Queries written in prose spans.
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "extract kv",
+        query: "* | extract kv",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "* | where host matches /^a b/",
+        query: "* | where host matches /^a b/",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "path=/tmp* | where x / 2 == 1",
+        query: "path=/tmp* | where x / 2 == 1",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "where f != x",
+        query: "* | where f != x",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: r#"where f != "x""#,
+        query: r#"* | where f != "x""#,
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "where isnull(f)",
+        query: "* | where isnull(f)",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "top 10 f",
+        query: "* | top 10 f",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "rare 10 f",
+        query: "* | rare 10 f",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "dedup f",
+        query: "* | dedup f",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "table f",
+        query: "* | table f",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "fields f",
+        query: "* | fields f",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "let y = f",
+        query: "* | let y = f",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "rename f as y",
+        query: "* | rename f as y",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "let a = 1, b = a",
+        query: "* | let a = 1, b = a",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "let web1 = web1 + 1",
+        query: "* | let web1 = web1 + 1",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "timechart on f count()",
+        query: "* | timechart on f count()",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: r#"where status == "400""#,
+        query: r#"* | where status == "400""#,
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "where status == 400",
+        query: "* | where status == 400",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "where a == b",
+        query: "* | where a == b",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: r#"where lower(status) == "a""#,
+        query: r#"* | where lower(status) == "a""#,
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "where status * 2 > 400",
+        query: "* | where status * 2 > 400",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "where f == null",
+        query: "* | where f == null",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "rename status as st",
+        query: "* | rename status as st",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "let s2 = status",
+        query: "* | let s2 = status",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "let ms = 1000, total = ms * 2",
+        query: "* | let ms = 1000, total = ms * 2",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "let a = status, b = a",
+        query: "* | let a = status, b = a",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "rename _time as t",
+        query: "* | rename _time as t",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "let t2 = _time",
+        query: "* | let t2 = _time",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: r#"let d = date_trunc("day", _time)"#,
+        query: r#"* | let d = date_trunc("day", _time)"#,
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "let t = coalesce(_time, x)",
+        query: "* | let t = coalesce(_time, x)",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "| where `true` == 1",
+        query: "| where `true` == 1",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "| let s = sev(level) | stats count() by s",
+        query: "| let s = sev(level) | stats count() by s",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: r#"| let s = sev(lower(level)) | where s == "error""#,
+        query: r#"| let s = sev(lower(level)) | where s == "error""#,
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "| sort -timestamp",
+        query: "| sort -timestamp",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "| let x = 0.0 / 0 | where x == x",
+        query: "| let x = 0.0 / 0 | where x == x",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "stats count()",
+        query: "* | stats count()",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "| stats count() as hits by count",
+        query: "| stats count() as hits by count",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "| stats count() as hits by count | sort -hits | head 5",
+        query: "| stats count() as hits by count | sort -hits | head 5",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "| where count == 1",
+        query: "| where count == 1",
+        expect: Expect::Valid,
+    },
+    // A scalar head in an aggregation slot runs in batch SQL, so
+    // `validate_pipeline` admits it; live tail and the kv tail refuse it
+    // when they compile, as the reference says.
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "| stats lower(x)",
+        query: "| stats lower(x)",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "extract kv | sort -bytes | head 2",
+        query: "* | extract kv | sort -bytes | head 2",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "stats lower(x)",
+        query: "* | stats lower(x)",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "stats coalesce(sum(x), 0)",
+        query: "* | stats coalesce(sum(x), 0)",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::QueryTutorial,
+        site: Site::Inline,
+        excerpt: "| head 10",
+        query: "| head 10",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::FirstQuery,
+        site: Site::Inline,
+        excerpt: "service=checkout _severity>=error | stats count() as errors by service",
+        query: "service=checkout _severity>=error | stats count() as errors by service",
+        expect: Expect::Valid,
+    },
     // Deliberate negatives the reference states in prose.
     Example {
         source: Source::DslReference,
@@ -1375,6 +1823,27 @@ pub const EXAMPLES: &[Example] = &[
         excerpt: "| stats coalesce(sum(x), 0)",
         query: "| stats coalesce(sum(x), 0)",
         expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "where m matches f",
+        query: "* | where m matches f",
+        expect: Expect::Parser,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: r#"where m like lower("A%")"#,
+        query: r#"* | where m like lower("A%")"#,
+        expect: Expect::Parser,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Inline,
+        excerpt: "let `_foo` = 1",
+        query: "* | let `_foo` = 1",
+        expect: Expect::Parser,
     },
 ];
 
@@ -1678,5 +2147,125 @@ pub const EXCLUSIONS: &[Exclusion] = &[
         excerpt: "!=",
         kind: Excluded::Operator,
         reason: "an operator token, not a query",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "|",
+        kind: Excluded::Operator,
+        reason: "the pipe operator named in prose",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: r"drop the spaces or write \s",
+        kind: Excluded::Transcript,
+        reason: "a hint the parser prints",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "stats ... by f",
+        kind: Excluded::Placeholder,
+        reason: "`...` stands for the aggregations",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "timechart ... by f",
+        kind: Excluded::Placeholder,
+        reason: "`...` stands for the aggregations",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "let y = <expr of f>",
+        kind: Excluded::Placeholder,
+        reason: "`<expr of f>` stands for an expression",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "| where",
+        kind: Excluded::Fragment,
+        reason: "a stage named in prose",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "| let",
+        kind: Excluded::Fragment,
+        reason: "a stage named in prose",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "where field <op> literal",
+        kind: Excluded::Grammar,
+        reason: "a comparison shape, with placeholders",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "where literal <op> field",
+        kind: Excluded::Grammar,
+        reason: "a comparison shape, with placeholders",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "where field matches|like|ilike <pattern>",
+        kind: Excluded::Grammar,
+        reason: "a comparison shape, with placeholders",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "let status = <expr>",
+        kind: Excluded::Placeholder,
+        reason: "`<expr>` stands for an expression",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "stats ... by status",
+        kind: Excluded::Placeholder,
+        reason: "`...` stands for the aggregations",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "extract <regex>",
+        kind: Excluded::Placeholder,
+        reason: "`<regex>` stands for a pattern",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "from saved",
+        kind: Excluded::Fragment,
+        reason: "the stage named without a saved query",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "| from saved",
+        kind: Excluded::Fragment,
+        reason: "the stage named without a saved query",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "from <field>",
+        kind: Excluded::Grammar,
+        reason: "an extract option, with a placeholder",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "sample <n>",
+        kind: Excluded::Grammar,
+        reason: "a sample size form, with a placeholder",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "stats ... by",
+        kind: Excluded::Placeholder,
+        reason: "`...` stands for the aggregations and the keys",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "tail is not supported after extract kv; use sort and head instead",
+        kind: Excluded::Transcript,
+        reason: "a refusal sentence the kv tail prints",
+    },
+    Exclusion {
+        source: Source::CliReference,
+        excerpt: "|",
+        kind: Excluded::Operator,
+        reason: "the pipe operator named in prose",
     },
 ];

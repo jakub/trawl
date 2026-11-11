@@ -800,6 +800,32 @@ fn covered(example: &doc_examples::Example, candidates: &[doc_examples::Candidat
     }
 }
 
+/// The candidates no row covers and no exclusion names, described for a
+/// failure message.
+fn strays(
+    candidates: &[doc_examples::Candidate],
+    accounted: &[bool],
+    exclusions: &[&doc_examples::Exclusion],
+) -> Vec<String> {
+    candidates
+        .iter()
+        .zip(accounted)
+        .filter(|(candidate, accounted)| {
+            !**accounted
+                && !exclusions.iter().any(|x| match candidate.block {
+                    Some(block) => candidates
+                        .iter()
+                        .any(|c| c.block == Some(block) && c.text == x.excerpt),
+                    None => candidate.text == x.excerpt,
+                })
+        })
+        .map(|(candidate, _)| {
+            let site = if candidate.span { "span" } else { "line" };
+            format!("{site} {:?}", candidate.text)
+        })
+        .collect()
+}
+
 /// Every query the documentation shows still means what it says: each
 /// positive parses and passes `validate_pipeline`, the call check
 /// included, and each deliberate negative is refused by the layer that
@@ -815,6 +841,7 @@ fn documented_examples_validate() {
         let exclusions: Vec<_> = EXCLUSIONS.iter().filter(|x| x.source == source).collect();
         assert!(!examples.is_empty(), "{path}: no example rows");
         let candidates = doc_examples::candidates(source);
+        let spans = doc_examples::spans(source);
         let coverage: Vec<Vec<usize>> = examples
             .iter()
             .map(|example| covered(example, &candidates))
@@ -826,7 +853,7 @@ fn documented_examples_validate() {
             let anchored = match example.site {
                 Site::Fenced => !rows.is_empty(),
                 Site::Shell => text.contains(excerpt),
-                Site::Inline => text.contains(&format!("`{excerpt}`")),
+                Site::Inline => spans.iter().any(|span| span == excerpt),
             };
             assert!(
                 anchored,
@@ -872,20 +899,14 @@ fn documented_examples_validate() {
             );
         }
 
-        // Every candidate is a row or an exclusion.
-        for (candidate, _) in candidates.iter().zip(&accounted).filter(|(_, a)| !**a) {
-            let excluded = exclusions.iter().any(|x| match candidate.block {
-                Some(block) => candidates
-                    .iter()
-                    .any(|c| c.block == Some(block) && c.text == x.excerpt),
-                None => candidate.text == x.excerpt,
-            });
-            assert!(
-                excluded,
-                "{path}: {:?} is neither a fixture row nor an exclusion",
-                candidate.text
-            );
-        }
+        // Every candidate is a row or an exclusion. Every stray is listed,
+        // not just the first.
+        let strays = strays(&candidates, &accounted, &exclusions);
+        assert!(
+            strays.is_empty(),
+            "{path}: neither a fixture row nor an exclusion:\n{}",
+            strays.join("\n")
+        );
 
         // What each row must answer. Every miss is listed, not just the
         // first.
