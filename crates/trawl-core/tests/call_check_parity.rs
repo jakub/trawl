@@ -20,6 +20,9 @@ use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 use trawl_core::stream::{StreamPlanError, compile_stream_plan};
 
+#[path = "call_check_parity/doc_examples.rs"]
+mod doc_examples;
+
 const SOURCE: &str = "/data/*.parquet";
 
 /// A FIXED anchor: nothing may self-serve an evaluation context
@@ -753,5 +756,122 @@ fn live_refuses_non_literal_integer_positions() {
     ] {
         assert_eq!(batch_refusal(query).display, display, "{query}");
         assert_eq!(live_refusal(query), display, "live: {query}");
+    }
+}
+
+/// Whether `example` covers `candidate`.
+fn covers(example: &doc_examples::Example, candidate: &doc_examples::Candidate) -> bool {
+    use doc_examples::Site;
+    match example.site {
+        Site::Fenced => {
+            !candidate.span && example.excerpt.lines().any(|line| line == candidate.text)
+        }
+        Site::Shell => !candidate.span && candidate.text.contains(example.excerpt),
+        Site::Inline => candidate.span && candidate.text == example.excerpt,
+    }
+}
+
+/// Every query the documentation shows still means what it says: each
+/// positive parses and passes `validate_pipeline`, the call check
+/// included, and each deliberate negative is refused by the layer that
+/// owns it. Every place a source can write a query is accounted for.
+#[test]
+fn documented_examples_validate() {
+    use doc_examples::{EXAMPLES, EXCLUSIONS, Expect, Site, Source};
+
+    for source in Source::ALL {
+        let text = source.text();
+        let path = source.path();
+        let examples: Vec<_> = EXAMPLES.iter().filter(|e| e.source == source).collect();
+        let exclusions: Vec<_> = EXCLUSIONS.iter().filter(|x| x.source == source).collect();
+        assert!(!examples.is_empty(), "{path}: no example rows");
+        let candidates = doc_examples::candidates(source);
+
+        // Each row is anchored in the source as it stands.
+        for example in &examples {
+            let excerpt = example.excerpt;
+            let anchored = match example.site {
+                Site::Fenced => excerpt
+                    .lines()
+                    .all(|line| text.lines().any(|source_line| source_line.trim() == line)),
+                Site::Shell => text.contains(excerpt),
+                Site::Inline => text.contains(&format!("`{excerpt}`")),
+            };
+            assert!(anchored, "{path}: the excerpt {excerpt:?} is gone");
+            let derived = match example.site {
+                Site::Shell => doc_examples::unquote(excerpt) == example.query,
+                Site::Fenced | Site::Inline => {
+                    example.query == excerpt || example.query == format!("* | {excerpt}")
+                }
+            };
+            assert!(
+                derived,
+                "{path}: {:?} is not the query {excerpt:?} writes",
+                example.query
+            );
+            // A fenced or shell row must still be a place a query is
+            // written; a prose span need only be present.
+            if source == Source::Essentials || example.site != Site::Inline {
+                assert!(
+                    candidates.iter().any(|c| covers(example, c)),
+                    "{path}: the row {excerpt:?} covers no candidate"
+                );
+            }
+        }
+
+        for exclusion in &exclusions {
+            assert!(
+                !exclusion.reason.is_empty(),
+                "{path}: {:?}",
+                exclusion.excerpt
+            );
+            assert!(
+                candidates.iter().any(|c| c.text == exclusion.excerpt),
+                "{path}: the {:?} exclusion {:?} names no candidate",
+                exclusion.kind,
+                exclusion.excerpt
+            );
+        }
+
+        // Every candidate is a row or an exclusion.
+        for candidate in &candidates {
+            if examples.iter().any(|e| covers(e, candidate)) {
+                continue;
+            }
+            let excluded = exclusions.iter().any(|x| match candidate.block {
+                Some(block) => candidates
+                    .iter()
+                    .any(|c| c.block == Some(block) && c.text == x.excerpt),
+                None => candidate.text == x.excerpt,
+            });
+            assert!(
+                excluded,
+                "{path}: {:?} is neither a fixture row nor an exclusion",
+                candidate.text
+            );
+        }
+
+        // What each row must answer. Every miss is listed, not just the
+        // first.
+        let mut misses = Vec::new();
+        for example in &examples {
+            let query = example.query;
+            let answer = match parser::parse(query) {
+                Err(_) => Err(None),
+                Ok(ast) => validate_pipeline(&ast.pipeline).map_err(|e| Some(e.to_string())),
+            };
+            let met = match (example.expect, &answer) {
+                (Expect::Valid, Ok(())) | (Expect::Parser, Err(None)) => true,
+                (Expect::Validate(sentence), Err(Some(refusal))) => refusal == sentence,
+                _ => false,
+            };
+            if !met {
+                misses.push(format!(
+                    "{query:?}: expected {:?}, got {answer:?}",
+                    example.expect
+                ));
+            }
+        }
+        assert!(misses.is_empty(), "{path}:\n{}", misses.join("\n"));
     }
 }
