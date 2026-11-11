@@ -655,8 +655,11 @@ the failure by its closed `cause_kind`, for example `io_permission_denied` or
 `unknown` means that the code kept no typed cause. The text goes to a DEBUG
 event with the same `event_type` and target.
 
-To read that text, add `trawl_server=debug` to `RUST_LOG`, restart trawld, and
-wait for the failure to recur. The same filter feeds
+To read that text, raise the event's own target to `debug` in `RUST_LOG`,
+restart trawld, and wait for the failure to recur. Each line names its target.
+Most events are on `trawl_server`, so add `trawl_server=debug`. Startup and
+boot events are on `trawld`, and app-state database failures are on
+`storage.backend`. The same filter feeds
 [`internal_telemetry`](/reference/configuration/#ingest), so while it is set,
 every key with `query` can read the text in `service=trawld`. Restore the
 default filter when you are done.
