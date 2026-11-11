@@ -1173,6 +1173,12 @@ pub mod seam {
         /// lookups and must never hold it: a hold parks a runtime thread,
         /// not a blocking worker.
         KeyChecked,
+        /// On a scheduled or manual run's own task, once its query
+        /// returned rows and before its result is written: the run's row
+        /// is still running and its frame still holds the run's lease.
+        /// The frame reaches it inside `block_in_place` on a
+        /// multi-thread runtime, so a test that holds it runs on one.
+        RunWriting,
     }
 
     /// A held (or merely watched) worker seam.

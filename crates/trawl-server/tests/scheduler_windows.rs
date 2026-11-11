@@ -2310,9 +2310,10 @@ async fn claim_error_returns_the_lease(
 /// parked in its preparation (`Preparing`, `Prepared`) or in its executor
 /// work (`Started`) records `timeout`, and its lease still holds the gate,
 /// so the key's press on another net is refused. Deleting and re-creating
-/// the net frees nothing. On a second server, a run parked in finishing
-/// its row (behind a fixture lock on its schedule row, which `finish_run`
-/// takes) holds it too. Each lease returns once its last work ends.
+/// the net frees nothing. On servers of their own, a run parked before
+/// writing its result (`RunWriting`) and a run parked in finishing its row
+/// (behind a fixture lock on its schedule row, which `finish_run` takes)
+/// hold it too. Each lease returns once its last work ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_lease_outlives_its_request() {
     use trawl_server::pool::seam::Seam;
@@ -2380,7 +2381,51 @@ async fn manual_run_lease_outlives_its_request() {
         );
     }
 
+    writing_keeps_the_lease().await;
     finishing_keeps_the_lease().await;
+}
+
+/// The result-writing phase of [`manual_run_lease_outlives_its_request`]:
+/// a run parked after its query returned and before its result is written
+/// (`RunWriting`) is still `running`, and its frame keeps the lease, so
+/// the key's press on another net is refused until the write and the
+/// finish end.
+async fn writing_keeps_the_lease() {
+    use trawl_server::pool::seam::Seam;
+
+    let server = common::setup().await;
+    let key_id = common::captured::key_id(&server, &server.analyst_token).await;
+    let pool = &server.state.query.pool;
+    let db = common::fixture_pool(&server.app_db_url, 1).await;
+    let client =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let (saved, _) = server_net(&server, key_id, "outlives_writing", None, None).await;
+    let (other, _) = server_net(&server, key_id, "outlives_writing_other", None, None).await;
+
+    let seams = pool.seams();
+    let writing = seams.hold(Seam::RunWriting);
+    let run = client
+        .trigger_run(saved)
+        .await
+        .expect("the writing run is accepted");
+    until("the run reached its result write", || async {
+        writing.arrivals() == 1
+    })
+    .await;
+    assert_eq!(
+        runs_of(&db, saved).await,
+        [(run.id, "running".to_owned(), false, None)]
+    );
+    assert_busy("writing: another net", client.trigger_run(other).await);
+    assert_eq!(pool.manual_leases_in_use(), 1, "the writing frame holds it");
+
+    writing.release();
+    drop(seams);
+    assert_eq!(
+        settled_runs(&server, &db, saved).await,
+        [(run.id, "success".to_owned(), true, None)]
+    );
+    assert!(runs_of(&db, other).await.is_empty());
 }
 
 /// The window-resolution phase of [`manual_run_lease_outlives_its_request`]:

@@ -612,6 +612,9 @@ pub(crate) async fn execute_scheduled_query(
         Ok(query_result) => {
             let row_count = query_result.rows.len();
 
+            #[cfg(any(test, feature = "test-support"))]
+            reach_run_writing(&pool);
+
             // Write result as parquet file.
             let (result_path, result_data) =
                 match write_result_parquet(&pool, run_id, &query_result) {
@@ -666,6 +669,22 @@ pub(crate) async fn execute_scheduled_query(
                 "scheduled query failed"
             );
         }
+    }
+}
+
+/// The run frame's side of [`crate::pool::seam::Seam::RunWriting`]. A hold
+/// parks the thread, and the frame runs on a runtime worker, so on a
+/// multi-thread runtime it parks inside `block_in_place`: the worker's
+/// other tasks move to another thread instead of waiting behind the hold.
+#[cfg(any(test, feature = "test-support"))]
+fn reach_run_writing(pool: &ExecutorPool) {
+    let reach = || pool.reach(crate::pool::seam::Seam::RunWriting);
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(reach);
+    } else {
+        reach();
     }
 }
 
