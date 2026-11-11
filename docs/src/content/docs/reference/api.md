@@ -3752,7 +3752,7 @@ A run keeps its place until its work ends: the window resolution at the claim, q
 
 The message names no setting and no count. `Retry-After` is advisory: the whole seconds until the run in the way is expected to end, and never less than 1. That is the key's own run when it has one, and the earliest of the runs in flight otherwise. A run is expected to end 5 s plus `[server] timeout_secs` after its place was taken. trawl-client does not retry it on its own. The `http_failure` event records `error_class=manual_run_busy` and `cause_kind=none`.
 
-The claim's work before its `COMMIT` has 5 s, its database locks included. When that time runs out before the `COMMIT` is sent, the response is 503 `service_unavailable`, nothing is claimed, and the run gives its place back. A window resolution still running at that point keeps the place until it ends, so a second press meanwhile is refused with 429. A `COMMIT` already sent is awaited past the 5 s, and the claim may commit.
+The claim's work before its `COMMIT` has 5 s, its database locks included. When that time runs out before the claim starts its `COMMIT`, the response is 503 `service_unavailable`, nothing is claimed, and the run gives its place back. A window resolution still running at that point keeps the place until it ends, so a second press meanwhile is refused with 429. Once the claim starts its `COMMIT`, the 5 s no longer applies: the claim waits for Postgres to answer, and a connection that stalls keeps the run's place until it resolves. The claim may commit.
 
 **Request**
 
