@@ -1,8 +1,8 @@
 diff --git a/crates/trawl-server/src/handlers.rs b/crates/trawl-server/src/handlers.rs
-index 5365bce7..e82be22c 100644
+index d30abd9e..f9f3b699 100644
 --- a/crates/trawl-server/src/handlers.rs
 +++ b/crates/trawl-server/src/handlers.rs
-@@ -3210,17 +3210,6 @@ pub async fn trigger_run(
+@@ -3211,17 +3211,6 @@ pub async fn trigger_run(
      // Before the claim too, and never waiting: a refusal has nothing to
      // undo. The estimate covers the claim and the run's timeout, and only
      // shapes a later refusal's advisory Retry-After.
@@ -20,7 +20,18 @@ index 5365bce7..e82be22c 100644
      let (answer, answered) = tokio::sync::oneshot::channel();
      let schedule_store = state.storage.schedule.clone();
      let pool = state.query.pool.clone();
-@@ -3241,11 +3230,22 @@ pub async fn trigger_run(
+@@ -3237,16 +3226,32 @@ pub async fn trigger_run(
+         // check rides the first lock, so this handler takes no snapshot of
+         // its own: what the run executes is what the claim recorded.
+         let claim = schedule_store
+-            .claim_manual_run(saved_id, key_id, max_catchup_intervals, &lease)
++            .claim_manual_run(
++                saved_id,
++                key_id,
++                max_catchup_intervals,
++                &crate::pool::RunLease::unattached(),
++            )
+             .await;
          let claimed = match started_manual_run(claim) {
              Ok(claimed) => claimed,
              Err(refusal) => {
