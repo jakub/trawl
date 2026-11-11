@@ -17,27 +17,24 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # As in ci.yml's test build. rust-cache keys on CARGO_* variables, so the
+  # soak reads CI's warm `test` cache only while this matches.
+  CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
 
+# Every job runs on a GitHub-hosted runner, set up as ci.yml's test jobs
+# are, so a soak reproduces CI's conditions.
+#
 # Each job's timeout-minutes is two to three times its slowest normal run,
 # so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   suite:
     name: ${{ matrix.suite }}
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
       # Both suites always run: a flake in one says nothing about the other,
       # and cancelling the survivor halves the evidence.
       fail-fast: false
-      # ... but one at a time. Unlike ci.yml's test jobs, which run on
-      # GitHub-hosted runners, this matrix would schedule both suites
-      # concurrently on the k8s-big pool, and two full workspace
-      # builds + two postgres containers co-scheduled on the k8s-big pool
-      # OOM the heavier runner pod ~15min in (step stuck in_progress, no
-      # logs uploaded, "lost communication"). Every such death so far --
-      # the 10 concurrent attempts and the first serial one -- was this,
-      # not a test failure.
-      max-parallel: 1
       matrix:
         include:
           - suite: default-features
@@ -57,8 +54,11 @@ jobs:
           POSTGRES_DB: postgres
         ports:
           - 5432:5432
+        # A TCP health check as in ci.yml, but the data directory stays on
+        # disk: ci.yml's tmpfs is RAM, and one server holding the whole
+        # workspace's test databases fills it (53100 at about test 7300).
         options: >-
-          --health-cmd="pg_isready -U postgres"
+          --health-cmd="pg_isready -h 127.0.0.1 -U postgres"
           --health-interval=2s
           --health-timeout=3s
           --health-retries=15
@@ -66,18 +66,24 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      - name: Turn off postgres durability
+        run: ci/postgres-no-durability.sh ${{ job.services.postgres.id }}
+      # trawl-config's and trawl-web's packaging contracts render the chart.
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      # The trawld_doctor tests that run as root in an unprivileged user
+      # namespace need Ubuntu 24.04's AppArmor restriction lifted.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: 1.98.0
-      # Read ci.yml's own warm cache, never write it. The soak's former
-      # private per-suite keys were never SAVED for the heavy suite --
-      # rust-cache saves in its post step, and a cold full-workspace
-      # compile OOMed the pod before post ever ran -- so every attempt
-      # rebuilt from scratch and died in the build, not the tests. CI's
-      # `test` job compiles both feature configs under this one key on
-      # every push, so reading it makes the soak build incremental: the
-      # exact memory shape the pool survives daily. save-if false keeps
-      # ten soak runs from churning the key CI maintains.
+      # Read ci.yml's warm `test` cache, never write it: save-if false keeps
+      # ten soak runs from churning the key CI maintains. That key holds the
+      # no-default-features build only, so the default-features suite still
+      # compiles most of the workspace cold.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: test
@@ -92,32 +98,26 @@ jobs:
       # `--retries 0` on the command line overrides every retry setting in
       # .config/nextest.toml, including its two named per-test overrides. A
       # soak that retries measures the retry, not the flake.
-      # Build and run are SEPARATE steps so the step boundary says which
-      # phase kills the pod, and the completed step's logs upload. History:
-      # unbounded cold build died ~16min (rustc parallelism); with
-      # CARGO_BUILD_JOBS=4 the death moved to ~29min -- still before any
-      # per-test output survived. CI's test job never builds the
-      # default-features workspace (no-default only), so the heavy suite
-      # is always a cold build here. --test-threads 4 bounds the run
-      # phase: default features boot real trawld+duckdb per integration
-      # test, and only the pg group is capped by nextest.toml -- the rest
-      # ran at full parallelism.
+      # Build and run are separate steps so the step timings say which
+      # phase a slow or dying run spent its time in.
       - name: Build test binaries
         run: cargo nextest run --workspace ${{ matrix.features }} --no-run
-        env:
-          CARGO_BUILD_JOBS: "4"
+      - name: Disk after the build
+        run: df -h /
       - name: Run suites
-        run: cargo nextest run --workspace ${{ matrix.features }} --retries 0 --test-threads 4
+        run: cargo nextest run --workspace ${{ matrix.features }} --retries 0
         env:
-          CARGO_BUILD_JOBS: "4"
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          # A doctor test that needs a user namespace fails here instead of
+          # printing SKIPPED, as in ci.yml.
+          TRAWL_TEST_REQUIRE_USERNS: "1"
       - name: Record suite outcome
         if: always()
         run: echo "${{ matrix.suite }} -> ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
 
   summary:
     name: soak summary
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     needs: [suite]
     if: always()
