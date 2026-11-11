@@ -908,7 +908,15 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Trigger an immediate report run for a saved query.
+    /// Trigger an immediate report run for a saved query
+    /// (`POST /api/v1/saved/{id}/run`, needs `query` and `saved_query`).
+    ///
+    /// The request is sent once and never retried here. A busy refusal is
+    /// [`ClientError::Server`] with status 429 and code `manual_run_busy`:
+    /// the caller's key already holds a manual run, or the installation
+    /// runs as many as it may. Nothing was claimed, so pressing again is
+    /// safe, and [`retry_after_secs`](ClientError::Server::retry_after_secs)
+    /// carries the server's advisory wait.
     pub async fn trigger_run(&self, saved_id: i64) -> Result<ReportRunSummary, ClientError> {
         let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/run"));
         let req = self.client.post(&url);
@@ -3068,6 +3076,78 @@ mod tests {
         let (result, request) = tokio::join!(client.whoami(), serve_once(listener, response));
         assert!(request.starts_with("GET /api/v1/whoami "), "{request}");
         result
+    }
+
+    /// A busy run-now refusal reaches the caller as one 429 `manual_run_busy`
+    /// with its `Retry-After`, and the client never sends the request a
+    /// second time: the listener answers every connection with the same
+    /// refusal and counts them.
+    #[tokio::test]
+    async fn run_now_busy_carries_retry_after_and_is_not_retried() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let envelope = br#"{"error":{"code":"manual_run_busy","message":"a manual run is already running; retry after the Retry-After interval"}}"#;
+        let mut response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 12\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            envelope.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(envelope);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let requests = Arc::clone(&requests);
+            async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert!(n > 0, "connection closed mid-head");
+                        head.extend_from_slice(&buf[..n]);
+                    }
+                    assert!(
+                        head.starts_with(b"POST /api/v1/saved/9/run "),
+                        "{}",
+                        String::from_utf8_lossy(&head)
+                    );
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    socket.write_all(&response).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
+            }
+        });
+        let client = HttpClient::with_trust_timeout(
+            format!("http://{address}"),
+            "tok",
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let err = client
+            .trigger_run(9)
+            .await
+            .expect_err("a busy refusal is an error");
+        server.abort();
+        match err {
+            ClientError::Server {
+                status,
+                error,
+                retry_after_secs,
+                ..
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(error.code, trawl_api::ErrorCode::ManualRunBusy);
+                assert_eq!(retry_after_secs, Some(12));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "sent exactly once");
     }
 
     /// `prefix` (an object missing its closing brace) padded past `cap`

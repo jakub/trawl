@@ -230,6 +230,11 @@ pub enum ErrorCode {
     InvalidName,
     /// The key already has a saved query with that name (409).
     DuplicateName,
+    /// The caller's key already holds a manual run, or the installation is
+    /// at its count of manual runs (429, with `Retry-After`, ADR-0018).
+    /// Refused before the claim, so no budget was spent, no run row was
+    /// written and no cursor moved. Nothing retries it automatically.
+    ManualRunBusy,
 }
 
 /// Source location within a query string.
@@ -2914,7 +2919,7 @@ mod tests {
     }
 
     /// Every wire code with its spelling.
-    const EVERY_ERROR_CODE: [(ErrorCode, &str); 38] = [
+    const EVERY_ERROR_CODE: [(ErrorCode, &str); 39] = [
         (ErrorCode::ParseError, "parse_error"),
         (ErrorCode::ValidationError, "validation_error"),
         (ErrorCode::ExecutionError, "execution_error"),
@@ -2959,6 +2964,7 @@ mod tests {
         ),
         (ErrorCode::InvalidName, "invalid_name"),
         (ErrorCode::DuplicateName, "duplicate_name"),
+        (ErrorCode::ManualRunBusy, "manual_run_busy"),
     ];
 
     /// The declaration index of a code. No wildcard arm, so a new code
@@ -3004,6 +3010,7 @@ mod tests {
             ErrorCode::EvidenceBudgetExceeded => 35,
             ErrorCode::InvalidName => 36,
             ErrorCode::DuplicateName => 37,
+            ErrorCode::ManualRunBusy => 38,
         }
     }
 
