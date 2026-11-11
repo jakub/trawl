@@ -3737,7 +3737,7 @@ The run spends one run of the schedule's `max_runs` budget, and a run that fails
 - One manual run per key, counted on the key that sends the request.
 - `max(1, max_concurrent_queries / 4)` manual runs across the installation, rounded down, where `max_concurrent_queries` is the `[server]` setting.
 
-These limits are separate from the cap on [scheduled runs](/reference/configuration/#scheduler), so a busy scheduler does not refuse a manual run, and manual runs do not delay a scheduled one. There is no setting for either limit.
+These limits are separate from the cap on [scheduled runs](/reference/configuration/#scheduler), so a busy scheduler does not refuse a manual run, and manual runs do not take a scheduled run's place. Both kinds of run still wait for the same query executors once they start. There is no setting for either limit.
 
 A run keeps its place until its work ends: the window resolution at the claim, query preparation, the executor work, and the writing of its result. A run that timed out keeps its place while its work still runs. When the request is refused, the response is 429 `manual_run_busy`. This includes a second press on the net whose manual run is still in progress. The refusal comes before the claim, so it spends no run of the budget, writes no run row, and moves neither `next_fire_at` nor `covered_through`. The body is fixed:
 
@@ -3752,7 +3752,7 @@ A run keeps its place until its work ends: the window resolution at the claim, q
 
 The message names no setting and no count. `Retry-After` is advisory: the whole seconds until the run in the way is expected to end, and never less than 1. That is the key's own run when it has one, and the earliest of the runs in flight otherwise. A run is expected to end 5 s plus `[server] timeout_secs` after its place was taken. trawl-client does not retry it on its own. The `http_failure` event records `error_class=manual_run_busy` and `cause_kind=none`.
 
-The claim waits at most 5 s for its database locks. When that time runs out, the response is 503 `service_unavailable`, nothing is claimed, and the run's place is given back.
+The claim's work before its `COMMIT` has 5 s, its database locks included. When that time runs out before the `COMMIT` is sent, the response is 503 `service_unavailable`, nothing is claimed, and the run's place is given back. A `COMMIT` already sent is awaited past the 5 s, and the claim may commit.
 
 **Request**
 
