@@ -85,6 +85,20 @@ pub const MAX_QUERY_LEN: usize = 65_536;
 /// and `in` lists while the grammar runs.
 pub const MAX_TREE_DEPTH: usize = 64;
 
+/// How many levels the search grammar may recurse through, as a count of
+/// the raw text, before the grammar reads the text at all. Past it, the
+/// query gets the search's [`MAX_TREE_DEPTH`] error and is never parsed.
+///
+/// The search grammar recurses once for each bracket and each `NOT`, and
+/// the tree depth check refuses a deep search only after the grammar has
+/// built it. A native build grows its stack while the grammar recurses,
+/// but wasm32 cannot: in the browser, a search about 1 500 brackets deep
+/// overflowed the tab's stack before the check ran. 512 is about a third
+/// of the depth the release build survived. The count may exceed a
+/// search's real depth, never fall short of it (`depth::prescan` says
+/// where), so text it admits recurses at most 512 levels.
+pub const MAX_SEARCH_PRESCAN: usize = 512;
+
 /// The most globs and regexes one query may hold, summed over every filter
 /// and list element and every `matches`, `like` and `ilike` pattern. Exact
 /// values do not count. An `extract` charges one for each named group it
@@ -335,10 +349,10 @@ mod watch {
 type Admitted = Result<Result<(Query, Vec<primitives::RegexSite>), Vec<ParseError>>, Cancelled>;
 
 /// The steps [`parse`] and [`parse_unbuilt`] share: the length cap, the
-/// grammar, the tree depth limit, the pattern cap and the translation
-/// budget, with a cancellation point before the grammar, after it and
-/// after each of the last two steps. It returns the query and the
-/// patterns the grammar recorded, built by no one yet.
+/// search pre-scan, the grammar, the tree depth limit, the pattern cap
+/// and the translation budget, with a cancellation point before the
+/// grammar, after it and after each of the last two steps. It returns the
+/// query and the patterns the grammar recorded, built by no one yet.
 fn admit(input: &str, stop: &Stop) -> Admitted {
     checkpoint(stop)?;
     if input.len() > MAX_QUERY_LEN {
@@ -351,6 +365,10 @@ fn admit(input: &str, stop: &Stop) -> Admitted {
             label: None,
             hint: None,
         }]));
+    }
+    // One linear pass, so it needs no cancellation point of its own.
+    if let Some(error) = depth::prescan_error(input) {
+        return Ok(Err(vec![error]));
     }
 
     // Comments are a grammar production (ADR-0014), so the raw input goes
@@ -1572,7 +1590,12 @@ mod tests {
                 "abs(".repeat(deepest_legal),
                 ")".repeat(deepest_legal)
             ),
-            format!("* | where {}1{}", "( ".repeat(4000), ") ".repeat(4000)),
+            // the deepest nesting the search pre-scan lets the grammar read
+            format!(
+                "* | where {}1{}",
+                "( ".repeat(MAX_SEARCH_PRESCAN),
+                ") ".repeat(MAX_SEARCH_PRESCAN)
+            ),
         ];
 
         std::thread::Builder::new()
@@ -1900,9 +1923,10 @@ mod tests {
 
     /// A parse cancelled at the checkpoint after its grammar ends with
     /// `Cancelled`, and drops the deep tree the grammar built on a tokio
-    /// worker's 2 MiB stack, for a search and for an expression as deep as
-    /// `MAX_QUERY_LEN` spells. The count of cancellation points is
-    /// thread-local, so the doors are tripped on the small thread itself.
+    /// worker's 2 MiB stack: a search as deep as the pre-scan lets the
+    /// grammar read, and an expression as deep as `MAX_QUERY_LEN` spells.
+    /// The count of cancellation points is thread-local, so the doors are
+    /// tripped on the small thread itself.
     #[test]
     fn a_parse_cancelled_after_the_grammar_drops_a_deep_tree() {
         const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
@@ -1910,7 +1934,11 @@ mod tests {
         let deep = [
             (
                 "search",
-                format!("{}a=1{}", "(".repeat(30_000), ")".repeat(30_000)),
+                format!(
+                    "{}a=1{}",
+                    "(".repeat(MAX_SEARCH_PRESCAN),
+                    ")".repeat(MAX_SEARCH_PRESCAN)
+                ),
             ),
             (
                 "expression",
@@ -1933,6 +1961,166 @@ mod tests {
             .expect("spawn")
             .join()
             .expect("a cancelled parse must drop its tree on a 2 MiB stack");
+    }
+
+    /// The search pre-scan's count of `text`, with no bound to pass.
+    fn prescan_count(text: &str) -> usize {
+        depth::prescan(text, usize::MAX).expect("no bound to pass")
+    }
+
+    /// A search whose raw nesting is [`MAX_SEARCH_PRESCAN`] reaches the
+    /// grammar, which builds it and refuses it for its tree depth. One
+    /// level more is refused before the grammar runs, with the same
+    /// sentence and hint, over the one bracket or `NOT` that passed the
+    /// bound. That holds for a bracket nest, a `NOT` run and alternating
+    /// `NOT (`. A parse the pre-scan refuses passes no cancellation point
+    /// after the start, as one over the length cap does.
+    #[test]
+    fn the_search_prescan_admits_512_and_refuses_513() {
+        /// A search `n` levels deep.
+        type Nest = fn(usize) -> String;
+
+        assert_eq!(MAX_SEARCH_PRESCAN, 512);
+        let shapes: [(&str, Nest); 3] = [
+            ("brackets", |n| {
+                format!("{}a=1{}", "(".repeat(n), " )".repeat(n))
+            }),
+            ("NOT run", |n| format!("{}a=1", "NOT ".repeat(n))),
+            ("NOT and brackets", |n| {
+                format!(
+                    "{}{}a=1{}",
+                    if n % 2 == 1 { "NOT " } else { "" },
+                    "NOT (".repeat(n / 2),
+                    " )".repeat(n / 2)
+                )
+            }),
+        ];
+        let (message, hint) = depth_refusal(depth_fixtures::Kind::Search);
+        let unbuilt = |dsl: &str| tripped(None, || parse_unbuilt_cancellable(dsl, &Stop::new()));
+        let (_, grammar_points) = unbuilt("a | where");
+        let (_, length_points) = unbuilt(&"x".repeat(MAX_QUERY_LEN + 1));
+        assert_eq!(grammar_points, length_points + 1);
+        for (name, shape) in shapes {
+            let at = shape(MAX_SEARCH_PRESCAN);
+            assert_eq!(prescan_count(&at), MAX_SEARCH_PRESCAN, "{name}");
+            assert_eq!(true_depth(&grammar_tree(&at)), MAX_SEARCH_PRESCAN, "{name}");
+            let (parsed, points) = unbuilt(&at);
+            let errors = parsed.expect("not cancelled").expect_err(name);
+            assert_eq!(points, grammar_points, "{name}: the grammar ran");
+            assert_eq!(errors.len(), 1, "{name}: {errors:?}");
+            assert_eq!(errors[0].message, message, "{name}");
+            // the tree depth check spans the top-level token
+            assert_eq!(errors[0].span, 0..at.len(), "{name}");
+
+            let over = shape(MAX_SEARCH_PRESCAN + 1);
+            assert_eq!(prescan_count(&over), MAX_SEARCH_PRESCAN + 1, "{name}");
+            let (parsed, points) = unbuilt(&over);
+            let errors = parsed.expect("not cancelled").expect_err(name);
+            assert_eq!(points, length_points, "{name}: the grammar never ran");
+            assert_eq!(parse(&over).as_ref().err(), Some(&errors), "{name}");
+            assert_eq!(errors.len(), 1, "{name}: {errors:?}");
+            assert_eq!(errors[0].message, message, "{name}");
+            assert_eq!(errors[0].hint.as_deref(), Some(hint), "{name}");
+            assert_eq!(errors[0].label, None, "{name}");
+            let span = errors[0].span.clone();
+            assert!(
+                ["(", "NOT"].contains(&&over[span.clone()]),
+                "{name}: {span:?}"
+            );
+            assert_eq!(
+                prescan_count(&over[..span.start]),
+                MAX_SEARCH_PRESCAN,
+                "{name}: the span is where the count passes the bound"
+            );
+        }
+    }
+
+    /// A search the pre-scan refuses never reaches the grammar, however
+    /// long: 30 000 brackets pass the same cancellation points as a query
+    /// over the length cap, none after the start, so no tree is built.
+    #[test]
+    fn a_search_the_prescan_refuses_builds_no_tree() {
+        let deep = format!("{}a=1{}", "(".repeat(30_000), ")".repeat(30_000));
+        assert!(deep.len() <= MAX_QUERY_LEN, "{}", deep.len());
+        let too_long = "x".repeat(MAX_QUERY_LEN + 1);
+        for door in [parse_cancellable, parse_unbuilt_cancellable] {
+            let (refused, points) = tripped(None, || door(&deep, &Stop::new()));
+            let errors = refused.expect("not cancelled").expect_err("refused");
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].message, "search is deeper than 64 levels");
+            assert_eq!(errors[0].span, MAX_SEARCH_PRESCAN..MAX_SEARCH_PRESCAN + 1);
+            let (_, length_points) = tripped(None, || door(&too_long, &Stop::new()));
+            assert_eq!(points, length_points);
+        }
+    }
+
+    /// The pre-scan never counts fewer levels than the search nests. A
+    /// `)` in a quoted value, in a value after a stray quote, in a
+    /// backticked name, a regex body or a comment ends no level the
+    /// grammar opened, and a comment between a `NOT` and its bracket
+    /// keeps the `NOT` open, even when the comment holds a whole group.
+    /// Each unit nests one or two levels; a text of
+    /// more units than the bound is refused before the grammar runs.
+    #[test]
+    fn the_prescan_counts_at_least_what_the_search_nests() {
+        let units = [
+            ("quoted value", r#"( ")" "#),
+            ("stray quote in a value", r#"( a=x"y ")" "#),
+            ("backticked name", "( `)`=1 "),
+            ("regex body", r"( a=/\)/ "),
+            ("comment", "( # )\n"),
+            ("comment after NOT", "NOT # )\n("),
+            ("bracket in a comment after NOT", "NOT # (a)\n("),
+        ];
+        for (name, unit) in units {
+            let nest = |n: usize| format!("{}a=1{}", unit.repeat(n), " )".repeat(n));
+            let text = nest(100);
+            let depth = true_depth(&grammar_tree(&text));
+            assert!(depth >= 100, "{name}: {depth}");
+            let count = prescan_count(&text);
+            assert!(count >= depth, "{name}: counted {count} of {depth}");
+
+            let over = nest(MAX_SEARCH_PRESCAN + 1);
+            let (parsed, points) = tripped(None, || parse_unbuilt_cancellable(&over, &Stop::new()));
+            let errors = parsed.expect("not cancelled").expect_err(name);
+            assert_eq!(points, 1, "{name}: the grammar never ran");
+            assert_eq!(
+                errors[0].message,
+                depth_refusal(depth_fixtures::Kind::Search).0,
+                "{name}"
+            );
+        }
+    }
+
+    /// How the pre-scan counts, rule by rule: what ends a level, and what
+    /// it counts that the search does not nest.
+    #[test]
+    fn the_prescan_counts_by_its_rules() {
+        for (text, count) in [
+            ("(a) (b) (c)", 1),
+            ("((a) (b))", 2),
+            ("NOT a NOT b NOT c", 1),
+            ("NOT NOT a", 2),
+            ("NOT(NOT(a))", 4),
+            ("NOT (a) NOT (b)", 2),
+            // a no-break space is layout to the grammar too
+            ("NOT\u{a0}(a) b", 2),
+            ("NOTICE (a) NOT_A NOT1", 1),
+            ("* | stats count() by a | where (b) > 1", 1),
+            // a `NOT` needs no word boundary before it
+            ("xNOT (a)", 2),
+            // brackets and `NOT`s count in quotes and comments
+            (r#"msg="(((NOT a""#, 4),
+            ("a=1 # (((\n", 3),
+            // a group that holds a `"`, backtick, `/` or `#` stays open
+            (r#"(a="x") (b="y")"#, 2),
+            ("* | where (a / 2) > (b)", 2),
+            ("(a # c\n) (b)", 2),
+            // so do the `NOT`s before a comment
+            ("NOT # c\n(a) (b)", 2),
+        ] {
+            assert_eq!(prescan_count(text), count, "{text:?}");
+        }
     }
 
     fn pattern_cap_refusal(input: &str) -> Option<ParseError> {
@@ -2382,8 +2570,9 @@ mod tests {
     }
 
     /// A query for every way a parse ends: clean with and without
-    /// patterns, refused by the length cap, the grammar, the pattern cap,
-    /// the translation budget, a build and the tree depth limit.
+    /// patterns, refused by the length cap, the search pre-scan, the
+    /// grammar, the pattern cap, the translation budget, a build and the
+    /// tree depth limit.
     fn every_ending() -> Vec<String> {
         let too_costly = format!("(?i){}", r"[\x00-\x{10FFFF}]".repeat(15));
         vec![
@@ -2398,6 +2587,7 @@ mod tests {
                 "* | where {}",
                 depth_fixtures::comparisons(MAX_TREE_DEPTH + 1, "or")
             ),
+            format!("{}a=1", "(".repeat(MAX_SEARCH_PRESCAN + 1)),
         ]
     }
 

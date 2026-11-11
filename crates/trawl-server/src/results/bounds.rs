@@ -1560,26 +1560,15 @@ mod tests {
 
     /// A clause beside nested parentheses resolves through the deepest
     /// search the parser admits, and a search nested thousands deep is
-    /// refused at its parse, before the proof walks any group. The test
-    /// runs on a stack sized for that depth: an unoptimized parser spends
-    /// about a kilobyte of it per level before the refusal.
+    /// refused at its parse, before the proof walks any group. The
+    /// parser's pre-scan refuses it before the grammar reads it, so no
+    /// stack is spent on its depth.
     #[test]
     fn nested_groups_resolve_to_the_tree_depth_limit() {
         const DEPTH: usize = 16_384;
-        let deepest = trawl_core::parser::MAX_TREE_DEPTH;
-
         let in_brackets = |depth| format!("last=1h {}a{}", "(".repeat(depth), ")".repeat(depth));
-        let (deepest, refused) = std::thread::Builder::new()
-            .stack_size(512 << 20)
-            .spawn(move || {
-                (
-                    resolve_dsl(&in_brackets(deepest)),
-                    resolve_dsl(&in_brackets(DEPTH)),
-                )
-            })
-            .expect("spawn the resolving thread")
-            .join()
-            .expect("the resolution finishes");
+        let deepest = resolve_dsl(&in_brackets(trawl_core::parser::MAX_TREE_DEPTH));
+        let refused = resolve_dsl(&in_brackets(DEPTH));
 
         assert_eq!(
             window_of(&deepest.unwrap()).0,

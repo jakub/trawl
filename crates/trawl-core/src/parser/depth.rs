@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The [`MAX_TREE_DEPTH`] check (#447, ADR-0024's amendment of
-//! 2026-11-11), over a query the grammar accepted.
+//! 2026-11-11), over a query the grammar accepted, and the
+//! [`MAX_SEARCH_PRESCAN`] count that runs before the grammar.
 //!
 //! Most later walks of a parsed query recurse once a level, and the
 //! grammar builds a flat chain as deep as it is long. This walk is the one
@@ -15,7 +16,7 @@
 
 use std::ops::Range;
 
-use super::{MAX_TREE_DEPTH, ParseError};
+use super::{MAX_SEARCH_PRESCAN, MAX_TREE_DEPTH, ParseError};
 use crate::ast::{
     AggExpr, DedupStage, DropStage, EventStatsStage, Expr, ExtractStage, FromSavedStage, LetStage,
     LimitStage, PipeStage, PivotStage, Query, RareStage, RenameStage, SampleStage, SearchStage,
@@ -234,6 +235,118 @@ fn search_too_deep(root: &SearchToken) -> bool {
         }
     }
     false
+}
+
+/// The refusal of `input` when the search grammar could recurse more than
+/// [`MAX_SEARCH_PRESCAN`] levels deep in it: the search's sentence, over
+/// the bracket or `NOT` at which [`prescan`]'s count passes the bound.
+pub(super) fn prescan_error(input: &str) -> Option<ParseError> {
+    prescan(input, MAX_SEARCH_PRESCAN)
+        .err()
+        .map(|at| refusal(Tree::Search, &at))
+}
+
+/// A level [`prescan`] holds open: a `(` or a `NOT`, at its byte offset.
+struct Level {
+    at: usize,
+    bracket: bool,
+}
+
+/// An upper bound on how many levels deep the search grammar can recurse
+/// in `input`, counted in one pass over its characters, with no lexing and
+/// no recursion. It is the most levels open at once, or the span of the
+/// bracket or `NOT` at which the count first passes `limit`.
+///
+/// The grammar opens a level at each `(` that starts a group and at each
+/// `NOT` that negates (`search::search_token`), even in an alternative it
+/// then backtracks out of. A group's level ends at its `)`, and a `NOT`'s
+/// when the token it negates ends. Here every `(` opens a level, and so
+/// does every `NOT` that the keyword rule admits, wherever it sits. A
+/// level ends only where no reading of the text can keep it open:
+///
+/// - A `)` ends the newest open `(`, the levels above it and the `NOT`s
+///   just before it, unless a `"`, backtick, `/` or `#` came after that
+///   `(` or those `NOT`s. A `)` that the search grammar does not read as
+///   a group's end is in the pipeline, where no search level is open, or
+///   in a quoted string, a backticked name, a regex body or a comment.
+///   Each of these starts with one of those four bytes, so such a `)`
+///   ends only levels opened inside the same span, and the grammar opened
+///   none there.
+/// - `NOT`s with only whitespace after each end at the next character
+///   that is not `(`, `#` or another `NOT`. The token they negate starts
+///   there, and it is a word, a filter or a phrase, which opens no level.
+///   A `#` can start a comment between a `NOT` and its token, so those
+///   `NOT`s stay open.
+///
+/// The count can exceed the grammar's depth. Brackets and `NOT`s count in
+/// quotes, names, regex bodies, comments and the pipeline, and a group or
+/// call that holds one of the four bytes stays open.
+pub(super) fn prescan(input: &str, limit: usize) -> Result<usize, Range<usize>> {
+    let bytes = input.as_bytes();
+    // Oldest first, so the offsets ascend.
+    let mut open: Vec<Level> = Vec::new();
+    // The index in `open` of each open `(`, oldest first.
+    let mut brackets: Vec<usize> = Vec::new();
+    // The `NOT`s on top of `open` that only whitespace has followed.
+    let mut waiting = 0;
+    // The offset of the latest `"`, backtick, `/` or `#`.
+    let mut opener: Option<usize> = None;
+    let mut peak = 0;
+    let mut chars = input.char_indices();
+    while let Some((at, c)) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        let not_word = bytes[at..].starts_with(b"NOT")
+            && !bytes
+                .get(at + 3)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        if not_word {
+            open.push(Level { at, bracket: false });
+            waiting += 1;
+            if open.len() > limit {
+                return Err(at..at + 3);
+            }
+            peak = peak.max(open.len());
+            // past the `O` and the `T`
+            chars.nth(1);
+            continue;
+        }
+        if c == '(' || c == '#' {
+            waiting = 0;
+        } else {
+            open.truncate(open.len() - waiting);
+            waiting = 0;
+        }
+        match c {
+            '(' => {
+                brackets.push(open.len());
+                open.push(Level { at, bracket: true });
+                if open.len() > limit {
+                    return Err(at..at + 1);
+                }
+                peak = peak.max(open.len());
+            }
+            ')' => {
+                let after_opener = |level: &Level| opener.is_none_or(|o| level.at > o);
+                if let Some(&newest) = brackets.last()
+                    && after_opener(&open[newest])
+                {
+                    brackets.pop();
+                    open.truncate(newest);
+                    while open
+                        .last()
+                        .is_some_and(|level| !level.bracket && after_opener(level))
+                    {
+                        open.pop();
+                    }
+                }
+            }
+            '"' | '`' | '/' | '#' => opener = Some(at),
+            _ => {}
+        }
+    }
+    Ok(peak)
 }
 
 /// Queries at a chosen tree depth, and trees deeper than the limit built

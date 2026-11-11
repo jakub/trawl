@@ -5,12 +5,15 @@
 //! The longest deep texts `MAX_QUERY_LEN` admits end in an answer on a
 //! tokio worker's 2 MiB stack, never in a stack overflow (#447).
 //!
-//! Each chain, run and bracket nest the grammar can spell in 64 KiB is
-//! refused for its tree depth, and a deep text followed by a grammar
-//! error is refused for the grammar error. The grammar builds every one of
-//! these trees in full before it is refused, so the parse also drops it on
-//! this stack. A chain of `let` aliases is no level deep, so it parses,
-//! and the checks after the parse walk it.
+//! Each chain, run and bracket nest that 64 KiB can spell is refused for
+//! its tree depth. The grammar builds each expression tree in full before
+//! it is refused, so the parse also drops it on this stack. A search
+//! `NOT` run or bracket nest that long is refused by the search pre-scan
+//! before the grammar reads it. A deep text followed by a grammar error
+//! is refused for the grammar error: a deep expression as long as 64 KiB
+//! spells, and a search as deep as the pre-scan lets the grammar read. A
+//! chain of `let` aliases is no level deep, so it parses, and the checks
+//! after the parse walk it.
 //!
 //! A parse cancelled after the grammar drops a deep tree too; the parser's
 //! own tests cover it
@@ -19,7 +22,7 @@
 
 use trawl_core::complexity::check_pipeline_complexity;
 use trawl_core::emitter::validate_pipeline;
-use trawl_core::parser::{MAX_QUERY_LEN, MAX_TREE_DEPTH, parse};
+use trawl_core::parser::{MAX_QUERY_LEN, MAX_SEARCH_PRESCAN, MAX_TREE_DEPTH, parse};
 
 const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
 
@@ -110,7 +113,11 @@ fn the_longest_texts_return_on_a_worker_stack() {
         ),
         (
             "deep search, then a grammar error",
-            format!("{}a=1{} | where", "(".repeat(30_000), ")".repeat(30_000)),
+            format!(
+                "{}a=1{} | where",
+                "(".repeat(MAX_SEARCH_PRESCAN),
+                ")".repeat(MAX_SEARCH_PRESCAN)
+            ),
         ),
     ];
     // a0 = 1, a1 = a0, …: each value one name, so no level deep
