@@ -15,6 +15,7 @@
 //! 5. **Pipe stages** — stats, where, sort, limit, table
 
 pub(crate) mod comment;
+mod depth;
 pub(crate) mod expr;
 pub(crate) mod pipe;
 pub(crate) mod primitives;
@@ -27,6 +28,8 @@ use chumsky::prelude::*;
 use crate::ast::Query;
 use crate::cancel::{Cancelled, Stop};
 use crate::pattern::{PatternError, PatternKind, Preparer, price};
+#[cfg(test)]
+pub(crate) use depth::fixtures as depth_fixtures;
 use primitives::{ParserExtra, ParserInput};
 pub use primitives::{RegexCut, first_cut};
 
@@ -61,6 +64,26 @@ impl std::fmt::Display for ParseError {
 ///
 /// `GET /api/v1/capabilities` advertises it as `max_query_bytes`.
 pub const MAX_QUERY_LEN: usize = 65_536;
+
+/// How many levels deep one expression, or a query's search, may be: the
+/// most levels on any path from its root down to a leaf, as `context.md`'s
+/// **Tree depth** counts them.
+///
+/// Each binary operator, `not`, minus sign, function call and `in` list
+/// adds a level, and so does each search `NOT` and each pair of search
+/// brackets. Fields, values, search words and filters, and time clauses
+/// add none, and neither do expression parentheses, the top-level `OR`
+/// between search filters, or an aggregation's call: each of its
+/// arguments is a root of its own. An `or` of 64 comparisons is 64 deep.
+///
+/// [`MAX_QUERY_LEN`] alone admits tens of thousands of levels, because
+/// the grammar folds a flat chain into a tree as deep as the chain is
+/// long, and most walks of a parsed query recurse once a level. 64 keeps
+/// each of them within a quarter of a 2 MiB worker stack in a debug build
+/// (ADR-0024's amendment of 2026-11-11). It is not the nesting bound
+/// `expr::MAX_EXPR_DEPTH`, which counts only parentheses, call arguments
+/// and `in` lists while the grammar runs.
+pub const MAX_TREE_DEPTH: usize = 64;
 
 /// The most globs and regexes one query may hold, summed over every filter
 /// and list element and every `matches`, `like` and `ilike` pattern. Exact
@@ -312,9 +335,10 @@ mod watch {
 type Admitted = Result<Result<(Query, Vec<primitives::RegexSite>), Vec<ParseError>>, Cancelled>;
 
 /// The steps [`parse`] and [`parse_unbuilt`] share: the length cap, the
-/// grammar, the pattern cap and the translation budget, with a
-/// cancellation point before the grammar and after each step. It returns
-/// the query and the patterns the grammar recorded, built by no one yet.
+/// grammar, the tree depth limit, the pattern cap and the translation
+/// budget, with a cancellation point before the grammar, after it and
+/// after each of the last two steps. It returns the query and the
+/// patterns the grammar recorded, built by no one yet.
 fn admit(input: &str, stop: &Stop) -> Admitted {
     checkpoint(stop)?;
     if input.len() > MAX_QUERY_LEN {
@@ -348,6 +372,9 @@ fn admit(input: &str, stop: &Stop) -> Admitted {
             return Ok(Err(reported));
         }
     };
+    if let Some(error) = depth::tree_depth_error(&query) {
+        return Ok(Err(vec![error]));
+    }
     let over_cap = pattern_cap_error(&query);
     checkpoint(stop)?;
     if let Some(error) = over_cap {
@@ -1620,10 +1647,11 @@ mod tests {
     fn abandoned_nesting_does_not_spend_the_depth_budget() {
         let n = crate::parser::expr::MAX_EXPR_DEPTH;
         // Each `(x)` opens and leaves a level; hundreds of them in
-        // sequence must not add up against the nesting that follows.
+        // sequence must not add up against the nesting that follows. They
+        // sit side by side in one list, so the tree stays two levels deep.
         let sequential = format!(
-            "* | where {} and {}1{}",
-            "(1) + ".repeat(500).trim_end_matches("+ "),
+            "* | where a in ({}) and {}1{}",
+            vec!["(1)"; 500].join(", "),
             "(".repeat(n),
             ")".repeat(n)
         );
@@ -1649,6 +1677,262 @@ mod tests {
             parse(&legal_max).is_ok(),
             "a failed parse must not spend this thread's depth budget"
         );
+    }
+
+    /// What the grammar builds from `dsl`, before any check after it.
+    fn grammar_tree(dsl: &str) -> Query {
+        let mut regexes = primitives::RegexSites::default();
+        query_parser()
+            .parse_with_state(dsl, &mut regexes)
+            .into_result()
+            .unwrap_or_else(|errors| panic!("{dsl:.80}: the grammar refused it: {errors:?}"))
+    }
+
+    /// The deepest root in `query`, counted as `context.md`'s **Tree
+    /// depth** counts, by plain recursion: a second count beside the
+    /// parser's, for trees shallow enough to recurse over.
+    fn true_depth(query: &Query) -> usize {
+        use crate::ast::{AggExpr, Expr, PipeStage, Spanned};
+
+        fn expr(e: &Expr) -> usize {
+            let deepest = |children: &mut dyn Iterator<Item = &Spanned<Expr>>| {
+                1 + children.map(|c| expr(&c.node)).max().unwrap_or(0)
+            };
+            match e {
+                Expr::Binary { lhs, op: _, rhs } => deepest(&mut [&**lhs, &**rhs].into_iter()),
+                Expr::Unary { op: _, operand } => deepest(&mut std::iter::once(&**operand)),
+                Expr::FunctionCall { name: _, args } => deepest(&mut args.iter()),
+                Expr::InList { expr, list } => {
+                    deepest(&mut std::iter::once(&**expr).chain(list.iter()))
+                }
+                Expr::FieldRef(_) | Expr::Literal(_) => 0,
+            }
+        }
+        fn token(t: &SearchToken) -> usize {
+            match t {
+                SearchToken::Not(inner) => 1 + token(&inner.node),
+                SearchToken::Group(groups) => {
+                    1 + groups
+                        .iter()
+                        .flatten()
+                        .map(|t| token(&t.node))
+                        .max()
+                        .unwrap_or(0)
+                }
+                SearchToken::FieldFilter(_)
+                | SearchToken::TextSearch(_)
+                | SearchToken::TimeFilter(_)
+                | SearchToken::QuotedSearch(_)
+                | SearchToken::EarliestFilter(_)
+                | SearchToken::LatestFilter(_) => 0,
+            }
+        }
+        fn args(aggs: &[AggExpr]) -> Vec<&Spanned<Expr>> {
+            aggs.iter().flat_map(|a| &a.args).collect()
+        }
+        let roots = query.pipeline.iter().flat_map(|stage| match &stage.node {
+            PipeStage::Where(w) => vec![&w.condition],
+            PipeStage::Let(l) => l.assignments.iter().map(|(_, v)| v).collect(),
+            PipeStage::Stats(s) => args(&s.aggregations),
+            PipeStage::EventStats(s) => args(&s.aggregations),
+            PipeStage::Timechart(t) => args(&t.aggregations),
+            PipeStage::Pivot(p) => args(std::slice::from_ref(&p.aggregation)),
+            _ => Vec::new(),
+        });
+        query
+            .search
+            .groups
+            .iter()
+            .flatten()
+            .map(|t| token(&t.node))
+            .chain(roots.map(|root| expr(&root.node)))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The two refusals, word for word as #447 states them.
+    fn depth_refusal(kind: depth_fixtures::Kind) -> (&'static str, &'static str) {
+        match kind {
+            depth_fixtures::Kind::Search => (
+                "search is deeper than 64 levels",
+                "each NOT and each pair of brackets is a level: use fewer nested brackets or negations",
+            ),
+            depth_fixtures::Kind::Expression => (
+                "expression is deeper than 64 levels",
+                "each operator, not, minus sign, call and in list is a level: write equality tests on one field as field in (…), and split a long and across several | where stages",
+            ),
+        }
+    }
+
+    /// Every shape #447 names parses at [`MAX_TREE_DEPTH`] and is refused
+    /// one level deeper with exactly one error: the sentence, the hint and
+    /// the span of the deep root. Each fixture's depth is counted, so a
+    /// shape that is not as deep as its name says fails here.
+    #[test]
+    fn tree_depth_limit_admits_64_and_refuses_65() {
+        assert_eq!(MAX_TREE_DEPTH, 64);
+        let at_limit = depth_fixtures::shapes(MAX_TREE_DEPTH);
+        let over = depth_fixtures::shapes(MAX_TREE_DEPTH + 1);
+        assert_eq!(at_limit.len(), 19);
+        for (at, over) in at_limit.iter().zip(&over) {
+            let name = at.name;
+            assert_eq!(
+                true_depth(&grammar_tree(&at.text)),
+                64,
+                "{name}: {}",
+                at.text
+            );
+            assert_eq!(
+                true_depth(&grammar_tree(&over.text)),
+                65,
+                "{name}: {}",
+                over.text
+            );
+
+            if let Err(errors) = parse(&at.text) {
+                panic!("{name}: 64 levels is the limit, not past it: {errors:?}");
+            }
+            let errors = parse(&over.text).expect_err(name);
+            assert_eq!(errors.len(), 1, "{name}: {errors:?}");
+            let (message, hint) = depth_refusal(over.kind);
+            assert_eq!(errors[0].message, message, "{name}");
+            assert_eq!(errors[0].hint.as_deref(), Some(hint), "{name}");
+            assert_eq!(errors[0].label, None, "{name}");
+            assert_eq!(&over.text[errors[0].span.clone()], over.refused, "{name}");
+        }
+    }
+
+    /// `parse`, `parse_unbuilt` and both cancellable doors refuse a deep
+    /// search and a deep expression with the same one error. The check
+    /// runs after the grammar's checkpoint, adds none of its own, and
+    /// comes before the pattern cap and the translation budget; a grammar
+    /// error wins over it. Of two deep roots, the first in the text is
+    /// the one refused, and the search comes before every stage.
+    #[test]
+    fn every_parse_door_enforces_tree_depth() {
+        use depth_fixtures::{Kind, chain, comparisons};
+
+        let over = MAX_TREE_DEPTH + 1;
+        let search = format!("{}a=1{}", "(".repeat(over), " )".repeat(over));
+        let expression = format!("* | where {}", comparisons(over, "or"));
+        let too_many = format!("f={}", vec!["/a/"; MAX_QUERY_PATTERNS + 1].join(","));
+        let too_costly = format!("(?i){}", r"[\x00-\x{10FFFF}]".repeat(15));
+        for (dsl, kind) in [(&search, Kind::Search), (&expression, Kind::Expression)] {
+            let label = format!("{dsl:.40}");
+            let refusal = parse(dsl).expect_err(&label);
+            assert_eq!(refusal.len(), 1, "{label}: {refusal:?}");
+            assert_eq!(refusal[0].message, depth_refusal(kind).0, "{label}");
+            assert_eq!(parse_unbuilt(dsl).as_ref().err(), Some(&refusal), "{label}");
+            for door in [parse_cancellable, parse_unbuilt_cancellable] {
+                let (refused, points) = tripped(None, || door(dsl, &Stop::new()));
+                assert_eq!(refused.ok().and_then(Result::err), Some(refusal.clone()));
+                let (_, grammar_error) = tripped(None, || door("a | where", &Stop::new()));
+                let (_, over_cap) = tripped(None, || door(&too_many, &Stop::new()));
+                assert_eq!(points, grammar_error, "{label}");
+                assert_eq!(over_cap, points + 1, "{label}");
+            }
+        }
+
+        let first = |dsl: &str| {
+            let errors = parse(dsl).expect_err(dsl);
+            assert_eq!(errors.len(), 1, "{dsl:.40}: {errors:?}");
+            errors[0].clone()
+        };
+        let deep_where = format!(" | where {}", comparisons(over, "or"));
+        let deep_expr = first(&format!("{too_many}{deep_where}"));
+        assert_eq!(deep_expr.message, depth_refusal(Kind::Expression).0);
+        let deep_expr = first(&format!("f=/{too_costly}/{deep_where}"));
+        assert_eq!(deep_expr.message, depth_refusal(Kind::Expression).0);
+        let deep_search = first(&format!("{too_many} {search}"));
+        assert_eq!(deep_search.message, depth_refusal(Kind::Search).0);
+        let grammar = first(&format!("*{deep_where} | where"));
+        assert!(!grammar.message.contains("deeper than"), "{grammar:?}");
+
+        let both = format!("{search}{deep_where}");
+        // a bracket group's span takes the whitespace after it
+        assert_eq!(&both[first(&both).span], format!("{search} "));
+        let two = format!("* | let x = {}, y = {} | where a > 0", chain(66), chain(67));
+        let error = first(&two);
+        assert_eq!(&two[error.span], chain(66));
+    }
+
+    /// Depth counts levels, not width or text: a 5 000-element `in` list
+    /// and a call with 5 000 arguments parse, and brackets, `not` and
+    /// `NOT` inside quoted values, backticked names, comments and regex
+    /// bodies add no level.
+    #[test]
+    fn tree_depth_is_not_width_or_text() {
+        let over = MAX_TREE_DEPTH + 1;
+        let brackets = "(".repeat(over);
+        // A capture group is a regex position, and a pattern holds 64, so
+        // the regex bodies nest groups that capture nothing.
+        let groups = "(?:".repeat(over);
+        let closes = ")".repeat(over);
+        let nots = "not ".repeat(over);
+        let big_nots = "NOT ".repeat(over);
+        let elements: Vec<String> = (0..5_000).map(|i| i.to_string()).collect();
+        let cases = [
+            (format!("* | where a in ({})", elements.join(", ")), 1),
+            (
+                format!("* | where coalesce({}) > 0", vec!["a"; 5_000].join(", ")),
+                2,
+            ),
+            (format!(r#"msg="{brackets}{nots}{big_nots}""#), 0),
+            (format!(r#""{brackets} {big_nots}""#), 0),
+            (format!(r#"* | where m == "{brackets}{nots}{big_nots}""#), 1),
+            (format!("`{brackets}{nots}{big_nots}x`=1"), 0),
+            (format!("* | where `{brackets}{nots}x` == 1"), 1),
+            (
+                format!("a=1 # {brackets}{big_nots}\n| where b == 1 # {brackets}{nots}"),
+                1,
+            ),
+            (format!("msg=/{groups}a{closes}/"), 0),
+            (format!("* | where m matches /{groups}a{closes}/"), 1),
+        ];
+        for (dsl, depth) in &cases {
+            let label = format!("{dsl:.60}");
+            if let Err(errors) = parse(dsl) {
+                panic!("{label}: {errors:?}");
+            }
+            assert_eq!(true_depth(&grammar_tree(dsl)), *depth, "{label}");
+        }
+    }
+
+    /// A parse cancelled at the checkpoint after its grammar ends with
+    /// `Cancelled`, and drops the deep tree the grammar built on a tokio
+    /// worker's 2 MiB stack, for a search and for an expression as deep as
+    /// `MAX_QUERY_LEN` spells. The count of cancellation points is
+    /// thread-local, so the doors are tripped on the small thread itself.
+    #[test]
+    fn a_parse_cancelled_after_the_grammar_drops_a_deep_tree() {
+        const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
+
+        let deep = [
+            (
+                "search",
+                format!("{}a=1{}", "(".repeat(30_000), ")".repeat(30_000)),
+            ),
+            (
+                "expression",
+                format!("* | where {} > 0", vec!["1"; 32_000].join("+")),
+            ),
+        ];
+        std::thread::Builder::new()
+            .stack_size(TOKIO_WORKER_STACK)
+            .spawn(move || {
+                for (case, dsl) in &deep {
+                    assert!(dsl.len() <= MAX_QUERY_LEN, "{case}: {}", dsl.len());
+                    for door in [parse_cancellable, parse_unbuilt_cancellable] {
+                        // point 0 is the start, point 1 follows the grammar
+                        let (parsed, points) = tripped(Some(1), || door(dsl, &Stop::new()));
+                        assert!(matches!(parsed, Err(Cancelled)), "{case}");
+                        assert_eq!(points, 2, "{case}");
+                    }
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("a cancelled parse must drop its tree on a 2 MiB stack");
     }
 
     fn pattern_cap_refusal(input: &str) -> Option<ParseError> {
@@ -1696,48 +1980,50 @@ mod tests {
         tokens.join(" ")
     }
 
-    /// The pattern count walks the parsed query in a 2 MiB stack, the size
-    /// of the tokio worker that parses it, however long a flat chain the
-    /// query spells. The longest chain that fits `MAX_QUERY_LEN` is the
-    /// corpus, in every position the walk enters an expression from.
+    /// The pattern count walks a query in a 2 MiB stack, the size of the
+    /// tokio worker that parses it, however deep its tree. The parser now
+    /// refuses a tree past [`MAX_TREE_DEPTH`] before the count runs, so the
+    /// deep trees are built in code, as deep as the longest chain
+    /// `MAX_QUERY_LEN` spells, in every position the walk enters an
+    /// expression from.
     #[test]
-    fn the_pattern_count_walks_a_flat_chain_within_a_tokio_workers_stack() {
-        const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
+    fn the_pattern_count_walks_a_deep_tree_within_a_tokio_workers_stack() {
+        use depth_fixtures::{flat_chain, spliced};
 
-        let chain = vec!["1"; 32_000].join("+");
-        let corpus = [
-            // 129 stages: the stage limit is the caller's check, after
-            // `parse` returns
-            format!("*{} | where {chain}", " | head 1".repeat(128)),
-            format!("* | where {chain} matches /a/"),
-            format!("* | let x = {chain}"),
-            format!("* | stats sum({chain})"),
-        ];
-        // Each tree drops on the small stack as soon as it is parsed.
-        let parsed = std::thread::Builder::new()
+        const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
+        const TERMS: usize = 32_000;
+
+        // Each tree drops on the small stack as soon as it is counted.
+        let counted = std::thread::Builder::new()
             .stack_size(TOKIO_WORKER_STACK)
-            .spawn(move || {
-                corpus
-                    .iter()
-                    .map(|body| parse(body).map(drop))
-                    .collect::<Vec<_>>()
+            .spawn(|| {
+                [
+                    format!("*{} | where DEEP", " | head 1".repeat(128)),
+                    "* | where DEEP matches /a/".to_owned(),
+                    "* | let x = DEEP".to_owned(),
+                    "* | stats sum(DEEP)".to_owned(),
+                ]
+                .iter()
+                .map(|template| pattern_cap_error(&spliced(template, flat_chain(TERMS))))
+                .collect::<Vec<_>>()
             })
             .expect("spawn")
             .join()
             .expect("the pattern count and the drop must not overflow a 2 MiB stack");
-        for result in &parsed {
-            assert!(result.is_ok(), "{result:.80?}");
-        }
+        assert_eq!(counted, [None, None, None, None]);
     }
 
     /// The walk counts in text order inside a chain, so the span is the
-    /// first `matches` pattern past the cap.
+    /// first `matches` pattern past the cap. The chains are 50 terms long,
+    /// under [`MAX_TREE_DEPTH`], so the pattern that passes the cap sits
+    /// in the middle of the sixth.
     #[test]
     fn pattern_cap_spans_the_first_pattern_past_it_in_a_chain() {
-        let terms: Vec<String> = (0..=MAX_QUERY_PATTERNS)
+        let terms: Vec<String> = (0..MAX_QUERY_PATTERNS + 5)
             .map(|i| format!("a matches /r{i}/"))
             .collect();
-        let over = format!("* | where {}", terms.join(" or "));
+        let stages: Vec<String> = terms.chunks(50).map(|chain| chain.join(" or ")).collect();
+        let over = format!("* | where {}", stages.join(" | where "));
         let error = pattern_cap_refusal(&over).expect("one pattern over the cap");
         assert_eq!(&over[error.span], format!("/r{MAX_QUERY_PATTERNS}/"));
     }
@@ -2097,7 +2383,7 @@ mod tests {
 
     /// A query for every way a parse ends: clean with and without
     /// patterns, refused by the length cap, the grammar, the pattern cap,
-    /// the translation budget and a build.
+    /// the translation budget, a build and the tree depth limit.
     fn every_ending() -> Vec<String> {
         let too_costly = format!("(?i){}", r"[\x00-\x{10FFFF}]".repeat(15));
         vec![
@@ -2108,6 +2394,10 @@ mod tests {
             format!("f={}", vec!["/a/"; MAX_QUERY_PATTERNS + 1].join(",")),
             format!("f=/{too_costly}/"),
             r"f=/\w{64}/".to_owned(),
+            format!(
+                "* | where {}",
+                depth_fixtures::comparisons(MAX_TREE_DEPTH + 1, "or")
+            ),
         ]
     }
 

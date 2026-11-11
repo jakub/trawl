@@ -27,9 +27,10 @@ use crate::pattern::{PatternKind, literal_operand};
 /// through the whole precedence chain, and each descent costs stack. The
 /// input cap (`MAX_QUERY_LEN`) alone does not bound that: `a(a(a(…` fits
 /// twenty thousand levels into 64 KiB of text, which is enough to walk a
-/// thread off the end of its stack. trawld parses inside its axum
-/// handlers, on a tokio worker whose stack is 2 MiB, so an unbounded
-/// grammar is a remote crash a single query can spell.
+/// thread off the end of its stack. trawld parses each query it admits
+/// in a `spawn_blocking` preparation job, whose thread has a tokio
+/// worker's 2 MiB stack, so an unbounded grammar is a remote crash a
+/// single query can spell.
 ///
 /// What a level costs is a property of the build, not of the DSL: a
 /// release build spends tens of bytes per level, an unoptimized build

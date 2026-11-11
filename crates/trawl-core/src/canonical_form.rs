@@ -751,51 +751,52 @@ mod tests {
     }
 
     /// The comparison walks with an explicit stack, so a flat chain far
-    /// deeper than `MAX_EXPR_DEPTH` compares on a tokio worker's 2 MiB
+    /// deeper than the parser admits compares on a tokio worker's 2 MiB
     /// stack in a debug build. `1+1+…` folds to a left-leaning tree as
-    /// deep as the chain is long.
+    /// deep as the chain is long; such a tree comes only from code, so the
+    /// deep chains are built there.
     #[test]
     fn a_flat_chain_compares_on_a_worker_stack() {
+        use crate::parser::depth_fixtures::{chain_of, flat_chain, int, spliced};
+
         const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
         const TERMS: usize = 20_000;
 
-        let chain = vec!["1"; TERMS].join("+");
-        let mut changed = vec!["1"; TERMS];
-        changed[0] = "2";
-        let changed = changed.join("+");
+        // the chain with its first, deepest term changed
+        let changed = || chain_of(std::iter::once(int(2)).chain((1..TERMS).map(|_| int(1))));
         // the longest OR chain `MAX_QUERY_LEN` admits; the search stage
         // keeps it flat, so it costs width rather than depth
         let ors = vec!["a"; 12_000].join(" OR ");
-        let corpus = [
-            (
-                format!("* | where {chain}"),
-                format!("* | where {chain}"),
-                true,
-            ),
-            (
-                format!("* | where {chain}"),
-                format!("* | where {changed}"),
-                false,
-            ),
-            (
-                format!("* | let x = {chain}"),
-                format!("* | let x = {changed}"),
-                false,
-            ),
-            (
-                format!("* | stats sum({chain})"),
-                format!("* | stats sum({chain})"),
-                true,
-            ),
-            (ors.clone(), ors, true),
-        ];
+
         // Each pair drops on the small stack once it is compared.
         std::thread::Builder::new()
             .stack_size(TOKIO_WORKER_STACK)
             .spawn(move || {
-                for (a, b, want) in &corpus {
-                    let (qa, qb) = (parsed(a), parsed(b));
-                    assert_eq!(same_query(&qa, &qb), *want, "{a:.40}… vs {b:.40}…");
+                let corpus = [
+                    (
+                        spliced("* | where DEEP", flat_chain(TERMS)),
+                        spliced("* | where DEEP", flat_chain(TERMS)),
+                        true,
+                    ),
+                    (
+                        spliced("* | where DEEP", flat_chain(TERMS)),
+                        spliced("* | where DEEP", changed()),
+                        false,
+                    ),
+                    (
+                        spliced("* | let x = DEEP", flat_chain(TERMS)),
+                        spliced("* | let x = DEEP", changed()),
+                        false,
+                    ),
+                    (
+                        spliced("* | stats sum(DEEP)", flat_chain(TERMS)),
+                        spliced("* | stats sum(DEEP)", flat_chain(TERMS)),
+                        true,
+                    ),
+                    (parsed(&ors), parsed(&ors), true),
+                ];
+                for (i, (a, b, want)) in corpus.iter().enumerate() {
+                    assert_eq!(same_query(a, b), *want, "pair {i}");
                 }
             })
             .expect("spawn")

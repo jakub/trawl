@@ -1558,36 +1558,39 @@ mod tests {
         );
     }
 
-    /// A clause beside thousands of nested parentheses resolves in time
-    /// that grows with the text, not with the depth times the text: the
-    /// proof walks the groups. The test runs on a stack
-    /// sized for the depth: an unoptimized parser spends about a kilobyte
-    /// of it per level.
+    /// A clause beside nested parentheses resolves through the deepest
+    /// search the parser admits, and a search nested thousands deep is
+    /// refused at its parse, before the proof walks any group. The test
+    /// runs on a stack sized for that depth: an unoptimized parser spends
+    /// about a kilobyte of it per level before the refusal.
     #[test]
-    fn deeply_nested_groups_resolve_in_linear_time() {
+    fn nested_groups_resolve_to_the_tree_depth_limit() {
         const DEPTH: usize = 16_384;
-        /// The walk per level this guards against took 29 s on a fast
-        /// desktop in an unoptimized build; the linear pass takes 2 s there
-        /// and has taken 5.03 s on a hosted CI runner sharing two cores with
-        /// the rest of its test slice. 15 s sits between, a threefold margin
-        /// over the slowest linear run and half the fastest quadratic one.
-        const BUDGET: Duration = Duration::from_secs(15);
+        let deepest = trawl_core::parser::MAX_TREE_DEPTH;
 
-        let dsl = format!("last=1h {}a{}", "(".repeat(DEPTH), ")".repeat(DEPTH));
-        let (resolved, elapsed) = std::thread::Builder::new()
+        let in_brackets = |depth| format!("last=1h {}a{}", "(".repeat(depth), ")".repeat(depth));
+        let (deepest, refused) = std::thread::Builder::new()
             .stack_size(512 << 20)
             .spawn(move || {
-                let started = std::time::Instant::now();
-                let resolved = resolve_dsl(&dsl);
-                (resolved, started.elapsed())
+                (
+                    resolve_dsl(&in_brackets(deepest)),
+                    resolve_dsl(&in_brackets(DEPTH)),
+                )
             })
             .expect("spawn the resolving thread")
             .join()
             .expect("the resolution finishes");
 
-        let resolved = resolved.unwrap();
-        assert_eq!(window_of(&resolved).0, "2026-10-23T09:20:30.123456Z");
-        assert!(elapsed < BUDGET, "{DEPTH} levels resolved in {elapsed:?}");
+        assert_eq!(
+            window_of(&deepest.unwrap()).0,
+            "2026-10-23T09:20:30.123456Z"
+        );
+        assert_eq!(
+            refused.unwrap_err(),
+            BoundsError::Unparseable {
+                message: r#""search is deeper than 64 levels""#.to_owned()
+            }
+        );
     }
 
     #[test]

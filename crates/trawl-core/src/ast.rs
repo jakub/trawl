@@ -1073,13 +1073,14 @@ mod tests {
             .unwrap_or_else(|_| panic!("{case}: must parse and drop on a 2 MiB stack"));
     }
 
-    /// Parses `dsl` and drops the tree, both on a 2 MiB stack.
-    fn parse_and_drop(case: &str, dsl: String) {
+    /// Parses `dsl` on a 2 MiB stack, where the parser builds the deep
+    /// tree, refuses it for its depth and drops it.
+    fn parse_refuse_and_drop(case: &str, dsl: String) {
         assert!(dsl.len() <= parser::MAX_QUERY_LEN, "{case}: {}", dsl.len());
         on_worker_stack(case, move || {
-            let query = parser::parse(&dsl);
-            assert!(query.is_ok(), "parses");
-            drop(query);
+            let errors = parser::parse(&dsl).expect_err("too deep to parse");
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].message, "expression is deeper than 64 levels");
         });
     }
 
@@ -1087,23 +1088,27 @@ mod tests {
     /// tokio worker's 2 MiB stack in a debug build, whatever variants it
     /// nests, and so does one a panic unwinds through. A recursive drop
     /// overflows this stack at about 16 000 levels.
+    ///
+    /// The grammar builds every such tree before the tree depth check
+    /// refuses it, and the refusal drops it inside the parse. A tree that
+    /// outlives a parse, as the unwind case needs, is built in code.
     #[test]
     fn expression_drop_fits_worker_stack() {
         const TERMS: usize = 32_000;
         let chain = || vec!["1"; TERMS].join("+");
         let prefix = "* | where ";
 
-        parse_and_drop("binary", format!("{prefix}{} > 0", chain()));
+        parse_refuse_and_drop("binary", format!("{prefix}{} > 0", chain()));
         // `-` repeats with no space between; one byte a level
         let negations = parser::MAX_QUERY_LEN - prefix.len() - 1;
-        parse_and_drop("neg", format!("{prefix}{}1", "-".repeat(negations)));
+        parse_refuse_and_drop("neg", format!("{prefix}{}1", "-".repeat(negations)));
         // four bytes a level: the longest `not` chain, 16 381 levels, fits
         // this stack even with a recursive drop
         let nots = (parser::MAX_QUERY_LEN - prefix.len() - 1) / "not ".len();
-        parse_and_drop("not", format!("{prefix}{}a", "not ".repeat(nots)));
-        parse_and_drop("call", format!("* | stats sum({})", chain()));
-        parse_and_drop("in subject", format!("{prefix}{} in (1)", chain()));
-        parse_and_drop("in element", format!("{prefix}a in (1, {})", chain()));
+        parse_refuse_and_drop("not", format!("{prefix}{}a", "not ".repeat(nots)));
+        parse_refuse_and_drop("call", format!("* | stats sum({})", chain()));
+        parse_refuse_and_drop("in subject", format!("{prefix}{} in (1)", chain()));
+        parse_refuse_and_drop("in element", format!("{prefix}a in (1, {})", chain()));
 
         // The parser drops what it built when the text after the chain
         // fails to parse.
@@ -1114,10 +1119,9 @@ mod tests {
             drop(query);
         });
 
-        let dsl = format!("{prefix}{} > 0", chain());
-        on_worker_stack("unwind", move || {
+        on_worker_stack("unwind", || {
             let unwound = std::panic::catch_unwind(|| {
-                let _query = parser::parse(&dsl);
+                let _tree = parser::depth_fixtures::flat_chain(TERMS);
                 panic!("unwinding through a live tree");
             });
             let payload = unwound.expect_err("the closure panics");

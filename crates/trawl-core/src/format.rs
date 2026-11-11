@@ -2734,55 +2734,86 @@ mod tests {
         );
     }
 
-    /// Rendering, the reparse and the comparison walk explicit stacks, so
-    /// a flat chain far deeper than `MAX_EXPR_DEPTH` formats and compares
-    /// on a tokio worker's 2 MiB stack in a debug build.
+    /// Rendering walks an explicit stack, so a flat chain far deeper than
+    /// the parser admits renders on a tokio worker's 2 MiB stack in a
+    /// debug build. Such a tree comes only from code, and the checked
+    /// renderer refuses it as too long before its reparse once the text
+    /// passes `MAX_QUERY_LEN`. At the tree depth limit, every shape renders,
+    /// reads back and compares as the same query.
     #[test]
     fn flat_chains_format_on_a_worker_stack() {
+        use crate::parser::depth_fixtures::{flat_chain, int, shapes, spliced, unary_run};
+
         const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
         // A recursive renderer overflows this stack at about 5 000 terms
         // in a debug build.
         const TERMS: usize = 12_000;
 
         let sum = vec!["1"; TERMS].join(" + ");
-        let faithful = vec![
-            format!("* | where {sum} > 0"),
-            format!("* | where {}1 == 1", "-".repeat(TERMS)),
-            format!("* | where {}a", "not ".repeat(TERMS)),
-            format!("* | stats sum({sum})"),
-        ];
-        // 30 000 terms, each two bytes as written and four once spaced
-        let too_long = format!("* | let x = {}", vec!["1"; 30_000].join("+"));
+        let deep = move || {
+            [
+                (
+                    spliced("* | where DEEP > 0", flat_chain(TERMS)),
+                    format!("*\n| where {sum} > 0"),
+                ),
+                (
+                    spliced(
+                        "* | where DEEP == 1",
+                        unary_run(UnaryOp::Neg, TERMS, int(1)),
+                    ),
+                    format!("*\n| where {}1 == 1", "-".repeat(TERMS)),
+                ),
+                (
+                    spliced(
+                        "* | where DEEP",
+                        unary_run(
+                            UnaryOp::Not,
+                            TERMS,
+                            Spanned::new(Expr::FieldRef("a".to_owned()), 0..0),
+                        ),
+                    ),
+                    format!("*\n| where {}a", "not ".repeat(TERMS)),
+                ),
+                (
+                    spliced("* | stats sum(DEEP)", flat_chain(TERMS)),
+                    format!("*\n| stats sum({sum})"),
+                ),
+            ]
+        };
 
         // Every tree drops on the small stack too, before the thread ends.
-        let (outcomes, refusal) = std::thread::Builder::new()
+        let (rendered, refusal, at_limit) = std::thread::Builder::new()
             .stack_size(TOKIO_WORKER_STACK)
             .spawn(move || {
-                let mut trees = Vec::new();
-                let mut outcomes = Vec::new();
-                for dsl in &faithful {
-                    let query = crate::parser::parse(dsl).expect("parses");
-                    let reparsed = checked_format_query(&query)
-                        .ok()
-                        .and_then(|text| crate::parser::parse(&text).ok());
-                    let same = reparsed.as_ref().is_some_and(|r| same_query(&query, r));
-                    outcomes.push((dsl.chars().take(40).collect::<String>(), same));
-                    trees.push(query);
-                    trees.extend(reparsed);
-                }
-                let query = crate::parser::parse(&too_long).expect("parses");
-                let refusal = checked_format_query(&query);
-                trees.push(query);
-                drop(trees);
-                (outcomes, refusal)
+                let rendered: Vec<bool> = deep()
+                    .into_iter()
+                    .map(|(query, want)| format_query(&query) == want)
+                    .collect();
+                // 30 000 terms, each four bytes once spaced
+                let too_long = spliced("* | let x = DEEP", flat_chain(30_000));
+                let refusal = checked_format_query(&too_long);
+                drop(too_long);
+                let at_limit: Vec<(&str, bool)> = shapes(crate::parser::MAX_TREE_DEPTH)
+                    .iter()
+                    .map(|shape| {
+                        let query = crate::parser::parse(&shape.text).expect("parses");
+                        let same = checked_format_query(&query)
+                            .ok()
+                            .and_then(|text| crate::parser::parse(&text).ok())
+                            .is_some_and(|reparsed| same_query(&query, &reparsed));
+                        (shape.name, same)
+                    })
+                    .collect();
+                (rendered, refusal, at_limit)
             })
             .expect("spawn")
             .join()
             .expect("formatting and dropping must not overflow a 2 MiB stack");
-        for (dsl, same) in outcomes {
-            assert!(same, "{dsl}… must format and read back the same");
-        }
+        assert_eq!(rendered, [true; 4], "each deep tree renders as written");
         assert_eq!(refusal, Err(FormatError::TooLong { bytes: 120_008 }));
+        for (shape, same) in at_limit {
+            assert!(same, "{shape} must format and read back the same");
+        }
     }
 
     /// Quoted output escapes the three control characters
