@@ -426,6 +426,8 @@ pub async fn list_runs(
 }
 
 /// GET `/api/v1/saved/{id}/runs/{run_id}` — single run with result data.
+/// Needs `query` beside `saved_query` (ADR-0018 as amended on 2026-11-11),
+/// so a session without `query` never builds the preview that calls it.
 ///
 /// A non-2xx keeps its envelope: a run whose stored result file is gone
 /// answers 409 with a sentence naming the run (issue #227), and the drawer
@@ -503,9 +505,11 @@ pub async fn update_saved_full(
 /// window early. The answer is the claimed run, window included, so the
 /// caller can state the bounds the server chose rather than guess them.
 ///
-/// A refusal (a run already in progress, the max-runs cap, nothing new
-/// to read, no schedule) is an operator-facing sentence, and the toast
-/// shows it rather than a bare status.
+/// Needs `query` beside `saved_query`, so a session without `query` is
+/// offered no Run now. A refusal (this key's manual run or the server's
+/// manual runs already going, a run already in progress, the max-runs
+/// cap, nothing new to read, no schedule) is an operator-facing sentence,
+/// and the toast shows it rather than a bare status.
 pub async fn trigger_run(saved_id: i64) -> Result<ReportRunSummary, ApiError> {
     let request = Request::post(&format!("/api/v1/saved/{saved_id}/run")).build()?;
     ordinary(request, &[200]).await
