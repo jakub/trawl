@@ -3163,12 +3163,9 @@ pub async fn runs_stats(
 /// `corpus_recovering`, answered before the claim, so it creates no run.
 pub async fn trigger_run(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::RunSavedQuery>,
     saved_id: Result<Path<i64>, PathRejection>,
 ) -> Result<Json<ReportRunSummary>, ServerError> {
-    if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
     let Path(saved_id) = shaped("saved query id", saved_id)?;
 
     let key_id = verified.id;
@@ -3294,12 +3291,9 @@ pub async fn trigger_run(
 /// to describe as "no result data" for a run that succeeded.
 pub async fn get_report_run(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::RunSavedQuery>,
     path: Result<Path<(i64, i64)>, PathRejection>,
 ) -> Result<Json<ReportRunResponse>, ServerError> {
-    if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
     let Path((saved_id, run_id)) = shaped("saved query and run ids", path)?;
 
     let key_id = verified.id;
