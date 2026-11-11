@@ -3,18 +3,25 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Run now and a run's stored rows need `query` beside `saved_query`
-// (issue #444, ADR-0018 as amended on 2026-11-11). A session with
-// `saved_query` alone still lists a net's runs, but is offered no Run now
-// in the net drawer or the nets list, its run rows do not expand, and the
-// browser never asks for a run's rows: not from the drawer, not from the
-// runs page. The last test is the control: with both permissions every
-// one of those is there.
+// (issue #444, ADR-0018 as amended on 2026-11-11). A session missing
+// either is offered no Run now in the net drawer or the nets list, its
+// run rows do not expand, and the browser never asks for a run's rows:
+// not from the drawer, not from the runs page. Each absence runs once
+// with `saved_query` alone, which trawld lets list a net's runs, and once
+// with `query` alone, so a control gated on `query` by itself fails here.
+// The last test is the control: with both permissions every one of those
+// is there.
 
 import { test, expect, resetScenario, CORPUS, SCHEDULE } from '../fixtures';
 import { SEL, COPY } from '../selectors';
 import type { Page } from '@playwright/test';
 
 const SAVED_ONLY = ['saved_query'];
+const QUERY_ONLY = ['query'];
+const MISSING_ONE: [string, string[]][] = [
+  ['saved_query alone', SAVED_ONLY],
+  ['query alone', QUERY_ONLY],
+];
 const QUERY_AND_SAVED = ['query', 'saved_query'];
 
 /** The single-run read: one run's summary and its stored rows. */
@@ -40,56 +47,58 @@ async function sessionWith(page: Page, permissions: string[]): Promise<string[]>
 const runNow = (scope: import('@playwright/test').Locator) =>
   scope.getByRole('button', { name: COPY.netRunNow, exact: true });
 
-test('run_now_is_absent_without_query: the net drawer offers no Run now', async ({ page, request }) => {
-  await resetScenario(request, 'schedule');
-  await sessionWith(page, SAVED_ONLY);
-  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
-  const drawer = page.locator(SEL.drawerPanel);
-  // The drawer header is up, with the control that does not need `query`
-  // to be offered, before the absence is read.
-  await expect(drawer.getByRole('button', { name: '▶ Search' })).toBeVisible();
-  await expect(runNow(drawer)).toHaveCount(0);
-});
+for (const [who, permissions] of MISSING_ONE) {
+  test(`run_now_is_absent_without_query (${who}): the net drawer offers no Run now`, async ({ page, request }) => {
+    await resetScenario(request, 'schedule');
+    await sessionWith(page, permissions);
+    await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
+    const drawer = page.locator(SEL.drawerPanel);
+    // The drawer header is up, with the control that does not need `query`
+    // to be offered, before the absence is read.
+    await expect(drawer.getByRole('button', { name: '▶ Search' })).toBeVisible();
+    await expect(runNow(drawer)).toHaveCount(0);
+  });
 
-test('run_now_is_absent_without_query: the nets list offers no Run now', async ({ page, request }) => {
-  await resetScenario(request, 'schedule');
-  await sessionWith(page, SAVED_ONLY);
-  await page.goto('/jobs/nets');
-  const row = page.locator(SEL.tableRow).filter({ hasText: SCHEDULE.windowedNetName });
-  await expect(row).toHaveCount(1);
-  await expect(runNow(page.locator(SEL.tableRow))).toHaveCount(0);
-});
+  test(`run_now_is_absent_without_query (${who}): the nets list offers no Run now`, async ({ page, request }) => {
+    await resetScenario(request, 'schedule');
+    await sessionWith(page, permissions);
+    await page.goto('/jobs/nets');
+    const row = page.locator(SEL.tableRow).filter({ hasText: SCHEDULE.windowedNetName });
+    await expect(row).toHaveCount(1);
+    await expect(runNow(page.locator(SEL.tableRow))).toHaveCount(0);
+  });
 
-test("run_now_is_absent_without_query: the net drawer's run rows list but do not expand or read", async ({ page, request }) => {
-  await resetScenario(request, 'schedule');
-  const reads = await sessionWith(page, SAVED_ONLY);
-  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=runs`);
-  const rows = page.locator(SEL.netRunRow);
-  await expect(rows).toHaveCount(3);
+  test(`run_now_is_absent_without_query (${who}): the net drawer's run rows list but do not expand or read`, async ({ page, request }) => {
+    await resetScenario(request, 'schedule');
+    const reads = await sessionWith(page, permissions);
+    await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=runs`);
+    const rows = page.locator(SEL.netRunRow);
+    await expect(rows).toHaveCount(3);
 
-  // Clicking where a readable row's control sits expands nothing and
-  // reads nothing.
-  await rows.first().locator('td').first().click();
-  await page.waitForLoadState('networkidle');
-  expect(reads).toEqual([]);
-  await expect(page.locator(SEL.netRunPreview)).toHaveCount(0);
-  // A row is plain text, not a disclosure control.
-  await expect(rows.locator(SEL.rowStretch)).toHaveCount(0);
-  await expect(rows.locator('[aria-expanded]')).toHaveCount(0);
-});
+    // Clicking where a readable row's control sits expands nothing and
+    // reads nothing.
+    await rows.first().locator('td').first().click();
+    await page.waitForLoadState('networkidle');
+    expect(reads).toEqual([]);
+    await expect(page.locator(SEL.netRunPreview)).toHaveCount(0);
+    // A row is plain text, not a disclosure control.
+    await expect(rows.locator(SEL.rowStretch)).toHaveCount(0);
+    await expect(rows.locator('[aria-expanded]')).toHaveCount(0);
+  });
 
-test('run_now_is_absent_without_query: the runs page shows no preview and reads no rows', async ({ page, request }) => {
-  await resetScenario(request, 'corpus');
-  const reads = await sessionWith(page, SAVED_ONLY);
-  await page.goto(`/jobs/runs?run=${CORPUS.runWithResult}&net=${CORPUS.netId}`);
-  const detail = page.locator(SEL.runDetail);
-  // The receipt stands on the list's record of the run.
-  await expect(detail.locator('#receipt-title')).toBeVisible();
-  await page.waitForLoadState('networkidle');
-  expect(reads).toEqual([]);
-  await expect(detail.locator('.run-preview')).toHaveCount(0);
-  await expect(detail.getByText("Reading a run's rows needs the query and saved_query permissions.")).toBeVisible();
-});
+  test(`run_now_is_absent_without_query (${who}): the runs page shows no preview and reads no rows`, async ({ page, request }) => {
+    await resetScenario(request, 'corpus');
+    const reads = await sessionWith(page, permissions);
+    await page.goto(`/jobs/runs?run=${CORPUS.runWithResult}&net=${CORPUS.netId}`);
+    const detail = page.locator(SEL.runDetail);
+    // The receipt stands on the list's record of the run.
+    await expect(detail.locator('#receipt-title')).toBeVisible();
+    await page.waitForLoadState('networkidle');
+    expect(reads).toEqual([]);
+    await expect(detail.locator('.run-preview')).toHaveCount(0);
+    await expect(detail.getByText("Reading a run's rows needs the query and saved_query permissions.")).toBeVisible();
+  });
+}
 
 test('run_now_is_absent_without_query: with query too, Run now is offered and a run row reads its rows', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
