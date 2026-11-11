@@ -40,8 +40,12 @@ async fn net(client: &HttpClient, name: &str, query: &str) -> i64 {
 }
 
 /// Trigger one run and return it once it has finished, with the run
-/// before it if there was one: newest first.
+/// before it if there was one: newest first. It returns only once the
+/// manual-run gate has drained too: a run's lease goes back after its
+/// terminal row is written, and the key's next press before then answers
+/// 429.
 async fn run_once(
+    server: &TestServer,
     client: &HttpClient,
     saved_id: i64,
     n: usize,
@@ -56,12 +60,18 @@ async fn run_once(
             .await
             .expect("the runs list answers")
             .runs;
-        if runs.len() >= n && runs.iter().all(|r| r.status != "running") {
+        if runs.len() >= n
+            && runs.iter().all(|r| r.status != "running")
+            && server.state.query.pool.manual_leases_in_use() == 0
+        {
             return runs;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("{n} finished runs never appeared for saved query {saved_id}");
+    panic!(
+        "{n} finished runs and a drained manual-run gate never appeared for saved query \
+         {saved_id}"
+    );
 }
 
 /// The absolute path of a run's stored parquet result.
@@ -119,7 +129,7 @@ async fn a_value_above_i64_max_is_stored_unsigned_and_reads_back_exactly() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let saved_id = net(&client, "big_sum", BIG_SUM).await;
-    let run = run_once(&client, saved_id, 1).await.remove(0);
+    let run = run_once(&server, &client, saved_id, 1).await.remove(0);
     assert_eq!(run.status, "success", "{run:?}");
 
     let path = stored_path(&server, &run);
@@ -164,7 +174,7 @@ async fn a_runs_columns_are_stored_in_their_exact_types() {
            max(nan) as nan, max(code) as code",
     )
     .await;
-    let run = run_once(&client, saved_id, 1).await.remove(0);
+    let run = run_once(&server, &client, saved_id, 1).await.remove(0);
     assert_eq!(run.status, "success", "{run:?}");
 
     assert_eq!(
@@ -220,7 +230,7 @@ async fn a_zero_row_run_stores_a_typed_empty_file() {
         "service=nginx host=no_such_host | table host, severity",
     )
     .await;
-    let run = run_once(&client, saved_id, 1).await.remove(0);
+    let run = run_once(&server, &client, saved_id, 1).await.remove(0);
     assert_eq!(run.status, "success", "{run:?}");
     assert_eq!(run.row_count, Some(0), "{run:?}");
 
@@ -275,7 +285,7 @@ async fn a_rust_tail_that_removes_every_row_stores_a_typed_empty_file() {
         "service=nginx | extract kv | where no_such_key == 999 | table host, severity",
     )
     .await;
-    let run = run_once(&client, saved_id, 1).await.remove(0);
+    let run = run_once(&server, &client, saved_id, 1).await.remove(0);
     assert_eq!(run.status, "success", "{run:?}");
     assert_eq!(run.row_count, Some(0), "{run:?}");
 
@@ -309,7 +319,7 @@ async fn a_mixed_column_run_is_a_blob_that_from_saved_refuses() {
          | extract kv from kvs | table x",
     )
     .await;
-    let run = run_once(&client, saved_id, 1).await.remove(0);
+    let run = run_once(&server, &client, saved_id, 1).await.remove(0);
     assert_eq!(run.status, "success", "{run:?}");
     assert!(run.result_path.is_none(), "{run:?}");
 
@@ -344,7 +354,7 @@ async fn a_zero_column_run_is_a_blob_that_counts_zero() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let saved_id = net(&client, "nothing", "service=no_such_service | table host").await;
-    let run = run_once(&client, saved_id, 1).await.remove(0);
+    let run = run_once(&server, &client, saved_id, 1).await.remove(0);
     assert_eq!(run.status, "success", "{run:?}");
     assert!(run.result_path.is_none(), "{run:?}");
     assert_eq!(
@@ -375,7 +385,7 @@ async fn run_all_unions_a_bigint_run_and_a_ubigint_run_exactly() {
         "service=nginx | stats sum(severity) as total",
     )
     .await;
-    let small = run_once(&client, saved_id, 1).await.remove(0);
+    let small = run_once(&server, &client, saved_id, 1).await.remove(0);
     assert_eq!(
         described(&stored_path(&server, &small)),
         pairs(&[("total", "BIGINT")])
@@ -384,7 +394,7 @@ async fn run_all_unions_a_bigint_run_and_a_ubigint_run_exactly() {
         .update_saved(saved_id, BIG_SUM)
         .await
         .expect("the saved query is updated");
-    let big = run_once(&client, saved_id, 2).await.remove(0);
+    let big = run_once(&server, &client, saved_id, 2).await.remove(0);
     assert_eq!(
         described(&stored_path(&server, &big)),
         pairs(&[("total", "UBIGINT")])
@@ -418,7 +428,7 @@ async fn a_field_the_run_does_not_carry_takes_no_live_pin() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let saved_id = net(&client, "hosts", "service=nginx | table host, severity").await;
-    let run = run_once(&client, saved_id, 1).await.remove(0);
+    let run = run_once(&server, &client, saved_id, 1).await.remove(0);
     assert_eq!(run.status, "success", "{run:?}");
     assert_eq!(
         described(&stored_path(&server, &run)),
@@ -495,7 +505,7 @@ async fn a_failed_parquet_write_records_a_readable_typed_blob() {
     std::fs::set_permissions(&scheduled, std::fs::Permissions::from_mode(0o555)).unwrap();
 
     let saved_id = net(&client, "unwritable", "service=nginx | table service").await;
-    let run = run_once(&client, saved_id, 1).await.remove(0);
+    let run = run_once(&server, &client, saved_id, 1).await.remove(0);
     std::fs::set_permissions(&scheduled, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     assert_eq!(run.status, "success", "{run:?}");
