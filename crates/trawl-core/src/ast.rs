@@ -250,6 +250,74 @@ pub enum SearchToken {
     Group(Vec<Vec<Spanned<SearchToken>>>),
 }
 
+/// Drops a search tree with an explicit work list, so its depth costs
+/// heap, not stack.
+///
+/// The search grammar builds `NOT` runs and nested brackets as deep as
+/// `MAX_QUERY_LEN` allows, tens of thousands of levels, before the tree
+/// depth check refuses them (#447), and the tree is dropped on every exit
+/// from the parser. Drop glue would recurse once a level and overflow a
+/// tokio worker's 2 MiB stack, so each token hands its children that own
+/// children to the work list before it is freed, as [`Expr`]'s drop does.
+///
+/// Only the drop has this guarantee: the derived `Clone`, `PartialEq` and
+/// `Debug` still recurse.
+impl Drop for SearchToken {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.defer_children(&mut pending);
+        while let Some(mut token) = pending.pop() {
+            token.defer_children(&mut pending);
+            // `token` drops here, its children leaves or placeholders
+        }
+    }
+}
+
+impl SearchToken {
+    /// Moves every child that owns children of its own onto `pending`,
+    /// leaving a leaf in its place.
+    ///
+    /// No wildcard: a new variant does not compile until it has a drop
+    /// decision here.
+    fn defer_children(&mut self, pending: &mut Vec<Self>) {
+        fn defer(child: &mut Spanned<SearchToken>, pending: &mut Vec<SearchToken>) {
+            if child.node.owns_children() {
+                pending.push(std::mem::replace(
+                    &mut child.node,
+                    SearchToken::EarliestFilter(String::new()),
+                ));
+            }
+        }
+        match self {
+            Self::Not(inner) => defer(inner, pending),
+            Self::Group(groups) => {
+                for child in groups.iter_mut().flatten() {
+                    defer(child, pending);
+                }
+            }
+            Self::FieldFilter(_)
+            | Self::TextSearch(_)
+            | Self::TimeFilter(_)
+            | Self::QuotedSearch(_)
+            | Self::EarliestFilter(_)
+            | Self::LatestFilter(_) => {}
+        }
+    }
+
+    fn owns_children(&self) -> bool {
+        match self {
+            Self::Not(_) => true,
+            Self::Group(groups) => !groups.is_empty(),
+            Self::FieldFilter(_)
+            | Self::TextSearch(_)
+            | Self::TimeFilter(_)
+            | Self::QuotedSearch(_)
+            | Self::EarliestFilter(_)
+            | Self::LatestFilter(_) => false,
+        }
+    }
+}
+
 /// A field-value filter with an operator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldFilter {
@@ -1087,6 +1155,77 @@ mod tests {
                 tree = Spanned::new(node, 0..1);
             }
             drop(tree);
+        });
+    }
+
+    /// A search leaf: one bare word.
+    fn search_leaf() -> Spanned<SearchToken> {
+        Spanned::new(
+            SearchToken::TextSearch(TextSearch {
+                term: "a".to_owned(),
+                negated: false,
+            }),
+            0..1,
+        )
+    }
+
+    /// `depth` nested brackets around one search word.
+    fn nested_groups(depth: usize) -> Spanned<SearchToken> {
+        let mut tree = search_leaf();
+        for _ in 0..depth {
+            tree = Spanned::new(SearchToken::Group(vec![vec![tree]]), 0..1);
+        }
+        tree
+    }
+
+    /// A search tree as deep as any text the grammar builds before the
+    /// tree depth check refuses it drops on a tokio worker's 2 MiB stack in
+    /// a debug build, whatever variants it nests, and so does one a panic
+    /// unwinds through. The trees are built in code, as the parser would
+    /// refuse their text.
+    #[test]
+    fn search_token_drop_fits_worker_stack() {
+        const BRACKETS: usize = 30_000;
+        const NOTS: usize = 16_000;
+
+        on_worker_stack("brackets", || drop(nested_groups(BRACKETS)));
+
+        on_worker_stack("NOT run", || {
+            let mut tree = search_leaf();
+            for _ in 0..NOTS {
+                tree = Spanned::new(SearchToken::Not(Box::new(tree)), 0..1);
+            }
+            drop(tree);
+        });
+
+        // Each bracket holds the deeper tree beside a leaf, and a second
+        // OR branch of its own.
+        on_worker_stack("mixed", || {
+            let mut tree = search_leaf();
+            for level in 0..BRACKETS {
+                let node = if level % 2 == 0 {
+                    SearchToken::Not(Box::new(tree))
+                } else {
+                    SearchToken::Group(vec![
+                        vec![search_leaf(), tree],
+                        vec![search_leaf(), search_leaf()],
+                    ])
+                };
+                tree = Spanned::new(node, 0..1);
+            }
+            drop(tree);
+        });
+
+        on_worker_stack("unwind", || {
+            let unwound = std::panic::catch_unwind(|| {
+                let _tree = nested_groups(BRACKETS);
+                panic!("unwinding through a live tree");
+            });
+            let payload = unwound.expect_err("the closure panics");
+            assert_eq!(
+                payload.downcast_ref::<&str>(),
+                Some(&"unwinding through a live tree")
+            );
         });
     }
 }
