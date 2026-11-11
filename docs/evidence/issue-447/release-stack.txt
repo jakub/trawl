@@ -1,13 +1,13 @@
 release-stack.sh for #447, tree depth limit
-sha:      db9cdad86ec0f4e32b13ec6f205bae3c5a53769e
+sha:      b1b03b7ba8d537733746943735c67d499706cb21
 rustc:    rustc 1.98.0 (88d9e12ae 2026-08-18)
 arch:     x86_64
 ulimit -s: 2048 KiB
 profile:  release (evidence-447/release/trawl)
 limits:   MAX_TREE_DEPTH=64 MAX_QUERY_LEN=65536
-date:     2026-11-11T19:48:00Z
+date:     2026-11-11T20:26:26Z
 
-== every shape at depth 64: a row, or a marked semantic refusal ==
+== every shape at depth 64: its one row ==
 plus chain                       depth=64     bytes=267    exit=0   row
 or chain                         depth=64     bytes=700    exit=0   row
 and chain                        depth=64     bytes=709    exit=0   row
@@ -61,7 +61,7 @@ chain as in subject, longest     depth=max    bytes=65536  exit=1   refused: tra
 chain as in element, longest     depth=max    bytes=65535  exit=1   refused: trawl: parse error: expression is deeper than 64 levels
 chain as call argument, longest  depth=max    bytes=65536  exit=1   refused: trawl: parse error: expression is deeper than 64 levels
 deep expression, grammar error   depth=32000  bytes=64021  exit=1   refused: trawl: parse error: found end of input, expected expression
-deep search, grammar error       depth=30000  bytes=60011  exit=1   refused: trawl: parse error: search is deeper than 64 levels
+deep search, grammar error       depth=512    bytes=1035   exit=1   refused: trawl: parse error: found end of input, expected expression
 let alias chain, 4000 links      depth=4000   bytes=57782  exit=1   refused: trawl: database error: Binder Error: Max expression depth limit of 1000 exceeded. Use "SET max_expression_depth TO x" to increase the maximu…
 
 summary: aborts=0 unexpected=0
