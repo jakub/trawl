@@ -47,65 +47,78 @@ fn chain(op: &str, n: usize) -> String {
     vec!["1"; n].join(&format!(" {op} "))
 }
 
-/// `a == 0 or a == 1 …`: `n` comparisons, `n` levels deep. Only
-/// `a == 1` is true, so the chain holds for the row.
-fn or_chain(n: usize) -> String {
-    (0..n)
-        .map(|i| format!("a == {i}"))
-        .collect::<Vec<_>>()
-        .join(" or ")
-}
-
-/// `k == <first> or …`: `n` comparisons over the kv field `k`, `n`
-/// levels deep, true for the row only when 1 is among them.
-fn kv_chain(first: usize, n: usize) -> String {
+/// `<field> == <first> or …`: `n` comparisons, `n` levels deep, true for
+/// the row only when 1 is among them.
+fn or_chain(field: &str, first: usize, n: usize) -> String {
     (first..first + n)
-        .map(|i| format!("k == {i}"))
+        .map(|i| format!("{field} == {i}"))
         .collect::<Vec<_>>()
         .join(" or ")
 }
 
 /// The queries the criterion names, each with its deepest tree `d` levels
-/// deep, the field it projects and that field's value in the row. The
-/// comments count the levels at `d` = 64.
-fn cases(d: usize) -> Vec<(&'static str, String, &'static str, Value)> {
+/// deep, the field it projects and that field's value in the row. With
+/// `hit` false each condition is false for the row, at the same depth, so
+/// a query whose deep condition never ran would be caught returning the
+/// row. The comments count the levels at `d` = 64.
+fn cases(d: usize, hit: bool) -> Vec<(&'static str, String, &'static str, Value)> {
     let a = |name, dsl| (name, dsl, "a", Value::Integer(1));
+    // the value `a` or `k` is compared against: the row's, or another
+    let one = if hit { 1 } else { 2 };
+    // where an or chain starts: 0 takes in 1, 2 leaves it out
+    let first = if hit { 0 } else { 2 };
     vec![
-        // 64 `+` terms are 63 levels; the comparison is the 64th.
+        // 64 `+` terms are 63 levels; the comparison is the 64th. The sum
+        // is `d`, so the hit needs every term.
         a(
             "plus chain",
-            format!("* | where {} > 0 | table a", chain("+", d)),
+            format!(
+                "* | where {} > {} | table a",
+                chain("+", d),
+                if hit { d - 1 } else { d }
+            ),
         ),
         // 63 minus signs over `a` (an odd count, so -1) and the
-        // comparison over them: 64 levels, and -1 < 2 holds.
+        // comparison over them: 64 levels, and -1 < 0 holds.
         a(
             "minus run",
-            format!("* | where {}a < 2 | table a", "-".repeat(d - 1)),
+            format!(
+                "* | where {}a {} 0 | table a",
+                "-".repeat(d - 1),
+                if hit { "<" } else { ">" }
+            ),
         ),
-        a("or chain", format!("* | where {} | table a", or_chain(d))),
+        a(
+            "or chain",
+            format!("* | where {} | table a", or_chain("a", first, d)),
+        ),
         // An even count of NOTs keeps the match.
         a(
             "search NOT run",
-            format!("{}a=1 | table a", "NOT ".repeat(d)),
+            format!("{}a={one} | table a", "NOT ".repeat(d)),
         ),
         a(
             "search brackets",
-            format!("{}a=1{} | table a", "(".repeat(d), " )".repeat(d)),
+            format!("{}a={one}{} | table a", "(".repeat(d), " )".repeat(d)),
         ),
         // `k` comes only from the message, so the row and its `k` come
         // back only through the kv tail.
         (
             "where after extract kv",
-            format!("* | extract kv | where {} | table k", kv_chain(0, d)),
+            format!(
+                "* | extract kv | where {} | table k",
+                or_chain("k", first, d)
+            ),
             "k",
             Value::Integer(1),
         ),
     ]
 }
 
-/// Every 64-deep query returns the one row, with `a` read back as 1. The
-/// same shapes one level deeper are refused, which pins each case at the
-/// limit rather than somewhere under it.
+/// Every 64-deep query returns the one row, with `a` or `k` read back as
+/// 1, and its false twin returns none. The same shapes one level deeper
+/// are refused, which pins each case at the limit rather than somewhere
+/// under it.
 #[test]
 fn queries_at_the_tree_depth_limit_return_their_row() {
     let (_dir, glob) = one_row();
@@ -114,7 +127,7 @@ fn queries_at_the_tree_depth_limit_return_their_row() {
         .stack_size(WORKER_STACK)
         .spawn(move || {
             let exec = Executor::new().expect("executor");
-            for (name, dsl, _, _) in cases(MAX_TREE_DEPTH + 1) {
+            for (name, dsl, _, _) in cases(MAX_TREE_DEPTH + 1, true) {
                 let Err(error) = exec.run_query(&dsl, &glob, &FieldTypes::new(), usize::MAX) else {
                     panic!("{name} at depth 65 is refused");
                 };
@@ -123,7 +136,7 @@ fn queries_at_the_tree_depth_limit_return_their_row() {
                     "{name} at depth 65 gets the depth refusal, got: {error}"
                 );
             }
-            for (name, dsl, field, value) in cases(MAX_TREE_DEPTH) {
+            for (name, dsl, field, value) in cases(MAX_TREE_DEPTH, true) {
                 let result = exec
                     .run_query(&dsl, &glob, &FieldTypes::new(), usize::MAX)
                     .unwrap_or_else(|error| panic!("{name} at depth 64 must run: {error}"));
@@ -139,16 +152,15 @@ fn queries_at_the_tree_depth_limit_return_their_row() {
                 );
             }
 
-            // The same 64-deep kv condition without 1 drops the row:
-            // the tail evaluates the condition, not only the projection.
-            let dsl = format!(
-                "* | extract kv | where {} | table k",
-                kv_chain(2, MAX_TREE_DEPTH)
-            );
-            let result = exec
-                .run_query(&dsl, &glob, &FieldTypes::new(), usize::MAX)
-                .unwrap_or_else(|error| panic!("the false kv chain must run: {error}"));
-            assert!(result.rows.is_empty(), "the false kv chain: {result:?}");
+            for (name, dsl, _, _) in cases(MAX_TREE_DEPTH, false) {
+                let result = exec
+                    .run_query(&dsl, &glob, &FieldTypes::new(), usize::MAX)
+                    .unwrap_or_else(|error| panic!("false {name} at depth 64 must run: {error}"));
+                assert!(
+                    result.rows.is_empty(),
+                    "false {name} drops the row: {result:?}"
+                );
+            }
         })
         .expect("spawn the 2 MiB thread")
         .join()
