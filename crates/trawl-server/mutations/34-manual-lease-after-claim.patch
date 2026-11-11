@@ -1,0 +1,46 @@
+diff --git a/crates/trawl-server/src/handlers.rs b/crates/trawl-server/src/handlers.rs
+index 5365bce7..e82be22c 100644
+--- a/crates/trawl-server/src/handlers.rs
++++ b/crates/trawl-server/src/handlers.rs
+@@ -3210,17 +3210,6 @@ pub async fn trigger_run(
+     // Before the claim too, and never waiting: a refusal has nothing to
+     // undo. The estimate covers the claim and the run's timeout, and only
+     // shapes a later refusal's advisory Retry-After.
+-    let lease = state
+-        .query
+-        .pool
+-        .try_lease_manual(
+-            key_id,
+-            CLAIM_WAIT + std::time::Duration::from_secs(state.query.timeout_secs),
+-        )
+-        .map_err(|busy| ServerError::ManualRunBusy {
+-            retry_after_secs: busy.retry_after_secs,
+-        })?;
+-
+     let (answer, answered) = tokio::sync::oneshot::channel();
+     let schedule_store = state.storage.schedule.clone();
+     let pool = state.query.pool.clone();
+@@ -3241,11 +3230,22 @@ pub async fn trigger_run(
+         let claimed = match started_manual_run(claim) {
+             Ok(claimed) => claimed,
+             Err(refusal) => {
+-                drop(lease);
+                 let _ = answer.send(Err(refusal));
+                 return;
+             }
+         };
++        let lease = match pool.try_lease_manual(
++            key_id,
++            CLAIM_WAIT + std::time::Duration::from_secs(timeout_secs),
++        ) {
++            Ok(lease) => lease,
++            Err(busy) => {
++                let _ = answer.send(Err(ServerError::ManualRunBusy {
++                    retry_after_secs: busy.retry_after_secs,
++                }));
++                return;
++            }
++        };
+ 
+         if let Some(window) = &claimed.window {
+             crate::scheduler::note_truncated_window(claimed.schedule_id, claimed.run_id, window);
