@@ -521,6 +521,20 @@ struct SchedulerHarness {
     _storage: StorageState,
 }
 
+/// Wait until every scheduled-run lease is free. A run's preparation job
+/// keeps the lease until the job's thread ends, which can come after the
+/// run's handle resolves.
+async fn scheduled_leases_free(pool: &ExecutorPool) {
+    let give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pool.scheduled_leases_available() < pool.scheduled_lease_limit() {
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "a scheduled lease stayed held after its run ended"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 async fn scheduler_harness() -> SchedulerHarness {
     let fleet_db_url = common::create_fleet_database().await;
     let app_db_url = common::create_app_database().await;
@@ -890,10 +904,13 @@ async fn a_stored_deep_query_fails_its_attempt_and_keeps_its_schedule() {
     // The harness pool leases one scheduled run at a time, so each tick
     // claims one due schedule. Every tick reads the same instant, and a
     // claimed schedule's cursor has moved past it, so the ticks run each
-    // schedule once and then claim nothing.
+    // schedule once and then claim nothing. Each tick starts with the
+    // lease free: a tick that finds it held claims nothing, which this
+    // loop would read as nothing due.
     let due = deep.len() + 1;
     let mut ticks = 0;
     loop {
+        scheduled_leases_free(&h.pool).await;
         let handles = poll_and_execute(
             &h.schedules,
             &h.key_store,
