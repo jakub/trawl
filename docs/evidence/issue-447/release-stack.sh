@@ -145,15 +145,16 @@ shape_text() {
   esac
 }
 
-# shape_row NAME D: what the one row of shape NAME at depth D must hold, as
-# the CLI's compact JSON spells it.
+# shape_row NAME D: the key and value the one row of shape NAME at depth D
+# must hold, as the CLI's compact JSON spells them. run_case requires a `,`
+# or `}` right after it, so "a":1 does not match "a":10.
 shape_row() {
   local d=$2
   case $1 in
   "chain as call argument" | "chain under pass-through calls") printf '"x":%d' $((d - 15)) ;;
   "let" | "eventstats") printf '"x":%d' $((d + 1)) ;;
   "stats" | "timechart") printf '"sum":%d' $((d + 1)) ;;
-  "pivot") printf '{"1":%d}' $((d + 1)) ;;
+  "pivot") printf '"1":%d' $((d + 1)) ;;
   "where after extract kv") printf '"k":1' ;;
   *) printf '"a":1' ;;
   esac
@@ -204,7 +205,7 @@ error_line() {
 # refusal), "grammar" (a parse error other than the depth refusal) or "any"
 # (a refusal or an engine error).
 run_case() {
-  local name=$1 depth=$2 expect=$3 text=$4 want=${5:-} status=0 outcome mark= rows
+  local name=$1 depth=$2 expect=$3 text=$4 want=${5:-} status=0 outcome mark= rows line
   # the limit applies to the trawl process only, not to the builder above
   (ulimit -s "$STACK_KB" && "$TRAWL" query --data "$PARQUET" --format json -- "$text") \
     >"$OUT" 2>"$ERR" || status=$?
@@ -214,10 +215,11 @@ run_case() {
     ABORTS=$((ABORTS + 1))
   elif ((status == 0)); then
     rows=$(grep -c . "$OUT" || true)
-    if ((rows == 1)) && grep -qF -- "$want" "$OUT"; then
+    line=$(head -n 1 "$OUT")
+    if ((rows == 1)) && [[ -n $want && ($line == *"$want,"* || $line == *"$want}"*) ]]; then
       outcome=row
     else
-      outcome="$rows row(s): $(head -c 100 "$OUT" | head -n 1)"
+      outcome="$rows row(s): ${line:0:100}"
     fi
   else
     outcome="refused: $(error_line "$ERR")"
