@@ -1,13 +1,13 @@
 diff --git a/crates/trawl-server/src/scheduler.rs b/crates/trawl-server/src/scheduler.rs
-index 522c6f12..dfb81c62 100644
+index 971b813f..f2bb0250 100644
 --- a/crates/trawl-server/src/scheduler.rs
 +++ b/crates/trawl-server/src/scheduler.rs
-@@ -226,10 +226,6 @@ pub async fn poll_and_execute(
- ) -> Vec<JoinHandle<()>> {
-     let mut spawned = Vec::new();
- 
+@@ -286,10 +286,6 @@ async fn claim_due(
+     now: DateTime<Utc>,
+     tick: &mut Tick,
+ ) {
 -    if pool.publication().unsettled().is_some() {
--        return spawned;
+-        return;
 -    }
 -
      // With no lease free the tick could claim nothing, so it lists
