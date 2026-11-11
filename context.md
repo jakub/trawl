@@ -248,6 +248,10 @@ _Avoid_: server timezone, query timezone
 Additional expression work caused by substituting earlier same-stage targets, including repeated references introduced by SQL translation. Independent expressions and flat lists without such references have zero lateral expansion.
 _Avoid_: query complexity, bind cost, node count
 
+**Tree depth**:
+The number of levels on the longest path from the root of one expression, or of a query's search, down to a leaf. Each operator, `not`, minus sign, call, `in` list, search `NOT` and search bracket adds a level. Fields, values and search words add none, and neither does the top-level `OR` between search filters. An `or` of n comparisons is n deep; `x in (1, 2, 3)` is 1 deep, however long its list.
+_Avoid_: chain length, node count, nesting depth
+
 **Executor pool**:
 The fixed set of connections to the query database that user queries, exports and field samples take turns on, one permit each. Its size is `max_concurrent_queries`.
 _Avoid_: query pool, connection pool, worker pool

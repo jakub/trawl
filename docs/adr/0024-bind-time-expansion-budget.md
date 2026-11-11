@@ -289,3 +289,23 @@ An acknowledgement still means requested, not stopped. A cancel during a prepara
 
 - **Document the gap and keep `cancelled: false`.** The human first chose this when the gap looked like at most 0.85 s of preparation. The wait lasts up to the deadline, so the ruling was asked again and changed.
 - **A second map for pending entries, or a lock of its own.** The proof that a stale interrupt never reaches a reused executor rests on one critical section. A second lock would make promotion a race.
+
+## Amendment (2026-11-11): one expression or search is at most 64 levels deep
+
+Recursive walks spend stack at every level of a tree: complexity scoring, field collection, SQL emission and its regex weigher, live compilation and evaluation, the derived `Clone`, and the drop of a search. `MAX_EXPR_DEPTH` counts only parentheses, call arguments and `in` lists. A left-deep chain such as `1+1+…`, an `or` of comparisons, a run of `not`s or `NOT`s, or nested search brackets is as deep as it is long, and `MAX_QUERY_LEN` admits tens of thousands of levels. Measured with the release `trawl` binary on a 2 MiB stack, a `+` or `or` chain of about 1 800 levels overflows and the process aborts; in a debug build nested search brackets abort near 600. trawld's workers have 2 MiB stacks. Any key that may query, validate, stream, export or save a query could abort trawld, and a stored query could abort it at every scheduled fire.
+
+Asked how deep one expression or search may be, the human ruled on 2026-11-11: "64 levels". A fourth fixed limit joins the three above: the parser refuses a query in which one expression, or the search, has a **tree depth** (`context.md`) above 64. It is not configurable. The check runs in the parser after the grammar, with an explicit stack, so every door and every process that parses query text refuses the same text with one sentence: trawld's doors and its scheduler, the CLI and its TUI, `trawl mcp`, and the browser. A stored query over the limit fails its next validation or scheduled attempt with the diagnostic, and its schedule is not disabled, as for the other limits. Nothing persisted changes format; deploying the previous binary makes such text parse again.
+
+64 is sized against the hungriest walk measured, the SQL regex weigher over a nested search bracket, at 4 224 bytes a level in a debug build with full debuginfo: 64 levels take about 270 KiB, so every walk at the limit fits a 512 KiB thread, a quarter of a worker's stack. Depth, not node count, is bounded: a wide `in` list or a long argument list is shallow and stays legal.
+
+Where this ADR says that alias-free multiplication is bounded only by the query-length and expression-depth limits, read: by the query-length, expression-depth and tree-depth limits. The walks that exist today stay recursive under this bound. A new whole-tree walk still uses an explicit stack, as ADR-0061 and ADR-0001's amendment of 2026-11-08 require.
+
+The limit does not bound what DuckDB's binder sees through aliases: `let a1 = a0, a2 = a1, …` has tree depth 0 and still meets DuckDB's own depth limit of 1 000, which answers with the redacted database error. ADR-0056 rejects classifying that error by its text, so it stays as it is.
+
+### Considered, not adopted
+
+- **Make every reachable walk iterative.** About twenty walks, including per-event evaluation, the emitter's parameter order and derived impls. Deep queries would keep parsing, but DuckDB still refuses most non-`or` chains past about 1 000 levels.
+- **128 levels.** Refuses fewer `or` chains, but the hungriest walk at 128 does not fit a 512 KiB thread.
+- **Larger thread stacks or `stacker` around the walks.** Covers trawld only, not the CLI, MCP or the browser; one 64 KiB query could still grow tens of MB of stack per walk.
+- **A bound in `check_pipeline_complexity`.** Field collection and the search drop run before it.
+- **A depth guard inside the search grammar.** Sound only with a failure state that survives backtracking; the check after the grammar plus an iterative search drop keeps the grammar as it is.
