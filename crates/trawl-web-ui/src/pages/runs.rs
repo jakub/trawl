@@ -433,7 +433,7 @@ fn RunDetail(
     let bus = expect_context::<ToastBus>();
     let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
     // Reading a run's rows needs `query` beside `saved_query` (ADR-0018 as
-    // amended on 2026-11-11). Without it no preview is built, and the
+    // amended on 2026-11-11). Without both no preview is built, and the
     // receipt stands on the list's record of the run alone.
     let rows_readable = Signal::derive(move || {
         me.with(|m| may_run_saved(m.as_ref().map(|m| m.permissions.as_slice())))
@@ -528,7 +528,7 @@ fn RunDetail(
                         />
                     </Show>
                     {move || rows_withheld().then(|| view! {
-                        <p role="status">"Reading a run's rows needs the query permission."</p>
+                        <p role="status">"Reading a run's rows needs the query and saved_query permissions."</p>
                     })}
                 </div>
                 <aside class="receipt" aria-labelledby="receipt-title">

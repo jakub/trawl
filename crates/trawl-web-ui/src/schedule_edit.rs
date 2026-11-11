@@ -235,13 +235,13 @@ pub const RUN_NOW_FIXED_LINE: &str =
 
 /// Whether the session may run a net now and read a run's stored rows.
 /// The server needs `query` beside `saved_query` for both (ADR-0018 as
-/// amended on 2026-11-11), so without `query` Run now and the run rows
+/// amended on 2026-11-11), so without either Run now and the run rows
 /// view are absent, not disabled (ADR-0025). The run history stays:
 /// listing runs needs `saved_query` alone. `None` is a session not read
 /// yet, which offers neither until it is.
 #[must_use]
 pub fn may_run_saved(permissions: Option<&[String]>) -> bool {
-    permissions.is_some_and(crate::perms::can_query)
+    permissions.is_some_and(crate::perms::can_run_saved)
 }
 
 /// Whether a net offers Run now: exactly when the session
@@ -587,17 +587,19 @@ mod tests {
         assert!(run_now_offered(&net(Some(paused)), runner));
     }
 
-    /// Without `query` the session offers neither Run now nor the run rows
-    /// view, whatever the net's schedule; a session not read yet counts as
-    /// without. With `query` both are there.
+    /// Without `query` and `saved_query` both, the session offers neither
+    /// Run now nor the run rows view, whatever the net's schedule; a
+    /// session not read yet counts as without. With both, both are there.
     #[test]
     fn run_now_is_absent_without_query() {
         let scheduled = net(Some(schedule(Some("since_last"), None)));
         let editor = permissions(&["saved_query"]);
+        let searcher = permissions(&["query"]);
         let runner = permissions(&["query", "saved_query"]);
         for (who, session) in [
             ("not read yet", None),
             ("saved_query alone", Some(editor.as_slice())),
+            ("query alone", Some(searcher.as_slice())),
         ] {
             assert!(!run_now_offered(&scheduled, session), "{who}");
             assert!(!may_run_saved(session), "{who}");

@@ -88,7 +88,7 @@ test('run_now_is_absent_without_query: the runs page shows no preview and reads 
   await page.waitForLoadState('networkidle');
   expect(reads).toEqual([]);
   await expect(detail.locator('.run-preview')).toHaveCount(0);
-  await expect(detail.getByText("Reading a run's rows needs the query permission.")).toBeVisible();
+  await expect(detail.getByText("Reading a run's rows needs the query and saved_query permissions.")).toBeVisible();
 });
 
 test('run_now_is_absent_without_query: with query too, Run now is offered and a run row reads its rows', async ({ page, request }) => {
@@ -115,6 +115,6 @@ test('run_now_is_absent_without_query: with query too, Run now is offered and a 
   await page.goto(`/jobs/runs?run=${CORPUS.runWithResult}&net=${CORPUS.netId}`);
   const detail = page.locator(SEL.runDetail);
   await expect(detail.locator('.run-preview').locator(SEL.previewRow)).toHaveCount(CORPUS.runWithResultRows);
-  await expect(detail.getByText("Reading a run's rows needs the query permission.")).toHaveCount(0);
+  await expect(detail.getByText("Reading a run's rows needs the query and saved_query permissions.")).toHaveCount(0);
   expect(reads).toContain(`/api/v1/saved/${CORPUS.netId}/runs/${CORPUS.runWithResult}`);
 });

@@ -604,7 +604,7 @@ manual run **Manual**.
 Reading a run's result rows needs `query` too. Without it, run history stays,
 but a run in the drawer's **Runs** tab is not a control and does not expand,
 and a run opened on the **Runs** page shows its receipt from the listing and
-`Reading a run's rows needs the query permission.` in place of the rows.
+`Reading a run's rows needs the query and saved_query permissions.` in place of the rows.
 
 With `query`, expanding a run in **Runs** shows the stored result 20 rows to a page, with a
 pager under the table. Paging works on the rows the response carried and issues
