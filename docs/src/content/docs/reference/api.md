@@ -33,7 +33,7 @@ A role is a named bundle of permission strings in the Fleet keystore. A key can 
 | `query` | Run queries, capture results and read the key's own [captured results](#captured-results), list running queries, and read or clear the key's query history |
 | `schema_read` | Read the schema, the field catalog, conflict samples, and repin status |
 | `validate` | Validate DSL without running it |
-| `saved_query` | Create, read, update, and delete saved queries, schedules, and report runs |
+| `saved_query` | Create, read, update, and delete saved queries and schedules, and list report runs and their statistics. With `query`, [run a saved query now](#run-a-saved-query-now) and [read a run's result rows](#report-run) |
 | `export` | Export query results |
 | `stream` | Subscribe to live event streams |
 | `query_cancel` | Cancel the key's own running queries |
@@ -101,6 +101,7 @@ Every error that trawld itself produces has this body:
 | `too_many_streams` | 429 | `max_sse_connections` reached |
 | `capture_busy` | 429 | The key's capture queue is full, the installation runs as many captures as it may, or the deadline passed during admission. For an [attached capture](#attach-a-capture-to-an-investigation) or a [keep or finding](#append-a-keep-a-finding-or-a-note) that keeps a result, that includes waiting for a database connection, a lock, or an answer from the database. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
 | `capture_quota_exceeded` | 429 | The key's or the installation's capture quota has no room for one more result. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
+| `manual_run_busy` | 429 | The key already has a manual run in progress, or the installation runs as many manual runs as it may. Nothing was claimed. Sent with `Retry-After`. See [run a saved query now](#run-a-saved-query-now) |
 | `execution_error` | 500 | DuckDB failed for a reason other than its resource budgets, or the query was cancelled. Details are logged, never returned. |
 | `execution_error` | 400 | A result cell is an integer outside the signed and unsigned 64-bit range. The message names the column. See [Result columns](#result-columns). |
 | `result_corrupt` | 500 | A captured result's file does not match its recorded digest. See [captured result outcomes](#captured-result-outcomes) |
@@ -169,7 +170,7 @@ trawld keeps one token bucket per API key and route class. The bucket refills co
 | Interactive | `[server.rate_limit] default_rpm` | `100` | Every authenticated route except `/api/v1/ingest` |
 | Ingest | `[server.rate_limit] ingest_rpm` | `1000` | `/api/v1/ingest`, for a key that holds `ingest` |
 
-A key without `ingest` spends its interactive bucket when it posts to `/api/v1/ingest`. A `0` disables the class. When any of the key's roles sets `rate_rpm`, the largest such value replaces the class default in both classes. The 429 body is the error envelope with code `rate_limited`. It carries `Retry-After`: the seconds until the bucket holds a token again, rounded up, and never less than 1. No response carries `X-RateLimit-*` headers. Three other responses carry `Retry-After`: 503 `hot_buffer_full` from [ingest](#ingest-events), and 429 `capture_busy` and `capture_quota_exceeded` from [captures](#admission-and-quotas). `/api/v1/health` and `/metrics` are not rate limited.
+A key without `ingest` spends its interactive bucket when it posts to `/api/v1/ingest`. A `0` disables the class. When any of the key's roles sets `rate_rpm`, the largest such value replaces the class default in both classes. The 429 body is the error envelope with code `rate_limited`. It carries `Retry-After`: the seconds until the bucket holds a token again, rounded up, and never less than 1. No response carries `X-RateLimit-*` headers. Four other responses carry `Retry-After`: 503 `hot_buffer_full` from [ingest](#ingest-events), 429 `capture_busy` and `capture_quota_exceeded` from [captures](#admission-and-quotas), and 429 `manual_run_busy` from [manual runs](#run-a-saved-query-now). `/api/v1/health` and `/metrics` are not rate limited.
 
 ### Pagination
 
@@ -3719,7 +3720,9 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X DELETE "$TRAWL_URL/api/v1
 
 `POST /api/v1/saved/{id}/run`
 
-Permission: `saved_query`
+Permission: `query` and `saved_query`
+
+trawld checks both permissions before it reads the path or looks up the saved query. A key with `saved_query` alone gets 403 `forbidden`.
 
 Runs the schedule's next window now, as if its next fire came early. Any schedule can be run this way, in any mode, including a disabled one. The server reads its clock once it holds the claim; call that instant `t`.
 
@@ -3728,6 +3731,28 @@ Runs the schedule's next window now, as if its next fire came early. Any schedul
 - Query mode runs the saved text as written.
 
 The run spends one run of the schedule's `max_runs` budget, and a run that fails, times out, or is interrupted still counts. It records `origin: "manual"`. A successful run advances `covered_through` like a scheduled `since_last` run. It also moves an overdue `next_fire_at` to the first fire after `t`, so the overdue scheduled run does not follow with an older window. A `next_fire_at` already after `t` stays where it is. A failed, timed-out, or interrupted run moves neither. The response returns at once with status `running`, and the run continues in the background.
+
+**Manual-run limits.** Before it claims the run, trawld takes a place for it among the manual runs in flight. It never waits for one. Two limits apply:
+
+- One manual run per key, counted on the key that sends the request.
+- `max(1, max_concurrent_queries / 4)` manual runs across the installation, rounded down, where `max_concurrent_queries` is the `[server]` setting.
+
+These limits are separate from the cap on [scheduled runs](/reference/configuration/#scheduler), so a busy scheduler does not refuse a manual run, and manual runs do not delay a scheduled one. There is no setting for either limit.
+
+A run keeps its place until its work ends: the window resolution at the claim, query preparation, the executor work, and the writing of its result. A run that timed out keeps its place while its work still runs. When the request is refused, the response is 429 `manual_run_busy`. This includes a second press on the net whose manual run is still in progress. The refusal comes before the claim, so it spends no run of the budget, writes no run row, and moves neither `next_fire_at` nor `covered_through`. The body is fixed:
+
+```json
+{
+  "error": {
+    "code": "manual_run_busy",
+    "message": "a manual run is already running; retry after the Retry-After interval"
+  }
+}
+```
+
+The message names no setting and no count. `Retry-After` is advisory: the whole seconds until the run in the way is expected to end, and never less than 1. That is the key's own run when it has one, and the earliest of the runs in flight otherwise. A run is expected to end 5 s plus `[server] timeout_secs` after its place was taken. trawl-client does not retry it on its own. The `http_failure` event records `error_class=manual_run_busy` and `cause_kind=none`.
+
+The claim waits at most 5 s for its database locks. When that time runs out, the response is 503 `service_unavailable`, nothing is claimed, and the run's place is given back.
 
 **Request**
 
@@ -3748,11 +3773,14 @@ The shape is the [report run](#report-runs) summary. `started_at` is `t`, and th
 | Status | Code | When |
 |--------|------|------|
 | 400 | `bad_request` | The saved query has no schedule |
+| 403 | `forbidden` | The key lacks `query` or `saved_query` |
 | 404 | `not_found` | No saved query with this id belongs to the key |
-| 409 | `bad_request` | A run is already in progress for this net. Nothing is recorded. |
+| 409 | `bad_request` | A scheduled run of this net is in progress. Nothing is recorded. |
 | 409 | `bad_request` | The run budget is spent: `max runs reached for this net`. Raise `max_runs`, or delete the schedule and create it again. Nothing is recorded. |
 | 409 | `bad_request` | A `since_last` window would be empty: `nothing new to read: coverage already reaches 2026-09-11T08:25:00.000000Z, and a run now would end at 2026-09-11T08:24:10.000000Z`. Nothing is recorded. |
+| 429 | `manual_run_busy` | The key already has a manual run in progress, this net's included, or the installation runs as many manual runs as it may. Nothing is recorded. Sent with `Retry-After` |
 | 503 | `corpus_recovering` | The corpus is unsettled. No run is created and the schedule does not move. See [corpus recovering](#corpus-recovering). |
+| 503 | `service_unavailable` | The claim could not take its database locks within 5 s. Nothing is recorded. |
 
 ## Report runs
 
@@ -3814,9 +3842,9 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/saved/7/r
 
 `GET /api/v1/saved/{id}/runs/{run_id}`
 
-Permission: `saved_query`
+Permission: `query` and `saved_query`
 
-Returns one run with its result rows. trawld reads the Parquet file when `result_path` is set and the stored blob otherwise. A zero-row run returns its typed columns with an empty `rows`.
+Returns one run with its result rows. trawld checks both permissions before it reads the path, looks up the run, or opens its result. A key with `saved_query` alone can still list runs and their statistics, but gets 403 `forbidden` here. trawld reads the Parquet file when `result_path` is set and the stored blob otherwise. A zero-row run returns its typed columns with an empty `rows`.
 
 **Request**
 
@@ -3850,6 +3878,7 @@ The stored Parquet file keeps the run's types. An `integer` column is stored as 
 
 | Status | Code | When |
 |--------|------|------|
+| 403 | `forbidden` | The key lacks `query` or `saved_query` |
 | 404 | `not_found` | The run does not exist, belongs to another key, or belongs to a different saved query |
 
 ### All runs
@@ -4400,6 +4429,17 @@ These series show the executor pool and the engine sample behind the `duckdb` he
 | `trawl_engine_sample_age_seconds` | gauge | Seconds since the latest probe started, or since the sampler started before the first probe. It resets every 10 seconds while probes finish, and it keeps growing while one is wedged |
 
 `trawl_query_permits_in_use` at `trawl_query_pool_size` means searches queue, not that the engine is down. Alarm on the sample age instead, or on `checks.duckdb` reading `error`. `trawl_health_check{subsystem="duckdb"}` is set each time `/api/v1/health` answers. It reads `1` for `ok` and `slow`, and `0` for `error`. See [diagnose a 503 or 504 from a query](/operate/health/#diagnose-a-503-or-504-from-a-query).
+
+#### Net run lease metrics
+
+These series show the caps on report runs in flight. They are read from the executor pool at each scrape, never from run rows. A run holds its lease until its work ends, so a run that timed out while its work still runs counts. `origin` is `scheduled` or `manual`. Every scrape publishes both origins, at zero when no run holds a lease.
+
+| Series | Type | Measurement |
+| --- | --- | --- |
+| `trawl_net_run_leases_in_use{origin}` | gauge | Run leases held now |
+| `trawl_net_run_lease_limit{origin}` | gauge | The cap: `max(1, max_concurrent_queries / 2)` for `scheduled`, `max(1, max_concurrent_queries / 4)` for `manual` |
+
+A `scheduled` gauge at its limit means due schedules wait for a later poll. A `manual` gauge at its limit means Run now answers 429 `manual_run_busy`. Neither changes health.
 
 #### Maintenance memory metric
 
