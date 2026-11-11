@@ -873,4 +873,51 @@ mod tests {
             .join()
             .expect("every hint walk must fit 512 KiB at depth 64");
     }
+
+    /// A query over the 64-level limit gets no query-derived hint, and the
+    /// hints never walk its tree: both entry points start with
+    /// `parse_unbuilt(…).ok()?`, which refuses the text before any walk.
+    ///
+    /// The 65-level `where` and `NOT` run show the boundary. The same
+    /// shapes thousands of levels deep show that nothing walks the tree:
+    /// on a quarter of a worker's stack, any recursive walk of a 32 000-term
+    /// chain or a 16 000-`NOT` run would overflow and abort the test
+    /// binary, where the refusal costs heap.
+    #[test]
+    fn an_over_deep_query_gets_no_hint() {
+        let deep_where = format!("* | where {}", comparisons(LIMIT + 1, "or"));
+        let deep_not = format!("{}a=1", "NOT ".repeat(LIMIT + 1));
+        // No spaces, so 32 000 terms fit the 64 KiB text limit.
+        let long_where = format!("* | where {} > 0", vec!["1"; 32_000].join("+"));
+        let long_not = format!("{}a=1", "NOT ".repeat(16_000));
+        let now: DateTime<Utc> = "2026-03-14T10:00:00Z".parse().expect("an instant");
+
+        std::thread::Builder::new()
+            .name("quarter-stack".to_owned())
+            .stack_size(QUARTER_STACK)
+            .spawn(move || {
+                for dsl in [&deep_where, &deep_not, &long_where, &long_not] {
+                    let refusal = trawl_core::parser::parse_unbuilt(dsl)
+                        .expect_err("the parser refuses a tree over the limit");
+                    assert!(
+                        refusal
+                            .iter()
+                            .any(|error| error.message.ends_with("is deeper than 64 levels")),
+                        "the refusal is the depth refusal: {:?}",
+                        refusal.iter().map(|e| &e.message).collect::<Vec<_>>()
+                    );
+                    assert!(fields_to_check(dsl).is_none(), "no field hint");
+                    let plan = NearestPlan::of(
+                        dsl,
+                        Some("2026-03-14T03:00:00Z"),
+                        Some("2026-03-14T04:00:00Z"),
+                        now,
+                    );
+                    assert!(plan.is_none(), "no nearest-bounds plan");
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("an over-deep query is refused before any hint walk");
+    }
 }
