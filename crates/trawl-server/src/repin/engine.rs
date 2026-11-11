@@ -40,7 +40,7 @@ use trawl_core::schema::CanonicalType;
 use crate::catalog::FieldCatalog;
 use crate::catalog::conform::open_bounded_connection;
 use crate::deadline::Deadline;
-use crate::error::ServerError;
+use crate::error::{CauseKind, ServerError};
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
 use crate::publication::CorpusUnsettled;
@@ -972,9 +972,17 @@ impl RepinEngine {
                     Err(unreadable())
                 }
                 Err(e) => {
-                    tracing::error!(
+                    // The text mixes the read's I/O wording with serde's
+                    // parse wording and keeps no typed source.
+                    tracing::debug!(
                         event_type = "repin_staging_unreadable",
                         error = %e,
+                        "the repin marker could not be read; refusing the repin"
+                    );
+                    tracing::error!(
+                        event_type = "repin_staging_unreadable",
+                        error_class = "internal",
+                        cause_kind = CauseKind::Unknown.as_str(),
                         "the repin marker could not be read; refusing the repin"
                     );
                     Err(unreadable())
@@ -1810,13 +1818,35 @@ impl RepinEngine {
     /// different terminal write: `cancelled` is only legal once the request
     /// row exists (see [`Self::finish_cancelled`]).
     async fn unwind_staging(&self, job_id: i64, status: RepinJobStatus, msg: &str) {
-        tracing::warn!(
-            event_type = "repin_abandoned",
-            job_id,
-            status = status.as_str(),
-            error = %msg,
-            "repin job abandoned before any visible change; corpus untouched"
-        );
+        if status == RepinJobStatus::Failed {
+            // A failed step's message can carry DuckDB, serde or I/O
+            // wording, and no typed source is left to classify it by.
+            tracing::debug!(
+                event_type = "repin_abandoned",
+                job_id,
+                status = status.as_str(),
+                error = %msg,
+                "repin job abandoned before any visible change; corpus untouched"
+            );
+            tracing::warn!(
+                event_type = "repin_abandoned",
+                job_id,
+                status = status.as_str(),
+                error_class = "internal",
+                cause_kind = CauseKind::Unknown.as_str(),
+                "repin job abandoned before any visible change; corpus untouched"
+            );
+        } else {
+            // A blocked, refused or cancelled job's message is a sentence
+            // trawl wrote.
+            tracing::warn!(
+                event_type = "repin_abandoned",
+                job_id,
+                status = status.as_str(),
+                error = %msg,
+                "repin job abandoned before any visible change; corpus untouched"
+            );
+        }
         // The marker is what licenses the next boot to delete the staging
         // roots. Removing it over a failed sweep strands whichever root
         // survived, which suppresses retention and refuses every later
@@ -1981,15 +2011,19 @@ impl RepinEngine {
             .stage_cutover_input(job_id, staged_totals, &staged_tallies)
             .await
             .map_err(|e| {
-                // The full error stays server-side: the abort message is
+                // The full error goes to DEBUG: the abort message is
                 // persisted on the job row and served to SchemaRead via the
                 // status route, and a StoreError's Display can carry raw
                 // postgres diagnostics the wire contract redacts.
-                tracing::error!(
-                    event_type = "repin_store_error",
-                    job_id,
-                    error = %e,
-                    "staging the cutover tallies failed; aborting before the marker"
+                log_store_fault(
+                    Loudness::Error,
+                    StoreFault {
+                        event_type: "repin_store_error",
+                        job_id: Some(job_id),
+                        ..StoreFault::default()
+                    },
+                    e,
+                    "staging the cutover tallies failed; aborting before the marker",
                 );
                 JobAbort::Failed(
                     "could not stage the cutover tallies (app-state store \
@@ -2130,10 +2164,22 @@ impl RepinEngine {
             // its exclusion guards here would serve the silently-promoting
             // mixed corpus the whole design exists to prevent — so die
             // crash-consistent and let the marker replay finish the swap.
-            tracing::error!(
+            //
+            // The swap's text names host paths and I/O errors, and no typed
+            // cause comes with it, so it goes to DEBUG only.
+            tracing::debug!(
                 event_type = "repin_cutover_fatal",
                 job_id,
                 error = %e,
+                "per-env swap failed mid-cutover; terminating so the boot \
+                 marker replay completes it rather than serving a \
+                 mixed-type corpus"
+            );
+            tracing::error!(
+                event_type = "repin_cutover_fatal",
+                job_id,
+                error_class = "internal",
+                cause_kind = CauseKind::Unknown.as_str(),
                 "per-env swap failed mid-cutover; terminating so the boot \
                  marker replay completes it rather than serving a \
                  mixed-type corpus"
@@ -2175,22 +2221,30 @@ impl RepinEngine {
                     break;
                 }
                 Err(e) if attempt < FLIP_ATTEMPTS => {
-                    tracing::warn!(
-                        event_type = "repin_flip_retry",
-                        job_id,
-                        attempt,
-                        error = %e,
-                        "pin flip failed; retrying"
+                    log_store_fault(
+                        Loudness::Warn,
+                        StoreFault {
+                            event_type: "repin_flip_retry",
+                            job_id: Some(job_id),
+                            attempt: Some(attempt),
+                            ..StoreFault::default()
+                        },
+                        e,
+                        "pin flip failed; retrying",
                     );
                     tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
                 }
                 Err(e) => {
-                    tracing::error!(
-                        event_type = "repin_cutover_fatal",
-                        job_id,
-                        error = %e,
+                    log_store_fault(
+                        Loudness::Error,
+                        StoreFault {
+                            event_type: "repin_cutover_fatal",
+                            job_id: Some(job_id),
+                            ..StoreFault::default()
+                        },
+                        e,
                         "pin flip unreachable after the swap; terminating so \
-                         the boot marker replay completes it"
+                         the boot marker replay completes it",
                     );
                 }
             }
@@ -2205,7 +2259,15 @@ impl RepinEngine {
             ..marker
         };
         if let Err(e) = write_marker(&self.data_dir, &marker) {
-            tracing::warn!(event_type = "repin_marker_error", error = %e, "cleanup marker write failed (boot replay covers it)");
+            // The text mixes serde's serialize wording with the staged
+            // write's I/O wording and keeps no typed source.
+            tracing::debug!(event_type = "repin_marker_error", error = %e, "cleanup marker write failed (boot replay covers it)");
+            tracing::warn!(
+                event_type = "repin_marker_error",
+                error_class = "internal",
+                cause_kind = CauseKind::Unknown.as_str(),
+                "cleanup marker write failed (boot replay covers it)"
+            );
         }
         drop(pool_guard);
         drop(corpus_gate);
@@ -2288,7 +2350,16 @@ impl RepinEngine {
     async fn publish_progress(&self, job_id: i64, state: &BuildState) {
         let totals = state.totals();
         if let Err(e) = self.store.record_progress(job_id, job_totals(totals)).await {
-            tracing::warn!(event_type = "repin_store_error", job_id, error = %e, "progress write failed");
+            log_store_fault(
+                Loudness::Warn,
+                StoreFault {
+                    event_type: "repin_store_error",
+                    job_id: Some(job_id),
+                    ..StoreFault::default()
+                },
+                e,
+                "progress write failed",
+            );
         }
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_DONE).set(totals.files_done as f64);

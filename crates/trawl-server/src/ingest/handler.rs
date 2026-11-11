@@ -687,25 +687,11 @@ fn finalize_ingest(
             .total_rejected
             .fetch_add(rejected as u64, std::sync::atomic::Ordering::Relaxed);
 
-        let reasons = parsed.reject_counts.summary();
-        // Sample up to 5 error messages so rejection causes are queryable
-        // without flooding telemetry with per-event detail. A message may
-        // quote a bounded client value (`Rejection::message`), which is why
-        // this is the one log line allowed to carry one.
-        let samples: Vec<&str> = parsed
-            .errors
-            .iter()
-            .take(5)
-            .map(|e| e.message.as_str())
-            .collect();
-        let sample_text = samples.join("; ");
-        tracing::warn!(
-            event_type = "ingest_rejections",
-            user = %verified.name,
+        log_rejections(
+            &verified.name,
             rejected,
-            reasons,
-            samples = sample_text,
-            "events rejected during ingest"
+            &parsed.reject_counts.summary(),
+            &parsed.errors,
         );
     }
 
@@ -826,6 +812,45 @@ fn decompress_gzip(data: &[u8], max_body_bytes: usize) -> Result<Vec<u8>, Server
         });
     }
     Ok(decompressed)
+}
+
+/// Log one request's rejections: the per-reason counts and up to 5 sampled
+/// messages, so rejection causes are queryable without flooding telemetry
+/// with per-event detail. A message may quote a bounded client value
+/// (`Rejection::message`), which is why this is the one log line allowed to
+/// carry one. An unparseable line's message ends in `serde_json`'s own
+/// wording, so its sample is the fixed part and the wording goes to DEBUG.
+fn log_rejections(user: &str, rejected: usize, reasons: &str, errors: &[IngestEventError]) {
+    let invalid_json = RejectReason::InvalidJson.as_str();
+    let first_five = || errors.iter().take(5);
+    if first_five().any(|e| e.reason == invalid_json) {
+        let full: Vec<&str> = first_five().map(|e| e.message.as_str()).collect();
+        tracing::debug!(
+            event_type = "ingest_rejections",
+            user,
+            rejected,
+            reasons,
+            samples = full.join("; "),
+            "events rejected during ingest"
+        );
+    }
+    let samples: Vec<&str> = first_five()
+        .map(|e| {
+            if e.reason == invalid_json {
+                "invalid JSON"
+            } else {
+                e.message.as_str()
+            }
+        })
+        .collect();
+    tracing::warn!(
+        event_type = "ingest_rejections",
+        user,
+        rejected,
+        reasons,
+        samples = samples.join("; "),
+        "events rejected during ingest"
+    );
 }
 
 /// One per-event error, as both ingest routes report it: the position, the

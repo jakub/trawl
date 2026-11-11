@@ -619,10 +619,18 @@ fn result_frame(name: &'static str, payload: &impl Serialize) -> Option<Frame> {
             event: Event::default().event(name).data(json),
         }),
         Err(error) => {
-            tracing::error!(
+            // serde's wording can quote the cell the codec refused.
+            tracing::debug!(
                 event_type = "stream_frame_unencodable",
                 frame = name,
                 %error,
+                "dropping a live result frame the result wire refused"
+            );
+            tracing::error!(
+                event_type = "stream_frame_unencodable",
+                frame = name,
+                error_class = "internal",
+                cause_kind = crate::error::CauseKind::Unknown.as_str(),
                 "dropping a live result frame the result wire refused"
             );
             None

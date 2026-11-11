@@ -81,11 +81,20 @@ pub fn spawn_snapshot_collector(
                     Ok(count) => {
                         monitor.set_schedule_count(usize::try_from(count).unwrap_or_default());
                     }
-                    Err(e) => tracing::warn!(
-                        event_type = "monitor_schedule_count_error",
-                        error = %e,
-                        "failed to refresh enabled-schedule count"
-                    ),
+                    Err(e) => {
+                        tracing::debug!(
+                            event_type = "monitor_schedule_count_error",
+                            error = %e,
+                            "failed to refresh enabled-schedule count"
+                        );
+                        let fault = crate::error::ServerError::from(e);
+                        tracing::warn!(
+                            event_type = "monitor_schedule_count_error",
+                            error_class = fault.error_class(),
+                            cause_kind = fault.cause_kind().as_str(),
+                            "failed to refresh enabled-schedule count"
+                        );
+                    }
                 }
             }
 

@@ -1162,9 +1162,11 @@ pub(crate) async fn unlink_evidence(root: &Arc<ResultsRoot>, files: Vec<ExpiredF
     })
     .await;
     if let Err(error) = unlinked {
+        // A panicked task's JoinError quotes the panic's payload in its
+        // Display; the fixed text drops it unread.
         tracing::warn!(
             event_type = "results_unlink_failed",
-            error = %error,
+            error = %crate::error::join_failure_text("evidence unlink", error),
             "could not unlink pruned evidence files; the sweep removes them"
         );
     }

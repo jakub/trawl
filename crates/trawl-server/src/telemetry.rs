@@ -435,18 +435,23 @@ pub struct ResolvedLogFilter {
     /// Directive string each layer builds its `EnvFilter` from.
     pub directives: String,
     /// Set when `RUST_LOG` was present but unparseable: a `config_warning`
-    /// message carrying the parse error but never the raw env value.
+    /// message in trawl's own words, carrying neither the raw env value nor
+    /// the parse error.
     pub warning: Option<String>,
+    /// The parse error behind [`Self::warning`], for a DEBUG
+    /// `config_warning` only: `tracing_subscriber`'s wording can quote a
+    /// piece of the raw value.
+    pub parse_error: Option<String>,
 }
 
 /// Resolve the effective tracing filter from an explicit `RUST_LOG` value.
 ///
 /// - unset → [`DEFAULT_LOG_FILTER`];
 /// - set and valid → the operator's value, authoritative;
-/// - set and invalid → [`DEFAULT_LOG_FILTER`] plus a warning that carries
-///   the parse error but **not** the raw environment value (it may contain
-///   anything — pasted secrets included — and the warning is persisted as
-///   telemetry).
+/// - set and invalid → [`DEFAULT_LOG_FILTER`] plus a fixed warning that
+///   carries neither the raw environment value (it may contain anything —
+///   pasted secrets included — and the warning is persisted as telemetry)
+///   nor the parse error, which is returned apart for DEBUG.
 ///
 /// Takes the env value as a parameter so it is unit-testable without
 /// mutating process env (`unsafe_code = "forbid"`).
@@ -455,18 +460,21 @@ pub fn resolve_log_filter(env_value: Option<&str>) -> ResolvedLogFilter {
         None => ResolvedLogFilter {
             directives: DEFAULT_LOG_FILTER.to_owned(),
             warning: None,
+            parse_error: None,
         },
         Some(value) => match tracing_subscriber::EnvFilter::try_new(value) {
             Ok(_) => ResolvedLogFilter {
                 directives: value.to_owned(),
                 warning: None,
+                parse_error: None,
             },
             Err(e) => ResolvedLogFilter {
                 directives: DEFAULT_LOG_FILTER.to_owned(),
                 warning: Some(format!(
-                    "RUST_LOG is set but could not be parsed ({e}); using the \
+                    "RUST_LOG is set but could not be parsed; using the \
                      default filter \"{DEFAULT_LOG_FILTER}\""
                 )),
+                parse_error: Some(e.to_string()),
             },
         },
     }
@@ -2543,6 +2551,7 @@ mod tests {
         let resolved = resolve_log_filter(None);
         assert_eq!(resolved.directives, DEFAULT_LOG_FILTER);
         assert!(resolved.warning.is_none());
+        assert!(resolved.parse_error.is_none());
     }
 
     #[test]
@@ -2550,6 +2559,7 @@ mod tests {
         let resolved = resolve_log_filter(Some("trawl_server=debug,hyper=warn"));
         assert_eq!(resolved.directives, "trawl_server=debug,hyper=warn");
         assert!(resolved.warning.is_none());
+        assert!(resolved.parse_error.is_none());
     }
 
     #[test]
@@ -2558,14 +2568,22 @@ mod tests {
         let resolved = resolve_log_filter(Some(raw));
         assert_eq!(resolved.directives, DEFAULT_LOG_FILTER);
         let warning = resolved.warning.expect("invalid RUST_LOG must warn");
-        // The raw env value must never be logged — it can contain anything.
-        assert!(
-            !warning.contains(raw) && !warning.contains("sup3r_s3cret_password"),
-            "warning must not leak the raw env value: {warning}"
+        // The raw env value must never be logged — it can contain anything —
+        // and the retained warning is trawl's fixed sentence, so the parse
+        // error's wording stays out of it too.
+        assert_eq!(
+            warning,
+            format!(
+                "RUST_LOG is set but could not be parsed; using the default \
+                 filter \"{DEFAULT_LOG_FILTER}\""
+            )
         );
+        let parse_error = resolved
+            .parse_error
+            .expect("the parse error is kept for DEBUG");
         assert!(
-            warning.contains("RUST_LOG"),
-            "warning names the env var: {warning}"
+            !parse_error.is_empty() && !warning.contains(&parse_error),
+            "the parse error is apart from the warning: {parse_error}"
         );
     }
 

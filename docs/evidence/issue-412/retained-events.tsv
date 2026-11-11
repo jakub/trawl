@@ -1,0 +1,484 @@
+# Every INFO, WARN and ERROR emission in non-test crates/trawl-server/src code,
+# plus one row per call of a logging helper that takes an error value from its
+# caller (source type names the helper), and one per macro_rules expansion.
+# Paths are relative to crates/trawl-server/src. Rows describe commit:
+# sha: e95041090c5f3a5776f896646ca94135aaa6de30
+# Search command (a help, not the list: it misses shorthand fields, plain string
+# fields and dynamic messages):
+#   rg -n --type rust '(error|err|reason|cause|source|detail)\s*=\s*[%?]|\{(e|err|error)\}' crates/trawl-server/src
+# Enumerator (the list): python3 -I docs/evidence/issue-412/enumerate.py
+# Dispositions are joined from docs/evidence/issue-412/dispositions.tsv.
+# rows: 472
+file	line	event_type	target	level	source type	disposition
+audit.rs	126	lifecycle	trawl_server::audit	INFO	none	unchanged: no error text
+audit.rs	156	audit_error	trawl_server::audit	WARN	operation: &'static str literal	unchanged: fixed text trawl wrote
+audit.rs	182	audit_gap	trawl_server::audit	WARN	none	unchanged: no error text
+audit.rs	197	audit_error	trawl_server::audit	ERROR	operation: &'static str literal	unchanged: fixed text trawl wrote
+audit.rs	281	lifecycle	trawl_server::audit	INFO	none	unchanged: no error text
+audit.rs	530	role_created	trawl_server::audit	INFO	none	unchanged: no error text
+audit.rs	544	role_changed	trawl_server::audit	INFO	none	unchanged: no error text
+audit.rs	554	role_deleted	trawl_server::audit	INFO	none	unchanged: no error text
+audit.rs	567	key_created	trawl_server::audit	INFO	none	unchanged: no error text
+audit.rs	585	key_roles_changed	trawl_server::audit	INFO	none	unchanged: no error text
+audit.rs	602	key_revoked	trawl_server::audit	INFO	none	unchanged: no error text
+boot.rs	108	catalog_conform	trawl_server::boot	INFO	none	unchanged: no error text
+boot.rs	140	investigations_boot	trawl_server::boot	INFO	none	unchanged: no error text
+boot.rs	177	catalog_identity_unproven	trawl_server::boot	WARN	none	unchanged: no error text
+boot.rs	184	catalog_identity	trawl_server::boot	INFO	ArchiveIdentity enum (Debug)	unchanged: closed enum
+boot.rs	198	wal_present_on_query_node	trawl_server::boot	WARN	none	unchanged: no error text
+catalog/conform.rs	193	catalog_conform_progress	trawl_server::catalog::conform	INFO	none	unchanged: no error text
+catalog/conform.rs	356	catalog_identity_walk_failed	trawl_server::catalog::conform	WARN	metrics::WalkError: std::io::Error from read_dir	D2b
+catalog/conform.rs	427	catalog_conform_start	trawl_server::catalog::conform	INFO	none	unchanged: no error text
+catalog/conform.rs	520	catalog_conform_complete	trawl_server::catalog::conform	INFO	none	unchanged: no error text
+catalog/conform.rs	555	catalog_conform_incomplete	trawl_server::catalog::conform	WARN	counts; fixed message	unchanged: no error text
+catalog/conform.rs	586	catalog_conform_skip	trawl_server::catalog::conform	WARN	helper skip_file: &str from callers, a fixed reason or the walk's io::Error	D2b
+catalog/conform.rs	613	catalog_conform_skip	trawl_server::catalog::conform	WARN	helper skip_failed: StatementFailure (DuckDB text); 62b519b4 logs class/cause, text at DEBUG	changed
+catalog/conform.rs	640	catalog_bookkeeping_error	trawl_server::catalog::conform	WARN	StoreError; 62b519b4 logs class/cause, text at DEBUG	changed
+catalog/conform.rs	756	catalog_conform_skip	trawl_server::catalog::conform	WARN	via skip_file: walk_parquet_files_lossy io::Error to_string()	D2b
+catalog/conform.rs	768	catalog_conform_claims_unreadable	trawl_server::catalog::conform	WARN	String from scan_claims: list_wal_envs io::Error with path	D2b
+catalog/conform.rs	786	catalog_conform_rollups_unreadable	trawl_server::catalog::conform	WARN	io::Error from pending_rollup_days	D2b
+catalog/conform.rs	801	catalog_conform_scan_start	trawl_server::catalog::conform	INFO	none	unchanged: no error text
+catalog/conform.rs	816	catalog_conform_skip	trawl_server::catalog::conform	WARN	via skip_file: fixed layout reason	unchanged: fixed text trawl wrote
+catalog/conform.rs	829	catalog_conform_skip	trawl_server::catalog::conform	WARN	via skip_file: fixed publication reason	unchanged: fixed text trawl wrote
+catalog/conform.rs	844	catalog_conform_skip	trawl_server::catalog::conform	WARN	via skip_file: fixed rollup reason	unchanged: fixed text trawl wrote
+catalog/conform.rs	859	catalog_conform_skip	trawl_server::catalog::conform	WARN	via skip_file: fixed sniff reason, moved to this call by 62b519b4	unchanged: fixed text trawl wrote
+catalog/conform.rs	875	catalog_conform_skip	trawl_server::catalog::conform	WARN	via skip_failed: StatementFailure from scan_file (DuckDB text); was skip_file(e.to_string()) before 62b519b4	changed
+catalog/conform.rs	963	catalog_conform_row_count_unreadable	trawl_server::catalog::conform	WARN	ParquetStatsError (io Open, parquet footer); ed3e6907 logs class/cause, text at DEBUG	changed
+catalog/conform.rs	1043	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+catalog/conform.rs	1224	catalog_conform_skip	trawl_server::catalog::conform	WARN	via skip_failed: StatementFailure from rewrite_file (DuckDB text); 62b519b4	changed
+catalog/conform.rs	1279	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+catalog/conform.rs	1300	catalog_conform_rewrite	trawl_server::catalog::conform	INFO	none	unchanged: no error text
+catalog/gc.rs	818	catalog_gc_reconcile_failed	trawl_server::catalog::gc	ERROR	StoreError by class	unchanged: class/cause only
+catalog/gc.rs	975	catalog_pin_gc_complete	trawl_server::catalog::gc	INFO	none	unchanged: no error text
+catalog/gc.rs	1010	catalog_pin_gc	trawl_server::catalog::gc	INFO	none	unchanged: no error text
+engine_sample.rs	455	engine_sample_panicked	trawl_server::engine_sample	ERROR	none	unchanged: no error text
+env_dirs.rs	351	-	trawl_server::env_dirs	WARN	via warn_unlisted: io::Error from read_dir	D2b
+env_dirs.rs	358	-	trawl_server::env_dirs	WARN	helper warn_unlisted: std::io::Error	D2b
+epoch.rs	768	epoch_dir_fsync_failed	trawl_server::epoch	WARN	std::io::Error from fsync	D2b
+error.rs	1097	-	auth.backend	ERROR	via auth_backend_fault: fleet_auth::AuthError source; class/cause only	unchanged: class/cause only
+error.rs	1628	-	storage.backend	ERROR	StoreError::Unavailable by class/cause; text at DEBUG	unchanged: class/cause only
+error.rs	1641	-	storage.backend	ERROR	StoreError::Migration by class/cause; text at DEBUG	unchanged: class/cause only
+error.rs	1654	report_window_error	trawl_server::error	ERROR	ServerError window plan by class/cause; text at DEBUG	unchanged: class/cause only
+error.rs	1667	missing_prepared_pattern	trawl_server::error	ERROR	EngineError::MissingPreparedPattern by class/cause; text at DEBUG	unchanged: class/cause only
+error.rs	1680	internal_error	trawl_server::error	ERROR	ServerError::Internal/Panicked by class/cause; text at DEBUG	unchanged: class/cause only
+error.rs	1706	-	auth.backend	ERROR	helper auth_backend_fault: fleet_auth error by class/cause; text at DEBUG; what is a literal	unchanged: class/cause only
+error.rs	1722	-/internal_error/missing_prepared_pattern/report_window_error	storage.backend/trawl_server::error	ERROR	via log_fault: the ServerError itself; class/cause only	unchanged: class/cause only
+from_saved.rs	98	from_saved_run_file_unresolved	trawl_server::from_saved	WARN	io::ErrorKind Display	unchanged: closed enum
+handlers.rs	166	query_start	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	443	history_error	trawl_server::handlers	WARN	StoreError; e4c1d44d logs class/cause, text at DEBUG	changed
+handlers.rs	452	history_error	trawl_server::handlers	WARN	none	unchanged: no error text
+handlers.rs	461	query_complete	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	515	query_timeout	trawl_server::handlers	WARN	none	unchanged: no error text
+handlers.rs	571	query_failed	trawl_server::handlers	WARN	ServerError by class	unchanged: class/cause only
+handlers.rs	583	query_failed	trawl_server::handlers	ERROR	ServerError by class	unchanged: class/cause only
+handlers.rs	983	schema_facts_refresh	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	1233	query_cancelled	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	1951	field_degraded_acked	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	2017	field_degraded_ack_cleared	trawl_server::handlers	INFO	reason is a literal; actor name and prefix	unchanged: no error text
+handlers.rs	2127	field_values_cache_hit	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	2164	field_values_complete	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	2246	history_cleared	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	2697	repin_store_error	trawl_server::handlers	ERROR	StoreError by class	unchanged: class/cause only
+handlers.rs	3353	report_run_parquet_read_failed	trawl_server::handlers	WARN	ServerError by class/cause	unchanged: class/cause only
+handlers.rs	3375	report_run_parquet_read_failed	trawl_server::handlers	WARN	trawl_engine EngineError (DuckDB text); 746047a8 logs class/cause, text at DEBUG	changed
+handlers.rs	3394	report_run_parquet_task_failed	trawl_server::handlers	ERROR	ServerError by class	unchanged: class/cause only
+handlers.rs	3471	export_start	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	3551	export_complete	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	3660	export_complete	trawl_server::handlers	INFO	none	unchanged: no error text
+handlers.rs	3757	history_error	trawl_server::handlers	WARN	none	unchanged: no error text
+handlers.rs	3776	history_error	trawl_server::handlers	WARN	StoreError by class	unchanged: class/cause only
+handlers.rs	3783	history_error	trawl_server::handlers	WARN	none	unchanged: no error text
+handlers.rs	4149	stream_start	trawl_server::handlers	INFO	none	unchanged: no error text
+hot_buffer.rs	454	hot_buffer_duplicate_batch	trawl_server::hot_buffer	ERROR	none	unchanged: no error text
+ingest/compaction.rs	386	lifecycle	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	415	lifecycle	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	434	lifecycle	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	541	compaction_error	trawl_server::ingest::compaction	ERROR	String from compact_pass: io listings, fixed repin-pause text, join_failure_text	D2b
+ingest/compaction.rs	913	compaction_error	trawl_server::ingest::compaction	ERROR	PublishIncomplete.error: io fsync, retire and marker-removal text	D2b
+ingest/compaction.rs	941	compaction_error	trawl_server::ingest::compaction	ERROR	String mixing DuckDB, store and io text; a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	965	coverage_proof	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	978	rollup_suppressed	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	1005	rollup_error	trawl_server::ingest::compaction	ERROR	String from rollup_once: io listings, join_failure_text, fixed proof text	D2b
+ingest/compaction.rs	1011	rollup_error	trawl_server::ingest::compaction	ERROR	String from scan_claims: io only	D2b
+ingest/compaction.rs	1103	publication_recovery_failed	trawl_server::ingest::compaction	ERROR	String from publication_marker::recover: list_wal_envs io::Error	D2b
+ingest/compaction.rs	1230	rollup_boot_recovery	trawl_server::ingest::compaction	ERROR	none	unchanged: no error text
+ingest/compaction.rs	1238	rollup_boot_recovery	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	1244	rollup_boot_recovery	trawl_server::ingest::compaction	ERROR	none	unchanged: no error text
+ingest/compaction.rs	1279	-	trawl_server::ingest::compaction	WARN	io::Error from try_list_env_dirs_observed	D2b
+ingest/compaction.rs	1324	rollup_suppressed	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	1335	rollup_blocked	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	1365	rollup_blocked	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	1487	rollup_error	trawl_server::ingest::compaction	ERROR	String from rollup marker recovery: io, fixed proof and day text	D2b
+ingest/compaction.rs	1559	rollup_error	trawl_server::ingest::compaction	ERROR	String from the rollup merge (DuckDB and io); a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	1962	rollup_recovery	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	1972	rollup_recovery	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	1992	rollup_recovery	trawl_server::ingest::compaction	WARN	none	unchanged: no error text
+ingest/compaction.rs	2034	rollup_recovery_unresolved	trawl_server::ingest::compaction	ERROR	rollup_marker::Proof label	unchanged: closed enum
+ingest/compaction.rs	2057	rollup_recovery_unresolved	trawl_server::ingest::compaction	ERROR	LOGGED_INVALID constant, not the day name	unchanged: fixed text trawl wrote
+ingest/compaction.rs	2241	{event_type}	trawl_server::ingest::compaction	ERROR	String from quarantine_target: io::Error with path	D2b
+ingest/compaction.rs	2255	{event_type}	trawl_server::ingest::compaction	WARN	none	unchanged: no error text
+ingest/compaction.rs	2268	quarantine_reservation_stranded	trawl_server::ingest::compaction	WARN	io::Error from remove_file	D2b
+ingest/compaction.rs	2276	{event_type}	trawl_server::ingest::compaction	ERROR	io::Error from rename	D2b
+ingest/compaction.rs	2481	rollup_data_loss	trawl_server::ingest::compaction	ERROR	none	unchanged: no error text
+ingest/compaction.rs	2553	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	2569	rollup_unreadable	trawl_server::ingest::compaction	ERROR	StatementFailure; a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	2643	rollup_complete	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	3037	catalog_bookkeeping_error	trawl_server::ingest::compaction	WARN	StoreError; a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	3148	catalog_bookkeeping_timeout	trawl_server::ingest::compaction	WARN	none	unchanged: no error text
+ingest/compaction.rs	3215	compaction_isolation	trawl_server::ingest::compaction	WARN	ServerError (engine/store); a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	3427	compaction_depth_fallback	trawl_server::ingest::compaction	WARN	duckdb::Error; a57556c7 logs CauseKind::of_duckdb, text at DEBUG	changed
+ingest/compaction.rs	3452	compaction_provenance_rename	trawl_server::ingest::compaction	WARN	duckdb::Error; a57556c7 logs CauseKind::of_duckdb, text at DEBUG	changed
+ingest/compaction.rs	3461	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	3464	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	3495	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	3496	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	3571	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	helper StatementFailure::duckdb: duckdb::Error (out of memory); a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	3636	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb from statement_failed: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	3653	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	3662	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	3665	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	3703	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	3716	catalog_invariant_violation	trawl_server::ingest::compaction	ERROR	StatementFailure, path kept; a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	3849	compaction_data_loss	trawl_server::ingest::compaction	ERROR	none	unchanged: no error text
+ingest/compaction.rs	3889	compaction_data_loss	trawl_server::ingest::compaction	ERROR	none	unchanged: no error text
+ingest/compaction.rs	4594	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	4626	catalog_sample_capture_failed	trawl_server::ingest::compaction	WARN	StatementFailure or serde text from capture_samples; a57556c7 logs class/cause, text at DEBUG	changed
+ingest/compaction.rs	4706	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+ingest/compaction.rs	5196	compaction_complete	trawl_server::ingest::compaction	INFO	none	unchanged: no error text
+ingest/compaction.rs	5229	catalog_pin_deferred	trawl_server::ingest::compaction	INFO	column names (ingest data, not error text)	unchanged: no error text
+ingest/compaction.rs	5394	compaction_error	trawl_server::ingest::compaction	ERROR	io::Error from scan_wal_files	D2b
+ingest/handler.rs	624	wal_write_failed	trawl_server::ingest::handler	WARN	WalWriteError: io::Error, or sync and withdraw io::Errors	D2b
+ingest/handler.rs	708	ingest_repairs	trawl_server::ingest::handler	WARN	RepairDetail text: trawl's repair codes with sender service names and counts	unchanged: fixed text trawl wrote
+ingest/handler.rs	736	ingest_complete	trawl_server::ingest::handler	INFO	RepairDetail text: trawl's repair codes with sender service names and counts	unchanged: fixed text trawl wrote
+ingest/handler.rs	804	ingest_body_too_large	trawl_server::ingest::handler	WARN	none	unchanged: no error text
+ingest/handler.rs	846	ingest_rejections	trawl_server::ingest::handler	WARN	Rejection messages: bounded client values and fixed reasons (ADR-0053 keeps them); an invalid_json sample is the fixed words, serde_json's wording at DEBUG	changed
+ingest/hydration/mod.rs	174	boot_hydration	trawl_server::ingest::hydration	INFO	none	unchanged: no error text
+ingest/pipeline.rs	198	pipeline_wal_write_failed	trawl_server::ingest::pipeline	WARN	via record_discarded_group: WalWriteError (io only)	D2b
+ingest/pipeline.rs	214	pipeline_wal_write_failed	trawl_server::ingest::pipeline	WARN	helper record_discarded_group: WalWriteError (io only)	D2b
+ingest/publication_marker.rs	920	publication_recovery_failed	trawl_server::ingest::publication_marker	ERROR	String: list_markers io::Error with path	D2b
+ingest/publication_marker.rs	932	publication_recovered/publication_recovery_failed	trawl_server::ingest::publication_marker	INFO/ERROR	via log_outcome: Result from recover_one; Err is io and fixed text, Contradictory is a closed reason	D2b
+ingest/publication_marker.rs	946	publication_recovered	trawl_server::ingest::publication_marker	INFO	none	unchanged: no error text
+ingest/publication_marker.rs	953	publication_recovered	trawl_server::ingest::publication_marker	INFO	none	unchanged: no error text
+ingest/publication_marker.rs	972	publication_recovery_failed	trawl_server::ingest::publication_marker	ERROR	Contradiction reason; InvalidMarker serde_json text; ed3e6907 logs the reason in trawl's words, serde text at DEBUG	changed
+ingest/publication_marker.rs	982	publication_recovery_failed	trawl_server::ingest::publication_marker	ERROR	String from recover_one: MarkerError Io/Missing, hash io, fixed text; the drain closures return Ok	D2b
+ingest/wal.rs	276	wal_tmp_unlink_failed	trawl_server::ingest::wal	WARN	io::Error from remove_file	D2b
+ingest/wal.rs	304	wal_dir_fsync_failed	trawl_server::ingest::wal	WARN	io::Errors from sync_directory and the withdrawal	D2b
+ingest/wal.rs	474	wal_dir_fsync_failed	trawl_server::ingest::wal	WARN	io::Error from fsync	D2b
+ingest/wal.rs	498	wal_dir_fsync_failed	trawl_server::ingest::wal	WARN	io::Error from fsync	D2b
+investigations/service.rs	635	investigation_promotion_in_doubt	trawl_server::investigations::service	WARN	id and grace; fixed message	unchanged: no error text
+investigations/service.rs	664	investigation_promotion_settled	trawl_server::investigations::service	INFO	none	unchanged: no error text
+investigations/service.rs	917	investigation_activity_failed	trawl_server::investigations::service	WARN	StoreError by class	unchanged: class/cause only
+investigations/service.rs	1155	results_unlink_failed	trawl_server::investigations::service	WARN	io::Error from ResultsRoot::unlink	D2b
+investigations/service.rs	1167	results_unlink_failed	trawl_server::investigations::service	WARN	tokio JoinError; 746047a8 logs join_failure_text, payload dropped	changed
+investigations/step.rs	396	investigation_step	trawl_server::investigations::step	INFO	none	unchanged: no error text
+investigations/step.rs	473	investigation_step_past_deadline	trawl_server::investigations::step	WARN	none	unchanged: no error text
+investigations/step.rs	483	investigation_step	trawl_server::investigations::step	INFO/WARN	via log: Result<bool, StoreError>; class only	unchanged: class/cause only
+investigations/step.rs	491	investigation_step	trawl_server::investigations::step	INFO	none	unchanged: no error text
+investigations/step.rs	499	investigation_step	trawl_server::investigations::step	WARN	helper log: StoreError by class	unchanged: class/cause only
+investigations/step.rs	700	investigation_step	trawl_server::investigations::step	INFO/WARN	via log: Result<bool, StoreError>; class only	unchanged: class/cause only
+live.rs	201	stream_job_lost	trawl_server::live	ERROR	none	unchanged: no error text
+live.rs	221	stream_missing_prepared_pattern	trawl_server::live	ERROR	via log_missing_prepared_pattern: PatternError from a running stream (Missing, Computed or a RegexRefusal)	unchanged: fixed text trawl wrote
+live.rs	530	stream_lagged	trawl_server::live	WARN	none	unchanged: no error text
+live.rs	547	stream_missing_prepared_pattern	trawl_server::live	ERROR	helper log_missing_prepared_pattern: PatternError fixed sentences; Syntax arises only at preparation	unchanged: fixed text trawl wrote
+live.rs	629	stream_frame_unencodable	trawl_server::live	ERROR	serde_json::Error; ed3e6907 logs class/cause, text at DEBUG	changed
+main.rs	299	config_warning	trawld	WARN	RUST_LOG parse error; ed3e6907 keeps a fixed sentence, parse error at DEBUG	changed
+main.rs	302	crash_dump	trawld	INFO/WARN	via log_crash_dump: trawl_crashdump Status, closed enums and a path	unchanged: closed enum
+main.rs	304	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	307	config_warning	trawld	WARN	config.warnings(): four fixed literals	unchanged: fixed text trawl wrote
+main.rs	310	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	395	lifecycle	trawld	ERROR	none	unchanged: no error text
+main.rs	414	epoch_gate	trawld	INFO	epoch::Outcome enum (Debug)	unchanged: closed enum
+main.rs	456	query_log_enabled	trawld	WARN	configured path and size	unchanged: no error text
+main.rs	491	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	519	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	644	lifecycle	trawld	ERROR	ServerError from http::serve (rustls/PEM text in Internal); ed3e6907 logs class/cause, text at DEBUG	changed
+main.rs	658	lifecycle	trawld	ERROR	io::Error from monitor::run	D2b
+main.rs	681	task_panic	trawld	WARN	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+main.rs	780	publication_recovery	trawld	INFO	none	unchanged: no error text
+main.rs	795	task_panic	trawld	WARN	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+main.rs	811	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	825	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	932	env_not_in_allowlist	trawld	WARN	none	unchanged: no error text
+main.rs	951	retention_env_without_dir	trawld	WARN	none	unchanged: no error text
+main.rs	1193	crash_dump	trawld	INFO	helper log_crash_dump (emit! info): readiness and FailureReason closed enums, dump dir path, fixed message	unchanged: closed enum
+main.rs	1194	crash_dump	trawld	WARN	helper log_crash_dump (emit! warn): readiness and FailureReason closed enums, dump dir path, fixed message	unchanged: closed enum
+main.rs	1211	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	1224	lifecycle	trawld	INFO	none	unchanged: no error text
+main.rs	1230	config_warning	trawld	WARN	rustix Errno from setrlimit (an OS errno)	D2b
+monitor/mod.rs	91	monitor_schedule_count_error	trawl_server::monitor	WARN	StoreError; e4c1d44d logs class/cause, text at DEBUG	changed
+owner_only.rs	597	storage_root_closed	trawl_server::owner_only	WARN	root kind, path and octal modes	unchanged: no error text
+policy.rs	202	-	trawl_server::policy	WARN	role permission string from the keystore (config data, not error text)	unchanged: no error text
+policy.rs	427	-	trawl_server::policy	ERROR	none	unchanged: no error text
+policy.rs	438	auth_failure	trawl_server::policy::unmetered	INFO	key name and roles on trawl_server::policy::unmetered	unchanged: unmetered target, never persisted
+pool.rs	883	query_request_abandoned	trawl_server::pool	INFO	none	unchanged: no error text
+pool.rs	941	query_not_started	trawl_server::pool	INFO	StartRefusal closed enum	unchanged: closed enum
+pool.rs	1980	pool_invariant	trawl_server::pool	ERROR	none	unchanged: no error text
+pool.rs	2067	query_permit_retained	trawl_server::pool	INFO	none	unchanged: no error text
+pool.rs	2261	pool_pressure	trawl_server::pool	WARN	none	unchanged: no error text
+pool.rs	2512	pool_pressure	trawl_server::pool	WARN	none	unchanged: no error text
+pool.rs	2707	pool_exclusive_blocked	trawl_server::pool	WARN	none	unchanged: no error text
+pool.rs	2732	lifecycle	trawl_server::pool	INFO	none	unchanged: no error text
+pool.rs	3226	capture_refused	trawl_server::pool	WARN	reason is a literal; sizes	unchanged: no error text
+prepare.rs	247	preparation_refused	trawl_server::prepare	INFO	none	unchanged: no error text
+prepare.rs	381	preparation_reclaimed	trawl_server::prepare	INFO	none	unchanged: no error text
+prepare.rs	425	preparation_retained	trawl_server::prepare	INFO	closed enum as_str	unchanged: closed enum
+publication.rs	286	publication_scan_failed	trawl_server::publication	ERROR	io::Error from scan_markers	D2b
+publication.rs	316	publication_scan_recovered	trawl_server::publication	INFO	none	unchanged: no error text
+publication.rs	434	corpus_settled	trawl_server::publication	INFO	none	unchanged: no error text
+publication.rs	564	rollup_removal_sync_owed	trawl_server::publication	ERROR	via log_removal_sync_owed: io::Error	D2b
+publication.rs	702	rollup_removal_sync_owed	trawl_server::publication	ERROR	via log_removal_sync_owed: io::Error	D2b
+publication.rs	746	rollup_removal_sync_owed	trawl_server::publication	ERROR	helper log_removal_sync_owed: io::ErrorKind (Debug)	unchanged: closed enum
+query_log.rs	115	{event_type}	trawl_server::query_log	WARN	via check_owner_only: chmod io::Error	D2b
+query_log.rs	169	{event_type}	trawl_server::query_log	WARN	helper check_owner_only: chmod io::Error	D2b
+query_log.rs	208	-	trawl_server::query_log	WARN	serde_json::Error; ed3e6907 logs class/cause, text at DEBUG	changed
+query_log.rs	217	-	trawl_server::query_log	WARN	none	unchanged: no error text
+query_log.rs	237	-	trawl_server::query_log	WARN	io::Error from rollover	D2b
+query_log.rs	244	-	trawl_server::query_log	WARN	io::Error from write	D2b
+query_log.rs	249	-	trawl_server::query_log	WARN	io::Error from flush	D2b
+query_log.rs	287	-	trawl_server::query_log	ERROR	io::Errors from restore and reopen	D2b
+query_timing.rs	542	query_timing	trawl_server::query_timing	INFO	outcome by class	unchanged: class/cause only
+query_timing.rs	603	query_permit_reclaimed	trawl_server::pool	INFO	none	unchanged: no error text
+rate_limit.rs	217	rate_limit_exceeded	trawl_server::rate_limit	WARN	none	unchanged: no error text
+repin/cancel.rs	281	repin_cancel_registry_overlap	trawl_server::repin::cancel	WARN	none	unchanged: no error text
+repin/cancel.rs	495	repin_cancel_requested	trawl_server::repin::cancel	INFO	none	unchanged: no error text
+repin/cancel.rs	509	repin_cancelled	trawl_server::repin::cancel	INFO	none	unchanged: no error text
+repin/cancel.rs	523	repin_cancel_refused	trawl_server::repin::cancel	INFO	none	unchanged: no error text
+repin/cutover.rs	79	repin_shadow_sweep_failed	trawl_server::repin::cutover	WARN	io::Error from remove_dir_all	D2b
+repin/cutover.rs	154	repin_stale_aside_parked	trawl_server::repin::cutover	WARN	none	unchanged: no error text
+repin/cutover.rs	180	repin_sweep_failed	trawl_server::repin::cutover	WARN	io::Error; what is a literal	D2b
+repin/cutover.rs	277	repin_marker_error	trawl_server::repin::cutover	WARN	String from remove_marker: io::Error with path	D2b
+repin/engine.rs	782	repin_claim_unanswered	trawl_server::repin::engine	WARN	none	unchanged: no error text
+repin/engine.rs	801	repin_start	trawl_server::repin::engine	INFO	none	unchanged: no error text
+repin/engine.rs	881	repin_cancel_unobserved	trawl_server::repin::engine	WARN	job id and actor	unchanged: no error text
+repin/engine.rs	893	repin_store_error	trawl_server::repin::engine	ERROR	StoreError by class	unchanged: class/cause only
+repin/engine.rs	951	repin_staging_unreadable	trawl_server::repin::engine	ERROR	io::Error from staging_evidence	D2b
+repin/engine.rs	967	repin_staging_unreadable	trawl_server::repin::engine	ERROR	none	unchanged: no error text
+repin/engine.rs	982	repin_staging_unreadable	trawl_server::repin::engine	ERROR	String mixing io and serde_json (read_marker); ed3e6907 logs class/cause, text at DEBUG	changed
+repin/engine.rs	1035	repin_store_error	trawl_server::repin::engine	ERROR	StoreError by class	unchanged: class/cause only
+repin/engine.rs	1407	catalog_bookkeeping_error	trawl_server::repin::engine	WARN	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+repin/engine.rs	1473	repin_store_retry	trawl_server::repin::engine	WARN	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+repin/engine.rs	1487	repin_store_error	trawl_server::repin::engine	ERROR	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+repin/engine.rs	1513	repin_store_recovered	trawl_server::repin::engine	INFO	none	unchanged: no error text
+repin/engine.rs	1522	repin_store_retry	trawl_server::repin::engine	WARN	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+repin/engine.rs	1634	repin_store_error	trawl_server::repin::engine	ERROR	StoreError by class	unchanged: class/cause only
+repin/engine.rs	1702	repin_complete	trawl_server::repin::engine	INFO	none	unchanged: no error text
+repin/engine.rs	1831	repin_abandoned	trawl_server::repin::engine	WARN	JobAbort::Failed String (DuckDB, serde, io); ed3e6907 logs class/cause, text at DEBUG	changed
+repin/engine.rs	1842	repin_abandoned	trawl_server::repin::engine	WARN	blocked, refused or cancelled sentence trawl wrote (split from the failed branch by ed3e6907)	unchanged: fixed text trawl wrote
+repin/engine.rs	1863	repin_sweep_failed	trawl_server::repin::engine	WARN	StepDied: fixed "{what} task panicked" or "was cancelled"	unchanged: fixed text trawl wrote
+repin/engine.rs	1868	repin_marker_error	trawl_server::repin::engine	WARN	String from remove_marker: io::Error with path	D2b
+repin/engine.rs	1871	repin_recovery_incomplete	trawl_server::repin::engine	WARN	none	unchanged: no error text
+repin/engine.rs	1940	repin_pass	trawl_server::repin::engine	INFO	none	unchanged: no error text
+repin/engine.rs	2018	repin_store_error	trawl_server::repin::engine	ERROR	via log_store_fault: StoreError; 17b8f28a routes it through the helper	changed
+repin/engine.rs	2131	repin_force_accepted	trawl_server::repin::engine	INFO	none	unchanged: no error text
+repin/engine.rs	2178	repin_cutover_fatal	trawl_server::repin::engine	ERROR	String from swap_envs (io and paths); 17b8f28a logs internal/unknown, text at DEBUG	changed
+repin/engine.rs	2211	field_degraded_ack_cleared	trawl_server::repin::engine	INFO	reason is a literal; field name	unchanged: no error text
+repin/engine.rs	2224	repin_flip_retry	trawl_server::repin::engine	WARN	via log_store_fault: StoreError; 17b8f28a routes it through the helper	changed
+repin/engine.rs	2238	repin_cutover_fatal	trawl_server::repin::engine	ERROR	via log_store_fault: StoreError; 17b8f28a routes it through the helper	changed
+repin/engine.rs	2265	repin_marker_error	trawl_server::repin::engine	WARN	String mixing serde_json and io (write_marker); ed3e6907 logs class/cause, text at DEBUG	changed
+repin/engine.rs	2298	repin_sweep_failed	trawl_server::repin::engine	WARN	StepDied: fixed text	unchanged: fixed text trawl wrote
+repin/engine.rs	2353	repin_store_error	trawl_server::repin::engine	WARN	via log_store_fault: StoreError; 17b8f28a routes it through the helper	changed
+repin/engine.rs	2496	repin_publication_claims_unreadable	trawl_server::repin::engine	ERROR	String from scan_claims: io only	D2b
+repin/engine.rs	2505	repin_publication_claims_unreadable	trawl_server::repin::engine	ERROR	StepDied: fixed text	unchanged: fixed text trawl wrote
+repin/engine.rs	2514	repin_cutover_refused	trawl_server::repin::engine	WARN	refusal: fixed literal	unchanged: fixed text trawl wrote
+repin/engine.rs	2596	{event_type}	trawl_server::repin::engine	WARN	helper log_store_fault: StoreError by class/cause; text at DEBUG	unchanged: class/cause only
+repin/engine.rs	2604	{event_type}	trawl_server::repin::engine	ERROR	helper log_store_fault: StoreError by class/cause; text at DEBUG	unchanged: class/cause only
+repin/recover.rs	81	repin_stale_shadow	trawl_server::repin::recover	WARN	none	unchanged: no error text
+repin/recover.rs	90	repin_stale_aside	trawl_server::repin::recover	WARN	none	unchanged: no error text
+repin/recover.rs	112	repin_recovery_deferred	trawl_server::repin::recover	WARN	none	unchanged: no error text
+repin/recover.rs	141	repin_recovered	trawl_server::repin::recover	INFO	RepinPhase and RecoveredAction enums (Debug)	unchanged: closed enum
+repin/recover.rs	208	field_degraded_ack_cleared	trawl_server::repin::recover	INFO	reason is a literal; field name	unchanged: no error text
+repin/recover.rs	238	repin_recovery_incomplete	trawl_server::repin::recover	WARN	RecoveredAction enum (Debug)	unchanged: closed enum
+repin/recover.rs	256	repin_orphans_reconciled	trawl_server::repin::recover	WARN	none	unchanged: no error text
+repin/rewrite.rs	371	repin_sample_failed	trawl_server::repin::rewrite	WARN	StatementFailure (DuckDB/serde); ed3e6907 logs class/cause, text at DEBUG	changed
+repin/rewrite.rs	436	maintenance_resource_exhausted	trawl_server::ingest::compaction	ERROR	via StatementFailure::duckdb: duckdb::Error; ERROR only on OOM, class/cause	unchanged: class/cause only
+results/charge.rs	638	{what.error_event()}	trawl_server::results::charge	WARN	via warn_retire_store: StoreError by class	unchanged: class/cause only
+results/charge.rs	661	{what.error_event()}	trawl_server::results::charge	WARN	via warn_retire_store: StoreError by class	unchanged: class/cause only
+results/charge.rs	693	{what.error_event()}	trawl_server::results::charge	WARN	via warn_retire: io::Error from ResultsRoot::unlink	D2b
+results/charge.rs	710	{what.error_event()}	trawl_server::results::charge	WARN	via warn_retire: tokio JoinError; 746047a8 passes join_failure_text	changed
+results/charge.rs	1140	{what.error_event()}	trawl_server::results::charge	WARN	helper warn_retire: dyn Display, io::Error (:693) or join_failure_text (:710)	D2b
+results/charge.rs	1153	{what.error_event()}	trawl_server::results::charge	WARN	helper warn_retire_store: StoreError by class	unchanged: class/cause only
+results/compare.rs	454	-	trawl_server::results::compare	WARN	via unlisted: FirstEnvNamesError::Root (io::Error)	D2b
+results/compare.rs	464	-	trawl_server::results::compare	WARN	helper unlisted: FirstEnvNamesError::Root io::Error	D2b
+results/compare.rs	472	-	trawl_server::results::compare	WARN	helper unlisted: FirstEnvNamesError::Entry io::Error	D2b
+results/compare.rs	509	-	trawl_server::results::compare	WARN	via unlisted: FirstEnvNamesError::Entry (io::Error)	D2b
+results/root.rs	177	results_stage_unlink_failed	trawl_server::results::root	WARN	io::Error from unlink	D2b
+results/root.rs	413	results_root_foreign_entry	trawl_server::results::root	WARN	fixed what literals; entry is a file name	unchanged: fixed text trawl wrote
+results/service.rs	704	query_start	trawl_server::results::service	INFO	none	unchanged: no error text
+results/service.rs	916	history_error	trawl_server::results::service	WARN	via log_history_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	917	history_error	trawl_server::results::service	WARN	none	unchanged: no error text
+results/service.rs	926	query_complete	trawl_server::results::service	INFO	none	unchanged: no error text
+results/service.rs	956	query_timeout	trawl_server::results::service	WARN	none	unchanged: no error text
+results/service.rs	977	query_failed	trawl_server::results::service	WARN	ServerError by class	unchanged: class/cause only
+results/service.rs	989	query_failed	trawl_server::results::service	ERROR	ServerError by class	unchanged: class/cause only
+results/service.rs	1148	capture_refused	trawl_server::results::service	WARN	reason is a literal; sizes	unchanged: no error text
+results/service.rs	1287	capture_refused	trawl_server::results::service	WARN	reason is a literal; scope and sizes	unchanged: no error text
+results/service.rs	1315	capture_refused	trawl_server::results::service	WARN	reason: fixed literal	unchanged: fixed text trawl wrote
+results/service.rs	1837	results_unlink_failed	trawl_server::results::service	WARN	io::Error from ResultsRoot::unlink	D2b
+results/service.rs	1906	results_commit_fenced	trawl_server::results::service	WARN	via log_fenced: StoreError by class	unchanged: class/cause only
+results/service.rs	1978	results_commit_fenced	trawl_server::results::service	WARN	via log_fenced: StoreError by class	unchanged: class/cause only
+results/service.rs	2037	history_error	trawl_server::results::service	WARN	helper log_history_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	2050	results_commit_fenced	trawl_server::results::service	WARN	helper log_fenced: StoreError by class; message is a literal	unchanged: class/cause only
+results/service.rs	2085	results_commit_unreadable	trawl_server::results::service	WARN	none	unchanged: no error text
+results/service.rs	2097	results_commit_unreadable	trawl_server::results::service	WARN	StoreError by class	unchanged: class/cause only
+results/service.rs	2115	results_commit_orphaned	trawl_server::results::service	ERROR	none	unchanged: no error text
+results/service.rs	2191	results_commit_in_doubt	trawl_server::results::service	WARN	none	unchanged: no error text
+results/service.rs	2219	results_commit_settled	trawl_server::results::service	INFO	none	unchanged: no error text
+results/service.rs	2229	results_commit_settled	trawl_server::results::service	INFO	none	unchanged: no error text
+results/service.rs	2240	results_commit_settled	trawl_server::results::service	WARN	none	unchanged: no error text
+results/service.rs	2704	results_expire_failed	trawl_server::results::service	WARN	helper log_expire_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	2724	results_expire_failed	trawl_server::results::service	WARN	via log_expire_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	2735	results_unlink_failed	trawl_server::results::service	WARN	io::Error from ResultsRoot::unlink	D2b
+results/service.rs	2740	results_unlink_failed	trawl_server::results::service	WARN	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+results/service.rs	2799	results_mark_missing_failed	trawl_server::results::service	WARN	via log_mark_missing_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	2808	results_mark_missing_failed	trawl_server::results::service	WARN	helper log_mark_missing_failed: StoreError by class	unchanged: class/cause only
+results/service.rs	2837	result_corrupt	trawl_server::results::service	ERROR	none	unchanged: no error text
+results/sweep.rs	222	results_reconcile	trawl_server::results::sweep	INFO	none	unchanged: no error text
+results/sweep.rs	289	results_sweep_error	trawl_server::results::sweep	WARN	via warn_store: StoreError by class	unchanged: class/cause only
+results/sweep.rs	304	results_sweep_error	trawl_server::results::sweep	WARN	via warn_store: StoreError by class	unchanged: class/cause only
+results/sweep.rs	312	results_sweep_error	trawl_server::results::sweep	WARN	via warn_store: StoreError by class	unchanged: class/cause only
+results/sweep.rs	321	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error, or io::Error::other(join_failure_text) from on_root	D2b
+results/sweep.rs	323	results_sweep_error	trawl_server::results::sweep	WARN	via warn_store: StoreError by class	unchanged: class/cause only
+results/sweep.rs	338	results_sweep	trawl_server::results::sweep	INFO	none	unchanged: no error text
+results/sweep.rs	374	lifecycle	trawl_server::results::sweep	INFO	none	unchanged: no error text
+results/sweep.rs	384	lifecycle	trawl_server::results::sweep	INFO	none	unchanged: no error text
+results/sweep.rs	420	results_sweep_error	trawl_server::results::sweep	WARN	helper warn: dyn Display, io::Error or io::Error::other(join_failure_text)	D2b
+results/sweep.rs	434	results_sweep_error	trawl_server::results::sweep	WARN	helper warn_store: StoreError by class	unchanged: class/cause only
+results/sweep.rs	479	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error from ResultsRoot::unlink	D2b
+results/sweep.rs	485	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error::other(join_failure_text) from on_root	D2b
+results/sweep.rs	503	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error from the file age read	D2b
+results/sweep.rs	513	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error from ResultsRoot::unlink	D2b
+results/sweep.rs	519	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error::other(join_failure_text) from on_root	D2b
+retention.rs	205	lifecycle	trawl_server::retention	INFO	none	unchanged: no error text
+retention.rs	234	retention_error	trawl_server::retention	ERROR	String from retention_tick: io and fixed text	D2b
+retention.rs	243	retention_error	trawl_server::retention	ERROR	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+retention.rs	253	lifecycle	trawl_server::retention	INFO	none	unchanged: no error text
+retention.rs	493	retention_repin_suppressed	trawl_server::retention	INFO	what: &'static str from repin_in_flight	unchanged: fixed text trawl wrote
+retention.rs	533	retention_publication_claims_unreadable	trawl_server::retention	WARN	String from scan_claims: io only	D2b
+retention.rs	550	retention_publication_claimed	trawl_server::retention	INFO	none	unchanged: no error text
+retention.rs	588	retention_delete	trawl_server::retention	INFO	none	unchanged: no error text
+retention.rs	601	retention_error	trawl_server::retention	ERROR	String from remove_dir_all: io::Error	D2b
+retention.rs	631	retention_sweep	trawl_server::retention	INFO	none	unchanged: no error text
+retention.rs	689	retention_disk_pressure	trawl_server::retention	WARN	none	unchanged: no error text
+retention.rs	719	retention_delete	trawl_server::retention	INFO	none	unchanged: no error text
+retention.rs	733	retention_error	trawl_server::retention	ERROR	String from remove_dir_all: io::Error	D2b
+retention.rs	762	retention_repin_suppressed	trawl_server::retention	INFO	what: &'static str from repin_in_flight	unchanged: fixed text trawl wrote
+retention.rs	795	retention_publication_claimed	trawl_server::retention	INFO	none	unchanged: no error text
+retention.rs	808	retention_publication_claims_unreadable	trawl_server::retention	WARN	String from scan_claims: io only	D2b
+retention.rs	829	retention_repin_evidence_unreadable	trawl_server::retention	WARN	io::Error from in_flight_evidence	D2b
+scheduler.rs	85	scheduler_started	trawl_server::scheduler	INFO	none	unchanged: no error text
+scheduler.rs	97	scheduler_shutdown	trawl_server::scheduler	INFO	none	unchanged: no error text
+scheduler.rs	150	scheduler_retention_error	trawl_server::scheduler	WARN	StoreError; 2d4d4a25 logs class/cause, text at DEBUG	changed
+scheduler.rs	182	scheduler_paused	trawl_server::scheduler	INFO	pause reason label, closed enum	unchanged: closed enum
+scheduler.rs	188	scheduler_resumed	trawl_server::scheduler	INFO	none	unchanged: no error text
+scheduler.rs	265	scheduler_error	trawl_server::scheduler	ERROR	StoreError; 2d4d4a25 logs class/cause, text at DEBUG	changed
+scheduler.rs	371	scheduler_error	trawl_server::scheduler	ERROR	StoreError by class	unchanged: class/cause only
+scheduler.rs	397	scheduler_window_truncated	trawl_server::scheduler	WARN	none	unchanged: no error text
+scheduler.rs	433	scheduler_error	trawl_server::scheduler	WARN	fleet_auth::AuthError; 2d4d4a25 logs class/cause, text at DEBUG	changed
+scheduler.rs	448	scheduler_skip	trawl_server::scheduler	INFO	none	unchanged: no error text
+scheduler.rs	564	scheduled_query_completed	trawl_server::scheduler	INFO	none	unchanged: no error text
+scheduler.rs	580	scheduled_query_failed	trawl_server::scheduler	WARN	ServerError by class	unchanged: class/cause only
+scheduler.rs	636	scheduled_query_failed	trawl_server::scheduler	WARN	none	unchanged: no error text
+scheduler.rs	669	scheduler_error	trawl_server::scheduler	ERROR	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+scheduler.rs	679	scheduler_error	trawl_server::scheduler	ERROR	helper log_store_fault: StoreError by class/cause; what is a literal	unchanged: class/cause only
+scheduler.rs	728	scheduler_orphan_cleanup	trawl_server::scheduler	INFO	none	unchanged: no error text
+scheduler.rs	743	scheduler_error/scheduler_orphan_cleanup	trawl_server::scheduler	INFO/ERROR	via recover_ambiguous_finish: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+scheduler.rs	795	scheduler_error	trawl_server::scheduler	ERROR	helper recover_ambiguous_finish: StoreError by class/cause	unchanged: class/cause only
+scheduler.rs	811	scheduler_orphan_cleanup	trawl_server::scheduler	INFO	none	unchanged: no error text
+scheduler.rs	820	scheduler_error	trawl_server::scheduler	ERROR	via log_store_fault: StoreError; class/cause, text at DEBUG	unchanged: class/cause only
+scheduler.rs	859	result_file_already_absent	trawl_server::scheduler	INFO	none	unchanged: no error text
+scheduler.rs	873	result_file_cleanup_error	trawl_server::scheduler	WARN	io::ErrorKind Display	unchanged: closed enum
+scheduler.rs	930	scheduler_parquet_error	trawl_server::scheduler	WARN	io::ErrorKind Display	unchanged: closed enum
+scheduler.rs	944	scheduler_parquet_error	trawl_server::scheduler	WARN	via log_parquet_engine_fault: EngineError; class/cause, text at DEBUG	unchanged: class/cause only
+scheduler.rs	968	scheduler_result_blob	trawl_server::scheduler	INFO	none	unchanged: no error text
+scheduler.rs	976	scheduler_parquet_error	trawl_server::scheduler	WARN	via log_parquet_engine_fault: EngineError; class/cause, text at DEBUG	unchanged: class/cause only
+scheduler.rs	993	scheduler_parquet_error	trawl_server::scheduler	WARN	io::ErrorKind Display	unchanged: closed enum
+scheduler.rs	1018	scheduler_parquet_error	trawl_server::scheduler	WARN	helper log_parquet_engine_fault: EngineError by class/cause; what is a literal	unchanged: class/cause only
+scheduler.rs	1058	run_result_blob_zstd_decode_failed	trawl_server::scheduler	WARN	io::Error carrying zstd codec text; 746047a8 logs class/cause, text at DEBUG	changed
+scheduler.rs	1075	run_result_blob_deserialize_failed	trawl_server::scheduler	WARN	serde_json::Error; 2d4d4a25 logs class/cause, text at DEBUG	changed
+schema_refresh.rs	79	schema_refresh_complete	trawl_server::schema_refresh	INFO	none	unchanged: no error text
+schema_refresh.rs	90	schema_refresh_error	trawl_server::schema_refresh	WARN	Box<dyn Error> from walk_parquet_files: io::Error	D2b
+schema_refresh.rs	97	schema_refresh_panic	trawl_server::schema_refresh	WARN	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+schema_refresh.rs	160	degraded_refresh_error	trawl_server::schema_refresh	WARN	StoreError; e4c1d44d logs class/cause, text at DEBUG	changed
+schema_refresh.rs	247	schema_refresh_unpinned_columns	trawl_server::schema_refresh	WARN	column names (ingest data, not error text)	unchanged: no error text
+schema_refresh.rs	332	schema_refresh_file_skip	trawl_server::schema_refresh	WARN	ParquetStatsError (parquet footer text); e4c1d44d logs class/cause, text at DEBUG	changed
+shutdown.rs	66	shutdown_signal	trawl_server::shutdown	INFO	none	unchanged: no error text
+shutdown.rs	69	shutdown_signal	trawl_server::shutdown	INFO	none	unchanged: no error text
+state.rs	615	lifecycle	trawl_server::state	INFO	none	unchanged: no error text
+state.rs	649	lifecycle	trawl_server::state	INFO	none	unchanged: no error text
+stats.rs	100	lifecycle	trawl_server::stats	INFO	none	unchanged: no error text
+stats.rs	111	stats_collection_failed	trawl_server::stats	WARN	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+stats.rs	145	server_stats	trawl_server::stats	INFO	none	unchanged: no error text
+store/catalog.rs	428	catalog_pin_purge_commit_failed	storage.backend	WARN	sqlx::Error; 9d0e846a logs class/cause, text at DEBUG	changed
+store/catalog.rs	444	catalog_pin_purge_commit_late	trawl_server::store::catalog	INFO	none	unchanged: no error text
+store/catalog.rs	463	catalog_pin_purge_commit_late_failed	storage.backend	WARN	sqlx::Error; 9d0e846a logs class/cause, text at DEBUG	changed
+store/catalog.rs	724	catalog_field_name_unstorable	trawl_server::store::catalog	WARN	field names (ingest data, not error text)	unchanged: no error text
+store/catalog.rs	1094	catalog_pin_cap_reached	trawl_server::store::catalog	WARN	field names (ingest data, not error text)	unchanged: no error text
+store/catalog.rs	2302	catalog_pin_purge_prepare_timeout	storage.backend	WARN	none	unchanged: no error text
+store/mod.rs	190	pool_connection_returned_in_transaction	trawl_server::store	WARN	none	unchanged: no error text
+store/mod.rs	285	storage_lock_lost	trawl_server::store	ERROR	sqlx::Error; 9d0e846a logs class/cause, text at DEBUG	changed
+store/mod.rs	383	storage_ready	trawl_server::store	INFO	none	unchanged: no error text
+store/repin.rs	878	repin_evidence_unstaged	trawl_server::store::repin	WARN	none	unchanged: no error text
+store/saved.rs	200	saved_query_created	trawl_server::store::saved	INFO	none	unchanged: no error text
+store/saved.rs	305	saved_query_updated	trawl_server::store::saved	INFO	none	unchanged: no error text
+store/saved.rs	385	saved_query_deleted	trawl_server::store::saved	INFO	none	unchanged: no error text
+store/schedule.rs	958	schedule_deleted	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	1139	report_run_started	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	1305	report_run_started	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	1413	schedule_cursor_advanced	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	1474	report_run_started	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	1658	report_run_finished	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	1712	report_run_fail_if_running	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	1888	stale_runs_cleaned	trawl_server::store::schedule	WARN	none	unchanged: no error text
+store/schedule.rs	1958	old_runs_deleted	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	2337	schedule_created	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	2349	schedule_updated	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	2384	schedule_cursor_advanced	trawl_server::store::schedule	INFO	none	unchanged: no error text
+store/schedule.rs	2393	scheduler_error	trawl_server::store::schedule	ERROR	report_window::PlanError	unchanged: decided: PlanError has fixed messages
+syslog/batch.rs	408	syslog_batcher_shutdown	trawl_server::syslog::batch	INFO	none	unchanged: no error text
+syslog/batch.rs	427	syslog_backpressure_shutdown_drop	trawl_server::syslog::batch	WARN	none	unchanged: no error text
+syslog/batch.rs	508	syslog_event_oversized	trawl_server::syslog::batch	WARN	none	unchanged: no error text
+syslog/batch.rs	521	syslog_backpressure	trawl_server::syslog::batch	WARN	none	unchanged: no error text
+syslog/batch.rs	527	syslog_backpressure_cleared	trawl_server::syslog::batch	INFO	none	unchanged: no error text
+syslog/batch.rs	554	syslog_flush_panic	trawl_server::syslog::batch	ERROR	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
+syslog/listener_error.rs	105	{self.listener.failed()}	preauth.transport	WARN	via record_failure: io::Error on preauth.transport	unchanged: unmetered target, never persisted
+syslog/listener_error.rs	133	{self.listener.failed()}	preauth.transport	WARN	helper record_failure: io::Error on preauth.transport	unchanged: unmetered target, never persisted
+syslog/listener_error.rs	152	{self.listener.recovered()}	preauth.transport	INFO	listener operation literal on preauth.transport	unchanged: unmetered target, never persisted
+syslog/mod.rs	104	syslog_udp_error	trawl_server::syslog	ERROR	io::Error from run_udp_listener	D2b
+syslog/mod.rs	127	syslog_tcp_error	trawl_server::syslog	ERROR	io::Error from run_tcp_listener	D2b
+syslog/tcp.rs	48	syslog_tcp_listening	trawl_server::syslog::tcp	INFO	none	unchanged: no error text
+syslog/tcp.rs	121	syslog_tcp_limit_reached	trawl_server::syslog::tcp	WARN	source is the peer IP	unchanged: no error text
+syslog/tcp.rs	168	syslog_tcp_shutdown	trawl_server::syslog::tcp	INFO	none	unchanged: no error text
+syslog/tcp.rs	289	syslog_tcp_event_limit	trawl_server::syslog::tcp	INFO	source is the peer IP	unchanged: no error text
+syslog/udp.rs	47	syslog_udp_listening	trawl_server::syslog::udp	INFO	none	unchanged: no error text
+syslog/udp.rs	160	syslog_udp_shutdown	trawl_server::syslog::udp	INFO	none	unchanged: no error text
+telemetry.rs	328	panic	trawl_server::panic	ERROR	panic location on trawl_server::panic, no payload	unchanged: unmetered target, never persisted
+telemetry.rs	1495	telemetry_dropped	trawl_server::telemetry	WARN	drop counts; fixed message	unchanged: no error text
+tls.rs	261	tls_cert_details	trawl_server::tls	INFO	x509 ASN1Time format error; ed3e6907 writes (invalid), formatter text at DEBUG	changed
+tls.rs	270	tls_cert_details	trawl_server::tls	WARN	via cert_details_unparsed: X.509 parse error; ed3e6907	changed
+tls.rs	272	tls_cert_details	trawl_server::tls	WARN	via cert_details_unparsed: PEM parse error; ed3e6907	changed
+tls.rs	294	tls_cert_details	trawl_server::tls	WARN	helper cert_details_unparsed: x509_parser/PEM error; ed3e6907 logs class/cause, text at DEBUG	changed
+tls.rs	340	lifecycle	trawl_server::tls	INFO	none	unchanged: no error text
+tls.rs	351	lifecycle	trawl_server::tls	WARN	exposure reason: fixed sentence with link count and uids	unchanged: fixed text trawl wrote
+tls.rs	360	lifecycle	trawl_server::tls	INFO	none	unchanged: no error text
+tls.rs	369	lifecycle	trawl_server::tls	INFO	none	unchanged: no error text
+tls.rs	417	lifecycle	trawl_server::tls	INFO	none	unchanged: no error text
+tls.rs	1204	tls_reload	trawl_server::tls	INFO	none	unchanged: no error text
+tls.rs	1219	tls_reload	trawl_server::tls	INFO	none	unchanged: no error text
+tls.rs	1225	tls_reload_error	trawl_server::tls	ERROR	TlsError ReadCert/ReadKey/Write (path and io::Error) or Unsafe (trawl's refusal)	D2b
+tls.rs	1229	tls_reload_error	trawl_server::tls	ERROR	TlsError InvalidCert/InvalidKey/Config/Generation (PEM, rustls, rcgen text); ed3e6907 logs class/cause, text at DEBUG	changed
+transport/failure.rs	403	http_failure	trawl_server::transport::failure	WARN	Failure record by class/cause	unchanged: class/cause only
+transport/failure.rs	420	http_failure	trawl_server::transport::failure	ERROR	Failure record by class/cause	unchanged: class/cause only
+transport/failure.rs	437	http_failure	trawl_server::transport::failure::unmetered	WARN	Failure record by class/cause	unchanged: class/cause only
+transport/failure.rs	454	http_failure	trawl_server::transport::failure::unmetered	ERROR	Failure record by class/cause	unchanged: class/cause only
+transport/http.rs	426	lifecycle	trawl_server::transport::http	WARN	none	unchanged: no error text
+transport/http.rs	521	lifecycle	trawl_server::transport::http	INFO	none	unchanged: no error text
+transport/http.rs	759	lifecycle	trawl_server::transport::http	INFO	none	unchanged: no error text
+transport/http.rs	889	accept_failed	preauth.transport	WARN	io::Error on preauth.transport	unchanged: unmetered target, never persisted
+transport/http.rs	893	lifecycle	trawl_server::transport::http	INFO	none	unchanged: no error text
+transport/http.rs	923	tls_handshake_failed	preauth.transport	WARN	rustls/io handshake error on preauth.transport	unchanged: unmetered target, never persisted
+transport/http.rs	927	tls_handshake_failed	preauth.transport	WARN	fixed text on preauth.transport	unchanged: unmetered target, never persisted
+transport/http.rs	990	connection_task_panicked	preauth.transport	ERROR	fixed text on preauth.transport	unchanged: unmetered target, never persisted
+transport/http.rs	995	lifecycle	trawl_server::transport::http	INFO	none	unchanged: no error text
+transport/http.rs	1005	lifecycle	trawl_server::transport::http	INFO	none	unchanged: no error text
+transport/http.rs	1018	lifecycle	trawl_server::transport::http	WARN	none	unchanged: no error text
+transport/http.rs	1027	lifecycle	trawl_server::transport::http	INFO	none	unchanged: no error text
