@@ -4,28 +4,33 @@
 
 //! Pre-emission pipeline validation.
 //!
-//! Catches malformed `extract` regexes, unknown function names, arity
-//! mismatches, projection-name collisions and reserved-namespace
-//! capture-group names before any emission state is mutated, so a failure
-//! reports one clean error instead of leaving half-built CTEs behind.
+//! Refuses, before any emission state is mutated, a query whose answer
+//! the lanes could not agree on: an over-budget expansion, a misplaced
+//! aggregate, a call that breaks its function's rule (name, argument
+//! count, literal arguments), a reserved or colliding output name, a
+//! malformed `extract` regex, and a `from saved` that is not first. A
+//! failure reports one clean error instead of leaving half-built CTEs
+//! behind. Field names are not checked against any schema.
 
 use crate::ast::{AggExpr, ExtractMode, PipeStage, Spanned};
 use crate::pattern::price::{self, Capture};
 
 use super::EmitError;
-use super::functions::validate_function_arity;
 
 /// Validate all pipe stages before emission begins.
 ///
-/// Checks function names, argument counts and `extract` regex syntax.
-/// Error messages are intentionally identical to those produced during
-/// emission so that callers see consistent diagnostics regardless of
-/// which layer catches the problem.
+/// In this order, each over the whole pipeline before the next starts:
+/// the bind-time expansion budget, aggregate positions, then every call
+/// (its name, argument count, unit, format and integer-literal
+/// arguments). Then, stage by stage: aggregation aliases, `extract` regex
+/// syntax and capture names, the place of `from saved`, and projection
+/// collisions. Error messages are the ones emission produces, so callers
+/// see the same diagnostic whichever layer catches the problem.
 ///
 /// This runs over the *whole* pipeline, including the stages the executor
-/// later peels off to run in Rust — so an `extract` capture group naming
-/// a reserved column is rejected the same way whether it ends up in SQL
-/// or in the post-SQL streaming engine.
+/// later peels off to run in Rust — so a bad call or an `extract` capture
+/// group naming a reserved column is rejected the same way whether it
+/// ends up in SQL or in the post-SQL streaming engine.
 pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError> {
     // The bind-time expansion budget first, over the whole pipeline
     // (ADR-0024): a query that would make `DuckDB` bind an exponential
@@ -42,26 +47,30 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
     // point, so a query with several defects gets one first sentence from
     // both lanes.
     crate::aggregate::check_positions(stages)?;
+    // Then every call, in every stage, the stages after `extract kv`
+    // included (ADR-0001, Amendment 2026-11-11). The stream compiler runs
+    // the same walk at the same point.
+    crate::calls::check_calls(stages)?;
 
     for (i, stage) in stages.iter().enumerate() {
         match &stage.node {
             PipeStage::Stats(s) => {
                 for agg in &s.aggregations {
-                    validate_function(agg)?;
+                    validate_alias(agg)?;
                 }
             }
             PipeStage::Timechart(tc) => {
                 for agg in &tc.aggregations {
-                    validate_function(agg)?;
+                    validate_alias(agg)?;
                 }
             }
             PipeStage::EventStats(es) => {
                 for agg in &es.aggregations {
-                    validate_function(agg)?;
+                    validate_alias(agg)?;
                 }
             }
             PipeStage::Pivot(p) => {
-                validate_function(&p.aggregation)?;
+                validate_alias(&p.aggregation)?;
             }
             PipeStage::Extract(e) => {
                 validate_extract(e)?;
@@ -77,8 +86,8 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
 
         // Every projecting stage's output-name set, from the one
         // lane-neutral check the stream compiler runs too (ADR-0013
-        // ruling 8) — after the per-stage checks above, so an unknown
-        // function or a reserved alias keeps its more specific sentence.
+        // ruling 8) — after the per-stage checks above, so a reserved
+        // alias keeps its more specific sentence.
         // Non-projecting stages are a no-op there.
         crate::projection::check_projection(&stage.node)
             .map_err(|message| EmitError::InvalidAggregation { message })?;
@@ -86,12 +95,10 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
     Ok(())
 }
 
-/// Validate a function call: name must be known, arity must match, and
-/// its alias — the fourth pipeline write position, beside `let`/`rename`
-/// targets and `extract` capture groups — may not mint a reserved name
-/// (ADR-0013 §5).
-fn validate_function(agg: &AggExpr) -> Result<(), EmitError> {
-    validate_function_arity(agg.function.as_str(), agg.args.len())?;
+/// An aggregation's alias — the fourth pipeline write position, beside
+/// `let`/`rename` targets and `extract` capture groups — may not mint a
+/// reserved name (ADR-0013 §5).
+fn validate_alias(agg: &AggExpr) -> Result<(), EmitError> {
     if let Some(alias) = &agg.alias
         && crate::schema::is_reserved_name(alias)
     {

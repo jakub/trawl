@@ -26,11 +26,8 @@ use state::EmitterState;
 
 pub use columns::{ColdColumns, HotColumns, InputColumns};
 pub(crate) use fields::coerce_filter_value;
+pub(crate) use functions::check_call;
 pub use functions::{DATE_PART_UNITS, DATE_UNITS};
-pub(crate) use functions::{
-    format_literal_position, unit_literal_positions, validate_format_literal,
-    validate_function_arity, validate_unit_literal,
-};
 pub use functions::{function_result_pin, is_aggregate_function};
 pub use regex_calls::{is_re2_function, macro_copies, regex_calls};
 pub use state::{
@@ -330,9 +327,12 @@ impl EmitError {
     ///
     /// Used by validation endpoints that need to return `Vec<ParseError>`
     /// from an `EmitError` (server validate handler, TUI real-time validation).
+    /// The hint travels in its own field, so the message is
+    /// [`Self::message`], not `Display`: a renderer that prints both says
+    /// the hint once.
     pub fn to_parse_errors(&self, query_len: usize) -> Vec<crate::parser::ParseError> {
         vec![crate::parser::ParseError {
-            message: self.to_string(),
+            message: self.message(),
             span: 0..query_len,
             label: None,
             hint: self.hint(),
@@ -3892,9 +3892,14 @@ mod tests {
     /// test.
     #[test]
     fn unknown_match_hints_the_matches_operator() {
+        // `validate_pipeline` refuses with the same error emit does.
         fn refusal(input: &str) -> EmitError {
             let query = parser::parse(input).expect("parse should succeed");
-            emit(&query, SRC, anchor()).expect_err("emit should fail")
+            let emitted = emit(&query, SRC, anchor()).expect_err("emit should fail");
+            let validated =
+                validate_pipeline(&query.pipeline).expect_err("validate_pipeline should fail");
+            assert_eq!(validated, emitted, "{input}");
+            emitted
         }
         const HINT: &str = "matches is an operator, not a function: where message matches /re/";
         for (input, name) in [
@@ -3927,5 +3932,26 @@ mod tests {
             "{regex:?}"
         );
         assert_eq!(regex.hint(), None);
+    }
+
+    /// A validation renderer prints a parse error's message and its hint
+    /// side by side, so the message must not carry the hint as well.
+    #[test]
+    fn to_parse_errors_carries_the_hint_once() {
+        let query = parser::parse(r#"last=1h | where match(message, "x")"#).expect("parses");
+        let err = validate_pipeline(&query.pipeline).expect_err("validate refuses");
+        let hint = err.hint().expect("match carries the operator hint");
+        let errors = err.to_parse_errors(10);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "unknown function: match");
+        assert_eq!(errors[0].hint.as_deref(), Some(hint.as_str()));
+        assert_eq!(errors[0].span, 0..10);
+
+        // Without a hint, the message is the whole sentence.
+        let query = parser::parse("last=1h | where length() > 0").expect("parses");
+        let err = validate_pipeline(&query.pipeline).expect_err("validate refuses");
+        let errors = err.to_parse_errors(10);
+        assert_eq!(errors[0].message, err.to_string());
+        assert_eq!(errors[0].hint, None);
     }
 }
