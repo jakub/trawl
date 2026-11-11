@@ -1248,8 +1248,8 @@ pub async fn cancel_query(
 ///
 /// Parses the text and checks every function call in every stage: its name,
 /// its argument count and its literal arguments (units, formats and integer
-/// positions). It does not check fields against the schema, or that every
-/// lane can run the query.
+/// positions). It also checks `extract` regex patterns. It does not check
+/// fields against the schema, or that every lane can run the query.
 ///
 /// This route runs the two halves [`crate::admission::admit`] runs, in the
 /// same order and from the same owners — so an over-budget pipeline
