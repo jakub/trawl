@@ -166,10 +166,16 @@ fn check_owner_only(
         ));
     }
     if let Some(err) = chmod_err {
-        tracing::warn!(
+        tracing::debug!(
             event_type,
             path = %path.display(),
             error = %err,
+            "could not chmod the log to 0600"
+        );
+        tracing::warn!(
+            event_type,
+            path = %path.display(),
+            cause_kind = crate::error::CauseKind::of_io(&err).as_str(),
             "could not chmod the log to 0600; it is trawld's own file and \
              already owner-only, continuing"
         );
@@ -234,19 +240,28 @@ impl QueryLog {
             // but do not re-attempt (or re-warn) until another cap's
             // worth of entries has been written.
             inner.next_attempt_bytes = inner.size.saturating_add(inner.max_bytes);
+            tracing::debug!(error = %e, "query log rollover failed");
             tracing::warn!(
-                error = %e,
+                cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
                 retry_after_bytes = inner.next_attempt_bytes,
                 "query log rollover failed; continuing in current file"
             );
         }
         if let Err(e) = writeln!(inner.writer, "{line}") {
-            tracing::warn!(error = %e, "failed to write query log entry");
+            tracing::debug!(error = %e, "failed to write query log entry");
+            tracing::warn!(
+                cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
+                "failed to write query log entry"
+            );
             return;
         }
         inner.size += line_bytes;
         if let Err(e) = inner.writer.flush() {
-            tracing::warn!(error = %e, "failed to flush query log");
+            tracing::debug!(error = %e, "failed to flush query log");
+            tracing::warn!(
+                cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
+                "failed to flush query log"
+            );
         }
     }
 }
@@ -284,9 +299,15 @@ impl Inner {
             Err(err) => {
                 if let Err(restore) = restore_rotated(&rotated, &self.path) {
                     self.detached = true;
-                    tracing::error!(
+                    tracing::debug!(
                         error = %restore,
                         reopen_error = %err,
+                        path = %self.path.display(),
+                        "query log rollover could not be undone"
+                    );
+                    tracing::error!(
+                        cause_kind = crate::error::CauseKind::of_io(&restore).as_str(),
+                        reopen_cause_kind = crate::error::CauseKind::of_io(&err).as_str(),
                         path = %self.path.display(),
                         "query log rollover could not be undone; the writer no longer \
                          holds the configured path, so the log is closed until restart"

@@ -42,7 +42,7 @@ use tokio::task::JoinHandle;
 use super::ResultsState;
 use super::root::ResultsRoot;
 use crate::config::CaptureConfig;
-use crate::error::join_failure_text;
+use crate::error::{CauseKind, join_failure_text};
 use crate::store::{ExpiredFile, StoreError};
 
 /// What [`reconcile_at_boot`] did.
@@ -318,7 +318,7 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
     // capture is not in the snapshot had its insert decided, or given its
     // grace, before the rows are read: its row is there, or it has none.
     match on_root(&results.root, ResultsRoot::list_ids).await {
-        Err(e) => outcome.errors += warn("listing the results root", &e),
+        Err(e) => outcome.errors += warn("listing the results root", &e, cause_of(&e)),
         Ok(files) => match (results.in_flight.snapshot(), store.live_ids().await) {
             (_, Err(e)) => outcome.errors += warn_store("reading the live captures", &e),
             (in_flight, Ok(live)) => {
@@ -414,13 +414,20 @@ fn with_files(retired: Vec<ExpiredFile>) -> Vec<String> {
         .collect()
 }
 
-/// Log a failed filesystem step of the sweep at warn. Returns 1, the
-/// error it counts.
-fn warn(step: &str, error: &dyn std::fmt::Display) -> usize {
-    tracing::warn!(
+/// Log a failed filesystem step of the sweep at warn, by its closed cause:
+/// the error's text goes to DEBUG only (ADR-0040, amended 2026-11-09).
+/// Returns 1, the error it counts.
+fn warn(step: &str, error: &dyn std::fmt::Display, cause_kind: CauseKind) -> usize {
+    tracing::debug!(
         event_type = "results_sweep_error",
         step,
         error = %error,
+        "a captured-results sweep step failed; the next sweep retries it"
+    );
+    tracing::warn!(
+        event_type = "results_sweep_error",
+        step,
+        cause_kind = cause_kind.as_str(),
         "a captured-results sweep step failed; the next sweep retries it"
     );
     1
@@ -449,7 +456,39 @@ async fn on_root<T: Send + 'static>(
     let root = Arc::clone(root);
     tokio::task::spawn_blocking(move || work(&root))
         .await
-        .map_err(|e| io::Error::other(join_failure_text("results root work", e)))?
+        .map_err(join_failure)?
+}
+
+/// A blocking task on the root that panicked or was cancelled, carried
+/// inside an [`io::Error`] as its own type, so [`cause_of`] can tell it
+/// from a filesystem error by type and never by text. It displays
+/// [`join_failure_text`]'s fixed words.
+#[derive(Debug)]
+struct JoinFailure(String);
+
+impl std::fmt::Display for JoinFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for JoinFailure {}
+
+fn join_failure(error: tokio::task::JoinError) -> io::Error {
+    io::Error::other(JoinFailure(join_failure_text("results root work", error)))
+}
+
+/// The closed cause of an [`on_root`] error: `unknown` for a task that
+/// failed to join, which is no filesystem fault, else the I/O kind.
+fn cause_of(error: &io::Error) -> CauseKind {
+    if error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<JoinFailure>)
+    {
+        CauseKind::Unknown
+    } else {
+        CauseKind::of_io(error)
+    }
 }
 
 /// Unlink every file in `ids`, stopping at the first failure. Returns how
@@ -476,13 +515,25 @@ async fn unlink_counting(root: &Arc<ResultsRoot>, ids: Vec<String>) -> (usize, u
             match root.unlink(id) {
                 Ok(true) => outcome.0 += 1,
                 Ok(false) => {}
-                Err(e) => outcome.1 += warn("unlinking a retired capture's file", &e),
+                Err(e) => {
+                    outcome.1 += warn(
+                        "unlinking a retired capture's file",
+                        &e,
+                        CauseKind::of_io(&e),
+                    );
+                }
             }
         }
         Ok(outcome)
     })
     .await;
-    unlinked.unwrap_or_else(|e| (0, warn("unlinking retired captures' files", &e)))
+    // The work returns no error of its own, so only the join can fail here.
+    unlinked.unwrap_or_else(|e| {
+        (
+            0,
+            warn("unlinking retired captures' files", &e, CauseKind::Unknown),
+        )
+    })
 }
 
 /// Unlink every file in `ids` last written at or before `cutoff`, logging
@@ -500,7 +551,11 @@ async fn remove_orphans(
                 Ok(Some(written)) => DateTime::<Utc>::from(written) <= cutoff,
                 Ok(None) => false,
                 Err(e) => {
-                    outcome.1 += warn("reading an unnamed capture file's age", &e);
+                    outcome.1 += warn(
+                        "reading an unnamed capture file's age",
+                        &e,
+                        CauseKind::of_io(&e),
+                    );
                     continue;
                 }
             };
@@ -510,13 +565,29 @@ async fn remove_orphans(
             match root.unlink(id) {
                 Ok(true) => outcome.0 += 1,
                 Ok(false) => {}
-                Err(e) => outcome.1 += warn("unlinking a capture file no row names", &e),
+                Err(e) => {
+                    outcome.1 += warn(
+                        "unlinking a capture file no row names",
+                        &e,
+                        CauseKind::of_io(&e),
+                    );
+                }
             }
         }
         Ok(outcome)
     })
     .await;
-    removed.unwrap_or_else(|e| (0, warn("removing capture files no row names", &e)))
+    // The work returns no error of its own, so only the join can fail here.
+    removed.unwrap_or_else(|e| {
+        (
+            0,
+            warn(
+                "removing capture files no row names",
+                &e,
+                CauseKind::Unknown,
+            ),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -537,6 +608,27 @@ mod tests {
             "{logged}"
         );
         assert_eq!(counted, 1);
+    }
+
+    /// A listing task that panics is not an I/O fault: its warning names
+    /// no I/O kind (#413 review), while a real filesystem error keeps its
+    /// own.
+    #[tokio::test]
+    async fn a_root_task_that_fails_to_join_has_no_io_cause() {
+        let joined = tokio::task::spawn_blocking(|| panic!("listing task panicked"))
+            .await
+            .unwrap_err();
+        let error = join_failure(joined);
+        assert_eq!(cause_of(&error), CauseKind::Unknown);
+        assert!(
+            !error.to_string().contains("listing task panicked"),
+            "{error}"
+        );
+        assert_eq!(
+            cause_of(&io::Error::from(io::ErrorKind::NotFound)),
+            CauseKind::IoNotFound
+        );
+        assert_eq!(cause_of(&io::Error::other("other")), CauseKind::IoOther);
     }
 
     #[test]

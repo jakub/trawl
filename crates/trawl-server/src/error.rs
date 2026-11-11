@@ -727,7 +727,8 @@ impl CauseKind {
     }
 
     /// The kind of an I/O error, from its [`std::io::ErrorKind`] alone.
-    pub(crate) fn of_io(err: &std::io::Error) -> Self {
+    /// Public so the `trawld` binary classifies its own I/O failures.
+    pub fn of_io(err: &std::io::Error) -> Self {
         use std::io::ErrorKind as K;
         match err.kind() {
             K::NotFound => Self::IoNotFound,
@@ -1151,8 +1152,7 @@ impl ServerError {
     /// The status and the envelope this error answers with, and the
     /// disclosure projection: the envelope's `message` is the public
     /// message every record stores ([`Self::safe_message`]). Pure: the
-    /// server-side log of a fault is [`Self::log_fault`]'s, written once
-    /// per response.
+    /// log of a fault is [`Self::log_fault`]'s, written once per response.
     ///
     /// No arm is a wildcard, here or in the nested `Store` match, and the
     /// lint below keeps it so: a new variant is a compile error until its
@@ -1231,7 +1231,8 @@ impl ServerError {
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::ResultTooLarge, err.to_string()),
             ),
-            // Database/IO errors are server-side — don't leak details.
+            // Database/IO errors answer without their details, which the
+            // log names by class and cause, with the text at DEBUG only.
             //
             // A cancellation caught at the bind-to-execute boundary answers
             // here too, deliberately: cancelling a running query has always
@@ -1286,8 +1287,8 @@ impl ServerError {
             ),
             // App-state store errors follow the ADR-0004 table. Backend
             // trouble is a 503 with pg diagnostics redacted from the wire
-            // (they are logged server-side); conflicts are 409 with their
-            // domain message; ownership misses are opaque 404s.
+            // (their text is logged at DEBUG only); conflicts are 409 with
+            // their domain message; ownership misses are opaque 404s.
             Self::Store(e) => match e {
                 StoreError::Unavailable(_) | StoreError::Migration(_) | StoreError::LockHeld => (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1613,8 +1614,8 @@ impl ServerError {
         }
     }
 
-    /// Log a server-side fault, which its response redacts: a store's
-    /// diagnostics, a report window's failure, an internal error.
+    /// Log a fault its response redacts: a store's diagnostics, a report
+    /// window's failure, an internal error.
     ///
     /// The ERROR event carries the class and the cause kind, never the
     /// error's text, which can quote the saved query, paths and driver

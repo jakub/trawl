@@ -645,6 +645,25 @@ silences the proxy's session, origin, and upstream diagnostics.
 A configuration-file failure happens before tracing starts. It appears on
 stderr with the resolved config path and never in stored telemetry.
 
+## Read the error text of a failure
+
+Every key with the `query` permission can read stored telemetry. So an event
+at INFO or above never carries the text of an error that trawl did not write,
+such as a driver message or an operating-system error with its path. It names
+the failure by its closed `cause_kind`, for example `io_permission_denied` or
+`io_storage_full`, and by `error_class` when the failure is a server error.
+`unknown` means that the code kept no typed cause. The text goes to a DEBUG
+event with the same `event_type` and target.
+
+To read that text, raise the event's own target to `debug` in `RUST_LOG`,
+restart trawld, and wait for the failure to recur. Each line names its target.
+Most events are on `trawl_server`, so add `trawl_server=debug`. Startup and
+boot events are on `trawld`, and app-state database failures are on
+`storage.backend`. The same filter feeds
+[`internal_telemetry`](/reference/configuration/#ingest), so while it is set,
+every key with `query` can read the text in `service=trawld`. Restore the
+default filter when you are done.
+
 ## Find authentication failures
 
 Symptom: a client reports 401 or 403, and a query for `service=trawld _producer=trawld`

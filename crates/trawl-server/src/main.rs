@@ -655,7 +655,12 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             trawl_server::monitor::run(state, config.server.monitor_refresh_ms, shutdown).await
         {
             // Terminal restore happens via TerminalGuard drop, so just log.
-            tracing::error!(event_type = "lifecycle", error = %e, "monitor error");
+            tracing::debug!(event_type = "lifecycle", error = %e, "monitor error");
+            tracing::error!(
+                event_type = "lifecycle",
+                cause_kind = trawl_server::error::CauseKind::of_io(&e).as_str(),
+                "monitor error"
+            );
         }
     } else {
         // Traditional mode: HTTP server runs on main, handles its own shutdown.
@@ -1227,13 +1232,23 @@ fn raise_nofile_limit() {
             nofile_hard = %rlimit_text(raised.maximum),
             "descriptor limit raised to the hard limit"
         ),
-        Err(error) => tracing::warn!(
-            event_type = "config_warning",
-            nofile_soft = %rlimit_text(inherited.current),
-            nofile_hard = %rlimit_text(inherited.maximum),
-            %error,
-            "could not raise the descriptor limit to the hard limit"
-        ),
+        Err(error) => {
+            tracing::debug!(
+                event_type = "config_warning",
+                nofile_soft = %rlimit_text(inherited.current),
+                nofile_hard = %rlimit_text(inherited.maximum),
+                %error,
+                "could not raise the descriptor limit to the hard limit"
+            );
+            tracing::warn!(
+                event_type = "config_warning",
+                nofile_soft = %rlimit_text(inherited.current),
+                nofile_hard = %rlimit_text(inherited.maximum),
+                cause_kind =
+                    trawl_server::error::CauseKind::of_io(&std::io::Error::from(error)).as_str(),
+                "could not raise the descriptor limit to the hard limit"
+            );
+        }
     }
 }
 

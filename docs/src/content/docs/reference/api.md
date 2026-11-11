@@ -4578,10 +4578,10 @@ Each `contradictory` or `failed` outcome also counts once in
 `CompactionStats.total_errors` for that tick. A `contradictory` marker
 repeats on every tick until an operator resolves it. The
 `publication_recovery_failed` log event for one marker names the env, the
-service, the marker path, and the `reason` or `error`. When recovery cannot
-list an env's WAL directory, the event carries only the env and the error,
-and nothing counts on this metric. A compaction tick lists the WAL root
+service, the marker path, and the `reason` or `cause_kind`. When recovery cannot
+list an env's WAL directory, the event carries only the env and the
+`cause_kind`, and nothing counts on this metric. A compaction tick lists the WAL root
 before recovery runs, and a failure of that listing counts under
 `wal_root_scan` and ends the tick before recovery. When that listing
 succeeds and recovery's own listing of the root fails, the event carries
-only the error and counts one `failed`.
+only `cause_kind=unknown` and counts one `failed`.

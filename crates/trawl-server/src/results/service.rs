@@ -265,7 +265,7 @@ use super::charge::{EvidenceBudget, Refusal, Reservation};
 use super::root::{self, Published, ResultsRoot, Verified};
 use super::{Entered, InFlight, ResultsState};
 use crate::deadline::{Deadline, Expired};
-use crate::error::{CaptureSourceKind, ServerError};
+use crate::error::{CaptureSourceKind, CauseKind, ServerError};
 use crate::from_saved::RunFile;
 use crate::investigations::service::{activity, unlink_evidence};
 use crate::investigations::step::{self, StepCompletion};
@@ -1834,9 +1834,14 @@ impl Drop for Uncommitted {
             return;
         }
         if let Err(error) = self.root.unlink(&self.id) {
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "results_unlink_failed",
                 error = %error,
+                "could not remove an uncommitted capture's file; the sweep removes it"
+            );
+            tracing::warn!(
+                event_type = "results_unlink_failed",
+                cause_kind = CauseKind::of_io(&error).as_str(),
                 "could not remove an uncommitted capture's file; the sweep removes it"
             );
         }
@@ -2732,11 +2737,18 @@ async fn expire_now(results: &ResultsState, row: &CaptureRow, now: DateTime<Utc>
     let id = row.id.clone();
     match tokio::task::spawn_blocking(move || root.unlink(&id)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(error)) => tracing::warn!(
-            event_type = "results_unlink_failed",
-            error = %error,
-            "could not remove an expired capture's file; the sweep removes it"
-        ),
+        Ok(Err(error)) => {
+            tracing::debug!(
+                event_type = "results_unlink_failed",
+                error = %error,
+                "could not remove an expired capture's file; the sweep removes it"
+            );
+            tracing::warn!(
+                event_type = "results_unlink_failed",
+                cause_kind = CauseKind::of_io(&error).as_str(),
+                "could not remove an expired capture's file; the sweep removes it"
+            );
+        }
         Err(error) => tracing::warn!(
             event_type = "results_unlink_failed",
             error = %crate::error::join_failure_text("capture unlink", error),

@@ -76,10 +76,16 @@ pub(crate) fn swap_envs(data_dir: &Path, shadow: &Path, aside: &Path) -> Result<
     if let Err(e) = std::fs::remove_dir_all(shadow)
         && e.kind() != std::io::ErrorKind::NotFound
     {
-        tracing::warn!(
+        tracing::debug!(
             event_type = "repin_shadow_sweep_failed",
             path = %shadow.display(),
             error = %e,
+            "failed to remove the spent shadow root"
+        );
+        tracing::warn!(
+            event_type = "repin_shadow_sweep_failed",
+            path = %shadow.display(),
+            cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
             "failed to remove the spent shadow root (harmless; retried \
              at the next boot's marker replay)"
         );
@@ -177,11 +183,18 @@ pub(crate) fn sweep_dir(path: &Path, what: &'static str) -> bool {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "repin_sweep_failed",
                 what,
                 path = %path.display(),
                 error = %e,
+                "failed to sweep a repin staging root"
+            );
+            tracing::warn!(
+                event_type = "repin_sweep_failed",
+                what,
+                path = %path.display(),
+                cause_kind = crate::error::CauseKind::of_io(&e).as_str(),
                 "failed to sweep a repin staging root; disk is not \
                  reclaimed until it is removed"
             );
@@ -274,9 +287,15 @@ pub(crate) fn finish_post_swap_staging(data_dir: &Path) {
         && shadow_swept
         && let Err(e) = crate::repin::marker::remove_marker(data_dir)
     {
-        tracing::warn!(
+        // `remove_marker` hands back text, so the kind is unknown here.
+        tracing::debug!(
             event_type = "repin_marker_error",
             error = %e,
+            "post-cutover marker removal failed"
+        );
+        tracing::warn!(
+            event_type = "repin_marker_error",
+            cause_kind = crate::error::CauseKind::Unknown.as_str(),
             "post-cutover marker removal failed; the repin itself is \
              complete and the next boot's replay retries the cleanup"
         );

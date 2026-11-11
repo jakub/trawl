@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use super::no_follow;
 use crate::env_dirs::{date_name, hour_dir, hour_name, hourly_file, parse_date, parse_hour};
+use crate::error::CauseKind;
 
 /// Marker file name prefix inside `wal_dir/{env}`.
 const MARKER_PREFIX: &str = ".publish-";
@@ -917,10 +918,16 @@ pub fn recover(
             Ok(markers) => markers,
             Err(e) => {
                 let error = format!("failed to list {}: {e}", env_dir.display());
-                tracing::error!(
+                tracing::debug!(
                     event_type = "publication_recovery_failed",
                     env = %env,
                     error = %error,
+                    "cannot list publication markers; the env stays blocked"
+                );
+                tracing::error!(
+                    event_type = "publication_recovery_failed",
+                    env = %env,
+                    cause_kind = CauseKind::of_io(&e).as_str(),
                     "cannot list publication markers; the env stays blocked"
                 );
                 report.unlisted_envs.push((env, error));
@@ -979,14 +986,26 @@ fn log_outcome(env: &str, service: &str, marker: &Path, result: &Result<Recovery
                 "contradictory publication marker; nothing touched and the service stays blocked"
             );
         }
-        Err(error) => tracing::error!(
-            event_type = "publication_recovery_failed",
-            env = %env,
-            compact_service = %service,
-            marker = %marker.display(),
-            error = %error,
-            "publication recovery failed; the service stays blocked until a later pass"
-        ),
+        // The text mixes marker I/O, hash I/O and fixed wording and keeps
+        // no typed source, so it goes to DEBUG only.
+        Err(error) => {
+            tracing::debug!(
+                event_type = "publication_recovery_failed",
+                env = %env,
+                compact_service = %service,
+                marker = %marker.display(),
+                error = %error,
+                "publication recovery failed; the service stays blocked until a later pass"
+            );
+            tracing::error!(
+                event_type = "publication_recovery_failed",
+                env = %env,
+                compact_service = %service,
+                marker = %marker.display(),
+                cause_kind = CauseKind::Unknown.as_str(),
+                "publication recovery failed; the service stays blocked until a later pass"
+            );
+        }
     }
 }
 

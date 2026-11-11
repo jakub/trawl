@@ -1,8 +1,8 @@
 `retained-events.tsv` is the inventory that issue #412's third acceptance
-criterion asks for. It has one row for every INFO, WARN and ERROR emission in
-non-test `crates/trawl-server/src` code, and one row for every call of a
-logging helper that takes an error value from its caller. Each row has a
-disposition: `changed`, `unchanged: <reason>` or `D2b`.
+criterion asks for, and that issue #413 completes. It has one row for every
+INFO, WARN and ERROR emission in non-test `crates/trawl-server/src` code, and
+one row for every call of a logging helper that takes an error value from its
+caller. Each row has a disposition: `changed` or `unchanged: <reason>`.
 
 - `enumerate.py` finds the rows. It is the list. The `rg` search in the TSV
   header is only a help: it misses shorthand fields, plain string fields and
@@ -31,18 +31,20 @@ They are sources, not log events, so the list is not empty.
 
 `--check` compares every line except the `# sha:` line. The script exits
 non-zero and names the row when a site has no disposition, when a disposition
-has no site, or when a disposition is blank or not one of the three forms.
+has no site, or when a disposition is blank or not one of the two forms.
 After a fix commit moves lines, run the script again. If a commit adds or
 removes an emission, add or remove its key in `dispositions.tsv` first.
 
 The dispositions follow these rules:
 
-- `changed`: a commit of this pull request changed the emission. It now
-  logs `error_class` and `cause_kind`, a fixed sentence or
-  `join_failure_text`, and puts the error text in a DEBUG event.
-- `D2b`: the error text comes only from `std::io::Error`, directly or through
-  a `String` built from one with trawl's own words and paths. Issue #413
-  handles these rows.
+- `changed`: issue #412 or #413 changed the emission, and it now carries
+  no foreign error text. A #412 row logs `error_class` and `cause_kind`, a
+  fixed sentence or `join_failure_text`. A #413 row's text came from
+  `std::io::Error`, directly or through a `String` built from one: it logs
+  `cause_kind` from the error's `io::ErrorKind`, or `unknown` where only the
+  `String` reaches the log site, plus `error_class` where the site already
+  builds a `ServerError`. Either way the error text goes to a DEBUG event with
+  the same `event_type` and target.
 - `unchanged: <reason>`: the event carries no foreign error text, or a
   decision keeps it. The reason says which.
 

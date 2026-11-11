@@ -461,20 +461,34 @@ impl Ranking {
         match error {
             FirstEnvNamesError::Cancelled => ServerError::Engine(EngineError::Cancelled),
             FirstEnvNamesError::Root(error) => {
-                tracing::warn!(
+                tracing::debug!(
                     dir = %self.base_dir,
                     error = %error,
                     "failed to list env directories for retention reach"
                 );
-                ServerError::EnvListing(error)
+                let error = ServerError::EnvListing(error);
+                tracing::warn!(
+                    dir = %self.base_dir,
+                    error_class = error.error_class(),
+                    cause_kind = error.cause_kind().as_str(),
+                    "failed to list env directories for retention reach"
+                );
+                error
             }
             FirstEnvNamesError::Entry { path, error } => {
-                tracing::warn!(
+                tracing::debug!(
                     path = %path.display(),
                     error = %error,
                     "failed to read an env directory for retention reach"
                 );
-                ServerError::EnvListing(error)
+                let error = ServerError::EnvListing(error);
+                tracing::warn!(
+                    path = %path.display(),
+                    error_class = error.error_class(),
+                    cause_kind = error.cause_kind().as_str(),
+                    "failed to read an env directory for retention reach"
+                );
+                error
             }
         }
     }
