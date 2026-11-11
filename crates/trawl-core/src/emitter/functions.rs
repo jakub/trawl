@@ -5,6 +5,7 @@
 use super::EmitError;
 use super::fields::quote_field;
 use crate::aggregate::Aggregate;
+use crate::ast::{Expr, LiteralValue, Spanned};
 use crate::parser::suggest;
 
 /// Known function names accepted by the emitter (canonical list in `parser::suggest`).
@@ -12,10 +13,8 @@ pub(crate) use crate::parser::suggest::KNOWN_FUNCTIONS;
 
 /// Validate that a function name is known and argument count is correct.
 ///
-/// Single source of truth for arity: read by pre-emission validation
-/// (`validate.rs`), by the argument walk (`emit_call_args`) and by the
-/// stream compiler (`stream::validate_expr` for a call, and
-/// `stream::compile_agg_expr` for an aggregation slot's head).
+/// Single source of truth for arity: [`check_call`] runs it first, for
+/// every call in every position.
 pub(crate) fn validate_function_arity(name: &str, argc: usize) -> Result<(), EmitError> {
     if !KNOWN_FUNCTIONS.contains(&name) {
         return Err(EmitError::UnknownFunction {
@@ -32,7 +31,7 @@ pub(crate) fn validate_function_arity(name: &str, argc: usize) -> Result<(), Emi
             (n, Some(m)) if n == m => format!("{name}() requires exactly {n} argument(s)"),
             (min, Some(max)) => format!("{name}() requires {min} to {max} arguments"),
             (1, None) => format!("{name}() requires at least one argument"),
-            (min, None) => format!("{name}() requires at least {min} argument(s)"),
+            (min, None) => format!("{name}() requires at least {min} arguments"),
         };
         return Err(EmitError::InvalidAggregation { message });
     }
@@ -91,12 +90,12 @@ pub const DATE_PART_UNITS: &[&str] = &[
 /// Arg positions (0-indexed) that must be string literals drawn from a
 /// closed vocabulary — date/time unit names, and `sev()`'s dialect.
 ///
-/// Returns `(arg_index, allowlist)` pairs. `emit_call_args` calls
-/// `validate_unit_literal` for each returned pair, and so does
-/// `stream::validate_expr`, which is the point of the table: the SSE lane
-/// and the `extract kv` batch tail never run `translate_function`, so a
-/// vocabulary they cannot honour has to be refused from the shared table
-/// or it would 400 in batch and silently null live.
+/// Returns `(arg_index, allowlist)` pairs. [`check_call`] runs
+/// `validate_unit_literal` for each returned pair, which is the point of
+/// the table: the SSE lane and the `extract kv` batch tail never run
+/// `translate_function`, so a vocabulary they cannot honour has to be
+/// refused from the shared table or it would 400 in batch and silently
+/// null live.
 pub(crate) fn unit_literal_positions(name: &str) -> &'static [(usize, &'static [&'static str])] {
     match name {
         "date_part" => &[(0, DATE_PART_UNITS)],
@@ -204,10 +203,9 @@ fn literal_noun(func_name: &str) -> &'static str {
 
 /// Arg position (0-indexed) of a `strftime`/`strptime` format string, if any.
 ///
-/// When the arg at this index is a string literal, both the batch
-/// (`emit_call_args`) and streaming (`stream::validate_expr`) paths run it
-/// through `validate_format_literal` so an invalid code is rejected
-/// identically.
+/// When the arg at this index is a string literal, [`check_call`] runs it
+/// through `validate_format_literal`, so an invalid code is rejected the
+/// same way in every lane.
 pub(crate) fn format_literal_position(name: &str) -> Option<usize> {
     match name {
         // DSL arg order: strftime(ts, fmt), strptime(str, fmt) — fmt is index 1.
@@ -272,6 +270,55 @@ pub(crate) fn validate_format_literal(func_name: &str, fmt: &str) -> Result<(), 
         });
     }
     Ok(())
+}
+
+/// One call's own rules, in the order ADR-0001 (Amendment 2026-11-11)
+/// fixes: the name, then the argument count, then each literal position
+/// that is present, in ascending order. An absent optional position
+/// (`round(x)`, `sev(x)`) is skipped. The arguments themselves are not
+/// visited: the caller walks them.
+///
+/// The one body of the rule. `calls::check_calls` runs it on every call
+/// in a pipeline, and `emit_call_args` runs it as its precondition.
+pub(crate) fn check_call(name: &str, args: &[Spanned<Expr>]) -> Result<(), EmitError> {
+    validate_function_arity(name, args.len())?;
+    let int_positions = literal_int_positions(name);
+    let unit_positions = unit_literal_positions(name);
+    let format_position = format_literal_position(name);
+    for (i, arg) in args.iter().enumerate() {
+        if int_positions.contains(&i) {
+            int_literal_arg(name, i, &arg.node)?;
+        } else if let Some((_, allowlist)) = unit_positions.iter().find(|(pos, _)| *pos == i) {
+            validate_unit_literal(name, i, allowlist, string_literal(&arg.node))?;
+        } else if format_position == Some(i)
+            && let Some(format) = string_literal(&arg.node)
+        {
+            // A computed format cannot be checked up front and keeps its
+            // runtime behaviour (eval nulls).
+            validate_format_literal(name, format)?;
+        }
+    }
+    Ok(())
+}
+
+/// The integer an integer-literal position (`literal_int_positions`)
+/// holds. Anything else is refused, including `-1`, which parses as a
+/// negation of `1` rather than as a literal.
+pub(crate) fn int_literal_arg(name: &str, index: usize, arg: &Expr) -> Result<i64, EmitError> {
+    match arg {
+        Expr::Literal(LiteralValue::Int(n)) => Ok(*n),
+        _ => Err(EmitError::InvalidAggregation {
+            message: format!("{name}() argument {} must be an integer literal", index + 1),
+        }),
+    }
+}
+
+/// The text of a string literal argument; `None` for anything else.
+fn string_literal(arg: &Expr) -> Option<&str> {
+    match arg {
+        Expr::Literal(LiteralValue::String(s)) => Some(s),
+        _ => None,
+    }
 }
 
 /// Translate a DSL function call to `DuckDB` SQL.

@@ -12,9 +12,8 @@ use super::EmitError;
 use super::SqlValue;
 use super::compare::{NullPolicy, comparison_sql, in_list_sql, pattern_target};
 use super::functions::{
-    absent_argument_type, format_literal_position, json_read_positions, literal_int_positions,
-    literal_text_positions, translate_function, unit_literal_positions, validate_format_literal,
-    validate_function_arity, validate_unit_literal,
+    absent_argument_type, check_call, int_literal_arg, json_read_positions, literal_int_positions,
+    literal_text_positions, translate_function,
 };
 use super::relation::Nullness;
 use super::state::{EmitterState, Use};
@@ -65,9 +64,10 @@ pub(crate) fn emit_expr(
     }
 }
 
-/// Translate one call's arguments, applying every per-position rule the
-/// function declares: literal ints, closed-vocabulary literals, format
-/// strings, and the literals read through `to_json`.
+/// Translate one call's arguments, after [`check_call`] has passed the
+/// call: integer positions inline as literals, closed-vocabulary tokens
+/// that choose the emitted expression reach the translation as text, and
+/// literals read through `to_json` carry their own type.
 ///
 /// The one argument walk for every position a call can sit in: the
 /// expression arm above and every aggregation call site
@@ -80,51 +80,28 @@ pub(crate) fn emit_call_args(
     args: &[Spanned<Expr>],
     state: &mut EmitterState,
 ) -> Result<Vec<String>, EmitError> {
+    // The call's own rules first, parent before its arguments, so emit
+    // refuses in the order every other lane does.
+    check_call(name, args)?;
     let lit_positions = literal_int_positions(name);
-    let unit_positions = unit_literal_positions(name);
     let text_positions = literal_text_positions(name);
     let json_positions = json_read_positions(name);
-    let fmt_position = format_literal_position(name);
-    if !lit_positions.is_empty() || !unit_positions.is_empty() {
-        // Arity before vocabulary: a call carrying an argument the
-        // function does not have must say so, rather than complaining
-        // about a literal at a position that is not a literal position
-        // at all. Scoped to the functions with literal positions
-        // because only they inspect an argument before
-        // `translate_function`'s own arity guard runs, and for those
-        // the table's message is the guard's, word for word.
-        validate_function_arity(name, args.len())?;
-    }
     let translated_args: Vec<String> = args
         .iter()
         .enumerate()
         .map(|(i, a)| {
             if lit_positions.contains(&i) {
                 // DuckDB requires certain args as literal ints, not parameters
+                int_literal_arg(name, i, &a.node).map(|n| n.to_string())
+            } else if text_positions.contains(&i) {
+                // The token chooses the emitted expression (`sev()`'s
+                // dialect), so it is never a bound parameter:
+                // `translate_function` has to read it. Case-folded here,
+                // so the vocabulary check and the dialect parse downstream
+                // read one spelling.
                 match &a.node {
-                    Expr::Literal(LiteralValue::Int(n)) => Ok(n.to_string()),
-                    _ => Err(EmitError::InvalidAggregation {
-                        message: format!("{name}() argument {} must be an integer literal", i + 1),
-                    }),
-                }
-            } else if let Some((_, allowlist)) = unit_positions.iter().find(|(pos, _)| *pos == i) {
-                // Date/time unit args must be string literals from the allowlist.
-                let raw = match &a.node {
-                    Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
-                    _ => None,
-                };
-                validate_unit_literal(name, i, allowlist, raw)?;
-                if text_positions.contains(&i) {
-                    // The token chooses the emitted expression
-                    // (`sev()`'s dialect), so it is never a bound
-                    // parameter: `translate_function` has to read it.
-                    // Case-folded here, so the vocabulary check and the
-                    // dialect parse downstream read one spelling.
-                    Ok(raw
-                        .expect("a non-literal was refused above")
-                        .to_ascii_lowercase())
-                } else {
-                    emit_expr(a, state)
+                    Expr::Literal(LiteralValue::String(s)) => Ok(s.to_ascii_lowercase()),
+                    _ => unreachable!("check_call refuses a non-literal {name}() dialect"),
                 }
             } else if json_positions.contains(&i)
                 && let Some(literal) = bare_literal(&a.node)
@@ -135,16 +112,6 @@ pub(crate) fn emit_call_args(
                 // binds as anyway.
                 Ok(typed_literal(&literal, state))
             } else {
-                if fmt_position == Some(i) {
-                    // strftime/strptime format arg: reject invalid format
-                    // codes at emit time when it is a string literal, so
-                    // batch and streaming fail identically. A non-literal
-                    // (field ref) can't be checked here and keeps its
-                    // runtime behaviour (eval nulls).
-                    if let Expr::Literal(LiteralValue::String(s)) = &a.node {
-                        validate_format_literal(name, s)?;
-                    }
-                }
                 match absent_argument_type(name, i).map(|ty| (ty, state.nullness(&a.node))) {
                     // A NULL with no type of its own (an absent field,
                     // `coalesce` of absent fields) takes the type the call

@@ -31,9 +31,9 @@ struct Refusal {
 /// Emit's refusal of each single-defect call, in a SQL position: a `where`
 /// condition, a `let`/`eval` value, and an aggregation head or operand.
 ///
-/// `case(x)` has two sentences today: a `let` value reaches
-/// `translate_function`'s own guard ("arguments"), and a `stats` head is
-/// refused by the arity table ("argument(s)").
+/// `case(x)` once had two sentences: the arity table said "argument(s)"
+/// where emit's SQL-position guard said "arguments". The table now says
+/// what the guard says, in every position.
 const BASELINE: &[Refusal] = &[
     // unknown name, with a suggestion
     Refusal {
@@ -135,7 +135,7 @@ const BASELINE: &[Refusal] = &[
     },
     Refusal {
         query: "* | stats case(x)",
-        display: "invalid aggregation: case() requires at least 2 argument(s)",
+        display: "invalid aggregation: case() requires at least 2 arguments",
         hint: None,
     },
     // integer-literal position
