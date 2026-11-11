@@ -1,0 +1,68 @@
+release-stack.sh for #447, tree depth limit
+sha:      db9cdad86ec0f4e32b13ec6f205bae3c5a53769e
+rustc:    rustc 1.98.0 (88d9e12ae 2026-08-18)
+arch:     x86_64
+ulimit -s: 2048 KiB
+profile:  release (evidence-447/release/trawl)
+limits:   MAX_TREE_DEPTH=64 MAX_QUERY_LEN=65536
+date:     2026-11-11T19:48:00Z
+
+== every shape at depth 64: a row, or a marked semantic refusal ==
+plus chain                       depth=64     bytes=267    exit=0   row
+or chain                         depth=64     bytes=700    exit=0   row
+and chain                        depth=64     bytes=709    exit=0   row
+minus run                        depth=64     bytes=78     exit=0   row
+not run                          depth=64     bytes=268    exit=0   row
+chain as in subject              depth=64     bytes=271    exit=0   row
+chain as in element              depth=64     bytes=273    exit=0   row
+chain as call argument           depth=64     bytes=285    exit=0   row
+chain under pass-through calls   depth=64     bytes=365    exit=0   row
+pass-through calls in where      depth=64     bytes=363    exit=0   row
+let                              depth=64     bytes=269    exit=0   row
+stats                            depth=64     bytes=272    exit=0   row
+timechart                        depth=64     bytes=284    exit=0   row
+eventstats                       depth=64     bytes=282    exit=0   row
+pivot                            depth=64     bytes=277    exit=0   row
+where after extract kv           depth=64     bytes=713    exit=0   row
+search NOT run                   depth=64     bytes=259    exit=0   row
+search brackets                  depth=64     bytes=195    exit=0   row
+search NOT and brackets          depth=64     bytes=227    exit=0   row
+
+== every shape at depth 65: the depth refusal ==
+plus chain                       depth=65     bytes=271    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+or chain                         depth=65     bytes=711    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+and chain                        depth=65     bytes=720    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+minus run                        depth=65     bytes=79     exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+not run                          depth=65     bytes=272    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+chain as in subject              depth=65     bytes=275    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+chain as in element              depth=65     bytes=277    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+chain as call argument           depth=65     bytes=289    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+chain under pass-through calls   depth=65     bytes=369    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+pass-through calls in where      depth=65     bytes=367    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+let                              depth=65     bytes=273    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+stats                            depth=65     bytes=276    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+timechart                        depth=65     bytes=288    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+eventstats                       depth=65     bytes=286    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+pivot                            depth=65     bytes=281    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+where after extract kv           depth=65     bytes=724    exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+search NOT run                   depth=65     bytes=263    exit=1   refused: trawl: parse error: search is deeper than 64 levels
+search brackets                  depth=65     bytes=198    exit=1   refused: trawl: parse error: search is deeper than 64 levels
+search NOT and brackets          depth=65     bytes=231    exit=1   refused: trawl: parse error: search is deeper than 64 levels
+
+== the longest texts (MAX_QUERY_LEN 65536 bytes) ==
+where chain, 32000 terms         depth=32000  bytes=64013  exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+let chain, 32000 terms           depth=32000  bytes=64011  exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+stats chain, 32000 terms         depth=32000  bytes=64014  exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+minus run, longest               depth=max    bytes=65536  exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+not run, longest                 depth=max    bytes=65535  exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+NOT run, longest                 depth=max    bytes=65533  exit=1   refused: trawl: parse error: search is deeper than 64 levels
+brackets, longest                depth=max    bytes=65535  exit=1   refused: trawl: parse error: search is deeper than 64 levels
+chain as in subject, longest     depth=max    bytes=65536  exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+chain as in element, longest     depth=max    bytes=65535  exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+chain as call argument, longest  depth=max    bytes=65536  exit=1   refused: trawl: parse error: expression is deeper than 64 levels
+deep expression, grammar error   depth=32000  bytes=64021  exit=1   refused: trawl: parse error: found end of input, expected expression
+deep search, grammar error       depth=30000  bytes=60011  exit=1   refused: trawl: parse error: search is deeper than 64 levels
+let alias chain, 4000 links      depth=4000   bytes=57782  exit=1   refused: trawl: database error: Binder Error: Max expression depth limit of 1000 exceeded. Use "SET max_expression_depth TO x" to increase the maximu…
+
+summary: aborts=0 unexpected=0
+arm64 was not measured; this capture is x86_64 only.
