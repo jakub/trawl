@@ -248,8 +248,91 @@ pub(crate) fn scheduled_cap(permits: usize) -> usize {
     (permits / 2).max(1)
 }
 
+/// How many manual runs may be in flight on a pool of `permits` executor
+/// permits: a quarter of them, at least 1 (ADR-0018, amended
+/// 2026-11-11). Separate from [`scheduled_cap`], so a busy scheduler never
+/// refuses Run now and Run now never defers a schedule.
+pub(crate) fn manual_cap(permits: usize) -> usize {
+    (permits / 4).max(1)
+}
+
+/// A manual run refused by its gate ([`ExecutorPool::try_lease_manual`]):
+/// the caller's key already holds a manual run, or the installation-wide
+/// cap is full. Nothing was taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManualBusy {
+    /// Advisory whole seconds until the refusing holder's estimated end,
+    /// at least 1.
+    pub retry_after_secs: u64,
+}
+
+/// The gate on manual runs in flight: one per key, [`manual_cap`] in all.
+///
+/// The map is the whole state. It holds one entry per active manual
+/// lease, keyed by the caller's key id, with that run's estimated end, and
+/// metadata only: never a reference back to a lease.
+#[derive(Debug)]
+struct ManualGate {
+    limit: usize,
+    holders: Mutex<HashMap<i64, Instant>>,
+}
+
+impl ManualGate {
+    /// Take a place for `key_id`, estimated to end `estimate` after `now`,
+    /// or refuse, deciding under one short lock with no await: a key that
+    /// already holds a place is refused with its own estimate, a full gate
+    /// with its earliest holder's. Both limits are taken together or not
+    /// at all.
+    fn try_take(
+        self: &Arc<Self>,
+        key_id: i64,
+        estimate: Duration,
+        now: Instant,
+    ) -> Result<ManualSlot, ManualBusy> {
+        let mut holders = self.holders.lock();
+        let refusing = if let Some(&end) = holders.get(&key_id) {
+            Some(end)
+        } else if holders.len() >= self.limit {
+            holders.values().min().copied()
+        } else {
+            None
+        };
+        if let Some(end) = refusing {
+            return Err(ManualBusy {
+                retry_after_secs: crate::results::charge::ceil_secs(
+                    end.saturating_duration_since(now),
+                ),
+            });
+        }
+        // An absurd estimate saturates instead of overflowing the clock.
+        let end = now
+            .checked_add(estimate)
+            .unwrap_or_else(|| now + Duration::from_secs(u64::from(u32::MAX)));
+        holders.insert(key_id, end);
+        Ok(ManualSlot {
+            gate: Arc::clone(self),
+            key_id,
+        })
+    }
+}
+
+/// One manual run's place in [`ManualGate`], shared by every clone of its
+/// [`RunLease`]. Its drop, when the last clone goes, removes the key's
+/// entry, so the gate holds only active leases.
+struct ManualSlot {
+    gate: Arc<ManualGate>,
+    key_id: i64,
+}
+
+impl Drop for ManualSlot {
+    fn drop(&mut self) {
+        self.gate.holders.lock().remove(&self.key_id);
+    }
+}
+
 /// One run's place in a cap on runs in flight: a scheduled run's
-/// ([`ExecutorPool::try_lease_scheduled`]).
+/// ([`ExecutorPool::try_lease_scheduled`]) or a manual run's
+/// ([`ExecutorPool::try_lease_manual`]).
 ///
 /// Clones share one charge, which returns its place when the last clone
 /// drops. A run's place lasts until its physical work ends, not until its
@@ -1531,6 +1614,9 @@ pub struct ExecutorPool {
     /// The cap on scheduled runs in flight ([`scheduled_cap`]), one
     /// permit per scheduled [`RunLease`].
     scheduled: Arc<Semaphore>,
+    /// The gate on manual runs in flight ([`manual_cap`]), one entry per
+    /// manual [`RunLease`].
+    manual: Arc<ManualGate>,
     /// The query scratch directory: the query database spills into it, and
     /// hot-buffer snapshots and export staging files are made in it
     /// (ADR-0056). Its lock is not held here but by every connection to
@@ -1867,6 +1953,10 @@ impl ExecutorPool {
             clone_source: Arc::new(Mutex::new(root)),
             preparation,
             scheduled: Arc::new(Semaphore::new(scheduled_cap(max_concurrent))),
+            manual: Arc::new(ManualGate {
+                limit: manual_cap(max_concurrent),
+                holders: Mutex::new(HashMap::new()),
+            }),
             scratch: query_scratch,
             #[cfg(any(test, feature = "test-support"))]
             _test_scratch: None,
@@ -2833,6 +2923,64 @@ impl ExecutorPool {
         self.scheduled.available_permits()
     }
 
+    /// How many scheduled-run leases are held right now.
+    #[must_use]
+    pub fn scheduled_leases_in_use(&self) -> usize {
+        self.scheduled_lease_limit()
+            .saturating_sub(self.scheduled.available_permits())
+    }
+
+    /// The cap on scheduled runs in flight ([`scheduled_cap`]).
+    #[must_use]
+    pub fn scheduled_lease_limit(&self) -> usize {
+        scheduled_cap(self.max_concurrent)
+    }
+
+    /// Take a manual run's lease for the caller's key `key_id`, or refuse,
+    /// and never wait (ADR-0018, amended 2026-11-11): one manual run per
+    /// key, [`manual_cap`] across the installation. `estimate` is how long
+    /// the run may take, from which a refusal derives its advisory
+    /// `Retry-After`. The lease's clones share one place, which returns
+    /// when the last of them drops.
+    ///
+    /// # Errors
+    /// [`ManualBusy`] when the key already holds a manual run or the cap
+    /// is full; the refusal holds nothing.
+    pub fn try_lease_manual(
+        &self,
+        key_id: i64,
+        estimate: Duration,
+    ) -> Result<RunLease, ManualBusy> {
+        self.try_lease_manual_at(key_id, estimate, Instant::now())
+    }
+
+    fn try_lease_manual_at(
+        &self,
+        key_id: i64,
+        estimate: Duration,
+        now: Instant,
+    ) -> Result<RunLease, ManualBusy> {
+        let slot = self.manual.try_take(key_id, estimate, now)?;
+        Ok(RunLease {
+            charge: Arc::new(slot),
+            #[cfg(any(test, feature = "test-support"))]
+            seams: Arc::clone(&self.seams),
+        })
+    }
+
+    /// How many manual-run leases are held right now: one per key holding
+    /// one.
+    #[must_use]
+    pub fn manual_leases_in_use(&self) -> usize {
+        self.manual.holders.lock().len()
+    }
+
+    /// The cap on manual runs in flight ([`manual_cap`]).
+    #[must_use]
+    pub fn manual_lease_limit(&self) -> usize {
+        self.manual.limit
+    }
+
     /// Prepare query text on the blocking pool, behind the preparation
     /// allowance and never behind an executor permit
     /// ([`crate::prepare::Preparation::run`]).
@@ -3434,6 +3582,231 @@ mod tests {
         );
         drop(hold);
         assert_eq!(clone.scheduled_leases_available(), 2);
+    }
+
+    /// The run gates follow the pool: manual runs in flight are capped at
+    /// a quarter of the permits and scheduled runs at half, each at least
+    /// one (ADR-0018, amended 2026-11-11), and each gate admits exactly
+    /// its limit.
+    #[test]
+    fn run_gate_limits_follow_the_pool() {
+        for (permits, manual, scheduled) in [(1, 1, 1), (2, 1, 1), (3, 1, 1), (4, 1, 2), (8, 2, 4)]
+        {
+            assert_eq!(manual_cap(permits), manual, "{permits} permits");
+            assert_eq!(scheduled_cap(permits), scheduled, "{permits} permits");
+
+            let pool = ExecutorPool::for_test("/nonexistent".into(), permits, 100, None).unwrap();
+            assert_eq!(pool.manual_lease_limit(), manual, "{permits} permits");
+            assert_eq!(pool.scheduled_lease_limit(), scheduled, "{permits} permits");
+
+            let manual_leases: Vec<RunLease> = (0..manual)
+                .map(|key| {
+                    pool.try_lease_manual(i64::try_from(key).unwrap(), Duration::from_secs(60))
+                        .expect("a free manual lease")
+                })
+                .collect();
+            assert!(
+                pool.try_lease_manual(-1, Duration::from_secs(60)).is_err(),
+                "{permits} permits: the manual gate is full at {manual}"
+            );
+            assert_eq!(pool.manual_leases_in_use(), manual);
+
+            let scheduled_leases: Vec<RunLease> = (0..scheduled)
+                .map(|_| pool.try_lease_scheduled().expect("a free scheduled lease"))
+                .collect();
+            assert!(
+                pool.try_lease_scheduled().is_none(),
+                "{permits} permits: the scheduled cap is full at {scheduled}"
+            );
+            assert_eq!(pool.scheduled_leases_in_use(), scheduled);
+
+            drop(manual_leases);
+            drop(scheduled_leases);
+            assert_eq!(pool.manual_leases_in_use(), 0);
+            assert_eq!(pool.scheduled_leases_in_use(), 0);
+        }
+    }
+
+    /// The manual gate takes both limits or neither, under concurrent
+    /// requests from many keys and from repeated keys: the admitted count
+    /// never exceeds the installation-wide limit, a key never holds two
+    /// places, a refused request holds nothing, and the key map holds
+    /// exactly the active leases after every drop. A lease's clones share
+    /// one entry, which stays until the last clone drops. A refusal's
+    /// Retry-After reads the refusing key's own estimate when the key
+    /// holds a place, else the earliest holder's, rounded up and at least
+    /// one second.
+    #[test]
+    fn manual_gate_acquires_atomically() {
+        // 8 permits: 2 manual places.
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 8, 100, None).unwrap();
+        assert_eq!(pool.manual_lease_limit(), 2);
+        manual_gate_under_contention(&pool);
+        manual_gate_one_at_a_time(&pool);
+    }
+
+    /// [`manual_gate_acquires_atomically`]'s concurrent phase: 16 threads
+    /// over 6 keys, so most keys are requested from several threads at
+    /// once.
+    fn manual_gate_under_contention(pool: &ExecutorPool) {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        const THREADS: usize = 16;
+        const ROUNDS: usize = 300;
+        const KEYS: usize = 6;
+
+        let limit = pool.manual_lease_limit();
+        let live = Arc::new(AtomicUsize::new(0));
+        let per_key: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..KEYS).map(|_| AtomicUsize::new(0)).collect());
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let pool = pool.clone();
+                let (live, per_key, admitted, refused, start) = (
+                    Arc::clone(&live),
+                    Arc::clone(&per_key),
+                    Arc::clone(&admitted),
+                    Arc::clone(&refused),
+                    Arc::clone(&start),
+                );
+                std::thread::spawn(move || {
+                    start.wait();
+                    for round in 0..ROUNDS {
+                        let key = (thread + round) % KEYS;
+                        let Ok(lease) = pool
+                            .try_lease_manual(i64::try_from(key).unwrap(), Duration::from_secs(30))
+                        else {
+                            refused.fetch_add(1, Ordering::SeqCst);
+                            assert!(pool.manual_leases_in_use() <= limit);
+                            continue;
+                        };
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                        let now_live = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        assert!(now_live <= limit, "{now_live} admitted at once");
+                        let holders = per_key[key].fetch_add(1, Ordering::SeqCst) + 1;
+                        assert_eq!(holders, 1, "key {key} holds two places");
+                        assert!(pool.manual_leases_in_use() <= limit);
+                        // Some leases travel as clones and holds, as a
+                        // run's do; the place lasts until the last drops.
+                        let kept = (round % 3 == 0).then(|| lease.clone().into_hold());
+                        std::thread::yield_now();
+                        per_key[key].fetch_sub(1, Ordering::SeqCst);
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        drop(lease);
+                        drop(kept);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker
+                .join()
+                .expect("a worker found the gate over its limit");
+        }
+        assert!(admitted.load(Ordering::SeqCst) > 0);
+        assert!(refused.load(Ordering::SeqCst) > 0, "the requests contended");
+        assert_eq!(
+            pool.manual_leases_in_use(),
+            0,
+            "every entry left with its last lease"
+        );
+    }
+
+    /// [`manual_gate_acquires_atomically`]'s sequential phase: the map
+    /// size is the active leases after every drop, a refusal adds
+    /// nothing, clones share one entry, and Retry-After reads the right
+    /// holder.
+    fn manual_gate_one_at_a_time(pool: &ExecutorPool) {
+        let now = Instant::now();
+        let later = pool
+            .try_lease_manual_at(1, Duration::from_secs(30), now)
+            .expect("a free place");
+        assert_eq!(pool.manual_leases_in_use(), 1);
+        assert_eq!(
+            pool.try_lease_manual_at(1, Duration::from_secs(5), now + Duration::from_millis(500))
+                .map(drop),
+            Err(ManualBusy {
+                retry_after_secs: 30
+            }),
+            "a key holding a place is refused with its own estimate, in a gate not full"
+        );
+        assert_eq!(pool.manual_leases_in_use(), 1, "a refusal holds nothing");
+        let earlier = pool
+            .try_lease_manual_at(2, Duration::from_secs(10), now)
+            .expect("the second place");
+        assert_eq!(pool.manual_leases_in_use(), 2);
+
+        let half = now + Duration::from_millis(500);
+        assert_eq!(
+            pool.try_lease_manual_at(1, Duration::from_secs(5), half)
+                .map(drop),
+            Err(ManualBusy {
+                retry_after_secs: 30
+            }),
+            "the key's own estimate, not the earliest holder's"
+        );
+        assert_eq!(
+            pool.try_lease_manual_at(3, Duration::from_secs(5), half)
+                .map(drop),
+            Err(ManualBusy {
+                retry_after_secs: 10
+            }),
+            "a full gate answers with its earliest holder, rounded up"
+        );
+        assert_eq!(
+            pool.try_lease_manual_at(3, Duration::from_secs(5), now + Duration::from_secs(20))
+                .map(drop),
+            Err(ManualBusy {
+                retry_after_secs: 1
+            }),
+            "an expired estimate still gives one second"
+        );
+        assert_eq!(
+            pool.try_lease_manual_at(1, Duration::from_secs(5), now + Duration::from_secs(40))
+                .map(drop),
+            Err(ManualBusy {
+                retry_after_secs: 1
+            }),
+            "the key's own expired estimate gives one second"
+        );
+        assert_eq!(pool.manual_leases_in_use(), 2, "refusals hold nothing");
+
+        // Clones share one entry, which stays until the last clone drops.
+        let clone = earlier.clone();
+        let hold = earlier.clone().into_hold();
+        drop(earlier);
+        assert_eq!(pool.manual_leases_in_use(), 2, "the clones keep the place");
+        assert!(
+            pool.try_lease_manual(2, Duration::from_secs(5)).is_err(),
+            "a clone keeps its key's place"
+        );
+        drop(clone);
+        assert_eq!(pool.manual_leases_in_use(), 2, "the hold keeps the place");
+        drop(hold);
+        assert_eq!(
+            pool.manual_leases_in_use(),
+            1,
+            "the last clone removed the key"
+        );
+        let again = pool
+            .try_lease_manual(2, Duration::from_secs(5))
+            .expect("the key's place came back");
+        assert_eq!(pool.manual_leases_in_use(), 2);
+        drop(later);
+        assert_eq!(pool.manual_leases_in_use(), 1);
+        drop(again);
+        assert_eq!(pool.manual_leases_in_use(), 0);
+        // A pool's clones share its gate.
+        let other = pool.clone();
+        let taken = pool.try_lease_manual(9, Duration::from_secs(5)).unwrap();
+        assert!(other.try_lease_manual(9, Duration::from_secs(5)).is_err());
+        assert_eq!(other.manual_leases_in_use(), 1);
+        drop(taken);
+        assert_eq!(other.manual_leases_in_use(), 0);
     }
 
     /// Nothing is registered: no pending entry, no interrupt slot, no
