@@ -331,7 +331,7 @@ results/sweep.rs	results_reconcile	info	site	1	none	unchanged: no error text
 results/sweep.rs	results_sweep_error	warn	call:warn_store	1	via warn_store: StoreError by class	unchanged: class/cause only
 results/sweep.rs	results_sweep_error	warn	call:warn_store	2	via warn_store: StoreError by class	unchanged: class/cause only
 results/sweep.rs	results_sweep_error	warn	call:warn_store	3	via warn_store: StoreError by class	unchanged: class/cause only
-results/sweep.rs	results_sweep_error	warn	call:warn	1	via warn: io::Error, or io::Error::other(join_failure_text) from on_root	changed
+results/sweep.rs	results_sweep_error	warn	call:warn	1	via warn: io::Error, or on_root's typed JoinFailure, which cause_of names unknown	changed
 results/sweep.rs	results_sweep_error	warn	call:warn_store	4	via warn_store: StoreError by class	unchanged: class/cause only
 results/sweep.rs	results_sweep	info	site	1	none	unchanged: no error text
 results/sweep.rs	lifecycle	info	site	1	none	unchanged: no error text
@@ -339,10 +339,10 @@ results/sweep.rs	lifecycle	info	site	2	none	unchanged: no error text
 results/sweep.rs	results_sweep_error	warn	site	1	helper warn: dyn Display text, logged at DEBUG only, and a CauseKind from the caller	changed
 results/sweep.rs	results_sweep_error	warn	site	2	helper warn_store: StoreError by class	unchanged: class/cause only
 results/sweep.rs	results_sweep_error	warn	call:warn	2	via warn: io::Error from ResultsRoot::unlink	changed
-results/sweep.rs	results_sweep_error	warn	call:warn	3	via warn: io::Error::other(join_failure_text) from on_root	changed
+results/sweep.rs	results_sweep_error	warn	call:warn	3	via warn: on_root's typed JoinFailure (join_failure_text), logged as unknown	changed
 results/sweep.rs	results_sweep_error	warn	call:warn	4	via warn: io::Error from the file age read	changed
 results/sweep.rs	results_sweep_error	warn	call:warn	5	via warn: io::Error from ResultsRoot::unlink	changed
-results/sweep.rs	results_sweep_error	warn	call:warn	6	via warn: io::Error::other(join_failure_text) from on_root	changed
+results/sweep.rs	results_sweep_error	warn	call:warn	6	via warn: on_root's typed JoinFailure (join_failure_text), logged as unknown	changed
 retention.rs	lifecycle	info	site	1	none	unchanged: no error text
 retention.rs	retention_error	error	site	1	io::Error from retention_tick (data-dir read_dir or free-space check, typed through the tick)	changed
 retention.rs	retention_error	error	site	2	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text

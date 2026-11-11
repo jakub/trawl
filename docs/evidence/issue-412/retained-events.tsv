@@ -2,7 +2,7 @@
 # plus one row per call of a logging helper that takes an error value from its
 # caller (source type names the helper), and one per macro_rules expansion.
 # Paths are relative to crates/trawl-server/src. Rows describe commit:
-# sha: af3c9ef3397da4f4c820f5ecaac110526aa500a3
+# sha: 6756809c640b61ae56e19df0ca83497518341d6f
 # Search command (a help, not the list: it misses shorthand fields, plain string
 # fields and dynamic messages):
 #   rg -n --type rust '(error|err|reason|cause|source|detail)\s*=\s*[%?]|\{(e|err|error)\}' crates/trawl-server/src
@@ -337,18 +337,18 @@ results/sweep.rs	222	results_reconcile	trawl_server::results::sweep	INFO	none	un
 results/sweep.rs	289	results_sweep_error	trawl_server::results::sweep	WARN	via warn_store: StoreError by class	unchanged: class/cause only
 results/sweep.rs	304	results_sweep_error	trawl_server::results::sweep	WARN	via warn_store: StoreError by class	unchanged: class/cause only
 results/sweep.rs	312	results_sweep_error	trawl_server::results::sweep	WARN	via warn_store: StoreError by class	unchanged: class/cause only
-results/sweep.rs	321	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error, or io::Error::other(join_failure_text) from on_root	changed
+results/sweep.rs	321	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error, or on_root's typed JoinFailure, which cause_of names unknown	changed
 results/sweep.rs	323	results_sweep_error	trawl_server::results::sweep	WARN	via warn_store: StoreError by class	unchanged: class/cause only
 results/sweep.rs	338	results_sweep	trawl_server::results::sweep	INFO	none	unchanged: no error text
 results/sweep.rs	374	lifecycle	trawl_server::results::sweep	INFO	none	unchanged: no error text
 results/sweep.rs	384	lifecycle	trawl_server::results::sweep	INFO	none	unchanged: no error text
 results/sweep.rs	427	results_sweep_error	trawl_server::results::sweep	WARN	helper warn: dyn Display text, logged at DEBUG only, and a CauseKind from the caller	changed
 results/sweep.rs	441	results_sweep_error	trawl_server::results::sweep	WARN	helper warn_store: StoreError by class	unchanged: class/cause only
-results/sweep.rs	487	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error from ResultsRoot::unlink	changed
-results/sweep.rs	502	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error::other(join_failure_text) from on_root	changed
-results/sweep.rs	522	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error from the file age read	changed
-results/sweep.rs	537	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error from ResultsRoot::unlink	changed
-results/sweep.rs	552	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error::other(join_failure_text) from on_root	changed
+results/sweep.rs	519	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error from ResultsRoot::unlink	changed
+results/sweep.rs	534	results_sweep_error	trawl_server::results::sweep	WARN	via warn: on_root's typed JoinFailure (join_failure_text), logged as unknown	changed
+results/sweep.rs	554	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error from the file age read	changed
+results/sweep.rs	569	results_sweep_error	trawl_server::results::sweep	WARN	via warn: io::Error from ResultsRoot::unlink	changed
+results/sweep.rs	584	results_sweep_error	trawl_server::results::sweep	WARN	via warn: on_root's typed JoinFailure (join_failure_text), logged as unknown	changed
 retention.rs	205	lifecycle	trawl_server::retention	INFO	none	unchanged: no error text
 retention.rs	239	retention_error	trawl_server::retention	ERROR	io::Error from retention_tick (data-dir read_dir or free-space check, typed through the tick)	changed
 retention.rs	248	retention_error	trawl_server::retention	ERROR	tokio JoinError via join_failure_text	unchanged: fixed join_failure_text
