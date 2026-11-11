@@ -29,7 +29,7 @@ use std::cell::OnceCell;
 
 use serde_json::Value;
 
-use crate::ast::{FilterOp, FilterValue, Scalar, SearchStage, SearchToken};
+use crate::ast::{FieldFilter, FilterOp, FilterValue, Scalar, SearchStage, SearchToken};
 use crate::cancel::Cancelled;
 use crate::compare::{self, PatternForm};
 use crate::context::EvalContext;
@@ -308,73 +308,7 @@ fn compile_token(
     preparer: &mut Preparer,
 ) -> Result<Option<TokenMatcher>, FilterError> {
     Ok(match token {
-        SearchToken::FieldFilter(ff) => {
-            // The catalog pin typing this comparison (ADR-0011); the
-            // lookup folds through `catalog_key`, same as the emitter.
-            let pin = pins.pin_for(&ff.field);
-            // Glob/regex match one canonical text per pin, resolved by the
-            // shared rule table: plain stringification mirrors the SQL
-            // side's bare column only where there is no pin to conform to
-            // (unpinned, VARCHAR), and every typed pin renders the value's
-            // own conformed reading — RFC 3339 microseconds for TIMESTAMP,
-            // DuckDB's DOUBLE text for DOUBLE, the conformed integer for
-            // BIGINT, lowercase `true`/`false` for BOOLEAN, the ladder
-            // token for SEVERITY — so a pattern cannot mean one thing live
-            // and another in batch. Each is corroborated by execution
-            // probes in trawl-engine/tests/duckdb_probe.rs, not assumed.
-            let form = compare::pattern_form(pin);
-            let predicate = match &ff.value {
-                FilterValue::Single(Scalar::Exact(v)) => FieldPredicate::Compare {
-                    op: compile_op(ff.op),
-                    value: coerce_form(compare::compare_form(pin, ff.op, v)?),
-                },
-                FilterValue::Single(pattern) => FieldPredicate::Pattern {
-                    regex: compile_pattern(pattern, preparer)?,
-                    form,
-                    negated: match ff.op {
-                        FilterOp::Eq => false,
-                        FilterOp::Ne => true,
-                        FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
-                            unreachable!(
-                                "the parser refuses an ordered operator with a pattern (ADR-0060)"
-                            )
-                        }
-                    },
-                },
-                FilterValue::List(values) => FieldPredicate::List {
-                    elements: values
-                        .iter()
-                        .map(|v| match v {
-                            Scalar::Exact(v) => Ok(ListElement::Exact(coerce_form(
-                                compare::compare_form(pin, FilterOp::Eq, v)?,
-                            ))),
-                            pattern => compile_pattern(pattern, preparer).map(ListElement::Pattern),
-                        })
-                        .collect::<Result<_, FilterError>>()?,
-                    form,
-                    negated: match ff.op {
-                        FilterOp::Eq => false,
-                        FilterOp::Ne => true,
-                        FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
-                            unreachable!("ordered operators cannot reach a comma-separated list")
-                        }
-                    },
-                },
-            };
-            Some(TokenMatcher::Field(FieldMatcher {
-                // The event key is the same `catalog_key` the pin lookup
-                // used: an ASCII fold and nothing else, mirroring DuckDB
-                // binding `"Status"` to the real `status` column. Ingest
-                // folds every incoming field name, so an exact lookup on
-                // the folded spelling is the one that finds the value —
-                // without the fold a mixed-case reference would read every
-                // event as a NULL column, which `!=` reports as a match
-                // (`OR col IS NULL`): live tail would stream everything
-                // while `/query` returned nothing.
-                field: crate::schema::catalog_key(&ff.field),
-                predicate,
-            }))
-        }
+        SearchToken::FieldFilter(ff) => compile_field_filter(ff, pins, preparer)?,
         SearchToken::TextSearch(ts) => {
             // Wildcard `*` matches everything — skip.
             if ts.term == "*" {
@@ -406,6 +340,85 @@ fn compile_token(
             Some(TokenMatcher::OrGroup(compiled_groups))
         }
     })
+}
+
+/// Compiles one field filter, out of line from [`compile_token`].
+///
+/// `compile_token` recurses once per search bracket and per `NOT`, and
+/// #447's 64-level tree depth limit budgets that recursion to a quarter of
+/// a 2 MiB worker stack. Inlined, this arm's locals would sit in every
+/// level's frame; here they cost one frame, at the leaf.
+#[inline(never)]
+fn compile_field_filter(
+    ff: &FieldFilter,
+    pins: &FieldTypes,
+    preparer: &mut Preparer,
+) -> Result<Option<TokenMatcher>, FilterError> {
+    // The catalog pin typing this comparison (ADR-0011); the
+    // lookup folds through `catalog_key`, same as the emitter.
+    let pin = pins.pin_for(&ff.field);
+    // Glob/regex match one canonical text per pin, resolved by the
+    // shared rule table: plain stringification mirrors the SQL
+    // side's bare column only where there is no pin to conform to
+    // (unpinned, VARCHAR), and every typed pin renders the value's
+    // own conformed reading — RFC 3339 microseconds for TIMESTAMP,
+    // DuckDB's DOUBLE text for DOUBLE, the conformed integer for
+    // BIGINT, lowercase `true`/`false` for BOOLEAN, the ladder
+    // token for SEVERITY — so a pattern cannot mean one thing live
+    // and another in batch. Each is corroborated by execution
+    // probes in trawl-engine/tests/duckdb_probe.rs, not assumed.
+    let form = compare::pattern_form(pin);
+    let predicate = match &ff.value {
+        FilterValue::Single(Scalar::Exact(v)) => FieldPredicate::Compare {
+            op: compile_op(ff.op),
+            value: coerce_form(compare::compare_form(pin, ff.op, v)?),
+        },
+        FilterValue::Single(pattern) => FieldPredicate::Pattern {
+            regex: compile_pattern(pattern, preparer)?,
+            form,
+            negated: match ff.op {
+                FilterOp::Eq => false,
+                FilterOp::Ne => true,
+                FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
+                    unreachable!("the parser refuses an ordered operator with a pattern (ADR-0060)")
+                }
+            },
+        },
+        FilterValue::List(values) => {
+            FieldPredicate::List {
+                elements: values
+                    .iter()
+                    .map(|v| match v {
+                        Scalar::Exact(v) => Ok(ListElement::Exact(coerce_form(
+                            compare::compare_form(pin, FilterOp::Eq, v)?,
+                        ))),
+                        pattern => compile_pattern(pattern, preparer).map(ListElement::Pattern),
+                    })
+                    .collect::<Result<_, FilterError>>()?,
+                form,
+                negated: match ff.op {
+                    FilterOp::Eq => false,
+                    FilterOp::Ne => true,
+                    FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
+                        unreachable!("ordered operators cannot reach a comma-separated list")
+                    }
+                },
+            }
+        }
+    };
+    Ok(Some(TokenMatcher::Field(FieldMatcher {
+        // The event key is the same `catalog_key` the pin lookup
+        // used: an ASCII fold and nothing else, mirroring DuckDB
+        // binding `"Status"` to the real `status` column. Ingest
+        // folds every incoming field name, so an exact lookup on
+        // the folded spelling is the one that finds the value —
+        // without the fold a mixed-case reference would read every
+        // event as a NULL column, which `!=` reports as a match
+        // (`OR col IS NULL`): live tail would stream everything
+        // while `/query` returned nothing.
+        field: crate::schema::catalog_key(&ff.field),
+        predicate,
+    })))
 }
 
 /// The live matcher for one glob or regex element, or the error a
