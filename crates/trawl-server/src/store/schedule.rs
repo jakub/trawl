@@ -114,6 +114,31 @@ pub struct Schedule {
 /// holds.
 pub const DUE_SCHEDULE_PAGE: usize = 64;
 
+/// The first page of the due listing: `$1` is `now`, `$2` the page size.
+/// Its predicate is `schedules_due_idx`'s, so the planner reads that index
+/// in `(next_fire_at, id)` order and never sorts (ADR-0018 amended
+/// 2026-11-11). `due_listing_uses_ordered_seek` pins the plan.
+pub const DUE_FIRST_PAGE: &str = "SELECT id, key_id, next_fire_at
+     FROM schedules
+     WHERE enabled
+       AND (max_runs IS NULL OR runs_claimed < max_runs)
+       AND next_fire_at <= $1
+     ORDER BY next_fire_at, id
+     LIMIT $2";
+
+/// A resumed page of the due listing: [`DUE_FIRST_PAGE`] that starts
+/// strictly after `($2, $3)`, the `(next_fire_at, id)` of the previous
+/// page's last row; `$4` is the page size. The row comparison is the
+/// index seek.
+pub const DUE_RESUMED_PAGE: &str = "SELECT id, key_id, next_fire_at
+     FROM schedules
+     WHERE enabled
+       AND (max_runs IS NULL OR runs_claimed < max_runs)
+       AND next_fire_at <= $1
+       AND (next_fire_at, id) > ($2, $3)
+     ORDER BY next_fire_at, id
+     LIMIT $4";
+
 /// A due schedule as the scheduler tick lists it: the fields the tick
 /// needs before a claim, and no query text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1008,37 +1033,33 @@ impl ScheduleStore {
     }
 
     /// One page of the schedules due at `now`, for the scheduler tick:
-    /// enabled, with `next_fire_at <= now`, oldest fire cursor first and
-    /// then by id (ADR-0018, amended 2026-11-09). A page holds at most
-    /// `limit` rows and never more than [`DUE_SCHEDULE_PAGE`]. `after` is
-    /// the `(next_fire_at, id)` of the last row of the previous page, and
-    /// the page starts strictly after it.
+    /// enabled, with run budget left, with `next_fire_at <= now`, oldest
+    /// fire cursor first and then by id (ADR-0018, amended 2026-11-09 and
+    /// 2026-11-11). A page holds at most `limit` rows and never more than
+    /// [`DUE_SCHEDULE_PAGE`]. `after` is the `(next_fire_at, id)` of the
+    /// last row of the previous page, and the page starts strictly after
+    /// it.
     ///
     /// No ownership check: the scheduler runs every key's schedules. No
     /// query text: [`Self::claim_due_run`] reads every value a run depends
-    /// on again under its row locks.
+    /// on again under its row locks, the budget among them, so a cap
+    /// lowered after this read still refuses the claim.
     pub async fn list_due_schedule_page(
         &self,
         now: DateTime<Utc>,
         after: Option<(DateTime<Utc>, i64)>,
         limit: usize,
     ) -> Result<Vec<DueSchedule>, StoreError> {
-        let (after_fire, after_id) = after.unzip();
-        let rows = sqlx::query(
-            "SELECT id, key_id, next_fire_at
-             FROM schedules
-             WHERE enabled
-               AND next_fire_at <= $1
-               AND ($2::timestamptz IS NULL OR (next_fire_at, id) > ($2::timestamptz, $3::bigint))
-             ORDER BY next_fire_at, id
-             LIMIT $4",
-        )
-        .bind(now)
-        .bind(after_fire)
-        .bind(after_id)
-        .bind(bind_usize(limit.min(DUE_SCHEDULE_PAGE)))
-        .fetch_all(&self.pool)
-        .await?;
+        let limit = bind_usize(limit.min(DUE_SCHEDULE_PAGE));
+        let page = match after {
+            None => sqlx::query(DUE_FIRST_PAGE).bind(now).bind(limit),
+            Some((after_fire, after_id)) => sqlx::query(DUE_RESUMED_PAGE)
+                .bind(now)
+                .bind(after_fire)
+                .bind(after_id)
+                .bind(limit),
+        };
+        let rows = page.fetch_all(&self.pool).await?;
         let page = rows
             .iter()
             .map(|row| {
