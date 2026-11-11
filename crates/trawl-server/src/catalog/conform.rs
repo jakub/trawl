@@ -353,10 +353,17 @@ pub(crate) fn archive_is_empty(data_dir: &Path) -> bool {
     }
     let walk = walk_archive(data_dir);
     if let Some((path, e)) = walk.failure {
-        tracing::warn!(
+        tracing::debug!(
             event_type = "catalog_identity_walk_failed",
             file = %path.display(),
             error = %e,
+            "cannot enumerate the data root, so the archive cannot be proven \
+             empty; treating it as holding standing data"
+        );
+        tracing::warn!(
+            event_type = "catalog_identity_walk_failed",
+            file = %path.display(),
+            cause_kind = CauseKind::of_io(&e).as_str(),
             "cannot enumerate the data root, so the archive cannot be proven \
              empty; treating it as holding standing data"
         );
@@ -580,14 +587,16 @@ async fn publish_completion(
 /// would be a destructive surprise on a path (foreign parquet dropped into
 /// the tree) where the honest answer is "not mine".
 ///
-/// `error` is a fixed reason trawl wrote, or the walk's I/O error.
-fn skip_file(path: &Path, phase: &str, error: &str) {
+/// `error` is always a fixed reason trawl wrote. A walk failure passes its
+/// I/O kind as `cause_kind`; its caller logs the error's text at DEBUG.
+fn skip_file(path: &Path, phase: &str, error: &'static str, cause_kind: Option<CauseKind>) {
     metrics::counter!(crate::metrics::CATALOG_CONFORM_SKIPPED_TOTAL).increment(1);
     tracing::warn!(
         event_type = "catalog_conform_skip",
         file = %path.display(),
         phase,
         error,
+        cause_kind = cause_kind.map(CauseKind::as_str),
         "unreadable, foreign, publication-claimed or rollup-deferred path \
          skipped by the boot conformance pass; it is left untouched and \
          remains outside the catalog invariant"
@@ -753,7 +762,21 @@ fn scan_corpus(
     let (files, walk_errors) = crate::metrics::walk_parquet_files_lossy(data_dir);
     let mut skipped = walk_errors.len();
     for (path, error) in walk_errors {
-        skip_file(&path, "walk", &error.to_string());
+        tracing::debug!(
+            event_type = "catalog_conform_skip",
+            file = %path.display(),
+            phase = "walk",
+            error = %error,
+            "unreadable, foreign, publication-claimed or rollup-deferred path \
+             skipped by the boot conformance pass; it is left untouched and \
+             remains outside the catalog invariant"
+        );
+        skip_file(
+            &path,
+            "walk",
+            "the walk could not enumerate this path",
+            Some(CauseKind::of_io(&error)),
+        );
     }
     if files.is_empty() {
         return Ok((Vec::new(), skipped));
@@ -765,10 +788,20 @@ fn scan_corpus(
             // warning for the whole corpus, not one per file.
             metrics::counter!(crate::metrics::CATALOG_CONFORM_SKIPPED_TOTAL)
                 .increment(files.len() as u64);
-            tracing::warn!(
+            // The claims scan returns its I/O error as text, so it keeps no
+            // typed source and goes to DEBUG only.
+            tracing::debug!(
                 event_type = "catalog_conform_claims_unreadable",
                 files = files.len(),
                 error = %e,
+                "cannot read the publication markers, so any standing file may \
+                 be a pending publish; the boot conformance pass skips every \
+                 file and will re-run on the next boot"
+            );
+            tracing::warn!(
+                event_type = "catalog_conform_claims_unreadable",
+                files = files.len(),
+                cause_kind = CauseKind::Unknown.as_str(),
                 "cannot read the publication markers, so any standing file may \
                  be a pending publish; the boot conformance pass skips every \
                  file and will re-run on the next boot"
@@ -783,10 +816,18 @@ fn scan_corpus(
             // an unresolved rollup.
             metrics::counter!(crate::metrics::CATALOG_CONFORM_SKIPPED_TOTAL)
                 .increment(files.len() as u64);
-            tracing::warn!(
+            tracing::debug!(
                 event_type = "catalog_conform_rollups_unreadable",
                 files = files.len(),
                 error = %e,
+                "cannot read the rollup markers, so any standing file may \
+                 belong to an unresolved rollup; the boot conformance pass \
+                 skips every file and will re-run on the next boot"
+            );
+            tracing::warn!(
+                event_type = "catalog_conform_rollups_unreadable",
+                files = files.len(),
+                cause_kind = CauseKind::of_io(e).as_str(),
                 "cannot read the rollup markers, so any standing file may \
                  belong to an unresolved rollup; the boot conformance pass \
                  skips every file and will re-run on the next boot"
@@ -818,6 +859,7 @@ fn scan_corpus(
                 "layout",
                 "not in trawl's {env}/{date}[/{HH}]/{service}.parquet layout — \
                  the boot pass only rewrites files it wrote itself",
+                None,
             );
             progress.tick();
             continue;
@@ -831,6 +873,7 @@ fn scan_corpus(
                 "publication",
                 "claimed by a pending publication marker — the boot pass \
                  conforms it after the marker resolves",
+                None,
             );
             progress.tick();
             continue;
@@ -847,6 +890,7 @@ fn scan_corpus(
                 "in a day directory an unresolved rollup marker holds, or \
                  whose marker removal is not yet durable — the boot pass \
                  conforms it after the rollup settles",
+                None,
             );
             progress.tick();
             continue;
@@ -860,6 +904,7 @@ fn scan_corpus(
                 &path,
                 "scan",
                 "not a parquet file (magic-byte sniff failed)",
+                None,
             );
             progress.tick();
             continue;

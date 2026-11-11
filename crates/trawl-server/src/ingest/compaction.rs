@@ -538,7 +538,14 @@ pub fn spawn_compaction(
                     if let Some(ref stats) = compaction_stats {
                         stats.total_errors.fetch_add(1, Ordering::Relaxed);
                     }
-                    tracing::error!(event_type = "compaction_error", error = %e, "compaction tick failed");
+                    // The text mixes I/O listings, repin wording and join
+                    // text and keeps no typed source, so it goes to DEBUG.
+                    tracing::debug!(event_type = "compaction_error", error = %e, "compaction tick failed");
+                    tracing::error!(
+                        event_type = "compaction_error",
+                        cause_kind = CauseKind::Unknown.as_str(),
+                        "compaction tick failed"
+                    );
                     // The whole pass failed before or while scanning the
                     // WAL: an unreadable WAL root, unlistable markers, or
                     // rollup recovery paused by a repin.
@@ -910,12 +917,24 @@ async fn compact_pass(
                         drained += chunk.len() as u64;
                         incomplete.operation.record_failure();
                         chunk_failures += 1;
-                        tracing::error!(
+                        // The text joins several I/O steps' errors and keeps
+                        // no typed source, so it goes to DEBUG only.
+                        tracing::debug!(
                             event_type = "compaction_error",
                             compact_service = %service,
                             chunk = chunk_idx + 1,
                             total_chunks,
                             error = %incomplete.error,
+                            "published, but finishing the publish failed; its \
+                             publication marker blocks this service until recovery \
+                             completes it"
+                        );
+                        tracing::error!(
+                            event_type = "compaction_error",
+                            compact_service = %service,
+                            chunk = chunk_idx + 1,
+                            total_chunks,
+                            cause_kind = CauseKind::Unknown.as_str(),
                             "published, but finishing the publish failed; its \
                              publication marker blocks this service until recovery \
                              completes it"
@@ -1002,15 +1021,29 @@ async fn compact_pass(
                 {
                     Ok(n) => n,
                     Err(e) => {
-                        tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
+                        // The text mixes I/O, join and proof wording and
+                        // keeps no typed source, so it goes to DEBUG only.
+                        tracing::debug!(event_type = "rollup_error", error = %e, "daily rollup failed");
+                        tracing::error!(
+                            event_type = "rollup_error",
+                            cause_kind = CauseKind::Unknown.as_str(),
+                            "daily rollup failed"
+                        );
                         1
                     }
                 }
             }
             Err(e) => {
-                tracing::error!(
+                // The claims scan returns its I/O error as text, so it keeps
+                // no typed source and goes to DEBUG only.
+                tracing::debug!(
                     event_type = "rollup_error",
                     error = %e,
+                    "cannot read publication markers; daily rollup skipped this tick"
+                );
+                tracing::error!(
+                    event_type = "rollup_error",
+                    cause_kind = CauseKind::Unknown.as_str(),
                     "cannot read publication markers; daily rollup skipped this tick"
                 );
                 1
@@ -1100,9 +1133,16 @@ async fn recover_publications(
             Ok(report) => (report.record(), report.retired()),
             Err(error) => {
                 RecoveryOutcomeKind::Failed.record();
-                tracing::error!(
+                // Recovery returns its listing error as text, so it keeps no
+                // typed source and goes to DEBUG only.
+                tracing::debug!(
                     event_type = "publication_recovery_failed",
                     error = %error,
+                    "cannot list publication markers; no WAL is compacted this tick"
+                );
+                tracing::error!(
+                    event_type = "publication_recovery_failed",
+                    cause_kind = CauseKind::Unknown.as_str(),
                     "cannot list publication markers; no WAL is compacted this tick"
                 );
                 return Err(error);
@@ -1276,7 +1316,9 @@ async fn rollup_once(
         CompactionOperation::DailyRollupScan.record_failure();
     }
     let env_dirs = env_dirs.unwrap_or_else(|e| {
-        tracing::warn!(dir = %data_dir.display(), error = %e,
+        tracing::debug!(dir = %data_dir.display(), error = %e,
+            "failed to list env directories, treating as empty");
+        tracing::warn!(dir = %data_dir.display(), cause_kind = CauseKind::of_io(&e).as_str(),
             "failed to list env directories, treating as empty");
         Vec::new()
     });
@@ -1484,10 +1526,18 @@ async fn rollup_env_once(
             // it on the error tally like the quarantine path does. Do not
             // merge surviving inputs again until recovery has retired them.
             failures += 1;
-            tracing::error!(
+            // The text mixes I/O and proof wording and keeps no typed
+            // source, so it goes to DEBUG only.
+            tracing::debug!(
                 event_type = "rollup_error",
                 date = %dir_name,
                 error = %e,
+                "rollup recovery failed"
+            );
+            tracing::error!(
+                event_type = "rollup_error",
+                date = %dir_name,
+                cause_kind = CauseKind::Unknown.as_str(),
                 "rollup recovery failed"
             );
             continue;
@@ -2179,7 +2229,10 @@ const MAX_QUARANTINE_ATTEMPTS: u32 = 1000;
 /// only by its size. Accepted — closing it needs
 /// `renameat2(RENAME_NOREPLACE)`, unavailable under the workspace unsafe
 /// forbid.
-fn quarantine_target(path: &Path) -> Result<PathBuf, String> {
+///
+/// An error keeps the failed reservation's `io::ErrorKind`, so the caller
+/// can log it as a closed cause; every name taken is `AlreadyExists`.
+fn quarantine_target(path: &Path) -> std::io::Result<PathBuf> {
     for n in 0..MAX_QUARANTINE_ATTEMPTS {
         let mut candidate = path.as_os_str().to_owned();
         if n == 0 {
@@ -2196,16 +2249,22 @@ fn quarantine_target(path: &Path) -> Result<PathBuf, String> {
             Ok(_) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => {
-                return Err(format!(
-                    "failed to reserve quarantine name {}: {e}",
-                    candidate.display()
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to reserve quarantine name {}: {e}",
+                        candidate.display()
+                    ),
                 ));
             }
         }
     }
-    Err(format!(
-        "no free quarantine name for {} after {MAX_QUARANTINE_ATTEMPTS} attempts",
-        path.display()
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "no free quarantine name for {} after {MAX_QUARANTINE_ATTEMPTS} attempts",
+            path.display()
+        ),
     ))
 }
 
@@ -2237,15 +2296,24 @@ fn quarantine_file(
     event_type: &str,
     kind: QuarantineKind,
 ) -> Result<PathBuf, String> {
-    let quarantined = quarantine_target(path).inspect_err(|e| {
-        tracing::error!(
-            event_type,
-            compact_service = %service,
-            file = %path.display(),
-            error = %e,
-            "failed to quarantine corrupt file"
-        );
-    })?;
+    let quarantined = quarantine_target(path)
+        .inspect_err(|e| {
+            tracing::debug!(
+                event_type,
+                compact_service = %service,
+                file = %path.display(),
+                error = %e,
+                "failed to quarantine corrupt file"
+            );
+            tracing::error!(
+                event_type,
+                compact_service = %service,
+                file = %path.display(),
+                cause_kind = CauseKind::of_io(e).as_str(),
+                "failed to quarantine corrupt file"
+            );
+        })
+        .map_err(|e| e.to_string())?;
     match std::fs::rename(path, &quarantined) {
         Ok(()) => {
             // Observe the rename now: later work can fail or panic, and a
@@ -2265,19 +2333,33 @@ fn quarantine_file(
             // The reservation is ours and empty; drop it so a retry re-uses
             // the same name instead of accumulating zero-byte placeholders.
             if let Err(cleanup) = std::fs::remove_file(&quarantined) {
-                tracing::warn!(
+                tracing::debug!(
                     event_type = "quarantine_reservation_stranded",
                     path = %quarantined.display(),
                     error = %cleanup,
                     "failed to remove the quarantine reservation after a failed rename; \
                      a zero-byte artifact remains under this name"
                 );
+                tracing::warn!(
+                    event_type = "quarantine_reservation_stranded",
+                    path = %quarantined.display(),
+                    cause_kind = CauseKind::of_io(&cleanup).as_str(),
+                    "failed to remove the quarantine reservation after a failed rename; \
+                     a zero-byte artifact remains under this name"
+                );
             }
-            tracing::error!(
+            tracing::debug!(
                 event_type,
                 compact_service = %service,
                 file = %path.display(),
                 error = %e,
+                "failed to quarantine corrupt file"
+            );
+            tracing::error!(
+                event_type,
+                compact_service = %service,
+                file = %path.display(),
+                cause_kind = CauseKind::of_io(&e).as_str(),
                 "failed to quarantine corrupt file"
             );
             Err(format!("failed to quarantine {}: {e}", path.display()))
@@ -5391,11 +5473,18 @@ fn scan_env_wal_files(env: &str, env_wal_dir: &Path, min_age: Duration) -> Optio
         Ok(files) => Some(files),
         Err(e) => {
             CompactionOperation::WalEnvironmentScan.record_failure();
-            tracing::error!(
+            tracing::debug!(
                 event_type = "compaction_error",
                 compact_env = %env,
                 dir = %env_wal_dir.display(),
                 error = %e,
+                "failed to scan env WAL directory, skipping env this tick"
+            );
+            tracing::error!(
+                event_type = "compaction_error",
+                compact_env = %env,
+                dir = %env_wal_dir.display(),
+                cause_kind = CauseKind::of_io(&e).as_str(),
                 "failed to scan env WAL directory, skipping env this tick"
             );
             None
@@ -6808,7 +6897,10 @@ mod tests {
         let log = logged(&logs);
         assert!(log.contains("finishing the publish failed"), "{log}");
         assert!(log.contains("publication_recovery_failed"), "{log}");
-        assert!(log.contains("failed to retire merged input"), "{log}");
+        // The retire failure's text is DEBUG-only; the ERROR names the cause
+        // (ADR-0040, amended 2026-11-09).
+        assert!(log.contains("cause_kind=\"unknown\""), "{log}");
+        assert!(!log.contains("failed to retire merged input"), "{log}");
 
         drop(guard);
         assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);

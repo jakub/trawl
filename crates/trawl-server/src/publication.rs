@@ -58,7 +58,7 @@ use tokio::sync::{
 };
 
 use crate::env_dirs;
-use crate::error::ServerError;
+use crate::error::{CauseKind, ServerError};
 use crate::ingest::rollup_marker;
 
 /// Why the corpus is not settled, so reads refuse with 503
@@ -283,8 +283,13 @@ impl PublicationGate {
             // refusals and failed rescans are its consequences, not new
             // failures.
             crate::metrics::CompactionOperation::PendingRollupScan.record_failure();
-            tracing::error!(event_type = "publication_scan_failed", %error,
+            tracing::debug!(event_type = "publication_scan_failed", %error,
                 "cannot establish rollup publication state; corpus reads refused until a later scan completes");
+            tracing::error!(
+                event_type = "publication_scan_failed",
+                cause_kind = CauseKind::of_io(&error).as_str(),
+                "cannot establish rollup publication state; corpus reads refused until a later scan completes"
+            );
             corpus.scan_failed = true;
         }
     }
