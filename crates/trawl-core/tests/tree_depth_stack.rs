@@ -44,9 +44,19 @@ fn phase(shape: &str, step: &str) {
     eprintln!("shape={shape} step={step}");
 }
 
-/// Records a step that refused the shape for what it means.
+/// The only refusals a shape may meet: the streaming plan does not take
+/// these stages. Any other refusal would skip the walks after it, so it
+/// fails the test.
+const STREAM_REFUSALS: [&str; 4] = ["stats", "timechart", "eventstats", "pivot"];
+
+/// Records a step that refused the shape for what it means, and fails on
+/// a refusal [`STREAM_REFUSALS`] does not name.
 fn refused(shape: &str, step: &str, why: &dyn std::fmt::Display) {
     eprintln!("shape={shape} step={step} refused: {why}");
+    assert!(
+        step == "compile_stream_plan_with" && STREAM_REFUSALS.contains(&shape),
+        "{shape}: {step} must not refuse: {why}"
+    );
 }
 
 /// `n` terms joined by `+`: an operator chain `n - 1` levels deep.
