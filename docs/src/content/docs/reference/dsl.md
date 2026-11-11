@@ -1000,7 +1000,7 @@ expression is deeper than 64 levels
 search is deeper than 64 levels
 ```
 
-Brackets or `NOT`s nested more than 512 deep are refused with the search error before the query is read, even inside quotes, comments or the pipeline. A bracket that holds a quoted value, a regex, a backticked name or a comment counts as still open there, so more than 512 of them in one query are refused the same way.
+Brackets or `NOT`s nested more than 512 deep are refused with the search error before the query is read, even inside quotes, comments or the pipeline. This check reads the raw text, so a bracket pair that holds a `"`, a `/`, a backtick or a `#` counts as still open. A query with more than 512 such pairs is refused the same way, even when the brackets sit side by side. For example, 513 groups like `(host="web-1" path=/api)` joined by `OR` are refused. 512 run.
 
 Write equality tests on one field as `field in (…)`, which is one level however long the list is. Split a long `and` across several `| where` stages. In the search, use fewer nested brackets or negations.
 
