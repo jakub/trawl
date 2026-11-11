@@ -7,16 +7,33 @@
 //! Amendment 2026-11-11).
 //!
 //! The emitter's SQL-position refusals are the reference: their exact
-//! `to_string()` and `hint()` are pinned here as a baseline, so the shared
-//! call check that the validate door and the stream compiler adopt has to
-//! say what emit already says.
+//! `to_string()` and `hint()` were pinned here as a baseline on the code
+//! before the shared call check existed, so every door has to say what
+//! emit said.
 
+use trawl_core::ast::{PipeStage, Spanned};
 use trawl_core::context::EvalContext;
 use trawl_core::emitter::{EmitError, emit, validate_pipeline};
 use trawl_core::parser;
 use trawl_core::parser::suggest::KNOWN_FUNCTIONS;
 
 const SOURCE: &str = "/data/*.parquet";
+
+/// A FIXED anchor: nothing may self-serve an evaluation context
+/// (`tests/now_anchor_contract.rs`).
+fn anchor() -> EvalContext {
+    EvalContext::at(
+        chrono::DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
+            .expect("literal is RFC 3339")
+            .with_timezone(&chrono::Utc),
+    )
+}
+
+fn pipeline(query: &str) -> Vec<Spanned<PipeStage>> {
+    parser::parse(query)
+        .unwrap_or_else(|e| panic!("{query}: parse failed: {e:?}"))
+        .pipeline
+}
 
 /// The operator hint every spelling of `match(` carries.
 const MATCH_HINT: &str = "matches is an operator, not a function: where message matches /re/";
@@ -195,7 +212,7 @@ const BASELINE: &[Refusal] = &[
 
 fn emit_refusal(query: &str) -> EmitError {
     let ast = parser::parse(query).unwrap_or_else(|e| panic!("{query}: parse failed: {e:?}"));
-    match emit(&ast, SOURCE, EvalContext::capture()) {
+    match emit(&ast, SOURCE, anchor()) {
         Ok(_) => panic!("{query}: emit accepted a bad call"),
         Err(err) => err,
     }
@@ -403,32 +420,205 @@ fn every_known_function_has_a_valid_call() {
             if let Err(err) = validate_pipeline(&ast.pipeline) {
                 panic!("{query}: validate_pipeline refused: {err}");
             }
-            if let Err(err) = emit(&ast, SOURCE, EvalContext::capture()) {
+            if let Err(err) = emit(&ast, SOURCE, anchor()) {
                 panic!("{query}: emit refused: {err}");
             }
         }
     }
 }
 
-/// Bad calls in the stages after `extract kv`, which run in Rust behind
-/// the SQL.
-///
-/// This pins the gap #435 closes: `validate_pipeline` answers `valid` for
-/// each of these today, and the run refuses them only when the kv tail
-/// compiles. The shared call check makes them refuse at the door.
-const KV_TAIL_GAP: &[&str] = &[
-    "* | extract kv | let r = nosuchfn(a)",
-    r#"* | extract kv | let r = split(a, ",", i)"#,
-    "* | extract kv | where length() > 0",
+/// The baseline pin for one PC-1 query.
+fn pin(query: &str) -> &'static Refusal {
+    BASELINE
+        .iter()
+        .find(|case| case.query == query)
+        .unwrap_or_else(|| panic!("{query}: no baseline pin"))
+}
+
+/// One refusal as a caller sees it: the whole sentence, and the hint
+/// alone.
+#[derive(Debug, PartialEq)]
+struct Seen {
+    display: String,
+    hint: Option<String>,
+}
+
+impl From<&EmitError> for Seen {
+    fn from(err: &EmitError) -> Self {
+        Self {
+            display: err.to_string(),
+            hint: err.hint(),
+        }
+    }
+}
+
+/// The batch lanes' refusal of `query`: `validate_pipeline` and emit must
+/// both refuse, with the same sentence and the same hint.
+fn batch_refusal(query: &str) -> Seen {
+    let ast = parser::parse(query).unwrap_or_else(|e| panic!("{query}: parse failed: {e:?}"));
+    let validated = Seen::from(
+        &validate_pipeline(&ast.pipeline)
+            .expect_err(&format!("{query}: validate_pipeline accepted a bad call")),
+    );
+    let emitted = Seen::from(&emit_refusal(query));
+    assert_eq!(validated, emitted, "{query}: validate and emit disagree");
+    validated
+}
+
+/// Each rule: a bad call, and the PC-1 query whose pin it must reproduce.
+const RULES: &[(&str, &str)] = &[
+    // unknown name, with and without a suggestion
+    ("countt(message)", "* | let x = countt(message)"),
+    ("nosuchfn(message)", "* | let x = nosuchfn(message)"),
+    // `match(` in either case, with the operator hint
+    (
+        r#"match(message, "x")"#,
+        r#"* | let x = match(message, "x")"#,
+    ),
+    (r#"MATCH(message, "x")"#, r#"* | where MATCH(message, "x")"#),
+    // argument count
+    ("length()", "* | let x = length()"),
+    ("case(x)", "* | let x = case(x)"),
+    // integer-literal position
+    ("round(1, message)", "* | let x = round(1, message)"),
+    (r#"split(a, ",", i)"#, r#"* | let x = split(a, ",", i)"#),
+    // unit and dialect
+    (
+        r#"date_part("nanosecond", _time)"#,
+        r#"* | let x = date_part("nanosecond", _time)"#,
+    ),
+    ("date_part(u, _time)", "* | let x = date_part(u, _time)"),
+    (
+        r#"sev(level, "klingon")"#,
+        r#"* | let x = sev(level, "klingon")"#,
+    ),
+    // format
+    (
+        r#"strftime(_time, "%Q")"#,
+        r#"* | let x = strftime(_time, "%Q")"#,
+    ),
+];
+
+/// Every position a call can stand in; `{}` is the bad call.
+const POSITIONS: &[(&str, &str)] = &[
+    ("where", "* | where {}"),
+    ("let", "* | let r = {}"),
+    ("eval", "* | eval r = {}"),
+    ("nested in a known call", "* | let r = coalesce({}, 0)"),
+    ("under a binary operator", "* | where {} > 0"),
+    ("under a unary operator", "* | where not {}"),
+    ("subject of in", "* | where {} in (1, 2)"),
+    ("element of in", "* | where x in (1, {})"),
+    ("aggregation head", "* | stats {}"),
+    ("aggregation operand", "* | stats max({}) by host"),
+    ("timechart operand", "* | timechart span=1h max({})"),
+    ("eventstats operand", "* | eventstats max({}) as m"),
+    ("pivot operand", "* | pivot max({}) on status by host"),
+    ("after extract kv", "* | extract kv | let r = {}"),
+    ("where after extract kv", "* | extract kv | where {} > 0"),
 ];
 
 #[test]
-fn validate_accepts_bad_calls_after_extract_kv() {
-    for query in KV_TAIL_GAP {
-        let ast = parser::parse(query).unwrap_or_else(|e| panic!("{query}: parse failed: {e:?}"));
-        assert!(
-            validate_pipeline(&ast.pipeline).is_ok(),
-            "{query}: validate_pipeline already refuses"
-        );
+fn every_call_rule_refuses_in_every_position() {
+    for (call, baseline) in RULES {
+        let pinned = pin(baseline);
+        let expected = Seen {
+            display: pinned.display.to_owned(),
+            hint: pinned.hint.map(str::to_owned),
+        };
+        for (label, template) in POSITIONS {
+            let query = template.replace("{}", call);
+            assert_eq!(batch_refusal(&query), expected, "{label}: {query}");
+        }
     }
+}
+
+/// Bad calls in the stages after `extract kv`, which run in Rust behind
+/// the SQL. `validate_pipeline` once answered `valid` for each of these,
+/// and the run refused them only when the kv tail compiled.
+const KV_TAIL: &[(&str, &str)] = &[
+    (
+        "* | extract kv | let r = nosuchfn(a)",
+        "unknown function: nosuchfn",
+    ),
+    (
+        r#"* | extract kv | let r = split(a, ",", i)"#,
+        "invalid aggregation: split() argument 3 must be an integer literal",
+    ),
+    (
+        "* | extract kv | where length() > 0",
+        "invalid aggregation: length() requires exactly one argument",
+    ),
+];
+
+#[test]
+fn bad_calls_after_extract_kv_are_refused() {
+    for (query, display) in KV_TAIL {
+        assert_eq!(batch_refusal(query).display, *display, "{query}");
+    }
+}
+
+/// One query with several defects: the first in the shared order wins.
+const ORDER: &[(&str, &str)] = &[
+    // parent before children
+    (
+        "* | let r = foo(bar(x))",
+        "unknown function: foo (did you mean 'floor'?)",
+    ),
+    // a known parent passes, so its bad argument is next
+    (
+        "* | let r = lower(bar(x))",
+        "unknown function: bar (did you mean 'max'?)",
+    ),
+    // within one call: name, count, then literal positions; the
+    // arguments' own calls come after
+    (
+        r#"* | let r = split(nosuch(x), ",", i)"#,
+        "invalid aggregation: split() argument 3 must be an integer literal",
+    ),
+    // stages in written order
+    (
+        "* | let a = nosuchfn(x) | let b = length()",
+        "unknown function: nosuchfn",
+    ),
+    (
+        "* | where length() > 0 | let a = nosuchfn(x)",
+        "invalid aggregation: length() requires exactly one argument",
+    ),
+    // the aggregate-position phase before the call phase
+    (
+        "* | where count(nosuch(x))",
+        "invalid aggregation: count() is an aggregation; use it in stats, timechart, \
+         eventstats or pivot",
+    ),
+    // the call phase before the projection check
+    (
+        "* | stats count(), count() | where x > 0 | let r = nosuchfn(x)",
+        "unknown function: nosuchfn",
+    ),
+];
+
+/// A same-stage chain over `n` references, over the lateral-expansion
+/// budget at 513 (`tests/complexity_parity.rs`), with a bad call after it.
+fn over_budget_with_a_bad_call() -> String {
+    let args = vec!["x"; 513].join(", ");
+    format!("* | let x = abs(y), z = coalesce({args}) | let r = nosuchfn(x)")
+}
+
+#[test]
+fn the_phase_and_call_order_is_shared() {
+    for (query, display) in ORDER {
+        assert_eq!(batch_refusal(query).display, *display, "{query}");
+    }
+
+    // The expansion budget runs before every other phase. Each lane keeps
+    // its own form of the budget's sentence.
+    let query = over_budget_with_a_bad_call();
+    let budget = trawl_core::complexity::check_pipeline_complexity(&pipeline(&query))
+        .expect_err("the fixture is over budget")
+        .to_string();
+    assert_eq!(
+        batch_refusal(&query).display,
+        format!("unsupported operation: {budget}"),
+    );
 }

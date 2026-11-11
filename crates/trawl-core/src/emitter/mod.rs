@@ -28,7 +28,7 @@ pub use columns::{ColdColumns, HotColumns, InputColumns};
 pub(crate) use fields::coerce_filter_value;
 pub use functions::{DATE_PART_UNITS, DATE_UNITS};
 pub(crate) use functions::{
-    format_literal_position, unit_literal_positions, validate_format_literal,
+    check_call, format_literal_position, unit_literal_positions, validate_format_literal,
     validate_function_arity, validate_unit_literal,
 };
 pub use functions::{function_result_pin, is_aggregate_function};
