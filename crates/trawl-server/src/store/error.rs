@@ -167,11 +167,12 @@ pub enum StoreError {
     PurgePrepareTimeout,
 
     /// A write bounded by its caller's deadline reached it before its
-    /// commit, waiting for a connection or a lock, and gave up: nothing was
+    /// commit, waiting for a connection, a lock, or work it depends on such
+    /// as a run claim's window resolution, and gave up: nothing was
     /// written (ADR-0059). The work it would have admitted never started,
     /// so a caller answers as its admission would for a deadline that
     /// expired while it waited.
-    #[error("the write gave up waiting on the database before it committed; nothing was written")]
+    #[error("the write ran out of time before it committed; nothing was written")]
     WaitExpired,
 
     /// The claim's `from` pin was not in `field_types` when the claim

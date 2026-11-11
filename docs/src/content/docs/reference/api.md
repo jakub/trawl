@@ -3780,7 +3780,7 @@ The shape is the [report run](#report-runs) summary. `started_at` is `t`, and th
 | 409 | `bad_request` | A `since_last` window would be empty: `nothing new to read: coverage already reaches 2026-09-11T08:25:00.000000Z, and a run now would end at 2026-09-11T08:24:10.000000Z`. Nothing is recorded. |
 | 429 | `manual_run_busy` | The key already has a manual run in progress, this net's included, or the installation runs as many manual runs as it may. Nothing is recorded. Sent with `Retry-After` |
 | 503 | `corpus_recovering` | The corpus is unsettled. No run is created and the schedule does not move. See [corpus recovering](#corpus-recovering). |
-| 503 | `service_unavailable` | The claim could not take its database locks within 5 s. Nothing is recorded. |
+| 503 | `service_unavailable` | The claim's 5 s ran out before its `COMMIT`: waiting for its database locks, a connection, or its window resolution. Nothing is recorded. |
 
 ## Report runs
 
