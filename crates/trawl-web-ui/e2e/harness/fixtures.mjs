@@ -118,12 +118,14 @@ export function repinStatusNoJobResponse() {
 
 /** Non-admin identity: no `server_manage`, so AuthShell never opens the
  * admin stats SSE stream and the only /api/v1/stream open in these tests
- * is the one the live-tail toggle opens itself. */
+ * is the one the live-tail toggle opens itself. It holds `saved_query`
+ * beside `query`, as trawld requires to list nets, run one and read its
+ * rows. */
 export function meResponse() {
   return {
     name: 'e2e',
     roles: ['viewer'],
-    permissions: ['query'],
+    permissions: ['query', 'saved_query'],
     exp: Math.floor(Date.now() / 1000) + 3600,
   };
 }

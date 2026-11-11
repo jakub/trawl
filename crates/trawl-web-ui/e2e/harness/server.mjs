@@ -1118,7 +1118,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       const identity = healthScenario() ? healthIdentity() : meResponse();
-      if (savedScenario()) identity.permissions = ['query', 'saved_query'];
       if (scenario in INVESTIGATION_SESSIONS) identity.permissions = INVESTIGATION_SESSIONS[scenario];
       sendJson(res, 200, identity);
       return;
