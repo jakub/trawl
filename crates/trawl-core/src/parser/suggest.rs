@@ -514,6 +514,7 @@ mod tests {
     /// keeps the list complete: a new parser file must join it.
     const PARSER_SOURCES: &[(&str, &str)] = &[
         ("comment.rs", include_str!("comment.rs")),
+        ("depth.rs", include_str!("depth.rs")),
         ("expr.rs", include_str!("expr.rs")),
         ("mod.rs", include_str!("mod.rs")),
         ("pipe.rs", include_str!("pipe.rs")),

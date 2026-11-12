@@ -109,8 +109,10 @@
 //! # What it does not bound
 //!
 //! Multiplication that no alias reference feeds — `x in (1,…,1000)` over an
-//! ordinary column — has `d = 0` and is bounded by the existing query
-//! length and expression depth limits instead. Corpus width, file
+//! ordinary column — has `d = 0`. The query length limit bounds its size
+//! instead, and the parser's two depth limits bound its depth: the
+//! nesting of parentheses, calls and `in` lists (`MAX_EXPR_DEPTH`), and
+//! the levels of the whole tree (`MAX_TREE_DEPTH`). Corpus width, file
 //! discovery and pivot cardinality are database planning costs and sit
 //! outside the node measure entirely; only the regex count above prices
 //! a pivot's copies.

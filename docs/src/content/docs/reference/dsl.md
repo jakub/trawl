@@ -993,6 +993,22 @@ Precedence runs from lowest to highest: `or`, `and`, `not`, the comparison and p
 
 Expressions may nest 16 levels deep. A nesting level is a parenthesised sub-expression, a function call's arguments, or an `in (...)` list, so `abs((a + b) * 2)` is two levels. Deeper is a parse error naming the limit.
 
+A second, separate limit applies to the parsed tree: one expression, and the search, may each be at most 64 levels deep. In an expression, each operator, `not`, minus sign, scalar function call and `in` list is a level. Parentheses add no level. In the search, each `NOT` and each pair of brackets is a level. The `OR` between top-level search filters adds none. An aggregation call such as `sum(…)` is not a level, but its argument is counted as an expression of its own. So `a == 1 or a == 2 or a == 3` is three levels deep: two `or` operators, then the `==` under them. Deeper is a parse error:
+
+```text
+expression is deeper than 64 levels
+search is deeper than 64 levels
+```
+
+Brackets or `NOT`s nested more than 512 deep are refused with the search error before the query is read, even inside quotes, comments or the pipeline. This check reads the raw text, so a bracket pair that holds a `"`, a `/`, a backtick or a `#` counts as still open. A query with more than 512 such pairs is refused the same way, even when the brackets sit side by side. For example, 513 groups like `(host="web-1" path=/api)` joined by `OR` are refused. 512 run.
+
+Write equality tests on one field as `field in (…)`, which is one level however long the list is. Split a long `and` across several `| where` stages. In the search, use fewer nested brackets or negations.
+
+```
+* | where status in (500, 502, 503, 504)
+* | where status >= 500 | where host == "web-1" | where bytes > 0
+```
+
 ## Aggregation functions
 
 | Function | Result |

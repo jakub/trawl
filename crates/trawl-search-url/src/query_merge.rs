@@ -2129,4 +2129,47 @@ mod tests {
             assert!(earliest <= event && event < latest, "{event}");
         }
     }
+
+    /// The bracket a filter puts around a search of several OR groups is a
+    /// level of the search tree (#447). A group 63 levels deep is 64 deep
+    /// inside it and still parses; a group 64 deep is 65 deep inside it,
+    /// and the merged text is refused with the search sentence, which is
+    /// what the server and the page then show.
+    #[test]
+    fn the_facet_bracket_is_a_level_of_the_search_tree() {
+        let limit = trawl_core::parser::MAX_TREE_DEPTH;
+        let base = |depth: usize| {
+            format!(
+                "service=web OR {}a=1{}",
+                "(".repeat(depth),
+                " )".repeat(depth)
+            )
+        };
+        for depth in [limit - 1, limit] {
+            let search = base(depth);
+            trawl_core::parser::parse(&search)
+                .unwrap_or_else(|e| panic!("the {depth}-deep base parses: {e:?}"));
+            for merged in [
+                effective_query(&search, &[inc("host", "web-01")], &quick("1h")),
+                live_query(&search, &[inc("host", "web-01")]),
+            ] {
+                assert!(
+                    merged.contains("(service=web OR "),
+                    "the filter brackets the groups: {merged}"
+                );
+                let parsed = trawl_core::parser::parse(&merged);
+                if depth < limit {
+                    let query =
+                        parsed.unwrap_or_else(|e| panic!("63 deep plus the bracket parses: {e:?}"));
+                    assert_eq!(query.search.groups.len(), 1);
+                } else {
+                    let Err(errors) = parsed else {
+                        panic!("64 deep plus the bracket is refused");
+                    };
+                    let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+                    assert_eq!(messages, ["search is deeper than 64 levels"]);
+                }
+            }
+        }
+    }
 }

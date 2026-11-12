@@ -4,8 +4,8 @@
 
 //! One admission contract at every door that takes DSL (ADR-0024).
 //!
-//! The bind-time expansion budget and the field-list limit live in
-//! `trawl-core` and are proven there. What this file proves is reach: the
+//! The bind-time expansion budget, the field-list limit and the tree
+//! depth limit live in `trawl-core` and are proven there. What this file proves is reach: the
 //! same over-budget text is
 //! refused with the same sentence whether it arrives as a query, an
 //! export, a live tail, a validation call or a saved-query write, and a
@@ -93,6 +93,26 @@ async fn every_entry_point_refuses_a_wide_field_list() {
     every_entry_point_refuses(&wide_dedup_dsl(), WIDE_SENTENCE, None).await;
 }
 
+/// `GET /api/v1/stream?query=<dsl>`, encoded by hand.
+///
+/// Form encoding keeps only `[A-Za-z0-9*-._]` raw, so a 64 KiB query of
+/// brackets or `+` would grow past http's 65 534-byte URI limit and never
+/// reach the door. A URI query may carry `( ) * =` raw, and the server's
+/// query extractor splits each pair at its first `=`, so only the other
+/// bytes are percent-encoded.
+fn stream_url(base: &str, dsl: &str) -> String {
+    use std::fmt::Write as _;
+    let mut url = format!("{base}/api/v1/stream?query=");
+    for byte in dsl.bytes() {
+        if byte.is_ascii_alphanumeric() || b"()*=._-".contains(&byte) {
+            url.push(char::from(byte));
+        } else {
+            let _ = write!(url, "%{byte:02X}");
+        }
+    }
+    url
+}
+
 /// A call the run would refuse is refused before it runs, at every door
 /// (#435). `match` is refused everywhere, with its hint as a detail. A
 /// wrong argument count and a bad call after `extract kv`, which once
@@ -130,6 +150,39 @@ async fn every_entry_point_refuses_an_invalid_call() {
 /// `validation_error` that carries `sentence` and, as a detail, `hint`.
 async fn every_entry_point_refuses(dsl: &str, sentence: &str, hint: Option<&str>) {
     let server = common::setup().await;
+    for (door, body) in every_entry_point_refuses_on(&server, dsl, sentence).await {
+        let error = &body["error"];
+        assert_eq!(error["code"], "validation_error", "{door}: {body}");
+        assert_eq!(
+            error["details"][0]["hint"].as_str(),
+            hint,
+            "{door} carries the hint as a detail: {body}"
+        );
+    }
+
+    // Validation reports the same refusal as its own successful answer:
+    // being told the query is invalid is what a client asked this route
+    // for, so it is a 200 whose body says no.
+    let http = raw_client();
+    assert_validate_refuses(
+        &http,
+        &server.url,
+        &server.analyst_token,
+        dsl,
+        sentence,
+        hint,
+    )
+    .await;
+}
+
+/// Send `dsl` to every door but `/validate` and require each to refuse it
+/// with 400 and `sentence`. Each door's JSON body is returned beside its
+/// name.
+async fn every_entry_point_refuses_on(
+    server: &common::TestServer,
+    dsl: &str,
+    sentence: &str,
+) -> Vec<(&'static str, serde_json::Value)> {
     let http = raw_client();
     let token = &server.analyst_token;
 
@@ -180,8 +233,7 @@ async fn every_entry_point_refuses(dsl: &str, sentence: &str, hint: Option<&str>
     )
     .await;
     let stream = http
-        .get(format!("{}/api/v1/stream", server.url))
-        .query(&[("query", dsl)])
+        .get(stream_url(&server.url, dsl))
         .bearer_auth(token)
         .send()
         .await
@@ -194,6 +246,7 @@ async fn every_entry_point_refuses(dsl: &str, sentence: &str, hint: Option<&str>
         .await
         .expect("update request");
 
+    let mut answers = Vec::new();
     for (door, response) in [
         ("query", query),
         ("export csv", csv),
@@ -210,24 +263,14 @@ async fn every_entry_point_refuses(dsl: &str, sentence: &str, hint: Option<&str>
             message.contains(sentence),
             "{door} carries the shared sentence, got: {message}"
         );
-        let value: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
-        let error = &value["error"];
-        assert_eq!(error["code"], "validation_error", "{door}: {body}");
-        assert_eq!(
-            error["details"][0]["hint"].as_str(),
-            hint,
-            "{door} carries the hint as a detail: {body}"
-        );
+        answers.push((door, serde_json::from_str(&body).expect("a JSON body")));
     }
-
-    // Validation reports the same refusal as its own successful answer:
-    // being told the query is invalid is what a client asked this route
-    // for, so it is a 200 whose body says no.
-    assert_validate_refuses(&http, &server.url, token, dsl, sentence, hint).await;
+    answers
 }
 
 /// `/validate` answers `dsl` with HTTP 200, `valid: false` and one error
-/// that carries `sentence` and, as its own field, `hint`.
+/// that carries `sentence` and, as its own field, `hint`. The answer is
+/// returned.
 async fn assert_validate_refuses(
     http: &reqwest::Client,
     url: &str,
@@ -235,7 +278,7 @@ async fn assert_validate_refuses(
     dsl: &str,
     sentence: &str,
     hint: Option<&str>,
-) {
+) -> serde_json::Value {
     let response = http
         .post(format!("{url}/api/v1/validate"))
         .bearer_auth(token)
@@ -259,6 +302,7 @@ async fn assert_validate_refuses(
         hint,
         "{dsl}: validate carries the hint apart: {validation}"
     );
+    validation
 }
 
 /// A time clause neither lane can hold is a parse error over that clause
@@ -462,7 +506,8 @@ async fn refused_saved_write_leaves_the_store_untouched(dsl: &str) {
 // ---------------------------------------------------------------------------
 
 /// Everything one scheduler tick needs, and nothing this file does not
-/// assert on: no fixture corpus, because the query never reaches `DuckDB`.
+/// assert on: no fixture corpus, because a refused query never reaches
+/// `DuckDB`, and a sound one finds no files and succeeds with no rows.
 struct SchedulerHarness {
     _dir: tempfile::TempDir,
     pool: ExecutorPool,
@@ -474,6 +519,55 @@ struct SchedulerHarness {
     _fleet_pool: PgPool,
     // Holds the app-state advisory lock and the pool the stores came from.
     _storage: StorageState,
+}
+
+/// Wait until every scheduled-run lease is free. A run's preparation job
+/// keeps the lease until the job's thread ends, which can come after the
+/// run's handle resolves.
+async fn scheduled_leases_free(pool: &ExecutorPool) {
+    trawl_server::test_timing::until("every scheduled lease is free", || {
+        pool.scheduled_leases_available() == pool.scheduled_lease_limit()
+    })
+    .await;
+}
+
+/// Tick the scheduler at `now` until each of `scheduled` has its run row,
+/// awaiting every run a tick starts.
+///
+/// The harness pool leases one scheduled run at a time, so a tick claims
+/// at most one due schedule, and a tick can claim none while one is still
+/// due: a claim can give up, or the last run's lease can still be held.
+/// So the ticks go on until every schedule has a run, under the hang
+/// guard, and the caller's run counts catch a schedule that ran twice.
+async fn tick_until_each_ran(h: &SchedulerHarness, scheduled: &[i64], now: chrono::DateTime<Utc>) {
+    let deadline = std::time::Instant::now() + trawl_server::test_timing::HANG_GUARD;
+    loop {
+        let mut waiting = false;
+        for id in scheduled {
+            let runs = h
+                .schedules
+                .list_runs(*id, h.key_id, 1, 0)
+                .await
+                .expect("list runs");
+            waiting |= runs.is_empty();
+        }
+        if !waiting {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every due schedule ran within the hang guard"
+        );
+        scheduled_leases_free(&h.pool).await;
+        let handles =
+            poll_and_execute(&h.schedules, &h.key_store, &h.pool, &h.config, 30, now).await;
+        if handles.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        for handle in handles {
+            handle.await.expect("a scheduled execution must not panic");
+        }
+    }
 }
 
 async fn scheduler_harness() -> SchedulerHarness {
@@ -603,5 +697,356 @@ async fn stored_query_fails_its_attempt_and_keeps_its_schedule(dsl: &str, senten
         schedule.next_fire_at > t0,
         "the cursor advanced to the next fire: {:?}",
         schedule.next_fire_at
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the tree depth limit (#447)
+// ---------------------------------------------------------------------------
+
+/// What every tree depth refusal says, search or expression.
+const DEPTH_SENTENCE: &str = "deeper than 64 levels";
+
+/// `a == 0 or a == 1 …`: `n` comparisons, `n` levels deep.
+fn or_chain(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("a == {i}"))
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+/// A `where` one level over the limit.
+fn deep_where_dsl() -> String {
+    format!("* | where {}", or_chain(65))
+}
+
+/// A search of 30 000 nested brackets, 60 004 bytes.
+fn deep_brackets_dsl() -> String {
+    format!("{}a=1 {}", "(".repeat(30_000), ")".repeat(30_000))
+}
+
+/// A 32 000-term chain, 64 013 bytes: under the 64 KiB text limit, and
+/// under http's URI limit as a stream URL, because `*` needs no encoding.
+fn long_chain_dsl() -> String {
+    format!("* | where {} > 0", vec!["1"; 32_000].join("*"))
+}
+
+/// The three over-deep texts, each with the sentence its refusal starts
+/// with.
+fn deep_dsls() -> [(String, &'static str); 3] {
+    [
+        (deep_where_dsl(), "expression is deeper than 64 levels"),
+        (deep_brackets_dsl(), "search is deeper than 64 levels"),
+        (long_chain_dsl(), "expression is deeper than 64 levels"),
+    ]
+}
+
+/// Every door refuses a tree over the limit as a parse error with the
+/// depth sentence, `/validate` reports the same detail as its 200 answer,
+/// and trawld answers an ordinary query afterwards: the refusal costs a
+/// parse, not the process.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_entry_point_refuses_deep_query_trees() {
+    for (dsl, message) in deep_dsls() {
+        // A fixture per text: the door helper names its saved query, and
+        // names are unique per key.
+        let server = common::setup().await;
+        let client = trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token)
+            .expect("build the client");
+        let head = &dsl[..dsl.len().min(24)];
+        let mut answers = every_entry_point_refuses_on(&server, &dsl, DEPTH_SENTENCE).await;
+
+        // A capture parses its query at the same door.
+        let (status, _, capture) = common::captured::capture(
+            &server,
+            &server.analyst_token,
+            &serde_json::json!({ "query": dsl }),
+        )
+        .await;
+        assert_eq!(status, 400, "{head}…: capture refuses: {capture}");
+        answers.push(("capture", capture));
+
+        let (_, query) = &answers[0];
+        let detail = &query["error"]["details"][0];
+        assert_eq!(detail["message"], message, "{head}…: {query}");
+        assert!(detail["hint"].is_string(), "{head}…: a hint names the fix");
+        for (door, body) in &answers {
+            let error = &body["error"];
+            assert_eq!(error["code"], "parse_error", "{head}…: {door}: {body}");
+            assert_eq!(error["message"], message, "{head}…: {door}: {body}");
+            assert_eq!(
+                error["details"],
+                serde_json::json!([detail]),
+                "{head}…: {door} carries the one detail /query does"
+            );
+        }
+        let validation = assert_validate_refuses(
+            &raw_client(),
+            &server.url,
+            &server.analyst_token,
+            &dsl,
+            message,
+            detail["hint"].as_str(),
+        )
+        .await;
+        assert_eq!(
+            validation["errors"],
+            serde_json::json!([detail]),
+            "{head}…: /validate reports the same detail"
+        );
+
+        let ordinary = client
+            .query_paginated("service=nginx | head 1", None, None)
+            .await
+            .expect("trawld still answers an ordinary query");
+        assert_eq!(ordinary.result.row_count(), 1, "after {head}…");
+    }
+}
+
+/// A refused deep write leaves the store as it was, for each over-deep
+/// text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_deep_saved_write_leaves_the_store_untouched() {
+    for (dsl, _) in deep_dsls() {
+        refused_saved_write_leaves_the_store_untouched(&dsl).await;
+    }
+}
+
+/// The queries [`queries_at_the_tree_depth_limit_run_in_trawld`] runs,
+/// each with its deepest tree `d` levels deep, beside a shallow query that
+/// selects the same rows. The comments count the levels at `d` = 64; each
+/// shape keeps its truth at any `d` of the same parity.
+fn limit_queries(d: usize) -> [(String, &'static str); 5] {
+    [
+        // 64 `+` terms are 63 levels; the comparison is the 64th.
+        (format!("* | where {} > 0", vec!["1"; d].join(" + ")), "*"),
+        // 63 minus signs over a bracketed 1, which the grammar keeps as a
+        // literal under the signs, and the comparison over them. An odd
+        // run is -1, under 2.
+        (format!("* | where {}(1) < 2", "-".repeat(d - 1)), "*"),
+        // 63 comparisons of an absent field, which are null, and one true
+        // one.
+        (format!("* | where {} or 1 == 1", or_chain(d - 1)), "*"),
+        // An even run of NOTs keeps the match.
+        (
+            format!("{}service=nginx", "NOT ".repeat(d)),
+            "service=nginx",
+        ),
+        (
+            format!("{}service=nginx {}", "(".repeat(d), ")".repeat(d)),
+            "service=nginx",
+        ),
+    ]
+}
+
+/// At exactly 64 levels, `/query` returns the rows the shallow form of
+/// each query returns, and `/stream` opens its event stream. The parse
+/// and every walk after it run on trawld's own threads, so this is the
+/// check of trawld's base stack at the limit. The same shapes at 65 are
+/// refused, which pins each one at the limit rather than under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn queries_at_the_tree_depth_limit_run_in_trawld() {
+    let server = common::setup().await;
+    let client = trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token)
+        .expect("build the client");
+    let http = raw_client();
+
+    for ((deep, shallow), (over, _)) in limit_queries(64).into_iter().zip(limit_queries(65)) {
+        let head = &deep[..deep.len().min(24)];
+        let refused = http
+            .post(format!("{}/api/v1/query", server.url))
+            .bearer_auth(&server.analyst_token)
+            .json(&serde_json::json!({ "query": over }))
+            .send()
+            .await
+            .expect("query request");
+        assert_eq!(refused.status(), 400, "{head}…: depth 65 is refused");
+        let message = envelope_message(&refused.text().await.expect("response body"));
+        assert!(message.contains(DEPTH_SENTENCE), "{head}…: {message}");
+
+        let expected = client
+            .query_paginated(shallow, None, None)
+            .await
+            .expect("the shallow query runs")
+            .result
+            .row_count();
+        assert!(expected > 0, "{shallow} selects rows in the fixture corpus");
+        let answer = client
+            .query_paginated(&deep, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{head}… at depth 64 runs: {e}"));
+        assert_eq!(answer.result.row_count(), expected, "{head}…");
+
+        let stream = http
+            .get(stream_url(&server.url, &deep))
+            .bearer_auth(&server.analyst_token)
+            .send()
+            .await
+            .expect("stream request");
+        assert_eq!(stream.status(), 200, "{head}…: stream setup at depth 64");
+        let content_type = stream
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{head}…: {content_type}"
+        );
+        drop(stream);
+    }
+}
+
+/// A deep query stored before the limit existed fails each attempt with
+/// the depth diagnostic and keeps its schedule: the attempt is recorded,
+/// the schedule stays enabled and its cursor moves on. A manual run fails
+/// the same way, and a sound query scheduled beside it still succeeds.
+///
+/// The scheduler is ticked at fixed instants. The manual run executes on
+/// a spawned task, so its end is waited for as an event, under the hang
+/// guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_deep_query_fails_its_attempt_and_keeps_its_schedule() {
+    let h = scheduler_harness().await;
+    let t0 = Utc.with_ymd_and_hms(2026, 3, 14, 3, 0, 0).unwrap();
+    let interval = 3600;
+
+    // Straight through the store: no door this row ever passed knew the
+    // limit.
+    let mut deep = Vec::new();
+    for (i, (dsl, message)) in deep_dsls().into_iter().enumerate() {
+        let saved = h
+            .saved
+            .create(h.key_id, &format!("legacy-{i}"), &dsl)
+            .await
+            .expect("store the deep saved query");
+        h.schedules
+            .create_schedule(saved.id, h.key_id, interval, None, None, 0, t0)
+            .await
+            .expect("schedule the deep query");
+        deep.push((saved.id, message));
+    }
+    let sound = h
+        .saved
+        .create(h.key_id, "sound", "* | head 1")
+        .await
+        .expect("store the sound saved query");
+    h.schedules
+        .create_schedule(sound.id, h.key_id, interval, None, None, 0, t0)
+        .await
+        .expect("schedule the sound query");
+
+    let scheduled: Vec<i64> = deep.iter().map(|(id, _)| *id).chain([sound.id]).collect();
+    tick_until_each_ran(&h, &scheduled, t0 + chrono::Duration::seconds(1)).await;
+
+    for (saved_id, message) in &deep {
+        let runs = h
+            .schedules
+            .list_runs(*saved_id, h.key_id, 10, 0)
+            .await
+            .expect("list runs");
+        assert_eq!(runs.len(), 1, "the attempt was made and recorded");
+        let run = &runs[0];
+        assert_eq!(run.status, RunStatus::Error, "{run:?}");
+        let error = run
+            .error_message
+            .as_deref()
+            .expect("a failed run records why");
+        assert!(
+            error.contains(message),
+            "the run records the sentence: {error}"
+        );
+
+        let schedule = h
+            .schedules
+            .get_schedule_for_saved_query(*saved_id, h.key_id)
+            .await
+            .expect("read the schedule")
+            .expect("the schedule still exists");
+        assert!(
+            schedule.enabled,
+            "a refused attempt does not disable the schedule"
+        );
+        assert_eq!(
+            schedule.next_fire_at,
+            t0 + chrono::Duration::seconds(interval.try_into().expect("an hour")),
+            "the cursor advanced one interval"
+        );
+    }
+    let runs = h
+        .schedules
+        .list_runs(sound.id, h.key_id, 10, 0)
+        .await
+        .expect("list runs");
+    assert_eq!(runs.len(), 1, "the sound query ran");
+    assert_eq!(runs[0].status, RunStatus::Success, "{:?}", runs[0]);
+
+    manual_run_of_a_stored_deep_query_fails().await;
+}
+
+/// The manual-run half of the stored-query test: `POST /saved/{id}/run`
+/// on a deep query stored straight through the store records a failed run
+/// with the depth diagnostic. The fixture spawns no scheduler loop, so the
+/// only run is the one this asks for.
+async fn manual_run_of_a_stored_deep_query_fails() {
+    let server = common::setup().await;
+    let client = trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token)
+        .expect("build the client");
+
+    // The analyst key's id, read from the row a write through the door
+    // records.
+    let probe = client
+        .create_saved("probe", "* | head 1")
+        .await
+        .expect("create a saved query");
+    let app = common::app_pool(&server.app_db_url).await;
+    let (key_id,): (i64,) = sqlx::query_as("SELECT key_id FROM saved_queries WHERE id = $1")
+        .bind(probe.id)
+        .fetch_one(&app)
+        .await
+        .expect("read the key id");
+
+    let saved = server
+        .state
+        .storage
+        .saved
+        .create(key_id, "legacy", &deep_where_dsl())
+        .await
+        .expect("store the deep saved query");
+    server
+        .state
+        .storage
+        .schedule
+        .create_schedule(saved.id, key_id, 3600, None, None, 0, Utc::now())
+        .await
+        .expect("schedule the deep query");
+
+    let started = client
+        .trigger_run(saved.id)
+        .await
+        .expect("the run is claimed");
+    assert_eq!(started.status, "running");
+
+    let deadline = std::time::Instant::now() + trawl_server::test_timing::HANG_GUARD;
+    let run = loop {
+        let runs = client
+            .list_report_runs(saved.id, Some(10), None)
+            .await
+            .expect("list runs")
+            .runs;
+        if let Some(run) = runs.into_iter().find(|r| r.status != "running") {
+            break run;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the manual run did not finish within the hang guard"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(run.status, "error", "{run:?}");
+    let error = run.error_message.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("expression is deeper than 64 levels"),
+        "the manual run records the sentence: {error}"
     );
 }

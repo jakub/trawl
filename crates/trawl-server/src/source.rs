@@ -83,9 +83,10 @@ impl Services {
 const MAX_PINNED_SERVICES: usize = 32;
 
 /// How deep in parenthesised groups a `service=` filter can sit and still
-/// pin. The walk recurses once per level and the parser does not bound the
-/// nesting of search groups, so a deeper group pins nothing instead of
-/// spending the worker's stack.
+/// pin. The walk recurses once per level. The parser refuses a search
+/// deeper than [`trawl_core::parser::MAX_TREE_DEPTH`], and this bound is
+/// tighter still, so a deeper group pins nothing instead of spending the
+/// worker's stack.
 const MAX_PIN_NESTING: usize = 32;
 
 /// The services a search stage pins: the service files every event it
@@ -1678,24 +1679,40 @@ mod tests {
 
     /// A `service=` filter pins through [`MAX_PIN_NESTING`] groups and no
     /// deeper. Past the bound the walk stops, so a search nested thousands
-    /// deep, which the parser accepts, reads every service on the 2 MiB
-    /// stack of a blocking worker instead of overflowing it.
+    /// deep reads every service on the 2 MiB stack of a blocking worker
+    /// instead of overflowing it. The parser refuses a search that deep,
+    /// so that tree is built in code.
     #[test]
     fn a_group_nested_past_the_bound_pins_nothing() {
-        let nested = |depth: usize| {
-            let dsl = format!("{}service=a{}", "(".repeat(depth), ")".repeat(depth));
+        let nested = |depth: usize, parsed: bool| {
             std::thread::Builder::new()
                 .stack_size(2 << 20)
-                .spawn(move || service_pins(&trawl_core::parser::parse(&dsl).unwrap().search))
+                .spawn(move || {
+                    let in_brackets =
+                        |depth| format!("{}service=a{}", "(".repeat(depth), ")".repeat(depth));
+                    if parsed {
+                        let dsl = in_brackets(depth);
+                        return service_pins(&trawl_core::parser::parse(&dsl).unwrap().search);
+                    }
+                    let mut search = trawl_core::parser::parse("service=a").unwrap().search;
+                    let mut token = search.groups[0].pop().unwrap();
+                    for _ in 0..depth {
+                        token = Spanned::new(SearchToken::Group(vec![vec![token]]), 0..0);
+                    }
+                    search.groups[0].push(token);
+                    service_pins(&search)
+                })
                 .unwrap()
                 .join()
                 .unwrap()
         };
         let a = Services::Only(BTreeSet::from(["a".to_owned()]));
-        assert_eq!(nested(1), a);
-        assert_eq!(nested(MAX_PIN_NESTING), a);
-        assert_eq!(nested(MAX_PIN_NESTING + 1), Services::Any);
-        assert_eq!(nested(4000), Services::Any);
+        assert_eq!(nested(1, true), a);
+        assert_eq!(nested(MAX_PIN_NESTING, true), a);
+        assert_eq!(nested(MAX_PIN_NESTING + 1, true), Services::Any);
+        let deepest = trawl_core::parser::MAX_TREE_DEPTH;
+        assert_eq!(nested(deepest, true), Services::Any);
+        assert_eq!(nested(4000, false), Services::Any);
     }
 
     /// A pin reads only `{name}.parquet`, so it is sound only while every

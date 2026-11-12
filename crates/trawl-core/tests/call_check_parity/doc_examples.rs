@@ -1845,6 +1845,20 @@ pub const EXAMPLES: &[Example] = &[
         query: "* | let `_foo` = 1",
         expect: Expect::Parser,
     },
+    Example {
+        source: Source::DslReference,
+        site: Site::Fenced,
+        excerpt: "* | where status in (500, 502, 503, 504)",
+        query: "* | where status in (500, 502, 503, 504)",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Fenced,
+        excerpt: "* | where status >= 500 | where host == \"web-1\" | where bytes > 0",
+        query: "* | where status >= 500 | where host == \"web-1\" | where bytes > 0",
+        expect: Expect::Valid,
+    },
 ];
 
 pub const EXCLUSIONS: &[Exclusion] = &[
@@ -1973,6 +1987,12 @@ pub const EXCLUSIONS: &[Exclusion] = &[
         excerpt: "pipeline stage 1 (`let`) goes over this query's alias-expansion budget of",
         kind: Excluded::Transcript,
         reason: "refusal sentences the query engine prints",
+    },
+    Exclusion {
+        source: Source::DslReference,
+        excerpt: "expression is deeper than 64 levels",
+        kind: Excluded::Transcript,
+        reason: "refusal sentences the parser prints",
     },
     Exclusion {
         source: Source::CliReference,
