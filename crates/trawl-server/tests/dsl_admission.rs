@@ -525,13 +525,48 @@ struct SchedulerHarness {
 /// keeps the lease until the job's thread ends, which can come after the
 /// run's handle resolves.
 async fn scheduled_leases_free(pool: &ExecutorPool) {
-    let give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while pool.scheduled_leases_available() < pool.scheduled_lease_limit() {
+    trawl_server::test_timing::until("every scheduled lease is free", || {
+        pool.scheduled_leases_available() == pool.scheduled_lease_limit()
+    })
+    .await;
+}
+
+/// Tick the scheduler at `now` until each of `scheduled` has its run row,
+/// awaiting every run a tick starts.
+///
+/// The harness pool leases one scheduled run at a time, so a tick claims
+/// at most one due schedule, and a tick can claim none while one is still
+/// due: a claim can give up, or the last run's lease can still be held.
+/// So the ticks go on until every schedule has a run, under the hang
+/// guard, and the caller's run counts catch a schedule that ran twice.
+async fn tick_until_each_ran(h: &SchedulerHarness, scheduled: &[i64], now: chrono::DateTime<Utc>) {
+    let deadline = std::time::Instant::now() + trawl_server::test_timing::HANG_GUARD;
+    loop {
+        let mut waiting = false;
+        for id in scheduled {
+            let runs = h
+                .schedules
+                .list_runs(*id, h.key_id, 1, 0)
+                .await
+                .expect("list runs");
+            waiting |= runs.is_empty();
+        }
+        if !waiting {
+            return;
+        }
         assert!(
-            tokio::time::Instant::now() < give_up,
-            "a scheduled lease stayed held after its run ended"
+            std::time::Instant::now() < deadline,
+            "every due schedule ran within the hang guard"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        scheduled_leases_free(&h.pool).await;
+        let handles =
+            poll_and_execute(&h.schedules, &h.key_store, &h.pool, &h.config, 30, now).await;
+        if handles.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        for handle in handles {
+            handle.await.expect("a scheduled execution must not panic");
+        }
     }
 }
 
@@ -901,35 +936,8 @@ async fn a_stored_deep_query_fails_its_attempt_and_keeps_its_schedule() {
         .await
         .expect("schedule the sound query");
 
-    // The harness pool leases one scheduled run at a time, so each tick
-    // claims one due schedule. Every tick reads the same instant, and a
-    // claimed schedule's cursor has moved past it, so the ticks run each
-    // schedule once and then claim nothing. Each tick starts with the
-    // lease free: a tick that finds it held claims nothing, which this
-    // loop would read as nothing due.
-    let due = deep.len() + 1;
-    let mut ticks = 0;
-    loop {
-        scheduled_leases_free(&h.pool).await;
-        let handles = poll_and_execute(
-            &h.schedules,
-            &h.key_store,
-            &h.pool,
-            &h.config,
-            30,
-            t0 + chrono::Duration::seconds(1),
-        )
-        .await;
-        if handles.is_empty() {
-            break;
-        }
-        for handle in handles {
-            handle.await.expect("a scheduled execution must not panic");
-        }
-        ticks += 1;
-        assert!(ticks <= due, "a tick claimed a schedule twice");
-    }
-    assert_eq!(ticks, due, "every due schedule ran");
+    let scheduled: Vec<i64> = deep.iter().map(|(id, _)| *id).chain([sound.id]).collect();
+    tick_until_each_ran(&h, &scheduled, t0 + chrono::Duration::seconds(1)).await;
 
     for (saved_id, message) in &deep {
         let runs = h
