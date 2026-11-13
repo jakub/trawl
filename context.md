@@ -252,6 +252,10 @@ _Avoid_: query complexity, bind cost, node count
 The number of levels on the longest path from the root of one expression, or of a query's search, down to a leaf. Each operator, `not`, minus sign, call, `in` list, search `NOT` and search bracket adds a level. Fields, values and search words add none, and neither does the top-level `OR` between search filters. An `or` of n comparisons is n deep; `x in (1, 2, 3)` is 1 deep, however long its list.
 _Avoid_: chain length, node count, nesting depth
 
+**JSON path**:
+The string literal that says where `json`, `json_extract_string` and `json_extract` read inside a document. It is one of: `$` or the empty string for the root, a `$`-rooted chain of member and index steps, an RFC 6901 pointer that starts with `/`, or one bare key. The query check refuses any other path, and any path that is not a string literal, before either lane runs. ADR-0017's amendment of 2026-11-13 lists the forms.
+_Avoid_: JSONPath (the full language, most of which trawl refuses), selector, pointer (when a rooted path is meant)
+
 **Executor pool**:
 The fixed set of connections to the query database that user queries, exports and field samples take turns on, one permit each. Its size is `max_concurrent_queries`.
 _Avoid_: query pool, connection pool, worker pool

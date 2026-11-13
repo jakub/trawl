@@ -118,3 +118,44 @@ Considered, not adopted:
 - **Cache the parsed instant beside the text and let the emitter keep binding the text.** Two parsers would remain on the execution path, and a residual difference between them would change SQL without a test noticing.
 
 Premise checks at `b71f9e6e`: `filter.rs:212-222` (RFC 3339, `.ok()`, `with_timezone(Utc)`); `emitter/search.rs:44-57` (`CAST`, not `TRY_CAST`, over the bound text); `compare.rs:322-350` (`Instant` with ordered infinities and `cast_text`); `parser/search.rs:540-565` (each clause overwrites its slot, and `hoisted` keeps every clause's kind and span); `format.rs:450` prints the written text, and `canonical_form.rs:139-158` compares the written slots.
+
+## Amendment (2026-11-13): a document that is not JSON is NULL, and a JSON path is checked before either lane runs
+
+This amendment records the prep of 2026-11-13 for the json defect found while proving 0.9.5. Batch mapped `json`, `json_extract_string`, `json_extract`, `json_keys` and `json_array_length` straight to DuckDB (`crates/trawl-core/src/emitter/functions.rs:511-520`). DuckDB raises `Malformed JSON` for one value that is not JSON, so one plain-text line failed the whole query with an opaque 500. The streaming evaluator answered null for the same value. The path had no check in either lane: a constant `$[` was a whole-query DuckDB binder error, and `eval.rs`'s `jsonpath_to_pointer` read it as the root.
+
+**A document that is not JSON is NULL in both lanes.** §2's rule now covers the json family. Batch emits each of the five functions as `F(TRY_CAST(<document> AS JSON), <path>)`. The document is written once, so parameter order and the nesting bound do not change. `TRY_CAST` nulls exactly the text `json_valid` rejects and keeps valid text unchanged. It catches no error from computing the document, unlike `TRY(…)`, so an overflow inside the argument still raises. No later step can raise on a bad document, so DuckDB's common-subexpression hoisting cannot move a raising call out of the guard. `json_valid` is unchanged. A JSON-typed input skips the cast. That rests on DuckDB validating JSON-typed values when it creates and scans them, and a probe test pins it.
+
+**Deterministic drifts on valid documents fix toward DuckDB (§4).** In the evaluator, `json_keys` of a valid document that is not an object is an empty list, `json_array_length` of a valid document that is not an array is 0, and `json_extract_string` over a JSON `null` is SQL null. `json_extract` keeps the text `null`, which already matches DuckDB.
+
+**A JSON path is a string literal from one grammar, checked before either lane runs.** One parser in `trawl-core` reads the path into typed steps. `check_call` uses it at argument 2 of `json`, `json_extract_string` and `json_extract`, beside the format-literal check. Both lanes reach that check (`validate_pipeline` for batch and the kv tail, `compile_stream_plan_with` for live), and so does the local `trawl validate`. The evaluator walks the same steps, and `jsonpath_to_pointer` is deleted. Accepted:
+
+- `$` and the empty string: the root.
+- `$`-rooted steps, chained in any order:
+  - `.member`: one or more characters, excluding `.` `[` `]` `"` `\` `*`, whitespace and control characters;
+  - `."quoted member"`: non-empty, not exactly `*`, with `\"` and `\\` as the only escapes;
+  - `[n]`: n from 0 to `i64::MAX`, on arrays only. Leading zeros are allowed, but the digits, zeros included, are at most 19 long: DuckDB refuses a 20-digit index even when its value is small;
+  - `[-n]` and `[#-n]`: the n-th element from the end, n from 1 to `i64::MAX`, with the same 19-digit limit.
+- An RFC 6901 pointer that starts with `/`, with `~0` and `~1` as its only escapes. A pointer token keeps DuckDB's container-dependent meaning: `/0` reads an object key `0` or array element 0.
+- One bare key that both lanes read the same way: it does not start with `$` or `/`, and it holds none of `.` `[` `]` `"` `\` `*`, whitespace or control characters.
+
+Refused with a reason that names the form:
+
+- A path that is not a string literal: a field, an expression, a null, a number. A computed path cannot be checked, and a malformed or wildcard one failed a whole batch query once a valid document arrived (owner ruling, 2026-11-13).
+- Malformed paths: `$[`, `$.k.`, `$.`, `$x`, `$['k']`, an unterminated quote, an index out of range or longer than 19 digits, other escapes, control characters.
+- Wildcards and recursive descent (`$.*`, `$[*]`, `$..k`, a quoted `"*"`, a bare `*`). In batch they return a list, which changes the result type, and the evaluator has no list semantics for them.
+- `[-0]`, `[#-0]` and `[#]`. DuckDB reads the zero forms as the first element. The refusal points to `[0]` or `[#-1]`.
+- A bare key holding `.`, `[`, `]`, quotes, `*` or whitespace. DuckDB reads `a.b` as one key named `a.b`, and a reader expects nesting, so the answer would be a silent null. The refusal points to `$.a.b` or `$."a.b"`.
+
+**Stored query text may stop validating on upgrade.** A saved query, schedule or investigation step whose DSL uses a refused path fails its next validation or run with the diagnostic, as the 2026-11-08 amendment describes for search bounds. No stored format changes.
+
+Considered, not adopted:
+
+- **`TRY(F(…))`.** It hides errors raised while computing the document, and it costs 2 to 50 times a plain call in prep's measurements.
+- **A `CASE WHEN json_valid(x)` guard.** It is correct, but the document must be written twice or bound through a lambda. DuckDB folds equal bound parameters before eliminating common subexpressions, so a guarded and an unguarded copy of one call in a SELECT still raised in prep's probe.
+- **Accept DuckDB's whole path grammar.** Wildcards change the result type, and bare `a.b`, `[-0]` and quoted-key escapes have meanings readers do not expect. The evaluator would have to copy each one.
+- **Leave computed paths unchecked and document the lane split.** The owner chose a literal path, to close the last way event data can fail a json query.
+- **Return 4xx for other data-caused engine errors** (for example, a foreign parquet column of type JSON that holds invalid text). Out of scope. Error redaction stays as #390 left it (owner ruling, 2026-11-13).
+
+Residual drifts, pinned as named tests and not fixed here: the evaluator sorts object keys and keeps the last of duplicate keys, where DuckDB keeps document order and the first. The two parsers disagree on trailing commas, `NaN`, `Infinity` and `1e999`. Batch casts a non-text document to JSON, where the evaluator answers null.
+
+Premise checks at `04603b8b` with DuckDB 1.5.6: `TRY_CAST(varchar AS JSON)` nulled exactly what `json_valid` rejected over 18 hand-picked inputs and 283 generated ones. `TRY(json_extract_string(CAST(CAST(x AS INTEGER) AS VARCHAR), '$'))` hid the conversion error, and the `TRY_CAST` form raised it. Selecting `TRY(json_extract_string(x,'$'))` and `CASE WHEN json_valid(x) THEN json_extract_string(x,'$') END` together raised `Malformed JSON`. A constant `$[` raised `Binder Error: JSON path error near '['` whatever the data. `json_keys('[1,2]')` gave `[]` and `json_array_length('{"a":1}')` gave 0. A dynamic wildcard path raised `JSON path cannot contain wildcards if the path is not a constant parameter`.
