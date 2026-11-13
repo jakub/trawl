@@ -1125,7 +1125,9 @@ Nested objects and arrays are stringified at ingest, so a field such as `k8s: {"
 | `json_keys(x)` | The object's keys. A document that is not an object gives an empty list. |
 | `json_array_length(x)` | The array's length. A document that is not an array gives `0`. |
 
-A document that is not JSON, such as a plain-text line in a JSON log, reads as `null` in every JSON function except `json_valid`. This holds in batch and live alike, and the query keeps the row. A path that selects nothing, such as an absent key or an index past the end, is `null` too.
+A document that is not JSON, such as a plain-text line in a JSON log, reads as `null` in every JSON function except `json_valid`. The query keeps the row. A path that selects nothing, such as an absent key or an index past the end, is `null` too.
+
+Each lane decides what is JSON with its own parser, and the two disagree at the edges. The query engine accepts a trailing comma (`[1,2,]`), `NaN`, `Infinity` and an out-of-range number such as `1e999`. The streaming lane reads those documents as not JSON, so `json_keys("[1,2,]")` is `[]` in a batch query and `null` in live. On an object with duplicate keys, the lanes can select different occurrences. `json_keys` can list keys in a different order. A document that is not text, such as a number, is cast to JSON in batch and reads as `null` in live.
 
 ```
 # reach into a stringified object
