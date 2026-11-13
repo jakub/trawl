@@ -21,7 +21,7 @@ use super::EmitError;
 ///
 /// In this order, each over the whole pipeline before the next starts:
 /// the bind-time expansion budget, aggregate positions, then every call
-/// (its name, argument count, unit, format and integer-literal
+/// (its name, argument count, unit, format, JSON path and integer-literal
 /// arguments). Then, stage by stage: aggregation aliases, `extract` regex
 /// syntax and capture names, the place of `from saved`, and projection
 /// collisions. Error messages are the ones emission produces, so callers

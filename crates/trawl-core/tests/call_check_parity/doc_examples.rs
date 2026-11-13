@@ -1048,6 +1048,22 @@ pub const EXAMPLES: &[Example] = &[
     Example {
         source: Source::DslReference,
         site: Site::Fenced,
+        excerpt: "* | let last_hop = json(hops, \"$[-1]\"), app = json(labels, \"$.\\\"app.kubernetes.io/name\\\"\")",
+        query: "* | let last_hop = json(hops, \"$[-1]\"), app = json(labels, \"$.\\\"app.kubernetes.io/name\\\"\")",
+        expect: Expect::Valid,
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Fenced,
+        excerpt: "* | let v = json(message, path_field)",
+        query: "* | let v = json(message, path_field)",
+        expect: Expect::Validate(
+            "json() argument 2 must be a string literal JSON path (a JSON path is $ for the root, $ then steps such as .key, .\"quoted key\", [0], [-1] or [#-1], a pointer such as /key/0, or one bare key)",
+        ),
+    },
+    Example {
+        source: Source::DslReference,
+        site: Site::Fenced,
         excerpt: "_severity>=error last=1h | stats count() by service | sort -count",
         query: "_severity>=error last=1h | stats count() by service | sort -count",
         expect: Expect::Valid,
@@ -1142,6 +1158,15 @@ pub const EXAMPLES: &[Example] = &[
         excerpt: "\"_severity>=error | stats count() by host\"",
         query: "_severity>=error | stats count() by host",
         expect: Expect::Valid,
+    },
+    Example {
+        source: Source::CliReference,
+        site: Site::Shell,
+        excerpt: "'* | let k = json(message, \"$[\")'",
+        query: "* | let k = json(message, \"$[\")",
+        expect: Expect::Validate(
+            "json(): invalid JSON path \"$[\" in argument 2: expected an array index after [ (a JSON path is $ for the root, $ then steps such as .key, .\"quoted key\", [0], [-1] or [#-1], a pointer such as /key/0, or one bare key)",
+        ),
     },
     Example {
         source: Source::CliTuiGuide,

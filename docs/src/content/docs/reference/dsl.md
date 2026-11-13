@@ -1119,15 +1119,49 @@ Nested objects and arrays are stringified at ingest, so a field such as `k8s: {"
 
 | Function | Result |
 | --- | --- |
-| `json_extract_string(x, path)`, `json(x, path)` | The contents of a JSON string, unquoted: `"x"` becomes `x`. |
-| `json_extract(x, path)` | The value's JSON text. A string keeps its quotes, a number, boolean or `null` is its own text, and an array or object is compact JSON. |
+| `json_extract_string(x, path)`, `json(x, path)` | The value at `path`. A string is unquoted, so `"x"` becomes `x`. A JSON `null` is `null`. Other values are their JSON text. |
+| `json_extract(x, path)` | The value's JSON text at `path`. A string keeps its quotes, a number, boolean or `null` is its own text, and an array or object is compact JSON. |
 | `json_valid(x)` | Whether `x` parses as JSON. |
-| `json_keys(x)` | The object's keys. |
-| `json_array_length(x)` | The array's length. |
+| `json_keys(x)` | The object's keys. A document that is not an object gives an empty list. |
+| `json_array_length(x)` | The array's length. A document that is not an array gives `0`. |
+
+A document that is not JSON, such as a plain-text line in a JSON log, reads as `null` in every JSON function except `json_valid`. This holds in batch and live alike, and the query keeps the row. A path that selects nothing, such as an absent key or an index past the end, is `null` too.
 
 ```
 # reach into a stringified object
 service=kubelet | eval pod = json_extract_string(k8s, "$.pod") | where isnotnull(pod)
+```
+
+#### JSON paths
+
+The second argument of `json`, `json_extract_string` and `json_extract` is a JSON path. It must be a string literal in the query. A field, an expression, `null` or a number there is refused before the query runs, because a computed path cannot be checked.
+
+Both lanes read a path the same way. The forms are:
+
+| Form | Example | Reads |
+| --- | --- | --- |
+| `$` or `""` | `$` | The whole document. |
+| `.key` | `$.user-agent` | An object key. The key may hold any character except `.` `[` `]` `"` `\` `*`, whitespace and control characters. |
+| `."key"` | `$."app.kubernetes.io/name"` | An object key, quoted. Only `\"` and `\\` are escapes. In a query, the quotes are escaped too: `"$.\"a.b\""`. |
+| `[n]` | `$.items[0]` | An array element, counted from 0. |
+| `[-n]`, `[#-n]` | `$.hops[-1]` | An array element, counted from the end: `[-1]` and `[#-1]` are the last. |
+| `/token/...` | `/a~1b/0` | An RFC 6901 pointer. `~1` is `/` and `~0` is `~`. A token reads an object key, or an array element when it is a plain decimal such as `0` or `12`. |
+| A bare key | `level` | One top-level key. |
+
+Steps chain in any order, as in `$.m[0][1]`. A key step reads objects only and an index step reads arrays only, so `$[0]` on `{"0":1}` is `null`. An index has at most 19 digits, leading zeros included, and is at most `9223372036854775807`. A pointer `/` alone reads the key `""`, not the whole document.
+
+The check refuses every other path, with a message that names the fault:
+
+- A malformed path has no reading: `$[`, `$.k.`, `$x`, `$['k']`, `$[1:2]`, an unterminated quote, another escape, a control character, or an index that is too long or too large.
+- Wildcards and recursive descent: `$.*`, `$[*]`, `$..k`, `$."*"` and a bare `*`. The query engine answers them with a list, which changes the result type. To read a key named `*`, use the pointer `/*`.
+- `[-0]`, `[#-0]` and `[#]`. The query engine reads the zero forms as the first element, and `[#]` is one past the last. Write `[0]` or `[#-1]`.
+- A bare key holding `.`, `[`, `]`, a quote, `*` or whitespace. The query engine reads `a.b` as one key named `a.b`, where a reader expects nesting. Write `$.a.b` to read nested keys, or `$."a.b"` for one key.
+
+```
+# the last hop of an array, and a key with dots in its name
+* | let last_hop = json(hops, "$[-1]"), app = json(labels, "$.\"app.kubernetes.io/name\"")
+# refused: a path must be a string literal
+* | let v = json(message, path_field)
 ```
 
 On numbers of exotic magnitude, the streaming lane re-renders a number from its `f64` where the query engine renders the source spelling. A value written `1e16` through `1e20`, or an integer with more digits than a 64-bit one holds, can come back spelled differently, as `1e20` against `100000000000000000000`. Values inside those bounds render identically in both lanes.

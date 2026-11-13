@@ -3,7 +3,7 @@ title: CLI & TUI
 description: Command syntax, options, defaults, and output formats for the trawl binary.
 ---
 
-The `trawl` binary runs the terminal UI, executes queries, validates syntax,
+The `trawl` binary runs the terminal UI, executes queries, validates them,
 previews ingest, inspects the field catalog, checks a connection, serves the
 [MCP server](#mcp-mode), and drives a running TUI over a Unix socket.
 For catalog procedures, see [catalog administration](/operate/catalog/).
@@ -242,13 +242,20 @@ trawl query --data 'data/**/*.parquet' "* | stats count() by service"
 trawl validate <QUERY>
 ```
 
-Validate checks syntax without executing. With a token the server also checks
-semantics, function arity, and regex patterns. With no token from any source,
-`trawl` parses locally. A token bound to another URL is an error, not a local
-parse. See [where a token goes](#where-a-token-goes).
+Validate checks a query without executing it. It parses the query, then runs
+the semantic checks both query lanes share: function names and argument
+counts, literal arguments such as date units, format strings and
+[JSON paths](/reference/dsl/#json-paths), where aggregates stand, and output
+names. With a token the server runs the same checks. With no token from any
+source, `trawl` runs them locally. A token bound to another URL is an error,
+not a local check. See [where a token goes](#where-a-token-goes).
+
+A refused query prints the reason on standard error and exits non-zero.
 
 ```bash
 trawl validate "_severity>=error | stats count() by host"
+# refused: $[ has no array index
+trawl validate '* | let k = json(message, "$[")'
 ```
 
 ## Preview ingest mode

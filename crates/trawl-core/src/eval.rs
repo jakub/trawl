@@ -1190,31 +1190,16 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
     Some(v)
 }
 
-/// Convert a `JSONPath` like `$.foo.bar[0]` to a JSON Pointer like `/foo/bar/0`.
-fn jsonpath_to_pointer(path: &str) -> String {
-    let stripped = path.strip_prefix('$').unwrap_or(path);
-    let mut result = String::new();
-    for part in stripped.split('.') {
-        if part.is_empty() {
-            continue;
-        }
-        // handle bracket notation: "items[0]" -> "items" + "0"
-        if let Some(bracket_pos) = part.find('[') {
-            let field = &part[..bracket_pos];
-            if !field.is_empty() {
-                result.push('/');
-                result.push_str(field);
-            }
-            if let Some(idx_str) = part[bracket_pos + 1..].strip_suffix(']') {
-                result.push('/');
-                result.push_str(idx_str);
-            }
-        } else {
-            result.push('/');
-            result.push_str(part);
-        }
-    }
-    result
+/// The value `path` selects in the JSON text `doc`, read through `read`.
+///
+/// `None` when the path is outside the grammar ([`crate::json_path`]),
+/// the document is not JSON, or the path misses. The shared check refuses
+/// an out-of-grammar path before either lane runs; one that reaches eval
+/// anyway (fuzz, an internal caller) selects nothing, never the root.
+fn json_select<R>(doc: &str, path: &str, read: impl FnOnce(&serde_json::Value) -> R) -> Option<R> {
+    let steps = crate::json_path::parse(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(doc).ok()?;
+    crate::json_path::select(&steps, &value).map(read)
 }
 
 fn eval_json_extract_string(args: &[EvalValue]) -> EvalValue {
@@ -1223,18 +1208,13 @@ fn eval_json_extract_string(args: &[EvalValue]) -> EvalValue {
     }
     match (&args[0], &args[1]) {
         (EvalValue::Str(json_str), EvalValue::Str(path)) => {
-            let pointer = jsonpath_to_pointer(path);
-            serde_json::from_str::<serde_json::Value>(json_str)
-                .ok()
-                .and_then(|val| {
-                    val.pointer(&pointer).map(|v| match v {
-                        // A JSON `null` is SQL null, as `DuckDB` reads it.
-                        serde_json::Value::Null => EvalValue::Null,
-                        serde_json::Value::String(s) => EvalValue::Str(s.clone()),
-                        other => EvalValue::Str(other.to_string()),
-                    })
-                })
-                .unwrap_or(EvalValue::Null)
+            json_select(json_str, path, |v| match v {
+                // A JSON `null` is SQL null, as `DuckDB` reads it.
+                serde_json::Value::Null => EvalValue::Null,
+                serde_json::Value::String(s) => EvalValue::Str(s.clone()),
+                other => EvalValue::Str(other.to_string()),
+            })
+            .unwrap_or(EvalValue::Null)
         }
         _ => EvalValue::Null,
     }
@@ -1258,11 +1238,7 @@ fn eval_json_extract(args: &[EvalValue]) -> EvalValue {
     }
     match (&args[0], &args[1]) {
         (EvalValue::Str(json_str), EvalValue::Str(path)) => {
-            let pointer = jsonpath_to_pointer(path);
-            serde_json::from_str::<serde_json::Value>(json_str)
-                .ok()
-                .and_then(|val| val.pointer(&pointer).map(duckdb_json_text))
-                .map_or(EvalValue::Null, EvalValue::Str)
+            json_select(json_str, path, duckdb_json_text).map_or(EvalValue::Null, EvalValue::Str)
         }
         _ => EvalValue::Null,
     }

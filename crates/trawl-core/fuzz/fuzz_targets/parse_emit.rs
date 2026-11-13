@@ -35,8 +35,9 @@ use libfuzzer_sys::fuzz_target;
 
 use trawl_core::compare::CompareError;
 use trawl_core::context::EvalContext;
-use trawl_core::emitter::{self, EmitError, EmittedQuery};
+use trawl_core::emitter::{self, EmitError, EmittedQuery, JsonPathFault};
 use trawl_core::fuzz_input;
+use trawl_core::json_path::{PathError, PathErrorKind};
 use trawl_core::parser::ParseError;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
@@ -94,6 +95,10 @@ fn classify_emit_failure(err: &EmitError, query: &str) {
         }
         | EmitError::ComputedPattern
         | EmitError::RegexParameters { count: _, bytes: _ } => {}
+        EmitError::InvalidJsonPath {
+            func_name: _,
+            fault,
+        } => classify_json_path_fault(fault),
         EmitError::Comparison(cause) => classify_compare_failure(cause),
     }
 
@@ -118,6 +123,25 @@ fn classify_emit_failure(err: &EmitError, query: &str) {
             !rendered.message.is_empty(),
             "EmitError::to_parse_errors returned an empty message: {err:?}"
         );
+    }
+}
+
+/// Accept a JSON path refusal by naming every variant of
+/// [`JsonPathFault`] and [`PathErrorKind`], for the same reason as
+/// [`classify_emit_failure`]: a new kind of path refusal is a compile
+/// error here, not an outcome accepted unread.
+fn classify_json_path_fault(fault: &JsonPathFault) {
+    match fault {
+        JsonPathFault::NotLiteral => {}
+        JsonPathFault::Invalid {
+            path: _,
+            error:
+                PathError {
+                    kind: PathErrorKind::Malformed | PathErrorKind::Unsupported,
+                    reason,
+                    fix: _,
+                },
+        } => assert!(!reason.is_empty(), "a JSON path refusal with no reason"),
     }
 }
 

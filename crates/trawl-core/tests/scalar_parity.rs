@@ -2702,3 +2702,123 @@ fn current_non_text_json_document_residual_is_pinned() {
     assert_eq!(batch_value(&conn, &event, listed), DuckValue::List(vec![]));
     assert_eq!(eval_value(&event, listed), EvalValue::Null);
 }
+
+/// `text` as a DSL string literal: `\` and `"` escaped, every other
+/// character as written.
+fn dsl_string(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// One row of the accepted-path table: (JSON document, path, expected
+/// `json`/`json_extract_string` value, expected `json_extract` value),
+/// `None` for SQL null. Each target is a scalar, an array or a
+/// single-key object, so key order cannot decide the answer.
+type JsonPathCase = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
+const JSON_PATH_CASES: &[JsonPathCase] = &[
+    // the root
+    (r#"{"k":1}"#, "$", Some(r#"{"k":1}"#), Some(r#"{"k":1}"#)),
+    (r#"{"k":1}"#, "", Some(r#"{"k":1}"#), Some(r#"{"k":1}"#)),
+    // members
+    (r#"{"k":"v"}"#, "$.k", Some("v"), Some(r#""v""#)),
+    (r#"{"a":{"b":2}}"#, "$.a.b", Some("2"), Some("2")),
+    (
+        r#"{"user-agent":"curl"}"#,
+        "$.user-agent",
+        Some("curl"),
+        Some(r#""curl""#),
+    ),
+    (r#"{"@t":"x"}"#, "$.@t", Some("x"), Some(r#""x""#)),
+    (r#"{"é":1}"#, "$.é", Some("1"), Some("1")),
+    // quoted members
+    (
+        r#"{"a.b":1,"a":{"b":2}}"#,
+        r#"$."a.b""#,
+        Some("1"),
+        Some("1"),
+    ),
+    (r#"{"a b":[1]}"#, r#"$."a b""#, Some("[1]"), Some("[1]")),
+    (
+        r#"{"q\"x":true}"#,
+        r#"$."q\"x""#,
+        Some("true"),
+        Some("true"),
+    ),
+    // indexes
+    ("[7,8]", "$[0]", Some("7"), Some("7")),
+    ("[7,8]", "$[01]", Some("8"), Some("8")),
+    ("[7,8,9]", "$[-1]", Some("9"), Some("9")),
+    ("[7,8,9]", "$[#-2]", Some("8"), Some("8")),
+    (r#"{"m":[[1,2]]}"#, "$.m[0][1]", Some("2"), Some("2")),
+    // the longest accepted spelling: 19 digits, value 1
+    ("[7,8]", "$[0000000000000000001]", Some("8"), Some("8")),
+    ("[7,8]", "$[-0000000000000000001]", Some("8"), Some("8")),
+    ("[7,8]", "$[#-0000000000000000001]", Some("8"), Some("8")),
+    // an index misses on an object, and past the end
+    (r#"{"0":1}"#, "$[0]", None, None),
+    ("[7,8]", "$[2]", None, None),
+    ("[7,8]", "$[-3]", None, None),
+    // pointers
+    (r#"{"k":[1]}"#, "/k", Some("[1]"), Some("[1]")),
+    (r#"{"m":[[1,2]]}"#, "/m/0/1", Some("2"), Some("2")),
+    (r#"{"a/b":1}"#, "/a~1b", Some("1"), Some("1")),
+    (r#"{"a~b":1}"#, "/a~0b", Some("1"), Some("1")),
+    // `/` reads the empty key, not the root
+    (r#"{"":1}"#, "/", Some("1"), Some("1")),
+    (r#"{"k":1}"#, "/", None, None),
+    (r#"{"*":1}"#, "/*", Some("1"), Some("1")),
+    // `/0` reads a key on an object and an element on an array
+    (r#"{"0":"o"}"#, "/0", Some("o"), Some(r#""o""#)),
+    ("[5,6]", "/0", Some("5"), Some("5")),
+    ("[5,6]", "/01", None, None),
+    // bare keys
+    (
+        r#"{"level":"info"}"#,
+        "level",
+        Some("info"),
+        Some(r#""info""#),
+    ),
+    (
+        r#"{"user-agent":"curl"}"#,
+        "user-agent",
+        Some("curl"),
+        Some(r#""curl""#),
+    ),
+    // a JSON null target
+    (r#"{"k":null}"#, "$.k", None, Some("null")),
+];
+
+/// Every path form the grammar accepts selects the same value in both
+/// lanes, and the value the table writes out (#457, ADR-0017's amendment
+/// of 2026-11-13). `agreed_value` fails on a batch error, so a path
+/// `DuckDB` refuses cannot pass as null here.
+#[test]
+fn every_accepted_json_path_selects_the_same_value_in_both_lanes() {
+    let conn = utc_connection();
+    let event = fixed_event();
+    let value = |want: Option<&str>| want.map_or(EvalValue::Null, text);
+    for &(doc, path, string, json) in JSON_PATH_CASES {
+        trawl_core::json_path::parse(path)
+            .unwrap_or_else(|e| panic!("{path:?}: the grammar refused it: {e:?}"));
+        let (doc, path_literal) = (dsl_string(doc), dsl_string(path));
+        for (call, want) in [
+            (format!("json({doc}, {path_literal})"), value(string)),
+            (
+                format!("json_extract_string({doc}, {path_literal})"),
+                value(string),
+            ),
+            (format!("json_extract({doc}, {path_literal})"), value(json)),
+        ] {
+            assert_eq!(
+                agreed_value(&conn, &event, "accepted JSON path", &call),
+                want,
+                "{call}"
+            );
+        }
+    }
+}

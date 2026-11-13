@@ -176,18 +176,30 @@ const JSON_DOCUMENTS: &[&str] = &[
     "not-json",
 ];
 
-/// Paths for the same door, including ones that reach nothing and ones
-/// that are not paths at all.
+/// Paths for the same door: each form the shared check accepts
+/// (ADR-0017, amendment of 2026-11-13), including ones that reach
+/// nothing. A refused path never reaches eval through a query;
+/// [`a_refused_json_path_reaching_eval_selects_nothing`] feeds those
+/// directly.
 const JSON_PATHS: &[&str] = &[
     "$",
+    "",
     "$.a",
     "$.a.b",
     "$.a.b.c",
     "$.missing",
     "$[0]",
-    "",
+    "$[-1]",
+    "$[#-2]",
+    "$[9223372036854775807]",
+    "$[-9223372036854775807]",
+    "$.a.b[1].c",
+    r#"$."a""#,
+    "/a/b/1",
+    "/",
+    "/01",
+    "a",
     "not-a-path",
-    "$..a",
 ];
 
 /// Scalars whose arity is 1 and whose argument is the composed
@@ -466,16 +478,59 @@ fn call(name: &str, args: Vec<Spanned<Expr>>) -> Spanned<Expr> {
 /// count only the `true` answers, so a run that skips every tree cannot
 /// pass as one that evaluated them.
 fn eval_where_prepared(expression: &Spanned<Expr>, event: &trawl_core::row::Row) -> bool {
-    let Ok(patterns) = PatternTable::prepare([expression], &mut Preparer::new()) else {
-        return false;
-    };
-    let _answer = eval_expr(
+    eval_prepared(expression, event).is_some()
+}
+
+/// [`eval_where_prepared`]'s answer: `None` when the patterns do not
+/// prepare, else what `eval_expr` returned.
+fn eval_prepared(
+    expression: &Spanned<Expr>,
+    event: &trawl_core::row::Row,
+) -> Option<Result<EvalValue, trawl_core::pattern::PatternError>> {
+    let patterns = PatternTable::prepare([expression], &mut Preparer::new()).ok()?;
+    Some(eval_expr(
         expression,
         event,
         &patterns,
         &trawl_core::context::EvalContext::capture(),
-    );
-    true
+    ))
+}
+
+/// A path the shared check refuses never reaches eval through a query.
+/// One that reaches it anyway (fuzz, an internal caller) selects nothing:
+/// never the root, never a parsed prefix, never a bare key read from the
+/// failed rooted text.
+#[test]
+fn a_refused_json_path_reaching_eval_selects_nothing() {
+    let event = trawl_core::row::from_json(&hostile_event());
+    let documents = [
+        r#"{"a":{"b":1},"a.b":2,"$[":3,"$..a":4,"$.a.":5,"k":6}"#,
+        "[1,2]",
+        r#""text""#,
+    ];
+    let refused = [
+        "$[", "$..a", "a.b", "$.a.", "$.", "$x", "$[-0]", "$[#]", "$.*", "*", "/a~2b", "[0]", " k",
+        "k ",
+    ];
+    for name in ["json", "json_extract_string", "json_extract"] {
+        for document in documents {
+            for path in refused {
+                let expression = call(
+                    name,
+                    vec![
+                        literal(LiteralValue::String(document.to_string())),
+                        literal(LiteralValue::String(path.to_string())),
+                    ],
+                );
+                let answer = eval_prepared(&expression, &event)
+                    .unwrap_or_else(|| panic!("{name}({document}, {path:?}) did not prepare"));
+                assert!(
+                    matches!(answer, Ok(EvalValue::Null)),
+                    "{name}({document}, {path:?}) answered {answer:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

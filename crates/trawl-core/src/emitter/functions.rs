@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use super::EmitError;
 use super::fields::quote_field;
+use super::{EmitError, JsonPathFault};
 use crate::aggregate::Aggregate;
 use crate::ast::{Expr, LiteralValue, Spanned};
 use crate::parser::suggest;
@@ -214,6 +214,36 @@ pub(crate) fn format_literal_position(name: &str) -> Option<usize> {
     }
 }
 
+/// Arg position (0-indexed) of a JSON path, if any. [`check_call`] runs
+/// the argument through [`validate_json_path`], so a computed or refused
+/// path is rejected before either lane runs (ADR-0017's amendment of
+/// 2026-11-13).
+pub(crate) fn json_path_position(name: &str) -> Option<usize> {
+    match name {
+        "json" | "json_extract_string" | "json_extract" => Some(1),
+        _ => None,
+    }
+}
+
+/// Validate a JSON path argument: it must be a string literal the
+/// [`crate::json_path`] grammar accepts.
+fn validate_json_path(func_name: &str, path: Option<&str>) -> Result<(), EmitError> {
+    let fault = match path {
+        None => JsonPathFault::NotLiteral,
+        Some(path) => match crate::json_path::parse(path) {
+            Ok(_) => return Ok(()),
+            Err(error) => JsonPathFault::Invalid {
+                path: path.to_string(),
+                error,
+            },
+        },
+    };
+    Err(EmitError::InvalidJsonPath {
+        func_name: func_name.to_string(),
+        fault,
+    })
+}
+
 /// Validate that a date/time unit argument is a known literal.
 ///
 /// `allowlist` is the set of accepted unit names for this `(func, arg)` pair
@@ -285,8 +315,11 @@ pub(crate) fn check_call(name: &str, args: &[Spanned<Expr>]) -> Result<(), EmitE
     let int_positions = literal_int_positions(name);
     let unit_positions = unit_literal_positions(name);
     let format_position = format_literal_position(name);
+    let json_path = json_path_position(name);
     for (i, arg) in args.iter().enumerate() {
-        if int_positions.contains(&i) {
+        if json_path == Some(i) {
+            validate_json_path(name, string_literal(&arg.node))?;
+        } else if int_positions.contains(&i) {
             int_literal_arg(name, i, &arg.node)?;
         } else if let Some((_, allowlist)) = unit_positions.iter().find(|(pos, _)| *pos == i) {
             validate_unit_literal(name, i, allowlist, string_literal(&arg.node))?;

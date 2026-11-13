@@ -293,9 +293,9 @@ fn write_degraded_footer(
 
 /// Validate a DSL query.
 ///
-/// If connection params are provided, validates via the server (checks syntax,
-/// semantics, function arity, regex patterns). Otherwise, validates locally
-/// (parse-only via `trawl_core`).
+/// If connection params are provided, validates via the server. Otherwise,
+/// validates locally with the same checks: the parse, then
+/// `trawl_core::emitter::validate_pipeline`.
 pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result<(), CliError> {
     if let Some(conn) = conn {
         // Server-side validation (richer checks).
@@ -308,14 +308,22 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
             return Err(CliError::Usage("query validation failed".into()));
         }
     } else {
-        // Local parse-only validation.
-        match trawl_core::parser::parse(query) {
-            Ok(_) => println!("valid"),
-            Err(errors) => {
-                let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();
-                render_error_details(query, &details);
-                return Err(CliError::Usage("query validation failed".into()));
-            }
+        // Local validation: the parse, then the shared semantic checks
+        // the server's validate and both query lanes run (calls, literal
+        // positions, JSON paths, projections), with no catalog to consult.
+        let errors = match trawl_core::parser::parse(query) {
+            Ok(parsed) => match trawl_core::emitter::validate_pipeline(&parsed.pipeline) {
+                Ok(()) => Vec::new(),
+                Err(e) => e.to_parse_errors(query.len()),
+            },
+            Err(errors) => errors,
+        };
+        if errors.is_empty() {
+            println!("valid");
+        } else {
+            let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();
+            render_error_details(query, &details);
+            return Err(CliError::Usage("query validation failed".into()));
         }
     }
 

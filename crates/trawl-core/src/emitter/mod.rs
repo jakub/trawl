@@ -222,6 +222,14 @@ pub enum EmitError {
         func_name: String,
         format: String,
     },
+    /// The path argument of `json`, `json_extract_string` or
+    /// `json_extract` is not a string literal, or is one the JSON path
+    /// grammar refuses ([`crate::json_path`], ADR-0017's amendment of
+    /// 2026-11-13).
+    InvalidJsonPath {
+        func_name: String,
+        fault: JsonPathFault,
+    },
     /// A literal the ADR-0011 pin rule table refuses under the field's
     /// catalog pin. Reads as an unsupported operation, and carries the
     /// typed cause so a caller can classify the refusal without reading
@@ -241,6 +249,36 @@ pub enum EmitError {
         count: u64,
         bytes: u64,
     },
+}
+
+/// Why [`EmitError::InvalidJsonPath`] refused a path argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonPathFault {
+    /// A field, an expression, a null or a number: a computed path
+    /// cannot be checked before the query runs.
+    NotLiteral,
+    /// A string literal the grammar refuses, with the parser's reason.
+    Invalid {
+        path: String,
+        error: crate::json_path::PathError,
+    },
+}
+
+/// The forms [`EmitError::InvalidJsonPath`]'s hint lists.
+const JSON_PATH_FORMS: &str = "a JSON path is $ for the root, $ then steps such as .key, \
+     .\"quoted key\", [0], [-1] or [#-1], a pointer such as /key/0, or one bare key";
+
+/// How many characters of a refused path the message echoes.
+const JSON_PATH_ECHO_CHARS: usize = 80;
+
+/// A refused path as the message quotes it: escaped, so a control
+/// character never prints raw, and cut after [`JSON_PATH_ECHO_CHARS`]
+/// characters with an ellipsis after the closing quote.
+fn json_path_echo(path: &str) -> String {
+    match path.char_indices().nth(JSON_PATH_ECHO_CHARS) {
+        Some((cut, _)) => format!("{:?}…", &path[..cut]),
+        None => format!("{path:?}"),
+    }
 }
 
 /// The message, then the hint in parentheses when there is one. A caller
@@ -288,6 +326,24 @@ impl EmitError {
             Self::InvalidFormat { func_name, format } => {
                 format!("{func_name}(): invalid format string {format:?}")
             }
+            Self::InvalidJsonPath {
+                func_name,
+                fault: JsonPathFault::NotLiteral,
+            } => format!("{func_name}() argument 2 must be a string literal JSON path"),
+            Self::InvalidJsonPath {
+                func_name,
+                fault: JsonPathFault::Invalid { path, error },
+            } => {
+                let adjective = match error.kind {
+                    crate::json_path::PathErrorKind::Malformed => "invalid",
+                    crate::json_path::PathErrorKind::Unsupported => "unsupported",
+                };
+                format!(
+                    "{func_name}(): {adjective} JSON path {} in argument 2: {}",
+                    json_path_echo(path),
+                    error.reason
+                )
+            }
             Self::ComputedPattern => format!(
                 "unsupported operation: {}",
                 crate::pattern::PatternError::Computed
@@ -313,6 +369,13 @@ impl EmitError {
             Self::ComputedPattern => {
                 Some("write the pattern itself in the query, as a quoted string".to_string())
             }
+            Self::InvalidJsonPath { fault, .. } => Some(match fault {
+                JsonPathFault::Invalid {
+                    error: crate::json_path::PathError { fix: Some(fix), .. },
+                    ..
+                } => format!("{fix}; {JSON_PATH_FORMS}"),
+                _ => JSON_PATH_FORMS.to_string(),
+            }),
             Self::RegexParameters { .. } => Some(
                 "use fewer regex patterns, compute a value several outputs read in a `| let` \
                  stage of its own, or compute the value a pivot aggregates in a `| let` stage \
@@ -3280,6 +3343,82 @@ mod tests {
         let err = EmitError::Comparison(cause.clone());
         assert_eq!(err.to_string(), format!("unsupported operation: {cause}"));
         assert_eq!(err.message(), err.to_string());
+    }
+
+    /// A refused JSON path names its function, its argument, whether it is
+    /// malformed or unsupported, and the parser's reason; the hint gives
+    /// the fix when there is one, then the accepted forms.
+    #[test]
+    fn an_invalid_json_path_names_the_fault_and_lists_the_forms() {
+        use crate::json_path::parse;
+        let refused = |func_name: &str, path: &str| EmitError::InvalidJsonPath {
+            func_name: func_name.into(),
+            fault: JsonPathFault::Invalid {
+                path: path.into(),
+                error: parse(path).expect_err(path),
+            },
+        };
+
+        let err = refused("json", "$[");
+        assert_eq!(
+            err.message(),
+            r#"json(): invalid JSON path "$[" in argument 2: expected an array index after ["#
+        );
+        assert_eq!(err.hint().as_deref(), Some(JSON_PATH_FORMS));
+        assert_eq!(
+            err.to_string(),
+            format!("{} ({JSON_PATH_FORMS})", err.message())
+        );
+
+        let err = refused("json_extract", "$[-0]");
+        assert_eq!(
+            err.message(),
+            "json_extract(): unsupported JSON path \"$[-0]\" in argument 2: a reverse index of \
+             0 is not supported: DuckDB reads it as the first element"
+        );
+        assert_eq!(
+            err.hint(),
+            Some(format!(
+                "use [0] for the first element, [#-1] for the last; {JSON_PATH_FORMS}"
+            ))
+        );
+
+        let err = EmitError::InvalidJsonPath {
+            func_name: "json_extract_string".into(),
+            fault: JsonPathFault::NotLiteral,
+        };
+        assert_eq!(
+            err.message(),
+            "json_extract_string() argument 2 must be a string literal JSON path"
+        );
+        assert_eq!(err.hint().as_deref(), Some(JSON_PATH_FORMS));
+    }
+
+    /// The echoed path is escaped, so a control character never prints
+    /// raw, and cut after 80 characters on a character boundary.
+    #[test]
+    fn an_invalid_json_path_echo_is_escaped_and_bounded() {
+        assert_eq!(json_path_echo("$.k\u{1}"), r#""$.k\u{1}""#);
+        assert_eq!(json_path_echo("$.\"a\nb\""), r#""$.\"a\nb\"""#);
+
+        let exact = format!("$.{}", "a".repeat(78));
+        assert_eq!(json_path_echo(&exact), format!("{exact:?}"));
+
+        // Multi-byte characters: the cut falls after the 80th character,
+        // not inside one.
+        let long = format!("$.{}x", "é".repeat(100));
+        let kept: String = long.chars().take(80).collect();
+        assert_eq!(json_path_echo(&long), format!("{kept:?}…"));
+
+        let err = EmitError::InvalidJsonPath {
+            func_name: "json".into(),
+            fault: JsonPathFault::Invalid {
+                path: format!("{long}."),
+                error: crate::json_path::parse(&format!("{long}.")).expect_err("trailing ."),
+            },
+        };
+        assert!(err.message().contains(&format!("{kept:?}… in argument 2")));
+        assert!(!err.message().contains(&long));
     }
 
     /// The emitter's own did-you-mean reaches `Display` from a real query,
