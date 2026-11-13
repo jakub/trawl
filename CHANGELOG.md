@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.5
+
+See the [0.9.5 release notes](docs/releases/v0.9.5.md) for the 1.0 release
+candidate's query-language fixes, run caps, token scoping, terminal-safe
+output, and what to back up before upgrading.
+
 ## 0.9.4
 
 See the [0.9.4 release notes](docs/releases/v0.9.4.md) for the MCP server,
