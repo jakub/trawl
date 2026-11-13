@@ -1093,6 +1093,28 @@ impl EmitterState {
         }
     }
 
+    /// Sample the rows the stages so far produced, in a SELECT of its own.
+    ///
+    /// `DuckDB` samples a SELECT's FROM input before its WHERE, GROUP BY,
+    /// ORDER BY and LIMIT run, so anything pending on this level is
+    /// flushed first and the sample reads its finished output. The
+    /// sampled SELECT is then flushed at once, so no later stage can add
+    /// a clause to it either.
+    pub(crate) fn sample_boundary(&mut self, clause: String) {
+        let pending = !self.where_clauses.is_empty()
+            || !self.select.is_empty()
+            || !self.group_by.is_empty()
+            || !self.order_by.is_empty()
+            || self.limit.is_some()
+            || self.has_aggregation
+            || self.has_projection;
+        if pending {
+            self.flush_to_cte();
+        }
+        self.sample = Some(clause);
+        self.flush_to_cte();
+    }
+
     /// Flush the current state into a CTE and reset for the next stage.
     pub(crate) fn flush_to_cte(&mut self) {
         let cte_name = format!("_s{}", self.step);
@@ -1239,7 +1261,18 @@ impl EmitterState {
         sql.push_str("\nFROM ");
         sql.push_str(&self.source);
 
-        // USING SAMPLE (between FROM and WHERE)
+        // A sampled SELECT is `SELECT * FROM <input> USING SAMPLE …` and
+        // nothing else ([`Self::sample_boundary`]): DuckDB samples the
+        // FROM input before WHERE, GROUP BY, ORDER BY and LIMIT run, so
+        // any of them here would read rows the stage before never kept.
+        debug_assert!(
+            self.sample.is_none()
+                || (self.where_clauses.is_empty()
+                    && self.group_by.is_empty()
+                    && self.order_by.is_empty()
+                    && self.limit.is_none()),
+            "a sampled SELECT carries no WHERE, GROUP BY, ORDER BY or LIMIT"
+        );
         if let Some(ref sample) = self.sample {
             sql.push('\n');
             sql.push_str(sample);
