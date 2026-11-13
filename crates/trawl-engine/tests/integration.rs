@@ -3517,3 +3517,70 @@ fn one_document_that_is_not_json_keeps_every_row() {
         assert_eq!(got, want, "{call}");
     }
 }
+
+/// `sample` over the two composite sources: the hot+cold union and the
+/// hot-only read a cold start falls back to. A sample larger than its
+/// input returns every hot and cold row once, and a sample of one row
+/// stays one row through a second, larger sample.
+#[test]
+fn sample_source_shapes() {
+    use duckdb::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let cold = dir.path().join("cold");
+    std::fs::create_dir_all(&cold).unwrap();
+    // Cold ids 0-5, hot ids 6-11; `service` is `a` for an even id.
+    Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) + to_seconds(i) AS \"_time\", \
+                          i AS id, CASE WHEN i % 2 = 0 THEN 'a' ELSE 'b' END AS service \
+                   FROM range(0, 6) t(i)) \
+             TO '{}' (FORMAT PARQUET)",
+            cold.join("cold.parquet").display()
+        ))
+        .unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    let lines: Vec<String> = (6..12)
+        .map(|id| {
+            let service = if id % 2 == 0 { "a" } else { "b" };
+            format!(
+                "{{\"_time\":\"2024-01-15T10:01:{id:02}Z\",\"_ingested\":\"2024-01-15T10:01:{id:02}Z\",\"id\":{id},\"service\":\"{service}\"}}\n"
+            )
+        })
+        .collect();
+    std::fs::write(&hot, lines.concat()).unwrap();
+
+    let exec = Executor::new().unwrap();
+    let pins = FieldTypes::new();
+    let run = |dsl: &str, source: &str| {
+        exec.run_query_with_hot(
+            dsl,
+            source,
+            hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
+            &pins,
+            &pins,
+            usize::MAX,
+        )
+        .unwrap_or_else(|error| panic!("{dsl} over {source}: {error}"))
+    };
+
+    let union = format!("{}/*.parquet", cold.display());
+    let hot_only = format!("{}/nothing/*.parquet", dir.path().display());
+    for (source, ids, evens) in [
+        (
+            &union,
+            (0..12).collect::<Vec<i64>>(),
+            vec![0, 2, 4, 6, 8, 10],
+        ),
+        (&hot_only, (6..12).collect(), vec![6, 8, 10]),
+    ] {
+        assert_eq!(integer_column(&run("* | sample 100", source), "id"), ids);
+        assert_eq!(
+            integer_column(&run("service=a | sample 100", source), "id"),
+            evens,
+            "the sample reads the filtered rows of {source}"
+        );
+        assert_eq!(run("* | sample 1 | sample 100", source).row_count(), 1);
+    }
+}

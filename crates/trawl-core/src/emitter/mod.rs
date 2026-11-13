@@ -1731,6 +1731,113 @@ mod tests {
         assert_snapshot!(emit_dsl("* | sample 1000"));
     }
 
+    /// Assert every SELECT in `sql` that carries `USING SAMPLE` is a CTE
+    /// reading `SELECT * FROM <input> USING SAMPLE …` and nothing else.
+    ///
+    /// `DuckDB` samples the FROM input before WHERE, GROUP BY, ORDER BY
+    /// and LIMIT run, so any of those beside the sample reads rows the
+    /// stage before it never produced. A SELECT starts at a `SELECT` line
+    /// indented 0 (the final statement) or 2 (a CTE body); source
+    /// subqueries render on one line, so they never start one.
+    fn assert_sample_owns_its_select(dsl: &str, sql: &str) {
+        let mut selects: Vec<Vec<&str>> = Vec::new();
+        for line in sql.lines() {
+            let indent = line.len() - line.trim_start().len();
+            if line.trim_start().starts_with("SELECT") && indent <= 2 {
+                selects.push(Vec::new());
+            }
+            if let Some(current) = selects.last_mut() {
+                current.push(line);
+            }
+        }
+        let sampled: Vec<&Vec<&str>> = selects
+            .iter()
+            .filter(|lines| lines.iter().any(|l| l.contains("USING SAMPLE")))
+            .collect();
+        assert!(!sampled.is_empty(), "no sampled SELECT for {dsl:?}:\n{sql}");
+        for lines in sampled {
+            // The CTE body, without the `), _sN AS (` or `)` line that
+            // closes it.
+            let body: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
+                .collect();
+            let shape: Vec<&str> = body.iter().map(|l| l.trim_start()).collect();
+            assert!(
+                shape.len() == 3
+                    && shape[0] == "SELECT *"
+                    && shape[1].starts_with("FROM ")
+                    && shape[2].starts_with("USING SAMPLE "),
+                "the sampled SELECT for {dsl:?} must be a CTE holding \
+                 `SELECT * FROM <input> USING SAMPLE …` alone:\n{sql}"
+            );
+            for clause in ["WHERE", "GROUP BY", "ORDER BY", "LIMIT"] {
+                assert!(
+                    !lines.iter().any(|l| l.trim_start().starts_with(clause)),
+                    "the sampled SELECT for {dsl:?} carries {clause}:\n{sql}"
+                );
+            }
+        }
+    }
+
+    /// Emit each query, check its sampled SELECTs, and render them all
+    /// into one snapshot as `dsl\n---\nsql` blocks.
+    fn sample_boundary_snapshot(queries: &[&str]) -> String {
+        queries
+            .iter()
+            .map(|dsl| {
+                let sql = emit_dsl(dsl);
+                assert_sample_owns_its_select(dsl, &sql);
+                format!("{dsl}\n---\n{sql}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n=====\n\n")
+    }
+
+    #[test]
+    fn sample_input_boundaries() {
+        assert_snapshot!(sample_boundary_snapshot(&[
+            "* | sample 10%",
+            "* | sample 1000",
+            "service=a | sample 5",
+            "last=1h | sample 5",
+            r#"* | where service == "a" | sample 5"#,
+            "* | sort _time | sample 5",
+            "* | sort _time | head 5 | sample 5",
+            "* | tail 5 | sample 5",
+            "* | table id, service | sample 5",
+            "* | rename service as svc | sample 5",
+            "* | stats count() by service | sample 5",
+            "* | top 10 service | sample 5",
+        ]));
+    }
+
+    #[test]
+    fn sample_output_boundaries() {
+        assert_snapshot!(sample_boundary_snapshot(&[
+            r#"* | sample 5 | where service == "a""#,
+            "* | sample 5 | sort id",
+            "* | sample 5 | head 2",
+            "* | sample 5 | tail 2",
+            "* | sample 5 | table id, service",
+            "* | sample 5 | fields id",
+            "* | sample 5 | drop message",
+            "* | sample 5 | rename service as svc",
+            "* | sample 5 | stats count() as n",
+            "* | sample 5 | stats count() as n by service",
+            "* | sample 5 | timechart span=1h count()",
+            "* | sample 5 | top 10 service",
+            "* | sample 5 | rare 10 service",
+            "* | sample 5 | sample 2",
+            "* | sample 5 | let x = id + 1",
+            r#"* | sample 5 | extract "k=(?P<k>\w+)" from message"#,
+            "* | sample 5 | dedup service",
+            "* | sample 5 | eventstats count() as n by service",
+            "* | sample 5 | pivot count() on service",
+        ]));
+    }
+
     // -----------------------------------------------------------------------
     // eventstats
     // -----------------------------------------------------------------------
@@ -1804,6 +1911,26 @@ mod tests {
             anchor(),
         )
         .unwrap();
+        assert_snapshot!(format_result(&result));
+    }
+
+    /// A hot+cold source is a parenthesized union, so the sample reads
+    /// its filtered output from a CTE of its own.
+    #[test]
+    fn hot_source_sample_reads_the_filtered_union() {
+        let dsl = "service=a | sample 3";
+        let query = parser::parse(dsl).unwrap();
+        let result = emit_with_hot_source(
+            &query,
+            SRC,
+            "/tmp/hot_abc123.ndjson",
+            &crate::schema::FieldTypes::new(),
+            &crate::schema::FieldTypes::new(),
+            &InputColumns::unprobed(),
+            anchor(),
+        )
+        .unwrap();
+        assert_sample_owns_its_select(dsl, &result.sql);
         assert_snapshot!(format_result(&result));
     }
 

@@ -57,6 +57,48 @@ async fn query_with_filter() {
     assert_eq!(result.result.row_count(), 2);
 }
 
+/// A `sample` after a search reads the filtered rows in a SELECT of its
+/// own: the query answers 200 rather than a parser error, a sample
+/// larger than its input returns exactly the matching rows, and a stage
+/// after it reads only the sample.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_sample_stage_boundaries() {
+    use trawl_api::value::Value;
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let sampled = client
+        .query_paginated("service=nginx | sample 10", None, None)
+        .await
+        .expect("a sample after a search filter answers 200")
+        .result;
+    let service = sampled
+        .columns
+        .iter()
+        .position(|c| c.name == "service")
+        .expect("service column present");
+    assert_eq!(sampled.row_count(), 2, "both nginx rows, nothing else");
+    assert!(
+        sampled
+            .rows
+            .iter()
+            .all(|row| row[service] == Value::String("nginx".into())),
+        "{:?}",
+        sampled.rows
+    );
+
+    let counted = client
+        .query_paginated(
+            "service=nginx | sample 100% | stats count() as n",
+            None,
+            None,
+        )
+        .await
+        .expect("a stage after the sample answers 200")
+        .result;
+    assert_eq!(counted.rows, vec![vec![Value::Integer(2)]]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn query_with_stats_pipeline() {
     let server = setup().await;

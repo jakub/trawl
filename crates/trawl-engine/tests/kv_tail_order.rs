@@ -559,3 +559,36 @@ fn kv_dedup_keeps_newest_per_key() {
         [1, 4]
     );
 }
+
+/// The kv tail refuses a `sample` after `extract kv` with today's
+/// result, the live lane's sentence framed by `post-processing: `. A
+/// `sample` before `extract kv` stays in the SQL prefix, and one larger
+/// than its input feeds every row's extracted values to the tail.
+#[test]
+fn sample_lane_boundaries() {
+    let (_dir, glob) = three_sizes();
+    assert_eq!(
+        refusal("* | extract kv from message | sample 5", &glob),
+        "post-processing: sample is not supported in streaming mode: \
+         statistical sampling requires the full dataset",
+    );
+
+    let result = run(
+        "* | sample 100 | extract kv from message | table seq, k",
+        &glob,
+    );
+    let mut values: Vec<(Value, Value)> = cells(&result, "seq")
+        .into_iter()
+        .zip(cells(&result, "k"))
+        .collect();
+    values.sort_by_key(|(seq, _)| match seq {
+        Value::Integer(seq) => *seq,
+        other => panic!("seq must be an integer: {other:?}"),
+    });
+    assert_eq!(
+        values,
+        (1..=3)
+            .map(|seq| (Value::Integer(seq), Value::String(format!("v{seq}"))))
+            .collect::<Vec<_>>(),
+    );
+}
