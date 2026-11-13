@@ -2,6 +2,10 @@
 source: crates/trawl-core/src/emitter/mod.rs
 expression: "emit_dsl(\"* | sample 1000\")"
 ---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 1000 ROWS (reservoir)
+)
 SELECT *
-FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-USING SAMPLE 1000 ROWS (reservoir)
+FROM "_s0"

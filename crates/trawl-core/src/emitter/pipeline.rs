@@ -588,12 +588,11 @@ fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Resu
 }
 
 fn process_sample(mode: &SampleMode, ctx: &mut EmitterState) {
-    ctx.flush_if(FlushCondition::IfModified);
     let clause = match mode {
         SampleMode::Percent(p) => format!("USING SAMPLE {p} PERCENT (bernoulli)"),
         SampleMode::Count(n) => format!("USING SAMPLE {n} ROWS (reservoir)"),
     };
-    ctx.sample = Some(clause);
+    ctx.sample_boundary(clause);
 }
 
 fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result<(), EmitError> {

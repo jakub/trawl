@@ -1,0 +1,18 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: format_result(&result)
+---
+WITH _s0 AS (
+  SELECT *
+  FROM (SELECT * FROM read_parquet('/data/**/*.parquet', union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested") FROM read_json('/tmp/hot_abc123.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+  WHERE "service" = ?
+), _s1 AS (
+  SELECT *
+  FROM "_s0"
+  USING SAMPLE 3 ROWS (reservoir)
+)
+SELECT *
+FROM "_s1"
+---
+params:
+  0: 'a'

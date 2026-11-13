@@ -1,0 +1,289 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "sample_boundary_snapshot(&[r#\"* | sample 5 | where service == \"a\"\"#,\n\"* | sample 5 | sort id\", \"* | sample 5 | head 2\", \"* | sample 5 | tail 2\",\n\"* | sample 5 | table id, service\", \"* | sample 5 | fields id\",\n\"* | sample 5 | drop message\", \"* | sample 5 | rename service as svc\",\n\"* | sample 5 | stats count() as n\",\n\"* | sample 5 | stats count() as n by service\",\n\"* | sample 5 | timechart span=1h count()\", \"* | sample 5 | top 10 service\",\n\"* | sample 5 | rare 10 service\", \"* | sample 5 | sample 2\",\n\"* | sample 5 | let x = id + 1\",\nr#\"* | sample 5 | extract \"k=(?P<k>\\w+)\" from message\"#,\n\"* | sample 5 | dedup service\",\n\"* | sample 5 | eventstats count() as n by service\",\n\"* | sample 5 | pivot count() on service\",])"
+---
+* | sample 5 | where service == "a"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT *
+FROM "_s0"
+WHERE ("service" = ?)
+---
+params:
+  0: 'a'
+
+=====
+
+* | sample 5 | sort id
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT *
+FROM "_s0"
+ORDER BY "id" ASC
+
+=====
+
+* | sample 5 | head 2
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT *
+FROM "_s0"
+LIMIT 2
+
+=====
+
+* | sample 5 | tail 2
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT *
+FROM "_s0"
+ORDER BY "_time" DESC
+LIMIT 2
+
+=====
+
+* | sample 5 | table id, service
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT "id", "service"
+FROM "_s0"
+
+=====
+
+* | sample 5 | fields id
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT "id"
+FROM "_s0"
+
+=====
+
+* | sample 5 | drop message
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('message'))
+FROM "_s0"
+
+=====
+
+* | sample 5 | rename service as svc
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('service', 'svc')), "service" AS "svc"
+FROM "_s0"
+
+=====
+
+* | sample 5 | stats count() as n
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT COUNT(*) AS "n"
+FROM "_s0"
+
+=====
+
+* | sample 5 | stats count() as n by service
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT "service", COUNT(*) AS "n"
+FROM "_s0"
+GROUP BY "service"
+
+=====
+
+* | sample 5 | timechart span=1h count()
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+)
+SELECT time_bucket(INTERVAL '1 hours', TRY_CAST("_time" AS TIMESTAMP)) AS "_time", COUNT(*) AS "count"
+FROM "_s0"
+GROUP BY time_bucket(INTERVAL '1 hours', TRY_CAST("_time" AS TIMESTAMP))
+ORDER BY time_bucket(INTERVAL '1 hours', TRY_CAST("_time" AS TIMESTAMP)) ASC
+
+=====
+
+* | sample 5 | top 10 service
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+), _s1 AS (
+  SELECT "service", COUNT(*) AS "count"
+  FROM "_s0"
+  GROUP BY "service"
+)
+SELECT *
+FROM "_s1"
+ORDER BY "count" DESC
+LIMIT 10
+
+=====
+
+* | sample 5 | rare 10 service
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+), _s1 AS (
+  SELECT "service", COUNT(*) AS "count"
+  FROM "_s0"
+  GROUP BY "service"
+)
+SELECT *
+FROM "_s1"
+ORDER BY "count" ASC
+LIMIT 10
+
+=====
+
+* | sample 5 | sample 2
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+), _s1 AS (
+  SELECT *
+  FROM "_s0"
+  USING SAMPLE 2 ROWS (reservoir)
+)
+SELECT *
+FROM "_s1"
+
+=====
+
+* | sample 5 | let x = id + 1
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+), _s1 AS (
+  SELECT *
+  FROM "_s0"
+)
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('x')), (("id" + ?)) AS "x"
+FROM "_s1"
+---
+params:
+  0: 1
+
+=====
+
+* | sample 5 | extract "k=(?P<k>\w+)" from message
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+), _s1 AS (
+  SELECT *
+  FROM "_s0"
+), _s2 AS (
+  SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('k')), regexp_extract("message", ?, ?::VARCHAR[]) AS "_extract"
+  FROM "_s1"
+)
+SELECT * EXCLUDE ("_extract"), nullif(struct_extract("_extract", 'g1'), '') AS "k"
+FROM "_s2"
+---
+params:
+  0: 'k=(?P<k>\w+)'
+  1: '[g1]'
+
+=====
+
+* | sample 5 | dedup service
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+), _s1 AS (
+  SELECT *
+  FROM "_s0"
+), _s2 AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY "service" ORDER BY TRY_CAST("_time" AS TIMESTAMP) DESC) AS "_rn"
+  FROM "_s1"
+)
+SELECT * EXCLUDE ("_rn")
+FROM "_s2"
+WHERE "_rn" = 1
+
+=====
+
+* | sample 5 | eventstats count() as n by service
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+), _s1 AS (
+  SELECT *
+  FROM "_s0"
+)
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('n')), COUNT(*) OVER (PARTITION BY "service") AS "n"
+FROM "_s1"
+
+=====
+
+* | sample 5 | pivot count() on service
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  USING SAMPLE 5 ROWS (reservoir)
+), _s1 AS (
+  SELECT *
+  FROM "_s0"
+), _s2 AS (
+  SELECT "service"
+  FROM "_s1"
+)
+PIVOT "_s2"
+ON "service"
+USING COUNT(*)

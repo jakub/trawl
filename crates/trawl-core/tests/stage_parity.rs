@@ -961,3 +961,199 @@ fn the_row_doors_keep_an_event_maps_bytes() {
         "the map's key order or cell rendering changed"
     );
 }
+
+/// Twenty events, `id` 0-19, time rising with `id`, `service` `a` for
+/// an even `id` and `b` for an odd one.
+fn twenty_events() -> Vec<Value> {
+    (0..20)
+        .map(|id| {
+            json!({
+                "_time": format!("2026-01-15T09:00:{id:02}Z"),
+                "id": id,
+                "service": if id % 2 == 0 { "a" } else { "b" },
+                "message": format!("k=v{id}"),
+            })
+        })
+        .collect()
+}
+
+/// The `id` column of a batch answer, as sorted integers.
+fn ids(rows: &TextRows) -> Vec<i64> {
+    let mut ids: Vec<i64> = column(rows, "id")
+        .iter()
+        .map(|id| id.parse().expect("an integer id"))
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The column names of every row of a batch answer, one set per row.
+fn columns_of(rows: &TextRows) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|row| row.iter().map(|(name, _)| name.clone()).collect())
+        .collect()
+}
+
+/// One row's cells as `(column, text)` pairs, for a one-row answer.
+fn only_row(dsl: &str, rows: &TextRows) -> Vec<(String, String)> {
+    assert_eq!(rows.len(), 1, "{dsl:?} must answer one row: {rows:?}");
+    rows[0].clone()
+}
+
+fn cells(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut cells: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
+        .collect();
+    cells.sort();
+    cells
+}
+
+/// `sample` reads exactly the rows the stage before it produced. A
+/// sample at least as large as its input returns that input, so a stage
+/// whose clauses landed on the sampled SELECT shows up as wrong rows or
+/// a refused query. The live lane refuses `sample`, so this is batch
+/// only.
+#[test]
+fn sample_reads_completed_input() {
+    let conn = conn();
+    let events = twenty_events();
+    let even_ids: Vec<i64> = (0..20).filter(|id| id % 2 == 0).collect();
+
+    for dsl in [
+        "service=a | sample 100",
+        r#"* | where service == "a" | sample 100"#,
+    ] {
+        assert_eq!(ids(&batch_rows(&conn, dsl, &events)), even_ids, "{dsl}");
+    }
+    let dsl = "* | sort _time | head 5 | sample 5";
+    assert_eq!(
+        ids(&batch_rows(&conn, dsl, &events)),
+        vec![0, 1, 2, 3, 4],
+        "{dsl}"
+    );
+    let dsl = "* | tail 5 | sample 5";
+    assert_eq!(
+        ids(&batch_rows(&conn, dsl, &events)),
+        vec![15, 16, 17, 18, 19],
+        "{dsl}"
+    );
+    let dsl = "service=a | sample 100% | stats count() as n";
+    assert_eq!(
+        only_row(dsl, &batch_rows(&conn, dsl, &events)),
+        cells(&[("n", "10")]),
+    );
+    for dsl in ["service=c | sample 5", "service=c | sample 50%"] {
+        assert_eq!(batch_rows(&conn, dsl, &events), TextRows::new(), "{dsl}");
+    }
+}
+
+/// The stage after a `sample` reads only the sample: each runs after a
+/// sample that keeps every row and answers what it answers over the
+/// whole input, and a sample of one row stays one row through a second,
+/// larger sample.
+#[test]
+fn sample_output_stage_composition() {
+    let conn = conn();
+    let events = twenty_events();
+    let all: Vec<i64> = (0..20).collect();
+    let run = |dsl: &str| batch_rows(&conn, dsl, &events);
+
+    let dsl = r#"* | sample 100 | where service == "a""#;
+    assert_eq!(
+        ids(&run(dsl)),
+        (0..20).filter(|id| id % 2 == 0).collect::<Vec<_>>(),
+        "{dsl}"
+    );
+    let dsl = "* | sample 1 | sample 100 | stats count() as n";
+    assert_eq!(only_row(dsl, &run(dsl)), cells(&[("n", "1")]));
+    let dsl = "* | sample 100 | stats count() as n by service";
+    assert_eq!(
+        run(dsl),
+        vec![
+            cells(&[("n", "10"), ("service", "a")]),
+            cells(&[("n", "10"), ("service", "b")]),
+        ],
+        "{dsl}"
+    );
+    let dsl = "* | sample 100 | stats count() as n";
+    assert_eq!(only_row(dsl, &run(dsl)), cells(&[("n", "20")]));
+
+    let dsl = "* | sample 100 | sort id | head 3";
+    assert_eq!(ids(&run(dsl)), vec![0, 1, 2], "{dsl}");
+    let dsl = "* | sample 100 | tail 2";
+    assert_eq!(ids(&run(dsl)), vec![18, 19], "{dsl}");
+
+    let dsl = "* | sample 100 | table id, service";
+    let rows = run(dsl);
+    assert_eq!(ids(&rows), all, "{dsl}");
+    assert!(
+        columns_of(&rows).iter().all(|c| c == &["id", "service"]),
+        "{dsl}: {rows:?}"
+    );
+    let dsl = "* | sample 100 | fields id";
+    let rows = run(dsl);
+    assert_eq!(ids(&rows), all, "{dsl}");
+    assert!(columns_of(&rows).iter().all(|c| c == &["id"]), "{dsl}");
+    let dsl = "* | sample 100 | drop message";
+    let rows = run(dsl);
+    assert_eq!(ids(&rows), all, "{dsl}");
+    assert!(
+        columns_of(&rows).iter().all(|c| c == &["id", "service"]),
+        "{dsl}: {rows:?}"
+    );
+    let dsl = "* | sample 100 | rename service as svc";
+    let rows = run(dsl);
+    assert_eq!(ids(&rows), all, "{dsl}");
+    assert_eq!(column(&rows, "svc").len(), 20, "{dsl}");
+
+    let dsl = "* | sample 100 | timechart span=1h count()";
+    let rows = run(dsl);
+    assert_eq!(only_row(dsl, &rows), cells(&[("count", "20")]));
+
+    let dsl = "* | sample 100 | top 10 service";
+    assert_eq!(column(&run(dsl), "count"), vec!["10", "10"], "{dsl}");
+    let dsl = "* | sample 100 | rare 10 service";
+    assert_eq!(column(&run(dsl), "count"), vec!["10", "10"], "{dsl}");
+
+    let dsl = "* | sample 100 | let x = id + 1";
+    let mut xs: Vec<i64> = column(&run(dsl), "x")
+        .iter()
+        .map(|x| x.parse().unwrap())
+        .collect();
+    xs.sort_unstable();
+    assert_eq!(xs, (1..=20).collect::<Vec<_>>(), "{dsl}");
+
+    let dsl = r#"* | sample 100 | extract "k=(?P<k>\w+)" from message"#;
+    let mut ks = column(&run(dsl), "k");
+    let mut want: Vec<String> = (0..20).map(|id| format!("v{id}")).collect();
+    want.sort();
+    ks.sort();
+    assert_eq!(ks, want, "{dsl}");
+
+    let dsl = "* | sample 100 | dedup service";
+    assert_eq!(column(&run(dsl), "service"), vec!["a", "b"], "{dsl}");
+    let dsl = "* | sample 100 | eventstats count() as n by service";
+    let rows = run(dsl);
+    assert_eq!(ids(&rows), all, "{dsl}");
+    assert!(column(&rows, "n").iter().all(|n| n == "10"), "{dsl}");
+    let dsl = "* | sample 100 | pivot count() on service";
+    assert_eq!(only_row(dsl, &run(dsl)), cells(&[("a", "10"), ("b", "10")]),);
+}
+
+/// The live lane refuses `sample` with today's unsupported-stage
+/// result; the kv-tail half of this boundary lives in the engine's
+/// `kv_tail_order` tests.
+#[test]
+fn sample_lane_boundaries() {
+    let query = trawl_core::parser::parse("* | sample 5").expect("dsl parses");
+    let err = compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None)
+        .expect_err("the live lane refuses sample");
+    assert!(
+        matches!(
+            &err,
+            trawl_core::stream::StreamPlanError::UnsupportedStage { stage, .. } if stage == "sample"
+        ),
+        "{err}"
+    );
+}
