@@ -59,6 +59,10 @@ pub mod eval;
 /// input (ADR-0011).
 pub mod field_refs;
 
+/// The JSON path grammar `json`, `json_extract_string` and `json_extract`
+/// accept, and the walk the evaluator reads it by (ADR-0017).
+pub mod json_path;
+
 /// In-memory event filter compiled from the search stage.
 pub mod filter;
 
