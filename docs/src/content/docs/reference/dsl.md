@@ -857,7 +857,7 @@ sample 10%
 sample 1000
 ```
 
-There is no seed argument and no stable ordering, so a repeated query can return different rows. Stage order matters: sampling a filtered relation and filtering a sample answer different questions.
+There is no seed argument and no stable ordering, so a repeated query can return different rows. Stage order matters: sampling a filtered relation and filtering a sample answer different questions. To order a sample, put `sort` after `sample`.
 
 ### eventstats
 
