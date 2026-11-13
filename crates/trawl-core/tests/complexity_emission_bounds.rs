@@ -762,6 +762,9 @@ fn shape_of(name: &str, args: &str) -> Rendering {
             dialect: Dialect::Otel,
             argc: arity,
         },
+        "json" | "json_extract" | "json_extract_string" | "json_keys" | "json_array_length" => {
+            FunctionShape::JsonGuarded(arity)
+        }
         _ => FunctionShape::Plain(arity),
     })
 }

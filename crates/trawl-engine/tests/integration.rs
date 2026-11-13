@@ -3435,3 +3435,85 @@ fn the_regex_counter_charges_a_pivot_fill() {
         "{stages}: {refused:?}"
     );
 }
+
+/// Twenty events whose `message` is `{"k":<id>}`, except id 5, which is the
+/// plain-text line a JSON logger prints now and then (#457's fixture).
+fn one_plain_text_line_parquet(dir: &std::path::Path) -> String {
+    let path = dir.join("json_documents.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT TIMESTAMP '2026-11-13 00:00:00' + INTERVAL (i) SECOND AS _time,
+                      i AS id,
+                      CASE WHEN i % 2 = 0 THEN 'a' ELSE 'b' END AS service,
+                      CASE WHEN i = 5 THEN 'plain text line'
+                           ELSE '{{\"k\":' || i || '}}' END AS message
+               FROM range(20) t(i)) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("json document fixture should be written");
+    path.display().to_string()
+}
+
+/// A json call and the value it gives the event `{"k":<id>}`.
+type JsonCase = (&'static str, fn(i64) -> Value);
+
+/// One event whose `message` is not JSON no longer fails the query: each
+/// json function reads it as null and keeps every row (ADR-0017, amendment
+/// of 2026-11-13). Before the document guard, `DuckDB` raised `Malformed
+/// JSON` for the whole statement.
+#[test]
+fn one_document_that_is_not_json_keeps_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = one_plain_text_line_parquet(dir.path());
+    let exec = Executor::new().expect("executor should initialize");
+
+    // The value each function gives the event `{"k":<id>}`.
+    let cases: [JsonCase; 5] = [
+        (r#"json_extract_string(message, "$.k")"#, |id| {
+            Value::String(id.to_string())
+        }),
+        (r#"json(message, "$.k")"#, |id| {
+            Value::String(id.to_string())
+        }),
+        (r#"json_extract(message, "$.k")"#, |id| {
+            Value::String(id.to_string())
+        }),
+        ("json_keys(message)", |_| {
+            Value::Array(vec![Value::String("k".into())])
+        }),
+        // Every valid document is an object, which has no array length:
+        // 0, not null, so 19 rows count.
+        ("json_array_length(message)", |_| Value::Integer(0)),
+    ];
+    for (call, expected) in cases {
+        let counted = exec
+            .run_query_max(
+                &format!("* | let k = {call} | stats count(k) as n, count() as total"),
+                &source,
+            )
+            .unwrap_or_else(|error| panic!("{call}: the counting query failed: {error}"));
+        assert_eq!(integer_column(&counted, "n"), vec![19], "{call}");
+        assert_eq!(integer_column(&counted, "total"), vec![20], "{call}");
+
+        // Row by row, so the aggregate cannot hide a dropped row or a
+        // value moved onto the wrong event.
+        let rows = exec
+            .run_query_max(
+                &format!("* | let k = {call} | sort id | table id, k"),
+                &source,
+            )
+            .unwrap_or_else(|error| panic!("{call}: the row query failed: {error}"));
+        let got: Vec<(Value, Value)> = rows
+            .rows
+            .iter()
+            .map(|row| (row[0].clone(), row[1].clone()))
+            .collect();
+        let want: Vec<(Value, Value)> = (0..20)
+            .map(|id| {
+                let value = if id == 5 { Value::Null } else { expected(id) };
+                (Value::Integer(id), value)
+            })
+            .collect();
+        assert_eq!(got, want, "{call}");
+    }
+}

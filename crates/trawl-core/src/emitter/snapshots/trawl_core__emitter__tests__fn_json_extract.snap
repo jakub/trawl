@@ -4,7 +4,7 @@ expression: "emit_dsl(r#\"* | where json(message, \"$.user\") == \"alice\"\"#)"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE (JSON_EXTRACT_STRING("message", ?) = ?)
+WHERE (JSON_EXTRACT_STRING(TRY_CAST("message" AS JSON), ?) = ?)
 ---
 params:
   0: '$.user'

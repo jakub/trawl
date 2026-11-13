@@ -483,6 +483,10 @@ pub enum FunctionShape {
     Split,
     /// `CAST(? AS TIMESTAMP)` — `now()` binds the query's anchor.
     Now,
+    /// `F(TRY_CAST(a AS JSON)[, b])`: a json function over `n` arguments,
+    /// each written once, whose document passes through a cast
+    /// (ADR-0017, amendment of 2026-11-13).
+    JsonGuarded(usize),
     /// `sev(x[, dialect])`: the severity reading kernel, bound once, over
     /// the argument's canonical text form. The dialect argument is inlined
     /// text and never an operand.
@@ -649,6 +653,8 @@ fn function_profile(shape: FunctionShape) -> RenderProfile {
         FunctionShape::Split => RenderProfile::new(3, vec![1, 1, 0]),
         // `CAST(? AS TIMESTAMP)`.
         FunctionShape::Now => RenderProfile::new(2, Vec::new()),
+        // The call and the document's `TRY_CAST`.
+        FunctionShape::JsonGuarded(n) => RenderProfile::uniform(2, n),
         FunctionShape::Sev { dialect, argc } => {
             let reading = conform_profile(ConformShape::SeverityReadingBindOnce(dialect));
             let text = conform_profile(ConformShape::UntypedText);
@@ -1304,53 +1310,15 @@ fn call_rendering(name: &str, args: &[Spanned<Expr>]) -> Rendering {
             dialect: sev_dialect(args),
             argc: arity,
         },
-        "count"
-        | "avg"
-        | "sum"
-        | "min"
-        | "max"
-        | "dc"
-        | "distinct_count"
-        | "first"
-        | "last"
-        | "values"
-        | "list"
-        | "median"
-        | "stddev"
-        | "lower"
-        | "upper"
-        | "length"
-        | "len"
-        | "coalesce"
-        | "if"
-        | "replace"
-        | "substr"
-        | "trim"
-        | "ltrim"
-        | "rtrim"
-        | "abs"
-        | "ceil"
-        | "ceiling"
-        | "floor"
-        | "round"
-        | "typeof"
-        | "tonumber"
-        | "tostring"
-        | "contains"
-        | "startswith"
-        | "endswith"
-        | "concat"
-        | "date_part"
-        | "date_trunc"
-        | "date_diff"
-        | "strftime"
-        | "strptime"
-        | "json"
-        | "json_extract"
-        | "json_extract_string"
-        | "json_valid"
-        | "json_keys"
-        | "json_array_length" => FunctionShape::Plain(arity),
+        "count" | "avg" | "sum" | "min" | "max" | "dc" | "distinct_count" | "first" | "last"
+        | "values" | "list" | "median" | "stddev" | "lower" | "upper" | "length" | "len"
+        | "coalesce" | "if" | "replace" | "substr" | "trim" | "ltrim" | "rtrim" | "abs"
+        | "ceil" | "ceiling" | "floor" | "round" | "typeof" | "tonumber" | "tostring"
+        | "contains" | "startswith" | "endswith" | "concat" | "date_part" | "date_trunc"
+        | "date_diff" | "strftime" | "strptime" | "json_valid" => FunctionShape::Plain(arity),
+        "json" | "json_extract" | "json_extract_string" | "json_keys" | "json_array_length" => {
+            FunctionShape::JsonGuarded(arity)
+        }
         // `KNOWN_FUNCTIONS` grew a name this table does not price.
         // `every_known_function_has_a_profile` fails here, loudly, rather
         // than letting the new function score as something cheaper.

@@ -1128,23 +1128,28 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
             }
             _ => EvalValue::Null,
         }),
+        // A document that is not JSON is null; a valid one of the wrong
+        // shape has no keys and no length, as in `DuckDB` (ADR-0017,
+        // amendment of 2026-11-13).
         "json_keys" => args.first().map_or(EvalValue::Null, |v| match v {
-            EvalValue::Str(s) => serde_json::from_str::<serde_json::Value>(s)
-                .ok()
-                .and_then(|val| {
-                    val.as_object().map(|obj| {
-                        EvalValue::Array(obj.keys().map(|k| EvalValue::Str(k.clone())).collect())
+            EvalValue::Str(s) => {
+                serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .map_or(EvalValue::Null, |val| {
+                        EvalValue::Array(val.as_object().map_or_else(Vec::new, |obj| {
+                            obj.keys().map(|k| EvalValue::Str(k.clone())).collect()
+                        }))
                     })
-                })
-                .unwrap_or(EvalValue::Null),
+            }
             _ => EvalValue::Null,
         }),
         #[allow(clippy::cast_possible_wrap)]
         "json_array_length" => args.first().map_or(EvalValue::Null, |v| match v {
             EvalValue::Str(s) => serde_json::from_str::<serde_json::Value>(s)
                 .ok()
-                .and_then(|val| val.as_array().map(|arr| EvalValue::Int(arr.len() as i64)))
-                .unwrap_or(EvalValue::Null),
+                .map_or(EvalValue::Null, |val| {
+                    EvalValue::Int(val.as_array().map_or(0, |arr| arr.len() as i64))
+                }),
             _ => EvalValue::Null,
         }),
 
@@ -1223,6 +1228,8 @@ fn eval_json_extract_string(args: &[EvalValue]) -> EvalValue {
                 .ok()
                 .and_then(|val| {
                     val.pointer(&pointer).map(|v| match v {
+                        // A JSON `null` is SQL null, as `DuckDB` reads it.
+                        serde_json::Value::Null => EvalValue::Null,
                         serde_json::Value::String(s) => EvalValue::Str(s.clone()),
                         other => EvalValue::Str(other.to_string()),
                     })

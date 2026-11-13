@@ -508,16 +508,22 @@ pub(crate) fn translate_function(
             sql.push_str(" END");
             Ok(sql)
         }
-        // json functions
+        // json functions. The document passes through `TRY_CAST(… AS
+        // JSON)`, so a value that is not JSON reads as NULL instead of
+        // failing the statement, while an error raised computing the
+        // document still raises (ADR-0017, amendment of 2026-11-13).
+        // The document is written once.
         "json" | "json_extract_string" => require_n_args(name, args, 2, |a| {
-            format!("JSON_EXTRACT_STRING({}, {})", a[0], a[1])
+            format!("JSON_EXTRACT_STRING(TRY_CAST({} AS JSON), {})", a[0], a[1])
         }),
         "json_extract" => require_n_args(name, args, 2, |a| {
-            format!("JSON_EXTRACT({}, {})", a[0], a[1])
+            format!("JSON_EXTRACT(TRY_CAST({} AS JSON), {})", a[0], a[1])
         }),
         "json_valid" => require_one_arg(name, args, |a| format!("JSON_VALID({a})")),
-        "json_keys" => require_one_arg(name, args, |a| format!("JSON_KEYS({a})")),
-        "json_array_length" => require_one_arg(name, args, |a| format!("JSON_ARRAY_LENGTH({a})")),
+        "json_keys" => require_one_arg(name, args, |a| format!("JSON_KEYS(TRY_CAST({a} AS JSON))")),
+        "json_array_length" => require_one_arg(name, args, |a| {
+            format!("JSON_ARRAY_LENGTH(TRY_CAST({a} AS JSON))")
+        }),
         _ => Err(EmitError::UnknownFunction {
             name: name.to_string(),
             suggestion: suggest::suggest_function(name).map(String::from),

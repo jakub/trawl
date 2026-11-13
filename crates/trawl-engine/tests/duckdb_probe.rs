@@ -5374,6 +5374,205 @@ fn current_json_number_spelling_follows_serdes_f64() {
     assert_eq!(json_extract_mirror(doc, "$.a"), None);
 }
 
+// ── the json document guard (ADR-0017, amendment of 2026-11-13) ─────
+//
+// Batch emits each json function over `TRY_CAST(<document> AS JSON)`, so
+// a document that is not JSON reads as NULL instead of failing the
+// statement. These probes pin the engine facts that guard rests on.
+
+/// Hand-picked documents at the edge of what `DuckDB` calls JSON.
+const JSON_GUARD_DOCUMENTS: &[&str] = &[
+    "",
+    " ",
+    "plain text line",
+    r#""""#,
+    r#"{"k":1}"#,
+    r#"{"k":1} x"#,
+    "{",
+    "[1,2,3]",
+    "[1,2,]",
+    r#""str""#,
+    "42",
+    "-0",
+    "1e999",
+    "null",
+    "true",
+    r#"{ "k" : [ 1 , 2 ] }"#,
+    r#"{"a":NaN}"#,
+    r#"{"a":1,"a":2}"#,
+    "\u{feff}{}",
+];
+
+/// The fragments the generated documents are built from.
+const JSON_GUARD_FRAGMENTS: &[&str] = &[
+    "{", "}", "[", "]", "\"", ":", ",", "1", "a", "null", "true", "-", ".", "e", "\\", " ", "x",
+];
+
+/// Deterministic documents stitched from [`JSON_GUARD_FRAGMENTS`], so the
+/// corpus reaches shapes nobody thought to write down.
+fn generated_json_guard_documents() -> Vec<String> {
+    let mut state: u64 = 0x0457_0457_0457_0457;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        usize::try_from(state >> 33).expect("a 31-bit value fits usize")
+    };
+    (0..300)
+        .map(|_| {
+            let len = next() % 7;
+            (0..len)
+                .map(|_| JSON_GUARD_FRAGMENTS[next() % JSON_GUARD_FRAGMENTS.len()])
+                .collect()
+        })
+        .collect()
+}
+
+/// `TRY_CAST(varchar AS JSON)` nulls exactly the text `json_valid`
+/// rejects, and keeps every other text byte for byte. If either half
+/// moves, the guard either lets a raising document through or changes
+/// what a valid one reads as.
+#[test]
+fn try_cast_to_json_nulls_exactly_what_json_valid_rejects() {
+    let conn = conn();
+    let generated = generated_json_guard_documents();
+    let mut valid = 0;
+    let mut invalid = 0;
+    for doc in JSON_GUARD_DOCUMENTS
+        .iter()
+        .copied()
+        .chain(generated.iter().map(String::as_str))
+    {
+        let (is_valid, cast): (bool, Option<String>) = conn
+            .query_row(
+                "SELECT json_valid(d), CAST(TRY_CAST(d AS JSON) AS VARCHAR) \
+                 FROM (SELECT CAST(? AS VARCHAR) AS d)",
+                [doc],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_else(|error| panic!("{doc:?}: {error}"));
+        if is_valid {
+            valid += 1;
+            assert_eq!(cast.as_deref(), Some(doc), "a valid document changed");
+        } else {
+            invalid += 1;
+            assert_eq!(cast, None, "an invalid document survived the cast: {doc:?}");
+        }
+    }
+    // Both sides of the line were exercised.
+    assert!(
+        valid >= 10 && invalid >= 10,
+        "valid={valid} invalid={invalid}"
+    );
+}
+
+/// A parquet column of type JSON holding text that is not JSON fails at
+/// scan, before any json function runs, and the document guard cannot
+/// help: `TRY_CAST(json AS JSON)` is elided. This is the out-of-scope
+/// residual of ADR-0017's 2026-11-13 amendment: such a source stays an
+/// engine error.
+#[test]
+fn a_parquet_json_column_holding_invalid_text_fails_at_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("json_column.parquet");
+    let conn = conn();
+    conn.execute_batch(&format!(
+        "COPY (SELECT CAST('[\"qqqqqqqqqq\"]' AS JSON) AS j) TO '{}' \
+         (FORMAT parquet, COMPRESSION uncompressed)",
+        path.display()
+    ))
+    .unwrap();
+
+    // Swap the valid document for invalid text of the same length,
+    // everywhere it is written (the page and the column statistics).
+    let valid = br#"["qqqqqqqqqq"]"#;
+    let invalid = b"plain text!!!!";
+    assert_eq!(valid.len(), invalid.len());
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut patched = 0;
+    let mut at = 0;
+    while let Some(offset) = bytes[at..]
+        .windows(valid.len())
+        .position(|window| window == valid)
+    {
+        let start = at + offset;
+        bytes[start..start + valid.len()].copy_from_slice(invalid);
+        patched += 1;
+        at = start + valid.len();
+    }
+    assert!(patched >= 1, "the fixture value was not found in the file");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let column_type: String = conn
+        .query_row(
+            &format!(
+                "SELECT column_type FROM (DESCRIBE SELECT j FROM read_parquet('{}'))",
+                path.display()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(column_type, "JSON");
+
+    for select in [
+        "CAST(j AS VARCHAR)",
+        "json_extract_string(TRY_CAST(j AS JSON), '$')",
+    ] {
+        let read: Result<Option<String>, _> = conn.query_row(
+            &format!("SELECT {select} FROM read_parquet('{}')", path.display()),
+            [],
+            |row| row.get(0),
+        );
+        let error = read.expect_err(select).to_string();
+        assert!(error.contains("Malformed JSON"), "{select}: {error}");
+    }
+}
+
+/// Negative control for the guard's form: an output that selects both a
+/// `TRY(…)`-wrapped call and a `CASE WHEN json_valid` guarded call over
+/// one document still raises, because `DuckDB` folds the equal paths and
+/// hoists the shared call out of both guards. The emitted
+/// `TRY_CAST(<document> AS JSON)` form over the same pair does not.
+#[test]
+fn a_try_and_case_guard_pair_still_raises_where_the_cast_guard_does_not() {
+    let conn = conn();
+    let source = "FROM (VALUES ('plain text line'), ('{\"k\":1}')) t(x)";
+    let mixed: Result<Option<String>, _> = conn.query_row(
+        &format!(
+            "SELECT TRY(json_extract_string(x, ?)), \
+             CASE WHEN json_valid(x) THEN json_extract_string(x, ?) END {source} LIMIT 1"
+        ),
+        ["$", "$"],
+        |row| row.get(0),
+    );
+    let error = mixed.expect_err("the mixed TRY and CASE pair").to_string();
+    assert!(error.contains("Malformed JSON"), "{error}");
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT json_extract_string(TRY_CAST(x AS JSON), ?), \
+             CASE WHEN json_valid(x) THEN json_extract_string(TRY_CAST(x AS JSON), ?) END \
+             {source}"
+        ))
+        .unwrap();
+    let rows: Vec<(Option<String>, Option<String>)> = stmt
+        .query_map(["$", "$"], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (None, None),
+            (
+                Some(r#"{"k":1}"#.to_string()),
+                Some(r#"{"k":1}"#.to_string())
+            ),
+        ]
+    );
+}
+
 // ── the now() anchor's bound TIMESTAMP (ADR-0017 §3) ─────────────────
 //
 // `now()` does not emit `DuckDB`'s own clock: the statement's instant is
