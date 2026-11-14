@@ -129,7 +129,11 @@ fn many_findings() -> String {
         .join(" ")
 }
 
-/// A Parquet file of three events, two of them carrying the address.
+/// A Parquet file of five events, four of them carrying the address. In
+/// two of those the `service` field and the message text disagree: a
+/// coredns event whose text never says `service=coredns`, and a kubelet
+/// event whose text does. A text search for `service=coredns` and a
+/// filter on the `service` field keep different rows.
 fn fixture(dir: &Path) -> String {
     let executor = trawl_engine::executor::Executor::new().expect("an executor");
     let string = |s: &str| Value::String(s.to_owned());
@@ -158,6 +162,18 @@ fn fixture(dir: &Path) -> String {
                 string("refused 10.244.0.83, \"quoted\", comma"),
                 string("kubelet"),
                 string("c"),
+            ],
+            vec![
+                string("answered 10.244.0.83 upstream"),
+                string("answered 10.244.0.83 upstream"),
+                string("coredns"),
+                string("d"),
+            ],
+            vec![
+                string("probe 10.244.0.83 forwarded to service=coredns"),
+                string("probe 10.244.0.83 forwarded to service=coredns"),
+                string("kubelet"),
+                string("e"),
             ],
         ],
     };
@@ -395,6 +411,30 @@ async fn cli_query_advice_precedes_execution() {
     );
 }
 
+/// The rows [`NEGATED`] keeps from [`fixture`]: every event with the
+/// address whose text lacks `service=coredns`, whatever its `service`.
+const NEGATED_KEEPS: [&str; 3] = [
+    "lookup 10.244.0.83 ok",
+    "refused 10.244.0.83",
+    "answered 10.244.0.83 upstream",
+];
+/// The rows [`NEGATED`] drops from [`fixture`]: the text says
+/// `service=coredns`, whether or not the `service` field does.
+const NEGATED_DROPS: [&str; 2] = [
+    "lookup 10.244.0.83 via service=coredns",
+    "probe 10.244.0.83 forwarded to service=coredns",
+];
+
+/// `text` holds every row [`NEGATED`] keeps and none it drops.
+fn assert_negated_rows(text: &str, what: &str) {
+    for kept in NEGATED_KEEPS {
+        assert!(text.contains(kept), "{what} lacks {kept:?}:\n{text}");
+    }
+    for dropped in NEGATED_DROPS {
+        assert!(!text.contains(dropped), "{what} holds {dropped:?}:\n{text}");
+    }
+}
+
 #[tokio::test]
 async fn cli_query_advice_preserves_stdout_and_exports() {
     let (home, config) = local_home();
@@ -432,10 +472,9 @@ async fn cli_query_advice_preserves_stdout_and_exports() {
             "{}",
             describe(&silenced)
         );
-        assert!(
-            String::from_utf8_lossy(&advised.stdout).contains("10.244.0.83 ok"),
-            "{format}: {}",
-            describe(&advised)
+        assert_negated_rows(
+            &String::from_utf8_lossy(&advised.stdout),
+            &format!("{format} stdout"),
         );
         assert_eq!(advised.stdout, silenced.stdout, "{format} stdout differs");
     }
@@ -466,6 +505,28 @@ async fn cli_query_advice_preserves_stdout_and_exports() {
         let silenced = std::fs::read(&silenced_path).expect("read the silenced export");
         assert!(!advised.is_empty(), "{format} export is empty");
         assert_eq!(advised, silenced, "{format} export differs");
+        // The export holds the rows the text search keeps: a Parquet
+        // file is read back through the CLI as JSON.
+        let rows = if format == "parquet" {
+            let output = trawl(
+                &home,
+                &config,
+                &[
+                    "query",
+                    "*",
+                    "--data",
+                    advised_path.to_str().unwrap(),
+                    "--format",
+                    "json",
+                ],
+            )
+            .await;
+            assert!(output.status.success(), "{}", describe(&output));
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        } else {
+            String::from_utf8_lossy(&advised).into_owned()
+        };
+        assert_negated_rows(&rows, &format!("{format} export"));
     }
 }
 

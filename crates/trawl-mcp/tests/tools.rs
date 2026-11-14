@@ -710,14 +710,27 @@ async fn search_validate_reports_budget_dropped_hints() {
 }
 
 /// A text trawld refuses shows only its errors: no advice, though the
-/// same text with no error would have some.
+/// same text with no error has some.
 #[tokio::test]
 async fn search_errors_suppress_query_advice() {
-    let query = format!("{ADVISED} | stat count()");
+    // The text parses here, so only trawld's verdict tells the cases apart.
+    let query = format!("{ADVISED} | stats count()");
+    trawl_core::parser::parse_unbuilt(&query).expect("the text parses locally");
+    let start = query.find("stats").unwrap();
+
+    // The control: trawld calls it valid, and the advice prints.
+    let result = validate(&validates(), json!({"mode": "validate", "query": query})).await;
+    let advice = advice_lines(&query);
+    let mirror = result.structured_content.as_ref().expect("a mirror");
+    assert_eq!(mirror["validation"]["valid"], json!(true));
+    assert_eq!(mirror["hints"], json!(advice));
+    let text = text_of(&result);
+    assert_eq!(lines_starting(text, "hint: ").len(), advice.len(), "{text}");
+
     let backend = Fake {
         validate: ok(serde_json::from_value(json!({
             "valid": false,
-            "errors": [{"message": "unknown command 'stat'", "span": {"start": 39, "end": 43}}]
+            "errors": [{"message": "stats is refused here", "span": {"start": start, "end": start + 5}}]
         }))
         .unwrap()),
         ..Fake::default()

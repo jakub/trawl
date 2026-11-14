@@ -1688,7 +1688,7 @@ fn non_advice_hint_drop_order_is_unchanged() {
             ROWS,
         )
     };
-    let mut seen_hints_gone = false;
+    let mut seen = std::collections::BTreeSet::new();
     for budget in (Budget::MIN.bytes()..=hi).step_by(8) {
         let result = at(budget);
         let Some(mirror) = result.structured_content.as_ref() else {
@@ -1711,9 +1711,20 @@ fn non_advice_hint_drop_order_is_unchanged() {
             json!(hints_gone),
             "{budget}"
         );
-        seen_hints_gone |= hints_gone;
+        seen.insert(order);
     }
-    assert!(seen_hints_gone, "the sweep reached the hints");
+    // Each part goes on a rung of its own: the sweep reaches every state
+    // where the parts before it are gone and the parts after it remain,
+    // so no rung gives up a later part early.
+    for state in [
+        [false, false, false, false],
+        [true, false, false, false],
+        [true, true, false, false],
+        [true, true, true, false],
+        [true, true, true, true],
+    ] {
+        assert!(seen.contains(&state), "never reached {state:?}: {seen:?}");
+    }
 }
 
 // -- properties ---------------------------------------------------------------------

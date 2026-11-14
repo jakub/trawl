@@ -77,6 +77,8 @@ test.describe('query advice', () => {
     await expect(page.locator(`${SEL.dslEditor} .cm-lintRange-warning`)).toHaveCount(0);
     await editorBlock(page).screenshot({ path: testInfo.outputPath('browser-corrected.png') });
 
+    // The observer saw the haul, so its silence on /validate counts.
+    expect(paths).toContain('/api/v1/query');
     expect(paths.filter(p => p.includes('/validate'))).toEqual([]);
   });
 
@@ -88,11 +90,23 @@ test.describe('query advice', () => {
 
     await expect(page.locator(SEL.draftDiagnosticAdvice)).toBeVisible();
     await expect(page.locator(SEL.draftDiagnosticFirst)).toHaveText(/^Line 1:1 — -service=… is a text search/);
-    await expect(page.locator(SEL.draftDiagnosticMore).locator('summary')).toHaveText('+7 more');
+    const more = page.locator(SEL.draftDiagnosticMore);
+    await expect(more.locator('summary')).toHaveText('+7 more');
+    // Opened, the disclosure lists the second through eighth findings,
+    // each at its own term: `-service=sN` starts at column 1 + 12·N.
+    await more.locator('summary').click();
+    const entries = more.locator('li');
+    await expect(entries).toHaveCount(7);
+    for (let i = 0; i < 7; i++) {
+      await expect(entries.nth(i)).toBeVisible();
+      await expect(entries.nth(i)).toHaveText(new RegExp(`^Line 1:${1 + 12 * (i + 1)} — -service=… is a text search`));
+    }
     await expect(page.locator(SEL.draftDiagnosticOmitted)).toHaveText('and 2 more advice notes not shown');
     // Eight spans, never a ninth for the count.
     await expect(page.locator(`${SEL.dslEditor} .cm-lintRange-warning`)).toHaveCount(8);
 
+    // The observer saw the page load, so its silence on /validate counts.
+    expect(paths).toContain('/search');
     expect(paths.filter(p => p.includes('/validate'))).toEqual([]);
   });
 
