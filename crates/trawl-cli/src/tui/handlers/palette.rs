@@ -212,11 +212,13 @@ impl App {
                 self.tab.editor.clear();
                 self.tab.editor.insert_text(&query);
                 self.tab.editor.move_to_line_end();
+                self.tab.mark_editor_dirty();
                 self.switch_to_main_tab(MainTab::Query);
                 self.focus = Focus::Editor;
             }
             PaletteAction::InsertAtCursor(text) => {
                 self.tab.editor.insert_text(&text);
+                self.tab.mark_editor_dirty();
                 self.switch_to_main_tab(MainTab::Query);
                 self.focus = Focus::Editor;
             }

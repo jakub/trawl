@@ -41,18 +41,22 @@ export interface EditorHandle {
   closeCompletion: () => void;
 }
 
-/** The accessible name of every lint gutter marker. The marker's DOM
+/** The accessible name of an error lint gutter marker. The marker's DOM
  * does not carry its diagnostics, and the draft diagnostic line under the
  * editor already reads them out in full, so the name says what the mark
  * is rather than repeating the message. */
 const LINT_MARKER_NAME = "Query syntax error";
+/** The accessible name of a warning marker: advice on a query that parses
+ * (ADR-0068), which never blocks it. CodeMirror classes a marker by the
+ * worst severity on its line. */
+const ADVICE_MARKER_NAME = "Query advice";
 
 // CodeMirror hides the whole gutter column from assistive technology
 // (`aria-hidden` on `.cm-gutters`), and its lint markers are bare divs.
 // Lift the hiding onto each gutter except the lint one, so line numbers
-// stay silent, and name each marker as an image. Runs in the write phase
-// of a measure, after the gutter view has synced its DOM for the update
-// that produced the markers.
+// stay silent, and name each marker as an image by its severity. Runs
+// in the write phase of a measure, after the gutter view has synced its
+// DOM for the update that produced the markers.
 const lintMarkerNames = ViewPlugin.fromClass(
   class {
     constructor(readonly view: EditorView) {
@@ -78,7 +82,10 @@ const lintMarkerNames = ViewPlugin.fromClass(
       }
       for (const el of dom.querySelectorAll(".cm-lint-marker")) {
         el.setAttribute("role", "img");
-        el.setAttribute("aria-label", LINT_MARKER_NAME);
+        el.setAttribute(
+          "aria-label",
+          el.classList.contains("cm-lint-marker-warning") ? ADVICE_MARKER_NAME : LINT_MARKER_NAME
+        );
       }
     }
   }

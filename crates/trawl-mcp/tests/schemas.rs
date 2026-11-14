@@ -11,6 +11,7 @@ use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use trawl_mcp::reply::{
     Bounds, DslEffects, Link, PageRead, Presentation, ResultView, SearchMode, SearchReply,
+    ValidationView,
 };
 use trawl_mcp::tools::schema::tools;
 
@@ -685,8 +686,52 @@ fn a_filled_search_reply_validates_against_its_output_schema() {
         investigation: None,
         hints: vec![],
         next_actions: vec![],
+        advice_hint_count: 0,
     };
     let instance = serde_json::to_value(&reply).expect("the reply serializes");
+    let output = validator("search", "output");
+    let errors: Vec<_> = output
+        .iter_errors(&instance)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// The count of advice hints is the fitting's own bookkeeping: no tool's
+/// output schema names it, and a reply carrying advice serializes without
+/// it. The validation verdict's drop fact is on the wire, and a verdict
+/// that says its hints were dropped validates.
+#[test]
+fn query_advice_metadata_is_not_in_the_output_schema() {
+    let mut names = Vec::new();
+    for tool in tools() {
+        for (_, schema) in schemas(&tool) {
+            property_names(&schema, &mut names);
+        }
+    }
+    assert!(!names.iter().any(|name| name == "advice_hint_count"));
+    assert!(names.iter().any(|name| name == "hints_dropped_to_fit"));
+
+    let reply = SearchReply {
+        outcome: "The query is valid.".to_owned(),
+        mode: SearchMode::Validate,
+        validation: Some(ValidationView {
+            valid: true,
+            formatted: None,
+            format_error: None,
+            errors: vec![],
+            diagnostics_dropped_to_fit: 0,
+            hints_dropped_to_fit: true,
+        }),
+        result: None,
+        investigation: None,
+        hints: vec!["advice: a note; a hint".to_owned()],
+        next_actions: vec![],
+        advice_hint_count: 1,
+    };
+    let instance = serde_json::to_value(&reply).expect("the reply serializes");
+    assert!(instance.get("advice_hint_count").is_none(), "{instance}");
+    assert_eq!(instance["validation"]["hints_dropped_to_fit"], json!(true));
     let output = validator("search", "output");
     let errors: Vec<_> = output
         .iter_errors(&instance)

@@ -237,6 +237,7 @@ pub fn validation_view(sent: &str, response: &ValidationResponse) -> ValidationV
         }),
         errors: refusal::diagnostics(sent, &response.errors),
         diagnostics_dropped_to_fit: 0,
+        hints_dropped_to_fit: false,
     }
 }
 
@@ -267,6 +268,44 @@ impl Fit for SearchReply {
     }
     fn hints_mut(&mut self) -> Option<&mut Vec<String>> {
         Some(&mut self.hints)
+    }
+    fn hints_dropped(&mut self) {
+        if let Some(view) = self.result.as_mut() {
+            view.presentation.hints_dropped_to_fit = true;
+        }
+        if let Some(validation) = self.validation.as_mut() {
+            validation.hints_dropped_to_fit = true;
+        }
+    }
+    fn drop_advice(&mut self) -> bool {
+        let advice = std::mem::take(&mut self.advice_hint_count).min(self.hints.len());
+        if advice == 0 {
+            return false;
+        }
+        self.hints.drain(..advice);
+        self.hints_dropped();
+        true
+    }
+    /// A reply that can carry advice, every reply but an invalid verdict,
+    /// is charged as if it said its hints were dropped, whether or not it
+    /// has advice or hints. The reply with its advice dropped then costs
+    /// what the same reply without advice is charged, so dropping advice
+    /// changes nothing else the fitting keeps, at the exact boundary too.
+    /// The cost is the bytes of that one omission fact, which a reply
+    /// that drops no hint cannot spend on rows or other parts.
+    fn charged(&self) -> Option<Self> {
+        let flagged = match (&self.validation, &self.result) {
+            (Some(validation), _) if !validation.valid => return None,
+            (Some(validation), _) => validation.hints_dropped_to_fit,
+            (None, Some(view)) => view.presentation.hints_dropped_to_fit,
+            (None, None) => return None,
+        };
+        if flagged {
+            return None;
+        }
+        let mut charged = self.clone();
+        charged.hints_dropped();
+        Some(charged)
     }
     fn validation_mut(&mut self) -> Option<&mut ValidationView> {
         self.validation.as_mut()
@@ -572,6 +611,12 @@ fn validation_lines(validation: &ValidationView, budget: Budget, lines: &mut Vec
             "To fit the {}-byte budget the response dropped {dropped} {} from the end.",
             budget.bytes(),
             plural_u64(dropped, "error", "errors")
+        ));
+    }
+    if validation.hints_dropped_to_fit {
+        lines.push(format!(
+            "To fit the {}-byte budget the response dropped the hints.",
+            budget.bytes()
         ));
     }
 }

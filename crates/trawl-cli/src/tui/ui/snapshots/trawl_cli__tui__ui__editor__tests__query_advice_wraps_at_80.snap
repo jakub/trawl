@@ -1,0 +1,28 @@
+---
+source: crates/trawl-cli/src/tui/ui/editor.rs
+expression: screen
+---
+" M-1 Query   M-2 History   M-3 Schema   M-4 Saved                               "
+"                                                                                "
+"┌ Query Editor ────────────────────────────────────────────────────────────────┐"
+"│ "10.244.0.83" -service=coredns                                               │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" i advice: -service=… is a text search, not a field filter: it drops events     "
+"   whose message or _raw contain that text                                      "
+"   hint: to filter the field, write service!=… (keeps events with no service) or"
+"   NOT service=… (drops them too); to keep the text search and silence this,    "
+"   write NOT "service=…"                                                        "
+"┌ Results ─────────────────────────────────────────────────────────────────────┐"
+"│                                 trawl                                        │"
+"│                                                                              │"
+"│                     Command Palette: Ctrl+P                                  │"
+"│                                Tabs: Alt+<num>                               │"
+"│                                Quit: Ctrl+Q                                  │"
+"│                                Docs: https://trawl.sh                        │"
+"│                                                                              │"
+"│                              Client: 0.9.5                                   │"
+"│                              Server: —                                       │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" [editor]                    Shift+Enter: execute | Ctrl+S: save | Ctrl+L: clear"

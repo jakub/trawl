@@ -39,6 +39,7 @@ impl App {
                     editor.clear();
                     editor.insert_text(&query);
                     editor.move_to_line_end();
+                    self.tab.mark_editor_dirty();
                     self.switch_to_main_tab(MainTab::Query);
                     self.focus = Focus::Editor;
                 }
@@ -257,6 +258,7 @@ impl App {
         editor.clear();
         editor.insert_text(&query_text);
         editor.move_to_line_end();
+        self.tab.mark_editor_dirty();
 
         // Reset saved tab state
         self.panel.saved_detail = None;

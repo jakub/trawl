@@ -2,10 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Computed hints for a `search` result (ADR-0058).
+//! Computed hints for a `search` reply (ADR-0058).
 //!
-//! A hint is computed from facts trawld answered, never generated, and
-//! each one names the population it was computed over:
+//! A hint is computed, never generated. [`advice`] reads only the query
+//! text the call sent: trawl-core's advice on a valid query (ADR-0068),
+//! one line per finding, ahead of every other hint. It never changes
+//! whether the query is valid or what the reply proposes, and the budget
+//! fitting drops it before anything else. Every other hint is computed
+//! from facts trawld answered, and names the population it was computed
+//! over:
 //!
 //! - [`dominance`]: one value of `service` or `host` holds at least
 //!   [`DOMINANCE_PERCENT`] of the captured rows, from the capture's column
@@ -40,6 +45,7 @@ use trawl_api::value::{
     QueryResult, TRAILING_LOG_FIELDS, Value, WELL_KNOWN_LOG_FIELDS, wire_cell_text,
 };
 use trawl_client::{CapturedResult, ErrorCode};
+use trawl_core::advice::advise;
 use trawl_core::ast::{
     AggExpr, Expr, ExtractMode, FilterOp, FilterValue, PipeStage, Query, Scalar, SearchToken,
     Spanned, TimeBound,
@@ -84,6 +90,39 @@ pub const CATALOG_PAGE_ROWS: usize = 100;
 /// The most catalog pages the never-observed check reads per field; past
 /// it the answer is unknown and no hint is given.
 pub const CATALOG_MAX_PAGES: usize = 3;
+
+/// The advice hints for the query text `query`: one line per finding
+/// trawl-core's [`advise`] gives, its message then its hint, and one more
+/// line counting the findings it left out, if any. Empty when `query` does
+/// not parse: a text with any error shows only its errors.
+///
+/// Parses with [`parse_unbuilt`], so it builds no regex from the text.
+#[must_use]
+pub fn advice(query: &str) -> Vec<String> {
+    let Ok(parsed) = parse_unbuilt(query) else {
+        return Vec::new();
+    };
+    let report = advise(&parsed);
+    let mut lines: Vec<String> = report
+        .findings
+        .iter()
+        .map(|finding| format!("advice: {}; {}", finding.message, finding.hint))
+        .collect();
+    if report.omitted > 0 {
+        lines.push(format!(
+            "advice: {} more advice {} not shown",
+            report.omitted,
+            if report.omitted == 1 { "note" } else { "notes" }
+        ));
+    }
+    lines
+}
+
+/// [`advice`] for `query`, on the blocking pool.
+pub(crate) async fn query_advice(query: &str) -> Vec<String> {
+    let query = query.to_owned();
+    parse_work(move || advice(&query)).await
+}
 
 /// The hint for a zero-row result whose query is not a plain search stage.
 pub const NEAREST_NOT_COMPUTED: &str = "nearest bounds: not computed for this shape; only a \
@@ -220,24 +259,30 @@ pub async fn never_observed<B: Backend>(backend: &B, query: &str) -> Vec<String>
     check_fields(backend, parse_work(move || fields_to_check(&query)).await).await
 }
 
-/// The hints that read trawld for `result`: [`nearest_bounds`] when it has
-/// no rows, and [`never_observed`]. Both read its query in one task on the
-/// blocking pool; then their calls run together, the nearest bounds' first.
-pub(crate) async fn backend_hints<B: Backend>(
+/// The hints of an executed search: the [`advice`] on `sent`, the text the
+/// call sent, then the hints that read trawld for `result`:
+/// [`nearest_bounds`] when it has no rows, and [`never_observed`]. All
+/// three read their text in one task on the blocking pool, each from its
+/// own parse, so one that finds nothing never empties another; then the
+/// trawld calls run together, the nearest bounds' first.
+pub(crate) async fn search_hints<B: Backend>(
     backend: &B,
     result: &CapturedResult,
+    sent: &str,
     now: DateTime<Utc>,
-) -> (Option<String>, Vec<String>) {
+) -> (Vec<String>, Option<String>, Vec<String>) {
     let zero_rows = result.total_rows == 0;
     let (query, earliest, latest) = (
         result.query.clone(),
         result.earliest.clone(),
         result.latest.clone(),
     );
-    let (plan, checks) = parse_work(move || {
+    let sent = sent.to_owned();
+    let (advice, plan, checks) = parse_work(move || {
+        let advice = advice(&sent);
         let plan =
             zero_rows.then(|| NearestPlan::of(&query, earliest.as_deref(), latest.as_deref(), now));
-        (plan, fields_to_check(&query))
+        (advice, plan, fields_to_check(&query))
     })
     .await;
     let nearest = async {
@@ -246,7 +291,8 @@ pub(crate) async fn backend_hints<B: Backend>(
             None => None,
         }
     };
-    tokio::join!(nearest, check_fields(backend, checks))
+    let (nearest, unobserved) = tokio::join!(nearest, check_fields(backend, checks));
+    (advice, nearest, unobserved)
 }
 
 /// The [`never_observed`] hints for the service and fields
@@ -777,6 +823,82 @@ mod tests {
         // Both read the text: one named its fields, one widened it.
         assert!(checks.is_some_and(|(_, fields)| fields.contains(&"path".to_owned())));
         assert!(plan.is_some());
+    }
+
+    /// The advice on a query text builds no regex from it, and both search
+    /// modes compute it on the blocking pool, never on the reactor: the
+    /// test's current-thread runtime polls the handler on this thread.
+    #[tokio::test]
+    async fn query_advice_builds_no_regex_and_runs_off_the_reactor() {
+        use serde_json::json;
+        use trawl_api::value::ColumnType;
+
+        use crate::blocking::record;
+        use crate::support::{Fake, RESULT_ID, capabilities, captured, no_values, ok, page, s};
+        use crate::tools::search;
+
+        let text = r"-service=coredns path=/v[0-9]+\.(users|orders)/";
+        let before = thread_builds();
+        let advice = super::advice(text);
+        assert_eq!(thread_builds(), before, "the advice built a regex");
+        assert_eq!(advice.len(), 1, "{advice:?}");
+
+        let reactor = std::thread::current().id();
+        let validates = Fake {
+            validate: ok(serde_json::from_value(json!({"valid": true, "errors": []})).unwrap()),
+            ..Fake::default()
+        };
+        let input = serde_json::from_value(json!({"mode": "validate", "query": text})).unwrap();
+        let now: DateTime<Utc> = "2026-03-14T10:00:00Z".parse().expect("an instant");
+        let (result, threads) = record::threads(search::run(
+            &validates,
+            &crate::session::Seen::default(),
+            input,
+            now,
+        ))
+        .await;
+        let mirror = result.structured_content.expect("a mirror");
+        assert_eq!(mirror["hints"], json!(advice));
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        assert!(
+            threads.iter().all(|thread| *thread != reactor),
+            "{threads:?}"
+        );
+
+        let capture = captured(
+            text,
+            &[("_time", ColumnType::Timestamp)],
+            vec![no_values(1)],
+            1,
+            1,
+        );
+        let executes = Fake {
+            capture: ok(trawl_client::CaptureResponse {
+                result: capture.clone(),
+                execution: None,
+                activity: None,
+                step_seq: None,
+            }),
+            result_page: ok(page(&capture, vec![vec![s("2026-03-14T03:59:00Z")]], 0)),
+            capabilities: ok(capabilities(None)),
+            ..Fake::default()
+        };
+        let input = serde_json::from_value(json!({"mode": "execute", "query": text})).unwrap();
+        let (result, threads) = record::threads(search::run(
+            &executes,
+            &crate::session::Seen::default(),
+            input,
+            now,
+        ))
+        .await;
+        let mirror = result.structured_content.expect("a mirror");
+        assert_eq!(mirror["hints"][0], json!(advice[0]), "{mirror}");
+        assert_eq!(mirror["result"]["result_id"], json!(RESULT_ID));
+        assert!(!threads.is_empty());
+        assert!(
+            threads.iter().all(|thread| *thread != reactor),
+            "{threads:?}"
+        );
     }
 
     /// A quarter of a worker's 2 MiB stack.

@@ -836,6 +836,13 @@
   padding-left: 18px;
 }
 .draft-diagnostic-more li { overflow-wrap: anywhere; }
+/* Advice on a draft that parses (ADR-0068): the same sentence, with the
+ * location in the advice tone, since nothing here blocks the query. */
+.draft-diagnostic-advice .draft-diagnostic-at { color: var(--yellow); }
+.draft-diagnostic-omitted {
+  margin: 2px 0 0;
+  color: var(--ink-3);
+}
 
 /* Editor mount — a well that grows with its document from three lines
  * to 40vh; past that the CodeMirror scroller scrolls. The view defaults

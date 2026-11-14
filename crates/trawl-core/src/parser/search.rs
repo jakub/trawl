@@ -17,7 +17,7 @@ use crate::parser::comment::{self, Spaced};
 use crate::parser::primitives::{
     MSG_REGEX_LINE_BREAK, ParserExtra, ParserInput, RegexCut, bare_value, check_pattern,
     check_regex_body, duration, ends_bare_value, field_name, filter_op, keyword, quoted_string,
-    regex_shape, slash_run, spanned, value_cut,
+    quoted_string_reported, regex_shape, slash_run, spanned, value_cut,
 };
 use crate::pattern::PatternKind;
 
@@ -89,8 +89,8 @@ struct ParsedValue {
     value: FilterValue,
     /// Whether an element's own production already emitted an error: the
     /// ADR-0014 opener, a regex body or glob that a pattern check refused,
-    /// a `"` after a regex, a regex a raw line break cuts, or a bare value
-    /// that opens with `"`. A pattern that fails to build is refused after
+    /// a `"` after a regex, a regex a raw line break cuts, a quoted value
+    /// with an unknown escape, or a bare value that opens with `"`. A pattern that fails to build is refused after
     /// the parse (`crate::parser::parse`), so it is not counted here. Such a value gets no operator error on top: one
     /// error per value, and the first one names what the user has to
     /// change.
@@ -193,7 +193,8 @@ fn filter_value<'src>()
     // just alone, so `format` can quote a list element that would
     // otherwise re-lex as something else — a `#` in one is a parse error
     // bare (ADR-0014 ruling 2), and the round trip has to survive it.
-    let quoted = quoted_string().map(|s| (Scalar::Exact(s), false));
+    // An unknown escape inside it is its own emitted error.
+    let quoted = quoted_string_reported().map(|(s, reported)| (Scalar::Exact(s), reported));
     let bare = pipe_cut_run
         .ignore_then(bare_value())
         .validate(|s, extra, emitter| {

@@ -2155,6 +2155,30 @@ const CONTRACTS: &[Contract] = &[
         hook: "const LINT_MARKER_NAME = \"Query syntax error\";",
     },
     Contract {
+        assignment: "adviceMarkerName: 'Query advice',",
+        source_path: "vendor/src/codemirror.ts",
+        source: CODEMIRROR_TS,
+        hook: "const ADVICE_MARKER_NAME = \"Query advice\";",
+    },
+    Contract {
+        assignment: "adviceMarkerName: 'Query advice',",
+        source_path: "vendor/src/codemirror.ts",
+        source: CODEMIRROR_TS,
+        hook: "el.classList.contains(\"cm-lint-marker-warning\") ? ADVICE_MARKER_NAME : LINT_MARKER_NAME",
+    },
+    Contract {
+        assignment: "draftDiagnosticAdvice: '.editor-wrap .draft-diagnostic.draft-diagnostic-advice',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "<div class=\"draft-diagnostic\" class:draft-diagnostic-advice=advice>",
+    },
+    Contract {
+        assignment: "draftDiagnosticOmitted: '.draft-diagnostic .draft-diagnostic-omitted',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "<p class=\"draft-diagnostic-omitted\">",
+    },
+    Contract {
         assignment: "queryErrorNotice: '#search-results .query-error[role=\"alert\"]',",
         source_path: "src/pages/search.rs",
         source: SEARCH_RS,

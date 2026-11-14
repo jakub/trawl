@@ -204,11 +204,12 @@ const PAYLOAD_SEP: char = '\u{1f}';
 /// U+001F could hand the renderer a string that splits into a head this
 /// module never wrote. Splitting only on an exact head keeps a foreign
 /// message whole, message and all.
-const PAYLOAD_MESSAGES: [&str; 4] = [
+const PAYLOAD_MESSAGES: [&str; 5] = [
     MSG_OPENER_IN_TOKEN,
     MSG_OPENER_IN_VALUE,
     MSG_OPENER_IN_NEGATED_TERM,
     crate::parser::search::MSG_ORDERED_GLOB,
+    crate::parser::primitives::MSG_UNKNOWN_ESCAPE,
 ];
 
 /// The payload an emitting production sends when it holds the offending
@@ -244,6 +245,59 @@ pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
         Some((msg, exact)) if PAYLOAD_MESSAGES.contains(&msg) => (msg, Some(exact)),
         _ => (raw, None),
     }
+}
+
+/// The message a parse error shows for a custom message: the message
+/// itself, except where a payload's slice belongs in it. An unknown
+/// escape names its pair (`unknown escape \s: …`) when the character after
+/// the backslash can be shown as itself ([`showable_escape`]), and its
+/// code point otherwise, so a control, whitespace or bidi character never
+/// reaches the message raw.
+pub(crate) fn message_for(msg: &str, exact: Option<&str>) -> String {
+    if msg == crate::parser::primitives::MSG_UNKNOWN_ESCAPE
+        && let Some(after) = exact.and_then(escaped_char)
+    {
+        let shown = if showable_escape(after) {
+            format!("\\{after}")
+        } else {
+            format!("(a backslash before U+{:04X})", u32::from(after))
+        };
+        let rest = msg
+            .strip_prefix("unknown escape")
+            .expect("the unknown-escape message opens with its name");
+        return format!("unknown escape {shown}{rest}");
+    }
+    msg.to_string()
+}
+
+/// The character after the backslash of an unknown-escape pair.
+fn escaped_char(pair: &str) -> Option<char> {
+    let mut chars = pair.strip_prefix('\\')?.chars();
+    let c = chars.next()?;
+    chars.next().is_none().then_some(c)
+}
+
+/// Whether the character after a backslash may be printed as itself in an
+/// unknown-escape message or hint: printable, not whitespace, and not a
+/// character that renders as something else
+/// ([`crate::sanitize::is_unsafe_display_char`]).
+fn showable_escape(c: char) -> bool {
+    !c.is_control() && !c.is_whitespace() && !crate::sanitize::is_unsafe_display_char(c)
+}
+
+/// The hint for an unknown escape: the doubled spelling of the pair, or
+/// of a backslash when the character cannot be shown, then the two
+/// positions where a backslash needs no doubling.
+fn unknown_escape_hint(exact: Option<&str>) -> String {
+    let keep = match exact.and_then(escaped_char).filter(|c| showable_escape(*c)) {
+        Some(c) => format!("write \\\\{c} to keep the backslash"),
+        None => "double the backslash to keep it".to_string(),
+    };
+    format!(
+        "{keep}; in a regex position, a /…/ regex takes backslashes as written \
+         (matches /^\\s+at /); an extract or rex body decodes nothing, so its \
+         backslashes need no doubling"
+    )
 }
 
 /// The hint for one of this module's messages, for the search stage's
@@ -306,6 +360,7 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
             None => comment_half(),
         }),
         MSG_OPENER_IN_COMMAND => Some(comment_half()),
+        crate::parser::primitives::MSG_UNKNOWN_ESCAPE => Some(unknown_escape_hint(exact)),
         // A pattern takes `=`/`!=` only (ADR-0060). Quoting is offered for
         // a glob alone, and says what it means: `host<"a*"` compares the
         // text `a*`. The quoted text of a regex would carry its slashes.
@@ -772,5 +827,76 @@ mod tests {
         assert_eq!(opener_in_command_word("* | stats count(),# x", 18), None);
         // …and a stage word with no opener is not this diagnosis
         assert_eq!(opener_in_command_word("* | staats", 4), None);
+    }
+
+    /// An unknown escape before a character that cannot be shown as
+    /// itself gets the generic hint, and neither the hint nor the message
+    /// carries that character raw. A printable character is shown, so the
+    /// doubled spelling is one the user can paste.
+    #[test]
+    fn unknown_escape_hint_never_prints_unsafe_chars() {
+        for c in [
+            '\u{7}',    // a control
+            '\u{1b}',   // escape, which starts a terminal sequence
+            '\u{7f}',   // delete
+            '\u{85}',   // a C1 control, also a line break
+            '\u{1f}',   // the payload separator
+            ' ',        // whitespace
+            '\t',       // a raw tab, not the `\t` escape
+            '\u{a0}',   // a no-break space
+            '\u{3000}', // an ideographic space
+            '\u{2028}', // the line separator
+            '\u{202e}', // a bidi override
+            '\u{2066}', // a bidi isolate
+            '\u{200b}', // a zero-width space
+            '\u{ad}',   // a soft hyphen
+        ] {
+            let dsl = format!("\"a\\{c}b\"");
+            let errors = crate::parser::parse(&dsl).expect_err("an unknown escape is an error");
+            let [one] = &errors[..] else {
+                panic!("{c:?}: {errors:?}")
+            };
+            assert_eq!(one.span, 2..2 + 1 + c.len_utf8(), "{c:?}");
+            let hint = one.hint.as_deref().expect("an escape hint");
+            assert!(
+                hint.starts_with("double the backslash to keep it;"),
+                "{c:?}: {hint:?}"
+            );
+            // the copy holds ordinary spaces of its own, so a space is
+            // checked as the pair it would be printed in
+            for text in [hint, one.message.as_str()] {
+                assert!(!text.contains(&format!("\\{c}")), "{c:?}: {text:?}");
+                assert!(c == ' ' || !text.contains(c), "{c:?}: {text:?}");
+            }
+            assert!(
+                one.message.starts_with(&format!(
+                    "unknown escape (a backslash before U+{:04X}):",
+                    u32::from(c)
+                )),
+                "{c:?}: {:?}",
+                one.message
+            );
+        }
+
+        // a printable multibyte character is shown, doubled in the hint
+        let errors = crate::parser::parse("\"a\\éb\"").expect_err("an unknown escape");
+        let [one] = &errors[..] else {
+            panic!("{errors:?}")
+        };
+        assert!(one.message.starts_with("unknown escape \\é:"), "{one:?}");
+        let hint = one.hint.as_deref().expect("an escape hint");
+        assert!(
+            hint.starts_with("write \\\\é to keep the backslash;"),
+            "{hint:?}"
+        );
+
+        // the payload splits at its own separator even when the pair holds
+        // one, so the head is always the message
+        let raw = payload(crate::parser::primitives::MSG_UNKNOWN_ESCAPE, "\\\u{1f}");
+        let (msg, exact) = split_payload(&raw);
+        assert_eq!(msg, crate::parser::primitives::MSG_UNKNOWN_ESCAPE);
+        assert_eq!(exact, Some("\\\u{1f}"));
+        assert!(!message_for(msg, exact).contains('\u{1f}'));
+        assert!(!hint_for(msg, exact).expect("hint").contains('\u{1f}'));
     }
 }

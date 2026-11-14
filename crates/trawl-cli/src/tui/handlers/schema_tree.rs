@@ -289,6 +289,7 @@ impl App {
                     return;
                 };
                 self.tab.editor.insert_text(&name);
+                self.tab.mark_editor_dirty();
                 self.switch_to_main_tab(MainTab::Query);
                 self.focus = Focus::Editor;
             }

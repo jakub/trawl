@@ -706,3 +706,53 @@ async fn nearest_preserves_escaped_backslashes() {
         phrase_and_service(r"c:\tmp\")
     );
 }
+
+// -- advice on the query text -------------------------------------------------
+
+/// The advice hints are one line per finding, its message then its hint,
+/// then one line counting the findings past the cap; a text that does not
+/// parse, or has nothing to advise, gets none.
+#[test]
+fn query_advice_is_one_line_per_finding_then_the_count_left_out() {
+    assert_eq!(
+        hints::advice("\"10.244.0.83\" -service=coredns"),
+        [
+            "advice: -service=… is a text search, not a field filter: it drops events whose \
+             message or _raw contain that text; to filter the field, write service!=… (keeps \
+             events with no service) or NOT service=… (drops them too); to keep the text search \
+             and silence this, write NOT \"service=…\""
+        ]
+    );
+    let [line] = hints::advice("service=trawld event_type in (a, b)")
+        .try_into()
+        .expect("one line");
+    assert!(
+        line.starts_with("advice: in the search stage, in (…) is not a list test: ")
+            && line.ends_with(
+                "; to match a list, write event_type=a,b; in (…) is expression \
+                               syntax, as in | where event_type in (\"a\", \"b\")"
+            ),
+        "{line}"
+    );
+
+    let nine = (0..9)
+        .map(|i| format!("-f{i}=v"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lines = hints::advice(&nine);
+    assert_eq!(lines.len(), trawl_core::advice::MAX_ADVICE_FINDINGS + 1);
+    assert_eq!(lines[8], "advice: 1 more advice note not shown");
+    let ten = format!("{nine} -f9=v");
+    assert_eq!(
+        hints::advice(&ten).last().map(String::as_str),
+        Some("advice: 2 more advice notes not shown")
+    );
+
+    for quiet in [
+        r#"-service=coredns | where m matches "^\s+at ""#,
+        "service=trawld NOT \"service=coredns\"",
+        "",
+    ] {
+        assert_eq!(hints::advice(quiet), Vec::<String>::new(), "{quiet}");
+    }
+}

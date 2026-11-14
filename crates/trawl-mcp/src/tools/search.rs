@@ -7,7 +7,9 @@
 //!
 //! `mode: validate` asks `/validate`. A query that does not validate is a
 //! successful call whose outcome says so, with a caret excerpt per error;
-//! only a refused request is an error.
+//! only a refused request is an error. A query trawld calls valid gets the
+//! [`hints::advice`] on its text, which changes neither the verdict nor the
+//! proposed execution.
 //!
 //! `mode: execute` reads trawld's capabilities once, first, then captures
 //! the query (`POST /api/v1/results`) and reads the first page of the
@@ -18,7 +20,8 @@
 //! reply carries the four truncation facts (rows produced, rows captured,
 //! what the DSL itself cut, what this response left out), facets from the
 //! capture's column facts, at most two continuations, the search URL under
-//! trawld's `link_origin`, and the computed hints of [`crate::hints`].
+//! trawld's `link_origin`, and the computed hints of [`crate::hints`], the
+//! advice on the sent text first.
 //! Nothing here runs the query twice: a later page is `read`.
 //!
 //! `mode: execute` with `investigation` attaches the capture to that
@@ -107,6 +110,12 @@ async fn validate<B: Backend>(
         Err(error) => return refusal::refusal(SEARCH, &error, Some(query)),
     };
     let view = render::validation_view(query, &response);
+    // A text with any error shows only its errors.
+    let advice = if view.valid {
+        hints::query_advice(query).await
+    } else {
+        Vec::new()
+    };
     let next_actions = if view.valid {
         vec![NextAction {
             tool: SEARCH.to_owned(),
@@ -147,7 +156,8 @@ async fn validate<B: Backend>(
             activity: None,
             note: notice("validate"),
         }),
-        hints: Vec::new(),
+        advice_hint_count: advice.len(),
+        hints: advice,
         next_actions,
     };
     render::search(reply, budget, rows)
@@ -199,7 +209,11 @@ async fn execute<B: Backend>(
             Err(failed) => return failed,
         };
 
-    let mut found = backend_hints(backend, &captured, now).await;
+    let (mut found, nearest, unobserved) =
+        hints::search_hints(backend, &captured, &input.query, now).await;
+    let advice_hint_count = found.len();
+    found.extend(nearest);
+    found.extend(unobserved);
     found.extend(hints::dominance(&captured));
     found.extend(hints::lag(&page.page));
 
@@ -223,6 +237,7 @@ async fn execute<B: Backend>(
         }),
         hints: found,
         next_actions,
+        advice_hint_count,
     };
     let result = render::search(reply, budget, rows);
     if let Some(held) = held.as_mut() {
@@ -246,17 +261,6 @@ fn link(
             )),
         },
     }
-}
-
-/// The hints that read trawld: the nearest bounds for a capture with no
-/// rows, then the fields the catalog holds no pin or observation of.
-async fn backend_hints<B: Backend>(
-    backend: &B,
-    captured: &CapturedResult,
-    now: DateTime<Utc>,
-) -> Vec<String> {
-    let (nearest, unobserved) = hints::backend_hints(backend, captured, now).await;
-    nearest.into_iter().chain(unobserved).collect()
 }
 
 /// The outcome line.

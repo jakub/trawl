@@ -253,6 +253,7 @@ const NESTED_TIME_CLAUSE: &str = "a time clause cannot sit inside parentheses or
 const OR_ONLY_GROUP: &str = "a group needs a search term or filter, not only OR";
 const NOT_DASH_BEFORE_BACKTICK: &str = "'NOT-' cannot sit directly before a backticked name";
 const NEGATED_BACKTICK: &str = "found '`'";
+const UNKNOWN_ESCAPE: &str = r"unknown escape \s: a quoted string decodes only";
 
 /// A regex body over the 1024-byte limit in bytes, but not in characters:
 /// 513 two-byte characters.
@@ -476,6 +477,10 @@ fn follower_rows() -> Vec<(String, Want)> {
         (r#""é" m=/[/"#, err(INVALID_REGEX, 7..10)),
         (r#""é" m=/x/"y""#, err(QUOTE_AFTER_REGEX, 7..11)),
         (r#""é" m=/x/#"#, err(OPENER_IN_VALUE, 10..11)),
+        // an unknown escape in a closed quoted value is its own error at
+        // the backslash pair, never an unclosed-quote error (ADR-0068)
+        (r#"host="a\sb""#, err(UNKNOWN_ESCAPE, 7..9)),
+        (r#"host=a,"b\sb""#, err(UNKNOWN_ESCAPE, 9..11)),
     ];
     rows.into_iter().map(|(d, w)| (d.to_string(), w)).collect()
 }

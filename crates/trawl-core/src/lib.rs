@@ -14,6 +14,9 @@ pub mod ast;
 /// DSL parser — transforms query strings into AST.
 pub mod parser;
 
+/// Advice on a valid query: a local note that never gates (ADR-0068).
+pub mod advice;
+
 /// The closed set of aggregate functions both lanes implement.
 pub mod aggregate;
 

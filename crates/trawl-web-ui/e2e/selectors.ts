@@ -438,6 +438,11 @@ export const SEL = {
   draftDiagnostic: '.editor-wrap .draft-diagnostic',
   draftDiagnosticFirst: '.draft-diagnostic .draft-diagnostic-first',
   draftDiagnosticMore: '.draft-diagnostic details.draft-diagnostic-more',
+  /// The same line in the advice tone: the buffer parses and the local
+  /// advice names what it probably meant (ADR-0068).
+  draftDiagnosticAdvice: '.editor-wrap .draft-diagnostic.draft-diagnostic-advice',
+  /// The count of advice notes left out past the core's cap.
+  draftDiagnosticOmitted: '.draft-diagnostic .draft-diagnostic-omitted',
   /// crates/trawl-web-ui/src/pages/search.rs — the reading-mode
   /// disclosure in the result header. A button, so it is the thing that
   /// opens the popover and the thing `aria-expanded` rides.
@@ -624,8 +629,11 @@ export const COPY = {
   /// header marks an editor buffer that differs from the executed query.
   draftDirty: 'Edited',
   /// crates/trawl-web-ui/vendor/src/codemirror.ts LINT_MARKER_NAME — the
-  /// accessible name of every lint gutter marker.
+  /// accessible name of every error lint gutter marker.
   lintMarkerName: 'Query syntax error',
+  /// crates/trawl-web-ui/vendor/src/codemirror.ts ADVICE_MARKER_NAME — the
+  /// accessible name of a warning marker, advice on a query that parses.
+  adviceMarkerName: 'Query advice',
   /// crates/trawl-web-ui/src/components/query_error_notice.rs — the label
   /// over each excerpt.
   queryErrorCaption: 'Query sent to server',
