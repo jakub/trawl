@@ -102,7 +102,9 @@ enum Command {
         output: Option<PathBuf>,
     },
 
-    /// Validate DSL query syntax without executing.
+    /// Validate a DSL query without executing it: its syntax, then the
+    /// checks both query lanes run (calls, literal arguments, JSON paths).
+    /// With a server, the server validates it.
     Validate {
         /// The trawl DSL query to validate.
         query: String,

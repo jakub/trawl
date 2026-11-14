@@ -1746,10 +1746,9 @@ mod absent_equals_explicit_null {
         Bool,
         /// `j`, VARCHAR holding JSON text.
         Json,
-        /// `p`, VARCHAR holding a JSON path.
-        Path,
         /// A literal, written as is: a unit, a format (`DuckDB` refuses a
-        /// format that is not a constant, column or not), an index.
+        /// format that is not a constant, column or not), an index, a JSON
+        /// path (the check refuses a path that is not a string literal).
         Lit(&'static str),
     }
 
@@ -1763,7 +1762,6 @@ mod absent_equals_explicit_null {
                 Self::Time => ("t", "TIMESTAMP"),
                 Self::Bool => ("b", "BOOLEAN"),
                 Self::Json => ("j", "VARCHAR"),
-                Self::Path => ("p", "VARCHAR"),
                 Self::Lit(_) => return None,
             })
         }
@@ -1773,8 +1771,9 @@ mod absent_equals_explicit_null {
     /// arguments' natural types. `every_known_function_has_an_emission_fixture`
     /// (`trawl-core`) keeps the same inventory for emission bounds.
     fn function_fixtures() -> Vec<(&'static str, Vec<Arg>)> {
-        use Arg::{Bool, Int, Json, Lit, Num, Path, Text, Time};
+        use Arg::{Bool, Int, Json, Lit, Num, Text, Time};
         let day = Lit("\"day\"");
+        let path = Lit("\"$.a\"");
         vec![
             ("count", vec![Text]),
             ("avg", vec![Num]),
@@ -1831,9 +1830,9 @@ mod absent_equals_explicit_null {
             ("strptime", vec![Text, Lit("\"%Y\"")]),
             ("case", vec![Bool, Text]),
             ("case", vec![Bool, Text, Text]),
-            ("json", vec![Json, Path]),
-            ("json_extract", vec![Json, Path]),
-            ("json_extract_string", vec![Json, Path]),
+            ("json", vec![Json, path]),
+            ("json_extract", vec![Json, path]),
+            ("json_extract_string", vec![Json, path]),
             ("json_valid", vec![Json]),
             ("json_keys", vec![Json]),
             ("json_array_length", vec![Json]),
@@ -1855,11 +1854,11 @@ mod absent_equals_explicit_null {
             "(SELECT *{nulls} FROM (VALUES \
              (TIMESTAMP '2024-01-15 10:00:00', TIMESTAMP '2024-01-15 10:00:00', 1, \
               'Web1 ', 2.5::DOUBLE, 3::BIGINT, TIMESTAMP '2024-01-15 10:00:00', true, \
-              '{{\"a\":[1,2]}}', '$.a'), \
+              '{{\"a\":[1,2]}}'), \
              (TIMESTAMP '2024-01-15 11:00:00', TIMESTAMP '2024-01-15 11:00:00', 2, \
               'x,y', -1.5::DOUBLE, 1::BIGINT, TIMESTAMP '2024-02-16 11:30:00', false, \
-              '[1,2,3]', '$[0]')) \
-             AS v(_time, _ingested, id, s, n, i, t, b, j, p))"
+              '[1,2,3]')) \
+             AS v(_time, _ingested, id, s, n, i, t, b, j))"
         )
     }
 

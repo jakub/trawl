@@ -2403,3 +2403,422 @@ fn strptime_partial_formats_match_duckdb() {
         );
     }
 }
+
+fn text(value: &str) -> EvalValue {
+    EvalValue::Str(value.to_string())
+}
+
+fn keys(names: &[&str]) -> EvalValue {
+    EvalValue::Array(names.iter().map(|name| text(name)).collect())
+}
+
+/// One document of the guard's parity table: (label, DSL document
+/// literal, then the expected value of `json(doc, "$")`,
+/// `json_extract(doc, "$")`, `json(doc, "$.k")`, `json_extract(doc, "$.k")`,
+/// `json_keys(doc)` and `json_array_length(doc)`).
+type JsonDocumentCase = (&'static str, &'static str, [EvalValue; 6]);
+
+#[allow(clippy::too_many_lines)] // one table, kept in one place to stay readable
+fn json_document_cases() -> Vec<JsonDocumentCase> {
+    let null = EvalValue::Null;
+    vec![
+        (
+            "plain text",
+            r#""plain text line""#,
+            std::array::from_fn(|_| null.clone()),
+        ),
+        (
+            "zero-byte string",
+            r#""""#,
+            std::array::from_fn(|_| null.clone()),
+        ),
+        (
+            "trailing text",
+            r#""{\"k\":1} x""#,
+            std::array::from_fn(|_| null.clone()),
+        ),
+        (
+            "unterminated object",
+            r#""{""#,
+            std::array::from_fn(|_| null.clone()),
+        ),
+        ("SQL null", "null", std::array::from_fn(|_| null.clone())),
+        (
+            "the JSON string \"\"",
+            r#""\"\"""#,
+            [
+                text(""),
+                text(r#""""#),
+                null.clone(),
+                null.clone(),
+                keys(&[]),
+                EvalValue::Int(0),
+            ],
+        ),
+        (
+            "object",
+            r#""{\"k\":1}""#,
+            [
+                text(r#"{"k":1}"#),
+                text(r#"{"k":1}"#),
+                text("1"),
+                text("1"),
+                keys(&["k"]),
+                EvalValue::Int(0),
+            ],
+        ),
+        (
+            "object holding a JSON null",
+            r#""{\"k\":null}""#,
+            [
+                text(r#"{"k":null}"#),
+                text(r#"{"k":null}"#),
+                // `json_extract_string` reads a JSON null as SQL null;
+                // `json_extract` keeps the JSON text.
+                null.clone(),
+                text("null"),
+                keys(&["k"]),
+                EvalValue::Int(0),
+            ],
+        ),
+        (
+            "object holding a string",
+            r#""{\"k\":\"v\"}""#,
+            [
+                text(r#"{"k":"v"}"#),
+                text(r#"{"k":"v"}"#),
+                text("v"),
+                text(r#""v""#),
+                keys(&["k"]),
+                EvalValue::Int(0),
+            ],
+        ),
+        (
+            "array",
+            r#""[1,2,3]""#,
+            [
+                text("[1,2,3]"),
+                text("[1,2,3]"),
+                null.clone(),
+                null.clone(),
+                keys(&[]),
+                EvalValue::Int(3),
+            ],
+        ),
+        (
+            "string",
+            r#""\"str\"""#,
+            [
+                text("str"),
+                text(r#""str""#),
+                null.clone(),
+                null.clone(),
+                keys(&[]),
+                EvalValue::Int(0),
+            ],
+        ),
+        (
+            "number",
+            r#""42""#,
+            [
+                text("42"),
+                text("42"),
+                null.clone(),
+                null.clone(),
+                keys(&[]),
+                EvalValue::Int(0),
+            ],
+        ),
+        (
+            "JSON null",
+            r#""null""#,
+            [
+                null.clone(),
+                text("null"),
+                null.clone(),
+                null.clone(),
+                keys(&[]),
+                EvalValue::Int(0),
+            ],
+        ),
+    ]
+}
+
+/// A document that is not JSON is null in both lanes, and a valid document
+/// of each shape reads the same in both (ADR-0017, amendment of
+/// 2026-11-13). `agreed_value` fails on a batch error, so the
+/// errored-equals-null rule cannot pass a `Malformed JSON` raise here.
+#[test]
+fn a_document_that_is_not_json_is_null_in_both_lanes() {
+    let conn = utc_connection();
+    let event = fixed_event();
+    for (label, doc, [root_string, root_json, k_string, k_json, doc_keys, length]) in
+        json_document_cases()
+    {
+        for (expression, expected) in [
+            (format!(r#"json({doc}, "$")"#), &root_string),
+            (format!(r#"json_extract_string({doc}, "$")"#), &root_string),
+            (format!(r#"json_extract({doc}, "$")"#), &root_json),
+            (format!(r#"json({doc}, "$.k")"#), &k_string),
+            (format!(r#"json_extract_string({doc}, "$.k")"#), &k_string),
+            (format!(r#"json_extract({doc}, "$.k")"#), &k_json),
+            (format!("json_keys({doc})"), &doc_keys),
+            (format!("json_array_length({doc})"), &length),
+        ] {
+            assert_eq!(
+                &agreed_value(&conn, &event, label, &expression),
+                expected,
+                "{label}: {expression}"
+            );
+        }
+    }
+}
+
+/// An error raised while computing the document still raises in batch.
+///
+/// Guards against a regression from `TRY_CAST(<document> AS JSON)` to
+/// `TRY(…)`, which would swallow these errors along with the bad document
+/// (ADR-0017, amendment of 2026-11-13). The evaluator cannot raise per
+/// event, so it nulls, as for any other batch error.
+#[test]
+fn an_error_inside_the_json_document_still_raises() {
+    let conn = utc_connection();
+    let event = fixed_event();
+    let overflow = "tostring(9223372036854775807 + 1)";
+    // A condition with no boolean reading is a Conversion error in DuckDB
+    // (`an_if_or_case_condition_takes_duckdbs_boolean_domain`).
+    let conversion = r#"if("nonempty", "{}", "[]")"#;
+    for (document, duckdb_error) in [
+        (overflow, "Overflow in addition of INT64"),
+        (conversion, "Could not convert string 'nonempty' to BOOL"),
+    ] {
+        for call in [
+            format!(r#"json({document}, "$")"#),
+            format!(r#"json_extract_string({document}, "$")"#),
+            format!(r#"json_extract({document}, "$")"#),
+            format!("json_keys({document})"),
+            format!("json_array_length({document})"),
+        ] {
+            let dsl = format!("* | let x = {call}");
+            assert_sql_errored(
+                &sql_scalar_result(&conn, &dsl, &event, now_anchor()),
+                duckdb_error,
+                &dsl,
+            );
+            assert_eq!(
+                eval_scalar(&dsl, &event, now_anchor()),
+                EvalValue::Null,
+                "streaming eval must null where batch errors for {dsl:?}"
+            );
+        }
+    }
+}
+
+/// The value batch gives `expression`, asserted to be a value.
+fn batch_value(conn: &Connection, event: &Map<String, Value>, expression: &str) -> DuckValue {
+    let dsl = format!("* | let x = {expression}");
+    match sql_scalar_result(conn, &dsl, event, now_anchor()) {
+        SqlOutcome::Value(cell) => cell.value,
+        other => panic!("{dsl:?}: expected a batch value, got {other:?}"),
+    }
+}
+
+fn duck_text(value: &str) -> DuckValue {
+    DuckValue::Text(value.to_string())
+}
+
+fn eval_value(event: &Map<String, Value>, expression: &str) -> EvalValue {
+    eval_scalar(&format!("* | let x = {expression}"), event, now_anchor())
+}
+
+/// Residual: object key order. `DuckDB` lists `json_keys` in document order;
+/// the evaluator's `serde_json` map sorts them.
+#[test]
+fn current_json_keys_order_residual_is_pinned() {
+    let conn = utc_connection();
+    let event = fixed_event();
+    let expression = r#"json_keys("{\"b\":1,\"a\":2}")"#;
+    assert_eq!(
+        batch_value(&conn, &event, expression),
+        DuckValue::List(vec![duck_text("b"), duck_text("a")])
+    );
+    assert_eq!(eval_value(&event, expression), keys(&["a", "b"]));
+}
+
+/// Residual: duplicate keys. `DuckDB` reads the first `a` and lists both;
+/// `serde_json` keeps the last and lists one.
+#[test]
+fn current_json_duplicate_key_residual_is_pinned() {
+    let conn = utc_connection();
+    let event = fixed_event();
+    let doc = r#""{\"a\":1,\"a\":2}""#;
+    let path = format!(r#"json({doc}, "$.a")"#);
+    assert_eq!(batch_value(&conn, &event, &path), duck_text("1"));
+    assert_eq!(eval_value(&event, &path), text("2"));
+    let listed = format!("json_keys({doc})");
+    assert_eq!(
+        batch_value(&conn, &event, &listed),
+        DuckValue::List(vec![duck_text("a"), duck_text("a")])
+    );
+    assert_eq!(eval_value(&event, &listed), keys(&["a"]));
+}
+
+/// Residual: parser leniency. `DuckDB` accepts a trailing comma, `NaN` and
+/// `1e999` as JSON; `serde_json` refuses all three, so the evaluator reads
+/// each document as not JSON and answers null.
+#[test]
+fn current_lenient_json_document_residual_is_pinned() {
+    let conn = utc_connection();
+    let event = fixed_event();
+    for (doc, batch_keys) in [
+        (r#""[1,2,]""#, vec![]),
+        (r#""{\"a\":NaN}""#, vec![duck_text("a")]),
+        (r#""{\"a\":1e999}""#, vec![duck_text("a")]),
+    ] {
+        let listed = format!("json_keys({doc})");
+        assert_eq!(
+            batch_value(&conn, &event, &listed),
+            DuckValue::List(batch_keys),
+            "{listed}"
+        );
+        assert_eq!(eval_value(&event, &listed), EvalValue::Null, "{listed}");
+    }
+    let nan = r#"json("{\"a\":NaN}", "$.a")"#;
+    assert_eq!(batch_value(&conn, &event, nan), duck_text("NaN"));
+    assert_eq!(eval_value(&event, nan), EvalValue::Null);
+}
+
+/// Residual: a document that is not text. Batch casts the number 42 to the
+/// JSON `42`; the evaluator reads only a string as a document and answers
+/// null.
+#[test]
+fn current_non_text_json_document_residual_is_pinned() {
+    let conn = utc_connection();
+    let event = fixed_event();
+    let root = r#"json(42, "$")"#;
+    assert_eq!(batch_value(&conn, &event, root), duck_text("42"));
+    assert_eq!(eval_value(&event, root), EvalValue::Null);
+    let listed = "json_keys(42)";
+    assert_eq!(batch_value(&conn, &event, listed), DuckValue::List(vec![]));
+    assert_eq!(eval_value(&event, listed), EvalValue::Null);
+}
+
+/// `text` as a DSL string literal: `\` and `"` escaped, every other
+/// character as written.
+fn dsl_string(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// One row of the accepted-path table: (JSON document, path, expected
+/// `json`/`json_extract_string` value, expected `json_extract` value),
+/// `None` for SQL null. Each target is a scalar, an array or a
+/// single-key object, so key order cannot decide the answer.
+type JsonPathCase = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
+const JSON_PATH_CASES: &[JsonPathCase] = &[
+    // the root
+    (r#"{"k":1}"#, "$", Some(r#"{"k":1}"#), Some(r#"{"k":1}"#)),
+    (r#"{"k":1}"#, "", Some(r#"{"k":1}"#), Some(r#"{"k":1}"#)),
+    // members
+    (r#"{"k":"v"}"#, "$.k", Some("v"), Some(r#""v""#)),
+    (r#"{"a":{"b":2}}"#, "$.a.b", Some("2"), Some("2")),
+    (
+        r#"{"user-agent":"curl"}"#,
+        "$.user-agent",
+        Some("curl"),
+        Some(r#""curl""#),
+    ),
+    (r#"{"@t":"x"}"#, "$.@t", Some("x"), Some(r#""x""#)),
+    (r#"{"é":1}"#, "$.é", Some("1"), Some("1")),
+    // quoted members
+    (
+        r#"{"a.b":1,"a":{"b":2}}"#,
+        r#"$."a.b""#,
+        Some("1"),
+        Some("1"),
+    ),
+    (r#"{"a b":[1]}"#, r#"$."a b""#, Some("[1]"), Some("[1]")),
+    (
+        r#"{"q\"x":true}"#,
+        r#"$."q\"x""#,
+        Some("true"),
+        Some("true"),
+    ),
+    // indexes
+    ("[7,8]", "$[0]", Some("7"), Some("7")),
+    ("[7,8]", "$[01]", Some("8"), Some("8")),
+    ("[7,8,9]", "$[-1]", Some("9"), Some("9")),
+    ("[7,8,9]", "$[#-2]", Some("8"), Some("8")),
+    (r#"{"m":[[1,2]]}"#, "$.m[0][1]", Some("2"), Some("2")),
+    // the longest accepted spelling: 19 digits, value 1
+    ("[7,8]", "$[0000000000000000001]", Some("8"), Some("8")),
+    ("[7,8]", "$[-0000000000000000001]", Some("8"), Some("8")),
+    ("[7,8]", "$[#-0000000000000000001]", Some("8"), Some("8")),
+    // an index misses on an object, and past the end
+    (r#"{"0":1}"#, "$[0]", None, None),
+    ("[7,8]", "$[2]", None, None),
+    ("[7,8]", "$[-3]", None, None),
+    // pointers
+    (r#"{"k":[1]}"#, "/k", Some("[1]"), Some("[1]")),
+    (r#"{"m":[[1,2]]}"#, "/m/0/1", Some("2"), Some("2")),
+    (r#"{"a/b":1}"#, "/a~1b", Some("1"), Some("1")),
+    (r#"{"a~b":1}"#, "/a~0b", Some("1"), Some("1")),
+    // `/` reads the empty key, not the root
+    (r#"{"":1}"#, "/", Some("1"), Some("1")),
+    (r#"{"k":1}"#, "/", None, None),
+    (r#"{"*":1}"#, "/*", Some("1"), Some("1")),
+    // `/0` reads a key on an object and an element on an array
+    (r#"{"0":"o"}"#, "/0", Some("o"), Some(r#""o""#)),
+    ("[5,6]", "/0", Some("5"), Some("5")),
+    ("[5,6]", "/01", None, None),
+    // bare keys
+    (
+        r#"{"level":"info"}"#,
+        "level",
+        Some("info"),
+        Some(r#""info""#),
+    ),
+    (
+        r#"{"user-agent":"curl"}"#,
+        "user-agent",
+        Some("curl"),
+        Some(r#""curl""#),
+    ),
+    // a JSON null target
+    (r#"{"k":null}"#, "$.k", None, Some("null")),
+];
+
+/// Every path form the grammar accepts selects the same value in both
+/// lanes, and the value the table writes out (#457, ADR-0017's amendment
+/// of 2026-11-13). `agreed_value` fails on a batch error, so a path
+/// `DuckDB` refuses cannot pass as null here.
+#[test]
+fn every_accepted_json_path_selects_the_same_value_in_both_lanes() {
+    let conn = utc_connection();
+    let event = fixed_event();
+    let value = |want: Option<&str>| want.map_or(EvalValue::Null, text);
+    for &(doc, path, string, json) in JSON_PATH_CASES {
+        trawl_core::json_path::parse(path)
+            .unwrap_or_else(|e| panic!("{path:?}: the grammar refused it: {e:?}"));
+        let (doc, path_literal) = (dsl_string(doc), dsl_string(path));
+        for (call, want) in [
+            (format!("json({doc}, {path_literal})"), value(string)),
+            (
+                format!("json_extract_string({doc}, {path_literal})"),
+                value(string),
+            ),
+            (format!("json_extract({doc}, {path_literal})"), value(json)),
+        ] {
+            assert_eq!(
+                agreed_value(&conn, &event, "accepted JSON path", &call),
+                want,
+                "{call}"
+            );
+        }
+    }
+}

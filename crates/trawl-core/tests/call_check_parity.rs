@@ -13,7 +13,7 @@
 
 use trawl_core::ast::{PipeStage, Spanned};
 use trawl_core::context::EvalContext;
-use trawl_core::emitter::{EmitError, emit, validate_pipeline};
+use trawl_core::emitter::{EmitError, JsonPathFault, emit, validate_pipeline};
 use trawl_core::parser;
 use trawl_core::parser::suggest::KNOWN_FUNCTIONS;
 use trawl_core::pin_scope::PinScope;
@@ -214,7 +214,28 @@ const BASELINE: &[Refusal] = &[
         display: "strftime(): invalid format string \"%Q\"",
         hint: None,
     },
+    // JSON path (ADR-0017, amendment of 2026-11-13); added with the
+    // check, not part of the pre-check baseline
+    Refusal {
+        query: r#"* | let x = json(message, "$[")"#,
+        display: "json(): invalid JSON path \"$[\" in argument 2: expected an array index \
+                  after [ (a JSON path is $ for the root, $ then steps such as .key, \
+                  .\"quoted key\", [0], [-1] or [#-1], a pointer such as /key/0, or one bare \
+                  key)",
+        hint: Some(JSON_PATH_FORMS),
+    },
+    Refusal {
+        query: "* | let x = json_extract(message, p)",
+        display: "json_extract() argument 2 must be a string literal JSON path (a JSON path \
+                  is $ for the root, $ then steps such as .key, .\"quoted key\", [0], [-1] \
+                  or [#-1], a pointer such as /key/0, or one bare key)",
+        hint: Some(JSON_PATH_FORMS),
+    },
 ];
+
+/// The accepted forms every JSON path refusal's hint ends with.
+const JSON_PATH_FORMS: &str = "a JSON path is $ for the root, $ then steps such as .key, \
+     .\"quoted key\", [0], [-1] or [#-1], a pointer such as /key/0, or one bare key";
 
 fn emit_refusal(query: &str) -> EmitError {
     let ast = parser::parse(query).unwrap_or_else(|e| panic!("{query}: parse failed: {e:?}"));
@@ -396,15 +417,31 @@ const VALID_CALLS: &[(&str, &[&str])] = &[
             r#"* | let x = case(status >= 500, "error", status >= 400, "warn")"#,
         ],
     ),
-    // json
-    ("json", &[r#"* | let x = json(payload, "$.a")"#]),
+    // json: every path form the grammar accepts
+    (
+        "json",
+        &[
+            r#"* | let x = json(payload, "$.a")"#,
+            r#"* | let x = json(payload, "$")"#,
+            r#"* | let x = json(payload, "")"#,
+            r#"* | let x = json(payload, "$.\"a.b\".c[0][-1][#-2]")"#,
+            r#"* | let x = json(payload, "/a~1b/0")"#,
+            r#"* | let x = json(payload, "user-agent")"#,
+        ],
+    ),
     (
         "json_extract",
-        &[r#"* | let x = json_extract(payload, "$.a")"#],
+        &[
+            r#"* | let x = json_extract(payload, "$.a")"#,
+            r#"* | let x = json_extract(payload, "$[0000000000000000001]")"#,
+        ],
     ),
     (
         "json_extract_string",
-        &[r#"* | let x = json_extract_string(payload, "$.a")"#],
+        &[
+            r#"* | let x = json_extract_string(payload, "$.a")"#,
+            r#"* | let x = json_extract_string(payload, "/")"#,
+        ],
     ),
     ("json_valid", &["* | where json_valid(payload)"]),
     ("json_keys", &["* | let k = json_keys(payload)"]),
@@ -581,6 +618,15 @@ const RULES: &[(&str, &str)] = &[
         r#"strftime(_time, "%Q")"#,
         r#"* | let x = strftime(_time, "%Q")"#,
     ),
+    // JSON path: refused, and computed
+    (
+        r#"json(message, "$[")"#,
+        r#"* | let x = json(message, "$[")"#,
+    ),
+    (
+        "json_extract(message, p)",
+        "* | let x = json_extract(message, p)",
+    ),
 ];
 
 /// Every position a call can stand in; `{}` is the bad call.
@@ -756,6 +802,131 @@ fn live_refuses_non_literal_integer_positions() {
     ] {
         assert_eq!(batch_refusal(query).display, display, "{query}");
         assert_eq!(live_refusal(query), display, "live: {query}");
+    }
+}
+
+/// `text` as a DSL string literal: `\` and `"` escaped, every other
+/// character as written.
+fn dsl_string(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The refused paths of #457's acceptance criteria, as the path text
+/// itself (not as DSL).
+const REFUSED_JSON_PATHS: &[&str] = &[
+    // malformed
+    "$[",
+    "$.k.",
+    "$.",
+    "$x",
+    "$['k']",
+    "$[1:2]",
+    "$[0",
+    r#"$."k"#,
+    r#"$."""#,
+    "$[+1]",
+    "$[ 1 ]",
+    "$[9223372036854775808]",
+    "$[00000000000000000001]",
+    "$[-00000000000000000001]",
+    "$[#-00000000000000000001]",
+    r#"$."a\nb""#,
+    "/a~2b",
+    // unsupported
+    "$.*",
+    "$[*]",
+    "$..k",
+    r#"$."*""#,
+    "*",
+    "$[-0]",
+    "$[#-0]",
+    "$[#]",
+    "a.b",
+    "[0]",
+    " k",
+];
+
+/// The JSON path refusal `query` gets from `validate_pipeline`, after
+/// asserting emit and the stream compiler say the same.
+/// `compile_stream_plan` is `compile_stream_plan_with` over a fresh
+/// ledger; calling it keeps this file out of the pattern construction
+/// inventory.
+fn json_path_refusal(query: &str) -> EmitError {
+    let ast = parser::parse(query).unwrap_or_else(|e| panic!("{query}: parse failed: {e:?}"));
+    let err = validate_pipeline(&ast.pipeline)
+        .expect_err(&format!("{query}: validate_pipeline accepted the path"));
+    assert_eq!(
+        emit_refusal(query),
+        err,
+        "{query}: emit and validate disagree"
+    );
+    match compile_stream_plan(&ast.pipeline, &PinScope::unpinned(), None) {
+        Err(StreamPlanError::InvalidFunction(sentence)) => {
+            assert_eq!(sentence, err.to_string(), "live: {query}");
+        }
+        other => panic!("{query}: live must refuse the path: {other:?}"),
+    }
+    err
+}
+
+/// Each malformed or unsupported literal path is refused with the typed
+/// variant and the parser's reason, through `validate_pipeline` and the
+/// stream compiler, before either lane reads a row: a search that matches
+/// nothing is refused the same way (#457, ADR-0017's amendment of
+/// 2026-11-13).
+#[test]
+fn json_path_refusal_reaches_both_lanes() {
+    for &path in REFUSED_JSON_PATHS {
+        let expected = trawl_core::json_path::parse(path)
+            .expect_err(&format!("{path:?}: the grammar accepted it"));
+        for func_name in ["json", "json_extract_string", "json_extract"] {
+            for search in ["*", "service=no-such-service last=1m"] {
+                let query = format!(
+                    "{search} | let k = {func_name}(message, {})",
+                    dsl_string(path)
+                );
+                let err = json_path_refusal(&query);
+                assert_eq!(
+                    err,
+                    EmitError::InvalidJsonPath {
+                        func_name: func_name.to_owned(),
+                        fault: JsonPathFault::Invalid {
+                            path: path.to_owned(),
+                            error: expected.clone(),
+                        },
+                    },
+                    "{query}"
+                );
+                let message = err.message();
+                assert!(message.contains(expected.reason), "{query}: {message}");
+                assert!(message.contains(&format!("{path:?}")), "{query}: {message}");
+            }
+        }
+    }
+}
+
+/// A path that is not a string literal (a field, an expression, a null, a
+/// number) cannot be checked before the query runs, so both lanes refuse
+/// it.
+#[test]
+fn json_path_must_be_a_string_literal() {
+    for path in ["path_field", r#"concat("$.", "k")"#, "null", "1"] {
+        for func_name in ["json", "json_extract_string", "json_extract"] {
+            let query = format!("* | let k = {func_name}(message, {path})");
+            let err = json_path_refusal(&query);
+            assert_eq!(
+                err,
+                EmitError::InvalidJsonPath {
+                    func_name: func_name.to_owned(),
+                    fault: JsonPathFault::NotLiteral,
+                },
+                "{query}"
+            );
+            assert_eq!(
+                err.message(),
+                format!("{func_name}() argument 2 must be a string literal JSON path"),
+            );
+        }
     }
 }
 

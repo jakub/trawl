@@ -711,9 +711,11 @@ fn every_known_function_has_an_emission_fixture() {
         ("strftime", "`__c0__`, \"%Y\"", 1),
         ("strptime", "`__c0__`, \"%Y\"", 1),
         ("case", "`__c0__`, `__c1__`", 2),
-        ("json", "`__c0__`, `__c1__`", 2),
-        ("json_extract", "`__c0__`, `__c1__`", 2),
-        ("json_extract_string", "`__c0__`, `__c1__`", 2),
+        // The path must be a string literal (ADR-0017, amendment of
+        // 2026-11-13), so only the document is a marker.
+        ("json", "`__c0__`, \"$.k\"", 1),
+        ("json_extract", "`__c0__`, \"$.k\"", 1),
+        ("json_extract_string", "`__c0__`, \"$.k\"", 1),
         ("json_valid", "`__c0__`", 1),
         ("json_keys", "`__c0__`", 1),
         ("json_array_length", "`__c0__`", 1),
@@ -762,6 +764,9 @@ fn shape_of(name: &str, args: &str) -> Rendering {
             dialect: Dialect::Otel,
             argc: arity,
         },
+        "json" | "json_extract" | "json_extract_string" | "json_keys" | "json_array_length" => {
+            FunctionShape::JsonGuarded(arity)
+        }
         _ => FunctionShape::Plain(arity),
     })
 }

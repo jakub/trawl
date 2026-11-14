@@ -2875,6 +2875,178 @@ async fn a_binder_failure_on_a_query_only_node_answers_by_its_subtype() {
     }
 }
 
+/// One event whose `message` is not JSON no longer fails a query through
+/// `/api/v1/query`: each json function reads it as null and every row
+/// counts (ADR-0017, amendment of 2026-11-13). Before the document guard
+/// the whole query was an opaque 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_document_that_is_not_json_keeps_every_row_through_the_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = common::setup_in_dir_with_ingest(dir.path(), false).await;
+    let hour = dir.path().join("data/prod/2024-01-15/10");
+    duckdb::Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT TIMESTAMP '2024-01-15 10:00:00' + INTERVAL (i) SECOND AS _time, \
+                    TIMESTAMP '2024-01-15 10:00:30' AS _ingested, 'raw' AS _raw, \
+                    NULL::VARCHAR AS _repairs, 'prod' AS env, \
+                    CASE WHEN i % 2 = 0 THEN 'a' ELSE 'b' END AS service, \
+                    i AS id, \
+                    CASE WHEN i = 5 THEN 'plain text line' \
+                         ELSE '{{\"k\":' || i || '}}' END AS message \
+                    FROM range(20) t(i)) \
+             TO '{}' (FORMAT PARQUET)",
+            hour.join("json_documents.parquet").display()
+        ))
+        .unwrap();
+    let query = |dsl: String| {
+        let request = common::harness_client_builder()
+            .build()
+            .unwrap()
+            .post(format!("{}/api/v1/query", server.url))
+            .bearer_auth(&server.analyst_token)
+            .json(&serde_json::json!({ "query": dsl }));
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            (status, response.json::<serde_json::Value>().await.unwrap())
+        }
+    };
+
+    for (call, valid_value) in [
+        (
+            r#"json_extract_string(message, "$.k")"#,
+            serde_json::json!("7"),
+        ),
+        (r#"json(message, "$.k")"#, serde_json::json!("7")),
+        (r#"json_extract(message, "$.k")"#, serde_json::json!("7")),
+        ("json_keys(message)", serde_json::json!(["k"])),
+        // An object has no array length: 0, not null, so it counts.
+        // The wire spells an integer as a string.
+        ("json_array_length(message)", serde_json::json!("0")),
+    ] {
+        // The harness seeds events of its own; only this fixture has `id`.
+        let (status, body) = query(format!(
+            "* | where isnotnull(id) | let k = {call} | stats count(k) as n, count() as total"
+        ))
+        .await;
+        assert_eq!(status, 200, "{call}: {body}");
+        assert_eq!(
+            body["rows"],
+            serde_json::json!([["19", "20"]]),
+            "{call}: {body}"
+        );
+
+        // The bad event and a good one, read row by row.
+        let (status, body) = query(format!(
+            "* | where id == 5 or id == 7 | let k = {call} | sort id | table id, k"
+        ))
+        .await;
+        assert_eq!(status, 200, "{call}: {body}");
+        assert_eq!(
+            body["rows"],
+            serde_json::json!([["5", null], ["7", valid_value]]),
+            "{call}: {body}"
+        );
+    }
+}
+
+/// A JSON path outside the grammar, or one that is not a string literal,
+/// is refused before either lane reads a row (#457, ADR-0017's amendment
+/// of 2026-11-13): `/api/v1/validate` answers `valid: false` and
+/// `/api/v1/query` answers 400, with the shared check's sentence, whether
+/// or not any event matches. Before the check, `$[` was a whole-query
+/// binder 500 and a computed path failed once a valid document arrived.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_json_path_is_refused_by_validate_and_query_with_and_without_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = common::setup_in_dir_with_ingest(dir.path(), false).await;
+    let hour = dir.path().join("data/prod/2024-01-15/10");
+    duckdb::Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT TIMESTAMP '2024-01-15 10:00:00' + INTERVAL (i) SECOND AS _time, \
+                    TIMESTAMP '2024-01-15 10:00:30' AS _ingested, 'raw' AS _raw, \
+                    NULL::VARCHAR AS _repairs, 'prod' AS env, 'a' AS service, \
+                    i AS id, '{{\"k\":' || i || '}}' AS message, '$.k' AS path_field \
+                    FROM range(3) t(i)) \
+             TO '{}' (FORMAT PARQUET)",
+            hour.join("json_paths.parquet").display()
+        ))
+        .unwrap();
+    let post = |route: &'static str, dsl: String| {
+        let request = common::harness_client_builder()
+            .build()
+            .unwrap()
+            .post(format!("{}/api/v1/{route}", server.url))
+            .bearer_auth(&server.analyst_token)
+            .json(&serde_json::json!({ "query": dsl }));
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            (status, response.json::<serde_json::Value>().await.unwrap())
+        }
+    };
+
+    // The fixture's rows answer a valid path, so a refusal below is the
+    // path's and not the data's.
+    let (status, body) = post(
+        "query",
+        r#"* | where isnotnull(id) | let k = json(message, "$.k") | stats count(k) as n"#
+            .to_owned(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rows"], serde_json::json!([["3"]]), "{body}");
+
+    for call in [
+        r#"json(message, "$[")"#,
+        r#"json_extract_string(message, "$..k")"#,
+        r#"json_extract(message, "a.b")"#,
+        "json(message, path_field)",
+    ] {
+        let expected = trawl_core::parser::parse(&format!("* | let k = {call}"))
+            .ok()
+            .map(|query| trawl_core::emitter::validate_pipeline(&query.pipeline))
+            .and_then(Result::err)
+            .unwrap_or_else(|| panic!("{call}: the shared check accepted it"));
+        assert!(
+            matches!(
+                expected,
+                trawl_core::emitter::EmitError::InvalidJsonPath { .. }
+            ),
+            "{call}: {expected:?}"
+        );
+        for search in ["* | where isnotnull(id)", "service=no-such-service"] {
+            let dsl = format!("{search} | let k = {call}");
+
+            let (status, body) = post("validate", dsl.clone()).await;
+            assert_eq!(status, 200, "{dsl}: {body}");
+            assert_eq!(body["valid"], false, "{dsl}: {body}");
+            assert_eq!(
+                body["errors"][0]["message"],
+                expected.message().as_str(),
+                "{dsl}: {body}"
+            );
+            assert_eq!(
+                body["errors"][0]["hint"],
+                expected.hint().as_deref().unwrap_or_default(),
+                "{dsl}: {body}"
+            );
+
+            let (status, body) = post("query", dsl.clone()).await;
+            assert_eq!(status, 400, "{dsl}: {body}");
+            assert_eq!(body["error"]["code"], "validation_error", "{dsl}: {body}");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(&expected.message())),
+                "{dsl}: {body}"
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn query_pagination_limit_offset() {
     let server = setup().await;
