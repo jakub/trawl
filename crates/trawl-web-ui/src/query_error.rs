@@ -285,36 +285,81 @@ pub fn local_details(errors: &[trawl_core::parser::ParseError]) -> Vec<ErrorDeta
         .collect()
 }
 
+/// What the draft diagnostic reports: errors that block the draft, or
+/// advice on a draft that parses (ADR-0068). Errors take precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftKind {
+    Error,
+    Advice,
+}
+
 /// The draft diagnostic: the local parser's verdict on the draft, as
 /// visible text under the editor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftDiagnostic {
-    /// The first error, in full.
+    pub kind: DraftKind,
+    /// The first error or advice note, in full.
     pub first: String,
-    /// Every further error, behind the `+N more` disclosure.
+    /// Every further one, behind the `+N more` disclosure.
     pub rest: Vec<String>,
+    /// Advice notes the core left out past its cap. Always 0 for errors.
+    pub omitted: usize,
+}
+
+/// The line that counts advice notes left out past the cap.
+#[must_use]
+pub fn omitted_advice_note(omitted: usize) -> String {
+    if omitted == 1 {
+        "and 1 more advice note not shown".to_owned()
+    } else {
+        format!("and {omitted} more advice notes not shown")
+    }
+}
+
+/// `Line L:C — message — hint`, or the joined message alone when the span
+/// cannot index `doc`.
+fn draft_line(doc: &str, start: usize, end: usize, message: &str, hint: Option<&str>) -> String {
+    let message = join_hint(message, hint);
+    match locate(doc, &ErrorSpan { start, end }) {
+        Some(at) => format!("Line {}:{} — {message}", at.line, at.column),
+        None => message,
+    }
 }
 
 /// Parse `doc` locally and describe each error as `Line L:C — message`,
-/// with the hint joined on. `None` when the draft parses.
+/// with the hint joined on. A draft that parses gets its advice the same
+/// way, if it has any. `None` when the draft parses with no advice.
 #[must_use]
 pub fn draft_diagnostic(doc: &str) -> Option<DraftDiagnostic> {
-    let errors = trawl_core::parser::parse(doc).err()?;
-    let mut lines = errors.iter().map(|e| {
-        let message = join_hint(&e.message, e.hint.as_deref());
-        let span = ErrorSpan {
-            start: e.span.start,
-            end: e.span.end,
-        };
-        match locate(doc, &span) {
-            Some(at) => format!("Line {}:{} — {message}", at.line, at.column),
-            None => message,
+    let (kind, lines, omitted): (_, Vec<String>, _) = match trawl_core::parser::parse(doc) {
+        Err(errors) => (
+            DraftKind::Error,
+            errors
+                .iter()
+                .map(|e| draft_line(doc, e.span.start, e.span.end, &e.message, e.hint.as_deref()))
+                .collect(),
+            0,
+        ),
+        Ok(query) => {
+            let report = trawl_core::advice::advise(&query);
+            (
+                DraftKind::Advice,
+                report
+                    .findings
+                    .iter()
+                    .map(|a| draft_line(doc, a.span.start, a.span.end, &a.message, Some(&a.hint)))
+                    .collect(),
+                report.omitted,
+            )
         }
-    });
+    };
+    let mut lines = lines.into_iter();
     let first = lines.next()?;
     Some(DraftDiagnostic {
+        kind,
         first,
         rest: lines.collect(),
+        omitted,
     })
 }
 
@@ -706,6 +751,86 @@ mod tests {
         assert_eq!(diagnostic.rest.len(), errors.len() - 1);
         assert!(diagnostic.first.starts_with("Line 1:"));
         assert!(diagnostic.rest.iter().all(|r| r.starts_with("Line 1:")));
+    }
+
+    /// A draft that parses but reads like a field filter gets advice, not
+    /// an error: the advice kind, the core's copy verbatim, located like an
+    /// error.
+    #[test]
+    fn draft_advice_uses_the_advice_kind() {
+        let draft = "\"10.244.0.83\" -service=coredns";
+        let diagnostic = draft_diagnostic(draft).expect("the draft has advice");
+        assert_eq!(diagnostic.kind, DraftKind::Advice);
+        assert_eq!(diagnostic.omitted, 0);
+        assert!(diagnostic.rest.is_empty(), "{:?}", diagnostic.rest);
+        let advice = trawl_core::advice::advise(&trawl_core::parser::parse(draft).expect("parses"));
+        assert_eq!(advice.findings[0].span, 14..30);
+        assert_eq!(
+            diagnostic.first,
+            format!(
+                "Line 1:15 — {} — {}",
+                advice.findings[0].message, advice.findings[0].hint
+            )
+        );
+        assert!(
+            diagnostic.first.contains("-service=… is a text search"),
+            "{}",
+            diagnostic.first
+        );
+
+        let in_draft = "service=trawld event_type in (a, b)";
+        let diagnostic = draft_diagnostic(in_draft).expect("the draft has advice");
+        assert_eq!(diagnostic.kind, DraftKind::Advice);
+        assert!(
+            diagnostic
+                .first
+                .starts_with("Line 1:16 — in the search stage, in (…) is not a list test"),
+            "{}",
+            diagnostic.first
+        );
+
+        assert_eq!(draft_diagnostic("\"10.244.0.83\" service!=coredns"), None);
+    }
+
+    /// A draft with an error shows only its errors, never advice, even when
+    /// the rest of it holds an advice shape.
+    #[test]
+    fn draft_errors_suppress_advice() {
+        let draft = "-service=coredns | where m matches \"^\\s+at \"";
+        let diagnostic = draft_diagnostic(draft).expect("the draft does not parse");
+        assert_eq!(diagnostic.kind, DraftKind::Error);
+        assert_eq!(diagnostic.omitted, 0);
+        assert!(
+            diagnostic.first.contains("unknown escape \\s"),
+            "{}",
+            diagnostic.first
+        );
+        let all = std::iter::once(&diagnostic.first).chain(&diagnostic.rest);
+        for line in all {
+            assert!(!line.contains("text search, not a field filter"), "{line}");
+        }
+    }
+
+    /// Advice past the core's cap is counted, not listed: the draft line
+    /// holds the retained findings and says how many it left out.
+    #[test]
+    fn draft_advice_reports_omitted_findings() {
+        let draft = (1..=10)
+            .map(|i| format!("-service=s{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let diagnostic = draft_diagnostic(&draft).expect("the draft has advice");
+        assert_eq!(diagnostic.kind, DraftKind::Advice);
+        assert_eq!(
+            1 + diagnostic.rest.len(),
+            trawl_core::advice::MAX_ADVICE_FINDINGS
+        );
+        assert_eq!(diagnostic.omitted, 2);
+        assert_eq!(
+            omitted_advice_note(diagnostic.omitted),
+            "and 2 more advice notes not shown"
+        );
+        assert_eq!(omitted_advice_note(1), "and 1 more advice note not shown");
     }
 
     fn envelope(code: trawl_api::ErrorCode, details: Vec<ErrorDetail>) -> trawl_api::ErrorEnvelope {

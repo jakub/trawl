@@ -7,8 +7,9 @@
 //!
 //! The parser is the same crate the server uses, compiled to wasm. Every
 //! keystroke re-parses and produces `Diagnostic` entries that codemirror
-//! renders as red squiggles. No network round-trip; zero schema drift
-//! between server and browser possible.
+//! renders as red squiggles, or, on a draft that parses, as advice
+//! warnings. No network round-trip; zero schema drift between server and
+//! browser possible.
 //!
 //! Autocomplete is fed from `trawl_core::parser::suggest::{KNOWN_PIPE_STAGES,
 //! KNOWN_FUNCTIONS}` — compile-time constants shared with the server.
@@ -21,7 +22,7 @@ use wasm_bindgen::prelude::*;
 use crate::completion::complete_at;
 use crate::interop::codemirror::{EditorHandle, create_editor};
 use crate::offset::utf8_to_utf16;
-use crate::query_error::join_hint;
+use crate::query_error::{join_hint, omitted_advice_note};
 
 /// JS-side `Diagnostic` shape expected by the codemirror bundle.
 #[derive(Serialize)]
@@ -32,15 +33,38 @@ struct Diagnostic {
     message: String,
 }
 
-/// Emits `CodeMirror` diagnostics for every parse error from trawl-core.
+/// Emits `CodeMirror` diagnostics for every parse error from trawl-core,
+/// or, when the draft parses, a `warning` for each advice finding
+/// (ADR-0068). Errors take precedence: a draft with any error gets no
+/// advice.
 ///
 /// `doc` is the current document text. Parser spans are UTF-8 byte
 /// offsets; `CodeMirror` expects UTF-16 code-unit offsets — we translate
 /// so squiggles line up under the correct characters for non-ASCII
-/// input.
+/// input. Advice left out past the core's cap is counted on the last
+/// retained finding, never drawn as a span of its own.
 fn lint_document(doc: &str) -> Vec<Diagnostic> {
     match trawl_core::parser::parse(doc) {
-        Ok(_) => Vec::new(),
+        Ok(query) => {
+            let report = trawl_core::advice::advise(&query);
+            let mut diagnostics: Vec<Diagnostic> = report
+                .findings
+                .into_iter()
+                .map(|a| Diagnostic {
+                    from: utf8_to_utf16(doc, a.span.start),
+                    to: utf8_to_utf16(doc, a.span.end),
+                    severity: "warning",
+                    message: join_hint(&a.message, Some(&a.hint)),
+                })
+                .collect();
+            if report.omitted > 0
+                && let Some(last) = diagnostics.last_mut()
+            {
+                last.message.push('\n');
+                last.message.push_str(&omitted_advice_note(report.omitted));
+            }
+            diagnostics
+        }
         Err(errors) => errors
             .into_iter()
             .map(|e| Diagnostic {
