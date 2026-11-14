@@ -716,7 +716,7 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
         // other custom error is its message and nothing else.
         let (msg, exact) = comment::split_payload(raw);
         return ParseError {
-            message: msg.to_string(),
+            message: comment::message_for(msg, exact),
             hint: comment::hint_for(msg, exact),
             span: span.start..span.end,
             label,
