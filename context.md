@@ -256,6 +256,10 @@ _Avoid_: chain length, node count, nesting depth
 The string literal that says where `json`, `json_extract_string` and `json_extract` read inside a document. It is one of: `$` or the empty string for the root, a `$`-rooted chain of member and index steps, an RFC 6901 pointer that starts with `/`, or one bare key. The query check refuses any other path, and any path that is not a string literal, before either lane runs. ADR-0017's amendment of 2026-11-13 lists the forms.
 _Avoid_: JSONPath (the full language, most of which trawl refuses), selector, pointer (when a rooted path is meant)
 
+**Advice**:
+A note about a query that parses: it says the text probably asks a different question than its author meant, such as `-service=coredns` (a text search) where `service!=coredns` (a field filter) was meant. trawl-core computes it from the query text alone. Each surface shows it in its own place: next to the draft in an editor, on stderr in the CLI, and among an MCP reply's hints. Advice never makes a query invalid and never stops it from running. ADR-0068 lists the shapes.
+_Avoid_: warning (the CLI and editors may draw it with warning styling, but it is not an error of lower severity), lint, hint (a parse error's hint is a different thing)
+
 **Executor pool**:
 The fixed set of connections to the query database that user queries, exports and field samples take turns on, one permit each. Its size is `max_concurrent_queries`.
 _Avoid_: query pool, connection pool, worker pool
