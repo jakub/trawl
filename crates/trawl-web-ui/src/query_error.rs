@@ -326,6 +326,19 @@ fn draft_line(doc: &str, start: usize, end: usize, message: &str, hint: Option<&
     }
 }
 
+/// The advice for a draft that parsed (ADR-0068), or none when trawl-core's
+/// semantic checks refuse its pipeline: a draft with any error shows only
+/// errors. The browser marks parse errors alone and leaves the semantic
+/// error to the server's verdict (ADR-0039), so this only withholds the
+/// advice.
+#[must_use]
+pub fn query_advice(query: &trawl_core::ast::Query) -> trawl_core::advice::AdviceReport {
+    if trawl_core::emitter::validate_pipeline(&query.pipeline).is_err() {
+        return trawl_core::advice::AdviceReport::default();
+    }
+    trawl_core::advice::advise(query)
+}
+
 /// Parse `doc` locally and describe each error as `Line L:C — message`,
 /// with the hint joined on. A draft that parses gets its advice the same
 /// way, if it has any. `None` when the draft parses with no advice.
@@ -341,7 +354,7 @@ pub fn draft_diagnostic(doc: &str) -> Option<DraftDiagnostic> {
             0,
         ),
         Ok(query) => {
-            let report = trawl_core::advice::advise(&query);
+            let report = query_advice(&query);
             (
                 DraftKind::Advice,
                 report
@@ -809,6 +822,21 @@ mod tests {
         for line in all {
             assert!(!line.contains("text search, not a field filter"), "{line}");
         }
+    }
+
+    /// A draft that parses but fails trawl-core's semantic checks is a
+    /// draft with an error: it gets no advice, though the browser leaves
+    /// that error itself to the server's verdict.
+    #[test]
+    fn draft_semantic_errors_suppress_advice() {
+        let draft = "-service=x | stats nosuchfn(x)";
+        assert!(trawl_core::parser::parse(draft).is_ok(), "the draft parses");
+        assert_eq!(draft_diagnostic(draft), None);
+        assert!(
+            query_advice(&trawl_core::parser::parse(draft).unwrap())
+                .findings
+                .is_empty()
+        );
     }
 
     /// Advice past the core's cap is counted, not listed: the draft line

@@ -22,7 +22,7 @@ use wasm_bindgen::prelude::*;
 use crate::completion::complete_at;
 use crate::interop::codemirror::{EditorHandle, create_editor};
 use crate::offset::utf8_to_utf16;
-use crate::query_error::{join_hint, omitted_advice_note};
+use crate::query_error::{join_hint, omitted_advice_note, query_advice};
 
 /// JS-side `Diagnostic` shape expected by the codemirror bundle.
 #[derive(Serialize)]
@@ -35,8 +35,8 @@ struct Diagnostic {
 
 /// Emits `CodeMirror` diagnostics for every parse error from trawl-core,
 /// or, when the draft parses, a `warning` for each advice finding
-/// (ADR-0068). Errors take precedence: a draft with any error gets no
-/// advice.
+/// (ADR-0068). Errors take precedence: a draft with any error, a
+/// semantic one included, gets no advice.
 ///
 /// `doc` is the current document text. Parser spans are UTF-8 byte
 /// offsets; `CodeMirror` expects UTF-16 code-unit offsets — we translate
@@ -46,7 +46,7 @@ struct Diagnostic {
 fn lint_document(doc: &str) -> Vec<Diagnostic> {
     match trawl_core::parser::parse(doc) {
         Ok(query) => {
-            let report = trawl_core::advice::advise(&query);
+            let report = query_advice(&query);
             let mut diagnostics: Vec<Diagnostic> = report
                 .findings
                 .into_iter()
