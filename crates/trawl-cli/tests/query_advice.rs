@@ -129,7 +129,7 @@ fn many_findings() -> String {
         .join(" ")
 }
 
-/// A Parquet file of five events, four of them carrying the address. In
+/// A Parquet file of six events, five of them carrying the address. In
 /// two of those the `service` field and the message text disagree: a
 /// coredns event whose text never says `service=coredns`, and a kubelet
 /// event whose text does. A text search for `service=coredns` and a
@@ -174,6 +174,12 @@ fn fixture(dir: &Path) -> String {
                 string("probe 10.244.0.83 forwarded to service=coredns"),
                 string("kubelet"),
                 string("e"),
+            ],
+            vec![
+                string("lookup 10.244.0.99 ok"),
+                string("lookup 10.244.0.99 ok"),
+                string("trawld"),
+                string("f"),
             ],
         ],
     };
@@ -419,10 +425,12 @@ const NEGATED_KEEPS: [&str; 3] = [
     "answered 10.244.0.83 upstream",
 ];
 /// The rows [`NEGATED`] drops from [`fixture`]: the text says
-/// `service=coredns`, whether or not the `service` field does.
-const NEGATED_DROPS: [&str; 2] = [
+/// `service=coredns`, whether or not the `service` field does, or the
+/// event lacks the address.
+const NEGATED_DROPS: [&str; 3] = [
     "lookup 10.244.0.83 via service=coredns",
     "probe 10.244.0.83 forwarded to service=coredns",
+    "lookup 10.244.0.99 ok",
 ];
 
 /// `text` holds every row [`NEGATED`] keeps and none it drops.

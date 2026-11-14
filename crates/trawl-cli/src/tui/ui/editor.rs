@@ -1032,9 +1032,32 @@ mod tests {
             let app = app_with_draft(draft);
             let report = app.tab.draft_advice().expect("advice").clone();
             for width in [20, 40, 80, 200] {
+                let unlimited: Vec<_> = advice_rows(&report, width, u16::MAX)
+                    .into_iter()
+                    .filter(|r| r.kind != AdviceRowKind::Note)
+                    .collect();
                 for budget in 1..=30 {
                     let rows = advice_rows(&report, width, budget);
                     assert!(rows.len() <= usize::from(budget));
+                    // The finding rows shown are the unlimited layout's first
+                    // rows, wrapped continuations included, and stop where a
+                    // finding ends.
+                    let shown: Vec<_> = rows
+                        .iter()
+                        .filter(|r| r.kind != AdviceRowKind::Note)
+                        .cloned()
+                        .collect();
+                    assert!(
+                        unlimited.starts_with(&shown),
+                        "width {width} budget {budget}: {rows:?}"
+                    );
+                    if let Some(next) = unlimited.get(shown.len()) {
+                        assert!(
+                            next.kind == AdviceRowKind::Message
+                                && next.text.starts_with(super::ADVICE_MARKER),
+                            "width {width} budget {budget} cut a finding: {rows:?}"
+                        );
+                    }
                     let messages = rows
                         .iter()
                         .filter(|r| r.kind == AdviceRowKind::Message && r.text.starts_with(" i "))

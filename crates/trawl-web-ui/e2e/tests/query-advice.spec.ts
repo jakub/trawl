@@ -21,6 +21,13 @@ const CORRECTED = '"10.244.0.83" service!=coredns';
 /// pair sits at byte 9, UTF-16 offset 5, character column 5.
 const ESCAPE = '"雪🌊 \\s"';
 
+/// The whole draft line for a negated `service=` term at `column`: the
+/// core's message and hint for the `=` operator, as the page renders them.
+const negatedServiceLine = (column: number) =>
+  `Line 1:${column} — -service=… is a text search, not a field filter: it drops events whose message or _raw contain that text — ` +
+  'to filter the field, write service!=… (keeps events with no service) or NOT service=… (drops them too); ' +
+  'to keep the text search and silence this, write NOT "service=…"';
+
 async function typeDraft(page: Page, text: string) {
   await page.locator(SEL.cmContent).click();
   await page.keyboard.press('Control+a');
@@ -89,7 +96,7 @@ test.describe('query advice', () => {
     await typeDraft(page, Array.from({ length: 10 }, (_, i) => `-service=s${i}`).join(' '));
 
     await expect(page.locator(SEL.draftDiagnosticAdvice)).toBeVisible();
-    await expect(page.locator(SEL.draftDiagnosticFirst)).toHaveText(/^Line 1:1 — -service=… is a text search/);
+    await expect(page.locator(SEL.draftDiagnosticFirst)).toHaveText(negatedServiceLine(1));
     const more = page.locator(SEL.draftDiagnosticMore);
     await expect(more.locator('summary')).toHaveText('+7 more');
     // Opened, the disclosure lists the second through eighth findings,
@@ -99,7 +106,7 @@ test.describe('query advice', () => {
     await expect(entries).toHaveCount(7);
     for (let i = 0; i < 7; i++) {
       await expect(entries.nth(i)).toBeVisible();
-      await expect(entries.nth(i)).toHaveText(new RegExp(`^Line 1:${1 + 12 * (i + 1)} — -service=… is a text search`));
+      await expect(entries.nth(i)).toHaveText(negatedServiceLine(1 + 12 * (i + 1)));
     }
     await expect(page.locator(SEL.draftDiagnosticOmitted)).toHaveText('and 2 more advice notes not shown');
     // Eight spans, never a ninth for the count.
