@@ -39,22 +39,34 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     }
 }
 
-/// Render the Query tab: tab bar, editor, [validation hint], results, status bar.
+/// Render the Query tab: tab bar, editor, [validation hint or advice],
+/// results, status bar.
 fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
     let has_validation_hint = !app.active_tab().validation_errors.is_empty();
+    // Errors take precedence: the advice region exists only without them.
+    let advice_height = if has_validation_hint {
+        0
+    } else {
+        advice_region_height(app, frame.area())
+    };
 
     // Build layout conditionally to avoid affecting percentage distribution
     // when there is no hint line.
-    let (editor_area, hint_area, results_area, status_area) = if has_validation_hint {
+    let (editor_area, hint_area, advice_area, results_area, status_area) = if has_validation_hint {
         let [tab_bar, editor, hint, results, status] =
             vertical![==2, ==40%, ==1, ==55%, ==1].areas(frame.area());
         tabs::render(app, frame, tab_bar);
-        (editor, Some(hint), results, status)
+        (editor, Some(hint), None, results, status)
+    } else if advice_height > 0 {
+        let [tab_bar, editor, advice, results, status] =
+            vertical![==2, ==40%, ==advice_height, ==55%, ==1].areas(frame.area());
+        tabs::render(app, frame, tab_bar);
+        (editor, None, Some(advice), results, status)
     } else {
         let [tab_bar, editor, results, status] =
             vertical![==2, ==40%, ==55%, ==1].areas(frame.area());
         tabs::render(app, frame, tab_bar);
-        (editor, None, results, status)
+        (editor, None, None, results, status)
     };
 
     // Populate layout areas for mouse hit-testing.
@@ -75,6 +87,9 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
 
     if let Some(hint) = hint_area {
         editor::render_validation_hint(app, frame, hint);
+    }
+    if let Some(advice) = advice_area {
+        editor::render_query_advice(app, frame, advice);
     }
 
     // Visible rows for scroll math: 2 borders plus the header row account for 3 of the 4
@@ -105,6 +120,24 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
         let y = editor_area.y + vrow.saturating_sub(scroll_row) as u16 + 1;
         frame.set_cursor_position((x, y));
     }
+}
+
+/// Rows the advice region takes in a query layout over `area`: the rows
+/// [`editor::advice_rows`] lays out at the full width, within
+/// [`advice_row_budget`]. Zero when the draft has no advice to show.
+fn advice_region_height(app: &App, area: Rect) -> u16 {
+    app.active_tab().draft_advice().map_or(0, |report| {
+        let rows = editor::advice_rows(report, area.width, advice_row_budget(area.height));
+        u16::try_from(rows.len()).unwrap_or(u16::MAX)
+    })
+}
+
+/// The most rows advice may take from a query layout `height` rows tall:
+/// a third of the screen, and never the rows the tab bar, the status bar
+/// and a three-row editor and results pane need.
+fn advice_row_budget(height: u16) -> u16 {
+    const RESERVED: u16 = 2 + 1 + 3 + 3;
+    height.saturating_sub(RESERVED).min(height / 3)
 }
 
 /// Render the Dashboard tab: tab bar, dashboard content, status bar.

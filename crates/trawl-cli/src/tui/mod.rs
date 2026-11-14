@@ -3974,4 +3974,40 @@ mod tests {
         assert!(!text.contains("Run #102"), "{text}");
         assert_eq!(q_prefill(&app), saved_run_query("X", Some(101)));
     }
+
+    /// Advice describes the draft, not the tab: switching to another main
+    /// tab and back shows the same advice without an edit.
+    #[test]
+    fn query_advice_survives_main_tab_round_trip() {
+        let mut app = test_app();
+        app.tab
+            .editor
+            .insert_text("service=trawld event_type in (a, b)");
+        app.tab.mark_editor_dirty();
+        app.tab.last_edit_time = None;
+        assert!(app.tab.maybe_validate());
+
+        let draw = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|f| crate::tui::ui::render(app, f))
+                .expect("render");
+            buffer_text(terminal.backend().buffer())
+        };
+        let before = draw(&mut app);
+        assert!(
+            before.contains("advice: in the search stage, in (…) is not a list test"),
+            "{before}"
+        );
+
+        app.switch_to_main_tab(MainTab::Saved);
+        let away = draw(&mut app);
+        assert!(!away.contains("advice:"), "the panel layout has no editor");
+
+        app.switch_to_main_tab(MainTab::Query);
+        assert!(!app.tab.validation_dirty, "no edit happened");
+        let after = draw(&mut app);
+        assert_eq!(before, after, "the same advice returns with the query tab");
+    }
 }
