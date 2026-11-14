@@ -662,44 +662,89 @@ pub fn advice_rows(report: &AdviceReport, width: u16, max_rows: u16) -> Vec<Advi
         return Vec::new();
     }
 
-    let mut rows = Vec::new();
-    for finding in &report.findings {
-        push_wrapped(
-            &mut rows,
-            AdviceRowKind::Message,
-            ADVICE_MARKER,
-            &format!("advice: {}", sanitize_display_text(&finding.message)),
-            width,
-        );
-        push_wrapped(
-            &mut rows,
-            AdviceRowKind::Hint,
-            ADVICE_INDENT,
-            &format!("hint: {}", sanitize_display_text(&finding.hint)),
-            width,
-        );
-    }
-    if report.omitted > 0 {
-        let noun = if report.omitted == 1 { "note" } else { "notes" };
-        push_wrapped(
-            &mut rows,
-            AdviceRowKind::Note,
-            ADVICE_INDENT,
-            &format!("and {} more advice {noun} not shown", report.omitted),
-            width,
-        );
+    let groups: Vec<Vec<AdviceRow>> = report
+        .findings
+        .iter()
+        .map(|finding| {
+            let mut group = Vec::new();
+            push_wrapped(
+                &mut group,
+                AdviceRowKind::Message,
+                ADVICE_MARKER,
+                &format!("advice: {}", sanitize_display_text(&finding.message)),
+                width,
+            );
+            push_wrapped(
+                &mut group,
+                AdviceRowKind::Hint,
+                ADVICE_INDENT,
+                &format!("hint: {}", sanitize_display_text(&finding.hint)),
+                width,
+            );
+            group
+        })
+        .collect();
+
+    // Everything fits: every finding, then the core's omitted count.
+    let mut rows: Vec<AdviceRow> = Vec::new();
+    let note_rows = |hidden: usize, shown: usize| {
+        let mut note = Vec::new();
+        if hidden > 0 {
+            push_wrapped(
+                &mut note,
+                AdviceRowKind::Note,
+                ADVICE_INDENT,
+                &hidden_note(hidden, shown),
+                width,
+            );
+        }
+        note
+    };
+    let total: usize = groups.iter().map(Vec::len).sum::<usize>()
+        + note_rows(report.omitted, report.findings.len()).len();
+    if total <= max_rows {
+        rows.extend(groups.into_iter().flatten());
+        rows.extend(note_rows(report.omitted, report.findings.len()));
+        return rows;
     }
 
-    if rows.len() > max_rows {
-        rows.truncate(max_rows);
-        if let Some(last) = rows.last_mut() {
-            *last = AdviceRow {
-                kind: AdviceRowKind::Note,
-                text: fit_cells(&format!("{ADVICE_INDENT}… more advice below"), width),
-            };
+    // Too many rows: keep whole findings in source order, and give the
+    // last row to a count of every finding left out, so the region never
+    // points at text the author cannot reach. A first finding taller than
+    // the region keeps as many of its rows as fit.
+    let room = max_rows - 1;
+    let mut shown = 0;
+    for group in groups {
+        if rows.len() + group.len() > room {
+            if shown == 0 && room > 0 {
+                rows.extend(group.into_iter().take(room));
+                shown = 1;
+            }
+            break;
         }
+        rows.extend(group);
+        shown += 1;
     }
+    let hidden = report.findings.len() - shown + report.omitted;
+    rows.push(AdviceRow {
+        kind: AdviceRowKind::Note,
+        text: fit_cells(
+            &format!("{ADVICE_INDENT}{}", hidden_note(hidden, shown)),
+            width,
+        ),
+    });
     rows
+}
+
+/// The count of advice the region leaves out: `and N more …` after shown
+/// findings, `N … not shown` when none fit.
+fn hidden_note(hidden: usize, shown: usize) -> String {
+    let noun = if hidden == 1 { "note" } else { "notes" };
+    if shown == 0 {
+        format!("{hidden} advice {noun} not shown")
+    } else {
+        format!("and {hidden} more advice {noun} not shown")
+    }
 }
 
 /// Wrap `body` into rows of `width` cells, the first starting with
@@ -907,11 +952,11 @@ mod tests {
             }
         }
 
-        // A short budget keeps that many rows and says some were cut.
-        let rows = advice_rows(&report, 40, 3);
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[2].kind, AdviceRowKind::Note);
-        assert!(rows[2].text.contains("more advice below"));
+        // A budget too short for the finding still says it is there.
+        let rows = advice_rows(&report, 40, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, AdviceRowKind::Note);
+        assert_eq!(rows[0].text.trim(), "1 advice note not shown");
 
         // Whole frames, tiny and empty, draw without panicking; a frame too
         // short for any advice row leaves the region out.
@@ -934,6 +979,43 @@ mod tests {
         let mut app = app_with_draft(r#""10.244.0.83" -service=coredns"#);
         let screen = draw(&mut app, 40, 9);
         assert!(!screen.contains("advice"), "no room for advice:\n{screen}");
+    }
+
+    /// A region too short for every finding keeps whole findings and
+    /// counts the rest, with the core's omitted findings, on its last row:
+    /// nothing the author cannot reach is promised.
+    #[test]
+    fn query_advice_counts_what_the_region_cuts() {
+        let draft = (0..10)
+            .map(|i| format!("-f{i}=v"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut app = app_with_draft(&draft);
+        let report = app.tab.draft_advice().expect("advice").clone();
+        assert_eq!(report.omitted, 2);
+
+        let budget = 8;
+        let rows = advice_rows(&report, 80, budget);
+        assert!(rows.len() <= usize::from(budget));
+        let shown = rows
+            .iter()
+            .filter(|r| r.kind == AdviceRowKind::Message && r.text.starts_with(" i "))
+            .count();
+        assert!(shown >= 1, "{rows:?}");
+        let last = rows.last().expect("rows");
+        assert_eq!(last.kind, AdviceRowKind::Note);
+        let hidden = report.findings.len() - shown + report.omitted;
+        assert_eq!(
+            last.text.trim(),
+            format!("and {hidden} more advice notes not shown")
+        );
+        assert!(rows.iter().all(|r| !r.text.contains("below")), "{rows:?}");
+
+        let screen = draw(&mut app, 80, 24);
+        assert!(
+            screen.contains(&format!("and {hidden} more advice notes not shown")),
+            "{screen}"
+        );
     }
 
     #[test]
