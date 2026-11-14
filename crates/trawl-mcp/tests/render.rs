@@ -96,6 +96,7 @@ fn reply_over(page: &QueryResult, rows_captured: u64) -> SearchReply {
         investigation: None,
         hints: vec![],
         next_actions: vec![],
+        advice_hint_count: 0,
     }
 }
 
@@ -1111,6 +1112,7 @@ fn line_and_paragraph_separators_never_reach_an_excerpt_raw() {
             investigation: None,
             hints: vec![],
             next_actions: vec![],
+            advice_hint_count: 0,
         };
         let result = render::search(reply, Budget::DEFAULT, ROWS);
         let validated = text_of(&result);
@@ -1161,6 +1163,7 @@ fn excerpt_texts(sent: &str, needle: &str) -> [String; 2] {
         investigation: None,
         hints: vec![],
         next_actions: vec![],
+        advice_hint_count: 0,
     };
     let validated = text_of(&render::search(reply, Budget::DEFAULT, ROWS)).to_owned();
     [refused, validated]
@@ -1316,6 +1319,7 @@ fn a_failed_validation_is_a_successful_call_with_the_excerpt() {
         investigation: None,
         hints: vec![],
         next_actions: vec![],
+        advice_hint_count: 0,
     };
     let result = render::search(reply, Budget::DEFAULT, ROWS);
     assert_eq!(result.is_error, Some(false));
@@ -1353,6 +1357,7 @@ fn validation_render_shows_the_format_error() {
         investigation: None,
         hints: vec![],
         next_actions: vec![],
+        advice_hint_count: 0,
     };
     let result = render::search(reply, Budget::DEFAULT, ROWS);
     assert_eq!(result.is_error, Some(false));
@@ -1365,6 +1370,350 @@ fn validation_render_shows_the_format_error() {
     let mirror = &result.structured_content.as_ref().unwrap()["validation"];
     assert!(mirror.get("formatted").is_none(), "{mirror}");
     assert_eq!(mirror["format_error"]["kind"], "too_long", "{mirror}");
+}
+
+// -- advice under the budget (ADR-0068, #460) ---------------------------------
+
+/// A text with one finding of each advice kind.
+const ADVISED: &str = "\"10.244.0.83\" -service=coredns service=trawld event_type in (a, b)";
+
+/// `reply` with the advice on [`ADVISED`] ahead of its hints, counted as
+/// the tool counts it.
+fn advised(reply: &SearchReply) -> SearchReply {
+    let advice = trawl_mcp::hints::advice(ADVISED);
+    assert_eq!(advice.len(), 2, "{advice:?}");
+    let mut advised = reply.clone();
+    advised.advice_hint_count = advice.len();
+    advised.hints = advice.into_iter().chain(reply.hints.clone()).collect();
+    advised
+}
+
+/// An execute reply whose ladder changes within the budgets a call may
+/// name: six 400-byte rows of 40 captured, three facets, a long link, a
+/// page continuation and a narrowing search, and one computed hint.
+fn execute_reply() -> SearchReply {
+    let page = wide_page(6);
+    let mut reply = reply_over(&page, 40);
+    let view = reply.result.as_mut().unwrap();
+    view.facets = (0..3)
+        .map(|f| Facet {
+            field: format!("f{f}"),
+            values: (0..5)
+                .map(|v| FacetValue {
+                    value: json!(format!("{v}{}", "v".repeat(60))),
+                    count: 8,
+                })
+                .collect(),
+            captured_rows: 40,
+        })
+        .collect();
+    view.link = Link {
+        url: Some(format!(
+            "https://trawl.example.net/search?q={}",
+            "u".repeat(300)
+        )),
+        reason: None,
+    };
+    reply.next_actions = vec![
+        NextAction {
+            tool: "read".to_owned(),
+            arguments: arguments(
+                json!({"action": "page", "result_id": RESULT_ID, "offset": 6, "rows": 6}),
+            ),
+            reason: "print the next captured rows without running the query again".to_owned(),
+        },
+        NextAction {
+            tool: "search".to_owned(),
+            arguments: arguments(json!({"mode": "execute", "query": "n".repeat(300)})),
+            reason: "Narrow it.".to_owned(),
+        },
+    ];
+    reply.hints = vec![format!("lag: {}", "l".repeat(500))];
+    reply
+}
+
+/// A valid verdict proposing the execution of a long text.
+fn validate_reply() -> SearchReply {
+    let query = format!("service=trawld {}", "w".repeat(1500));
+    let response = ValidationResponse {
+        valid: true,
+        errors: vec![],
+        formatted: Some(query.clone()),
+        format_error: None,
+    };
+    let view = render::validation_view(&query, &response);
+    SearchReply {
+        outcome: render::validation_outcome(&view),
+        mode: SearchMode::Validate,
+        validation: Some(view),
+        result: None,
+        investigation: None,
+        hints: vec![],
+        next_actions: vec![NextAction {
+            tool: "search".to_owned(),
+            arguments: arguments(json!({"mode": "execute", "query": query})),
+            reason: "run the query and keep its rows as a result".to_owned(),
+        }],
+        advice_hint_count: 0,
+    }
+}
+
+/// What a fitted search reply kept, from its mirror, but its hints and the
+/// facts that say hints were dropped: the parts advice must never cost.
+fn kept_parts(result: &CallToolResult) -> Json {
+    if result.is_error == Some(true) {
+        return json!({"error": text_of(result)});
+    }
+    let mirror = result.structured_content.as_ref().unwrap();
+    let mut kept = json!({
+        "next_actions": mirror["next_actions"],
+        "validation": mirror.get("validation"),
+        "result": mirror.get("result"),
+    });
+    if let Some(validation) = kept["validation"].as_object_mut() {
+        validation.remove("hints_dropped_to_fit");
+    }
+    if let Some(presentation) = kept["result"]["presentation"].as_object_mut() {
+        presentation.remove("hints_dropped_to_fit");
+    }
+    kept
+}
+
+/// The hints a fitted reply printed, from its mirror; `None` for an error.
+fn printed_hints(result: &CallToolResult) -> Option<Vec<Json>> {
+    let mirror = result.structured_content.as_ref()?;
+    Some(mirror["hints"].as_array().unwrap().clone())
+}
+
+/// One budget of a sweep: the advised and the advice-free reply fitted.
+struct Fitted {
+    budget: usize,
+    advised: CallToolResult,
+    plain: CallToolResult,
+}
+
+/// Fit `plain` and its [`advised`] counterpart under every budget a
+/// coarse pass over `lo..=hi` finds a change between, byte by byte, and
+/// every coarse budget besides: a change of what either reply keeps or of
+/// which hints the advised one prints. Returns every budget fitted, in
+/// increasing order.
+fn sweep(plain: &SearchReply, lo: usize, hi: usize) -> Vec<Fitted> {
+    let advised_reply = advised(plain);
+    let fit = |budget: usize| {
+        let at = Budget::new(Some(u32::try_from(budget).unwrap()));
+        assert_eq!(at.bytes(), budget);
+        Fitted {
+            budget,
+            advised: render::search(advised_reply.clone(), at, ROWS),
+            plain: render::search(plain.clone(), at, ROWS),
+        }
+    };
+    let shape = |fitted: &Fitted| {
+        (
+            kept_parts(&fitted.plain),
+            printed_hints(&fitted.advised).map(|hints| hints.len()),
+        )
+    };
+    let coarse: Vec<usize> = (lo..=hi).step_by(16).chain([hi]).collect();
+    let mut all = Vec::new();
+    let mut previous: Option<Fitted> = None;
+    for budget in coarse {
+        let fitted = fit(budget);
+        if let Some(before) = previous.take() {
+            let changed = shape(&before) != shape(&fitted);
+            let from = before.budget;
+            all.push(before);
+            if changed {
+                all.extend((from + 1..budget).map(fit));
+            }
+        }
+        previous = Some(fitted);
+    }
+    all.extend(previous);
+    all
+}
+
+/// The smallest budget at which `reply` fits whole, by fitting it at the
+/// hard cap and measuring.
+fn whole_size(reply: &SearchReply) -> usize {
+    used_bytes(&render::search(reply.clone(), Budget::HARD, ROWS))
+}
+
+/// Check every budget of `swept`: both replies stay within it; the
+/// advised one keeps exactly what the advice-free one keeps, next calls
+/// compared whole; and its hints are its advice and then the others, or
+/// the advice-free reply's hints with the hints-dropped fact said.
+fn assert_advice_costs_nothing(plain: &SearchReply, swept: &[Fitted]) {
+    let advice = advised(plain).hints[..2].to_vec();
+    for fitted in swept {
+        let budget = fitted.budget;
+        for result in [&fitted.advised, &fitted.plain] {
+            if result.is_error != Some(true) {
+                assert!(
+                    used_bytes(result) <= budget,
+                    "{budget}: {}",
+                    used_bytes(result)
+                );
+            }
+        }
+        assert_eq!(
+            kept_parts(&fitted.advised),
+            kept_parts(&fitted.plain),
+            "at max_bytes={budget} the advice changed what the reply kept"
+        );
+        let (Some(advised), Some(plain)) =
+            (printed_hints(&fitted.advised), printed_hints(&fitted.plain))
+        else {
+            continue;
+        };
+        let with_advice: Vec<Json> = advice
+            .iter()
+            .map(|a| json!(a))
+            .chain(plain.clone())
+            .collect();
+        assert!(
+            advised == with_advice || advised == plain,
+            "{budget}: {advised:?} against {plain:?}"
+        );
+        if advised == plain {
+            let mirror = fitted.advised.structured_content.as_ref().unwrap();
+            let flag = mirror
+                .get("validation")
+                .map_or(&mirror["result"]["presentation"], |v| v)["hints_dropped_to_fit"]
+                .clone();
+            assert_eq!(flag, json!(true), "{budget}: the drop is said");
+        }
+    }
+}
+
+/// A reply sized at any boundary has the same next calls, compared whole,
+/// and keeps the same rows, facets, link and verdict, with advice as
+/// without, in execute mode and in validate mode: every budget from the
+/// smallest a call may name to past the advised reply's whole size, byte by
+/// byte around every change of what either reply keeps.
+#[test]
+fn advice_never_costs_next_actions() {
+    for plain in [execute_reply(), validate_reply()] {
+        let hi = whole_size(&advised(&plain)) + 64;
+        let swept = sweep(&plain, Budget::MIN.bytes(), hi.min(Budget::HARD.bytes()));
+        assert_advice_costs_nothing(&plain, &swept);
+        // The sweep crossed the advice boundary and the next calls'.
+        let actions = |result: &CallToolResult| {
+            result
+                .structured_content
+                .as_ref()
+                .map_or(0, |mirror| mirror["next_actions"].as_array().unwrap().len())
+        };
+        assert!(
+            swept.iter().any(|f| actions(&f.plain) == 0),
+            "{:?}",
+            plain.mode
+        );
+        assert!(
+            swept.iter().any(|f| actions(&f.plain) > 0),
+            "{:?}",
+            plain.mode
+        );
+        assert!(
+            swept.iter().any(|f| printed_hints(&f.advised)
+                .is_some_and(|hints| hints.len() == plain.hints.len() + 2)),
+            "the advice prints whole somewhere"
+        );
+        assert!(
+            swept.iter().any(|f| printed_hints(&f.advised)
+                .is_some_and(|hints| hints.len() == plain.hints.len() && actions(&f.advised) > 0)),
+            "the advice is dropped where the next calls still print"
+        );
+    }
+}
+
+/// Advice goes before anything else: some budget prints every row, facet,
+/// next call, the link and the other hint, without the advice, and says
+/// the hints were dropped.
+#[test]
+fn advice_drops_before_rows_facets_and_other_hints() {
+    let plain = execute_reply();
+    let whole = render::search(plain.clone(), Budget::HARD, ROWS);
+    let whole_mirror = whole.structured_content.as_ref().unwrap();
+    let hi = whole_size(&advised(&plain)) + 64;
+    let swept = sweep(&plain, Budget::MIN.bytes(), hi);
+    let first = swept
+        .iter()
+        .find(|fitted| {
+            let Some(mirror) = fitted.advised.structured_content.as_ref() else {
+                return false;
+            };
+            mirror["hints"] == json!(plain.hints)
+                && mirror["result"]["rows"] == whole_mirror["result"]["rows"]
+                && mirror["result"]["facets"] == whole_mirror["result"]["facets"]
+                && mirror["result"]["link"] == whole_mirror["result"]["link"]
+                && mirror["next_actions"] == whole_mirror["next_actions"]
+        })
+        .expect("a budget that drops only the advice");
+    let mirror = first.advised.structured_content.as_ref().unwrap();
+    assert_eq!(
+        mirror["result"]["presentation"]["hints_dropped_to_fit"],
+        json!(true)
+    );
+    let text = text_of(&first.advised);
+    assert!(
+        text.contains(&format!(
+            "To fit the {}-byte budget it dropped the hints.",
+            first.budget
+        )),
+        "{text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("hint: "))
+            .count(),
+        1,
+        "{text}"
+    );
+}
+
+/// Without advice, the fitting gives up the same parts in the same order
+/// as before advice existed: the facets, then the next calls, then the
+/// link, then the hints, each only once no count of rows fits without it.
+#[test]
+fn non_advice_hint_drop_order_is_unchanged() {
+    let mut plain = execute_reply();
+    plain.hints = vec![format!("lag: {}", "l".repeat(1200))];
+    plain.result.as_mut().unwrap().executed_query = "q".repeat(600);
+    let hi = whole_size(&plain);
+    let at = |budget: usize| {
+        render::search(
+            plain.clone(),
+            Budget::new(Some(u32::try_from(budget).unwrap())),
+            ROWS,
+        )
+    };
+    let mut seen_hints_gone = false;
+    for budget in (Budget::MIN.bytes()..=hi).step_by(8) {
+        let result = at(budget);
+        let Some(mirror) = result.structured_content.as_ref() else {
+            continue;
+        };
+        let view = &mirror["result"];
+        let facets_gone = view["facets"] == json!([]);
+        let actions_gone = mirror["next_actions"] == json!([]);
+        let link_gone = view["link"]["url"].is_null();
+        let hints_gone = mirror["hints"] == json!([]);
+        let order = [facets_gone, actions_gone, link_gone, hints_gone];
+        // A part is gone only when every part before it is.
+        for (i, gone) in order.iter().enumerate() {
+            if *gone {
+                assert!(order[..i].iter().all(|g| *g), "{budget}: {order:?}");
+            }
+        }
+        assert_eq!(
+            view["presentation"]["hints_dropped_to_fit"],
+            json!(hints_gone),
+            "{budget}"
+        );
+        seen_hints_gone |= hints_gone;
+    }
+    assert!(seen_hints_gone, "the sweep reached the hints");
 }
 
 // -- properties ---------------------------------------------------------------------

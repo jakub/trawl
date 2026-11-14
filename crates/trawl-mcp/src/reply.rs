@@ -352,6 +352,9 @@ pub struct ValidationView {
     /// budget.
     #[serde(default)]
     pub diagnostics_dropped_to_fit: u64,
+    /// Whether the reply's hints were dropped to fit the response budget.
+    #[serde(default)]
+    pub hints_dropped_to_fit: bool,
 }
 
 /// Why trawld returned no formatted text for a valid query (ADR-0061).
@@ -579,11 +582,17 @@ pub struct SearchReply {
     /// one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation: Option<AttachedView>,
-    /// Computed hints: dominance, the nearest bounds holding data, a
-    /// lagging sender, a field the catalog holds no pin or observation of.
+    /// Computed hints: advice on the query text first, then dominance, the
+    /// nearest bounds holding data, a lagging sender, a field the catalog
+    /// holds no pin or observation of.
     pub hints: Vec<String>,
     /// At most two proposed next calls.
     pub next_actions: Vec<NextAction>,
+    /// How many of the first `hints` are advice on the query text, which
+    /// the fitting drops before anything else; never serialized.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub advice_hint_count: usize,
 }
 
 /// `read`: a page of a captured result, one cell's text, or an

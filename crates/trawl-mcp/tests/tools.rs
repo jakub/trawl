@@ -508,6 +508,237 @@ async fn a_valid_query_proposes_its_execution() {
     );
 }
 
+// -- search: advice on the query text (ADR-0068, #460) -----------------------
+
+/// The survey text whose `in (…)` reads like a list test.
+const ADVISED: &str = "service=trawld event_type in (a, b)";
+
+/// The hint lines trawl-core's advice on `query` gives, as the text prints
+/// them: `advice:`, the message, then the hint.
+fn advice_lines(query: &str) -> Vec<String> {
+    let parsed = trawl_core::parser::parse_unbuilt(query).expect("the text parses");
+    let report = trawl_core::advice::advise(&parsed);
+    assert!(!report.findings.is_empty(), "{query} has advice");
+    report
+        .findings
+        .iter()
+        .map(|finding| format!("advice: {}; {}", finding.message, finding.hint))
+        .collect()
+}
+
+/// A backend whose `/validate` calls every text valid.
+fn validates() -> Fake {
+    Fake {
+        validate: ok(serde_json::from_value(json!({"valid": true, "errors": []})).unwrap()),
+        ..Fake::default()
+    }
+}
+
+async fn validate(backend: &Fake, arguments: Json) -> CallToolResult {
+    search::run(
+        backend,
+        &trawl_mcp::session::Seen::default(),
+        search_input(arguments),
+        now(),
+    )
+    .await
+}
+
+/// Validate mode renders the advice as a `hint:` line in the text and in
+/// the mirror's hints, keeps `valid` true with no errors, and proposes the
+/// same execution of the same text.
+#[tokio::test]
+async fn search_validate_keeps_query_advice() {
+    let backend = validates();
+    let result = validate(&backend, json!({"mode": "validate", "query": ADVISED})).await;
+    assert_ne!(result.is_error, Some(true));
+    let text = text_of(&result);
+    let advice = advice_lines(ADVISED);
+    assert_eq!(advice.len(), 1, "{advice:?}");
+    assert!(
+        advice[0].contains("in (…) is not a list test"),
+        "{advice:?}"
+    );
+    assert_eq!(
+        lines_starting(text, "hint: "),
+        [format!("hint: {}", advice[0])],
+        "{text}"
+    );
+    assert!(text.starts_with("The query is valid.\n"), "{text}");
+    let mirror = result.structured_content.as_ref().expect("a mirror");
+    assert_eq!(mirror["validation"]["valid"], json!(true));
+    assert_eq!(mirror["validation"]["errors"], json!([]));
+    assert_eq!(mirror["validation"]["hints_dropped_to_fit"], json!(false));
+    assert_eq!(mirror["hints"], json!(advice));
+    assert_eq!(
+        mirror["next_actions"],
+        json!([{
+            "tool": "search",
+            "arguments": {"mode": "execute", "query": ADVISED},
+            "reason": "run the query and keep its rows as a result"
+        }])
+    );
+    assert!(mirror.get("advice_hint_count").is_none(), "{mirror}");
+    assert_eq!(backend.calls(), [format!("validate {ADVISED}")]);
+}
+
+/// Execute mode computes the advice from the text it sent, puts it ahead
+/// of the computed hints that read trawld's facts, and keeps its result
+/// shape: no validation section, and the same trawld calls.
+#[tokio::test]
+async fn search_execute_computes_query_advice() {
+    let mut service = values(&[(s("trawld"), 9), (s("vector"), 1)]);
+    service.nulls = 0;
+    let captured = captured(
+        ADVISED,
+        &[
+            ("_time", ColumnType::Timestamp),
+            ("service", ColumnType::String),
+            ("message", ColumnType::String),
+        ],
+        vec![no_values(10), service, no_values(10)],
+        10,
+        10,
+    );
+    let rows = vec![vec![
+        s("2026-03-14T03:59:00.000000Z"),
+        s("trawld"),
+        s("event_type in a"),
+    ]];
+    let backend = Fake {
+        capture: ok(trawl_client::CaptureResponse {
+            result: captured.clone(),
+            execution: None,
+            activity: None,
+            step_seq: None,
+        }),
+        result_page: ok(page(&captured, rows, 0)),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let result = search::run(
+        &backend,
+        &trawl_mcp::session::Seen::default(),
+        search_input(json!({"mode": "execute", "query": ADVISED, "rows": 1})),
+        now(),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let text = text_of(&result);
+    let advice = advice_lines(ADVISED);
+    let dominance = r#"dominance: "service" "trawld" holds 9 of the 10 captured rows (90%) among 2 distinct values"#;
+    let hints: Vec<String> = advice
+        .iter()
+        .cloned()
+        .chain([dominance.to_owned()])
+        .collect();
+    assert_eq!(
+        lines_starting(text, "hint: "),
+        hints
+            .iter()
+            .map(|hint| format!("hint: {hint}"))
+            .collect::<Vec<_>>(),
+        "{text}"
+    );
+    let mirror = result.structured_content.as_ref().expect("a mirror");
+    assert_eq!(mirror["hints"], json!(hints));
+    assert!(mirror.get("validation").is_none(), "{mirror}");
+    assert!(mirror.get("advice_hint_count").is_none(), "{mirror}");
+    assert_eq!(mirror["mode"], json!("execute"));
+    assert_eq!(mirror["result"]["rows_captured"], json!(10));
+    assert_eq!(
+        mirror["result"]["presentation"]["hints_dropped_to_fit"],
+        json!(false)
+    );
+    assert!(text.starts_with("The query produced 10 rows, all captured as result"));
+    assert!(!text.contains("formatted query"), "{text}");
+    assert_eq!(
+        backend.calls(),
+        [
+            "capabilities".to_owned(),
+            format!("capture {ADVISED}"),
+            format!("result_page {RESULT_ID} 0 1 None"),
+        ]
+    );
+}
+
+/// Nine negated field-shaped terms: eight findings and a count of one more.
+fn nine_negated_terms() -> String {
+    (0..9)
+        .map(|i| format!("-field_{i}=value_{i}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A validate reply whose advice does not fit its budget drops the hints
+/// and says so in its validation section and its mirror, keeps `valid`
+/// true with no errors, and keeps its proposed execution.
+#[tokio::test]
+async fn search_validate_reports_budget_dropped_hints() {
+    let query = nine_negated_terms();
+    let backend = validates();
+    let whole = validate(&backend, json!({"mode": "validate", "query": query})).await;
+    let mirror = whole.structured_content.as_ref().expect("a mirror");
+    let hints = mirror["hints"].as_array().expect("hints");
+    assert_eq!(hints.len(), 9, "{hints:?}");
+    assert_eq!(hints[8], json!("advice: 1 more advice note not shown"));
+    assert!(used_bytes(&whole) > 4096, "{} bytes", used_bytes(&whole));
+
+    let result = validate(
+        &backend,
+        json!({"mode": "validate", "query": query, "max_bytes": 4096}),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    assert!(used_bytes(&result) <= 4096, "{}", used_bytes(&result));
+    let text = text_of(&result);
+    assert!(lines_starting(text, "hint: ").is_empty(), "{text}");
+    assert!(
+        text.contains("\nTo fit the 4096-byte budget the response dropped the hints.\n"),
+        "{text}"
+    );
+    let mirror = result.structured_content.as_ref().expect("a mirror");
+    assert_eq!(mirror["validation"]["valid"], json!(true));
+    assert_eq!(mirror["validation"]["errors"], json!([]));
+    assert_eq!(mirror["validation"]["hints_dropped_to_fit"], json!(true));
+    assert_eq!(mirror["hints"], json!([]));
+    assert_eq!(
+        mirror["next_actions"],
+        whole.structured_content.as_ref().unwrap()["next_actions"]
+    );
+    assert_eq!(mirror["next_actions"].as_array().map(Vec::len), Some(1));
+}
+
+/// A text trawld refuses shows only its errors: no advice, though the
+/// same text with no error would have some.
+#[tokio::test]
+async fn search_errors_suppress_query_advice() {
+    let query = format!("{ADVISED} | stat count()");
+    let backend = Fake {
+        validate: ok(serde_json::from_value(json!({
+            "valid": false,
+            "errors": [{"message": "unknown command 'stat'", "span": {"start": 39, "end": 43}}]
+        }))
+        .unwrap()),
+        ..Fake::default()
+    };
+    let result = validate(&backend, json!({"mode": "validate", "query": query})).await;
+    let text = text_of(&result);
+    assert!(lines_starting(text, "hint: ").is_empty(), "{text}");
+    let mirror = result.structured_content.as_ref().expect("a mirror");
+    assert_eq!(mirror["hints"], json!([]));
+    assert_eq!(mirror["validation"]["valid"], json!(false));
+
+    // The local parse refuses the escape, so a text trawld calls valid
+    // that this crate's trawl-core does not parse gets no advice either.
+    let escaped = r#"-service=coredns | where m matches "^\s+at ""#;
+    let backend = validates();
+    let result = validate(&backend, json!({"mode": "validate", "query": escaped})).await;
+    let mirror = result.structured_content.as_ref().expect("a mirror");
+    assert_eq!(mirror["hints"], json!([]));
+    assert_eq!(mirror["validation"]["valid"], json!(true));
+}
+
 /// A truncated capture of a deduplicating query with facets, a
 /// dominating service and a lagging sender.
 fn busy_capture() -> trawl_client::CapturedResult {
