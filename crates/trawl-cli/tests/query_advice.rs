@@ -277,6 +277,60 @@ async fn cli_semantic_error_has_no_advice() {
     );
 }
 
+/// A text that parses with its patterns unbuilt but whose regex fails to
+/// build, and that advice would otherwise flag.
+const INVALID_REGEX: &str = r"-service=x f=/\p{Nope}/";
+
+/// Daemon-mode `trawl query` refuses advice for a text local validation
+/// rejects, as `trawl validate` does, on the table and Parquet paths. The
+/// endpoint is unreachable: the advice is printed before any request.
+#[tokio::test]
+async fn cli_query_advice_skips_locally_invalid_regex() {
+    let (home, config) = local_home();
+    let token = home.path().join("token");
+    std::fs::write(&token, "flt_test_not_real").expect("write the token");
+    let token = token.to_str().unwrap();
+    let out = home.path().join("never.parquet");
+    let daemon = |query: &'static str, parquet: bool| {
+        let mut args = vec![
+            "query",
+            "--url",
+            "http://127.0.0.1:1",
+            "--token-file",
+            token,
+        ];
+        if parquet {
+            args.extend(["--format", "parquet", "-o", out.to_str().unwrap()]);
+        }
+        args.extend(["--", query]);
+        args
+    };
+
+    let output = trawl(&home, &config, &["validate", "--", INVALID_REGEX]).await;
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(
+        stderr(&output).contains("invalid regex"),
+        "{}",
+        describe(&output)
+    );
+
+    for parquet in [false, true] {
+        // The control: the same daemon path advises a valid text.
+        let output = trawl(&home, &config, &daemon(NEGATED, parquet)).await;
+        assert!(
+            stderr(&output).contains(NEGATED_MESSAGE),
+            "parquet={parquet}: {}",
+            describe(&output)
+        );
+        let output = trawl(&home, &config, &daemon(INVALID_REGEX, parquet)).await;
+        assert!(
+            !stderr(&output).contains("advice:"),
+            "parquet={parquet}: {}",
+            describe(&output)
+        );
+    }
+}
+
 #[tokio::test]
 async fn cli_query_advice_precedes_execution() {
     let (home, config) = local_home();

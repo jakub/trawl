@@ -104,12 +104,7 @@ pub async fn run_parquet_query(
         ));
     };
     // Callers reach this without `run_query`, so it advises for itself.
-    let parsed = if data.is_some() {
-        trawl_core::parser::parse(query).ok()
-    } else {
-        trawl_core::parser::parse_unbuilt(query).ok()
-    };
-    render_query_advice(query, parsed.as_ref());
+    render_query_advice(query, trawl_core::parser::parse(query).ok().as_ref());
     // Use DuckDB's native COPY TO directly.
     run_parquet_export(query, data, conn.as_ref(), output_path).await
 }
@@ -135,14 +130,10 @@ pub async fn run_query(
         return run_parquet_query(query, data, output, conn).await;
     }
 
-    // One local parse serves the embedded checks below and the advice. The
-    // daemon path parses only to advise, so it skips the pattern build; a
-    // failed parse there gives no advice and leaves the run to the server.
-    let parsed = if data.is_some() {
-        trawl_core::parser::parse(query).ok()
-    } else {
-        trawl_core::parser::parse_unbuilt(query).ok()
-    };
+    // One local parse serves the embedded checks below and the advice. It
+    // builds the patterns on both paths, so a text local validation refuses
+    // gets no advice; a failed parse leaves the error to the run.
+    let parsed = trawl_core::parser::parse(query).ok();
 
     // Block `from saved` in embedded mode: resolving a saved query's name
     // to parquet paths needs the server's saved-query and report-run stores.
