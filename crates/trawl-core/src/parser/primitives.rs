@@ -96,9 +96,52 @@ pub(crate) fn number_literal<'src>()
 // strings
 // ---------------------------------------------------------------------------
 
-/// Parse a double-quoted string with basic escape support.
+/// Parse a double-quoted string with basic escape support
+/// ([`quoted_string_reported`]).
+///
+/// Boxed: the expression grammar holds this lexer inside every recursive
+/// level, and chumsky inlines a combinator tower into the frame of each
+/// level that holds it. Boxed, the lexer's frames exist only while a
+/// string is being read, so a deep query's levels cost what they did
+/// before the unknown-escape arm (the stack premise
+/// `tests/tree_depth_stack.rs` checks, and the failure mode
+/// `crate::parser::comment::ws` and `expr.rs`'s `.boxed()` guard against).
 pub(crate) fn quoted_string<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
+    quoted_string_reported().map(|(s, _)| s).boxed()
+}
+
+/// The message head an unknown escape in a quoted string carries. A
+/// payload: the backslash pair rides along, and
+/// [`crate::parser::comment::message_for`] puts a display-safe rendering
+/// of it into the message.
+pub(crate) const MSG_UNKNOWN_ESCAPE: &str =
+    "unknown escape: a quoted string decodes only \\\\, \\\", \\n, \\t and \\r";
+
+/// One piece of a quoted string's body: a decoded character, or an
+/// unknown escape kept as written.
+#[derive(Clone)]
+enum Chunk<'src> {
+    Char(char),
+    Unknown(&'src str),
+}
+
+/// [`quoted_string`], plus whether it emitted an unknown-escape error.
+///
+/// The five escapes decode. A backslash before any other character is an
+/// emitted error over the backslash and that whole character, and both
+/// are kept in the value as written, so the string still closes and no
+/// later arm reads the same text again: a returned failure would let a
+/// filter value fall back to the bare scanner and report `close the
+/// quote` for a string that is closed. A filter value asks for the flag
+/// so it adds no operator error on top (`ParsedValue::reported`).
+///
+/// The unknown arm also expects a `"` after the backslash, which `any()`
+/// already covers: the redundant alternative keeps `'"'` in the expected
+/// set at the end of input, so `"a\` still reports an unterminated string
+/// (`crate::parser::enrich_error`).
+pub(crate) fn quoted_string_reported<'src>()
+-> impl Parser<'src, ParserInput<'src>, (String, bool), ParserExtra<'src>> + Clone {
     let escape = just('\\').ignore_then(choice((
         just('\\'),
         just('"'),
@@ -106,11 +149,33 @@ pub(crate) fn quoted_string<'src>()
         just('t').to('\t'),
         just('r').to('\r'),
     )));
+    let unknown = just('\\').then(any().or(just('"'))).to_slice().validate(
+        |pair: &'src str, extra, emitter| {
+            emitter.emit(Rich::custom(
+                extra.span(),
+                crate::parser::comment::payload(MSG_UNKNOWN_ESCAPE, pair),
+            ));
+            Chunk::Unknown(pair)
+        },
+    );
 
-    none_of("\\\"")
-        .or(escape)
+    choice((none_of("\\\"").or(escape).map(Chunk::Char), unknown))
         .repeated()
-        .collect::<String>()
+        .collect::<Vec<_>>()
+        .map(|chunks| {
+            let mut reported = false;
+            let mut s = String::new();
+            for chunk in chunks {
+                match chunk {
+                    Chunk::Char(c) => s.push(c),
+                    Chunk::Unknown(pair) => {
+                        reported = true;
+                        s.push_str(pair);
+                    }
+                }
+            }
+            (s, reported)
+        })
         .delimited_by(just('"'), just('"'))
         .labelled("quoted string")
 }

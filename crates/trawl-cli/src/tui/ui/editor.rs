@@ -11,7 +11,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
+use trawl_core::advice::AdviceReport;
 use trawl_core::sanitize::sanitize_display_text;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::App;
 use crate::tui::highlight::Highlighter;
@@ -616,5 +619,475 @@ pub fn render_validation_hint(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
         let line = Line::from(spans);
         frame.render_widget(Paragraph::new(line), area);
+    }
+}
+
+/// What one row of the advice region shows, which picks its style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdviceRowKind {
+    /// A finding's message (its first row carries the marker).
+    Message,
+    /// A finding's hint.
+    Hint,
+    /// How many findings were left out, or that rows were cut.
+    Note,
+}
+
+/// One terminal row of the advice region: its text is sanitized and fits
+/// the width it was laid out for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdviceRow {
+    pub kind: AdviceRowKind,
+    pub text: String,
+}
+
+/// The marker in front of a finding's first row.
+const ADVICE_MARKER: &str = " i ";
+/// Where the message and hint text start, so wrapped rows line up.
+const ADVICE_INDENT: &str = "   ";
+
+/// Lay out `report` as rows `width` cells wide, at most `max_rows` of
+/// them. The region's height is the number of rows this returns, and the
+/// renderer draws exactly these rows, so measurement and drawing agree.
+///
+/// Every message and hint is sanitized before it is measured. Text wraps
+/// at whitespace by display width; a word wider than the row breaks at
+/// grapheme boundaries. When the rows do not fit `max_rows`, the last one
+/// kept says so.
+#[must_use]
+pub fn advice_rows(report: &AdviceReport, width: u16, max_rows: u16) -> Vec<AdviceRow> {
+    let width = usize::from(width);
+    let max_rows = usize::from(max_rows);
+    if width == 0 || max_rows == 0 {
+        return Vec::new();
+    }
+
+    let groups: Vec<Vec<AdviceRow>> = report
+        .findings
+        .iter()
+        .map(|finding| {
+            let mut group = Vec::new();
+            push_wrapped(
+                &mut group,
+                AdviceRowKind::Message,
+                ADVICE_MARKER,
+                &format!("advice: {}", sanitize_display_text(&finding.message)),
+                width,
+            );
+            push_wrapped(
+                &mut group,
+                AdviceRowKind::Hint,
+                ADVICE_INDENT,
+                &format!("hint: {}", sanitize_display_text(&finding.hint)),
+                width,
+            );
+            group
+        })
+        .collect();
+
+    // Everything fits: every finding, then the core's omitted count.
+    let mut rows: Vec<AdviceRow> = Vec::new();
+    let note_rows = |hidden: usize, shown: usize| {
+        let mut note = Vec::new();
+        if hidden > 0 {
+            push_wrapped(
+                &mut note,
+                AdviceRowKind::Note,
+                ADVICE_INDENT,
+                &hidden_note(hidden, shown),
+                width,
+            );
+        }
+        note
+    };
+    let total: usize = groups.iter().map(Vec::len).sum::<usize>()
+        + note_rows(report.omitted, report.findings.len()).len();
+    if total <= max_rows {
+        rows.extend(groups.into_iter().flatten());
+        rows.extend(note_rows(report.omitted, report.findings.len()));
+        return rows;
+    }
+
+    // Too many rows: keep whole findings in source order, and give the
+    // last row to a count of every finding left out, so the region never
+    // cuts a finding silently or points at text the author cannot reach.
+    // A finding taller than the room left is left out whole, the first one
+    // included, and the count says a taller terminal shows it.
+    let room = max_rows - 1;
+    let mut shown = 0;
+    for group in groups {
+        if rows.len() + group.len() > room {
+            break;
+        }
+        rows.extend(group);
+        shown += 1;
+    }
+    let hidden = report.findings.len() - shown + report.omitted;
+    let note = format!(
+        "{ADVICE_INDENT}{}; a taller terminal shows more",
+        hidden_note(hidden, shown)
+    );
+    rows.push(AdviceRow {
+        kind: AdviceRowKind::Note,
+        text: fit_cells(&note, width),
+    });
+    rows
+}
+
+/// The count of advice the region leaves out: `and N more …` after shown
+/// findings, `N … not shown` when none fit.
+fn hidden_note(hidden: usize, shown: usize) -> String {
+    let noun = if hidden == 1 { "note" } else { "notes" };
+    if shown == 0 {
+        format!("{hidden} advice {noun} not shown")
+    } else {
+        format!("and {hidden} more advice {noun} not shown")
+    }
+}
+
+/// Wrap `body` into rows of `width` cells, the first starting with
+/// `first_prefix` and the rest indented to line up under it. A row too
+/// narrow for the prefix drops it.
+fn push_wrapped(
+    rows: &mut Vec<AdviceRow>,
+    kind: AdviceRowKind,
+    first_prefix: &str,
+    body: &str,
+    width: usize,
+) {
+    let prefix_width = UnicodeWidthStr::width(first_prefix);
+    let (first_prefix, indent) = if width > prefix_width {
+        (first_prefix, " ".repeat(prefix_width))
+    } else {
+        ("", String::new())
+    };
+    let room = width - UnicodeWidthStr::width(indent.as_str());
+
+    for (index, line) in wrap_cells(body, room).into_iter().enumerate() {
+        let prefix = if index == 0 {
+            first_prefix
+        } else {
+            indent.as_str()
+        };
+        rows.push(AdviceRow {
+            kind,
+            text: format!("{prefix}{line}"),
+        });
+    }
+}
+
+/// Greedy word wrap of `text` into lines at most `width` display cells.
+/// `width` is at least 1.
+fn wrap_cells(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0;
+    for word in text.split_whitespace() {
+        let word_width = UnicodeWidthStr::width(word);
+        let gap = usize::from(!line.is_empty());
+        if line_width + gap + word_width <= width {
+            if gap == 1 {
+                line.push(' ');
+            }
+            line.push_str(word);
+            line_width += gap + word_width;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0;
+        }
+        if word_width <= width {
+            line.push_str(word);
+            line_width = word_width;
+            continue;
+        }
+        // A word wider than the row breaks between graphemes.
+        for cluster in word.graphemes(true) {
+            let cluster_width = UnicodeWidthStr::width(cluster);
+            if line_width + cluster_width > width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                line_width = 0;
+            }
+            line.push_str(cluster);
+            line_width += cluster_width;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// The longest prefix of `text` that fits `width` cells.
+fn fit_cells(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for cluster in text.graphemes(true) {
+        let cluster_width = UnicodeWidthStr::width(cluster);
+        if used + cluster_width > width {
+            break;
+        }
+        out.push_str(cluster);
+        used += cluster_width;
+    }
+    out
+}
+
+/// Render the advice region: the rows [`advice_rows`] laid out for this
+/// area, which the caller sized from the same call.
+pub fn render_query_advice(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(report) = app.active_tab().draft_advice() else {
+        return;
+    };
+    let theme = &app.theme;
+    let lines: Vec<Line<'_>> = advice_rows(report, area.width, area.height)
+        .into_iter()
+        .map(|row| match row.kind {
+            AdviceRowKind::Message => {
+                if let Some(rest) = row.text.strip_prefix(ADVICE_MARKER) {
+                    Line::from(vec![
+                        Span::styled(
+                            ADVICE_MARKER,
+                            Style::default()
+                                .fg(theme.status_info)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(rest.to_owned(), Style::default().fg(theme.text_muted)),
+                    ])
+                } else {
+                    Line::styled(row.text, Style::default().fg(theme.text_muted))
+                }
+            }
+            AdviceRowKind::Hint => {
+                Line::styled(row.text, Style::default().fg(theme.status_warning))
+            }
+            AdviceRowKind::Note => Line::styled(
+                row.text,
+                Style::default()
+                    .fg(theme.text_muted)
+                    .add_modifier(Modifier::DIM),
+            ),
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use unicode_width::UnicodeWidthStr;
+
+    use super::{AdviceRowKind, advice_rows};
+    use crate::tui::App;
+    use crate::tui::tests::test_app;
+
+    /// An app whose query draft is `text`, validated past the debounce.
+    fn app_with_draft(text: &str) -> App {
+        let mut app = test_app();
+        app.tab.editor.insert_text(text);
+        app.tab.mark_editor_dirty();
+        app.tab.last_edit_time = None;
+        assert!(app.tab.maybe_validate());
+        app
+    }
+
+    fn draw(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| crate::tui::ui::render(app, f)).unwrap();
+        terminal.backend().to_string()
+    }
+
+    #[test]
+    fn query_advice_wraps_at_80() {
+        let mut app = app_with_draft(r#""10.244.0.83" -service=coredns"#);
+        let screen = draw(&mut app, 80, 24);
+        assert!(
+            screen.contains("advice: -service=… is a text search"),
+            "{screen}"
+        );
+        assert!(screen.contains("hint: to filter the field"));
+        insta::assert_snapshot!(screen);
+    }
+
+    #[test]
+    fn query_advice_yields_to_errors() {
+        let mut app = app_with_draft("service=trawld event_type in (a, b)");
+        assert!(app.tab.advice.is_some(), "advice is stored");
+        app.tab.validation_errors = vec![trawl_core::parser::ParseError {
+            message: "unknown command 'staats'".to_owned(),
+            span: 0..1,
+            label: None,
+            hint: Some("did you mean 'stats'?".to_owned()),
+        }];
+        let screen = draw(&mut app, 80, 24);
+        assert!(screen.contains("unknown command 'staats'"));
+        assert!(
+            !screen.contains("advice:"),
+            "errors take precedence:\n{screen}"
+        );
+        insta::assert_snapshot!(screen);
+    }
+
+    #[test]
+    fn query_advice_layout_handles_narrow_and_zero_areas() {
+        let app = app_with_draft(r#""10.244.0.83" -service=coredns"#);
+        let report = app.tab.draft_advice().expect("advice").clone();
+
+        assert!(advice_rows(&report, 0, 10).is_empty(), "zero width");
+        assert!(advice_rows(&report, 80, 0).is_empty(), "zero height");
+
+        for width in 1..=12 {
+            let rows = advice_rows(&report, width, u16::MAX);
+            assert!(!rows.is_empty(), "width {width} lays out rows");
+            for row in &rows {
+                assert!(
+                    UnicodeWidthStr::width(row.text.as_str()) <= usize::from(width),
+                    "row {:?} overflows width {width}",
+                    row.text
+                );
+            }
+        }
+
+        // A budget too short for the finding still says it is there.
+        let rows = advice_rows(&report, 80, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, AdviceRowKind::Note);
+        assert_eq!(
+            rows[0].text.trim(),
+            "1 advice note not shown; a taller terminal shows more"
+        );
+
+        // Whole frames, tiny and empty, draw without panicking; a frame too
+        // short for any advice row leaves the region out.
+        for (width, height) in [(1, 1), (3, 3), (20, 6), (12, 30)] {
+            let mut app = app_with_draft(r#""10.244.0.83" -service=coredns"#);
+            let _ = draw(&mut app, width, height);
+        }
+        // The region itself, handed an empty area, draws nothing.
+        let mut terminal = Terminal::new(TestBackend::new(10, 5)).unwrap();
+        terminal
+            .draw(|f| super::render_query_advice(&app, f, ratatui::layout::Rect::default()))
+            .unwrap();
+        assert_eq!(
+            terminal
+                .backend()
+                .to_string()
+                .trim_matches([' ', '"', '\n']),
+            ""
+        );
+        let mut app = app_with_draft(r#""10.244.0.83" -service=coredns"#);
+        let screen = draw(&mut app, 40, 9);
+        assert!(!screen.contains("advice"), "no room for advice:\n{screen}");
+    }
+
+    /// A region too short for every finding keeps whole findings and
+    /// counts the rest, with the core's omitted findings, on its last row:
+    /// nothing the author cannot reach is promised.
+    #[test]
+    fn query_advice_counts_what_the_region_cuts() {
+        let draft = (0..10)
+            .map(|i| format!("-f{i}=v"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut app = app_with_draft(&draft);
+        let report = app.tab.draft_advice().expect("advice").clone();
+        assert_eq!(report.omitted, 2);
+
+        let budget = 8;
+        let rows = advice_rows(&report, 80, budget);
+        assert!(rows.len() <= usize::from(budget));
+        let shown = rows
+            .iter()
+            .filter(|r| r.kind == AdviceRowKind::Message && r.text.starts_with(" i "))
+            .count();
+        assert!(shown >= 1, "{rows:?}");
+        let last = rows.last().expect("rows");
+        assert_eq!(last.kind, AdviceRowKind::Note);
+        let hidden = report.findings.len() - shown + report.omitted;
+        assert_eq!(
+            last.text.trim(),
+            format!("and {hidden} more advice notes not shown; a taller terminal shows more")
+        );
+        assert!(rows.iter().all(|r| !r.text.contains("below")), "{rows:?}");
+
+        let screen = draw(&mut app, 80, 24);
+        assert!(
+            screen.contains(&format!("and {hidden} more advice notes not shown")),
+            "{screen}"
+        );
+    }
+
+    /// Whatever the region's size, it shows whole findings only, and its
+    /// count names every finding it does not show: a finding is never cut
+    /// silently, and the count is never zero.
+    #[test]
+    fn query_advice_never_cuts_a_finding_silently() {
+        let many = (0..10)
+            .map(|i| format!("-f{i}=v"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for draft in ["-service=coredns", many.as_str()] {
+            let app = app_with_draft(draft);
+            let report = app.tab.draft_advice().expect("advice").clone();
+            for width in [20, 40, 80, 200] {
+                for budget in 1..=30 {
+                    let rows = advice_rows(&report, width, budget);
+                    assert!(rows.len() <= usize::from(budget));
+                    let messages = rows
+                        .iter()
+                        .filter(|r| r.kind == AdviceRowKind::Message && r.text.starts_with(" i "))
+                        .count();
+                    let hints = rows
+                        .iter()
+                        .filter(|r| r.kind == AdviceRowKind::Hint && r.text.contains("hint: "))
+                        .count();
+                    assert_eq!(messages, hints, "a finding lost its hint: {rows:?}");
+                    let hidden = report.findings.len() - messages + report.omitted;
+                    let notes: Vec<_> = rows
+                        .iter()
+                        .filter(|r| r.kind == AdviceRowKind::Note)
+                        .collect();
+                    if hidden == 0 {
+                        assert!(notes.is_empty(), "{rows:?}");
+                    } else {
+                        let last = rows.last().expect("a count row");
+                        assert_eq!(last.kind, AdviceRowKind::Note, "{rows:?}");
+                        assert!(
+                            last.text.contains(&format!("{hidden} ")),
+                            "width {width} budget {budget}: {rows:?}"
+                        );
+                    }
+                    assert!(rows.iter().all(|r| !r.text.contains(" 0 ")), "{rows:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn query_advice_reports_omitted_findings() {
+        let draft = (0..10)
+            .map(|i| format!("-f{i}=v"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let app = app_with_draft(&draft);
+        let report = app.tab.draft_advice().expect("advice").clone();
+        assert_eq!(
+            report.findings.len(),
+            trawl_core::advice::MAX_ADVICE_FINDINGS
+        );
+        assert_eq!(report.omitted, 2);
+
+        let rows = advice_rows(&report, 200, u16::MAX);
+        let last = rows.last().expect("rows");
+        assert_eq!(last.kind, AdviceRowKind::Note);
+        assert_eq!(last.text.trim(), "and 2 more advice notes not shown");
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.kind == AdviceRowKind::Message && r.text.starts_with(" i "))
+                .count(),
+            trawl_core::advice::MAX_ADVICE_FINDINGS
+        );
     }
 }

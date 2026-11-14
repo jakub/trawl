@@ -813,6 +813,7 @@ pub(crate) mod calibration {
         r"\w{3,30}",
         r"[A-Za-z0-9_]{3,30}",
         r"\w+",
+        r"^\s+at ",
     ];
 
     /// The cases ADR-0063 names, and the ordinary patterns that must stay

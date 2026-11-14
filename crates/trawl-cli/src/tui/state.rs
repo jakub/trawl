@@ -2123,6 +2123,11 @@ pub struct Tab {
     next_run: u64,
     /// Real-time validation errors from local parsing (separate from execution errors).
     pub validation_errors: Vec<trawl_core::parser::ParseError>,
+    /// Advice on the last draft that parsed and validated, kept apart from
+    /// `validation_errors` because it never makes the draft invalid.
+    /// Read it through [`Tab::draft_advice`], which checks it still
+    /// describes the editor's text.
+    pub advice: Option<DraftAdvice>,
     /// Whether the editor has been modified since last validation.
     pub validation_dirty: bool,
     /// Timestamp of the last editor modification (for debounce).
@@ -2151,6 +2156,7 @@ impl Tab {
             execution: Execution::Idle,
             next_run: 0,
             validation_errors: Vec::new(),
+            advice: None,
             validation_dirty: false,
             last_edit_time: None,
             ghost: None,
@@ -2171,6 +2177,7 @@ impl Tab {
         self.last_visible_rows = 15;
         self.column_config = None;
         self.validation_errors.clear();
+        self.advice = None;
         self.validation_dirty = false;
         self.last_edit_time = None;
         self.ghost = None;
@@ -2186,6 +2193,7 @@ impl Tab {
     /// Mark the editor content as modified, triggering validation after debounce.
     pub fn mark_editor_dirty(&mut self) {
         self.validation_dirty = true;
+        self.advice = None;
         self.last_edit_time = Some(std::time::Instant::now());
     }
 
@@ -2205,6 +2213,7 @@ impl Tab {
         }
 
         let text = self.editor.text();
+        self.advice = None;
         if text.trim().is_empty() {
             self.validation_errors.clear();
             self.validation_dirty = false;
@@ -2213,7 +2222,13 @@ impl Tab {
 
         match trawl_core::parser::parse(&text) {
             Ok(query) => match trawl_core::emitter::validate_pipeline(&query.pipeline) {
-                Ok(()) => self.validation_errors.clear(),
+                Ok(()) => {
+                    self.validation_errors.clear();
+                    let report = trawl_core::advice::advise(&query);
+                    if !report.findings.is_empty() {
+                        self.advice = Some(DraftAdvice { text, report });
+                    }
+                }
                 Err(e) => self.validation_errors = e.to_parse_errors(text.len()),
             },
             Err(errors) => self.validation_errors = errors,
@@ -2221,6 +2236,27 @@ impl Tab {
         self.validation_dirty = false;
         true
     }
+
+    /// The advice to show for the editor's current text: none while the
+    /// draft has errors, and none once the text differs from the draft the
+    /// advice was computed on. Every edit marks the editor dirty, which
+    /// clears the advice; the text comparison keeps stale advice off the
+    /// screen if a path ever changes the text without doing so.
+    #[must_use]
+    pub fn draft_advice(&self) -> Option<&trawl_core::advice::AdviceReport> {
+        let advice = self.advice.as_ref()?;
+        (self.validation_errors.is_empty() && advice.text == self.editor.text())
+            .then_some(&advice.report)
+    }
+}
+
+/// Advice on one draft, with the text it describes.
+#[derive(Debug, Clone)]
+pub struct DraftAdvice {
+    /// The editor text that was parsed.
+    pub text: String,
+    /// What `trawl_core::advice::advise` reported for it; never empty.
+    pub report: trawl_core::advice::AdviceReport,
 }
 
 #[cfg(test)]
@@ -3339,5 +3375,94 @@ mod tests {
         assert!(search.matches.is_empty(), "the UTC wire text is not shown");
         search.update_matches(&result, None, DisplayZone::Utc);
         assert_eq!(search.matches, vec![(0, 0)]);
+    }
+
+    /// Type `text` into a fresh draft the way the editor does, then run
+    /// validation past its debounce.
+    fn validate_draft(tab: &mut Tab, text: &str) {
+        tab.editor.clear();
+        tab.editor.insert_text(text);
+        tab.mark_editor_dirty();
+        tab.last_edit_time = None;
+        assert!(tab.maybe_validate(), "validation runs");
+    }
+
+    #[test]
+    fn query_advice_lifecycle_tracks_the_draft() {
+        let mut tab = Tab::new();
+
+        // A valid draft with a negated field shape gets its advice.
+        validate_draft(&mut tab, r#""10.244.0.83" -service=coredns"#);
+        let report = tab.draft_advice().expect("advice for the draft");
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(
+            report.findings[0].kind,
+            trawl_core::advice::AdviceKind::NegatedFieldShape
+        );
+        assert_eq!(report.findings[0].span, 14..30);
+        assert!(tab.validation_errors.is_empty());
+
+        // An edit hides it at once, before validation runs again.
+        tab.editor.insert_char(' ');
+        tab.mark_editor_dirty();
+        assert!(tab.draft_advice().is_none(), "a dirty edit clears advice");
+
+        // Text changed without marking the editor dirty still shows no
+        // stale advice.
+        validate_draft(&mut tab, "service=trawld event_type in (a, b)");
+        assert_eq!(
+            tab.draft_advice().expect("in advice").findings[0].kind,
+            trawl_core::advice::AdviceKind::SearchStageIn
+        );
+        tab.editor.clear();
+        tab.editor.insert_text("service=trawld");
+        assert!(
+            tab.draft_advice().is_none(),
+            "advice describes another text"
+        );
+
+        // A clean draft has none.
+        validate_draft(&mut tab, "service=trawld");
+        assert!(tab.advice.is_none());
+
+        // A parse error clears it; the error takes its place.
+        validate_draft(&mut tab, "service=trawld event_type in (a, b)");
+        assert!(tab.draft_advice().is_some());
+        validate_draft(&mut tab, r#"* | where m matches "^\s+at ""#);
+        assert!(tab.advice.is_none(), "a parse error leaves no advice");
+        assert_eq!(tab.validation_errors.len(), 1);
+        assert_eq!(tab.validation_errors[0].span, 22..24);
+
+        // A semantic error clears it too.
+        validate_draft(&mut tab, "service=trawld event_type in (a, b)");
+        assert!(tab.draft_advice().is_some());
+        validate_draft(
+            &mut tab,
+            "service=trawld event_type in (a, b) | stats nosuchfn(x)",
+        );
+        assert!(tab.advice.is_none(), "a semantic error leaves no advice");
+        assert!(!tab.validation_errors.is_empty());
+
+        // Errors take precedence even over advice still stored.
+        validate_draft(&mut tab, "service=trawld event_type in (a, b)");
+        tab.validation_errors = vec![trawl_core::parser::ParseError {
+            message: "boom".to_owned(),
+            span: 0..1,
+            label: None,
+            hint: None,
+        }];
+        assert!(tab.draft_advice().is_none(), "errors win");
+        tab.validation_errors.clear();
+        assert!(tab.draft_advice().is_some());
+
+        // Blank text clears it.
+        validate_draft(&mut tab, "   ");
+        assert!(tab.advice.is_none(), "blank text leaves no advice");
+
+        // And so does resetting the tab.
+        validate_draft(&mut tab, "service=trawld event_type in (a, b)");
+        assert!(tab.draft_advice().is_some());
+        tab.clear();
+        assert!(tab.advice.is_none(), "Tab::clear leaves no advice");
     }
 }

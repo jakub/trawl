@@ -41,6 +41,49 @@ Once the whole query parses, three checks cover the query:
 
 The batch lane has one more limit, checked as the SQL is written. One statement may bind 256 regex parameters and 256 KiB of regex text. The count includes every copy the database binds. A reference to an earlier output of the same stage copies that output's expression with its regexes. A `pivot` binds its aggregate once for each pivot value, and once more when a later stage reads a column the pivot may not make, such as one of its value columns. Trawl's generated SQL can repeat an expression too (see [Query limits](#query-limits)). `matches`, search-stage regexes and each named `extract` group bind a regex parameter. Globs, `like` and `ilike` do not. Over the limit returns `unsupported operation: the query binds N regex patterns of B bytes in all, counting each copy a same-stage alias or a pivot makes, over the limit of 256 patterns or 262144 bytes`.
 
+### Quoted strings
+
+A double-quoted string decodes five escapes:
+
+| Escape | Decodes to |
+| --- | --- |
+| `\\` | One backslash. |
+| `\"` | A double quote. |
+| `\n` | A line feed. |
+| `\t` | A tab. |
+| `\r` | A carriage return. |
+
+Any other backslash pair is a parse error over the backslash and the character after it. `\s` returns `unknown escape \s: a quoted string decodes only \\, \", \n, \t and \r`. Its hint names the three fixes: double the backslash, use a `/…/` regex in a regex position, or leave an `extract` or `rex` body as it is. A backslash at the end of the input returns `unterminated string literal`.
+
+This holds for every ordinary quoted string: a quoted search term, a filter value or list element, an `earliest=` or `latest=` bound, a saved-query name, and a string in an expression or a function argument, including the right side of `matches`, `like` and `ilike`. Three positions decode nothing and take a backslash as written: a `/…/` regex, an `extract` or `rex` body, and the `sep=` value of `extract kv`.
+
+So `* | where m matches "^\s+at "` is a parse error at `\s`. Write the pattern as a regex, or double the backslash:
+
+```
+# a regex takes backslashes as written
+* | where m matches /^\s+at /
+# a quoted pattern doubles them
+* | where m matches "^\\s+at "
+```
+
+### Query advice
+
+Advice is a note on a query that parses. It says that the text probably asks a different question than its author meant, and names the query that asks the other one. trawl-core computes it from the query text alone. Advice never makes a query invalid, never stops it from running, and never changes its results or exit code. A text with any parse error shows only its errors.
+
+Two shapes in the search stage get advice:
+
+- A negated term shaped like a field filter, such as `-service=coredns`. It is a text search. See [Text search](#text-search).
+- A field name, then `in`, `not in` or `NOT in`, then a bracketed group, such as `event_type in (a, b)`. The search stage has no `in (…)`. See [Field filters](#field-filters).
+
+A note names the field and prints the value as `…`. A query gets at most 8 notes, in source order. When there are more, each surface says how many it left out.
+
+| Surface | Where advice shows |
+| --- | --- |
+| Web editor | A mark on the text, with a gutter marker named Query advice, and the first note on the line under the editor. The rest are behind that line's disclosure. |
+| Terminal UI | A region under the draft, when the draft has no errors. |
+| `trawl validate` and `trawl query` | Stderr, as `advice:` with a caret line and a `hint:` line. Stdout, the `valid` line, the exit code and exported files do not change. |
+| MCP validate and execute | One hint line per note, `<message>; <hint>`, ahead of the other hints. A reply that is over its budget drops advice first. |
+
 ## Comments
 
 `#` starts a comment that runs to the end of the line. `#` is the only comment character.
@@ -164,6 +207,8 @@ path=/tmp* | where x / 2 == 1
 ```
 
 Comma lists take `=` and `!=` only, so an ordered spelling such as `f>=a,b` is a parse error. Each element keeps its own kind: `f=a,b*,/c/` is `f=a OR f=b* OR f=/c/`. `f!=a,b*,/c/` is `f!=a AND f!=b* AND f!=/c/` with the search-stage null rule on each term, so an event without `f` matches it. Quote an element to compare it as exact text: `f="b*",c`. The regex is read before the list is split, so `f=/a,b/` is one regex, not two elements.
+
+The search stage has no `in (…)`. `event_type in (a, b)` parses, but as the text searches `event_type` and `in`, then a bracketed search group, and it gets [advice](#query-advice). `event_type NOT in (a, b)` reads the same way. Write a list as a comma list: `event_type=a,b` matches either value, and `event_type!=a,b` excludes both. `in (…)` is expression syntax, as in `| where event_type in ("a", "b")`. The expression grammar has no `not in` operator, so `not` goes before the comparison: `| where not event_type in ("a", "b")`.
 
 A bare `*` term matches everything and emits no filter. A bare field name is `[A-Za-z_][A-Za-z0-9_]*` with `.` separating segments; `@name` and a backtick-quoted name are field names too.
 
@@ -443,6 +488,16 @@ error
 ```
 
 Bare words and phrases match `message` and `_raw`, case-insensitively. The match folds case with the query engine's own lowercase table, one character to one, so a live query and a stored query agree on every character: `İ` matches `i`, and `ẞ` matches `ß` but not `ss`. The characters `_`, `%` and `\` in a search term are literal, so `user_42` does not match `userX42`. Negation excludes an event when either column matches. Containment is two-valued, so a missing, null or non-text `message` or `_raw` does not contain the term, and `-debug`, `NOT debug` and `NOT "debug"` agree even on foreign data that lacks one or both columns.
+
+A `-` term is always a text search, also when it looks like a field filter. `-service=coredns` drops the events whose `message` or `_raw` contains the text `service=coredns`. It does not read the field `service`, and it gets [advice](#query-advice). To filter the field, write one of these:
+
+| Query | Events without `service` | Meaning |
+| --- | --- | --- |
+| `service!=coredns` | Match. | A field filter: `service` is not `coredns`. |
+| `NOT service=coredns` | Do not match. | A field filter: `service` is present and not `coredns`. |
+| `NOT "service=coredns"` | Match, unless `message` or `_raw` holds the text. | The same text search as `-service=coredns`, written so that it gets no advice. |
+
+The other operators work the same way: `-status>=500` is a text search, and `NOT status>=500` is the field filter.
 
 Searching `_raw` is whole-event search. `_raw` holds the most original form of the event, so what a term reaches depends on who filled it.
 

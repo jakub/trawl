@@ -22,8 +22,10 @@
 //!
 //! Under the editor row sits the draft diagnostic: the local parser's
 //! first error on the buffer as a visible line, `Line L:C — message`,
-//! with any further errors behind a `+N more` disclosure (ADR-0039). Like
-//! the draft state it is derived from the buffer and announces nothing:
+//! with any further errors behind a `+N more` disclosure (ADR-0039). A
+//! buffer that parses shows its advice the same way, in the advice tone
+//! (ADR-0068); errors take precedence. Like the draft state it is derived
+//! from the buffer and announces nothing:
 //! no live region, no control of its own, and it never gates Haul. The
 //! server's verdict on a sent query is the results region's notice, not
 //! this line.
@@ -32,7 +34,7 @@ use leptos::prelude::*;
 use leptos::web_sys;
 
 use crate::components::editor::DslEditor;
-use crate::query_error::{DraftDiagnostic, draft_diagnostic};
+use crate::query_error::{DraftDiagnostic, DraftKind, draft_diagnostic, omitted_advice_note};
 use crate::state::query::{QUICK_RANGES, RangeSpec};
 use fleet_ui::{CopyButton, RangeDialog, RangePreset, RangeValue, ToastBus, ToastKind};
 
@@ -234,8 +236,10 @@ fn located(first: String) -> AnyView {
     }
 }
 
-/// The local parser's verdict on the buffer: nothing while it parses,
-/// else the first error in full and the rest behind a disclosure.
+/// The local parser's verdict on the buffer: nothing while it parses
+/// with no advice, else the first error (or, on a draft that parses, the
+/// first advice note) in full and the rest behind a disclosure. Advice
+/// past the core's cap is counted on a line of its own.
 #[component]
 fn DraftDiagnosticLine(query: RwSignal<String>) -> impl IntoView {
     let diagnostic = Memo::new(move |_| draft_diagnostic(&query.get()));
@@ -251,9 +255,10 @@ fn DraftDiagnosticLine(query: RwSignal<String>) -> impl IntoView {
     });
 
     move || {
-        diagnostic.get().map(|DraftDiagnostic { first, rest }| {
+        diagnostic.get().map(|DraftDiagnostic { kind, first, rest, omitted }| {
+            let advice = kind == DraftKind::Advice;
             view! {
-                <div class="draft-diagnostic">
+                <div class="draft-diagnostic" class:draft-diagnostic-advice=advice>
                     <p class="draft-diagnostic-first">{located(first)}</p>
                     {(!rest.is_empty()).then(|| view! {
                         <details class="draft-diagnostic-more" node_ref=more>
@@ -262,6 +267,9 @@ fn DraftDiagnosticLine(query: RwSignal<String>) -> impl IntoView {
                                 {rest.into_iter().map(|line| view! { <li>{line}</li> }).collect_view()}
                             </ul>
                         </details>
+                    })}
+                    {(omitted > 0).then(|| view! {
+                        <p class="draft-diagnostic-omitted">{omitted_advice_note(omitted)}</p>
                     })}
                 </div>
             }

@@ -103,6 +103,8 @@ pub async fn run_parquet_query(
             "parquet output requires -o/--output flag".into(),
         ));
     };
+    // Callers reach this without `run_query`, so it advises for itself.
+    render_query_advice(query, trawl_core::parser::parse(query).ok().as_ref());
     // Use DuckDB's native COPY TO directly.
     run_parquet_export(query, data, conn.as_ref(), output_path).await
 }
@@ -128,10 +130,15 @@ pub async fn run_query(
         return run_parquet_query(query, data, output, conn).await;
     }
 
+    // One local parse serves the embedded checks below and the advice. It
+    // builds the patterns on both paths, so a text local validation refuses
+    // gets no advice; a failed parse leaves the error to the run.
+    let parsed = trawl_core::parser::parse(query).ok();
+
     // Block `from saved` in embedded mode: resolving a saved query's name
     // to parquet paths needs the server's saved-query and report-run stores.
     if data.is_some()
-        && let Ok(ast) = trawl_core::parser::parse(query)
+        && let Some(ast) = &parsed
         && ast.from_saved_stage().is_some()
     {
         return Err(CliError::Usage(
@@ -139,12 +146,14 @@ pub async fn run_query(
         ));
     }
 
+    render_query_advice(query, parsed.as_ref());
+
     let (mut result, degraded, severity_columns) = if let Some(data) = data {
         match run_embedded_mode(data, query) {
             // Embedded mode has no catalog, so no degraded notice to
             // carry; `sev()` declares its own pin, so its columns still
             // render as tokens without one.
-            Ok(r) => (r, Vec::new(), embedded_severity_columns(query)),
+            Ok(r) => (r, Vec::new(), embedded_severity_columns(parsed.as_ref())),
             Err(CliError::Engine(ref engine_err)) => {
                 render_engine_error(query, engine_err);
                 return Err(CliError::Usage("query failed".into()));
@@ -180,22 +189,19 @@ pub async fn run_query(
     )
 }
 
-/// The severity-rendering columns of an embedded query.
+/// The severity-rendering columns of an embedded query, given its parse.
 ///
 /// The same walk the server runs, from a pin-blind root: with no catalog
 /// only a function-declared pin survives it, which is exactly `sev()`. An
-/// unparseable query renders nothing special; the engine reports the parse
-/// error.
-fn embedded_severity_columns(query: &str) -> Vec<String> {
-    trawl_core::parser::parse(query).map_or_else(
-        |_| Vec::new(),
-        |ast| {
-            trawl_core::pin_scope::severity_output_columns(
-                &ast.pipeline,
-                &trawl_core::pin_scope::PinScope::unpinned(),
-            )
-        },
-    )
+/// unparseable query (`None`) renders nothing special; the engine reports
+/// the parse error.
+fn embedded_severity_columns(parsed: Option<&trawl_core::ast::Query>) -> Vec<String> {
+    parsed.map_or_else(Vec::new, |ast| {
+        trawl_core::pin_scope::severity_output_columns(
+            &ast.pipeline,
+            &trawl_core::pin_scope::PinScope::unpinned(),
+        )
+    })
 }
 
 /// Write the results and their footer to the two streams.
@@ -303,6 +309,15 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
         let response = client.validate(query).await?;
         if response.valid {
             write_valid(&mut std::io::stdout().lock(), &response)?;
+            // Advice is local and needs no catalog: the server's verdict
+            // stands, and a text the local parser refuses gets none.
+            if let Ok(parsed) = trawl_core::parser::parse_unbuilt(query) {
+                let _ = write_advice(
+                    &mut io::stderr().lock(),
+                    query,
+                    &trawl_core::advice::advise(&parsed),
+                );
+            }
         } else {
             render_error_details(query, &response.errors);
             return Err(CliError::Usage("query validation failed".into()));
@@ -311,15 +326,18 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
         // Local validation: the parse, then the shared semantic checks
         // the server's validate and both query lanes run (calls, literal
         // positions, JSON paths, projections), with no catalog to consult.
-        let errors = match trawl_core::parser::parse(query) {
+        let (errors, advice) = match trawl_core::parser::parse(query) {
             Ok(parsed) => match trawl_core::emitter::validate_pipeline(&parsed.pipeline) {
-                Ok(()) => Vec::new(),
-                Err(e) => e.to_parse_errors(query.len()),
+                Ok(()) => (Vec::new(), Some(trawl_core::advice::advise(&parsed))),
+                Err(e) => (e.to_parse_errors(query.len()), None),
             },
-            Err(errors) => errors,
+            Err(errors) => (errors, None),
         };
         if errors.is_empty() {
             println!("valid");
+            if let Some(advice) = advice {
+                let _ = write_advice(&mut io::stderr().lock(), query, &advice);
+            }
         } else {
             let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();
             render_error_details(query, &details);
@@ -638,20 +656,73 @@ fn write_error_details(
             .as_ref()
             .and_then(|span| locate_span(query, span.start, span.end));
         if let Some(at) = located {
-            let layout = caret_layout(query, &at);
-            writeln!(out)?;
-            writeln!(out, "  {}{}{}", layout.before, layout.covered, layout.after)?;
-            writeln!(
-                out,
-                "  {}{}",
-                " ".repeat(layout.pad),
-                "~".repeat(layout.carets)
-            )?;
+            write_caret_excerpt(out, query, &at)?;
         }
         writeln!(out, "  {}", sanitize_display_text(&detail.message))?;
         if let Some(hint) = &detail.hint {
             writeln!(out, "  hint: {}", sanitize_display_text(hint))?;
         }
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+/// Write the excerpt that heads a located span: a blank line, the span's
+/// start line sanitized, and carets under the span's display cells.
+fn write_caret_excerpt(
+    out: &mut impl Write,
+    query: &str,
+    at: &trawl_core::text_layout::SpanLine,
+) -> io::Result<()> {
+    let layout = caret_layout(query, at);
+    writeln!(out)?;
+    writeln!(out, "  {}{}{}", layout.before, layout.covered, layout.after)?;
+    writeln!(
+        out,
+        "  {}{}",
+        " ".repeat(layout.pad),
+        "~".repeat(layout.carets)
+    )
+}
+
+/// Print the advice on `parsed`, the parse of `query`, to stderr before
+/// the query runs. A query that did not parse, or that fails the shared
+/// semantic checks, gets none: its errors are the run's to report.
+/// Advice never changes what runs or what is printed on stdout.
+fn render_query_advice(query: &str, parsed: Option<&trawl_core::ast::Query>) {
+    let Some(parsed) = parsed else { return };
+    if trawl_core::emitter::validate_pipeline(&parsed.pipeline).is_err() {
+        return;
+    }
+    // stderr is the last place to report anything; a failed write has
+    // nowhere to go.
+    let _ = write_advice(
+        &mut io::stderr().lock(),
+        query,
+        &trawl_core::advice::advise(parsed),
+    );
+}
+
+/// Write `report`, advice on `query`, in the error layout: the caret
+/// excerpt, then `advice:` with the message and `hint:` with the hint,
+/// both sanitized. A span that cannot index `query` gets no excerpt. When
+/// the report left findings out, the last line says how many.
+fn write_advice(
+    out: &mut impl Write,
+    query: &str,
+    report: &trawl_core::advice::AdviceReport,
+) -> io::Result<()> {
+    for finding in &report.findings {
+        if let Some(at) = locate_span(query, finding.span.start, finding.span.end) {
+            write_caret_excerpt(out, query, &at)?;
+        }
+        writeln!(out, "  advice: {}", sanitize_display_text(&finding.message))?;
+        writeln!(out, "  hint: {}", sanitize_display_text(&finding.hint))?;
+        writeln!(out)?;
+    }
+    if report.omitted > 0 {
+        let noun = if report.omitted == 1 { "note" } else { "notes" };
+        writeln!(out, "  and {} more advice {noun} not shown", report.omitted)?;
         writeln!(out)?;
     }
     Ok(())
@@ -1238,6 +1309,9 @@ mod tests {
     /// is the function's, so it survives a catalog-less root.
     #[test]
     fn the_embedded_lane_declares_sev_columns_without_a_catalog() {
+        let embedded_severity_columns = |query: &str| {
+            super::embedded_severity_columns(trawl_core::parser::parse(query).ok().as_ref())
+        };
         assert_eq!(embedded_severity_columns("* | let s = sev(level)"), ["s"]);
         assert_eq!(
             embedded_severity_columns("* | let s = sev(level) | stats count() by s"),

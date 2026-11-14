@@ -44,6 +44,15 @@
 //! result: below [`Budget::HARD`] a larger budget, and at every budget the
 //! `columns` route and, at the hard cap, `fields` and one cell call.
 //!
+//! A `search` reply's advice on its query text (ADR-0068) goes before
+//! anything else: a reply that does not fit whole drops its advice hints,
+//! says so, and tries to fit whole again before any of the above. Advice
+//! never costs a reply its rows, facets, link, other hints or next calls,
+//! because every candidate of a reply that can carry advice is charged as
+//! if it said its hints were dropped: the reply without its advice then
+//! measures exactly as a reply that never had any, so both fit the same
+//! way ([`Fit::charged`]).
+//!
 //! A result reply that fits whole is sent as it is. One that does not
 //! first omits every column whose cell is null in every row the call read,
 //! all of them and not only the rows it prints, in the columns line, the
@@ -67,7 +76,7 @@ use crate::tools::orient::object;
 use crate::tools::schema::{DEFAULT_MAX_BYTES, HARD_MAX_BYTES, MIN_MAX_BYTES, READ};
 
 use super::MAX_NEXT_ACTIONS;
-use super::rows::{as_u64, floor_char_boundary, mirror};
+use super::rows::{self, as_u64, floor_char_boundary, mirror};
 
 /// Why a page continuation is proposed, whether a tool or the fitting
 /// proposes it.
@@ -145,6 +154,19 @@ pub(crate) trait Fit: Serialize + Clone {
     fn rows_kept(&mut self) {}
     /// The hints, for a reply that has them.
     fn hints_mut(&mut self) -> Option<&mut Vec<String>>;
+    /// Say that the fitting dropped hints, for a reply that has them.
+    fn hints_dropped(&mut self) {}
+    /// Drop the advice hints, which lead the hints, saying so; false when
+    /// the reply has none.
+    fn drop_advice(&mut self) -> bool {
+        false
+    }
+    /// The reply as the budget charges it, when that is not the reply
+    /// itself: for a reply that can carry advice, the reply saying its
+    /// hints were dropped. `None` charges the reply as it renders.
+    fn charged(&self) -> Option<Self> {
+        None
+    }
     /// The validation verdict whose diagnostics may be cut and dropped,
     /// for a reply that has one.
     fn validation_mut(&mut self) -> Option<&mut ValidationView> {
@@ -188,7 +210,8 @@ pub const DIAGNOSTIC_TEXT_SHARE: usize = 16;
 /// the fitting creates asks for. Once the proposed next calls are dropped
 /// it creates none, and a cut that needed one says the calls were dropped.
 ///
-/// A reply that fits whole is returned as it is. Otherwise its null
+/// A reply that fits whole is returned as it is. Otherwise its advice
+/// goes, and it is returned whole if it fits so. Otherwise its null
 /// columns go and [`ladder`] fits it; when that prints no row and not even
 /// one row fits with every droppable part gone, [`widest_prefix`] keeps the
 /// most columns with which one does, and the ladder fits again at that
@@ -197,6 +220,11 @@ pub const DIAGNOSTIC_TEXT_SHARE: usize = 16;
 pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget, page_rows: u64) -> Option<(String, Json)> {
     let rows = reply.view_mut().map_or(0, |view| view.rows.len());
     if let Some(whole) = fitted(&whole(&reply, rows, page_rows), budget) {
+        return Some(whole);
+    }
+    if reply.drop_advice()
+        && let Some(whole) = fitted(&whole(&reply, rows, page_rows), budget)
+    {
         return Some(whole);
     }
     omit_null_columns(&mut reply);
@@ -572,9 +600,7 @@ fn apply<R: Fit>(drop: Drop, reply: &mut R, budget: Budget) {
                 && !hints.is_empty()
             {
                 hints.clear();
-                if let Some(view) = reply.view_mut() {
-                    view.presentation.hints_dropped_to_fit = true;
-                }
+                reply.hints_dropped();
             }
         }
         Drop::DiagnosticText => {
@@ -769,11 +795,15 @@ fn advance(
 }
 
 /// `candidate` rendered under `budget`: its text and its mirror, or `None`
-/// when they do not fit.
+/// when what the budget charges for it ([`Fit::charged`]) does not fit.
 pub(crate) fn fitted<R: Fit>(candidate: &R, budget: Budget) -> Option<(String, Json)> {
     let mirror = mirror(candidate).ok()?;
     let text = candidate.text(budget);
-    (measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
+    let charged = match candidate.charged() {
+        Some(charged) => measure(&charged.text(budget), &rows::mirror(&charged).ok()?),
+        None => measure(&text, &mirror),
+    };
+    (charged <= budget.bytes()).then_some((text, mirror))
 }
 
 /// Keep the first `kept` of the view's `read` rows and make its
