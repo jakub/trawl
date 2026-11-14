@@ -4010,4 +4010,125 @@ mod tests {
         let after = draw(&mut app);
         assert_eq!(before, after, "the same advice returns with the query tab");
     }
+
+    /// Run the tab's validation as the event loop would once the debounce
+    /// has passed. False means no edit was pending.
+    fn tick_validation_past_debounce(app: &mut App) -> bool {
+        if let Some(last) = app.tab.last_edit_time {
+            app.tab.last_edit_time = last.checked_sub(Duration::from_millis(400));
+        }
+        app.tab.maybe_validate()
+    }
+
+    fn history_with(query: &str) -> HistoryResponse {
+        HistoryResponse {
+            entries: vec![trawl_api::HistoryEntryResponse {
+                id: 1,
+                query: query.to_owned(),
+                executed_at: "2026-03-18T14:30:00Z".to_owned(),
+                duration_ms: 3,
+                row_count: 0,
+                status: trawl_client::QueryStatus::Success,
+            }],
+            total: 1,
+        }
+    }
+
+    /// Load `query` through the history pane's Enter.
+    fn load_from_history(app: &mut App, query: &str) {
+        app.history_cache = Some(history_with(query));
+        app.panel.history_selected = 0;
+        app.switch_to_main_tab(MainTab::History);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.tab.editor.text(), query, "history loads the text");
+    }
+
+    /// Load `query` through the command palette, picking the saved query
+    /// named `name` that holds it.
+    fn load_from_palette(app: &mut App, name: &str, query: &str) {
+        let mut entry = saved_entry(9, name);
+        entry.query = query.to_owned();
+        app.saved_cache = Some(ListSavedResponse {
+            queries: vec![entry],
+        });
+        app.handle_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        for ch in name.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.popup.is_none(), "the palette closes");
+        assert_eq!(app.tab.editor.text(), query, "the palette loads the text");
+    }
+
+    /// A query loaded from history, the palette or a saved run is validated
+    /// like a typed one: advice for a valid text, errors for a broken one.
+    #[test]
+    fn query_advice_follows_loaded_queries() {
+        const ADVISED: &str = r#""10.244.0.83" -service=coredns"#;
+        const BROKEN: &str = r#"* | where m matches "^\s+at ""#;
+        let advised = |app: &App| {
+            let report = app.tab.draft_advice().expect("advice for the loaded text");
+            assert_eq!(report.findings.len(), 1);
+            assert_eq!(
+                report.findings[0].kind,
+                trawl_core::advice::AdviceKind::NegatedFieldShape
+            );
+            assert!(app.tab.validation_errors.is_empty());
+        };
+        let broken = |app: &App| {
+            assert!(app.tab.draft_advice().is_none(), "errors only");
+            assert_eq!(app.tab.validation_errors.len(), 1);
+            assert_eq!(app.tab.validation_errors[0].span, 22..24);
+        };
+
+        let mut app = test_app();
+        load_from_history(&mut app, ADVISED);
+        assert!(
+            tick_validation_past_debounce(&mut app),
+            "history load validates"
+        );
+        advised(&app);
+        load_from_history(&mut app, BROKEN);
+        assert!(
+            tick_validation_past_debounce(&mut app),
+            "history load validates"
+        );
+        broken(&app);
+
+        let mut app = test_app();
+        load_from_palette(&mut app, "qadv", ADVISED);
+        assert!(
+            tick_validation_past_debounce(&mut app),
+            "palette load validates"
+        );
+        advised(&app);
+        load_from_palette(&mut app, "qbrk", BROKEN);
+        assert!(
+            tick_validation_past_debounce(&mut app),
+            "palette load validates"
+        );
+        broken(&app);
+
+        // The saved-run prefill replaces the text too, and a stale error
+        // from the text it replaced does not survive it.
+        let mut app = test_app();
+        load_from_history(&mut app, BROKEN);
+        assert!(tick_validation_past_debounce(&mut app));
+        app.saved_cache = Some(ListSavedResponse {
+            queries: vec![saved_entry(7, "nightly")],
+        });
+        app.panel.saved_selected = 0;
+        app.panel.saved_focus = state::SavedFocus::Detail;
+        app.switch_to_main_tab(MainTab::Saved);
+        app.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(
+            app.tab.editor.text(),
+            handlers::saved_run_query("nightly", None)
+        );
+        assert!(
+            tick_validation_past_debounce(&mut app),
+            "the prefill validates"
+        );
+        assert!(app.tab.validation_errors.is_empty());
+    }
 }

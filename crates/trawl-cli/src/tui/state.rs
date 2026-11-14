@@ -2239,9 +2239,9 @@ impl Tab {
 
     /// The advice to show for the editor's current text: none while the
     /// draft has errors, and none once the text differs from the draft the
-    /// advice was computed on. Some editor loads replace the text without
-    /// marking the editor dirty, so the text comparison is what keeps
-    /// stale advice off the screen.
+    /// advice was computed on. Every edit marks the editor dirty, which
+    /// clears the advice; the text comparison keeps stale advice off the
+    /// screen if a path ever changes the text without doing so.
     #[must_use]
     pub fn draft_advice(&self) -> Option<&trawl_core::advice::AdviceReport> {
         let advice = self.advice.as_ref()?;
@@ -3407,8 +3407,8 @@ mod tests {
         tab.mark_editor_dirty();
         assert!(tab.draft_advice().is_none(), "a dirty edit clears advice");
 
-        // A load that replaces the text without marking the editor dirty
-        // shows no stale advice.
+        // Text changed without marking the editor dirty still shows no
+        // stale advice.
         validate_draft(&mut tab, "service=trawld event_type in (a, b)");
         assert_eq!(
             tab.draft_advice().expect("in advice").findings[0].kind,
