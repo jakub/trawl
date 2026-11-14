@@ -710,28 +710,26 @@ pub fn advice_rows(report: &AdviceReport, width: u16, max_rows: u16) -> Vec<Advi
 
     // Too many rows: keep whole findings in source order, and give the
     // last row to a count of every finding left out, so the region never
-    // points at text the author cannot reach. A first finding taller than
-    // the region keeps as many of its rows as fit.
+    // cuts a finding silently or points at text the author cannot reach.
+    // A finding taller than the room left is left out whole, the first one
+    // included, and the count says a taller terminal shows it.
     let room = max_rows - 1;
     let mut shown = 0;
     for group in groups {
         if rows.len() + group.len() > room {
-            if shown == 0 && room > 0 {
-                rows.extend(group.into_iter().take(room));
-                shown = 1;
-            }
             break;
         }
         rows.extend(group);
         shown += 1;
     }
     let hidden = report.findings.len() - shown + report.omitted;
+    let note = format!(
+        "{ADVICE_INDENT}{}; a taller terminal shows more",
+        hidden_note(hidden, shown)
+    );
     rows.push(AdviceRow {
         kind: AdviceRowKind::Note,
-        text: fit_cells(
-            &format!("{ADVICE_INDENT}{}", hidden_note(hidden, shown)),
-            width,
-        ),
+        text: fit_cells(&note, width),
     });
     rows
 }
@@ -953,10 +951,13 @@ mod tests {
         }
 
         // A budget too short for the finding still says it is there.
-        let rows = advice_rows(&report, 40, 1);
+        let rows = advice_rows(&report, 80, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, AdviceRowKind::Note);
-        assert_eq!(rows[0].text.trim(), "1 advice note not shown");
+        assert_eq!(
+            rows[0].text.trim(),
+            "1 advice note not shown; a taller terminal shows more"
+        );
 
         // Whole frames, tiny and empty, draw without panicking; a frame too
         // short for any advice row leaves the region out.
@@ -1007,7 +1008,7 @@ mod tests {
         let hidden = report.findings.len() - shown + report.omitted;
         assert_eq!(
             last.text.trim(),
-            format!("and {hidden} more advice notes not shown")
+            format!("and {hidden} more advice notes not shown; a taller terminal shows more")
         );
         assert!(rows.iter().all(|r| !r.text.contains("below")), "{rows:?}");
 
@@ -1016,6 +1017,52 @@ mod tests {
             screen.contains(&format!("and {hidden} more advice notes not shown")),
             "{screen}"
         );
+    }
+
+    /// Whatever the region's size, it shows whole findings only, and its
+    /// count names every finding it does not show: a finding is never cut
+    /// silently, and the count is never zero.
+    #[test]
+    fn query_advice_never_cuts_a_finding_silently() {
+        let many = (0..10)
+            .map(|i| format!("-f{i}=v"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for draft in ["-service=coredns", many.as_str()] {
+            let app = app_with_draft(draft);
+            let report = app.tab.draft_advice().expect("advice").clone();
+            for width in [20, 40, 80, 200] {
+                for budget in 1..=30 {
+                    let rows = advice_rows(&report, width, budget);
+                    assert!(rows.len() <= usize::from(budget));
+                    let messages = rows
+                        .iter()
+                        .filter(|r| r.kind == AdviceRowKind::Message && r.text.starts_with(" i "))
+                        .count();
+                    let hints = rows
+                        .iter()
+                        .filter(|r| r.kind == AdviceRowKind::Hint && r.text.contains("hint: "))
+                        .count();
+                    assert_eq!(messages, hints, "a finding lost its hint: {rows:?}");
+                    let hidden = report.findings.len() - messages + report.omitted;
+                    let notes: Vec<_> = rows
+                        .iter()
+                        .filter(|r| r.kind == AdviceRowKind::Note)
+                        .collect();
+                    if hidden == 0 {
+                        assert!(notes.is_empty(), "{rows:?}");
+                    } else {
+                        let last = rows.last().expect("a count row");
+                        assert_eq!(last.kind, AdviceRowKind::Note, "{rows:?}");
+                        assert!(
+                            last.text.contains(&format!("{hidden} ")),
+                            "width {width} budget {budget}: {rows:?}"
+                        );
+                    }
+                    assert!(rows.iter().all(|r| !r.text.contains(" 0 ")), "{rows:?}");
+                }
+            }
+        }
     }
 
     #[test]
