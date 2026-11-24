@@ -1,6 +1,6 @@
 # A saved token goes only to the URL it was saved for
 
-status: accepted (2026-11-08), prep record for the untangle defect D11
+status: accepted (2026-11-08), prep record for the untangle defect D11; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 Ordinary CLI commands send a saved API token to whatever URL the command names. `Config::apply_profile` copies a profile's `url` and `token` into `[server]` one key at a time (`crates/trawl-cli/src/config.rs:259-264`), so a profile with its own `url` and no `token` keeps `[server].token`. `Config::apply_overrides` then replaces the URL again for `--url` or `TRAWL_URL` (`config.rs:280-287`). `Config::load_token` returns the direct token or the flattened `[server].token` (`config.rs:332-342`), and `connection` builds the client from the two (`crates/trawl-cli/src/lib.rs:696-707`). `trawl --url https://lab2 query ...` therefore sends the homelab key to lab2. Ordinary commands also accept a URL with userinfo, a query, or a fragment.
 
@@ -72,3 +72,12 @@ Checked at `b71f9e6e`. `62ee208b..b71f9e6e` changes only `crates/fleet-dev`, `fl
 - The documented flag and environment equivalence narrows: `TRAWL_TOKEN` no longer authorizes a different command-line `--url`. `reference/cli.md`, `reference/configuration.md`, and `start/connect.md` say so, and say how profiles bind tokens.
 - A config URL with userinfo, a query, or a fragment stops working for every command.
 - No persisted state changes. `config.toml` keeps its format.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **`Config::apply_profile` copies only a profile's trust (`insecure` and `ca_cert`) into `[server]`, and leaves its `url` and `token` in `[profiles.<name>]`.** The ordinary resolver reads the profile's `url` and `token` from that table to bind them. A token copied into `[server]` would be bound to `[server].url` and lose the base it was saved for. `Config::apply_overrides` applies `--insecure` only, for the same reason: the resolver reads `--url` itself.
+- **The ordinary resolver uses the first key source present, in this order: a command-line `--token`, `--token-file`, `TRAWL_TOKEN`, the profile's own `token`, then `[server].token`.** If that source is empty, unreadable, or bound to another base, the command fails. The resolver never tries the next source in its place, so it never sends a key that the user did not mean to send.
+- **Every `ConnectionError` and every `Failure` names sources and flags, such as `--url`, `TRAWL_TOKEN`, or `token in [server]`, and never prints a URL, a key, or a path.** The rule covers all of them, not only the binding refusal. A user can paste a key where a URL or a path belongs, and an error that echoed the input would print the key.
+- **The `Debug` output of `ApiBase` shows the origin only.** A path prefix can name an installation behind a proxy, and a refusal never prints a URL.

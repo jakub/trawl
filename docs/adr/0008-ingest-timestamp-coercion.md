@@ -1,6 +1,6 @@
 # Malformed ingest timestamps are substituted, never fatal
 
-status: accepted (2026-07-28); amended (2026-11-08): the hour directory bounds `_time` from above, see the Amendment
+status: accepted (2026-07-28); amended (2026-11-08): the hour directory bounds `_time` from above, see the Amendment; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 `timestamp` is trawl's partition and sort key: compaction writes
 `data/{date}/{HH}/{service}.parquet` ordered by it, row-group min/max stats on
@@ -136,3 +136,11 @@ the event is kept.
 Past rows need no bound. Compaction time is at or after `_time` for them, and a
 `last=` window always runs to now, so the walk always reaches their directory.
 Rows on disk before this amendment keep their stored `_time`.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **A list source is resolved against disk before the read because `read_parquet` rejects the whole list when one element matches nothing.** The server emits one element per hour of the query's range, so the everyday `service=X last=Nh` query routinely carries elements for hour directories that hold only other services' files. Every entry point shares one resolver and one outcome policy (`cold_action`), because a per-lane rule is what lets a query and its export disagree.
+- **`ColdDataUnread` is a transient, retryable error: HTTP 503 `service_unavailable` with "retry the query", never a 400 and never an empty 200.** The source reached files when it was resolved, so an empty read means a file moved before the read ran: compaction's rename, a retention sweep, a repin cutover, or a replaced hot-buffer snapshot. A retry resolves the source again and reads the files that now exist.
+- **A conform of a standing file never writes a NULL `_time`: `guard_partition_key` wraps the TIMESTAMP-pinned envelope column's conform in `COALESCE(..., <the file's partition instant>)`.** A NULL partition key sorts first and falls outside every `last=Xh` filter, so the row would survive the rewrite and stay unqueryable by time. The boot conformance pass (`ConformPolicy::StandingFile`) and the repin rewrite (`ConformPolicy::Repin`) have no WAL filename to recover an instant from, so they use the instant that `env_dirs::layout_path` reads from the file's path: the start of its `{date}/{HH}` directory, or midnight of `{date}` for a daily rollup. `layout_path` rejects any path outside the storage layout, so the pass never rewrites a file without a partition instant.

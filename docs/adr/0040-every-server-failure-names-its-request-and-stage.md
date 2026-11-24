@@ -1,6 +1,6 @@
 # Every server failure names its request and its stage; unmetered failures persist under a fixed cap
 
-status: accepted (2026-09-22) — prep ruling record for #235; amended (2026-11-08): one public message for the wire and every record; amended (2026-11-09): every retained event logs foreign error text at DEBUG only, see the Amendments
+status: accepted (2026-09-22) — prep ruling record for #235; amended (2026-11-08): one public message for the wire and every record; amended (2026-11-09): every retained event logs foreign error text at DEBUG only, see the Amendments; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 On 2026-09-21 a plain query on the homelab returned 500 once. The only
 trace was `http_failure` with a status and a latency: no request id, no
@@ -246,3 +246,34 @@ the sites from #319 were found one by one after the first sweep.
 - **A typed error for the cutover swap.** Not adopted here: the boot
   replay runs the swap again and stops boot with the same text on stderr
   (`repin/recover.rs:131`), and the type change is larger than the fix.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**The failure record and event.**
+
+- **Every field of `RequestRecord` holds a closed-set literal or a number, never text from the request or from an error.** The record is the source of the failure event, so text kept out of the record cannot reach the event by any path.
+- **An `Unrecorded` failure event carries `reached`, the furthest `Progress` mark the request passed.** The producer that recorded nothing is the thing to fix, and `reached` is the only lead to where it sits.
+- **A panic in a task the request awaits becomes `ServerError::Panicked` with a fixed label, through `ServerError::from_join`.** That panic never unwinds the request, so the outer panic catcher never sees it. The error must stay typed up to the request, or the event reports an ordinary internal error. The request still answers with the fixed 500 sentence. A job row stores fixed text, such as `repin scan task panicked`. The payload is dropped unread, because `JoinError`'s `Display` quotes it.
+
+**The panic diagnostic.**
+
+- **The panic hook emits a root event (`parent: None`) and does not chain the previous hook.** The request span the panic fires inside would lend the event the raw path and user agent. The default hook prints the payload.
+- **When no stdout or file logger records the panic event, the hook writes one payload-free line to stderr.** The WAL refuses `PANIC_TARGET`, so without that line a panic in monitor mode, or under a filter that disables the target, leaves no location anywhere. When a text sink records the event, the hook writes nothing to stderr, so the location is never printed twice.
+- **The WAL layer refuses `PANIC_TARGET` before it takes any lock of its own.** A panic inside that layer then cannot deadlock on its way out.
+
+**Persistence of unmetered events.**
+
+- **The cap exemption covers exactly `UNMETERED_FAILURE_TARGET`, and every other target matches `UNMETERED_TARGETS` by whole segment.** A target beneath the failure target has no cap, so it stays excluded and never spends the cap. Segment matching keeps `fleet_auth` from excluding a `fleet_authority` target. `is_persisted_target` is a predicate over the resolved directives, not an appended `off` directive, because `EnvFilter` resolves by specificity and an operator `RUST_LOG` naming `fleet_auth::middleware=info` would outrank the `off`.
+- **The cap counts over a fixed one-minute window that opens at the first event after the previous window closed, and it decides and counts under one lock.** Concurrent events on any number of threads never admit more than `UNMETERED_FAILURE_CAP_PER_MINUTE` in one window, and the cap holds no per-peer state. Each event past the cap counts under drop reason `unmetered_cap`.
+- **Every unmetered 401, 403 and 503 that trawl's policy layer sees increments `trawl_auth_failures_total{reason}`, through `policy::count_auth_failure`.** The events stay off the WAL, so the counter is the only in-product signal for a failed authentication. `reason` is a closed set fixed in code, so a flood cannot grow the series count. Credential stuffing, token brute force and a revoked key still in use stay alarmable on `/metrics`.
+
+**Text in retained events and public messages.**
+
+- **Default-level lifecycle events of `/query`, `/export` and `/stream` carry no DSL and no error message, the public message included.** Parser and emitter messages quote the user's own tokens, and every key with `query` can read `service=trawld`. The DSL and the error text go only to the DEBUG events `query_text` and `query_error_text`, which the default `trawl_server=info` filter never stores.
+- **`rendered()` is pure, and `log_fault` logs a fault once per response.** Several records store the same public message, so a projection that logged would repeat the fault event for each record.
+
+**The client.**
+
+- **The client reads `X-Request-Id` as an id only when it is 1 to `MAX_REQUEST_ID_BYTES` (64) visible ASCII bytes, and reads any other value as absent.** An endpoint that is not trawld, or a proxy that rewrites the header, can send any value. A caller that prints the id therefore prints at most 64 safe bytes.

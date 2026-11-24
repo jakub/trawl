@@ -1,6 +1,6 @@
 # The filter rail opens for a countable page, and a hand choice holds for the session
 
-status: accepted (2026-09-25), prep record for #231
+status: accepted (2026-09-25), prep record for #231, amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 At 900px and wider the Search page gives the filter rail a fixed 224px
 column, whether or not the rail has anything to count
@@ -100,3 +100,11 @@ and its tests unchanged.
 - The user docs call the control the **Filters** rail, so "sidebar" names
   only the navigation sidebar.
 - fleet-ui does not change, so Coastwatch is not affected.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **The content of a closed wide rail is `inert`, so the browser cannot open the wide rail by itself.** Find-in-page and a link's text fragment show a match inside a closed `<details>` by opening it, and that open would bypass both the hand choice and the automatic state. The browser does not search inert content, so find-in-page finds nothing in a closed wide rail.
+- **Below 900px the disclosure also opens without a press in two cases, and neither writes the wide choice.** It takes up an open or a close that the browser made by itself, such as find-in-page showing a match, because otherwise the next press would appear to do nothing. It also opens when the layout narrows while focus is in the rail's content, so the focused control is not hidden in a closed disclosure. Focus on the `<summary>` leaves the disclosure as it is, because a closed disclosure still shows the `<summary>`. The `toggle` handler in `FacetSidebar` does this reconcile and nothing else: the event arrives a frame after the change, when the width may have crossed the breakpoint, so it cannot say which layout the reader acted in.
+- **The rail never counts `_time`, `_ingested`, or `_raw`, and result surfaces offer no value filter on them.** These fields hold an instant or the whole original event, so a count of their values groups nothing. A filter on one belongs to the time range or to a text search. Every other reserved name, such as `_severity` or `_repairs`, stays a field the rail may count. Code asks `trawl_core::schema::is_non_dimension` instead of comparing names against `NON_DIMENSION_FIELDS`.

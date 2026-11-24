@@ -1,6 +1,6 @@
 # First run is a trial the CLI owns; an installation starts fresh
 
-status: accepted (2026-09-25), prep record for #203; amended (2026-09-25, 2026-09-27) during the #203 run, by ADR-0048 (2026-09-28), (2026-11-06) by the prep record for #354, and (2026-11-08) by the untangle prep for defects D11 and D10, see the Amendments
+status: accepted (2026-09-25), prep record for #203; amended (2026-09-25, 2026-09-27) during the #203 run, by ADR-0048 (2026-09-28), (2026-11-06) by the prep record for #354, (2026-11-08) by the untangle prep for defects D11 and D10, and (2026-11-23) by rulings moved from code comments, see the Amendments
 
 Before a first query, an evaluator needs five executables, PostgreSQL with two databases, two roles, two keys, a certificate, and a hand-written config. No install channel creates a key. A fresh `apt install` starts `trawld` against placeholder database URLs, and systemd restarts it every five seconds. This record adds a **trial**: a disposable installation that the `trawl` CLI creates, runs, and deletes on one Linux machine. It also makes the Debian package install without starting anything.
 
@@ -119,3 +119,11 @@ Considered and not adopted:
 - **Regenerating whenever the host pin is missing.** A running trawld keeps serving the old certificate, so the new host pin and web copy fail verification until a restart.
 - **Moving the trial key into a separate `tls-key/` directory**, as durable installations do. Durable trawld splits the two because the Helm sidecar mounts `tls/`. Nothing mounts the trial's `tls/` except trawld. The move would break the release proof and the secret scan, and force every existing trial down.
 - **A SAN setting for trawld's generator.** It adds a configuration surface to every installation for one disposable consumer.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **A resume keeps the engine, the ports, and the images that the trial was created with.** `check_resume` reads an omitted `--api-port`, `--web-port`, or `--image` as the recorded value and refuses a different one, because the `-p trial` URL, the browser origins, and the published ports all come from the recorded values. `check_images` requires the trawl image and the postgres image each to match both the recorded image id and the recorded registry digest. A locally built image has no registry digest, so its id is then the only thing that identifies it.
+- **Every `up` judges the certificate in the `trawld` volume before it writes certificate material, and never replaces a certificate it finds there.** `judge_certificate` counts a certificate as recorded when the TLS phase is done or the state holds a fingerprint. A trial with no recorded certificate generates a pair only when nothing exists at `compose::TLS_CERT`. When a file exists there, `up` reuses it if it is exactly one PEM certificate, and refuses it if it is not a regular file, is empty, is larger than `MAX_CA_BYTES`, or holds anything else. An earlier `up` may already have published that file to a pin, and `up` cannot tell which pins it reached.
+- **Preflight tests only the Docker endpoint, with no OS check and no detection of Podman or Docker Desktop.** The trial states the one test it performs: the endpoint is a local Unix socket that no other user can replace. A trusted local socket that forwards to another engine is its owner's business, and the trial does not try to detect one.

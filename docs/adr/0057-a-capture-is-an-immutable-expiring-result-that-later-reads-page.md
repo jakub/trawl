@@ -1,6 +1,6 @@
 # A capture is an immutable, expiring result that later reads page
 
-status: accepted (2026-10-22), prep record for the MCP 1.0 slices (A1 of the arc #214 → A1 → A2 → B, C1 → C2); amended (2026-10-23): decided during implementation; amended (2026-10-25): the apartness proof sees bind aliases between mounts
+status: accepted (2026-10-22), prep record for the MCP 1.0 slices (A1 of the arc #214 → A1 → A2 → B, C1 → C2); amended (2026-10-23): decided during implementation; amended (2026-10-25): the apartness proof sees bind aliases between mounts; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 Trawl has no stable event identifier. Identical events exist, the hot buffer moves between two pages of one query, and a repin or compaction can change what a second run of the same text returns. An agent that reads a page, reasons about row 7 and then asks for "the events around row 7" needs row 7 to mean the same thing a minute later. Offset paging over `/query` re-runs the text each time, so it cannot promise that. The proposal of 2026-10-21 said a captured result "is a run result without a net" and could reuse the retained-run machinery. The tree disagrees: a report run has mandatory schedule and saved-query foreign keys (`migrations/20260913000001_initial_schema.sql`), its parquet writer is private, goes through NDJSON and `read_json` type inference so exact types are lost, writes no file for zero rows, lives under `scheduled/` inside the epoch-managed data root, and expires by days. Only its publication pattern (stage a temporary file, rename, then commit metadata) and its named missing-file outcome carry over.
 
@@ -71,3 +71,41 @@ The proof keeps the walk over directory parents and adds a second ground of refu
 - **Separate directories of one filesystem stay apart.** Two bind mounts of sibling directories, as a compose file with one bind per directory makes, compare as siblings and pass.
 
 Out of scope, as operator rules in the configuration reference rather than checks: a mount made inside a root after the roots are configured (retention deletes a date directory with `remove_dir_all`, which reaches through a mount below it), aliases that only an overlayfs layer or a second mount of one network export can create, mounts changed after startup, a doctor prediction of apartness (the doctor keeps the lexical rule of `--check-config`), and platforms other than Linux, which keep the walk over parents alone. The human chose this narrow scope: only an operator with `CAP_SYS_ADMIN` can make a bind mount, so the defect guards against a configuration mistake, not an attacker.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**Bounds and the cut**
+
+- **A `from saved` capture is whole-shaped, and a window or a time clause with it is refused.** The server runs a stored run's text unchanged and splices no order into it, so a prefix of its rows would be an arbitrary subset. Stored report rows take no bounds, so a window or a clause has nothing to apply to.
+- **An event-shaped query may use one stage fewer than `/query` allows (`bounds::MAX_EVENT_STAGES`).** The server appends the `_time DESC, _ingested DESC` order as a stage, and the executed text must still pass the DSL's stage cap.
+- **A result is cut as events only when it has both `_time` and `_ingested`; any other result is whole-shaped.** The imposed order needs both keys. The event cut keeps the rows before the first row that does not fit, so the kept rows are always a contiguous prefix of the ordered result, and a first row too large keeps none.
+- **The text as sent passes the DSL check before the server splices its bounds in, and a failure of the executed text is a 500.** A parse error then points into the text the caller wrote. The executed text is the server's own composition, so its failure is a server defect, not a caller error.
+
+**The file and the results root**
+
+- **The parquet file names its columns by position, `c0`, `c1`, and so on, and stores a column that `StoredType` refuses as `VARCHAR` wire text (`StoredAs::WireText`).** Display names and duplicates live only in the metadata. A `mixed` column, or an integer column that needs both a negative value and the range above `i64::MAX`, has no native parquet type that keeps every value, so it keeps each cell's wire JSON and reads back through the wire decoder.
+- **`write_capture_parquet` writes into the caller's 0600 file in place, with `USE_TMP_FILE false`.** DuckDB's default writes a `tmp_` sibling and renames it over the destination. That makes a new inode with the umask's mode and loses the 0600 mode the results root requires.
+- **Every entry of the results root is reached through the held directory handle, by `openat`, `renameat2` and `unlinkat`, and a result id is checked to be 32 lowercase hex digits before any name is built from it.** No link in the configured path can then redirect a call, and no id can name an entry outside the root or one that is not a result.
+- **`ResultsRoot::path_of` is the one path-based access, for DuckDB's `read_parquet`, which cannot open by descriptor.** The root is 0700, owned by trawld's euid, held no-follow and locked, and the directories above it are operator-trusted storage (ADR-0052, ADR-0056). A reader that checks the digest through `ResultsRoot::verify` and then reads by path reads the file it checked, unless trawld's own uid replaced it in between.
+- **The results root follows the query scratch directory's rules (ADR-0056), so it also stays apart from both repin staging roots, and the results root and the query scratch directory may not equal, sit inside or contain each other.** Boot removes the names it makes in scratch, and a query spills there, so neither may reach a capture file. Config validation compares the spellings, and `open_results_root` compares the directories.
+- **trawld takes the results root's lock before it waits on PostgreSQL.** A second trawld on the same root then refuses before it touches the database.
+
+**Metadata rows**
+
+- **The JSON documents in a `captured_results` row (`columns`, `column_facts` and `correlation`) are stored as text, not JSONB.** JSONB refuses `\u0000`, and a column name, a listed value or a sightings literal can hold any string. A capture that holds one must commit like any other.
+- **Every store statement that compares against the current time binds `now` as a parameter and never reads SQL `now()`.** The caller's injected clock then decides every lifecycle outcome: expiry, tombstone age and live usage. A temporary row past its deadline is no longer live and stops counting toward the quotas before a sweep or a read marks it `expired`.
+
+**Commit and file removal**
+
+- **The row insert runs in a task of its own, and the tracker, history and the response report success only after it commits.** The same task records the outcome, so a client that goes away cuts short neither the commit nor its record.
+- **The server unlinks a committed capture's file only after the store marked its row expired or pruned, and a gone row never lives again.** `expire_now` marks and then unlinks. The sweep, boot and the admission gate unlink only the ids that the store's expiry or prune returned, or files that no live row names. A read that finds its file missing, or whose engine fails on the file, can therefore read the row again: a gone row answers 410 or 404, and a live row lost its file out of band and is marked `file_missing` (409). For a live row whose file is present, the digest decides between 500 `result_corrupt` and the engine's own failure.
+- **A capture stays in the in-flight set (`results::InFlight`) from before it publishes its file until its insert is decided, and the sweep never unlinks a file in that set.** An insert can run past the capture deadline when the store is slow, so no file age proves an orphan. A capture whose insert and fence both failed stays in the set through `COMMIT_GRACE`, so no sweep judges its file while its row may still land.
+- **Boot removes every published file that no live row names, with no age floor and no in-flight check.** No capture, fence or commit grace survives a restart, because the process that published the files ended with every connection its inserts ran on. The accepted residual: a backend stalled in an insert across the restart, or an insert whose fence failed and whose commit outlives the grace, can commit a row whose file is gone. That row reads as `file_missing`.
+- **`COMMIT_GRACE` is 60 seconds, twice `PURGE_COMMIT_BOUND`.** A backend whose client saw the connection fail still finishes the insert. A temporary insert waits on no other session, an attached one waits only on its investigation's short-held row lock, and a fence waits only on the first insert's row, so what remains is I/O and the WAL flush. Missing the grace costs a row that is listed as the owner's and answers 409 until it expires. Waiting longer holds one reservation and one file, and only after two store failures. A promotion whose transaction answers a store failure holds its evidence charge for the same grace.
+
+**Admission and the mount table**
+
+- **A key's capture lane is made the first time one of the key's captures passes the pre-check, and is kept for the life of the process.** A lane costs a few dozen bytes, and only an administrator makes keys, so the map cannot grow without bound.
+- **trawld reads at most 64 MiB of `/proc/self/mountinfo` (`TABLE_MAX_BYTES`), and a larger table refuses the start.** The limit is fixed, not configuration. A real table is a few kilobytes, and the limit only bounds what a hostile procfs could make trawld hold.

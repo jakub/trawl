@@ -1,6 +1,6 @@
 # WebGL shader backdrop (Atmosphere)
 
-status: accepted (2026-08-07)
+status: accepted (2026-08-07); amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 > **amendment (2026-08-07):** both intended consumers have since
 > adopted the backdrop — coastwatch on its login + auth-boot surfaces
@@ -230,3 +230,9 @@ build time, and the contract test asserts banner == pin.
   Permanent, silent, by design.
 - trawl-web-ui mounting and coastwatch wiring are deliberately out of
   scope here (coastwatch companion PR on the next `TRAWL_REV` bump).
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **`tests/atmosphere_vendor_contract.rs` checks the contents of the committed `vendor/paper-shaders.js`, including the `createShader` and `shaderCatalog` exports, and does not rebuild it.** wasm-bindgen fails the build only when the file is missing. A bad module shape, a renamed export, or a stale banner compiles on every target and leaves only the CSS floor, with no error. The `vendor-drift` job proves the committed bytes equal `build.sh` output, so a test over the committed bytes tests the build.

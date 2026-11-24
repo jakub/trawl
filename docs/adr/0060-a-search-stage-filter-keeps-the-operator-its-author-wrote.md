@@ -1,6 +1,6 @@
 # A search-stage filter keeps the operator its author wrote
 
-status: accepted (2026-10-30), prep record for the search-stage pattern fix; human rulings of 2026-10-30 recorded below
+status: accepted (2026-10-30), prep record for the search-stage pattern fix; human rulings of 2026-10-30 recorded below; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 Two parser defects give a search-stage field filter a meaning its author did not write, and nothing reports either one.
 
@@ -77,3 +77,9 @@ Still open, for a separate 1.0 issue (human ruling 2026-11-02): `matches` recomp
 ## Amendment (2026-11-02): ADR-0063
 
 [ADR-0063](0063-a-querys-regex-work-is-bounded-before-it-runs.md) decides the open paragraph of the parse-time amendment above. Patterns are literal only, every regex body passes the same validation, admission prices translation, repeats and fan-out before any regex compiles, live evaluation never builds a regex, regex memory has a reservation, and preparation and live matching run off the reactor. ADR-0063's third pull request (#336) moves preparation and live matching off the reactor, which discharges the paragraph.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **A glob that opens with `/` and holds no second `/` has no safe spelling, and the formatter writes it bare like any other glob.** A later `/` in the query closes such a value into a regex: in the next list element (`/a*,b/`) or in a later token (`f=/a* g=b/`). Quoting would make the glob exact, so the formatter cannot spell around the gap, and the nested round trip excludes these globs from its domain. The formatter quotes an exact value of this shape, through `could_open_a_regex` in `format.rs`.

@@ -1,6 +1,6 @@
 # Capacity reads as retention reach, not a countdown
 
-status: accepted (2026-09-23), prep record for #202; amended (2026-10-17) by ADR-0056: the spill role is the query scratch directory
+status: accepted (2026-09-23), prep record for #202; amended (2026-10-17) by ADR-0056: the spill role is the query scratch directory; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 With a deletion floor set, a trawl data disk does not fill. When free space drops below `min_free_disk_bytes`, pressure deletion removes date directories in expiry-ratio order (ADR-0018). The loss lands on retention: an environment that should hold 90 days quietly holds 40. A "days until full" countdown answers the wrong question. The free-space line also stays flat exactly while pressure deletion is destroying data. So trawl reports capacity as **retention reach**: how many days of each environment's policy the disk is projected to hold.
 
@@ -99,3 +99,13 @@ Writes to the data directory from outside the process are out of scope. The data
 ## Amendment: the spill role is the query scratch directory, 2026-10-17
 
 ADR-0056 moves query spill, the hot-buffer query snapshots and export staging out of the system temp directory into `[server] query_scratch_dir`. The **spill** role now names that directory. Its default sits beside the data root, so on a default install it shares the data filesystem and collapses into the data row. It gets its own row only when an operator puts it on another device. Scratch is transient use of ordinary headroom, like compaction spill. Pressure deletion keeps comparing real available bytes with the floor, so a large query can start it early. The human ruled this on 2026-10-17, over counting scratch bytes as free, because the WAL must keep its room.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **Repin evidence that cannot be read fails the headroom attempt.** `RepinFence::open` and `RepinFence::close` return the error from `repin::in_flight_evidence`, so the attempt reports `failed` and reach is withheld as `measurement_unavailable`. A fence that cannot read the marker or the staging roots cannot rule out a second generation. Staging that a job in this process kept after a failed sweep counts as evidence, the same as staging left by an earlier process.
+- **Each measurement's repin evidence speaks only for that measurement.** `projection_basis` withholds reach as `retention_suppressed` when the Parquet scan saw a repin or the headroom sample saw one. The two samples come from separate caches with separate ages, so a clean fence on one says nothing about the time the other was taken. When either measurement is not `complete`, `measurement_unavailable` wins over `retention_suppressed`.
+- **The repin fence is not a snapshot.** Files written, compacted, or deleted during a measurement may or may not land in it, as ADR-0033 allows. The fence only keeps a repin's two generations out of a measurement that reports itself clean.
+- **`/metrics` emits one disk series per device, labelled with its first role.** Roles on one device are ordered `data`, `wal`, `spill`, and `publish_headroom_gauges` labels the series with the first. A `sum()` across roles then never counts one device twice.
+- **The terminal monitor's capacity line shows the data filesystem only, and no reach.** `capacity_line` shows the status and sample age first, then the data filesystem's available and total bytes, its floor, the last sweep, and the pressure deletions. The status leads so that a clipped line never shows a retained reading as fresh. No environment's reach appears, because one environment's reach is not an answer for the installation.

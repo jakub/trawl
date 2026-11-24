@@ -5,7 +5,8 @@ live and refused in batch, see the Amendment; amended (2026-11-08), see the
 Amendment (2026-11-08); amended (2026-11-09): globs and regex classes match
 as DuckDB matches them in every lane, see the Amendment (2026-11-09);
 amended (2026-11-11): every call is checked once, before either lane runs,
-see the Amendment (2026-11-11)
+see the Amendment (2026-11-11); amended (2026-11-23): rulings moved from
+code comments, see the Amendment (2026-11-23)
 
 trawl has two expression evaluators that must produce the same answer for the
 same DSL: the **batch path** (`emitter/` → DuckDB SQL → DuckDB) used by
@@ -218,3 +219,15 @@ Considered, not adopted:
 - **A recursive walker.** ADR-0061 and ADR-0024 require an explicit stack for a new whole-tree walk.
 
 Premise checks at `4dd30bf2`: `emitter/validate.rs:46-94` (only aggregation heads are checked); `emitter/functions.rs:19-40,228-269,474` (one name and arity table, the unit and format checks, the unknown-function refusal); `emitter/expr.rs:47-49,102-107` (emit refuses arguments before the head, and refuses a non-literal integer position); `stream.rs:1212-1270` (live checks without integer literals); `eval.rs:1001-1014,1470-1488` (live evaluates field-valued precision and index); `emitter/mod.rs:480,493` (emit runs `validate_pipeline` first and splits off the kv tail); `trawl-engine/src/post_process.rs:211-226` (the tail compiles through the stream plan and wraps its error); `handlers.rs:4093-4106` and `error.rs:1188-1201` (the live compile refusal is `bad_request`, admission's is `validation_error` with a hint).
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **A post-aggregation `limit` caps each live snapshot and is re-armed before the next one, while a pre-aggregation `limit` stays spent for the life of the subscription.** Batch is the contract. A pre-aggregation `limit` caps the input set, which batch reads once, and a snapshot is the live rendering of one batch result set, so `emit_snapshot` calls `CompiledStage::reset_limit` on every post-stage. A post-aggregation `limit` spent once would leave the stream silent while the aggregation kept changing.
+- **Every lane names an aggregate's output column through one function, `projection::agg_output_name`, and the live lane refuses a computed aggregation operand.** The SQL emitter's `AS` alias, the stream compiler's accumulator column and the pin-scope walk all read that function, so a column has one name in every lane. The live accumulators read a bare field only, and a computed operand would answer NULL live under a column that SQL fills. That would be parity in name only.
+- **The one accepted regex difference between the lanes is an empty match on `\B` inside a multi-byte character.** RE2 tests an assertion at every byte offset, so `\B` matches `xéy` in batch. The live lane and the kv batch tail build with `utf8_empty(true)` (`pattern/mod.rs`, `meta_config`), which never places an empty match inside a character, so they do not match there. Only a body that can match empty on `\B`, such as `\B` or `x*\B`, is affected. `pattern::tests::regex_class_view_premise` pins those rows, and `tests/regex_class_parity.rs` compares those bodies on every other subject.
+- **A glob range compares bytes as signed C `char` values, so `[Ã-a]` holds `Z`.** DuckDB's `Glob()` compares range ends as `char`, which is signed on `x86_64`, and a glob matches byte for byte as the bundled DuckDB matches it. `glob_to_regex` follows that reading, and `glob_lane_semantics_probe` in `trawl-engine/tests/duckdb_probe.rs` checks it against the bundled engine. Outside a class, `\` escapes the next byte, not the next character.
+- **chrono decides which `strftime` and `strptime` format literals are valid, and a computed format is not checked before the run.** `validate_format_literal` refuses a literal that chrono reads as an `Item::Error`, such as `%Q` or a trailing `%`. So both lanes refuse the same text before either runs, and an invalid literal never errors in batch while it answers null in live tail. A computed format has no value until the run, so the live lane answers null for an invalid one.
+- **The aggregate-position check reports the first misplaced aggregate as written.** `aggregate::check_positions` visits stages in written order and the children of an expression left to right. That matches the written order of the call phase, so a query gets the same refusal from both doors.
+- **The TUI puts the cap mark first in the results title.** A narrow pane cuts the end of the title, so it drops the row counts before the warning that the live aggregate is partial (`capped_title` in `trawl-cli/src/tui/ui/results.rs`).

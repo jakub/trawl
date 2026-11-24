@@ -1,6 +1,6 @@
 # Grammar-owned comments: retire the pre-parse scanner, drop `//`
 
-status: accepted (2026-08-17) — prep ruling record for #83
+status: accepted (2026-08-17) — prep ruling record for #83; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 Comments entered the DSL as a pre-parse byte walker
 (`trawl-core/src/parser/mod.rs::strip_comments`): blank every `#`/`//` run to
@@ -227,3 +227,12 @@ Ruling 6 stands, and [ADR-0060](0060-a-search-stage-filter-keeps-the-operator-it
 ## Amendment: ADR-0061, 2026-11-02
 
 Ruling 6 stands, and [ADR-0061](0061-formatting-never-changes-what-a-query-means.md) states what it guarantees. For every query `parse` accepts, formatting returns text whose reparse has an equal canonical form, or a typed refusal. A checked renderer reparses its own output before it returns text, and it is the only public way to format.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **Each position where a `#` can sit inside an unquoted token has its own error message, and `hint_for` in `parser/comment.rs` is the one place that writes each position's escape.** A hint that changes what the query means is worse than no hint. Quoting a whole `color=#ff0000` turns a field filter into a phrase search, so a value's hint quotes the value alone. Quoting a negated term is no escape either: `-"a#b"` is a bare term that spells literal quote characters, so that hint offers `NOT "a#b"`.
+- **`scan_outside_quotes` in `parser/scan.rs` stays an approximation of the grammar and never becomes a second parser.** It runs on partial, mid-typing input that the grammar rejects, so it can only approximate. The grammar decides what a query means. The scan decides only where the date-range popover splices text. It lives in `trawl-core` beside the grammar because a span it picks wrongly drops or duplicates a time bound.
+- **The TUI highlighter dims a comment only where the grammar opens one: a `#` at the start of a line or after whitespace, and never `//`.** Dimming a `#` anywhere else would show text that the parser rejects as a valid comment. Dimming from `//` would dim every URL in a query.
+- **Correction.** Ruling 5 says `trawl-cli/src/tui/highlight.rs::tokenize` has "no `#`". `tokenize` colours a `#` comment at a layout boundary, as the bullet above states. The ruling's other claim, "no backtick awareness", still holds.

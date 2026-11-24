@@ -1,6 +1,6 @@
 # The kv batch tail runs its stages in written order
 
-status: accepted (2026-11-06), prep record for the kv batch tail order fix (#346); human rulings of 2026-11-06 recorded below; amended (2026-11-06) with what the #346 run shipped, see the Amendment
+status: accepted (2026-11-06), prep record for the kv batch tail order fix (#346); human rulings of 2026-11-06 recorded below; amended (2026-11-06) with what the #346 run shipped, see the Amendment; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 `extract kv` mints columns that SQL cannot name, so the emitter sends it and every later stage to the kv batch tail (`emitter/mod.rs:490-503`). The tail runs over the rows the SQL prefix returned. On main (`42e05d0f`) it does not run those stages in the order the query wrote them:
 
@@ -79,3 +79,9 @@ narrowly.
    a stage in another stage's place. trawl-core gains no compiler entry
    point. It only makes `bind_event_key`, `EvalValue::as_instant` and
    `stream::dedup_key` public.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **A NaN sorts after every other number, infinity included, whichever number type it meets.** DuckDB orders NaN greatest, and `compare_cells` gives the same answer for a DOUBLE pair (`compare::double_total_cmp`) and for an integer or `u64` against a NaN (`int_float`, `uint_float`), so the comparison stays a total order. A NaN is a value and not a NULL: a descending sort puts it first, and NULLs still sort after it.

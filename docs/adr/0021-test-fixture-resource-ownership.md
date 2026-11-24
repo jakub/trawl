@@ -1,6 +1,6 @@
 # Test fixtures own their resources: ports, databases, pools, shared state — and admission is static
 
-status: accepted (2026-08-25) — prep ruling record for #125
+status: accepted (2026-08-25) — prep ruling record for #125; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 The postgres-backed suites flaked under parallel load in five distinct
 ways (#125): a TOCTOU'd ephemeral port, a `55006` teardown race on the
@@ -89,3 +89,34 @@ fixes the ownership model; the repin evidence half of #125 is ADR-0022.
    (default and no-default-features suites), reported as attempts and
    failures — a finite soak bounds the flake rate, it does not prove
    zero.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**Pools and connection ceilings**
+
+- **A pool handed to the app store skips only the connect, never the boot.** `StorageState::from_pool` takes the advisory lock and then migrates. `StorageState::connect` only builds the production pool and calls `from_pool`. Ruling 3's fixtures therefore still run the production boot sequence, and a change that moved the lock or the migration into `connect` would leave both untested.
+- **A test shape is charged every pool it holds at its `max_connections`, plus every raw connection it keeps open.** The `*_CONNECTION_CEILING` constants in `crates/trawl-server/tests/common/mod.rs` follow this rule, and the worst of them sizes the group against `CI_MAX_CONNECTIONS`. fleet-auth's `connect_and_ping_via_url` is left out on purpose. It is the one test of the production constructor `KeyStore::connect`, so pool arithmetic charges it 13, but it issues one query at a time and closes the pool before it returns, so it holds at most three connections.
+- **The `postgres` test group runs 8 tests at a time.** DuckDB memory per booted trawld limits the width, not Postgres connections. Raise `max-threads` in `.config/nextest.toml` only after the `pg soak` workflow stays green at the new width.
+
+**Failure diagnostics**
+
+- **Ruling 7's dump prints names, numbers, and grouped counts, and nothing that identifies a connection.** `FixtureFacts` holds database names, the port, and pool ceilings, with no DSN or token. Its fields are private, so a test cannot put a DSN in a printed field. The snapshot connects with the admin DSN from `DATABASE_URL` at print time and never prints it. The `pg_stat_activity` census groups by `datname`, `backend_type`, `state`, and the wait event, and leaves out `usename`, `client_addr`, `application_name`, and `query`. SQL text and connection identities in CI logs are a leak, and the grouped counts alone tell pool exhaustion apart from many sessions that wait on one lock.
+
+**Shared seed state**
+
+- **A change to the parquet seed data bumps the version in its directory name (`parquet-v1`).** A tree from an older checkout is then a directory that no test reads. Ruling 5 forbids a setup path to delete shared state, and without the version a test would have to detect a stale tree and delete it.
+- **`seed_data_root` copies the seed into the private data root and does not hardlink it.** The test's tempdir is on `/tmp`, which is a tmpfs on the dev machine, so a hard link from the repository's filesystem fails with `EXDEV`.
+
+**The admission guard (`xtask/src/pg_admission.rs`)**
+
+- **The guard derives the member set and asks nextest for the group membership, as two independent sides.** Derivation reads `cargo metadata` and makes one lexer pass over each target's sources. A target is pg-touching when it has an `#[sqlx::test]` attribute, when it pulls in a `common` module that defines `fixture_pool`, or when its test code names a connection-opening API such as `KeyStore::connect` or `PgPool`. The third class catches a plain `#[tokio::test]` that connects by hand. In a `src/` tree the pass reads only test regions: the body of a `#[cfg(test)]` item and the body of a fn with a test attribute. Membership comes from `cargo nextest list -E 'group(postgres)'`, so the engine that enforces the group also answers the question. Parsing the override filters out of `.config/nextest.toml` is rejected, because it would be a second implementation of nextest's filterset semantics that could disagree with the first.
+- **A target-level finding requires the whole binary in the group.** The guard matches by test name only when every finding for a target names tests. A fixture module or a connection API makes every non-ignored test of the binary need `filter-match.status == "matches"`. `trawl-server::auth_pg` has both kinds of evidence, and checking only its named tests would let a narrowed filter admit two of 26 tests while the other 24 boot a server outside the group. Name matching stays for targets with only named tests, so the filter can admit `from_saved::` and `scheduler::` from trawl-server's library target and leave about 600 pure unit tests outside the 8-thread cap.
+- **The guard is a CI tripwire for an accidental escape, not a security boundary.** The threat is an author who adds a test that opens a Postgres connection and forgets to extend the group. Anyone who edits the workspace can also edit `.config/nextest.toml`. Every judgement call fails in one direction. When it is unclear whether something is a pg test, the guard collects it. When it is unclear which target owns a file, the guard charges the file to both. A silent false green is the only defect class, and a false failure is noise.
+- **Lexer gaps are accepted when they fail loudly or over-collect.** Unresolved `cfg` and `cfg_attr`, a nested `#[cfg(test)]` that yields two spans, a bodyless item that spans its own extent, a non-body brace at item depth, `# [test]` spacing (which `cargo fmt` rejects), and raw keywords all fall in this class. Eight shapes can hide a connection or misname a test, and they stay open because nobody here writes them by accident: an `include!` edge, a non-ASCII identifier, a `cfg_attr` path override on a `mod`, a `#[cfg(test)]` macro invocation, `#[::sqlx::test]`, an attributed `if` statement, a `>>` at angle depth 1 in `skip_to_body`, and a comment inside a `#[path]` value. Judge a new gap by one question: does it give a silent pass, or only noise?
+- **The module walk decides module paths, and the sweep of leftover files is only a safety net.** `unit_files` adds every `.rs` file under a `src/` tree that `module_tree` did not reach, and `path_prefix` names it from its path. A file that no `mod` reaches does not compile in, so including it can cost only a loud false failure. Leaving a file out could cost a silent escape. Integration targets under `tests/` have no sweep.
+
+**Retries**
+
+- **Browser tests do not retry either.** `crates/trawl-web-ui/e2e/playwright.config.ts` sets `retries: 0`. A flaky browser test is fixed or quarantined in a way that people see, the same as ruling 6 requires for nextest.

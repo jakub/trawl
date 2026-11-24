@@ -1,6 +1,6 @@
 # ADR-0007: Mira Blue design language
 
-Status: accepted (2026-07-27)
+Status: accepted (2026-07-27); amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 > **amendment (2026-08-19, #119):** Geist 1.8.0 and Geist Mono 1.8.0
 > are now self-hosted from two committed variable WOFF2 files owned by
@@ -163,3 +163,9 @@ the Mira Blue values become the enforced baseline.
   are measured against the Mira Blue baseline.
 - Any straggler CSS reading the retired assumptions (solid `#fff` on accent,
   2–3px radii) must be caught in the port's visual QA.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **`--violet` holds the OKLab lightness of `--teal` in each theme, and its hue stays apart from both `--accent` and `--teal`.** `--violet` is the fifth colour in the chart's series list in `crates/trawl-web-ui/vendor/src/uplot.ts`, after `--accent`, `--teal`, `--red` and `--yellow`. At equal lightness no series line looks heavier than another, so the hue alone tells the series apart. Both themes match today: light `#7241a0` and `#0a6d60` are both about 0.48, and dark `#c09aeb` and `#4ec9b0` are about 0.75.

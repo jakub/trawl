@@ -1,6 +1,6 @@
 # An investigation is grant-visible and its evidence outlives the corpus
 
-status: accepted (2026-10-22), prep record for the MCP 1.0 slices (C1 and C2 of the arc #214 → A1 → A2 → B, C1 → C2); human rulings of 2026-10-22 recorded below
+status: accepted (2026-10-22), prep record for the MCP 1.0 slices (C1 and C2 of the arc #214 → A1 → A2 → B, C1 → C2); human rulings of 2026-10-22 recorded below; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 An agent investigating through the MCP server (ADR-0058) holds its own key. The human watching from a phone holds another. Saved queries are key-owned (`saved_queries.key_id`, ADR-0004), so a key-owned investigation would be invisible to the person it is for. ADR-0035 already decided that installation objects are visible by grant, never by ownership, for the 1.1 tables, nets and analyses. The investigation adopts that pattern now, for one object, and is the first installation-owned object in trawl. It is also the thing that makes the agent's work inspectable: the server records what ran, the agent records why, and the human sees both without a chat transcript.
 
@@ -94,3 +94,37 @@ Building the live board settled points the decision left open and corrected one 
 ## Amendment: the briefing, 2026-11-12
 
 *Amended 2026-11-12 by [ADR-0067](0067-an-investigation-ends-in-a-conclusion-that-cites-its-findings.md), the prep record for the investigation briefing (milestone 1.1). A finding has a statement, at most 512 bytes for new writes, and an optional `basis`: attributed text that its author chose to store, not hidden reasoning. This amends **The server records steps; the client records reasons.** The log gains a `conclusion` kind, which amends the kind list in the decision and in the 2026-10-25 amendment. A conclusion is an overwrite under the investigation's `expected_seq` on its own `PUT` route, recorded as a new entry. This amends **Edits are sequenced, and only overwrites can conflict.***
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**The log and its writes**
+
+- **Every log entry carries the `seq` that created it and an `updated_seq` that its last change sets to the investigation's next sequence, and `read since=<n>` answers the entries whose `updated_seq` is after `n`, in `updated_seq` order.** A step gains its outcome after it was appended. A reader that already saw the step's `seq` must see the step again when the outcome lands, and a read keyed by the creating `seq` would never show it.
+- **A closed investigation refuses every new entry and every overwrite with 409 `investigation_closed`, except a `PATCH` that reopens it, and the terminal outcome of a step admitted while it was open is still written after it closes.** Close means the case takes no new work. The step's work was admitted while the investigation was open, and refusing its outcome would leave the step running until a restart marked it `interrupted`.
+- **The retention extension (`PUT /api/v1/investigations/{id}/retention`) is an overwrite: it carries the `expected_seq` it observed and fails with 409 `sequence_conflict` when the sequence moved.** It replaces the investigation's deadline and ceiling, and two writers acting on different views of the board must not overwrite each other's decision about how long the evidence lives.
+- **A promotion locks the results it cites in ascending id order, whatever order the caller names them in, and `ResultStore::expire_due` locks its due temporary results in the same order with `SKIP LOCKED`, leaving a skipped row to the next pass.** Two promotions that cite the same results in opposite orders, or an expiry beside a promotion, would otherwise close a lock cycle and make one of them a deadlock victim.
+
+**Evidence and its clock**
+
+- **A write by a principal moves `retain_until` to `GREATEST(retain_until, LEAST(retain_ceiling, now + idle))`, so a write never moves the deadline back, and reads, refused writes and a replayed create move nothing.** A `server_manage` extension can set the deadline past `now + idle`, and a write takes its `now` before it holds the lock, so writes commit out of `now` order. Neither may shorten a deadline already set. A replayed create changed nothing, so it does not keep the evidence alive.
+- **A read that reaches a kept result past its investigation's `retain_until` prunes that investigation's evidence under its lock, as a write would, before it answers 410 `result_gone`.** A 410 given without the prune would be undone by the next write, which slides the clock and revives the rows the read called gone.
+- **An evidence-budget refusal is 409 `evidence_budget_exceeded`, not 429, and trawld answers it before it takes any executor permit.** Kept evidence frees only when its investigation's retention ends or `server_manage` deletes the investigation. A short retry cannot succeed, so the status must not invite one, as `capture_busy` does.
+- **An attached correlation read keeps its own result as evidence and never promotes the focus result it reads from.** The focus result becomes evidence only through a keep or a finding that cites it, so a context read does not charge another result to the evidence budgets without anyone choosing to keep it.
+
+**Authority**
+
+- **No authenticated handler takes a raw `Request` or `Body`, and the route shape guard in `crates/trawl-server/tests/route_shape_guard.rs` fails closed.** It fails on a registration it cannot follow to its handlers, on an extractor it does not know, on a body extractor with no authority extractor ahead of it (tuple members included, in extraction order), and on an exemption for an unauthenticated handler that is no longer mounted outside the authenticated router. A raw request or body lets a handler read the body where the scan cannot see, and a guard that passes what it cannot classify would let a new route skip authority before shape unnoticed.
+
+**The MCP server**
+
+- **The MCP server prints every actor name and every stored text of an investigation entry as a JSON string, one entry per line.** Other keys write entries, a human or another agent. Raw text could break onto new lines that read as entries, markers or `next:` calls. As a JSON string it stays data and stays on its line.
+- **When a reply's response budget cannot hold all of an attached call's activity, the MCP server drops result rows before any activity entry, cuts activity entries from the end only, and abbreviates an entry longer than its allowance instead of omitting it.** It advances the session's `seen_seq` only to the `updated_seq` of the last entry the reply printed, and the cut's continuation line survives when the proposed next calls are dropped. The session's cursor is one sequence number, so an entry dropped from the middle would count as seen without being shown.
+- **The MCP `create` action prints the id it sent in every reply, a failed create included, and adds a recovery hint unless trawld refused with 400 or 403.** The MCP server mints the id, never the model. After a lost or failed answer, the model recovers only by sending the same create with the same id, so the failed reply must name that id.
+
+**The board**
+
+- **The board shows the findings and the latest finding only from the whole log: a read that leaves entries unread is followed at once, up to `AUTO_PAGES` reads, and past that the findings say which entry they are as of.** A later finding can be the latest one, and a later `finding_status` entry can overwrite a status, so findings shown from part of the log could present a stale status as current.
+- **The board reads its cited rows through one paced queue, `EvidenceQueue`.** At most `MAX_IN_FLIGHT` (4) reads run at once, with one read per row however many findings cite it. A 429 pauses the whole queue for its `Retry-After`, clamped to `REFILL_MS` through `MAX_PAUSE_MS` and doubled for each consecutive throttled round. After `MAX_AUTO_ROUNDS` (4) rounds the queue stops until the person resumes it. A finding cites up to 32 rows and a page shows every finding, so one board can cite more rows than the reader's interactive rate limit admits in a burst. With trawld's `Retry-After: 1`, four rounds give about 15 seconds of automatic recovery before the page says the reads stopped.
+- **Send to investigation sends the accepted execution's query state and server start instant, taken once when the dialog opens, never the editor's draft, and the dialog has no default target investigation.** The server must attest the rows the person saw. A draft edited after the run, or a default target nobody chose, would send a capture of something nobody looked at, or to a case nobody picked.

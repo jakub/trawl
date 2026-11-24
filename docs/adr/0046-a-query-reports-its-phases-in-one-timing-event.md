@@ -1,6 +1,6 @@
 # A query reports its phases in one timing event
 
-status: accepted (2026-09-27), prep record for slice A of query-path observability; amended (2026-10-22) by ADR-0057 and ADR-0058: four new kinds; amended (2026-10-23): the capture kind and the write phase; amended (2026-11-03) by ADR-0062: the raw-free retry is gone, and `probe` books the input-column probe; amended (2026-11-08): a run record keeps the public message, see the Amendment
+status: accepted (2026-09-27), prep record for slice A of query-path observability; amended (2026-10-22) by ADR-0057 and ADR-0058: four new kinds; amended (2026-10-23): the capture kind and the write phase; amended (2026-11-03) by ADR-0062: the raw-free retry is gone, and `probe` books the input-column probe; amended (2026-11-08): a run record keeps the public message, see the Amendment; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 `/metrics` shows that queries got slow, but nothing shows where a single query spent its time. The only split today is the permit wait in the opt-in query debug log. This record adds a `query_timing` event to trawld's own telemetry. The event splits each executed query into named **query phases**, so an operator finds the slow phase with the DSL. Per-operator DuckDB profiles are slice B and are out of scope here.
 
@@ -96,3 +96,11 @@ The Decision's cleanup paragraph says "the run record keeps the text". The untan
 The clause was wrong because run rows reach readers through the runs API, and the scheduler wrote `format!("{e}")` (`scheduler.rs:475`, `:477`) and `format!("result persistence failed: {err}")` (`scheduler.rs:661`). The comment at `scheduler.rs:482-483` and the assertion message at `scheduler.rs:1344` restate the old clause and change with it.
 
 Considered, not adopted: keeping the raw text for the run's owner. A query reader who shares the run sees it too, and ADR-0040's amendment rejects an owner exception.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **One phase is active at a time, and a phase accumulates at full precision until its totals are taken.** `PhaseClock` holds each phase as a `Duration` and floors it to whole microseconds only when it builds a `PhaseTotals`. Flooring on every exit would lose up to a microsecond per entry, so a phase entered many times, such as `bind` across attempts, would under-report.
+- **Work that never crossed the work-start transition reports no worker phase.** The request in `RequestGuard::settle` and the worker in `finish` both discard `startup` when the work never started, and either may do it first. Nothing ran, so such an account is complete, even if a registered slot still needs cleanup. A `query_permit_reclaimed` for retained work that never started carries no phase totals and `physical_outcome=not_started`.
+- **`query_permit_reclaimed` is a root event with explicit fields, like `query_timing`.** `emit_reclaimed` writes it with `parent: None`, so it inherits nothing from the `http_request` span, which carries the raw path and user agent (ADR-0040). It carries only numbers, closed enums, and ids.

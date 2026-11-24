@@ -1,6 +1,6 @@
 # Retention and report windows: age is per-env policy, pressure is survival, the schedule owns its window
 
-status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class; amended (2026-10-23): the capture sweep without the scheduler; amended (2026-11-06): stale runs at boot, retention of terminal runs only, and a lifetime run budget; amended (2026-11-08): ruling 8's pruning claim, see the Amendment; amended (2026-11-09): scheduled runs in flight are capped at half the executor permits, see the Amendment; amended (2026-11-11): manual runs are capped too, running a net now needs `query`, and the tick lists only due schedules under a deadline, see the Amendment
+status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class; amended (2026-10-23): the capture sweep without the scheduler; amended (2026-11-06): stale runs at boot, retention of terminal runs only, and a lifetime run budget; amended (2026-11-08): ruling 8's pruning claim, see the Amendment; amended (2026-11-09): scheduled runs in flight are capped at half the executor permits, see the Amendment; amended (2026-11-11): manual runs are capped too, running a net now needs `query`, and the tick lists only due schedules under a deadline, see the Amendment; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 Two parked halves of PR #58, one subject: who owns time. Retention is one
 install-wide `max_age_days`, so keeping `prod` a year forces keeping the
@@ -235,3 +235,36 @@ Considered, not adopted:
 - **Cap how many schedules a key may own.** It needs its own policy, as in the 2026-11-09 amendment.
 
 Premise checks at `4dd30bf2`: `handlers.rs:3169,3300` (both routes check only `saved_query`); `scheduler.rs:405-445` (a scheduled run needs both grants); `handlers.rs:3199-3278` (claim, then spawn with no lease, then answer); `pool.rs:247-268,2777-2787` (the scheduled cap, its lease and its try); `store/schedule.rs:1020-1041,1387-1403,2412-2460` (the listing has no budget term; an exhausted claim rolls back); `migrations/20260913000001_initial_schema.sql:35-40,278,286-287` (indexes on `schedules`, one running run per schedule); `store/investigations.rs:1403-1624` (the `WriteTx` deadline, its commit rule, and lock and statement timeouts mapped to `WaitExpired`); `store/migrations.rs:195-209` (an older binary refuses a newer ledger); `web-ui perms.rs:65` (`can_query`).
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**Watermark and fire cursor**
+
+- **Creating a `since_last` schedule, or an edit that re-anchors one with no watermark stored, seeds `covered_through` with the start of its first window, `next_fire_at - interval - lag`, and never replaces a stored watermark.** Without the seed, a failed first run sends the next run back to ruling 14's one-interval fallback, which ends at the later fire, so the failed interval is dropped and no `window_truncated` records the loss. With the seed, the next success covers both intervals, as after any later failure (ruling 9). The watermark marks where coverage resumes. It never proves that a run happened.
+- **An edit re-anchors `next_fire_at` only when the interval or the window changes, and an edit to `max_runs`, `enabled` or `lag` keeps the planned cursor.** If every edit moved the cursor, repeated edits could keep a schedule from ever falling due. `update_schedule_in` compares against the schedule row it holds locked, so a concurrent edit cannot change the answer between the read and the write.
+- **A successful run advances the watermark only when the run was claimed as `since_last`, recorded a window, and that window ends after the stored watermark.** `ScheduleStore::finish_run` reads the mode from the run row, never from the schedule. A finish that arrives out of order then cannot move coverage back, and a run that finishes while an operator changes the window gives the same coverage whichever commit lands first.
+- **The API reports `covered_through` only while the schedule's window is `since_last`.** The stored watermark survives a switch to a fixed window or to query mode, so a schedule switched back to `since_last` resumes where it stopped. Reporting it under a mode that claims no coverage would tell the operator something false.
+
+**What a schedule write accepts**
+
+- **A schedule with no window refuses a non-zero `lag` with a 400 that names both fields (`StoreError::LagWithoutWindow`).** Without a window, the saved DSL owns its time clause and runs verbatim. A stored lag would change no answer while the schedule reads back as if the allowance were in force.
+- **Every duration the schedule grammar parses is at most `MAX_DURATION_SECS` (10 years), and a fixed window has the same 60-second minimum as the interval.** Each duration becomes date arithmetic, so one bound at the grammar means no consumer has to prove that its arithmetic cannot overflow. A fixed window shorter than the shortest interval describes a report that no schedule can produce.
+- **`max_catchup_intervals` must be between 1 and `MAX_SCHEDULER_CATCHUP_INTERVALS`, and any other value stops the boot.** A value of 0 would clamp every `since_last` window to nothing. To turn the clamp off in practice, set a large value. The planner multiplies the value by the interval into one time delta, so the largest allowed value must still compute.
+- **A schedule window requires saved text that parses, and without a window the text is stored unexamined.** A window over text that cannot run claims coverage of nothing. Saved-query creation has never parsed the DSL, so refusing unparseable text without a window would be a new rejection under the window's name.
+- **The TUI schedule form, like the web form, checks only that the interval is not empty and sends the window and the lag as typed.** The server owns the window and lag contract, and its 400 naming both fields is what the operator reads. A second check in the client could drift from the server's sentence.
+
+**How the window reaches the query**
+
+- **The scheduler materializes a window as an `earliest`/`latest` prefix on the saved text (`materialize_window`), never by rendering the text again from the AST.** The formatter drops `#` comments and normalizes spelling, and `report_runs.query` must paste back to the same report (ruling 11).
+
+**Clock and lock order**
+
+- **Every run's `started_at`, scheduled or manual, and a schedule's `next_fire_at` come from the application clock, never from Postgres `now()`.** A claim reads the clock after it holds its locks. `now()` is the transaction start, and a remote Postgres can be skewed, so it would misorder manual and scheduled runs under `run=latest`, in run history, and in count-based retention. The scheduler also samples one application instant per tick.
+- **Every write that touches a saved query, its schedule or its runs takes row locks in one order: `saved_queries`, then `schedules`, then `report_runs`.** The order holds on paths that write only a run row. Both writes that could put a schedule window beside a time clause, `ScheduleStore::set_schedule_checked` and `SavedQueryStore::update_checked`, lock the saved query first. Inserting a run takes `FOR KEY SHARE` on the saved query through its foreign key, so any other order closes a cycle that Postgres breaks with 40P01. The shared first lock also makes ruling 7 hold under concurrency, because the loser reads the winner's commit and refuses. It also means that when `SavedQueryStore::delete` races `ScheduleStore::finish_run`, exactly one side removes the result file.
+
+**Retention configuration**
+
+- **A `[retention.env.<name>]` table must set `max_age_days`, and a table without it is a load error.** Inheriting the global value and keeping forever are opposite answers, and an operator who wrote the table meant one of them. Ruling 1's inherit applies only to an env with no table.
+- **The Helm chart renders `config.retention.envs` names and values through `toJson` in `chart/trawl/templates/configmap.yaml`, so trawld receives them typed and quoted and refuses a malformed one at boot.** Coercing with `int` would turn `1.9` into a one-day limit, `"typo"` into a keep-forever 0, and a key like `prod] #` into an override for `prod`. Each of these silently changes what retention deletes.

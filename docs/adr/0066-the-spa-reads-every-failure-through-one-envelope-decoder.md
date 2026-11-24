@@ -1,6 +1,6 @@
 # The SPA reads every failure through one envelope decoder
 
-status: accepted (2026-11-08), prep record for the untangle defect D14
+status: accepted (2026-11-08), prep record for the untangle defect D14; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 trawld answers every failure with the `ErrorResponse` envelope: a code, a message, and optional details and conflict data. The SPA reads it in about 40 hand-written `match resp.status()` ladders in `crates/trawl-web-ui/src/api/mod.rs`. Seventeen of them end in `s => Err(ApiError::Status(s))` and drop the envelope: `login`, `me`, `logout`, `health`, `history`, `clear_history`, `schema_services`, `catalog_field`, `repin_status`, `repin_job_status`, `list_saved`, `update_saved`, `delete_saved`, `delete_schedule`, `list_runs`, `list_all_runs`, and `runs_stats`. The rest go through `server_error` (`api/mod.rs:376`), which keeps only the status and the message.
 
@@ -80,3 +80,9 @@ Checked at `b71f9e6e`. `62ee208b..b71f9e6e` changes only `crates/fleet-dev`, `fl
 - The envelope is the only failure body that trawl-web produces. Tests that read the legacy `"error"` string move to the envelope.
 - `invalid_name` and `duplicate_name` are new wire codes. API clients that matched `bad_request` for these refusals see the new codes.
 - No persisted state changes.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **An `Unauthorized` failure always displays `SESSION_ENDED` ("Your session has ended. Sign in again."), never the envelope's message.** A 401 means the session failed, not the request, so the display names that one cause and its remedy whatever trawld or trawl-web wrote. A read normally leaves for sign-in through `auth_return::sign_in_if_unauthorized`. A write that toasts the failure, and a read whose redirect `redirect_to_login` declines because a redirect already started or an explicit logout is pending, settle on the failure and show this sentence.

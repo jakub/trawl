@@ -1,6 +1,6 @@
 # An acknowledged event is counted exactly once across compaction and restart
 
-status: accepted (2026-09-23), prep record for the restart-visibility work; amended (2026-11-08): rollup marker discovery ignores the parent's name, and marker hours are 00 to 23, see the Amendment
+status: accepted (2026-09-23), prep record for the restart-visibility work; amended (2026-11-08): rollup marker discovery ignores the parent's name, and marker hours are 00 to 23, see the Amendment; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 A search can read an acknowledged event from two places: the hot buffer and the parquet files. Two defects break that on disk today.
 
@@ -205,3 +205,33 @@ a marker now fails closed and stays, with its files, for the operator.
 **Considered, not adopted.** Filtering discovery by the strict date grammar.
 It would hide a marker under a non-canonical parent and admit reads while a
 rollup may be pending.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**Boot conformance.**
+
+- **Boot conformance skips every file when it cannot read the publication markers or the rollup markers.** A marker that cannot be read may claim any file, and the pass cannot tell which files are safe to rewrite.
+- **Every file that conformance defers withholds conformance completion, so the next boot runs the pass again.** Conformance defers the canonical output and the `.parquet.tmp` that a pending publication marker claims. It also defers every file in a day directory whose rollup marker unlink still owes its fsync. Recovery proves a publish or a rollup by the exact bytes of those files, and a marker whose unlink was not durable can come back after a power loss. A rewrite, or a delete of the tmp, would turn a recoverable publish into a permanent identity contradiction.
+
+**Publication.**
+
+- **Every compaction publish fsyncs the hour, date, env and data-root directories, even when this attempt created none of them.** An earlier attempt that failed can leave a directory whose entry is not durable, and a retry that synced only its own directories could retire WAL under that output path. Trawl keeps no cache of directories it has already synced, because retention can delete a date directory and a later publish can recreate it.
+- **Any pending publication marker refuses a repin cutover.** The job ends `blocked` with `publication_marker_pending`, and the corpus stays as it was. The swap replaces every canonical file, so recovery could no longer tell a finished publish from an unfinished one.
+- **Retention takes no lock against compaction, and it accepts one residual window.** A sweep stands down when it cannot read the publication markers, keeps every date directory a marker claims, scans the markers again before each deletion, and never deletes the date it reads as today. A publish that crosses midnight can still write its marker between that last scan and the `remove_dir_all` of the previous date. No row is then counted twice, and no row is lost that retention was not already deleting. The marker outlives its output, recovery reports it as contradictory, and the service stays blocked under `TrawlPublicationRecoveryBlocked` until an operator resolves it.
+
+**Restart visibility.**
+
+- **Hydration rejects a whole file when any of its rows has an envelope instant that compaction would repair.** Compaction replaces such an instant, for example a `_time` that is not an instant, while a hot read casts it to NULL. The event would read one way hot and another way cold.
+- **Hydration finishes before self-telemetry is activated.** Telemetry inserts each WAL file it writes into the hot buffer, so a hydration after activation would count that file twice.
+- **The coverage proof re-checks at most `MAX_PROOF_CANDIDATES` (1024) files that are not resident.** The re-check holds the publication write guard, which holds off ingest and every read. More candidates than the bound fail the proof, and overhang stays.
+
+**Search page.**
+
+- **The search page shows a 503 `corpus_recovering` as its own notice, with the server's message and a Retry button.** The notice keys on the code, so any other 503 stays a load failure. An empty table would say there is nothing to find, and the generic load error would read as a fault. The same request succeeds once the corpus settles, so the notice keeps Retry. The server's message is a fixed sentence for each reason, with no counts or paths.
+
+**Corrections.**
+
+- **Correction.** The rollup marker size bound is `MAX_ROLLUP_MARKER_BYTES` = 7168 bytes: 1 KiB for the fixed fields and identities, plus `MAX_INPUTS` (24) inputs of 128 bytes each plus `trawl_config::MAX_SERVICE_NAME_LEN` (128). Every marker a rollup writes fits. This corrects "comes to 26 KiB, down from about 1.2 MB" in the 2026-11-07 amendment, which held before `MAX_INPUTS` became 24.
+- **Correction.** The 2026-11-08 Amendment cites line ranges (`publication.rs:787-793`, `ingest/rollup_marker.rs:296-301`, `:56-59`, `ingest/publication_marker.rs:332-340`) that no longer point at the code they describe. Read them as `publication::scan_markers`, `rollup_marker::parse_input_name` and `rollup_marker::MAX_INPUTS`. `parse_input_name` now accepts the hours `00` to `23` only, through `env_dirs::parse_hour`.

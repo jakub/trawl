@@ -1,6 +1,6 @@
 # Syslog reads zone-less time in a configured zone, never the host's
 
-status: accepted (2026-10-02), prep record for #280
+status: accepted (2026-10-02), prep record for #280; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 An RFC 3164 frame carries wall-clock time with no zone and often no year: `Oct  2 14:00:05`. trawld reads that time in the zone of the host it runs on. syslog_loose defaults to `chrono::Local`, and nobody chose it: #126 kept it as a named residual risk. A deb install inherits the host's `/etc/localtime`. The container image has no tzdata, so it reads UTC. One sender therefore lands at different instants depending on how trawld was deployed. A sender in a different zone from trawld lands hours off on every deployment. This record makes the zone a setting.
 
@@ -45,3 +45,9 @@ An RFC 3164 frame carries wall-clock time with no zone and often no year: `Oct  
 **jiff**, rejected: a second datetime library, and its default reads the host's zone files. **tz-rs**, rejected: it needs tzdata in the image, and rules would vary by host. **Fixed offsets only**, rejected: wrong for half of every year in a zone with DST.
 
 **Patching syslog_loose upstream**, not needed. Calling it with UTC sidesteps both defects, and correctness does not wait on an upstream release.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **`SyslogPeerFault` carries no key, value, service, or zone, and the `allow_cidrs` index is the only thing it adds to the setting path.** A `sender_timezones` or `source_service_map` key is a peer address from the configuration, so a fault that held it would let `Display` or `Debug` echo configuration (ADR-0047).

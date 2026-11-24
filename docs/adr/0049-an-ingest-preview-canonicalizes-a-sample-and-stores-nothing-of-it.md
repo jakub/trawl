@@ -1,6 +1,6 @@
 # An ingest preview canonicalizes a sample as the HTTP door would and stores nothing of it
 
-status: accepted (2026-09-30), prep record for #200; amended (2026-10-01): the peer address is optional and the sample's source is documented; amended (2026-10-07): a body-limit refusal carries an envelope and a cut-off upload has its own message, see the Amendments
+status: accepted (2026-09-30), prep record for #200; amended (2026-10-01): the peer address is optional and the sample's source is documented; amended (2026-10-07): a body-limit refusal carries an envelope and a cut-off upload has its own message, see the Amendments; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 An operator who connects a new source learns what trawld did to its events only after they land. The `/api/v1/ingest` response reports a rejected event's index and message. It drops the typed reason and never reports repairs. A repair surfaces later, as a `_repairs` code on stored rows or as a `/metrics` counter. By then the events are permanent, because ingest has no idempotency key (ADR-0045). The doctors do not help: a doctor never ingests (ADR-0047). This record adds an **ingest preview**. It is a route that runs a bounded sample through the HTTP producer's canonicalization and returns what each event would become, without keeping any of it.
 
@@ -79,3 +79,9 @@ The 2026-10-07 amendment accepted that one request may hold its configured body 
 ## Amendment: route authority is judged before the body, 2026-10-25
 
 The 2026-10-07 amendment said that interactive handlers read a body before they check the route's own permission, so a raised `[server] max_request_body_bytes` let any key with a trawl permission make trawld hold that much per request. ADR-0059's security-review amendment of 2026-10-25 (#310) changed that order: every handler that reads a body names its permission with `policy::Authorized<needs::…>`, a request-parts extractor that axum runs before the body extractor, as `/ingest`'s `IngestKey` already did. Only a key holding the route's permission can make a request hold body memory. The attached capture judges its additional `investigation_write` after the body names an investigation, before anything is written. The preview's refusal order and the body ceiling arithmetic are otherwise unchanged.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **`trawl preview-ingest` sends the sample's bytes exactly as it read them from the file or standard input.** The server tells NDJSON from a JSON array by the first byte and reports each line that is not valid JSON with a parse reason. A CLI that parsed, trimmed, or re-encoded the sample would hide those outcomes, and the preview would no longer show what the HTTP door does with the collector's bytes. `read_sample` in `crates/trawl-cli/src/preview_ingest.rs` does no more than read.

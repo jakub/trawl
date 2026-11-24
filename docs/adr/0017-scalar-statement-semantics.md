@@ -1,6 +1,6 @@
 # Scalar statement semantics: one mirror per value domain, one instant per unit of output
 
-status: accepted (2026-08-18) — prep ruling record for #93; amended (2026-11-08), see the Amendment
+status: accepted (2026-08-18) — prep ruling record for #93; amended (2026-11-08), see the Amendment; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 The DSL evaluates in two lanes: DuckDB SQL (batch) and the in-memory Rust
 evaluator (SSE live tail, and the `rust_stages` batch tail behind
@@ -159,3 +159,30 @@ Considered, not adopted:
 Residual drifts, pinned as named tests and not fixed here: the evaluator sorts object keys and keeps the last of duplicate keys, where DuckDB keeps document order and the first. The two parsers disagree on trailing commas, `NaN`, `Infinity` and `1e999`. Batch casts a non-text document to JSON, where the evaluator answers null.
 
 Premise checks at `04603b8b` with DuckDB 1.5.6: `TRY_CAST(varchar AS JSON)` nulled exactly what `json_valid` rejected over 18 hand-picked inputs and 283 generated ones. `TRY(json_extract_string(CAST(CAST(x AS INTEGER) AS VARCHAR), '$'))` hid the conversion error, and the `TRY_CAST` form raised it. Selecting `TRY(json_extract_string(x,'$'))` and `CASE WHEN json_valid(x) THEN json_extract_string(x,'$') END` together raised `Malformed JSON`. A constant `$[` raised `Binder Error: JSON path error near '['` whatever the data. `json_keys('[1,2]')` gave `[]` and `json_array_length('{"a":1}')` gave 0. A dynamic wildcard path raised `JSON path cannot contain wildcards if the path is not a constant parameter`.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**The `now()` anchor**
+
+- **`EvalContext::at` truncates the instant to microseconds, and no other code truncates it.** `Utc::now` carries nanoseconds and a DuckDB TIMESTAMP holds microseconds. An untruncated anchor would compare against Rust values at one precision, render at another, and differ from the bound parameter.
+- **`EvalContext` holds the instant and nothing else.** A context that also carried pins, a source or a row would make "which context" a question with more than one answer. There must be exactly one context per unit of output.
+- **The batch `now()` placeholder is emitted as `CAST(? AS TIMESTAMP)` (`emitter/functions.rs`).** A bare placeholder leaves the result type to the driver's parameter inference, so `typeof(now())` would depend on the driver. DuckDB's own `now()` is TIMESTAMPTZ, so it is no alternative.
+- **A re-emission of one logical query inherits its `EmittedQuery::anchor` and never samples a second instant.** The executor's hot-only fallback and the `rust_stages` tail behind `extract kv` both take the first emission's anchor. A fresh sample would let one statement read two clocks.
+- **No evaluation path in `trawl-core` reads the clock. `EvalContext::capture` is the one place that calls `Utc::now`, and `tests/now_anchor_contract.rs` walks the source to enforce it, `#[cfg(test)]` code included.** An evaluator, filter or stage that samples its own clock reads a different instant from the one its caller anchored, and a value test written against a fresh clock cannot see that. Tests therefore build their contexts with `EvalContext::at` and a fixed instant.
+- **In the live lane, `stream::accept_event` takes one `EvalContext` for the search-stage filter and every stage after it.** The filter's `last=` window and a later `| where now() - _time < …` read the same instant, so an event cannot pass the window and then fail an equal age check because the clock moved. The caller captures one context per event. A bus batch is not a sampling boundary, as §3 already rules.
+- **A `timechart` row with no readable `_time` takes its bucket from the context it was admitted under, never from a fresh clock read.** Live, that is the event's instant. In the batch tail behind `extract kv`, it is the statement anchor. A fresh read could put the row in a span bucket that no other reader in the query names.
+- **`event_time_bucket` reads a `_time` string with the RFC 3339 parse first, and only a string that parse refuses goes through `compare::conformed_timestamp`.** Ingest accepts `_time` with that RFC 3339 parse, so every instant ingest keeps also buckets, including a leap second such as `2016-12-31T23:59:60Z`. The second reader takes the zoneless UTC text that the SQL prefix renders, so that text buckets where the SQL lane would put it.
+- **Correction.** The batch search stage's `last=` window does not read the anchor. `emitter/search.rs` emits `now()::TIMESTAMP - INTERVAL …`, which is DuckDB's own statement clock. This corrects §3's sentence "one instant per statement, captured in Rust and bound as a TIMESTAMP parameter" for `last=`: in batch, the window and `now()` are two clock reads, with no bound on the gap between them.
+
+**Arithmetic and conditions**
+
+- **Integer `+`, `-` and `*` in `eval.rs` are checked, and an overflow is NULL in every build profile. A DOUBLE overflow is unchecked and gives infinity.** DuckDB raises `Out of Range Error` on an integer overflow, and the streaming lane cannot raise an error for one event's data, so the evaluator nulls as §5's rule says. Unchecked integer arithmetic would panic in a debug build, which ends the whole SSE subscription, and wrap in a release build. DuckDB gives infinity for a DOUBLE overflow, so IEEE arithmetic already matches it.
+- **`and`, `or`, `not` and the streaming `where` gate read a value through `EvalValue::is_truthy`, not through DuckDB's boolean cast.** Only `if` and `case` read their condition through `read_condition`. A `where` decides whether a live tail matches, and a cast there would drop events that a standing alert matches today.
+- **A condition that `read_condition` cannot read makes the whole `if` or `case` call NULL. `case` reads its arms in order and stops at the first true arm, so an unreadable condition counts only when evaluation reaches it.** DuckDB raises a conversion error at that arm, and skipping the arm would answer where batch refuses the query.
+
+**JSON and search bounds**
+
+- **The evaluator's `json_extract` spells a number from `serde_json`'s `f64`, and the workspace does not enable `serde_json`'s `arbitrary_precision` feature.** DuckDB spells a number from its source text: it expands an exponent form below 1e21 and keeps every digit of an integer too wide for `u64`. Only `arbitrary_precision` keeps the source text, and it changes number handling across the whole ingest path. The difference is a residual that `JSON_NUMBER_SPELLING_RESIDUALS` in `duckdb_probe.rs` pins.
+- **`compare::bound_instant` refuses an instant whose `cast_text` does not read back through `literal_timestamp` as the same instant. A finite year above 9999 is refused for this reason, although `literal_timestamp` reads it.** chrono writes such a year as `+10000-…`, and `TRY_CAST(… AS TIMESTAMP)` reads that text as NULL. A bound that binds NULL would limit nothing.
