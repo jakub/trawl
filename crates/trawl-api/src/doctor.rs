@@ -4,12 +4,6 @@
 
 //! The report and exit contract every doctor shares (ADR-0047).
 //!
-//! `trawl doctor`, `trawld --doctor` and `trawl-web --doctor` each run
-//! named checks from their own vantage and hand back one [`Report`]. This
-//! module holds the shape of that report, the four check outcomes, and the
-//! verdict and exit-status rule. It carries no rendering: each binary renders
-//! the same [`Report`] as text or serializes it as the versioned JSON form.
-//!
 //! Optional fields serialize as `null`, never omitted, so a consumer of the
 //! JSON form sees every key on every check.
 
@@ -20,8 +14,6 @@ pub mod health;
 /// Version of the JSON report document. Bump it when the shape changes.
 pub const REPORT_VERSION: u32 = 1;
 
-/// One doctor run: what it checked, from where, and what it concluded.
-///
 /// The fields are private so the verdict always agrees with the checks:
 /// [`Report::new`] is the only constructor and computes it, nothing can
 /// change the checks afterwards, and deserializing recomputes the verdict
@@ -43,15 +35,10 @@ pub const REPORT_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ReportDocument")]
 pub struct Report {
-    /// Document version, always [`REPORT_VERSION`] when built here.
     version: u32,
-    /// Which process ran the checks.
     vantage: Vantage,
-    /// What the checks were aimed at.
     target: Target,
-    /// Conclusion over every check, computed by [`Report::new`].
     verdict: Verdict,
-    /// Every check, in the order the doctor ran them.
     checks: Vec<Check>,
     /// Report-level notes that never change an outcome, e.g. a version
     /// mismatch between client and server.
@@ -59,10 +46,6 @@ pub struct Report {
 }
 
 impl Report {
-    /// Build a report and compute its verdict from the checks' outcomes.
-    ///
-    /// This is the only constructor, so a report's verdict always agrees
-    /// with its checks.
     #[must_use]
     pub fn new(vantage: Vantage, target: Target, checks: Vec<Check>, notes: Vec<String>) -> Self {
         let verdict = Verdict::of(checks.iter().map(|check| &check.outcome));
@@ -76,25 +59,21 @@ impl Report {
         }
     }
 
-    /// Document version.
     #[must_use]
     pub const fn version(&self) -> u32 {
         self.version
     }
 
-    /// Which process ran the checks.
     #[must_use]
     pub const fn vantage(&self) -> Vantage {
         self.vantage
     }
 
-    /// What the checks were aimed at.
     #[must_use]
     pub const fn target(&self) -> &Target {
         &self.target
     }
 
-    /// Conclusion over every check.
     #[must_use]
     pub const fn verdict(&self) -> Verdict {
         self.verdict
@@ -106,7 +85,6 @@ impl Report {
         &self.checks
     }
 
-    /// Report-level notes.
     #[must_use]
     pub fn notes(&self) -> &[String] {
         &self.notes
@@ -127,9 +105,7 @@ struct ReportDocument {
 /// A report document whose stated verdict is not the one its checks give.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerdictMismatch {
-    /// The verdict the document states.
     pub stated: Verdict,
-    /// The verdict its checks give.
     pub computed: Verdict,
 }
 
@@ -180,7 +156,6 @@ pub enum Vantage {
     Web,
 }
 
-/// What a doctor run was aimed at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
     /// The origin checked (`scheme://host:port`), when one resolved.
@@ -190,8 +165,6 @@ pub struct Target {
     pub source: String,
 }
 
-/// One named check and its outcome.
-///
 /// Every string here is a name or a sanitized observation. None carries a
 /// key, a key prefix, a database URL, a certificate body, a response body or
 /// driver error text.
@@ -199,7 +172,6 @@ pub struct Target {
 pub struct Check {
     /// Stable check id, e.g. `api.tls` or `api.health.duckdb`.
     pub id: String,
-    /// What the doctor observed.
     pub outcome: Outcome,
     /// Why the outcome is what it is. For `not_sampled`, one of the stable
     /// codes in [`reason`].
@@ -228,7 +200,6 @@ pub enum Outcome {
     NotSampled,
 }
 
-/// Conclusion of a doctor run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
@@ -241,8 +212,6 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    /// Conclude over a set of outcomes. A failure outweighs a check that
-    /// could not look, and an empty set passes.
     pub fn of<'a>(outcomes: impl IntoIterator<Item = &'a Outcome>) -> Self {
         let mut verdict = Self::Pass;
         for outcome in outcomes {
@@ -415,7 +384,6 @@ mod tests {
                 Verdict::Incomplete,
                 3,
             ),
-            // A failure outweighs a check that could not look, in either order.
             (&[NotSampled, Failed], Verdict::Fail, 1),
             (&[Failed, NotSampled], Verdict::Fail, 1),
         ];
@@ -494,8 +462,6 @@ mod tests {
         }
     }
 
-    /// A document whose stated verdict disagrees with its checks is
-    /// refused; one that agrees round-trips unchanged.
     #[test]
     fn doctor_report_deserialize_checks_the_verdict() {
         let built = report(&[Outcome::Complete, Outcome::NotSampled]);
@@ -515,7 +481,6 @@ mod tests {
             );
         }
 
-        // An empty report passes, and must say so.
         let mut forged = serde_json::to_value(report(&[])).unwrap();
         forged["verdict"] = serde_json::Value::from("fail");
         assert!(serde_json::from_value::<Report>(forged).is_err());

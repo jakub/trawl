@@ -5,14 +5,6 @@
 //! What a doctor may show of trawld's health answer, and what each reported
 //! value means (ADR-0047).
 //!
-//! `trawl doctor`, `trawld --doctor` and `trawl-web --doctor` all read
-//! `GET /api/v1/health` and turn its `checks` map into one row per check
-//! name. They classify names and values here, so the vantages cannot
-//! disagree about which values pass. [`judge`] decides what a whole answer
-//! is, from its HTTP status and its body, and hands back a typed [`Answer`]
-//! that holds no text the server sent. Each binary builds its own rows from
-//! that answer: the wording of a row's next action belongs to the vantage.
-//!
 //! A server's check names and values are remote text. A name is shown only
 //! when [`is_health_key`] accepts it, and a value the doctor does not know is
 //! quoted only when [`is_quotable_value`] accepts it. An [`Answer`] carries
@@ -35,7 +27,7 @@ pub const DUCKDB_KEY: &str = "duckdb";
 
 /// The names of the checks `GET /api/v1/health` reports, in the order
 /// trawld fills them. [`judge`] gives an answer's check a place of its own
-/// only under one of these names (#269).
+/// only under one of these names.
 pub const HEALTH_CHECK_NAMES: [&str; 6] = [
     DUCKDB_KEY,
     "auth_db",
@@ -53,7 +45,6 @@ pub const BODY_MAX: usize = 64 * 1024;
 /// agree on what the refusal means.
 pub const REQUEST_LIMIT_REFUSED: &str = "probe refused: trawld at its request limit";
 
-/// A check name the report may show: `[a-z][a-z0-9_]{0,63}`.
 #[must_use]
 pub fn is_health_key(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -63,7 +54,6 @@ pub fn is_health_key(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// A check value the report may quote: `[a-z0-9_]{1,32}`.
 #[must_use]
 pub fn is_quotable_value(value: &str) -> bool {
     (1..=32).contains(&value.len())
@@ -72,7 +62,6 @@ pub fn is_quotable_value(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// What one reported health value means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueClass {
     /// `ok`: the server vouches for the check.
@@ -93,7 +82,6 @@ pub enum ValueClass {
 }
 
 impl ValueClass {
-    /// The outcome a row with this value has.
     #[must_use]
     pub const fn outcome(self) -> Outcome {
         match self {
@@ -104,8 +92,6 @@ impl ValueClass {
     }
 }
 
-/// Classify the value `value` that the health answer reports for the check
-/// `name`.
 #[must_use]
 pub fn classify(name: &str, value: &str) -> ValueClass {
     Reported::of(name, value).class()
@@ -116,25 +102,17 @@ pub fn classify(name: &str, value: &str) -> ValueClass {
 /// server sent is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reported {
-    /// `ok`.
     Ok,
-    /// `slow` on [`DUCKDB_KEY`].
     Slow,
-    /// `rollup_pending` on [`CORPUS_KEY`].
     RollupPending,
-    /// `restart_backlog` on [`CORPUS_KEY`].
     RestartBacklog,
-    /// `error`.
     Error,
-    /// `refusing`.
     Refusing,
     /// Any other value, or a corpus recovery value on another check.
     Unknown,
 }
 
 impl Reported {
-    /// The value `value` that the health answer reports for the check
-    /// `name`.
     #[must_use]
     pub fn of(name: &str, value: &str) -> Self {
         match value {
@@ -148,7 +126,6 @@ impl Reported {
         }
     }
 
-    /// What the value means.
     #[must_use]
     pub const fn class(self) -> ValueClass {
         match self {
@@ -168,9 +145,6 @@ pub const fn is_health_http_status(http: u16) -> bool {
     matches!(http, 200 | 503)
 }
 
-/// Whether the HTTP status `http` is the one trawld sends with a health
-/// body whose `status` is `status`: 200 with `ok` or `degraded`, 503 with
-/// `unavailable`.
 #[must_use]
 pub const fn status_agrees(http: u16, status: &HealthStatus) -> bool {
     matches!(
@@ -236,7 +210,6 @@ impl Health {
         self.http
     }
 
-    /// The body's `status`.
     #[must_use]
     pub const fn status(&self) -> &HealthStatus {
         &self.status
@@ -291,32 +264,20 @@ impl KeyAnswer {
         self.name
     }
 
-    /// The value the check reported.
     #[must_use]
     pub const fn value(&self) -> Reported {
         self.value
     }
 
-    /// The outcome of the check's row.
     #[must_use]
     pub const fn outcome(&self) -> Outcome {
         self.value.class().outcome()
     }
 }
 
-/// Judge a health answer that arrived whole with HTTP status `http` and
-/// body `body`.
-///
-/// The status comes first: one trawld's health endpoint never sends is
-/// [`Answer::Status`] whatever the body. A body past [`BODY_MAX`] is
-/// [`Answer::TooLarge`] and not parsed. A 200 or 503 health body with a
+/// A 200 or 503 health body with a
 /// `checks` map keeps one [`KeyAnswer`] per known check, so a 503 from a
-/// failed `DuckDB` probe fails its own row, unless its `status` disagrees
-/// with the HTTP status. A 503 `corpus_recovering` refusal is
-/// [`Answer::Recovering`], as [`classify`] maps the corpus recovery values,
-/// and a 503 `request_limit_reached` refusal is [`Answer::RequestLimit`].
-/// Either code under any other status, like any other body, is not
-/// trawld's health answer.
+/// failed `DuckDB` probe fails its own row.
 #[must_use]
 pub fn judge(http: u16, body: &[u8]) -> Answer {
     if !is_health_http_status(http) {
@@ -374,7 +335,6 @@ mod tests {
             ("duckdb", "ok", ValueClass::Ok, Outcome::Complete),
             ("duckdb", "error", ValueClass::Refused, Outcome::Failed),
             ("duckdb", "slow", ValueClass::Degraded, Outcome::Complete),
-            // Only the engine sample is slow; elsewhere the value is unknown.
             ("auth_db", "slow", ValueClass::Unknown, Outcome::Failed),
             ("corpus", "slow", ValueClass::Unknown, Outcome::Failed),
             (
@@ -395,7 +355,6 @@ mod tests {
                 ValueClass::Recovering,
                 Outcome::NotSampled,
             ),
-            // Only the corpus check recovers; elsewhere the value is unknown.
             (
                 "storage_db",
                 "restart_backlog",
@@ -431,10 +390,6 @@ mod tests {
         })
     }
 
-    /// Every way a health answer can come back, from any vantage: trawld's
-    /// body under each status it sends, its recovery refusal, and each way
-    /// an answer is not trawld's. No name or value the server sent survives
-    /// into the answer.
     #[test]
     #[expect(clippy::too_many_lines, reason = "one row per case")]
     fn health_answers_judge_status_and_body() {
@@ -467,15 +422,12 @@ mod tests {
                         ("data_path", Unknown),
                         ("duckdb", Ok),
                         ("ingest_capacity", Refusing),
-                        // Only the corpus check recovers.
                         ("storage_db", Unknown),
                     ],
                     0,
                 ),
                 Outcome::Complete,
             ),
-            // An unavailable answer fails the check itself, whatever its
-            // checks say, and keeps them.
             (
                 503,
                 br#"{"status":"unavailable","version":"0.9.0","checks":{
@@ -503,7 +455,6 @@ mod tests {
                 health(200, Healthy, false, &[("duckdb", Ok)], 0),
                 Outcome::Complete,
             ),
-            // Names trawld does not report are counted, never kept.
             (
                 200,
                 br#"{"status":"ok","version":"x","checks":{"duckdb":"ok",
@@ -512,7 +463,6 @@ mod tests {
                 health(200, Healthy, true, &[("duckdb", Ok)], 4),
                 Outcome::Complete,
             ),
-            // The status and the body disagree.
             (
                 200,
                 br#"{"status":"unavailable","version":"x","checks":{}}"#,
@@ -538,7 +488,6 @@ mod tests {
                 Answer::Foreign,
                 Outcome::Failed,
             ),
-            // The recovery refusal, only as a 503.
             (
                 503,
                 br#"{"error":{"code":"corpus_recovering","message":"not yet"}}"#,
@@ -557,7 +506,6 @@ mod tests {
                 Answer::Foreign,
                 Outcome::Failed,
             ),
-            // Garbage.
             (200, b"<html>hello</html>", Answer::Foreign, Outcome::Failed),
             (503, b"", Answer::Foreign, Outcome::Failed),
             (200, &[0xff, 0xfe, 0x00], Answer::Foreign, Outcome::Failed),
@@ -567,14 +515,12 @@ mod tests {
                 Answer::Foreign,
                 Outcome::Failed,
             ),
-            // A body past the cap is not parsed, even a well-formed one.
             (
                 200,
                 oversized.as_bytes(),
                 Answer::TooLarge,
                 Outcome::NotSampled,
             ),
-            // A status trawld never sends decides alone, before the body.
             (
                 404,
                 br#"{"status":"ok","version":"x","checks":{}}"#,
@@ -601,7 +547,6 @@ mod tests {
             }
         }
 
-        // A body at the cap exactly is read.
         let padded = |len: usize| {
             let mut body = br#"{"status":"ok","version":"x","checks":{"duckdb":"ok"}}"#.to_vec();
             body.resize(len, b' ');
@@ -613,7 +558,6 @@ mod tests {
         );
         assert_eq!(judge(200, &padded(BODY_MAX + 1)), Answer::TooLarge);
 
-        // Every per-check outcome follows the shared classifier.
         let Answer::Health(degraded) = judge(
             200,
             br#"{"status":"degraded","checks":{"duckdb":"ok","auth_db":"error",
@@ -641,9 +585,6 @@ mod tests {
         assert!(!degraded.has_version());
     }
 
-    /// A starved engine answers 200 `degraded` with `duckdb: slow` (ADR-0056).
-    /// The doctor reads that as trawld's own health answer, with the engine
-    /// row degraded and not failed, and it keeps the body's other checks.
     #[test]
     fn doctor_health_accepts_slow() {
         let Answer::Health(slow) = judge(
@@ -668,7 +609,6 @@ mod tests {
             ]
         );
         assert_eq!(Reported::Slow.class(), ValueClass::Degraded);
-        // `slow` rides only a 200: a 503 body that says it disagrees.
         assert_eq!(
             judge(
                 503,
@@ -676,7 +616,6 @@ mod tests {
             ),
             Answer::Disagrees
         );
-        // Another check reporting `slow` is a value nobody knows.
         let Answer::Health(odd) = judge(
             200,
             br#"{"status":"degraded","version":"x","checks":{"storage_db":"slow"}}"#,
@@ -687,11 +626,6 @@ mod tests {
         assert_eq!(odd.checks()[0].outcome(), Outcome::Failed);
     }
 
-    /// trawld's request-limit refusal, under the regular or the probe
-    /// message, is a capacity refusal: not sampled, with no checks, and
-    /// not a foreign answer. Only the 503 with the typed code is; the
-    /// same code under another status, another code, and an unrelated
-    /// body stay what they were (ADR-0054).
     #[test]
     fn health_request_limit_refusal_is_not_sampled_and_not_foreign() {
         let regular = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
@@ -713,12 +647,9 @@ mod tests {
             "request_limit_reached"
         );
 
-        // The code alone decides nothing: under a status trawld's health
-        // endpoint does not send it with, the answer is what it was.
         assert_eq!(judge(200, regular), Answer::Foreign);
         assert_eq!(judge(429, regular), Answer::Status(429));
         assert_eq!(judge(500, regular), Answer::Status(500));
-        // Another code, an unknown one, and an unrelated body are foreign.
         for body in [
             br#"{"error":{"code":"internal_error","message":"x"}}"#.as_slice(),
             br#"{"error":{"code":"request_limit","message":"x"}}"#,
@@ -751,7 +682,6 @@ mod tests {
         }
         assert!(is_health_http_status(200) && is_health_http_status(503));
         assert!(!is_health_http_status(204) && !is_health_http_status(502));
-        // Every name trawld reports is a key the report may show.
         assert!(HEALTH_CHECK_NAMES.into_iter().all(is_health_key));
     }
 

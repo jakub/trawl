@@ -4,31 +4,21 @@
 
 //! Wire types for `GET /api/v1/capabilities` (ADR-0058).
 //!
-//! One answer a client plans around before it sends anything: the server
-//! version, the DSL this server parses, the bounds a query or capture runs
-//! under, the capture quotas and admission numbers, the origin for links to
-//! Search, the evidence policy of investigations, and the health report. Any key with a trawl grant reads it. The
-//! server answers from its own process: the numbers are the configuration
-//! it applied at boot, and the DSL lists are trawl-core's grammar.
+//! Any key with a trawl grant reads it. The server answers from its own
+//! process: the numbers are the configuration it applied at boot.
 
 use serde::{Deserialize, Serialize};
 
 use crate::HealthResponse;
 
-/// Response body for `GET /api/v1/capabilities`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilitiesResponse {
     /// The trawld package version, such as `"0.9.3"`.
     pub version: String,
-    /// The DSL this server parses.
     pub dsl: DslCapabilities,
-    /// The bounds a query and a capture run under.
     pub bounds: CapabilityBounds,
-    /// The captured-result quotas (ADR-0057).
     pub quotas: CaptureQuotas,
-    /// The capture admission numbers, and this key's request rate.
     pub admission: CaptureAdmission,
-    /// The evidence clocks and budgets of investigations (ADR-0059).
     pub evidence: EvidencePolicy,
     /// `[server] link_origin`: the origin links to Search are built on, in
     /// its normalized form, such as `"https://trawl.example.com"`. `null`
@@ -189,8 +179,6 @@ mod tests {
         }
     }
 
-    /// An unset origin and an unlimited rate are written as `null`, never
-    /// left out: a client reads "not configured", not "an older server".
     #[test]
     fn unset_options_serialize_as_null() {
         let json = serde_json::to_value(response(None)).unwrap();

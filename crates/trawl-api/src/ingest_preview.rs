@@ -4,13 +4,6 @@
 
 //! Wire types for the ingest preview, `POST /api/v1/ingest/preview`
 //! (ADR-0049).
-//!
-//! A preview canonicalizes a sample exactly as `POST /api/v1/ingest` would
-//! and stores nothing of it. The response reports every input position in
-//! input order: an accepted event with its canonical form, repair codes and
-//! lineage, or a rejected one with the same `reason` and `message` real
-//! ingest gives. Codes travel as their wire strings (`env.defaulted`,
-//! `missing_service`), the spellings the events reference documents.
 
 use std::net::Ipv4Addr;
 
@@ -26,19 +19,16 @@ pub const MAX_PREVIEW_EVENTS: usize = 500;
 /// can never be mistaken for a real sender.
 pub const PLACEHOLDER_PEER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 
-/// The whole preview report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreviewResponse {
     /// The producer profile the sample was read as. Always `"http"`.
     pub producer: String,
-    /// The peer the sample was canonicalized against.
     pub peer: PreviewPeer,
     /// The one arrival time every event shares, RFC 3339 UTC at microsecond
     /// precision: what `_ingested` holds and what fills a missing `_time`.
     pub arrival: String,
     /// The effective derivation lists the HTTP producer applies.
     pub derivation: PreviewDerivation,
-    /// Accepted positions.
     pub accepted: usize,
     /// Rejected positions, parse failures included.
     pub rejected: usize,
@@ -46,7 +36,6 @@ pub struct PreviewResponse {
     pub events: Vec<PreviewEvent>,
 }
 
-/// The peer address a preview used.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewPeer {
     /// The canonical address: the given `peer_ip`, or [`PLACEHOLDER_PEER`].
@@ -69,7 +58,6 @@ pub struct PreviewDerivation {
     pub severity_from: Vec<SeveritySourceSpec>,
 }
 
-/// One configured severity source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeveritySourceSpec {
     /// The wire key read.
@@ -78,7 +66,6 @@ pub struct SeveritySourceSpec {
     pub dialect: String,
 }
 
-/// What became of one input position.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum PreviewEvent {
@@ -130,9 +117,7 @@ fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, 
 /// An accepted event's lineage, as the canonicalizer recorded it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewLineage {
-    /// Where `_time` came from.
     pub time: TimeLineage,
-    /// Where `_severity` came from, or why it is absent.
     pub severity: SeverityLineage,
     /// Field changes in decision order, one per step.
     pub fields: Vec<FieldChangeWire>,
@@ -143,10 +128,7 @@ pub struct PreviewLineage {
 #[serde(tag = "from", rename_all = "snake_case")]
 pub enum TimeLineage {
     /// The first present `time_from` source parsed.
-    Field {
-        /// The source field.
-        field: String,
-    },
+    Field { field: String },
     /// The arrival time filled `_time`: `time.from_ingest` when no source
     /// was present, `time.unparseable` when `unparseable` names one, and
     /// `time.ahead_of_arrival` when `ahead_of_arrival` names one. At most
@@ -169,7 +151,6 @@ pub enum TimeLineage {
 pub enum SeverityLineage {
     /// `field` mapped and fed `_severity`.
     Field {
-        /// The source field.
         field: String,
         /// Earlier sources that were present but mapped to nothing, in
         /// consultation order.
@@ -184,12 +165,10 @@ pub enum SeverityLineage {
     },
 }
 
-/// One field-level decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldChangeWire {
     /// The field as the deciding step saw it.
     pub field: String,
-    /// What the step did.
     pub change: FieldChangeKind,
     /// The new name, for a rename.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,7 +291,6 @@ mod tests {
         );
         assert_eq!(round_trip(&invalid), invalid);
 
-        // A `null` array element is present input, not a parse failure.
         let null_element = PreviewEvent::Rejected {
             index: 0,
             input: Some(Value::Null),

@@ -5,12 +5,6 @@
 //! The display zone: how a native client shows the UTC instants trawld
 //! answers with.
 //!
-//! The zone is presentation only. The server always answers in UTC, and a
-//! client converts each instant as it prints it. `local` is the zone of the
-//! machine that runs the client, taken at each instant, so a client follows
-//! daylight saving time: the two 02:30s of a fall-back night print with
-//! different offsets.
-//!
 //! The wire spelling of a timestamp is RFC 3339 with six fraction digits,
 //! `Z` at offset zero and `±HH:MM` otherwise. `DuckDB` holds years from
 //! 290309 BC to 294247 AD, so a year outside 0000-9999 is written in
@@ -29,7 +23,6 @@ use crate::value::{ColumnType, QueryResult, Value};
 /// of its count. They are not instants and spell `infinity` and
 /// `-infinity` on the wire.
 pub const TIMESTAMP_INFINITY: i64 = i64::MAX;
-/// See [`TIMESTAMP_INFINITY`].
 pub const TIMESTAMP_NEG_INFINITY: i64 = -i64::MAX;
 
 const MICROS_PER_SEC: i128 = 1_000_000;
@@ -40,11 +33,9 @@ const CYCLE_MICROS: i128 = 146_097 * MICROS_PER_DAY;
 /// Where a native client shows instants: `ui.timezone`, parsed once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayZone {
-    /// Offset zero.
     Utc,
     /// The zone of the machine that runs the client, at each instant.
     Local,
-    /// One offset for every instant.
     Fixed(FixedOffset),
 }
 
@@ -69,10 +60,6 @@ impl std::error::Error for ZoneRefusal {}
 impl FromStr for DisplayZone {
     type Err = ZoneRefusal;
 
-    /// `UTC` or `local` in any case, or a fixed offset spelled exactly
-    /// `±HH:MM` in ASCII digits, hours 00-23 and minutes 00-59. Whitespace
-    /// around the value is ignored. Zone names such as `Europe/Berlin` are
-    /// refused: `local` already follows the machine's zone rules.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let value = s.trim();
         if value.eq_ignore_ascii_case("utc") {
@@ -89,7 +76,6 @@ impl FromStr for DisplayZone {
     }
 }
 
-/// A strict `±HH:MM`: six ASCII bytes, nothing else.
 fn fixed_offset(value: &str) -> Option<FixedOffset> {
     let &[sign, h1, h2, b':', m1, m2] = value.as_bytes() else {
         return None;
@@ -109,7 +95,6 @@ fn fixed_offset(value: &str) -> Option<FixedOffset> {
 }
 
 impl fmt::Display for DisplayZone {
-    /// The canonical spelling: `UTC`, `local`, or `±HH:MM`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Utc => f.write_str("UTC"),
@@ -160,11 +145,8 @@ fn utc() -> FixedOffset {
 
 /// An instant in the wire's spelling, at `offset`.
 ///
-/// Byte for byte chrono's `to_rfc3339_opts(SecondsFormat::Micros, true)`
-/// at a whole-minute offset where chrono's calendar reaches, and the same form for every other
-/// count `DuckDB` holds; [`TIMESTAMP_INFINITY`] and
-/// [`TIMESTAMP_NEG_INFINITY`] spell `infinity` and `-infinity`. The offset
-/// is applied and written in whole minutes, the precision the wire spells.
+/// The offset is applied and written in whole minutes, the precision the
+/// wire spells.
 #[must_use]
 pub fn wire_timestamp(micros: i64, offset: FixedOffset) -> String {
     match micros {
@@ -332,7 +314,6 @@ pub enum Presented {
 }
 
 impl Presented {
-    /// The text, whichever way it came.
     #[must_use]
     pub fn text(&self) -> &str {
         match self {
@@ -357,9 +338,7 @@ pub fn present(wire: &str, zone: DisplayZone) -> Option<Presented> {
 }
 
 /// `wire` as a terminal table shows it in `zone`
-/// (`2026-10-25 02:30:00 +02:00`), each instant with its own offset. An
-/// instant the zone cannot place shows in UTC followed by
-/// [`NOT_CONVERTED`]. `None` when `wire` is not a wire timestamp.
+/// (`2026-10-25 02:30:00 +02:00`), each instant with its own offset.
 #[must_use]
 pub fn present_human(wire: &str, zone: DisplayZone) -> Option<String> {
     let micros = wire_micros(wire)?;
@@ -410,10 +389,8 @@ fn cell_text(ty: &ColumnType, value: &Value, zone: DisplayZone) -> String {
 /// Re-spell every `timestamp` cell of `result`, in lists at any depth too,
 /// in `zone`, for machine output such as JSON and CSV.
 ///
-/// Only columns typed `timestamp` change: text that merely looks like a
-/// time stays as sent. An instant the zone cannot place keeps its UTC text,
-/// which says so with its `Z`; machine output carries no marker a parser
-/// would trip on. A cell that is not a wire timestamp stays as it came.
+/// An instant the zone cannot place keeps its UTC text, which says so
+/// with its `Z`; machine output carries no marker a parser would trip on.
 pub fn apply_zone(result: &mut QueryResult, zone: DisplayZone) {
     let QueryResult { columns, rows } = result;
     for row in rows {
@@ -525,7 +502,6 @@ mod display_zone_grammar {
         }
     }
 
-    /// The canonical spelling parses back to the same zone.
     #[test]
     fn canonical_spelling_round_trips() {
         for minutes in -(23 * 60 + 59)..=(23 * 60 + 59) {
@@ -552,7 +528,6 @@ mod typed_timestamp_presentation_domain {
     const DUCKDB_MIN: i64 = -9_223_372_022_400_000_000;
     const DUCKDB_MAX: i64 = 9_223_372_036_854_775_806;
 
-    /// The wire spelling the engine has always written, case for case.
     #[test]
     fn wire_spelling_matches_the_engine_cases() {
         let at = 1_705_312_800_000_000; // 2024-01-15T10:00:00Z
@@ -583,7 +558,6 @@ mod typed_timestamp_presentation_domain {
         }
     }
 
-    /// Wherever chrono's calendar reaches, the spelling is chrono's own.
     #[test]
     fn wire_spelling_is_chronos_inside_its_calendar() {
         let min = DateTime::<Utc>::MIN_UTC.timestamp_micros();
@@ -624,8 +598,6 @@ mod typed_timestamp_presentation_domain {
         }
     }
 
-    /// Every count, at every offset, reads back to itself, the `i64`
-    /// extremes and the offsets that carry a reading past them included.
     #[test]
     fn wire_spelling_round_trips_across_the_domain() {
         let counts = [
@@ -654,7 +626,6 @@ mod typed_timestamp_presentation_domain {
                 assert_eq!(wire_micros(&text), Some(micros), "{text}");
             }
         }
-        // The other wire, without a fraction or with a short one, reads too.
         assert_eq!(
             wire_micros("2026-02-18T12:00:00Z"),
             wire_micros("2026-02-18T12:00:00.000000Z")
@@ -688,9 +659,6 @@ mod typed_timestamp_presentation_domain {
         assert!(wire_micros("+10000-02-29T00:00:00.000000Z").is_some());
     }
 
-    /// A fixed offset converts every timestamp cell, lists at any depth
-    /// included, and keeps microseconds, the infinities and expanded
-    /// years; a `string` column that looks like time stays as sent.
     #[test]
     fn apply_zone_converts_typed_timestamps_only() {
         let timestamp_list = ColumnType::List {
@@ -777,8 +745,6 @@ mod typed_timestamp_presentation_domain {
         assert_eq!(at_minus_eight.rows[0][1], s("2024-01-15T10:00:00.000000Z"));
     }
 
-    /// The human form: each instant with its own offset, the fraction's
-    /// trailing zeros gone, the infinities as they stand.
     #[test]
     fn human_text_carries_each_offset() {
         let zone = fixed(19_800);
@@ -829,10 +795,6 @@ mod typed_timestamp_presentation_domain {
         );
     }
 
-    /// `local` places every instant inside chrono's calendar at the
-    /// machine's offset for that instant; past it, the instant stays UTC,
-    /// marked in human text and plain in machine output. No assumption
-    /// about the machine's zone.
     #[test]
     fn local_beyond_chronos_calendar_is_not_converted() {
         let beyond = "+294247-01-10T04:00:54.775806Z";

@@ -3,18 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Wire types for captured results (ADR-0057).
-//!
-//! `POST /api/v1/results` runs one query and keeps its answer as an
-//! immutable, typed, expiring result; `GET /api/v1/results/{id}` pages its
-//! rows, `GET /api/v1/results/{id}/cells/{row}/{column}` reads one cell by
-//! byte range, and `GET /api/v1/results` lists the caller's own unexpired
-//! captures. A captured row is the pair (result id, 0-based row number):
-//! a row of a frozen copy, never an event identity.
-//!
-//! Columns are positional, so duplicate display names survive. Every page
-//! carries the result's metadata ([`CapturedResult`]) so a client never
-//! reads rows without the bounds, the executed text and the expiry that
-//! say what they are.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -22,99 +10,53 @@ use crate::investigations::{Activity, Attach, InvestigationId};
 use crate::value::{ColumnType, QueryResult, Value, land_cell, serialize_cell};
 use crate::{PaginationMeta, QueryExecution};
 
-// -- request -----------------------------------------------------------------
-
 /// Request body for `POST /api/v1/results`.
-///
-/// The bounds come from one source: either `window` or the DSL's own
-/// `last=`, `earliest=` and `latest=` clauses in `query`. A request that
-/// carries both is refused; one that carries neither captures the last 15
-/// minutes. `from saved` takes no bounds and no window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureRequest {
-    /// The trawl DSL query text, as the caller wrote it.
     pub query: String,
-    /// A structured time window, instead of time clauses in the text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<CaptureWindow>,
-    /// The investigation to attach the capture to (ADR-0059). Its result
-    /// is then kept as evidence, and the response carries the other
-    /// actors' activity since `seen_seq`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation: Option<Attach>,
 }
 
 /// A structured capture window. `last` is a DSL duration such as `1h`.
 /// `earliest` and `latest` are RFC 3339 instants with an offset, such as
-/// `2026-10-23T09:00:00Z`; the server accepts no other spelling. The server
-/// resolves the window once, at execution time, to a half-open
-/// `[earliest, latest)` in microseconds.
+/// `2026-10-23T09:00:00Z`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureWindow {
-    /// The inclusive start, as an RFC 3339 instant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub earliest: Option<String>,
-    /// The exclusive end, as an RFC 3339 instant. An open end closes at the
-    /// execution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest: Option<String>,
-    /// A duration ending at the execution time, as a DSL duration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<String>,
 }
 
-/// Seconds either side of the focus row a `context` read covers by
-/// default.
 pub const CONTEXT_DEFAULT_SECONDS: u64 = 30;
-/// Strictly earlier, or strictly later, rows a `context` read returns by
-/// default.
 pub const CONTEXT_DEFAULT_SIDE_ROWS: u64 = 10;
-/// The most strictly earlier, or strictly later, rows a `context` read
-/// returns.
 pub const CONTEXT_MAX_SIDE_ROWS: u64 = 50;
-/// The most rows sharing the focus row's `_time` a `context` read returns.
 pub const CONTEXT_SAME_TIME_ROWS: u64 = 20;
-/// What every `context` answer says about itself.
 pub const CONTEXT_STATEMENT: &str = "new read; equal timestamps establish no order";
-/// The most group fields a `compare` read accepts.
 pub const COMPARE_MAX_GROUP_FIELDS: usize = 2;
-/// The `min_count` a `compare` read applies by default.
 pub const COMPARE_DEFAULT_MIN_COUNT: u64 = 1;
 
 /// Request body for `POST /api/v1/results/context` (ADR-0058).
-///
-/// The focus row is captured row `row` of result `result_id`. The read
-/// covers `seconds` either side of the focus row's `_time` on the focus
-/// keys `scope` names, with the values the focus row holds. A focus row
-/// lacking `_time` or a key the scope names is refused with
-/// `focus_incomplete`, never widened.
-///
-/// `before` and `after` are at most [`CONTEXT_MAX_SIDE_ROWS`]; the server
-/// refuses more.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextRequest {
-    /// The captured result holding the focus row.
     pub result_id: String,
-    /// The focus row's 0-based captured row number.
     pub row: u64,
-    /// Which focus keys constrain the read.
     #[serde(default)]
     pub scope: ContextScope,
-    /// Seconds either side of the focus row's `_time`.
     #[serde(default = "context_default_seconds")]
     pub seconds: u64,
-    /// Strictly earlier rows to return.
     #[serde(default = "context_default_side_rows")]
     pub before: u64,
-    /// Strictly later rows to return.
     #[serde(default = "context_default_side_rows")]
     pub after: u64,
-    /// The investigation to attach the read to (ADR-0059), as a search
-    /// capture attaches: its result is then kept as evidence, and the
-    /// response carries the other actors' activity since `seen_seq`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation: Option<Attach>,
 }
@@ -127,73 +69,46 @@ fn context_default_side_rows() -> u64 {
     CONTEXT_DEFAULT_SIDE_ROWS
 }
 
-/// Which of the focus row's keys a `context` read constrains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextScope {
-    /// The focus row's `env` and `host`.
     #[default]
     EnvAndHost,
-    /// The focus row's `env` alone, across its hosts.
     Env,
-    /// The focus row's `host` alone, across its envs.
     Host,
 }
 
 /// Request body for `POST /api/v1/results/sightings` (ADR-0058).
-///
-/// One literal, searched once as a quoted text search over `message` and
-/// `_raw`. `window` defaults to the last 24 hours and spans at most 7
-/// days. `fields` restricts which fields the literal is attributed to in
-/// the captured rows; it never selects a different population.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SightingsRequest {
     /// The literal: non-empty, no NUL, at most 1024 bytes.
     pub literal: String,
-    /// The bounds, as a capture window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<CaptureWindow>,
     /// The fields attribution is restricted to; empty attributes to every
-    /// field. At most 16 distinct names under the DSL field fold, none of
-    /// them `_raw`, `sighting_count`, `sighting_first` or `sighting_last`.
+    /// field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
-    /// The investigation to attach the read to (ADR-0059), as a search
-    /// capture attaches: its result is then kept as evidence, and the
-    /// response carries the other actors' activity since `seen_seq`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation: Option<Attach>,
 }
 
 /// Request body for `POST /api/v1/results/compare` (ADR-0058).
-///
-/// One statement scans the hull of both windows and labels each event's
-/// membership. `baseline` defaults to the window of equal duration
-/// immediately before `foreground`. The windows are half-open and may
-/// touch; overlapping windows are refused with `windows_overlap`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompareRequest {
-    /// DSL search tokens: no pipe stage, and no time clause at any depth,
-    /// under `NOT` or in a group included.
+    /// DSL search tokens: no pipe stage, and no time clause at any depth.
     pub filter: String,
-    /// The window under question.
     pub foreground: CaptureWindow,
-    /// The window it is compared against. Absent, the window of equal
-    /// duration immediately before `foreground`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<CaptureWindow>,
-    /// At most [`COMPARE_MAX_GROUP_FIELDS`] distinct fields to group by.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_by: Vec<String>,
     /// A group is listed when either window counts at least this many
     /// events for it.
     #[serde(default = "compare_default_min_count")]
     pub min_count: u64,
-    /// The investigation to attach the read to (ADR-0059), as a search
-    /// capture attaches: its result is then kept as evidence, and the
-    /// response carries the other actors' activity since `seen_seq`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation: Option<Attach>,
 }
@@ -202,77 +117,49 @@ fn compare_default_min_count() -> u64 {
     COMPARE_DEFAULT_MIN_COUNT
 }
 
-// -- enums -------------------------------------------------------------------
-
-/// Which read made a capture: a plain search, or one of the correlation
-/// reads (ADR-0058).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureKind {
-    /// `POST /api/v1/results`.
     #[default]
     Search,
-    /// `POST /api/v1/results/context`.
     Context,
-    /// `POST /api/v1/results/sightings`.
     Sightings,
-    /// `POST /api/v1/results/compare`.
     Compare,
 }
 
 impl CaptureKind {
-    /// Whether this is [`Self::Search`], which the wire leaves unspelled.
     #[must_use]
     pub fn is_search(&self) -> bool {
         *self == Self::Search
     }
 }
 
-/// Where a capture's rows came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultSource {
-    /// The corpus, read inside the capture's resolved bounds.
     Live,
-    /// A stored report run, read through `from saved`. A stored source has
-    /// no bounds: the run's own window decided what it holds.
     Stored,
 }
 
-/// Which rule kept the captured rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultShape {
-    /// Events in `_time DESC, _ingested DESC` order. Past the cap the most
-    /// recent rows are kept and the rest are counted in `total_rows`.
     Events,
-    /// A whole answer (an aggregate, a projection, a stored run). Never cut:
-    /// a whole result past the cap is refused with `result_too_large`.
     Whole,
 }
 
-/// A capture's lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultState {
-    /// Owned by the key that made it and readable until `expires_at`.
     Temporary,
-    /// Attached to an investigation and kept under its evidence policy
-    /// (ADR-0059). Has no `expires_at`.
     Kept,
-    /// Past its deadline. Reads answer `result_gone` while the tombstone
-    /// lasts.
     Expired,
-    /// Removed to bring its key back inside a lowered quota. Reads answer
-    /// `result_gone`.
     Pruned,
 }
 
-/// How one column is stored in the capture's parquet file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoredAs {
-    /// In the engine's own parquet type for the column's [`ColumnType`].
     Native,
     /// As a VARCHAR holding each cell's #214 wire JSON, because no single
     /// engine type holds the column: it is `mixed`, or it is an integer
@@ -281,25 +168,14 @@ pub enum StoredAs {
     WireText,
 }
 
-// -- metadata ----------------------------------------------------------------
-
-/// One column of a captured result: its display name, its type and how
-/// the file stores it.
-///
-/// The type is flattened beside the name the way [`crate::value::Column`]
-/// spells it: `{"name":"status","type":"integer","stored_as":"native"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultColumn {
-    /// The display name. Not unique: columns are addressed by position.
     pub name: String,
-    /// The column's wire type; every cell of the column is encoded under it.
     #[serde(flatten)]
     pub ty: ColumnType,
-    /// How the parquet file stores the column.
     pub stored_as: StoredAs,
 }
 
-/// One distinct value of a column and how many captured rows hold it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValueCount {
     /// The value, as a self-tagged cell (the `mixed` cell encoding:
@@ -308,19 +184,12 @@ pub struct ValueCount {
     /// the column says whether it is a timestamp.
     #[serde(with = "tagged_cell")]
     pub value: Value,
-    /// Captured rows holding the value.
     pub count: u64,
 }
 
-/// Facts about one column over the captured rows, computed once at capture
-/// so a reader can see what a column holds without paging it.
-///
-/// Values are self-tagged cells, as in [`ValueCount`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnFacts {
-    /// Captured rows whose cell in this column is null.
     pub nulls: u64,
-    /// Distinct non-null values, counted up to a small cap.
     pub distinct: u64,
     /// Whether counting stopped at the cap, so `distinct` is a lower bound.
     pub distinct_capped: bool,
@@ -344,129 +213,74 @@ pub struct ColumnFacts {
     pub max: Option<Value>,
 }
 
-/// The metadata of one captured result, carried by every capture, list and
-/// page answer.
-///
 /// Timestamps are RFC 3339 UTC with microseconds. `truncated` is
 /// `captured_rows < total_rows`; the server sets both from the same
 /// execution, and the type does not enforce the relation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapturedResult {
-    /// The result id: 32 lowercase hex digits, a random 128-bit value never
-    /// reused.
+    /// The result id: 32 lowercase hex digits.
     pub id: String,
-    /// The query text as the caller sent it.
     pub query: String,
-    /// The text that ran: the caller's text with the resolved bounds
-    /// spliced in and, for an event-shaped result, the imposed
-    /// `sort -_time, -_ingested`.
     pub executed_query: String,
-    /// Where the rows came from.
     pub source: ResultSource,
-    /// Which rule kept the rows.
     pub shape: ResultShape,
-    /// The resolved inclusive start. Absent for a `stored` source, which
-    /// has no bounds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub earliest: Option<String>,
-    /// The resolved exclusive end. Absent for a `stored` source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest: Option<String>,
-    /// When the result was committed.
     pub created_at: String,
-    /// When a temporary result stops being readable. Absent once kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
-    /// The lifecycle state.
     pub state: ResultState,
-    /// The columns in stored positional order.
     pub columns: Vec<ResultColumn>,
-    /// Rows the file holds.
     pub captured_rows: u64,
-    /// Rows the executed query produced before the capture cut, exact,
-    /// from the same execution.
     pub total_rows: u64,
-    /// Bytes of #214 wire JSON over every captured cell, without framing
-    /// (the cap's measure, [`crate::value::wire_cell_len`]).
     pub wire_bytes: u64,
-    /// Bytes of the stored parquet file; zero for a result with no
-    /// columns, which has no file. A correlation read's facts document is
-    /// not counted here, though the quota charges it with the file.
     pub file_bytes: u64,
-    /// Whether rows were cut: `captured_rows < total_rows`.
     pub truncated: bool,
-    /// Facts per column, positional with `columns`.
     pub column_facts: Vec<ColumnFacts>,
-    /// The stored file's layout version.
     pub format_version: u16,
-    /// Which read made the capture. Absent on the wire for a search, so a
-    /// search capture is spelled as it was before the correlation reads.
     #[serde(default, skip_serializing_if = "CaptureKind::is_search")]
     pub kind: CaptureKind,
-    /// The facts a correlation read computed, carried on every answer
-    /// about the capture. Absent for a search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation: Option<Correlation>,
-    /// The investigation the result is kept for, once it is kept evidence
-    /// (ADR-0059).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation_id: Option<InvestigationId>,
 }
 
-// -- correlation facts -------------------------------------------------------
-
-/// What a correlation read established beside its captured rows, tagged
-/// by `kind` (ADR-0058).
-///
 /// Counts here are JSON numbers: the server computes them, they are not
 /// result cells.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Correlation {
-    /// A `context` read.
     Context(ContextFacts),
-    /// A `sightings` read.
     Sightings(SightingsFacts),
-    /// A `compare` read.
     Compare(CompareFacts),
 }
 
 /// A half-open range `[start, end)` of 0-based captured row numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RowRange {
-    /// The first row in the range.
     pub start: u64,
-    /// One past the last row; equal to `start` for an empty range.
     pub end: u64,
 }
 
-/// The facts of a `context` read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextFacts {
-    /// The row the read was centred on.
     pub focus: FocusRow,
-    /// The constraints the read applied.
     pub scope_used: ScopeUsed,
-    /// Where each group sits in the captured rows.
     pub groups: ContextGroups,
-    /// Always [`CONTEXT_STATEMENT`]: the rows are a new read, and rows
-    /// sharing a timestamp are in no meaningful order.
+    /// Always [`CONTEXT_STATEMENT`].
     pub statement: String,
 }
 
-/// The focus row of a `context` read, as the request named it and the
-/// values the read took from it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FocusRow {
-    /// The captured result holding the focus row.
     pub result_id: String,
-    /// The focus row's 0-based captured row number.
     pub row: u64,
     /// The focus row's `_time`, RFC 3339 UTC with microseconds.
     pub time: String,
-    /// The focus row's `env`, null when the row has none.
     pub env: Option<String>,
-    /// The focus row's `host`, null when the row has none.
     pub host: Option<String>,
 }
 
@@ -474,45 +288,31 @@ pub struct FocusRow {
 /// is null.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeUsed {
-    /// The `env` the read was held to.
     pub env: Option<String>,
-    /// The `host` the read was held to.
     pub host: Option<String>,
-    /// Seconds either side of the focus row's `_time`.
     pub seconds: u64,
 }
 
-/// The three groups of a `context` read, each a range of the captured
-/// rows, each ordered by `_time`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextGroups {
-    /// Rows strictly earlier than the focus row's `_time`.
     pub earlier: RowRange,
     /// Rows sharing the focus row's `_time`, the focus event among them.
     pub same_time: RowRange,
-    /// Rows strictly later than the focus row's `_time`.
     pub later: RowRange,
 }
 
-/// The facts of a `sightings` read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SightingsFacts {
-    /// The literal searched for.
     pub literal: String,
-    /// Events the search matched, over the whole bounds.
     pub matches_total: u64,
-    /// Matches captured: the most recent ones, at most the capture's cut.
     pub captured: u64,
     /// The request's `fields` after the server validated them, in request
-    /// order; empty when attribution ran over every field. This is the
-    /// frozen statement of what `fields` was computed over: a field named
+    /// order; empty when attribution ran over every field. A field named
     /// here and absent from `fields` held the literal in no captured match,
-    /// which `fields` alone cannot say. `raw_only_rows` does not depend on
-    /// it.
+    /// which `fields` alone cannot say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attribution_fields: Vec<String>,
-    /// Matches per (`env`, `service`), exact over every match, most
-    /// matches first. At most 5000; a read with more is refused.
+    /// Matches per (`env`, `service`), most matches first.
     pub groups: Vec<SightingGroup>,
     /// Captured matches per field the literal occurs in, over the
     /// attributed fields, most matches first, then by name. At most 256.
@@ -527,20 +327,14 @@ pub struct SightingsFacts {
     /// `sighting_*` columns holds the literal, counted over every column
     /// whatever `attribution_fields` says: matched through `_raw` alone.
     pub raw_only_rows: u64,
-    /// The populations the counts are over.
     pub denominators: SightingsDenominators,
-    /// At most two next queries, as DSL text over the same bounds.
     pub follow_ups: Vec<String>,
 }
 
-/// One (`env`, `service`) group of a `sightings` read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SightingGroup {
-    /// The group's `env`, null for events without one.
     pub env: Option<String>,
-    /// The group's `service`, null for events without one.
     pub service: Option<String>,
-    /// Matches in the group.
     pub count: u64,
     /// The group's earliest matching `_time`, RFC 3339 UTC.
     pub first_seen: String,
@@ -548,137 +342,92 @@ pub struct SightingGroup {
     pub last_seen: String,
 }
 
-/// How many captured matches hold the literal in one field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldSightings {
-    /// The field name.
     pub field: String,
-    /// Captured matches whose value of the field holds the literal.
     pub rows: u64,
 }
 
-/// What each count of a `sightings` read is over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SightingsDenominators {
-    /// Field counts are over this many captured matches.
     pub field_counts_over: u64,
-    /// Group counts are over this many matches, every one in the bounds.
     pub service_counts_over: u64,
 }
 
-/// The facts of a `compare` read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompareFacts {
-    /// The window under question.
     pub foreground: CompareWindow,
-    /// The window it was compared against.
     pub baseline: CompareWindow,
-    /// The fields the counts are grouped by.
     pub group_by: Vec<String>,
-    /// The count a group reached in either window to be listed.
     pub min_count: u64,
-    /// The unit of every rate column.
     pub rate_unit: RateUnit,
     /// Groups listed, ranked: absolute rate change descending, then
-    /// count, then group key. At most 5000; a read with more is refused.
+    /// count, then group key.
     pub rows_ranked: u64,
-    /// What the read could not vouch for. Never a claim of completeness.
     /// At most four: one `retention_reach` per window and one
     /// `degraded_pin` per group field.
     pub warnings: Vec<CompareWarning>,
 }
 
-/// One resolved `compare` window, half-open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompareWindow {
     /// The inclusive start, RFC 3339 UTC with microseconds.
     pub start: String,
     /// The exclusive end, RFC 3339 UTC with microseconds.
     pub end: String,
-    /// `end - start` in milliseconds.
     pub duration_ms: u64,
 }
 
-/// The unit a `compare` rate is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RateUnit {
-    /// Events per minute of the window.
     PerMinute,
 }
 
-/// A warning a `compare` read attaches to its answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompareWarning {
-    /// What kind of warning it is.
     pub code: CompareWarningCode,
-    /// The warning, worded for a reader.
     pub message: String,
-    /// The group field it is about, when it is about one.
     #[serde(default)]
     pub field: Option<String>,
 }
 
-/// The kinds of `compare` warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompareWarningCode {
-    /// A window starts before the oldest day retention kept for an env the
-    /// filter selects, so data from its start may be missing. One per
-    /// window, naming at most eight envs and counting the rest.
     RetentionReach,
     /// A group field has a degraded pin: its type keeps shelving real
     /// values, so events whose value was shelved group under null.
     DegradedPin,
 }
 
-// -- responses ---------------------------------------------------------------
-
 /// Response body for `POST /api/v1/results`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaptureResponse {
-    /// The captured result.
     pub result: CapturedResult,
-    /// Execution facts, spelled as `/api/v1/query` spells them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<QueryExecution>,
-    /// For an attached capture, the entries other actors changed since the
-    /// request's `seen_seq` (ADR-0059). Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<Activity>,
-    /// For an attached capture, the seq of the step this capture appended
-    /// (ADR-0059); absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_seq: Option<u64>,
 }
 
 /// Response body for `POST /api/v1/results/context`, `/sightings` and
-/// `/compare`: the capture response with the read's facts beside it.
-///
-/// What the read established is carried once, as `result.correlation`,
-/// which a route of this family always fills. One fact has one place on
-/// the wire, so two copies cannot drift, and a later `GET
-/// /api/v1/results/{id}` page shows the same copy.
+/// `/compare`. What the read established is carried once, as
+/// `result.correlation`, which a route of this family always fills.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CorrelationResponse {
-    /// The captured result, with the read's facts in `correlation`.
     pub result: CapturedResult,
-    /// Execution facts, spelled as `/api/v1/query` spells them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<QueryExecution>,
-    /// For an attached read, the entries other actors changed since the
-    /// request's `seen_seq` (ADR-0059). Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<Activity>,
-    /// For an attached read, the seq of the step this read appended
-    /// (ADR-0059); absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_seq: Option<u64>,
 }
 
 impl From<CaptureResponse> for CorrelationResponse {
-    /// The capture a correlation read made, answered whole: one
-    /// conversion, so no read drops a member of the capture's answer.
     fn from(captured: CaptureResponse) -> Self {
         let CaptureResponse {
             result,
@@ -698,13 +447,11 @@ impl From<CaptureResponse> for CorrelationResponse {
 /// Response body for `GET /api/v1/results/{id}`: one page of captured rows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResultPage {
-    /// The result the page belongs to.
     pub result: CapturedResult,
     /// For each column of `page`, its 0-based position in `result.columns`,
     /// ascending.
     pub positions: Vec<usize>,
-    /// The projected columns and the page's rows. Row `i` of the page is
-    /// captured row `pagination.offset + i`.
+    /// Row `i` of the page is captured row `pagination.offset + i`.
     pub page: QueryResult,
     /// The page window; `total` is the result's `captured_rows`.
     pub pagination: PaginationMeta,
@@ -712,26 +459,17 @@ pub struct ResultPage {
 
 /// Response body for `GET /api/v1/results/{id}/cells/{row}/{column}`: a
 /// byte range of one cell's #214 wire JSON text.
-///
-/// The type is flattened beside the range, as in [`ResultColumn`]. A client
-/// reads the whole cell by following `next_offset` until it is absent and
-/// lands the joined text with [`land_cell`] under the type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultCell {
-    /// The column's wire type.
     #[serde(flatten)]
     pub ty: ColumnType,
-    /// Byte offset of `text` within the cell's wire text.
     pub offset: u64,
     /// Byte length of `text`. It can be shorter than asked for, because
     /// the range is cut back to a UTF-8 boundary.
     pub length: u64,
-    /// Byte length of the cell's whole wire text.
     pub total_bytes: u64,
-    /// The offset of the next range, absent when `text` reaches the end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<u64>,
-    /// The range of the cell's wire text.
     pub text: String,
 }
 
@@ -743,9 +481,6 @@ pub struct ResultList {
     pub results: Vec<CapturedResult>,
 }
 
-// -- self-tagged cells -------------------------------------------------------
-
-/// A [`Value`] as a self-tagged `mixed` cell.
 mod tagged_cell {
     use super::{ColumnType, Deserialize, Deserializer, Serializer, Value, land_cell};
     use serde::de::Error as _;
@@ -765,7 +500,6 @@ mod tagged_cell {
     }
 }
 
-/// An optional [`Value`] as a self-tagged `mixed` cell.
 mod optional_tagged_cell {
     use super::{Deserializer, Serializer, Value};
 
@@ -883,8 +617,6 @@ mod tests {
         }
     }
 
-    /// The whole metadata spelling, so a renamed or retyped field shows up
-    /// in review.
     #[test]
     fn captured_result_has_a_golden_spelling() {
         let golden = json!({
@@ -941,8 +673,6 @@ mod tests {
         assert_eq!(round_trip(&result), result);
     }
 
-    /// A stored source has no bounds and a kept result no deadline: the
-    /// members are absent, not null, and decode back to `None`.
     #[test]
     fn a_stored_kept_result_omits_bounds_and_deadline() {
         let result = CapturedResult {
@@ -964,8 +694,6 @@ mod tests {
         assert_eq!(round_trip(&result), result);
     }
 
-    /// `truncated` is carried as sent: the type documents the relation to
-    /// the row counts and leaves it to the server.
     #[test]
     fn truncated_is_carried_not_derived() {
         let result = CapturedResult {
@@ -1049,8 +777,6 @@ mod tests {
         assert_eq!(round_trip(&windowed), windowed);
     }
 
-    /// A misspelled member is refused, not ignored: an ignored `windw`
-    /// would silently capture the default 15 minutes.
     #[test]
     fn capture_request_refuses_unknown_members() {
         let err = serde_json::from_value::<CaptureRequest>(json!({
@@ -1099,9 +825,6 @@ mod tests {
         assert_eq!(round_trip(&bare), bare);
     }
 
-    /// A request, a response and a result written before investigations
-    /// existed (the #308 client and server) decode with no attachment, no
-    /// activity and no investigation, and nothing new is written for them.
     #[test]
     fn pre_investigation_json_still_decodes() {
         let request: CaptureRequest =
@@ -1123,8 +846,6 @@ mod tests {
         assert!(wire.get("activity").is_none(), "{wire}");
         assert!(wire.get("step_seq").is_none(), "{wire}");
 
-        // A kept result names its investigation, and an id in another
-        // shape does not decode.
         result["investigation_id"] = json!("0123456789abcdef0123456789abcdef");
         let kept: CapturedResult = serde_json::from_value(result.clone()).unwrap();
         assert_eq!(
@@ -1150,7 +871,6 @@ mod tests {
         assert_eq!(attach.seen_seq, Some(3));
         assert_eq!(attach.purpose.as_deref(), Some("find the first 502"));
         assert_eq!(round_trip(&request), request);
-        // An unknown member inside the attachment is refused too.
         assert!(
             serde_json::from_value::<CaptureRequest>(json!({
                 "query": "x",
@@ -1263,7 +983,6 @@ mod tests {
         );
         assert_eq!(round_trip(&last), last);
 
-        // The ranges join into wire text that lands under the type.
         let whole: serde_json::Value =
             serde_json::from_str(&format!("{}{}", first.text, last.text)).unwrap();
         assert_eq!(
@@ -1318,7 +1037,6 @@ mod tests {
             max: None,
         };
         assert_eq!(round_trip(&facts), facts);
-        // A fact value that is not a tagged cell does not decode.
         assert!(serde_json::from_value::<ValueCount>(json!({"value": "200", "count": 1})).is_err());
     }
 
@@ -1335,8 +1053,6 @@ mod tests {
         assert_eq!(wire["items"], plain["items"]);
         assert_eq!(round_trip(&column), column);
     }
-
-    // -- correlation reads ---------------------------------------------------
 
     fn context_facts() -> Correlation {
         Correlation::Context(ContextFacts {
@@ -1434,8 +1150,6 @@ mod tests {
         })
     }
 
-    /// Each kind's whole spelling: the tag is `kind`, counts are numbers,
-    /// and an absent key is `null`, never missing.
     #[test]
     fn correlation_facts_have_golden_spellings() {
         let cases = [
@@ -1539,9 +1253,6 @@ mod tests {
         );
     }
 
-    /// The attributed field list is frozen in the facts: absent on the
-    /// wire when attribution ran over every field, and carried in request
-    /// order, requested fields with no match included, when it did not.
     #[test]
     fn sightings_facts_carry_the_attribution_field_list_only_when_restricted() {
         let Correlation::Sightings(unrestricted) = sightings_facts() else {
@@ -1570,8 +1281,6 @@ mod tests {
         assert_eq!(round_trip(&restricted), restricted);
     }
 
-    /// The omitted-field count is always spelled, and a document written
-    /// without it decodes as nothing omitted.
     #[test]
     fn sightings_facts_count_the_fields_they_do_not_list() {
         let Correlation::Sightings(facts) = sightings_facts() else {
@@ -1593,9 +1302,6 @@ mod tests {
         );
     }
 
-    /// A capture made before the correlation reads, without `kind` or
-    /// `correlation`, decodes as a search, and a search encodes without
-    /// either member: #308's decoders and the documented examples hold.
     #[test]
     fn a_search_capture_carries_no_kind_and_no_correlation() {
         let mut wire = serde_json::to_value(captured()).unwrap();
@@ -1783,8 +1489,6 @@ mod tests {
         assert_eq!(round_trip(&compare), compare);
     }
 
-    /// A misspelled member is refused, not ignored, in each request and in
-    /// the windows they carry.
     #[test]
     fn correlation_requests_refuse_unknown_members() {
         let refused = [
@@ -1813,7 +1517,6 @@ mod tests {
             let err = err.unwrap_or_else(|| panic!("case {i} was accepted"));
             assert!(err.to_string().contains("unknown field"), "case {i}: {err}");
         }
-        // Required members stay required.
         assert!(serde_json::from_value::<ContextRequest>(json!({"row": 1})).is_err());
         assert!(serde_json::from_value::<SightingsRequest>(json!({})).is_err());
         assert!(serde_json::from_value::<CompareRequest>(json!({"filter": "x"})).is_err());
@@ -1825,10 +1528,6 @@ mod tests {
         );
     }
 
-    /// Each correlation read takes the attachment a search capture takes
-    /// (ADR-0059), as the same nested object: absent, nothing is written
-    /// for it; present, it round-trips; an unknown member, inside it or
-    /// beside it, is refused.
     #[test]
     fn correlation_requests_carry_an_optional_investigation_and_refuse_unknown_members() {
         let attachment = json!({
@@ -1887,7 +1586,6 @@ mod tests {
             }
         }
 
-        // Unattached, the member is not written at all.
         let context: ContextRequest = serde_json::from_value(json!({
             "result_id": "0123456789abcdef0123456789abcdef", "row": 3,
         }))
@@ -1914,10 +1612,6 @@ mod tests {
         );
     }
 
-    /// A correlation response spells the attachment's answer as a capture
-    /// response does: `activity` and `step_seq` absent when the read was
-    /// not attached, present beside `result` and `execution` when it was.
-    /// Converting the capture response keeps all four members.
     #[test]
     fn a_correlation_response_omits_activity_and_step_seq_when_unattached() {
         let result = CapturedResult {
