@@ -13,14 +13,6 @@
 //! Capture is enabled by the environment contract the Helm chart sets:
 //! `TRAWL_CRASH_DUMP_DIR` (directory for `*.dmp`) and `TRAWL_CRASH_DUMP_RETAIN`
 //! (keep at most N dumps).
-//!
-//! Whether an armed handler would actually produce a usable dump depends on
-//! `CAP_SYS_PTRACE`, `kernel.yama.ptrace_scope` and the daemon's own dumpable
-//! flag, so [`init`] probes all three and returns the verdict as data
-//! ([`Readiness`]). It prints nothing: the daemon logs the verdict once, through
-//! `tracing`, after its subscriber exists. The daemon also comes back from
-//! [`init`] without `CAP_SYS_PTRACE` and with `no_new_privs` set (ADR-0023
-//! ruling 4), so it may exec nothing afterwards.
 
 #[cfg(target_os = "linux")]
 mod caps;
@@ -43,17 +35,11 @@ pub use readiness::{
 /// in `main` and hold it for the whole run.
 #[derive(Debug)]
 pub struct Guard {
-    // Held only for its `Drop` (which detaches the handler); never read, so the
-    // leading underscore suppresses dead_code (a derived `Debug` does not count
-    // as a read for that analysis).
     #[cfg(target_os = "linux")]
     _inner: imp::Guard,
 }
 
 /// What [`init`] did, with the guard the caller has to keep alive.
-///
-/// [`status`](InitReport::status) copies the verdict out so it can be logged
-/// long after `main` has parked the guard.
 // One value, built once per process and parked in `main`'s frame for the whole
 // run. Boxing the readiness to even out the variants would buy an allocation
 // and an indirection and save nothing.
@@ -64,18 +50,9 @@ pub enum InitReport {
     Disabled,
     /// The handler is installed. `readiness` says whether a crash would produce
     /// a dump with anything in it.
-    Armed {
-        /// Hold this for the lifetime of the process.
-        guard: Guard,
-        /// The probe and its verdict.
-        readiness: Readiness,
-    },
-    /// Capture did not arm. `reason` names the step, without quoting an OS
-    /// message at what is a trust boundary.
-    Failed {
-        /// Which step failed.
-        reason: FailureReason,
-    },
+    Armed { guard: Guard, readiness: Readiness },
+    /// Capture did not arm. `reason` names the step.
+    Failed { reason: FailureReason },
 }
 
 impl InitReport {
@@ -92,13 +69,8 @@ impl InitReport {
 
 /// Proof that [`seal_for_config_check`] ran and succeeded in this process.
 ///
-/// Only `seal_for_config_check` makes one: the type has no public
-/// constructor, its one field is private to this crate, and it implements
-/// neither `Default` nor any conversion. So a function that takes a
-/// `Sealed` cannot be called before the seal, and code that reads
-/// configuration only through such a function cannot read it earlier: the
-/// order is checked by the compiler, not by a test that samples the
-/// process. Copying one proves nothing new; the seal ran either way.
+/// Only `seal_for_config_check` makes one, so code that reads configuration
+/// only through a function that takes a `Sealed` cannot read it earlier.
 #[derive(Debug, Clone, Copy)]
 pub struct Sealed {
     _private: (),

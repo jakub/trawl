@@ -5,9 +5,7 @@
 //! this module decides what they mean, so the whole decision table is testable
 //! on any host.
 //!
-//! The verdict is ADVISORY (ADR-0023 ruling 5). Nothing between the probe and
-//! `CrashHandler::attach` reads it, so a probe that is wrong costs an operator a
-//! misleading log line, never a disarmed handler.
+//! The verdict is ADVISORY (ADR-0023 ruling 5).
 
 use std::path::PathBuf;
 
@@ -134,14 +132,6 @@ pub fn credentials_match(monitor: &MonitorStatus, parent: &SelfStatus) -> bool {
 }
 
 /// Turn the probe into a verdict (ADR-0023 ruling 5).
-///
-/// The order matters and is the ruling's order: yama scope 3 denies everything,
-/// an unreadable scope or monitor is indeterminate, an effective
-/// `CAP_SYS_PTRACE` on the monitor is ready at every other scope, and only then
-/// do the scope-specific fallbacks apply.
-///
-/// `Ready` means the capability, yama and commoncap prerequisites hold. Seccomp
-/// and other LSMs are not probed.
 #[must_use]
 pub fn classify(inputs: ProbeInputs) -> ReadinessClass {
     use ReadinessClass::{Denied, Indeterminate, Ready};
@@ -201,17 +191,13 @@ pub fn classify(inputs: ProbeInputs) -> ReadinessClass {
 /// The armed state: the verdict, what it was made of, and where dumps land.
 #[derive(Debug, Clone)]
 pub struct Readiness {
-    /// The verdict.
     pub class: ReadinessClass,
     /// The inputs [`classify`] saw.
     pub inputs: ProbeInputs,
     /// The daemon's own status re-read after the seal. `None` = unreadable.
     pub after_seal: Option<SelfStatus>,
-    /// Pid of the monitor process.
     pub monitor_pid: u32,
-    /// Directory dumps are written to.
     pub dir: PathBuf,
-    /// How many dumps are kept.
     pub retain: usize,
 }
 
@@ -232,15 +218,12 @@ impl Readiness {
     }
 }
 
-/// Why arming failed. Content-free by design (ADR-0023 ruling 6): these reach a
-/// log at a trust boundary, so they name a step and never quote an OS message.
+/// Why arming failed. Content-free by design (ADR-0023 ruling 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureReason {
     /// `std::env::current_exe` failed, so the monitor could not be re-exec'd.
     CurrentExe,
-    /// The dump directory could not be created.
     DumpDir,
-    /// Spawning the monitor failed.
     SpawnMonitor,
     /// The monitor never came up on its socket, or it had already exited when
     /// the parent went to use its pid.
@@ -250,7 +233,6 @@ pub enum FailureReason {
     /// bind it first and accept that connection; `SO_PEERCRED` on the
     /// descriptor the client holds says who received it.
     MonitorIdentity,
-    /// `CrashHandler::attach` failed.
     AttachHandler,
     /// Dropping `CAP_SYS_PTRACE` or setting `no_new_privs` failed.
     Seal,
@@ -275,11 +257,8 @@ impl FailureReason {
 /// after `main` has parked the guard.
 #[derive(Debug, Clone)]
 pub enum Status {
-    /// No dump directory configured.
     Disabled,
-    /// Handler installed; the verdict says whether a dump would be usable.
     Armed(Readiness),
-    /// Capture did not arm.
     Failed(FailureReason),
 }
 
@@ -381,8 +360,6 @@ mod tests {
 
     #[test]
     fn classify_scope2_without_the_capability_is_denied() {
-        // Nothing rescues scope 2: ptracer, credentials and dumpable are all
-        // satisfied here and the verdict is still denied.
         assert_eq!(
             classify(inputs(Some(2), Some(monitor(false)))),
             ReadinessClass::Denied

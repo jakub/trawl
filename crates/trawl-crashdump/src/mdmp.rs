@@ -2,10 +2,8 @@
 //!
 //! A dump whose `PTRACE_ATTACH` was refused is still a well-formed file:
 //! `minidump-writer` treats the failure as soft and writes a dump with no
-//! threads and no memory. So "a `.dmp` exists" answers nothing and "how many
-//! threads did it capture" answers everything. This mirrors the reader the deb
-//! harness already uses (crates/trawl-server/debian/tests/crashdump-harness.sh
-//! lines 459-483), field for field.
+//! threads and no memory. This mirrors the reader the deb harness already uses
+//! (crates/trawl-server/debian/tests/crashdump-harness.sh), field for field.
 //!
 //! Layout: header `magic(4) version(4) stream_count(4) directory_rva(4)`,
 //! then `stream_count` directory entries of `type(4) size(4) rva(4)`. A stream's
@@ -62,7 +60,6 @@ fn malformed(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
-/// Count the threads and memory regions a dump captured.
 pub(crate) fn counts<R: ReadAt + ?Sized>(src: &R) -> io::Result<MdmpCounts> {
     let mut header = [0u8; 16];
     src.read_exact_at(&mut header, 0)?;
@@ -140,8 +137,6 @@ mod tests {
 
     #[test]
     fn counts_the_denied_signature() {
-        // The shape a refused PTRACE_ATTACH leaves behind: a valid file that
-        // captured nothing.
         let bytes = dump(&[(THREAD_LIST_STREAM, 0), (MEMORY_LIST_STREAM, 0)]);
         assert_eq!(
             counts(bytes.as_slice()).unwrap(),
