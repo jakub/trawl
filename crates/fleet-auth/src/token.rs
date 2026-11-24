@@ -2,13 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Token generation, hashing, and verification.
-//!
-//! Tokens use the `flt_` prefix followed by 32 bytes of base64url-encoded
-//! random data (43 chars after the prefix). The first 8 chars of the
-//! base64url body are the operational prefix. The indexed database lookup,
-//! revocation, and one component of the verification cache key all use it.
-
 use std::sync::LazyLock;
 
 use base64ct::{Base64UrlUnpadded, Encoding as _};
@@ -17,27 +10,16 @@ use zeroize::Zeroizing;
 
 use crate::error::AuthError;
 
-/// Length of the random token body in bytes.
 const TOKEN_BYTES: usize = 32;
 
-/// String prefix prepended to every fleet API token.
 const TOKEN_PREFIX: &str = "flt_";
 
-/// Number of characters from the base64url body used as the operational
-/// prefix. NOT a security boundary — randomness lives in the full 32 bytes.
+/// NOT a security boundary — randomness lives in the full 32 bytes.
 const PREFIX_LENGTH: usize = 8;
 
-/// A generated API token. Shown to the user exactly once at creation; the
-/// plaintext is never persisted.
-///
-/// The `Debug` impl redacts `plaintext` — accidental `{:?}` logging of a
-/// freshly-generated token would leak the one-time API key otherwise.
 #[derive(Clone)]
 pub struct GeneratedToken {
-    /// Full token string: `flt_` + 43 base64url chars.
     pub plaintext: Zeroizing<String>,
-    /// First 8 chars of the base64url body — the operational prefix used
-    /// for identification and the indexed DB lookup.
     pub prefix: String,
 }
 
@@ -51,15 +33,9 @@ impl std::fmt::Debug for GeneratedToken {
 }
 
 /// Dummy argon2id hash for timing equalization on prefix miss.
-///
-/// The `verify_token` call on the miss path checks against it, so a miss
-/// takes the same wall-clock as a hit. It is hashed once, on first use. The
-/// key store dereferences it only inside a blocking-pool step that holds an
-/// argon2 permit, so that first hash runs under the process-wide limit too.
 pub static DUMMY_HASH: LazyLock<String> =
     LazyLock::new(|| hash_token("dummy-timing-equalization").expect("failed to hash dummy"));
 
-/// Generate a new cryptographically random API token.
 pub fn generate_token() -> GeneratedToken {
     let mut bytes = [0u8; TOKEN_BYTES];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -71,9 +47,6 @@ pub fn generate_token() -> GeneratedToken {
     GeneratedToken { plaintext, prefix }
 }
 
-/// Extract the operational prefix from a full token string.
-///
-/// Returns `None` if the token doesn't start with `flt_` or is too short.
 pub fn extract_prefix(token: &str) -> Option<&str> {
     let body = token.strip_prefix(TOKEN_PREFIX)?;
     if body.len() < PREFIX_LENGTH {
@@ -82,13 +55,6 @@ pub fn extract_prefix(token: &str) -> Option<&str> {
     Some(&body[..PREFIX_LENGTH])
 }
 
-/// Hash a plaintext token using argon2id.
-///
-/// Returns the PHC-formatted hash string (algorithm + params + salt + hash).
-///
-/// Production params: 128 MiB memory, 3 iterations, 4 lanes — appropriate for
-/// long-lived admin credentials. With the `fast-hash` feature: 1 MiB / 1 / 1
-/// — used in tests so the suite doesn't burn ~200 ms per KDF.
 pub fn hash_token(plaintext: &str) -> Result<String, AuthError> {
     use argon2::password_hash::SaltString;
     use argon2::{Algorithm, Argon2, Params, PasswordHasher as _, Version};
@@ -108,10 +74,6 @@ pub fn hash_token(plaintext: &str) -> Result<String, AuthError> {
         .map_err(|e| AuthError::Hash(e.to_string()))
 }
 
-/// Verify a plaintext token against an argon2id PHC hash string.
-///
-/// Returns `true` if the token matches, `false` otherwise. Constant-time
-/// comparison provided by argon2.
 pub fn verify_token(plaintext: &str, hash: &str) -> Result<bool, AuthError> {
     use argon2::password_hash::PasswordHash;
     use argon2::{Argon2, PasswordVerifier as _};
@@ -191,9 +153,6 @@ mod tests {
 
     #[test]
     fn dummy_hash_exists_and_verifies_false_for_random_input() {
-        // DUMMY_HASH must be a valid PHC string that always returns false for
-        // non-matching plaintext — required for the `verify_key` timing
-        // equalization path.
         let token = generate_token();
         let result = verify_token(&token.plaintext, &DUMMY_HASH);
         assert!(!result.unwrap());
@@ -216,9 +175,6 @@ mod tests {
 
     #[test]
     fn ten_thousand_tokens_are_unique() {
-        // Statistical sanity: a CSPRNG should never collide in 10k draws of
-        // 256-bit tokens. Catches catastrophic RNG/base64/slicing regressions.
-        // Not a security proof — that comes from the 256-bit entropy.
         let mut plaintexts = HashSet::with_capacity(10_000);
         let mut prefixes = HashSet::with_capacity(10_000);
         for _ in 0..10_000 {

@@ -4,15 +4,10 @@
 
 //! The origin guard's truth table and its rejection log (ADR-0016).
 //!
-//! These ran as unit tests inside `session.rs` until the structural guard
-//! in `no_forwarded_trust.rs` started scanning whole source files. That
-//! scan has to read every line of `src/` to be worth anything, and one of
-//! the tests below deliberately plants `Host`, `Forwarded` and
-//! `X-Forwarded-*` headers to prove they move no verdict. That is evidence
-//! for the rule, not a breach of it, but a text scanner cannot tell the
-//! two apart. So the table lives out here, where the scan does not reach,
-//! and still exercises exactly the surface a caller has: `check_origin`,
-//! `origin_allowed` and `PublicOrigins`.
+//! One of the tests below deliberately plants `Host`, `Forwarded` and
+//! `X-Forwarded-*` headers, and the scan in `no_forwarded_trust.rs` cannot
+//! tell the two apart. So the table lives out here, where the scan does not
+//! reach.
 
 #![cfg(feature = "session")]
 
@@ -20,10 +15,8 @@ use fleet_auth::{
     PublicOrigins, REASON_MULTIPLE_HEADERS, REASON_NON_UTF8, check_origin, origin_allowed,
 };
 
-/// The allowlist every guard test runs against: a public HTTPS
-/// deployment, the packaged loopback bind, and that bind's IPv6
-/// spelling. Three entries, so "allowed" cannot be an accident of a
-/// single-element list.
+/// Three entries, so "allowed" cannot be an accident of a single-element
+/// list.
 fn test_origins() -> PublicOrigins {
     PublicOrigins::parse([
         "https://trawl.example.com",
@@ -42,11 +35,6 @@ fn headers_with_origin(origin: &str) -> http::HeaderMap {
     headers
 }
 
-/// Every row is a verdict the deployment has to get right, and most of
-/// the `false` rows are a CSRF bypass if they ever flip. The `true`
-/// rows matter just as much in the other direction: each is a spelling
-/// a real browser sends for an origin the operator configured, and a
-/// wrong `false` is a 403 nobody can explain.
 const ORIGIN_VERDICTS: &[(&str, bool, &str)] = &[
     ("https://trawl.example.com", true, "the configured origin"),
     (
@@ -129,8 +117,6 @@ fn the_guard_answers_the_truth_table() {
     for (origin, expected, why) in ORIGIN_VERDICTS {
         let verdict = check_origin(&headers_with_origin(origin), &allowed, "login").is_ok();
         assert_eq!(verdict, *expected, "{origin:?}: {why}");
-        // Same claim through the string-level door, so the two cannot
-        // disagree about a row.
         assert_eq!(
             origin_allowed(Some(origin), &allowed),
             *expected,
@@ -141,8 +127,6 @@ fn the_guard_answers_the_truth_table() {
 
 #[test]
 fn an_absent_origin_is_allowed() {
-    // A browser CSRF control, not client authentication: curl, the CLI
-    // and every scripted client send no Origin and must keep working.
     let allowed = test_origins();
     assert!(check_origin(&http::HeaderMap::new(), &allowed, "logout").is_ok());
     assert!(origin_allowed(None, &allowed));
@@ -150,11 +134,6 @@ fn an_absent_origin_is_allowed() {
 
 #[test]
 fn two_origin_headers_are_rejected_even_when_identical() {
-    // `HeaderMap::get` would hand back the first of the two and the
-    // guard would answer about a request nobody sent. Byte-identical
-    // copies are refused as well: the request still passed through
-    // something that appends Origin headers, and the next one it
-    // forwards may not be a copy.
     let allowed = test_origins();
     for second in ["https://trawl.example.com", "https://evil.example.com"] {
         let mut headers = headers_with_origin("https://trawl.example.com");
@@ -171,8 +150,6 @@ fn two_origin_headers_are_rejected_even_when_identical() {
 
 #[test]
 fn a_non_utf8_origin_is_rejected() {
-    // Header values are bytes; a serialized origin is ASCII. There is
-    // nothing to parse and nothing safe to log.
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::ORIGIN,
@@ -183,11 +160,6 @@ fn a_non_utf8_origin_is_rejected() {
 
 #[test]
 fn forwarding_headers_and_host_change_no_verdict() {
-    // The structural half of ADR-0016: these headers are free text to
-    // anyone who can reach the port, and the old rule let them move the
-    // answer. Now they are inert in both directions — they cannot open
-    // the guard for a foreign origin, and they cannot close it against
-    // a configured one.
     let allowed = test_origins();
     let forged = [
         (http::header::HOST, "evil.example.com"),
@@ -220,11 +192,6 @@ fn forwarding_headers_and_host_change_no_verdict() {
     }
 }
 
-// -- the rejection log's contract -----------------------------------
-
-/// Collects one formatted `field=value` line per event, so the tests
-/// below can assert on what the guard actually recorded rather than on
-/// what it meant to record.
 #[derive(Clone, Default)]
 struct CaptureLayer {
     lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -259,22 +226,12 @@ where
     }
 }
 
-/// Serializes the capture tests against each other.
-///
-/// `tracing` caches every callsite's `Interest` process-wide and
-/// rebuilds that cache whenever a subscriber registers or dies. Two of
-/// these tests running at once can leave the guard's `warn!` callsite
-/// cached as "never interested" for the thread that is about to emit,
-/// so the event vanishes and the test reads "the guard did not log"
-/// — which is exactly the failure it exists to catch, arriving at
-/// random. One lock over register/emit/read makes the rebuild
-/// deterministic. Poisoning is ignored deliberately: a panic in one
-/// capture test must not turn the other three into cascade failures
-/// that hide their own result.
+/// `tracing` caches every callsite's `Interest` process-wide and rebuilds
+/// that cache whenever a subscriber registers or dies, so two capture tests
+/// at once can make the guard's `warn!` event vanish. Poisoning is ignored
+/// so a panic in one capture test does not cascade into the others.
 static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Run the guard under a capturing subscriber and hand back the lines
-/// it emitted.
 fn captured_lines(headers: &http::HeaderMap, handler: &'static str) -> Vec<String> {
     use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -291,10 +248,6 @@ fn captured_lines(headers: &http::HeaderMap, handler: &'static str) -> Vec<Strin
 
 #[test]
 fn a_hostile_origin_header_never_reaches_the_log() {
-    // 10 KiB of attacker-chosen bytes. Whatever else this line says, it
-    // must not say this: a log field an attacker fills is a way to bury
-    // other evidence, blow up log storage, or smuggle terminal escapes
-    // into whoever greps for it.
     let hostile = format!("https://{}.example.com", "a".repeat(10 * 1024));
     let lines = captured_lines(&headers_with_origin(&hostile), "login");
 
@@ -317,10 +270,6 @@ fn a_hostile_origin_header_never_reaches_the_log() {
 
 #[test]
 fn a_foreign_origin_logs_its_normalized_text() {
-    // The one case with safe text: it parsed, so what gets logged is
-    // the parser's own canonical form. That is what makes a
-    // misconfigured public_origins debuggable — the operator can paste
-    // the logged text straight into the config.
     let lines = captured_lines(
         &headers_with_origin("https://EVIL.example.com:443"),
         "logout",
@@ -369,7 +318,6 @@ fn every_rejection_reason_is_from_the_closed_vocabulary() {
             "expected reason={expected}, got: {}",
             lines[0]
         );
-        // The two field-less refusals must stay field-less.
         if expected == REASON_MULTIPLE_HEADERS || expected == REASON_NON_UTF8 {
             assert!(!lines[0].contains("origin="), "got: {}", lines[0]);
         }

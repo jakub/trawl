@@ -2,20 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! App namespace, role-name, and permission-string validation for the
-//! multi-app substrate.
-//!
-//! These rules keep identifiers safe to embed in log fields, file paths,
-//! and SQL string literals without escaping, and reject the
-//! obviously-broken inputs at the application boundary. They mirror the
+//! App namespace, role-name, and permission-string validation. They mirror the
 //! CHECK constraints on the `roles` / `role_permissions` /
 //! `app_permissions` tables.
 
 use crate::error::AuthError;
 
-/// The app namespace that trawl uses for its own grants. Exists so
-/// trawl-side code can avoid bare string literals when asking permission
-/// questions (`verified.has_app_permission(TRAWL_APP, ...)`).
 pub const TRAWL_APP: &str = "trawl";
 
 /// Maximum length of an app namespace identifier, in bytes.
@@ -27,15 +19,6 @@ pub const MAX_ROLE_NAME_LEN: usize = 64;
 /// Maximum length of a permission string, in bytes.
 pub const MAX_PERMISSION_LEN: usize = 64;
 
-/// The one place the identifier rules live: non-empty, within a byte
-/// budget, and restricted to lowercase ascii alphanumerics + underscore
-/// (optionally plus hyphen). Every public validator below is a thin
-/// wrapper over this, so a charset or length tweak lands in one spot
-/// instead of drifting across three copies — and stays checkable against
-/// its Postgres CHECK-constraint twin.
-///
-/// `kind` names the identifier in error messages ("role name"), and
-/// `ctor` picks the [`AuthError`] variant the caller's domain expects.
 fn validate_identifier(
     value: &str,
     kind: &str,
@@ -60,10 +43,7 @@ fn validate_identifier(
     Ok(())
 }
 
-/// Validate an app namespace identifier.
-///
-/// Rules: lowercase ascii + digits + underscore, length 1..=64. Mirrors
-/// the `app_permissions_app_format` CHECK.
+/// Mirrors the `app_permissions_app_format` CHECK.
 pub fn validate_app_namespace(app: &str) -> Result<(), AuthError> {
     validate_identifier(
         app,
@@ -74,13 +54,9 @@ pub fn validate_app_namespace(app: &str) -> Result<(), AuthError> {
     )
 }
 
-/// Validate a role name.
-///
-/// Rules: lowercase ascii + digits + underscore + hyphen, length 1..=64.
 /// The hyphen is the one charset difference from app namespaces and
-/// permission strings, which reject it: role names are `<app>-<role>`
-/// (`trawl-admin`, `coastwatch-analyst`). Mirrors the `roles_name_format`
-/// CHECK.
+/// permission strings: role names are `<app>-<role>` (`trawl-admin`,
+/// `coastwatch-analyst`). Mirrors the `roles_name_format` CHECK.
 pub fn validate_role_name(role: &str) -> Result<(), AuthError> {
     validate_identifier(
         role,
@@ -91,11 +67,7 @@ pub fn validate_role_name(role: &str) -> Result<(), AuthError> {
     )
 }
 
-/// Validate a permission string.
-///
-/// Rules: same charset discipline as app namespaces — lowercase ascii +
-/// digits + underscore, length 1..=64. Mirrors the
-/// `role_permissions_permission_format` CHECK.
+/// Mirrors the `role_permissions_permission_format` CHECK.
 pub fn validate_permission(permission: &str) -> Result<(), AuthError> {
     validate_identifier(
         permission,

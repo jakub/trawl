@@ -31,27 +31,21 @@ use tokio::sync::{Notify, watch};
 /// reads: the longest pattern a test arms, less one, fits.
 const TAIL: usize = 63;
 
-/// The proxy, listening on a loopback port of its own.
 pub struct Proxy {
     pub port: u16,
     shared: Arc<Shared>,
 }
 
 struct Shared {
-    /// What the next held session sends, while armed.
     armed: Mutex<Option<&'static [u8]>>,
     /// One gate per session: `true` while its answers are held back.
     gates: Mutex<Vec<Arc<watch::Sender<bool>>>>,
-    /// Notified once an answer is held back.
     holding: Notify,
-    /// Notified once a client closes a session whose answers are held.
     closed: Notify,
-    /// How many held answers have reached their clients.
     let_through: AtomicUsize,
 }
 
 impl Proxy {
-    /// A proxy to the server `upstream` names.
     pub async fn start(upstream: &PgConnectOptions) -> Self {
         let upstream = format!("{}:{}", upstream.get_host(), upstream.get_port());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -88,7 +82,6 @@ impl Proxy {
         Self { port, shared }
     }
 
-    /// `base`, pointed at the proxy.
     pub fn options(&self, base: &PgConnectOptions) -> PgConnectOptions {
         base.clone()
             .host("127.0.0.1")
@@ -96,23 +89,18 @@ impl Proxy {
             .ssl_mode(PgSslMode::Disable)
     }
 
-    /// Hold back every answer of the next session to send `pattern`, from
-    /// that message on.
     pub fn hold_next(&self, pattern: &'static [u8]) {
         *self.shared.armed.lock().unwrap() = Some(pattern);
     }
 
-    /// Wait until an answer is held back.
     pub async fn holding(&self) {
         self.shared.holding.notified().await;
     }
 
-    /// Wait until a client closes a session whose answers are held.
     pub async fn closed(&self) {
         self.shared.closed.notified().await;
     }
 
-    /// Let every held answer through.
     pub fn release(&self) {
         for gate in self.shared.gates.lock().unwrap().iter() {
             gate.send_replace(false);
@@ -170,8 +158,6 @@ async fn sent(
     }
 }
 
-/// Postgres to client: forward everything, waiting while the session's
-/// gate is closed.
 async fn answered(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,

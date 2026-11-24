@@ -4,26 +4,6 @@
 
 //! Axum middleware: [`require_session`] for cookie auth, [`require_bearer`]
 //! for `Authorization: Bearer flt_...` auth (ADR-0030).
-//!
-//! Both insert a [`crate::VerifiedKey`] into request extensions on success.
-//! Handlers extract it with `axum::Extension<VerifiedKey>`.
-//!
-//! Wiring pattern (callers):
-//!
-//! ```ignore
-//! use axum::middleware::from_fn_with_state;
-//! use fleet_auth::{SessionState, require_session, require_bearer};
-//!
-//! let state = SessionState::new(keystore, session_key, session_config);
-//!
-//! let web_router = Router::new()
-//!     .route("/dashboard", get(dashboard))
-//!     .route_layer(from_fn_with_state(state.clone(), require_session));
-//!
-//! let api_router = Router::new()
-//!     .route("/ingest", post(ingest))
-//!     .route_layer(from_fn_with_state(state.clone(), require_bearer));
-//! ```
 
 use std::sync::Arc;
 
@@ -36,12 +16,6 @@ use crate::error::AuthError;
 use crate::session::{self, SessionConfig, SessionKey};
 use crate::store::KeyStore;
 
-/// Shared per-app state for [`require_session`], [`require_bearer`], and
-/// the login/logout handler factories.
-///
-/// Cheap to `Clone` — `KeyStore` wraps `Arc`-backed Postgres pool and cache,
-/// and the session key + config are wrapped in [`Arc`] explicitly so the
-/// secret material is shared rather than duplicated.
 #[derive(Clone)]
 pub struct SessionState {
     store: KeyStore,
@@ -50,14 +24,6 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    /// Construct a `SessionState`. Validates the embedded [`SessionConfig`]
-    /// up front so misconfigurations surface at startup, not on first
-    /// request.
-    ///
-    /// # Errors
-    /// Returns the underlying [`AuthError`] when `config.validate()` fails
-    /// (e.g. empty `app_namespace`, empty `cookie_name`, malformed
-    /// `post_login_redirect`).
     pub fn new(
         store: KeyStore,
         session_key: Arc<SessionKey>,
@@ -71,19 +37,16 @@ impl SessionState {
         })
     }
 
-    /// Borrow the underlying [`KeyStore`].
     #[must_use]
     pub fn store(&self) -> &KeyStore {
         &self.store
     }
 
-    /// Borrow the shared [`SessionKey`].
     #[must_use]
     pub fn session_key(&self) -> &SessionKey {
         &self.session_key
     }
 
-    /// Borrow the shared [`SessionConfig`].
     #[must_use]
     pub fn config(&self) -> &SessionConfig {
         &self.config
@@ -100,22 +63,9 @@ impl std::fmt::Debug for SessionState {
     }
 }
 
-/// Axum middleware: require a valid session cookie + at least one
-/// permission in the app namespace.
-///
-/// Flow: parse Cookie header → find `config.cookie_name` → decrypt → check
-/// expiry → `KeyStore::verify_key` → confirm the key resolves ≥1 permission
-/// in `config.app_namespace` → insert [`crate::VerifiedKey`] into request
-/// extensions → call inner.
-///
-/// Failure mapping:
-/// - Missing/malformed/decrypt-fail/expired cookie → 401 (no cookie cleared
-///   — clearing the shared `fleet_session` cookie from one app's error
-///   handler logs the user out of every sibling app).
-/// - `verify_key` failure (revoked, retyped, expired-at-DB) → 401.
-/// - Valid session but zero permissions in `config.app_namespace` → branded
-///   403 HTML page, cookie left intact so the user can navigate back to a
-///   sibling app where they DO have access.
+/// Missing/malformed/decrypt-fail/expired cookie → 401 (no cookie cleared
+/// — clearing the shared `fleet_session` cookie from one app's error
+/// handler logs the user out of every sibling app).
 pub async fn require_session(
     State(state): State<SessionState>,
     mut req: Request,
@@ -166,26 +116,9 @@ pub async fn require_session(
     next.run(req).await
 }
 
-/// Axum middleware: require a valid `Authorization: Bearer flt_...` header.
-///
-/// Flow: parse Authorization header → extract bearer token →
-/// `KeyStore::verify_key` → insert [`crate::VerifiedKey`] into request extensions
-/// → call inner.
-///
-/// # Important: does not check the app namespace grant
-///
-/// Unlike [`require_session`], this layer accepts *any* verified key
-/// regardless of which app(s) the key holds permissions in. That is
-/// intentional (ADR-0030: cross-app service principals must be able to call
-/// API routes), but it means mounting this layer on a route is not
-/// sufficient authorisation: every consumer must also gate the route on
-/// `verified.has_app_permission(app, permission)` and reject keys without
-/// it.
-///
 /// This middleware authenticates, it does not authorise. Forgetting the
 /// permission guard on a downstream route accepts any valid fleet token from
-/// any sibling app. The integration test
-/// `bearer_does_not_enforce_namespace` locks this behaviour in.
+/// any sibling app.
 pub async fn require_bearer(
     State(state): State<SessionState>,
     req: Request,
@@ -194,27 +127,17 @@ pub async fn require_bearer(
     verify_bearer(&state.store, req, next).await
 }
 
-/// Keystore-only auth state for [`require_bearer_only`].
-///
-/// Unlike [`SessionState`] it carries no session key or cookie config, just
-/// the [`KeyStore`]: a bearer-only service (a daemon that authenticates
-/// *only* `Authorization: Bearer flt_...` and never reads session cookies,
-/// e.g. trawld) has no cookie secret to embed. Carrying no session key also
-/// means it cannot be handed to [`require_session`], so cookie auth will not
-/// type-check against a service that has no cookie material.
 #[derive(Clone)]
 pub struct BearerState {
     store: KeyStore,
 }
 
 impl BearerState {
-    /// Wrap a [`KeyStore`] as bearer-only auth state.
     #[must_use]
     pub fn new(store: KeyStore) -> Self {
         Self { store }
     }
 
-    /// Borrow the underlying [`KeyStore`].
     #[must_use]
     pub fn store(&self) -> &KeyStore {
         &self.store
@@ -229,19 +152,7 @@ impl std::fmt::Debug for BearerState {
     }
 }
 
-/// Axum middleware: identical to [`require_bearer`] but backed by a
-/// keystore-only [`BearerState`] instead of a full [`SessionState`].
-///
-/// Use this on daemons that only ever verify bearer tokens and never read
-/// session cookies — it lets them hold just a [`KeyStore`] rather than
-/// fabricating a throwaway session key to satisfy [`SessionState`].
-///
-/// # Important: does not check the app namespace grant
-///
-/// Like [`require_bearer`], this authenticates but does not authorise: it
-/// accepts *any* verified key regardless of app grants. Every consumer must
-/// still gate the route with its own permission guard. See
-/// [`require_bearer`] for the full rationale.
+/// Like [`require_bearer`], this authenticates but does not authorise.
 pub async fn require_bearer_only(
     State(state): State<BearerState>,
     req: Request,
@@ -250,9 +161,6 @@ pub async fn require_bearer_only(
     verify_bearer(&state.store, req, next).await
 }
 
-/// Shared body for [`require_bearer`] and [`require_bearer_only`]: extract the
-/// bearer token, verify it against the [`KeyStore`], and insert the resulting
-/// [`crate::VerifiedKey`] into request extensions before calling the inner service.
 async fn verify_bearer(store: &KeyStore, mut req: Request, next: Next) -> Response {
     let Some(token) = extract_bearer(req.headers()) else {
         tracing::warn!("auth: missing or malformed bearer header");
@@ -268,19 +176,9 @@ async fn verify_bearer(store: &KeyStore, mut req: Request, next: Next) -> Respon
     next.run(req).await
 }
 
-/// Parse a Cookie header and return the value of `name`, or None if absent.
-///
 /// Returns the LAST match (not the first) when the same name appears more
-/// than once. RFC 6265 §5.4 doesn't fully define ordering when multiple
-/// cookies with the same name exist at different domain scopes
-/// (parent-domain vs subdomain) — browsers vary. Pick the last value as a
-/// deterministic tiebreak so behaviour is stable across clients. Practical
-/// impact is minimal because `fleet_session` is always set at `path=/` and
-/// any domain-scope collision implies a misconfigured `Domain=` attribute,
-/// which an operator should fix upstream.
-///
-/// No URL-decoding — session cookie values are base64url, which is
-/// cookie-safe.
+/// than once. Pick the last value as a deterministic tiebreak so behaviour
+/// is stable across clients.
 fn find_cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
     let mut found = None;
     for pair in header.split(';') {
@@ -294,11 +192,6 @@ fn find_cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
     found
 }
 
-/// Extract the token from an `Authorization: Bearer <token>` header.
-///
-/// Case-insensitive on the scheme name (RFC 7235 §2.1). Rejects empty
-/// tokens and any non-Bearer scheme. Borrows from the header — no
-/// per-request alloc on the bearer hot path.
 fn extract_bearer(headers: &HeaderMap<HeaderValue>) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
@@ -309,11 +202,6 @@ fn extract_bearer(headers: &HeaderMap<HeaderValue>) -> Option<&str> {
     if token.is_empty() { None } else { Some(token) }
 }
 
-/// Build a small `{"error": ..., "detail": ...}` JSON body for an error
-/// response. Uses `serde_json` so `detail` can never break JSON framing —
-/// crucial because callers pass arbitrary user-facing strings, and a future
-/// caller that forwards user-controlled bytes here would otherwise turn this
-/// into a JSON-injection footgun.
 pub(crate) fn error_response(status: StatusCode, kind: &str, detail: &str) -> Response {
     let body = serde_json::json!({ "error": kind, "detail": detail }).to_string();
     (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
@@ -323,30 +211,13 @@ pub(crate) fn unauthorized_json(message: &str) -> Response {
     error_response(StatusCode::UNAUTHORIZED, "unauthorized", message)
 }
 
-/// 503 Service Unavailable for transient backend failures in the auth path.
-///
 /// Distinct from 401 so operators can alarm separately on "auth backend
 /// down" and "wrong credentials": collapsed into 401, a Postgres blip reads
-/// as a brute-force attack. Paired with `tracing::error!(target:
-/// "auth.backend", ...)` at the call site for filterable alerting.
+/// as a brute-force attack.
 pub(crate) fn service_unavailable_json(detail: &str) -> Response {
     error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", detail)
 }
 
-/// Classify a [`KeyStore::verify_key`] failure into the right HTTP response.
-///
-/// Centralised so the three auth paths (session, bearer, login) agree on
-/// status codes + tracing targets:
-///
-/// - `Database` / `Migration` / `Hash` / `TokenGeneration` → 503 with
-///   `tracing::error!(target: "auth.backend", ...)`, so operators can
-///   alarm on backend health independently of 401 spikes.
-/// - `InvalidKey` / `MalformedToken` → 401 with `tracing::warn!` —
-///   legitimate auth failure.
-/// - Anything else → 500 + `tracing::error!`. Shouldn't happen in this
-///   call path (`verify_key` doesn't produce admin-only variants), so a
-///   loud signal beats a silent one.
-///
 /// `path` is one of "session", "bearer" or "login": it names the auth path in
 /// the log line and picks the 401 detail wording, so any other tag reads as a
 /// session failure.
@@ -394,10 +265,6 @@ pub(crate) fn classify_verify_error(err: AuthError, path: &str) -> Response {
     }
 }
 
-/// Build the no-grant 403 HTML body.
-///
-/// Cookie is NOT cleared (per ADR-0030: the user can navigate back to a
-/// sibling app where they DO have a grant without re-authenticating).
 pub(crate) fn no_grant_response(name: &str, app: &str) -> Response {
     let body = format!(
         "<!doctype html>\n\
@@ -419,10 +286,6 @@ pub(crate) fn no_grant_response(name: &str, app: &str) -> Response {
         .into_response()
 }
 
-/// Escape the five HTML special chars. Defence in depth — `app_namespace`
-/// is validated at config time and `name` comes from the operator-controlled
-/// `api_keys.name` column, but rendering raw user-supplied strings into HTML
-/// without escaping is the kind of mistake one only makes once.
 fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

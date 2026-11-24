@@ -2,15 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Postgres-backed integration tests for `require_session` and
-//! `require_bearer` middleware (ADR-0030).
-//!
-//! Builds a real `axum::Router` with the middleware layered on, fires
-//! requests via `tower::ServiceExt::oneshot`, and asserts both response
-//! shape and that downstream handlers receive a populated
-//! `Extension<VerifiedKey>`. Real `KeyStore` against an ephemeral
-//! per-test Postgres database (via `#[sqlx::test]`).
-
 #![cfg(feature = "axum")]
 
 mod common;
@@ -33,12 +24,6 @@ use zeroize::Zeroizing;
 
 use common::{body_string, session_state};
 
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-/// Downstream handler used by every test — proves the middleware actually
-/// populated `Extension<VerifiedKey>` before forwarding.
 async fn echo_handler(Extension(key): Extension<VerifiedKey>) -> impl IntoResponse {
     format!(
         "ok name={} kind={} roles={}",
@@ -49,9 +34,6 @@ async fn echo_handler(Extension(key): Extension<VerifiedKey>) -> impl IntoRespon
 }
 
 fn session_config(app_namespace: &str) -> SessionConfig {
-    // ADR-0016: `public_origins` is required, so even a fixture that never
-    // sends an `Origin` states one. These tests exercise `RequireSession`,
-    // which does not run the origin guard.
     SessionConfig::builder()
         .cookie_name("fleet_session")
         .app_namespace(app_namespace)
@@ -90,8 +72,6 @@ fn issue_session_cookie(session_key: &SessionKey, token: &str, ttl_secs: i64) ->
     encrypt(session_key, &payload).expect("encrypt cookie")
 }
 
-/// Seed the `trawl-analyst` role and return its name as the role list every
-/// test key is created with.
 async fn trawl_role(store: &KeyStore) -> Vec<String> {
     store
         .create_role(
@@ -106,10 +86,6 @@ async fn trawl_role(store: &KeyStore) -> Vec<String> {
         .expect("seed trawl-analyst role");
     vec!["trawl-analyst".to_owned()]
 }
-
-// ---------------------------------------------------------------------------
-// require_session
-// ---------------------------------------------------------------------------
 
 #[sqlx::test]
 async fn session_valid_cookie_sets_extension(pool: sqlx::PgPool) {
@@ -181,7 +157,6 @@ async fn session_expired_cookie_returns_401_keeps_cookie(pool: sqlx::PgPool) {
         .unwrap();
 
     let (state, session_key) = session_state(store, session_config("trawl"));
-    // ttl_secs negative → exp in the past → is_expired true
     let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, -60);
     let app = session_router(state);
 
@@ -200,8 +175,6 @@ async fn session_expired_cookie_returns_401_keeps_cookie(pool: sqlx::PgPool) {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    // ADR-0030: do NOT clear shared cookie on expiry — would log user out
-    // of every sibling app.
     assert!(
         !response.headers().contains_key(header::SET_COOKIE),
         "expired session must NOT clear the cookie"
@@ -245,8 +218,6 @@ async fn session_no_grant_returns_403_html_keeps_cookie(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
     let roles = trawl_role(&store).await;
 
-    // Key has trawl permissions only, but the app is configured as
-    // "coastwatch" — zero permissions in the app namespace → 403.
     let created = store
         .create_key("alice", PrincipalKind::Human, &roles, None)
         .await
@@ -289,10 +260,6 @@ async fn session_grant_revoked_during_session_returns_403(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
     let roles = trawl_role(&store).await;
 
-    // Key remains active, but its only role is unassigned after the
-    // cookie was issued. The next request must take the no-permission
-    // 403 path, proving middleware re-resolves roles from the DB on
-    // each request rather than trusting cached state.
     let created = store
         .create_key("alice", PrincipalKind::Human, &roles, None)
         .await
@@ -360,10 +327,6 @@ async fn session_revoked_key_returns_401(pool: sqlx::PgPool) {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
-
-// ---------------------------------------------------------------------------
-// require_bearer
-// ---------------------------------------------------------------------------
 
 #[sqlx::test]
 async fn bearer_valid_token_sets_extension(pool: sqlx::PgPool) {
@@ -468,10 +431,6 @@ async fn bearer_does_not_enforce_namespace(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
     let roles = trawl_role(&store).await;
 
-    // A key with no permission in "coastwatch" still passes bearer
-    // middleware configured for "coastwatch": per ADR-0030 cross-app
-    // service principals must be allowed past, and each app gates further
-    // with its own permission guard.
     let created = store
         .create_key("svc", PrincipalKind::Service, &roles, None)
         .await
@@ -497,19 +456,10 @@ async fn bearer_does_not_enforce_namespace(pool: sqlx::PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-// ---------------------------------------------------------------------------
-// build-time sanity: the builder rejects invalid config before construction
-// ---------------------------------------------------------------------------
-
 #[sqlx::test]
 async fn session_state_rejects_invalid_config(pool: sqlx::PgPool) {
     let _store = KeyStore::from_pool(pool);
 
-    // External code can't construct an invalid SessionConfig:
-    // `#[non_exhaustive]` and `pub(crate)` fields force every external
-    // value through `SessionConfig::builder().build()`, which validates
-    // first. So the reachable check is the builder's, and this asserts it
-    // rejects an empty cookie name.
     let err = SessionConfig::builder()
         .cookie_name("")
         .app_namespace("trawl")
