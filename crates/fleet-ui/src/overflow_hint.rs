@@ -10,7 +10,6 @@ use leptos_use::{
 };
 
 /// Place beside the scroll region so the instruction cannot affect its width.
-/// Both observers disconnect when the component unmounts.
 #[component]
 pub fn OverflowHint(viewport: NodeRef<html::Div>) -> impl IntoView {
     let overflowing = RwSignal::new(false);

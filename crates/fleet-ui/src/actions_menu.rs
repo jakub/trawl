@@ -3,18 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<ActionsMenu/>` — `⋯` overflow menu for table rows.
-//!
-//! This module owns the trigger button (`.btn-icon`, accessible name
-//! "Actions"), the open/close state, the positioning wrapper
-//! (`.actions-wrap`) and the entries. Everything else — the overlay
-//! layer, Escape, outside dismissal, roving tabindex, the arrow walk
-//! and restore-by-cause — is the shared contract in
-//! [`crate::menu`], which the topbar's account menu mounts too, so the
-//! two menus cannot drift apart (ADR-0028).
-//!
-//! Clicks on the trigger and the items stop propagation: every current
-//! call site nests the menu inside a clickable table row, so the panel
-//! is mounted with `stop_click_propagation`.
 
 use leptos::html::{Button, Div};
 use leptos::prelude::*;
@@ -22,8 +10,7 @@ use leptos::web_sys;
 
 use crate::menu::{MenuEntry, MenuItem, MenuPanel};
 
-/// One entry in the menu. `danger` renders the destructive (red)
-/// treatment. The menu closes, and focus returns to the trigger, before
+/// The menu closes, and focus returns to the trigger, before
 /// `on_click` runs.
 #[derive(Clone, Debug)]
 pub struct ActionItem {
@@ -33,7 +20,6 @@ pub struct ActionItem {
 }
 
 impl ActionItem {
-    /// A regular entry.
     #[must_use]
     pub fn new(label: &'static str, on_click: Callback<()>) -> Self {
         Self {
@@ -43,7 +29,6 @@ impl ActionItem {
         }
     }
 
-    /// A destructive entry (`.item.danger`).
     #[must_use]
     pub fn danger(label: &'static str, on_click: Callback<()>) -> Self {
         Self {
@@ -54,9 +39,6 @@ impl ActionItem {
     }
 }
 
-/// Overflow menu: `⋯` trigger + dropdown panel. The component owns the
-/// positioning context (`.actions-wrap`), so call sites just drop it
-/// into the row cell.
 #[component]
 pub fn ActionsMenu(items: Vec<ActionItem>) -> impl IntoView {
     let open = RwSignal::new(false);

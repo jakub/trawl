@@ -7,32 +7,18 @@
 //! size via the `size` prop on `IconView` (CSS doesn't size these
 //! because the consumer expects the `width`/`height` attributes to be
 //! present for layout).
-//!
-//! Adding a glyph is a one-line enum change plus a match arm. There is
-//! no escape hatch by design: ADR-0030 keeps the fleet on one closed
-//! icon set rather than letting consumers pass arbitrary SVGs in.
 
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 
-/// Every icon shipped by fleet-ui. Used by the sidebar, the command
-/// bar, the modal family, and app content. Variants are grouped by
-/// where they are used: shared chrome, sidebar, then app content.
-///
-/// The enum itself is a pure `&'static` descriptor that builds on every
-/// target (like [`crate::theme::prefs`] and [`crate::toast::kinds`]) so
-/// native consumers — and their unit tests — can name icons without the
-/// leptos renderer. [`IconView`] (the SVG component) is wasm32-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
-    // shared chrome
     Search,
     Chevron,
     Bell,
     Close,
     Menu,
     PanelLeft,
-    // sidebar
     Clock,
     Database,
     News,
@@ -44,7 +30,6 @@ pub enum Icon {
     User,
     Chart,
     Question,
-    // app content
     Download,
     Pin,
     Calendar,
@@ -56,10 +41,6 @@ pub enum Icon {
     Copy,
 }
 
-/// Renders an [`Icon`] as a 16×16 inline SVG. `stroke_width` defaults
-/// to 1.4 (sidebar-tuned); `size` defaults to 16 so the SVG matches the
-/// viewBox 1:1 unless the caller wants something smaller (topbar uses
-/// 10–14, modal close uses 12).
 #[cfg(target_arch = "wasm32")]
 #[component]
 pub fn IconView(

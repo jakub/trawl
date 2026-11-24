@@ -41,8 +41,6 @@ mod component {
     use leptos_use::{use_event_listener, use_window};
     use wasm_bindgen::JsCast;
 
-    /// A trigger and range-selection dialog. Apps supply the preset labels
-    /// and accept or refuse raw selections; live mode is optional.
     #[component]
     pub fn RangeDialog(
         #[prop(into)] value: Signal<RangeValue>,
@@ -119,8 +117,6 @@ mod component {
         }
     }
 
-    /// Popover body: Relative (quick presets grid), Absolute (from/to inputs),
-    /// Real-time (Live Tail). Click-outside via a fullscreen scrim closes it.
     #[component]
     fn RangePanel(
         #[prop(into)] value: Signal<RangeValue>,
@@ -131,11 +127,7 @@ mod component {
         on_commit: Callback<RangeValue, Result<(), String>>,
         on_live: Option<Callback<(), Result<(), String>>>,
         open: RwSignal<bool>,
-        /// True while the link cannot be read: presets, Apply and Live Tail
-        /// all navigate, so all three are disabled and their handlers return
-        /// before they emit anything (ADR-0027).
-        #[prop(into)]
-        disabled: Signal<bool>,
+        #[prop(into)] disabled: Signal<bool>,
     ) -> impl IntoView {
         let live_label = StoredValue::new(live_label);
         let live_description = StoredValue::new(live_description);
@@ -152,31 +144,12 @@ mod component {
         let scrim_ref = NodeRef::<Div>::new();
         let panel_ref = NodeRef::<Div>::new();
 
-        // The picker is a modal dialog on fleet-ui's overlay stack, and one
-        // causal chain runs through this registration:
-        //
-        // The hook reads `document.activeElement` at mount and keeps it as
-        // the opener, then restores focus to it on unmount. Opening the
-        // picker is a click on the trigger, so the opener is whatever the
-        // trigger element happens to be — and only a native button is
-        // focused by that click. The trigger was a `<div>`, which is not
-        // focusable, so the captured opener would have been the editor (or
-        // the body) and Escape would have dropped focus somewhere else
-        // entirely. Focus restore works because the trigger is now a button.
-        //
-        // Trap rather than Capture: the scrim already blocks every pointer
-        // event outside the panel, so letting Tab walk out into a page the
-        // mouse cannot reach is the one combination that strands a keyboard
-        // user (ADR-0029). Trap also earns the aria-modal="true" below, and
-        // gives the panel its initial focus — the Segmented's first tab.
         let layer =
             crate::overlay::use_overlay_layer_with(crate::overlay::FocusPolicy::Trap, move || {
                 panel_ref.get().map(web_sys::Element::from)
             });
         // Escape at the window, not on the panel: the key has to work before
-        // focus has moved anywhere. use_event_listener registers its own
-        // on_cleanup, so the discarded handle is deliberate. The topmost
-        // guard keeps a modal stacked over the picker from closing both.
+        // focus has moved anywhere.
         let _ = use_event_listener(use_window(), ev::keydown, move |e| {
             if !layer.is_topmost() {
                 return;
@@ -227,10 +200,6 @@ mod component {
             commit.run(RangeValue::Absolute { from: f, to: t });
         });
 
-        // Dismiss on mousedown, and only when the press landed on the scrim
-        // element itself: an identity compare, never a class-name heuristic
-        // (the shape fleet-ui's Modal uses). Gated on topmost so a dialog
-        // stacked over the picker is not dismissed through it.
         let on_scrim_mousedown = move |e: web_sys::MouseEvent| {
             if !layer.is_topmost() {
                 return;
@@ -246,20 +215,16 @@ mod component {
                 // mousedown's default action is the browser's focus fix-up,
                 // and it runs AFTER this handler: the scrim is not
                 // focusable, so it would clear focus to <body> right after
-                // the overlay hook put it back on the trigger. Suppressing
-                // it is what makes a scrim dismissal end where Escape does.
-                // Nothing else on a transparent full-screen scrim depends on
-                // that default (no selection, no drag).
+                // the overlay hook put it back on the trigger.
                 e.prevent_default();
                 close();
             }
         };
 
         view! {
-            // Fullscreen scrim captures outside presses. Transparent — the
-            // popover sits on top of it. A sibling BEFORE the panel, and
-            // never the panel the focus resolver is given: only .dr-pop is
-            // resolved, so the scrim stays out of the Tab cycle.
+            // A sibling BEFORE the panel, and never the panel the focus
+            // resolver is given: only .dr-pop is resolved, so the scrim stays
+            // out of the Tab cycle.
             <div
                 class="scrim"
                 node_ref=scrim_ref
@@ -273,7 +238,6 @@ mod component {
                 aria-label="Time range"
                 tabindex="-1"
             >
-                // The optional callback decides whether the third tab exists.
                 <Segmented
                     size=Size::Sm
                     full=true
@@ -284,9 +248,6 @@ mod component {
                 {move || match tab.get() {
                     Tab::Relative => view! {
                         <div class="grid">
-                            // Buttons rather than divs: a preset navigates,
-                            // so an unreadable link has to be able to say so
-                            // with the attribute browsers already honour.
                             {presets.get_value().into_iter().map(|preset| {
                                 let id = StoredValue::new(preset.id);
                                 let is_on = Signal::derive(move || quick.get() == Some(id.get_value()));
@@ -295,11 +256,6 @@ mod component {
                                         type="button"
                                         class="opt"
                                         class:on=move || is_on.get()
-                                        // The picked preset is a pressed
-                                        // state, not a disabled one: the
-                                        // grid is a set of toggles and the
-                                        // .on class alone says nothing to a
-                                        // screen reader.
                                         aria-pressed=move || is_on.get().to_string()
                                         disabled=move || disabled.get()
                                         on:click=move |_| commit.run(RangeValue::Quick(id.get_value()))

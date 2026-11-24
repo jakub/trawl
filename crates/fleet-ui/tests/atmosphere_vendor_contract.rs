@@ -4,21 +4,10 @@
 
 //! Native contract tests over the committed vendor artifacts
 //! (ADR-0012).
-//!
-//! wasm-bindgen inlines the vendored `paper-shaders.js` at compile
-//! time, so a missing or renamed file is already a build error. What
-//! it cannot see is the bundle's contents: a malformed module shape, a
-//! renamed export, or a stale attribution banner produces a backdrop
-//! that silently never appears, with no compile-time signal on any
-//! target. `include_str!` over the committed artifacts turns those
-//! failure modes into `cargo nextest` reds. The CI vendor-drift job
-//! guarantees the committed bundle matches `build.sh` output, so
-//! asserting on the committed bytes is asserting on the build.
 
 const BUNDLE: &str = include_str!("../vendor/paper-shaders.js");
 const PACKAGE_JSON: &str = include_str!("../vendor/package.json");
 
-/// The `@paper-design/shaders` version pinned in `vendor/package.json`.
 fn pinned_version() -> String {
     let key = "\"@paper-design/shaders\":";
     let start = PACKAGE_JSON
@@ -40,11 +29,6 @@ fn pinned_version() -> String {
 
 #[test]
 fn bundle_carries_the_apache_attribution_banner() {
-    // The upstream package is Apache-2.0: redistribution must carry
-    // attribution IN the artifact actually served to browsers. Only an
-    // esbuild `--banner:js` comment (the `/*!` form minifiers keep)
-    // survives minification — LICENSE/NOTICE next to the bundle never
-    // leave the repo checkout.
     let banner_end = BUNDLE.find("*/").map_or(0, |i| i + 2);
     let banner = &BUNDLE[..banner_end];
     assert!(
@@ -93,10 +77,6 @@ fn atmosphere_vendor_contract_dispose_removes_the_parent_style_marker() {
 
 #[test]
 fn bundle_is_a_self_contained_esm_module() {
-    // wasm-bindgen `module = "…"` loads the file as one browser ES
-    // module with no resolver: a relative import or a CommonJS
-    // `require()` escaping minification means the bundle silently fails
-    // to load at runtime — the backdrop just never appears.
     let body = &BUNDLE[BUNDLE.find("*/").map_or(0, |i| i + 2)..];
     for needle in ["from\"./", "from\"../", "from \"./", "from \"../"] {
         assert!(
@@ -131,12 +111,6 @@ const CARGO_TOML: &str = include_str!("../Cargo.toml");
 
 #[test]
 fn the_snippet_binding_stays_behind_the_default_off_atmosphere_feature() {
-    // wasm-bindgen emits a local snippet for every consumer that links
-    // the extern block; calling it is irrelevant. Ungated, `interop`
-    // plants 142 KB in the dist of every fleet-ui consumer and
-    // modulepreloads it, mounted or not. The cfg is the only thing
-    // keeping those bytes opt-in (ADR-0012), and native builds cannot
-    // observe the emission, so pin the gate itself here.
     assert!(
         ATMOSPHERE_MOD.contains(
             "#[cfg(all(target_arch = \"wasm32\", feature = \"atmosphere\"))]\npub mod interop;"
@@ -162,10 +136,8 @@ fn the_snippet_binding_stays_behind_the_default_off_atmosphere_feature() {
 
 #[test]
 fn interop_path_agrees_with_the_vendored_filename() {
-    // The wasm-bindgen module path is a compile-time snippet path
-    // resolved against the crate root, so it must name the committed
-    // file (whose existence include_str! proves). The compiler enforces
-    // this on wasm32 only; this test carries it onto native builds.
+    // The compiler enforces this on wasm32 only; this test carries it onto
+    // native builds.
     assert!(
         INTEROP.contains(r#"module = "/vendor/paper-shaders.js""#),
         "interop.rs must bind module = \"/vendor/paper-shaders.js\" — \
@@ -175,10 +147,6 @@ fn interop_path_agrees_with_the_vendored_filename() {
 
 #[test]
 fn palette_shader_is_a_catalog_key() {
-    // createShader falls through to treating an unknown name as raw
-    // GLSL source, so a typo'd catalog name compiles as a broken shader
-    // and renders nothing. Pin the name against the unminified wrapper
-    // source's catalog keys.
     let key = format!("\n  {}: ", fleet_ui::atmosphere::palette::SHADER);
     assert!(
         WRAPPER_TS.contains(&key),

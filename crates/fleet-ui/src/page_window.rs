@@ -7,7 +7,6 @@
 
 use std::num::NonZeroUsize;
 
-/// Whether the server reports the whole result count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageTotal {
     Known(usize),
@@ -16,7 +15,6 @@ pub enum PageTotal {
     Probe,
 }
 
-/// The requested offset or returned row range cannot fit in `usize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageWindowOverflow;
 
@@ -33,8 +31,6 @@ pub struct PageWindow {
 }
 
 impl PageWindow {
-    /// Compute an offset before sending a request.
-    ///
     /// # Errors
     /// Returns an error when multiplication would overflow.
     pub fn checked_offset(page: usize, size: NonZeroUsize) -> Result<usize, PageWindowOverflow> {

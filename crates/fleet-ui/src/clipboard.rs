@@ -2,14 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Async clipboard write (wasm-only — there is no clipboard off the
-//! browser). [`crate::copy_button::CopyButton`] is the toast-wired UI
-//! over it; the bare helper stays public for programmatic copies.
-
 use wasm_bindgen_futures::JsFuture;
 
-/// Write `text` to the system clipboard via the async Clipboard API.
-///
 /// # Errors
 ///
 /// Returns the stringified JS error when the browser rejects the

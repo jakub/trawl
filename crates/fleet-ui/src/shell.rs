@@ -2,34 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Shell/>` — chrome-only application layout: body(sidebar +
-//! content(command bar + main(children))) + footer + toast host.
-//!
-//! Owns the [`ToastBus`] via `provide_context` and the route command palette.
-//! Does NOT do auth, fetch `/me`, render a status bar, or know what
-//! routes exist beyond the sidebar groups it is handed. Consumers wrap
-//! `Shell` with whatever app-specific concerns they need — trawl's
-//! `AuthShell` gates on `/me`, owns its `StatusBar`, passes that as the
-//! `footer` prop, and renders its router `<Outlet/>` as `children`.
-//!
-//! # Compact navigation
-//!
-//! Below 900px the sidebar is not docked: the command bar's toggle opens
-//! it as a `FocusPolicy::Capture` overlay layer over a scrim, the same
-//! posture [`crate::drawer`] has. While it is open `has_layers()` is
-//! true, so the palette chord is inert, Escape closes it only while it
-//! is topmost, a route change closes it, and focus returns to the
-//! toggle through the layer's opener restore.
-//!
-//! # `ToastBus` contract
-//!
-//! Shell is the single owner of the toast stack: one bus, one
-//! `<Toasts/>` host, provided via context. `children` and `footer`
-//! closures execute inside Shell's body, so `<Outlet/>` page content
-//! reaches the bus with `expect_context::<ToastBus>()`. Consumers must
-//! not create their own bus or mount their own `<Toasts/>` inside a
-//! Shell — see [`crate::toast`] for the full contract.
-
 use leptos::ev;
 use leptos::html::{Button, Div};
 use leptos::prelude::*;
@@ -53,7 +25,7 @@ use crate::toast::{ToastBus, Toasts};
 use crate::topbar::{TopBar, UserInfo};
 
 #[component]
-#[allow(clippy::too_many_lines)] // the chrome is one cohesive view tree
+#[allow(clippy::too_many_lines)]
 pub fn Shell(
     #[prop(into)] brand: String,
     #[prop(into)] brand_accent: String,
@@ -61,14 +33,9 @@ pub fn Shell(
     #[prop(into)] sidebar_active: Signal<String>,
     #[prop(into)] user: Signal<Option<UserInfo>>,
     on_logout: Callback<()>,
-    /// App footer (status bar). Optional — footer-less apps omit it and
-    /// the shell grid's `auto` row collapses to zero height.
-    #[prop(optional)]
-    footer: Option<Children>,
-    /// Bottom-pinned sidebar slot, passed through to [`Sidebar`]'s
-    /// `bottom` prop. A [`ViewFn`], not `Children`: the sidebar is
-    /// mounted docked or as the compact overlay, so the slot has to
-    /// render more than once.
+    #[prop(optional)] footer: Option<Children>,
+    /// A [`ViewFn`], not `Children`: the sidebar is mounted docked or as the
+    /// compact overlay, so the slot has to render more than once.
     #[prop(optional, into)]
     sidebar_bottom: Option<ViewFn>,
     children: Children,
@@ -142,9 +109,8 @@ pub fn Shell(
     // reports.
     let compact = use_media_query("(max-width: 899.98px)");
     let nav_open = RwSignal::new(false);
-    // Leaving compact docks the sidebar and unmounts the overlay, but the
-    // flag it was opened with survived, so narrowing again re-opened the
-    // overlay by itself over a page nobody had asked it about.
+    // Leaving compact unmounts the overlay, but the flag it was opened with
+    // survived, so narrowing again re-opened the overlay by itself.
     Effect::new(move |_| {
         if !compact.get() {
             nav_open.set(false);
@@ -154,8 +120,6 @@ pub fn Shell(
     let close_nav = Callback::new(move |()| nav_open.set(false));
     let toggle_nav = Callback::new(move |()| nav_open.update(|open| *open = !*open));
 
-    // The crumb names the active destination; before the consumer's
-    // routing state resolves, the brand is the honest fallback.
     let brand_title = brand.clone();
     let page_title = Signal::derive(move || {
         let active = sidebar_active.get();
@@ -170,9 +134,6 @@ pub fn Shell(
             .unwrap_or_else(|| brand_title.clone())
     });
 
-    // Collapse is a persisted preference, so the control exists only
-    // where `fleet_ui::install()` was called: without prefs there is
-    // nowhere to write the state and the sidebar stays expanded.
     let prefs = use_context::<UiPrefs>();
     let collapsed =
         prefs.map(|p| Signal::derive(move || p.sidebar().get() == SidebarPref::Collapsed));
@@ -245,12 +206,6 @@ pub fn Shell(
     }
 }
 
-/// The compact-width sidebar: a scrim plus the sidebar itself, registered
-/// with the overlay stack so the rest of the chrome arbitrates against it.
-///
-/// `FocusPolicy::Capture` — initial focus moves into the panel and
-/// returns to the opener on close, but nothing is Tab-trapped and the
-/// background stays interactive, exactly as [`crate::drawer`] behaves.
 #[component]
 fn NavOverlay(
     brand: String,
@@ -274,9 +229,8 @@ fn NavOverlay(
         }
     });
 
-    // Navigating is what the overlay is for, so the first route change
-    // after it opens closes it. Comparing against the pathname at mount
-    // keeps the effect from firing on its own first run.
+    // Comparing against the pathname at mount keeps the effect from firing on
+    // its own first run.
     let pathname = use_location().pathname;
     let opened_at = pathname.get_untracked();
     Effect::new(move |_| {

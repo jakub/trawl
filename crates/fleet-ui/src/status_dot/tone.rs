@@ -2,15 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pure status-dot tone. No `leptos`, no `web_sys` — builds on every
-//! target so the per-tone CSS-class fragment is exercised by native
-//! unit tests (mirrors [`crate::button::variant`]). Run status, schema
-//! health and everything else share the one `.status-dot` family;
-//! mapping a domain status *string* onto a tone stays app-side
-//! (ADR-0002: status vocabularies are app semantics).
-
-/// Dot tone. Maps onto the `.status-dot.{tone}` classes shipped in
-/// `styles/fleet-ui.css`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StatusTone {
     /// Bare `.status-dot` — an unknown/other status. Renders as an
@@ -23,8 +14,6 @@ pub enum StatusTone {
 }
 
 impl StatusTone {
-    /// CSS class fragment appended by [`dot_class`]. `None` for the
-    /// neutral (bare-class) tone.
     #[must_use]
     pub fn css_suffix(self) -> Option<&'static str> {
         match self {
@@ -36,7 +25,6 @@ impl StatusTone {
     }
 }
 
-/// Compose the full `class` attribute rendered by `<StatusDot>`.
 #[must_use]
 pub fn dot_class(tone: StatusTone) -> String {
     match tone.css_suffix() {
@@ -59,7 +47,6 @@ mod tests {
 
     #[test]
     fn dot_class_composition() {
-        // The unknown-status arm carries no tone suffix.
         assert_eq!(dot_class(StatusTone::Neutral), "status-dot");
         assert_eq!(dot_class(StatusTone::Error), "status-dot error");
     }

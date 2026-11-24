@@ -4,56 +4,6 @@
 
 //! `<Tabs/>` — generic tab strip, rendered as a WAI-ARIA tablist
 //! (ADR-0028).
-//!
-//! One component, two class families, selected by [`TabsStyle`]:
-//!
-//! - [`TabsStyle::Workspace`] — trawl's search-workspace strip
-//!   (`.tabs > .tablist > button.t.active`, weight 500, optional
-//!   per-tab count chip).
-//! - [`TabsStyle::Drawer`] — the drawer strip
-//!   (`.sd-tabs > .tablist > button.tb.on`, weight 600, optional
-//!   trailing meta text). [`Drawer`](crate::Drawer) composes this
-//!   internally.
-//!
-//! Both families render `<button type="button" role="tab">`; they
-//! differ in class and in the active-class idiom only, because each
-//! matches its own CSS rules and merging them would point one strip at
-//! the other's font weight. Tab identity is a `&'static str` id; apps
-//! with typed tab enums adapt at the call site (a two-line id ↔ enum
-//! map), keeping app semantics in the app (ADR-0002).
-//!
-//! ## What the strip owns
-//!
-//! The `role="tablist"` node wraps the tab buttons and nothing else.
-//! The flex spacer, the workspace family's `trailing` action slot and
-//! the drawer family's `meta` text are siblings of that node, inside
-//! the outer `.tabs` / `.sd-tabs` container: a Save link announced as a
-//! tab is worse than one announced as a button. An `items`-less strip
-//! (the field case drawer uses the container purely as a meta bar)
-//! renders the `.tablist` div without `role` or `aria-label`, because a
-//! named tablist holding no tabs is a defect an assistive technology
-//! would report.
-//!
-//! `label` is required and names the strip ("Results", "Service
-//! details"): a screen reader announcing "tab list" with no name leaves
-//! two strips on one page indistinguishable.
-//!
-//! ## Keyboard
-//!
-//! Arrow Right/Left wrap, Home and End jump to the ends
-//! ([`crate::roving::horizontal_nav`]), each moving FOCUS only. The
-//! strip's single tab stop is derived from SELECTION — `aria-selected`
-//! and `tabindex` are one predicate over
-//! [`resolve_selected`](crate::roving::resolve_selected), so the strip
-//! needs no focus state of its own — which is the deliberate deviation
-//! from the APG that [`crate::roving`] documents. That one predicate is
-//! also why an `active` id matching no tab selects the FIRST tab
-//! instead of none: these ids come out of the URL (`?ntab=bogus`), and
-//! selecting none would leave every tab at `tabindex="-1"`, a strip no
-//! keyboard can enter, under a pane already showing the first tab.
-//! Activation is manual: Enter and Space are the native button's own
-//! click, and an arrow never runs `on_change`, so arrowing across
-//! trawl's `?ntab=` strip does not rewrite the URL under the user.
 
 use leptos::html::Div;
 use leptos::prelude::*;
@@ -62,10 +12,7 @@ use wasm_bindgen::JsCast;
 
 use crate::roving::{horizontal_nav, next_index, resolve_selected};
 
-/// One tab in the strip. `count` drives the workspace count chip
-/// (`.t .c`, e.g. the Events row count) — it renders only while the
-/// signal is `Some`, and is ignored by the drawer family (no chip in
-/// that design).
+/// `count` is ignored by the drawer family (no chip in that design).
 #[derive(Debug, Clone)]
 pub struct TabItem {
     pub id: &'static str,
@@ -74,7 +21,6 @@ pub struct TabItem {
 }
 
 impl TabItem {
-    /// Tab without a count chip.
     #[must_use]
     pub fn new(id: &'static str, label: &'static str) -> Self {
         Self {
@@ -84,7 +30,6 @@ impl TabItem {
         }
     }
 
-    /// Tab with a reactive count chip (workspace family only).
     #[must_use]
     pub fn with_count(
         id: &'static str,
@@ -99,30 +44,16 @@ impl TabItem {
     }
 }
 
-/// Which class family the strip renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TabsStyle {
-    /// `.tabs > div.t(.active)` — workspace strip.
     #[default]
     Workspace,
-    /// `.sd-tabs > span.tb(.on)` — drawer strip.
     Drawer,
 }
 
-/// Generic tab strip. `active` is the id of the selected tab;
-/// `on_change` fires with the clicked tab's id. `label` names the
-/// tablist for assistive technology and is required (see the module
-/// docs). `meta` renders the drawer strip's trailing `.meta` text
-/// (service drawer's "N events · size · M fields"); ignored by the
-/// workspace family. (`meta` is a reactive optional — `MaybeProp` — so
-/// live counts tick, while static `String`s still convert via `into`
-/// and [`Drawer`](crate::Drawer) forwards its own optional straight
-/// through.)
-///
-/// `trailing` is the workspace family's right-aligned action slot,
-/// rendered after the flex spacer and outside the tablist (trawl's
-/// results View/Export links); ignored by the drawer family, which has
-/// `meta` in that position.
+/// `meta` renders the drawer strip's trailing `.meta` text; ignored by the
+/// workspace family. `trailing` is the workspace family's right-aligned
+/// action slot; ignored by the drawer family.
 #[component]
 pub fn Tabs(
     #[prop(optional)] style: TabsStyle,
@@ -135,8 +66,6 @@ pub fn Tabs(
 ) -> impl IntoView {
     let list_ref = NodeRef::<Div>::new();
     let ids: Vec<&'static str> = items.iter().map(|i| i.id).collect();
-    // A strip with no tabs is a bare container: naming an empty tablist
-    // would announce a widget that has nothing in it.
     let named = !ids.is_empty();
     let role = named.then_some("tablist");
     let aria_label = named.then_some(label);
@@ -216,15 +145,8 @@ pub fn Tabs(
     }
 }
 
-/// The tablist's arrow walk: move focus, never selection.
-///
-/// The current position is read from the DOM — the index of
-/// `document.activeElement` among the queried `[role="tab"]` list —
-/// rather than from a signal, because focus may sit on a tab the user
-/// arrowed to and never activated, which by construction is not the
-/// selected one. When focus is somewhere else entirely (a keypress
-/// routed here from the container), the walk starts from the selected
-/// tab.
+/// The current position is read from the DOM rather than from a signal,
+/// because focus may sit on a tab the user arrowed to and never activated.
 fn tab_keydown(
     list_ref: NodeRef<Div>,
     ids: Vec<&'static str>,
@@ -268,16 +190,8 @@ fn tab_keydown(
     }
 }
 
-/// Map a URL-backed tab signal's empty default to a concrete tab id.
-///
 /// URL-synced tab signals (trawl's `?ntab=…` / `?stab=…`) read back
-/// the empty string before the user touches the strip. [`Tabs`] and
-/// [`Drawer`](crate::Drawer) compare ids verbatim, so that initial
-/// empty value matches no tab. This derives the effective id — the
-/// raw value, or `default` while it is empty — for use as both the
-/// strip's `active` and the app's pane switch, keeping the
-/// empty→default mapping (generic tab-strip behaviour) out of every
-/// call site.
+/// the empty string before the user touches the strip.
 #[must_use]
 pub fn effective_active(active: Signal<String>, default: &'static str) -> Signal<String> {
     Signal::derive(move || {

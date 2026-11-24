@@ -4,9 +4,6 @@
 
 //! `<ConfirmModal/>` — reusable confirmation dialog (delete,
 //! destructive actions).
-//!
-//! A thin composition over the [`Modal`] shell, which owns the scrim,
-//! Escape and outside-click machinery.
 
 use leptos::prelude::*;
 

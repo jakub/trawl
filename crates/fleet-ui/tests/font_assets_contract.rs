@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Native contract tests for the self-hosted Albert Sans / Chivo Mono assets.
-
 use sha2::{Digest as _, Sha256};
 
 const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");

@@ -4,12 +4,6 @@
 
 //! Typed `<Btn variant=Variant>` over the `.btn-pri` / `.btn-sec` /
 //! `.btn-danger` classes, so no call site spells one by hand.
-//!
-//! Split into two layers, mirroring [`crate::toast`]:
-//! - [`variant`] — the pure [`Variant`] enum and its CSS-class
-//!   contract. Builds on every target so the class attribute rendered
-//!   by `<Btn>` is locked by native unit tests.
-//! - [`component`] — the wasm-only `<Btn>` component.
 
 pub mod variant;
 

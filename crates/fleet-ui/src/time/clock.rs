@@ -2,19 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The single shared "now" tick every relative timestamp subscribes
-//! to. One module-level signal, advanced by one 30s interval installed
-//! once via [`install`] (the [`theme::install`](crate::theme)
-//! pattern), never per-instance timers: a page of 200
-//! [`When`](super::when::When) labels costs one timer and re-renders
-//! in one batch.
+//! One module-level signal, advanced by one 30s interval, never per-instance
+//! timers: a page of 200 [`When`](super::when::When) labels costs one timer.
 
 use std::cell::RefCell;
 
 use leptos::prelude::*;
 
 thread_local! {
-    /// The shared now-ms signal; `None` until [`install`] runs.
     static NOW_MS: RefCell<Option<RwSignal<i64>>> = const { RefCell::new(None) };
 }
 
@@ -23,10 +18,8 @@ fn current_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// Install the shared clock: one `RwSignal<i64>` advanced by a single
-/// 30-second interval. Call once at the app root (right after
-/// [`theme::install`](crate::theme)); re-entry is a no-op if the clock
-/// `is_some` already, so nested roots can't stack timers.
+/// Call once at the app root; re-entry is a no-op, so nested roots can't
+/// stack timers.
 pub fn install() {
     NOW_MS.with_borrow_mut(|slot| {
         if slot.is_some() {
@@ -38,9 +31,6 @@ pub fn install() {
     });
 }
 
-/// The shared now-ms signal. If [`install`] was never called, falls
-/// back to a derived one-shot snapshot — labels still render, they
-/// just don't tick.
 #[must_use]
 pub fn now_ms() -> Signal<i64> {
     NOW_MS

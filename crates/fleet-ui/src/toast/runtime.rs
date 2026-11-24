@@ -2,12 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Toasts/>` host + `ToastBus` push handle (wasm-only runtime).
-//!
-//! Errors stay until dismissed. Other toasts expire after 4.5s without
-//! pointer or keyboard interaction. Border-left color encodes the kind — the class
-//! mapping lives on [`ToastKind::as_class`] so it's testable natively.
-//!
 //! The title+detail wrapper is `toast-body`, not `body`: `.body` is a
 //! reserved Shell chrome class (the rail+main row) whose `display: flex`
 //! would flatten a toast's title and detail onto one line.
@@ -19,18 +13,10 @@ use std::time::Duration;
 use super::kinds::ToastKind;
 use super::stack::{Toast, ToastLink, ToastStack};
 
-/// Push handle — clone-and-share. Drives the `<Toasts/>` host.
-///
-/// # Ownership contract
-///
 /// [`Shell`](crate::shell::Shell) owns the bus: it calls
 /// `ToastBus::new()`, `provide_context`s it, and mounts the single
-/// `<Toasts/>` host. Everything rendered inside the Shell (router
-/// `<Outlet/>` content, footer, modals) pushes via
-/// `expect_context::<ToastBus>()`; a second bus or a second
-/// `<Toasts/>` inside a Shell means two competing stacks. Only screens
-/// rendered outside a Shell need their own `ToastBus::new()` +
-/// `<Toasts bus=bus/>` pair.
+/// `<Toasts/>` host. A second bus or a second
+/// `<Toasts/>` inside a Shell means two competing stacks.
 #[derive(Debug, Clone, Copy)]
 pub struct ToastBus {
     stack: RwSignal<ToastStack>,
@@ -44,18 +30,7 @@ impl ToastBus {
         }
     }
 
-    /// Push a toast. The mounted item owns expiry; errors never expire.
     pub fn push(self, kind: ToastKind, title: impl Into<String>, detail: Option<String>) {
-        // Single-closure mutation: id allocation and append happen atomically
-        // inside `ToastStack::push`, so there's no read/write window for a
-        // concurrent push to observe the same counter and produce a duplicate
-        // key in `<For key=|t| t.id>`. Wasm is single-threaded today; this is
-        // insurance against future `spawn_local` interleaving.
-        //
-        // `try_update` returns `None` only if the signal was disposed. In that
-        // case no toast was appended, so log the swallow — toasts are the app's error-surfacing primitive,
-        // so a silently-dropped push (especially an error toast) would leave the
-        // failure with zero trace.
         if self
             .stack
             .try_update(|s| s.push(kind, title, detail))
@@ -65,8 +40,6 @@ impl ToastBus {
         }
     }
 
-    /// Push a toast that also offers `link`, such as the record the
-    /// reported operation created. Expiry follows [`Self::push`].
     pub fn push_with_link(
         self,
         kind: ToastKind,
@@ -74,7 +47,6 @@ impl ToastBus {
         detail: Option<String>,
         link: ToastLink,
     ) {
-        // Same single-closure mutation and disposed-signal trace as `push`.
         if self
             .stack
             .try_update(|s| s.push_with_link(kind, title, detail, link))
@@ -84,9 +56,6 @@ impl ToastBus {
         }
     }
 
-    /// Variant-encoded sugar over [`Self::push`]. Use these at call
-    /// sites — `bus.push_error("save failed", None)` reads better than
-    /// `bus.push(ToastKind::Error, "save failed", None)`.
     pub fn push_info(self, title: impl Into<String>, detail: Option<String>) {
         self.push(ToastKind::Info, title, detail);
     }
@@ -99,9 +68,6 @@ impl ToastBus {
         self.push(ToastKind::Error, title, detail);
     }
 
-    /// Programmatically dismiss a toast by id (e.g. when an in-flight
-    /// retry succeeds before the auto-dismiss timeout). No-op if the id
-    /// has already been removed.
     pub fn dismiss(self, id: u64) {
         let _ = self.stack.try_update(|s| s.dismiss(id));
     }
@@ -189,8 +155,6 @@ fn ToastItem(toast: Toast, bus: ToastBus, paused: Signal<bool>) -> impl IntoView
                     <a class="link" href=link.href().to_owned()>{link.label().to_owned()}</a>
                 })}
             </div>
-            // The multiplication sign is decoration; the button's name
-            // comes from aria-label, not a spoken "times" glyph.
             <button
                 type="button"
                 class="x"

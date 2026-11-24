@@ -3,12 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Typed `<Badge tone=Tone>`, the one badge treatment (ADR-0003).
-//!
-//! Split into two layers, mirroring [`crate::button`]:
-//! - [`tone`] — the pure [`Tone`] enum and its CSS-class contract.
-//!   Builds on every target so the class attribute rendered by
-//!   `<Badge>` is locked by native unit tests.
-//! - [`component`] — the wasm-only `<Badge>` component.
 
 pub mod tone;
 

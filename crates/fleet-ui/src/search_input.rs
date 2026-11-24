@@ -3,18 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<SearchInput/>` — icon-adorned filter input.
-//!
-//! The `.inp-wrap` toolbar filter of the list pages
-//! (history/nets/runs/schema). Deliberately a sibling of
-//! [`Field`](crate::field::Field), not a Field mode: Field is a
-//! label+input+helper cluster; this has no caption at all.
 
 use leptos::prelude::*;
 
 use crate::icon::{Icon, IconView};
 
-/// Uncontrolled-looking, signal-backed filter input with the search
-/// glyph. `value` is written on every input event.
 #[component]
 pub fn SearchInput(
     value: RwSignal<String>,

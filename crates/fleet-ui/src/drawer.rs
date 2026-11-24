@@ -5,41 +5,9 @@
 //! `<Drawer/>` — detail inspector over the `sd-*` classes, in either of
 //! two presentations.
 //!
-//! Owns the shell: the host element (scrim, with outside-click
-//! dismissal via `NodeRef` identity), the panel, the header row (title
-//! slot + actions slot + close affordance), the tab strip
-//! ([`Tabs`](crate::tabs::Tabs) in its `Drawer` style), and the
-//! scrolling body. Pane content, tab-switching state, and the title's
-//! inner markup stay app-owned.
-//!
-//! **Name.** The panel is `role="dialog"` in both presentations, and the
-//! required `label` names it: the bare name of the thing the drawer
-//! shows. The title slot is visual only and never names the dialog,
-//! because consumers fill it with buttons, badges and links whose text
-//! would otherwise become part of the name (ADR-0028).
-//!
-//! **Presentation.** `docked` picks it. Undocked (the default) is the
-//! right-slide overlay: a scrim host, a `Capture`
-//! [`overlay`](crate::overlay) layer, initial focus into the panel and
-//! restore to the opener on close. Both presentations restore the
-//! opener; only the undocked one takes focus on open, and only it can
-//! read the answer off its layer. Docked is the same header, tabs and
-//! body rendered in flow beside its list: the host collapses to
-//! `display: contents`, there is no scrim, and no overlay layer is
-//! registered (ADR-0032). The children mount once and stay mounted when
-//! `docked` flips — only the layer registration and the two host
-//! classes change.
-//!
 //! **Escape** is bound at window level so it fires regardless of focus;
 //! a scrim-bound `on:keydown` only dispatches once focus has entered the
 //! drawer subtree, which leaves Esc dead on a freshly-opened drawer.
-//! Undocked it is gated on topmost-layer arbitration, so a drawer
-//! sitting beneath an open modal ignores Escape (the modal owns it).
-//! Docked there is no layer to arbitrate with, so focus does it: Escape
-//! closes a docked drawer only while focus is inside its panel and no
-//! overlay is open at all. `on_escape` overrides the default close
-//! behaviour for drawers that need a pre-close step, such as cancelling
-//! an in-flight inline rename.
 
 use leptos::ev;
 use leptos::html::Div;
@@ -54,53 +22,20 @@ use crate::overlay::{
 };
 use crate::tabs::{TabItem, Tabs, TabsStyle};
 
-/// Drawer shell. `label` names the dialog; `title` fills `.sd-ttl`,
-/// which is visual only; `actions` fills `.sd-actions`
-/// ahead of the built-in close button (pass `<Btn>`s); `children` fills
-/// `.sd-body`. Slots use the same boxed-closure idiom as
-/// [`Shell`](crate::Shell)'s footer. `meta` renders trailing text in the
-/// tab strip (service drawer's event/size/field summary), outside the
-/// tablist.
 #[component]
 pub fn Drawer(
     tabs: Vec<TabItem>,
-    /// Names the drawer's tab strip for assistive technology
-    /// ("Service details", "Saved query details"). Required, and
-    /// forwarded verbatim to [`Tabs`]: the drawer is the only thing
-    /// that knows what its strip is a list of.
-    #[prop(into)]
-    tabs_label: String,
-    /// Names the dialog for assistive technology with the bare name of
-    /// the entity it shows ("errors by host", "nginx", "Event 3").
-    /// Required, and the only source of the name: the title slot is
-    /// visual and never names the dialog (ADR-0028). Reactive, so a
-    /// landed rename renames the dialog.
-    #[prop(into)]
-    label: Signal<String>,
+    #[prop(into)] tabs_label: String,
+    #[prop(into)] label: Signal<String>,
     #[prop(into)] active_tab: Signal<String>,
     on_tab_change: Callback<String>,
     on_close: Callback<()>,
     #[prop(optional, into)] on_escape: Option<Callback<()>>,
     #[prop(into, optional)] meta: MaybeProp<String>,
-    /// Render in flow beside the list instead of over a scrim: no
-    /// backdrop, no overlay layer, Escape only from inside (ADR-0032).
-    /// Defaults to `false`, the overlay presentation.
-    #[prop(into, optional)]
-    docked: Signal<bool>,
-    /// Optional `id` on the panel, so a docked panel can be the target
-    /// of an `aria-controls` or an in-page link.
-    #[prop(optional)]
-    panel_id: Option<&'static str>,
-    /// Optional extra class on the panel, for app-owned styling of one
-    /// docked instance. Composed beside `sd-drawer`, never instead of it.
-    #[prop(optional)]
-    panel_class: Option<&'static str>,
-    /// Close-glyph size in px. A prop because the sizes in use differ
-    /// (trawl's drawers pass 12, the default is 14) and the 2px delta
-    /// is pixel-visible in the stroke tips; picking one size for the
-    /// fleet is deliberate visual work, not a default to flip.
-    #[prop(default = 14)]
-    close_size: u16,
+    #[prop(into, optional)] docked: Signal<bool>,
+    #[prop(optional)] panel_id: Option<&'static str>,
+    #[prop(optional)] panel_class: Option<&'static str>,
+    #[prop(default = 14)] close_size: u16,
     title: Children,
     #[prop(optional)] actions: Option<Children>,
     children: Children,
@@ -116,10 +51,6 @@ pub fn Drawer(
             return;
         }
         let mine = if docked.get() {
-            // No layer of its own: a docked panel is page furniture, so
-            // it answers Escape only while it holds focus, and only
-            // while nothing is stacked over the page (an open modal or
-            // menu owns the key).
             !has_layers()
                 && panel_ref
                     .get()
@@ -134,11 +65,9 @@ pub fn Drawer(
     });
 
     let on_scrim_mousedown = move |e: web_sys::MouseEvent| {
-        // Docked, the host paints nothing and dismisses nothing.
         if docked.get() {
             return;
         }
-        // Identity comparison, same rationale as the Modal shell.
         let Some(scrim) = scrim_ref.get() else {
             return;
         };
@@ -159,10 +88,6 @@ pub fn Drawer(
             node_ref=scrim_ref
             on:mousedown=on_scrim_mousedown
         >
-            // A complementary-landmark element is not an allowed host
-            // for role="dialog" (audit finding A05), so the panel is a
-            // plain div. The `.sd-drawer` class carries every pixel, so
-            // nothing else moves.
             <div class="sd-drawer"
                 class:sd-docked=move || docked.get()
                 // An optional app class, added beside `sd-drawer`
@@ -179,14 +104,6 @@ pub fn Drawer(
                     <div class="sd-ttl">{title()}</div>
                     <div class="sd-actions">
                         {actions.map(|a| a())}
-                        // A native button, not a styled span: the close
-                        // affordance has to be reachable by Tab and
-                        // operable by Enter/Space. `.sd-x` already
-                        // declares the full button reset (background,
-                        // border, cursor, line-height, inline-flex
-                        // centring) and the sheet's global
-                        // `button { font: inherit }` covers the rest, so
-                        // the element swap needs no CSS change.
                         <button
                             type="button"
                             class="sd-x"
@@ -214,27 +131,10 @@ pub fn Drawer(
     }
 }
 
-/// The overlay registration a drawer holds while it is **not** docked,
-/// and the whole of the difference between the two presentations.
-///
 /// The layer is owned here rather than by
 /// [`use_overlay_layer_with`](crate::overlay::use_overlay_layer_with)
-/// because `docked` flips at runtime — a panel docks past its breakpoint
-/// and goes back over a scrim below it — while a layer that hook
-/// registers lives exactly as long as the component. The registration is
-/// otherwise the same one: `FocusPolicy::Capture`, so the drawer takes
-/// initial focus on open and restores the opener on close but never
-/// Tab-traps. It is non-modal by design (the background stays
-/// interactive, and a modal may stack over a live drawer), which is also
-/// why the panel renders `role="dialog"` without `aria-modal`.
-///
-/// A presentation change is not an open. Undocking registers the layer
-/// beneath whatever is already stacked — a modal opened over the docked
-/// panel keeps focus and Escape — and takes no initial focus; the latch
-/// that guards initial focus is set once and never reset by a flip, so
-/// only a real reopen (a remount) focuses the panel again.
-///
-/// Returns the live layer for the caller's Escape guard.
+/// because `docked` flips at runtime, while a layer that hook registers
+/// lives exactly as long as the component.
 fn overlay_presentation(
     docked: Signal<bool>,
     panel_ref: NodeRef<Div>,
@@ -265,17 +165,13 @@ fn overlay_presentation(
     };
 
     // The opener is recorded for BOTH presentations. A docked panel
-    // holds no layer, so the layer's own restore never runs for it and
-    // closing one dropped focus to <body> — the keyboard lost the page.
-    // Whatever had focus when the panel mounted is the place to go back
-    // to: the row control that was clicked, or the results region a
-    // keyboard selection was made from.
+    // holds no layer, so the layer's own restore never runs for it.
     opener.set_value(document().active_element());
 
-    // An overlay drawer registers synchronously at mount, exactly where
-    // `use_overlay_layer_with` did: the stack is LIFO, so its order has
-    // to match mount order, and `Shell` reads `has_layers()` to leave the
-    // palette chord inert from the first keystroke on.
+    // An overlay drawer registers synchronously at mount: the stack is
+    // LIFO, so its order has to match mount order, and `Shell` reads
+    // `has_layers()` to leave the palette chord inert from the first
+    // keystroke on.
     if !docked.get_untracked() {
         acquire(true);
     }
@@ -317,13 +213,9 @@ fn overlay_presentation(
         // Ownership must be read before release: a drawer unmounting
         // beneath a live modal doesn't own focus and must not restore.
         let Some(live) = layer.get_value() else {
-            // Docked. There is no layer, so the question the layer
-            // answers — "is this panel where focus lives?" — is asked of
-            // the document instead: focus is still inside the panel that
-            // is going away, or it has already fallen to <body>. Both
-            // are the case where leaving it alone loses the keyboard.
-            // Anything else (a click on another row, a page turn) put
-            // focus somewhere deliberate and must not be overruled.
+            // Docked. Focus is still inside the panel that is going away, or
+            // it has already fallen to <body>: leaving it alone loses the
+            // keyboard. Anything else put focus somewhere deliberate.
             let active = document().active_element();
             let inside = panel_ref
                 .get_untracked()

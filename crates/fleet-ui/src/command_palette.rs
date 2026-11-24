@@ -3,9 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Route inventory, filtering, selection and keyboard rules for ADR-0031.
-//! Browser components project their sidebar groups into borrowed inputs,
-//! so the palette's grouping is the sidebar's grouping (ADR-0032). These
-//! rules need no DOM or consumer routing state.
 
 use std::collections::HashSet;
 
@@ -19,7 +16,6 @@ pub(crate) struct CommandInput<'a> {
 pub(crate) struct Command {
     pub label: String,
     pub path: String,
-    /// The sidebar group's heading, absent for an unlabelled group.
     pub group: Option<String>,
     /// Position of the owning group in the inventory, so consecutive
     /// commands can be regrouped without comparing labels.
@@ -38,9 +34,6 @@ impl Command {
     }
 }
 
-/// Flatten the groups in source order, keeping their labels. The first
-/// command at a path wins; equal labels at different paths remain
-/// separate.
 pub(crate) fn commands_from<'a, G, I>(groups: G) -> Vec<Command>
 where
     G: IntoIterator<Item = (Option<&'a str>, I)>,
@@ -85,7 +78,6 @@ pub(crate) fn group_runs(commands: &[Command]) -> Vec<(Option<&str>, Vec<usize>)
     runs
 }
 
-/// Empty inventories omit the trigger and disable the global chord.
 pub(crate) fn palette_available(commands: &[Command]) -> bool {
     !commands.is_empty()
 }
@@ -106,9 +98,8 @@ pub(crate) fn filter_commands(commands: &[Command], filter: &str) -> Vec<Command
         .collect()
 }
 
-/// Each mount starts with an empty filter. Every filter change selects the
-/// first match, or nothing when no command matches. Arrow moves update only
-/// `selected`, which indexes `visible`, never the original inventory.
+/// Arrow moves update only `selected`, which indexes `visible`, never the
+/// original inventory.
 #[derive(Clone, Debug)]
 pub(crate) struct PaletteState {
     pub filter: String,
@@ -158,8 +149,8 @@ pub(crate) fn platform_kbd_hint(ua: &str) -> PlatformKbdHint {
     }
 }
 
-/// Whether an input accepts writable text. `input_type` is the normalized
-/// HTMLInputElement.type value, so a missing or invalid type arrives as text.
+/// `input_type` is the normalized HTMLInputElement.type value, so a missing
+/// or invalid type arrives as text.
 fn text_input_is_editable(input_type: &str, disabled: bool, read_only: bool) -> bool {
     !disabled
         && !read_only
@@ -169,8 +160,6 @@ fn text_input_is_editable(input_type: &str, disabled: bool, read_only: bool) -> 
         )
 }
 
-/// Event facts normalized by Shell's browser listener. Editable includes
-/// enabled writable text controls and contenteditable descendants.
 #[derive(Clone, Copy, Debug, Default)]
 #[allow(clippy::struct_excessive_bools)] // Independent browser event flags.
 pub(crate) struct ChordFacts<'a> {
@@ -321,14 +310,10 @@ mod tests {
 
     #[test]
     fn unlabelled_group_renders_no_header() {
-        // The unlabelled run keeps its options directly under the
-        // listbox; only a labelled run earns a role="group" wrapper.
         assert_eq!(
             group_runs(&inventory()),
             vec![(None, vec![0, 1]), (Some("Sections"), vec![2, 3])]
         );
-        // Runs follow source order in both directions: an unlabelled
-        // group after a labelled one stays after it.
         let mixed = commands_from([
             (Some("Sections"), vec![input("Schema", "/search/schema")]),
             (None, vec![input("Search", "/search")]),

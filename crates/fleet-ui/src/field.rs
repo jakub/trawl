@@ -4,37 +4,9 @@
 
 //! `<Field/>` — labelled form wrapper around an `<input>`/`<select>`/
 //! `<textarea>` slot.
-//!
-//! Owns the wrapper element (`.field` by default — see `class`), the
-//! label text, and an optional single helper paragraph (hint OR error —
-//! not both, by type construction). The actual control is passed via
-//! `children` so the caller controls `type`, `value`, and event
-//! handlers.
-//!
-//! Two shapes:
-//!
-//! * **default** — `<div class><label for=id>…</label>{control}</div>`.
-//!   Explicit association: the caller should pass `id` and must thread
-//!   it onto the inner control so `<label for=id>` and
-//!   `aria-describedby` resolve. `id` is optional for clusters that
-//!   carry a bare `<label>` (trawl's `.m-field` ones): omit it and no
-//!   `for` is emitted.
-//! * **wrap** (`wrap=true`) — `<label class><span>{label}</span>
-//!   {control}</label>`. Implicit association by nesting; no `for`/`id`
-//!   wiring, and the caption `<span>` stays unstyled (exactly the login
-//!   card's markup, which dogfoods this mode).
-//!
-//! `class` overrides the wrapper class (default `"field"`); trawl's
-//! modal field clusters pass `class="m-field"`, whose `.modal .m-field`
-//! styling differs from `.field` on purpose. An override class is
-//! caller-supplied and therefore caller-styled: it lives in the app's
-//! stylesheet, not fleet-ui.css.
 
 use leptos::prelude::*;
 
-/// Optional helper text under the field. Hint XOR Error — having both
-/// crowds the layout and dilutes the error message, so the type forces
-/// the choice instead of accepting two independent `Option`s.
 #[derive(Debug, Clone, Default)]
 pub enum Helper {
     #[default]

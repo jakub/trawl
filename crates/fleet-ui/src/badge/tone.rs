@@ -2,16 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pure badge tone. No `leptos`, no `web_sys` — builds on every target
-//! so the per-tone CSS-class fragment is exercised by native unit
-//! tests (mirrors [`crate::button::variant`]). Apps map their domain
-//! kinds (story state, TLP marking, claim relationship, …) onto this
-//! closed tone set at the call site; there is deliberately no
-//! color/style passthrough prop (ADR-0003).
-
-/// Semantic tone. Maps onto the `.bdg.{tone}` classes shipped in
-/// `styles/fleet-ui.css`, drawing on the fleet color tokens
-/// (`--ink-3` / `--blue` / `--green` / `--yellow` / `--red`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tone {
     #[default]
@@ -23,9 +13,6 @@ pub enum Tone {
 }
 
 impl Tone {
-    /// CSS class fragment appended by [`badge_class`]. The contract
-    /// with fleet-ui.css's `.bdg.neutral` / `.bdg.info` / `.bdg.success`
-    /// / `.bdg.warn` / `.bdg.danger` selectors.
     #[must_use]
     pub fn css_class(self) -> &'static str {
         match self {
@@ -38,11 +25,10 @@ impl Tone {
     }
 }
 
-/// Compose the full `class` attribute rendered by `<Badge>`. The base
-/// class is `bdg`, not `badge`, because fleet-ui.css already owns a
-/// `.rail .it .badge` rule (the rail count chip) and a top-level
-/// `.badge` rule would leak `display` / `text-transform` /
-/// `letter-spacing` into that chip through the cascade.
+/// The base class is `bdg`, not `badge`, because fleet-ui.css already owns a
+/// `.rail .it .badge` rule (the rail count chip) and a top-level `.badge`
+/// rule would leak `display` / `text-transform` / `letter-spacing` into
+/// that chip through the cascade.
 #[must_use]
 pub fn badge_class(tone: Tone) -> String {
     format!("bdg {}", tone.css_class())

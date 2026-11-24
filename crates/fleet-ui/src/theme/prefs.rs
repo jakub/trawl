@@ -2,14 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pure pref types + parsers. No `web_sys`, no `leptos`, no I/O.
-//!
-//! The JSON shape this layer reads/writes is the contract with
-//! `localStorage`. Round-trip tests (`as_attr` ↔ `FromStr`) and
-//! corrupt-input tests live here so the contract is enforced on native
-//! `cargo nextest run --workspace`, not just deferred to a wasm
-//! integration suite.
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
@@ -17,9 +9,6 @@ use std::str::FromStr;
 use serde::de::{Deserialize, Deserializer, Visitor};
 use serde_json::value::RawValue;
 
-/// Returned by [`FromStr`] impls when the input doesn't name a known
-/// variant. Carries the offending string so logs / warnings can show
-/// what came in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseThemeError(pub String);
 
@@ -60,7 +49,6 @@ impl FromStr for Theme {
 }
 
 /// The user's stored appearance choice. System follows the operating system.
-/// Renderers consume the binary [`Theme`] returned by [`Self::resolve`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemePreference {
     #[default]
@@ -104,8 +92,6 @@ impl FromStr for ThemePreference {
     }
 }
 
-/// Table row decoration — bordered is the default; striped/plain are
-/// user preferences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowStyle {
     Bordered,
@@ -136,8 +122,6 @@ impl FromStr for RowStyle {
     }
 }
 
-/// Sidebar presentation — expanded is the default; collapsed is
-/// icon-only, with every label kept as screen-reader text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sidebar {
     Expanded,
@@ -173,8 +157,6 @@ impl FromStr for Sidebar {
     }
 }
 
-/// How a result row's fields are read — inline is the default (the
-/// row expands in place), inspector docks a panel beside the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Details {
     Inline,
@@ -202,9 +184,6 @@ impl FromStr for Details {
     }
 }
 
-/// How a result row is laid out — compact is the default column table,
-/// message-first promotes the message to full width with the rest of
-/// the row as a muted secondary line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rows {
     Compact,
@@ -232,13 +211,6 @@ impl FromStr for Rows {
     }
 }
 
-/// Persisted preference snapshot — the JSON shape on disk in
-/// `localStorage`. `pub(crate)` so the wasm `runtime` layer can build,
-/// read, and write it without leaking the on-disk shape to consumers.
-///
-/// `allow(dead_code)` because the only non-test consumer (`runtime`) is
-/// cfg-gated to wasm32; the type is exercised on every target through
-/// the `#[cfg(test)]` block below.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stored {
@@ -261,10 +233,6 @@ impl Default for Stored {
     }
 }
 
-/// Outcome of parsing a `localStorage` blob. The `Vec<String>` carries
-/// human-readable diagnostics — top-level JSON failure or per-field
-/// unknown-variant messages — so the wasm caller can `console.warn`
-/// them and tests can assert on them.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParseOutcome {
@@ -323,10 +291,6 @@ fn stored_fields(raw: &str) -> Result<BTreeMap<PrefKey, &RawValue>, serde_json::
     }
 }
 
-/// Parse a `localStorage` payload. Missing fields fall back to defaults
-/// silently (older blobs predate newer fields); malformed JSON or
-/// unknown values are recorded in `warnings` and the field is left at
-/// its default.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn parse_stored(raw: &str) -> ParseOutcome {
     let mut warnings = Vec::new();
@@ -553,8 +517,6 @@ mod tests {
 
     #[test]
     fn parse_stored_ignores_retired_density_field() {
-        // Older blobs carry a `density` field from before the pref was
-        // removed; it must be skipped silently, not warned about.
         let out = parse_stored(r#"{"theme":"dark","density":"compact"}"#);
         assert_eq!(out.stored.theme, ThemePreference::Dark);
         assert!(out.warnings.is_empty(), "retired field must not warn");
@@ -579,8 +541,6 @@ mod tests {
 
     #[test]
     fn parse_stored_wrong_field_type_silently_keeps_default() {
-        // The recognized field is not a JSON string, so parse_field leaves its
-        // default without warning, as it does for a missing field.
         let out = parse_stored(r#"{"theme": 42}"#);
         assert_eq!(out.stored, Stored::default());
         assert!(out.warnings.is_empty());

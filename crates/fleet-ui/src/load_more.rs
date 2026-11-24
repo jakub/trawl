@@ -3,38 +3,15 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<LoadMore/>` — cursor-driven list footer.
-//!
-//! The one busy-flag load-more idiom for every consumer: a "load more"
-//! button while a cursor remains, the canonical `loading…` label
-//! (disabled) while a fetch is in flight, and two terminal texts —
-//! "end of list" when the cursor runs out, "nothing here yet" when the
-//! list is empty. Domain-informative copy stays a prop (`end_text` /
-//! `empty_text`); the defaults are the canonical generic strings.
-//!
-//! A standalone component, not a [`Pager`](crate::pager::Pager) mode —
-//! it composes into `Pager`'s trailing-children slot for footer
-//! placement, or renders bare.
-//!
-//! The phase resolution is pure ([`phase`]) and native-tested; the
-//! wasm-only [`LoadMore`] component renders it.
 
-/// Which of the three terminal shapes (plus the busy button state)
-/// [`LoadMore`] renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadMorePhase {
-    /// The list has no items at all → `empty_text`.
     Empty,
-    /// No further pages → `end_text`.
     End,
-    /// A cursor remains → the load button, enabled.
     Idle,
-    /// A fetch is in flight → the load button, disabled, canonical
-    /// `loading…` label.
     Busy,
 }
 
-/// Resolve the rendered phase. `empty` wins over everything (an empty
-/// list has nothing to page), then exhaustion, then busy.
 #[must_use]
 pub fn phase(empty: bool, has_more: bool, busy: bool) -> LoadMorePhase {
     if empty {
@@ -56,12 +33,6 @@ mod component {
     use crate::button::{Btn, Variant};
     use crate::loaded::state::loading_copy;
 
-    /// Cursor-driven list footer. `has_more` is typically derived from
-    /// `Option<Cursor>::is_some()`; `empty` (default `false`) from the
-    /// list length. `busy` disables the button and swaps its label to
-    /// the canonical `loading…`. `label` exists for sites whose idle
-    /// copy isn't "load more" (trawl's timeline says "load older");
-    /// `full` renders the button full-width (`btn-full`).
     #[component]
     pub fn LoadMore(
         #[prop(into)] has_more: Signal<bool>,
@@ -110,8 +81,6 @@ mod tests {
 
     #[test]
     fn empty_wins_over_everything() {
-        // Even a lying cursor (empty list, has_more set) renders the
-        // empty text — there is nothing beneath the footer to extend.
         assert_eq!(phase(true, true, true), LoadMorePhase::Empty);
         assert_eq!(phase(true, false, false), LoadMorePhase::Empty);
     }
@@ -119,7 +88,6 @@ mod tests {
     #[test]
     fn exhausted_cursor_is_the_end_state() {
         assert_eq!(phase(false, false, false), LoadMorePhase::End);
-        // busy without a cursor can't render a button — still End.
         assert_eq!(phase(false, false, true), LoadMorePhase::End);
     }
 

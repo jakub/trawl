@@ -1,83 +1,18 @@
 /*
- * fleet-ui — shared design system (ADR-0030, step 2)
+ * fleet-ui — shared design system (ADR-0030)
  *
- * Tokens, reset, base styles, and component CSS for fleet apps.
- * Extracted verbatim from trawl-web-ui's "Herring" main.css, restyled
- * by the design-workbench pass (ADR-0005), then ported to the Mira
- * Blue design language (ADR-0007): neutral OKLCH surfaces, blue
- * accent, Albert Sans/Chivo Mono, tokenized radii, --fs-* type
- * rhythm. App
- * consumers reach this file via Trunk's `data-trunk rel="css"`
- * directive; Trunk resolves the href relative to the consumer's
- * index.html location. The two current consumers:
- *
- *   trawl (crates/trawl-web-ui/index.html — sibling crate):
- *     <link data-trunk rel="css" href="../fleet-ui/styles/fleet-ui.css"/>
- *
- *   coastwatch (crates/web-ui/index.html — sibling repo checkout):
- *     <link data-trunk rel="css" href="../../../trawl/crates/fleet-ui/styles/fleet-ui.css"/>
- *
- * In both apps this file is linked BEFORE the app's own stylesheet so
+ * This file is linked BEFORE the app's own stylesheet so
  * app-specific selectors keep cascade priority.
  *
  * @import is intentionally NOT used here. Trunk doesn't follow
  * @import — the browser fetches the imported file at runtime, hits
  * the SPA HTML fallback, and complains about MIME. Ship one combined
  * file and one <link> tag per consumer.
- *
- * What this file ships:
- *   - Design tokens: :root + [data-theme="light"] + [data-theme="dark"]
- *   - Typography + spacing custom properties
- *   - Self-hosted Albert Sans / Chivo Mono faces plus reset + base
- *     styles
- *     (box-sizing, typography, focus ring, scrollbars, ::selection)
- *   - Universal keyframes: blink, spin, toastIn, fadeIn, modalFadeIn,
- *     modalIn
- *   - Base form/button: .field, .btn, .btn-full, .error-banner
- *   - Variants: .btn-pri, .btn-sec, .btn-danger
- *   - Sizes: .btn-sm (standalone compact), .btn-xs (modifier)
- *   - Modal scaffolding: .modal-scrim, .modal, .modal-sm, .m-hd
- *     (+ .ic icon chip), .m-body, .m-ft; modal fields: .m-field,
- *     .reason-input (emitted by ConfirmWithReasonModal / Field)
- *   - Tab strips: .tabs (workspace) + .sd-tabs (drawer) families
- *   - Drawer shell: .sd-scrim, .sd-host, .sd-drawer,
- *     .sd-drawer.sd-docked, .sd-hd, .sd-ttl, .sd-actions, .sd-x,
- *     .sd-body (+ sd-fade-in/sd-slide-in)
- *   - Toast host + items: .toasts, .toast, .toast.{success,error,info},
- *     .toast .link (an optional destination below the detail)
- *   - Login page: .login-shell, .login-card
- *   - App chrome: .shell grid + .shell-content, .topbar
- *     (nav-toggle/crumb/jump/user), .user-menu, .body, .main, and the
- *     .rail sidebar: .brand, .grp/.grp-lb group headings, .it items
- *     (+ .badge chip), .bot slot, .collapsed and .overlay states,
- *     .nav-scrim
- *   - Small widgets (issue #31): .bdg tones, .seg strip, .load-hint,
- *     .status-dot tones, .sc-spark, .toggle, .kbd/.kbd-inline,
- *     .results-footer pager family, .inp-wrap, .actions-wrap/
- *     .actions-menu/.btn-icon
- *   - Atmosphere backdrop (coastwatch#308): .atmosphere fixed layer
- *     (var(--bg) fallback floor) + its canvas sizing
- *
- * What this file does NOT ship (stays in each app's own stylesheet):
- *   - [data-rowstyle] selectors targeting .results-table (the enum is
- *     shared via fleet-ui, but the selector references trawl's table)
- *   - .field-label and other extras
- *   - Trawl-specific modal sub-styles (.m-body .preview, .m-ft .hint)
- *     and the status bar (.statusbar)
- *   - Drawer CONTENT (app-owned panes + title-slot content):
- *     .sd-overview, .sd-card, .sd-fields, .sd-tail, .sf-*,
- *     .sd-ttl .name / .sub, .name-edit
- *   - Anything app-specific: facets, editor, histogram, schema cards.
  */
 
 /* Self-hosted Albert Sans and Chivo Mono variable faces (ADR-0007
- * amendment). fleet-ui owns two committed TrueType files, pinned to the
- * google/fonts bytes, because neither family publishes a variable WOFF2;
- * every Trunk consumer copies `fonts/` beside the emitted stylesheet. Both
- * files carry a 100-900 wght axis; the advertised axis is restricted to the
- * weights the UI uses, so the typography contract remains 400/500/600/700
- * and no weight is synthesized. Neither family ships an italic file, so
- * italics stay synthesized, as they were under the previous pair. */
+ * amendment). Every Trunk consumer copies `fonts/` beside the emitted
+ * stylesheet. */
 @font-face {
   font-family: "Albert Sans";
   src: url("fonts/AlbertSans-Variable.ttf") format("truetype");
@@ -94,26 +29,13 @@
   font-display: swap;
 }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Design tokens
- * ─────────────────────────────────────────────────────────────── */
-/* Mira Blue direction (ADR-0007): Basecoat Mira's neutral zero-chroma
- * OKLCH surface ramp with fleet's blue accent retained. Dark lines are
- * white-alpha overlays, not solid greys. --on-accent carries button
- * text (dark mode keeps Mira's inversion: near-black on light blue);
- * --ring drives the 2px solid focus outline, and
- * --accent-glow aliases it for the brand text-shadow. The accent hue
- * deliberately equals --blue today; the tokens stay separate because
- * they name different ROLES (brand accent vs info semantic) that
- * merely share a value. */
+/* Mira Blue direction (ADR-0007). The accent hue
+ * deliberately equals --blue; the tokens stay separate because
+ * they name different ROLES (brand accent vs info semantic). */
 :root, [data-theme="light"] {
   color-scheme: light;
 
-  /* Plane ramp (ADR-0032): floor / sheet / support / well. Direction A's
-   * measured hexes (#edf0f3 / #ffffff / #f3f5f7 / #e5eaf0 / #eef2f6)
-   * expressed in OKLCH. --bg is the floor every page, drawer body and
-   * expanded-row detail sits on; --panel is the sheet; --panel-2 the
-   * support strip (sidebar, table headers); --well the inset control. */
+  /* Plane ramp (ADR-0032): floor / sheet / support / well. */
   --bg:        oklch(95.4% .005 248);
   --panel:     oklch(100% 0 0);
   --panel-2:   oklch(96.9% .003 248);
@@ -121,103 +43,59 @@
   --well:      oklch(95.9% .007 248);
   --ink:       oklch(26.6% .016 252);
   --ink-2:     oklch(43.7% .024 251);
-  /* --ink-3 carries every secondary label and count: table headers, the
-   * kbd chip, facet counts, captions. Measured on its composited floors:
-   * 5.86:1 on --panel, 5.36:1 on --panel-2, 5.21:1 on --well, 5.13:1 on
-   * --bg and on the accent wash over --panel, 4.71:1 on the wash over
-   * --panel-2. The pairs the 2026-09-13 audit measured at 4.34:1 and
-   * 4.14:1 with the old oklch(55.6%) neutral now clear AA. */
   --ink-3:     oklch(50.5% .029 252);
-  /* --ink-4 is a TEXT colour, not a hairline: .lvl-debug (over a --panel
-   * row) and the DSL editor gutter numbers (over --well) read it.
-   * Held one step lighter than --ink-3 so the ramp keeps
-   * four visible stops: 5.27:1 on --panel, 4.82:1 on --panel-2, 4.68:1 on
-   * --well, 4.60:1 on --bg. It measures 4.35:1 on --panel-3, so no text
-   * on that surface may read it (none does today). */
+  /* --ink-4 is a TEXT colour, not a hairline. It measures 4.35:1 on
+   * --panel-3, so no text on that surface may read it. */
   --ink-4:     oklch(53% .024 253);
   --line:      oklch(90.7% .010 248);
   --line-2:    oklch(94.4% .007 248);
   --selection: rgba(0,0,0,.08);
 
-  /* Control fills (ADR-0007): the translucent wash under inputs, the
-   * app DSL editor and the range trigger. --fill is the resting fill —
-   * the ADR's "~20% of the border color" — and --fill-2 the hover step.
-   * Every such fill reads these tokens; a literal `color-mix(var(--line)
-   * N%, transparent)` at the call site is theme-blind, and the dark
-   * --line is an alpha overlay (see the dark block). */
+  /* Control fills (ADR-0007). Every such fill reads these tokens; a
+   * literal `color-mix(var(--line) N%, transparent)` at the call site is
+   * theme-blind, and the dark --line is an alpha overlay. */
   --fill:      color-mix(in oklab, var(--line) 20%, transparent);
   --fill-2:    color-mix(in oklab, var(--line) 45%, transparent);
 
   --accent:      #2a5c8a;
   /* The blue arc scale is --blue / --accent-2 / --accent-soft: the STR,
-   * INT and NUM arcs of the schema drawer's field-type donut
-   * (trawl-web-ui service_card_fmt.rs `type_bucket`) plus their legend
-   * swatches, where colour is the only encoding. Neither --accent-2 nor
-   * --accent-soft has any other consumer, so the three must stay
-   * mutually separable in EVERY theme — the gaps below are measured per
-   * block, in oklab, and the dark block states its own (see there).
-   *
-   * Light: ADR-0007 flips --accent-2 from a DARKER accent to a tint
-   * mixed toward white, which on light mode's dark accent still lands
-   * .081 above --blue. --accent-soft therefore keeps its pre-Mira value
-   * rather than the skin's companion move (soft → #4a7cab), which would
-   * sit .031 from the new --accent-2; holding soft at #7ea6cc keeps the
-   * scale monotonic in both L and C (gaps .081 / .167). */
+   * INT and NUM arcs of the schema drawer's field-type donut plus their
+   * legend swatches, where colour is the only encoding, so the three must
+   * stay mutually separable in EVERY theme. */
   --accent-2:    color-mix(in oklab, #2a5c8a 85%, white);
   --accent-soft: #7ea6cc;
   --on-accent:   oklch(98.5% 0 0);
   /* --ring is the 2px focus outline (outline-offset 2px, so it sits on
    * whatever floor surrounds the control): 3.98:1 on --bg, 4.05:1 on
-   * --well, 4.55:1 on --panel. The 45% mix it replaces measured 2.83:1
-   * on the new floor, under the 3:1 non-text floor. */
+   * --well, 4.55:1 on --panel. */
   --ring:        color-mix(in oklab, #2a5c8a 70%, oklch(80% 0 0));
   --accent-glow: var(--ring);
-  /* Accent-coloured TEXT reads --accent-ink, never --accent. The two are
-   * equal here and diverge in dark, where the brand blue misses AA on
-   * --panel-3 (see the dark block). */
+  /* Accent-coloured TEXT reads --accent-ink, never --accent. */
   --accent-ink:  #2a5c8a;
   --accent-wash: color-mix(in oklab, #2a5c8a 9%, transparent);
 
   /* --teal is text in the schema drawer's BOOL/IP type chips (.tp-bool,
-   * .tp-ip, a 14% mix over --panel-2): 4.66:1 there, 6.23:1 on --panel.
-   * The percentage is the one the rules use; at 18% the BOOL chip
-   * measured 4.38:1 and missed the AA floor. */
+   * .tp-ip, a 14% mix over --panel-2): 4.66:1 there. */
   --teal:       #0a6d60;
   --teal-wash:  rgba(10,109,96,.10);
   /* Light --red is toned for the TINTED destructive recipe, not for a
    * solid fill: it is the FOREGROUND over --red-wash (.btn-danger,
    * .lvl-error, .meta .chip.excl), so its contrast is measured against
-   * the wash composited on the panel, not against the panel. Mira's
-   * oklch(57.7% .245) renders 3.97:1 there (3.31:1 on the 20% hover
-   * wash) — below the 4.5:1 AA floor for normal text. This deeper tone
-   * measures 6.03:1 / 5.06:1, and 6.88:1 for --on-accent on the solid
-   * red (.chip.excl .x:hover). Dark mode keeps Mira's lighter red: it
-   * sits on dark panels and already clears AA. */
+   * the wash composited on the panel, not against the panel. */
   --red:        oklch(48% .177 27.325);
   --red-2:      oklch(41% .155 27.325);
   --red-wash:   color-mix(in oklab, var(--red) 10%, transparent);
   /* --yellow and --green are foregrounds over their own 10% washes
-   * (.bdg.warn, .lvl-warn, .bdg.success) and bare on --panel-2 (the tail
-   * bar's lag label). Mira's #a68210 measured 3.24:1 on the warn wash in
-   * the 2026-09-13 audit; these tones measure 5.42:1 / 5.54:1 on the
-   * washes and 6.24:1 / 6.38:1 on --panel. Dark keeps its lighter pair. */
+   * (.bdg.warn, .lvl-warn, .bdg.success) and bare on --panel-2. */
   --yellow:     #7a5c0c;
   --yellow-wash:rgba(122,92,12,.10);
   --green:      #3a6a33;
   --green-wash: rgba(58,106,51,.10);
   --blue:       #2a5c8a;
-  /* --violet is a chart series colour, held near --teal's lightness in
-   * each theme so no series outweighs another; its hue sits apart from
-   * the blue accent and the teal series beside it. */
   --violet:     #7241a0;
 
-  /* Elevation ramp (ADR-0032): a well inset plus three raised steps, each
-   * a tight contact layer under a soft ambient one, tinted toward the
-   * accent hue so light-mode shadows read as ambient rather than soot.
-   * --edge-hi is the 1px top highlight a raised surface adds as its FIRST
-   * box-shadow layer. --shadow-1/2/3 alias the ramp so existing readers
-   * (toasts, popovers, coastwatch.css) keep working. Shadows are never the
-   * only separator: every plane keeps its hairline. */
+  /* Elevation ramp (ADR-0032). --shadow-1/2/3 alias the ramp so existing
+   * readers (toasts, popovers, coastwatch.css) keep working. */
   --edge-hi:     rgb(255 255 255 / .9);
   --inset:       inset 0 1px 3px rgb(15 25 40 / .075);
   --elev-1:      0 1px 2px rgb(25 39 53 / .09), 0 5px 14px rgb(25 39 53 / .045);
@@ -229,15 +107,9 @@
   --shadow-3:    var(--elev-3);
 }
 
-/* Dark theme — Mira's dark neutrals. Lines are white-alpha overlays so
- * they read as the same "ink on surface" system at any panel depth;
- * the accent inverts: light-blue surfaces carry near-black text. */
 [data-theme="dark"] {
   color-scheme: dark;
 
-  /* Direction A's dark planes (#101419 / #1a1f25 / #222931 / #2b3440 /
-   * #13191f) in OKLCH. Lines stay white-alpha overlays (dark block
-   * rule, see --fill below). */
   --bg:        oklch(18.9% .012 254);
   --panel:     oklch(23.7% .014 253);
   --panel-2:   oklch(27.8% .018 252);
@@ -245,54 +117,36 @@
   --well:      oklch(21% .015 249);
   --ink:       oklch(95.6% .007 248);
   --ink-2:     oklch(84.1% .017 251);
-  /* 7.42:1 on --panel, 6.58:1 on --panel-2, 5.64:1 on --panel-3, 5.26:1
-   * on the accent wash over --panel-2. */
   --ink-3:     oklch(74.8% .025 250);
-  /* 6.44:1 on --panel, 6.88:1 on --well, 4.89:1 on --panel-3. */
   --ink-4:     oklch(70.9% .027 250);
   --line:      oklch(100% 0 0 / .11);
   --line-2:    oklch(100% 0 0 / .06);
   --selection: rgba(255,255,255,.14);
 
   /* Dark control fills are stated as white-alpha overlays instead of
-   * mixed from --line: --line is ITSELF a 10%-alpha white here, and
+   * mixed from --line: --line is ITSELF an alpha white here, and
    * `color-mix(..., transparent)` MULTIPLIES alphas, so the light
-   * recipe would resolve to .10 x .20 = 2% — a wash of nothing on an
-   * oklch(18%) panel. These are the dark counterparts of the light
-   * --line mixes (ADR-0007's "~30% dark"), expressed in the same
-   * overlay system the lines use. */
+   * recipe would resolve to a wash of nothing. */
   --fill:      oklch(100% 0 0 / .06);
   --fill-2:    oklch(100% 0 0 / .11);
 
   --accent:      #5a9fd4;
-  /* --accent-2 mixes toward BLACK here, not white. The Mira recipe is
-   * "step the accent one notch away from the surface"; dark inverts
-   * that direction, exactly as --on-accent inverts. Mixing the already
-   * light dark accent toward white compresses near the top of the L
-   * range: it lands only .050 from --blue and .045 from --accent-soft,
-   * collapsing the donut's STR/INT/NUM arcs (and their .ft-legend .sw
-   * swatches) into one light blue — well under the light block's .081
-   * smallest gap. The same 85% mix toward black instead orders the
-   * scale --accent-2 / --blue / --accent-soft in L (.577 / .679 / .766,
-   * the dark-first ordering the pre-Mira tokens had), with no pair
-   * closer than .095. */
+  /* --accent-2 mixes toward BLACK here, not white. Mixing the already
+   * light dark accent toward white lands only .050 from --blue and .045
+   * from --accent-soft, collapsing the donut's STR/INT/NUM arcs into one
+   * light blue. */
   --accent-2:    color-mix(in oklab, #5a9fd4 85%, black);
   --accent-soft: #8fb8dc;
   --on-accent:   oklch(16% 0 0);
-  /* 3.54:1 on --panel-3, 4.66:1 on --panel, 5.19:1 on --bg; the 55% mix
-   * it replaces measured 2.65:1 on --panel-3. */
+  /* 3.54:1 on --panel-3, 4.66:1 on --panel, 5.19:1 on --bg. */
   --ring:        color-mix(in oklab, #5a9fd4 80%, oklch(40% 0 0));
   --accent-glow: var(--ring);
-  /* The dark accent stays the brand, button and chart colour (a six-digit
-   * hex: atmosphere parity and uPlot's translucent() read it). As TEXT it
-   * measures 4.40:1 on --panel-3, the raised segmented option's floor, so
-   * accent text reads this lighter step: 5.05:1 on --panel-3, 4.71:1 on
-   * the wash over --panel-2, 6.65:1 on --panel. */
+  /* The dark accent stays a six-digit hex: atmosphere parity and uPlot's
+   * translucent() read it. As TEXT it measures 4.40:1 on --panel-3, so
+   * accent text reads this lighter step. */
   --accent-ink:  #6baadd;
   --accent-wash: color-mix(in oklab, #5a9fd4 14%, transparent);
 
-  /* Same chips, same 14% mix over the dark --panel-2: 5.59:1 there,
-   * 8.14:1 on --panel. */
   --teal:       #4ec9b0;
   --teal-wash:  rgba(78,201,176,.12);
   --red:        oklch(70.4% .191 22.216);
@@ -321,10 +175,7 @@
   --font-mono: "Chivo Mono", ui-monospace, Menlo, monospace;
 
   /* Radius scale (ADR-0007): every border-radius in fleet-ui.css and
-   * app stylesheets reads one of these — no px literals. panel/ctl/sm
-   * are the Mira trio; xs pins the hairline bar/meter/swatch
-   * roundings, pill/round close out the scale so the no-literals rule
-   * (issue #47 AC2) holds file-wide. */
+   * app stylesheets reads one of these — no px literals. */
   --radius-panel: 10px;  /* cards, modals, popovers, menus */
   --radius-ctl: 8px;     /* buttons, inputs, editor, segmented, rail items */
   --radius-sm: 6px;      /* chips, badges, ghost affordances, facet rows */
@@ -332,7 +183,7 @@
   --radius-pill: 999px;  /* full-round pills (toggle track, count chips) */
   --radius-round: 50%;   /* circles (dots, avatar, toggle knob) */
 
-  /* Type rhythm (workbench pass): one base size drives every level.
+  /* Type rhythm: one base size drives every level.
    * Up-steps are golden ratio, down-steps interpolate geometrically
    * from base to a 13px readability floor. To re-derive at base B
    * (floor F = 13): up B·φⁿ; down max(F, B·(F/B)^frac) for
@@ -347,17 +198,13 @@
   --fs-small:   13px;    /* floor */
   --lh:         1.5;
 
-  /* Dense sub-scale: data-dense surfaces (tables, facets, chips,
-   * axes) that sit BELOW the 13px readability floor by design —
-   * the same exemption --table-fs/--editor-fs already claim. 1px
-   * steps. Don't use these for prose or controls. */
+  /* Dense sub-scale: data-dense surfaces that sit BELOW the 13px
+   * readability floor by design. Don't use these for prose or controls. */
   --fs-ui:     13px;   /* compact ui text: meta strips, buttons, group titles */
   --fs-dense:  12px;   /* dense data rows: facet values, chips, hints */
   --fs-micro:  11px;   /* table headers, badges, pills, secondary counts */
   --fs-tiny:   10px;   /* axis labels, sort arrows — smallest legible */
 
-  /* Label + title treatment: sentence case (the uppercase-mono label
-   * treatment was rejected in the workbench pass). */
   --label-font:      var(--font-ui);
   --label-transform: none;
   --label-variant:   normal;
@@ -382,9 +229,6 @@
   --facets-w:   224px;
 }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Reset + base
- * ─────────────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; }
 /* Firefox scrollbars follow the theme (color-scheme is declared per theme
@@ -405,18 +249,13 @@ body {
   line-height: var(--lh);
   /* Chivo Mono draws zero as an unslashed oval unless its `zero` feature
    * is on, and a log viewer has to keep 0 and O apart. Albert Sans has no
-   * `zero` feature, so the declaration is inert for UI text.
-   * font-feature-settings inherits and is independent of the
-   * font-variant-numeric: tabular-nums declarations elsewhere, so no
-   * per-rule change is needed. */
+   * `zero` feature, so the declaration is inert for UI text. */
   font-feature-settings: "zero";
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 button { font: inherit; }
-/* A link with no class of its own reads as product text in accent ink,
- * visited or not, instead of the browser's blue and purple (any author
- * colour beats the UA's :visited one). `:where` keeps the rule at zero
+/* `:where` keeps the rule at zero
  * specificity, so any classed link, and any rule that styles links
  * inside a component, still wins. */
 :where(a:not([class])) {
@@ -426,9 +265,6 @@ button { font: inherit; }
 }
 ::selection { background: var(--selection); }
 
-/* Focus ring — a 2px outline offset from the control, so it never
- * competes with an elevation box-shadow (ADR-0032) and survives
- * forced colors. Anchors are controls too (ADR-0029). */
 button:focus-visible,
 a[href]:focus-visible,
 input:focus-visible,
@@ -439,7 +275,6 @@ select:focus-visible,
   outline-offset: 2px;
 }
 
-/* Scrollbars — slim, panel-toned. */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
@@ -454,7 +289,6 @@ select:focus-visible,
   border: 2px solid transparent;
 }
 
-/* Motion utilities. */
 @keyframes blink        { 50% { opacity: .2; } }
 @keyframes spin         { to { transform: rotate(360deg); } }
 @keyframes toastIn      { from { transform: translateY(8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
@@ -465,9 +299,6 @@ select:focus-visible,
   to   { opacity: 1; transform: translateY(0)   scale(1); }
 }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Form: .field, .error-banner
- * ─────────────────────────────────────────────────────────────── */
 .field {
   display: block;
   margin-bottom: 16px;
@@ -517,16 +348,6 @@ select:focus-visible,
   font-size: var(--fs-base);
 }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Buttons
- *  - .btn        is the large accent primary (login-page form)
- *  - .btn-pri    is the compact accent primary (modal footers, toolbars)
- *  - .btn-sec    is the neutral secondary
- *  - .btn-danger is the destructive variant (NEW — closes the dangling
- *                reference that existed in confirm_modal.rs before
- *                extraction)
- *  - .btn-full   makes any variant width: 100%
- * ─────────────────────────────────────────────────────────────── */
 .btn {
   display: inline-block;
   padding: 8px 18px;
@@ -546,23 +367,6 @@ select:focus-visible,
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-full { width: 100%; }
 
-/* Dark outline buttons carry a whisper of surface (Mira), keeping the
- * outline pair visible on dark panels — the same white-alpha overlay
- * every other dark control fill uses, so both the rest and the hover
- * step are backdrop-INDEPENDENT.
- *
- * The shared `:hover` fill (`--panel-3` at 55%) is backdrop-dependent:
- * it only lifts where the backdrop is darker than --panel-3. Measured
- * on --panel that is rgb(27)->rgb(29), no perceptible feedback; inside
- * a --panel-2 container (.tl-bar, .sd-card — both hold Variant::
- * Secondary buttons) it renders rgb(36)->rgb(33), a DIP. So dark mode
- * overrides the hover too: --fill -> --fill-2 is a fixed +5% white lift
- * on every surface.
- *
- * The resting fill out-specifies the `.btn-sec` / `.btn-sm` base fills
- * (0,2,0 vs 0,1,0) but ties with `.btn-sec:hover`, so it must stay
- * BEFORE the hover rules; the dark hover pair is (0,3,0) and wins on
- * specificity. */
 [data-theme="dark"] .btn-sec,
 [data-theme="dark"] .btn-sm {
   background: var(--fill);
@@ -604,8 +408,6 @@ select:focus-visible,
 .btn-pri:active:not(:disabled) { translate: 0 1px; box-shadow: inset 0 1px 0 rgb(255 255 255 / .2); }
 .btn-pri:disabled { opacity: .5; cursor: not-allowed; }
 
-/* Destructive is TINTED (ADR-0007): red text on the red wash, never a
- * solid red fill — the hover deepens the wash instead of darkening. */
 .btn-danger {
   padding: 5px 14px;
   font-size: var(--fs-control);
@@ -622,15 +424,11 @@ select:focus-visible,
 .btn-danger:active:not(:disabled) { translate: 0 1px; }
 .btn-danger:disabled { opacity: .5; cursor: not-allowed; }
 
-/* Size axis (issue #28) — moved verbatim from trawl's main.css when
- * <Btn> grew the `size` prop.
- * - .btn-sm is a SELF-CONTAINED compact style (own background/border/
- *   hover), historically used standalone (`class="btn-sm"`); Btn's
- *   Size::Sm therefore suppresses the variant class.
+/* - .btn-sm is a SELF-CONTAINED compact style (own background/border/
+ *   hover); Btn's Size::Sm therefore suppresses the variant class.
  * - .btn-xs is a true modifier (font-size + padding only) composed
  *   after a variant class (`btn-sec btn-xs`). It must stay AFTER the
- *   variant rules so its padding/font-size win the cascade, exactly as
- *   they did when main.css loaded after this file. */
+ *   variant rules so its padding/font-size win the cascade. */
 .btn-sm {
   padding: 3px 10px;
   background: var(--fill);
@@ -654,12 +452,6 @@ select:focus-visible,
 
 .btn-xs { font-size: var(--fs-small); padding: 3px 8px; }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Modal scaffolding
- *  Only the scrim + frame + header/body/footer slots. Trawl's
- *  modal-internal fields, previews, and explanatory copy stay in
- *  trawl-web-ui until they prove generic.
- * ─────────────────────────────────────────────────────────────── */
 .modal-scrim {
   position: fixed; inset: 0; z-index: 200;
   background: oklch(14.5% 0 0 / .42);
@@ -681,9 +473,6 @@ select:focus-visible,
   overflow: hidden;
 }
 
-/* modal-sm is a narrower variant used by ConfirmModal. The original
- * trawl-web-ui CSS referenced this class but never defined it — fleet-ui
- * closes that gap. */
 .modal-sm { width: 380px; }
 
 .modal .m-hd {
@@ -691,8 +480,6 @@ select:focus-visible,
   display: flex; align-items: center; gap: 10px;
   padding: 12px 16px; border-bottom: 1px solid var(--line);
 }
-/* Header icon chip — rendered by the Modal shell's optional `icon`
- * prop (moved from trawl's main.css, issue #28). */
 .modal .m-hd .ic {
   width: 22px; height: 22px; display: grid; place-items: center;
   color: var(--accent);
@@ -709,7 +496,6 @@ select:focus-visible,
 }
 .modal .m-hd .x:hover { color: var(--ink); background: var(--panel-2); }
 
-/* Long plans scroll inside the frame; their actions remain visible. */
 .modal .m-body {
   padding: 14px 16px; display: flex; flex-direction: column; gap: 12px;
   min-height: 0; overflow-y: auto; overscroll-behavior: contain;
@@ -725,10 +511,6 @@ select:focus-visible,
   border-top: 1px solid var(--line);
 }
 
-/* Modal field cluster + reason textarea — emitted by fleet-ui's
- * ConfirmWithReasonModal (and by app modal bodies via
- * `<Field class="m-field">`), so the rules ship with the crate
- * (moved from trawl's main.css, issue #28). */
 .modal .m-field { display: flex; flex-direction: column; gap: 4px; }
 .modal .m-field label {
   font-family: var(--label-font); font-size: var(--fs-label); font-weight: 600;
@@ -757,15 +539,10 @@ select:focus-visible,
   border-color: var(--accent);
 }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Tab strips — fleet_ui::Tabs renders BOTH families (issue #28):
+/* fleet_ui::Tabs renders BOTH families:
  *  - .tabs / .t / .active  — workspace strip (Events/Visualization)
  *  - .sd-tabs / .tb / .on  — drawer strip (weights differ on purpose:
- *    500 active vs 600 on; do not merge)
- *  Moved verbatim from trawl's main.css. (Trawl's old .dr-pop .tabs
- *  popover reskin was retired in issue #31 — that strip is
- *  fleet_ui::Segmented, the .seg family below.)
- * ─────────────────────────────────────────────────────────────── */
+ *    500 active vs 600 on; do not merge) */
 .tabs {
   display: flex;
   align-items: center;
@@ -795,10 +572,6 @@ select:focus-visible,
 .tabs .t.active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 500; }
 .tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: var(--fs-small); }
 .tabs .sp { flex: 1; }
-/* The trailing slot is one wrapping unit. The strip wraps at narrow
- * widths, and consumer actions sat in it as loose siblings, so the row
- * broke between them — "Export" alone on a second line. They move
- * together now, and never break from each other. */
 .tabs .tabs-actions {
   display: flex;
   align-items: center;
@@ -806,18 +579,9 @@ select:focus-visible,
   margin-inline-start: auto;
   flex-wrap: nowrap;
 }
-/* The role="tablist" node holds ONLY the tabs (ADR-0028); the spacer
- * and the trailing action slot are its siblings, so the strip keeps one
- * flex row and each tab's -1px bottom margin still laps the container's
- * border. */
+/* The role="tablist" node holds ONLY the tabs (ADR-0028). */
 .tablist { display: flex; align-items: center; }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Drawer shell — fleet_ui::Drawer (issue #28). Scrim, right-slide
- *  panel, header (title slot + actions slot + close), tab strip,
- *  body. Drawer CONTENT (.sd-overview, .sd-card, .sf-*, .sd-ttl
- *  .name/.sub, …) stays in each app's stylesheet.
- * ─────────────────────────────────────────────────────────────── */
 .sd-scrim {
   position: fixed; inset: 0; background: oklch(14.5% 0 0 / .18);
   z-index: 50; animation: sd-fade-in 140ms ease-out;
@@ -835,7 +599,6 @@ select:focus-visible,
 @keyframes sd-fade-in { from { opacity: 0 } to { opacity: 1 } }
 @keyframes sd-slide-in { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
 
-/* Drawer header */
 .sd-hd {
   display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
   flex-shrink: 0;
@@ -853,7 +616,6 @@ select:focus-visible,
 }
 .sd-x:hover { background: var(--fill-2); color: var(--ink); border-color: var(--line); }
 
-/* Drawer tabs */
 .sd-tabs {
   display: flex; align-items: center; gap: 4px;
   padding: 0 14px; border-bottom: 1px solid var(--line);
@@ -870,21 +632,14 @@ select:focus-visible,
 .sd-tabs .tb.on { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
 .sd-tabs .sp { flex: 1; }
 .sd-tabs .meta { font-size: var(--fs-small); color: var(--ink-3); padding-right: 4px; }
-/* The 4px inter-tab gap moves to the nested tablist. .sd-tabs keeps its
- * own gap, which now falls either side of the flex:1 spacer and is
- * absorbed by it — the tabs and the meta text do not move. */
 .sd-tabs .tablist { gap: 4px; }
 
 .sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; background: var(--bg); }
 
-/* Docked presentation (ADR-0032). The host stops being a scrim and
- * stops being a box at all, so the panel becomes a grid/flex child of
- * the layout that placed the drawer; the panel drops fixed positioning,
- * the overlay elevation and the slide-in, and reads as the sheet it now
- * sits beside. Sticky so a long list scrolls past a panel that stays in
- * view. Every app-side placement rule (column width, the narrow-width
- * stack) is written as a descendant of the placing layout, never as a
- * bare `.sd-host`, so the two stylesheets keep their split. */
+/* Docked presentation (ADR-0032). Every app-side placement rule (column
+ * width, the narrow-width stack) is written as a descendant of the placing
+ * layout, never as a bare `.sd-host`, so the two stylesheets keep their
+ * split. */
 .sd-host { display: contents; }
 .sd-drawer.sd-docked {
   position: sticky; top: 0; right: auto; bottom: auto;
@@ -895,9 +650,6 @@ select:focus-visible,
   animation: none;
 }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Toasts (bottom-right stack)
- * ─────────────────────────────────────────────────────────────── */
 .toasts {
   position: fixed;
   bottom: var(--statusbar-h);
@@ -934,8 +686,7 @@ select:focus-visible,
 .toast.error   { border-left-color: var(--red); }
 .toast.info    { border-left-color: var(--blue); }
 /* `toast-body`, not `body` — the Shell chrome reserves `.body` for the
- * rail+main row below, and its `display: flex` used to leak into any
- * toast child sharing the name. The rename ends the collision class. */
+ * rail+main row. */
 .toast .toast-body { flex: 1; }
 .toast .title {
   font-weight: 600;
@@ -953,7 +704,6 @@ select:focus-visible,
   font-size: var(--fs-small);
   text-underline-offset: 2px;
 }
-/* Close ✕ nudged to optically align with the title's first line. */
 .toast .x {
   background: none; border: 0;
   color: var(--ink-3);
@@ -966,21 +716,10 @@ select:focus-visible,
 }
 .toast .x:hover { color: var(--ink); background: var(--panel-2); }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Login page (.login-shell, .login-card)
- *
- *  Centered card on the bg, sized for the API-key form. Reuses the
- *  generic .field + .btn classes defined above; the .error-banner
- *  rule lives in the form block so login-specific spacing
- *  (margin-bottom) is preserved without duplicating the base rule.
- * ─────────────────────────────────────────────────────────────── */
-/* No background here — deliberately (coastwatch#308, ADR-0012). An
+/* No background here — deliberately (ADR-0012). An
  * opaque normal-flow block paints ABOVE the z-index:-1 .atmosphere
  * canvas, so a background on .login-shell fully occludes the shader
- * backdrop. The page floor it used to paint comes from body's
- * `background: var(--bg)` propagating to the viewport canvas instead
- * (html declares no background of its own — both invariants pinned by
- * atmosphere_palette_parity / css_chrome_parity). */
+ * backdrop. */
 .login-shell {
   display: grid;
   place-items: center;
@@ -999,10 +738,6 @@ select:focus-visible,
   box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
 }
 
-/* The wordmark, when the card carries a heading of its own: the brand
- * is the product signature and the h1 is the sentence under it. Cards
- * with no heading (coastwatch's boot card, the 404) keep the wordmark
- * in the h1 and render no `.brand`. */
 .login-card .brand {
   display: flex;
   gap: 2px;
@@ -1014,9 +749,6 @@ select:focus-visible,
 }
 .login-card .brand .accent { color: var(--accent-ink); }
 
-/* The card's own heading: a sentence, not a wordmark, so it drops to
- * the section step in body ink. The 404 card renders its "404" through
- * this same rule. */
 .login-card h1 {
   margin: 0 0 8px;
   font-size: var(--fs-section);
@@ -1034,16 +766,8 @@ select:focus-visible,
 
 .login-card .error-banner { margin-bottom: 16px; }
 
-/* ─────────────────────────────────────────────────────────────────
- *  App shell — grid (body / footer)
- *
- *  Reserved class names from this point down: .shell, .topbar, .body,
- *  .main, .rail. Apps must NOT redefine these — they're shared chrome.
- * ─────────────────────────────────────────────────────────────── */
-/* Columns: sidebar + content. Rows: content / footer. The `auto`
- * footer row collapses to zero for footer-less apps and sizes to the
- * footer's own height (e.g. trawl's .statusbar at var(--statusbar-h))
- * when the Shell's optional footer slot is filled. */
+/* Reserved class names from this point down: .shell, .topbar, .body,
+ * .main, .rail. Apps must NOT redefine these — they're shared chrome. */
 .shell {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -1051,7 +775,6 @@ select:focus-visible,
   height: 100%;
 }
 
-/* The column beside the sidebar: command bar over the page. */
 .shell-content {
   flex: 1;
   min-width: 0;
@@ -1060,7 +783,6 @@ select:focus-visible,
   grid-template-rows: auto minmax(0, 1fr);
 }
 
-/* Command bar — nav toggle · page title · palette · account (ADR-0032). */
 .topbar {
   display: flex;
   align-items: center;
@@ -1074,7 +796,6 @@ select:focus-visible,
   flex-shrink: 0;
 }
 
-/* Compact widths only: the docked sidebar becomes an overlay this opens. */
 .topbar .nav-toggle {
   display: none;
   align-items: center;
@@ -1125,7 +846,6 @@ select:focus-visible,
 .topbar .jump:hover { border-color: var(--ink-3); }
 .topbar .jump .gh { flex: 1; font-family: var(--font-ui); font-size: var(--fs-label); }
 
-/* Command palette: the input keeps focus while arrows select real links. */
 .command-palette-scrim {
   position: fixed; inset: 0; z-index: 200;
   display: flex; align-items: flex-start; justify-content: center;
@@ -1178,8 +898,6 @@ select:focus-visible,
   color: var(--ink); text-decoration: none; font-size: var(--fs-ui);
 }
 .command-palette-option:hover { background: var(--panel-2); }
-/* Selected is the wash plus a 3px rule; focus stays on the combobox
- * input, so the selected option and the focus ring never collide. */
 .command-palette-option[aria-selected="true"] {
   background: var(--accent-wash);
   color: var(--accent-ink);
@@ -1229,7 +947,6 @@ select:focus-visible,
 }
 .topbar .user .who { font-family: var(--font-ui); font-size: var(--fs-base); }
 
-/* User menu dropdown — anchored to .user-wrap. */
 .user-menu {
   position: absolute;
   top: 36px;
@@ -1282,7 +999,6 @@ select:focus-visible,
 }
 .user-menu .menu-choice-mark { width: 1em; flex: 0 0 1em; }
 
-/* Body row: sidebar + content column, fills the shell above the footer. */
 .body {
   display: flex;
   flex: 1;
@@ -1298,10 +1014,6 @@ select:focus-visible,
   overflow: hidden;
 }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Sidebar — one labelled destination list. `nav.rail` keeps its class
- *  so the nav selectors change minimally (ADR-0032).
- * ─────────────────────────────────────────────────────────────── */
 .rail {
   width: var(--sidebar-w);
   flex-shrink: 0;
@@ -1342,9 +1054,6 @@ select:focus-visible,
   white-space: nowrap;
   overflow: hidden;
 }
-/* One recipe for both element kinds: the destinations are anchors and
- * the collapse control is a button, so the rule carries the button
- * reset as well as the anchor underline suppression. */
 .rail .it {
   height: 32px;
   width: 100%;
@@ -1376,7 +1085,6 @@ select:focus-visible,
 .rail .it:hover { color: var(--ink); background: var(--fill-2); }
 .rail .it.active { color: var(--accent-ink); background: var(--accent-wash); }
 .rail .it.active .lb { font-weight: 700; }
-/* Count chip — RailItem.badge, trailing the label. */
 .rail .it .badge {
   margin-inline-start: auto;
   min-width: 18px;
@@ -1413,8 +1121,7 @@ select:focus-visible,
   min-width: 0; width: 8px; height: 8px; padding: 0;
   overflow: hidden; color: transparent; background: var(--accent);
 }
-/* Below 899.98px: the sidebar is a Capture overlay behind the command
- * bar's toggle. One spelling of "narrow" across the codebase — `Shell`
+/* Below 899.98px: `Shell`
  * and `FacetSidebar` query the same width, so the toggle is never
  * revealed at a width where it opens nothing. */
 .nav-scrim { position: fixed; inset: 0; z-index: 50; background: oklch(14.5% 0 0 / .18); animation: sd-fade-in 140ms ease-out; }
@@ -1426,20 +1133,8 @@ select:focus-visible,
 }
 @keyframes nav-slide-in { from { transform: translateX(-20px); opacity: 0; } to { transform: none; opacity: 1; } }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Small widgets (issue #31, ADR-0003 unification)
- *
- *  One canonical treatment per widget. New families first (.bdg,
- *  .seg, .load-hint, .actions-wrap — these REPLACED the app-side
- *  .intel-badge / .fmt-btn / .seg-mini / bespoke loading markup they
- *  were extracted from; trawl's .intel-badge sites went with the
- *  surface #112 retired). The verbatim moves (.kbd, .inp-wrap,
- *  .toggle, .status-dot, …) are appended by the per-family sweep
- *  commits so the move-not-copy invariant in trawl's
- *  css_move_invariant stays green per commit.
- * ─────────────────────────────────────────────────────────────── */
 
-/* Badge — <Badge tone=…>. `.bdg`, not `.badge`: the rail count chip
+/* `.bdg`, not `.badge`: the rail count chip
  * above already owns `.rail .it .badge`, and a top-level `.badge`
  * rule would leak display/text-transform into it via the cascade. */
 .bdg {
@@ -1451,13 +1146,9 @@ select:focus-visible,
 .bdg.neutral { background: var(--panel-2);   color: var(--ink-3); }
 .bdg.info    { background: var(--panel-2);   color: var(--accent-ink); }
 .bdg.success { background: var(--green-wash);color: var(--green); }
-/* warn reads yellow, not the accent — warnings must keep their
- * semantic color regardless of what hue the accent slot carries. */
 .bdg.warn    { background: var(--yellow-wash);color: var(--yellow); }
 .bdg.danger  { background: var(--red-wash);  color: var(--red); }
 
-/* Segmented — <Segmented/>. One active treatment: the option is raised
- * out of the well track (ADR-0032), never a second active rule. */
 .seg {
   display: inline-flex; gap: 2px; padding: 2px;
   background: var(--well); box-shadow: var(--inset);
@@ -1483,7 +1174,6 @@ select:focus-visible,
 }
 .seg-sm .seg-opt { padding: 3px 9px; font-size: var(--fs-small); }
 
-/* Loaded — <Loaded/> tri-state hints (canonical copy tested natively). */
 .load-hint {
   padding: 12px;
   font-size: var(--fs-base);
@@ -1492,28 +1182,16 @@ select:focus-visible,
 }
 .load-hint.error { color: var(--red); }
 .load-recovery { margin-top: 8px; }
-/* Missing-state explanatory second line (issue #33 D5) — stays on the
- * neutral hint tone, slightly dimmer than the headline copy. */
 .load-hint .load-sub {
   margin-top: 4px;
   font-size: var(--fs-small);
   color: var(--ink-4);
 }
 
-/* ActionsMenu — positioning context owned by the component (the
- * trigger `.btn-icon` and panel `.actions-menu` rules move in with
- * the nets-page sweep commit). */
 .actions-wrap { position: relative; display: inline-block; }
 
-/* Sparkline — <Sparkline/> (moved verbatim from trawl's main.css). */
 .sc-spark { display: block; }
 
-/* StatusDot — <StatusDot tone=…>. Unified canonical dot (issue #31):
- * trawl's 6px flat `.status-dot` run dots and the 7px ringed
- * `.sd-dot` schema-health dots fold onto ONE treatment — 7px with the
- * ring, pulse reserved for the in-flight (running) tone. Bare
- * `.status-dot` (Neutral) stays an invisible spacer, matching the
- * pre-unification unknown-status arm. */
 .status-dot {
   width: 7px; height: 7px; border-radius: var(--radius-round);
   display: inline-block; vertical-align: middle;
@@ -1524,7 +1202,6 @@ select:focus-visible,
 .status-dot.running { background: var(--accent);  box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 25%, transparent); animation: dot-pulse 1.6s ease-in-out infinite; }
 @keyframes dot-pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
 
-/* Toggle — <Toggle/> (moved verbatim from trawl's main.css). */
 .toggle {
   position: relative; display: inline-block; width: 32px; height: 18px;
 }
@@ -1543,11 +1220,6 @@ select:focus-visible,
 .toggle input:checked + .toggle-slider { background: var(--accent); }
 .toggle input:checked + .toggle-slider::before { transform: translateX(14px); }
 
-/* Kbd — <Kbd/>. `.kbd` moved verbatim from trawl's main.css (the
- * topbar user-menu shortcut chips were already emitting it from
- * fleet-ui, styled across the crate boundary — this closes that gap).
- * `.kbd-inline` generalizes trawl's `.run .kbd-inline`: the borderless
- * dimmed treatment for shortcuts inside colored buttons. */
 .kbd {
   font-family: var(--font-mono);
   font-size: var(--fs-small);
@@ -1563,8 +1235,6 @@ select:focus-visible,
   opacity: .6;
 }
 
-/* Pager — <Pager/> table footer (moved verbatim from trawl's main.css;
- * the .tbl-foot mirror family was retired onto this one, ADR-0003). */
 .results-footer {
   display: flex;
   align-items: center;
@@ -1585,8 +1255,6 @@ select:focus-visible,
   gap: 6px;
 }
 
-/* SearchInput — <SearchInput/> toolbar filter (moved verbatim from
- * trawl's main.css). */
 .inp-wrap {
   display: flex; align-items: center; gap: 6px;
   padding: 4px 10px;
@@ -1607,9 +1275,6 @@ select:focus-visible,
   outline-offset: 2px;
 }
 
-/* ActionsMenu trigger + panel (moved verbatim from trawl's main.css;
- * the trigger's sole user was the nets-page overflow menu, so the
- * .btn-icon rule graduated with the component). */
 .btn-icon {
   background: none; border: none; cursor: pointer;
   font-size: 16px; color: var(--ink-3); padding: 2px 6px;
@@ -1638,10 +1303,8 @@ select:focus-visible,
 .actions-menu .item.danger:hover,
 .actions-menu .item.danger:focus-visible { background: color-mix(in oklab, var(--red) 10%, var(--panel-2)); }
 
-/* When — <When/> canonical timestamp label (issue #33). */
 .when { white-space: nowrap; }
 
-/* LoadMore — <LoadMore/> cursor-driven list footer (issue #33). */
 .load-more { display: flex; align-items: center; gap: 6px; }
 .load-more .load-more-end {
   font-size: var(--fs-small);
@@ -1649,16 +1312,10 @@ select:focus-visible,
   font-family: var(--font-ui);
 }
 
-/* ─────────────────────────────────────────────────────────────────
- *  Atmosphere — WebGL shader backdrop (coastwatch#308, ADR-0012)
- * ─────────────────────────────────────────────────────────────── */
-/* Fixed full-viewport layer behind everything; content composes above
- * it (z-index: -1 keeps normal-flow siblings on top with no stacking
- * gymnastics on their side). The background is the DEGRADATION FLOOR:
+/* The background is the DEGRADATION FLOOR:
  * it paints before the shader mounts and is all that shows when WebGL
  * is unavailable or the context is lost — var(--bg) so it re-themes
- * with the token system (never a literal color; pinned var()-only by
- * atmosphere_palette_parity). */
+ * with the token system (never a literal color). */
 .atmosphere {
   position: fixed;
   inset: 0;
@@ -1676,11 +1333,6 @@ select:focus-visible,
   height: 100%;
 }
 
-/* Range control — trigger and dialog travel together. */
-/* Date range — single trigger (grafana-style); all presets live in the
- * popover. The trigger is a <button> (ADR-0029): it already declares its
- * own background, border and colour, so `font: inherit` is the whole
- * reset the user-agent chrome needs. */
 .daterange { position: relative; display: flex; align-items: stretch; min-width: 0; }
 .daterange .dr-trigger { flex: 1; }
 .dr-trigger {
@@ -1712,7 +1364,7 @@ select:focus-visible,
 }
 /* Absolute-range labels ("2026-07-16… → now") exceed the column at
  * narrow widths: the trigger grows down and wraps the whole value
- * rather than ellipsizing it into the Haul button (F06). */
+ * rather than ellipsizing it into the Haul button. */
 .dr-trigger span {
   min-width: 0;
   white-space: normal;
@@ -1720,7 +1372,6 @@ select:focus-visible,
 }
 .dr-trigger svg { flex-shrink: 0; }
 
-/* Bypass links stay first in keyboard order without taking layout space. */
 .skip-link {
   position: fixed;
   top: 8px;
@@ -1741,7 +1392,6 @@ select:focus-visible,
   border-color: color-mix(in oklab, var(--accent) 45%, transparent);
 }
 
-/* Fullscreen click-outside scrim under the popover. */
 .scrim {
   position: fixed;
   inset: 0;
@@ -1764,8 +1414,6 @@ select:focus-visible,
 /* Dark shadows barely read, so the popover steps up to --panel-2 to
  * part from the --panel console it overlaps. */
 [data-theme="dark"] .dr-pop { background: var(--panel-2); }
-/* .dr-pop .tabs reskin retired (issue #31): the popover's mode strip
- * renders fleet_ui::Segmented; the layout margin stays with the dialog. */
 .dr-pop .seg { margin-bottom: 10px; }
 .dr-pop .grid {
   display: grid;
@@ -1784,13 +1432,11 @@ select:focus-visible,
   text-align: center;
   user-select: none;
 }
-/* Full width: a <button> in the preset grid does not stretch the way
- * the <div> it replaced did. */
+/* Full width: a <button> in the preset grid does not stretch. */
 .dr-pop button.opt { width: 100%; font: inherit; }
 .dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
 /* A disabled preset does not change under the pointer: this restates
- * the base rule's own resting tones, which the plane pass moved to a
- * --fill track with no border. */
+ * the base rule's own resting tones. */
 .dr-pop .opt:disabled:hover { background: var(--fill); border-color: transparent; }
 .dr-pop .opt.on {
   background: var(--panel);
@@ -1801,8 +1447,7 @@ select:focus-visible,
 }
 /* On the dark --panel-2 popover a --panel chip sinks below its --fill
  * siblings, so the chosen preset takes the open trigger's wash and a
- * half-strength accent border instead: still quieter than the full
- * --accent border a hovered preset shows. */
+ * half-strength accent border instead. */
 [data-theme="dark"] .dr-pop .opt.on {
   background: var(--accent-wash);
   border-color: color-mix(in oklab, var(--accent) 45%, transparent);
@@ -1824,8 +1469,6 @@ select:focus-visible,
   flex-direction: column;
   gap: 3px;
 }
-/* .lb is a <label for> now, not a div; it is a flex item of .fld, which
- * blockifies it, so the box is the one the div had. */
 .dr-pop .cust .fld .lb {
   font-size: var(--fs-dense);
   color: var(--ink-3);
@@ -1855,7 +1498,6 @@ select:focus-visible,
 /* Wrapper around fleet-ui's Apply button, which takes no class of its
  * own; inline-flex so it is exactly the button's box. */
 .dr-apply { display: inline-flex; }
-/* What Apply refused. The popover stays open while this shows. */
 .dr-pop .dr-err {
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
@@ -1876,9 +1518,7 @@ select:focus-visible,
   cursor: not-allowed;
 }
 
-/* Compact chrome keeps its original links and focus-return targets.
- * 899.98px, not 900px: `Shell` gates the overlay on the same width, and
- * at exactly 900 the toggle used to be visible and dead. */
+/* 899.98px, not 900px: `Shell` gates the overlay on the same width. */
 @media (max-width: 899.98px) {
   .topbar { gap: 10px; }
   .topbar .nav-toggle { display: inline-flex; }
@@ -1909,10 +1549,8 @@ select:focus-visible,
   .login-card .field input { font-size: 16px; }
 }
 
-/* Shown by OverflowHint only when its associated region overflows. */
 .overflow-hint { flex-shrink: 0; margin: 0; padding: 6px 12px; font-size: var(--fs-dense); color: var(--ink-2); background: var(--panel); }
 
-/* Focus belongs on the visible switch track, since the checkbox is hidden. */
 .toggle input:focus-visible + .toggle-slider {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
@@ -1931,9 +1569,7 @@ select:focus-visible,
     outline: 2px solid Highlight !important;
     outline-offset: 2px;
   }
-  /* Raised panels use borders when forced colors drops their shadows;
-   * selected controls keep a Highlight outline of their own.
-   * The raised segmented option is
+  /* The raised segmented option is
    * addressed through aria-pressed so the stylesheet keeps exactly one
    * active-option rule (component_class_contract). */
   .rail .it.active, .sd-drawer, .sd-hd, .sd-host, .scope,
@@ -1944,7 +1580,6 @@ select:focus-visible,
   .command-palette-option[aria-selected="true"] { outline: 2px solid Highlight; outline-offset: -2px; }
 }
 
-/* These effects are decorative; state remains visible without motion. */
 @media (prefers-reduced-motion: reduce) {
   .modal-scrim, .modal, .sd-scrim, .sd-drawer, .toast,
   .user-menu, .dr-pop, .status-dot.running, .nav-scrim, .rail.overlay {
@@ -1958,7 +1593,6 @@ select:focus-visible,
   }
 }
 
-/* Native management tables share tracks and cell insets. Consumers own columns. */
 .fleet-table-frame {
   border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--panel);
   box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
