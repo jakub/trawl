@@ -3,21 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The mount table behind the second ground of the apartness proof
-//! ([`super::hold_apart_from`], ADR-0057): Linux's `/proc/self/mountinfo`,
-//! read under a fixed ceiling and checked to be procfs, the parser of the
-//! one record a comparison needs, and the pure comparison of two
-//! directories' paths within one filesystem.
-//!
-//! A bind mount keeps the device and inode of its source, so the walk over
-//! parents in `scratch.rs` cannot see that a directory under one mount
-//! point is a directory under another. The table can: each record names a
-//! mount by the ID `statx` gives (field 1), the filesystem it is of
-//! (field 3, the kernel's `major:minor`, one value for every mount of one
-//! filesystem and for every subvolume of one btrfs, where `st_dev` would
-//! differ), the mount's root within that filesystem (field 4) and its
-//! mount point (field 5). A directory's path within its filesystem is the
-//! root followed by the directory's path below the mount point, and two
-//! such paths of one filesystem compare by component.
+//! ([`super::hold_apart_from`], ADR-0057).
 //!
 //! Everything here is bytes and [`OsStr`] paths, never `str`: a mount
 //! point may hold any byte but NUL, and the kernel escapes only a space,
@@ -30,15 +16,10 @@ use std::path::{Path, PathBuf};
 
 use super::{Overlap, ProofFault};
 
-/// The kernel's table of this process's mounts.
 pub(super) const MOUNTINFO: &str = "/proc/self/mountinfo";
 
-/// The most of the table trawld reads; a larger table refuses. Fixed, not
-/// configurable: a real table is kilobytes, and the ceiling only bounds
-/// what a hostile procfs could make trawld hold.
 pub(super) const TABLE_MAX_BYTES: u64 = 64 << 20;
 
-/// What one record of the table says that the comparison needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MountRecord {
     /// Field 3: the filesystem's `major:minor`, as the kernel prints it.
@@ -50,20 +31,14 @@ pub(super) struct MountRecord {
     pub(super) mount_point: PathBuf,
 }
 
-/// One side of a comparison: a directory that exists, in a mount, with
-/// the components of the compared path below it. It carries no device on
-/// purpose: the filesystem is the record's to say, never `st_dev`'s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Anchor {
-    /// The ID of the mount the directory is in, as `statx` names it.
     pub(super) mount: u64,
     /// The directory's path, as `/proc/self/fd` names it: absolute from
     /// the process's root, and checked to still open the same inode.
     pub(super) path: PathBuf,
     /// The components of the compared path below the directory, which its
-    /// lookup could not open: ones that do not exist yet, or a symlink or
-    /// non-directory in the way, which trawld refuses before it makes or
-    /// holds anything there. Each is a plain name (no `.` or `..`); empty
+    /// lookup could not open. Each is a plain name (no `.` or `..`); empty
     /// when the compared directory is the one at `path`.
     pub(super) tail: PathBuf,
 }
@@ -76,9 +51,6 @@ pub(super) struct MountTable {
 }
 
 impl MountTable {
-    /// Read the table from the kernel: open [`MOUNTINFO`], refuse it unless
-    /// `fstatfs` says procfs, and read at most [`TABLE_MAX_BYTES`].
-    ///
     /// Every descriptor whose mount the caller will look up must be open
     /// before this is called and stay open until the lookups are done: an
     /// open descriptor pins its mount, so the mount's ID cannot be freed
@@ -96,7 +68,6 @@ impl MountTable {
         Self::read_file(Path::new(MOUNTINFO))
     }
 
-    /// [`Self::read`] from the file at `path`, which must be on procfs.
     fn read_file(path: &Path) -> Result<Self, ProofFault> {
         let file = std::fs::File::open(path).map_err(ProofFault::TableUnreadable)?;
         let statfs =
@@ -107,10 +78,7 @@ impl MountTable {
         Self::read_from(file)
     }
 
-    /// [`Self::read`] from `reader`, already known to be the table: at most
-    /// [`TABLE_MAX_BYTES`], read through a limit one byte wider so that
-    /// a larger table is told from one exactly at the ceiling. procfs
-    /// reports every file as empty, so the size cannot be asked first.
+    /// procfs reports every file as empty, so the size cannot be asked first.
     fn read_from(reader: impl std::io::Read) -> Result<Self, ProofFault> {
         let mut bytes = Vec::new();
         reader
@@ -123,10 +91,6 @@ impl MountTable {
         Ok(Self { bytes })
     }
 
-    /// The one record of mount `id`. Only field 1 of every line is read to
-    /// find it; none refuses as [`ProofFault::NoRecord`], more than one as
-    /// [`ProofFault::DuplicateRecord`], and only then is the one line
-    /// parsed in full, refusing as [`ProofFault::Malformed`].
     pub(super) fn record(&self, id: u64) -> Result<MountRecord, ProofFault> {
         let mut found: Option<&[u8]> = None;
         for line in self.bytes.split(|&b| b == b'\n') {
@@ -143,7 +107,6 @@ impl MountTable {
     }
 }
 
-/// Field 1 of `line`, when it is a number.
 fn field_id(line: &[u8]) -> Option<u64> {
     parse_u64(line.split(|&b| b == b' ').next()?)
 }
@@ -185,7 +148,6 @@ fn parse_record(line: &[u8]) -> Result<MountRecord, &'static str> {
     })
 }
 
-/// Whether `field` reads `major:minor`, as the kernel prints field 3.
 fn is_device(field: &[u8]) -> bool {
     field
         .split(|&b| b == b':')
@@ -194,33 +156,27 @@ fn is_device(field: &[u8]) -> bool {
         == (2, true)
 }
 
-/// What is wrong with a path field, named for its field.
 struct PathFault {
     escape: &'static str,
     relative: &'static str,
     unclean: &'static str,
 }
 
-/// Faults of field 4.
 const ROOT: PathFault = PathFault {
     escape: "its root has an escape other than \\040, \\011, \\012 or \\134",
     relative: "its root is not an absolute path",
     unclean: "its root has a repeated /, a trailing /, or a . or .. component",
 };
 
-/// Faults of field 5.
 const MOUNT_POINT: PathFault = PathFault {
     escape: "its mount point has an escape other than \\040, \\011, \\012 or \\134",
     relative: "its mount point is not an absolute path",
     unclean: "its mount point has a repeated /, a trailing /, or a . or .. component",
 };
 
-/// Field 4 or 5: unescaped, and checked to be the kernel's spelling of an
-/// absolute path, one `/` between plain names. The kernel prints a mount
-/// root whose directory was removed as `<path>//deleted`, which a
-/// component walk would read as a directory named `deleted`; the repeated
-/// `/` refuses it, as it refuses any other spelling the kernel does not
-/// print.
+/// The kernel prints a mount root whose directory was removed as
+/// `<path>//deleted`, which a component walk would read as a directory
+/// named `deleted`; the repeated `/` refuses it.
 fn path_field(field: &[u8], fault: &PathFault) -> Result<PathBuf, &'static str> {
     let bytes = unescape(field).ok_or(fault.escape)?;
     let Some(rest) = bytes.strip_prefix(b"/") else {
@@ -236,8 +192,6 @@ fn path_field(field: &[u8], fault: &PathFault) -> Result<PathBuf, &'static str> 
     Ok(PathBuf::from(OsStr::from_bytes(&bytes)))
 }
 
-/// `field` with the kernel's four escapes decoded, or `None` at any other
-/// backslash.
 fn unescape(field: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(field.len());
     let mut rest = field;
@@ -260,11 +214,6 @@ fn unescape(field: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The path within its filesystem of the directory `anchor` describes,
-/// given its mount's `record`: the mount's root, then the directory's path
-/// below the mount point, then the anchor's tail. Refuses
-/// when the path does not start with the mount point, which a record of
-/// another mount, or a path from outside the process's root, would show.
 pub(super) fn within_filesystem(
     anchor: &Anchor,
     record: &MountRecord,
@@ -283,11 +232,7 @@ pub(super) fn within_filesystem(
     Ok(path)
 }
 
-/// How the directory `held` overlaps the directory `root` through their
-/// mounts, by `table`: `None` when their mounts are of different
-/// filesystems, which cannot alias, or their paths within the one
-/// filesystem are apart; else the overlap and the mount point that exposed
-/// it. Of the two mounts, the one whose root within the filesystem is
+/// Of the two mounts, the one whose root within the filesystem is
 /// deeper is the alias of the other's interior, so its mount point is
 /// named; with equal roots, the held directory's.
 pub(super) fn alias(
@@ -320,24 +265,16 @@ pub(super) fn alias(
     Ok(Some((overlap, through)))
 }
 
-/// Where [`MountTable::read`] reads from on this thread, for tests that
-/// stand in for a kernel or a procfs that answers differently.
 #[cfg(test)]
 pub(super) enum TableSource {
-    /// The kernel's table, as in production.
     Proc,
-    /// The real open and procfs check, on the file at this path.
     Path(PathBuf),
-    /// Bytes from this reader, past the open and the procfs check; the
-    /// ceiling and the parser still apply.
     Reader(Box<dyn Fn() -> Box<dyn std::io::Read>>),
-    /// Reading the table is a test failure.
     Unreachable,
 }
 
 #[cfg(test)]
 impl TableSource {
-    /// A table of these bytes.
     pub(super) fn bytes(table: impl Into<Vec<u8>>) -> Self {
         let table = table.into();
         Self::Reader(Box::new(move || {
@@ -345,7 +282,6 @@ impl TableSource {
         }))
     }
 
-    /// A table one byte over the ceiling.
     pub(super) fn too_large() -> Self {
         Self::Reader(Box::new(|| {
             Box::new(std::io::repeat(b'x').take(TABLE_MAX_BYTES + 1))
@@ -355,12 +291,10 @@ impl TableSource {
 
 #[cfg(test)]
 thread_local! {
-    /// See [`TableSource`].
     pub(super) static TABLE_SOURCE: std::cell::RefCell<TableSource> =
         const { std::cell::RefCell::new(TableSource::Proc) };
 }
 
-/// Read the table from `source` for the rest of this test's thread.
 #[cfg(test)]
 pub(super) fn set_table_source(source: TableSource) {
     TABLE_SOURCE.set(source);
@@ -370,7 +304,6 @@ pub(super) fn set_table_source(source: TableSource) {
 mod tests {
     use super::*;
 
-    /// A record as the kernel prints one, with the given optional fields.
     fn line(id: u64, device: &str, root: &str, mount_point: &str, optional: &str) -> String {
         format!("{id} 1 {device} {root} {mount_point} rw,relatime {optional}- ext4 /dev/sda1 rw\n")
     }
@@ -397,8 +330,6 @@ mod tests {
         }
     }
 
-    /// The parser decodes exactly the kernel's four escapes, in both path
-    /// fields, and skips any number of optional fields.
     #[test]
     fn a_record_parses_with_escapes_and_optional_fields() {
         type Case<'a> = (&'a str, &'a str, &'a str, &'a [u8], &'a [u8]);
@@ -436,8 +367,6 @@ mod tests {
         }
     }
 
-    /// Each malformation the comparison must not guess at refuses with a
-    /// reason, and the reason reads as the refusal prints it.
     #[test]
     fn a_malformed_record_refuses_with_its_reason() {
         let cases: [(&str, &str); 14] = [
@@ -500,8 +429,6 @@ mod tests {
         }
     }
 
-    /// `record` finds exactly one line by its first field, parses only
-    /// that line, and refuses none or more than one.
     #[test]
     fn a_mount_has_exactly_one_record() {
         let table = table(&[
@@ -548,10 +475,6 @@ mod tests {
         );
     }
 
-    /// The path within the filesystem is the root, the path below the
-    /// mount point (empty when the directory is the mount point, the whole
-    /// path when the mount point is `/`), then the tail; a path outside
-    /// the mount point refuses.
     #[test]
     fn a_path_within_the_filesystem_joins_root_below_and_tail() {
         let cases: [(Anchor, MountRecord, &str); 5] = [
@@ -597,10 +520,6 @@ mod tests {
         );
     }
 
-    /// The relation of two directories through their mounts: equal paths
-    /// within one filesystem are `Is`, a prefix is `Inside` or `Above`,
-    /// siblings and different filesystems are apart, and the mount point
-    /// named is the one whose root is deeper, the held side's on a tie.
     #[test]
     fn an_alias_is_judged_by_paths_within_one_filesystem() {
         type Case<'a> = (&'a str, Anchor, Anchor, Option<(Overlap, &'a str)>);
@@ -685,7 +604,6 @@ mod tests {
         assert!(matches!(fault, ProofFault::NoRecord(99)), "{fault}");
     }
 
-    /// The ceiling: a table exactly at it reads, one byte over refuses.
     #[test]
     fn a_table_over_the_ceiling_refuses() {
         let at = MountTable::read_from(std::io::repeat(b'x').take(TABLE_MAX_BYTES))
@@ -696,9 +614,6 @@ mod tests {
         assert!(matches!(over, ProofFault::TableTooLarge), "{over}");
     }
 
-    /// The reader checks procfs before it reads a byte: a missing file
-    /// is unreadable, a file on another filesystem is not the table, and
-    /// the kernel's own table reads and names this process's root mount.
     #[test]
     fn the_reader_accepts_only_procfs() {
         let missing =

@@ -4,45 +4,6 @@
 
 //! The query scratch directory (ADR-0056), and the hold every directory
 //! trawld keeps apart from its storage roots shares with it.
-//!
-//! `[server] query_scratch_dir` holds what trawld writes while it answers a
-//! query: the query database's private spill directory, and beside it the
-//! hot-buffer query snapshots, the Parquet export staging files and the
-//! rows a captured result stages for its write. This module owns the names
-//! trawld makes there, so the code that creates an entry and the code that
-//! recognizes one left behind read one spelling.
-//!
-//! The spill directory follows ADR-0052: a fresh random name, mode 0700,
-//! refused unless a no-follow handle shows it owned by this process's euid
-//! with no group or other bit. `DuckDB` opens its spill files by predictable
-//! names without `O_EXCL`, so a directory another user could enter would let
-//! them plant or read one.
-//!
-//! [`hold_apart_from`] makes a directory trawld's for the life of the
-//! process. It makes the directory 0700 if it is missing, holds its final
-//! component no-follow as ADR-0052 holds a storage root, and refuses the
-//! held directory if it is one of trawld's storage roots or sits inside or
-//! above one. The proof has two grounds. By device and inode it compares
-//! the held directory and the parents the kernel names from it with each
-//! root and its parents. On Linux, for a root in a different mount, it
-//! also compares the two directories' paths within their filesystem by
-//! the mount table, so a bind mount of a protected root's interior is
-//! refused through its mount point, and a comparison it cannot make, as on
-//! a kernel before 5.8 or without a readable procfs, refuses the start.
-//! Other platforms keep the first ground alone (see [`hold_apart_from`]).
-//! It then takes an exclusive `flock` on that handle. The query scratch
-//! directory and the results root (ADR-0057) are both held this way; a
-//! [`RootRole`] says which one a refusal names.
-//!
-//! [`ScratchLock::open_apart_from`] holds the scratch directory, and only
-//! then clears what an earlier trawld left behind, such as after a SIGKILL
-//! or an eviction. The clearing reads the whole tree before it removes
-//! anything: one entry it does not recognize refuses the start with nothing
-//! deleted. It never follows a link and never crosses a mount. The
-//! `PostgreSQL` sole-writer lock does not authorize it: that lock guards one
-//! app-state database, not this directory, and a lost lock can go unseen
-//! for seconds. The results root is never cleared: what it holds outlives
-//! a restart.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -50,23 +11,15 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 mod mounts;
 
-/// Prefix of a query database's private spill directory.
 pub const SPILL_DIR_PREFIX: &str = "trawl-spill-";
 
-/// Prefix and suffix of a hot-buffer query snapshot file.
 pub const SNAPSHOT_FILE_PREFIX: &str = "trawl-snapshot-";
-/// See [`SNAPSHOT_FILE_PREFIX`].
 pub const SNAPSHOT_FILE_SUFFIX: &str = ".ndjson";
 
-/// Prefix and suffix of a Parquet export staging file.
 pub const EXPORT_FILE_PREFIX: &str = "trawl-export-";
-/// See [`EXPORT_FILE_PREFIX`].
 pub const EXPORT_FILE_SUFFIX: &str = ".parquet";
 
-/// Prefix and suffix of the file a captured result stages its rows in for
-/// `DuckDB` to copy to parquet (ADR-0057).
 pub const STAGE_FILE_PREFIX: &str = "trawl-stage-";
-/// See [`STAGE_FILE_PREFIX`].
 pub const STAGE_FILE_SUFFIX: &str = ".ndjson";
 
 /// The prefix `DuckDB` 1.5.5's `COPY ... TO` gives the file it writes before
@@ -75,46 +28,30 @@ pub const STAGE_FILE_SUFFIX: &str = ".ndjson";
 /// beside its staging file.
 const COPY_TMP_PREFIX: &str = "tmp_";
 
-/// Length of the random part of every name trawld makes in the scratch
-/// directory, pinned so the recognizers can demand exactly what the
-/// creators make.
 const RANDOM_LEN: usize = 6;
 
-/// The setting an operator changes to move query spill, named in refusals
-/// of the scratch directory and of a spill directory made in it.
 pub(crate) const SCRATCH_SETTING: &str = "[server] query_scratch_dir";
 
-/// Which directory [`hold_apart_from`] holds, as its refusals name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootRole {
-    /// What the directory is, as a refusal names it: `query scratch
-    /// directory`.
     pub noun: &'static str,
-    /// The setting an operator changes to move it: `[server]
-    /// query_scratch_dir`.
     pub setting: &'static str,
 }
 
 impl RootRole {
-    /// The query scratch directory (ADR-0056).
     pub const QUERY_SCRATCH: Self = Self {
         noun: "query scratch directory",
         setting: SCRATCH_SETTING,
     };
 
-    /// The results root, where captured results live (ADR-0057).
     pub const RESULTS: Self = Self {
         noun: "results root",
         setting: "[server] results_dir",
     };
 }
 
-/// The variable an operator changes to move spill of a database opened
-/// without a scratch directory ([`crate::executor::Executor::new`]).
 pub(crate) const TMPDIR_SETTING: &str = "TMPDIR";
 
-/// The query scratch directory, by path.
-///
 /// It names the directory and makes the entries trawld keeps inside it. It
 /// does not create, lock or clear the directory itself: [`ScratchLock`]
 /// does, and hands out this name once it holds the lock.
@@ -129,46 +66,32 @@ impl QueryScratch {
         Self { path: path.into() }
     }
 
-    /// The scratch directory's path.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Make a query database's private spill directory inside the scratch
-    /// directory.
     pub(crate) fn private_spill_dir(&self) -> std::io::Result<tempfile::TempDir> {
         private_dir_in(&self.path, SCRATCH_SETTING, |_| Ok(()))
     }
 
-    /// Create a hot-buffer query snapshot file, 0600, named so
-    /// [`is_snapshot_file_name`] recognizes it.
     pub fn snapshot_file(&self) -> std::io::Result<tempfile::NamedTempFile> {
         named_file_in(&self.path, SNAPSHOT_FILE_PREFIX, SNAPSHOT_FILE_SUFFIX)
     }
 
-    /// Create a Parquet export staging file, 0600, named so
-    /// [`is_export_file_name`] recognizes it.
     pub fn export_file(&self) -> std::io::Result<tempfile::NamedTempFile> {
         named_file_in(&self.path, EXPORT_FILE_PREFIX, EXPORT_FILE_SUFFIX)
     }
 
-    /// Create a captured result's row staging file, 0600, named so
-    /// [`is_stage_file_name`] recognizes it.
     pub fn stage_file(&self) -> std::io::Result<tempfile::NamedTempFile> {
         stage_file_in(&self.path)
     }
 }
 
-/// Create a captured result's row staging file in `dir`, 0600, named as
-/// [`QueryScratch::stage_file`] names one: for a database opened without a
-/// scratch directory, whose private spill directory holds it instead.
 pub(crate) fn stage_file_in(dir: &Path) -> std::io::Result<tempfile::NamedTempFile> {
     named_file_in(dir, STAGE_FILE_PREFIX, STAGE_FILE_SUFFIX)
 }
 
-/// Create a 0600 file in `dir` named `prefix`, [`RANDOM_LEN`] ASCII letters
-/// or digits, then `suffix`.
 fn named_file_in(
     dir: &Path,
     prefix: &str,
@@ -181,8 +104,6 @@ fn named_file_in(
         .tempfile_in(dir)
 }
 
-/// Whether `name` is `prefix`, exactly [`RANDOM_LEN`] ASCII letters or
-/// digits, then `suffix`.
 fn is_made_name(name: &OsStr, prefix: &str, suffix: &str) -> bool {
     name.to_str()
         .and_then(|name| name.strip_prefix(prefix))
@@ -192,22 +113,16 @@ fn is_made_name(name: &OsStr, prefix: &str, suffix: &str) -> bool {
         })
 }
 
-/// Whether `name` is one trawld gives a query database's spill directory:
-/// [`SPILL_DIR_PREFIX`] and exactly six ASCII letters or digits.
 #[must_use]
 pub fn is_spill_dir_name(name: &OsStr) -> bool {
     is_made_name(name, SPILL_DIR_PREFIX, "")
 }
 
-/// Whether `name` is one [`QueryScratch::snapshot_file`] makes.
 #[must_use]
 pub fn is_snapshot_file_name(name: &OsStr) -> bool {
     is_made_name(name, SNAPSHOT_FILE_PREFIX, SNAPSHOT_FILE_SUFFIX)
 }
 
-/// Whether `name` is one [`QueryScratch::export_file`] makes, or the
-/// `tmp_`-prefixed file `DuckDB`'s `COPY ... TO` writes before it renames
-/// it onto that name.
 #[must_use]
 pub fn is_export_file_name(name: &OsStr) -> bool {
     let name = name
@@ -216,7 +131,6 @@ pub fn is_export_file_name(name: &OsStr) -> bool {
     name.is_some_and(|name| is_made_name(OsStr::new(name), EXPORT_FILE_PREFIX, EXPORT_FILE_SUFFIX))
 }
 
-/// Whether `name` is one [`QueryScratch::stage_file`] makes.
 #[must_use]
 pub fn is_stage_file_name(name: &OsStr) -> bool {
     is_made_name(name, STAGE_FILE_PREFIX, STAGE_FILE_SUFFIX)
@@ -235,23 +149,11 @@ const SPILL_SIZE_CLASSES: [&str; 8] = [
 /// and nothing else: the preflight unlinks what this accepts, so a name
 /// `DuckDB` cannot have made must refuse the start instead.
 ///
-/// Two shapes, both from the bundled source. The grouped block files are
-/// `duckdb_temp_storage_<size>-<n>.tmp` (`temporary_file_manager.cpp`,
-/// `CreateTemporaryFileName`: `"duckdb_temp_storage_%s-%llu.tmp"`), where
-/// `<size>` is one of [`SPILL_SIZE_CLASSES`] and `<n>` is the file index,
-/// an `idx_t` (`uint64_t`). The files of buffers larger than a block are
-/// `duckdb_temp_block-<id>.block` (`standard_buffer_manager.cpp`,
-/// `GetTemporaryPath`: `"duckdb_temp_block-" + to_string(id) + ".block"`),
-/// where `<id>` is a `block_id_t` (`int64_t`). The buffer manager starts
-/// its temporary-id counter at `MAXIMUM_BLOCK`
-/// (`storage_info.hpp`: `4611686018427388000`) and pre-increments it
-/// before it names a block (`standard_buffer_manager.cpp`: `++temporary_id`
-/// at both allocation sites), so the first id a file can carry is
-/// `MAXIMUM_BLOCK + 1` and every id from `0` through `MAXIMUM_BLOCK` is
-/// one `DuckDB` cannot have made. Each number is accepted only as the C++
-/// library prints it: no sign, no leading zero, within its type's width
-/// (and, for a block id, above that floor). A `DuckDB` upgrade has to
-/// re-check both shapes, the classes and the floor.
+/// The grouped block files are `duckdb_temp_storage_<size>-<n>.tmp`
+/// (`temporary_file_manager.cpp`, `CreateTemporaryFileName`). The files
+/// of buffers larger than a block are `duckdb_temp_block-<id>.block`
+/// (`standard_buffer_manager.cpp`, `GetTemporaryPath`). A `DuckDB`
+/// upgrade has to re-check both shapes, the classes and the floor.
 #[must_use]
 pub fn is_spill_file_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
@@ -292,13 +194,7 @@ fn is_printed_integer<T: std::str::FromStr>(digits: &str) -> bool {
 
 /// Make a private spill directory in `parent`, run `after_create` on it
 /// (tests stand in a filesystem that ignores the requested mode), then
-/// check it. `setting` is what a refusal tells the operator to change.
-///
-/// The directory is asked for at 0700, and a filesystem can still answer
-/// otherwise: a fixed-mode mount ignores the mode. So it is opened
-/// no-follow and its owner and mode are read from that handle: it must
-/// belong to this process's euid and carry no group or other bit, or it is
-/// refused and removed.
+/// check it.
 pub(crate) fn private_dir_in(
     parent: &Path,
     setting: &str,
@@ -321,14 +217,11 @@ pub(crate) fn private_dir_in(
     Ok(dir)
 }
 
-/// Refuse the directory at `path` unless `euid` owns it and it has no group
-/// or other bit, read through a handle opened without following a symlink.
 #[cfg(unix)]
 pub(crate) fn check_private(path: &Path, euid: u32, setting: &str) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
     use rustix::fs::{Mode, OFlags};
-    /// The group and other permission bits.
     const GROUP_OTHER: u32 = 0o077;
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let handle = std::fs::File::from(rustix::fs::open(path, flags, Mode::empty())?);
@@ -350,32 +243,19 @@ pub(crate) fn check_private(path: &Path, euid: u32, setting: &str) -> std::io::R
     ))
 }
 
-/// A directory whose entries trawld names and removes on its own, which a
-/// held directory ([`hold_apart_from`]) must not be, sit inside or sit
-/// above: for the scratch directory (ADR-0056) the data root, the WAL
-/// directory and the two repin staging roots, and for the results root
-/// (ADR-0057) those and the scratch directory.
 #[derive(Debug, Clone)]
 pub struct OwnedRoot {
-    /// What the root is, with the setting it comes from, such as `the data
-    /// root ([data] path)`.
     pub what: &'static str,
     /// Its configured path. It need not exist yet, but it must carry no
-    /// `..` component: a root that does not exist yet is placed by the
-    /// nearest directory on its path that does, and a `..` after a missing
-    /// component would name a directory other than the one trawld makes
-    /// (`<base>/missing/../x` is placed at `<base>` but made at
-    /// `<base>/x`). Config validation refuses such a spelling for every
-    /// root trawld passes here.
+    /// `..` component: a `..` after a missing component would name a
+    /// directory other than the one trawld makes (`<base>/missing/../x` is
+    /// placed at `<base>` but made at `<base>/x`).
     pub path: PathBuf,
 }
 
-/// How a held directory overlaps an [`OwnedRoot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlap {
-    /// It is the root.
     Is,
-    /// It sits inside the root.
     Inside,
     /// The root sits inside it, or would once trawld makes the root.
     Above,
@@ -391,101 +271,51 @@ impl std::fmt::Display for Overlap {
     }
 }
 
-/// Why the mount comparison of [`hold_apart_from`] could not be made for a
-/// held directory and a root in different mounts, so the hold refused
-/// ([`ScratchError::Unproven`]). Each reads as a clause after the
-/// directory's name. The comparison is made only on Linux; the type is
-/// plain data on every platform, so the refusal reads the same everywhere.
 #[derive(Debug, thiserror::Error)]
 pub enum ProofFault {
-    /// `statx` names no mount: Linux before 5.8, or a seccomp filter
-    /// that refuses the call. Without a mount ID one mount cannot be told
-    /// from two, so every comparison refuses.
     #[error("this kernel does not name mounts (Linux 5.8 and later do)")]
     NoMountId,
-    /// `/proc/self/mountinfo` could not be opened or read.
     #[error("cannot read /proc/self/mountinfo: {0}")]
     TableUnreadable(#[source] std::io::Error),
-    /// The file at `/proc/self/mountinfo` is not on procfs, so it is not
-    /// the kernel's table.
     #[error("/proc/self/mountinfo is not on procfs")]
     TableNotProcfs,
-    /// The table is over the 64 MiB trawld reads.
     #[error("/proc/self/mountinfo is larger than 64 MiB")]
     TableTooLarge,
-    /// No record carries the mount ID `statx` named.
     #[error("/proc/self/mountinfo has no record of mount {0}")]
     NoRecord(u64),
-    /// More than one record carries the mount ID.
     #[error("/proc/self/mountinfo has more than one record of mount {0}")]
     DuplicateRecord(u64),
-    /// The record the comparison needs does not parse.
     #[error("the record of mount {id} in /proc/self/mountinfo is malformed ({why})")]
-    Malformed {
-        /// The mount the record is for.
-        id: u64,
-        /// What is wrong with it.
-        why: &'static str,
-    },
-    /// The directory's path could not be read from `/proc/self/fd`.
+    Malformed { id: u64, why: &'static str },
     #[error("cannot read a directory's path from /proc/self/fd: {0}")]
     PathUnreadable(#[source] std::io::Error),
-    /// The path `/proc/self/fd` gave for the directory no longer opens
-    /// the same inode: the directory was removed or renamed, or the path
-    /// is spelled from outside this process's root.
     #[error(
         "the directory at {}, as /proc/self/fd names it, is not the one trawld opened",
         .path.display()
     )]
-    PathMoved {
-        /// The path as `/proc/self/fd` gave it.
-        path: PathBuf,
-    },
-    /// The directory's path does not start with its mount's mount point,
-    /// so its path within the filesystem cannot be built.
+    PathMoved { path: PathBuf },
     #[error(
         "the directory {} is not below the mount point {} of its mount",
         .path.display(),
         .mount_point.display()
     )]
-    OutsideMount {
-        /// The directory's path.
-        path: PathBuf,
-        /// The mount point of the mount `statx` named for it.
-        mount_point: PathBuf,
-    },
-    /// The components of a directory that does not exist yet include `.`
-    /// or `..`, which name nothing until the directories before them are
-    /// made, so where trawld would make it cannot be known.
+    OutsideMount { path: PathBuf, mount_point: PathBuf },
     #[error(
         "the components {} still to be made include . or .., which cannot be placed before \
          they exist",
         .tail.display()
     )]
-    DotInTail {
-        /// The components below the nearest directory that exists.
-        tail: PathBuf,
-    },
+    DotInTail { tail: PathBuf },
 }
 
-/// The clause [`ScratchError::Overlap`] adds after the root when only the
-/// mount comparison found the overlap: ` through the mount at <mount
-/// point>`, or nothing when the walk over parents found it.
 fn through_clause(through: Option<&Path>) -> String {
     through.map_or_else(String::new, |mount_point| {
         format!(" through the mount at {}", mount_point.display())
     })
 }
 
-/// Why [`hold_apart_from`] or [`ScratchLock::open`] refused a directory.
-/// Every message names the directory by its [`RootRole`], with the setting
-/// the operator changes.
 #[derive(Debug, thiserror::Error)]
 pub enum ScratchError {
-    /// The directory overlaps one of trawld's roots as the filesystem
-    /// resolves both. A symlink, `..` or a relative path can hide that from
-    /// the configured spellings, and so can a bind mount, which `through`
-    /// names.
     #[error(
         "the {} {} {overlap} {what} {}{}, as the filesystem resolves them; point {} at a \
          directory of its own",
@@ -496,25 +326,15 @@ pub enum ScratchError {
         .role.setting
     )]
     Overlap {
-        /// Which directory was refused.
         role: RootRole,
-        /// The configured path.
         path: PathBuf,
-        /// How it overlaps the root.
         overlap: Overlap,
-        /// What the root is ([`OwnedRoot::what`]).
         what: &'static str,
-        /// The root's configured path.
         root: PathBuf,
-        /// The mount point that exposed the overlap, when only the
-        /// comparison of paths within one filesystem found it; `None` when
-        /// the walk over parents did. Boxed to keep the error under
-        /// clippy's `result_large_err` threshold.
+        /// Boxed to keep the error under clippy's `result_large_err`
+        /// threshold.
         through: Option<Box<Path>>,
     },
-    /// The directory and a root are in different mounts and the comparison
-    /// that tells whether they alias one directory could not be made, so
-    /// the hold refuses rather than guess.
     #[error(
         "cannot prove the {} {} apart from trawld's storage roots: {fault}; comparing \
          directories in different mounts needs Linux 5.8 or later, statx allowed and a readable \
@@ -524,21 +344,11 @@ pub enum ScratchError {
         .role.setting
     )]
     Unproven {
-        /// Which directory was refused.
         role: RootRole,
-        /// The configured path.
         path: PathBuf,
-        /// What could not be done.
         #[source]
         fault: ProofFault,
     },
-    /// A root's path, at the root or at a directory above it, failed to
-    /// look up for a reason other than a component that does not exist
-    /// yet or is not a directory: a directory on it that trawld may not
-    /// search, say, or a loop of symbolic links. Such a path may name a directory that exists,
-    /// so it is not read as missing, which would place the root by a
-    /// directory above it and miss a held directory inside it. This
-    /// refusal is the same on every platform.
     #[error(
         "cannot look up {what} {} to prove the {} {} apart from it: {source}; give the service \
          user search access to every directory on that path, or check {}",
@@ -548,33 +358,20 @@ pub enum ScratchError {
         .role.setting
     )]
     RootUnreachable {
-        /// Which directory was refused.
         role: RootRole,
-        /// The configured path.
         path: PathBuf,
-        /// What the root is ([`OwnedRoot::what`]).
         what: &'static str,
-        /// The root's configured path.
         root: PathBuf,
-        /// The failed lookup.
         #[source]
         source: std::io::Error,
     },
-    /// The path does not end in a directory name: it is empty, `/`, or ends
-    /// in `..`.
     #[error(
         "the {} {} does not end in a directory name; point {} at a directory of its own",
         .role.noun,
         .path.display(),
         .role.setting
     )]
-    BadPath {
-        /// Which directory was refused.
-        role: RootRole,
-        /// The configured path.
-        path: PathBuf,
-    },
-    /// A filesystem call failed.
+    BadPath { role: RootRole, path: PathBuf },
     #[error(
         "cannot {action} the {} {}: {source}; check {}",
         .role.noun,
@@ -582,31 +379,19 @@ pub enum ScratchError {
         .role.setting
     )]
     Io {
-        /// Which directory was refused.
         role: RootRole,
-        /// What trawld was doing, as a verb phrase.
         action: &'static str,
-        /// The path it was doing it to.
         path: PathBuf,
-        /// The failure.
         #[source]
         source: std::io::Error,
     },
-    /// The directory cannot be written: a query-only node whose data root is
-    /// mounted read-only keeps the default scratch directory beside it.
     #[error(
         "the {} {} is on a read-only filesystem; point {} at a writable directory",
         .role.noun,
         .path.display(),
         .role.setting
     )]
-    ReadOnly {
-        /// Which directory was refused.
-        role: RootRole,
-        /// The configured path.
-        path: PathBuf,
-    },
-    /// The final component is a symbolic link, which trawld does not follow.
+    ReadOnly { role: RootRole, path: PathBuf },
     #[error(
         "the {} {} is a symbolic link, which trawld does not follow; point {} at the directory \
          itself",
@@ -614,27 +399,14 @@ pub enum ScratchError {
         .path.display(),
         .role.setting
     )]
-    Symlink {
-        /// Which directory was refused.
-        role: RootRole,
-        /// The configured path.
-        path: PathBuf,
-    },
-    /// Something other than a directory is at the path.
+    Symlink { role: RootRole, path: PathBuf },
     #[error(
         "the {} {} is not a directory; move it aside or point {} at a directory",
         .role.noun,
         .path.display(),
         .role.setting
     )]
-    NotDirectory {
-        /// Which directory was refused.
-        role: RootRole,
-        /// The configured path.
-        path: PathBuf,
-    },
-    /// Another user owns the directory. trawld does not take over a
-    /// directory it was not given, even when it runs as root.
+    NotDirectory { role: RootRole, path: PathBuf },
     #[error(
         "the {} {} is owned by uid {owner}, not uid {euid}, the user trawld runs as; point {} at \
          a directory uid {euid} owns",
@@ -643,17 +415,11 @@ pub enum ScratchError {
         .role.setting
     )]
     ForeignOwner {
-        /// Which directory was refused.
         role: RootRole,
-        /// The configured path.
         path: PathBuf,
-        /// The directory's owner.
         owner: u32,
-        /// The uid trawld runs as.
         euid: u32,
     },
-    /// A group or other bit survived the change that removes them, as on a
-    /// filesystem with fixed modes.
     #[error(
         "the {} {} keeps mode {mode:04o} after trawld removed its group and other bits, so \
          other users could read query data; point {} at a directory on a filesystem that keeps \
@@ -663,14 +429,10 @@ pub enum ScratchError {
         .role.setting
     )]
     NotPrivate {
-        /// Which directory was refused.
         role: RootRole,
-        /// The configured path.
         path: PathBuf,
-        /// The mode read back after the change.
         mode: u32,
     },
-    /// Another process holds the lock, or another open in this one does.
     #[error(
         "the {} {} is locked by another trawld; stop that trawld, or point this one's {} at a \
          directory of its own",
@@ -678,15 +440,7 @@ pub enum ScratchError {
         .path.display(),
         .role.setting
     )]
-    Locked {
-        /// Which directory was refused.
-        role: RootRole,
-        /// The configured path.
-        path: PathBuf,
-    },
-    /// An entry trawld does not make, or one it cannot remove safely. The
-    /// whole tree is read before anything is removed, so nothing was. Only
-    /// the scratch directory is cleared, so only it refuses this way.
+    Locked { role: RootRole, path: PathBuf },
     #[error(
         "the {} {} holds {}, which {reason}; trawld removes only the entries it makes and has \
          removed nothing. Move the entry out, or point {} at a directory of its own",
@@ -696,43 +450,28 @@ pub enum ScratchError {
         .role.setting
     )]
     ForeignEntry {
-        /// Which directory was refused.
         role: RootRole,
-        /// The configured path.
         path: PathBuf,
-        /// The entry.
         entry: PathBuf,
-        /// Why it refuses the start, as a predicate.
         reason: String,
     },
 }
 
-/// What [`ScratchLock::open`] removed: the entries an earlier trawld left
-/// behind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reclaimed {
-    /// Query database spill directories, each with its spill files.
     pub spill_dirs: usize,
-    /// Hot-buffer query snapshot files.
     pub snapshots: usize,
-    /// Parquet export staging files, `DuckDB`'s `tmp_` copies included.
     pub exports: usize,
-    /// Captured results' row staging files.
     pub stages: usize,
 }
 
-/// A directory held for this process by [`hold_apart_from`]: made, checked
-/// owner-only and locked, its contents left as they were.
-///
 /// The lock is an exclusive `flock` on the directory's own no-follow
-/// handle, so it lives exactly as long as this value: dropping it closes
-/// the handle and frees the lock, and so does the end of the process,
-/// however it ends. `flock` belongs to the open file description, so a
-/// second hold in the same process is refused like one in another process.
+/// handle, so it lives exactly as long as this value. `flock` belongs
+/// to the open file description, so a second hold in the same process
+/// is refused like one in another process.
 #[derive(Debug)]
 pub struct HeldRoot {
     path: PathBuf,
-    /// The handle the lock is held on.
     handle: std::fs::File,
 }
 
@@ -744,67 +483,17 @@ impl HeldRoot {
         &self.path
     }
 
-    /// The no-follow handle the lock is held on. Reach the directory's
-    /// entries through it, by `openat`, `renameat` and `unlinkat`, and
-    /// `fsync` it after a rename, so no link in the configured path can
-    /// redirect a call to another directory. Unlocking it gives the
-    /// directory up to any other process.
+    /// Reach the directory's entries through it, by `openat`, `renameat`
+    /// and `unlinkat`, and `fsync` it after a rename, so no link in the
+    /// configured path can redirect a call to another directory.
     #[must_use]
     pub fn dir(&self) -> &std::fs::File {
         &self.handle
     }
 }
 
-/// Make, check and lock the directory at `path` for a trawld running as
-/// `euid`, which must not be, sit inside or sit above any of `roots`.
 /// Nothing in it is removed: the scratch directory's clearing is
 /// [`ScratchLock::open_apart_from`]'s own.
-///
-/// A missing directory is made 0700, below parents made as needed, as the
-/// epoch gate makes the data root, unless the directory that would hold it
-/// is or sits inside a root. Its final component is then opened no-follow,
-/// and everything after is judged and done through that handle. It refuses
-/// a symlink, a non-directory, a directory that overlaps a root, a
-/// directory another user owns, and one on a read-only filesystem. A group
-/// or other bit is removed through the handle, as ADR-0052 closes a root,
-/// and refused if it survives. Then it takes the lock, refusing if another
-/// process holds it. Every refusal names the directory by `role`.
-///
-/// The overlap is judged by device and inode, never by spelling: the
-/// handle's own directory and each one above it, reached by opening `..`,
-/// against each root and each directory above it, or, for a root that does
-/// not exist yet, above where it would be made. A symlink, a `..` and a
-/// relative path in either path all resolve to the same pairs. Judging the
-/// handle makes the answer hold for the directory that is locked, whatever
-/// its path names by then. Only a component that does not exist yet or is
-/// not a directory places a root, or the held directory before it is made,
-/// by a directory above it. A path whose lookup fails any other way, through a directory trawld
-/// may not search or a loop of symbolic links, may name a directory that
-/// exists, so it refuses the start: a root's as
-/// [`ScratchError::RootUnreachable`], the held directory's own as
-/// [`ScratchError::Io`].
-///
-/// The parents are the ones the kernel names from the held directory. At
-/// a bind-mount root, `..` is the mount point's parent, not the source
-/// directory's, so the walk alone would miss a bind mount whose source lies
-/// inside a protected root. On Linux the proof has a second ground for
-/// that: each root in a different mount from the held directory, by the
-/// mount ID `statx` names (a root in the same mount needs nothing more), is
-/// compared by the mount table. `/proc/self/mountinfo` is read at most once
-/// before the directory is made and once after it is held, each time while
-/// every handle compared then is open, and the two directories' paths
-/// within their filesystem, the mount's root followed by the path below
-/// the mount point, are compared by component. A held directory that does
-/// not exist yet is compared by its nearest existing ancestor plus the
-/// components to be made, so nothing is made inside a root. An overlap
-/// found this way names the mount point that exposed it. A comparison that
-/// cannot be made, on a kernel that names no mount (before Linux 5.8),
-/// without a readable procfs, or with no single record of a mount, refuses
-/// the start rather than guess ([`ScratchError::Unproven`]). Platforms
-/// other than Linux keep the walk over parents alone. What stays the
-/// operator's: a mount made inside a root, an alias only an overlay or a
-/// second mount of one network export can make, and a mount changed after
-/// the start.
 pub fn hold_apart_from(
     path: &Path,
     roots: &[OwnedRoot],
@@ -825,32 +514,18 @@ pub fn hold_apart_from(
     }
 }
 
-/// The query scratch directory, locked for this process and cleared of
-/// what an earlier trawld left behind.
-///
-/// The lock is [`HeldRoot`]'s: it lives exactly as long as this value.
 #[derive(Debug)]
 pub struct ScratchLock {
     scratch: QueryScratch,
-    /// The held directory, whose handle carries the lock.
     _held: HeldRoot,
     reclaimed: Reclaimed,
 }
 
 impl ScratchLock {
-    /// [`Self::open_apart_from`] with no root to keep apart from, for a
-    /// directory that cannot overlap trawld's storage, such as a test's own
-    /// temporary directory.
     pub fn open(path: &Path) -> Result<Self, ScratchError> {
         Self::open_apart_from(path, &[])
     }
 
-    /// Hold the scratch directory at `path` apart from `roots`, as
-    /// [`hold_apart_from`] holds a directory, then clear it (see the module
-    /// documentation). Refusals name [`RootRole::QUERY_SCRATCH`].
-    ///
-    /// The lock comes before the clearing, so a directory another trawld
-    /// holds, for any role, is refused with nothing removed.
     pub fn open_apart_from(path: &Path, roots: &[OwnedRoot]) -> Result<Self, ScratchError> {
         #[cfg(unix)]
         return Self::open_as(path, roots, rustix::process::geteuid().as_raw());
@@ -863,7 +538,6 @@ impl ScratchLock {
         });
     }
 
-    /// [`Self::open_apart_from`] for a trawld running as `euid`.
     #[cfg(unix)]
     fn open_as(path: &Path, roots: &[OwnedRoot], euid: u32) -> Result<Self, ScratchError> {
         let held = lock::hold_apart_from(path, roots, euid, RootRole::QUERY_SCRATCH)?;
@@ -876,13 +550,11 @@ impl ScratchLock {
         })
     }
 
-    /// The scratch directory this lock holds.
     #[must_use]
     pub fn scratch(&self) -> &QueryScratch {
         &self.scratch
     }
 
-    /// What the open removed.
     #[must_use]
     pub fn reclaimed(&self) -> Reclaimed {
         self.reclaimed
@@ -911,13 +583,10 @@ mod lock {
     #[cfg(target_os = "linux")]
     use super::{ProofFault, mounts};
 
-    /// The role the clearing names: only the scratch directory is cleared.
     const SCRATCH: RootRole = RootRole::QUERY_SCRATCH;
 
-    /// The group and other permission bits.
     const GROUP_OTHER: u32 = 0o077;
 
-    /// Flags for a no-follow directory open.
     const DIR_FLAGS: OFlags = OFlags::RDONLY
         .union(OFlags::DIRECTORY)
         .union(OFlags::NOFOLLOW)
@@ -932,7 +601,6 @@ mod lock {
         matches!(components.last(), Some(Component::Normal(_))).then(|| components.iter().collect())
     }
 
-    /// [`super::hold_apart_from`].
     pub(super) fn hold_apart_from(
         path: &Path,
         roots: &[OwnedRoot],
@@ -1000,9 +668,6 @@ mod lock {
         Ok(HeldRoot { path, handle })
     }
 
-    /// Make the directory at `path` 0700 if nothing is there, and its
-    /// parents as needed. Something already there is left for [`hold`] to
-    /// judge.
     fn make(path: &Path, role: RootRole) -> Result<(), ScratchError> {
         use std::os::unix::fs::DirBuilderExt as _;
         let refuse = |action, source: io::Error| match source.kind() {
@@ -1027,7 +692,6 @@ mod lock {
         }
     }
 
-    /// Open the directory at `path` without following a final symlink.
     pub(super) fn hold(path: &Path, role: RootRole) -> Result<File, ScratchError> {
         match rustix::fs::open(path, DIR_FLAGS, Mode::empty()) {
             Ok(fd) => Ok(File::from(fd)),
@@ -1055,10 +719,6 @@ mod lock {
         }
     }
 
-    /// A directory's device and inode. Every spelling of a directory, a
-    /// symlink, a `..`, a relative path or a bind mount, leads to one pair.
-    /// The pair says nothing about which parents a spelling reaches: see
-    /// [`lineage`].
     type Identity = (u64, u64);
 
     /// Flags for an open that only finds a directory, following links. On
@@ -1076,16 +736,6 @@ mod lock {
         Ok((stat.st_dev as u64, stat.st_ino as u64))
     }
 
-    /// The identities of the directory `fd` holds and of each directory
-    /// above it, nearest first, up to the process's root. Each step opens
-    /// `..` from the step before, so the kernel names every parent.
-    ///
-    /// The parents are the ones the kernel names from `fd`, not the ones of
-    /// the directory's source. At a bind-mount root, `..` is the mount
-    /// point's parent, so the lineage of a bind mount whose source lies
-    /// inside a protected root leaves out that root and its ancestors. On
-    /// Linux [`refuse_aliases`] sees that case by the mount table; elsewhere
-    /// the lineage is the whole proof.
     fn lineage(fd: BorrowedFd<'_>) -> io::Result<Vec<Identity>> {
         let mut lineage = vec![identity(fd)?];
         let mut dir = rustix::fs::openat(fd, c"..", LOOKUP_FLAGS, Mode::empty())?;
@@ -1100,27 +750,18 @@ mod lock {
         }
     }
 
-    /// A path, or failing that the nearest directory on its path above it,
-    /// opened for lookups, with the components of the path below that
-    /// directory, which could not be opened: ones that do not exist yet, or
-    /// one that is not a directory.
     struct Nearest {
         /// The directory, held open: as long as it is, its mount cannot be
         /// unmounted and its mount ID cannot be given to another mount.
         fd: rustix::fd::OwnedFd,
-        /// The components below it that could not be opened: empty when the
-        /// path itself opened.
         missing: PathBuf,
     }
 
-    /// `path`, or failing that the nearest directory on its path above it.
     /// Only a component that does not exist yet (`ENOENT`) or is not a
     /// directory (`ENOTDIR`) moves the lookup to the parent. Any other
-    /// failure, such as a directory on the path that trawld may not search
-    /// or a loop of symbolic links, ends it with that error: such a path
-    /// may name a directory that exists, and placing it by a directory
-    /// above would miss what sits inside it. So does `/`, or the working
-    /// directory for a relative path, failing to open.
+    /// failure ends it with that error: such a path may name a directory
+    /// that exists, and placing it by a directory above would miss what
+    /// sits inside it.
     fn nearest(path: &Path) -> io::Result<Nearest> {
         let mut absent = None;
         for ancestor in path.ancestors() {
@@ -1144,9 +785,7 @@ mod lock {
         Err(absent.expect("a path is its own first ancestor").into())
     }
 
-    /// Where a root is, as far as the filesystem says.
     struct Located {
-        /// The root itself, when it is a directory.
         at: Option<Identity>,
         /// The directories above it, or, for a root that is not there yet,
         /// the nearest one on its path that is and those above that: where
@@ -1162,8 +801,6 @@ mod lock {
         nearest: Nearest,
     }
 
-    /// Where the root [`nearest`] found on its path is, by the lineage of
-    /// the directory it opened.
     fn locate(nearest: Nearest) -> io::Result<Located> {
         let mut above = lineage(nearest.fd.as_fd())?;
         let at = nearest
@@ -1174,11 +811,8 @@ mod lock {
         Ok(Located { at, above, nearest })
     }
 
-    /// How the directory `here` with the directories `above` it overlaps
-    /// `root`. Without `here`, `above` is where the directory would be
-    /// made, which can only land inside a root. Where a symlink or a
-    /// non-directory stands in the way, nothing is made: [`make`] or
-    /// [`hold`] refuses it.
+    /// Without `here`, `above` is where the directory would be made, which
+    /// can only land inside a root.
     fn overlap(here: Option<Identity>, above: &[Identity], root: &Located) -> Option<Overlap> {
         if here.is_some() && root.at == here {
             Some(Overlap::Is)
@@ -1191,9 +825,6 @@ mod lock {
         }
     }
 
-    /// The held side of a comparison: the directory trawld holds, or,
-    /// before it is held, the directory itself when it already exists,
-    /// else the nearest directory on its path that does.
     struct Held<'a> {
         /// The directory's handle, open for the whole comparison.
         #[cfg_attr(
@@ -1201,15 +832,8 @@ mod lock {
             allow(dead_code, reason = "only the Linux mount comparison reads it")
         )]
         fd: BorrowedFd<'a>,
-        /// The held directory's identity, or `None` before it is held.
         here: Option<Identity>,
-        /// The directories above `here`, or, before it is held, its parent
-        /// or the nearest directory above that exists, and those above.
         above: &'a [Identity],
-        /// The components of the held directory's path below `fd`'s
-        /// directory: ones trawld would make, or a symlink or non-directory
-        /// in the way, which [`make`] or [`hold`] refuses. Empty when `fd`
-        /// holds the directory.
         #[cfg_attr(
             not(target_os = "linux"),
             allow(dead_code, reason = "only the Linux mount comparison reads it")
@@ -1217,14 +841,7 @@ mod lock {
         tail: &'a Path,
     }
 
-    /// Refuse at the first of `roots` that `held` overlaps, on two grounds
-    /// in turn. First the walk over parents, by identity, over every root
-    /// in order: an overlap it finds reads as it always has, and nothing
-    /// under `/proc` is touched. A root whose path fails to look up, other
-    /// than by a component not there yet or not a directory, refuses in its
-    /// place in that order as [`ScratchError::RootUnreachable`]. Then, on
-    /// Linux, the mount comparison of [`refuse_aliases`]. Every root's
-    /// handle stays open until both are done.
+    /// Every root's handle stays open until both are done.
     fn refuse_roots(
         path: &Path,
         held: &Held<'_>,
@@ -1274,8 +891,6 @@ mod lock {
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    /// The ID of the mount the directory `fd` holds is in, as `statx`
-    /// names it, or `None` on a kernel that names no mount.
     #[cfg(target_os = "linux")]
     pub(super) fn mount_of(fd: BorrowedFd<'_>) -> io::Result<Option<u64>> {
         let mount = stat_handle(fd)?.placement.mount;
@@ -1295,13 +910,10 @@ mod lock {
         Ok(mount)
     }
 
-    /// The directory `fd` holds, in `mount`, with `tail` below it, placed
-    /// for the mount comparison. Its path is read from
-    /// `/proc/self/fd`, then that path is opened and its identity compared
-    /// with `fd`'s, so a path the kernel marks deleted, one renamed since,
-    /// or one spelled from outside this process's root cannot stand for
-    /// the directory. A tail with a `.` or `..` has no place until the
-    /// directories before it exist, so it refuses.
+    /// Its path is read from `/proc/self/fd`, then that path is opened and
+    /// its identity compared with `fd`'s, so a path the kernel marks
+    /// deleted, one renamed since, or one spelled from outside this
+    /// process's root cannot stand for the directory.
     #[cfg(target_os = "linux")]
     pub(super) fn anchor(
         fd: BorrowedFd<'_>,
@@ -1333,16 +945,6 @@ mod lock {
         })
     }
 
-    /// The second ground of refusal, after the walk over parents found no
-    /// overlap: for each of `roots` that is in a different mount from
-    /// `held`, compare the two directories' paths within their filesystem
-    /// by the mount table ([`mounts`]), and refuse at the first overlap,
-    /// naming the mount point that exposed it. A root in the same mount
-    /// needs nothing more than the walk already did; only the first root
-    /// in another mount reads the table, once for this pass, while every
-    /// compared handle is open. A comparison that cannot be made refuses
-    /// as [`ScratchError::Unproven`], and so does every pass on a kernel
-    /// that names no mount, since there one mount cannot be told from two.
     #[cfg(target_os = "linux")]
     fn refuse_aliases(
         path: &Path,
@@ -1404,19 +1006,9 @@ mod lock {
         Ok(())
     }
 
-    /// Refuse before [`make`] runs when the directory that would hold
-    /// `path`, its parent or the nearest directory above that exists, is a
-    /// root or sits inside one, or, by the mount table, when `path` would
-    /// be made at, inside or above a root: making `path` there would make
-    /// directories inside the root. A directory already at `path` is
-    /// compared by the mount table as itself, not as its parent plus its
-    /// name, which for a mount point names the directory the mount covers.
-    /// A lookup that fails refuses too, since where `path` would be made is
-    /// then unknown, with these exceptions. For the parent, ENOENT and
-    /// ENOTDIR place `path` by the nearest directory above that exists, and
-    /// [`make`] refuses a non-directory in the way. For `path` itself,
-    /// ENOENT, ELOOP and ENOTDIR place it by its parent like a missing one,
-    /// and [`hold`] refuses a symlink or a non-directory in its own words.
+    /// A directory already at `path` is compared by the mount table as
+    /// itself, not as its parent plus its name, which for a mount point
+    /// names the directory the mount covers.
     fn refuse_making_inside(
         path: &Path,
         roots: &[OwnedRoot],
@@ -1461,8 +1053,6 @@ mod lock {
         refuse_roots(path, &held, roots, role)
     }
 
-    /// Refuse the directory `handle` holds when it is one of `roots`, sits
-    /// inside one, or sits above one or above where trawld would make one.
     pub(super) fn refuse_overlap(
         path: &Path,
         handle: &File,
@@ -1490,9 +1080,6 @@ mod lock {
         refuse_roots(path, &held, roots, role)
     }
 
-    /// Where an inode lives: its filesystem and, where the kernel says,
-    /// its mount. A bind mount keeps the device, so the device alone
-    /// cannot see one; Linux 5.8 and later name the mount.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct Placement {
         device: u64,
@@ -1500,16 +1087,14 @@ mod lock {
     }
 
     impl Placement {
-        /// Whether this placement can prove two inodes share a mount, as
-        /// `owner_only` asks of the WAL directory: on Linux it must name its
-        /// mount, since a bind mount keeps the device. Elsewhere the
-        /// platform names no mount, and the device is all there is.
+        /// On Linux it must name its mount, since a bind mount keeps the
+        /// device. Elsewhere the platform names no mount, and the device is all
+        /// there is.
         const fn names_its_mount(self) -> bool {
             !cfg!(any(target_os = "linux", target_os = "android")) || self.mount.is_some()
         }
     }
 
-    /// What one `stat` of an entry says, without following a symlink.
     #[derive(Debug, Clone, Copy)]
     pub(super) struct EntryStat {
         kind: FileType,
@@ -1521,8 +1106,6 @@ mod lock {
 
     #[cfg(test)]
     impl EntryStat {
-        /// This stat as a kernel before Linux 5.8 answers it, without the
-        /// mount.
         pub(super) fn without_mount(self) -> Self {
             Self {
                 placement: Placement {
@@ -1536,16 +1119,13 @@ mod lock {
 
     #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
     thread_local! {
-        /// Whether `statx` answers `ENOSYS` on this thread, as Linux before
-        /// 4.11 does.
         pub(super) static STATX_ANSWERS_NOSYS: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
     }
 
-    /// The entry `name` in `dir`, or with `AtFlags::EMPTY_PATH` the inode
-    /// `dir` holds. Linux before 4.11 has no `statx`; there a plain `stat`
-    /// answers, which names no mount, and [`refusal`] refuses every entry
-    /// as on a kernel before 5.8.
+    /// Linux before 4.11 has no `statx`; there a plain `stat` answers,
+    /// which names no mount, and [`refusal`] refuses every entry as on a
+    /// kernel before 5.8.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn statx(dir: BorrowedFd<'_>, name: &CStr, flags: AtFlags) -> io::Result<EntryStat> {
         use rustix::fs::StatxFlags;
@@ -1580,19 +1160,16 @@ mod lock {
         })
     }
 
-    /// The entry `name` in `dir`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn stat_entry(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<EntryStat> {
         statx(dir, name, AtFlags::empty())
     }
 
-    /// The inode `fd` holds.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn stat_handle(fd: BorrowedFd<'_>) -> io::Result<EntryStat> {
         statx(fd, c"", AtFlags::EMPTY_PATH)
     }
 
-    /// What a plain `stat` says, which names no mount.
     fn from_stat(stat: &rustix::fs::Stat) -> EntryStat {
         #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
         EntryStat {
@@ -1607,8 +1184,6 @@ mod lock {
         }
     }
 
-    /// The entry `name` in `dir`. This platform names no mount, so the
-    /// device is all there is.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn stat_entry(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<EntryStat> {
         Ok(from_stat(&rustix::fs::statat(
@@ -1618,14 +1193,11 @@ mod lock {
         )?))
     }
 
-    /// The inode `fd` holds.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn stat_handle(fd: BorrowedFd<'_>) -> io::Result<EntryStat> {
         Ok(from_stat(&rustix::fs::fstat(fd)?))
     }
 
-    /// The entries of the directory `dir` holds, `.` and `..` left out,
-    /// each with its `stat`. `path` names `dir` in errors.
     fn entries(dir: &File, path: &Path) -> Result<Vec<(CString, EntryStat)>, ScratchError> {
         let io = |source: io::Error| ScratchError::Io {
             role: SCRATCH,
@@ -1646,24 +1218,17 @@ mod lock {
         Ok(out)
     }
 
-    /// An entry an earlier trawld left behind, checked and due for removal.
     pub(super) enum Stale {
-        /// A spill directory, held open, and the spill files in it.
         SpillDir {
             name: CString,
             dir: File,
             files: Vec<CString>,
         },
-        /// A snapshot file.
         Snapshot(CString),
-        /// An export staging file.
         Export(CString),
-        /// A captured result's row staging file.
         Stage(CString),
     }
 
-    /// Why `stat` refuses whatever its name: a symlink, another mount or a
-    /// mount the kernel does not name, or another owner.
     fn refusal(stat: &EntryStat, home: Placement, euid: u32) -> Option<String> {
         if stat.kind == FileType::Symlink {
             Some("is a symbolic link, which trawld does not follow".to_owned())
@@ -1685,21 +1250,6 @@ mod lock {
         }
     }
 
-    /// Read the whole tree under the locked directory `root` and return
-    /// what to remove, or refuse at the first entry trawld did not make.
-    /// Nothing is removed here, so a refusal leaves the tree as it was.
-    ///
-    /// trawld makes four kinds of entry. A spill directory is a directory
-    /// named by [`is_spill_dir_name`] holding only regular files named by
-    /// [`is_spill_file_name`]. A snapshot, an export or a stage is a regular
-    /// file named by [`is_snapshot_file_name`], [`is_export_file_name`] or
-    /// [`is_stage_file_name`]. Each
-    /// is owned by `euid` and sits in the root's mount. Anything else
-    /// refuses: another name, a symlink, a special file, a directory
-    /// inside a spill directory, another owner, another mount. On Linux a
-    /// kernel that does not name mounts, before 5.8, refuses every entry:
-    /// a bind mount keeps the device, so the device alone cannot show an
-    /// entry sits in the root's mount. An empty directory still opens.
     pub(super) fn preflight(
         path: &Path,
         root: &File,
@@ -1708,9 +1258,6 @@ mod lock {
         preflight_seen(path, root, euid, |stat| stat)
     }
 
-    /// [`preflight`], with every `stat` passed through `seen`: unchanged in
-    /// production, and in tests a stand-in for a kernel that answers
-    /// differently.
     pub(super) fn preflight_seen(
         path: &Path,
         root: &File,
@@ -1792,9 +1339,6 @@ mod lock {
         Ok(stale)
     }
 
-    /// Remove what [`preflight`] found, by name relative to the open
-    /// directories, so no link is followed. An entry already gone counts
-    /// as removed.
     pub(super) fn remove(
         path: &Path,
         root: &File,
@@ -1872,10 +1416,6 @@ mod tests {
         }
     }
 
-    /// The recognizer accepts exactly what `DuckDB` 1.5.5 prints: one of
-    /// its eight size-class names and a `uint64_t` file index, or an
-    /// `int64_t` block id, each as the C++ library prints it, so a name
-    /// `DuckDB` cannot have made is foreign however spill-like it looks.
     #[test]
     fn spill_file_names_are_recognized_exactly() {
         for name in [
@@ -1901,13 +1441,11 @@ mod tests {
             "duckdb_temp_storage_default-0.tmp",
             "duckdb_temp_storage_DEFAULT-0.tmp.x",
             "duckdb_temp_storage_DEFAULT-0-1.tmp",
-            // Size classes DuckDB does not have, or never names a file by.
             "duckdb_temp_storage_NOTTRAWLDS-0.tmp",
             "duckdb_temp_storage_INVALID-0.tmp",
             "duckdb_temp_storage_S48K-0.tmp",
             "duckdb_temp_storage_S256K-0.tmp",
             "duckdb_temp_storage_S32K2-0.tmp",
-            // Over the width of a uint64_t, or not how one is printed.
             "duckdb_temp_storage_DEFAULT-18446744073709551616.tmp",
             "duckdb_temp_storage_DEFAULT-00.tmp",
             "duckdb_temp_storage_DEFAULT-01.tmp",
@@ -1923,7 +1461,6 @@ mod tests {
             "duckdb_temp_block-1.block",
             "duckdb_temp_block-4611686018427387999.block",
             "duckdb_temp_block-4611686018427388000.block",
-            // Over the width of an int64_t.
             "duckdb_temp_block-9223372036854775808.block",
             "duckdb_temp_block-18446744073709551615.block",
             "duckdb_temp_block-1.tmp",
@@ -1934,10 +1471,8 @@ mod tests {
         }
     }
 
-    /// The names a real spill writes are the ones the recognizer accepts:
-    /// a whole-input window sort past a 64 MB memory limit spills into the
-    /// private directory, which is read while the sort runs (`DuckDB`
-    /// removes its files when the query ends).
+    /// The private directory is read while the sort runs (`DuckDB` removes
+    /// its files when the query ends).
     #[test]
     fn duckdb_spill_files_carry_the_recognized_names() {
         let parent = tempfile::tempdir().expect("parent");
@@ -2038,12 +1573,8 @@ mod tests {
 
     /// Every refusal of the scratch directory, word for word: the boot
     /// error an operator reads, the startup tests and the docs quote these.
-    /// An overlap the walk over parents finds reads as it always has; one
-    /// only the mount comparison finds adds the mount point after the
-    /// root; and a proof that cannot be made names its fault, one row per
-    /// [`ProofFault`].
     #[test]
-    #[allow(clippy::too_many_lines)] // one case per variant, kept in one table
+    #[allow(clippy::too_many_lines)]
     fn scratch_refusals_read_word_for_word() {
         let path = || PathBuf::from("/srv/data.query-scratch");
         let unproven = |fault| ScratchError::Unproven {
@@ -2272,9 +1803,6 @@ mod tests {
         }
     }
 
-    /// Every entry under `root`, `root` included, with what it is: a
-    /// directory, a file and its bytes, or a link and its target. A refused
-    /// open must leave this unchanged.
     #[cfg(unix)]
     fn tree(root: &Path) -> Vec<(PathBuf, String)> {
         let meta = std::fs::symlink_metadata(root).expect("stat");
@@ -2314,10 +1842,6 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
     }
 
-    /// Leave in `scratch` what a trawld killed mid-query leaves: a spill
-    /// directory holding both kinds of `DuckDB` spill file, a snapshot, an
-    /// export staging file and `DuckDB`'s `tmp_` copy of it, and a
-    /// capture's row staging file. Returns the spill directory.
     #[cfg(unix)]
     fn plant_stale(scratch: &Path) -> PathBuf {
         let made = QueryScratch::new(scratch);
@@ -2348,15 +1872,12 @@ mod tests {
         assert_eq!(lock.scratch().path(), path);
         assert_eq!(mode_of(&path), 0o700);
         assert_eq!(lock.reclaimed(), Reclaimed::default());
-        // A trailing `/` names the same directory.
         drop(lock);
         let again = ScratchLock::open(&parent.path().join("absent/parents/data.query-scratch/"))
             .expect("reopen");
         assert_eq!(again.scratch().path(), path);
     }
 
-    /// ADR-0052's close: a directory trawld owns loses its group and other
-    /// bits through the held handle, and keeps its setgid bit.
     #[cfg(unix)]
     #[test]
     fn scratch_open_closes_an_open_directory() {
@@ -2368,9 +1889,6 @@ mod tests {
         assert_eq!(mode_of(&path), 0o2700);
     }
 
-    /// `flock` belongs to the open file description, so a second open in
-    /// this process is refused as one in another trawld is, and touches
-    /// nothing; dropping the first frees the lock.
     #[cfg(unix)]
     #[test]
     fn scratch_lock_refuses_a_second_open_until_dropped() {
@@ -2394,7 +1912,6 @@ mod tests {
         assert_eq!(second.reclaimed().spill_dirs, 1);
     }
 
-    /// Hold `path` as the results root, for a trawld running as this test.
     #[cfg(unix)]
     fn hold_results(path: &Path, roots: &[OwnedRoot]) -> Result<HeldRoot, ScratchError> {
         hold_apart_from(
@@ -2405,8 +1922,6 @@ mod tests {
         )
     }
 
-    /// A refusal of the results root names it and the setting that moves
-    /// it.
     #[cfg(unix)]
     fn assert_names_the_results_root(error: &ScratchError) {
         let message = error.to_string();
@@ -2414,10 +1929,6 @@ mod tests {
         assert!(message.contains("[server] results_dir"), "{message}");
     }
 
-    /// ADR-0057: the results root is held as the scratch directory is,
-    /// made 0700 when missing and closed through its handle when open, but
-    /// what it holds outlives the hold: names the scratch preflight would
-    /// refuse and names it would reclaim both stay.
     #[cfg(unix)]
     #[test]
     fn a_held_root_keeps_what_it_holds() {
@@ -2448,9 +1959,6 @@ mod tests {
         assert_eq!(mode_of(&path), 0o2700, "the hold closes the root");
     }
 
-    /// The lock is the scratch directory's lock: a second hold of a held
-    /// root refuses, in this process as in another, and so does opening it
-    /// as the scratch directory, before anything in it is removed.
     #[cfg(unix)]
     #[test]
     fn a_second_hold_refuses_until_the_first_drops() {
@@ -2478,9 +1986,6 @@ mod tests {
         drop(again);
     }
 
-    /// The results root is kept apart from the scratch directory and the
-    /// data root by device and inode, and the refusal names the results
-    /// root and its setting.
     #[cfg(unix)]
     #[test]
     fn a_held_root_refuses_an_owned_root_by_its_role() {
@@ -2539,12 +2044,6 @@ mod tests {
         hold_results(&base.join("data.results"), &roots).expect("a sibling holds");
     }
 
-    /// The results root's final component is held no-follow: a symlink
-    /// refuses, the link's target is left as it was, and a file, a path
-    /// without a final name and another owner refuse too. Each refusal
-    /// names the results root. A symlink and a file refuse the same way
-    /// with roots to keep apart from: the pass before the directory is
-    /// made leaves them for the hold.
     #[cfg(unix)]
     #[test]
     fn a_held_root_refuses_a_symlink_and_names_its_role() {
@@ -2654,8 +2153,6 @@ mod tests {
         }
     }
 
-    /// The roots trawld derives from a data root and a WAL directory, as
-    /// `trawl-server` lists them, with short names for the assertions.
     #[cfg(unix)]
     fn owned_roots(data: &Path, wal: &Path) -> Vec<OwnedRoot> {
         let sibling = |suffix: &str| {
@@ -2683,8 +2180,6 @@ mod tests {
         ]
     }
 
-    /// `path` spelled relative to the working directory, through `..` up to
-    /// `/`.
     #[cfg(unix)]
     fn relative_to_cwd(path: &Path) -> PathBuf {
         let cwd = std::env::current_dir().expect("cwd");
@@ -2695,12 +2190,6 @@ mod tests {
         relative.join(path.strip_prefix("/").expect("an absolute path"))
     }
 
-    /// #304 F1: the scratch directory is judged against the roots by device
-    /// and inode, so no spelling hides an overlap: a symlink in the
-    /// scratch path or a root's path, a `..`, or a root spelled relative to
-    /// the working directory. Each refusal changes nothing, a directory
-    /// that would be made inside a root is not made, and a root that does
-    /// not exist yet is refused below the scratch directory.
     #[cfg(unix)]
     #[test]
     fn scratch_open_refuses_an_owned_root_however_it_is_spelled() {
@@ -2803,8 +2292,6 @@ mod tests {
         assert!(!data.join("newenv").exists());
     }
 
-    /// Siblings and lookalikes beside the roots open, and the repin roots
-    /// beside the data root, which do not exist, refuse nothing.
     #[cfg(unix)]
     #[test]
     fn scratch_open_accepts_the_roots_siblings() {
@@ -2820,13 +2307,9 @@ mod tests {
         }
     }
 
-    /// #314: both hold paths refuse when the data root, the first of
-    /// `roots`, fails to look up with `errno`, rather than reading it as
-    /// missing. Read as missing, the root would be placed at the nearest
-    /// directory above it that opens: a results root at `hour` would hold,
-    /// and a scratch directory at `hour` would be cleared. A held directory
-    /// `held` whose own path fails that way refuses before anything is
-    /// made. Nothing under `protected` changes.
+    /// Read as missing, the root would be placed at the nearest directory
+    /// above it that opens: a results root at `hour` would hold, and a
+    /// scratch directory at `hour` would be cleared.
     #[cfg(unix)]
     fn assert_lookup_refuses(
         protected: &Path,
@@ -2892,9 +2375,8 @@ mod tests {
         assert_eq!(tree(protected), before, "the refusal made something");
     }
 
-    /// #314: the data root is spelled through a link that points at
-    /// itself, so its lookup fails with ELOOP for every uid, root
-    /// included. This test never skips.
+    /// The data root is spelled through a link that points at itself, so
+    /// its lookup fails with ELOOP for every uid, root included.
     #[cfg(unix)]
     #[test]
     fn a_root_behind_a_symlink_loop_refuses() {
@@ -2916,12 +2398,9 @@ mod tests {
         );
     }
 
-    /// #314: the data root is spelled through a link whose target walks
-    /// `..` out of a directory this uid may not search, so its lookup
-    /// fails with EACCES while the directory itself stays in reach. Root
-    /// searches a directory of mode 0o000, so a root run skips this test
-    /// and says so; `a_root_behind_a_symlink_loop_refuses` covers the
-    /// refusal there.
+    /// The data root is spelled through a link whose target walks `..` out
+    /// of a directory this uid may not search, so its lookup fails with
+    /// EACCES while the directory itself stays in reach.
     #[cfg(unix)]
     #[test]
     fn a_root_that_cannot_be_looked_up_refuses() {
@@ -2964,11 +2443,6 @@ mod tests {
         );
     }
 
-    /// #314: the held directory's own name is looked up before anything
-    /// is made, so a directory already there is compared as itself. A
-    /// lookup that fails other than by absence, a symlink or a
-    /// non-directory, here a name longer than the filesystem allows,
-    /// refuses as a parent that fails to look up does, with nothing made.
     #[cfg(unix)]
     #[test]
     fn a_held_name_that_fails_to_look_up_refuses() {
@@ -3025,12 +2499,6 @@ mod tests {
         assert_eq!(tree(&path), before);
     }
 
-    /// #304 F4: a kernel before Linux 5.8 names no mount, so a bind mount of
-    /// a directory on the scratch directory's own filesystem looks like any
-    /// directory there. With the mount unknown on both sides, the preflight
-    /// refuses the first entry before anything is removed, rather than
-    /// reading two unknown mounts as one. An empty directory has nothing to
-    /// cross and passes.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn scratch_preflight_refuses_entries_when_the_kernel_names_no_mount() {
@@ -3069,10 +2537,6 @@ mod tests {
         assert_eq!(tree(&path), before);
     }
 
-    /// #304 H3: Linux before 4.11 has no `statx` and answers `ENOSYS`. The
-    /// open then reads a plain `stat`, which names no mount, so an empty
-    /// scratch directory still opens and one with entries refuses, as F4
-    /// rules for a kernel that does not name mounts.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn scratch_open_without_statx_opens_only_an_empty_directory() {
@@ -3106,8 +2570,6 @@ mod tests {
     #[cfg(unix)]
     type Plant = fn(&Path, &Path, &Path) -> PathBuf;
 
-    /// Each entry the preflight refuses: what it is, how to plant it, and
-    /// the reason the refusal gives.
     #[cfg(unix)]
     fn foreign_entries() -> [(&'static str, Plant, &'static str); 10] {
         [
@@ -3244,14 +2706,11 @@ mod tests {
                 b"not trawld's",
                 "{case}"
             );
-            // The refusal released the lock with the handle.
             std::fs::remove_dir_all(&path).expect("clear");
             ScratchLock::open(&path).expect("free after a refusal");
         }
     }
 
-    /// A refusal that could not prove the directory apart names the
-    /// results root, its setting and the capability to restore.
     #[cfg(target_os = "linux")]
     fn assert_unproven(error: &ScratchError, needle: &str) {
         assert!(
@@ -3272,9 +2731,6 @@ mod tests {
         }
     }
 
-    /// Where a directory is, as the kernel's table places it: the ID of
-    /// its mount, that mount's filesystem, its path as `/proc/self/fd`
-    /// names it, and its path within the filesystem.
     #[cfg(target_os = "linux")]
     struct Placed {
         mount: u64,
@@ -3305,8 +2761,6 @@ mod tests {
         }
     }
 
-    /// Put the directory at `path` in mount `mount` for every comparison on
-    /// this thread, in place of whatever the kernel says.
     #[cfg(target_os = "linux")]
     fn stand_in_mount(path: &Path, mount: u64) {
         use std::os::unix::fs::MetadataExt as _;
@@ -3314,7 +2768,6 @@ mod tests {
         lock::MOUNT_OVERRIDES.set(vec![((meta.dev(), meta.ino()), mount)]);
     }
 
-    /// A record of the table for mount `id`, as the kernel prints one.
     #[cfg(target_os = "linux")]
     fn mount_line(id: u64, filesystem: &[u8], root: &Path, mount_point: &Path) -> Vec<u8> {
         use std::os::unix::ffi::OsStrExt as _;
@@ -3344,9 +2797,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     const OTHER_MOUNT: u64 = 1 << 32;
 
-    /// #314: when every compared root is in the held directory's mount, the
-    /// hold reads no mount table, before the directory is made and after it
-    /// is held; the walk over parents was the whole proof.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_hold_in_one_mount_reads_no_mount_table() {
@@ -3367,10 +2817,6 @@ mod tests {
         );
     }
 
-    /// #314: the walk over parents runs over every root before the mount
-    /// comparison starts, so an overlap it finds with a later root refuses
-    /// in today's words, unread by a table that an earlier root in another
-    /// mount would have needed.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_walk_overlap_refuses_before_any_mount_is_compared() {
@@ -3400,9 +2846,6 @@ mod tests {
         lock::MOUNT_OVERRIDES.set(Vec::new());
     }
 
-    /// #314: a kernel that names no mount cannot tell one mount from two,
-    /// so a hold with a root to compare refuses with nothing made, and a
-    /// hold with nothing to compare still opens.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_hold_refuses_when_the_kernel_names_no_mount() {
@@ -3442,16 +2885,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     type UnprovenCase = (&'static str, Stand, fn(&ProofFault) -> bool, &'static str);
 
-    /// #314: every way the comparison can fail to be made refuses the hold
-    /// with its reason, with nothing made: the table unreadable, not on
-    /// procfs, over the ceiling, without the root's record, with two of
-    /// them, with a malformed one, and with one whose mount point is not
-    /// above the root. The data root stands in another mount so the
-    /// comparison is reached; the table is read as the kernel's would be,
-    /// through the real open and procfs check where the case is about them.
     #[cfg(target_os = "linux")]
     #[test]
-    #[allow(clippy::too_many_lines)] // one case per fault, kept in one table
+    #[allow(clippy::too_many_lines)]
     fn a_hold_refuses_what_it_cannot_prove() {
         let cases: [UnprovenCase; 7] = [
             (
@@ -3553,14 +2989,6 @@ mod tests {
         }
     }
 
-    /// #314: an alias through another mount is judged by the two paths
-    /// within one filesystem, grouped by the table's device (field 3) and
-    /// never by `st_dev`: a data root on another device (procfs) whose
-    /// record says the results root's filesystem and a root above the
-    /// results root refuses as inside, through the data root's mount
-    /// point, whether the results root exists or would be made one or two
-    /// components down, and with nothing made. The same record on another
-    /// filesystem compares nothing and the hold succeeds.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_bind_alias_in_another_mount_refuses_through_its_mount_point() {
@@ -3623,8 +3051,6 @@ mod tests {
             );
         }
 
-        // The held handle is judged too, after the directory is made: the
-        // pass over the handle finds the same alias as the pass before.
         let existing = base.join("existing");
         let handle = lock::hold(&existing, RootRole::RESULTS).expect("hold");
         let error = lock::refuse_overlap(&existing, &handle, &roots, RootRole::RESULTS)
@@ -3653,10 +3079,6 @@ mod tests {
         lock::MOUNT_OVERRIDES.set(Vec::new());
     }
 
-    /// #314: a protected root that is itself a bind mount of the held
-    /// directory's interior is seen too: its record places it inside the
-    /// held directory, so the hold refuses as above, through the root's
-    /// mount point.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_root_bound_from_inside_the_held_directory_refuses_as_above() {
@@ -3702,11 +3124,6 @@ mod tests {
         lock::MOUNT_OVERRIDES.set(Vec::new());
     }
 
-    /// #314: a held directory whose components still to be made include
-    /// `..` has no place within a filesystem until they exist, so a
-    /// comparison with a root in another mount refuses rather than guess;
-    /// and a directory whose path, as `/proc/self/fd` names it, no longer
-    /// opens the same inode cannot be placed either.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_directory_that_cannot_be_placed_refuses() {

@@ -2,11 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Advice never changes what a query returns (ADR-0068). The two 0.9.5
-//! RC survey queries run through the real executor over disposable
-//! parquet data, before and after the advice is computed, and each
-//! returns exactly the rows its text-search reading selects, which are
-//! not the rows its author meant.
+//! Advice never changes what a query returns (ADR-0068).
 
 use trawl_core::advice::{AdviceKind, advise};
 use trawl_core::parser;
@@ -14,17 +10,6 @@ use trawl_core::schema::FieldTypes;
 use trawl_engine::executor::Executor;
 use trawl_engine::value::Value;
 
-/// Seven events, each named by `id`.
-///
-/// - 1: a coredns event whose text never spells `service=coredns`.
-/// - 2: a web event whose message holds the text `service=coredns`.
-/// - 3: a trawld event in `event_type` `a` whose text holds none of the
-///   searched words.
-/// - 4: a trawld event in `event_type` `c` whose message holds every word
-///   of `event_type in (a, b)`.
-/// - 5: a trawld event in `event_type` `b` whose message lacks `a,`.
-/// - 6: a web event that mentions the address.
-/// - 7: an event with no `service` that mentions the address.
 fn source() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -49,7 +34,6 @@ fn source() -> (tempfile::TempDir, String) {
     (dir, path.display().to_string())
 }
 
-/// The ids `dsl` selects, in id order.
 fn ids(executor: &Executor, source: &str, dsl: &str) -> Vec<i64> {
     let query = format!("{dsl} | table id | sort id");
     let result = executor
@@ -70,17 +54,12 @@ fn footgun_hints_do_not_change_results() {
     let (_dir, source) = source();
     let executor = Executor::new().unwrap();
 
-    // (query, the advice it draws, the rows it selects)
     let survey: [(&str, AdviceKind, &[i64]); 2] = [
-        // Drops only the event whose text holds `service=coredns`: the
-        // coredns event itself stays.
         (
             "\"10.244.0.83\" -service=coredns",
             AdviceKind::NegatedFieldShape,
             &[1, 6, 7],
         ),
-        // Selects the event whose text holds the words, not the events in
-        // `event_type` `a` or `b`.
         (
             "service=trawld event_type in (a, b)",
             AdviceKind::SearchStageIn,
@@ -105,13 +84,9 @@ fn footgun_hints_do_not_change_results() {
         assert_eq!(after, before, "{dsl:?} after advice");
     }
 
-    // The spellings the advice offers select what their copy says.
     for (dsl, expected) in [
-        // `service!=…` keeps events with no service.
         ("\"10.244.0.83\" service!=coredns", &[2, 6, 7][..]),
-        // `NOT service=…` drops them too.
         ("\"10.244.0.83\" NOT service=coredns", &[2, 6][..]),
-        // `NOT "service=…"` keeps the text search and draws no advice.
         ("\"10.244.0.83\" NOT \"service=coredns\"", &[1, 6, 7][..]),
         ("service=trawld event_type=a,b", &[3, 5][..]),
         ("service=trawld event_type!=a,b", &[4][..]),

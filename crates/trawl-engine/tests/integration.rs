@@ -2,12 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end integration tests: DSL → parse → emit → `DuckDB` → results.
-//!
-//! These tests validate the full pipeline against parquet fixture files
-//! generated at test time. They catch bugs that unit tests miss, like
-//! valid SQL that `DuckDB` actually rejects.
-
 mod common;
 
 use trawl_core::schema::FieldTypes;
@@ -15,7 +9,6 @@ use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, hot_columns_of};
 use trawl_engine::value::{ColumnType, QueryResult, Value};
 
-/// Test helper — runs query with no row limit.
 trait RunQueryUnlimited {
     fn run_query_max(&self, dsl: &str, source: &str) -> Result<QueryResult, EngineError>;
 }
@@ -71,7 +64,6 @@ fn field_filter_severity_number() {
     // TOKEN vocabulary needs the catalog's SEVERITY pin, so here the
     // ladder number is the query.
     let result = exec.run_query_max("severity=17", &glob).unwrap();
-    // nginx 500, nginx 502, sshd "Connection refused"
     assert_eq!(result.row_count(), 3);
 }
 
@@ -79,7 +71,6 @@ fn field_filter_severity_number() {
 fn text_search_ilike() {
     let (exec, glob) = setup();
     let result = exec.run_query_max("error", &glob).unwrap();
-    // only the nginx 500 message ("internal server error") carries the word
     assert!(result.row_count() >= 1);
 }
 
@@ -89,7 +80,6 @@ fn quoted_search() {
     let result = exec
         .run_query_max(r#""connection refused""#, &glob)
         .unwrap();
-    // case-insensitive: matches "Connection refused from 10.0.0.99"
     assert_eq!(result.row_count(), 1);
 }
 
@@ -97,8 +87,6 @@ fn quoted_search() {
 fn negated_text_search() {
     let (exec, glob) = setup();
     let result = exec.run_query_max("-error service=nginx", &glob).unwrap();
-    // nginx rows whose message does NOT contain "error"
-    // excludes the 500 row ("internal server error")
     assert!(result.row_count() < 6);
     assert!(result.row_count() > 0);
 }
@@ -107,7 +95,6 @@ fn negated_text_search() {
 fn status_comparison_gte() {
     let (exec, glob) = setup();
     let result = exec.run_query_max("status>=400", &glob).unwrap();
-    // 404, 500, 502
     assert_eq!(result.row_count(), 3);
 }
 
@@ -115,7 +102,6 @@ fn status_comparison_gte() {
 fn in_list_filter() {
     let (exec, glob) = setup();
     let result = exec.run_query_max("status=200,301", &glob).unwrap();
-    // 2x 200, 1x 301
     assert_eq!(result.row_count(), 3);
 }
 
@@ -125,7 +111,6 @@ fn stats_count_by_service() {
     let result = exec
         .run_query_max("* | stats count() by service", &glob)
         .unwrap();
-    // nginx, sshd, systemd, kernel
     assert_eq!(result.row_count(), 4);
     assert_eq!(result.columns[0].name, "service");
     assert_eq!(result.columns[1].name, "count");
@@ -133,11 +118,6 @@ fn stats_count_by_service() {
 
 #[test]
 fn stats_group_by_repairs_separates_clean_from_repaired() {
-    // ADR-0009: `_repairs` is NULL on clean events and carries the repair
-    // codes on repaired ones, so it must behave as an ordinary groupable
-    // dimension — one group per distinct code plus a NULL group for the
-    // untouched majority. The fixture seeds exactly one repaired row
-    // (`host.from_peer`) among 13.
     let (exec, glob) = setup();
     let result = exec
         .run_query_max("* | stats count() by _repairs", &glob)
@@ -172,7 +152,6 @@ fn stats_with_where_cte() {
             &glob,
         )
         .unwrap();
-    // web01 has 4 nginx rows, web02 has 2 — only web01 passes
     assert_eq!(result.row_count(), 1);
     assert_eq!(result.rows[0][0], Value::String("web01".to_string()));
 }
@@ -187,7 +166,6 @@ fn sort_and_limit() {
         )
         .unwrap();
     assert_eq!(result.row_count(), 1);
-    // web01 has 4 nginx rows (most), should be first when sorted desc
     assert_eq!(result.rows[0][0], Value::String("web01".to_string()));
 }
 
@@ -214,7 +192,6 @@ fn full_pipeline() {
         )
         .unwrap();
     assert!(result.row_count() > 0);
-    // should have: host, count, avg_duration
     assert!(result.columns.len() >= 3);
 }
 
@@ -223,29 +200,23 @@ fn empty_result() {
     let (exec, glob) = setup();
     let result = exec.run_query_max("service=nonexistent", &glob).unwrap();
     assert_eq!(result.row_count(), 0);
-    // columns should still be present from the parquet schema
     assert!(!result.columns.is_empty());
 }
 
 #[test]
 fn time_filter_large_window() {
     let (exec, glob) = setup();
-    // fixtures are from 2024-01-15 — use a massive window to include them
     let result = exec.run_query_max("last=99999d", &glob).unwrap();
     assert_eq!(result.row_count(), 13);
 }
-
-// -- extended DSL stages --
 
 #[test]
 fn top_by_service() {
     let (exec, glob) = setup();
     let result = exec.run_query_max("* | top 3 service", &glob).unwrap();
-    // nginx=6, sshd=4, systemd=2 (kernel excluded by limit)
     assert_eq!(result.row_count(), 3);
     assert_eq!(result.columns[0].name, "service");
     assert_eq!(result.columns[1].name, "count");
-    // first row = highest count = nginx
     assert_eq!(result.rows[0][0], Value::String("nginx".to_string()));
 }
 
@@ -253,10 +224,8 @@ fn top_by_service() {
 fn rare_by_service() {
     let (exec, glob) = setup();
     let result = exec.run_query_max("* | rare 2 service", &glob).unwrap();
-    // kernel=1, systemd=2 (ascending order)
     assert_eq!(result.row_count(), 2);
     assert_eq!(result.columns[0].name, "service");
-    // first row = lowest count = kernel
     assert_eq!(result.rows[0][0], Value::String("kernel".to_string()));
 }
 
@@ -272,10 +241,6 @@ fn drop_columns() {
     assert!(!col_names.contains(&"src_ip"));
 }
 
-/// `drop` of a field no event carries is a no-op: every row, every
-/// column, as the live tail answers it (ADR-0001). `DuckDB`'s
-/// `* EXCLUDE` refused the name, with no structured marker the binder
-/// fallback could read.
 #[test]
 fn drop_of_an_absent_field_keeps_every_row_and_column() {
     let (exec, glob) = setup();
@@ -296,9 +261,6 @@ fn drop_of_an_absent_field_keeps_every_row_and_column() {
     assert_eq!(names(&mixed), expected);
 }
 
-/// `drop` folds a field's ASCII case as `DuckDB` binds identifiers, so
-/// `drop SERVICE` removes the `service` column, as `* EXCLUDE ("SERVICE")`
-/// did, and every other column stays.
 #[test]
 fn drop_folds_ascii_case_as_duckdb_binds() {
     let (exec, glob) = setup();
@@ -344,9 +306,7 @@ fn extract_ip_from_message() {
 fn dedup_single_field() {
     let (exec, glob) = setup();
     let result = exec.run_query_max("* | dedup host", &glob).unwrap();
-    // 4 unique hosts: web01, web02, bastion, db01
     assert_eq!(result.row_count(), 4);
-    // _rn helper column should be excluded from output
     let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(!col_names.contains(&"_rn"));
 }
@@ -357,8 +317,6 @@ fn dedup_multiple_fields() {
     let result = exec
         .run_query_max("* | dedup host, service", &glob)
         .unwrap();
-    // 6 unique combos: web01+nginx, web01+systemd, web02+nginx,
-    // bastion+sshd, db01+systemd, db01+kernel
     assert_eq!(result.row_count(), 6);
 }
 
@@ -368,7 +326,6 @@ fn timechart_minute_buckets() {
     let result = exec
         .run_query_max("* | timechart span=1m count()", &glob)
         .unwrap();
-    // 3 minute buckets: 10:00 (6 nginx), 10:01 (4 sshd), 10:02 (3 system)
     assert_eq!(result.row_count(), 3);
     assert_eq!(result.columns[0].name, "_time");
     assert_eq!(result.columns[1].name, "count");
@@ -380,7 +337,7 @@ fn timechart_bucket_values_group_by_full_expression() {
     // it is derived from. Grouping must reference the full time_bucket
     // expression, not the ambiguous alias, or DuckDB groups by the raw
     // source column and the aggregation is silently wrong (one output row
-    // per input row). Pin actual bucket values and counts, not SQL text.
+    // per input row).
     let (exec, glob) = setup();
     let result = exec
         .run_query_max("* | timechart span=1m count()", &glob)
@@ -412,7 +369,6 @@ fn timechart_bucket_values_group_by_full_expression() {
 
 #[test]
 fn severity_gte_warn_returns_only_warn_and_above() {
-    // Only WARN-and-above rows (severity 13 and 17 in the fixture).
     let (exec, glob) = setup();
     let result = exec.run_query_max("severity>=13", &glob).unwrap();
     assert_eq!(result.row_count(), 7, "4 warn + 3 error rows");
@@ -438,20 +394,14 @@ fn severity_error_band_matches_three_rows() {
 
 #[test]
 fn bare_word_matches_content_only_in_raw() {
-    // "gateway-detail" appears only in one row's `_raw`, never in `message`
-    // — bare-word search must cover both columns.
     let (exec, glob) = setup();
     let result = exec.run_query_max("gateway-detail", &glob).unwrap();
     assert_eq!(result.row_count(), 1, "the _raw-only term must match");
 
-    // And a message-only term still matches (that row's _raw is "raw4").
     let result = exec.run_query_max("redirect", &glob).unwrap();
     assert_eq!(result.row_count(), 1, "message-only terms keep matching");
 }
 
-/// Write a parquet file shaped like the ingest canonicalizer's output: no
-/// collector sent a pre-parse line, so `_raw` is the server's JSON
-/// serialization of the event as it arrived.
 fn canonicalized_parquet(dir: &std::path::Path) -> String {
     let path = dir.join("canonical.parquet");
     let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
@@ -468,17 +418,12 @@ fn canonicalized_parquet(dir: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-/// Bare-word search over a server-filled `_raw` is whole-event search
-/// (ADR-0009): the term reaches another field's *value* and a field *name*,
-/// and negation excludes on exactly the same basis. Pinned because it is a
-/// decision the DSL reference documents, not an accident of the fill.
 #[test]
 fn bare_word_search_reaches_the_whole_event_through_raw() {
     let dir = tempfile::tempdir().unwrap();
     let source = canonicalized_parquet(dir.path());
     let exec = Executor::new().expect("executor should initialize");
 
-    // Another field's value: "nginx" is in `service`, never in `message`.
     let by_value = exec.run_query_max("nginx", &source).expect("field value");
     assert_eq!(
         by_value.row_count(),
@@ -486,7 +431,6 @@ fn bare_word_search_reaches_the_whole_event_through_raw() {
         "a bare term must find the event through another field's value"
     );
 
-    // A field name: "debug" exists only as the key `debug_mode`.
     let by_name = exec.run_query_max("debug", &source).expect("field name");
     assert_eq!(
         by_name.row_count(),
@@ -494,7 +438,6 @@ fn bare_word_search_reaches_the_whole_event_through_raw() {
         "serialized field names are part of the searched text"
     );
 
-    // Negation is the exact mirror — the same row drops out.
     let negated = exec.run_query_max("-debug", &source).expect("negated");
     assert_eq!(
         negated.row_count(),
@@ -512,7 +455,6 @@ fn bare_word_search_reaches_the_whole_event_through_raw() {
         "the row whose serialization contains 'debug' is the one excluded"
     );
 
-    // A field filter never consults `_raw` — that is the narrow form.
     let confined = exec
         .run_query_max("message=/debug/", &source)
         .expect("field filter");
@@ -545,17 +487,15 @@ fn pivot_on_service() {
     let result = exec
         .run_query_max("* | pivot count() on service", &glob)
         .unwrap();
-    // no GROUP BY → single aggregated row with dynamic columns per service
     assert_eq!(result.row_count(), 1);
-    assert!(result.columns.len() >= 4); // at least nginx, sshd, systemd, kernel
+    assert!(result.columns.len() >= 4);
 }
 
 /// The PIVOT lane inlines every parameter (`DuckDB` cannot parameterize a
 /// PIVOT), and `sev()` emits a `?` inside a string literal: its digits
 /// guard, `'[+-]?[0-9]+'`. An inliner that scans for `?` without skipping
 /// string literals splices the next user literal into the middle of that
-/// regex and shifts every later parameter by one, so this runs the whole
-/// shape end to end and the SQL has to actually parse and answer.
+/// regex and shifts every later parameter by one.
 #[test]
 fn pivot_over_sev_keeps_the_digits_guard_intact() {
     let (exec, glob) = setup();
@@ -566,11 +506,6 @@ fn pivot_over_sev_keeps_the_digits_guard_intact() {
         )
         .expect("pivot over sev() must emit parseable SQL");
     assert_eq!(result.row_count(), 1);
-    // Exactly one nginx row carries that message and it is a `warn`, so
-    // the pivot has exactly one dynamic column: the ladder number, which
-    // is what the column holds. A parameter spliced into the regex, or
-    // shifted past it, would either fail to parse or let the other
-    // severities through as extra columns.
     let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["13"], "unexpected pivot columns");
 }
@@ -583,10 +518,6 @@ fn pivot_over_sev_keeps_the_digits_guard_intact() {
 #[test]
 fn sev_in_an_aggregation_position_keeps_its_dialect() {
     let (exec, glob) = setup();
-    // The fixture's `severity` column carries OTel numbers; read as
-    // syslog, 9 (info) is out of the 0-7 range and 17 has no reading
-    // either, so a syslog reading of this corpus is all NULL while the
-    // OTel one is the ladder itself. Both must emit.
     let syslog = exec
         .run_query_max(r#"* | stats max(sev(severity, "syslog")) as m"#, &glob)
         .expect(r#"stats sev(x, "syslog") must emit"#);
@@ -601,14 +532,11 @@ fn sev_in_an_aggregation_position_keeps_its_dialect() {
         .expect("stats sev(x) must emit");
     assert_eq!(otel.rows[0][0], Value::Integer(17));
 
-    // The bare (non-aggregate) form in the same position still works,
-    // and the inversion is real where the numeral IS syslog-shaped.
     let inverted = exec
         .run_query_max(r#"* | let s = 3 | stats max(sev(s, "syslog")) as m"#, &glob)
         .expect("a syslog numeral must invert");
     assert_eq!(inverted.rows[0][0], Value::Integer(17), "syslog 3 is err");
 
-    // And the vocabulary is still closed in that position.
     let err = exec
         .run_query_max(r#"* | stats max(sev(severity, "rfc5424")) as m"#, &glob)
         .expect_err("an unknown dialect must be refused");
@@ -617,8 +545,6 @@ fn sev_in_an_aggregation_position_keeps_its_dialect() {
         "must name the vocabulary: {err}"
     );
 }
-
-// -- JSON source tests (validates read_json_auto pipeline) --
 
 fn setup_json() -> (Executor, String) {
     let glob = common::fixture_glob_json();
@@ -650,11 +576,6 @@ fn json_stats_pipeline() {
     assert_eq!(result.columns[0].name, "service");
 }
 
-// -- sources outside the ADR-0009 envelope -----------------------------------
-
-/// Write a parquet file with a `message` but no `_raw` column — user-owned
-/// data read in embedded mode (`trawl query --data ...`), or any corpus trawl
-/// did not write itself.
 fn foreign_parquet(dir: &std::path::Path) -> String {
     let path = dir.join("foreign.parquet");
     let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
@@ -669,9 +590,6 @@ fn foreign_parquet(dir: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-/// Every per-row presence/NULL combination of `message` and `_raw` has a
-/// two-valued containment answer (ADR-0015). A NULL cell is how a sparse
-/// parquet row represents an event that did not carry that field.
 #[test]
 fn text_containment_is_total_for_sparse_rows() {
     let dir = tempfile::tempdir().unwrap();
@@ -742,8 +660,6 @@ fn text_containment_treats_non_text_columns_as_non_matches() {
     }
 }
 
-/// Write a foreign parquet file whose text lives in `text_column`: rows 1
-/// and 2 are nginx, row 3 is sshd, and only row 1's text holds `boom`.
 fn foreign_text_parquet(dir: &std::path::Path, text_column: &str) -> String {
     let path = dir.join(format!("foreign-{text_column}.parquet"));
     let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
@@ -759,12 +675,6 @@ fn foreign_text_parquet(dir: &std::path::Path, text_column: &str) -> String {
     path.display().to_string()
 }
 
-/// Text search over foreign parquet reads an absent `message` or `_raw` as
-/// NULL (ADR-0062), so the column that is present answers alone, and a
-/// source with neither (its text is in `note`, which text search never
-/// reads) contains no term. A second absent field, `nosuch`, keeps the
-/// null rule beside it: `!=` matches, `=` is unknown, and neither removes
-/// an `OR` sibling's matches. No absent name becomes an output column.
 #[test]
 fn text_search_over_foreign_parquet_without_raw() {
     let dir = tempfile::tempdir().unwrap();
@@ -823,8 +733,6 @@ fn text_search_over_foreign_parquet_without_raw() {
     }
 }
 
-// -- error path tests --------------------------------------------------------
-
 #[test]
 fn invalid_dsl_returns_parse_error() {
     let (exec, glob) = setup();
@@ -839,11 +747,8 @@ fn missing_source_returns_empty_result() {
     let result = exec
         .run_query_max("*", "/nonexistent/path/**/*.parquet")
         .expect("no-files-found should return empty result, not error");
-    // A glob matching zero files is semantically "no data", not an error.
     assert!(result.is_empty());
 }
-
-// -- schema introspection tests ----------------------------------------------
 
 #[test]
 fn describe_schema_returns_columns() {
@@ -869,10 +774,6 @@ fn describe_schema_missing_source() {
     assert!(result.is_err());
 }
 
-// -- extract kv integration tests -------------------------------------------
-
-/// Create a parquet fixture with kv-style messages and return (executor, glob).
-///
 /// Uses a separate directory so the kv fixture doesn't pollute the main
 /// `fixtures/parquet/**/*.parquet` glob used by other tests.
 fn setup_kv() -> (Executor, String) {
@@ -910,7 +811,6 @@ fn extract_kv_basic_pipeline() {
     let result = exec
         .run_query("* | extract kv | head 5", &src, &FieldTypes::new(), 1000)
         .unwrap();
-    // Should have original columns + extracted kv columns.
     let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(col_names.contains(&"method"), "missing extracted 'method'");
     assert!(col_names.contains(&"status"), "missing extracted 'status'");
@@ -933,7 +833,6 @@ fn extract_kv_with_where() {
             1000,
         )
         .unwrap();
-    // status >= 400: 500 and 404 → 2 rows.
     assert_eq!(result.row_count(), 2);
 }
 
@@ -948,7 +847,6 @@ fn extract_kv_with_stats() {
             1000,
         )
         .unwrap();
-    // GET: 3, POST: 1, PUT: 1 → 3 groups.
     assert_eq!(result.row_count(), 3);
     let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(col_names.contains(&"method"));
@@ -966,20 +864,16 @@ fn extract_kv_with_search_prefix() {
             1000,
         )
         .unwrap();
-    // web01 has 3 rows.
     assert_eq!(result.row_count(), 3);
     let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(col_names.contains(&"method"));
 }
-
-// -- parquet export tests ----------------------------------------------------
 
 #[test]
 fn export_parquet_writes_valid_file() {
     let (exec, glob) = setup();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_owned();
-    // Remove the temp file so export_parquet creates it fresh.
     drop(tmp);
 
     exec.export_parquet(
@@ -991,7 +885,6 @@ fn export_parquet_writes_valid_file() {
     )
     .unwrap();
 
-    // Verify the file exists and is re-readable via DuckDB.
     assert!(path.exists());
     let read_glob = format!("{}", path.display());
     let result = exec.run_query_max("*", &read_glob).unwrap();
@@ -1000,10 +893,6 @@ fn export_parquet_writes_valid_file() {
     std::fs::remove_file(&path).ok();
 }
 
-/// A `max_rows` BELOW the query's own row count caps the written file.
-/// Every other export test passes a limit larger than the fixture, so the
-/// bounded arm could be deleted with the suite still green while
-/// `[server] max_export_rows` silently stopped applying.
 #[test]
 fn export_parquet_row_limit_binds() {
     let (exec, glob) = setup();
@@ -1011,7 +900,6 @@ fn export_parquet_row_limit_binds() {
     let path = tmp.path().to_owned();
     drop(tmp);
 
-    // The nginx fixture head is 3 rows; the cap is 2.
     exec.export_parquet(
         "service=nginx | head 3",
         &glob,
@@ -1073,7 +961,6 @@ fn export_parquet_with_stats_roundtrips() {
 
     let read_glob = format!("{}", path.display());
     let result = exec.run_query_max("*", &read_glob).unwrap();
-    // 13 rows across nginx/sshd/systemd/kernel = 4 services.
     assert_eq!(result.row_count(), 4);
 
     std::fs::remove_file(&path).ok();
@@ -1103,9 +990,6 @@ fn export_parquet_rejects_rust_stages() {
     std::fs::remove_file(&path).ok();
 }
 
-/// Write a one-row cold parquet with a BIGINT `duration` next to a hot
-/// ndjson whose `duration` is the string `"n/a"` — the hot-side conflict
-/// shape the field catalog resolves via pins. Returns the hot path.
 fn write_pin_conflict_corpus(cold_dir: &std::path::Path, hot: &std::path::Path) {
     use duckdb::Connection;
     let conn = Connection::open_in_memory().unwrap();
@@ -1123,10 +1007,6 @@ fn write_pin_conflict_corpus(cold_dir: &std::path::Path, hot: &std::path::Path) 
     .unwrap();
 }
 
-/// Write a one-row cold parquet whose `meta` is a STRUCT next to a hot
-/// ndjson whose `meta` is a plain string — a FOREIGN nonconformant corpus:
-/// server-written parquet can never hold a STRUCT (write-time conformance,
-/// ADR-0009), so no catalog pin exists for it.
 fn write_foreign_struct_corpus(cold_dir: &std::path::Path, hot: &std::path::Path) {
     use duckdb::Connection;
     let conn = Connection::open_in_memory().unwrap();
@@ -1144,17 +1024,12 @@ fn write_foreign_struct_corpus(cold_dir: &std::path::Path, hot: &std::path::Path
     .unwrap();
 }
 
-/// The catalog pins for the pin-conflict corpus: `duration` is BIGINT.
 fn duration_bigint_pins() -> FieldTypes {
     let mut pins = FieldTypes::new();
     pins.insert("duration", trawl_core::schema::CanonicalType::BigInt);
     pins
 }
 
-/// Assert the pin-conflict result: both rows present from one execution of
-/// the pin-conformed union, the cold value still a BIGINT integer and the
-/// nonconforming hot value degraded to NULL. A String in the duration
-/// column would mean a second, stringifying execution ran.
 fn assert_pin_conflict_rows(columns: &[trawl_engine::value::Column], rows: &[Vec<Value>]) {
     let dur = columns
         .iter()
@@ -1178,10 +1053,6 @@ fn assert_pin_conflict_rows(columns: &[trawl_engine::value::Column], rows: &[Vec
 
 #[test]
 fn hot_pin_conflict_nulls_hot_value_keeps_both_rows() {
-    // Cold parquet has `duration` as BIGINT (write-time conformant); the hot
-    // snapshot carries "n/a" for it. Under the BIGINT pin the emitter
-    // TRY_CASTs the hot branch, so one execution returns both rows with the
-    // hot value NULL: no second pass, no VARCHAR coercion, cold data intact.
     let dir = tempfile::tempdir().unwrap();
     let hot = dir.path().join("hot.ndjson");
     write_pin_conflict_corpus(dir.path(), &hot);
@@ -1203,20 +1074,8 @@ fn hot_pin_conflict_nulls_hot_value_keeps_both_rows() {
     assert_pin_conflict_rows(&result.columns, &result.rows);
 }
 
-// NOTE: no case-variant pin test lives here. Field names are ASCII-folded
-// at `envelope::canonicalize`, the one door every producer enters, and
-// again at the catalog's entry points (boot seeding, compaction proposals),
-// so a `FieldTypes` carrying two spellings of one DuckDB identifier cannot
-// be produced by the wired system. The end-to-end proofs live in
-// trawl-server's `case_variant_field_names_fold_to_one_column_across_services`
-// and `syslog_mixed_case_sd_param_lands_folded_and_pins_folded`.
-
 #[test]
 fn hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
-    // Same pinned conflict behind the list source shape the server emits,
-    // with one element pointing at an hour dir holding no file. Resolution
-    // narrows the list before the read, and the narrowed source must carry
-    // the pins too.
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
     let empty = dir.path().join("empty");
@@ -1248,9 +1107,6 @@ fn hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
 
 #[test]
 fn export_parquet_hot_pin_conflict_nulls_hot_value() {
-    // The export lane of the pinned conflict: both rows land in the exported
-    // parquet, with `duration` still BIGINT (a VARCHAR column would mean a
-    // second, coercing execution ran).
     use duckdb::Connection;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1295,8 +1151,6 @@ fn export_parquet_hot_pin_conflict_nulls_hot_value() {
 
 #[test]
 fn export_parquet_hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
-    // Export lane crossed with the list source shape whose second element
-    // reaches no file.
     use duckdb::Connection;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1342,11 +1196,6 @@ fn export_parquet_hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
 
 #[test]
 fn foreign_nonconformant_corpus_errors_loudly() {
-    // A STRUCT-typed parquet column can only come from foreign parquet
-    // dropped into the data root (the boot pass conforms everything else),
-    // so no pin exists and the union hard-errors. Degrading to a coerced or
-    // hot-only result would hide the breach; the contract is a loud error
-    // the operator can act on.
     let dir = tempfile::tempdir().unwrap();
     let hot = dir.path().join("hot.ndjson");
     write_foreign_struct_corpus(dir.path(), &hot);
@@ -1372,10 +1221,6 @@ fn foreign_nonconformant_corpus_errors_loudly() {
 
 #[test]
 fn foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_source() {
-    // Same foreign corpus behind a list source one of whose elements
-    // reaches no file: the conflict surfaces on the narrowed read, which
-    // must also error loudly rather than fall back hot-only past existing
-    // cold files.
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
     let empty = dir.path().join("empty");
@@ -1409,7 +1254,6 @@ fn foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_source() {
 
 #[test]
 fn export_parquet_foreign_nonconformant_corpus_errors_loudly() {
-    // Export lane of the foreign-corpus contract: error, not a hot-only file.
     let dir = tempfile::tempdir().unwrap();
     let hot = dir.path().join("hot.ndjson");
     let out = dir.path().join("export.parquet");
@@ -1441,8 +1285,6 @@ fn export_parquet_foreign_nonconformant_corpus_errors_loudly() {
 
 #[test]
 fn export_parquet_foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_source() {
-    // Export lane crossed with the list source shape whose second element
-    // reaches no file.
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
     let empty = dir.path().join("empty");
@@ -1478,11 +1320,6 @@ fn export_parquet_foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_s
 
 #[test]
 fn hot_cold_malformed_timestamp_keeps_cold_data() {
-    // A malformed timestamp in the hot buffer must not throw the hot+cold
-    // union (ADR-0008: the partition key is never hard-CAST). With TRY_CAST
-    // on the union's hot side both rows survive; a hard cast raises a
-    // Conversion error that reads as a schema conflict and drops the entire
-    // parquet history.
     use duckdb::Connection;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1532,18 +1369,12 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
 
 #[test]
 fn hot_sparse_repair_column_survives_inside_the_sample_window() {
-    // `_repairs` is by construction sparse — it appears only on repaired
-    // events (ADR-0009). DuckDB's JSON auto-detection samples a
-    // bounded prefix by default (~20480 rows) and then errors on any later
-    // record carrying a key outside the inferred schema, so the hot-buffer
-    // snapshot writer hoists one event per novel key to the front of the
-    // file (`HotBuffer::build_snapshot`) rather than making these readers
-    // pay whole-file detection on every query. This asserts the reader half
-    // of that contract: a snapshot far larger than the sample window keeps
-    // the sparse column as long as it appears in the prefix. Checked with
-    // and without cold parquet present: those are two different reader call
-    // sites (hot+cold union vs the hot-only reader used before any file has
-    // been compacted).
+    // DuckDB's JSON auto-detection samples a bounded prefix by default
+    // (~20480 rows) and then errors on any later record carrying a key
+    // outside the inferred schema, so the hot-buffer snapshot writer hoists
+    // one event per novel key to the front of the file
+    // (`HotBuffer::build_snapshot`). Checked with and without cold parquet
+    // present: those are two different reader call sites.
     use duckdb::Connection;
     use std::fmt::Write as _;
 
@@ -1595,8 +1426,6 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
             "the sparse repair column must survive a hot snapshot larger than \
              the JSON sample window (with_cold={with_cold}); got columns {col_names:?}"
         );
-        // Row counts pin that this rode the real union (with cold present)
-        // rather than a silent hot-only fallback.
         let expected = 30_001 + usize::from(with_cold);
         assert_eq!(
             result.row_count(),
@@ -1607,11 +1436,6 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
     }
 }
 
-// ── pin-aware comparisons survive every lane (ADR-0011) ────────────────
-
-/// Cold parquet with a VARCHAR `status` column holding mixed
-/// numeric-looking and word values — the write-time-conformant shape a
-/// VARCHAR pin guarantees.
 fn write_varchar_status_parquet(dir: &std::path::Path) {
     use duckdb::Connection;
     let conn = Connection::open_in_memory().unwrap();
@@ -1632,10 +1456,6 @@ fn status_varchar_pins() -> FieldTypes {
 
 #[test]
 fn pinned_comparison_applies_on_cold_only_run_query() {
-    // The cold-only branch (pool cold path): run_query itself must consult
-    // the pins. `status=200` binds text and matches only the stored "200";
-    // `status>=400` TRY_CASTs and excludes "accepted" without erroring
-    // (pin-blind emission Conversion-errors here).
     let dir = tempfile::tempdir().unwrap();
     write_varchar_status_parquet(dir.path());
     let exec = Executor::new().unwrap();
@@ -1655,10 +1475,6 @@ fn pinned_comparison_applies_on_cold_only_run_query() {
 
 #[test]
 fn pinned_comparison_survives_pruned_list_source() {
-    // One list element points at an hour dir holding no file, so resolution
-    // narrows the list before the read. The narrowed source must carry the
-    // same comparison pins: a pin dropped there turns `status>=400` into a
-    // Conversion error over 'accepted'.
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
     let empty = dir.path().join("empty");
@@ -1690,17 +1506,11 @@ fn pinned_comparison_survives_pruned_list_source() {
             usize::MAX,
         )
         .expect("the pruned retry must keep the comparison pins");
-    // cold '404' + hot '500'; cold 'accepted'/'200' excluded, no error.
     assert_eq!(result.row_count(), 2);
 }
 
 #[test]
 fn pinned_comparison_survives_hot_only_fallback() {
-    // Genuine cold start: the glob matches nothing, so the executor falls
-    // back to the hot-only read — which must keep the SAME comparison
-    // interpretation. The hot snapshot holds both a numeric-looking and a
-    // word value; pin-blind emission would Conversion-error the ordered
-    // comparison over the VARCHAR-inferred column.
     let dir = tempfile::tempdir().unwrap();
     let hot = dir.path().join("hot.ndjson");
     std::fs::write(
@@ -1731,7 +1541,6 @@ fn pinned_comparison_survives_hot_only_fallback() {
 
 #[test]
 fn pinned_comparison_survives_export_retry() {
-    // The export lane: a narrowed list source with comparison pins carried.
     use duckdb::Connection;
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
@@ -1792,13 +1601,6 @@ fn write_numeric_status_hot(hot: &std::path::Path) {
 
 #[test]
 fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
-    // Cold start (the glob matches no file), so the executor reads hot-only.
-    // That changes the SOURCE, never the TYPES: the hot column must arrive
-    // conformed to the VARCHAR pin exactly as the union's hot branch
-    // conforms it, or the answer would flip the moment the first parquet
-    // landed — in the returned VALUE (a JSON-inferred BIGINT comes back as
-    // an Integer) and in what a non-numeric literal does (text compares,
-    // a BIGINT column throws a Conversion error).
     let dir = tempfile::tempdir().unwrap();
     let hot = dir.path().join("hot.ndjson");
     write_numeric_status_hot(&hot);
@@ -1854,8 +1656,6 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
         "'200.0' is the same number as the stored '200'"
     );
 
-    // And the column really is text: a non-numeric literal compares
-    // cleanly, which a JSON-inferred BIGINT column could not do.
     let word = exec
         .run_query_with_hot(
             "status!=accepted",
@@ -1872,10 +1672,6 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
 
 #[test]
 fn export_hot_only_fallback_conforms_hot_columns_to_the_pin() {
-    // The export lane of the same cold start: the exported parquet must
-    // carry the catalog's type, not `read_json`'s inference — otherwise an
-    // export taken before the first compaction disagrees with one taken
-    // after.
     use duckdb::Connection;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1917,10 +1713,6 @@ fn export_hot_only_fallback_conforms_hot_columns_to_the_pin() {
     );
 }
 
-// ── pinned rust_stages tail (ADR-0011) ────────────────────────────────
-
-/// A source with a VARCHAR `status` column and kv-free messages, plus the
-/// VARCHAR pin for it.
 fn setup_pinned_kv() -> (Executor, String, FieldTypes, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pinned.parquet");
@@ -1939,10 +1731,6 @@ fn setup_pinned_kv() -> (Executor, String, FieldTypes, tempfile::TempDir) {
     (exec, format!("{}", path.display()), ft, dir)
 }
 
-/// The `rust_stages` lane is pin-aware: `… | extract kv | where <pinned
-/// cmp>` returns the same rows as the equivalent query without the kv
-/// split — the tail's `where` runs under the scope stamped at the split,
-/// not pin-blind.
 #[test]
 fn extract_kv_tail_where_is_pin_aware() {
     let (exec, src, ft, _dir) = setup_pinned_kv();
@@ -1952,8 +1740,6 @@ fn extract_kv_tail_where_is_pin_aware() {
     let without_kv = exec
         .run_query("* | where status > 400", &src, &ft, 1000)
         .unwrap();
-    // '404' and '500' compare in the DECIMAL space; 'accepted' and '1.5'
-    // vs 400 are UNKNOWN/false; '200' is below.
     assert_eq!(without_kv.row_count(), 2);
     assert_eq!(
         with_kv.row_count(),
@@ -1961,15 +1747,12 @@ fn extract_kv_tail_where_is_pin_aware() {
         "the kv tail must answer exactly as the split-free query"
     );
 
-    // The equality rung too: '200' matches == 200 as text.
     let eq_kv = exec
         .run_query("* | extract kv | where status == 200", &src, &ft, 1000)
         .unwrap();
     assert_eq!(eq_kv.row_count(), 1);
 }
 
-/// A rename BEFORE the kv split remaps the pin in the stamped scope, so
-/// the tail's `where` under the new name stays pin-aware.
 #[test]
 fn extract_kv_tail_after_rename_carries_the_remapped_pin() {
     let (exec, src, ft, _dir) = setup_pinned_kv();
@@ -1984,9 +1767,6 @@ fn extract_kv_tail_after_rename_carries_the_remapped_pin() {
     assert_eq!(result.row_count(), 2, "the pin travels under the new name");
 }
 
-/// The pin-blind door stays pin-blind: the same tail without pins keeps
-/// literal-driven evaluation (a string status has no numeric reading in
-/// the streaming evaluator, so nothing matches).
 #[test]
 fn extract_kv_tail_without_pins_stays_literal_driven() {
     let (exec, src, _ft, _dir) = setup_pinned_kv();
@@ -2001,8 +1781,6 @@ fn extract_kv_tail_without_pins_stays_literal_driven() {
     assert_eq!(result.row_count(), 0, "embedded mode keeps today's answer");
 }
 
-/// A source holding one row at `_time = 2026-01-01 05:30:00` UTC, plus
-/// the TIMESTAMP pin the envelope seed gives `_time` on every install.
 fn setup_pinned_time() -> (Executor, String, FieldTypes, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("timed.parquet");
@@ -2021,16 +1799,12 @@ fn setup_pinned_time() -> (Executor, String, FieldTypes, tempfile::TempDir) {
     (exec, format!("{}", path.display()), ft, dir)
 }
 
-/// The tail's pin-aware TIMESTAMP comparison reads the STORED instant, and
-/// the surviving column is still that TIMESTAMP, typed and rendered as one.
 #[test]
 fn extract_kv_tail_timestamp_compare_reads_the_stored_instant() {
     let (exec, src, ft, _dir) = setup_pinned_time();
     let dsl = "* | extract kv | where _time > \"2026-01-01T05:00:00Z\"";
     let result = exec.run_query(dsl, &src, &ft, 1000).unwrap();
     assert_eq!(result.row_count(), 1, "05:30Z is after 05:00Z");
-    // The tail compared the stored instant; the column it passed
-    // through is still that TIMESTAMP, typed and rendered as one.
     let idx = result
         .columns
         .iter()
@@ -2041,13 +1815,11 @@ fn extract_kv_tail_timestamp_compare_reads_the_stored_instant() {
         result.rows[0][idx],
         Value::String("2026-01-01T05:30:00.000000Z".into())
     );
-    // The threshold that genuinely excludes the row excludes it.
     let after = "* | extract kv | where _time > \"2026-01-01T06:00:00Z\"";
     assert_eq!(
         exec.run_query(after, &src, &ft, 1000).unwrap().row_count(),
         0
     );
-    // And it agrees with the same predicate without the kv split.
     assert_eq!(
         exec.run_query(
             "* | where _time > \"2026-01-01T05:00:00Z\"",
@@ -2061,9 +1833,6 @@ fn extract_kv_tail_timestamp_compare_reads_the_stored_instant() {
     );
 }
 
-/// Running the tail over cast text does not cost the cell its wire
-/// rendering: the surviving TIMESTAMP columns are rendered afterwards, so
-/// the cell is the same one the split-free query prints.
 #[test]
 fn extract_kv_tail_still_renders_timestamps_as_wire_text() {
     let (exec, src, ft, _dir) = setup_pinned_time();
@@ -2086,9 +1855,6 @@ fn extract_kv_tail_still_renders_timestamps_as_wire_text() {
     assert_eq!(cell(&with_kv), cell(&without_kv));
 }
 
-/// The wire rendering follows the tail's own lineage: a timestamp column
-/// renamed INSIDE the tail still renders as wire text under its new name,
-/// the value untransformed and only the label moved.
 #[test]
 fn extract_kv_tail_rename_keeps_the_wire_rendering() {
     let (exec, src, ft, _dir) = setup_pinned_time();
@@ -2109,10 +1875,8 @@ fn extract_kv_tail_rename_keeps_the_wire_rendering() {
     );
 }
 
-/// The tail answers in the column order its stages project, as the SQL
-/// lane does: `table` in the order it lists and a `let` target last, not
-/// the sorted order a row keeps its keys in. (The names are not envelope
-/// fields, which the query's log-column reorder would move.)
+/// The names are not envelope fields, which the query's log-column reorder
+/// would move.
 #[test]
 fn extract_kv_tail_keeps_the_projected_column_order() {
     let (exec, src, ft, _dir) = setup_pinned_time();
@@ -2141,8 +1905,6 @@ fn extract_kv_tail_keeps_the_projected_column_order() {
     }
 }
 
-/// `let t2 = _time` copies the value verbatim, so both columns must show
-/// the same rendering, never one wire text and one cast text side by side.
 #[test]
 fn extract_kv_tail_alias_copy_keeps_the_wire_rendering() {
     let (exec, src, ft, _dir) = setup_pinned_time();
@@ -2173,9 +1935,6 @@ fn extract_kv_tail_alias_copy_keeps_the_wire_rendering() {
     );
 }
 
-/// A COMPUTED value is the tail's own, not the stored rendering: the
-/// lineage kills it and it stays exactly as the tail produced it (UTC
-/// text here) — the honest reading for a transformed value.
 #[test]
 fn extract_kv_tail_computed_value_stays_as_rendered() {
     let (exec, src, ft, _dir) = setup_pinned_time();
@@ -2215,27 +1974,6 @@ fn extract_kv_tail_computed_value_stays_as_rendered() {
     assert_eq!(ty("t3"), Some(ColumnType::String), "text the tail computed");
 }
 
-// ── parameter ordering across an aggregate SELECT list ────────────────
-//
-// `DuckDB` binds `?` positionally, so the parameter list has to run in the
-// order the placeholders appear in the rendered SQL. A built SELECT renders
-// `SELECT … FROM … WHERE …`, but the emitter walks the search stage first,
-// so a parameter the search predicate pushed sits first in the list while
-// its placeholder sits last in the text. Any parameter an aggregating stage
-// pushes into the SELECT list therefore collides with it: the predicate's
-// value is fed to the SELECT's placeholder. Flushing to a CTE is what keeps
-// them apart, because a CTE renders before the outer SELECT.
-//
-// The failure is worst when the two values happen to be type-compatible, a
-// timestamp-shaped window bound against `now()`'s TIMESTAMP anchor, because
-// then nothing errors and the query answers the wrong values in both
-// places.
-//
-// These execute against real `DuckDB` rather than asserting on SQL text:
-// the defect is the binding, and only the engine can show it.
-
-/// The anchor these emit under, so an assertion can name the exact
-/// instant `now()` has to answer.
 fn fixed_anchor() -> trawl_core::context::EvalContext {
     trawl_core::context::EvalContext::at(
         chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06.789012Z")
@@ -2244,11 +1982,8 @@ fn fixed_anchor() -> trawl_core::context::EvalContext {
     )
 }
 
-/// [`fixed_anchor`] on the result wire once bound, rendered in UTC.
 const ANCHOR_TEXT: &str = "2026-02-03T04:05:06.789012Z";
 
-/// Emit under the fixed anchor and execute through the production
-/// emit-and-bind seam.
 fn run_at_anchor(exec: &Executor, dsl: &str, source: &str) -> Result<QueryResult, EngineError> {
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let emitted =
@@ -2256,9 +1991,6 @@ fn run_at_anchor(exec: &Executor, dsl: &str, source: &str) -> Result<QueryResult
     exec.execute_emitted(&emitted, usize::MAX)
 }
 
-/// [`run_at_anchor`], with the emitter told what `source` carries, as the
-/// executor's schema probe tells it (ADR-0062): the columns a `DESCRIBE`
-/// of the parquet file reports. A field the file lacks then reads as NULL.
 fn run_at_anchor_described(
     exec: &Executor,
     dsl: &str,
@@ -2317,8 +2049,6 @@ fn text_cell(result: &QueryResult, row: usize, name: &str) -> String {
     }
 }
 
-/// (a) The loud half: a plain filter's value cannot be cast to a
-/// TIMESTAMP, so a swap takes the whole query down.
 #[test]
 fn an_aggregate_now_binds_after_the_search_predicate() {
     let (exec, glob) = setup();
@@ -2353,7 +2083,6 @@ fn a_time_window_bound_cannot_swap_with_an_aggregate_now() {
     );
 }
 
-/// (c) `timechart` builds its aggregate SELECT the same way `stats` does.
 #[test]
 fn a_timechart_aggregate_now_binds_after_the_search_predicate() {
     let (exec, glob) = setup();
@@ -2369,9 +2098,6 @@ fn a_timechart_aggregate_now_binds_after_the_search_predicate() {
     }
 }
 
-/// (d) A bare text search reads `_raw` as a column over a source that
-/// carries it and as NULL over one that does not (ADR-0062), and the
-/// realignment holds for both statements: asserted over each source.
 #[test]
 fn a_bare_text_search_keeps_aggregate_params_aligned_in_both_raw_variants() {
     let (exec, glob) = setup();
@@ -2403,22 +2129,8 @@ fn an_aggregate_literal_argument_binds_after_the_search_predicate() {
     assert_eq!(text_cell(&result, 0, "m"), "POS");
 }
 
-// ── the same guard after a PIVOT ──────────────────────────────────────
-//
-// `DuckDB` cannot parameterize PIVOT, so `flush_pivot_to_cte` inlines every
-// accumulated placeholder and empties the parameter list. The ordering
-// guard reads "has this level pushed anything yet" as a comparison against
-// how many parameters are already inside a CTE, so the inlining must reset
-// that count: left stale, the guard reads "nothing pushed here" as soon as
-// the post-pivot count climbs back to it and skips the flush it exists to
-// perform.
-
-/// The pivot's own output columns, so a `where` downstream has something
-/// real to bind: `host` plus one column per status value.
 const PIVOT_PREFIX: &str = "service=nginx | pivot count() on status by host";
 
-/// (a) The loud half after a pivot: the predicate's text reaches the
-/// anchor's TIMESTAMP cast.
 #[test]
 fn an_aggregate_now_after_a_pivot_binds_after_the_predicate() {
     let (exec, glob) = setup();
@@ -2454,8 +2166,8 @@ fn an_aggregate_literal_after_a_pivot_binds_after_the_predicate() {
     );
 }
 
-/// (c) `timechart` after a pivot takes the same guard. The pivot groups
-/// BY `_time` so the bucket column survives into the downstream stage.
+/// The pivot groups BY `_time` so the bucket column survives into the
+/// downstream stage.
 #[test]
 fn a_timechart_aggregate_after_a_pivot_binds_after_the_predicate() {
     let (exec, glob) = setup();
@@ -2477,21 +2189,6 @@ fn a_timechart_aggregate_after_a_pivot_binds_after_the_predicate() {
     }
 }
 
-// ── an aggregating stage's placement ──────────────────────────────────
-//
-// SQL applies a LIMIT and an ORDER BY after the aggregation on the same
-// SELECT, so a pending one has to be flushed to a CTE first or
-// `head 2 | stats count()` counts the whole input and then limits a
-// one-row result.
-//
-// Placement must also not key off parameter accounting, or the answer
-// depends on a sibling: `stats count() as c` would give the un-limited
-// count while `stats count() as c, max(now()) as n` gives the limited one,
-// because only the second pushes a parameter. An aggregating stage
-// therefore flushes whenever a LIMIT or ORDER BY is pending, and both
-// spellings agree.
-
-/// `head` before `stats` limits the INPUT to the aggregation.
 #[test]
 fn a_limit_before_stats_applies_before_the_aggregation() {
     let (exec, glob) = setup();
@@ -2504,8 +2201,6 @@ fn a_limit_before_stats_applies_before_the_aggregation() {
     );
 }
 
-/// …and the answer does not depend on whether a SIBLING aggregate
-/// happens to bind a parameter.
 #[test]
 fn a_limit_before_stats_answers_the_same_beside_a_bound_sibling() {
     let (exec, glob) = setup();
@@ -2519,9 +2214,6 @@ fn a_limit_before_stats_answers_the_same_beside_a_bound_sibling() {
     assert_eq!(text_cell(&result, 0, "n"), ANCHOR_TEXT);
 }
 
-/// A pending ORDER BY is the same trap: it has to order the AGGREGATION'S
-/// INPUT, so `sort -duration | head 2 | stats sum(duration)` sums the two
-/// LARGEST durations rather than every row.
 #[test]
 fn a_pending_sort_orders_the_aggregations_input() {
     let (exec, glob) = setup();
@@ -2546,7 +2238,6 @@ fn a_pending_sort_orders_the_aggregations_input() {
     );
 }
 
-/// `timechart` places the same way.
 #[test]
 fn a_limit_before_timechart_applies_before_the_aggregation() {
     let (exec, glob) = setup();
@@ -2563,23 +2254,12 @@ fn a_limit_before_timechart_applies_before_the_aggregation() {
     );
 }
 
-// ── `top`/`rare` place the same way ───────────────────────────────────
-//
-// `top`/`rare` desugar to `stats count() by field | sort count | limit N`
-// through `process_frequency`, so they take the same placement rule. A
-// pending LIMIT absorbed into the aggregation's own SELECT would make
-// `head 2 | top 3 host` count all six matching rows and then keep two
-// groups, which is a different question from the one the pipeline asks.
-
-/// Every `count` a frequency stage produced, summed: the rows the
-/// aggregation actually saw. Deliberately order-independent, because
-/// `head` with no sort takes whichever rows the scan yields, so the
-/// assertion is the number of survivors and not their identity.
+/// Deliberately order-independent, because `head` with no sort takes
+/// whichever rows the scan yields.
 fn counted_rows(result: &QueryResult) -> i64 {
     integer_column(result, "count").iter().sum()
 }
 
-/// (a) `head` before `top` limits the INPUT to the frequency count.
 #[test]
 fn a_limit_before_top_applies_before_the_aggregation() {
     let (exec, glob) = setup();
@@ -2592,7 +2272,6 @@ fn a_limit_before_top_applies_before_the_aggregation() {
     );
 }
 
-/// (b) `rare` shares the desugaring, so it shares the placement.
 #[test]
 fn a_limit_before_rare_applies_before_the_aggregation() {
     let (exec, glob) = setup();
@@ -2605,9 +2284,6 @@ fn a_limit_before_rare_applies_before_the_aggregation() {
     );
 }
 
-/// (c) A pending `sort` orders the frequency stage's INPUT rather than
-/// being appended to its grouped output. Sorting `host` descending puts
-/// both `web02` rows first, so `head 2` leaves exactly them.
 #[test]
 fn a_pending_sort_orders_the_frequency_stages_input() {
     let (exec, glob) = setup();
@@ -2626,20 +2302,6 @@ fn a_pending_sort_orders_the_frequency_stages_input() {
     assert_eq!(integer_column(&result, "count"), vec![2]);
 }
 
-// ── a pivot follows a pivot ───────────────────────────────────────────
-//
-// A pending pivot is flushed to a CTE before any following stage,
-// including another pivot. `process_pivot` opens with an ordinary
-// `flush_to_cte`, whose `build_select` does not render a pending `PIVOT`,
-// and then overwrites the spec, so without the pivot-aware flush the first
-// pivot is silently dropped and the second runs over pre-pivot input.
-
-/// The second pivot reads the FIRST one's dynamic output columns.
-///
-/// Over the six nginx fixture rows the first pivot counts statuses per
-/// host — `web01` has two 200s, `web02` none — so its `200` column holds
-/// `{2, 0}`, and pivoting on THAT column is only expressible if the first
-/// pivot actually ran.
 #[test]
 fn a_second_pivot_reads_the_first_pivots_output() {
     let (exec, glob) = setup();
@@ -2671,14 +2333,8 @@ fn a_second_pivot_reads_the_first_pivots_output() {
     }
 }
 
-/// A column the first pivot consumed into dynamic columns is gone from
-/// the second pivot's input, so it reads as NULL there (ADR-0062), never
-/// as its old values. A dropped first pivot would let `status` keep its
-/// values here, returning `sum(status)` per status per host. With the
-/// first pivot run, the second pivots on nothing but NULL, which `DuckDB`
-/// leaves out of a pivot's value list: the answer is the `by` column
-/// alone, exactly as over `user_name`, a column the first pivot keeps and
-/// that is NULL on every nginx row.
+/// With the first pivot run, the second pivots on nothing but NULL, which
+/// `DuckDB` leaves out of a pivot's value list.
 #[test]
 fn a_second_pivot_reads_a_consumed_column_as_null() {
     let (exec, glob) = setup();
@@ -2723,12 +2379,6 @@ fn a_second_pivot_reads_a_consumed_column_as_null() {
     );
 }
 
-/// A pivot's value columns come from the data, so a later read of a value
-/// no event produced (`web03`) answers as a present all-null column would
-/// (ADR-0062): `web03 > 0` matches nothing, `isnull(web03)` matches every
-/// pivoted row, and a value the data did produce keeps its counts. The
-/// fill rides the pivot's CTE: the request's one `DESCRIBE` is of the
-/// cold reader, never of the pivot.
 #[test]
 fn pivot_value_column_absent_reads_null() {
     use trawl_engine::executor::schema_probe;
@@ -2786,8 +2436,6 @@ fn pivot_value_column_absent_reads_null() {
     );
 }
 
-/// A terminal pivot is never flushed by the loop: no stage follows it, so
-/// `finalize` renders it, inlining every parameter.
 #[test]
 fn a_terminal_pivot_is_unchanged() {
     let (exec, glob) = setup();
@@ -2805,11 +2453,6 @@ fn a_terminal_pivot_is_unchanged() {
     assert_eq!(columns, vec!["host", "200", "301", "404", "500", "502"]);
 }
 
-// -- regex patterns (ADR-0063) ------------------------------------------------
-
-/// The literal-only rule removes computed pattern operands, not the
-/// literal path: a `/regex/` operand still emits `regexp_matches` and
-/// returns the rows it matches.
 #[test]
 fn literal_matches_still_runs() {
     let (exec, glob) = setup();
@@ -2836,8 +2479,6 @@ fn literal_matches_still_runs() {
     assert_eq!(matched.row_count(), contained.row_count());
 }
 
-/// Run `dsl` through the live lane over one event, and return the row it
-/// emits.
 fn live_row(dsl: &str, event: &serde_json::Value) -> trawl_core::row::Row {
     let query = trawl_core::parser::parse(dsl).expect("the live query parses");
     let filter = trawl_core::filter::CompiledFilter::compile(&query.search, &FieldTypes::new())
@@ -2864,16 +2505,6 @@ fn live_row(dsl: &str, event: &serde_json::Value) -> trawl_core::row::Row {
     row
 }
 
-/// An `extract` regex with an unnamed group ahead of its named ones binds
-/// each name to the same text in every lane: batch SQL, the live lane, and
-/// the Rust tail behind `extract kv`.
-///
-/// Each lane reads an `extract` body's named groups as the live lane
-/// does, by name, however many unnamed groups sit before or around them.
-/// The batch lane's struct-form `regexp_extract` reads the k-th capture
-/// group as its k-th field, so it binds the body with its unnamed groups
-/// made non-capturing and reads each named group by its place among the
-/// named ones (ADR-0063).
 #[test]
 fn extract_mixed_groups_agree_across_lanes() {
     // A body, the message it reads, and each named group's text, `None`
@@ -2945,20 +2576,16 @@ fn extract_mixed_groups_agree_across_lanes() {
                 .collect()
         };
 
-        // Batch: the whole pipeline is SQL.
         assert_eq!(
             captured(&format!("* | {extract}")),
             expected,
             "batch {body}"
         );
-        // The `extract kv` tail: the kv stage splits the pipeline, so the
-        // regex runs in Rust after the SQL prefix.
         assert_eq!(
             captured(&format!("* | extract kv | {extract}")),
             expected,
             "extract kv tail {body}"
         );
-        // Live: one event through the stream plan.
         let row = live_row(
             &format!("* | {extract}"),
             &serde_json::json!({ "message": message }),
@@ -2978,9 +2605,6 @@ fn extract_mixed_groups_agree_across_lanes() {
     }
 }
 
-/// A body of ten named groups reads all ten in the batch lane: the
-/// struct form of `regexp_extract` has no 0-to-9 index limit, which the
-/// scalar form an extract once bound per group had.
 #[test]
 fn extract_of_ten_named_groups_reads_in_batch() {
     let dir = tempfile::tempdir().unwrap();
@@ -3013,11 +2637,6 @@ fn extract_of_ten_named_groups_reads_in_batch() {
     }
 }
 
-/// How many `regexp_matches` calls `DuckDB` binds for `sql`, read off its
-/// unoptimized logical plan: every bound call compiles its own RE2 when
-/// its pattern is a constant, so this is what the emitter's regex counter
-/// must not undercount.
-///
 /// `json_serialize_plan` cannot serialize `to_json`'s bind data (an
 /// internal error), so the alias's text read is swapped for a cast first.
 /// The swap writes `"a"` exactly as often as the read did, and any other
@@ -3061,9 +2680,6 @@ fn bound_regex_calls(sql: &str) -> u64 {
     count(&plan)
 }
 
-/// What the emitter charges for `dsl`'s one `let` stage: the patterns it
-/// writes as parameters, plus the further copies the stage's same-stage
-/// aliases and repeating renderings make `DuckDB` bind.
 fn charged_regex_copies(dsl: &str, glob: &str) -> (String, u64) {
     let query = trawl_core::parser::parse(dsl).expect("the probe parses");
     let emitted =
@@ -3082,17 +2698,6 @@ fn charged_regex_copies(dsl: &str, glob: &str) -> (String, u64) {
     (emitted.sql, 1 + further)
 }
 
-/// `DuckDB` binds a same-stage alias by copying the expression it names
-/// (ADR-0024), so one written regex parameter binds once per reference:
-/// the emitter writes `regexp_matches("message", ?)` once and `DuckDB`
-/// binds it three times for `b = a, c = a`. A rendering that repeats its
-/// subject repeats the alias with it: `sev(a) in (1, 3)` writes `sev(a)`
-/// once per severity run.
-///
-/// The counter charges exactly that. Where a comparison's rendering
-/// depends on a pin the alias does not have, the charge prices the
-/// rendering that copies most, so it may count more than `DuckDB` binds,
-/// never fewer.
 #[test]
 fn the_regex_counter_charges_every_copy_duckdb_binds() {
     let (_exec, glob) = setup();
@@ -3113,9 +2718,6 @@ fn the_regex_counter_charges_every_copy_duckdb_binds() {
     }
 }
 
-/// The counter's limit is the copies `DuckDB` binds: an alias named 255
-/// times binds 256 `regexp_matches` calls and is admitted, and one more
-/// reference is refused before anything runs.
 #[test]
 fn the_regex_counter_refuses_the_copy_past_its_limit() {
     let (_exec, glob) = setup();
@@ -3153,8 +2755,6 @@ fn the_regex_counter_refuses_the_copy_past_its_limit() {
     );
 }
 
-// ── a pivot's regex copies (ADR-0063) ─────────────────────────────────
-
 /// The `pivot_filter_threshold` every engine connection runs with is the
 /// one the emitter's regex counter charges a pivot aggregate at: the
 /// bundled `DuckDB`'s default, which trawl never sets. A `DuckDB` upgrade
@@ -3188,15 +2788,10 @@ fn the_pivot_charge_reads_the_engines_filter_threshold() {
     }
 }
 
-/// `sql` with its one `ON "<on>"` given an explicit `IN` list of `values`
-/// pivot values, so `json_serialize_plan` can plan it.
-///
 /// The emitted pivot has no `IN` list: `DuckDB` reads the distinct values
 /// from the data into an enum in a statement of its own, which the plan
 /// serializer cannot take. The binder turns the enum's members into the
-/// same pivot entries an `IN` list gives (`bind_pivot.cpp`), and only
-/// their number decides how often the aggregate is copied, so `values`
-/// synthetic members stand for `values` distinct values in the data.
+/// same pivot entries an `IN` list gives (`bind_pivot.cpp`).
 fn pivot_over_values(sql: &str, on: &str, values: u64) -> String {
     let clause = format!(r#"ON "{on}""#);
     assert_eq!(
@@ -3211,9 +2806,6 @@ fn pivot_over_values(sql: &str, on: &str, values: u64) -> String {
     sql.replace(&clause, &format!("{clause} IN ({members})"))
 }
 
-/// What the emitter charges `query` for its regexes, every stage
-/// together: the patterns it writes, which the pivot inlines into its
-/// SQL text, and every stage's further copies.
 fn charged_pivot_copies(query: &trawl_core::ast::Query, sql: &str) -> u64 {
     let written = u64::try_from(sql.matches("regexp_matches(").count()).unwrap();
     let further: u64 = query
@@ -3231,16 +2823,6 @@ fn emit_capture(
     trawl_core::emitter::emit(query, glob, trawl_core::context::EvalContext::capture())
 }
 
-/// `DuckDB` binds a pivot's aggregate once per pivot value while there are
-/// at most `pivot_filter_threshold` values, one filtered aggregate each,
-/// and twice above that, where it aggregates once and lists the results.
-/// The values come from the data, so the counter charges the worst case:
-/// the threshold, which is exactly what `DuckDB` binds at the threshold
-/// and at least what it binds anywhere else.
-///
-/// The real query, run over exactly that many distinct values, makes one
-/// column per value, so the enum the binder reads holds them all.
-/// A pattern tested in a `let` before the pivot binds once.
 #[test]
 fn the_regex_counter_charges_a_pivot_for_every_copy_duckdb_binds() {
     let threshold = trawl_core::complexity::PIVOT_FILTER_THRESHOLD;
@@ -3263,8 +2845,6 @@ fn the_regex_counter_charges_a_pivot_for_every_copy_duckdb_binds() {
         assert!(charged >= bound, "{values} values");
     }
 
-    // The emitted query, no `IN` list, over data with exactly that many
-    // distinct `service` values.
     let data = tempfile::tempdir().expect("data dir");
     let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
     conn.execute_batch(&format!(
@@ -3283,7 +2863,6 @@ fn the_regex_counter_charges_a_pivot_for_every_copy_duckdb_binds() {
         result.columns
     );
 
-    // The same test in a `let` before the pivot is one bound copy.
     let before = r#"* | let m = if(host matches "x", 1, null) | pivot count(m) on service by host"#;
     let query = trawl_core::parser::parse(before).expect("the let parses");
     let emitted = emit_capture(&query, &glob).expect("the let emits");
@@ -3294,11 +2873,6 @@ fn the_regex_counter_charges_a_pivot_for_every_copy_duckdb_binds() {
         .expect("the let before the pivot runs");
 }
 
-/// The counter's limit holds across a pivot: twelve patterns in the
-/// aggregate charge 240 copies, and sixteen search regexes make 256,
-/// which `DuckDB` binds at the threshold and the counter admits. One more
-/// search regex, or a thirteenth pattern in the aggregate, is refused
-/// before anything runs.
 #[test]
 fn the_regex_counter_refuses_a_pivot_past_its_limit() {
     let threshold = trawl_core::complexity::PIVOT_FILTER_THRESHOLD;
@@ -3348,20 +2922,6 @@ fn the_regex_counter_refuses_a_pivot_past_its_limit() {
     }
 }
 
-/// #333 (ADR-0062) gives a dynamic pivot a zero-row fill when a later
-/// stage reads a name the pivot's keys do not cover: `SELECT <the
-/// aggregate> AS "_v" FROM <the pivot's input> WHERE FALSE HAVING FALSE`.
-/// The fill repeats the aggregate, so `DuckDB` binds every pattern in it
-/// once more than the pivot's threshold. The counter charges that copy
-/// when the fill renders, and only then.
-///
-/// Twelve aggregate patterns leave room for sixteen search regexes
-/// without a fill and for four with one. A `stats` stage whose first
-/// emission attempt padded the pivot and was discarded keeps the fill
-/// and its charge. Each statement at its cap binds exactly the cap, and
-/// one more search regex is refused before anything runs. The sixteen
-/// search regexes with the fill are refused at 268, the count the
-/// statement would bind.
 #[test]
 fn the_regex_counter_charges_a_pivot_fill() {
     use trawl_core::emitter::EmitError;
@@ -3378,7 +2938,6 @@ fn the_regex_counter_charges_a_pivot_fill() {
         "the boundary this test states"
     );
 
-    // `searches` three-byte search regexes, then `stages`.
     let query = |searches: u64, stages: &str| {
         let search = (0..searches)
             .map(|i| format!("message=/{i:03}/"))
@@ -3436,8 +2995,6 @@ fn the_regex_counter_charges_a_pivot_fill() {
     );
 }
 
-/// Twenty events whose `message` is `{"k":<id>}`, except id 5, which is the
-/// plain-text line a JSON logger prints now and then (#457's fixture).
 fn one_plain_text_line_parquet(dir: &std::path::Path) -> String {
     let path = dir.join("json_documents.parquet");
     let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
@@ -3454,20 +3011,14 @@ fn one_plain_text_line_parquet(dir: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-/// A json call and the value it gives the event `{"k":<id>}`.
 type JsonCase = (&'static str, fn(i64) -> Value);
 
-/// One event whose `message` is not JSON no longer fails the query: each
-/// json function reads it as null and keeps every row (ADR-0017, amendment
-/// of 2026-11-13). Before the document guard, `DuckDB` raised `Malformed
-/// JSON` for the whole statement.
 #[test]
 fn one_document_that_is_not_json_keeps_every_row() {
     let dir = tempfile::tempdir().unwrap();
     let source = one_plain_text_line_parquet(dir.path());
     let exec = Executor::new().expect("executor should initialize");
 
-    // The value each function gives the event `{"k":<id>}`.
     let cases: [JsonCase; 5] = [
         (r#"json_extract_string(message, "$.k")"#, |id| {
             Value::String(id.to_string())
@@ -3518,17 +3069,12 @@ fn one_document_that_is_not_json_keeps_every_row() {
     }
 }
 
-/// `sample` over the two composite sources: the hot+cold union and the
-/// hot-only read a cold start falls back to. A sample larger than its
-/// input returns every hot and cold row once, and a sample of one row
-/// stays one row through a second, larger sample.
 #[test]
 fn sample_source_shapes() {
     use duckdb::Connection;
     let dir = tempfile::tempdir().unwrap();
     let cold = dir.path().join("cold");
     std::fs::create_dir_all(&cold).unwrap();
-    // Cold ids 0-5, hot ids 6-11; `service` is `a` for an even id.
     Connection::open_in_memory()
         .unwrap()
         .execute_batch(&format!(

@@ -5,43 +5,17 @@
 //! Every committed pin-aware seed emits SQL that real `DuckDB` binds and
 //! plans.
 //!
-//! That is the whole claim of this file, and it is narrow on purpose. The
-//! `parse_emit` fuzz target proves emission does not PANIC over arbitrary
-//! text and arbitrary pin maps; it never asks whether the string it
-//! produced is SQL. A target that emits `SELECT WHERE FROM` all day would
-//! stay green. This fixture closes that hole for the seeds someone chose
-//! deliberately: for each one it builds a parquet file carrying the columns
-//! the query binds, emits under the seed's own pins, and hands the result
-//! to `Connection::prepare`, which runs `DuckDB`'s parser and binder
-//! without executing anything.
+//! The `parse_emit` fuzz target proves emission does not PANIC; it never
+//! asks whether the string it produced is SQL. `Connection::prepare` runs
+//! `DuckDB`'s parser and binder without executing anything.
 //!
-//! This is NOT [`duckdb_probe`](../duckdb_probe.rs)'s job and does not
-//! belong in that file. The probe establishes GROUND TRUTH, meaning what a
-//! cast domain actually contains and what a live mirror must reproduce, by
-//! executing statements and reading values back. Here nothing is executed
-//! and no value is read: the oracle is "does the binder accept it", so the
-//! two files fail for disjoint reasons and share no fixtures.
-//!
-//! # The pin map is decoded, never hardcoded
-//!
-//! A seed is `QUERY \0 SELECTOR` and its pins come out of
-//! [`trawl_core::fuzz_input::derive_field_types`], the same decoder the
-//! fuzz target runs. Writing the pin maps out in Rust here would be a
-//! second source of truth for what a seed MEANS, and the first time a
-//! selector byte changed, this file would keep asserting against the old
-//! reading while reporting green.
-//!
-//! # What a seed may reference
+//! A seed's pins come out of [`trawl_core::fuzz_input::derive_field_types`],
+//! the same decoder the fuzz target runs. Writing the pin maps out in Rust
+//! here would be a second source of truth for what a seed MEANS.
 //!
 //! The fixture parquet gets one column per PINNED field plus the declared
 //! envelope, and nothing else (see [`fixture_columns`]). So a seed may
 //! reference an unpinned name only when the PIPELINE produces that name.
-//! `| rename status as code` mints `code`, and materialising a `code`
-//! column would collide with the rename's own output. A future seed that
-//! reads an unpinned name out of the source instead makes this test red
-//! with `Referenced column ... not found`, which is the correct outcome:
-//! the seeds directory is a shared on-disk contract and the constraint
-//! belongs somewhere that enforces it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -51,10 +25,6 @@ use trawl_core::emitter;
 use trawl_core::fuzz_input;
 use trawl_core::schema::{self, CanonicalType, FieldTypes};
 
-/// The committed pin-aware seed corpus, reached across the crate boundary.
-///
-/// Canonicalised so a failure names an absolute location rather than a
-/// relative path whose meaning depends on the reader's cwd.
 fn seeds_dir() -> PathBuf {
     let expected =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../trawl-core/fuzz/seeds/parse_emit");
@@ -67,11 +37,6 @@ fn seeds_dir() -> PathBuf {
     })
 }
 
-/// Every `.case` file, sorted by path.
-///
-/// Sorted because `read_dir` yields whatever order the filesystem feels
-/// like, and an assertion that names "the third seed" has to mean the same
-/// file on every host or a CI failure cannot be reproduced locally.
 fn seed_files() -> Vec<PathBuf> {
     let dir = seeds_dir();
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -87,11 +52,7 @@ fn seed_files() -> Vec<PathBuf> {
     files
 }
 
-/// A connection configured the way every conforming connection is
-/// ([`trawl_core::conform::SESSION_TIME_ZONE_SQL`]).
-///
-/// The session zone matters even here, where nothing executes: a
-/// `TIMESTAMPTZ` conform expression binds against the session's zone, so a
+/// A `TIMESTAMPTZ` conform expression binds against the session's zone, so a
 /// host running in `Europe/Warsaw` must not plan a different statement
 /// than one running in UTC.
 fn conn() -> duckdb::Connection {
@@ -101,27 +62,17 @@ fn conn() -> duckdb::Connection {
     conn
 }
 
-/// Quote a column name as a `DuckDB` identifier.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// A path as the body of a single-quoted SQL string literal, with `'`
-/// doubled the way SQL escapes it.
-///
-/// `tempfile` names are alphanumeric, so this only bites under a `TMPDIR`
-/// carrying an apostrophe — at which point the literal would close early
-/// and the fixture would fail for a reason that has nothing to do with the
-/// emitter.
 fn sql_path(path: &Path) -> String {
     path.display().to_string().replace('\'', "''")
 }
 
-/// A plausible one-row value for a column, as a SQL literal.
-///
-/// Plausible rather than arbitrary: the planner is allowed to look at the
-/// data, and a corpus of NULLs invites a constant-folding shortcut that
-/// would let a genuinely unplannable expression through.
+/// Plausible rather than arbitrary: a corpus of NULLs invites a
+/// constant-folding shortcut that would let a genuinely unplannable
+/// expression through.
 fn sample_literal(name: &str, ty: CanonicalType) -> String {
     match ty {
         CanonicalType::Boolean => "TRUE".to_owned(),
@@ -135,8 +86,6 @@ fn sample_literal(name: &str, ty: CanonicalType) -> String {
     }
 }
 
-/// The text a VARCHAR column carries: the envelope slots get something
-/// shaped like what ingest writes there, everything else a placeholder.
 fn varchar_sample(name: &str) -> &'static str {
     match name {
         schema::RAW => "{\"service\":\"nginx\",\"status\":\"200\"}",
@@ -150,29 +99,6 @@ fn varchar_sample(name: &str) -> &'static str {
     }
 }
 
-/// The columns a seed's fixture parquet must carry, in file order.
-///
-/// Three rules, and the reasoning behind each:
-///
-/// 1. Every DECLARED ENVELOPE field, at its envelope type. A bare text
-///    search binds `message` and `_raw`; the default ordering binds
-///    `_time`. Those columns exist on every file trawl writes, so leaving
-///    them out would fail prepares for a reason that has nothing to do
-///    with the emitter.
-/// 2. Every field in the DERIVED PIN MAP, at
-///    [`CanonicalType::as_duckdb`] for its pin. A pinned field is by
-///    definition a catalog field, which is to say a real source column.
-///    `as_duckdb` is deliberately not injective, since SEVERITY is a
-///    BIGINT on disk, so a SEVERITY pin lands a BIGINT column here,
-///    exactly as compaction would write it.
-/// 3. A pin WINS over the envelope type for the same name, and the column
-///    appears ONCE. The severity seed pins `_severity` (to SEVERITY, which
-///    is what the envelope declares anyway), and emitting the name twice
-///    would put two columns of one name in the parquet.
-///
-/// Referenced-but-unpinned names get NO column. See the module docs: they
-/// are pipeline-invented, and inventing a source column of that name would
-/// collide with the stage that produces it.
 fn fixture_columns(pins: &FieldTypes) -> Vec<(String, CanonicalType)> {
     let mut columns: Vec<(String, CanonicalType)> = Vec::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -189,14 +115,9 @@ fn fixture_columns(pins: &FieldTypes) -> Vec<(String, CanonicalType)> {
     columns
 }
 
-/// Write a one-row parquet with exactly `columns`, then prove by
-/// `DESCRIBE` that it came back with the names and physical types asked
-/// for.
-///
-/// The read-back is not ceremony. If the fixture were silently wrong, say
-/// a column missing or a `CAST` collapsing two types into one, every
-/// prepare downstream would fail with a message about the emitted SQL, and
-/// the file would look like it had found an emitter bug.
+/// If the fixture were silently wrong, say a column missing or a `CAST`
+/// collapsing two types into one, every prepare downstream would fail with a
+/// message about the emitted SQL.
 fn write_fixture(conn: &duckdb::Connection, path: &Path, columns: &[(String, CanonicalType)]) {
     let projection = columns
         .iter()
@@ -229,7 +150,6 @@ fn write_fixture(conn: &duckdb::Connection, path: &Path, columns: &[(String, Can
     );
 }
 
-/// `DESCRIBE` a parquet file: `(column_name, column_type)` in file order.
 fn describe(conn: &duckdb::Connection, path: &Path) -> Vec<(String, String)> {
     let sql = format!("DESCRIBE SELECT * FROM read_parquet('{}')", sql_path(path));
     let mut statement = conn
@@ -244,9 +164,6 @@ fn describe(conn: &duckdb::Connection, path: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Replay one seed end to end, returning the pins `derive_field_types`
-/// read out of its selector half for the corpus-wide assertions that run
-/// after the loop.
 fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> FieldTypes {
     let label = seed.display().to_string();
     let text = std::fs::read_to_string(seed)
@@ -292,12 +209,9 @@ fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> FieldTy
     pins
 }
 
-/// Prepare one emitted statement and check its placeholder count.
-///
-/// The `?` placeholders are handed to `DuckDB` exactly as emitted.
-/// Nothing here rewrites or inlines them, because the placeholder count IS
-/// half the claim. An emitter that dropped a parameter would still produce
-/// preparable SQL; it would just bind the wrong values at runtime.
+/// The `?` placeholders are handed to `DuckDB` exactly as emitted. An emitter
+/// that dropped a parameter would still produce preparable SQL; it would
+/// just bind the wrong values at runtime.
 fn prepare_ok(conn: &duckdb::Connection, sql: &str, params: usize, label: &str, lane: &str) {
     let statement = conn.prepare(sql).unwrap_or_else(|err| {
         panic!("seed {label} emitted {lane} DuckDB cannot prepare: {err}\n  {sql}")
@@ -311,8 +225,6 @@ fn prepare_ok(conn: &duckdb::Connection, sql: &str, params: usize, label: &str, 
     );
 }
 
-/// The main event: every committed seed's emitted SQL prepares, and the
-/// seeds between them pin every entry of `CanonicalType::ALL`.
 #[test]
 fn every_committed_seed_emits_sql_duckdb_can_prepare() {
     let scratch = tempfile::tempdir().expect("a scratch dir");
@@ -320,9 +232,8 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
     let seeds = seed_files();
 
     // A renamed or emptied directory must be red, never a quiet pass over
-    // zero files. Eight is what is committed today: six pin seeds, a bare
-    // text search and a NaN parameter. A FLOOR, not an equality: a ninth
-    // seed is a legitimate addition and must not redden this.
+    // zero files. A FLOOR, not an equality: a ninth seed is a legitimate
+    // addition and must not redden this.
     assert!(
         seeds.len() >= 8,
         "expected at least the eight committed .case seeds under {}, found {}",
@@ -336,18 +247,8 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
         covered.extend(pins.iter().map(|(_, ty)| ty));
     }
 
-    // Every entry of `CanonicalType::ALL` is pinned by some committed seed.
     // The vocabulary is iterated, never re-listed here, so adding an entry
     // to `ALL` widens what this demands without anyone editing this file.
-    //
-    // What it cannot demand is a seed for a variant left OUT of `ALL`:
-    // `covered` comes from `derive_field_types`, which draws its pins from
-    // `ALL` too, so both sides of this comparison read the same list. That
-    // also makes `covered` a subset of `all` by construction, which is why
-    // the emptiness of `missing` is the only assertion here — an equality
-    // check would be a line that cannot fail. `ALL`'s own completeness has
-    // no test anywhere; the compile error at `CanonicalType::index` is the
-    // signpost that stands in for one.
     let all: BTreeSet<CanonicalType> = CanonicalType::ALL.into_iter().collect();
     let missing: Vec<CanonicalType> = all.difference(&covered).copied().collect();
     assert!(
@@ -358,14 +259,6 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
     );
 }
 
-/// CONTROL. If `DuckDB` ever prepares this statement, every other
-/// assertion in this file is worthless.
-///
-/// It proves `DuckDB`'s binder resolves column names at PREPARE time. The
-/// whole design leans on that: nothing here executes a statement, so if
-/// binding were deferred to execution, a seed emitting `SELECT
-/// nonsense_column` would prepare happily and this file would be asserting
-/// that the emitter produces well-formed *text*.
 #[test]
 fn control_prepare_rejects_a_missing_column() {
     let scratch = tempfile::tempdir().expect("a scratch dir");
@@ -390,13 +283,6 @@ fn control_prepare_rejects_a_missing_column() {
     );
 }
 
-/// CONTROL. A missing source that prepares cleanly would mean this file
-/// cannot tell "your SQL is fine" from "the file you pointed at is not
-/// there".
-///
-/// Every seed's prepare names a fixture path. If a missing source prepared
-/// cleanly, a broken fixture builder would look exactly like a passing
-/// suite.
 #[test]
 fn control_prepare_rejects_a_missing_source_file() {
     let scratch = tempfile::tempdir().expect("a scratch dir");
@@ -415,15 +301,6 @@ fn control_prepare_rejects_a_missing_source_file() {
     );
 }
 
-/// CONTROL. Name resolution alone is a weak oracle: the emitter's whole
-/// pin-aware job is choosing an expression that TYPE-CHECKS against the
-/// column it reads.
-///
-/// The pair is the point. `abs` over the BIGINT `_severity` prepares;
-/// `abs` over the TIMESTAMP `_time` must not, and both name real columns
-/// of the same file. If the invalid half prepared, the binder would be
-/// resolving names but deferring types, and every claim this file makes
-/// about conform expressions would shrink to "the column exists".
 #[test]
 fn control_prepare_rejects_a_type_invalid_expression() {
     let scratch = tempfile::tempdir().expect("a scratch dir");

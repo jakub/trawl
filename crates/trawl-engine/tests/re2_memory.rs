@@ -7,10 +7,9 @@
 //! ADR-0063's limits admit in one query, and whether the query database's
 //! `memory_limit` (trawld's `query_memory_limit`) sees that memory.
 //!
-//! ADR-0063 ships RE2's memory as a measured envelope (human ruling,
-//! 2026-11-02): this harness measures it and prints the transcript that
-//! `scripts/evidence/issue-335/re2.sh` commits. Nothing here enforces a
-//! bound. The measuring parts are `#[ignore]`d, because a resident-memory
+//! ADR-0063 ships RE2's memory as a measured envelope: this harness measures
+//! it and prints the transcript that `scripts/evidence/issue-335/re2.sh`
+//! commits. The measuring parts are `#[ignore]`d, because a resident-memory
 //! figure on a shared machine is evidence for a reader, not a CI gate. The
 //! tests that are not ignored check the harness itself.
 //!
@@ -56,11 +55,7 @@
 //! The `probe` part measures a few families at the edge of admission, each
 //! as 256 distinct patterns in one query (the query's pattern cap), with
 //! the largest count `trawl_core::parser::parse` admits for the whole
-//! query. So each passes every limit a query passes: the 64-position repeat
-//! budget, the 1024-byte body cap, the 2^24-unit translation budget, the
-//! 1 MiB Rust program, the 512 KiB batch view, the 256-pattern cap, and
-//! the 65 536-byte query cap, which leaves 256 copies of a pattern under
-//! 256 bytes each on average. Every family runs beside its control, and
+//! query. Every family runs beside its control, and
 //! the probe keeps the `matches` family whose RE2 share is largest, at one
 //! thread, for the later parts. It records the largest `extract` share as
 //! well, but does not sweep it: 128 `extract` stages grow `DuckDB`'s own
@@ -87,11 +82,10 @@
 //!
 //! # The allowance per site
 //!
-//! Since 2026-11-04 every batch query reserves an RE2 allowance per
-//! regex site per thread from the regex reservation (human ruling). The
-//! sweep's bodies are about 256 bytes, because the query cap leaves no
-//! room for more at 256 copies, so two more parts measure single bodies
-//! at the full 1024-byte body limit:
+//! Every batch query reserves an RE2 allowance per regex site per thread
+//! from the regex reservation. The sweep's bodies are about 256 bytes,
+//! because the query cap leaves no room for more at 256 copies, so two
+//! more parts measure single bodies at the full 1024-byte body limit:
 //!
 //! - `site_size`: each of [`site_families`], padded to the body limit, as
 //!   1, 4 and 16 copies on 1 and 4 threads, each beside a control of the
@@ -107,12 +101,10 @@
 //! `trawl_core::conform::FIXED_REGEXES`, the severity reading's
 //! whitespace trim and its two guards, which `sev()` and the hot branch's
 //! severity conform write. The batch allowance counts each of their sites
-//! too, at one figure for every fixed pattern (human ruling, 2026-11-04).
-//! The `fixed_sites` part measures that figure: each pattern as 512 and
-//! 2048 sites in one query, on 1 and 4 threads, over rows built to grow
-//! its DFA, beside a control of the same columns through a function that
-//! compiles no RE2. It sets the figure at the worst point's median per
-//! site per thread, plus the margin, and stops at 1 MiB.
+//! too, at one figure for every fixed pattern. The `fixed_sites` part
+//! measures that figure: each pattern as 512 and 2048 sites in one query,
+//! on 1 and 4 threads, over rows built to grow its DFA, beside a control of
+//! the same columns through a function that compiles no RE2.
 //!
 //! # Union branches
 //!
@@ -160,7 +152,6 @@ const DEFAULT_QUERY_MEMORY_LIMIT: u64 = 2 << 30;
 /// `trawl_config::DEFAULT_QUERY_THREADS`, repeated for the same reason.
 const DEFAULT_QUERY_THREADS: u32 = 4;
 
-/// The `max_concurrent_queries` default on this host.
 fn max_concurrent_queries() -> usize {
     thread::available_parallelism()
         .map_or(1, std::num::NonZero::get)
@@ -170,7 +161,6 @@ fn max_concurrent_queries() -> usize {
 /// The query's pattern cap, `MAX_QUERY_PATTERNS`.
 const PATTERNS: usize = 256;
 
-/// Repeats of every measured point.
 const REPS: usize = 3;
 
 /// The corpus is this many parquet files, so a scan has a task per file
@@ -190,17 +180,11 @@ const SWEEP_ROWS_PER_FILE: usize = 20;
 /// grows by at 256 patterns.
 const LOW_MEMORY_LIMIT: u64 = 64 * MIB;
 
-/// The watchdog's cap on resident growth over a child's baseline, unless
-/// `RE2_RSS_CAP_MIB` sets another.
 const RSS_CAP: u64 = 12 << 30;
 
 /// The extract stages one query may hold: the emitter's pipeline-stage
 /// limit. Two named groups a stage reach 256 patterns.
 const MAX_STAGES: usize = 128;
-
-// ---------------------------------------------------------------------
-// Families
-// ---------------------------------------------------------------------
 
 /// A subject alphabet: `a` starts a needle, `b` is filler and `c` ends an
 /// `extract` needle.
@@ -239,26 +223,21 @@ const OTHERS: [Alphabet; 3] = [
     },
 ];
 
-/// Which batch function a family runs in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 enum Kind {
     /// A search-stage `/re/`, `regexp_matches` in SQL. The needle never
     /// matches, so every call scans its whole row.
     Matches,
     /// An `extract "(?P<g>re)(?P<h>)"` stage: one struct-form
-    /// `regexp_extract` call in SQL, one RE2 for the stage (before
-    /// 2026-11-04, a call and an RE2 a named group, which is what the
-    /// transcript's parts before `extract_struct` ran). Every row ends in a
-    /// match, so RE2 also runs its reverse program to find where the match
-    /// starts.
+    /// `regexp_extract` call in SQL, one RE2 for the stage. Every row ends
+    /// in a match, so RE2 also runs its reverse program to find where the
+    /// match starts.
     Extract,
 }
 
-/// One shape of needle over [`DESERET`].
 struct Family {
     name: &'static str,
     kind: Kind,
-    /// The needle at count `k`.
     body: fn(usize) -> String,
 }
 
@@ -270,12 +249,10 @@ fn not3() -> String {
     format!("[^{}{}{}]", DESERET.a, DESERET.b, DESERET.c)
 }
 
-/// The last level of FIX7's fan class over Deseret (part 1's `fan`, in
-/// `tests/regex_cost.rs`): every other continuation byte under Deseret's
-/// own 3-byte prefix, beside `a`, `b` and `c`. Its byte ranges are many,
-/// so every DFA state carries a wide transition table. Part 1's whole fan
-/// is about 800 bytes, and 256 copies of it are over the 65 536-byte query
-/// cap; this part of it fits.
+/// Every other continuation byte under Deseret's own 3-byte prefix, beside
+/// `a`, `b` and `c`. Its byte ranges are many, so every DFA state carries
+/// a wide transition table. 256 copies of `tests/regex_cost.rs`'s whole
+/// fan are over the 65 536-byte query cap; this part of it fits.
 fn fan() -> String {
     let mut buf = [0; 4];
     let path = DESERET.a.encode_utf8(&mut buf).as_bytes().to_owned();
@@ -355,11 +332,10 @@ fn families() -> Vec<Family> {
 }
 
 /// The query of `n` distinct copies of `body`. A `matches` copy is told
-/// apart by a three-digit suffix, as part 1's `copies` does. An `extract`
-/// copy is told apart by its group's name, two groups a stage, because a
-/// query holds at most [`MAX_STAGES`] stages: the second group is empty.
-/// Since the struct form, both groups of a stage read one
-/// `regexp_extract`, so a stage is one site ([`sites`]).
+/// apart by a three-digit suffix. An `extract` copy is told apart by its
+/// group's name, two groups a stage, because a query holds at most
+/// [`MAX_STAGES`] stages: the second group is empty. Both groups of a
+/// stage read one `regexp_extract`, so a stage is one site ([`sites`]).
 fn dsl(kind: Kind, body: &str, n: usize) -> String {
     match kind {
         Kind::Matches => {
@@ -382,13 +358,6 @@ fn dsl(kind: Kind, body: &str, n: usize) -> String {
     }
 }
 
-/// The control for a needle of `kind` at count `k`: the same query shape
-/// over the same rows, with the same output, but a body whose DFA has at
-/// most `k + 2` states, so RE2 holds next to nothing for it: `a`, `k`
-/// literal `b`s, and the needle's end. An `extract` control matches each
-/// row's tail, as the needle does. What a query grows by beyond its
-/// control is RE2's: the 128-stage `extract` query grows `DuckDB`'s own
-/// buffers by far more than its regexes hold.
 fn control(kind: Kind, k: usize) -> String {
     let end = match kind {
         Kind::Matches => not3(),
@@ -397,9 +366,7 @@ fn control(kind: Kind, k: usize) -> String {
     format!("{}{}{{{k}}}{end}", DESERET.a, DESERET.b)
 }
 
-/// The largest count at which 256 copies of the family pass `parse` as one
-/// query, and the parse error at the next count. Admission is monotone in
-/// the count.
+/// Admission is monotone in the count.
 fn edge(f: &Family) -> Option<(usize, String)> {
     let (mut admitted, mut refused, mut why) = (0, 65, String::from("none"));
     while refused - admitted > 1 {
@@ -417,11 +384,6 @@ fn edge(f: &Family) -> Option<(usize, String)> {
     (admitted > 0).then_some((admitted, why))
 }
 
-// ---------------------------------------------------------------------
-// The corpus
-// ---------------------------------------------------------------------
-
-/// xorshift64, so the corpus is the same on every run.
 struct Rng(u64);
 
 impl Rng {
@@ -469,10 +431,6 @@ fn row(rng: &mut Rng, x: Alphabet, len: usize, gap: usize, extract: bool) -> Str
 /// Shortest and longest row, in characters.
 const ROW_CHARS: (usize, usize) = (64, 512);
 
-/// Write [`FILES`] parquet files of `rows_per_file` rows under `dir`, seven
-/// in eight over Deseret and the rest over the other alphabets in turn,
-/// with `_time` and `message` columns. `gap` is the needle's span, for the
-/// `c` rule. Returns the glob and the characters written.
 fn write_corpus(dir: &Path, rows_per_file: usize, gap: usize, kind: Kind) -> (String, usize) {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).expect("corpus dir");
@@ -511,10 +469,6 @@ fn write_corpus(dir: &Path, rows_per_file: usize, gap: usize, kind: Kind) -> (St
     (format!("{}/*.parquet", dir.display()), chars)
 }
 
-// ---------------------------------------------------------------------
-// Memory
-// ---------------------------------------------------------------------
-
 /// This process's resident memory and its private dirty pages, in bytes.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 struct Mem {
@@ -541,7 +495,6 @@ fn read_mem() -> Mem {
     }
 }
 
-/// The host's load average, for the record beside a measurement.
 fn load() -> String {
     std::fs::read_to_string("/proc/loadavg").map_or_else(
         |_| "unknown".to_string(),
@@ -563,15 +516,9 @@ fn signed(bytes: u64) -> i64 {
     i64::try_from(bytes).expect("a byte count")
 }
 
-// ---------------------------------------------------------------------
-// One measurement, in a child process
-// ---------------------------------------------------------------------
-
-/// What a child measures: one point, once.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Spec {
     glob: String,
-    /// The measured query, in the DSL.
     dsl: String,
     /// A statement to run in place of the one the emitter writes for
     /// [`dsl`](Self::dsl), with its string parameters, which `parse` still
@@ -605,22 +552,18 @@ struct Seen {
     secs: f64,
     /// Each query's outcome: `ok`, or its error's text.
     outcomes: Vec<String>,
-    /// The watchdog interrupted the queries.
     capped: bool,
 }
 
 const SPEC_ENV: &str = "RE2_MEMORY_SPEC";
 const SEEN_PREFIX: &str = "RE2_MEMORY_SEEN ";
 
-/// The `duckdb_memory()` total, or -1 when the read fails.
 fn duck_total(executor: &Executor) -> i64 {
     executor
         .query_i64_for_test("SELECT sum(memory_usage_bytes)::BIGINT FROM duckdb_memory()")
         .unwrap_or(-1)
 }
 
-/// The query database at `scratch`, as trawld opens it, under the spec's
-/// threads and memory limit.
 fn open_database(spec: &Spec, scratch: &Path) -> Executor {
     let lock = Arc::new(ScratchLock::open(scratch).expect("the scratch directory locks"));
     let budgets = QueryBudgets {
@@ -631,8 +574,6 @@ fn open_database(spec: &Spec, scratch: &Path) -> Executor {
     Executor::open_query_database(lock, &budgets).expect("the query database opens")
 }
 
-/// Sample resident memory every 10 ms until `stop`, and interrupt every
-/// lane once it grows past `cap` over `base`. Returns the peak.
 fn rss_sampler(
     base: Mem,
     cap: u64,
@@ -659,8 +600,6 @@ fn rss_sampler(
     })
 }
 
-/// Sample `duckdb_memory()` every 50 ms on a connection of its own until
-/// `stop`. Returns the largest total.
 fn duck_sampler(duck: Executor, base: i64, stop: &Arc<AtomicBool>) -> JoinHandle<i64> {
     let stop = Arc::clone(stop);
     thread::spawn(move || {
@@ -778,7 +717,6 @@ fn measure(spec: &Spec) -> Seen {
     }
 }
 
-/// Run `spec` in a child process: this test binary's `child` test.
 fn in_child(spec: &Spec) -> Seen {
     let exe = std::env::current_exe().expect("the test binary");
     let output = Command::new(exe)
@@ -806,8 +744,6 @@ fn in_child(spec: &Spec) -> Seen {
     serde_json::from_str(line).expect("the child's report")
 }
 
-/// One measurement, run by a parent part in a process of its own. Without
-/// a spec it does nothing.
 #[test]
 #[ignore = "a child of the measuring parts"]
 fn child() {
@@ -824,12 +760,6 @@ fn child() {
     );
 }
 
-// ---------------------------------------------------------------------
-// Parts
-// ---------------------------------------------------------------------
-
-/// Where the parts keep the corpora, the probe's choice and the results:
-/// `RE2_WORK_DIR`, or a directory under the target dir.
 fn work_dir() -> PathBuf {
     let dir = std::env::var_os("RE2_WORK_DIR").map_or_else(
         || PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("re2-memory"),
@@ -846,7 +776,6 @@ fn rss_cap() -> u64 {
         .map_or(RSS_CAP, |m| m * MIB)
 }
 
-/// The family the probe chose, as the later parts read it back.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Choice {
     family: String,
@@ -856,21 +785,10 @@ struct Choice {
     control: String,
 }
 
-/// The probe's choice for the sweep: the `matches` family with the largest
-/// RE2 share.
 const CHOICE_FILE: &str = "choice.json";
 
-/// What the probe found for both kinds, for the summary.
 const PROBE_FILE: &str = "probe.json";
 
-/// The probe's shares: the chosen `matches` family's, and the largest
-/// `extract` family's with its name and count.
-///
-/// The sweep runs the `matches` family because an `extract` control's own
-/// growth varies by hundreds of MiB from run to run: 128 `extract` stages
-/// grow `DuckDB`'s buffers by about a GiB. So the `extract` share is known
-/// only to within that, and the summary carries the larger of the two
-/// shares into the worst total.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProbeNote {
     matches_share: i64,
@@ -883,7 +801,6 @@ fn read_choice(work: &Path, file: &str) -> Choice {
     serde_json::from_str(&text).expect("the choice")
 }
 
-/// The sweep's corpus for `choice`, written once into the work directory.
 fn sweep_corpus(work: &Path, choice: &Choice) -> (String, usize) {
     let dir = work.join(format!("corpus-sweep-{:?}-{}", choice.kind, choice.k));
     let marker = dir.join("chars");
@@ -913,9 +830,6 @@ fn footer(part: &str, started: Instant, out: &mut String) {
     );
 }
 
-/// The growth of one measurement over its baseline: the peak during the
-/// queries, of resident memory and of private dirty pages, the resident
-/// memory retained after, and the peak of `duckdb_memory()`.
 #[derive(Clone, Copy, Debug)]
 struct Growth {
     peak_rss: i64,
@@ -933,8 +847,6 @@ fn growth(s: &Seen) -> Growth {
     }
 }
 
-/// Which probe families to measure, from `RE2_FAMILIES` (indices into
-/// [`families`]) where set, for a run by hand.
 fn probe_families() -> Vec<(usize, Family)> {
     let keep: Option<Vec<usize>> = std::env::var("RE2_FAMILIES")
         .ok()
@@ -946,8 +858,6 @@ fn probe_families() -> Vec<(usize, Family)> {
         .collect()
 }
 
-/// One probe row: a family at its edge, and its control, once each.
-/// Returns RE2's share of the peak growth, the family's over the control's.
 fn probe_row(
     work: &Path,
     index: usize,
@@ -1025,10 +935,6 @@ fn outcome_text(seen: &Seen) -> String {
     text
 }
 
-/// The probe: every family at its edge, 256 patterns, one thread, one
-/// query, once, beside its control. Keeps the `matches` family with the
-/// largest RE2 share of the peak for the sweep, and notes the largest
-/// `extract` share for the summary.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn probe() {
@@ -1111,8 +1017,6 @@ fn probe() {
     print!("{out}");
 }
 
-/// One point of the sweep: the chosen family and its control, each
-/// measured [`REPS`] times, in turns.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Point {
     patterns: usize,
@@ -1123,7 +1027,6 @@ struct Point {
     control: Vec<Seen>,
 }
 
-/// Median and max.
 fn med_max(mut xs: Vec<i64>) -> (i64, i64) {
     xs.sort_unstable();
     (xs[xs.len() / 2], xs[xs.len() - 1])
@@ -1135,18 +1038,14 @@ fn all_ok(seen: &[Seen]) -> bool {
 }
 
 impl Point {
-    /// Median and max of one growth figure of the family's runs.
     fn family(&self, pick: fn(&Growth) -> i64) -> (i64, i64) {
         med_max(self.seen.iter().map(|s| pick(&growth(s))).collect())
     }
 
-    /// Median and max of one growth figure of the control's runs.
     fn control(&self, pick: fn(&Growth) -> i64) -> (i64, i64) {
         med_max(self.control.iter().map(|s| pick(&growth(s))).collect())
     }
 
-    /// RE2's share of one growth figure: each family run over the control
-    /// run beside it, median and max.
     fn share(&self, pick: fn(&Growth) -> i64) -> (i64, i64) {
         med_max(
             self.seen
@@ -1242,8 +1141,6 @@ fn point_row(p: &Point, out: &mut String) {
 
 const RESULTS_PREFIX: &str = "results-";
 
-/// Measure `points` of the family in `choice_file`, print them, and keep
-/// them for the summary as `results-<key>.json`.
 fn sweep_part(
     (part, key, choice_file): (&str, &str, &str),
     intro: &str,
@@ -1276,7 +1173,6 @@ fn sweep_part(
     print!("{out}");
 }
 
-/// The patterns axis: 1, 64 and 256 patterns in one query, on one thread.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn patterns() {
@@ -1288,7 +1184,6 @@ fn patterns() {
     );
 }
 
-/// The threads axis: 256 patterns on 1, 2 and 4 database threads.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn threads() {
@@ -1304,7 +1199,6 @@ fn threads() {
     );
 }
 
-/// The concurrency axis: `max_concurrent_queries` queries at once.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn queries() {
@@ -1318,7 +1212,6 @@ fn queries() {
     );
 }
 
-/// The limit: the 256-pattern, 4-thread point under a low `memory_limit`.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn limit() {
@@ -1330,7 +1223,6 @@ fn limit() {
     sweep_part(("limit", "limit", CHOICE_FILE), &intro, &point);
 }
 
-/// What a run under the low `memory_limit` says about RE2's memory.
 fn limit_verdict(low: &Point, choice: &Choice) -> String {
     let what = format!("{} at k = {}", choice.family, choice.k);
     match (all_ok(&low.seen), all_ok(&low.control)) {
@@ -1369,8 +1261,6 @@ fn find(points: &[Point], patterns: usize, threads: u32, queries: usize) -> &Poi
         .expect("the point was measured")
 }
 
-/// The worst total scaled by how much more the probe's largest `extract`
-/// family held than the sweep's family, when it held more.
 #[expect(clippy::cast_precision_loss, reason = "MiB figures for a reader")]
 fn extract_scaling(work: &Path, total: f64, out: &mut String) {
     let note: ProbeNote = serde_json::from_str(
@@ -1396,7 +1286,6 @@ fn extract_scaling(work: &Path, total: f64, out: &mut String) {
     }
 }
 
-/// The summary: the envelope in plain sentences, from the parts' results.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 #[expect(clippy::cast_precision_loss, reason = "MiB figures for a reader")]
@@ -1492,23 +1381,14 @@ fn summary() {
     print!("{out}");
 }
 
-// ---------------------------------------------------------------------
-// The allowance per site: single bodies at the full body limit
-// ---------------------------------------------------------------------
-
-/// The site counts the `site_size` part runs: copies of one body in one
-/// query.
 const SITE_COUNTS: [usize; 3] = [1, 4, 16];
 
-/// The database threads the `site_size` part runs each count on.
 const SITE_THREADS: [u32; 2] = [1, DEFAULT_QUERY_THREADS];
 
 /// The sites an ordinary body runs as: enough copies that its share
 /// rises above the run-to-run noise.
 const ORDINARY_SITES: usize = 16;
 
-/// The margin the allowance model keeps over the worst measured point:
-/// 25 %, as a fraction in hundredths.
 const MARGIN_PERCENT: u64 = 25;
 
 /// The concurrent ordinary queries the stop rule asks a reservation to
@@ -1520,7 +1400,6 @@ const STOP_RESERVATION: u64 = 1 << 30;
 /// row holds.
 const PAD_START: u32 = 0x400;
 
-/// One body the `site_size` part measures at the full body limit.
 struct SiteFamily {
     name: &'static str,
     kind: Kind,
@@ -1535,11 +1414,7 @@ struct SiteFamily {
 /// The bodies that might hold the most: each core is a DFA that meets a
 /// new state on almost every character, at the largest count `parse`
 /// admits for 16 copies with room for the padding, padded to the
-/// 1024-byte body limit. They vary
-/// what makes a state and a program large: an alternation, a counted
-/// repeat near 64 positions, a fan class, a large Unicode class at the
-/// batch view's cap, and `(?i)`. CP8's own 256-copy body (unpadded)
-/// shows what a short body holds. The `extract` bodies run RE2's reverse
+/// 1024-byte body limit. The `extract` bodies run RE2's reverse
 /// program too: the first blows up forward, the second also backward,
 /// from the match's end.
 fn site_families() -> Vec<SiteFamily> {
@@ -1642,8 +1517,6 @@ fn padded(core: &str, pad: usize) -> String {
     format!("(?:{core}|[{class}])")
 }
 
-/// The most padding characters a family's core at count `k` takes while
-/// 16 copies of it still pass `parse`.
 fn site_pad(f: &SiteFamily, k: usize) -> Option<usize> {
     let n = SITE_COUNTS[SITE_COUNTS.len() - 1];
     let core = (f.core)(k);
@@ -1670,9 +1543,6 @@ fn largest(max: usize, admits: impl Fn(usize) -> bool) -> Option<usize> {
     Some(ok)
 }
 
-/// A family's body at its edge: the largest count whose core passes
-/// `parse` as 16 copies, then, for a padded family, the largest padding
-/// that still does. Returns the count and the body.
 fn site_body(f: &SiteFamily) -> Option<(usize, String)> {
     let n = SITE_COUNTS[SITE_COUNTS.len() - 1];
     let parses = |body: &str| parse(&dsl(f.kind, body, n)).is_ok();
@@ -1686,8 +1556,6 @@ fn site_body(f: &SiteFamily) -> Option<(usize, String)> {
     Some((k, padded(&(f.core)(k), pad)))
 }
 
-/// The regex text one site of `body` binds: what the first copy of the
-/// query hands RE2.
 fn bound_text(kind: Kind, body: &str) -> String {
     match kind {
         Kind::Matches => format!("{body}000"),
@@ -1695,8 +1563,6 @@ fn bound_text(kind: Kind, body: &str) -> String {
     }
 }
 
-/// The batch view's compiled size of the text one site binds, as the
-/// ledger measures it under its 512 KiB cap.
 fn view_bytes(kind: Kind, body: &str) -> usize {
     trawl_core::pattern::Preparer::new()
         .batch_compiled_bytes(&bound_text(kind, body))
@@ -1705,17 +1571,11 @@ fn view_bytes(kind: Kind, body: &str) -> usize {
 
 /// How many `regexp_*` calls `DuckDB`'s logical plan of the SQL the
 /// emitter writes for `dsl` over `glob` holds, unoptimized or optimized.
-///
 /// The optimized count is the sites that run, each compiling its own RE2
-/// on every thread. The unoptimized count is what `DuckDB` binds: the
-/// scalar `nullif(regexp_extract(…), '')` an extract wrote before the
-/// struct form bound as a `CASE` that held the call twice, which the
-/// optimizer's common-subexpression pass folded into one. The plan is of
-/// the statement with its parameters inlined ([`inline_strings`]):
-/// `json_serialize_plan` cannot plan a struct-form extract whose names
-/// are still unbound, and raises an internal error for it.
-/// (`tests/integration.rs`'s `bound_regex_calls` counts `regexp_matches`
-/// alone, unoptimized.)
+/// on every thread. The plan is of the statement with its parameters
+/// inlined ([`inline_strings`]): `json_serialize_plan` cannot plan a
+/// struct-form extract whose names are still unbound, and raises an
+/// internal error for it.
 fn bound_sites(dsl: &str, glob: &str, optimize: bool) -> u64 {
     fn count(node: &serde_json::Value) -> u64 {
         match node {
@@ -1762,7 +1622,6 @@ fn bound_sites(dsl: &str, glob: &str, optimize: bool) -> u64 {
     count(&plan)
 }
 
-/// One measured body of the `site_size` part.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SiteBody {
     name: String,
@@ -1774,7 +1633,6 @@ struct SiteBody {
     points: Vec<SitePoint>,
 }
 
-/// One body as `sites` copies on `threads` threads, [`REPS`] runs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SitePoint {
     sites: usize,
@@ -1782,8 +1640,6 @@ struct SitePoint {
     seen: Vec<Seen>,
 }
 
-/// The shared control of one shape: `sites` copies of the control body
-/// of `kind`, on `threads` threads, [`REPS`] runs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SiteControl {
     kind: Kind,
@@ -1809,8 +1665,6 @@ impl SiteResults {
             .expect("the control was measured")
     }
 
-    /// RE2's share at `p` of `b`: each run's peak growth over the control
-    /// run beside it, median and max.
     fn share(&self, b: &SiteBody, p: &SitePoint) -> (i64, i64) {
         let c = self.control(b.kind, p.sites, p.threads);
         med_max(
@@ -1823,9 +1677,6 @@ impl SiteResults {
     }
 }
 
-/// The regex sites [`dsl`] writes for `copies` copies of a body of
-/// `kind`: a `matches` copy is a site of its own, and an `extract` stage,
-/// which holds two copies, is one.
 fn sites(kind: Kind, copies: usize) -> usize {
     match kind {
         Kind::Matches => copies,
@@ -1833,8 +1684,6 @@ fn sites(kind: Kind, copies: usize) -> usize {
     }
 }
 
-/// The share of one site on one thread at `p` of a body of `kind`, in
-/// bytes.
 fn per_site_thread(share: i64, kind: Kind, p: &SitePoint) -> i64 {
     share / i64::try_from(sites(kind, p.sites) * p.threads as usize).expect("a small count")
 }
@@ -1853,9 +1702,6 @@ fn site_spec(glob: &str, work: &Path, dsl: String, threads: u32) -> Spec {
     }
 }
 
-/// Every run of `dsl`, `copies` copies of a body of `kind`, on `threads`
-/// threads, after checking that it passes `parse` and that `DuckDB` runs
-/// a regex call for each of its [`sites`].
 fn site_runs(
     glob: &str,
     work: &Path,
@@ -1874,7 +1720,6 @@ fn site_runs(
     (0..REPS).map(|_| in_child(&spec)).collect()
 }
 
-/// The `site_size` part's table: one row a point.
 fn site_table(results: &SiteResults, out: &mut String) {
     let _ = writeln!(
         out,
@@ -1925,8 +1770,6 @@ fn site_table(results: &SiteResults, out: &mut String) {
     }
 }
 
-/// Every run of the `site_size` part: the controls of each shape, then
-/// each family's points.
 fn measure_sites(
     glob: &str,
     work: &Path,
@@ -1986,8 +1829,6 @@ fn measure_sites(
     }
 }
 
-/// The corpus's `c` rule: one more than the first `extract` family's
-/// count, so each row ends in one match of it.
 fn site_gap(families: &[SiteFamily]) -> usize {
     families
         .iter()
@@ -2010,9 +1851,6 @@ fn site_control_k(gap: usize) -> usize {
     .unwrap_or(1)
 }
 
-/// The `site_size` part: what one site of RE2 holds for single bodies at
-/// the full body limit, as 1, 4 and 16 copies on 1 and 4 threads, each
-/// beside a control of the same shape.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn site_size() {
@@ -2027,8 +1865,6 @@ fn site_size() {
             (f, k, body)
         })
         .collect();
-    // One corpus for every body, with the `c` rule at the forward extract
-    // family's span, so each of its rows holds one match, at the end.
     let gap = site_gap(&site_families());
     let control_k = site_control_k(gap);
     let (glob, chars) = write_corpus(
@@ -2071,8 +1907,6 @@ fn site_size() {
     print!("{out}");
 }
 
-/// One measured point, for the fit: a body's view, its kind, and RE2's
-/// share of one site on one thread, the median and the largest run.
 #[derive(Clone, Copy, Debug)]
 struct Fit {
     view: usize,
@@ -2082,7 +1916,6 @@ struct Fit {
     max: i64,
 }
 
-/// `bytes` raised by [`MARGIN_PERCENT`] and rounded up to 64 KiB.
 fn with_margin(bytes: i64) -> u64 {
     let bytes = u64::try_from(bytes.max(0)).expect("non-negative");
     let raised = (bytes * (100 + MARGIN_PERCENT)).div_ceil(100);
@@ -2104,10 +1937,6 @@ impl Model {
     }
 }
 
-/// The size model: a least-squares slope of the per-site figure over the
-/// view across the `kinds` points, clamped at zero, and the intercept
-/// that puts the line at or above every point (median and max), both
-/// raised by the margin.
 #[expect(clippy::cast_precision_loss, reason = "a fit over byte counts")]
 #[expect(
     clippy::cast_possible_truncation,
@@ -2139,7 +1968,6 @@ fn size_model(fits: &[Fit]) -> Model {
     }
 }
 
-/// The flat model: the worst point (median or max), raised by the margin.
 fn flat_model(fits: &[Fit]) -> Model {
     let worst = fits.iter().map(|f| f.max.max(f.median)).max().unwrap_or(0);
     Model {
@@ -2148,8 +1976,6 @@ fn flat_model(fits: &[Fit]) -> Model {
     }
 }
 
-/// The access-log parser: the corpus's one `extract`-shaped body, with its
-/// named groups.
 fn access_log() -> &'static str {
     trawl_core::pattern::charge::LOG_REGEXES
         .iter()
@@ -2158,8 +1984,6 @@ fn access_log() -> &'static str {
         .expect("the corpus holds the access-log parser")
 }
 
-/// The ordinary query of the stop rule: the corpus's first five patterns
-/// as one search.
 fn ordinary_query() -> (String, Vec<&'static str>) {
     let five: Vec<&str> = trawl_core::pattern::charge::LOG_REGEXES
         .iter()
@@ -2170,9 +1994,6 @@ fn ordinary_query() -> (String, Vec<&'static str>) {
     (format!("message={}", list.join(",")), five)
 }
 
-/// What each model (name, its `regexp_matches` charge, its
-/// `regexp_extract` charge) charges the ordinary queries on the default
-/// threads, against the stop rule.
 fn ordinary_charges(work: &Path, models: [(&str, Model, Model); 3], out: &mut String) {
     let (query, five) = ordinary_query();
     let glob = format!("{}/*.parquet", work.join("corpus-site").display());
@@ -2242,9 +2063,6 @@ fn ordinary_charges(work: &Path, models: [(&str, Model, Model); 3], out: &mut St
     );
 }
 
-/// Every body under each model (flat, size, and by kind: the matches
-/// and the extract figure), and the smallest charge over a body's worst
-/// point.
 #[expect(clippy::cast_precision_loss, reason = "ratios for a reader")]
 fn model_table(results: &SiteResults, models: [Model; 4], out: &mut String) {
     let [flat, sized, matches_flat, extract_flat] = models;
@@ -2295,7 +2113,6 @@ fn model_table(results: &SiteResults, models: [Model; 4], out: &mut String) {
     );
 }
 
-/// Every measured point of the `site_size` results, per site per thread.
 fn site_fits(results: &SiteResults) -> Vec<Fit> {
     results
         .bodies
@@ -2315,8 +2132,6 @@ fn site_fits(results: &SiteResults) -> Vec<Fit> {
         .collect()
 }
 
-/// Every model is at or above every point it covers: the flat and size
-/// models every point, each by-kind figure its own kind's points.
 fn assert_covered(fits: &[Fit], models: [Model; 4]) {
     let [flat, sized, matches_flat, extract_flat] = models;
     let covers = |m: Model, f: &Fit| {
@@ -2334,9 +2149,6 @@ fn assert_covered(fits: &[Fit], models: [Model; 4]) {
     }
 }
 
-/// The ordinary bodies, each as [`ORDINARY_SITES`] copies on the default
-/// threads, beside the `site_size` part's control of that shape: their
-/// rows of the table, and their points added to `results`.
 fn measure_ordinary(results: &mut SiteResults, work: &Path, out: &mut String) {
     let glob = format!("{}/*.parquet", work.join("corpus-site").display());
     let (glob, work) = (glob.as_str(), work);
@@ -2378,8 +2190,6 @@ fn measure_ordinary(results: &mut SiteResults, work: &Path, out: &mut String) {
     let _ = writeln!(out);
 }
 
-/// The `allowance` part: fit the allowance per site per thread to the
-/// `site_size` results, and state what it charges ordinary queries.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 #[expect(clippy::cast_precision_loss, reason = "MiB figures for a reader")]
@@ -2475,10 +2285,6 @@ fn allowance() {
     print!("{out}");
 }
 
-// ---------------------------------------------------------------------
-// One RE2 per extract: the struct form
-// ---------------------------------------------------------------------
-
 /// The named groups of the `extract_struct` part's body: past the scalar
 /// form's 0 to 9.
 const STRUCT_GROUPS: usize = 40;
@@ -2498,8 +2304,6 @@ fn struct_body(class: &str, k: usize) -> String {
     format!("{}{groups}{}", DESERET.a, DESERET.c)
 }
 
-/// The largest count of class groups at which the needle and its control
-/// both pass `parse` as one extract.
 fn struct_k() -> usize {
     largest(STRUCT_GROUPS, |k| {
         [class3(), DESERET.b.to_string()]
@@ -2509,18 +2313,14 @@ fn struct_k() -> usize {
     .expect("an empty-group body is admitted")
 }
 
-/// How a 40-group extract reaches `DuckDB`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 enum ExtractForm {
     /// One scalar `regexp_extract(message, ?, 1)` a named group, each with
-    /// the whole body bound as its own parameter, as the emitter wrote an
-    /// extract before 2026-11-04. The scalar form reads groups 0 to 9
-    /// only, so every call reads group 1, and each call's copy of the body
-    /// names its first group apart, so no two calls are the same
-    /// expression. Each still compiles the whole body.
+    /// the whole body bound as its own parameter. The scalar form reads
+    /// groups 0 to 9 only, so every call reads group 1, and each call's
+    /// copy of the body names its first group apart, so no two calls are
+    /// the same expression. Each still compiles the whole body.
     Calls,
-    /// One struct-form `regexp_extract(message, ?, ?::VARCHAR[])` in an
-    /// inner select, its fields read by the outer one.
     Struct,
     /// Whatever the emitter writes for `* | extract "<body>"`.
     Emitted,
@@ -2532,8 +2332,6 @@ const EXTRACT_FORMS: [ExtractForm; 3] = [
     ExtractForm::Emitted,
 ];
 
-/// The statement and its parameters for `form`, over the parquet files at
-/// `glob`, or `None` for [`ExtractForm::Emitted`], which runs the DSL.
 fn form_sql(form: ExtractForm, glob: &str, body: &str) -> Option<(String, Vec<String>)> {
     let source = format!("read_parquet('{}')", glob.replace('\'', "''"));
     let fields = 1..=STRUCT_GROUPS;
@@ -2633,7 +2431,6 @@ fn plan_regex_calls(sql: &str) -> Result<u64, String> {
     Ok(count(&plan))
 }
 
-/// The statement `form` runs for `body`, with its parameters inlined.
 fn form_plan_sql(form: ExtractForm, glob: &str, body: &str) -> Result<String, String> {
     if let Some((sql, params)) = form_sql(form, glob, body) {
         Ok(inline_strings(&sql, &params))
@@ -2654,12 +2451,10 @@ fn form_plan_sql(form: ExtractForm, glob: &str, body: &str) -> Result<String, St
     }
 }
 
-/// One form on one thread count: the needle's runs and its control's.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct FormPoint {
     form: ExtractForm,
     threads: u32,
-    /// The regex calls the optimized plan runs, or why it would not plan.
     sites: Result<u64, String>,
     seen: Vec<Seen>,
     control: Vec<Seen>,
@@ -2766,7 +2561,6 @@ fn extract_struct() {
     print!("{out}");
 }
 
-/// The `extract_struct` part's table and its verdict.
 fn struct_table(points: &[FormPoint], out: &mut String) {
     let _ = writeln!(
         out,
@@ -2867,16 +2661,11 @@ fn struct_table(points: &[FormPoint], out: &mut String) {
     }
 }
 
-// ---------------------------------------------------------------------
-// The emitter's own regexes: one site of each fixed pattern
-// ---------------------------------------------------------------------
-
 /// The site counts the `fixed_sites` part runs each fixed regex at. One
 /// site of these short patterns holds too little to rise above the
 /// run-to-run noise, so a point runs many.
 const FIXED_SITE_COUNTS: [usize; 2] = [512, 2048];
 
-/// The rows of each file of the `fixed_sites` corpus.
 const FIXED_ROWS_PER_FILE: usize = 20;
 
 /// Site `i` reads its row through `left(message, FIXED_LEFT + i)`, which
@@ -2885,8 +2674,7 @@ const FIXED_ROWS_PER_FILE: usize = 20;
 /// optimizer's common-subexpression pass.
 const FIXED_LEFT: usize = 1 << 20;
 
-/// The most a fixed site may take a thread before the run stops (human
-/// ruling, 2026-11-04): 1 MiB.
+/// The most a fixed site may take a thread before the run stops: 1 MiB.
 const FIXED_STOP: u64 = 1 << 20;
 
 /// Characters that are not whitespace but share a UTF-8 lead byte, and
@@ -2909,7 +2697,6 @@ fn near_misses() -> Vec<char> {
     .collect()
 }
 
-/// `len` characters drawn from `from`.
 fn run_of(rng: &mut Rng, from: &[char], len: usize) -> String {
     (0..len)
         .map(|_| from[rng.below_usize(from.len())])
@@ -2980,9 +2767,6 @@ fn fixed_row(rng: &mut Rng, r: usize) -> String {
     }
 }
 
-/// Write [`FILES`] parquet files of [`FIXED_ROWS_PER_FILE`] rows of
-/// [`fixed_row`] under `dir`, with `_time` and `message` columns. Returns
-/// the glob and the characters written.
 fn write_fixed_corpus(dir: &Path) -> (String, usize) {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).expect("corpus dir");
@@ -3043,23 +2827,18 @@ fn fixed_sql(fixed: FixedRegex, glob: &str, n: usize, control: bool) -> String {
     format!("SELECT {} FROM {source}", items.join(", "))
 }
 
-/// One fixed regex at one site count on one thread count: its runs and
-/// its control's.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct FixedPoint {
     function: String,
     pattern: String,
     sites: usize,
     threads: u32,
-    /// The regex calls the optimized plan runs, or why it would not plan.
     planned: Result<u64, String>,
     seen: Vec<Seen>,
     control: Vec<Seen>,
 }
 
 impl FixedPoint {
-    /// RE2's share of the peak, each run over the control run beside it:
-    /// median and max.
     fn share(&self) -> (i64, i64) {
         med_max(
             self.seen
@@ -3070,8 +2849,6 @@ impl FixedPoint {
         )
     }
 
-    /// The share of one site on one thread: of the median run, and of the
-    /// largest.
     fn per_site_thread(&self) -> (i64, i64) {
         let (median, max) = self.share();
         let n = i64::try_from(self.sites).expect("a small count") * i64::from(self.threads);
@@ -3079,7 +2856,6 @@ impl FixedPoint {
     }
 }
 
-/// `bytes` raised by [`MARGIN_PERCENT`] and rounded up to a whole KiB.
 fn fixed_with_margin(bytes: i64) -> u64 {
     let bytes = u64::try_from(bytes.max(0)).expect("non-negative");
     (bytes * (100 + MARGIN_PERCENT))
@@ -3088,12 +2864,6 @@ fn fixed_with_margin(bytes: i64) -> u64 {
         * 1024
 }
 
-/// The `fixed_sites` part: every regex the emitter's own SQL carries
-/// (`trawl_core::conform::FIXED_REGEXES`), as 512 and 2048 sites in one
-/// query on 1 and 4 threads, over rows built to grow each one's DFA,
-/// beside a control that compiles no RE2. It sets the allowance for one
-/// fixed site on one thread at the worst point's median plus the margin,
-/// and stops the run if that passes 1 MiB.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn fixed_sites() {
@@ -3185,7 +2955,6 @@ fn fixed_sites() {
     print!("{out}");
 }
 
-/// One line of the `fixed_sites` table.
 fn fixed_row_line(p: &FixedPoint, out: &mut String) {
     let peak = med_max(p.seen.iter().map(|s| growth(s).peak_rss).collect());
     let ctl = med_max(p.control.iter().map(|s| growth(s).peak_rss).collect());
@@ -3221,9 +2990,6 @@ fn fixed_row_line(p: &FixedPoint, out: &mut String) {
     );
 }
 
-/// The `fixed_sites` part's verdict: the worst point's median for one
-/// site on one thread, over every pattern, and the allowance it sets. The
-/// largest single run is printed beside it.
 fn fixed_verdict(points: &[FixedPoint], out: &mut String) {
     let _ = writeln!(out);
     let worst_of = |pattern: Option<&str>, pick: fn((i64, i64)) -> i64| {
@@ -3275,10 +3041,6 @@ fn fixed_verdict(points: &[FixedPoint], out: &mut String) {
     );
 }
 
-// ---------------------------------------------------------------------
-// Union branches: one branch's RE2 a thread, or both at once
-// ---------------------------------------------------------------------
-
 /// The site counts the `union_branches` part runs: up to the 16 copies of
 /// a body at the body limit that one query admits.
 const UNION_SITES: [usize; 2] = [4, SITE_COUNTS[SITE_COUNTS.len() - 1]];
@@ -3292,24 +3054,19 @@ const UNION_ROWS_PER_FILE: usize = 2 * SWEEP_ROWS_PER_FILE;
 /// `matches` family at the body limit.
 const UNION_FAMILY: usize = 1;
 
-/// The two statements the `union_branches` part compares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Branches {
     /// A `UNION ALL` of one scan of each corpus, the filter above it,
     /// which the optimizer pushes into both branches, as it pushes a hot
     /// search's filter into the hot and the stored branch.
     Union,
-    /// One scan of both corpora under the same filter.
     Single,
 }
 
-/// The `union_branches` statement: the count of the rows of the corpora
-/// at `globs` that `n` regex sites match, read through a `UNION ALL` of a
-/// scan each or through one scan of both. The sites are `regexp_matches`
-/// calls joined by `OR`, each with a parameter of its own, as the emitter
-/// binds a search's patterns. The control is the same calls through
-/// `contains`, which compiles no RE2. A `count(*)` sink takes its input
-/// in any order, so `DuckDB` schedules both branches' pipelines at once.
+/// The sites are `regexp_matches` calls joined by `OR`, each with a
+/// parameter of its own, as the emitter binds a search's patterns. A
+/// `count(*)` sink takes its input in any order, so `DuckDB` schedules
+/// both branches' pipelines at once.
 fn union_sql(shape: Branches, globs: [&str; 2], n: usize, control: bool) -> String {
     let quote = |glob: &str| format!("'{}'", glob.replace('\'', "''"));
     let call = if control {
@@ -3329,19 +3086,14 @@ fn union_sql(shape: Branches, globs: [&str; 2], n: usize, control: bool) -> Stri
     format!("SELECT count(*) FROM {source} WHERE {filter}")
 }
 
-/// The parameters of [`union_sql`]: `n` distinct copies of `body`, each
-/// told apart by a three-digit suffix, as [`dsl`] writes a search's.
 fn union_params(body: &str, n: usize) -> Vec<String> {
     (0..n).map(|i| format!("{body}{i:03}")).collect()
 }
 
-/// One site count on one thread count of the `union_branches` part.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct UnionPoint {
     sites: usize,
     threads: u32,
-    /// The regex calls each shape's optimized plan runs, the union's and
-    /// the single scan's, or why it would not plan.
     planned: [Result<u64, String>; 2],
     union: Vec<Seen>,
     union_control: Vec<Seen>,
@@ -3350,8 +3102,6 @@ struct UnionPoint {
 }
 
 impl UnionPoint {
-    /// RE2's share of the union and of the single scan, each run over the
-    /// control run of its shape beside it: median and max.
     fn shares(&self) -> [(i64, i64); 2] {
         let share = |runs: &[Seen], controls: &[Seen]| {
             med_max(
@@ -3376,7 +3126,6 @@ impl UnionPoint {
         union.0 as f64 / single.0.max(1) as f64
     }
 
-    /// Every run and control ran, and each plan runs `n` calls a branch.
     fn sound(&self) -> bool {
         let n = u64::try_from(self.sites).expect("a small count");
         self.planned == [Ok(2 * n), Ok(n)]
@@ -3391,14 +3140,6 @@ impl UnionPoint {
     }
 }
 
-/// The `union_branches` part: whether one database thread holds the RE2
-/// of both branches of a `UNION ALL` at once, or only of the branch it
-/// runs. Each point runs `n` sites of one body at the body limit through
-/// the union of two corpora, the filter pushed into both branches, and
-/// through one scan of both corpora, on 1 and 4 threads, each beside a
-/// control through `contains`. The union's share over the single scan's
-/// is about 1 if a thread holds one branch's at a time, and about 2 if it
-/// holds both.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn union_branches() {
@@ -3527,7 +3268,6 @@ fn union_branches() {
     print!("{out}");
 }
 
-/// One line of the `union_branches` table.
 fn union_row_line(p: &UnionPoint, out: &mut String) {
     let peak = |runs: &[Seen]| med_max(runs.iter().map(|s| growth(s).peak_rss).collect());
     let [union, single] = p.shares();
@@ -3577,9 +3317,6 @@ fn union_row_line(p: &UnionPoint, out: &mut String) {
     );
 }
 
-/// The `union_branches` part's verdict: which model each point's ratio
-/// is nearer, one branch a thread (1) or both (2), and whether every
-/// point agrees.
 fn union_verdict(points: &[UnionPoint], admitted: bool, out: &mut String) {
     let _ = writeln!(out);
     let one = |p: &UnionPoint| p.ratio() < 1.5;
@@ -3610,10 +3347,6 @@ fn union_verdict(points: &[UnionPoint], admitted: bool, out: &mut String) {
     let _ = writeln!(out, "verdict: {verdict}");
 }
 
-/// The `union_branches` part's statements plan as it says, `2n` calls
-/// through the union and `n` through the single scan, none in either
-/// control, and run on the engine's own path to the same count; `n`
-/// copies of its body pass `parse` as one search.
 #[test]
 fn union_branches_shapes_plan_and_run() {
     let families = site_families();
@@ -3672,9 +3405,6 @@ fn union_branches_shapes_plan_and_run() {
     }
 }
 
-/// The `extract_struct` part's hand-written forms plan as it says, 40
-/// `regexp_` calls and one, and run on the engine's own path; its bodies
-/// pass `parse`.
 #[test]
 fn extract_struct_forms_plan_and_run() {
     let dir = tempfile::tempdir().expect("a corpus dir");
@@ -3748,8 +3478,6 @@ fn every_site_family_reaches_the_body_limit() {
     }
 }
 
-/// `DuckDB` binds one `regexp_` call for each site the `site_size` part
-/// counts, and the ordinary queries bind what the `allowance` part says.
 #[test]
 fn duckdb_binds_one_regex_call_a_site() {
     let dir = tempfile::tempdir().expect("a corpus dir");
@@ -3774,10 +3502,6 @@ fn duckdb_binds_one_regex_call_a_site() {
     assert_eq!(bound_sites(&log, &glob, false), 1, "bound once");
 }
 
-/// The `fixed_sites` part's statements plan as it says, one `regexp_`
-/// call a site and none in the control, and run on the engine's own path;
-/// its corpus gives every fixed pattern rows it matches and rows it
-/// reads to the end and refuses.
 #[test]
 fn fixed_sites_shapes_plan_and_run() {
     let dir = tempfile::tempdir().expect("a corpus dir");
@@ -3813,7 +3537,6 @@ fn fixed_sites_shapes_plan_and_run() {
             assert_eq!(result.columns.len(), 4, "{fixed:?}");
             assert_eq!(result.rows.len(), rows, "{fixed:?}");
         }
-        // How many rows the pattern changes or matches, out of all.
         let hits = match fixed.function {
             "regexp_replace" => format!(
                 "count_if(length(regexp_replace(message, '{}', '')) < length(message))",

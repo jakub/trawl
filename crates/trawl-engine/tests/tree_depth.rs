@@ -2,17 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Queries at the tree depth limit run (#447).
-//!
-//! The parser admits a tree exactly `MAX_TREE_DEPTH` (64) levels deep, so
-//! every such query has to reach `DuckDB` (or the kv tail) and come back
-//! with its row, not with `DuckDB`'s own `Max expression depth` error or a
-//! stack overflow. Each case runs parse, execution and the drop of the
-//! result on a thread with a worker's 2 MiB stack, against one parquet
-//! row whose `a` is 1 and whose message is `k=1`. Each shape's truth and
-//! parity are chosen so the row comes back, and the test reads the row,
-//! not only the absence of an error.
-
 use trawl_core::parser::MAX_TREE_DEPTH;
 use trawl_core::schema::FieldTypes;
 use trawl_engine::executor::Executor;
@@ -21,9 +10,6 @@ use trawl_engine::value::Value;
 /// trawld's worker and blocking threads.
 const WORKER_STACK: usize = 2 * 1024 * 1024;
 
-/// One parquet row: the base columns, a message that `extract kv` splits
-/// into `k=1`, and a BIGINT column `a` of 1. `k` is in no column, so a
-/// query reads it only through the kv tail.
 fn one_row() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("one.parquet");
@@ -63,7 +49,6 @@ fn or_chain(field: &str, first: usize, n: usize) -> String {
 /// row. The comments count the levels at `d` = 64.
 fn cases(d: usize, hit: bool) -> Vec<(&'static str, String, &'static str, Value)> {
     let a = |name, dsl| (name, dsl, "a", Value::Integer(1));
-    // the value `a` or `k` is compared against: the row's, or another
     let one = if hit { 1 } else { 2 };
     // where an or chain starts: 0 takes in 1, 2 leaves it out
     let first = if hit { 0 } else { 2 };
@@ -115,10 +100,6 @@ fn cases(d: usize, hit: bool) -> Vec<(&'static str, String, &'static str, Value)
     ]
 }
 
-/// Every 64-deep query returns the one row, with `a` or `k` read back as
-/// 1, and its false twin returns none. The same shapes one level deeper
-/// are refused, which pins each case at the limit rather than somewhere
-/// under it.
 #[test]
 fn queries_at_the_tree_depth_limit_return_their_row() {
     let (_dir, glob) = one_row();

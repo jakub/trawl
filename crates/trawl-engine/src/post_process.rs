@@ -10,10 +10,7 @@
 //! and after the boundary are collected into `EmittedQuery::rust_stages`.
 //!
 //! This module applies those Rust stages to the SQL result set in the
-//! order the query writes them (ADR-0064). A run of streamable stages
-//! reuses the streaming engine's per-event transforms and aggregation
-//! machinery; a `sort` or a `dedup` is a barrier that reads its whole
-//! input before the next stage sees a row.
+//! order the query writes them (ADR-0064).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -38,55 +35,19 @@ use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 
 /// Apply Rust pipeline stages to a SQL result set.
 ///
-/// Compiles the stages into ordered steps ([`compile_tail`]), converts the
-/// columnar `QueryResult` into typed pipeline rows, runs the steps in the
-/// order the query writes them, and converts back. The result's columns
-/// are the steps' output schema over the input's
-/// ([`StreamPlan::output_schema`], folded across the steps), so a tail
-/// that removes every row still answers with the columns it projects,
-/// typed as far as the input says ([`tail_cell_type`]), and then any field
-/// an `extract kv` found.
+/// The result's columns are the steps' output schema over the input's, so a
+/// tail that removes every row still answers with the columns it projects.
 ///
 /// An input with no columns is the SQL read's answer for a source that
-/// matched no file, and it is returned as it came, as the same query
-/// without the tail returns it: there is no input schema to walk, and no
-/// row for the tail to read. The tail is compiled first, so a stage it
-/// refuses is refused over that input too.
+/// matched no file, and it is returned as it came.
 ///
-/// `pins` is the pin scope stamped at the kv split
-/// (`EmittedQuery::rust_stage_pins`), so the tail's `where`/`let` evaluate
-/// under the same interpretation the SQL prefix used, plus a Timestamp pin
-/// for each column the SQL step returned as a TIMESTAMP that the split
-/// scope leaves unpinned. The tail compiles in one walk of that scope,
-/// which a `sort` or a `dedup` leaves unchanged.
-///
-/// `anchor` is the statement's `now()` instant (`EmittedQuery::anchor`,
-/// ADR-0017 §3). Every row — pre-stage, accumulator feed, snapshot,
-/// post-stage — evaluates under this one instant, in every step, because
-/// the tail is part of one unit of output with the SQL prefix that bound
-/// it. Nothing here samples a clock.
-///
-/// `last` is the query's `last=` window (`ast.search.time_filter`). A
-/// `timechart` in the tail with no `span=` picks its automatic bucket
-/// width from it, through the resolver the SQL emitter uses for the same
-/// stage (ADR-0038), so `last=4h | extract kv | timechart count()` cuts
-/// the five-minute buckets the same query without the kv split cuts in
-/// SQL — and that the web chart lays its grid with — rather than the
-/// live stream's one-minute default.
+/// `anchor` is the statement's `now()` instant (ADR-0017 §3). `last` is the
+/// query's `last=` window: a `timechart` in the tail with no `span=` picks
+/// its automatic bucket width from it (ADR-0038).
 ///
 /// The tail's patterns are prepared through `preparer`, the query's one
-/// metered ledger, so each is built and charged once, their charge is
-/// held from the server-wide regex reservation, and it shares the query's
-/// cap with any RE2 allowance the ledger holds for the SQL statement
-/// (ADR-0063). The plan is local to this call, so the charge comes back
-/// when it returns or unwinds: inside the executor's work, when the work
-/// that matches with it ends, whatever the request's deadline did. A tail
-/// whose patterns do not fit is [`EngineError::RegexResources`].
-///
-/// `cancel` is the lane's latch. The tail reads it before each step, row
-/// and stage, and a ledger built over its stop ends a pattern build or
-/// search the same way, so a cancelled tail stops at its next step with
-/// [`EngineError::Cancelled`] (ADR-0063).
+/// metered ledger (ADR-0063). The plan is local to this call, so the charge
+/// comes back when it returns or unwinds.
 pub fn apply_rust_stages(
     result: QueryResult,
     stages: &[Spanned<PipeStage>],
@@ -111,7 +72,6 @@ pub fn apply_rust_stages(
         .collect();
     let schema = steps.iter().fold(input, |schema, step| match step {
         TailStep::Stream(plan) => plan.output_schema(schema),
-        // A barrier orders or drops rows and leaves the columns alone.
         TailStep::Sort(_) | TailStep::Dedup(_) => schema,
     });
 
@@ -124,28 +84,17 @@ pub fn apply_rust_stages(
     rows_to_result_within(&rows, &schema, cancel)
 }
 
-/// The sentence a `tail` after `extract kv` is refused with: the kv tail
-/// has no rule yet for which rows are last after a rename, an
-/// aggregation or a dropped `_time` (ADR-0064).
 const TAIL_REFUSAL: &str =
     "post-processing: tail is not supported after extract kv; use sort and head instead";
 
-/// One step of the kv batch tail (ADR-0064). Each step takes the
-/// previous step's rows by value and hands its own to the next.
+/// One step of the kv batch tail (ADR-0064).
 enum TailStep {
-    /// A run of streamable stages, compiled as the live lane compiles
-    /// them. A `limit` that is spent ends only this run.
     Stream(StreamPlan),
-    /// A `sort` barrier: it reads its whole input before the next step
-    /// sees a row.
     Sort(SortStage),
-    /// A `dedup` barrier, for the same reason: the newest row of a key
-    /// can be the last row of the input.
     Dedup(DedupStage),
 }
 
 impl TailStep {
-    /// Run this step over `rows`.
     fn run(
         &mut self,
         rows: impl IntoIterator<Item = Row>,
@@ -167,27 +116,12 @@ impl TailStep {
     }
 }
 
-/// Whether `stage` is a barrier of the kv tail: a stage that reads its
-/// whole input before the next stage sees a row.
 fn is_barrier(stage: &PipeStage) -> bool {
     matches!(stage, PipeStage::Sort(_) | PipeStage::Dedup(_))
 }
 
 /// The kv tail's stages, compiled into the steps that run them in written
 /// order (ADR-0064).
-///
-/// A `tail` is refused first, before anything is built: the kv tail has
-/// no rule for it yet ([`TAIL_REFUSAL`]).
-///
-/// The barriers are taken out, and one call to the live lane's compiler
-/// compiles every other stage. That one call is the whole tail's
-/// validation, before any row runs: the expansion budget, projection
-/// collisions, the stages the tail cannot run, and the one-aggregation
-/// rule, which a barrier between two aggregations does not reset. It is
-/// also one walk of the pin scope (a barrier leaves the scope unchanged,
-/// `PinScope::advance`), one `last` span and one pass over the ledger. Its
-/// plan is then cut back into steps at the barriers' positions
-/// ([`cut_into_steps`]).
 fn compile_tail(
     stages: &[Spanned<PipeStage>],
     pins: &PinScope,
@@ -212,14 +146,11 @@ fn compile_tail(
     Ok(cut_into_steps(stages, plan))
 }
 
-/// The tail's answer for a plan the live lane's compiler refused.
 fn plan_error(error: StreamPlanError) -> EngineError {
     match error {
         StreamPlanError::Pattern(PatternError::Resources(refusal)) => {
             EngineError::RegexResources(refusal)
         }
-        // The ledger reads the lane's latch: a cancellation, never a
-        // refusal of the query (ADR-0063).
         StreamPlanError::Cancelled | StreamPlanError::Pattern(PatternError::Cancelled) => {
             EngineError::Cancelled
         }
@@ -229,24 +160,11 @@ fn plan_error(error: StreamPlanError) -> EngineError {
     }
 }
 
-/// One compiled piece of a stream plan: a per-event stage, or the
-/// aggregation.
 enum Piece {
     Stage(CompiledStage),
     Aggregation(stream::CompiledAggregation),
 }
 
-/// Cut `plan`, compiled from `stages` with their barriers taken out, back
-/// into steps at the barriers' positions.
-///
-/// The live compiler emits one piece per stage it is given, in order: a
-/// [`CompiledStage`] for each per-event stage and the
-/// [`stream::CompiledAggregation`] at the aggregation's place
-/// (`stream::compile_stream_plan_with`). So the pieces pair one for one,
-/// in order, with the stages that are not barriers, and a run between two
-/// barriers holds exactly its own stages. A count that does not pair is
-/// the server's own broken invariant, and the tail panics rather than run
-/// a stage at another stage's position.
 fn cut_into_steps(stages: &[Spanned<PipeStage>], plan: StreamPlan) -> Vec<TailStep> {
     let pieces: Vec<Piece> = match plan {
         StreamPlan::PassThrough(stages) => stages.into_iter().map(Piece::Stage).collect(),
@@ -291,7 +209,6 @@ fn cut_into_steps(stages: &[Spanned<PipeStage>], plan: StreamPlan) -> Vec<TailSt
     steps
 }
 
-/// The stream step a run of pieces compiles to, or none for an empty run.
 fn stream_step(run: Vec<Piece>) -> Option<TailStep> {
     if run.is_empty() {
         return None;
@@ -316,13 +233,9 @@ fn stream_step(run: Vec<Piece>) -> Option<TailStep> {
     }))
 }
 
-/// Run `steps` in order, the first over `rows` and each later one over
-/// the rows the step before it kept.
-///
 /// The latch is read before each step and once after the last, so a stop
-/// that lands as a step ends, or while a step has no row to read it over,
-/// ends the query as [`EngineError::Cancelled`] rather than answering
-/// (ADR-0063).
+/// that lands while a step has no row to read it over ends the query as
+/// [`EngineError::Cancelled`] rather than answering.
 fn run_steps(
     steps: &mut [TailStep],
     rows: impl IntoIterator<Item = Row>,
@@ -343,8 +256,6 @@ fn run_steps(
     Ok(rows)
 }
 
-/// The type the tail's own cells give an input column of type `ty`.
-///
 /// The SQL read hands the tail DATE, TIME and TIMESTAMP cells as text
 /// ([`crate::executor`] renders them before the tail reads them), so such
 /// a column, or a list of them, passes through the tail as `string` cells;
@@ -364,9 +275,8 @@ fn tail_cell_type(ty: &ColumnType) -> ColumnType {
     }
 }
 
-/// Convert a columnar `QueryResult` into a vec of typed pipeline rows,
-/// reading the lane's latch every [`TAIL_CANCEL_STRIDE`] rows: a result
-/// can be a million rows, and the copy holds the lane's permit.
+/// Reads the lane's latch every [`TAIL_CANCEL_STRIDE`] rows: a result can be
+/// a million rows, and the copy holds the lane's permit.
 fn rows_to_events(result: &QueryResult, cancel: &CancelLatch) -> Result<Vec<Row>, EngineError> {
     let mut events = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
@@ -385,8 +295,6 @@ fn rows_to_events(result: &QueryResult, cancel: &CancelLatch) -> Result<Vec<Row>
     Ok(events)
 }
 
-/// A result cell as a pipeline cell — a direct bridge, variant for variant.
-///
 /// Deliberately not a `serde_json` hop: JSON has no spelling for a
 /// non-finite double, so a SQL prefix computing `1.0/0` would hand the
 /// `extract kv` tail a null and the tail would count, compare and print
@@ -405,8 +313,6 @@ fn cell_to_eval(cell: &crate::value::Value) -> EvalValue {
     }
 }
 
-/// A pipeline cell as a result cell.
-///
 /// A non-finite double survives as `Value::Float`, and the wire spells it
 /// as `NaN`, `Infinity` or `-Infinity` under its `float` column, the same
 /// as the all-SQL path. Nulling it here would make the kv tail disagree
@@ -422,11 +328,6 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
         EvalValue::Null => crate::value::Value::Null,
         EvalValue::Bool(b) => crate::value::Value::Boolean(*b),
         EvalValue::Int(i) => crate::value::Value::Integer(*i),
-        // `Value::Integer` is signed, so a magnitude above `i64::MAX`
-        // lands in `Value::UInt` instead — the rule `trawl_api::value`
-        // owns for every decoder on this wire. A kv tail must not answer
-        // with a rounded reading of a number the SQL prefix would have
-        // spelled exactly.
         EvalValue::UInt(u) => land_u64(*u),
         EvalValue::Float(f) => crate::value::Value::Float(*f),
         EvalValue::Str(s) => crate::value::Value::String(s.clone()),
@@ -441,8 +342,6 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
     }
 }
 
-/// The unsigned bridge arm lands the number, not a rounded double, and
-/// picks the narrower signed variant when that holds the value.
 #[cfg(test)]
 #[test]
 fn unsigned_arm() {
@@ -456,8 +355,6 @@ fn unsigned_arm() {
     );
 }
 
-/// Add one pipeline cell's type to a column's evidence.
-///
 /// The pipeline cell, not the result cell it becomes: an
 /// [`EvalValue::Timestamp`] is text in the result, but its column is a
 /// `timestamp` column.
@@ -481,8 +378,6 @@ fn observe_cell(fold: &mut TypeFold, cell: &EvalValue) {
     fold.observe(&ty);
 }
 
-/// Convert pipeline rows to a typed, columnar [`QueryResult`].
-///
 /// The one builder for every result a Rust-side stage produces: the batch
 /// tail behind `extract kv`, and the live lane's frames and snapshots.
 /// The columns are `schema`'s, in its order, then every other key the rows
@@ -498,14 +393,9 @@ fn observe_cell(fold: &mut TypeFold, cell: &EvalValue) {
 /// fills the column from the exact one, else from the first in key order,
 /// as a stage reading the name would.
 ///
-/// Each column is typed from the cells it holds (ADR-0035, amended
-/// 2026-10-22): one type of cell gives that type, several give `mixed`,
-/// and list items fold the same way. The type its schema column carries
-/// fills what the cells leave open ([`TypeFold::finish_with`]): a column
-/// with no non-null cell takes it whole, and a list whose cells are all
-/// empty or null takes its items, so a stored `BIGINT[]` with nothing in
-/// it is still `list` of `integer` after the tail. A column that carries
-/// nothing and shows nothing is `string`.
+/// Each column is typed from the cells it holds (ADR-0035), and the type its
+/// schema column carries fills what the cells leave open
+/// ([`TypeFold::finish_with`]).
 pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> QueryResult {
     match rows_to_result_within(rows, schema, &CancelLatch::never()) {
         Ok(result) => result,
@@ -522,9 +412,6 @@ struct ResultColumns {
     index: HashMap<String, usize>,
 }
 
-/// [`ResultColumns`] for `rows`. This pass reads every row too, so it
-/// reads the lane's latch every [`TAIL_CANCEL_STRIDE`] rows, as the copy
-/// after it does.
 fn result_columns(
     rows: &[Row],
     schema: &[OutputColumn<ColumnType>],
@@ -556,9 +443,6 @@ fn result_columns(
     Ok(columns)
 }
 
-/// [`rows_to_result`], reading the lane's latch every
-/// [`TAIL_CANCEL_STRIDE`] rows: the batch tail's answer can be a million
-/// rows, and the copy holds the lane's permit.
 fn rows_to_result_within(
     rows: &[Row],
     schema: &[OutputColumn<ColumnType>],
@@ -612,17 +496,8 @@ fn rows_to_result_within(
     Ok(QueryResult { columns, rows: out })
 }
 
-/// The tail's answer for a stage that has no prepared pattern for an
-/// operand it reads (ADR-0063). The plan compile prepared every pattern
-/// the tail reads, so whatever the cause, the server broke its own
-/// invariant and the query is not to blame:
-/// [`EngineError::MissingPreparedPattern`], which names no pattern. The
-/// cause is logged here, by its fixed sentence. The tail stops at the
-/// first such row rather than read it as a non-match.
-///
-/// A search the lane's latch stopped ([`PatternError::Cancelled`]) is
-/// [`EngineError::Cancelled`] instead: the query was cancelled, and no
-/// invariant broke.
+/// The plan compile prepared every pattern the tail reads, so the server
+/// broke its own invariant and the query is not to blame (ADR-0063).
 fn tail_pattern_error(error: &PatternError) -> EngineError {
     if matches!(error, PatternError::Cancelled) {
         return EngineError::Cancelled;
@@ -635,10 +510,6 @@ fn tail_pattern_error(error: &PatternError) -> EngineError {
     EngineError::MissingPreparedPattern
 }
 
-/// Run pass-through stages on each event.
-///
-/// Refuses through [`tail_pattern_error`] when a stage lacks a prepared
-/// pattern.
 fn apply_pass_through(
     stages: &mut [CompiledStage],
     events: impl IntoIterator<Item = Row>,
@@ -663,13 +534,6 @@ fn apply_pass_through(
     Ok(output)
 }
 
-/// Run an aggregation plan: pre-stages → accumulate → snapshot → post-stages.
-///
-/// Refuses with [`EngineError::AggregationCapped`] when the accumulators
-/// dropped input at a cap: the live lane can report a partial answer on
-/// its snapshot, but a batch answer cannot, so it gives none (ADR-0001).
-/// Refuses through [`tail_pattern_error`] when a stage lacks a prepared
-/// pattern.
 fn apply_aggregate(
     pre_stages: &mut [CompiledStage],
     aggregation: &mut stream::CompiledAggregation,
@@ -678,7 +542,6 @@ fn apply_aggregate(
     anchor: &EvalContext,
     cancel: &CancelLatch,
 ) -> Result<Vec<Row>, EngineError> {
-    // Feed events through pre-stages into the aggregation.
     'event: for mut event in events {
         cancel.check()?;
         for stage in pre_stages.iter_mut() {
@@ -691,26 +554,18 @@ fn apply_aggregate(
                 // `Done` ends the input, not just this event's stage
                 // run: breaking only the inner loop would feed the
                 // accumulator the very event an exhausted `limit` just
-                // refused, and then every event after it, so
-                // `extract kv | limit 1 | stats count()` would count
-                // every row. Exhaustion is sticky, so no later event
-                // could be admitted anyway. Same rule as the post-stage
-                // loop below.
+                // refused.
                 StageResult::Done => break 'event,
             }
         }
-        // One statement anchor for every row, the pre-stages and the
-        // accumulator feed alike (ADR-0017 §3).
         aggregation.feed_event(&event, anchor);
     }
     if let Some(&cap) = aggregation.capped().first() {
         return Err(EngineError::AggregationCapped(cap));
     }
 
-    // Snapshot the aggregation results.
     let (_columns, snapshot_rows) = aggregation.snapshot();
 
-    // Apply post-stages to snapshot rows.
     let mut output = Vec::new();
     'row: for mut row in snapshot_rows {
         cancel.check()?;
@@ -729,25 +584,11 @@ fn apply_aggregate(
     Ok(output)
 }
 
-/// A `sort` step: a stable sort of `rows` by the stage's fields, the
-/// first field written the primary one.
+/// A `sort` step: a stable sort of `rows` by the stage's fields (ADR-0064).
 ///
-/// Each field binds per row through [`bind_event_key`] ([`sort_cell`]), as
-/// every other stage of the tail binds a name, and a row without it reads
-/// NULL. A NULL sorts after every value in both directions, as batch SQL
-/// puts it: [`compare_cells`] puts it last, and `-` reverses only the
-/// comparison of two values. Rows whose keys compare equal keep their
-/// input order, so of several `sort` steps the last is the primary key and
-/// the earlier ones break its ties.
-///
-/// Each row's keys bind once, before any comparison. One pass binds every
-/// field the stage writes, a repeated or absent name included, for every
-/// row, into one table of references to the rows' own cells, so no cell
-/// is copied and a comparison binds nothing. The row indices are sorted by
-/// that table ([`sort_rows`]), and the rows then move out in sorted order.
-/// Every pass over the rows reads the lane's latch each
-/// [`TAIL_CANCEL_STRIDE`] rows: the bind pass, the sort, which draws its
-/// indices one run at a time, and both halves of the move.
+/// Each row's keys bind once, before any comparison, into one table of
+/// references to the rows' own cells, so no cell is copied and a comparison
+/// binds nothing.
 fn sort_step(
     rows: Vec<Row>,
     sort: &SortStage,
@@ -814,8 +655,7 @@ fn sort_step_with(
 }
 
 /// The cell a sort key `name` reads in `row`, bound as `DuckDB` binds an
-/// identifier. A sort step calls it once per row and written key
-/// ([`sort_step`]).
+/// identifier.
 fn sort_cell<'r>(row: &'r Row, name: &str) -> Option<&'r EvalValue> {
     #[cfg(test)]
     SORT_BINDS.with(|binds| binds.set(binds.get() + 1));
@@ -830,30 +670,12 @@ thread_local! {
     static SORT_BINDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Whether a sort key read a value rather than a NULL or nothing.
 fn is_value(cell: Option<&EvalValue>) -> bool {
     !matches!(cell, None | Some(EvalValue::Null))
 }
 
 /// A `dedup` step: for each key, the row with the newest `_time`, the
 /// winners in their input order (ADR-0064).
-///
-/// The key is the live stage's ([`stream::dedup_key`]): the named fields'
-/// cell text, where an absent field and a NULL are one key, or with no
-/// field the whole row. Unlike the live stage, no key is ever evicted: a
-/// batch answer has every row before the step runs.
-///
-/// A row's `_time` binds as every name in the tail binds
-/// ([`bind_event_key`]) and is read as batch SQL's
-/// `TRY_CAST(_time AS TIMESTAMP)` reads it ([`EvalValue::as_instant`]).
-/// Only a strictly newer row replaces the one held for its key, so of
-/// rows with the same time the earliest wins, and a row with no readable
-/// time loses to any row with one. Identical rows have the same `_time`,
-/// so a bare `dedup` keeps the first of them.
-///
-/// One pass picks each key's winner by its index, and a second moves the
-/// winners out in input order, so no row is copied. Both read the lane's
-/// latch every [`TAIL_CANCEL_STRIDE`] rows.
 fn dedup_step(
     rows: Vec<Row>,
     dedup: &DedupStage,
@@ -900,15 +722,9 @@ fn dedup_step(
 }
 
 /// How many rows a row pass of the batch tail takes between two reads
-/// of the lane's latch: a sort step's bind pass, run, merge or move, a
-/// dedup step's pass, a copy in or out, or the render of a tracked
-/// timestamp column.
+/// of the lane's latch.
 pub const TAIL_CANCEL_STRIDE: usize = 4096;
 
-/// A stable sort of `items` by `compare` that a cancellation stops within
-/// [`TAIL_CANCEL_STRIDE`] items of work. A sort step sorts its row indices
-/// with it ([`sort_step`]).
-///
 /// One sort call cannot be left early, so the items are sorted in runs of
 /// one stride, each run reading the latch first, and the runs are merged
 /// pairwise, reading it every stride of output. Ties keep the earlier
@@ -983,13 +799,7 @@ const INSERTION_SORT_MAX: usize = 16;
 
 /// A stable sort of `items` by `compare` that answers each item exactly
 /// once whatever `compare` answers, even when `compare` is not a total
-/// order. Up to [`INSERTION_SORT_MAX`] items are insertion-sorted. A
-/// longer input is split in half, each half is sorted the same way, and
-/// the halves are merged, the left half's item first on a tie.
-///
-/// For a total order it answers what `sort_by` answers: a stable order is
-/// unique. It reads no latch, since [`sort_rows`] gives it one stride at a
-/// time.
+/// order.
 fn stable_sort<T>(
     mut items: Vec<T>,
     compare: &mut impl FnMut(&T, &T) -> std::cmp::Ordering,
@@ -1024,46 +834,27 @@ fn stable_sort<T>(
     out
 }
 
-/// Compare two optional cells for sorting purposes.
-///
-/// NULLs sort last. Two numbers compare numerically and exactly: an
-/// integer pair never becomes a pair of doubles, so `u64::MAX` and
-/// `u64::MAX - 1` keep their order instead of rounding to the same
-/// reading. Only a pair that already holds a DOUBLE reaches floating
-/// point, and a DOUBLE pair goes through the probed DOUBLE order
-/// (`compare::double_total_cmp`) rather than
-/// `partial_cmp(…).unwrap_or(Equal)`, which would leave a NaN wherever
-/// arrival order happened to put it. Everything else compares as the text
-/// the cell shows (`row::cell_text`, the same renderer the live lane groups
-/// by).
+/// Two numbers compare numerically and exactly: an integer pair never
+/// becomes a pair of doubles, so `u64::MAX` and `u64::MAX - 1` keep their
+/// order. Everything else compares as the text the cell shows
+/// (`row::cell_text`, the same renderer the live lane groups by).
 fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Ordering {
     match (a, b) {
         (None | Some(EvalValue::Null), None | Some(EvalValue::Null)) => std::cmp::Ordering::Equal,
         (None | Some(EvalValue::Null), _) => std::cmp::Ordering::Greater, // NULLs last
         (_, None | Some(EvalValue::Null)) => std::cmp::Ordering::Less,
         (Some(a), Some(b)) => {
-            // Try numeric comparison first.
             if let Some(ordering) = compare_numeric(a, b) {
                 return ordering;
             }
-            // Fall back to the cell's own text.
             row::cell_text(a).cmp(&row::cell_text(b))
         }
     }
 }
 
-/// Order two numeric cells, or answer `None` when either side is not a
-/// number.
-///
 /// These are the rules `result_actions::compare` already encodes for the
 /// results table in `trawl-web-ui`, so a column sorted by the browser and
-/// the same column sorted by `| sort` read the same way for every value the
-/// JSON hop can carry (a non-finite DOUBLE lands as null there; only the
-/// in-memory NaN sign rule differs, see `int_float`). Every integer is
-/// a point on one line, so the signed and unsigned variants compare as the
-/// numbers they are through `i128` — the narrowest type holding both
-/// ranges — rather than by variant rank. Nothing but a pair that already
-/// holds a DOUBLE is allowed near `f64`.
+/// the same column sorted by `| sort` read the same way.
 fn compare_numeric(a: &EvalValue, b: &EvalValue) -> Option<std::cmp::Ordering> {
     use EvalValue::{Float, Int, UInt};
     Some(match (a, b) {
@@ -1103,10 +894,6 @@ fn int_float(i: i64, f: f64) -> std::cmp::Ordering {
 }
 
 /// The unsigned twin of [`int_float`], for the range above `i64::MAX`.
-///
-/// Same shape, same NaN placement, same truncate-then-refine tie-break;
-/// only the bounds move, because a `u64` cannot be negative and reaches
-/// twice as far up.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -1125,8 +912,6 @@ fn uint_float(u: u64, f: f64) -> std::cmp::Ordering {
         .then_with(|| (whole as f64).partial_cmp(&f).unwrap_or(Ordering::Equal))
 }
 
-/// A `sort` in the Rust tail orders an oversized unsigned by value.
-///
 /// `u64::MAX` and `u64::MAX - 1` are the same `f64`, so a comparator that
 /// read every number as a double called the two rows equal and left them
 /// in whatever order they arrived in. The four rows here span both
@@ -1178,11 +963,6 @@ fn rust_tail_sort_orders_large_unsigned_exactly() {
     );
 }
 
-/// The batch tail behind `extract kv` goes through the same streaming
-/// compiler the live lane does, so a `timechart` naming a bucket column
-/// is refused there too — and the refusal reaches the caller as the
-/// 400-class `Emit` error, naming the lane and the column.
-///
 /// The other door into that compiler,
 /// `compile_stream_plan`, is pinned by
 /// `stream::timechart_on_refused_in_live_lane` in trawl-core, which
@@ -1230,10 +1010,8 @@ fn timechart_on_refused_in_batch_tail() {
     }
 }
 
-/// A tail whose patterns need more regex memory than one query holds is
-/// refused before it matches a row, typed as the capacity refusal it is,
-/// with a sentence that quotes none of its patterns. Seven bodies of the
-/// `(\pL{12})` class charge past the budget at the seventh (ADR-0063).
+/// Seven bodies of the `(\pL{12})` class charge past the budget at the
+/// seventh (ADR-0063).
 #[cfg(test)]
 #[test]
 fn a_tail_over_the_regex_budget_is_a_typed_refusal() {
@@ -1289,8 +1067,6 @@ fn a_tail_over_the_regex_budget_is_a_typed_refusal() {
     );
 }
 
-/// A `timechart` with no `span=` in the tail cuts its buckets from the
-/// query's `last=` window, as the SQL emitter would for the same stage:
 /// `last=4h` is the five-minute band, so two rows a minute apart share a
 /// bucket that the live default of one minute would split.
 #[cfg(test)]
@@ -1368,7 +1144,6 @@ fn tail_timechart_span_follows_the_query_window() {
     assert_eq!(live.rows.len(), 2, "{:?}", live.rows);
 }
 
-/// A fresh metered ledger for one tail, as a query lane opens one.
 #[cfg(test)]
 fn ledger() -> Preparer {
     Preparer::new()
@@ -1393,9 +1168,6 @@ mod tests {
         }
     }
 
-    /// The bridge is an identity on every cell shape a result can hold,
-    /// specials included: a JSON hop would turn `inf` and `NaN` into NULL
-    /// on the way in.
     #[test]
     fn the_bridge_round_trips_every_cell_shape() {
         let cells = [
@@ -1432,8 +1204,6 @@ mod tests {
         }
     }
 
-    /// A `Timestamp` cell — the one shape with no result-side twin — lands
-    /// as the wire's RFC 3339 text in UTC, and an infinity as its word.
     #[test]
     fn a_timestamp_cell_leaves_the_bridge_as_wire_text() {
         let ts = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
@@ -1455,9 +1225,6 @@ mod tests {
         }
     }
 
-    /// The schema fixes the column order a sorted [`Row`] cannot, keeps a
-    /// schema column no row carries (typed by what it carries, else
-    /// `string`), and every other key follows it.
     #[test]
     fn the_schema_leads_the_column_order() {
         let row = |cells: &[(&str, EvalValue)]| -> Row {
@@ -1514,9 +1281,6 @@ mod tests {
         assert!(empty.rows.is_empty());
     }
 
-    /// One name is one column: a row key lands in the column it names
-    /// ASCII case-insensitively, under the spelling first listed, and a
-    /// row holding both spellings fills it from the exact one.
     #[test]
     fn a_case_variant_key_lands_in_its_column() {
         let row = |cells: &[(&str, EvalValue)]| -> Row {
@@ -1582,7 +1346,6 @@ mod tests {
         assert_eq!(out.columns.len(), 3); // message, user, status
         assert_eq!(out.rows.len(), 2);
 
-        // Check first row values.
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         assert_eq!(
             out.rows[0][col_idx("user")],
@@ -1729,7 +1492,6 @@ mod tests {
         .unwrap();
         assert_eq!(out.rows.len(), 2);
 
-        // Find GET row — should have count=2.
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         let get_row = out
             .rows
@@ -1887,7 +1649,6 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// `n` messages `k=v{i}` for the kv tail to split, one per row.
     fn kv_messages(n: usize) -> QueryResult {
         make_result(
             &["message"],
@@ -1897,11 +1658,6 @@ mod tests {
         )
     }
 
-    /// A tail stage whose table lacks the pattern it reads refuses the
-    /// batch answer in every position of the tail as the server's own
-    /// fault, [`EngineError::MissingPreparedPattern`], whose sentence names
-    /// no pattern: a row is never read as a non-match, and the query is
-    /// not blamed.
     #[test]
     fn missing_prepared_pattern_is_an_error() {
         use trawl_core::eval::PatternTable;
@@ -1978,14 +1734,11 @@ mod tests {
         }
     }
 
-    /// A latch over a fresh flag, and the flag that sets it.
     fn tripwire() -> (std::sync::Arc<std::sync::atomic::AtomicBool>, CancelLatch) {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         (std::sync::Arc::clone(&flag), CancelLatch::new(flag))
     }
 
-    /// `dsl`'s pipeline compiled as the tail compiles it, its patterns
-    /// prepared on a ledger that reads `cancel`'s stop.
     fn cancellable_plan(dsl: &str, cancel: &CancelLatch) -> StreamPlan {
         let tail = trawl_core::parser::parse(dsl).expect("dsl parses").pipeline;
         stream::compile_stream_plan_with(
@@ -1997,8 +1750,6 @@ mod tests {
         .expect("plan compiles")
     }
 
-    /// How many events a `head` stage of cap `count` has admitted, read
-    /// off its live counter.
     fn admitted(stage: &CompiledStage) -> u64 {
         let CompiledStage::Limit { count, remaining } = stage else {
             panic!("a head stage: {stage:?}");
@@ -2006,11 +1757,6 @@ mod tests {
         count - remaining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// The batch tail reads the latch between events and between stages
-    /// (ADR-0063), so a cancellation stops it at its next step with
-    /// [`EngineError::Cancelled`], never a pattern or emit error. A `head`
-    /// after the `extract kv` counts the events that reached it.
-    ///
     /// Pass-through: the latch trips as the input hands over event `k+1`,
     /// and only the first `k` events reached the `head`. Aggregate: the
     /// latch trips when the input runs out, between the pre-stages and the
@@ -2107,7 +1853,6 @@ mod tests {
         ));
     }
 
-    /// Rows carrying `n` = each of `values`.
     fn numbered(values: impl IntoIterator<Item = i64>) -> Vec<Row> {
         values
             .into_iter()
@@ -2115,8 +1860,6 @@ mod tests {
             .collect()
     }
 
-    /// A comparator by `n` that counts its calls in `calls` and sets
-    /// `flag` on call `trip`.
     fn tripping_compare<'a>(
         calls: &'a std::cell::Cell<usize>,
         flag: &'a std::sync::atomic::AtomicBool,
@@ -2131,8 +1874,6 @@ mod tests {
         }
     }
 
-    /// `dsl`'s pipeline compiled into the tail's steps, its patterns
-    /// prepared on a ledger that reads `cancel`'s stop.
     fn cancellable_steps(dsl: &str, cancel: &CancelLatch) -> Vec<TailStep> {
         let tail = trawl_core::parser::parse(dsl).expect("dsl parses").pipeline;
         compile_tail(
@@ -2144,8 +1885,6 @@ mod tests {
         .expect("the tail compiles")
     }
 
-    /// A step's shape: its kind and its compiled pieces in order, each
-    /// `head` with its count.
     fn shape(step: &TailStep) -> String {
         let piece = |stage: &CompiledStage| match stage {
             CompiledStage::Limit { count, .. } => format!("head {count}"),
@@ -2187,12 +1926,6 @@ mod tests {
         }
     }
 
-    /// The plan of the tail without its barriers is cut back at each
-    /// barrier's position, so every compiled piece runs in its own stage's
-    /// place: each `head` keeps its own count, the aggregation lands in
-    /// the run that wrote it, a run between two barriers holds exactly its
-    /// own stages, and two barriers in a row leave no empty run between
-    /// them.
     #[test]
     fn the_cut_puts_each_piece_at_its_stage() {
         let cases: &[(&str, &[&str])] = &[
@@ -2259,10 +1992,6 @@ mod tests {
         }
     }
 
-    /// A sort step reads the lane's latch (ADR-0063): a sort cancelled
-    /// before it runs ends as [`EngineError::Cancelled`] rather than
-    /// answering with sorted rows, and so does a tail with no rows to
-    /// sort, which only the reads around the steps can see.
     #[test]
     fn sort_steps_observe_cancellation() {
         let anchor = EvalContext::capture();
@@ -2295,9 +2024,6 @@ mod tests {
         );
     }
 
-    /// A dedup step reads the lane's latch in its passes: a cancelled
-    /// dedup over more than one stride of rows ends as
-    /// [`EngineError::Cancelled`] rather than answering with its winners.
     #[test]
     fn a_dedup_step_observes_cancellation() {
         let steps = cancellable_steps("* | dedup n", &CancelLatch::never());
@@ -2363,9 +2089,6 @@ mod tests {
         }
     }
 
-    /// Sorting in strides and merging them answers exactly what one
-    /// stable `sort_by` answers, ties in arrival order included, for an
-    /// input over several strides with a ragged last one.
     #[test]
     fn a_strided_sort_matches_a_stable_sort() {
         let len = 3 * TAIL_CANCEL_STRIDE + TAIL_CANCEL_STRIDE / 2;
@@ -2385,10 +2108,6 @@ mod tests {
         assert_eq!(sorted, expected);
     }
 
-    /// For a total order with many ties, the run sort answers exactly what
-    /// a stable `sort_by` answers: for no item and one, at the insertion
-    /// sort's limit and either side of it, over an odd split, for an odd
-    /// few thousand items, and for a whole stride.
     #[test]
     fn the_run_sort_matches_a_stable_sort() {
         let mut by_key = |a: &(usize, usize), b: &(usize, usize)| a.0.cmp(&b.0);
@@ -2440,8 +2159,6 @@ mod tests {
         assert!(calls.get() <= bound, "{} comparisons", calls.get());
     }
 
-    /// A latch set inside a merge's comparator ends the merge at the next
-    /// stride of output, before the rest of the runs is read.
     #[test]
     fn a_merge_stops_within_a_stride_of_its_cancellation() {
         let stride = TAIL_CANCEL_STRIDE;
@@ -2465,8 +2182,6 @@ mod tests {
         assert!(calls.get() <= stride, "{} comparisons", calls.get());
     }
 
-    /// The copies into and out of the tail read the latch too: a
-    /// cancelled lane does not copy a whole result on either side.
     #[test]
     fn the_tail_copies_observe_cancellation() {
         let (flag, cancel) = tripwire();
@@ -2519,7 +2234,6 @@ mod tests {
         );
     }
 
-    /// A sort stage over `fields`, each a name and its direction.
     fn sort_over(fields: &[(&str, SortDirection)]) -> SortStage {
         SortStage {
             fields: fields
@@ -2765,11 +2479,6 @@ mod tests {
         )
     }
 
-    /// The batch tail feeds the live lane's accumulators, which stop
-    /// taking input at their caps. A batch answer has no channel to say
-    /// it is partial, so a tail that would drop input refuses as
-    /// `result_too_large` and names the cap, instead of answering with
-    /// counts that leave groups out (ADR-0001).
     #[test]
     fn kv_tail_over_group_cap_refuses() {
         let limit = trawl_core::stream::AggregationCap::Groups.limit();
@@ -2791,7 +2500,6 @@ mod tests {
         );
     }
 
-    /// Exactly at a cap nothing is dropped, so the tail answers whole.
     #[test]
     fn kv_tail_at_group_cap_answers() {
         let limit = trawl_core::stream::AggregationCap::Groups.limit();
@@ -2800,7 +2508,6 @@ mod tests {
         assert_eq!(out.rows.len(), limit);
     }
 
-    /// The per-group value caps refuse the same way, each naming itself.
     #[test]
     fn kv_tail_over_value_caps_refuses() {
         use trawl_core::stream::AggregationCap;

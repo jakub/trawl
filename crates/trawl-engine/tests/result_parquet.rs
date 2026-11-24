@@ -3,9 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The run parquet writer stores every column in an exact type and reads
-//! it back as the same typed result (ADR-0035, amended 2026-10-22). Each
-//! test writes a real file, then asks `DuckDB` what the file holds and
-//! reads it back through `read_parquet_to_result`.
+//! it back as the same typed result (ADR-0035).
 
 use std::path::Path;
 
@@ -17,7 +15,6 @@ fn text(s: &str) -> Value {
     Value::String(s.to_owned())
 }
 
-/// The `DuckDB` type of every column in the file, in order.
 fn described(path: &Path) -> Vec<(String, String)> {
     let conn = duckdb::Connection::open_in_memory().unwrap();
     let mut stmt = conn
@@ -32,7 +29,6 @@ fn described(path: &Path) -> Vec<(String, String)> {
         .unwrap()
 }
 
-/// A leaf column's parquet physical and converted type, from the footer.
 fn footer(path: &Path, name: &str) -> (String, Option<String>) {
     duckdb::Connection::open_in_memory()
         .unwrap()
@@ -65,8 +61,6 @@ fn read(path: &Path) -> QueryResult {
         .expect("the file reads back")
 }
 
-/// AC 7, and every other type the writer stores: the file holds exact
-/// types, never inferred ones, and reads back cell for cell.
 #[test]
 #[allow(clippy::too_many_lines)] // one row per stored type, kept in one table
 fn every_column_type_is_stored_exactly_and_reads_back() {
@@ -190,9 +184,6 @@ fn every_column_type_is_stored_exactly_and_reads_back() {
     assert_eq!(back.rows.len(), expected.len());
 }
 
-/// The writer declares every column's text and never infers one, so a
-/// column of digit strings is still a string column in the file. Before
-/// this, `read_json(..., auto_detect=true)` read it as `BIGINT`.
 #[test]
 fn a_column_of_digit_strings_stays_a_string() {
     let written = QueryResult {
@@ -207,9 +198,6 @@ fn a_column_of_digit_strings_stays_a_string() {
     assert_eq!(read(&path), written);
 }
 
-/// AC 1: a zero-row result writes a parquet file that carries its schema,
-/// and reads back as typed columns with no rows. An `integer` column with
-/// no cell to ask is `BIGINT`.
 #[test]
 fn a_zero_row_result_writes_a_typed_empty_file() {
     let written = QueryResult {
@@ -234,9 +222,6 @@ fn a_zero_row_result_writes_a_typed_empty_file() {
     assert_eq!(read(&path), written);
 }
 
-/// A timestamp list a Rust tail passed through is a list of timestamps in
-/// its result, so a run of it stores `TIMESTAMP[]` and reads back as the
-/// same instants, in UTC.
 #[test]
 fn a_timestamp_list_through_a_rust_tail_is_stored_as_timestamps() {
     let dir = tempfile::tempdir().unwrap();
@@ -296,9 +281,6 @@ fn column_names_are_kept_verbatim() {
     assert_eq!(read(&path), written);
 }
 
-/// What the writer refuses, and that a refusal leaves no file behind:
-/// parquet holds no zero-column file and no union type, and a cell its
-/// column's type does not admit fails the wire encoding.
 #[test]
 fn the_writer_refuses_what_parquet_cannot_hold_exactly() {
     let dir = tempfile::tempdir().unwrap();

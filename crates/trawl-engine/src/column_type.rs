@@ -2,24 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Result column types, read off `DuckDB`'s logical types.
-//!
-//! A `DuckDB` result column is typed before its first row is read
-//! (`column_logical_type`), so a zero-row or all-null column is typed from
-//! execution like any other (ADR-0035, amended 2026-10-22). Types never
-//! come from the catalog: this is what the statement returned.
+//! Result column types, read off `DuckDB`'s logical types (ADR-0035).
 //!
 //! The map has to agree with what the executor's `extract_value` lands for
 //! the same column, or the wire encoder refuses the cell. The executor's
 //! `every_duckdb_type_agrees_with_its_cells` drives `test_all_types()`
-//! through both. A type `extract_value` renders as text, or lands only as
-//! null (`DECIMAL`, `INTERVAL`, `STRUCT`, `MAP`, `UNION`), is `string`
-//! here, and so is `SQLNULL`, which has no evidence of its own (`DuckDB`
-//! resolves a bare `NULL` result column to `INTEGER` before it gets here).
-//!
-//! [`StoredType`] is the way back: the `DuckDB` type a run's parquet result
-//! stores a typed column as, so reading the file maps it to the same
-//! `ColumnType` again.
+//! through both.
 
 use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 use trawl_api::value::{ColumnType, Value};
@@ -54,21 +42,9 @@ pub fn column_type(ty: &LogicalTypeHandle) -> ColumnType {
 /// The `DuckDB` type a run's parquet result stores a column as: the reverse
 /// of [`column_type`], for `Executor::write_query_result_to_parquet`.
 ///
-/// The wire has one `integer` type, so the width comes from the cells
-/// (ADR-0035, amended 2026-10-22): `BIGINT` when every cell fits `i64`,
-/// `UBIGINT` when some cell is above `i64::MAX` and none is negative, and
-/// `BIGINT` when there is no cell to ask. Reading the file back maps both
-/// to `integer` again, and a `UBIGINT` cell above `i64::MAX` lands as
-/// `Value::UInt`.
-///
-/// Cells that need both a negative and a magnitude above `i64::MAX` have
-/// no exact stored type. `DuckDB`'s parquet writer stores a `HUGEINT`
-/// column as `DOUBLE`, which rounds past 2^53, so such a column is refused
-/// like a `mixed` one, which has no stored type because parquet has no
-/// union.
-///
-/// A timestamp is stored as `TIMESTAMP` in UTC, the way the corpus stores
-/// `_time`.
+/// `DuckDB`'s parquet writer stores a `HUGEINT` column as `DOUBLE`, which
+/// rounds past 2^53, so cells that need both a negative and a magnitude
+/// above `i64::MAX` have no exact stored type and are refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoredType {
     Boolean,
@@ -83,9 +59,6 @@ pub enum StoredType {
 }
 
 impl StoredType {
-    /// How `ty` is stored, given every cell the column holds, or why it
-    /// cannot be: a `mixed` column (or list items), or integers that need
-    /// both signs and the unsigned range.
     pub fn of<'a>(
         ty: &ColumnType,
         cells: impl IntoIterator<Item = &'a Value>,
@@ -117,7 +90,6 @@ impl StoredType {
         })
     }
 
-    /// The `DuckDB` type name, `UBIGINT` or `BIGINT[]`.
     pub fn sql(&self) -> String {
         match self {
             Self::Boolean => "BOOLEAN".to_owned(),
@@ -142,14 +114,9 @@ impl StoredType {
         }
     }
 
-    /// The `DuckDB` expression that turns `expr`, the column's wire text
-    /// read as [`text_sql`](Self::text_sql), into this type exactly.
-    ///
-    /// A cast for every type but a timestamp. The wire spells a timestamp
-    /// in RFC 3339 with its offset, so it casts to `TIMESTAMPTZ` and is
-    /// read back `AT TIME ZONE 'UTC'`, a `TIMESTAMP` holding the same
-    /// instant whatever offset it was written in. A list maps its elements
-    /// through the same rule; `depth` names each level's lambda parameter.
+    /// The wire spells a timestamp in RFC 3339 with its offset, so it casts to
+    /// `TIMESTAMPTZ` and is read back `AT TIME ZONE 'UTC'`, a `TIMESTAMP`
+    /// holding the same instant whatever offset it was written in.
     pub fn cast_text(&self, expr: &str) -> String {
         self.cast_text_at(expr, 0)
     }
@@ -170,8 +137,6 @@ impl StoredType {
     }
 }
 
-/// What a column's integer cells need: a negative, a magnitude above
-/// `i64::MAX`, or both. A list's elements count toward its items' type.
 #[derive(Debug, Clone, Copy, Default)]
 struct IntegerRange {
     negative: bool,

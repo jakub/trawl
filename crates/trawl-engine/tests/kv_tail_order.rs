@@ -9,8 +9,7 @@
 //! `sort seq` before `extract kv`, and every expectation names rows by
 //! `seq` or by a group key, never by scan order. The fixture files are
 //! written out of `seq` order, so a test that leaned on scan order would
-//! read the wrong rows. Batch SQL is the oracle only for `sort | head` and
-//! `stats | sort | limit`; every other expectation is computed by hand.
+//! read the wrong rows.
 
 use std::io::Write as _;
 
@@ -20,7 +19,6 @@ use trawl_engine::error::EngineError;
 use trawl_engine::executor::Executor;
 use trawl_engine::value::{QueryResult, Value};
 
-/// The ndjson rows, written where `read_json` can reach them.
 fn source(rows: &[String]) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.ndjson");
@@ -43,7 +41,6 @@ fn run(dsl: &str, glob: &str) -> QueryResult {
     try_run(dsl, glob).unwrap_or_else(|error| panic!("{dsl:?} must run: {error}"))
 }
 
-/// The 400-class sentence a refused tail answers with.
 fn refusal(dsl: &str, glob: &str) -> String {
     match try_run(dsl, glob) {
         Err(EngineError::Emit(EmitError::UnsupportedOperation { message })) => message,
@@ -59,13 +56,11 @@ fn column(result: &QueryResult, name: &str) -> usize {
         .unwrap_or_else(|| panic!("missing {name}: {:?}", result.columns))
 }
 
-/// Every row's `name` cell, in answer order.
 fn cells(result: &QueryResult, name: &str) -> Vec<Value> {
     let at = column(result, name);
     result.rows.iter().map(|row| row[at].clone()).collect()
 }
 
-/// Every row's `seq`, in answer order.
 fn seqs(result: &QueryResult) -> Vec<i64> {
     cells(result, "seq")
         .into_iter()
@@ -76,8 +71,6 @@ fn seqs(result: &QueryResult) -> Vec<i64> {
         .collect()
 }
 
-/// Rows `seq` 1..=n, each with message `k=v{seq}` and the given extra
-/// JSON fields, written in a fixed scramble of `seq` order.
 fn scrambled(fields: &[String]) -> Vec<String> {
     let rows: Vec<(String, String)> = fields
         .iter()
@@ -87,11 +80,8 @@ fn scrambled(fields: &[String]) -> Vec<String> {
     scrambled_messages(&rows)
 }
 
-/// Rows `seq` 1..=n, each a `(message, extra JSON fields)` pair, written
-/// in a fixed scramble of `seq` order.
 fn scrambled_messages(rows: &[(String, String)]) -> Vec<String> {
     let mut order: Vec<usize> = (0..rows.len()).collect();
-    // A fixed scramble: odd positions from the back, then even ones.
     order.sort_by_key(|&i| (i % 2 == 0, std::cmp::Reverse(i)));
     order
         .into_iter()
@@ -104,7 +94,6 @@ fn scrambled_messages(rows: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
-/// `bytes` 10, 20 and 100 in `seq` order.
 fn three_sizes() -> (tempfile::TempDir, String) {
     source(&scrambled(&[
         r#""bytes":10"#.to_owned(),
@@ -113,8 +102,6 @@ fn three_sizes() -> (tempfile::TempDir, String) {
     ]))
 }
 
-/// Six rows: `bytes` 30, 10, 20, 60, 50, 40 and `grp` a, b, a, b, a, b in
-/// `seq` order. The three largest are the last three rows.
 fn six_sizes() -> (tempfile::TempDir, String) {
     let bytes = [30, 10, 20, 60, 50, 40];
     source(&scrambled(
@@ -129,8 +116,6 @@ fn six_sizes() -> (tempfile::TempDir, String) {
     ))
 }
 
-/// `(seq, bytes)` for each answer row, for comparing two answers whose
-/// other columns differ.
 fn seq_bytes(result: &QueryResult) -> Vec<(Value, Value)> {
     cells(result, "seq")
         .into_iter()
@@ -254,7 +239,6 @@ fn kv_sort_barrier_matrix() {
             "the old name binds nothing after a rename",
         ),
         (
-            // 70, 90, 80, 40, 50, 60
             "let bytes = 100 - bytes | sort -bytes | head 2",
             &[2, 3],
             "a key overwritten by let sorts by its new value",
@@ -283,8 +267,6 @@ fn kv_barrier_protocols() {
     let none = run("* | sort seq | extract kv | head 0 | sort bytes", &glob);
     assert!(none.rows.is_empty(), "head 0 hands the sort no rows");
 
-    // A source that matches no file answers with no columns; the tail is
-    // still validated whole.
     let empty_dir = tempfile::tempdir().unwrap();
     let no_files = empty_dir.path().join("none-*.ndjson").display().to_string();
     assert!(
@@ -306,7 +288,6 @@ fn kv_barrier_protocols() {
         "an empty earlier step never skips a later refusal"
     );
 
-    // One more distinct `k` than the group cap.
     let groups = trawl_core::stream::AggregationCap::Groups.limit();
     let many: Vec<String> = (0..=groups).map(|_| String::new()).collect();
     let (_many_dir, many_glob) = source(&scrambled(&many));
@@ -326,7 +307,6 @@ fn kv_barrier_protocols() {
     );
 }
 
-/// The sentence `tail` after `extract kv` is refused with.
 const TAIL_REFUSAL: &str = "post-processing: tail is not supported after extract kv; \
                             use sort and head instead";
 
@@ -352,8 +332,6 @@ fn kv_sort_binding_and_values() {
         "equal keys keep input order descending"
     );
 
-    // `n` is NULL in SQL for rows 2 and 5, and `ax` is a kv key that row
-    // 4's `pairs` lacks.
     let (_nulls_dir, nulls) = source(&scrambled(&[
         r#""n":3,"pairs":"ax=3""#.to_owned(),
         r#""n":null,"pairs":"ax=1""#.to_owned(),
@@ -432,12 +410,6 @@ fn kv_stats_sort_stats_is_refused() {
     );
 }
 
-/// A scalar head in an aggregation slot is legal in the SQL prefix, where
-/// it projects (ADR-0024). The tail compiles through the live lane's
-/// accumulators, which have nothing to run for one, so it is refused
-/// rather than counted (ADR-0001, Amendment 2026-11-08). The tail frames
-/// the live sentence with `post-processing: `, so the reason is matched
-/// inside it.
 #[test]
 fn kv_tail_refuses_scalar_heads() {
     let (_dir, glob) = three_sizes();
@@ -560,10 +532,6 @@ fn kv_dedup_keeps_newest_per_key() {
     );
 }
 
-/// The kv tail refuses a `sample` after `extract kv` with today's
-/// result, the live lane's sentence framed by `post-processing: `. A
-/// `sample` before `extract kv` stays in the SQL prefix, and one larger
-/// than its input feeds every row's extracted values to the tail.
 #[test]
 fn sample_lane_boundaries() {
     let (_dir, glob) = three_sizes();

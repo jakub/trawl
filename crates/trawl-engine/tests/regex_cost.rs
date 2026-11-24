@@ -4,15 +4,8 @@
 
 //! What one regex call costs, in Rust and in the bundled `DuckDB`'s RE2,
 //! for the worst patterns ADR-0063's limits admit, over the longest value
-//! ingest stores.
-//!
-//! ADR-0063, as amended on 2026-11-04, holds the Rust engine to a hard
-//! ceiling: one call over one stored value of at most `MAX_RAW_CHARS`
-//! (65 536) characters costs under 0.5 s, in the live tail and in every
-//! live plan. RE2 runs every batch regex and has no ceiling: its worst
-//! measured call is reported as an envelope. This harness measures both
-//! and prints the transcript that `scripts/evidence/issue-334/cost.sh`
-//! commits.
+//! ingest stores. This harness measures both and prints the transcript
+//! that `scripts/evidence/issue-334/cost.sh` commits.
 //!
 //! Not a correctness test and not run in CI: every part is `#[ignore]`d,
 //! because a wall-clock number on a shared machine is evidence for a
@@ -47,110 +40,23 @@
 //! first non-ASCII byte, so over non-ASCII text Rust runs the Pike VM from
 //! the start.
 //!
-//! The search composes shapes from the node kinds the walk prices
-//! (`trawl_core::pattern::price`). Each repeated unit is an atom with a
-//! prefix before it and a wrapper around it:
-//!
-//! - atoms: `[abc]`, `.` under `(?s)`, `[^\n]`, `\w`, `\pL`, `\PN`,
-//!   `[abc]` and `\pL` under `(?i)`, the fan class (below), and two atoms
-//!   that cost the most translation: `\p{Any}` and the full-range bracket
-//!   `[\x00-\x{10FFFF}]`, each under `(?i)`;
-//! - prefixes: none, `\B`, `(?:\b|\B)`, `(?m:^)?`, an empty capture group,
-//!   a repeat of nothing, `(?:)?`, and an empty alternation, `(?:|)`;
-//! - wrappers: none, a capture group, `?`, two nested `?`, an alternation
-//!   with `[abc]`, and `{0,2}`.
-//!
-//! The outer shapes are `a (?:unit){k} [^abc]` for every combination,
-//! `\B (?:unit){k} \PL` for every wrapped atom, and the unit written out
-//! `k` times, with no prefix and with `\B`. Writing a unit out compiles to
-//! the same program as counting it, but it is `k` times the text and the
-//! translation, so it reaches the body cap and the translation budget:
-//! the two translation atoms written out reach the budget at about 14.
-//! Two-unit mixes put `j` optional big classes before a counted run of
-//! `[abc]` or `\B[abc]`, and the fan class padded to the body cap reaches
-//! the cap with every `k`. The fan mix, `a (?:\BX{0,2}){j} (?:X{0,2}){k}
-//! [^abc]` with `X` each of the mixes' large classes and `j` each even
-//! count up to 18, spends the positions and the batch-engine view
-//! together: each `\B` unit is three positions and two copies of the
-//! class, each plain unit two of each.
-//!
 //! Each composed shape takes the largest `k` that
 //! `trawl_core::parser::parse` admits, so it passes every check a query
-//! passes and sits at the edge of a limit: the 1024-byte body cap, the
-//! repeat budget of 64 positions, the translation budget of 2^24 units a
-//! query, the 1 MiB limit on the Rust program, or the 512 KiB cap on the
-//! program the batch engine compiles from the body's view. A body that
-//! nests a class or uses a class set operator is refused outright, so
-//! none is composed. The transcript counts the limit that refuses each
-//! shape's next `k`.
+//! passes and sits at the edge of a limit.
 //!
-//! Named cases sit beside the composed ones: the families of the earlier
-//! transcripts, which put each priced node kind in a counted repeat or
-//! nest repeats outside and inside one; the shapes review round 3 and
-//! FIX4 to FIX9 reported, each at the count it was reported at; and the
-//! fan class.
-//!
-//! The fan class is FIX7's, ported from its generator, `gen_fan.py`. It
-//! holds only literal code points: alternating ASCII letters and digits,
-//! one character for each UTF-8 lead byte, and along the subject's own
-//! UTF-8 path one character for each sibling continuation byte, every
-//! other one at the last level. Every list of byte ranges the subject's
-//! bytes walk through is then long, and once a DFA gives up, both
+//! The fan class holds only literal code points: alternating ASCII letters
+//! and digits, one character for each UTF-8 lead byte, and along the
+//! subject's own UTF-8 path one character for each sibling continuation
+//! byte, every other one at the last level. Every list of byte ranges the
+//! subject's bytes walk through is then long, and once a DFA gives up, both
 //! engines scan those lists for every live position on every byte. A
 //! class is one position, so the fan costs the most a position can.
 //!
-//! Every shape is measured over four alphabets: Deseret letters (4-byte,
-//! with case folds), CJK ideographs (3-byte, without), three characters
-//! of the Specials block, U+FFFD, U+FFFC and U+FFFB, and ASCII letters.
-//! The specials' UTF-8 bytes, `EF BF xx`, sort at or near the end of each
-//! sorted list of byte ranges the fan compiles to, and Rust's Pike VM
-//! scans each list from its start, so FIX9 found them the costliest
-//! subject for the fan. None of them is a letter, so over them a needle
-//! that ends in `\PL` ends in `\pL` instead, which they never hold either. The 2026-11-03
-//! transcripts also measured 4-byte letters with and without a 4-byte
-//! symbol, and ASCII with a space; Deseret matched or led every one of
-//! them in both engines, so they are dropped.
-//!
 //! The subject defeats literal prefilters by holding the pattern's
-//! literals everywhere: it is eight tenths `a`, which keeps many positions
-//! alive at once, or three tenths, which keeps the set of live positions
-//! varied. The rest is split between `b` and `c`. A composed shape ends in
-//! `[^abc]` or `\PL`, which the subject never holds, so it never matches
-//! and each call scans the whole subject. A named family that ends in `c`
-//! gets a subject with no `c` exactly `k + 1` characters after an `a`. The
-//! harness checks that no call finds a match.
-//!
-//! Every admitted shape is screened with one call, over the subject that
-//! is eight tenths `a`. The slowest shapes of the screen are then timed in
-//! full over both subjects: Rust's ten slowest in seven calls each after a
-//! warm-up, and RE2's six slowest in five, because one RE2 call of those
-//! costs seconds. A shape that
-//! holds a capture group has Rust's `captures` timed beside `is_match`,
-//! because the live `extract` calls it. The slowest shape in each engine is
-//! last timed at smaller `k`, to show how its cost scales with the count.
-//!
-//! # RE2's step
-//!
-//! A second cost does not follow the positions. RE2 sizes its DFA from a
-//! fixed memory budget (`DuckDB` binds RE2's default `max_mem`, 8 MiB),
-//! and a program too large for that budget fails the DFA's init: every
-//! call then runs the NFA, at hundreds of milliseconds where the DFA took
-//! a few. Large classes, `\pL` above all, make a program large within few
-//! positions. The step part times the families FIX6 calibrated, at counts
-//! on both sides of the step, over Deseret, CJK and ASCII. Each row gives
-//! what the body compiles to in Rust and in its batch-engine view, which
-//! writes `\w`, `\d`, `\s`, `\b` and `\B` in RE2's ASCII meanings
-//! (`trawl_core::pattern::Preparer::batch_compiled_bytes`), and where the
-//! parser puts it.
-//!
-//! # What the ceiling covers
-//!
-//! The ceiling is per call, over one stored value of at most
-//! `MAX_RAW_CHARS` characters. Two things fall outside it: values stored
-//! before the ingest cap existed keep their length, and a computed
-//! subject such as `concat(message, message)` can be longer than any one
-//! stored value. A query over either stays correct and pays in proportion
-//! to the longer subject.
+//! literals everywhere. A composed shape ends in `[^abc]` or `\PL`, which
+//! the subject never holds, so it never matches and each call scans the
+//! whole subject. A named family that ends in `c` gets a subject with no
+//! `c` exactly `k + 1` characters after an `a`.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -165,12 +71,10 @@ use trawl_core::pattern::{Pattern, PatternKind, Preparer};
 /// trawl-server, so the value is repeated here.
 const SUBJECT_CHARS: usize = 65_536;
 
-/// ADR-0063's hard bound on one Rust regex call over one stored value, as
-/// the 2026-11-04 ruling sets it. RE2 has none.
+/// ADR-0063's hard bound on one Rust regex call over one stored value. RE2
+/// has none.
 const CEILING: Duration = Duration::from_millis(500);
 
-/// Timed calls per case in Rust's full timing and in the admission part,
-/// after one untimed warm-up call.
 const RUNS: usize = 7;
 
 /// The share of the subject that is `a`, in tenths. Three tenths keeps
@@ -179,14 +83,12 @@ const RUNS: usize = 7;
 /// Pike VM pays for on every byte.
 const A_SHARES: [u64; 2] = [3, 8];
 
-/// The share the screen times every shape at.
 const SCREEN_SHARE: u64 = 8;
 
 /// The largest count the edge search tries: every unit is at least one
 /// position, so no shape admits more.
 const MAX_K: usize = 64;
 
-/// How many of the Rust screen's slowest shapes the gate times in full.
 const TOP: usize = 10;
 
 /// How many of the RE2 screen's slowest shapes the envelope times in
@@ -255,35 +157,28 @@ const ASCII: Alphabet = Alphabet {
     none: "\\PL",
 };
 
-/// The alphabets the search measures over.
 const ALPHABETS: [Alphabet; 4] = [DESERET, CJK, SPECIALS, ASCII];
 
-/// The alphabets [`re2_step`] measures over: the three FIX6 calibrated
-/// RE2's step on. Its families are large letter classes, which match none
-/// of the specials.
+/// The alphabets [`re2_step`] measures over. Its families are large letter
+/// classes, which match none of the specials.
 const STEP_ALPHABETS: [Alphabet; 3] = [DESERET, CJK, ASCII];
 
 fn class3(x: Alphabet) -> String {
     format!("[{}{}{}]", esc(x.a), esc(x.b), esc(x.c))
 }
 
-/// Every character but the subject's three: a needle end the subject
-/// never holds, with no literal for a prefilter to look for.
 fn not3(x: Alphabet) -> String {
     format!("[^{}{}{}]", esc(x.a), esc(x.b), esc(x.c))
 }
 
-/// `inner` wrapped `depth` times in `(?:…)` and the repeat operator `op`.
 fn nest(op: &str, inner: &str, depth: usize) -> String {
     (0..depth).fold(inner.to_owned(), |s, _| format!("(?:{s}){op}"))
 }
 
-/// `\B` and the 3-character class.
 fn b_class3(x: Alphabet) -> String {
     format!("\\B{}", class3(x))
 }
 
-/// A character as a regex literal: escaped when it is a metacharacter.
 fn esc(c: char) -> String {
     if c.is_ascii_punctuation() {
         format!("\\{c}")
@@ -310,8 +205,6 @@ fn plus_one(k: usize) -> usize {
     k + 1
 }
 
-/// FIX7's fan class over `x`'s characters (`gen_fan.py`'s `fan`, with
-/// depth). See the module documentation.
 fn fan(x: Alphabet) -> String {
     let chars: String = fan_chars(x).into_iter().map(esc).collect();
     format!("[{chars}]")
@@ -390,16 +283,13 @@ fn padded_fan(x: Alphabet, shape: impl Fn(&str) -> String) -> String {
     class(&chars)
 }
 
-/// How a template's count is chosen.
 #[derive(Clone, Copy)]
 enum Knob {
     /// The largest count in `1..=MAX_K` the parser admits.
     Edge,
-    /// Each listed count, as a review or a fix reported it.
     At(&'static [usize]),
 }
 
-/// One shape of needle, before its alphabet and count are chosen.
 struct Template {
     name: String,
     /// The atom of a composed shape, or empty for a named one.
@@ -426,7 +316,6 @@ fn named(
     }
 }
 
-/// An atom of a composed unit.
 #[derive(Clone, Copy)]
 struct Atom {
     name: &'static str,
@@ -483,10 +372,8 @@ const ATOMS: [Atom; 11] = [
     },
 ];
 
-/// What goes before the atom in a composed unit.
 const PREFIXES: [&str; 7] = ["", "\\B", "(?:\\b|\\B)", "(?m:^)?", "()", "(?:)?", "(?:|)"];
 
-/// What goes around the atom in a composed unit.
 #[derive(Clone, Copy)]
 struct Wrap {
     name: &'static str,
@@ -520,7 +407,6 @@ const WRAPS: [Wrap; 6] = [
     },
 ];
 
-/// Every composed template: see the module documentation.
 fn composed() -> Vec<Template> {
     let mut out = Vec::new();
     for atom in ATOMS {
@@ -584,8 +470,6 @@ fn composed() -> Vec<Template> {
     out
 }
 
-/// The large classes the mixes are made of: `\pL`, the fan, `\w` and
-/// `(?i:\pL)`.
 const MIX_ATOMS: [Atom; 4] = [ATOMS[4], ATOMS[8], ATOMS[3], ATOMS[7]];
 
 /// Two-unit mixes: `j` optional big classes, then a counted run of a small
@@ -621,9 +505,8 @@ fn mixes() -> Vec<Template> {
 /// and the class under `{0,2}`, then `k` units of the class under `{0,2}`
 /// alone. A `\B` unit is three positions and a plain one two, and each is
 /// two copies of the class, so the mix trades the repeat budget against
-/// the batch-engine view: FIX9 found the fan at `j = 14` and `k = 10`
-/// over the specials at both limits at once. `j` takes every even count
-/// up to 18; at 20 no plain unit fits.
+/// the batch-engine view. `j` takes every even count up to 18; at 20 no
+/// plain unit fits.
 fn fan_mixes() -> Vec<Template> {
     let mut out = Vec::new();
     for atom in MIX_ATOMS {
@@ -647,22 +530,16 @@ fn fan_mixes() -> Vec<Template> {
     out
 }
 
-/// Review round 3's F7 core: four branches of `x` that count 1, 2, 4 and 5
-/// positions, under `{0,2}`.
+/// Four branches of `x` that count 1, 2, 4 and 5 positions, under `{0,2}`.
 fn f7_core(x: &str) -> String {
     let b3 = format!("(?:(?:{x}){{0,2}}){{0,2}}");
     format!("(?:{x}|(?:{x})?|{b3}|(?:{b3})?){{0,2}}")
 }
 
-/// `inner` between `\B` and the alphabet's class [`Alphabet::none`]: the
-/// subject never holds a character of that class, so the needle never
-/// matches, and neither end gives a prefilter a literal to look for.
 fn between_b_and_none(x: Alphabet, inner: &str) -> String {
     format!("\\B{inner}{}", x.none)
 }
 
-/// The families of the 2026-11-03 transcripts: each priced node kind in a
-/// counted repeat, and repeats nested outside and inside one.
 #[expect(
     clippy::too_many_lines,
     reason = "one entry per family, kept in one list"
@@ -759,7 +636,6 @@ fn families() -> Vec<Template> {
         edge("a ?^k(\\B[abc]) [^abc]", |x, k| {
             format!("{}{}{}", x.a, nest("?", &b_class3(x), k), not3(x))
         }),
-        // Nested repeats at a fixed depth inside a `{k}`.
         edge("\\B (?:*^1([abc])){k} [^abc]", |x, k| {
             format!("\\B(?:{}){{{k}}}{}", nest("*", &class3(x), 1), not3(x))
         }),
@@ -822,8 +698,6 @@ fn families() -> Vec<Template> {
                 not3(x)
             )
         }),
-        // The attack's own spelling: it ends in a letter the subject never
-        // holds.
         edge("\\B (?:*^1([abc])){k} d", |x, k| {
             format!("\\B(?:{}){{{k}}}{}", nest("*", &class3(x), 1), x.d)
         }),
@@ -836,8 +710,6 @@ fn families() -> Vec<Template> {
     ]
 }
 
-/// The shapes reviews and fixes reported, each at the count it was
-/// reported at. Most are refused now, and the transcript says by what.
 #[expect(
     clippy::too_many_lines,
     reason = "one entry per reported shape, kept in one list"
@@ -946,7 +818,6 @@ fn reported() -> Vec<Template> {
     ]
 }
 
-/// Every template the search measures: composed, then named.
 fn templates() -> Vec<Template> {
     let mut all = composed();
     all.extend(families());
@@ -954,7 +825,6 @@ fn templates() -> Vec<Template> {
     all
 }
 
-/// A deterministic xorshift64 stream, so every run times the same subject.
 struct Rng(u64);
 
 impl Rng {
@@ -966,9 +836,6 @@ impl Rng {
     }
 }
 
-/// `SUBJECT_CHARS` pseudo-random characters of `x`, `a_tenths` tenths of
-/// them `a` and the rest split between `b` and `c`, with no `c` exactly
-/// `gap` characters after an `a`.
 fn subject(x: Alphabet, gap: usize, a_tenths: u64) -> String {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut chars: Vec<char> = Vec::with_capacity(SUBJECT_CHARS);
@@ -989,12 +856,10 @@ fn subject(x: Alphabet, gap: usize, a_tenths: u64) -> String {
     chars.into_iter().collect()
 }
 
-/// The search-stage query that carries `body` as one regex filter.
 fn query(body: &str) -> String {
     format!("message=/{body}/")
 }
 
-/// The limit a parse refusal names, in a word.
 fn limit_of(message: &str) -> &'static str {
     if message.starts_with("pattern repeats too much") {
         "pos"
@@ -1013,7 +878,6 @@ fn limit_of(message: &str) -> &'static str {
     }
 }
 
-/// What the screen's limit words stand for.
 const LIMIT_LEGEND: [(&str, &str); 7] = [
     ("pos", "the repeat budget, 64 positions"),
     ("units", "the translation budget, 2^24 units a query"),
@@ -1027,8 +891,6 @@ const LIMIT_LEGEND: [(&str, &str); 7] = [
     ("class", "nested classes or a class set operator"),
 ];
 
-/// The admission verdict for `body`: `Ok`, or the limit of the parser's
-/// first refusal.
 fn verdict(body: &str) -> Result<(), &'static str> {
     match parse(&query(body)) {
         Ok(_) => Ok(()),
@@ -1036,7 +898,6 @@ fn verdict(body: &str) -> Result<(), &'static str> {
     }
 }
 
-/// One admitted shape: a template at an alphabet and a count.
 struct Shape {
     template: usize,
     alphabet: Alphabet,
@@ -1047,7 +908,6 @@ struct Shape {
     next: Option<&'static str>,
 }
 
-/// A template at an alphabet and a count the parser refuses.
 struct Refusal {
     template: usize,
     alphabet: Alphabet,
@@ -1061,14 +921,11 @@ struct Search {
     templates: Vec<Template>,
     shapes: Vec<Shape>,
     refused: Vec<Refusal>,
-    /// Bodies parsed to find the edges.
     parsed: usize,
 }
 
-/// The largest count of an edge template the parser admits, and the limit
-/// that refuses the next; or, when none is admitted, the limit that
-/// refuses a count of one. Admission is monotone in the count: positions,
-/// bytes, translation units and compiled sizes all grow with it.
+/// Admission is monotone in the count: positions, bytes, translation units
+/// and compiled sizes all grow with it.
 fn edge(
     t: &Template,
     x: Alphabet,
@@ -1093,7 +950,6 @@ fn edge(
     }
 }
 
-/// Find every template's admitted shapes over every alphabet.
 fn search() -> Search {
     let templates = templates();
     let (mut shapes, mut refused, mut parsed) = (Vec::new(), Vec::new(), 0);
@@ -1145,7 +1001,6 @@ fn search() -> Search {
     }
 }
 
-/// What was tried, and the limit each admitted edge shape sits at.
 fn report_search(s: &Search, out: &mut String) {
     let composed = s.templates.iter().filter(|t| !t.atom.is_empty()).count();
     let named = s.templates.len() - composed;
@@ -1189,9 +1044,6 @@ fn report_search(s: &Search, out: &mut String) {
 /// the engine could not run it.
 type Screened = Option<f64>;
 
-/// The screen table: one row per template and count, one cell per
-/// alphabet, each the count, the screen's ms and the limit at the next
-/// count (`at` for a reported count).
 fn report_screen(s: &Search, screen: &[Screened], engine: &str, out: &mut String) {
     let _ = writeln!(
         out,
@@ -1236,7 +1088,6 @@ fn report_screen(s: &Search, screen: &[Screened], engine: &str, out: &mut String
     }
 }
 
-/// Median and maximum of `samples`, in milliseconds.
 fn summary(samples: &mut [Duration]) -> (f64, f64) {
     samples.sort();
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
@@ -1246,8 +1097,6 @@ fn summary(samples: &mut [Duration]) -> (f64, f64) {
     )
 }
 
-/// Time `call` `runs` times after one warm-up, checking each answer is
-/// `false`.
 fn time_runs(runs: usize, mut call: impl FnMut() -> bool) -> (f64, f64) {
     assert!(!call(), "the subject must not match");
     let mut samples = Vec::with_capacity(runs);
@@ -1260,7 +1109,6 @@ fn time_runs(runs: usize, mut call: impl FnMut() -> bool) -> (f64, f64) {
     summary(&mut samples)
 }
 
-/// One call of `call`, in ms, checking the answer is `false`.
 fn time_once(call: impl FnOnce() -> bool) -> f64 {
     let start = Instant::now();
     let matched = call();
@@ -1275,7 +1123,6 @@ fn ledger() -> Preparer {
     Preparer::new()
 }
 
-/// `body` built as the live lane builds it.
 fn build(body: &str) -> Pattern {
     ledger()
         .build(PatternKind::Regex, body)
@@ -1293,7 +1140,6 @@ fn has_group(body: &str) -> bool {
     })
 }
 
-/// The host's load average, for the record beside a timing.
 fn load() -> String {
     std::fs::read_to_string("/proc/loadavg").map_or_else(
         |_| "unknown".to_string(),
@@ -1301,8 +1147,6 @@ fn load() -> String {
     )
 }
 
-/// A `DuckDB` connection and the subject it holds, so a run of shapes over
-/// the same subject stores it once.
 struct Re2 {
     conn: Connection,
     holds: Option<(&'static str, usize, u64)>,
@@ -1316,7 +1160,6 @@ impl Re2 {
         Self { conn, holds: None }
     }
 
-    /// Store `x`'s subject for `gap` and `a_tenths`, unless it is held.
     fn hold(&mut self, x: Alphabet, gap: usize, a_tenths: u64) {
         let key = (x.name, gap, a_tenths);
         if self.holds == Some(key) {
@@ -1343,7 +1186,6 @@ impl Re2 {
             .query_row(params![body], |row| row.get::<_, bool>(0))
     }
 
-    /// One call, in ms, or `None` when `DuckDB` refuses the body.
     fn once(&mut self, x: Alphabet, gap: usize, a_tenths: u64, body: &str) -> Screened {
         self.hold(x, gap, a_tenths);
         let start = Instant::now();
@@ -1353,7 +1195,6 @@ impl Re2 {
         Some(ms)
     }
 
-    /// `runs` calls after one warm-up: median and max ms.
     fn runs(
         &mut self,
         x: Alphabet,
@@ -1367,7 +1208,6 @@ impl Re2 {
     }
 }
 
-/// The shapes the screen ranks slowest, at most `top`, slowest first.
 fn slowest(screen: &[Screened], top: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..screen.len()).filter(|&n| screen[n].is_some()).collect();
     order.sort_by(|&l, &r| {
@@ -1379,13 +1219,11 @@ fn slowest(screen: &[Screened], top: usize) -> Vec<usize> {
     order
 }
 
-/// A row of a full timing.
 struct Timed {
     shape: usize,
     a_tenths: u64,
     /// Median and max ms of the engine's call (`is_match` in Rust).
     call: (f64, f64),
-    /// Rust's `captures`, for a shape that holds a group.
     captures: Option<(f64, f64)>,
 }
 
@@ -1401,11 +1239,8 @@ fn shape_label(s: &Search, sh: &Shape) -> String {
     }
 }
 
-/// The two timings of one shape at one share: the engine's call, and
-/// Rust's `captures` where it applies.
 type Timing = ((f64, f64), Option<(f64, f64)>);
 
-/// Time each of the screen's slowest shapes in full at both shares.
 fn full_timing(
     s: &Search,
     top: &[usize],
@@ -1444,8 +1279,6 @@ fn full_timing(
     rows
 }
 
-/// The slowest timed row whose shape is an edge template, by `key`: the
-/// shape [`sweep`] times at smaller counts.
 fn slowest_edge<'r>(
     s: &Search,
     rows: &'r [Timed],
@@ -1456,9 +1289,6 @@ fn slowest_edge<'r>(
         .max_by(|l, r| key(l).total_cmp(&key(r)))
 }
 
-/// How the slowest edge shape scales with its count: at a quarter, a half
-/// and three quarters of its edge count, on the share it was slowest
-/// over.
 fn sweep(
     s: &Search,
     worst: Option<&Timed>,
@@ -1498,8 +1328,6 @@ fn sweep(
     );
 }
 
-/// Screen every admitted shape in Rust: `is_match`, and `captures` for a
-/// shape that holds a group. The slower of the two is the shape's time.
 fn rust_screen(s: &Search) -> Vec<Screened> {
     s.shapes
         .iter()
@@ -1517,7 +1345,6 @@ fn rust_screen(s: &Search) -> Vec<Screened> {
         .collect()
 }
 
-/// Rust's full timing of one shape.
 fn rust_full(sh: &Shape, a_tenths: u64) -> Timing {
     let pattern = build(&sh.body);
     let text = subject(sh.alphabet, sh.gap, a_tenths);
@@ -1547,7 +1374,6 @@ fn footer(part: &str, started: Instant, out: &mut String) {
     );
 }
 
-/// The 1-minute load average, the first of [`load`]'s three.
 fn load_1m() -> String {
     load()
         .split_whitespace()
@@ -1556,9 +1382,6 @@ fn load_1m() -> String {
         .to_string()
 }
 
-/// The Rust gate: the search, timed in Rust's live lane, against the hard
-/// ceiling. It fails when any call, in the screen or in the full timing,
-/// takes the ceiling or more.
 #[test]
 #[ignore = "wall-clock evidence for a reader; run through scripts/evidence/issue-334/cost.sh"]
 fn rust_gate() {
@@ -1636,9 +1459,6 @@ fn rust_gate() {
     assert!(pass, "an admitted shape's Rust call reaches the ceiling");
 }
 
-/// The RE2 envelope: the search, timed in the batch lane's
-/// `regexp_matches`. It reports the slowest call and asserts nothing about
-/// time.
 #[test]
 #[ignore = "wall-clock evidence for a reader; run through scripts/evidence/issue-334/cost.sh"]
 fn re2_envelope() {
@@ -1718,7 +1538,6 @@ fn re2_envelope() {
     print!("{out}");
 }
 
-/// Time a whole admission, parse to built patterns, of `q`.
 fn time_parse(q: &str) -> (f64, f64) {
     parse(q).expect("the query is admitted");
     let mut samples = Vec::with_capacity(RUNS);
@@ -1772,7 +1591,6 @@ fn most_compile_body() -> (String, usize, usize) {
     best.expect("some \\w{a}\\pL{b} is admitted")
 }
 
-/// What admitting the costliest queries takes: parse, price and build.
 #[test]
 #[ignore = "wall-clock evidence for a reader; run through scripts/evidence/issue-334/cost.sh"]
 fn admission() {
@@ -1783,9 +1601,6 @@ fn admission() {
         out,
         "\n## admission of the costliest queries (parse, price and build; {RUNS} parses after one)\n"
     );
-    // The calibration's slowest admitted translation (ADR-0063, CP2):
-    // (?i) and 14 full-range brackets, 15 844 598 units, under the
-    // 2^24-unit budget. One more bracket is refused.
     let brackets = "[\\x00-\\x{10FFFF}]".repeat(14);
     let worst_units = query(&format!("(?i){brackets}"));
     let refused = query(&format!("(?i){brackets}[\\x00-\\x{{10FFFF}}]"));
@@ -1801,9 +1616,6 @@ fn admission() {
         parse(&refused).is_err()
     );
 
-    // The most compile work one query may hold: 256 distinct patterns,
-    // each compiling a program near the 1 MiB limit and a view near the
-    // batch engine's 512 KiB cap.
     let (body, rust, view) = most_compile_body();
     let (median, max) = time_parse(&copies(&body));
     let _ = writeln!(
@@ -1827,16 +1639,12 @@ fn kib(bytes: usize) -> f64 {
 /// them apart.
 const STEP_RUNS: usize = 3;
 
-/// One family [`re2_step`] measures, at each of `ks`.
 struct StepFamily {
     name: &'static str,
     body: fn(Alphabet, usize) -> String,
     ks: &'static [usize],
 }
 
-/// The families FIX6 calibrated RE2's step on, each at counts on both
-/// sides of its step: large classes, which RE2 compiles to many
-/// instructions, in the shapes that keep its DFA busiest.
 const STEP_FAMILIES: [StepFamily; 14] = [
     StepFamily {
         name: "\\B (?:\\pL?){k} \\PL",
@@ -1927,16 +1735,8 @@ const STEP_FAMILIES: [StepFamily; 14] = [
 /// on a busy cache stays near 200 ms over these subjects.
 const STEP_SLOW_MS: f64 = 250.0;
 
-/// An RE2 median under this, in ms, is the DFA's.
 const STEP_FAST_MS: f64 = 50.0;
 
-/// RE2's step against the batch-engine view (ADR-0063). RE2's DFA gives up
-/// at once on a program past its init budget, and then every call runs
-/// the NFA, which costs hundreds of milliseconds where the DFA cost a few.
-/// Each row gives what the body compiles to in Rust, and in its view as
-/// the batch engine reads it (`trawl_core::pattern::Preparer::batch_compiled_bytes`),
-/// with both engines' times. A row the ledger refuses is timed in RE2
-/// alone.
 #[test]
 #[ignore = "wall-clock evidence for a reader; run through scripts/evidence/issue-334/cost.sh"]
 fn re2_step() {
@@ -1961,8 +1761,6 @@ fn re2_step() {
         "re2 max"
     );
     let mut re2 = Re2::new();
-    // Per family: the largest view RE2 ran fast, and the smallest it ran
-    // slow, on any alphabet.
     let mut steps: Vec<(&str, Option<f64>, Option<f64>)> = Vec::new();
     for family in &STEP_FAMILIES {
         let (mut fast, mut slow): (Option<f64>, Option<f64>) = (None, None);

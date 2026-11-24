@@ -2,15 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The `extract kv` batch tail against real `DuckDB`: what the SQL prefix
-//! computes is what the tail receives.
-//!
-//! Non-finite doubles are where that can break. `serde_json` has no
-//! spelling for one, so a bridge that carried rows to the tail as JSON
-//! would turn a prefix's `1.0/0` into a NULL and the same query without
-//! the kv split would answer differently. These tests run both shapes of each query
-//! against one another rather than against a hand-written expectation, so
-//! agreement is the assertion.
+//! `serde_json` has no spelling for a non-finite double, so a bridge that
+//! carried rows to the tail as JSON would turn a prefix's `1.0/0` into a
+//! NULL.
 
 use std::io::Write as _;
 
@@ -18,7 +12,6 @@ use trawl_core::schema::{CanonicalType, FieldTypes};
 use trawl_engine::executor::{Executor, hot_columns_of};
 use trawl_engine::value::{QueryResult, Value};
 
-/// The ndjson rows, written where `read_json` can reach them.
 fn source(rows: &[&str]) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.ndjson");
@@ -45,8 +38,6 @@ fn cell<'r>(result: &'r QueryResult, row: usize, name: &str) -> &'r Value {
     &result.rows[row][index]
 }
 
-/// (a) The specials arrive as themselves, and (b) the same query without
-/// the kv split answers identically.
 #[test]
 fn the_kv_tail_receives_the_specials_the_sql_prefix_computed() {
     let (_dir, glob) = source(&[r#"{"message":"k=v","service":"nginx"}"#]);
@@ -71,7 +62,6 @@ fn the_kv_tail_receives_the_specials_the_sql_prefix_computed() {
     assert!(neg.is_infinite() && neg.is_sign_negative(), "{neg}");
     assert!(undef.is_nan(), "{undef}");
 
-    // The same query WITHOUT the kv split — pure SQL, no tail at all.
     let without_tail = run(
         &exec,
         "* | let pos = 1.0 / 0, neg = -1.0 / 0, undef = 0.0 / 0 | table pos, neg, undef",
@@ -84,7 +74,6 @@ fn the_kv_tail_receives_the_specials_the_sql_prefix_computed() {
             "the kv split changed {name}"
         );
     }
-    // NaN is never equal to itself, so the pair is compared by rendering.
     let (Value::Float(tail_nan), Value::Float(sql_nan)) = (
         cell(&with_tail, 0, "undef"),
         cell(&without_tail, 0, "undef"),
@@ -98,9 +87,6 @@ fn the_kv_tail_receives_the_specials_the_sql_prefix_computed() {
     );
 }
 
-/// A special that survives the bridge is also usable BY the tail — it
-/// filters, aggregates and sorts as the value it is, where a NULL would
-/// have dropped the row and emptied the aggregate.
 #[test]
 fn the_tail_computes_over_the_specials_it_received() {
     let (_dir, glob) = source(&[
@@ -109,9 +95,7 @@ fn the_tail_computes_over_the_specials_it_received() {
     ]);
     let exec = Executor::new().unwrap();
 
-    // `where` over an infinity: `inf > 1000000.0` is TRUE, so both rows
-    // stay. (A plain decimal literal: the DSL float grammar has no
-    // exponent form.)
+    // A plain decimal literal: the DSL float grammar has no exponent form.
     let kept = run(
         &exec,
         "* | let big = 1.0 / 0 | extract kv from message | where big > 1000000.0 | table k",
@@ -123,7 +107,6 @@ fn the_tail_computes_over_the_specials_it_received() {
         "an infinity compares, it does not null"
     );
 
-    // …and `max`/`count` see it.
     let stats = run(
         &exec,
         "* | let big = 1.0 / 0 | extract kv from message | stats count() as n, max(big) as m",
@@ -135,9 +118,7 @@ fn the_tail_computes_over_the_specials_it_received() {
     };
     assert!(max.is_infinite() && max.is_sign_positive(), "{max}");
 
-    // A NaN sorts GREATEST, the way DuckDB orders it — not "wherever
-    // arrival order left it". The tail runs the sort before `table`, in
-    // the order the query writes them (ADR-0064).
+    // A NaN sorts GREATEST, the way DuckDB orders it.
     let sorted = run(
         &exec,
         "* | extract kv from message | let v = if(k == 1, 0.0 / 0, 5.0) | sort v | table k, v",
@@ -150,9 +131,6 @@ fn the_tail_computes_over_the_specials_it_received() {
     );
 }
 
-/// (c) The silent-regression guard: a TIMESTAMP column still renders as
-/// the wire's UTC text after a tail runs.
-///
 /// The tail reads `DuckDB`'s cast text in UTC and the render after it
 /// re-parses that TEXT (`render_tracked_timestamps`), so a bridge that
 /// retyped timestamp cells would break it without any test noticing: the
@@ -178,12 +156,6 @@ fn a_timestamp_column_still_renders_as_wire_text_after_the_tail() {
     );
 }
 
-/// A timestamp the TAIL computes, an infinity included, survives the
-/// render after the tail.
-///
-/// The render after the tail only touches the columns its lineage tracks;
-/// a computed infinity is the tail's own value, so it passes through as
-/// the word while a real `_time` beside it still renders as wire text.
 /// Both halves are asserted, because "nothing moved" is also what a broken
 /// render looks like.
 #[test]
@@ -210,13 +182,8 @@ fn a_tail_computed_infinity_survives_the_wire_render() {
     );
 }
 
-/// (d) A DOUBLE-pinned infinity answers a tail's `| where d > 1` the way
-/// the batch lane does.
-///
 /// A pinned read that projected a non-finite as JSON null would make it
-/// UNKNOWN and drop the row, while the SQL lane compares it happily. The
-/// column is written as a real DOUBLE, which is what a conformed corpus
-/// holds (both `inf` spellings survive the pin's round-trip guard).
+/// UNKNOWN and drop the row, while the SQL lane compares it happily.
 #[test]
 fn a_double_pinned_infinity_compares_in_the_tail() {
     let dir = tempfile::tempdir().unwrap();
@@ -260,10 +227,6 @@ fn a_double_pinned_infinity_compares_in_the_tail() {
     );
 }
 
-// ── the now() anchor across the kv split (ADR-0017 §3) ────────────────
-
-/// One row of real parquet, written by `DuckDB` itself — the shape the
-/// production cold lane reads.
 fn parquet_source() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.parquet");
@@ -277,12 +240,6 @@ fn parquet_source() -> (tempfile::TempDir, String) {
     (dir, path.display().to_string())
 }
 
-/// The SQL prefix and the `rust_stages` tail read one instant.
-///
-/// `now()` appears three times in one statement across the kv split —
-/// twice in the SQL prefix (a `let` and a `where`) and once in the tail.
-/// The prefix's cell and the tail's cell must be the same string: one
-/// unit of output, one instant, whichever side of the split computed it.
 #[test]
 fn the_kv_tail_and_the_sql_prefix_read_one_now() {
     let (_dir, glob) = parquet_source();
@@ -309,11 +266,6 @@ fn the_kv_tail_and_the_sql_prefix_read_one_now() {
     );
 }
 
-/// The same guarantee where the tail's anchor could most easily drift:
-/// the COLD-START lane, where the union attempt finds no parquet and the
-/// query is RE-EMITTED hot-only. The tail keeps evaluating under the
-/// original emission's anchor, so a re-capture at the re-emission would
-/// split the two cells apart.
 #[test]
 fn the_cold_start_fallback_keeps_the_statements_anchor() {
     let dir = tempfile::tempdir().unwrap();
@@ -350,13 +302,6 @@ fn the_cold_start_fallback_keeps_the_statements_anchor() {
     );
 }
 
-/// A `limit` among the kv tail's PRE-stages caps what reaches the
-/// aggregation, exactly as the same query without the split does.
-///
-/// Reading `StageResult::Done` as "stop running stages for this event"
-/// would break only the inner stage loop, then feed the aggregation the
-/// very event an exhausted `limit` just refused, so
-/// `extract kv | limit 1 | stats count()` would count every row.
 #[test]
 fn a_pre_stage_limit_caps_what_the_kv_tail_aggregates() {
     let (_dir, glob) = source(&[
@@ -386,12 +331,6 @@ fn a_pre_stage_limit_caps_what_the_kv_tail_aggregates() {
     );
 }
 
-/// The batch tail's POST-aggregation `limit` is unaffected by the live
-/// lane's per-snapshot re-arming.
-///
-/// This lane emits one snapshot from a freshly compiled plan, so its
-/// counter is armed once and spent once, giving the same answer the query
-/// gives without the kv split.
 #[test]
 fn a_post_stage_limit_caps_the_kv_tails_one_snapshot() {
     let (_dir, glob) = source(&[
@@ -416,16 +355,10 @@ fn a_post_stage_limit_caps_the_kv_tails_one_snapshot() {
     );
 }
 
-/// A `timechart` in the kv tail cuts the buckets the SQL emitter cuts for
-/// the same query: `last=4h` is the five-minute band in both, so the tail
-/// and the split-free query return the same bucket, not a one-minute
-/// grid the chart would then lay on a five-minute lattice (ADR-0038).
 #[test]
 fn the_kv_tail_timechart_cuts_the_buckets_the_sql_lane_cuts() {
     use chrono::{DateTime, Utc};
 
-    // Two events in the same five-minute bucket but different minutes,
-    // both safely inside `last=4h` and in the past.
     let now = Utc::now().timestamp();
     let floor = now - now.rem_euclid(300);
     let bucket = floor - 300;
@@ -438,8 +371,6 @@ fn the_kv_tail_timechart_cuts_the_buckets_the_sql_lane_cuts() {
     let (_dir, glob) = source(&[&event(bucket + 60), &event(bucket + 120)]);
     let exec = Executor::new().unwrap();
 
-    // A `_time` cell as epoch seconds: both lanes write the wire's
-    // RFC 3339.
     let instant = |cell: &Value| -> i64 {
         let Value::String(text) = cell else {
             panic!("_time must be text: {cell:?}");
@@ -464,7 +395,6 @@ fn the_kv_tail_timechart_cuts_the_buckets_the_sql_lane_cuts() {
     assert_eq!(cell(&without_tail, 0, "count"), &Value::Integer(2));
 }
 
-/// The `id` of each row of `result`, in order.
 fn ids(result: &QueryResult) -> Vec<String> {
     (0..result.rows.len())
         .map(|row| match cell(result, row, "id") {
@@ -474,11 +404,6 @@ fn ids(result: &QueryResult) -> Vec<String> {
         .collect()
 }
 
-/// A `where … matches` in the kv tail reads `\d`, `\w`, `\s`, `\b` and
-/// `\B` as the batch lane reads them: `extract kv … | where f matches /…/`
-/// keeps the rows the same filter keeps in pure SQL. Each body keeps an
-/// ASCII subject and drops its non-ASCII twin in both lanes, over a
-/// column the source carries and over a field the kv split writes.
 #[test]
 fn kv_tail_regex_classes_match_batch() {
     // (id, subject, kv value): the kv value is the subject where the kv
@@ -510,7 +435,6 @@ fn kv_tail_regex_classes_match_batch() {
     let (_dir, glob) = source(&rows);
     let exec = Executor::new().unwrap();
 
-    // (body, the ids it keeps over `subject`)
     let cases: [(&str, &[&str]); 7] = [
         (r"^\d+$", &["d-ascii"]),
         (r"^\w$", &["d-ascii", "w-ascii"]),
@@ -539,7 +463,6 @@ fn kv_tail_regex_classes_match_batch() {
         assert_eq!(ids(&in_tail), expected, "the kv tail for /{body}/");
     }
 
-    // A field the kv split writes, against the same text in a column.
     for body in [r"\d", r"^\w+$", r"x\b", r"x\B", r"(?i)^\w$"] {
         let in_sql = run(
             &exec,

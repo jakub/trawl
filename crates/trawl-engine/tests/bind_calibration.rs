@@ -5,41 +5,19 @@
 //! What the queries the expansion budget ADMITS actually cost `DuckDB` to
 //! prepare (ADR-0024, #150).
 //!
-//! `MAX_LATERAL_EXPANSION = 512` is a number picked from structure, not
-//! from a stopwatch, so the claim it needs is narrow and checkable: on the
-//! calibration host, a query the checker admits prepares quickly enough
-//! that a wedged binder is not the failure an operator meets. Each case
-//! below sits at or near the budget for one family of shapes, warms the
-//! connection once and then measures five prepares. EVERY sample must
-//! finish under a second, not the average, because the failure this whole
-//! budget exists to prevent is one bad prepare, not a bad mean.
+//! EVERY sample must finish under a second, not the average, because the
+//! failure this budget exists to prevent is one bad prepare, not a bad mean.
 //!
-//! Not a CI gate. These are `#[ignore]`d wall-clock measurements, and a
-//! shared runner would turn them into a flaky test rather than evidence.
-//! The committed run lives in `visual-evidence/issue-150/bind-calibration.md`
-//! and is reproduced by the wrapper that owns the watchdog:
-//!
-//! ```sh
-//! scripts/bind-calibration
-//! ```
-//!
-//! The wrapper runs each case in its own process under `timeout 5`, so a
-//! case that does wedge is killed from outside rather than measured from
-//! inside. Cases are ordered cheapest-first within a family so a cutoff
-//! stops that family with the cheaper members already recorded.
-//!
-//! Nothing here prepares a query the checker refuses. The refused shapes
-//! are proved refused in `trawl-core`'s own tests and in
-//! `duckdb_probe.rs`; the eight-link severity chain is never emitted at
-//! all.
+//! Not a CI gate: a shared runner would turn these wall-clock measurements
+//! into a flaky test. The committed run lives in
+//! `visual-evidence/issue-150/bind-calibration.md`, reproduced by
+//! `scripts/bind-calibration`.
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-/// The ceiling every measured sample must clear.
 const SAMPLE_BUDGET: Duration = Duration::from_secs(1);
 
-/// Discarded warm-up prepares, then measured ones.
 const WARMUPS: usize = 1;
 const SAMPLES: usize = 5;
 
@@ -50,10 +28,6 @@ fn conn() -> duckdb::Connection {
     conn
 }
 
-/// A small parquet with a declared schema, written by this harness. The
-/// bind-time cost measured here is a property of the SQL: the fixture is
-/// two rows so that `prepare` has a real schema to bind against and
-/// nothing else.
 fn fixture(conn: &duckdb::Connection, dir: &std::path::Path) -> String {
     let file = dir.join("bind.parquet");
     conn.execute_batch(&format!(
@@ -67,8 +41,6 @@ fn fixture(conn: &duckdb::Connection, dir: &std::path::Path) -> String {
     file.display().to_string()
 }
 
-/// Admit, emit, warm, measure, and print one row of the evidence table.
-///
 /// The admission check is part of the measurement, not a precondition
 /// checked elsewhere: a case that stopped being admitted would otherwise
 /// quietly calibrate a query the server refuses.
@@ -154,8 +126,6 @@ fn addition_chain_single_reference_depth_twenty_two() {
     calibrate("addition-linear-22", &dsl);
 }
 
-/// The same chain built out of `stats` scalar outputs, which land in the
-/// aggregate's own SELECT list and substitute exactly as `let` does.
 #[test]
 #[ignore = "wall-clock calibration; run through scripts/bind-calibration"]
 fn scalar_stats_chain_depth_thirty_one() {
@@ -166,8 +136,6 @@ fn scalar_stats_chain_depth_thirty_one() {
     calibrate("stats-scalar-31", &dsl);
 }
 
-/// `timechart`'s scalar outputs, the same chain again beside a generated
-/// time-bucket expression.
 #[test]
 #[ignore = "wall-clock calibration; run through scripts/bind-calibration"]
 fn scalar_timechart_chain_depth_thirty_one() {

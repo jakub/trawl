@@ -2,15 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! A latched cancellation binds nothing — the timechart input probes
-//! included.
-//!
-//! `executor::prepare_probe` counts statements handed to `DuckDB`, and
-//! the counter is process-global, so this claim cannot be asserted from
-//! the crate's unit tests: under the plain `cargo test` harness those
-//! run as threads of one process and any of them binding would land in
-//! the middle of the measurement. Here the file is its own binary with
-//! one test in it, so the count belongs to this call alone.
+//! `executor::prepare_probe` counts statements handed to `DuckDB`, and the
+//! counter is process-global: this file is its own binary with one test in
+//! it, so the count belongs to this call alone.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +14,6 @@ use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, RowCap, prepare_probe};
 
-/// A one-row parquet whose only timestamp column is `good`.
 fn fixture(dir: &tempfile::TempDir) -> String {
     let path = dir
         .path()
@@ -38,15 +31,6 @@ fn fixture(dir: &tempfile::TempDir) -> String {
     path
 }
 
-/// The probes are binds like any other, so the latch is read at the top
-/// of each one, between a probe's bind and its execution, after the last
-/// of them, and again immediately before the statement they guard.
-///
-/// This pins the two ends of that chain: unlatched, the lane binds both
-/// the probe and the statement; latched, it binds neither. The reads in
-/// the middle have no injectable seam — the latch is a plain shared flag
-/// and every call is synchronous — so they are the same one-line read,
-/// placed by inspection.
 #[test]
 fn cancelled_during_probe_never_binds_main() {
     let dir = tempfile::tempdir().expect("tempdir");

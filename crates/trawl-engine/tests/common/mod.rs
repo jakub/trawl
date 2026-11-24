@@ -2,27 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Shared test utilities for trawl-engine integration tests.
-//!
-//! Generates deterministic fixtures (parquet and ndjson) using `DuckDB`
-//! itself, so we don't need arrow/parquet crates or external tooling.
-//!
-//! Handles nextest's parallel process model: each test runs in its own
-//! process, so we use filesystem-level coordination (existence check +
-//! unique temp files) instead of in-process synchronization.
-
 use std::path::{Path, PathBuf};
 
 use duckdb::Connection;
 
-/// Return the glob path for test parquet files, generating fixtures if needed.
 pub fn fixture_glob() -> String {
     let dir = fixtures_dir();
     ensure_fixture(&dir, "logs.parquet", "PARQUET");
     format!("{}/**/*.parquet", dir.display())
 }
 
-/// Return the glob path for test ndjson files, generating fixtures if needed.
 pub fn fixture_glob_json() -> String {
     let dir = fixtures_dir();
     ensure_fixture(&dir, "logs.ndjson", "JSON");
@@ -36,8 +25,6 @@ fn fixtures_dir() -> PathBuf {
         .join("parquet")
 }
 
-/// Generate a fixture file if it doesn't already exist.
-///
 /// Uses a process-unique temp file to avoid lock conflicts when
 /// multiple nextest processes run concurrently.
 fn ensure_fixture(dir: &Path, filename: &str, format: &str) {
@@ -86,7 +73,6 @@ fn generate_to(path: &Path, format: &str) -> Result<(), Box<dyn std::error::Erro
         )",
     )?;
 
-    // deterministic test data: 13 rows across 3 services
     // severity: info=9, warn=13, error=17 (OTel bands)
     conn.execute_batch(
         "INSERT INTO logs VALUES
