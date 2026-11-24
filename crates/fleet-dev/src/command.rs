@@ -15,19 +15,11 @@ use crate::error::{Error, Result};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Deadline for children that compile code or pull container images.
-///
-/// A cold Cargo build compiles the Rust workspace and downloads the `DuckDB`
-/// shared library; a first `compose up` also pulls the PostgreSQL image.
-/// These operations can exceed the default deadline.
 pub const BUILD_TIMEOUT: Duration = Duration::from_mins(30);
 const DEFAULT_STDOUT_LIMIT: usize = 1024 * 1024;
 const DEFAULT_STDERR_LIMIT: usize = 256 * 1024;
 const INTERRUPTED: &str = "the operator interrupted development preparation";
 
-/// Fully specified subprocess request.
-///
-/// Its `Debug` representation intentionally omits environment values because
-/// credential and resolver children may receive secrets.
 #[derive(Clone)]
 pub struct CommandSpec {
     pub program: OsString,
@@ -40,13 +32,9 @@ pub struct CommandSpec {
     pub stderr_limit: usize,
     pub output_mode: OutputMode,
     /// Run even once the operator interrupt has latched.
-    ///
-    /// Cleanup children exist precisely to unwind an interrupted preparation,
-    /// so the latch must not refuse them.
     pub runs_after_interrupt: bool,
 }
 
-/// How a child's stdout and stderr are handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputMode {
     /// Capture within the byte limits and keep failures free of child output.
@@ -58,9 +46,7 @@ pub enum OutputMode {
     CapturedReportingStderr,
     /// Inherit the controller's stdio; nothing is captured or limited.
     ///
-    /// Only valid for children whose output is never parsed. Streamed children
-    /// bypass the byte limits entirely, so build and pull progress reaches the
-    /// developer live and a failure carries the tool's own diagnostics.
+    /// Only valid for children whose output is never parsed.
     Streamed,
 }
 
@@ -131,8 +117,7 @@ impl CommandSpec {
     /// Stream this child's output to the controller's terminal.
     ///
     /// Callers must not read the captured stdout/stderr afterwards; both come
-    /// back empty. Streaming subsumes [`Self::report_stderr`] — the child has
-    /// already written its diagnostics to the same terminal.
+    /// back empty.
     #[must_use]
     pub const fn stream_output(mut self) -> Self {
         self.output_mode = OutputMode::Streamed;
@@ -140,9 +125,6 @@ impl CommandSpec {
     }
 
     /// Exempt this child from the operator-interrupt latch.
-    ///
-    /// Reserved for cleanup that must still run after an interrupt, such as
-    /// stopping a container the controller started moments earlier.
     #[must_use]
     pub const fn runs_after_interrupt(mut self) -> Self {
         self.runs_after_interrupt = true;
@@ -179,8 +161,6 @@ pub trait CommandRunner: std::fmt::Debug + Send + Sync {
     fn output(&self, spec: &CommandSpec) -> Result<Output>;
 
     /// Flag a signal watcher can set to abort an in-flight child.
-    ///
-    /// Returns `None` for test doubles that never spawn anything.
     fn interrupt_flag(&self) -> Option<Arc<AtomicBool>> {
         None
     }
@@ -323,10 +303,6 @@ impl SystemCommandRunner {
         !spec.runs_after_interrupt && self.interrupted.load(Ordering::Acquire)
     }
 
-    /// Run a child with inherited stdio.
-    ///
-    /// There is nothing to drain, so the loop only watches for exit, operator
-    /// interrupt, and the deadline.
     fn streamed(&self, spec: &CommandSpec) -> Result<Output> {
         let mut command = std::process::Command::new(&spec.program);
         command
@@ -565,7 +541,6 @@ mod tests {
 
     #[test]
     fn streamed_children_ignore_output_limits_and_return_the_real_status() {
-        // A build or image pull must not be killed for being chatty.
         let spec = CommandSpec::new("sh")
             .args(["-c", "head -c 65536 /dev/zero >/dev/null; exit 7"])
             .output_limits(16, 16)
@@ -608,12 +583,9 @@ mod tests {
             );
             assert!(started.elapsed() < Duration::from_secs(5));
 
-            // A latched interrupt must also stop the controller from starting
-            // the next stage of preparation.
             let error = runner.output(&CommandSpec::new("true")).unwrap_err();
             assert!(matches!(&error, Error::CommandLimit { reason, .. } if reason == INTERRUPTED));
 
-            // ...but must not block the cleanup that unwinds it.
             let cleanup = CommandSpec::new("true").runs_after_interrupt();
             assert!(runner.output(&cleanup).unwrap().status.success());
         }

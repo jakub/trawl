@@ -73,8 +73,6 @@ pub async fn prepare(
 }
 
 pub fn docker_setup(runner: &dyn CommandRunner, trawl_root: &Path) -> Result<()> {
-    // Half a gigabyte of image over a home link outlasts the default deadline,
-    // and a silent multi-minute pull is indistinguishable from a hang.
     let spec = compose_spec(trawl_root)
         .args(["pull"])
         .timeout(crate::command::BUILD_TIMEOUT)
@@ -88,8 +86,6 @@ pub fn docker_setup(runner: &dyn CommandRunner, trawl_root: &Path) -> Result<()>
 }
 
 pub fn stop_owned_docker(runner: &dyn CommandRunner, trawl_root: &Path) -> Result<()> {
-    // This is the unwind path for an interrupted preparation, so it must be
-    // exempt from the interrupt latch that aborted the preparation.
     let spec = compose_spec(trawl_root)
         .args(["stop", DOCKER_SERVICE])
         .runs_after_interrupt();
@@ -131,8 +127,6 @@ async fn prepare_docker(
         // Compose may create/start the container before `up --wait` returns,
         // including on a later health failure or controller timeout.
         docker_owned.store(true, Ordering::Release);
-        // `up` pulls the image on a machine that never ran `setup`, so this
-        // needs the same deadline and live progress as an explicit pull.
         let start_spec = compose_spec(trawl_root)
             .args(["up", "--detach", "--wait", DOCKER_SERVICE])
             .timeout(crate::command::BUILD_TIMEOUT)
@@ -263,8 +257,8 @@ async fn validate_database(url: &str, expected_database: &str) -> Result<()> {
 }
 
 async fn validate_database_inner(url: &str, expected_database: &str) -> Result<()> {
-    // validate_database_inner is a short-lived, single-connection
-    // validation pool that closes before returning (ADR-0021 ruling 3).
+    // A short-lived, single-connection validation pool that closes before
+    // returning (ADR-0021 ruling 3).
     #[allow(clippy::disallowed_methods)]
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -295,8 +289,8 @@ async fn validate_database_inner(url: &str, expected_database: &str) -> Result<(
 }
 
 async fn validate_extensions(url: &str, database: &str, required: &[&str]) -> Result<()> {
-    // validate_extensions is a short-lived, single-connection
-    // validation pool that closes before returning (ADR-0021 ruling 3).
+    // A short-lived, single-connection validation pool that closes before
+    // returning (ADR-0021 ruling 3).
     #[allow(clippy::disallowed_methods)]
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -336,9 +330,8 @@ async fn validate_docker_capabilities(url: &str) -> Result<()> {
 }
 
 async fn validate_docker_capabilities_inner(url: &str) -> Result<()> {
-    // validate_docker_capabilities_inner is a short-lived,
-    // single-connection validation pool that closes before returning
-    // (ADR-0021 ruling 3).
+    // A short-lived, single-connection validation pool that closes before
+    // returning (ADR-0021 ruling 3).
     #[allow(clippy::disallowed_methods)]
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -390,9 +383,7 @@ fn validate_docker_container(runner: &dyn CommandRunner) -> Result<()> {
     let image = value.pointer("/Config/Image").and_then(Value::as_str);
     // The container may predate this controller, so inspect the whole
     // publishing surface: every binding on the contracted port must be
-    // loopback, and no other container port may be published at all. Checking
-    // only the first binding would accept a container that also published the
-    // same port on a wildcard address.
+    // loopback, and no other container port may be published at all.
     let expected_port = DOCKER_PORT.to_string();
     let contract_ok = value
         .pointer("/HostConfig/PortBindings")
@@ -558,20 +549,16 @@ mod tests {
     #[test]
     fn a_second_binding_or_an_extra_published_port_is_rejected() {
         for document in [
-            // Loopback first, wildcard second: the whole publishing surface
-            // has to be inspected, not just the first entry.
             br#"{"Config":{"Image":"pgvector/pgvector:pg18"},
                  "HostConfig":{"PortBindings":{"5432/tcp":[
                      {"HostIp":"127.0.0.1","HostPort":"5435"},
                      {"HostIp":"0.0.0.0","HostPort":"5435"}]}}}"#
                 .as_slice(),
-            // Contracted port is fine, but a second port is published.
             br#"{"Config":{"Image":"pgvector/pgvector:pg18"},
                  "HostConfig":{"PortBindings":{
                      "5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"5435"}],
                      "9999/tcp":[{"HostIp":"0.0.0.0","HostPort":"9999"}]}}}"#
                 .as_slice(),
-            // The contracted port is not published at all.
             br#"{"Config":{"Image":"pgvector/pgvector:pg18"},
                  "HostConfig":{"PortBindings":{}}}"#
                 .as_slice(),
@@ -590,8 +577,6 @@ mod tests {
 
     #[test]
     fn exposed_but_unpublished_sibling_ports_are_tolerated() {
-        // `EXPOSE` without a host publish is not reachable, so it must not
-        // fail an otherwise contract-conforming container.
         let runner = OneOutput {
             stdout: br#"{"Config":{"Image":"pgvector/pgvector:pg18"},
                  "HostConfig":{"PortBindings":{

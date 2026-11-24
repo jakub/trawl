@@ -5,10 +5,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 
-/// Environment inherited by ordinary controller children.
-///
-/// Secret-looking ambient variables are excluded by construction. Resolved
-/// values are added to individual consumers later.
 #[must_use]
 pub fn sanitized_base_from(
     environment: impl IntoIterator<Item = (OsString, OsString)>,
@@ -52,10 +48,7 @@ fn allowed_name(name: &OsStr) -> bool {
             | "DOCKER_CERT_PATH"
             | "DOCKER_TLS_VERIFY"
             // Trust anchors and egress policy for `op`, `docker`, and `cargo`
-            // behind a private CA or a proxy. Proxy URLs can embed credentials,
-            // which is a deliberate exception to "no secrets in children": the
-            // tools that need them are the ones that would otherwise fail, and
-            // the value is already in the controller's own environment.
+            // behind a private CA or a proxy.
             | "SSL_CERT_FILE"
             | "SSL_CERT_DIR"
             | "HTTP_PROXY"

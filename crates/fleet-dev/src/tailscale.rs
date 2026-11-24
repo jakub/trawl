@@ -236,8 +236,7 @@ fn parse_serve_status(bytes: &[u8]) -> Result<Vec<ServeMapping>> {
         for (port_key, value) in tcp {
             // Serve reports bare keys (`"8445"`), but `:port` and `host:port`
             // are also valid and an unparsed key would silently drop the
-            // occupant. This check is all that stops `setup` from clobbering an
-            // unrelated Serve handler.
+            // occupant.
             let trimmed = port_key.trim_start_matches(':');
             let port = trimmed
                 .rsplit_once(':')

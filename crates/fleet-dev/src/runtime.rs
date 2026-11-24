@@ -107,8 +107,7 @@ pub fn render(
     let token = developer_key.token.expose().as_bytes();
     if token.is_empty() {
         // `windows(0)` panics, so an empty token would crash the leak check
-        // below instead of running it. No key source produces one today; the
-        // guard keeps a regression from landing as a panic.
+        // below instead of running it.
         return Err(Error::InvalidArgument(
             "internal error: developer API key is empty".to_owned(),
         ));
@@ -227,13 +226,7 @@ fn insert_web_topology(
         fleet_auth::ENV_SESSION_COOKIE_SECURE.to_owned(),
         topology.cookie_secure.to_string(),
     );
-    // The CSRF allowlist (ADR-0016). The dev stack is the case the file-based
-    // knob cannot serve: the browser origin is decided here, per machine and
-    // per exposure mode (`http://localhost:8081` locally, the MagicDNS name
-    // and Serve port on a tailnet), so a committed `[web] public_origins`
-    // would be wrong for everyone. Exactly one entry, because the topology
-    // publishes exactly one origin. Anything else the operator browses to
-    // is a foreign origin and should 403.
+    // The CSRF allowlist (ADR-0016).
     environment.insert(
         fleet_auth::ENV_SESSION_PUBLIC_ORIGINS.to_owned(),
         topology.browser_origin.clone(),
@@ -269,13 +262,10 @@ fn render_trunk_config(
         "dist".to_owned(),
         toml::Value::String(ui_root.join("dist").display().to_string()),
     );
-    // An app may opt into `create_nonce` for its release pipeline, where its
-    // web binary substitutes the placeholder per-request and emits the full
-    // CSP header. Under `trunk serve` (verified on 0.21.14) the same flag
-    // makes Trunk emit a nonce-only development CSP — `style-src 'nonce-…'`
-    // — that blocks the app's own stylesheets and any font origins. The
-    // controller serves the SPA through Trunk, so force it off here; the
-    // source Trunk.toml keeps the release behavior.
+    // An app may opt into `create_nonce` for its release pipeline. Under
+    // `trunk serve` (verified on 0.21.14) the same flag makes Trunk emit a
+    // nonce-only development CSP that blocks the app's own stylesheets and
+    // any font origins.
     build.insert("create_nonce".to_owned(), toml::Value::Boolean(false));
     let serve = document
         .get_mut("serve")
@@ -464,8 +454,6 @@ mod tests {
 
     #[test]
     fn an_empty_developer_key_is_refused_rather_than_panicking() {
-        // No key source produces an empty token, but `windows(0)` would panic
-        // if one did.
         let plan = DevelopmentPlan {
             schema: 1,
             exposure: crate::cli::Exposure::Localhost,
@@ -531,11 +519,7 @@ no_redirect = true
         render_trunk_config(&output, &ui, &topology).unwrap();
         let rendered: toml::Value =
             toml::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
-        // Trunk's serve-mode nonce CSP blocks the app's own stylesheets, so
-        // the generated config must always disable it…
         assert_eq!(rendered["build"]["create_nonce"].as_bool(), Some(false));
-        // …while the app's source Trunk.toml keeps the release-build nonce
-        // pipeline untouched.
         assert_eq!(
             std::fs::read_to_string(ui.join("Trunk.toml")).unwrap(),
             source_before

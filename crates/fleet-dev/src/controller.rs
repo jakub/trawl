@@ -173,9 +173,6 @@ async fn prepare_launch(
         }
     });
     let docker_owned = AtomicBool::new(false);
-    // An aborted child surfaces as `Error::CommandLimit`, so an interrupt needs
-    // no cleanup of its own. Whichever error path catches it already stops a
-    // Docker database this run started.
     let result = prepare_launch_inner(runner, profile, selection, state_root, &docker_owned).await;
     watcher.abort();
     result
@@ -231,7 +228,6 @@ async fn prepare_launch_inner(
     }
 }
 
-/// Termination signals, with their OS handlers installed at construction.
 #[cfg(unix)]
 struct InterruptSignals {
     interrupt: tokio::signal::unix::Signal,
@@ -302,10 +298,8 @@ async fn prepare_after_database(
     };
 
     // Preparation runs before the resolvers so a manifest can build its
-    // resolver (and migration) binaries first — handing the 1Password service
-    // token to a `cargo run` resolver would expose it to every build script
-    // and proc-macro in the dependency graph. Manifest validation restricts
-    // preparation's resolved sources to `fleet.*`, which all exist here.
+    // resolver binaries first: handing the 1Password service token to a
+    // `cargo run` resolver would expose it to every build script and proc-macro.
     run_app_preparations(runner, selection, &values)?;
 
     for (app, checkout) in &selection.selected {
@@ -436,9 +430,6 @@ fn run_command_manifest(
         .args(args)
         .cwd(cwd)
         .environment(child_environment)
-        // Preparation compiles the app and migration runs its schema tool.
-        // Both need a build-shaped deadline, and both are useless without
-        // their own diagnostics, so they stream to the developer's terminal.
         .timeout(crate::command::BUILD_TIMEOUT)
         .stream_output();
     let output = runner.output(&spec)?;
@@ -491,11 +482,6 @@ fn finish_without_supervisor(
     Ok(())
 }
 
-/// Say out loud what Tailscale exposure actually publishes.
-///
-/// Serve is the front door on the SPA port, but the API listener binds the
-/// node's tailnet address so the whole dev stack answers on one `MagicDNS`
-/// name. Every tailnet peer can therefore reach the backend directly.
 fn warn_tailnet_backend_exposure(plan: &DevelopmentPlan) {
     for app in &plan.apps {
         eprintln!(
@@ -650,8 +636,6 @@ mod tests {
             )]),
         };
         let runner = RecordingRunner::default();
-        // The controller calls these in this order: preparation runs before
-        // the resolver would, migration after it.
         run_app_preparations(&runner, &selection, &values).unwrap();
         run_app_migrations(&runner, &selection, &values).unwrap();
         let seen = runner.seen.lock().unwrap();

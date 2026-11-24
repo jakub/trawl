@@ -55,7 +55,6 @@ pub struct ProcessPlan {
 pub enum ProcessRole {
     /// Browser-facing backend that mints and consumes Fleet sessions.
     WebBackend,
-    /// Trunk-served SPA.
     WebUi,
     /// Everything else; receives no topology injection.
     Opaque,
@@ -273,8 +272,6 @@ mod tests {
 
     #[test]
     fn process_roles_are_classified_per_app() {
-        // The backend name differs per app, so a role must never be inferred
-        // from the name alone.
         assert_eq!(
             ProcessRole::classify(App::Trawl, "trawl-web"),
             ProcessRole::WebBackend

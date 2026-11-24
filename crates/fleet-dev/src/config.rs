@@ -17,9 +17,6 @@ pub const MANIFEST_FILE: &str = "fleet-dev.toml";
 /// Manifest process name of the Trunk-served SPA, identical across apps.
 pub const WEB_UI_PROCESS: &str = "web-ui";
 const OP_SERVICE_ACCOUNT_TOKEN: &str = "OP_SERVICE_ACCOUNT_TOKEN";
-/// The developer role holds every Trawl permission except `ingest`, the
-/// same split ADR-0045 gives `trial-operator`. The list is literal so a new
-/// permission reaches the dev role only by an edit here and in the manifest.
 pub const TRAWL_DEV_PERMISSIONS: [&str; 11] = [
     "trawl:query",
     "trawl:schema_read",
@@ -456,10 +453,6 @@ impl AppManifest {
             }
             validate_environment(&preparation.env, &preparation.resolved_env)
                 .map_err(|message| invalid_error(MANIFEST_KIND, path, message))?;
-            // Preparation runs before the app resolver so it can build the
-            // resolver binary; `app.*` values other than the provider-supplied
-            // database URL do not exist yet. Restrict to `fleet.*` outright —
-            // a build step has no business holding an app DSN either.
             if let Some(source) = preparation
                 .resolved_env
                 .values()
@@ -856,7 +849,6 @@ mod tests {
             "got: {error}"
         );
 
-        // `fleet.*` values exist before the resolver and stay allowed.
         let mut manifest = load_manifest(root).unwrap();
         manifest.preparation.as_mut().unwrap().resolved_env.insert(
             "FLEET_DATABASE_URL".to_owned(),

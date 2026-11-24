@@ -117,8 +117,6 @@ pub fn parse_output(app: &str, bytes: &[u8]) -> Result<BTreeMap<String, SecretVa
     let mut output = BTreeMap::new();
     for (name, value) in parsed {
         validate_name(app, &name)?;
-        // Source names are unique and `app.` prefixing is injective, so the
-        // destination cannot collide.
         output.insert(format!("app.{name}"), value);
     }
     Ok(output)
