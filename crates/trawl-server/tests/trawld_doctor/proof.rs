@@ -4,13 +4,6 @@
 
 //! `trawld --doctor` tests of whole installations, and the proof that the
 //! doctor writes nothing.
-//!
-//! The leak rule holds across the binary: every function in
-//! `tests/trawld_doctor/` that runs the doctor also calls
-//! [`assert_no_values`] on what it printed
-//! (`every_doctor_run_is_checked_for_leaks`), and [`assert_no_values`]
-//! refuses the shapes of the values no report may show, whatever a test
-//! planted (`the_leak_check_refuses_every_forbidden_shape`).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -28,7 +21,6 @@ use crate::support::{
     write_doctor_config,
 };
 
-/// The doctor's arguments for `config` in `format`.
 fn doctor_args(config: &Path, format: &str) -> [OsString; 5] {
     [
         "--doctor".into(),
@@ -39,9 +31,6 @@ fn doctor_args(config: &Path, format: &str) -> [OsString; 5] {
     ]
 }
 
-/// Run the doctor over `config` with `env`, in JSON and then in table
-/// form, check both runs for every value in `planted`, and return the exit
-/// status and the JSON report. Both forms must exit alike.
 fn doctor(config: &Path, env: &[(&str, OsString)], planted: &[String]) -> (i32, Report) {
     let planted: Vec<&str> = planted.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_doctor(&doctor_args(config, "json"), env);
@@ -96,9 +85,6 @@ fn functions(source: &str) -> Vec<(String, String)> {
     found
 }
 
-/// The functions in `source` that run the doctor (call any `run_doctor*`
-/// helper) without calling [`assert_no_values`], by name. The helpers
-/// themselves are not callers. Comment lines are ignored.
 fn unchecked_runs(source: &str) -> (usize, Vec<String>) {
     let mut callers = 0;
     let mut unchecked = Vec::new();
@@ -128,10 +114,6 @@ fn unchecked_runs(source: &str) -> (usize, Vec<String>) {
     (callers, unchecked)
 }
 
-/// Every function in `tests/trawld_doctor/` that runs the doctor checks
-/// what it printed with [`assert_no_values`] in the same function, so no
-/// run's output escapes the leak check (#269 AC12). The scan must see the
-/// runs of every group, and it catches a run that is not checked.
 #[test]
 fn every_doctor_run_is_checked_for_leaks() {
     let negative = [
@@ -175,8 +157,6 @@ fn every_doctor_run_is_checked_for_leaks() {
     }
 }
 
-/// [`assert_no_values`] refuses each shape no report may show, and passes
-/// the text the doctor does print, such as versions, uids and paths.
 #[test]
 fn the_leak_check_refuses_every_forbidden_shape() {
     for (text, shape) in [
@@ -272,11 +252,6 @@ fn malformed_configs(dir: &Path) -> Vec<(&'static str, Vec<u8>, Outcome, &'stati
     ]
 }
 
-/// Malformed input costs a row, never a leak: a configuration that does not
-/// parse, database URLs that do not parse, a listener address that is no
-/// address, and a certificate and key that are not PEM, each carrying
-/// [`SECRET`] where a parser would quote it. Every run is checked in both
-/// forms with [`assert_no_values`].
 #[test]
 fn doctor_malformed_input_leaks_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -295,7 +270,6 @@ fn doctor_malformed_input_leaks_nothing() {
         assert_eq!(code, 1, "{label}");
     }
 
-    // Database URLs that do not parse, from the environment and the file.
     let malformed_urls = [
         "postgres://user:private-secret@[::1/fleet",
         "private-secret is not a URL",
@@ -329,8 +303,6 @@ fn doctor_malformed_input_leaks_nothing() {
         }
     }
 
-    // A listener address that is no address, and one naming no host that
-    // resolves.
     for addr in ["private-secret", "private-secret.invalid:5514"] {
         let mut shown = planted.clone();
         shown.push(addr.to_owned());
@@ -347,7 +319,6 @@ fn doctor_malformed_input_leaks_nothing() {
         );
     }
 
-    // A configured certificate and key that are not PEM.
     let cert = dir.path().join("private.crt");
     let key = dir.path().join("private.key");
     std::fs::write(
@@ -368,9 +339,6 @@ fn doctor_malformed_input_leaks_nothing() {
     assert_eq!(code, 1);
 }
 
-/// Usage errors print a fixed message and exit 2, quoting no argument:
-/// an unknown flag, a stray value, and flags missing their values, each
-/// spelled with [`SECRET`].
 #[test]
 fn doctor_usage_errors_quote_no_argument() {
     let dir = tempfile::tempdir().unwrap();
@@ -422,7 +390,6 @@ fn doctor_usage_errors_quote_no_argument() {
 /// own generated pair carry (rcgen's default).
 const RCGEN_SUBJECT: &str = "rcgen self signed cert";
 
-/// `catalog_state.catalog_id` of the app-state database `url`.
 async fn catalog_id(url: &str) -> String {
     let mut conn = admin(url).await;
     let id: String = sqlx::query_scalar("SELECT catalog_id::text FROM catalog_state")
@@ -433,13 +400,9 @@ async fn catalog_id(url: &str) -> String {
     id
 }
 
-/// A running fixture server over an installation in `dir` that trawld's
-/// own boot steps made: the epoch gate initializes the absent data root, as
-/// `main` does before anything else, the seed parquet then stands for what
-/// ingest wrote, and the fixture's boot (`boot::prepare_corpus`) runs
-/// conformance and publishes the `CATALOG` marker. The fixture boot does
-/// not close the storage roots, and this test process's umask is not
-/// trawld's, so `main`'s close step runs last, as a restart would run it.
+/// The fixture boot does not close the storage roots, and this test
+/// process's umask is not trawld's, so `main`'s close step runs last, as a
+/// restart would run it.
 async fn running_server(dir: &Path) -> common::TestServer {
     use trawl_server::owner_only;
     let (data, wal) = (dir.join("data"), dir.join("wal"));
@@ -462,10 +425,6 @@ async fn running_server(dir: &Path) -> common::TestServer {
     server
 }
 
-/// A doctor configuration for a running fixture server in `dir`, which
-/// [`running_server`] put its data root and WAL under, and what to run the
-/// doctor with: the fixture's two databases through the planted role, and
-/// every value of the installation the report must not show.
 async fn running_installation(
     server: &common::TestServer,
     dir: &Path,
@@ -503,8 +462,6 @@ async fn running_installation(
     (path, env, values)
 }
 
-/// `(id, outcome, reason)` of every row that is not `complete` or
-/// `not_configured`.
 fn open_rows(report: &Report) -> Vec<(String, Outcome, Option<String>)> {
     report
         .checks()
@@ -514,10 +471,6 @@ fn open_rows(report: &Report) -> Vec<(String, Outcome, Option<String>)> {
         .collect()
 }
 
-/// Against a real, healthy, running trawld with both databases current, a
-/// configured certificate and ingest on, the run passes: exit 0, every row
-/// `complete` or `not_configured`, the writer lock seen held, trawld's own
-/// certificate proven and its health read, and no note (#269 AC2).
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_running_installation_passes() {
     ensure_role().await;
@@ -555,13 +508,6 @@ async fn doctor_running_installation_passes() {
     assert!(!server.serve_task.is_finished(), "trawld stopped serving");
 }
 
-/// A fresh installation before its first start: an empty app-state
-/// database, a migrated Fleet database, no data root on an ingest node,
-/// auto TLS with no pair yet, and trawld not running. Nothing fails, what
-/// boot initializes is `complete`/`will_initialize`, the listener is
-/// `not_listening`, and the run is incomplete, exit 3 (#269 AC3). The same
-/// state with an empty Fleet database is `db::doctor_unmigrated_fleet_fails`.
-/// Nothing was created.
 #[tokio::test]
 async fn doctor_fresh_install_is_incomplete() {
     ensure_role().await;
@@ -606,11 +552,6 @@ async fn doctor_fresh_install_is_incomplete() {
     assert_eq!(left, ["trawld.toml"], "the doctor created files");
 }
 
-/// The note "another process may own this database" is added when trawld's
-/// writer lock is held while nothing answers at the listener's address, and
-/// it changes no outcome: the report with the lock held, taken by a real
-/// `StorageState` as trawld's boot takes it, differs from the one without
-/// only in `server.app.writer`'s reason and the note (#269 D6).
 #[tokio::test]
 async fn doctor_notes_a_writer_lock_without_a_listener() {
     const NOTE: &str = "another process may own this database";
@@ -688,12 +629,9 @@ struct Entry {
     inode: u64,
     mtime: (i64, i64),
     ctime: (i64, i64),
-    /// A file's bytes, a symlink's target; empty for a directory.
     content: Vec<u8>,
 }
 
-/// Every entry under `root`, `root` itself included as `.`, by its path
-/// relative to `root`.
 fn fs_snapshot(root: &Path) -> std::collections::BTreeMap<String, Entry> {
     use std::os::unix::fs::MetadataExt as _;
     fn walk(root: &Path, path: &Path, into: &mut std::collections::BTreeMap<String, Entry>) {
@@ -748,8 +686,6 @@ fn fs_snapshot(root: &Path) -> std::collections::BTreeMap<String, Entry> {
     entries
 }
 
-/// Fail, naming only the entries that differ, when `after` is not
-/// `before`.
 fn assert_unchanged(
     before: &std::collections::BTreeMap<String, Entry>,
     after: &std::collections::BTreeMap<String, Entry>,
@@ -793,10 +729,6 @@ fn assert_unchanged(
     );
 }
 
-/// What a write to the database `url` would change: its schemas, every
-/// relation outside the system schemas with its kind, file node, owner and
-/// grants, every function there, and every row of every table and
-/// sequence there, which covers the ledger and `catalog_state`.
 async fn db_snapshot(url: &str) -> std::collections::BTreeMap<String, String> {
     let mut conn = admin(url).await;
     let mut snapshot = std::collections::BTreeMap::new();
@@ -846,12 +778,6 @@ async fn db_snapshot(url: &str) -> std::collections::BTreeMap<String, String> {
     snapshot
 }
 
-/// Make [`LOCKLESS`] a role that holds only `CONNECT` and `SELECT` in the
-/// database `url` names, and no advisory-lock function
-/// ([`forbid_advisory_locks`]), and assert that it does: no `CREATE` or
-/// `TEMPORARY` on the database, no `CREATE` on `public`, no privilege but
-/// `SELECT` on any table there, none on any sequence, and no role
-/// attribute that grants more.
 async fn connect_and_select_only(url: &str) {
     forbid_advisory_locks(url).await;
     let mut conn = admin(url).await;
@@ -904,9 +830,6 @@ async fn connect_and_select_only(url: &str) {
     conn.close().await.unwrap();
 }
 
-/// An installation for [`doctor_writes_nothing`]: its state directory, the
-/// parent of `[data] path`, holds the data root, the WAL, the generated
-/// certificate, the crash-dump directory and `trawld.toml`.
 struct Installation {
     name: &'static str,
     dir: tempfile::TempDir,
@@ -920,7 +843,6 @@ impl Installation {
         self.dir.path().join("dumps")
     }
 
-    /// Write the configuration of an ingest or a query-only node.
     fn configure(&self, ingest: bool) -> PathBuf {
         let config = DoctorConfig {
             ingest,
@@ -929,8 +851,6 @@ impl Installation {
         write_doctor_config(self.dir.path(), &config)
     }
 
-    /// The doctor's environment: both databases as [`LOCKLESS`], and
-    /// crash-dump capture enabled on this installation's dump directory.
     fn env(&self) -> Vec<(&'static str, OsString)> {
         vec![
             ("HOME", self.dir.path().as_os_str().to_owned()),
@@ -955,9 +875,6 @@ impl Installation {
     }
 }
 
-/// An installation before its first start: a migrated Fleet database, an
-/// empty app-state database, no data root, no certificate, and no
-/// crash-dump directory yet (capture would create one).
 async fn fresh_installation() -> Installation {
     let fleet = migrated_fleet().await;
     let app = common::create_app_database().await;
@@ -972,11 +889,6 @@ async fn fresh_installation() -> Installation {
     }
 }
 
-/// An installation that has run: both schemas current and conformance
-/// recorded, a data root trawld's epoch gate initialized holding parquet
-/// and its `CATALOG` marker, WAL with a pending publication marker, a
-/// pending rollup marker, the certificate trawld generates, and a
-/// crash-dump directory holding more dumps than capture would retain.
 async fn populated_installation() -> Installation {
     use trawl_server::ingest::publication_marker::{OutputIdentity, ValidatedMarker};
 
@@ -1079,31 +991,20 @@ impl Drop for WriteProtected {
     }
 }
 
-/// How a run of [`doctor_writes_nothing`] saw the installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leg {
-    /// As the test's own user, over the tree as it is.
     AsIs,
-    /// As the test's own user, with every write bit cleared.
     WriteProtected,
-    /// As root in a user namespace, over a read-only bind mount.
     ReadOnlyMount,
 }
 
 /// What a run over `installation` must have looked at, so a run that read
-/// nothing cannot pass for one that wrote nothing: every database row
-/// complete as [`LOCKLESS`] (an advisory-lock call is refused, and a write
-/// is refused by the read-only session and the role), and every storage
-/// content row run and complete: the epoch, the archive's identity,
-/// conformance (`not_configured` on a query-only node), and both recovery
-/// checks.
+/// nothing cannot pass for one that wrote nothing.
 ///
 /// Only the write-protected leg may stop at the data root's check: an
 /// ingest node cannot write its data root then, and no node can create or
 /// write its results root (ADR-0057), so a query-only node's row must name
-/// the results root. A root run over the read-only mount never asks about
-/// access, so its data root is `ran_as_root` and every content row still
-/// has to run.
+/// the results root.
 fn assert_looked(
     installation: &Installation,
     ingest: bool,
@@ -1159,19 +1060,6 @@ fn assert_looked(
     }
 }
 
-/// `trawld --doctor` writes nothing (#269 AC4, D19). Over a fresh and a
-/// populated installation, as an ingest and as a query-only node, the data
-/// root, the WAL, the state directory and the crash-dump directory keep
-/// every entry's content, mode, size, inode, modification and change time,
-/// and both databases keep their objects, grants and rows.
-///
-/// Leg 1, always: the doctor logs in as a role with only `CONNECT` and
-/// `SELECT` and no advisory-lock function, over the tree as it is (where a
-/// write would land and show) and then with every write bit cleared (where
-/// the doctor must report the root it cannot write, not write it). Leg 2:
-/// as root in a user namespace, over a read-only bind mount of the tree,
-/// which root cannot write through; skipped only where user namespaces are
-/// unavailable and `TRAWL_TEST_REQUIRE_USERNS` is not `1`.
 #[tokio::test]
 async fn doctor_writes_nothing() {
     ensure_role().await;
@@ -1259,15 +1147,6 @@ async fn doctor_writes_nothing() {
     }
 }
 
-/// Run as root, the doctor cannot pass (#269 AC11, D16). As uid 0 in a
-/// user namespace, against the running installation of
-/// `doctor_running_installation_passes`, the one access check,
-/// `server.data.root`, is `not_sampled`/`ran_as_root`, every content check
-/// still reports and completes (the epoch, the archive's identity and
-/// conformance, both recovery checks, the certificate, the listener and its
-/// health), and so the run is incomplete, exit 3, where the same run as the
-/// test's own user exits 0. Skipped only where user namespaces are
-/// unavailable and `TRAWL_TEST_REQUIRE_USERNS` is not `1`.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_root_run_is_incomplete() {
     let Some(userns) = Userns::for_test("doctor_root_run_is_incomplete") else {

@@ -2,21 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Boot recovery for an interrupted repin (ADR-0011) — the marker-driven
-//! decision table, split into filesystem and store phases before the
-//! daemon constructs corpus readers and writers:
-//!
-//! - both databases are admitted first, with the Trawl sole-writer lock held
-//!   across both recovery halves;
-//! - the filesystem half runs after `ensure_current_epoch` validates the
-//!   format and before any corpus reader starts. Per-env swaps leave EPOCH
-//!   in place, so an incompatible root can be refused before recovery mutates
-//!   anything. This half needs no postgres;
-//! - the postgres half runs before `AppState::from_parts` loads the live
-//!   catalog cache or constructs readers and writers. It finishes the job row
-//!   (idempotent flip or failure), re-arms the boot conformance pass for any
-//!   recovered cutover, sweeps the aside, and removes the marker — then
-//!   reconciles any orphaned `running` rows.
+//! Boot recovery for an interrupted repin (ADR-0011): the marker-driven
+//! decision table.
 //!
 //! Every branch is idempotent: recovery interrupted mid-recovery is the
 //! same state re-entered.
@@ -30,7 +17,6 @@ use crate::repin::marker::{
 };
 use crate::store::{RepinJobStatus, StorageState};
 
-/// What the filesystem half did, for the postgres half to finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveredAction {
     /// The job died building: the disposable shadow was deleted, the live
@@ -44,29 +30,16 @@ pub enum RecoveredAction {
     SweptCleanup,
 }
 
-/// A recovered marker plus the action the filesystem half took.
 #[derive(Debug, Clone)]
 pub struct Recovered {
-    /// The marker as read.
     pub marker: RepinMarker,
-    /// What was done.
     pub action: RecoveredAction,
     /// Whether every staging sweep this half owed actually left the
     /// staging root gone. A failed sweep keeps the marker (see
-    /// `reconcile_store`): the leftover root suppresses retention and
-    /// would make the next cutover's forward-only swap ambiguous, so the
-    /// replay must run again at the next boot rather than be forgotten.
+    /// `reconcile_store`).
     pub swept: bool,
 }
 
-/// The filesystem half of the decision table.
-///
-/// A query-only node (`ingest_enabled == false`) owns nothing here: a
-/// `building` marker is harmless (the live corpus was never touched —
-/// warn and serve, leaving the shadow for the owning node), but a
-/// `cutover`/`cleanup` marker means the corpus may be half-swapped, which
-/// probes showed does not even error — mixed scalar types silently
-/// promote — so the only honest answer is to refuse the boot.
 pub fn recover_filesystem(
     data_dir: &Path,
     ingest_enabled: bool,
@@ -74,9 +47,6 @@ pub fn recover_filesystem(
     let shadow = shadow_root(data_dir);
     let aside = aside_root(data_dir);
     let Some(marker) = read_marker(data_dir)? else {
-        // No marker: staging siblings should not exist. A stray shadow is
-        // disposable by construction (never authoritative); a stray aside
-        // is somebody's data and is left with a warning.
         if ingest_enabled && shadow.exists() {
             tracing::warn!(
                 event_type = "repin_stale_shadow",
@@ -154,10 +124,6 @@ pub fn recover_filesystem(
     }))
 }
 
-/// The postgres half: finish the recovered job, re-arm conformance for a
-/// recovered cutover, sweep the aside, remove the marker — then fail any
-/// orphaned `running` rows (a marker-less orphan means the process died
-/// before the cutover: the corpus is untouched).
 pub async fn reconcile_store(
     storage: &StorageState,
     cache: &FieldCatalog,
@@ -169,10 +135,6 @@ pub async fn reconcile_store(
         let mut swept = recovered.swept;
         match recovered.action {
             RecoveredAction::AbandonedBuild => {
-                // Conditional: the marker's job is `running` by
-                // construction here, and a row that somehow already carries
-                // a verdict keeps it rather than being restamped `failed`
-                // by a replay.
                 storage
                     .repin
                     .finish_if_running(
@@ -185,11 +147,10 @@ pub async fn reconcile_store(
                     .map_err(|e| format!("failed to fail recovered repin job: {e}"))?;
             }
             RecoveredAction::CompletedCutover | RecoveredAction::SweptCleanup => {
-                // [`RepinMarker::target_type`]: `from_catalog`, matching what the marker writes
-                // (`to.as_catalog()`): the physical parse (`from_duckdb`)
-                // has no `SEVERITY` spelling, so it would refuse a severity
-                // cutover marker. This path must never refuse — the corpus
-                // is already half-swapped.
+                // The physical parse (`from_duckdb`) has no `SEVERITY`
+                // spelling, so it would refuse a severity cutover marker.
+                // This path must never refuse — the corpus is already
+                // half-swapped.
                 let to = marker.target_type().ok_or_else(|| {
                     format!("repin marker names non-canonical type {:?}", marker.to_type)
                 })?;
@@ -198,12 +159,6 @@ pub async fn reconcile_store(
                     .finish_cutover(marker.job_id, &marker.field, to)
                     .await
                     .map_err(|e| format!("failed to complete recovered repin flip: {e}"))?;
-                // The clear is audited wherever it happens. `cleared_ack` is
-                // true only on the call that completed the job, so a boot
-                // that replays an already-finished cutover stays silent.
-                // Same contract as the live path: one line per OBSERVED
-                // clear, and a crash between the commit above and this emit
-                // loses it for good.
                 if outcome.cleared_ack {
                     tracing::info!(
                         event_type = "field_degraded_ack_cleared",
@@ -226,12 +181,9 @@ pub async fn reconcile_store(
             }
         }
         // The marker is the only record that a staging root is trawl's to
-        // delete: dropping it over a failed sweep strands the leftover
-        // root until an operator removes it (retention stays suppressed by
-        // its mere existence, and repin admission refuses every later
-        // repin while it stands). The store side is idempotent by
-        // construction, so keeping the marker just replays this at the
-        // next boot, which is exactly the retry.
+        // delete. The store side is idempotent by construction, so keeping
+        // the marker just replays this at the next boot, which is exactly
+        // the retry.
         if swept {
             remove_marker(data_dir)?;
         } else {
@@ -278,7 +230,6 @@ mod tests {
         }
     }
 
-    /// Build a live root with one env holding one file.
     fn live_root(tmp: &Path) -> std::path::PathBuf {
         let data = tmp.join("data");
         let dir = data.join("prod/2026-01-01/10");
@@ -315,11 +266,6 @@ mod tests {
         }
     }
 
-    /// A leftover aside from an earlier job's failed sweep is reclaimed by
-    /// the abandoned build rather than inherited: the marker standing over
-    /// it is the last one that will ever name it, and leaving it while the
-    /// marker goes strands it (retention stays suppressed by its mere
-    /// existence, and nothing deletes a marker-less aside).
     #[test]
     fn an_abandoned_build_reclaims_a_leftover_aside() {
         let tmp = tempfile::tempdir().unwrap();
@@ -349,9 +295,6 @@ mod tests {
         );
     }
 
-    /// A staging root that survives its sweep reports `swept == false` —
-    /// the signal `reconcile_store` gates marker removal on, so the
-    /// leftover root keeps its marker and the next boot retries.
     #[cfg(unix)]
     #[test]
     fn a_surviving_staging_root_reports_an_unfinished_sweep() {
@@ -379,12 +322,8 @@ mod tests {
         assert!(shadow.exists(), "the staging root is still on disk");
     }
 
-    /// The cutover crash windows: before any rename, between the two
-    /// renames of an env, and after every rename — all resume forward to
-    /// the completed repin, and re-running recovery is a no-op.
     #[test]
     fn cutover_crash_windows_all_resume_to_the_new_generation() {
-        // (a) marker written, no renames yet.
         let tmp = tempfile::tempdir().unwrap();
         let data = live_root(tmp.path());
         shadow_with_new_generation(&data);
@@ -404,8 +343,6 @@ mod tests {
             assert!(!shadow_root(&data).exists());
         }
 
-        // (b) between the two renames: live env moved aside, shadow not
-        // yet published — no data/prod at all.
         let tmp = tempfile::tempdir().unwrap();
         let data = live_root(tmp.path());
         shadow_with_new_generation(&data);
@@ -471,9 +408,6 @@ mod tests {
         );
     }
 
-    /// A query-only node: a building marker warns and serves (the corpus
-    /// was never touched); a cutover marker refuses the boot — the
-    /// half-swapped corpus would silently promote, not error.
     #[test]
     fn query_only_node_serves_building_and_refuses_cutover() {
         let tmp = tempfile::tempdir().unwrap();

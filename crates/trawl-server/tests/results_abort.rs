@@ -3,43 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! A capture whose client walks away mid-execution (ADR-0057, "Admission
-//! is per key"), through `trawl-client` over a real TLS listener: the
-//! transport drops the handler, the pool latches cancellation and
-//! interrupts `DuckDB`, the engine never finishes, and the executor
-//! permit, the admission slot and the quota reservation stay charged
-//! until the work physically stops.
+//! is per key").
 //!
-//! Two transports carry each sequence. The fixture's own listener is the
-//! production shape, HTTP/1.1 alone. The second is
-//! `serve_with_listener_h2_for_tests`, which negotiates HTTP/2. This
-//! listener exists only in tests. trawld serves HTTP/1.1 only (ADR-0054);
-//! this proves the router and the client under HTTP/2, not the production
-//! edge.
-//!
-//! Two sequences, one leg of each per transport:
-//!
-//! - Before execution. The work is parked at the pool's `Started` seam,
-//!   past its work-start transition and before the engine runs, so the
-//!   drop lands on work that is physically running. Released, it stops at
-//!   the latch on the engine's bind-to-execute boundary: `DuckDB` never
-//!   executes. These legs prove the handler's abandonment and the held
-//!   charges.
-//! - During execution. The capture runs a slow query: a regex that no
-//!   message of a one-row-group corpus matches and that RE2 answers only by
-//!   searching every byte, seconds of `DuckDB` execution. The client drops
-//!   while `DuckDB` executes it, and the work is held at the pool's
-//!   `Returned` seam, once the engine returned and before the slot lets go
-//!   of anything. These legs prove that the drop's interrupt stops `DuckDB`
-//!   mid-execution and that every charge is still held after the engine
-//!   stopped, until the work releases it. The engine had not returned
-//!   before the drop. It booked an `execute` phase. It ended `failed`, a
-//!   database error, where the latch's stop is `cancelled` and the query
-//!   left alone completes, as its control shows.
-//!
-//! A third sequence drops the client after execution, while the capture's
-//! row commits. The commit runs in a task of its own, so the capture is
-//! kept and recorded as a success all the same. One leg, over the
-//! production listener.
+//! The mid-execution capture runs a slow query: a regex that no
+//! message of a one-row-group corpus matches and that RE2 answers only by
+//! searching every byte, seconds of `DuckDB` execution.
 //!
 //! The capture limits are tightened so each charge is visible from
 //! outside: one result per key, so the held reservation refuses the same
@@ -48,7 +16,6 @@
 //!
 //! The mid-execution legs read the pool's own events, so each installs a
 //! process-wide subscriber: nextest runs every test in its own process.
-//! The binary is in the ADR-0021 `postgres` nextest group.
 
 mod common;
 
@@ -65,8 +32,6 @@ use trawl_server::config::RateLimitConfig;
 use trawl_server::pool::WorkKind;
 use trawl_server::pool::seam::Seam;
 
-/// A fixture over the capture corpus whose limits make each charge
-/// observable: one result per key, one capture installation-wide.
 async fn boot() -> TestServer {
     let server = captured::boot(
         RateLimitConfig::default(),
@@ -82,7 +47,6 @@ async fn boot() -> TestServer {
     server
 }
 
-/// [`boot`]'s fixture with the [`slow_corpus`] beside the capture corpus.
 /// Queries and captures may run a minute, so the control's slow capture
 /// completes under any load. The tempdir is leaked so it outlives the
 /// server.
@@ -110,7 +74,6 @@ async fn boot_slow() -> TestServer {
     server
 }
 
-/// Record every event this process logs, from every thread.
 fn record_events() -> Capture {
     let events = Capture::default();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(events.clone()))
@@ -118,8 +81,7 @@ fn record_events() -> Capture {
     events
 }
 
-/// The recorded events of `event_type` whose fields carry every
-/// `(name, value)` of `matching`. A string field is recorded through
+/// A string field is recorded through
 /// `Debug`, so it is matched quoted.
 fn recorded(events: &Capture, event_type: &str, matching: &[(&str, &str)]) -> Vec<Captured> {
     let quoted = |value: &str| format!("{value:?}");
@@ -135,7 +97,6 @@ fn recorded(events: &Capture, event_type: &str, matching: &[(&str, &str)]) -> Ve
         .collect()
 }
 
-/// The listener at `url` answers `version`.
 async fn assert_answers_over(url: &str, version: reqwest::Version, what: &str) {
     let response = common::harness_client_builder()
         .build()
@@ -147,15 +108,12 @@ async fn assert_answers_over(url: &str, version: reqwest::Version, what: &str) {
     assert_eq!(response.version(), version, "{what}");
 }
 
-/// A `trawl-client` for `url` as `token`, trusting the fixture's
-/// certificate alone, with verification on.
 fn client(url: &str, token: &str) -> HttpClient {
     let (cert, _) = common::ensure_test_cert();
     let pem = std::fs::read(cert).expect("read the shared test certificate");
     HttpClient::with_trust(url, token, &TlsTrust::PinnedCa(pem)).expect("build the client")
 }
 
-/// The capture every request here makes: the 20-event corpus, last hour.
 fn request() -> CaptureRequest {
     CaptureRequest {
         query: format!("service={}", captured::SERVICE),
@@ -167,8 +125,6 @@ fn request() -> CaptureRequest {
     }
 }
 
-/// The slow capture: a [`SLOW_PATTERN`] search of the [`slow_corpus`],
-/// last hour. It captures no row.
 fn slow_request() -> CaptureRequest {
     CaptureRequest {
         query: format!("service={SLOW_SERVICE} message=/{SLOW_PATTERN}/"),
@@ -180,7 +136,6 @@ fn slow_request() -> CaptureRequest {
     }
 }
 
-/// `answer` is a 429 refusal with `code`.
 fn assert_refused<T: std::fmt::Debug>(
     answer: Result<T, ClientError>,
     code: &ErrorCode,
@@ -195,7 +150,7 @@ fn assert_refused<T: std::fmt::Debug>(
     }
 }
 
-/// Every entry in the results root, sorted. The root's lock is a `flock`
+/// The root's lock is a `flock`
 /// on the directory itself, so an idle root is empty.
 fn results_root_entries(server: &TestServer) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(server.state.results.root.path())
@@ -212,7 +167,6 @@ fn results_root_entries(server: &TestServer) -> Vec<String> {
     names
 }
 
-/// Poll `cond` until it holds, failing after a generous bound.
 async fn until(what: &str, cond: impl Fn() -> bool) {
     tokio::time::timeout(Duration::from_secs(30), async {
         while !cond() {
@@ -223,8 +177,6 @@ async fn until(what: &str, cond: impl Fn() -> bool) {
     .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
 }
 
-/// `queries` lists query `id` in recent history as abandoned: no rows, the
-/// abandonment's error, and not a timeout.
 fn assert_abandoned(queries: &QueriesResponse, id: u64, what: &str) {
     let recent = queries
         .recent
@@ -240,8 +192,6 @@ fn assert_abandoned(queries: &QueriesResponse, id: u64, what: &str) {
     assert!(!recent.snapshot.timed_out, "{what}: {recent:?}");
 }
 
-/// The requests in progress on the regular count, from the server's own
-/// `/metrics`: 0 once no capture's request future is left.
 async fn regular_requests_in_progress(server: &TestServer) -> f64 {
     let scrape = common::harness_client_builder()
         .build()
@@ -266,9 +216,6 @@ async fn regular_requests_in_progress(server: &TestServer) -> f64 {
         .expect("a gauge value")
 }
 
-/// The abort sequence against the listener at `url`, over the fixture's
-/// state: drop a capture's request while its work is parked at `Started`,
-/// see every charge held, release the work, see every charge freed.
 #[allow(clippy::too_many_lines)] // one sequence, each step asserted in order
 async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
     server: &TestServer,
@@ -285,7 +232,6 @@ async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
     let reader = client(url, &server.reader_token);
     let before = server.state.query.tracker.active().len();
 
-    // The client's request future is dropped while the work is running.
     let dropped = tokio::spawn({
         let analyst = analyst.clone();
         async move { analyst.capture(&request()).await }
@@ -304,8 +250,6 @@ async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
         "{protocol}: the client future was dropped, not answered"
     );
 
-    // The transport dropped the handler: its request guard latched the
-    // cancellation and booked the still-running work as retained.
     until("the dropped request's work is retained", || {
         pool.retained() == 1
     })
@@ -316,7 +260,6 @@ async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
     assert!(retained[0].started, "{protocol}: the work had started");
     let id = retained[0].id;
 
-    // Every charge is held while the work exists.
     assert_eq!(
         pool.available_permits(),
         permits - 1,
@@ -371,8 +314,6 @@ async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
         "{protocol}: no row was inserted"
     );
 
-    // The request is gone and so is its work: nothing it tracked is
-    // still running, and its history says it was abandoned.
     let queries = analyst.queries().await.expect("list the queries");
     assert!(
         !queries.active.iter().any(|q| q.snapshot.id == id),
@@ -386,7 +327,6 @@ async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
     );
     assert_abandoned(&queries, id, protocol);
 
-    // Free: the same key's next capture is admitted, then another key's.
     let next = analyst
         .capture(&request())
         .await
@@ -401,10 +341,6 @@ async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
     assert_eq!(pool.available_permits(), permits, "{protocol}");
 }
 
-/// The mid-execution sequence against the listener at `url`, over the
-/// fixture's state: drop a slow capture's request while `DuckDB` executes
-/// it, see the interrupted engine return with every charge still held,
-/// release the work, see every charge freed.
 #[allow(clippy::too_many_lines)] // one sequence, each step asserted in order
 async fn a_capture_dropped_while_duckdb_executes_is_interrupted_and_holds_its_charges(
     server: &TestServer,
@@ -449,8 +385,6 @@ async fn a_capture_dropped_while_duckdb_executes_is_interrupted_and_holds_its_ch
         "{protocol}: the client future was dropped, not answered"
     );
 
-    // The interrupt stopped DuckDB, and the work is held where the engine
-    // handed its answer back: nothing it holds is released yet.
     until("the interrupted engine returned", || {
         returned.arrivals() == 1
     })
@@ -486,8 +420,6 @@ async fn a_capture_dropped_while_duckdb_executes_is_interrupted_and_holds_its_ch
     assert_eq!(finished.arrivals(), 0, "{protocol}");
     assert_eq!(released.arrivals(), 0, "{protocol}: nothing released yet");
 
-    // Let the work go: it never reaches its file write, and its slot
-    // releases everything.
     returned.release();
     until("the work stopped and released its slot", || {
         released.arrivals() == 1
@@ -542,7 +474,6 @@ async fn a_capture_dropped_while_duckdb_executes_is_interrupted_and_holds_its_ch
         "{protocol}: no row was inserted"
     );
 
-    // Free: the same key's next capture is admitted, then another key's.
     let next = analyst
         .capture(&request())
         .await
@@ -557,8 +488,6 @@ async fn a_capture_dropped_while_duckdb_executes_is_interrupted_and_holds_its_ch
     assert_eq!(pool.available_permits(), permits, "{protocol}");
 }
 
-/// HTTP/1.1, the production listener: a dropped capture request
-/// interrupts its work and holds every charge until the work stops.
 #[tokio::test(flavor = "multi_thread")]
 async fn over_http1_a_dropped_capture_holds_its_charges_until_its_work_stops() {
     let server = boot().await;
@@ -573,9 +502,6 @@ async fn over_http1_a_dropped_capture_holds_its_charges_until_its_work_stops() {
         .await;
 }
 
-/// HTTP/2, the test-only listener: the same router and the same client
-/// behave the same way when the request is one stream on a shared
-/// connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn over_http2_a_dropped_capture_holds_its_charges_until_its_work_stops() {
     let server = boot().await;
@@ -590,9 +516,6 @@ async fn over_http2_a_dropped_capture_holds_its_charges_until_its_work_stops() {
     a_dropped_capture_holds_its_charges_until_its_work_stops(&server, &url, "HTTP/2").await;
 }
 
-/// HTTP/1.1, the production listener: a capture dropped while `DuckDB`
-/// executes it interrupts the engine and holds every charge until its
-/// work releases them.
 #[tokio::test(flavor = "multi_thread")]
 async fn over_http1_a_capture_dropped_while_duckdb_executes_is_interrupted_and_holds_its_charges() {
     let events = record_events();
@@ -613,8 +536,6 @@ async fn over_http1_a_capture_dropped_while_duckdb_executes_is_interrupted_and_h
     .await;
 }
 
-/// HTTP/2, the test-only listener: the same mid-execution sequence when
-/// the request is one stream on a shared connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn over_http2_a_capture_dropped_while_duckdb_executes_is_interrupted_and_holds_its_charges() {
     let events = record_events();
@@ -633,10 +554,7 @@ async fn over_http2_a_capture_dropped_while_duckdb_executes_is_interrupted_and_h
     .await;
 }
 
-/// A capture whose client goes away while its row commits, past
-/// execution, still commits, and is still recorded as the success it is:
-/// its tracker entry leaves `/queries`' active list for recent history
-/// with its rows, and history holds it. The insert is held until the
+/// The insert is held until the
 /// server has dropped the request's future, which the regular request
 /// count in `/metrics` shows, and only then commits.
 #[tokio::test(flavor = "multi_thread")]

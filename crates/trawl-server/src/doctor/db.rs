@@ -4,59 +4,8 @@
 
 //! The `trawld --doctor` checks of the Fleet and app-state databases.
 //!
-//! Connections are bare `PgConnection`s with a bounded connect and query
-//! time, in read-only transactions; no pool, no lock, no migration
-//! (ADR-0021 ruling 3, ADR-0047). The group fills [`Ctx::app`] and
+//! The group fills [`Ctx::app`] and
 //! [`Ctx::writer_lock_held`] for the groups after it.
-//!
-//! Each database gets one connection, opened with the URL trawld's boot
-//! would use and these startup settings: `default_transaction_read_only`
-//! on, a 5 s `statement_timeout`, a 1 s `lock_timeout`, and
-//! `application_name` `trawld-doctor`, which is how a watcher finds the
-//! doctor's backend. Connecting and every query also run under a 5 s
-//! deadline here; a step that misses it drops the connection, and the
-//! checks after it on that database are `not_sampled`, `timed_out`. Each
-//! step runs in a task of its own, so a panic in `SQLx` while it decodes
-//! what the server sent ends only that task: the connection is dropped with
-//! it, the check is `not_sampled`, `protocol_error`, and the other groups
-//! still run.
-//!
-//! With `sslmode` `disable` or `allow`, `SQLx` opens with the startup
-//! message, and a server that is not PostgreSQL can answer it with bytes
-//! `SQLx` reads as a huge frame. So under those modes the doctor first
-//! dials the same target itself, sends the startup message `SQLx` would
-//! send, and reads the first answer's 5-byte header: a type other than
-//! `R`, `E` or `v`, or a length past 8 KiB, is `failed`, `not_postgres`,
-//! and `SQLx` never connects ([`speaks_postgres`]). The doctor sends no
-//! password on that connection. It reads the rest of the answer,
-//! half-closes, and reads until the server closes, so PostgreSQL logs no
-//! reset. On a real server the probe is one more login attempt: a
-//! challenge-first method such as SCRAM logs only the connection, `trust`
-//! or `peer` opens a brief session with the same read-only settings, and
-//! a PAM stack with a lockout module such as `pam_faillock` may count one
-//! failure per probe.
-//!
-//! Before connecting, the doctor refuses a startup field that holds a
-//! control character, since a NUL ends the field early and drops the
-//! settings after it, and a password file `SQLx` would read that is not a
-//! regular file or is too large. It reads each TLS file the URL or the
-//! `PGSSL*` environment names once, through [`fsread`], and hands `SQLx`
-//! the bytes, so `SQLx` never opens one. Once connected, it reads the
-//! settings back, `default_transaction_read_only` first; a session that
-//! did not take them is `not_sampled`, `session_not_read_only`, and gets
-//! no other query. Every query runs in an explicit read-only transaction.
-//!
-//! The doctor reads `SELECT`s only: the two ledgers, `catalog_state`, and
-//! `pg_locks`. Both advisory locks it reports on, the `SQLx` migrator's
-//! and trawld's writer lock, are observed in `pg_locks`, never taken.
-//!
-//! No error's text reaches a row. Every database error maps to a fixed
-//! reason by its kind or SQLSTATE, and no row names the URL, host, user,
-//! or password; the source names the setting the URL came from and where
-//! `SQLx` looks for the password. A refusal the server proves, such as a
-//! failed login or a ledger boot refuses, is `failed`; a query that broke
-//! or erred after the login proves nothing about boot and is
-//! `not_sampled`.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -75,8 +24,6 @@ use crate::config::{ConfigError, DatabaseUrlSource};
 use crate::store::migrations::{self, Ledger, SchemaError};
 use crate::store::{self, catalog};
 
-/// This group's checks, in [`ServerCheck::ALL`] order. [`run`] gates them
-/// one by one; the graph test in [`super`] reads this list.
 #[cfg(test)]
 pub(super) const CHECKS: [ServerCheck; 5] = [
     ServerCheck::FleetConnect,
@@ -86,24 +33,17 @@ pub(super) const CHECKS: [ServerCheck; 5] = [
     ServerCheck::AppWriter,
 ];
 
-/// How long connecting, or any one query, may take.
 const DEADLINE: Duration = Duration::from_secs(5);
 
-/// The `application_name` of every doctor connection.
 const APPLICATION_NAME: &str = "trawld-doctor";
 
-/// The server settings every doctor session starts with. Read-only by
-/// default, so a statement that writes fails instead of writing, and
-/// bounded on the server as well as here.
 const SESSION_SETTINGS: [(&str, &str); 3] = [
     ("default_transaction_read_only", "on"),
     ("statement_timeout", "5000"),
     ("lock_timeout", "1000"),
 ];
 
-/// How a session shows each of [`SESSION_SETTINGS`], and the
-/// `application_name`, once it took them: the statement that reads the
-/// setting and what it shows. `default_transaction_read_only` comes first,
+/// `default_transaction_read_only` comes first,
 /// so a writable session answers nothing else.
 const SESSION_SHOWN: [(&str, &str); 4] = [
     ("SHOW default_transaction_read_only", "on"),
@@ -116,10 +56,6 @@ const SESSION_SHOWN: [(&str, &str); 4] = [
 /// `SQLx` reads it whole, while parsing the URL.
 const PASSFILE_CAP: u64 = 1024 * 1024;
 
-/// A TLS file `SQLx` reads while connecting: the setting's name as the
-/// report shows it, the URL parameters that set it, the environment
-/// variable that sets it when no parameter does, the most the doctor
-/// reads of it, and how the bytes are handed to `SQLx` in its place.
 struct TlsFile {
     setting: &'static str,
     keys: &'static [&'static str],
@@ -154,7 +90,6 @@ const TLS_FILES: [TlsFile; 3] = [
     },
 ];
 
-/// Run this group's checks through `runner`.
 pub(super) async fn run(ctx: &mut Ctx, runner: &mut Runner) {
     let mut fleet = connect(ctx, runner, Database::Fleet).await;
     fleet_schema(runner, &mut fleet).await;
@@ -166,7 +101,6 @@ pub(super) async fn run(ctx: &mut Ctx, runner: &mut Runner) {
     app.close().await;
 }
 
-/// The two databases trawld's boot connects to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Database {
     Fleet,
@@ -181,7 +115,6 @@ impl Database {
         }
     }
 
-    /// The environment variable that names this database's URL.
     const fn env_var(self) -> &'static str {
         match self {
             Self::Fleet => "FLEET_DATABASE_URL",
@@ -189,7 +122,6 @@ impl Database {
         }
     }
 
-    /// The configuration setting that names this database's URL.
     const fn setting(self) -> &'static str {
         match self {
             Self::Fleet => "[auth] database_url",
@@ -197,7 +129,6 @@ impl Database {
         }
     }
 
-    /// The URL and the setting it came from, resolved as boot resolves it.
     fn resolve(self, ctx: &Ctx) -> Result<(String, DatabaseUrlSource), ConfigError> {
         match self {
             Self::Fleet => ctx.config.auth.resolve_database_url_with_source(),
@@ -206,24 +137,16 @@ impl Database {
     }
 }
 
-/// Why a [`Session`] has no connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lost {
-    /// The connect check did not complete, so no step runs on it.
     Unopened,
-    /// A step missed [`DEADLINE`], and its connection was dropped.
     TimedOut,
-    /// A step panicked, and its connection was dropped with its task.
     Panicked,
 }
 
-/// One step's work on a connection, boxed so it can run in a task of its
-/// own.
 type Step<'c, T> = Pin<Box<dyn Future<Output = T> + Send + 'c>>;
 
-/// Wait at most [`DEADLINE`] for `task`. A task past the deadline is
-/// aborted, which drops whatever it holds, such as a connection that may be
-/// mid-exchange. A panic inside it, such as `SQLx` decoding a malformed
+/// A panic inside `task`, such as `SQLx` decoding a malformed
 /// server message, ends only the task (`JoinError::is_panic`).
 async fn contained<T>(mut task: tokio::task::JoinHandle<T>) -> Result<T, Lost> {
     match tokio::time::timeout(DEADLINE, &mut task).await {
@@ -239,14 +162,9 @@ async fn contained<T>(mut task: tokio::task::JoinHandle<T>) -> Result<T, Lost> {
     }
 }
 
-/// One database connection, or why there is none.
 struct Session(Result<PgConnection, Lost>);
 
 impl Session {
-    /// Run one step on the connection, in a task of its own, under
-    /// [`DEADLINE`]. When the step misses the deadline or panics, the
-    /// connection is dropped and every later step answers the same
-    /// [`Lost`] without running.
     async fn step<T: Send + 'static>(
         &mut self,
         run: impl for<'c> FnOnce(&'c mut PgConnection) -> Step<'c, T> + Send + 'static,
@@ -287,8 +205,6 @@ impl Session {
         self.step(move |conn| Box::pin(read_only(conn, read))).await
     }
 
-    /// Close the connection, if there is one, in a task of its own under
-    /// [`DEADLINE`].
     async fn close(self) {
         if let Ok(conn) = self.0 {
             let _ = contained(tokio::spawn(conn.close())).await;
@@ -296,8 +212,6 @@ impl Session {
     }
 }
 
-/// Run `read` in a `BEGIN READ ONLY` transaction and roll it back. An
-/// error from `read` wins over an error rolling back.
 async fn read_only<T>(
     conn: &mut PgConnection,
     read: impl for<'c> FnOnce(&'c mut PgConnection) -> Step<'c, Result<T, sqlx::Error>>,
@@ -310,9 +224,6 @@ async fn read_only<T>(
     Ok(value)
 }
 
-/// Whether the session took [`SESSION_SETTINGS`] and the doctor's
-/// `application_name`, read back one `SHOW` at a time in the order of
-/// [`SESSION_SHOWN`], stopping at the first that differs.
 async fn session_took_settings(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
     read_only(conn, |conn| {
         Box::pin(async move {
@@ -339,22 +250,16 @@ async fn session_took_settings(conn: &mut PgConnection) -> Result<bool, sqlx::Er
 /// doctor does not know whether a password file held a matching line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PasswordSource {
-    /// The URL carries it.
     Url,
-    /// `PGPASSWORD` is set and the URL carries none.
     PgPassword,
-    /// `SQLx` looks in a password file: `PGPASSFILE` when that is set, and
-    /// `~/.pgpass`, when `home` says that file exists.
     PassFile {
         pgpassfile: Option<PathBuf>,
         home: bool,
     },
-    /// No source gave one; the server may not ask.
     Unnamed,
 }
 
 impl PasswordSource {
-    /// `text`, followed by where the password came from.
     fn named_after(&self, text: Text) -> Text {
         match self {
             Self::Url => text.lit("; password in the URL"),
@@ -379,50 +284,37 @@ impl PasswordSource {
         }
     }
 
-    /// Whether `SQLx` reads a password file for this URL.
     const fn reads_pass_files(&self) -> bool {
         matches!(self, Self::PassFile { .. } | Self::Unnamed)
     }
 }
 
-/// A password file the doctor does not let `SQLx` read, or a TLS file the
-/// doctor could not read for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileFault {
     file: NamedFile,
     kind: FileFaultKind,
-    /// The most the doctor reads, or lets `SQLx` read, of this file.
     cap: u64,
 }
 
-/// Which file a [`FileFault`] is about, as the report may name it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NamedFile {
-    /// The file `PGPASSFILE` names.
     PgPassFile(PathBuf),
-    /// `~/.pgpass`.
     HomePgPass,
-    /// A TLS file, by its setting's name. Its path comes from the URL or
-    /// the environment, so the report does not show it.
     Tls(&'static str),
 }
 
-/// Why the doctor does not connect with a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileFaultKind {
-    /// Not a regular file: reading a FIFO or a device may block or never
-    /// end.
     NotRegular,
-    /// Larger than the doctor reads, or lets `SQLx` read.
     TooLarge,
     /// A TLS file that does not exist. `tls_required` says the URL's
     /// `sslmode` requires TLS, so trawld's boot reads the file on every
     /// connection and cannot connect; otherwise it reads it only when the
     /// server offers TLS.
-    Missing { tls_required: bool },
-    /// A TLS file the running user may not read.
+    Missing {
+        tls_required: bool,
+    },
     PermissionDenied,
-    /// A TLS file the doctor could not read otherwise.
     Unreadable,
 }
 
@@ -450,17 +342,6 @@ fn is_inline_pem(value: &str) -> bool {
     trimmed.starts_with("-----BEGIN") && trimmed.ends_with("-----")
 }
 
-/// Check the password files `SQLx` reads for this URL, when `password`
-/// says it looks in them, before it reads either.
-///
-/// Trust posture (human decision 2026-09-29, the posture of the #265
-/// data-root ruling): the credential files an operator selects are
-/// trusted. This `stat` guards against an accident, such as a FIFO or a
-/// multi-gigabyte file left at the path, not against someone who can
-/// replace the file between this check and `SQLx`'s own read, which opens
-/// the path again while it parses the URL. The TLS files are not left to
-/// `SQLx` at all: [`inline_tls_files`] reads each once and hands it the
-/// bytes.
 fn check_pass_files(password: &PasswordSource) -> Result<(), FileFault> {
     let refuse = |file: NamedFile| {
         move |kind| FileFault {
@@ -555,27 +436,17 @@ fn startup_fields_clean(options: &PgConnectOptions) -> bool {
     .all(|field| !field.chars().any(char::is_control))
 }
 
-/// Why [`prepare`] did not ready a URL for connecting.
 #[derive(Debug)]
 enum Unprepared {
-    /// `SQLx` does not parse it.
     Unparsable,
-    /// A password file `SQLx` would read is refused, or a TLS file could
-    /// not be read.
     File(FileFault),
-    /// A startup field holds a control character.
     ControlCharacter,
 }
 
-/// Check `url` and the password files `SQLx` reads for it, parse it
-/// exactly as trawld's boot does, through `SQLx`, add the doctor's
-/// settings, and hand `SQLx` the TLS files' bytes. `SQLx` reads the
+/// `SQLx` reads the
 /// password file while parsing, so this runs on the blocking pool: a file
 /// swapped for a FIFO after its check blocks a thread, not the doctor.
-/// Nothing of a parse error is kept, so no parse error text can reach a
-/// row.
 fn prepare(url: &str) -> Result<(PgConnectOptions, PasswordSource), Unprepared> {
-    // The URL as SQLx's own parser reads it, before SQLx resolves anything.
     let given = parse_like(PgConnectOptions::from_url, url).ok_or(Unprepared::Unparsable)?;
     let pairs: Vec<(String, String)> = given
         .query_pairs()
@@ -614,8 +485,6 @@ fn parse_like<U: FromStr, T>(_from_url: fn(&U) -> Result<T, sqlx::Error>, text: 
     text.parse().ok()
 }
 
-/// `server.fleet.connect` or `server.app.connect`: resolve the URL, check
-/// it, and connect once, read-only, within [`DEADLINE`].
 async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
     let check = db.connect_check();
     let Some(gate) = runner.gate(check) else {
@@ -649,19 +518,6 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
     };
     let source = password.named_after(source);
 
-    // Trust posture (human decision 2026-09-29): the doctor trusts the
-    // database server trawld's configuration points at, as trawld does.
-    // SQLx waits for, and buffers, as many bytes as a server message's u32
-    // length declares (sqlx-postgres 0.9.0, `connection/stream.rs`,
-    // `recv_unchecked`), so a hostile server can make it reserve gigabytes.
-    // trawld has the same exposure, and a server that hostile already owns
-    // trawld's state. A message that makes SQLx panic ends only its task.
-    // What the doctor does guard against is a URL that names another kind
-    // of server by accident, under the modes where SQLx would read that
-    // server's first answer as a frame length. The guard reads only the
-    // first message of its own connection, and a server that answers it
-    // with a small, well-formed R, E or v header passes: that is no longer
-    // an accident.
     if let Some(row) = not_postgres(check, &options).await {
         runner.record(gate, row.source(source));
         return Session(Err(Lost::Unopened));
@@ -741,17 +597,13 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
 /// an error, or a protocol version answer, each far smaller.
 const FIRST_ANSWER_CAP: u32 = 8 * 1024;
 
-/// The most the doctor reads after it half-closes the probe connection,
-/// while the server ends the session.
 const DRAIN_CAP: usize = 64 * 1024;
 
 /// Where `SQLx` dials for `options`: `PgStream::connect` and
 /// `PgConnectOptions::fetch_socket` in sqlx-postgres 0.9.0.
 #[derive(Debug, PartialEq, Eq)]
 enum Dial<'o> {
-    /// A TCP host, a name or an address (`hostaddr` sets it too), and port.
     Tcp(&'o str, u16),
-    /// A Unix socket: the socket directory's `.s.PGSQL.<port>`.
     Unix(String),
 }
 
@@ -768,20 +620,12 @@ impl<'o> Dial<'o> {
     }
 }
 
-/// What a server answered the doctor's own startup message.
 #[derive(Debug)]
 enum FirstAnswer {
-    /// A whole message of type `R` (an authentication request), `E` (an
-    /// error) or `v` (a protocol version answer), no longer than
-    /// [`FIRST_ANSWER_CAP`], as a PostgreSQL server answers.
     Postgres,
-    /// Any other type byte, or a longer length.
     NotPostgres,
-    /// The connection could not be opened.
     Unreachable(std::io::Error),
-    /// The connection closed or broke before the whole answer arrived.
     Lost,
-    /// No whole answer within [`DEADLINE`].
     TimedOut,
 }
 
@@ -828,10 +672,6 @@ fn startup_message(options: &PgConnectOptions) -> Vec<u8> {
     message
 }
 
-/// Dial where `SQLx` would for `options`, send the startup message `SQLx`
-/// would send ([`startup_message`]), and read the whole first answer, all
-/// within [`DEADLINE`].
-///
 /// Under `sslmode` `disable`, and `allow`, which `SQLx` 0.9.0 treats as
 /// `disable` (`connection/tls.rs`, `maybe_upgrade`), `SQLx` sends the
 /// startup message first and reads the answer as a message: a type byte it
@@ -926,10 +766,6 @@ async fn speaks_postgres(options: &PgConnectOptions) -> FirstAnswer {
     }
 }
 
-/// Under `sslmode` `disable` or `allow`, ask the server [`speaks_postgres`]
-/// and return the connect check's row, without its source, when its answer
-/// stops the doctor. `None` under the other modes, where `SQLx` asks
-/// itself, and for a PostgreSQL server's answer.
 async fn not_postgres(check: ServerCheck, options: &PgConnectOptions) -> Option<Row> {
     if !matches!(
         options.get_ssl_mode(),
@@ -940,9 +776,6 @@ async fn not_postgres(check: ServerCheck, options: &PgConnectOptions) -> Option<
     refused_first_answer(check, speaks_postgres(options).await)
 }
 
-/// The connect check's row, without its source, for a first answer that
-/// stops the doctor from handing the URL to `SQLx`. `None` for a
-/// PostgreSQL server's answer.
 fn refused_first_answer(check: ServerCheck, answer: FirstAnswer) -> Option<Row> {
     match answer {
         FirstAnswer::Postgres => None,
@@ -954,7 +787,6 @@ fn refused_first_answer(check: ServerCheck, answer: FirstAnswer) -> Option<Row> 
                 ))
                 .next(Text::new("check the database URL's host and port")),
         ),
-        // The same row SQLx's own connect error gives.
         FirstAnswer::Unreachable(error) => Some(connect_failed(check, &sqlx::Error::Io(error))),
         FirstAnswer::Lost => Some(
             Row::not_sampled(check, reason::CONNECTION_LOST)
@@ -978,8 +810,6 @@ fn refused_first_answer(check: ServerCheck, answer: FirstAnswer) -> Option<Row> 
     }
 }
 
-/// [`prepare`] on the blocking pool under [`DEADLINE`]. The error is the
-/// connect check's row, without its source.
 async fn prepare_within_deadline(
     check: ServerCheck,
     url: String,
@@ -1019,8 +849,6 @@ async fn prepare_within_deadline(
     }
 }
 
-/// The row for a password file the doctor does not let `SQLx` read, or a
-/// TLS file it could not read.
 fn file_refused(check: ServerCheck, fault: &FileFault) -> Row {
     let named = match &fault.file {
         NamedFile::PgPassFile(path) => {
@@ -1068,7 +896,6 @@ fn file_refused(check: ServerCheck, fault: &FileFault) -> Row {
     }
 }
 
-/// The row for a connection the server or the network refused.
 fn connect_failed(check: ServerCheck, error: &sqlx::Error) -> Row {
     match error {
         sqlx::Error::Database(db) => match db.code().as_deref() {
@@ -1108,8 +935,6 @@ fn connect_failed(check: ServerCheck, error: &sqlx::Error) -> Row {
     }
 }
 
-/// The row for a query that failed on a connection that authenticated.
-/// None of these proves what boot would find, so each is `not_sampled`.
 fn query_failed(check: ServerCheck, error: &sqlx::Error) -> Row {
     match error {
         sqlx::Error::Database(db) => match db.code().as_deref() {
@@ -1145,24 +970,18 @@ fn query_failed(check: ServerCheck, error: &sqlx::Error) -> Row {
     }
 }
 
-/// The row for a connection that broke, or that the server ended, after
-/// it authenticated.
 fn lost_connection(check: ServerCheck) -> Row {
     Row::not_sampled(check, reason::CONNECTION_LOST)
         .detail(Text::new("the connection broke after it authenticated"))
         .next(Text::new("check the database server, then rerun"))
 }
 
-/// The row for a step that missed [`DEADLINE`], or ran on a connection an
-/// earlier step lost that way.
 fn timed_out(check: ServerCheck) -> Row {
     Row::not_sampled(check, reason::TIMED_OUT)
         .detail(Text::new("a query on this connection ran past 5 s"))
         .next(Text::new("rerun once the database server answers promptly"))
 }
 
-/// The row for a step that panicked, or ran on a connection an earlier step
-/// lost that way: `SQLx` could not decode what the server sent.
 fn protocol_error(check: ServerCheck) -> Row {
     Row::not_sampled(check, reason::PROTOCOL_ERROR)
         .detail(Text::new(
@@ -1175,16 +994,12 @@ fn protocol_error(check: ServerCheck) -> Row {
         ))
 }
 
-/// The row for a step that did not run to its end.
 fn lost_row(check: ServerCheck, lost: Lost) -> Row {
     match lost {
         Lost::Panicked => protocol_error(check),
         Lost::TimedOut | Lost::Unopened => timed_out(check),
     }
 }
-/// `server.fleet.schema`: the Fleet ledger is current, in one read-only
-/// snapshot. trawld's boot refuses an empty or behind Fleet schema, so
-/// both fail; `fleet-admin migrate` fixes them.
 async fn fleet_schema(runner: &mut Runner, session: &mut Session) {
     use fleet_auth::SchemaError as Fleet;
     use sqlx::migrate::MigrateError;
@@ -1241,14 +1056,10 @@ async fn fleet_schema(runner: &mut Runner, session: &mut Session) {
     runner.record(gate, row);
 }
 
-/// What the migrator's lock looked like around the ledger read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockSeen {
-    /// Held in at least one sample.
     Held,
-    /// Free in both samples.
     Free,
-    /// Not held in any sample that answered, and at least one did not.
     Unknown,
 }
 
@@ -1264,15 +1075,6 @@ impl LockSeen {
     }
 }
 
-/// `server.app.schema`: trawld's boot will admit the app-state ledger.
-///
-/// The migrator's lock is sampled before and after the ledger's snapshot.
-/// A ledger boot refuses fails whatever the lock shows. A current ledger
-/// is `complete` even while a migrator holds the lock. A fresh or behind
-/// one is `complete`, `will_initialize`, when the lock was free in both
-/// samples, and `not_sampled`, `migration_in_progress`, when either saw it
-/// held: a migrator may be bringing it current right now.
-///
 /// On a current or behind ledger the check also reads `catalog_state` for
 /// the storage group. Its `catalog_id` is written once, by the baseline
 /// migration every admitted non-fresh ledger holds, and never updated, so
@@ -1309,7 +1111,6 @@ async fn app_schema(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
                 .next(Text::new("rerun once the migration finishes"))
         }
         (Ledger::Fresh | Ledger::Behind { .. }, LockSeen::Unknown) => {
-            // The row of the first sample that gave no answer.
             let unanswered = [&before, &after]
                 .into_iter()
                 .find_map(|sample| match sample {
@@ -1369,8 +1170,6 @@ async fn app_schema(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
     runner.record(gate, row);
 }
 
-/// The row for an app-state ledger boot refuses, or a ledger read that
-/// failed.
 fn app_refused(check: ServerCheck, refused: &SchemaError) -> Row {
     use sqlx::migrate::MigrateError;
     match refused {
@@ -1410,9 +1209,6 @@ fn app_refused(check: ServerCheck, refused: &SchemaError) -> Row {
     }
 }
 
-/// `server.app.writer`: whether some session holds trawld's writer lock.
-/// Always `complete` when observed: a held lock is `held`, a free one
-/// `not_observed`. The lock is never taken.
 async fn app_writer(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
     let check = ServerCheck::AppWriter;
     let Some(gate) = runner.gate(check) else {
@@ -1444,9 +1240,6 @@ async fn app_writer(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
 mod tests {
     use super::*;
 
-    /// The doctor's startup message goes where `SQLx` dials: a TCP host and
-    /// port, `hostaddr` in place of the host, or a Unix socket named by the
-    /// URL's host or its `host` parameter.
     #[test]
     fn the_startup_probe_dials_where_sqlx_does() {
         let dial = |url: &str| {
@@ -1474,8 +1267,6 @@ mod tests {
         );
     }
 
-    /// The probe's startup message frames the fields `SQLx` sends, in its
-    /// order, and holds no password even when the URL has one.
     #[test]
     fn the_startup_message_carries_no_password() {
         let options = PgConnectOptions::from_str("postgres://role:hunter2@db.example/app")
@@ -1561,12 +1352,9 @@ mod tests {
         }
     }
 
-    /// A password in the userinfo or in the `password` parameter is "in
-    /// the URL", as `SQLx` reads both, and an IPv6 `hostaddr` parses: the
+    /// The
     /// doctor never renders the options back into a URL, which `SQLx`
-    /// 0.9.0 does with the host unbracketed and panics on. The test
-    /// process's own environment decides the other sources, so only the
-    /// URL cases are asserted.
+    /// 0.9.0 does with the host unbracketed and panics on.
     #[test]
     fn a_password_in_the_url_is_named_so() {
         for url in [
@@ -1585,8 +1373,6 @@ mod tests {
         ));
     }
 
-    /// A control character in any startup field stops the connection
-    /// before it is made; the password is not a startup field.
     #[test]
     fn a_control_character_in_a_startup_field_is_refused() {
         for url in [
@@ -1607,9 +1393,6 @@ mod tests {
         ));
     }
 
-    /// A TLS file named in the URL that is not a regular file, or is too
-    /// large, is refused before `SQLx` reads it; the last parameter wins,
-    /// as it does in `SQLx`.
     #[test]
     fn a_tls_file_that_is_not_regular_or_too_large_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -1661,7 +1444,6 @@ mod tests {
                 FileFaultKind::Missing { tls_required: true }
             ))
         );
-        // An sslmode that never negotiates TLS reads no TLS file.
         for mode in ["disable", "allow"] {
             assert_eq!(
                 refused(format!("sslmode={mode}&sslkey=/dev/zero")),
@@ -1671,8 +1453,6 @@ mod tests {
         }
     }
 
-    /// Each TLS file reaches `SQLx` as the bytes the doctor read, never as
-    /// a path `SQLx` would open.
     #[test]
     fn tls_files_reach_sqlx_as_bytes() {
         let dir = tempfile::tempdir().unwrap();

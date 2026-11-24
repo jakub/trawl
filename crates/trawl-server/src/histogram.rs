@@ -2,21 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The whole-result histogram (#197): every row of one execution counted
+//! The whole-result histogram: every row of one execution counted
 //! by `_time` into [`HISTOGRAM_BUCKETS`] half-open bins.
 //!
-//! The decision is split in two. The handler calls [`plan`] on the
-//! admitted parse, before execution: a request that did not ask, an
-//! aggregation, a `from saved` read and a `sample` stage are settled
-//! there, in that order. The worker that ran the query calls [`count`] on
-//! the final result, inside its permit and under the post phase, before
-//! the page is cut from it: the result's columns and rows settle the rest.
-//!
-//! Bins are integer microseconds. `start` is the minimum usable `_time`
-//! and the bin width is `ceil(max(1 s, max - min + 1 µs) / 48)`, so `end`
-//! is past the maximum and every usable row lands in exactly one bin. The
-//! arithmetic widens to `i128` before it subtracts, because the span of
-//! two finite instants can exceed `i64::MAX`.
+//! Bins are integer microseconds. The arithmetic widens to `i128` before it
+//! subtracts, because the span of two finite instants can exceed `i64::MAX`.
 
 use chrono::{Offset, Utc};
 use trawl_api::value::{ColumnType, QueryResult, Value};
@@ -29,43 +19,28 @@ use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
 use trawl_engine::post_process::TAIL_CANCEL_STRIDE;
 
-/// [`HISTOGRAM_BUCKETS`] in the bin arithmetic's type.
 const BINS: i128 = 48;
 const _: () = assert!(HISTOGRAM_BUCKETS == 48, "BINS restates the bin count");
 
-/// The narrowest bin: the minimum span over [`BINS`], rounded up. 20,834 µs.
 const MIN_WIDTH: i128 = (HISTOGRAM_MIN_SPAN_MICROS as i128 + BINS - 1) / BINS;
 
-/// A `_time` is usable only below this instant, 1,000,032 µs short of the
-/// infinity sentinel. A single instant spans [`MIN_WIDTH`] × 48 =
-/// 1,000,032 µs, so the bound keeps every `end` finite, and it drops only
-/// the last second or so before the year 294,247.
+/// A `_time` is usable only below this instant, so the bound keeps every
+/// `end` finite.
 #[allow(clippy::cast_possible_truncation)] // 1,000,032 fits i64
 const USABLE_BELOW: i64 = TIMESTAMP_INFINITY - (MIN_WIDTH * BINS) as i64;
 
-/// What the handler decided before execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistogramPlan {
-    /// The response carries no histogram field.
     Absent,
-    /// The response says why it carries no counts, whatever the rows hold.
     Refuse(HistogramReason),
-    /// The worker counts the result. `kept_some` is the answer's flag.
     Count { kept_some: bool },
 }
 
-/// The worker's half of [`HistogramPlan::Count`]: count the final result,
-/// and answer `kept_some` with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistogramAsk {
     pub kept_some: bool,
 }
 
-/// Steps 1-4 of the eligibility rule, read off the admitted parse. The
-/// first match wins: the flag is false, the query aggregates, the rows are
-/// a stored run's (`from_saved`), the query samples. Otherwise the worker
-/// counts, and the result holds only the rows a `head`, `limit`, `tail` or
-/// `dedup` stage kept, which `kept_some` says.
 pub fn plan(asked: bool, query: &Query, from_saved: bool) -> HistogramPlan {
     if !asked || query.has_aggregation() {
         return HistogramPlan::Absent;
@@ -87,19 +62,9 @@ pub fn plan(asked: bool, query: &Query, from_saved: bool) -> HistogramPlan {
     }
 }
 
-/// Count `result`, the final result of one execution, steps 5-7 of the
-/// eligibility rule: no `_time` column typed `timestamp` answers
-/// `no_time_column`, no row with a usable `_time` answers
-/// `no_usable_time`, and otherwise the counts are ready.
-///
-/// Two passes over the rows and constant extra memory: the first finds the
-/// bounds and the undated rows, the second fills the bins. Each pass reads
-/// `cancel` at its first row and every [`TAIL_CANCEL_STRIDE`] rows after,
-/// and once more when the pass ends, so a result with no usable time is
-/// not answered past a cancel either.
-///
-/// # Errors
-/// [`EngineError::Cancelled`] once `cancel` is latched.
+/// Each pass reads `cancel` at its first row and every [`TAIL_CANCEL_STRIDE`]
+/// rows after, and once more when the pass ends, so a result with no usable
+/// time is not answered past a cancel either.
 pub fn count(
     result: &QueryResult,
     kept_some: bool,
@@ -153,7 +118,6 @@ pub fn count(
         let Some(t) = usable(row.get(time)) else {
             continue;
         };
-        // `min <= t <= max < end`, so the quotient is in `0..48`.
         let bin = usize::try_from((i128::from(t) - start) / width)
             .ok()
             .filter(|&bin| bin < HISTOGRAM_BUCKETS)
@@ -177,7 +141,6 @@ pub fn count(
     })
 }
 
-/// Read the latch at row 0 and every [`TAIL_CANCEL_STRIDE`] rows after.
 fn stride(at: usize, cancel: &CancelLatch) -> Result<(), EngineError> {
     if at.is_multiple_of(TAIL_CANCEL_STRIDE) && cancel.latched() {
         return Err(EngineError::Cancelled);
@@ -185,8 +148,6 @@ fn stride(at: usize, cancel: &CancelLatch) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// A `_time` cell's instant, when it is text `wire_micros` reads, neither
-/// infinity, and below [`USABLE_BELOW`].
 fn usable(cell: Option<&Value>) -> Option<i64> {
     let Some(Value::String(text)) = cell else {
         return None;
@@ -209,7 +170,6 @@ mod tests {
     use super::*;
     use trawl_api::value::Column;
 
-    /// A UTC wire instant.
     fn wire(micros: i64) -> String {
         zone::wire_timestamp(micros, Utc.fix())
     }
@@ -218,7 +178,6 @@ mod tests {
         Value::String(wire(micros))
     }
 
-    /// A result with a timestamp-typed `_time` column holding `cells`.
     fn timed(cells: Vec<Value>) -> QueryResult {
         QueryResult {
             columns: vec![Column::new("_time", ColumnType::Timestamp)],
@@ -253,15 +212,11 @@ mod tests {
         }
     }
 
-    /// The bin width the rule gives for `min` and `max`, stated apart from
-    /// the counter: `ceil(max(1 s, max - min + 1) / 48)`.
     fn expected_width(min: i64, max: i64) -> i128 {
         let span = (i128::from(max) - i128::from(min) + 1).max(1_000_000);
         span / 48 + i128::from(span % 48 != 0)
     }
 
-    /// `min`, `max`, every inner edge between them and the microsecond
-    /// on each side of it.
     fn edges_and_neighbours(min: i64, max: i64) -> Vec<i64> {
         let width = expected_width(min, max);
         let mut times = vec![min, max];
@@ -276,10 +231,6 @@ mod tests {
         times
     }
 
-    /// Count `times` and check the geometry against the rule: `start` is
-    /// the minimum, the width is the rule's, `end` is 48 widths on and past
-    /// the maximum, and each time lands in exactly one half-open bin, the
-    /// one the counter put it in.
     fn assert_binned(label: &str, times: &[i64]) {
         let min = *times.iter().min().unwrap();
         let max = *times.iter().max().unwrap();
@@ -317,14 +268,11 @@ mod tests {
 
     #[test]
     fn histogram_bins_are_half_open_integer_microseconds() {
-        // A span of exactly 48 s: one-second bins, edges on whole seconds.
         assert_binned("whole seconds", &edges_and_neighbours(0, 47_999_999));
-        // A span that does not divide by 48: the width rounds up.
         assert_binned(
             "a ragged span",
             &edges_and_neighbours(1_700_000_000_000_000, 1_700_000_100_000_005),
         );
-        // Negative epochs, wholly before 1970 and across it.
         assert_binned(
             "before the epoch",
             &edges_and_neighbours(-86_400_000_000 - 7, -1),
@@ -338,10 +286,8 @@ mod tests {
             "the full range",
             &edges_and_neighbours(TIMESTAMP_NEG_INFINITY + 1, USABLE_BELOW - 1),
         );
-        // A span shorter than a second still spans one, from `min`.
         assert_binned("a short span", &edges_and_neighbours(5, 900_000));
 
-        // One instant: the narrowest bin, 20,834 µs, and all rows in bin 0.
         for t in [0, -1, 1_731_234_567_890_123, USABLE_BELOW - 1] {
             let result = timed(vec![timestamp(t), timestamp(t)]);
             let (start, end, buckets, _, _) = ready(&result);
@@ -352,8 +298,6 @@ mod tests {
             assert_eq!(buckets.iter().map(|b| b.events).sum::<u64>(), 2, "{t}");
         }
 
-        // Row order does not move `start`: it is the minimum, not the
-        // first row.
         let descending = timed(vec![
             timestamp(3_000_000),
             timestamp(2_000_000),
@@ -386,7 +330,6 @@ mod tests {
             Value::String("-infinity".to_owned()),
             Value::String(cutoff),
             Value::Integer(1_000_000),
-            // The microsecond below the cutoff is usable.
             timestamp(USABLE_BELOW - 1),
         ]);
         let (start, end, buckets, undated, _) = ready(&result);
@@ -406,7 +349,6 @@ mod tests {
             .consistent_with(result.rows.len())
         );
 
-        // A short row has no `_time` cell, and counts as undated too.
         let short = QueryResult {
             columns: vec![
                 Column::new("host", ColumnType::String),
@@ -545,8 +487,6 @@ mod tests {
 
     #[test]
     fn histogram_payload_is_bounded() {
-        // The widest bounds the counter writes: the oldest finite instant
-        // and the latest usable one, both in the expanded-year spelling.
         let extremes = timed(vec![
             timestamp(TIMESTAMP_NEG_INFINITY + 1),
             timestamp(USABLE_BELOW - 1),
@@ -589,13 +529,11 @@ mod tests {
             let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
             CancelLatch::new(flag)
         };
-        // Already latched: the first row of the first pass stops the walk.
         let rows = timed(vec![timestamp(0); 3]);
         assert!(matches!(
             count(&rows, false, &latched()),
             Err(EngineError::Cancelled)
         ));
-        // A reason settled by the columns walks nothing.
         assert!(matches!(
             count(&QueryResult::empty(), false, &latched()),
             Ok(EventHistogram::Unavailable {
@@ -611,10 +549,6 @@ mod tests {
         ));
     }
 
-    /// The eligibility order on real parses: an aggregation beats a
-    /// `from saved` read and a `sample`, a `from saved` read beats a
-    /// `sample`, and only `head`, `limit`, `tail` and `dedup` set
-    /// `kept_some`.
     #[test]
     fn histogram_plan_follows_the_eligibility_order() {
         let parse =

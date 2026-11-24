@@ -4,23 +4,6 @@
 
 //! A capture reads the same bytes while the corpus moves under it and after
 //! trawld restarts (ADR-0057).
-//!
-//! One test, one capture of the 20-event corpus
-//! (`common::captured::corpus`), read whole: the default page, the same rows
-//! in pages of seven, a projection, and every cell. The bytes each read
-//! answered are kept and compared after each of these:
-//!
-//! - more matching events are ingested and a real compaction pass is held
-//!   mid-publish, its files renamed into the data root and the publication
-//!   write guard still held, so the reads run with the corpus changing
-//!   under them;
-//! - the compaction finishes;
-//! - the fixture restarts in process over the same WAL, data root, results
-//!   root and databases (`common::captured::Restartable`).
-//!
-//! A `/query` of the recorded text answers the new events too, so the
-//! capture is a snapshot and not a re-run. The binary is in the ADR-0021
-//! `postgres` nextest group.
 
 mod common;
 
@@ -33,16 +16,12 @@ use serde_json::json;
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
 
-/// Matching events ingested after the capture, inside its window.
 const LATE: usize = 5;
 
-/// Every read of a capture, as `(path, bytes answered)`.
 type Reads = Vec<(String, Vec<u8>)>;
 
-/// Read every page form and every cell of capture `id` with `columns`
-/// columns, keeping the bytes each answered. One client for the batch,
-/// dropped with it: a connection kept alive would hold the old server's
-/// state across a restart.
+/// One client for the batch, dropped with it: a connection kept alive
+/// would hold the old server's state across a restart.
 async fn read_all(server: &TestServer, id: &str, columns: usize) -> Reads {
     let client = common::harness_client_builder().build().unwrap();
     let mut paths = vec![
@@ -80,7 +59,6 @@ async fn read_all(server: &TestServer, id: &str, columns: usize) -> Reads {
     reads
 }
 
-/// `after` answered every read with the bytes `before` did.
 fn assert_same(what: &str, before: &Reads, after: &Reads) {
     assert_eq!(before.len(), after.len(), "{what}: the same reads");
     for ((path, then), (_, now)) in before.iter().zip(after) {
@@ -93,7 +71,6 @@ fn assert_same(what: &str, before: &Reads, after: &Reads) {
     }
 }
 
-/// How many rows `/query` answers for `dsl` now.
 async fn query_rows(server: &TestServer, dsl: &str) -> usize {
     let response = common::harness_client_builder()
         .build()
@@ -119,7 +96,6 @@ async fn query_rows(server: &TestServer, dsl: &str) -> usize {
         .len()
 }
 
-/// Matching events inside the capture's window, ingested after it.
 fn late_events() -> Vec<serde_json::Value> {
     (0..LATE)
         .map(|seq| {
@@ -135,7 +111,6 @@ fn late_events() -> Vec<serde_json::Value> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_reads_the_same_bytes_through_ingest_compaction_and_a_restart() {
-    // Every page form and every cell is a request: no per-key rate.
     let unlimited = RateLimitConfig {
         default_rpm: 0,
         ..RateLimitConfig::default()
@@ -160,10 +135,8 @@ async fn a_capture_reads_the_same_bytes_through_ingest_compaction_and_a_restart(
         "the recorded text answers the corpus before the late events"
     );
 
-    // Late events land in the WAL and the hot buffer, then a compaction
-    // pass moves them into the data root. It is held after its rename with
-    // the publication write guard still held: every read runs while the
-    // corpus is mid-publish.
+    // Held after its rename with the publication write guard still held:
+    // every read runs while the corpus is mid-publish.
     captured::ingest(&server, &late_events()).await;
     let publication = server
         .state

@@ -2,22 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! What an HTTP ingest request logs about its repairs (ADR-0055): one
-//! `ingest_complete` INFO for every finalized request, carrying the key and
-//! every code, and one `ingest_repairs` WARN only when an actionable repair
-//! landed in an acknowledged group.
+//! What an HTTP ingest request logs about its repairs (ADR-0055).
 //!
-//! Its own test binary because `.init()` installs the global subscriber,
-//! exactly as `trawld` does: the production subscriber from
-//! `telemetry::build_subscriber` under [`telemetry::DEFAULT_LOG_FILTER`],
-//! with a stdout capture and a telemetry WAL layer. Tests tell their lines
-//! apart by request id and their metric series by service name.
-//!
-//! The events earn only codes whose meaning is settled: routine
-//! `env.defaulted`, `host.from_peer`, `time.from_ingest` (no time field at
-//! all) and `field.name_case_folded`; actionable `time.out_of_range`,
-//! `field.name_too_long`, `field.name_case_collision` and
-//! `field.truncated`.
+//! Its own test binary because `.init()` installs the global subscriber.
+//! Tests tell their lines apart by request id and their metric series by
+//! service name.
 
 mod common;
 
@@ -40,9 +29,6 @@ use trawl_server::telemetry::{self, LogSinks, WalHandle, WalLayer};
 
 const ENV: &str = "default";
 
-// -- the production subscriber, captured ------------------------------------
-
-/// Everything the global subscriber writes to stdout.
 #[derive(Clone, Default)]
 struct Stdout(Arc<Mutex<Vec<u8>>>);
 
@@ -71,8 +57,6 @@ struct Sinks {
     wal_dir: tempfile::TempDir,
 }
 
-/// The production subscriber under the default directives, installed once
-/// for the whole binary.
 fn sinks() -> &'static Sinks {
     static SINKS: OnceLock<Sinks> = OnceLock::new();
     SINKS.get_or_init(|| {
@@ -105,7 +89,6 @@ fn sinks() -> &'static Sinks {
     })
 }
 
-/// Every stdout line so far.
 fn stdout_lines() -> Vec<String> {
     let bytes = sinks().stdout.0.lock().unwrap().clone();
     String::from_utf8(bytes)
@@ -115,9 +98,8 @@ fn stdout_lines() -> Vec<String> {
         .collect()
 }
 
-/// A field's value on a formatted stdout line: `name="quoted"` or
-/// `name=bare`. The first span field follows `{`, every other field a
-/// space; the request span's fields come first.
+/// The first span field follows `{`, every other field a space; the request
+/// span's fields come first.
 fn field(line: &str, name: &str) -> Option<String> {
     let key = format!("{name}=");
     let at = line
@@ -138,7 +120,6 @@ fn field(line: &str, name: &str) -> Option<String> {
     }
 }
 
-/// Every record the telemetry WAL holds so far.
 fn wal_records() -> Vec<Value> {
     // Tests flush concurrently. Without this lock one test could find the
     // queue already drained by another whose WAL write has not landed yet.
@@ -165,7 +146,6 @@ fn read_wal(dir: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// The level a formatted stdout line was logged at.
 fn level(line: &str) -> &'static str {
     ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
         .into_iter()
@@ -173,12 +153,9 @@ fn level(line: &str) -> &'static str {
         .unwrap_or("none")
 }
 
-// -- one request's repair lines, on both sinks --------------------------------
-
 const COMPLETE: &str = "ingest_complete";
 const REPAIRS: &str = "ingest_repairs";
 
-/// One request's lines of `event_type`: stdout, then persisted.
 fn lines_of(request_id: &str, event_type: &str) -> (Vec<String>, Vec<Value>) {
     let stdout = stdout_lines()
         .into_iter()
@@ -193,7 +170,6 @@ fn lines_of(request_id: &str, event_type: &str) -> (Vec<String>, Vec<Value>) {
     (stdout, persisted)
 }
 
-/// The request's one line of `event_type` on each sink, at `level`.
 fn one_line(request_id: &str, event_type: &str, level_name: &str) -> (String, Value) {
     let (mut stdout, mut persisted) = lines_of(request_id, event_type);
     assert_eq!(stdout.len(), 1, "{event_type} on stdout: {stdout:#?}");
@@ -204,15 +180,14 @@ fn one_line(request_id: &str, event_type: &str, level_name: &str) -> (String, Va
     (line, record)
 }
 
-/// The request wrote no `ingest_repairs` line on either sink.
 fn assert_no_repair_warning(request_id: &str) {
     let (stdout, persisted) = lines_of(request_id, REPAIRS);
     assert!(stdout.is_empty(), "{stdout:#?}");
     assert!(persisted.is_empty(), "{persisted:#?}");
 }
 
-/// The repair fields logged as integers. Persisted telemetry pins a field's
-/// type, so each must reach stdout unquoted and the record as a number.
+/// Persisted telemetry pins a field's type, so each must reach stdout
+/// unquoted and the record as a number.
 const NUMERIC_FIELDS: &[&str] = &[
     "key_id",
     "repairs",
@@ -224,8 +199,6 @@ const NUMERIC_FIELDS: &[&str] = &[
     "actionable_detail_omitted_occurrences",
 ];
 
-/// Each `(field, value)` holds on the stdout line and on the persisted
-/// record alike, and each of [`NUMERIC_FIELDS`] keeps its integer type.
 fn assert_fields(line: &str, record: &Value, expected: &[(&str, &str)]) {
     for (name, want) in expected {
         assert_eq!(field(line, name).as_deref(), Some(*want), "{name}: {line}");
@@ -250,8 +223,6 @@ fn assert_fields(line: &str, record: &Value, expected: &[(&str, &str)]) {
     }
 }
 
-/// The WARN never claims data was lost: `time.out_of_range` keeps the value
-/// it flags.
 fn assert_says_inspect_not_lost(line: &str, record: &Value) {
     let message = record["message"].as_str().unwrap();
     assert!(message.contains("need inspection"), "{message}");
@@ -262,9 +233,6 @@ fn assert_says_inspect_not_lost(line: &str, record: &Value) {
     }
 }
 
-// -- metrics ------------------------------------------------------------------
-
-/// A rendered counter series' value, or `None` when it does not exist.
 fn series(rendered: &str, series: &str) -> Option<u64> {
     rendered.lines().find_map(|line| {
         let (name, value) = line.rsplit_once(' ')?;
@@ -286,7 +254,6 @@ fn severity_unmapped_series(service: &str) -> Option<u64> {
     )
 }
 
-/// No series of either counter names `service`.
 fn assert_no_series_for(service: &str) {
     let needle = format!("service=\"{service}\"");
     let rendered = common::test_metrics_handle().render();
@@ -297,9 +264,6 @@ fn assert_no_series_for(service: &str) {
     assert!(hits.is_empty(), "{hits:#?}");
 }
 
-// -- requests -----------------------------------------------------------------
-
-/// An ingest key named `name`: its token and its stable id.
 async fn mint(server: &TestServer, name: &str) -> (String, i64) {
     let created = KeyStore::from_pool(server.fleet_pool.clone())
         .create_key(
@@ -321,7 +285,6 @@ fn ndjson(events: &[Value]) -> String {
         .join("\n")
 }
 
-/// POST `events` as `token` and answer the status and the request id.
 async fn post(server: &TestServer, token: &str, events: &[Value]) -> (u16, String) {
     let response = common::harness_client_builder()
         .build()
@@ -343,7 +306,6 @@ async fn post(server: &TestServer, token: &str, events: &[Value]) -> (u16, Strin
     (response.status().as_u16(), request_id)
 }
 
-/// A timestamp inside the plausible window.
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -356,8 +318,6 @@ fn long_name() -> String {
     "n".repeat(300)
 }
 
-/// A counter stored as a string fails [`assert_fields`], so the integer
-/// fields cannot regress to text while the value assertions stay green.
 #[test]
 #[should_panic(expected = "not persisted as an integer")]
 fn assert_fields_rejects_a_counter_stored_as_text() {
@@ -379,10 +339,6 @@ fn addressed(service: &str) -> Value {
     json!({ "service": service, "env": "prod", "host": "h", "_time": now() })
 }
 
-// -- the acceptance criteria ----------------------------------------------------
-
-/// Routine repairs only: no WARN on either sink, and one INFO that carries
-/// the key, the request, every count and the `env.defaulted` count.
 #[tokio::test(flavor = "multi_thread")]
 async fn routine_only_request_writes_one_info_and_no_warning() {
     sinks();
@@ -429,8 +385,6 @@ async fn routine_only_request_writes_one_info_and_no_warning() {
     assert_eq!(repairs_series("env.defaulted", service), Some(3));
 }
 
-/// Actionable repairs only: one WARN with the key, the request and the
-/// actionable per-code totals, worded as a call to inspect, plus one INFO.
 #[tokio::test(flavor = "multi_thread")]
 async fn actionable_only_request_warns_once() {
     sinks();
@@ -483,7 +437,6 @@ async fn actionable_only_request_warns_once() {
             ("repairs_actionable", "3"),
         ],
     );
-    // The WARN comes first.
     let lines = stdout_lines();
     let position = |event_type: &str| {
         lines
@@ -497,8 +450,6 @@ async fn actionable_only_request_warns_once() {
     assert!(position(REPAIRS) < position(COMPLETE));
 }
 
-/// Both classes: the WARN's totals and detail hold only actionable codes and
-/// carry the routine count; the INFO lists every code.
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_request_warns_on_actionable_codes_and_completes_with_all() {
     sinks();
@@ -575,8 +526,6 @@ async fn mixed_request_warns_on_actionable_codes_and_completes_with_all() {
     );
 }
 
-/// A clean request: one INFO with zero counts and empty detail, no WARN,
-/// and no repair series.
 #[tokio::test(flavor = "multi_thread")]
 async fn clean_request_completes_with_zero_repairs() {
     sinks();
@@ -607,10 +556,6 @@ async fn clean_request_completes_with_zero_repairs() {
     assert_no_series_for(service);
 }
 
-/// The stored-value cap (ADR-0063) on the HTTP door: two values one
-/// character over are stored cut, and the event's one `field.truncated`
-/// reaches `_repairs`, the repairs counter and the WARN once each.
-///
 /// The event proposes a short `_raw`. Without one, `_raw` is the whole
 /// event serialized, which the long values push over the cap, so
 /// `capture_raw`'s own cut would raise `field.truncated` and every
@@ -664,9 +609,6 @@ async fn a_cut_value_is_stored_counted_and_warned_once() {
     assert_eq!(stored[0]["_repairs"], "field.truncated");
 }
 
-/// Twenty services: eight detail pairs in order, exact omitted counts, and a
-/// one-off actionable code that no listed pair outranks still in the
-/// per-code totals of both lines.
 #[tokio::test(flavor = "multi_thread")]
 async fn detail_is_bounded_and_totals_stay_exact() {
     sinks();
@@ -736,9 +678,6 @@ async fn detail_is_bounded_and_totals_stay_exact() {
     );
 }
 
-/// More than eight actionable pairs: the WARN's own detail is bounded, its
-/// omitted counts are exact and nonzero, and a one-off actionable code past
-/// the bound stays in its per-code totals.
 #[tokio::test(flavor = "multi_thread")]
 async fn actionable_detail_is_bounded_and_totals_stay_exact() {
     sinks();
@@ -800,11 +739,6 @@ async fn actionable_detail_is_bounded_and_totals_stay_exact() {
     );
 }
 
-/// Two keys with one display name and a third flooding actionable repairs,
-/// sending at once: every line names the key that sent it, and each
-/// actionable request has its own WARN. The flood first spends more
-/// actionable requests than any shared warning budget would allow
-/// (ADR-0055 rejects one), so a budget would starve the twins' warnings.
 #[tokio::test(flavor = "multi_thread")]
 async fn keys_are_attributed_per_request() {
     // Beyond the 60 a minute an ADR-0040-style shared cap would allow.
@@ -896,10 +830,6 @@ async fn keys_are_attributed_per_request() {
     }
 }
 
-/// The same service in two envs, one group's WAL write failing: the failed
-/// group's repairs and unmapped severities reach neither the metrics nor
-/// the log lines, the written group's do, and the answer is still the WAL
-/// failure. When every group fails, nothing is counted.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // two requests, stated in order
 async fn wal_failure_counts_only_acknowledged_groups() {
@@ -939,7 +869,6 @@ async fn wal_failure_counts_only_acknowledged_groups() {
             .unwrap()
             .to_owned()
     };
-    // The redacted 500, from the lab group's failed write.
     let wal_failure = async |response: axum::response::Response| {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let request_id = request_id(&response);
@@ -1001,7 +930,6 @@ async fn wal_failure_counts_only_acknowledged_groups() {
         ],
     );
 
-    // Every group fails.
     let lab_only = "rl-wal-lab-only";
     let events = (0..3)
         .map(|_| {

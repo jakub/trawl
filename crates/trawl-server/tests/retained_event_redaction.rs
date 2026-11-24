@@ -2,23 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! A retained event never carries error text trawl did not write (ADR-0040,
-//! amended 2026-11-09): a fault trawld swallows keeps its level and carries
-//! `error_class` and `cause_kind`, and the store, Postgres or auth text goes
-//! to DEBUG, which the default filter drops.
+//! A retained event never carries error text trawl did not write (ADR-0040).
 //!
 //! Its own test binary because `.init()` installs the global subscriber,
-//! exactly as `trawld` does: the production subscriber from
-//! `telemetry::build_subscriber` under [`telemetry::DEFAULT_LOG_FILTER`],
-//! with a stdout capture and a telemetry WAL layer.
-//!
-//! Each case makes a real Postgres failure in a database of its own, and
-//! the failure's message is a sentinel no other case uses. Every case first
-//! proves the raw error really carries its sentinel, then requires the
-//! retained event to exist with the class and the cause, then searches the
-//! whole of every stdout line and every WAL record for the sentinel. Cases
-//! share one subscriber and may run in one process, so each selects its
-//! events by a field only it logs, and the sentinel search is its own.
+//! exactly as `trawld` does. Cases share one subscriber and may run in one
+//! process, so each selects its events by a field only it logs, and the
+//! sentinel search is its own.
 
 mod common;
 
@@ -42,9 +31,6 @@ use trawl_server::telemetry::{self, LogSinks, WalHandle, WalLayer};
 
 const ENV: &str = "default";
 
-// -- the production subscriber, captured ------------------------------------
-
-/// Everything the global subscriber writes to stdout.
 #[derive(Clone, Default)]
 struct Stdout(Arc<Mutex<Vec<u8>>>);
 
@@ -73,8 +59,6 @@ struct Sinks {
     wal_dir: tempfile::TempDir,
 }
 
-/// The production subscriber under the default directives, installed once
-/// for the whole binary.
 fn sinks() -> &'static Sinks {
     static SINKS: OnceLock<Sinks> = OnceLock::new();
     SINKS.get_or_init(|| {
@@ -107,7 +91,6 @@ fn sinks() -> &'static Sinks {
     })
 }
 
-/// Every stdout line so far.
 fn stdout_lines() -> Vec<String> {
     let bytes = sinks().stdout.0.lock().unwrap().clone();
     String::from_utf8(bytes)
@@ -146,7 +129,6 @@ fn on_target(line: &str, target: &str) -> bool {
     line.contains(&format!(" {target}: "))
 }
 
-/// Every record the telemetry WAL holds so far, flushed first.
 fn wal_records() -> Vec<Value> {
     // Tests flush concurrently. Without this lock one test could find the
     // queue already drained by another whose WAL write has not landed yet.
@@ -173,7 +155,6 @@ fn read_wal(dir: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// The level a formatted stdout line was logged at.
 fn level(line: &str) -> &'static str {
     ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
         .into_iter()
@@ -181,9 +162,8 @@ fn level(line: &str) -> &'static str {
         .unwrap_or("none")
 }
 
-/// A sentinel no other case, and no other run, can produce. Alphanumerics
-/// and underscores only, so JSON and the formatter carry it unescaped and a
-/// substring search of a whole line or record finds it.
+/// Alphanumerics and underscores only, so JSON and the formatter carry it
+/// unescaped and a substring search of a whole line or record finds it.
 fn sentinel(case: &str) -> String {
     format!(
         "SENTINEL_{case}_{}_{:016x}",
@@ -192,8 +172,6 @@ fn sentinel(case: &str) -> String {
     )
 }
 
-/// The sentinel is on no stdout line and in no WAL record, whatever the
-/// line's level, target or fields.
 fn assert_sentinel_retained_nowhere(sentinel: &str) {
     let leaked: Vec<String> = stdout_lines()
         .into_iter()
@@ -213,9 +191,6 @@ fn assert_sentinel_retained_nowhere(sentinel: &str) {
     );
 }
 
-/// The one stdout line and the one WAL record `select` keeps, each at
-/// `level_name` and on `target`, with the class and the cause and no
-/// `error` field.
 fn assert_one_retained_event(
     what: &str,
     stdout_select: impl Fn(&str) -> bool,
@@ -259,7 +234,6 @@ fn assert_one_retained_event(
     assert!(record.get("error").is_none(), "no error field: {record}");
 }
 
-/// What the one retained event must say.
 #[derive(Clone, Copy)]
 struct Retained<'a> {
     level: &'a str,
@@ -268,8 +242,6 @@ struct Retained<'a> {
     cause_kind: &'a str,
 }
 
-/// The Postgres error inside a store error, which must be the server's
-/// answer to a `RAISE EXCEPTION` of `sentinel`.
 fn assert_raised(error: &sqlx::Error, sentinel: &str) {
     let sqlx::Error::Database(db) = error else {
         panic!("not a database error: {error:?}");
@@ -279,8 +251,6 @@ fn assert_raised(error: &sqlx::Error, sentinel: &str) {
     assert!(error.to_string().contains(sentinel), "{error}");
 }
 
-/// A plpgsql function named `name` that raises `sentinel`, returning
-/// `returns`.
 async fn create_raising_function(pool: &PgPool, name: &str, returns: &str, sentinel: &str) {
     pool.execute(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION {name}() RETURNS {returns} LANGUAGE plpgsql AS $fn$
@@ -291,11 +261,6 @@ async fn create_raising_function(pool: &PgPool, name: &str, returns: &str, senti
     .unwrap_or_else(|e| panic!("create {name}: {e}"));
 }
 
-// -- history_error: a write fails ---------------------------------------------
-
-/// A `query_history` insert that fails through a `BEFORE` trigger leaves
-/// one WARN `history_error` with the class and the cause, and the trigger's
-/// text nowhere a key holder can read it.
 #[tokio::test(flavor = "multi_thread")]
 async fn history_error_drops_the_store_text() {
     sinks();
@@ -321,8 +286,6 @@ async fn history_error_drops_the_store_text() {
     .await
     .unwrap();
 
-    // The injection works: the store call the handler makes fails, and its
-    // error carries the sentinel as Postgres raised it.
     let injected = server
         .state
         .storage
@@ -375,12 +338,6 @@ async fn history_error_drops_the_store_text() {
     assert_sentinel_retained_nowhere(&sentinel);
 }
 
-// -- ingest_rejections: an unparseable line --------------------------------
-
-/// An unparseable NDJSON line is rejected with `serde_json`'s wording in the
-/// response, where the sender reads it. The `ingest_rejections` warning
-/// keeps its sample, as ADR-0053 says, but the sample is trawl's own words:
-/// the parser's wording reaches no stdout line and no WAL record.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_rejection_samples_drop_the_serde_text() {
     sinks();
@@ -410,8 +367,6 @@ async fn ingest_rejection_samples_drop_the_serde_text() {
     let body: Value = response.json().await.unwrap();
     assert_eq!(status, 200, "one line is accepted: {body}");
 
-    // The injection works: the rejection's message carries the parser's own
-    // wording, which names a position in the line.
     let message = body["errors"][0]["message"].as_str().unwrap().to_owned();
     assert_eq!(body["errors"][0]["reason"], "invalid_json", "{body}");
     let wording = message
@@ -445,14 +400,6 @@ async fn ingest_rejection_samples_drop_the_serde_text() {
     assert!(!records[0].to_string().contains(wording), "{}", records[0]);
 }
 
-// -- catalog_pin_purge_commit_failed: a commit fails ------------------------
-
-/// A pin purge whose `COMMIT` fails, through a deferred constraint trigger,
-/// leaves `catalog_pin_purge_commit_failed` with the class and the cause,
-/// and the sqlx text nowhere a key holder can read it.
-///
-/// The event carries no id of its own, only the field count; no other case
-/// here purges pins, so its `event_type` alone selects it.
 #[tokio::test(flavor = "multi_thread")]
 async fn pin_purge_commit_failure_drops_the_sqlx_text() {
     sinks();
@@ -480,8 +427,6 @@ async fn pin_purge_commit_failure_drops_the_sqlx_text() {
     .await
     .unwrap();
 
-    // The injection works, and at the commit: the DELETE succeeds inside
-    // the transaction, the COMMIT raises the sentinel, and the row stays.
     let mut tx = pool.begin().await.unwrap();
     let deleted = sqlx::query("DELETE FROM field_types WHERE field = $1")
         .bind(pinned)
@@ -524,7 +469,6 @@ async fn pin_purge_commit_failure_drops_the_sqlx_text() {
             cause_kind: "pg_server",
         },
     );
-    // The commit failed inside its bound, so the late path never ran.
     assert!(
         !stdout_lines()
             .iter()
@@ -534,9 +478,6 @@ async fn pin_purge_commit_failure_drops_the_sqlx_text() {
     assert_sentinel_retained_nowhere(&sentinel);
 }
 
-/// Turn the key table into a view of the same name over a function that
-/// raises `sentinel`, and prove the scheduler's lookup of `key_id` is what
-/// reaches it: the lookup fails with the sentinel as Postgres raised it.
 async fn break_key_lookup(fleet_pool: &PgPool, key_store: &KeyStore, key_id: i64, sentinel: &str) {
     fleet_pool
         .execute("ALTER TABLE api_keys RENAME TO api_keys_base")
@@ -564,13 +505,6 @@ async fn break_key_lookup(fleet_pool: &PgPool, key_store: &KeyStore, key_id: i64
     assert_raised(raw, sentinel);
 }
 
-// -- scheduler_error: an auth read fails --------------------------------------
-
-/// A scheduler poll whose owning-key lookup fails leaves one
-/// `scheduler_error` with the class and the cause, writes no `auth.backend`
-/// event for a failure it swallows, and keeps the auth text out of every
-/// retained record.
-///
 /// No `TestServer`: its scheduler loop would poll on its own and could add
 /// a second `scheduler_error` for the same schedule.
 #[tokio::test(flavor = "multi_thread")]
@@ -658,7 +592,6 @@ async fn owning_key_lookup_failure_drops_the_auth_text() {
     );
     assert_sentinel_retained_nowhere(&sentinel);
 
-    // The fire cursor did not move: the skip is the only thing that ran.
     let after = storage
         .schedule
         .get_schedule_for_saved_query(saved.id, key_id)
@@ -668,13 +601,9 @@ async fn owning_key_lookup_failure_drops_the_auth_text() {
     assert_eq!(after.next_fire_at, schedule.next_fire_at);
 }
 
-// -- pipeline_wal_write_failed: a WAL write fails on the filesystem --------
-
 /// A pipeline over a WAL root that is a regular file: every write fails at
 /// `create_dir` of the env directory with `ENOTDIR`, whatever the test's
-/// uid. Before it returns, the fault is proven on the raw writer: its error
-/// is `NotADirectory` and its text is the operating system's, with
-/// `(os error`. The raw writer logs nothing on this path.
+/// uid.
 fn failing_wal_pipeline(
     root: &Path,
 ) -> (
@@ -695,7 +624,6 @@ fn failing_wal_pipeline(
     )
 }
 
-/// One admitted group of one event for `service`.
 fn one_event_group(
     pipeline: &trawl_server::ingest::pipeline::PipelineWriter,
     service: &str,
@@ -712,15 +640,6 @@ fn one_event_group(
     pipeline.admit_for_test(batches)
 }
 
-/// A WAL write the filesystem refuses leaves one WARN
-/// `pipeline_wal_write_failed` with the closed cause and no `error` field,
-/// and the operating system's text on no stdout line at INFO or above and
-/// in no WAL record.
-///
-/// The site is `ingest/pipeline.rs` `record_discarded_group`, the
-/// inventory's `ingest/pipeline.rs` rows 198 (the call) and 214 (the
-/// emission) in `docs/evidence/issue-412/retained-events.tsv`. The fault is
-/// `ENOTDIR`, which `CauseKind::of_io` names `io_other`.
 #[test]
 fn io_failure_event_drops_the_os_text() {
     sinks();

@@ -2,10 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end repin tests: a real TLS server over a per-test data root,
-//! ingest through HTTP, compaction driven per-tick with the catalog and the
-//! repin coordinator wired exactly as trawld wires them.
-
 mod common;
 
 use std::os::unix::fs::MetadataExt as _;
@@ -26,7 +22,6 @@ fn now_ts() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-/// One `/metrics` scrape off the running server (unauthenticated route).
 async fn scrape_metrics(url: &str) -> String {
     common::harness_client_builder()
         .build()
@@ -40,7 +35,6 @@ async fn scrape_metrics(url: &str) -> String {
         .unwrap()
 }
 
-/// Read an unlabelled gauge's value out of a scrape body.
 fn gauge_value(scrape: &str, name: &str) -> Option<f64> {
     scrape.lines().find_map(|line| {
         let rest = line.strip_prefix(name)?.strip_prefix(' ')?;
@@ -68,25 +62,16 @@ async fn harness() -> Harness {
     harness_with_query_timeout(DEFAULT_TEST_TIMEOUT_SECS).await
 }
 
-/// A harness whose `[server] timeout_secs` is the hang guard (#316).
-///
-/// Every query, and every repin trigger answer, waits under the server's
-/// deadline. A test that only needs the answer, not the deadline, uses
-/// this, so a loaded machine makes the answer later instead of turning it
-/// into a timeout. A test of the answer bound itself sets its own with
-/// [`harness_with_query_timeout`].
+/// `[server] timeout_secs` is the hang guard, so a loaded machine makes
+/// the answer later instead of turning it into a timeout.
 async fn hang_guard_harness() -> Harness {
     harness_with_query_timeout(HANG_GUARD.as_secs()).await
 }
 
-/// A harness whose `[server] timeout_secs` is `timeout_secs`, which also
-/// bounds how long the repin trigger holds its response.
+/// `timeout_secs` also bounds how long the repin trigger holds its response.
 ///
-/// The interactive API rate limit is off. These tests poll the status
-/// route and query in loops for as long as a job takes, so a per-minute
-/// budget would be a throughput bound: a job slowed by a loaded machine
-/// would spend it and fail a correct build with 429. No test here is about
-/// rate limiting.
+/// The rate limit is off: these tests poll in loops for as long as a job
+/// takes, and a per-minute budget would fail a correct build with 429.
 async fn harness_with_query_timeout(timeout_secs: u64) -> Harness {
     let rate_limit = RateLimitConfig {
         default_rpm: 0,
@@ -101,7 +86,7 @@ async fn harness_with_query_timeout(timeout_secs: u64) -> Harness {
 
     let server =
         setup_in_dir_with_data_and_timeout(&root, data_path, rate_limit, timeout_secs).await;
-    std::mem::forget(tmp); // outlives the server; OS cleans up
+    std::mem::forget(tmp);
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let query = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
@@ -117,8 +102,6 @@ async fn harness_with_query_timeout(timeout_secs: u64) -> Harness {
 }
 
 impl Harness {
-    /// One compaction tick with the catalog and the repin coordinator
-    /// wired, exactly as trawld's loop runs it.
     async fn compact_tick(&self) {
         let hot_buffer = self
             .server
@@ -158,7 +141,6 @@ impl Harness {
         self.compact_tick().await;
     }
 
-    /// Count from a `| stats count()` query.
     async fn count(&self, dsl: &str) -> i64 {
         let result = self
             .query
@@ -174,9 +156,6 @@ impl Harness {
         }
     }
 
-    /// Poll the status surface until the job with `id` leaves `running`.
-    /// The bound is a hang guard on the real clock, not a deadline for the
-    /// job: the job's own events decide when it ends.
     async fn wait_terminal(&self, id: i64) -> trawl_client::RepinJobResponse {
         let start = std::time::Instant::now();
         while start.elapsed() < HANG_GUARD {
@@ -196,14 +175,10 @@ impl Harness {
         panic!("repin job {id} did not reach a terminal state within {HANG_GUARD:?}");
     }
 
-    /// Poll until the `data/REPIN` marker is gone. On the SUCCESS path the
-    /// row terminalizes inside `finish_cutover`'s transaction while the
-    /// detached task is still sweeping staging, so `wait_terminal` is not a
-    /// barrier for filesystem cleanup; the marker is removed last (it is
-    /// what licenses deleting the staging roots), so its absence is. It is
-    /// the barrier for the disk only. The job's task holds the repin permit
-    /// a little longer, so [`Harness::wait_idle`] is the barrier before the
-    /// next job.
+    /// `wait_terminal` is not a barrier for filesystem cleanup: the row
+    /// terminalizes while the task is still sweeping staging, and the marker is
+    /// removed last. The task holds the repin permit a little longer, so
+    /// [`Harness::wait_idle`] is the barrier before the next job.
     async fn wait_cleanup(&self) {
         let start = std::time::Instant::now();
         while start.elapsed() < HANG_GUARD {
@@ -215,25 +190,16 @@ impl Harness {
         panic!("repin marker still present after {HANG_GUARD:?}");
     }
 
-    /// Wait until the repin permit is free ([`RepinEngine::repin_idle`]):
-    /// the barrier before a test starts its next job.
-    ///
     /// The permit outlives the terminal row, the marker's removal and the
-    /// job generation's end: a started job's task gives it up last, and a
-    /// request answered past its bound keeps it until its own task ends.
-    /// A dry run takes it too, and never enters the job generation.
-    ///
-    /// A yield loop through `test_timing::until`, never a tokio sleep, so
-    /// it leaves a paused clock where it is. It only reads the permit and
-    /// never takes it, so it cannot change the admission it waits for.
+    /// job generation's end: a started job's task gives it up last.
+    /// A yield loop, never a tokio sleep, so it leaves a paused clock where it is.
     async fn wait_idle(&self) {
         let engine = self.engine();
         trawl_server::test_timing::until("the repin permit is released", || engine.repin_idle())
             .await;
     }
 
-    /// The type `/api/v1/schema` advertises for a field, read off the
-    /// TTL-cached column listing. [`Harness::pinned_type`] reads
+    /// Read off the TTL-cached column listing; [`Harness::pinned_type`] reads
     /// `/schema/fields`, which has no cache in front of it.
     async fn schema_endpoint_type(&self, field: &str) -> String {
         let resp = self.query.schema().await.expect("schema");
@@ -245,8 +211,6 @@ impl Harness {
             .clone()
     }
 
-    /// The catalog's advertised type for a field, via `/api/v1/schema/fields`
-    /// (no TTL cache in front of it).
     async fn pinned_type(&self, field: &str) -> String {
         let resp = self
             .query
@@ -352,8 +316,6 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
         .collect();
     let engine = h.engine();
     let coordinator = h.server.state.ingest.repin_coordinator.as_ref().unwrap();
-    // Over HTTP the refusal is the typed `corpus_recovering` one, as for
-    // every other corpus read (ADR-0041), not a generic 503.
     match h
         .schema_admin
         .schema_repin(
@@ -541,11 +503,6 @@ async fn cancelling_repin_during_rollup_admission_terminalizes_the_job() {
     assert_eq!(h.count("service=api | stats count()").await, 1);
 }
 
-/// The acceptance test: a BIGINT-pinned field with a shelved conflict
-/// value is repinned to VARCHAR. The dry run projects, the rewrite
-/// matches the projection, existing queries answer identically, the
-/// shelved value becomes queryable, unaffected files keep their inodes,
-/// and a foreign file rides across untouched.
 #[tokio::test(flavor = "multi_thread")]
 async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
     let h = hang_guard_harness().await;
@@ -559,14 +516,10 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
     .await;
     h.ingest_and_compact(&[event("api", &json!({"status": "accepted"}))])
         .await;
-    // An unaffected service (no `status` field at all).
     h.ingest_and_compact(&[event("quiet", &json!({"other": 1}))])
         .await;
     assert_eq!(h.pinned_type("status").await, "BIGINT");
 
-    // A foreign parquet inside the env dir but off the layout: it must
-    // ride the swap byte-identical (hardlinked, same inode), never be
-    // rewritten.
     let foreign = h.data_dir.join("prod/notes.parquet");
     std::fs::write(&foreign, b"not even parquet, and not trawl's").unwrap();
     let foreign_ino = std::fs::metadata(&foreign).unwrap().ino();
@@ -580,7 +533,6 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
     };
     let quiet_ino = std::fs::metadata(&quiet_file).unwrap().ino();
 
-    // Record answers under the BIGINT pin.
     let q_ordered = "status>=400 last=1h | stats count()";
     let q_eq = "last=1h | where status == 200 | stats count()";
     // (`where status == "accepted"` is unaskable under the BIGINT pin —
@@ -598,8 +550,6 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
         "the conflict value is shelved: only two rows carry a stored status"
     );
 
-    // Dry run: one affected file, one resurrectable value, nothing lost
-    // (VARCHAR is the always-lossless target).
     let dry = match h
         .schema_admin
         .schema_repin(
@@ -622,7 +572,6 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
     assert_eq!(dry.projected_nulls, 0);
     assert_eq!(dry.resurrectable, 1);
 
-    // Execute; the dry-run projection is the rewrite's outcome.
     let started = match h
         .schema_admin
         .schema_repin(
@@ -645,53 +594,36 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
     assert_eq!(done.rows_nulled, dry.projected_nulls);
     assert_eq!(done.files_done, dry.files_total);
 
-    // The pin flipped.
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
 
-    // The invisibility promise: identical answers.
     assert_eq!(h.count(q_ordered).await, before_ordered);
     assert_eq!(h.count(q_eq).await, before_eq);
-    // The payoff: the shelved value is back in the structured column —
-    // present, and queryable by the equality that had no answer for it
-    // under the numeric pin.
     assert_eq!(h.count(q_present).await, 3);
     assert_eq!(h.count(q_accepted).await, 1);
 
-    // Unaffected file: same inode (hardlinked, never rewritten).
     assert_eq!(
         std::fs::metadata(&quiet_file).unwrap().ino(),
         quiet_ino,
         "unaffected files ride as hardlinks"
     );
-    // Foreign file: byte-identical, same inode.
     assert_eq!(
         std::fs::read(&foreign).unwrap(),
         b"not even parquet, and not trawl's"
     );
     assert_eq!(std::fs::metadata(&foreign).unwrap().ino(), foreign_ino);
 
-    // Staging is swept and the marker is gone. The success row lands inside
-    // the cutover and the sweep follows it, so wait for the engine's job
-    // generation to read idle (it drops after the sweep) before reading the
-    // aftermath.
+    // The success row lands inside the cutover and the sweep follows it, so
+    // wait for the job generation to read idle before reading the aftermath.
     h.await_jobs_idle().await;
     assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
     assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 
-    // And ingest still works against the new pin: a numeric wire value
-    // conforms to VARCHAR text.
     h.ingest_and_compact(&[event("api", &json!({"status": 503}))])
         .await;
     assert_eq!(h.count("status>=400 last=1h | stats count()").await, 2);
 }
 
-/// `/api/v1/schema` caches its unscoped column listing for
-/// `schema_cache_ttl_secs`, and the cached entry carries the pin generation
-/// it was built under. A cutover therefore invalidates it at once, instead
-/// of leaving the endpoint advertising the old type for up to a TTL while
-/// the corpus it describes has already been rewritten.
-///
 /// The harness TTL is 60s (`tests/common/mod.rs`) and this test sleeps
 /// nowhere, so TTL expiry cannot explain a pass.
 #[tokio::test(flavor = "multi_thread")]
@@ -726,8 +658,6 @@ async fn a_cutover_retypes_the_schema_endpoint_immediately() {
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
 
-    // No sleep: the primed entry is still well inside its TTL, and it must
-    // not be served.
     assert_eq!(
         h.schema_endpoint_type("status").await,
         "VARCHAR",
@@ -735,11 +665,6 @@ async fn a_cutover_retypes_the_schema_endpoint_immediately() {
     );
 }
 
-/// AC7 (#252): a pending publication marker refuses the cutover. The
-/// marker proves its publish by the canonical output's identity, and the
-/// swap would replace that output. The job ends `blocked` with the named
-/// reason and the corpus untouched; once the marker is gone, the same repin
-/// cuts over.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_publication_marker_refuses_the_cutover() {
     use trawl_server::ingest::publication_marker::{
@@ -825,10 +750,6 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// The force gate, both halves: a lossy repin refuses with the plan
-/// attached (HTTP 409, job terminal `refused_needs_force`, corpus
-/// untouched), and proceeds under `--force` with exact null accounting
-/// plus conflict evidence.
 #[tokio::test(flavor = "multi_thread")]
 async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     let h = harness().await;
@@ -842,7 +763,6 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     .await;
     assert_eq!(h.pinned_type("dur").await, "VARCHAR");
 
-    // Lossy without force: 409, plan attached, nothing changed.
     let refused = match h
         .schema_admin
         .schema_repin(
@@ -864,8 +784,6 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     assert_eq!(h.pinned_type("dur").await, "VARCHAR", "corpus untouched");
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 
-    // With force: exact accounting, and the loss lands as conflict
-    // evidence like any lossy conform.
     let started = match h
         .schema_admin
         .schema_repin("dur", "BIGINT", None, false, true, RepinCeilings::default())
@@ -878,11 +796,9 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
 
-    // The barrier (issue #137). `wait_terminal` returns on the FIRST status
-    // that is not `running`, and this is the very next request the test
-    // makes: no poll, no retry, no second chance. A repin that records its
-    // losses after the flip would fail here, which is exactly the window a
-    // client polling the status route lives in.
+    // `wait_terminal` returns on the FIRST status that is not `running`, and
+    // this is the very next request: no poll, no retry. A repin that records
+    // its losses after the flip would fail here.
     let conflicts = h
         .query
         .catalog_conflicts(Some("dur"), None, None, None)
@@ -904,19 +820,13 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     assert_eq!(done.rows_nulled, 1);
     assert_eq!(h.pinned_type("dur").await, "BIGINT");
 
-    // The numeric survivor still answers.
     assert_eq!(
         h.count("last=1h | where dur == 12 | stats count()").await,
         1
     );
-    // The lost value stays findable in _raw (whole-event search).
     assert_eq!(h.count("oops last=1h | stats count()").await, 1);
 }
 
-/// The force gate is asked of the finished shadow, not just the pre-build
-/// scan: a lossless plan whose corpus grows a non-conforming value while
-/// the rewrite runs is refused at the cutover, corpus untouched — and the
-/// same repin proceeds under force.
 #[tokio::test(flavor = "multi_thread")]
 async fn late_arriving_loss_refuses_the_cutover_without_force() {
     let h = harness().await;
@@ -950,7 +860,6 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
     };
     assert_eq!(dry.projected_nulls, 0, "the scanned corpus is all numeric");
 
-    // Execute without force on that lossless plan.
     trawl_server::repin::engine::TEST_FILE_DELAY_MS
         .store(400, std::sync::atomic::Ordering::Relaxed);
     let started = match h
@@ -984,7 +893,6 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
     );
     assert!(done.rows_nulled > 0, "the refusal reports the actual loss");
 
-    // Corpus untouched: the old pin, every row, and no staging left.
     assert_eq!(h.pinned_type("dur").await, "VARCHAR");
     assert_eq!(h.count("last=1h | stats count()").await, 7);
     assert_eq!(
@@ -996,7 +904,6 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
     assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 
-    // The operator's answer: the same repin, forced, accepts the loss.
     h.wait_idle().await;
     let forced = match h
         .schema_admin
@@ -1014,20 +921,11 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
     assert_eq!(h.count("last=1h | stats count()").await, 7);
 }
 
-/// A caller that walks away mid-scan must not strand the one-running
-/// slot or the repin permit. The scan is a full-corpus `DuckDB` pass, so
-/// a client or proxy timeout drops the request future long before it
-/// finishes: the claimed job's whole ladder therefore runs detached,
-/// terminalizes on its own, and leaves the next repin acceptable instead
-/// of 409ing every request until a daemon restart reconciles the orphan.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_disconnected_caller_does_not_strand_the_running_slot() {
     use std::sync::atomic::Ordering;
     use trawl_server::repin::engine::TEST_SCAN_HELD as SCAN_HELD;
 
-    // The closing dry run must answer with its report, so the answer bound
-    // is the hang guard: a loaded machine can keep a correct dry run past
-    // the default 10 s.
     let h = hang_guard_harness().await;
     for svc in ["api", "web", "worker"] {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
@@ -1064,8 +962,6 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
     drop(start);
     hold.release();
 
-    // The abandoned job still reaches a terminal state on its own. Polled
-    // through the store, which reads the row the job itself writes.
     let store = h.server.state.storage.repin.clone();
     let id = store
         .latest()
@@ -1073,8 +969,6 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         .expect("latest job")
         .expect("the claim left a job row")
         .id;
-    // Waits for: the detached job's terminal row. The bound only names a
-    // hang.
     let started = std::time::Instant::now();
     let mut terminal = None;
     while started.elapsed() < HANG_GUARD {
@@ -1093,8 +987,6 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         done.error
     );
 
-    // And the slot is free: once the abandoned request's task gives up
-    // the permit, the next repin is served, not 409ed.
     h.wait_idle().await;
     match h
         .schema_admin
@@ -1114,35 +1006,13 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
     }
 }
 
-/// One repin at a time: a concurrent second request 409s with the error
-/// envelope (not a refusal plan); ingest and queries ride through the
-/// rewrite — events land in the hot buffer immediately and exactly once in
-/// the post-cutover corpus, queries inside the build never error, and a
-/// query issued while the cutover holds every executor permit waits for
-/// the swap and answers from the new corpus. `/metrics` is scraped
-/// from inside the rewrite: the running gauge is up and the
-/// `files_total`/`files_done` progress pair is readable while the job is
-/// still running, with the outcome counter landing only at the terminal
-/// state.
-///
-/// Synchronised by ORDERING, not by timing (issue #79 review). The mid-job
-/// state this test observes — job row `running`, running gauge up,
-/// `files_done` ≥ 1 — exists only between the end of the first build pass
-/// (progress is published per PASS) and the job's terminal write, and a
-/// polling observer can miss that window or find the job already finished
-/// on its first read; both were reproducible here by removing the per-file
-/// delay, and `retries = 1` is why CI saw it as a flake rather than a
-/// failure. The build now HOLDS at its first published progress until this
-/// test releases it, so every mid-job assertion below is a fact about
-/// order. The query across the cutover is ordered the same way, by a
-/// second hold past the point of no return. No sleeps, and no per-file
-/// delay at all.
+/// Synchronised by ORDERING, not by timing. The build HOLDS at its first
+/// published progress until this test releases it (progress is published
+/// per PASS), and the query across the cutover is ordered by a second hold
+/// past the point of no return.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+#[allow(clippy::too_many_lines)]
 async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
-    // The queries below must all succeed, so the server's query deadline is
-    // the hang guard: a query that a loaded machine starves past the
-    // default 10 s would time out and fail the test on a correct build.
     let h = hang_guard_harness().await;
 
     // Seed a few affected files across services, so the build's first pass
@@ -1157,9 +1027,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     assert_eq!(h.count("last=1h | stats count()").await, 6);
 
     // Arm the hold before the request: from its first published progress
-    // until this test releases it, the job cannot terminalize, so every
-    // "during the rewrite" step below is during the rewrite by
-    // construction.
+    // until this test releases it, the job cannot terminalize.
     let progress_hold = Hold::at_progress();
 
     let started = match h
@@ -1179,8 +1047,6 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         other => panic!("expected started, got {other:?}"),
     };
 
-    // A second repin while one runs: the repin permit answers 409 through
-    // the error envelope, before any claim.
     let second = h
         .schema_admin
         .schema_repin(
@@ -1197,7 +1063,6 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         other => panic!("expected a 409 error envelope, got {other:?}"),
     }
 
-    // Ingest during the build: visible immediately via the hot buffer.
     let resp = h
         .ingest
         .ingest(&[event("api", &json!({"status": 418}))])
@@ -1209,12 +1074,10 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         7,
         "the in-flight event is queryable from the hot buffer during the build"
     );
-    // And fold it into the corpus mid-build: the catch-up loop must pick
-    // the new/replaced file up (the compact tick runs under the corpus
-    // gate, so it can never straddle the cutover).
+    // The compact tick runs under the corpus gate, so it can never straddle
+    // the cutover.
     h.compact_tick().await;
 
-    // The one state a mid-job scrape needs, pinned: wait for the hold.
     await_barrier(
         &TEST_PROGRESS_PUBLISHED,
         "the build never published progress",
@@ -1234,13 +1097,9 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         trawl_server::store::RepinJobStatus::Running,
         "the held job is still running, which is what makes the scrape mid-job"
     );
-    // Queries still answer inside the held build — nothing is excluded yet.
     assert_eq!(h.count("last=1h | stats count()").await, 7);
     let mid_job = scrape_metrics(&h.server.url).await;
 
-    // Progress is scrapeable mid-job: the running gauge is up and real
-    // per-file progress is already on it, by construction rather than by
-    // catching a window.
     assert_eq!(
         gauge_value(&mid_job, trawl_server::metrics::CATALOG_REPIN_RUNNING),
         Some(1.0),
@@ -1265,10 +1124,8 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     )
     .unwrap_or(0.0);
 
-    // Queries inside the held build: a fixed count, each awaited, none may
-    // error. They run while the progress hold pins the job mid-build, so
-    // each one has answered and given back its permit before the cutover
-    // starts its drain.
+    // They run while the progress hold pins the job mid-build, so each one has
+    // given back its permit before the cutover starts its drain.
     let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
     for _ in 0..3 {
         let result = client
@@ -1277,13 +1134,10 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         assert!(result.is_ok(), "query errored mid-repin: {result:?}");
     }
 
-    // A query across the cutover. No query may be in flight while the
-    // cutover drains, because the drain is bounded by the engine's
-    // real-time `CUTOVER_DRAIN_TIMEOUT` (30 s), and a query a loaded
-    // machine starved past it would end a correct job `blocked`. So the
-    // query starts only after the drain: the cutover holds just past its
-    // point of no return, inside the exclusion window, with every executor
-    // permit taken and not yet given back.
+    // No query may be in flight while the cutover drains: the drain is bounded
+    // by the real-time `CUTOVER_DRAIN_TIMEOUT` (30 s), and a starved query
+    // would end a correct job `blocked`. So the query starts only after the
+    // drain, with the cutover held past its point of no return.
     let cutover_hold = Hold::past_no_return();
     progress_hold.release();
     // Waits for: the cutover's arrival past its point of no return, which
@@ -1328,15 +1182,11 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     );
 
     cutover_hold.release();
-    // Waits for: the query's answer, once the cutover gives back the
-    // permits.
     let answered = until_polling("the query across the cutover", &mut across, || false)
         .await
         .expect("until_polling returns only once the future completes")
         .result
         .expect("a query queued behind the cutover waits, it does not error");
-    // It ran on the post-cutover corpus and pins: the repinned field now
-    // reads as a string.
     let status_col = answered
         .columns
         .iter()
@@ -1365,12 +1215,10 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     // below a fact about order.
     h.await_jobs_idle().await;
 
-    // Exactly once: everything ingested before and during the job.
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
     assert_eq!(h.count("last=1h | stats count()").await, 7);
     assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
 
-    // ...and the outcome landed once the job terminalized.
     let metrics = scrape_metrics(&h.server.url).await;
     assert_eq!(
         gauge_value(&metrics, trawl_server::metrics::CATALOG_REPIN_RUNNING),
@@ -1390,25 +1238,8 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     assert!(metrics.contains("trawl_catalog_repin_duration_seconds"));
 }
 
-/// The final pause defers WAL draining, and does nothing else an operator
-/// can observe. Inside the held pause (corpus gate + every executor permit)
-/// ingest still lands, the hot buffer still holds those events undrained
-/// (a drain follows a compaction batch, and no batch may run), and a query
-/// issued into the pause waits rather than erroring or missing them. A
-/// compaction batch that starts inside the pause is blocked, not starved
-/// and not dropped: it resumes on its own the moment the pause lifts, with
-/// no new tick and no operator action, and drains exactly the events it
-/// held. Past the cutover those events are in the corpus exactly once,
-/// before and after that drain lands: ADR-0008's invisible-events
-/// prohibition across the one stopped world a cutover needs.
-///
-/// (Draining is deferred rather than continuous because the cutover takes
-/// the corpus gate's write side, which excludes whole compaction batches —
-/// the mechanism correction recorded in ADR-0011's 2026-08-12 amendment:
-/// a mixed-type corpus silently promotes instead of erring, so exclusion
-/// is the entire atomicity budget.)
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+#[allow(clippy::too_many_lines)]
 async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
     let h = harness().await;
     let hot = h
@@ -1438,7 +1269,6 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
         "the seed batch drained after compaction"
     );
 
-    // Widen the pause so the test can act inside it.
     coordinator.set_cutover_hold_ms(3_000);
     let started = match h
         .schema_admin
@@ -1457,7 +1287,6 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
         other => panic!("expected started, got {other:?}"),
     };
 
-    // Wait for the rising edge into the pause.
     let mut entered = false;
     for _ in 0..600 {
         if coordinator.cutover_hold_active() {
@@ -1468,9 +1297,6 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
     }
     assert!(entered, "the cutover never entered its pause");
 
-    // Ingest into the pause: the WAL writer and the hot buffer take
-    // neither the corpus gate nor an executor permit, so this must not
-    // block on the cutover.
     let resp = tokio::time::timeout(
         Duration::from_secs(2),
         h.ingest.ingest(&[event("api", &json!({"status": 418}))]),
@@ -1485,9 +1311,6 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
         "the event ingested during the pause is held in the hot buffer"
     );
 
-    // A query issued into the pause waits for a permit; it must answer,
-    // and it must see that event. Spawned, because the pause is exactly
-    // what it is waiting on.
     let paused_query = {
         let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
         tokio::spawn(async move {
@@ -1523,8 +1346,6 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
         })
     };
 
-    // Nothing drains while the pause is held: a drain only follows a
-    // compaction batch, and no batch may start under the corpus gate.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         hot.event_count(),
@@ -1553,12 +1374,8 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
         "the paused query sees the event ingested during the pause"
     );
 
-    // (That answer is the pre-drain half of exactly-once: the event was
-    // still only in the hot buffer, and the paused query saw it once.)
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
 
-    // The deferred batch resumes itself: no second tick was issued, no
-    // operator acted, and the drain it was holding completes.
     let errors = tokio::time::timeout(Duration::from_secs(30), deferred_drain)
         .await
         .expect("the batch blocked by the pause must complete once it lifts")
@@ -1571,25 +1388,18 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
         "the pause deferred the drain, it neither dropped nor starved it"
     );
 
-    // Exactly once in the repinned corpus, now that the batch it deferred
-    // has published and drained. (Counted here rather than mid-publish: a
-    // batch in flight may briefly show an event in both its new parquet
-    // and the not-yet-drained hot snapshot — ADR-0008's accepted transient
-    // duplicate, ordinary compaction, nothing repin does.)
+    // Counted after the deferred batch drained: a batch in flight may briefly
+    // show an event in both its new parquet and the not-yet-drained hot
+    // snapshot, ADR-0008's accepted transient duplicate.
     assert_eq!(h.count("last=1h | stats count()").await, 3);
     assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
 }
 
-/// The postgres half of boot recovery over a real storage state: a marker
-/// in the cutover phase finishes the job transactionally, flips the pin,
-/// re-arms the conformance pass, sweeps the aside, and removes the
-/// marker; orphaned running rows without a marker fail.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+#[allow(clippy::too_many_lines)]
 async fn boot_reconciliation_completes_a_recovered_cutover() {
     let h = harness().await;
 
-    // A pinned custom field to flip.
     h.ingest_and_compact(&[event("api", &json!({"status": 200}))])
         .await;
     assert_eq!(h.pinned_type("status").await, "BIGINT");
@@ -1635,7 +1445,6 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
     )
     .unwrap();
 
-    // Boot replay, both halves.
     let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
         .unwrap()
         .expect("marker present");
@@ -1648,8 +1457,6 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
     .await
     .expect("store reconciliation");
 
-    // The swap completed forward, the pin flipped everywhere, staging and
-    // marker are gone, and the conformance pass is re-armed.
     assert_eq!(
         std::fs::read(data.join("prod/2026-01-01/10/svc.parquet")).unwrap(),
         b"new generation"
@@ -1678,9 +1485,7 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
     );
 
     // A staging root that survives its sweep keeps the marker: the marker
-    // is the only thing licensing trawl to delete it, and a stranded root
-    // suppresses retention and makes the next cutover's forward-only swap
-    // ambiguous.
+    // is the only thing licensing trawl to delete it.
     {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -1726,7 +1531,6 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
         }
     }
 
-    // An orphaned running row (no marker) fails at the same boot step.
     let orphan_id = h
         .server
         .state
@@ -1765,12 +1569,6 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
     assert_eq!(orphan.status, trawl_server::store::RepinJobStatus::Failed);
 }
 
-/// A repin killed between the Cutover marker and the pin flip loses its
-/// engine, its shadow and every tally it held in memory — and still owes the
-/// operator an account of what it nulled. Boot recovery pays it: the tallies
-/// were staged on the job row before the marker went down, so the replayed
-/// flip materialises the same evidence the live path does, and the first
-/// read that sees `succeeded` sees it (issue #137).
 #[tokio::test(flavor = "multi_thread")]
 // The crash state has to be built by hand (claim, stage, plant marker and
 // shadow), and both boot halves run twice.
@@ -1778,8 +1576,6 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
 async fn boot_reconciliation_materialises_the_staged_evidence() {
     let h = harness().await;
 
-    // A half-numeric text field pins VARCHAR, exactly as in the live lossy
-    // repin this replays.
     h.ingest_and_compact(&[
         event("api", &json!({"dur": "12"})),
         event("api", &json!({"dur": "oops"})),
@@ -1873,9 +1669,6 @@ async fn boot_reconciliation_materialises_the_staged_evidence() {
         .unwrap();
     assert_eq!(job.status, trawl_server::store::RepinJobStatus::Succeeded);
 
-    // The same rows the live path writes: one per lossy service, naming the
-    // pin the values were stored under. They are the same by construction —
-    // both lanes reach `finish_cutover` and nothing else writes them.
     let conflicts = h
         .query
         .catalog_conflicts(Some("dur"), None, None, None)
@@ -1892,8 +1685,6 @@ async fn boot_reconciliation_materialises_the_staged_evidence() {
     assert_eq!(rows[0].observed_type, "VARCHAR");
     assert_eq!(rows[0].expected_type, "BIGINT");
 
-    // And a second boot over the same marker adds nothing: the replay's
-    // completing UPDATE finds a job that is no longer `running`.
     plant_marker(trawl_server::repin::RepinPhase::Cleanup);
     let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
         .unwrap()
@@ -1918,9 +1709,6 @@ async fn boot_reconciliation_materialises_the_staged_evidence() {
     );
 }
 
-/// A resurrection-only pass (`to == current`, force): the shelved value
-/// comes back without changing the pin — the supported repair for a
-/// boot-conformed interrupted repin.
 #[tokio::test(flavor = "multi_thread")]
 async fn resurrection_only_pass_recovers_without_retyping() {
     let h = harness().await;
@@ -1930,7 +1718,6 @@ async fn resurrection_only_pass_recovers_without_retyping() {
         .await;
     assert_eq!(h.pinned_type("status").await, "BIGINT");
 
-    // Same type without force is a 400 (nothing to do without intent).
     let err = h
         .schema_admin
         .schema_repin(
@@ -1948,10 +1735,6 @@ async fn resurrection_only_pass_recovers_without_retyping() {
         other => panic!("expected 400, got {other:?}"),
     }
 
-    // With force: a resurrection-only rewrite. `"accepted"` still has no
-    // BIGINT reading — it stays shelved and counts as nulled-projection
-    // zero, since it was already null — but a recoverable value would
-    // return.
     let dry = match h
         .schema_admin
         .schema_repin(
@@ -1975,17 +1758,12 @@ async fn resurrection_only_pass_recovers_without_retyping() {
     assert_eq!(dry.resurrectable, 0, "`accepted` has no BIGINT reading");
 }
 
-/// Boot recovery over a SEVERITY cutover marker (issue #79): the engine
-/// writes the marker with the CATALOG spelling, so recovery has to read it
-/// back that way. The physical parse has no `SEVERITY` spelling at all,
-/// which made this the one replay path that could REFUSE — and it refuses
-/// after the corpus is already half-swapped, where forward is the only safe
-/// direction.
+/// The engine writes the marker with the CATALOG spelling, so recovery has
+/// to read it back that way: the physical parse has no `SEVERITY` spelling.
 #[tokio::test(flavor = "multi_thread")]
 async fn boot_reconciliation_replays_a_severity_cutover() {
     let h = harness().await;
 
-    // A sender field an operator repins onto the ladder.
     h.ingest_and_compact(&[event("api", &json!({"level": "error"}))])
         .await;
     assert_eq!(h.pinned_type("level").await, "VARCHAR");
@@ -2009,9 +1787,6 @@ async fn boot_reconciliation_replays_a_severity_cutover() {
         .await
         .unwrap();
 
-    // A throwaway root crashed mid-cutover: the shadow holds the new
-    // generation, the marker names the `SEVERITY` target as the engine
-    // spells it (`CanonicalType::as_catalog`).
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
     let dir = data.join("prod/2026-01-01/10");
@@ -2049,8 +1824,6 @@ async fn boot_reconciliation_replays_a_severity_cutover() {
     .await
     .expect("a severity cutover marker must replay, not refuse");
 
-    // Forward: the swap finished, the pin flipped in postgres and in the
-    // in-process cache, and the job completed.
     assert_eq!(
         std::fs::read(data.join("prod/2026-01-01/10/svc.parquet")).unwrap(),
         b"new generation"
@@ -2075,11 +1848,6 @@ async fn boot_reconciliation_replays_a_severity_cutover() {
     assert!(!trawl_server::repin::marker_path(&data).exists());
 }
 
-/// A dry run through the HTTP client, unwrapped to its report.
-///
-/// The ceilings stay at their defaults: a dry run mutates nothing, so what
-/// it is held to is the scan-derived number, which is the one an operator
-/// reading the plan is offered.
 async fn dry_run(
     client: &HttpClient,
     field: &str,
@@ -2097,11 +1865,6 @@ async fn dry_run(
     }
 }
 
-/// A dry run must say whether the IDENTICAL executing request would refuse
-/// (issue #79): the plan's numbers alone read as a clean 200, and an
-/// operator would learn about the force gate from the request that was
-/// meant to do the work. Both triggers, on the report and on the status
-/// route — one decision function, three askers.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
     let h = harness().await;
@@ -2116,7 +1879,6 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
     assert_eq!(h.pinned_type("level").await, "VARCHAR");
     assert_eq!(h.pinned_type("pri").await, "VARCHAR");
 
-    // (1) Loss: `gold` has no reading at all.
     let dry = dry_run(&h.schema_admin, "level", "severity", None, false).await;
     assert_eq!(dry.status, "succeeded", "a dry run still succeeds");
     assert_eq!(dry.projected_nulls, 1);
@@ -2133,7 +1895,6 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
         "the report shows WHICH value it cannot read"
     );
 
-    // The status route is the same row, so it carries the same verdict.
     let latest = h
         .schema_admin
         .schema_repin_status()
@@ -2155,8 +1916,6 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
     assert!(reason.contains("numeral 1-7"), "{reason}");
     assert!(reason.contains("dialect=syslog"), "{reason}");
 
-    // Asserting syslog answers the ambiguity, so the same corpus needs no
-    // force at all — and `--force` clears the OTel one.
     let dry = dry_run(&h.schema_admin, "pri", "severity", Some("syslog"), false).await;
     assert_eq!(dry.dialect.as_deref(), Some("syslog"));
     assert_eq!(dry.ambiguous_numerals, 1, "the COUNT is dialect-blind");
@@ -2173,11 +1932,6 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
     );
 }
 
-/// The force verdict has THREE states, and the missing one is the one that
-/// matters (issue #79 review): a claimed job whose scan has not recorded a
-/// plan yet reports NO verdict. Its counts are zeros meaning "not measured",
-/// and answering `false` there tells an operator polling the status route
-/// that a job about to 409 is clean.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_force_verdict_is_absent_until_the_scan_has_a_plan() {
     for force in [false, true] {
@@ -2224,8 +1978,6 @@ async fn the_force_verdict_is_absent_until_the_scan_has_a_plan() {
         };
         trawl_server::repin::engine::TEST_SCAN_DELAY_MS
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        // …and once the plan exists the verdict is a fact, both on the report
-        // and on the status route.
         assert_eq!(dry.requires_force, Some(!force), "{dry:?}");
         let latest = h
             .schema_admin
@@ -2236,8 +1988,6 @@ async fn the_force_verdict_is_absent_until_the_scan_has_a_plan() {
             .expect("a job has run");
         assert_eq!(latest.requires_force, Some(!force));
 
-        // The third state: a plan with nothing to accept (a BIGINT field to
-        // VARCHAR, which is lossless by construction).
         let clean = dry_run(&h.schema_admin, "dur", "varchar", None, false).await;
         assert_eq!(
             clean.requires_force,
@@ -2258,9 +2008,6 @@ fn severity_corpus() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// AC2/AC5: the dry run's numbers ARE the executed rewrite's, and the
-/// report carries the evidence an operator decides on (which value cannot
-/// be read, and whether anything is still writing the field).
 #[tokio::test(flavor = "multi_thread")]
 async fn repin_to_severity_dry_run_matches_the_executed_rewrite() {
     let h = harness().await;
@@ -2282,7 +2029,6 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite() {
         Some("otel"),
         "the default assertion"
     );
-    // The evidence, not just the count.
     assert_eq!(dry.unmapped_samples, vec!["gold".to_owned()]);
     let live = dry.liveness.as_ref().expect("the sender just wrote");
     assert_eq!(live.service, "api");
@@ -2292,8 +2038,6 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite() {
         "loss AND ambiguity, neither accepted yet"
     );
 
-    // The same plan, executed with force: the rewrite achieves exactly what
-    // the scan projected.
     let started = match h
         .schema_admin
         .schema_repin(
@@ -2348,18 +2092,13 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite() {
     );
 }
 
-/// AC3: the syslog assertion INVERTS the numeral, is persisted on the job
-/// row, and reads back off the status route — the one dialect-changing
-/// decision an operator can make about their own corpus.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion() {
     let h = harness().await;
     h.ingest_and_compact(&severity_corpus()).await;
 
-    // The ambiguity gate does not fire under an explicit syslog assertion
-    // (the other half of that gate is covered by
-    // `a_dry_run_reports_the_force_verdict_it_would_hit`), but `gold` is
-    // still a loss, so this run is forced for that reason.
+    // The ambiguity gate does not fire under an explicit syslog assertion,
+    // but `gold` is still a loss, so this run is forced for that reason.
     let started = match h
         .schema_admin
         .schema_repin(
@@ -2395,21 +2134,16 @@ async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion() {
     assert_eq!(h.count("level>=warn last=1h | stats count()").await, 4);
 }
 
-/// AC6 + ruling 13: a value a PRIOR conform shelved comes back under the
-/// new pin — including one whose `_raw` key still carries the sender's
-/// original mixed-case spelling, which the case-variant fallback recovers
-/// best-effort (the documented Unicode-`lower()`-vs-ASCII-fold edge).
 #[tokio::test(flavor = "multi_thread")]
 async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key() {
     let h = harness().await;
 
-    // First typed sight pins BIGINT…
     h.ingest_and_compact(&[event("api", &json!({"lvl": 17}))])
         .await;
     assert_eq!(h.pinned_type("lvl").await, "BIGINT");
-    // …and a token batch conflicts: the value is nulled and lives on in
-    // `_raw`, which holds the sender's original key spelling (`Lvl`),
-    // because `_raw` is captured before the name fold.
+    // The token batch conflicts: the value lives on in `_raw`, which holds the
+    // sender's original key spelling (`Lvl`), because `_raw` is captured before
+    // the name fold.
     h.ingest_and_compact(&[event("api", &json!({"Lvl": "error"}))])
         .await;
     assert_eq!(
@@ -2452,10 +2186,6 @@ async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key() {
     );
 }
 
-/// After the repin, the sender's own field is on the ladder in every lane —
-/// the cold parquet, the hot buffer a live event lands in, the pipeline's
-/// `where`, and the in-memory matcher the live tail uses — and a
-/// newly-ingested `"error"` conforms to 17 with no further operator action.
 #[tokio::test(flavor = "multi_thread")]
 async fn post_repin_severity_binds_in_every_lane_including_live_ingest() {
     let h = harness().await;
@@ -2479,12 +2209,8 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest() {
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
 
-    // Cold: the rewritten corpus.
     assert_eq!(h.count("level>=warn last=1h | stats count()").await, 3);
 
-    // Live ingest, uncompacted: the hot branch conforms through the same
-    // catalog pin, so a brand-new `"error"` is 17 the moment it lands —
-    // nothing about the sender changed.
     let live = event("api", &json!({"level": "error"}));
     assert_eq!(
         h.ingest
@@ -2499,7 +2225,6 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest() {
         4,
         "the hot row reads on the ladder before compaction"
     );
-    // The pipeline lane binds the same pin (ADR-0011).
     assert_eq!(
         h.count("last=1h | where level >= \"error\" | stats count()")
             .await,
@@ -2523,20 +2248,11 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest() {
     assert!(matches("level=error"));
     assert!(!matches("level=trace3"));
 
-    // And once it compacts, the answer does not move.
     h.compact_tick().await;
     assert_eq!(h.count("level>=warn last=1h | stats count()").await, 4);
     assert_eq!(h.count("level=error last=1h | stats count()").await, 4);
 }
 
-/// Every shadow pass — the initial build and the catch-up passes that fold
-/// in files compaction wrote meanwhile — rides the job's asserted dialect,
-/// while ordinary compaction stays on the `OTel` reading.
-///
-/// That combination is exactly the discontinuity the CLI warns about, so it
-/// is asserted rather than assumed: a `3` the catch-up rewrote reads as
-/// syslog err, and the next `3` to arrive after the cutover reads as `OTel`
-/// trace3.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
     let h = hang_guard_harness().await;
@@ -2546,10 +2262,7 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
 
     // A barrier, not just a delay: pass 0 takes its source snapshot and then
     // waits, so the file this test writes next provably did not exist when
-    // the build enumerated its sources. Only a catch-up pass can carry it
-    // into the shadow, which is the claim under test; a delay alone would
-    // let pass 0 see the file, and the assertions below would hold even if
-    // catch-up passes read the wrong dialect.
+    // the build enumerated its sources. Only a catch-up pass can carry it.
     let hold = Hold::at_first_pass();
 
     let started = match h
@@ -2586,8 +2299,6 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
     // never folded in would be gone.
     assert_eq!(h.count("last=1h | stats count()").await, 2);
 
-    // And it took the job's syslog reading (err), not OTel's — the pass that
-    // folded it in rode the job's dialect, not the live default.
     assert_eq!(
         h.count("level=error last=1h | stats count()").await,
         2,
@@ -2595,8 +2306,6 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
     );
     assert_eq!(h.count("level=trace3 last=1h | stats count()").await, 0);
 
-    // Ordinary compaction after the cutover conforms at OTel — the
-    // discontinuity the report's liveness warning exists to state.
     h.ingest_and_compact(&[event("api", &json!({"level": "3"}))])
         .await;
     assert_eq!(
@@ -2607,8 +2316,6 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
     );
     assert_eq!(h.count("level=error last=1h | stats count()").await, 2);
 }
-
-// -- cancellation (#109) -----------------------------------------------------
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2622,18 +2329,12 @@ use trawl_server::repin::engine::{
 };
 use trawl_server::store::{RepinJob, RepinJobStatus};
 
-/// Owner of one armed test-support hold in the repin engine.
-///
 /// A hold waits only for its release flag: the engine has no clock lapse
-/// that frees it. This guard is what frees it when a test fails. Dropping
-/// it unreleased disarms a hold the engine has not reached and sets the
-/// release flag for one it has, so a panicking test never leaves a job (or
-/// a blocking-pool thread the runtime waits for on teardown) held. The
-/// flags are process-global, so arming resets the arrival and release flags
-/// and sets the hold last.
-///
-/// [`Hold::release`] consumes the guard. A hold re-armed after a release
-/// gets a new guard, and the stale one cannot release it.
+/// that frees it. Dropping it unreleased disarms a hold the engine has not
+/// reached and sets the release flag for one it has, so a panicking test
+/// never leaves a job (or a blocking-pool thread the runtime waits for on
+/// teardown) held. The flags are process-global, so arming resets the
+/// arrival and release flags and sets the hold last.
 ///
 /// Bind the guard as a local of the test body, so unwinding drops it before
 /// the runtime does.
@@ -2659,7 +2360,6 @@ impl Hold {
         }
     }
 
-    /// Hold the build at its first published progress.
     fn at_progress() -> Self {
         Self::arm(
             &TEST_HOLD_AFTER_PROGRESS,
@@ -2668,12 +2368,10 @@ impl Hold {
         )
     }
 
-    /// Hold the scan at its first file boundary.
     fn in_scan() -> Self {
         Self::arm(&TEST_HOLD_IN_SCAN, &TEST_SCAN_HELD, &TEST_RELEASE_SCAN)
     }
 
-    /// Hold the cutover just past the point of no return.
     fn past_no_return() -> Self {
         Self::arm(
             &TEST_HOLD_AFTER_NO_RETURN,
@@ -2682,7 +2380,6 @@ impl Hold {
         )
     }
 
-    /// Hold the cutover on a decided finished-shadow force refusal.
     fn at_force_refusal() -> Self {
         Self::arm(
             &TEST_HOLD_AT_FORCE_REFUSAL,
@@ -2691,7 +2388,6 @@ impl Hold {
         )
     }
 
-    /// Hold the build's first pass right after its source snapshot.
     fn at_first_pass() -> Self {
         Self::arm(
             &TEST_BARRIER_FIRST_PASS,
@@ -2715,12 +2411,6 @@ impl Drop for Hold {
     }
 }
 
-/// Wait for a barrier the engine publishes. It proves nothing on its own:
-/// it turns "the job reached that point" into an ordering the assertions
-/// after it can stand on, and fails loudly rather than letting a test
-/// proceed past a barrier that was never reached. The bound is a hang
-/// guard on the real clock; a loaded machine only makes the barrier arrive
-/// later.
 async fn await_barrier(flag: &AtomicBool, what: &str) {
     let start = std::time::Instant::now();
     while start.elapsed() < HANG_GUARD {
@@ -2732,8 +2422,6 @@ async fn await_barrier(flag: &AtomicBool, what: &str) {
     panic!("{what}");
 }
 
-/// Every live file under the data root, as (relative path, length, content
-/// hash). The corpus a cancelled job must leave exactly as it found it.
 fn corpus_digest(data_dir: &std::path::Path) -> std::collections::BTreeMap<String, (u64, u64)> {
     use std::hash::{Hash as _, Hasher as _};
 
@@ -2753,7 +2441,6 @@ fn corpus_digest(data_dir: &std::path::Path) -> std::collections::BTreeMap<Strin
         .collect()
 }
 
-/// One labelled counter's value out of a scrape body.
 fn counter_value(scrape: &str, name: &str, labels: &str) -> Option<f64> {
     let prefix = format!("{name}{{{labels}}}");
     scrape.lines().find_map(|line| {
@@ -2774,9 +2461,6 @@ impl Harness {
             .expect("job")
     }
 
-    /// Wait for the detached request path to record the cancel on the job
-    /// row, and return the instant it wrote. The bound is a hang guard on
-    /// the real clock.
     async fn await_cancel_request(&self, id: i64) -> chrono::DateTime<chrono::Utc> {
         let start = std::time::Instant::now();
         while start.elapsed() < HANG_GUARD {
@@ -2788,11 +2472,6 @@ impl Harness {
         panic!("the cancel request never reached the job row within {HANG_GUARD:?}");
     }
 
-    /// Run retention the way trawld runs it (a spawned loop on a one-second
-    /// tick), and wait for a tick to publish the suppression gauge. The
-    /// gauge is 1 for every tick that stands down, so a stranded marker or
-    /// staging root shows up here as a timeout rather than a pass. The
-    /// bound is a hang guard on the real clock.
     async fn await_retention_gauge(&self) -> f64 {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let _retention = trawl_server::retention::spawn_retention(
@@ -2822,15 +2501,6 @@ impl Harness {
     }
 }
 
-/// AC1: a cancel mid-build stops the job at the next file boundary and
-/// leaves nothing behind: no staging, no marker, and a corpus identical
-/// byte for byte to the one the job started from.
-///
-/// Held at the build's first published progress, so "mid-build" is an
-/// ordering rather than a hope: the shadow generation exists, the marker is
-/// on disk, and the job cannot terminalize until this test releases it.
-/// The second cancel is the idempotence check. A repeat is accepted, and
-/// the row still names the first request, timestamp included.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one cancel, and everything it must leave alone
 async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
@@ -2870,8 +2540,6 @@ async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
     )
     .await;
 
-    // Mid-build means there is something to unwind: the shadow generation
-    // and the marker that licenses its deletion both exist right now.
     assert!(trawl_server::repin::shadow_root(&h.data_dir).exists());
     assert!(trawl_server::repin::marker_path(&h.data_dir).exists());
 
@@ -2893,7 +2561,6 @@ async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
     );
     let requested_at = h.await_cancel_request(started.id).await;
 
-    // Idempotent: a second asker is accepted and changes nothing.
     match h
         .schema_admin
         .schema_repin_cancel()
@@ -2921,19 +2588,16 @@ async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
         "neither the repeat request nor the effect site may restamp the first"
     );
 
-    // Nothing staged survives, and the marker went with it.
     assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
     assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 
-    // The corpus is the one the job started from, file for file.
     assert_eq!(corpus_digest(&h.data_dir), before);
     assert_eq!(h.pinned_type("status").await, "BIGINT", "the pin stands");
     assert_eq!(h.count("last=1h | stats count()").await, 6);
     assert_eq!(h.count("status>=400 last=1h | stats count()").await, 3);
 
-    // Metered exactly once, under the outcome the operator asked for. The
-    // terminal row lands before the outcome is counted, and the job
+    // The terminal row lands before the outcome is counted, and the job
     // generation ends only after the count, so the scrape waits for it.
     h.await_jobs_idle().await;
     let scrape = scrape_metrics(&h.server.url).await;
@@ -2956,8 +2620,6 @@ async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
         "a cancelled job is not a completed one"
     );
 
-    // And retention is free again: the sweep stands down for a marker or a
-    // staging root, and the cancel left neither.
     let suppressed = h.await_retention_gauge().await;
     assert!(
         suppressed.abs() < f64::EPSILON,
@@ -2965,14 +2627,6 @@ async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
     );
 }
 
-/// AC2: a cancel during the mandatory scan stops at a file boundary, and
-/// the job terminalizes without ever publishing a plan or touching the
-/// disk. A dry run's own request answers 200 with the cancelled row, never
-/// a fourth status code, since 409 already means refused-needs-force.
-///
-/// The scan is HELD at its first file rather than merely slowed: a scan
-/// that finished first would record a plan, which is exactly what this
-/// asserts never happened.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
     for force in [false, true] {
@@ -3003,7 +2657,6 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
         });
         await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
 
-        // A scan has staged nothing, so there is nothing on disk to unwind.
         assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
         assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
 
@@ -3037,8 +2690,6 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
             .expect("a cancelled row explains itself");
         assert!(error.contains("during scan"), "{error}");
 
-        // No plan: the counts are the row's zeros meaning "not measured", and
-        // `planned_at` is what says so.
         let row = h.repin_row(report.id).await;
         assert_eq!(row.planned_at, None, "no partial plan may be published");
         assert_eq!(report.files_total, 0);
@@ -3047,7 +2698,6 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
             "the scan stopped short of the corpus"
         );
 
-        // And the disk was never touched, before or after the stop.
         assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
         assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
         assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
@@ -3055,32 +2705,20 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
     }
 }
 
-// -- the answer bound on a frozen clock (#316) -------------------------------
-//
-// The tests of the trigger's answer bound boot and seed their harness on
-// real time, then pause tokio's clock. The server's tasks and the requests
-// share the test's one `current_thread` runtime, so the server's
-// `Deadline` reads the paused clock, and the bound passes only when a test
-// advances it, however long the claim and the scan take on a loaded
-// machine. Every wait from the pause on goes through the `test_timing`
-// yield driver ([`frozen`], [`frozen_until`], `until_polling`), which keeps
-// the runtime busy, so the clock never auto-advances behind a test's back.
-// An idle tokio sleep or timeout in their place would let it jump.
-//
-// Every server deadline is frozen with it, so a trailing read through the
-// 1 s `timeout_secs` (a query, a status read) cannot time out either.
+// The answer-bound tests pause tokio's clock after boot. The server's tasks
+// share the test's one `current_thread` runtime, so the server's `Deadline`
+// reads the paused clock. Every wait from the pause on goes through the
+// `test_timing` yield driver, which keeps the runtime busy, so the clock
+// never auto-advances. An idle tokio sleep or timeout would let it jump.
 
 /// The `[server] timeout_secs` of the answer-bound tests, which is also
 /// the trigger's answer bound.
 const ANSWER_BOUND: Duration = Duration::from_secs(1);
 
-/// [`harness_with_query_timeout`] at [`ANSWER_BOUND`].
 async fn answer_bound_harness() -> Harness {
     harness_with_query_timeout(ANSWER_BOUND.as_secs()).await
 }
 
-/// Await `fut` on a paused clock: poll it from the yield driver until it
-/// completes, under the hang guard.
 async fn frozen<F: std::future::Future>(what: &str, fut: F) -> F::Output {
     let mut fut = std::pin::pin!(fut);
     until_polling(what, &mut fut, || false)
@@ -3088,8 +2726,6 @@ async fn frozen<F: std::future::Future>(what: &str, fut: F) -> F::Output {
         .expect("until_polling returns only once the future completes")
 }
 
-/// Read `probe` on a paused clock until it returns `Some`, under the hang
-/// guard. Each read goes through [`frozen`].
 async fn frozen_until<T, F>(what: &str, mut probe: impl FnMut() -> F) -> T
 where
     F: std::future::Future<Output = Option<T>>,
@@ -3122,25 +2758,16 @@ async fn regular_requests_in_progress(h: &Harness) -> f64 {
     .expect("the regular in-progress gauge is published")
 }
 
-/// The message of every frozen-clock negative below. One message, so a
-/// trigger that answers early fails the same way whichever check sees it.
 const ANSWERED_ON_A_FROZEN_CLOCK: &str =
     "the trigger answered on a frozen clock, before its bound passed";
 
-/// Step 2 of an answer-bound test, for a `request` (the trigger, or a CLI
-/// run that sends it) already pinned, with [`Hold::in_scan`] armed and the
-/// clock paused: drive `request` until the scan holds at its first file,
-/// and return the claimed row.
-///
-/// The claim precedes the scan and hands its row to the waiting request
-/// before the scan starts, so the held scan means the claim landed and the
-/// request holds its row.
+/// The claim hands its row to the waiting request before the scan starts,
+/// so the held scan means the claim landed and the request holds its row.
 async fn drive_to_the_held_scan<F>(h: &Harness, request: &mut F) -> RepinJob
 where
     F: std::future::Future + Unpin,
     F::Output: std::fmt::Debug,
 {
-    // Waits for: the scan's arrival at its first file boundary.
     if let Some(early) = until_polling("the scan reaches its first file", request, || {
         TEST_SCAN_HELD.load(Ordering::SeqCst)
     })
@@ -3156,18 +2783,11 @@ where
     claimed
 }
 
-/// Step 3 of an answer-bound test, the anchored negative, once every
-/// precondition is published. With the clock frozen short of the bound, a
-/// correct bound cannot fire, so the server must still count the trigger
-/// in progress, and `request` must still be pending, across a `/metrics`
-/// round trip through the same server. That round trip reads no job row.
-/// A trigger that answers before its bound fails here.
 async fn assert_unanswered_on_the_frozen_clock<F>(h: &Harness, request: &mut F)
 where
     F: std::future::Future + Unpin,
     F::Output: std::fmt::Debug,
 {
-    // Waits for: one metrics round trip, with `request` polled throughout.
     let url = h.server.url.clone();
     let scrape = tokio::spawn(async move { scrape_metrics(&url).await });
     if let Some(early) =
@@ -3189,50 +2809,32 @@ where
     );
 }
 
-/// Step 4's clock move: just past the bound and no further, so the window
-/// stays the smallest one that expires the trigger's deadline.
 async fn pass_the_answer_bound() {
     tokio::time::advance(ANSWER_BOUND + Duration::from_millis(1)).await;
 }
 
-/// For a CLI run: after [`pass_the_answer_bound`], wait until the server
-/// has produced the trigger's response head. The scan is still held, so
-/// that answer is the 202 with the claimed row, and the hold may be
-/// released without the scan deciding inside the bound.
+/// The scan is still held, so the answer is the 202 with the claimed row,
+/// and the hold may be released without the scan deciding inside the bound.
 async fn await_the_late_answer(h: &Harness) {
-    // Waits for: the trigger's count to drop, as its response head is
-    // produced.
     frozen_until("the trigger answers past its bound", move || async move {
         (regular_requests_in_progress(h).await == 0.0).then_some(())
     })
     .await;
 }
 
-/// For a CLI run that follows a 202: resume the clock and drive `cli` to
-/// its end on real time, and return its result.
-///
-/// The CLI follows its job with a poll sleep and status reads whose client
-/// timeout runs on tokio's clock, and nothing publishes when a read is in
-/// flight end to end (connection, request, response body). Stepping a
-/// frozen clock could therefore move it under a pending read until that
-/// read times out on a correct build. So the clock stops being frozen
-/// here: every precondition the caller needed (the 202 produced, the job
-/// terminal, the slot taken) is already a fact, and a CLI read made at any
-/// later instant sees it. The only real-time bound left is the CLI
-/// client's own two-minute timeout, the same span as [`HANG_GUARD`].
+/// The CLI's status reads run a client timeout on tokio's clock, and nothing
+/// publishes when a read is in flight, so stepping a frozen clock could time
+/// out a pending read on a correct build. Every precondition is already a
+/// fact here, so the clock resumes.
 async fn follow_the_cli_on_real_time<F: std::future::Future + Unpin>(cli: &mut F) -> F::Output {
     tokio::time::resume();
-    // Waits for: the CLI's end.
     until_polling("the CLI follows its job", cli, || false)
         .await
         .expect("the CLI ends before an unreachable condition")
 }
 
 impl Harness {
-    /// The job row with `id` once it leaves `running`, read off the store
-    /// on a paused clock.
     async fn frozen_terminal(&self, id: i64) -> RepinJob {
-        // Waits for: the job's terminal row.
         frozen_until("the job leaves running", move || async move {
             let row = self.repin_row(id).await;
             (row.status != RepinJobStatus::Running).then_some(row)
@@ -3241,16 +2843,6 @@ impl Harness {
     }
 }
 
-/// A scan that outlasts `[server] timeout_secs` does not hold the request.
-/// trawl-web gives every upstream call `timeout_secs` plus 10 s to send its
-/// response head (ADR-0054), so the trigger answers 202 with the claimed
-/// row once that bound passes, and the verdict is read from the status
-/// route. The dry run here ends `succeeded` with its plan, exactly as it
-/// would have answered 200 inside the bound.
-///
-/// On a frozen clock: the claim lands and the scan holds, the trigger is
-/// still unanswered with the clock short of the bound, and only the clock
-/// passing the bound answers it, while the scan is still held.
 #[tokio::test]
 async fn a_scan_past_the_answer_bound_answers_202_and_reports_through_status() {
     let h = answer_bound_harness().await;
@@ -3273,7 +2865,6 @@ async fn a_scan_past_the_answer_bound_answers_202_and_reports_through_status() {
     assert_unanswered_on_the_frozen_clock(&h, &mut request).await;
 
     pass_the_answer_bound().await;
-    // Waits for: the trigger's answer, with the scan still held.
     let answered = frozen("the trigger answers past its bound", &mut request)
         .await
         .expect("an admitted dry run answers with its row");
@@ -3314,14 +2905,6 @@ async fn a_scan_past_the_answer_bound_answers_202_and_reports_through_status() {
     );
 }
 
-/// The CLI half of the answer bound: `trawl schema repin --dry-run` whose
-/// scan outlasts `[server] timeout_secs` gets a 202 with the running row,
-/// follows it through the status route, and prints the report and exits 0,
-/// exactly as it does for a dry run answered inside the bound.
-///
-/// On a frozen clock: the claim lands and the scan holds, the trigger is
-/// unanswered short of the bound, and the hold is released only once the
-/// server has answered past it, so the CLI's answer is the 202.
 #[tokio::test]
 async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
     use trawl_cli::cli::{ConnectionParams, OutputFormat};
@@ -3350,7 +2933,6 @@ async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
         max_ambiguous_rows: None,
     };
     let mut out = Vec::new();
-    // The CLI future borrows `out`, so it lives in this block.
     let result = {
         let mut cli = std::pin::pin!(run_repin(
             &mut out,
@@ -3386,14 +2968,10 @@ async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
     assert!(text.contains("succeeded"), "{text}");
 }
 
-/// `GET /schema/repin/status?id=<id>` with `token`, raw, so a test sees the
-/// status code and body the route gives for that id.
 async fn status_by_id(h: &Harness, token: &str, id: i64) -> (u16, serde_json::Value) {
     status_with_query(h, token, &format!("id={id}")).await
 }
 
-/// `GET /api/v1/schema/repin/status?<query>`, for a query no well-formed
-/// id produces.
 async fn status_with_query(h: &Harness, token: &str, query: &str) -> (u16, serde_json::Value) {
     let resp = common::harness_client_builder()
         .build()
@@ -3410,15 +2988,12 @@ async fn status_with_query(h: &Harness, token: &str, query: &str) -> (u16, serde
     (status, resp.json().await.expect("a JSON body"))
 }
 
-/// A key holding `trawl:schema_write` and nothing else: the one grant the
-/// repin trigger requires.
 async fn schema_write_only_token(h: &Harness) -> String {
     seed_schema_write_only_role(h).await;
     mint_schema_write_only_key(h, "schema-writer").await
 }
 
-/// The role [`mint_schema_write_only_key`] mints under: `trawl:schema_write`
-/// alone. Seed it once per harness.
+/// Seed it once per harness.
 async fn seed_schema_write_only_role(h: &Harness) {
     fleet_auth::KeyStore::from_pool(h.server.fleet_pool.clone())
         .create_role(
@@ -3430,7 +3005,6 @@ async fn seed_schema_write_only_role(h: &Harness) {
         .expect("seed a write-only role");
 }
 
-/// Mint a key named `name` under the write-only role, and return its token.
 async fn mint_schema_write_only_key(h: &Harness, name: &str) -> String {
     fleet_auth::KeyStore::from_pool(h.server.fleet_pool.clone())
         .create_key(
@@ -3445,15 +3019,6 @@ async fn mint_schema_write_only_key(h: &Harness, name: &str) -> String {
         .to_string()
 }
 
-/// Start a `status` → VARCHAR dry run through `client` whose scan holds at
-/// its first file, and return the 202 the trigger answers once its bound
-/// passes, with the hold's guard. The caller releases it, and dropping it
-/// unreleased frees the scan.
-///
-/// Runs on a paused clock, steps 2 to 4 of the frozen answer-bound order:
-/// the claim lands and the scan holds ([`drive_to_the_held_scan`]), the
-/// trigger is unanswered short of the bound, and only the clock passing
-/// the bound answers it, while the scan is still held.
 async fn held_dry_run_past_the_bound(h: &Harness, client: &HttpClient) -> (RepinJobResponse, Hold) {
     let hold = Hold::in_scan();
     let mut request = std::pin::pin!(client.schema_repin(
@@ -3468,7 +3033,6 @@ async fn held_dry_run_past_the_bound(h: &Harness, client: &HttpClient) -> (Repin
     assert_unanswered_on_the_frozen_clock(h, &mut request).await;
 
     pass_the_answer_bound().await;
-    // Waits for: the trigger's answer, with the scan still held.
     let answered = frozen("the trigger answers past its bound", &mut request)
         .await
         .expect("an admitted dry run answers with its row");
@@ -3485,15 +3049,6 @@ async fn held_dry_run_past_the_bound(h: &Harness, client: &HttpClient) -> (Repin
     }
 }
 
-/// A dry run answered 202 is followed by its own id. Without one the
-/// status route answers the running job, else the newest, so once the
-/// followed scan finishes and another job claims the freed slot, only the
-/// id still names the report the client is owed. An id the store never
-/// issued is the API's ordinary 404.
-///
-/// On a frozen clock, through [`held_dry_run_past_the_bound`]: the second
-/// job's claim and held scan are in place before its 202 and before any
-/// read below.
 #[tokio::test]
 async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_slot() {
     let h = answer_bound_harness().await;
@@ -3562,12 +3117,6 @@ async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_sl
     h.frozen_terminal(second.id).await;
 }
 
-/// The trigger needs `schema_write` alone, so following its own job needs
-/// no more: a key holding only that grant reads a job by its id. The
-/// unscoped status read, which shows whatever job is in the slot, keeps
-/// needing `schema_read`.
-///
-/// On a frozen clock, through [`held_dry_run_past_the_bound`].
 #[tokio::test]
 async fn a_schema_write_only_key_follows_its_dry_run_by_id() {
     let h = answer_bound_harness().await;
@@ -3597,13 +3146,6 @@ async fn a_schema_write_only_key_follows_its_dry_run_by_id() {
     }
 }
 
-/// A write-only key reads the jobs it requested and nothing else. A job
-/// another key requested, a job from before the key existed and an id the
-/// store never issued answer it the same 404 response, so a `schema_write`
-/// grant cannot read the durable job rows of other keys by id. Job ids are
-/// sequential, so an id's existence is not a secret; the rule protects the
-/// rows' contents. A `schema_read` key reads any job by id, and the
-/// unscoped read stays `schema_read` only.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_schema_write_only_key_reads_only_the_jobs_it_requested() {
     let h = harness().await;
@@ -3656,13 +3198,6 @@ async fn a_schema_write_only_key_reads_only_the_jobs_it_requested() {
     }
 }
 
-/// The CLI half of the write-only rule: `trawl schema repin --dry-run` run
-/// with a key holding only `schema_write` follows its 202 to the report and
-/// exits 0, as the same dry run answered inside the bound does.
-///
-/// On a frozen clock: the claim lands and the scan holds, the trigger is
-/// unanswered short of the bound, and the hold is released only once the
-/// server has answered past it, so the CLI's answer is the 202.
 #[tokio::test]
 async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
     use trawl_cli::cli::{ConnectionParams, OutputFormat};
@@ -3692,7 +3227,6 @@ async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
         max_ambiguous_rows: None,
     };
     let mut out = Vec::new();
-    // The CLI future borrows `out`, so it lives in this block.
     let result = {
         let mut cli = std::pin::pin!(run_repin(
             &mut out,
@@ -3720,15 +3254,6 @@ async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
     assert!(text.contains("succeeded"), "{text}");
 }
 
-/// The CLI follows its dry run by id, so a newer job cannot stand in for
-/// it. The followed scan is released while the CLI waits out its poll
-/// interval, and a second dry run claims the freed slot before the CLI
-/// polls again. The CLI still prints the first job's report.
-///
-/// On a frozen clock the CLI's poll sleep cannot fire, and the test lets
-/// the clock run again only once the second job's claim row exists and its
-/// scan holds. So every read the CLI makes after its 202 finds the slot
-/// taken by the newer job.
 #[tokio::test]
 async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
     use trawl_cli::cli::{ConnectionParams, OutputFormat};
@@ -3758,7 +3283,6 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
     };
     let store = h.server.state.storage.repin.clone();
     let mut out = Vec::new();
-    // The CLI future borrows `out`, so it lives in this block.
     let (result, first_id, second_id, second, second_hold) = {
         let mut cli = std::pin::pin!(run_repin(
             &mut out,
@@ -3827,7 +3351,6 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
         pass_the_answer_bound().await;
         await_the_late_answer(&h).await;
 
-        // Only now does the clock move the CLI's poll.
         let result = follow_the_cli_on_real_time(&mut cli).await;
         (result, first.id, running.id, second, second_hold)
     };
@@ -3836,7 +3359,6 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
     // its response head was produced before the CLI was stepped, so its
     // answer is the 202.
     second_hold.release();
-    // Waits for: the second trigger's 202 to reach its client.
     match frozen("the second trigger answers", second)
         .await
         .expect("the second trigger's task")
@@ -3855,11 +3377,6 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
     );
 }
 
-/// The answer bound covers the claim. With the claim's insert held behind
-/// a table lock past `timeout_secs`, the request answers 503 at the bound
-/// instead of waiting for the claim. The claim that lands later finds
-/// nobody waiting and ends its job `blocked` before any scan, so no repin
-/// runs from a request the server refused, and the slot frees.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_claim_still_pending_at_the_bound_answers_503_and_its_late_job_never_scans() {
     use sqlx::Connection as _;
@@ -3949,16 +3466,6 @@ async fn a_claim_still_pending_at_the_bound_answers_503_and_its_late_job_never_s
     }
 }
 
-/// Past the bound the trigger answers with the claimed row it already
-/// holds and reads nothing more. With every `repin_jobs` read held behind
-/// a table lock once the claim has landed, the 202 still arrives at the
-/// bound and names the job.
-///
-/// On a frozen clock: the claim lands and the scan holds, the lock is
-/// taken, the trigger is unanswered short of the bound, and only then does
-/// the clock pass the bound. The lock is held until the answer arrives, so
-/// an answer that read the job row after its bound would block on it and
-/// never arrive, and the hang guard is the only bound.
 #[tokio::test]
 async fn a_late_answer_reads_no_job_row_after_its_bound() {
     use sqlx::Connection as _;
@@ -3981,7 +3488,6 @@ async fn a_late_answer_reads_no_job_row_after_its_bound() {
     ));
     let claimed = drive_to_the_held_scan(&h, &mut request).await;
 
-    // Waits for: the LOCK statement's return, which is the lock acquired.
     let mut conn = frozen(
         "connect the app db",
         sqlx::postgres::PgConnection::connect(&h.server.app_db_url),
@@ -3996,11 +3502,9 @@ async fn a_late_answer_reads_no_job_row_after_its_bound() {
     .await
     .expect("hold every read");
 
-    // The anchored negative, with the lock held.
     assert_unanswered_on_the_frozen_clock(&h, &mut request).await;
 
     pass_the_answer_bound().await;
-    // Waits for: the trigger's answer, with every job row read locked out.
     let answered = frozen("the late answer, with the job rows locked", &mut request).await;
     frozen("release the reads", lock.rollback())
         .await
@@ -4019,13 +3523,6 @@ async fn a_late_answer_reads_no_job_row_after_its_bound() {
     assert_eq!(report.status, RepinJobStatus::Succeeded, "{report:?}");
 }
 
-/// Requests that go away before their claim leave at most one claim in
-/// flight. The first request takes the repin permit, its claim waits
-/// behind a table lock, and its caller drops it there. Fifteen more
-/// requests are refused at once with 409 and claim nothing, and postgres
-/// shows one claim waiting on the lock. That claim lands once the lock
-/// goes, finds nobody to answer, and ends its job `blocked` before any
-/// scan.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one held claim, sixteen requests, and the job they leave
 async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
@@ -4146,12 +3643,6 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
     }
 }
 
-/// A scan that panics answers the request as a panic, not as an ordinary
-/// internal error (ADR-0040). The decision task itself completes normally
-/// around the panicked blocking step, so the request only hears "panic"
-/// if the step's failure stays typed up to it. The stored job error keeps
-/// its fixed text, the wire keeps the redacted 500 every internal error
-/// gets, and the payload reaches none of them.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scan_panic_reaches_the_request_as_a_panic() {
     use trawl_server::error::ServerError;
@@ -4194,7 +3685,6 @@ async fn a_scan_panic_reaches_the_request_as_a_panic() {
         assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
     }
 
-    // The wire answer is the redacted 500 an internal error gets.
     TEST_PANIC_IN_SCAN.store(true, Ordering::SeqCst);
     match h
         .schema_admin
@@ -4221,14 +3711,6 @@ async fn a_scan_panic_reaches_the_request_as_a_panic() {
     assert_eq!(h.pinned_type("status").await, "BIGINT");
 }
 
-/// AC3: past the point of no return a cancel is refused, not queued. The
-/// job latched before the Cutover marker went down, so there is nothing
-/// left to unwind, and the refusal writes nothing to the row, because a
-/// request that took no effect must not read as one that did.
-///
-/// Held between the marker write and the first env swap, the window the
-/// refusal exists for; it is two renames wide in production, so a test
-/// aiming at it by timing would be asserting on its own scheduler.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_past_the_point_of_no_return_is_refused_and_the_job_completes() {
     let h = hang_guard_harness().await;
@@ -4286,7 +3768,6 @@ async fn a_cancel_past_the_point_of_no_return_is_refused_and_the_job_completes()
     assert_eq!(done.cancel_requested_at, None);
     assert_eq!(done.cancelled_by, None);
 
-    // Forward: the corpus is the new generation and the pin agrees.
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
     assert_eq!(h.count("last=1h | stats count()").await, 2);
     assert_eq!(h.count("status>=400 last=1h | stats count()").await, 1);
@@ -4296,13 +3777,6 @@ async fn a_cancel_past_the_point_of_no_return_is_refused_and_the_job_completes()
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 }
 
-/// AC4: a process that dies between an accepted cancel request and any
-/// boundary observing it recovers as `failed`, never `cancelled`.
-///
-/// `cancelled` is a live-process word: it means a file boundary saw the
-/// request and the unwind actually ran. Recovery cannot know that, and it
-/// must not infer it from `cancel_requested_at`, so the request fields
-/// survive as the audit trail they are, beside a `failed` verdict.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crash_between_a_cancel_request_and_its_effect_recovers_as_failed() {
     let h = harness().await;
@@ -4355,7 +3829,6 @@ async fn a_crash_between_a_cancel_request_and_its_effect_recovers_as_failed() {
     )
     .unwrap();
 
-    // Both halves of boot recovery, in the order a boot runs them.
     let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
         .unwrap()
         .expect("marker present");
@@ -4388,18 +3861,12 @@ async fn a_crash_between_a_cancel_request_and_its_effect_recovers_as_failed() {
     assert!(!shadow.exists(), "the disposable shadow is swept");
     assert!(!trawl_server::repin::marker_path(&data).exists());
 
-    // The one-running slot is free: the next repin is claimed, not 409ed.
     let next = store.claim(claim).await.expect("the slot is free again");
     assert_ne!(next, job_id);
 }
 
-/// AC5: the audit trail an operator reads after the fact: the request, the
-/// effect (with the stage it landed in), and the refusal, plus the one event
-/// boot recovery must NOT emit.
-///
 /// One test rather than three: the capture layer is a global subscriber and
-/// only the first installer in a process wins, so the three paths have to
-/// share it.
+/// only the first installer in a process wins.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // three cancel paths, one subscriber
 async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
@@ -4420,7 +3887,6 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
             .await;
     }
 
-    // (1) A build-stage cancel: request, then effect.
     let hold = Hold::at_progress();
     let cancelled = match h
         .schema_admin
@@ -4479,7 +3945,6 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
     );
     assert_key_prefix(&effect, &h.server.schema_admin_prefix);
 
-    // (2) A refusal past the point of no return.
     h.wait_idle().await;
     let hold = Hold::past_no_return();
     let completing = match h
@@ -4513,9 +3978,6 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
     assert_key_prefix(&refused, &h.server.schema_admin_prefix);
     assert!(refused.fields["job_id"].contains(&completing.id.to_string()));
 
-    // (3) Boot recovery over a crash-after-request state emits no
-    // `repin_cancelled`: nothing observed the request, so nothing may claim
-    // the unwind ran.
     let effects_before = capture.count("repin_cancelled");
     let store = h.server.state.storage.repin.clone();
     let job_id = store
@@ -4574,14 +4036,6 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
     );
 }
 
-/// Build a corpus whose pre-build scan is lossless and whose finished
-/// shadow is not: an all-numeric-text `dur` column under a VARCHAR pin,
-/// held at the build's first published progress so the test can compact a
-/// value BIGINT cannot read into the catch-up's path.
-///
-/// Returns the started job and the guard of its progress hold. The caller
-/// owns the release and whatever barrier it wants next; dropping the guard
-/// unreleased frees the job.
 async fn start_a_repin_the_finished_shadow_will_refuse(h: &Harness) -> (RepinJobResponse, Hold) {
     // Pin VARCHAR on a text value, then retire the file that carried it:
     // what is left is all numeric text, so the scan projects no loss.
@@ -4628,13 +4082,6 @@ async fn start_a_repin_the_finished_shadow_will_refuse(h: &Harness) -> (RepinJob
     (started, hold)
 }
 
-/// R3-1: a cancel pending when the finished-shadow force refusal settles
-/// wins. The operator asked for a stop and got a 202; parking the job as
-/// `refused_needs_force` instead would be an accepted cancel silently
-/// ignored, and nothing latched a point of no return to justify it.
-///
-/// Both verdicts leave the corpus untouched, so nothing is at stake on
-/// disk. What is at stake is whether a 202 means anything.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_pending_at_the_force_refusal_takes_the_verdict() {
     let h = hang_guard_harness().await;
@@ -4670,7 +4117,6 @@ async fn a_cancel_pending_at_the_force_refusal_takes_the_verdict() {
         "{error}"
     );
 
-    // The unwind ran either way: old pin, every row, no staging.
     assert_eq!(h.pinned_type("dur").await, "VARCHAR");
     assert_eq!(h.count("last=1h | stats count()").await, 3);
     assert_eq!(
@@ -4683,10 +4129,6 @@ async fn a_cancel_pending_at_the_force_refusal_takes_the_verdict() {
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 }
 
-/// The other side of R3-1: a refusal that settled first keeps its verdict,
-/// and the cancel that arrives afterwards is told there is nothing running
-/// (404). Arbitration decides one way or the other under the registry
-/// lock, so a late request cannot rewrite a settled row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_after_the_force_refusal_settled_finds_nothing_to_stop() {
     let h = hang_guard_harness().await;
@@ -4716,15 +4158,6 @@ async fn a_cancel_after_the_force_refusal_settled_finds_nothing_to_stop() {
     assert_eq!(h.pinned_type("dur").await, "VARCHAR");
 }
 
-/// A tracing capture layer over the events this file asserts on.
-///
-/// Its own copy rather than a shared one: `tests/common` is compiled into
-/// every integration binary in the crate, and a helper only this file uses
-/// would be dead code in all the others.
-/// Every cancel audit event names the key prefix beside the display name
-/// (#109 review F3). The name is operator-chosen and can be reused or
-/// renamed; the prefix is what identifies the credential that acted, so an
-/// event carrying only the name cannot answer "which key was this".
 fn assert_key_prefix(event: &audit_capture::Captured, prefix: &str) {
     let seen = event
         .fields
@@ -4741,7 +4174,6 @@ mod audit_capture {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// One captured event: its fields, stringified.
     #[derive(Debug, Clone)]
     pub struct Captured {
         pub fields: BTreeMap<String, String>,
@@ -4767,14 +4199,10 @@ mod audit_capture {
                 .collect()
         }
 
-        /// How many of `event_type` have been captured so far.
         pub fn count(&self, event_type: &str) -> usize {
             self.matching(event_type).len()
         }
 
-        /// The first `event_type` captured, waiting for it under the hang
-        /// guard: the request audit is written by a detached task, so its
-        /// arrival is ordered after the 202 rather than with it.
         pub async fn await_event(&self, event_type: &str) -> Option<Captured> {
             let start = std::time::Instant::now();
             while start.elapsed() < super::HANG_GUARD {
@@ -4811,11 +4239,6 @@ mod audit_capture {
     }
 }
 
-// -- force ceilings (#111) ---------------------------------------------------
-//
-// A forced job records a ceiling per dimension, and both gates enforce it.
-// These tests exercise the request surface and direct engine execution.
-
 impl Harness {
     fn engine(&self) -> std::sync::Arc<RepinEngine> {
         self.server
@@ -4825,8 +4248,6 @@ impl Harness {
             .expect("an ingest-enabled node owns a repin engine")
     }
 
-    /// The job row itself. The accepted ceilings are persisted state, not
-    /// wire state, until the wire carries them.
     async fn job_row(&self, id: i64) -> trawl_server::store::RepinJob {
         self.server
             .state
@@ -4839,8 +4260,6 @@ impl Harness {
     }
 }
 
-/// A field pinned VARCHAR whose values are `numeric` text plus `lossy`
-/// unreadable ones. Returns nothing; the pin is asserted here.
 async fn varchar_corpus(h: &Harness, numeric: &[&str], lossy: &[&str]) {
     let mut events = Vec::new();
     for v in numeric {
@@ -4853,13 +4272,6 @@ async fn varchar_corpus(h: &Harness, numeric: &[&str], lossy: &[&str]) {
     assert_eq!(h.pinned_type("dur").await, "VARCHAR");
 }
 
-/// The ceilings travel over HTTP, both ways (issue #111 M5).
-///
-/// Every other ceiling test drives the engine directly, so nothing yet
-/// proves the request fields reach it or that the resolved pair comes back.
-/// This one goes through the client: a forced dry run stating zero comes
-/// back refused, echoing what it asked for beside what the job was held to.
-/// The CLI reads exactly those two fields to restate a preview's numbers.
 #[tokio::test(flavor = "multi_thread")]
 async fn stated_ceilings_travel_over_the_wire_and_the_accepted_pair_returns() {
     let h = harness().await;
@@ -4887,18 +4299,14 @@ async fn stated_ceilings_travel_over_the_wire_and_the_accepted_pair_returns() {
     assert_eq!(report.max_nulled_rows, Some(0), "the request echoes back");
     assert_eq!(report.max_ambiguous_rows, None, "unstated stays absent");
     assert_eq!(report.accepted_max_nulled_rows, Some(0), "explicit wins");
-    // The unstated half is the scan-derived default, never "unlimited".
     assert!(
         report.accepted_max_ambiguous_rows.is_some(),
         "an unstated ceiling still resolves: {report:?}"
     );
-    // One unreadable row against a ceiling of zero: the executing request
-    // would refuse, and the dry run says so through the same decision.
     assert_eq!(report.requires_force, Some(true));
     let reason = report.requires_force_reason.expect("a reason");
     assert!(reason.contains("accepted 0"), "{reason}");
 
-    // A ceiling without force is a request that means nothing: 400.
     let err = h
         .schema_admin
         .schema_repin(
@@ -4917,9 +4325,6 @@ async fn stated_ceilings_travel_over_the_wire_and_the_accepted_pair_returns() {
     assert!(format!("{err}").contains("400"), "{err}");
 }
 
-/// The accepted number itself passes. One unreadable row against a ceiling
-/// of exactly one is what force said it would tolerate, so the cutover runs
-/// and the accepted pair is on the job row for anyone auditing it later.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forced_repin_proceeds_at_exactly_the_ceiling_it_accepted() {
     let h = harness().await;
@@ -4964,10 +4369,6 @@ async fn a_forced_repin_proceeds_at_exactly_the_ceiling_it_accepted() {
     );
 }
 
-/// One row past the accepted ceiling is a refusal, and it names both
-/// numbers: an operator whose next move is to re-run with a corrected flag
-/// needs to see what the corpus actually holds, not just that it was too
-/// much.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_ceiling_below_the_corpus_refuses_naming_accepted_and_actual() {
     let h = harness().await;
@@ -5009,9 +4410,6 @@ async fn a_ceiling_below_the_corpus_refuses_naming_accepted_and_actual() {
     );
 }
 
-/// `--max-nulled-rows 0` is a statement, not a mistake: force the ambiguity,
-/// accept no loss. It refuses at the SCAN gate, so the job never stages a
-/// byte — the whole point of asking the question before the build.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_explicit_zero_ceiling_refuses_before_anything_is_staged() {
     let h = harness().await;
@@ -5049,11 +4447,6 @@ async fn an_explicit_zero_ceiling_refuses_before_anything_is_staged() {
     assert_eq!(row.accepted_max_nulled_rows, Some(0));
 }
 
-/// Force with no numbers attached resolves the ceiling from this job's own
-/// scan: 10% headroom over a floor of ten rows. On a corpus this small the
-/// floor is the binding term (one projected null buys eleven), and it is
-/// what lets the ordinary "read the plan, accept it" path survive the drift
-/// a live install produces while the build runs.
 #[tokio::test(flavor = "multi_thread")]
 async fn boolean_force_resolves_the_ceiling_from_the_scan() {
     let h = harness().await;
@@ -5090,8 +4483,6 @@ async fn boolean_force_resolves_the_ceiling_from_the_scan() {
         "a zero-count dimension is still the floor, never unlimited"
     );
 
-    // And the resolved ceiling is a ceiling that works: the same repin,
-    // executed, is well inside it.
     let started = match engine
         .start(
             "dur",
@@ -5114,10 +4505,6 @@ async fn boolean_force_resolves_the_ceiling_from_the_scan() {
     assert_eq!(h.pinned_type("dur").await, "BIGINT");
 }
 
-/// The ceiling is enforced at the finished shadow too, which is the case it
-/// exists for. A lossless plan is forced with the default ceiling of ten;
-/// eleven unreadable rows land while the build runs, the catch-up folds them
-/// in, and the cutover is refused with the corpus at its old generation.
 #[tokio::test(flavor = "multi_thread")]
 async fn mid_build_growth_past_the_default_ceiling_refuses_the_cutover() {
     let h = harness().await;
@@ -5195,7 +4582,6 @@ async fn mid_build_growth_past_the_default_ceiling_refuses_the_cutover() {
          verdict and its evidence cannot disagree on the wire"
     );
 
-    // Corpus untouched: old pin, every row, no staging left behind.
     assert_eq!(h.pinned_type("dur").await, "VARCHAR");
     assert_eq!(h.count("last=1h | stats count()").await, 17);
     assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
@@ -5203,10 +4589,6 @@ async fn mid_build_growth_past_the_default_ceiling_refuses_the_cutover() {
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 }
 
-/// A forced cutover leaves an audit record naming both pairs: what force
-/// accepted, and what the rewrite actually did. It is emitted only for a
-/// forced job that reached the cutover, so an unforced repin and a refused
-/// one leave nothing.
 #[tokio::test(flavor = "multi_thread")]
 // Three jobs in one body: the capture layer is a global subscriber, so the
 // forced, refused and unforced cases have to share a process to prove the
@@ -5229,7 +4611,6 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
     varchar_corpus(&h, &["12"], &["oops"]).await;
     let engine = h.engine();
 
-    // A refusal reaches no cutover, so it records nothing.
     let refused = match engine
         .start(
             "dur",
@@ -5250,7 +4631,6 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
         other => panic!("expected a refusal, got {other:?}"),
     };
 
-    // The forced repin that does cut over.
     let forced = match engine
         .start(
             "dur",
@@ -5270,7 +4650,6 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
     let done = h.wait_terminal(forced.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
 
-    // An unforced, lossless repin of a different field.
     h.ingest_and_compact(&[event("api", &json!({"code": 200}))])
         .await;
     assert_eq!(h.pinned_type("code").await, "BIGINT");
@@ -5326,12 +4705,9 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
     );
     assert!(refused.error.is_some(), "the refused job kept its reason");
 
-    // The other place a cutover completes: boot recovery. A crash between
-    // the swap and the pin flip leaves the marker, and the replay finishes
-    // the flip — including the ack clear, which owes the same audit record
-    // the live path emits. `code` stands at VARCHAR, where the unforced
-    // repin above left it, and the claim proves that pin (#110), so the
-    // recovered job is the trip back to BIGINT.
+    // The other place a cutover completes: boot recovery. The replay finishes
+    // the flip, including the ack clear, which owes the same audit record
+    // the live path emits.
     let catalog = &h.server.state.storage.catalog;
     for _ in 0..3 {
         catalog
@@ -5416,8 +4792,6 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
     assert_eq!(cleared[0].field("job_id"), recovered_job.to_string());
     assert!(catalog.degraded_ack("code").await.unwrap().is_none());
 
-    // The replay: the job is already `succeeded`, so the flip completes
-    // nothing, clears nothing and announces nothing.
     replay(replay_marker).await;
     assert_eq!(
         capture
@@ -5428,8 +4802,6 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
     );
 }
 
-// -- the job generation the capacity samples read (ADR-0042) ----------------
-
 use trawl_server::repin::JobReading;
 
 impl Harness {
@@ -5437,13 +4809,9 @@ impl Harness {
         self.server.state.repin_jobs.read()
     }
 
-    /// Wait for the job generation to read idle, then check the job's disk
-    /// work was already done by then: the guard ends after the job's last
-    /// cleanup, so no marker and no staging root may outlive it. Polled
-    /// from the job's release, not from its terminal row: a success row
+    /// Polled from the job's release, not from its terminal row: a success row
     /// lands before the post-cutover sweep, the gauge reset and the outcome
-    /// count, and the generation guard drops after all three. The bound is
-    /// a hang guard on the real clock.
+    /// count, and the generation guard drops after all three.
     async fn await_jobs_idle(&self) -> JobReading {
         let start = std::time::Instant::now();
         while start.elapsed() < HANG_GUARD {
@@ -5459,10 +4827,6 @@ impl Harness {
         panic!("the repin job generation never read idle again within {HANG_GUARD:?}");
     }
 
-    /// Start a `status` BIGINT → VARCHAR repin over a three-service corpus
-    /// and hold it at its first published progress: the shadow and the
-    /// marker exist, and the job runs until its guard releases it (dropping
-    /// the guard unreleased frees it too).
     async fn start_a_held_repin(&self) -> (RepinJobResponse, Hold) {
         for svc in ["api", "web", "worker"] {
             self.ingest_and_compact(&[
@@ -5497,16 +4861,12 @@ impl Harness {
     }
 }
 
-/// A held job reads in flight: one running, one generation step past idle.
 fn assert_one_job_running(running: JobReading, idle: JobReading) {
     assert!(running.in_flight());
     assert_eq!(running.running(), 1);
     assert_eq!(running.changes_since(idle), 1);
 }
 
-/// A completed job enters the generation for its build and leaves it
-/// after the post-cutover sweep. A dry run only reads the corpus, so it
-/// never enters it.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_repin_job_generation_brackets_a_completed_job() {
     let h = hang_guard_harness().await;
@@ -5528,8 +4888,6 @@ async fn the_repin_job_generation_brackets_a_completed_job() {
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
 }
 
-/// A job cancelled mid-build leaves the generation after its abandon
-/// sweep has removed the shadow and the marker.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_repin_job_generation_brackets_a_cancelled_job() {
     let h = hang_guard_harness().await;
@@ -5548,8 +4906,6 @@ async fn the_repin_job_generation_brackets_a_cancelled_job() {
     assert_eq!(h.pinned_type("status").await, "BIGINT");
 }
 
-/// A job the finished shadow refuses leaves the generation after its
-/// abandon sweep, like a cancelled one.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_repin_job_generation_brackets_a_refused_job() {
     let h = hang_guard_harness().await;
@@ -5567,28 +4923,20 @@ async fn the_repin_job_generation_brackets_a_refused_job() {
     assert_eq!(h.pinned_type("dur").await, "VARCHAR");
 }
 
-// -- one repin job's work at a time (#345) -----------------------------------
-
 use trawl_server::repin::{CancelActor, CancelVerdict, JobHold, JobHolds};
 
-/// What a repin request answers while an earlier job still holds the
-/// engine's repin permit.
 const PERMIT_HELD: &str =
     "the previous repin is still running or still cleaning up its staging; retry when it finishes";
 
-/// Which of the engine's job holds an [`EngineHold`] owns.
 #[derive(Debug, Clone, Copy)]
 enum HoldPoint {
     BeforePostSwapSweep,
     BeforePermitRelease,
 }
 
-/// Owner of one armed job hold on an engine (`trawl_server::repin::holds`).
-///
-/// Dropping it disarms the hold, which also frees a job it holds now, so a
-/// failing test never leaves a job held, least of all on a blocking-pool
-/// thread the runtime waits for at teardown. Bind it as a local of the test
-/// body, so unwinding drops it before the runtime does.
+/// Dropping it disarms the hold, which also frees a job it holds now. Bind
+/// it as a local of the test body, so unwinding drops it before the runtime
+/// does.
 struct EngineHold {
     engine: std::sync::Arc<RepinEngine>,
     point: HoldPoint,
@@ -5612,7 +4960,6 @@ impl EngineHold {
         }
     }
 
-    /// Wait for a job to reach the hold, and return the job's id.
     async fn reached(&self) -> i64 {
         let what = format!("a repin job reaches {:?}", self.point);
         trawl_server::test_timing::until(&what, || self.hold().held_job().is_some()).await;
@@ -5630,10 +4977,6 @@ impl Drop for EngineHold {
     }
 }
 
-/// What a refused repin must leave as it found it: the job rows, the
-/// marker, both staging roots, the rollup pause and the cancel registry's
-/// owner. The newest row is compared by its debug form, which carries
-/// every column.
 #[derive(Debug, PartialEq)]
 struct RepinOwnership {
     rows: i64,
@@ -5645,8 +4988,6 @@ struct RepinOwnership {
     cancel_owner: CancelVerdict,
 }
 
-/// The files under a staging root, relative to it, or `None` when the root
-/// is absent.
 fn staging_listing(root: &std::path::Path) -> Option<Vec<String>> {
     if !root.exists() {
         return None;
@@ -5704,7 +5045,6 @@ impl Harness {
         }
     }
 
-    /// A `status` → `BIGINT` repin over HTTP, with how long it took.
     async fn repin_to_bigint(
         &self,
         dry_run: bool,
@@ -5727,16 +5067,11 @@ impl Harness {
         (answer, asked.elapsed())
     }
 
-    /// The route refuses a repin with 409 because job `owner` holds the
-    /// permit, and answers inside its bound rather than with the 503 a
-    /// request answers when the bound passes first.
     async fn assert_route_refuses(&self, owner: i64, dry_run: bool) {
         let (answer, took) = self.repin_to_bigint(dry_run).await;
         assert_permit_refusal(owner, dry_run, &answer, took);
     }
 
-    /// `RepinEngine::start` refuses a repin because job `owner` holds the
-    /// permit.
     async fn assert_engine_refuses(&self, owner: i64, dry_run: bool) {
         use trawl_server::error::ServerError;
 
@@ -5787,8 +5122,7 @@ fn assert_permit_refusal(
     );
 }
 
-/// The stored type of `status` and its values, sorted, in one parquet
-/// file. Read per file, so a mixed-type corpus cannot hide behind a union.
+/// Read per file, so a mixed-type corpus cannot hide behind a union.
 fn stored_status(file: &std::path::Path) -> (String, Vec<i64>) {
     let conn = duckdb::Connection::open_in_memory().expect("duckdb");
     let path = file.to_string_lossy().replace('\'', "''");
@@ -5814,21 +5148,6 @@ fn stored_status(file: &std::path::Path) -> (String, Vec<i64>) {
     (stored, values)
 }
 
-/// AC1-AC4 (#345): one repin job's work runs at a time, from before its
-/// claim to after its last staging deletion.
-///
-/// Job A's row turns `succeeded` inside the cutover, and the database's
-/// one-running slot frees with it, while A still owns its staging. A is
-/// held inside its post-swap sweep, with the Cleanup marker written and
-/// both exclusion guards dropped. A second repin must be refused there,
-/// over the route and through the engine, as a real run and as a dry run,
-/// without touching anything A owns. It must still be refused once A's
-/// sweep has removed the marker, until A's task gives the permit up. Then
-/// a second repin runs, and the corpus it leaves is read file by file.
-///
-/// Without the permit the first probe is admitted. The test then shows
-/// what that costs before it fails: the second job is held mid-build, A's
-/// sweep runs, and A deletes the second job's marker and shadow.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one held job, eight refusals, and the job that follows
 async fn cleanup_excludes_next_repin_until_owner_release() {
@@ -5875,8 +5194,6 @@ async fn cleanup_excludes_next_repin_until_owner_release() {
         "job A is held before its sweep"
     );
 
-    // The window: A's row is terminal, the pin is flipped, and A still owns
-    // the Cleanup marker and both staging roots.
     assert_eq!(h.repin_row(a.id).await.status, RepinJobStatus::Succeeded);
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
     let marker = trawl_server::repin::marker::read_marker(&h.data_dir)
@@ -5930,8 +5247,6 @@ async fn cleanup_excludes_next_repin_until_owner_release() {
         "a refused repin changed what job A owns"
     );
 
-    // Past the sweep: A's staging is gone and its guards are dropped, and
-    // A's task still holds the permit.
     sweep.release();
     assert_eq!(permit.reached().await, a.id, "job A ends its task");
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
@@ -5949,8 +5264,6 @@ async fn cleanup_excludes_next_repin_until_owner_release() {
     h.assert_engine_refuses(a.id, true).await;
     assert_eq!(h.repin_ownership().await.rows, rows, "no refusal claims");
 
-    // Released: the next repin runs, and every file it leaves stores the
-    // values as BIGINT.
     permit.release();
     h.wait_idle().await;
     let b = match h.repin_to_bigint(false).await.0.expect("start job B") {
@@ -5984,27 +5297,19 @@ async fn cleanup_excludes_next_repin_until_owner_release() {
     }
 }
 
-// -- admission refusals over leftover staging (#345) --------------------------
-
-/// What a repin request answers over a shadow root no marker names.
 const SHADOW_LEFT: &str =
     "a repin shadow root remains with no marker; restart trawld and boot removes it";
 
-/// What a repin request answers over an aside root no marker names.
 const ASIDE_LEFT: &str = "a repin aside root remains with no marker, and trawld never deletes \
                           one without a marker; remove the data root's .repin-aside sibling by \
                           hand, then retry";
 
-/// What a repin request answers when the staging state cannot be read.
 const STAGING_UNREADABLE: &str = "the repin staging state could not be read, so no repin can \
                                   start; the server log names the error";
 
-/// What a bounded request answers when its bound passes before its claim.
 const UNCLAIMED_AT_BOUND: &str = "the repin request could not claim a job within [server] \
                                   timeout_secs, so no repin runs from it; retry the repin";
 
-/// What a repin request answers over the marker job `job_id` left in
-/// `phase`.
 fn marker_left(job_id: i64, phase: &str) -> String {
     format!(
         "repin job {job_id} did not finish cleaning up (its marker stands in phase {phase}); \
@@ -6014,7 +5319,6 @@ fn marker_left(job_id: i64, phase: &str) -> String {
 }
 
 impl Harness {
-    /// A `status` repin to `to` through `RepinEngine::start`.
     async fn engine_repin(
         &self,
         to: &str,
@@ -6033,9 +5337,6 @@ impl Harness {
             .await
     }
 
-    /// The route refuses a `status` repin to `to` with `status` and
-    /// `message`, inside its bound, and no part of the answer names a path
-    /// under the test's root.
     async fn assert_route_answers(&self, to: &str, dry_run: bool, status: u16, message: &str) {
         let asked = std::time::Instant::now();
         let answer = self
@@ -6065,8 +5366,6 @@ impl Harness {
         );
     }
 
-    /// `RepinEngine::start` refuses a `status` repin to `to` with 409 and
-    /// `message`, and the message names no path.
     async fn assert_engine_conflict(&self, to: &str, dry_run: bool, message: &str) {
         match self.engine_repin(to, dry_run).await {
             Err(trawl_server::error::ServerError::Conflict(got)) => {
@@ -6080,8 +5379,6 @@ impl Harness {
         }
     }
 
-    /// Neither the data root nor the directory it lives in appears in
-    /// `text`: a refusal names the staging by role, never by path.
     fn assert_names_no_path(&self, text: &str) {
         let root = self.data_dir.parent().expect("the data root has a parent");
         for path in [&self.data_dir, &root.to_path_buf()] {
@@ -6090,8 +5387,6 @@ impl Harness {
         }
     }
 
-    /// The refusal left everything as `before` found it, and that is a
-    /// state with no job running: no pause, no armed cancel, no marker.
     async fn assert_refusal_wrote_nothing(&self, before: &RepinOwnership) {
         let after = self.repin_ownership().await;
         assert_eq!(&after, before, "a refused repin changed the repin state");
@@ -6107,7 +5402,6 @@ impl Harness {
         );
     }
 
-    /// Seed `status` BIGINT across three services, two values each.
     async fn seed_status_corpus(&self) {
         for svc in ["api", "web", "worker"] {
             self.ingest_and_compact(&[
@@ -6119,8 +5413,6 @@ impl Harness {
         assert_eq!(self.pinned_type("status").await, "BIGINT");
     }
 
-    /// Every corpus file stores `status` as BIGINT with the seeded values,
-    /// read per file, and the queries agree.
     async fn assert_status_corpus_is_bigint(&self) {
         assert_eq!(self.pinned_type("status").await, "BIGINT");
         assert_eq!(
@@ -6143,10 +5435,8 @@ impl Harness {
         }
     }
 
-    /// Wait for a job row newer than `after` to land and leave `running`,
-    /// polled through the store: a claim released from a lock lands a
-    /// moment later, so the newest row until then is an older job's. The
-    /// bound is a hang guard on the real clock.
+    /// A claim released from a lock lands a moment later, so the newest row
+    /// until then is an older job's.
     async fn wait_latest_terminal(&self, after: Option<i64>) -> RepinJob {
         let store = &self.server.state.storage.repin;
         let start = std::time::Instant::now();
@@ -6163,23 +5453,14 @@ impl Harness {
     }
 }
 
-/// AC5 (#345): a post-swap sweep that fails leaves the marker, and the
-/// next repin is refused until a restart replays the cleanup.
+/// The aside root is swapped for a regular file, so the sweep's
+/// `remove_dir_all` fails with ENOTDIR (as it does for root too, unlike a
+/// mode-bit fault).
 ///
-/// Job A is held inside its sweep, and its aside root is swapped for a
-/// regular file, so the sweep's `remove_dir_all` fails with ENOTDIR (as it
-/// does for root too, unlike a mode-bit fault). The Cleanup marker stands.
-/// Once A's task gives up the permit, a repin is refused with A's id, the
-/// phase and the restart remedy, over the route and through the engine,
-/// and nothing in the answer names a path.
-///
-/// The restart is boot's own recovery pair, `recover_filesystem` and then
-/// `reconcile_store`, run over this server's data root once the engine is
-/// idle. The fixture has no restart that runs it: trawld runs the pair in
-/// `main` before it builds the engine, and `Restartable` boots through
-/// `boot::prepare_corpus`, which does not. Keeping the engine also keeps
-/// its permit, so the repin that follows proves the stranded job's permit
-/// was released, not replaced by a fresh engine's.
+/// The restart is boot's own recovery pair run by hand: `Restartable` boots
+/// through `boot::prepare_corpus`, which does not run it. Keeping the engine
+/// also keeps its permit, so the repin that follows proves the stranded
+/// job's permit was released, not replaced by a fresh engine's.
 #[tokio::test(flavor = "multi_thread")]
 async fn stranded_cleanup_blocks_until_recovery() {
     let h = harness().await;
@@ -6214,8 +5495,6 @@ async fn stranded_cleanup_blocks_until_recovery() {
     sweep.release();
     h.wait_idle().await;
 
-    // The sweep failed on the aside, so the marker stands and A, past its
-    // point of no return, still succeeded.
     let marker = trawl_server::repin::marker::read_marker(&h.data_dir)
         .expect("read the marker")
         .expect("job A's marker stands over its failed sweep");
@@ -6236,8 +5515,6 @@ async fn stranded_cleanup_blocks_until_recovery() {
     h.assert_engine_conflict("BIGINT", true, &stranded).await;
     h.assert_refusal_wrote_nothing(&before).await;
 
-    // Fixing the cause is not enough: the marker still refuses until the
-    // boot replay finishes the cleanup.
     std::fs::remove_file(&aside).expect("remove the planted file");
     h.assert_engine_conflict("BIGINT", true, &stranded).await;
 
@@ -6279,12 +5556,6 @@ async fn stranded_cleanup_blocks_until_recovery() {
     h.assert_status_corpus_is_bigint().await;
 }
 
-/// AC6 (#345): staging with no marker refuses a repin. A shadow root names
-/// the restart remedy, because boot sweeps a marker-less shadow; an aside
-/// root names the manual one, because boot never deletes it. Each refusal
-/// is refused over the route and through the engine, as a real run and as
-/// a dry run, and writes no job row, takes no pause, arms no cancel and
-/// writes no marker. With the root gone, a dry run is admitted.
 #[tokio::test(flavor = "multi_thread")]
 async fn leftover_staging_without_marker_refuses() {
     let h = harness().await;
@@ -6319,11 +5590,8 @@ async fn leftover_staging_without_marker_refuses() {
     assert_eq!(h.pinned_type("status").await, "BIGINT");
 }
 
-/// AC6 (#345): staging that cannot be inspected refuses a repin with a
-/// fixed 503. `data/REPIN` is a symlink to itself, so `try_exists` fails
-/// with ELOOP, as it does for root too. The engine and the route both
-/// answer the fixed message, which names no path. Nothing is written. With
-/// the link gone, a dry run is admitted.
+/// `data/REPIN` is a symlink to itself, so `try_exists` fails with ELOOP,
+/// as it does for root too.
 #[tokio::test(flavor = "multi_thread")]
 async fn unreadable_staging_evidence_answers_503() {
     use trawl_server::error::ServerError;
@@ -6364,9 +5632,7 @@ async fn unreadable_staging_evidence_answers_503() {
     }
 }
 
-/// Hold every claim behind a `SHARE` lock on `repin_jobs`, which conflicts
-/// with the claim's INSERT and with no read. The lock lasts until the
-/// returned transaction is rolled back.
+/// `SHARE` conflicts with the claim's INSERT and with no read.
 async fn lock_out_claims(
     conn: &mut sqlx::postgres::PgConnection,
 ) -> sqlx::Transaction<'_, sqlx::Postgres> {
@@ -6381,8 +5647,6 @@ async fn lock_out_claims(
 }
 
 impl Harness {
-    /// Wait until a backend in this database waits on a lock: the held
-    /// claim reached postgres. The bound is a hang guard on the real clock.
     async fn wait_claim_waiting(&self) {
         use sqlx::Connection as _;
 
@@ -6407,8 +5671,6 @@ impl Harness {
         panic!("no claim waited on the lock within {HANG_GUARD:?}");
     }
 
-    /// A repin is refused because a job's work still holds the permit, and
-    /// the permit reads held.
     async fn assert_permit_still_held(&self, to: &str, what: &str) {
         assert!(!self.engine().repin_idle(), "{what}: the permit reads free");
         self.assert_engine_conflict(to, true, PERMIT_HELD).await;
@@ -6417,18 +5679,6 @@ impl Harness {
     }
 }
 
-/// AC7 (#345): the permit belongs to the job's own tasks, so neither the
-/// requesting client nor the request's bound can release it, and neither
-/// can a blocking staging step that is still running.
-///
-/// 1. A client goes away while its claim waits behind a table lock: its
-///    future is dropped as hyper drops a handler whose connection closed.
-/// 2. A request's bound passes while its claim waits behind the same lock,
-///    and `start_within` answers 503.
-/// 3. A real run is held inside the post-swap sweep's blocking closure.
-///
-/// Each time a repin is refused with the permit text until the work ends,
-/// and `wait_idle` then returns.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // three owners, each held, probed and released
 async fn admission_owner_survives_disconnect_and_blocking_work() {
@@ -6538,11 +5788,6 @@ async fn admission_owner_survives_disconnect_and_blocking_work() {
     assert_eq!(h.repin_ownership().await.rows, 3, "two blocked, one run");
 }
 
-/// AC8 (#345): a decision task that panics releases the permit. It dies
-/// right after it claims its rollup pause, with a claimed row and an armed
-/// cancel entry. The request settles it: the request answers as a panic,
-/// the row is `failed`, the rollup is no longer paused, nothing answers a
-/// cancel, and once the request's task ends a later repin is admitted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_panicked_decision_task_releases_the_permit() {
     use trawl_server::error::ServerError;

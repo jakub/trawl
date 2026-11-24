@@ -15,106 +15,42 @@ use metrics::{describe_counter, describe_gauge, describe_histogram, gauge};
 use crate::hot_buffer::HotBuffer;
 use crate::publication::PublicationGate;
 
-// -- metric name constants ---------------------------------------------------
-
 pub const QUERIES_TOTAL: &str = "trawl_queries_total";
 pub const QUERY_DURATION: &str = "trawl_query_duration_seconds";
 pub const INGEST_EVENTS_TOTAL: &str = "trawl_ingest_events_total";
 pub const INGEST_EVENTS_REJECTED_TOTAL: &str = "trawl_ingest_events_rejected_total";
 pub const INGEST_REPAIRS_TOTAL: &str = "trawl_ingest_repairs_total";
-/// Events a profile producer (syslog, telemetry) had to drop, by
-/// `{profile, reason}`.
-///
-/// Those producers have no one to reject to, so a drop means the server
-/// refused its own boot-validated assertion: a bug, not a sender's
-/// mistake. The whole closed label matrix is published at zero
-/// (`producer::init_profile_reject_metrics`), because an absent
-/// increment on a present series is what proves the salvage profiles are
-/// rejection-free — an absent series only proves nothing was wired up.
-/// The HTTP door keeps [`INGEST_EVENTS_REJECTED_TOTAL`], where per-event
-/// rejection is the contract.
 pub const INGEST_PROFILE_REJECT_TOTAL: &str = "trawl_ingest_profile_reject_total";
-/// Accepted events whose severity source mapped to nothing on the `OTel`
-/// ladder, so `_severity` was omitted (ADR-0013 §2). Deliberately a
-/// counter rather than a repair code: derivation into the `_` namespace
-/// touches nothing sender-visible, so there is nothing to confess in
-/// `_repairs` — but a sender whose whole feed lands unmapped is an ops
-/// question, and this is where it shows.
 pub const SEVERITY_UNMAPPED_TOTAL: &str = "trawl_severity_unmapped_total";
 pub const HOT_BUFFER_EVENTS: &str = "trawl_hot_buffer_events";
 pub const HOT_BUFFER_BYTES: &str = "trawl_hot_buffer_bytes";
-/// The full event cap (`ingest.hot_buffer_max_events`).
 pub const HOT_BUFFER_MAX_EVENTS: &str = "trawl_hot_buffer_max_events";
-/// The full byte cap (`ingest.hot_buffer_max_bytes`).
 pub const HOT_BUFFER_MAX_BYTES: &str = "trawl_hot_buffer_max_bytes";
-/// Age in seconds of the oldest resident batch, 0 when empty. A batch
-/// hydrated at boot counts from the time in its WAL file name.
 pub const HOT_BUFFER_OLDEST_BATCH_AGE_SECONDS: &str = "trawl_hot_buffer_oldest_batch_age_seconds";
-/// [`crate::hot_buffer::AdmissionState`] as 0 (open), 1 (pressure) or
-/// 2 (refusing).
 pub const HOT_BUFFER_ADMISSION_STATE: &str = "trawl_hot_buffer_admission_state";
-/// Reservations refused, by `{producer, kind}`
-/// ([`crate::ingest::producer::ProducerKind`] ×
-/// [`crate::hot_buffer::Refusal`]); the full matrix is zero-initialized.
 pub const HOT_BUFFER_ADMISSION_REFUSALS_TOTAL: &str = "trawl_hot_buffer_admission_refusals_total";
-/// Batches dropped because their id was already resident; the resident
-/// stays. A writer bug, so any increment is worth an operator's look.
 pub const HOT_BUFFER_DUPLICATE_BATCHES_TOTAL: &str = "trawl_hot_buffer_duplicate_batches_total";
 /// The configured compaction interval, so an alert can scale the drain
 /// stall threshold to it.
 pub const COMPACTION_INTERVAL_SECONDS: &str = "trawl_compaction_interval_seconds";
 pub const ACTIVE_CONNECTIONS: &str = "trawl_active_connections";
-/// Requests in progress on the HTTPS listener, labelled by `allowance`
-/// (`regular`, `probe` or `control`, ADR-0054). Follows ownership: blocking
-/// ingest and preview work that holds a request's body keeps its request
-/// counted.
 pub const REQUESTS_IN_PROGRESS: &str = "trawl_http_requests_in_progress";
-/// Requests refused at once because their allowance was full, labelled by
-/// `allowance` (ADR-0054).
 pub const REQUESTS_REFUSED_TOTAL: &str = "trawl_http_requests_refused_total";
-/// The size of each allowance: `[server] max_concurrent_requests` for
-/// `regular`, the fixed 3 for `probe` and the fixed 4 for `control`
-/// (ADR-0054).
 pub const REQUEST_ALLOWANCE: &str = "trawl_http_request_allowance";
-/// Pool permits held by work whose request already answered (ADR-0024).
-///
-/// A subset of the held permits, not an addition to them, and
-/// deliberately label-free: the only cardinality a query id or a key
+/// Deliberately label-free: the only cardinality a query id or a key
 /// name could add here is unbounded.
 pub const QUERY_PERMITS_RETAINED: &str = "trawl_query_permits_retained";
-/// Executor-pool permits held right now, by running or retained work and
-/// by the repin cutover's exclusive hold (ADR-0056). Label-free, like the
-/// retained count.
 pub const QUERY_PERMITS_IN_USE: &str = "trawl_query_permits_in_use";
-/// The executor pool's size: `[server] max_concurrent_queries`.
 pub const QUERY_POOL_SIZE: &str = "trawl_query_pool_size";
-/// The query preparation allowance's size: half the cores, at least 2, at
-/// most `[server] max_concurrent_queries` (ADR-0063).
 pub const QUERY_PREPARATION_SLOTS: &str = "trawl_query_preparation_slots";
-/// Preparation slots held right now, by jobs a request waits on and by jobs
-/// whose request already answered (ADR-0063). Label-free, like the permit
-/// counts.
 pub const QUERY_PREPARATION_IN_USE: &str = "trawl_query_preparation_in_use";
-/// Net run leases held right now, labelled by `origin` (`scheduled` or
-/// `manual`, ADR-0018 amended 2026-11-11). A lease lasts until its run's
-/// physical work ends, so a run that timed out while its work is retained
-/// still counts. Read off the pool at scrape, never from run rows.
+/// Read off the pool at scrape, never from run rows.
 pub const NET_RUN_LEASES_IN_USE: &str = "trawl_net_run_leases_in_use";
-/// The cap on net run leases, labelled by `origin`: `max(1, permits / 2)`
-/// for `scheduled`, `max(1, permits / 4)` for `manual`.
 pub const NET_RUN_LEASE_LIMIT: &str = "trawl_net_run_lease_limit";
-/// Seconds since the engine sample's latest probe started, or since the
-/// sampler started before its first (ADR-0056). It cycles under the sample
-/// interval while the sampler runs, and keeps growing while a probe is
-/// wedged.
 pub const ENGINE_SAMPLE_AGE_SECONDS: &str = "trawl_engine_sample_age_seconds";
 pub const PARQUET_FILES: &str = "trawl_parquet_files_total";
 pub const PARQUET_BYTES: &str = "trawl_parquet_size_bytes";
 pub const HEALTH_CHECK: &str = "trawl_health_check";
-/// 1 while corpus reads refuse for `reason`
-/// ([`crate::publication::CorpusUnsettled`]), else 0. One series per
-/// reason, each set on its own; computed from the publication gate at
-/// every collection.
 pub const CORPUS_UNSETTLED: &str = "trawl_corpus_unsettled";
 pub const SYSLOG_EVENTS_TOTAL: &str = "trawl_syslog_events_total";
 pub const SYSLOG_PARSE_ERRORS_TOTAL: &str = "trawl_syslog_parse_errors_total";
@@ -129,16 +65,8 @@ pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_t
 pub const CATALOG_PINS_REJECTED_TOTAL: &str = "trawl_catalog_pins_rejected_total";
 pub const CATALOG_SAMPLE_CAPTURE_FAILURES_TOTAL: &str =
     "trawl_catalog_sample_capture_failures_total";
-/// Batches whose catalog bookkeeping ran out of its wall-clock budget and
-/// was abandoned, labelled by the write that was in flight when the budget
-/// expired ([`BookkeepingWrite`]).
-///
-/// The log line that goes with it (`catalog_bookkeeping_timeout`) says the
-/// same thing once per batch; this is the series to alert on, because a
-/// sustained postgres outage costs one budget per batch and the evidence it
-/// abandons never comes back on its own. Retry exhaustion that fails FAST
-/// is a different failure and does not count here: it stays on
-/// `catalog_bookkeeping_error`.
+/// Retry exhaustion that fails FAST is a different failure and does not
+/// count here: it stays on `catalog_bookkeeping_error`.
 pub const CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL: &str = "trawl_catalog_bookkeeping_timeouts_total";
 pub const CATALOG_PINNED_FIELDS: &str = "trawl_catalog_pinned_fields";
 pub const CATALOG_PIN_CAPACITY: &str = "trawl_catalog_pin_capacity";
@@ -152,23 +80,10 @@ pub const CATALOG_REPIN_ROWS_NULLED_TOTAL: &str = "trawl_catalog_repin_rows_null
 pub const CATALOG_REPIN_ROWS_RESURRECTED_TOTAL: &str = "trawl_catalog_repin_rows_resurrected_total";
 pub const CATALOG_REPIN_DURATION_SECONDS: &str = "trawl_catalog_repin_duration_seconds";
 pub const RETENTION_SUPPRESSED: &str = "trawl_retention_suppressed";
-/// Date directories retention confirmed removed since process start, by
-/// `trigger` ([`crate::retention::RemovalTrigger`]). Incremented only when
-/// the removal returned success, never inferred from a later absence.
 pub const RETENTION_DELETIONS_TOTAL: &str = "trawl_retention_deletions_total";
-/// Retention sweeps since process start whose first free-space check found
-/// the data filesystem below the deletion floor.
 pub const RETENTION_PRESSURE_ATTEMPTS_TOTAL: &str = "trawl_retention_pressure_attempts_total";
-/// The configured deletion floor (`retention.min_free_disk_bytes`); 0 turns
-/// pressure deletion off.
 pub const RETENTION_MIN_FREE_DISK_BYTES: &str = "trawl_retention_min_free_disk_bytes";
-/// A filesystem trawl writes to, by `role` (ADR-0042). One series per
-/// device, labelled with the first role it holds (data, then wal, then
-/// spill), so a `sum()` never counts a device twice. No path, device or
-/// environment label.
 pub const DISK_TOTAL_BYTES: &str = "trawl_disk_total_bytes";
-/// Available bytes on the filesystem [`DISK_TOTAL_BYTES`] describes, with
-/// the same `role` label.
 pub const DISK_AVAILABLE_BYTES: &str = "trawl_disk_available_bytes";
 pub const SCHEDULER_WINDOW_TRUNCATED_TOTAL: &str = "trawl_scheduler_window_truncated_total";
 pub const AUTH_FAILURES_TOTAL: &str = "trawl_auth_failures_total";
@@ -178,41 +93,17 @@ pub const TELEMETRY_BYTES_DROPPED_TOTAL: &str = "trawl_telemetry_bytes_dropped_t
 pub const TELEMETRY_BUFFER_EVENTS: &str = "trawl_telemetry_buffer_events";
 pub const TELEMETRY_BUFFER_BYTES: &str = "trawl_telemetry_buffer_bytes";
 
-// -- operational alert measurements -----------------------------------------
-
 pub const SYSLOG_WAL_EVENTS_DISCARDED_TOTAL: &str = "trawl_syslog_wal_events_discarded_total";
 pub const SYSLOG_WRITE_TASKS_FAILED_TOTAL: &str = "trawl_syslog_write_tasks_failed_total";
 pub const WAL_DURABILITY_FAILURES_TOTAL: &str = "trawl_wal_durability_failures_total";
 pub const COMPACTION_OPERATION_FAILURES_TOTAL: &str = "trawl_compaction_operation_failures_total";
-/// Maintenance statements (compaction, rollup, conform and repin) that ran
-/// out of `[ingest] compaction_memory_limit`: `DuckDB` raised `Out of
-/// Memory` (ADR-0056). Counted once per failed statement, where it fails
-/// ([`crate::ingest::compaction::StatementFailure`]). The inputs stay where
-/// they are; whether the operation is retried is its own outcome (compaction
-/// and rollup on the next pass, boot conformance on the next boot, never a
-/// failed repin job). Optional sampling falls back and its pass completes,
-/// but the statement is still counted.
 pub const MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL: &str = "trawl_maintenance_resource_exhausted_total";
 pub const FILES_QUARANTINED_TOTAL: &str = "trawl_files_quarantined_total";
-/// Connections that came back to an app-state pool inside a transaction
-/// and were closed instead of reused, labelled by `pool` (`storage`). Each
-/// is a transaction some cancelled work left open, which no later caller
-/// ran inside ([`crate::store`]). Starts at zero.
 pub const POOL_CONNECTIONS_RETURNED_IN_TRANSACTION_TOTAL: &str =
     "trawl_pool_connections_returned_in_transaction_total";
-/// Publication markers recovery looked at, by `outcome`
-/// ([`crate::ingest::publication_marker::RecoveryOutcomeKind`]). A
-/// `contradictory` or `failed` outcome leaves the marker blocking its
-/// service's compaction until a later pass or an operator resolves it.
 pub const PUBLICATION_RECOVERY_TOTAL: &str = "trawl_publication_recovery_total";
-/// WAL files boot hydration looked at, by `outcome`
-/// ([`crate::ingest::hydration::HydrationOutcome`]); `unlisted` counts
-/// scopes that could not be listed. Any outcome but `hydrated` leaves
-/// overhang, so corpus reads stay refused until compaction proves coverage.
 pub const HYDRATION_FILES_TOTAL: &str = "trawl_hydration_files_total";
 
-/// Failed durability operations on an already-published WAL file. Each
-/// failure rejects the write it belonged to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalDurabilityOperation {
     ParentDirectorySync,
@@ -273,7 +164,6 @@ impl CompactionOperation {
     }
 }
 
-/// Successfully isolated files; this is not an event-loss count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuarantineKind {
     Wal,
@@ -291,14 +181,9 @@ impl QuarantineKind {
     }
 }
 
-/// Why the syslog receive queue abandoned an event: the `reason` label on
-/// [`SYSLOG_EVENTS_DROPPED_TOTAL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyslogDropReason {
-    /// The queue was full because the batcher stopped taking from it while
-    /// hot-buffer admission refused its pending groups.
     Backpressure,
-    /// The queue was full or closed for any other reason.
     QueueFull,
 }
 
@@ -313,7 +198,7 @@ impl SyslogDropReason {
     }
 }
 
-/// Existing telemetry reasons. A consumed crashed batch may be durable.
+/// A consumed crashed batch may be durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryDropReason {
     PreinitCap,
@@ -416,7 +301,7 @@ pub fn init_operational_alert_metrics() {
 /// ([`crate::state::AppState::from_parts`]), after the recorder is
 /// installed, so every server built from a config publishes them. The
 /// config is fixed for the process. Repeated calls never reset counters.
-#[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
+#[allow(clippy::cast_precision_loss)]
 pub fn init_retention_metrics(min_free_disk_bytes: u64) {
     gauge!(RETENTION_MIN_FREE_DISK_BYTES).set(min_free_disk_bytes as f64);
     for trigger in crate::retention::RemovalTrigger::ALL {
@@ -433,8 +318,6 @@ pub fn init_publication_recovery_metrics() {
         metrics::counter!(PUBLICATION_RECOVERY_TOTAL, "outcome" => outcome.label()).increment(0);
     }
 }
-
-// -- bookkeeping write identity ----------------------------------------------
 
 /// The two catalog bookkeeping writes one compacted batch makes, in the
 /// order it makes them.
@@ -454,10 +337,8 @@ pub enum BookkeepingWrite {
 }
 
 impl BookkeepingWrite {
-    /// Every variant, for zero-initializing the label matrix.
     pub const ALL: [BookkeepingWrite; 2] = [Self::Conflicts, Self::Observations];
 
-    /// The metric label value.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -466,7 +347,6 @@ impl BookkeepingWrite {
         }
     }
 
-    /// The postgres table, as the log field spells it.
     #[must_use]
     pub fn table(self) -> &'static str {
         match self {
@@ -476,10 +356,7 @@ impl BookkeepingWrite {
     }
 }
 
-// -- description registration ------------------------------------------------
-
-/// Register metric descriptions (help text + units). Call once at startup.
-#[allow(clippy::too_many_lines)] // a flat list of describe calls, one per metric
+#[allow(clippy::too_many_lines)]
 pub fn describe_metrics() {
     describe_counter!(QUERIES_TOTAL, "Total number of queries executed");
     describe_histogram!(QUERY_DURATION, "Query execution duration in seconds");
@@ -909,37 +786,21 @@ pub fn describe_metrics() {
     }
 }
 
-// -- bounded label values ----------------------------------------------------
-
-/// Maximum distinct `service` label values admitted to `trawl_ingest_repairs_total`.
-///
-/// Every other label in this crate (`reason`, `status`, `transport`, `subsystem`)
-/// comes from a closed, code-defined set. `service` is client-supplied and its
-/// charset admits effectively unbounded values, while the prometheus recorder
+/// `service` is client-supplied, while the prometheus recorder
 /// retains counter series for the process lifetime — so without a cap any key
 /// holding `ingest` could grow the registry and the `/metrics` payload without
 /// bound by posting events with fresh service names.
 pub const REPAIR_SERVICE_LABEL_CAP: usize = 256;
 
-/// Label value that novel services collapse into once the cap is reached.
-///
 /// The angle brackets are outside the ingest service charset (alphanumeric,
 /// dash, underscore, dot), so this can never collide with a real service name.
 pub const OVERFLOW_SERVICE_LABEL: &str = "<other>";
 
-/// Process-wide set of service names already admitted as a repair label value.
 fn repair_service_labels() -> &'static Mutex<HashSet<String>> {
     static LABELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     LABELS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Map a client-supplied service name onto a bounded `trawl_ingest_repairs_total`
-/// label value.
-///
-/// Already-admitted services pass through verbatim; once
-/// [`REPAIR_SERVICE_LABEL_CAP`] distinct services have been admitted, further
-/// novel names return [`OVERFLOW_SERVICE_LABEL`] so the series count stays
-/// bounded at `cap + 1` per repair code.
 pub fn repair_service_label(service: &str) -> String {
     let mut admitted = repair_service_labels()
         .lock()
@@ -947,8 +808,6 @@ pub fn repair_service_label(service: &str) -> String {
     bounded_label(&mut admitted, service, REPAIR_SERVICE_LABEL_CAP)
 }
 
-/// Cap-enforcing core of [`repair_service_label`], split out so it is testable
-/// without the process-wide static.
 fn bounded_label(admitted: &mut HashSet<String>, service: &str, cap: usize) -> String {
     if admitted.contains(service) {
         return service.to_string();
@@ -960,15 +819,8 @@ fn bounded_label(admitted: &mut HashSet<String>, service: &str, cap: usize) -> S
     service.to_string()
 }
 
-// -- gauge collection --------------------------------------------------------
-
-/// The configured compaction interval in seconds; `u64::MAX` until
-/// [`set_compaction_interval_secs`] runs.
 static COMPACTION_INTERVAL_SECS: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Record the configured compaction interval for
-/// [`COMPACTION_INTERVAL_SECONDS`]. Call once at startup, before serving;
-/// [`collect_gauges`] publishes it from then on.
 pub fn set_compaction_interval_secs(secs: u64) {
     COMPACTION_INTERVAL_SECS.store(secs, Ordering::Relaxed);
 }
@@ -978,7 +830,6 @@ fn compaction_interval_secs() -> Option<u64> {
     (secs != u64::MAX).then_some(secs)
 }
 
-/// Preserve the existing storage collection cadence, including failed attempts.
 const STORAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1009,8 +860,6 @@ pub(crate) struct StorageScan {
 }
 
 impl StorageScan {
-    /// Count one file of `bytes` into the totals and its partition.
-    ///
     /// # Errors
     /// Any sum that would overflow `u64`. A sparse file's logical length
     /// can approach it, and a wrapped sum would understate stored bytes and
@@ -1035,7 +884,6 @@ impl StorageScan {
     }
 }
 
-/// A cached sample that carries a file and byte total.
 trait StorageSample: Clone {
     fn totals(&self) -> StorageTotals;
 }
@@ -1079,11 +927,6 @@ impl<T> Default for StorageState<T> {
 
 /// One source's attempts and gauge publication share ownership. Dashboard reads
 /// only lock `state`, which is never held over a scan or gauge publication.
-///
-/// Generic over the sample so every measured source (WAL and Parquet totals,
-/// filesystem headroom) shares one implementation of the ADR-0033 contract:
-/// serialized attempts, the retry TTL, retain-last-complete on failure, and
-/// age measured from completion on the monotonic clock.
 struct StorageCache<T> {
     attempt: Mutex<()>,
     state: Mutex<StorageState<T>>,
@@ -1098,7 +941,6 @@ impl<T> Default for StorageCache<T> {
     }
 }
 
-/// A coherent view assembled under one short cache lock.
 pub(crate) struct StorageSnapshot {
     pub files: u64,
     pub bytes: u64,
@@ -1118,8 +960,6 @@ impl<T: StorageSample> StorageCache<T> {
 }
 
 impl<T: Clone> StorageCache<T> {
-    /// The status, age, and retained sample, read under one short lock.
-    /// Without a complete sample there is no value to present.
     fn read(&self, configured: bool, now: Instant) -> (trawl_api::StorageMeasurement, Option<T>) {
         use trawl_api::StorageMeasurementStatus as Status;
         let state = self.state.lock().expect("storage cache poisoned");
@@ -1209,30 +1049,17 @@ fn headroom_cache() -> &'static StorageCache<crate::capacity::HeadroomSample> {
     CACHE.get_or_init(StorageCache::default)
 }
 
-/// The executor pool's and the engine sample's numbers for one
-/// collection, read before it starts.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QueryGauges {
-    /// Permits held right now ([`QUERY_PERMITS_IN_USE`]).
     pub permits_in_use: usize,
-    /// Permits in all ([`QUERY_POOL_SIZE`]).
     pub pool_size: usize,
-    /// Permits held by work whose request already answered
-    /// ([`QUERY_PERMITS_RETAINED`]).
     pub permits_retained: usize,
-    /// The engine sample's age ([`ENGINE_SAMPLE_AGE_SECONDS`]).
     pub engine_sample_age: std::time::Duration,
-    /// The preparation allowance's size ([`QUERY_PREPARATION_SLOTS`]).
     pub preparation_slots: usize,
-    /// Preparation slots held right now ([`QUERY_PREPARATION_IN_USE`]).
     pub preparation_in_use: usize,
-    /// Scheduled-run leases held right now ([`NET_RUN_LEASES_IN_USE`]).
     pub scheduled_leases_in_use: usize,
-    /// The cap on scheduled-run leases ([`NET_RUN_LEASE_LIMIT`]).
     pub scheduled_lease_limit: usize,
-    /// Manual-run leases held right now ([`NET_RUN_LEASES_IN_USE`]).
     pub manual_leases_in_use: usize,
-    /// The cap on manual-run leases ([`NET_RUN_LEASE_LIMIT`]).
     pub manual_lease_limit: usize,
 }
 
@@ -1260,18 +1087,9 @@ impl QueryGauges {
     }
 }
 
-/// Update gauges that require periodic polling (query pool + engine sample +
-/// hot buffer + corpus state + parquet + WAL files).
-///
 /// Called by Prometheus scrapes and the stats emitter. Filesystem scans and
 /// competing attempts may block; dashboard readers only read the short cache.
-/// `data_root` is the configured data root: the Parquet gauges walk it and
-/// the headroom's data role samples its filesystem.
-/// `scratch_dir` is the query scratch directory, which the headroom's spill
-/// role samples (ADR-0056). `repin_jobs` is this process's repin job
-/// generation ([`crate::state::AppState::repin_jobs`]), which fences both
-/// capacity samples.
-#[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
+#[allow(clippy::cast_precision_loss)]
 pub fn collect_gauges(
     hot_buffer: Option<&Arc<HotBuffer>>,
     publication: &PublicationGate,
@@ -1333,7 +1151,6 @@ pub fn collect_gauges(
     collect_headroom(data_root, wal_dir, scratch_dir, repin_jobs);
 }
 
-/// Collect the ingested Parquet totals with the shared attempt/cache policy.
 fn collect_parquet_gauges(base: &Path, repin_jobs: &crate::repin::JobGeneration) {
     parquet_cache().collect(
         Instant::now,
@@ -1359,7 +1176,6 @@ fn scan_parquet(
     scan_parquet_with(root, repin_jobs, &mut |_, _| Ok(()))
 }
 
-/// [`scan_parquet`] with the walk's test seam ([`scan_storage_with`]).
 fn scan_parquet_with(
     root: &Path,
     repin_jobs: &crate::repin::JobGeneration,
@@ -1371,11 +1187,6 @@ fn scan_parquet_with(
     Ok(scan)
 }
 
-/// Sample the data, WAL and spill filesystems with the shared attempt/cache
-/// policy (ADR-0042 headroom under ADR-0033 status and age). `wal_dir` is the
-/// live WAL writer's directory, so a query-only node stats no WAL role. The
-/// spill role is the query scratch directory, where the query database
-/// spills (ADR-0056).
 fn collect_headroom(
     data_root: &Path,
     wal_dir: Option<&Path>,
@@ -1397,8 +1208,6 @@ fn collect_headroom(
     );
 }
 
-/// The `role` label for a headroom row: its first role, so each device has
-/// exactly one series.
 const fn role_label(role: trawl_api::FilesystemRole) -> &'static str {
     match role {
         trawl_api::FilesystemRole::Data => "data",
@@ -1410,7 +1219,7 @@ const fn role_label(role: trawl_api::FilesystemRole) -> &'static str {
 /// Called only while the headroom attempt owner is held, with the last
 /// complete sample: nothing is published before one exists, and a failed
 /// attempt republishes the retained sample, as for the storage totals.
-#[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
+#[allow(clippy::cast_precision_loss)]
 fn publish_headroom_gauges(sample: &crate::capacity::HeadroomSample) {
     for device in &sample.filesystems {
         let Some(&first) = device.roles.first() else {
@@ -1422,14 +1231,10 @@ fn publish_headroom_gauges(sample: &crate::capacity::HeadroomSample) {
     }
 }
 
-/// One walked `.parquet` file and its size on disk.
 pub(crate) type ParquetEntry = (std::path::PathBuf, u64);
 
-/// One path the walk could not enumerate, and why.
 pub(crate) type WalkError = (std::path::PathBuf, std::io::Error);
 
-/// Recursively walk a directory collecting `.parquet` file paths and sizes.
-///
 /// Strict: any IO error anywhere under `dir` fails the whole walk. A caller
 /// that must not be taken down by one unreadable corner of the tree wants
 /// [`walk_parquet_files_lossy`] instead.
@@ -1441,10 +1246,6 @@ pub(crate) fn walk_parquet_files(dir: &Path) -> std::io::Result<Vec<ParquetEntry
     }
 }
 
-/// The same walk, isolating IO failures instead of aborting on the first:
-/// returns every file that was enumerable plus one `(path, error)` pair per
-/// directory or entry that was not.
-///
 /// A caller that treats an unreadable path as a per-path skip — the boot
 /// conformance pass, where one unreadable subdirectory must not keep the
 /// daemon down — needs the readable remainder, not an early return.
@@ -1495,8 +1296,6 @@ fn walk_dir_recursive(dir: &Path, results: &mut Vec<ParquetEntry>, errors: &mut 
         }
     }
 }
-
-// -- storage measurement walking --------------------------------------------
 
 #[derive(Clone, Copy)]
 enum StorageKind {
@@ -1652,7 +1451,6 @@ fn scan_storage_dir(
     Ok(())
 }
 
-/// WAL and Parquet use separate owners, but the same invariant implementation.
 fn collect_wal_gauges(wal_dir: &Path) {
     wal_cache().collect(
         Instant::now,
@@ -1688,7 +1486,6 @@ pub(crate) fn cached_parquet_scan() -> (StorageSnapshot, Option<Arc<StorageScan>
     read_parquet_scan(parquet_cache(), Instant::now())
 }
 
-/// [`cached_parquet_scan`] over any Parquet cache, read at `now`.
 fn read_parquet_scan(
     cache: &StorageCache<Arc<StorageScan>>,
     now: Instant,
@@ -1870,7 +1667,6 @@ mod tests {
         }));
         assert!(panicked.is_err(), "the scan panic reaches the caller");
 
-        // The sample completed before the panic stays readable.
         let snapshot = cache.snapshot(true, due);
         assert_eq!(
             (snapshot.files, snapshot.bytes),
@@ -2117,9 +1913,6 @@ mod tests {
             );
         };
 
-        // A valid layout: hourly files under {env}/{date}/{hour}/, daily
-        // files under {env}/{date}/, a non-Parquet sibling, and saved
-        // report output under scheduled/.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write(root, "prod/2026-09-20/00/nginx.parquet", 10);
@@ -2169,7 +1962,6 @@ mod tests {
         assert_eq!(scan.unattributed_bytes, 65);
         assert_invariant(&scan);
 
-        // The WAL never buckets, even laid out as {env}/{date}/.
         write(root, "prod/2026-09-20/batch.ndjson", 8);
         write(root, "stray.ndjson", 4);
         let wal = scan_storage(root, StorageKind::Wal).unwrap();
@@ -2185,10 +1977,6 @@ mod tests {
         assert_invariant(&wal);
     }
 
-    /// A sparse file's logical length can be near `u64::MAX`, so the walk's
-    /// sums can overflow. Wrapping would understate the stored bytes and
-    /// overstate reach, so every accumulator is checked and an overflow
-    /// fails the attempt: the cache keeps the last complete scan (ADR-0033).
     /// The walk runs over real files, into an accumulator seeded next to
     /// the limit, since no portable filesystem holds files that large.
     #[test]
@@ -2256,8 +2044,6 @@ mod tests {
             }
         );
 
-        // Through the cache: the overflowing attempt is failed, and the last
-        // complete scan is retained and republished.
         let cache = StorageCache::<Arc<StorageScan>>::default();
         let now = Instant::now();
         cache.collect(
@@ -2307,11 +2093,6 @@ mod tests {
         }
     }
 
-    /// The Parquet attempt runs inside the repin fence, so a scan that
-    /// overlaps a repin job, or finds staging on disk at either end,
-    /// records it, and unreadable evidence fails the attempt like a walk
-    /// error: the cache keeps the last complete scan with the flag it was
-    /// taken under.
     #[test]
     fn storage_scan_records_a_repin_or_fails_the_attempt() {
         use std::cell::RefCell;
@@ -2378,7 +2159,6 @@ mod tests {
             trawl_api::StorageMeasurementStatus::Failed
         );
         assert!(!scan.expect("retained").repin_in_flight);
-        // Unreadable at open fails the attempt before the walk.
         assert!(scan_parquet(&root, &jobs).is_err());
     }
 
@@ -2436,7 +2216,6 @@ mod tests {
             write_env_date(&root, env, 10);
         }
 
-        // Control: the same walk seam with nothing moving is the plain scan.
         let scan = scan_parquet_with(&root, &jobs, &mut |_, _| Ok(())).unwrap();
         assert_eq!(
             scan.totals,
@@ -2867,8 +2646,7 @@ mod tests {
                 "trawl_hydration_files_total{outcome=\"claimed\"}",
                 "trawl_hydration_files_total{outcome=\"unlisted\"}",
             ];
-            // Every per-event refusal reason, not only the three the
-            // earlier alerts select: `increase()` sees a first refusal
+            // Every per-event refusal reason: `increase()` sees a first refusal
             // only against a published zero.
             let selected: Vec<String> = selected
                 .into_iter()
@@ -2888,8 +2666,7 @@ mod tests {
                 assert_eq!(test_support::sample(&handle, series), 0);
             }
             // Exercise idle upkeep with today's production configuration,
-            // which has no exporter expiry. This short wait does not prove
-            // survival past an arbitrary timeout added in a future change.
+            // which has no exporter expiry.
             std::thread::sleep(std::time::Duration::from_millis(10));
             handle.run_upkeep();
             for series in &selected {
@@ -2935,8 +2712,6 @@ mod tests {
             assert_eq!(test_support::sample(&handle, &series("contradictory")), 1);
         });
     }
-
-    // -- headroom measurement (ADR-0042 under ADR-0033) ------------------
 
     use crate::capacity::{DeviceHeadroom, HeadroomSample, sample_headroom};
     use trawl_api::FilesystemRole;
@@ -3010,8 +2785,6 @@ mod tests {
                 Some(one_device(400)),
             )
         );
-        // A failed stat keeps the last complete rows, and their age keeps
-        // growing from that sample's completion.
         let failed = start + Duration::from_secs(30);
         cache.collect(|| failed, || headroom_attempt(Err(io_failure())), |_| {});
         for (now, age) in [(failed, 30), (failed + Duration::from_secs(15), 45)] {
@@ -3057,7 +2830,6 @@ mod tests {
         assert_eq!(measurement.status, Status::Failed);
         assert_eq!(measurement.sample_age_secs, Some(60));
         assert_eq!(sample, Some(one_device(400)));
-        // Recovery replaces the sample and restarts its age.
         let recovered = repin_unreadable + Duration::from_secs(30);
         cache.collect(|| recovered, || headroom_attempt(Ok(300)), |_| {});
         assert_eq!(
@@ -3087,7 +2859,6 @@ mod tests {
         assert_eq!(unmeasured.1, None);
     }
 
-    /// Every sample line's series name and label pairs.
     fn rendered_series(rendered: &str) -> Vec<(String, Vec<(String, String)>)> {
         rendered
             .lines()
@@ -3163,7 +2934,6 @@ mod tests {
             describe_metrics();
             init_operational_alert_metrics();
             init_retention_metrics(1_073_741_824);
-            // A first attempt that fails publishes no headroom series.
             cache.collect(|| first, || attempt(true), |s| publish_headroom_gauges(&s));
             assert!(!handle.render().contains(&format!("{DISK_TOTAL_BYTES}{{")));
             cache.collect(
@@ -3171,7 +2941,6 @@ mod tests {
                 || attempt(false),
                 |s| publish_headroom_gauges(&s),
             );
-            // A later failure keeps the complete sample's series.
             cache.collect(
                 || first + Duration::from_secs(60),
                 || attempt(true),
@@ -3184,9 +2953,6 @@ mod tests {
         (handle, [data_device, wal_device])
     }
 
-    /// The ADR-0042 series: headroom per role, the floor, and retention's
-    /// two counters. Closed label sets, no path, device or env in a label,
-    /// and no projection series.
     #[test]
     fn capacity_metrics_labels_and_series() {
         let (handle, devices) = capacity_metrics_fixture();
@@ -3277,7 +3043,6 @@ mod tests {
 
     #[test]
     fn describe_metrics_does_not_panic() {
-        // Install a test recorder so describe calls succeed.
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let _handle = builder.install_recorder().expect("install test recorder");
         describe_metrics();
@@ -3315,7 +3080,6 @@ mod tests {
             assert_eq!(bounded_label(&mut admitted, &svc, 3), svc);
         }
 
-        // Novel services past the cap collapse into the overflow bucket...
         assert_eq!(
             bounded_label(&mut admitted, "svc-3", 3),
             OVERFLOW_SERVICE_LABEL
@@ -3324,10 +3088,8 @@ mod tests {
             bounded_label(&mut admitted, "svc-4", 3),
             OVERFLOW_SERVICE_LABEL
         );
-        // ...and do not consume admission slots, so the series count is capped.
         assert_eq!(admitted.len(), 3);
 
-        // Already-admitted services keep reporting under their own name.
         assert_eq!(bounded_label(&mut admitted, "svc-1", 3), "svc-1");
     }
 
@@ -3342,7 +3104,6 @@ mod tests {
 
     #[test]
     fn collect_gauges_no_hot_buffer_no_panic() {
-        // With no recorder installed and no hot buffer, should be a no-op.
         collect_gauges(
             None,
             &PublicationGate::new(),
@@ -3354,8 +3115,6 @@ mod tests {
         );
     }
 
-    /// The preparation allowance's size and the slots in use are published
-    /// label-free at every collection (ADR-0063).
     #[test]
     fn preparation_gauges_follow_the_allowance() {
         let recorder = prometheus_builder().build_recorder();
@@ -3389,8 +3148,6 @@ mod tests {
         });
     }
 
-    /// The collection reads the pool's own allowance: its size, and a
-    /// parked job's slot.
     #[tokio::test]
     async fn query_gauges_read_the_preparation_allowance() {
         let pool =
@@ -3422,10 +3179,6 @@ mod tests {
         sample.stop_and_wait_for_test();
     }
 
-    /// The run lease gauges count leases a run physically holds, read off
-    /// the pool at scrape (ADR-0018, amended 2026-11-11): for each origin,
-    /// zero at start, the limit when full, still full while a timed-out
-    /// run's executor work is retained, and zero once the last holder ends.
     #[tokio::test(start_paused = true)]
     async fn run_lease_gauges_follow_physical_ownership() {
         use crate::deadline::Deadline;
@@ -3743,7 +3496,6 @@ mod tests {
         assert_eq!(labels, ["backpressure", "queue_full"]);
     }
 
-    /// Every `trawl_*` metric name the alert pack selects.
     fn alert_pack_metric_names(rules: &str) -> std::collections::BTreeSet<&str> {
         let bytes = rules.as_bytes();
         let mut names = std::collections::BTreeSet::new();

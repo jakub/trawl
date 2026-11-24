@@ -5,15 +5,9 @@
 //! trawld's panic hook logs where a panic happened, never what it said, and
 //! the diagnostic never reaches the WAL (ADR-0040).
 //!
-//! Its own test binary because the panic hook and the subscriber are both
-//! process-global: the production subscriber from
-//! `telemetry::build_subscriber`, with a WAL layer and, outside monitor
-//! mode, a stdout capture, is installed with `.init()` exactly as `trawld`
-//! does. nextest runs each test in its own process, so each installs its
-//! own.
-//!
-//! In monitor mode no text sink records the diagnostic, so the hook writes
-//! one location line to stderr itself; with a text sink it writes none.
+//! The panic hook and the subscriber are both process-global, and the
+//! subscriber is installed with `.init()` exactly as `trawld` does. nextest
+//! runs each test in its own process, so each installs its own.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,10 +23,8 @@ const ENV: &str = "default";
 const PAYLOAD_SENTINEL: &str = "zz-panic-payload-sentinel";
 const THREAD: &str = "zz-panicking-worker";
 
-/// Set by the hook the test installs before trawld's.
 static PREVIOUS_RAN: AtomicBool = AtomicBool::new(false);
 
-/// Everything written to a captured stdout or stderr.
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
 
@@ -78,7 +70,6 @@ fn read_wal(dir: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A WAL layer writing under a fresh directory, and the directory.
 fn wal_layer() -> (WalLayer, tempfile::TempDir) {
     let wal_dir = tempfile::tempdir().unwrap();
     let handle = WalHandle::new();
@@ -93,11 +84,8 @@ fn wal_layer() -> (WalLayer, tempfile::TempDir) {
     (wal, wal_dir)
 }
 
-/// Install trawld's subscriber and panic hook, panic once with the payload
-/// sentinel on a thread named [`THREAD`], and return the line of the
-/// `panic!`. `directives` is the resolved log filter. `text_sink` is what
-/// `init_tracing` passes: whether `stdout` (or a file logger) exists to
-/// record the diagnostic.
+/// Returns the line of the `panic!`. `text_sink` is what `init_tracing`
+/// passes: whether `stdout` (or a file logger) exists to record the diagnostic.
 fn install_and_panic(
     directives: &str,
     stdout: Option<Capture>,
@@ -139,8 +127,6 @@ fn install_and_panic(
     rx.recv().unwrap()
 }
 
-/// With a stdout sink the diagnostic is one tracing event there, and the
-/// hook writes nothing to stderr.
 #[test]
 fn panic_diagnostic_carries_location_not_payload_and_never_persists() {
     let (wal, wal_dir) = wal_layer();
@@ -210,9 +196,6 @@ fn panic_diagnostic_carries_location_not_payload_and_never_persists() {
     }
 }
 
-/// In monitor mode no text sink records the diagnostic, so the hook writes
-/// exactly one line to stderr: the location and the thread, never the
-/// payload.
 #[test]
 fn a_panic_without_a_text_sink_writes_its_location_to_stderr() {
     let (wal, _wal_dir) = wal_layer();
@@ -221,9 +204,6 @@ fn a_panic_without_a_text_sink_writes_its_location_to_stderr() {
     assert_one_location_line(&stderr, panic_line);
 }
 
-/// A text sink exists, but `RUST_LOG` names only `trawld`, so the filter
-/// drops the diagnostic's target and the sink records nothing. The hook
-/// writes the location line to stderr as it does without a sink.
 #[test]
 fn a_filtered_out_panic_event_still_leaves_its_location_on_stderr() {
     let (wal, _wal_dir) = wal_layer();
@@ -238,8 +218,6 @@ fn a_filtered_out_panic_event_still_leaves_its_location_on_stderr() {
     assert_one_location_line(&stderr, panic_line);
 }
 
-/// `stderr` holds exactly one line: the location of the `panic!` on
-/// `panic_line` and the thread, never the payload.
 fn assert_one_location_line(stderr: &Capture, panic_line: u32) {
     let text = stderr.text();
     let lines: Vec<&str> = text.lines().collect();

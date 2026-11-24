@@ -2,18 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! An ingest preview stores nothing of its sample (ADR-0049, #200 AC5).
-//!
-//! The source scan in `ingest_preview_touches_nothing.rs` says what the
-//! preview code may not name. This binary watches a real trawld instead:
-//! the WAL, the hot buffer, the counters, the live stream, trawld's own
-//! persisted telemetry and its log lines, around previews whose samples
-//! carry a canary in every input position.
+//! An ingest preview stores nothing of its sample (ADR-0049).
 //!
 //! Its own test binary because it installs trawld's subscriber as the
-//! process's global one, with a WAL sink for self-telemetry and a captured
-//! stdout, the way `query_timing_roundtrip.rs` and `ingest_admission.rs`
-//! do. A process has one global subscriber, installed once here.
+//! process's global one.
 
 mod common;
 
@@ -32,25 +24,16 @@ use trawl_server::hot_buffer::Charge;
 use trawl_server::ingest::producer::Derivation;
 use trawl_server::telemetry::{self, LogSinks, WalHandle, WalLayer};
 
-/// Every canary starts with this, in some ASCII case. No line trawld
-/// writes about these requests may contain it, in any case.
 const CANARY: &str = "cnry";
 
-/// trawld's default directives with debug logging on for trawld and for
-/// tower-http, so the request lines a preview may produce are all there to
-/// be read.
 const DEBUG_FILTER: &str = "trawl_server=debug,tower_http=debug,trawld=info,fleet_auth=info,\
                             auth.backend=info,storage.backend=info,preauth.transport=info";
 
-/// Neither rate bucket binds the test's requests.
 const UNLIMITED: RateLimitConfig = RateLimitConfig {
     default_rpm: 0,
     ingest_rpm: 0,
 };
 
-// -- the production subscriber, captured ------------------------------------
-
-/// Everything the global subscriber writes to stdout.
 #[derive(Clone, Default)]
 struct Stdout(Arc<Mutex<Vec<u8>>>);
 
@@ -73,16 +56,12 @@ impl<'a> MakeWriter<'a> for Stdout {
     }
 }
 
-/// The subscriber's two sinks, as the test reads them.
 struct Telemetry {
     stdout: Stdout,
     handle: WalHandle,
     layer: WalLayer,
 }
 
-/// trawld's subscriber under [`DEBUG_FILTER`], with a WAL sink and a
-/// captured stdout, installed once for the whole binary. The WAL sink
-/// writes nothing until [`WalHandle::set`] names a server's WAL writer.
 fn telemetry() -> &'static Telemetry {
     static TELEMETRY: OnceLock<Telemetry> = OnceLock::new();
     TELEMETRY.get_or_init(|| {
@@ -114,24 +93,18 @@ fn telemetry() -> &'static Telemetry {
     })
 }
 
-/// Everything captured on stdout so far.
 fn captured_stdout() -> String {
     String::from_utf8(telemetry().stdout.0.lock().unwrap().clone()).unwrap()
 }
 
-/// Whether `text` holds a canary, in any ASCII case.
 fn has_canary(text: &str) -> bool {
     text.to_ascii_lowercase().contains(CANARY)
 }
-
-// -- requests -----------------------------------------------------------------
 
 fn client() -> reqwest::Client {
     common::harness_client_builder().build().unwrap()
 }
 
-/// POST `body` to the preview as the admin key, `query` appended verbatim,
-/// with any extra headers.
 async fn preview(
     server: &TestServer,
     query: &str,
@@ -158,8 +131,6 @@ fn request_id_of(response: &reqwest::Response) -> String {
         .to_owned()
 }
 
-/// POST NDJSON to real ingest as the ingest key, requiring every event in
-/// it accepted.
 async fn ingest(server: &TestServer, events: &[Value]) {
     let body: Vec<String> = events.iter().map(Value::to_string).collect();
     let response = client()
@@ -186,8 +157,6 @@ async fn metrics_text(server: &TestServer) -> String {
         .unwrap()
 }
 
-// -- what a preview must leave alone --------------------------------------------
-
 fn wal_dir(server: &TestServer) -> PathBuf {
     server
         .state
@@ -199,7 +168,6 @@ fn wal_dir(server: &TestServer) -> PathBuf {
         .to_path_buf()
 }
 
-/// Every path under `dir`, recursively, with its size.
 fn listing(dir: &Path) -> BTreeSet<(PathBuf, u64)> {
     let mut out = BTreeSet::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -219,7 +187,6 @@ fn listing(dir: &Path) -> BTreeSet<(PathBuf, u64)> {
     out
 }
 
-/// Every line of every file under the WAL directory.
 fn wal_lines(server: &TestServer) -> Vec<String> {
     listing(&wal_dir(server))
         .into_iter()
@@ -234,17 +201,13 @@ fn wal_lines(server: &TestServer) -> Vec<String> {
         .collect()
 }
 
-/// Everything a preview must leave unchanged.
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     wal: BTreeSet<(PathBuf, u64)>,
     charged: Charge,
-    /// The ingest, repair, reject and unmapped-severity series on
-    /// `/metrics`, verbatim. A set: the exporter renders in no fixed order.
+    /// A set: the exporter renders in no fixed order.
     counters: BTreeSet<String>,
-    /// `/stats`, less its uptime.
     stats: Value,
-    /// The monitor's ingest totals.
     totals: (u64, u64),
 }
 
@@ -300,12 +263,6 @@ async fn snapshot(server: &TestServer) -> Snapshot {
     }
 }
 
-// -- the samples ------------------------------------------------------------------
-
-/// A sample with a canary in every input position: keys and values, top
-/// level and nested, `_raw`, `service`, `env`, `host`, `message`, and each
-/// time and severity source. It holds a clean acceptance, a repaired one,
-/// a fold, and rejections that quote their input.
 fn canary_sample() -> String {
     let lines = [
         json!({"service": "cnry-svc-clean", "env": "prod", "host": "cnry-host-1",
@@ -329,20 +286,17 @@ fn canary_sample() -> String {
     body.join("\n")
 }
 
-/// A canary line repeated to `count` positions.
 fn repeated(count: usize) -> String {
     let line = json!({"service": "cnry-svc-many", "message": "cnry-msg-many"}).to_string();
     vec![line; count].join("\n")
 }
 
-/// The one sample, gzip-compressed.
 fn gzipped(body: &str) -> Vec<u8> {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(body.as_bytes()).unwrap();
     encoder.finish().unwrap()
 }
 
-/// Read the stream until `needle` arrives, returning everything read.
 async fn read_stream_until(response: &mut reqwest::Response, needle: &str) -> String {
     let mut bytes: Vec<u8> = Vec::new();
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -371,9 +325,6 @@ async fn read_stream_until(response: &mut reqwest::Response, needle: &str) -> St
     String::from_utf8(bytes).unwrap()
 }
 
-// -- AC5 ------------------------------------------------------------------------
-
-/// Point the global subscriber's WAL sink at `server`.
 fn bind_telemetry(server: &TestServer) -> &'static Telemetry {
     let telemetry = telemetry();
     telemetry.handle.set(
@@ -386,9 +337,6 @@ fn bind_telemetry(server: &TestServer) -> &'static Telemetry {
     telemetry
 }
 
-/// A real ingest, accepted with repairs and an unmapped severity beside a
-/// rejection, so every counter series a preview must leave alone exists
-/// before one runs.
 async fn seed_counters(server: &TestServer) {
     let response = client()
         .post(format!("{}/api/v1/ingest", server.url))
@@ -407,9 +355,6 @@ async fn seed_counters(server: &TestServer) {
     assert_eq!(response.status(), 200);
 }
 
-/// Send the canary sample as an accepted-repaired-rejected report and as
-/// every refusal (body limit, position limit, gzip, a framing error, a bad
-/// `peer_ip`), returning each response's request id.
 async fn send_canary_previews(server: &TestServer) -> Vec<String> {
     use trawl_api::ingest_preview::{MAX_PREVIEW_EVENTS, PreviewEvent, PreviewResponse};
 
@@ -505,9 +450,6 @@ async fn send_canary_previews(server: &TestServer) -> Vec<String> {
     request_ids
 }
 
-/// Require that the tail, read up to the barrier, carried no canary and no
-/// event but the barrier and trawld's own telemetry (the baseline flush
-/// published that).
 fn assert_only_the_barrier_streamed(streamed: &str) {
     assert!(!has_canary(streamed), "the tail saw a sample: {streamed}");
     let others: Vec<Value> = streamed
@@ -528,11 +470,6 @@ fn assert_only_the_barrier_streamed(streamed: &str) {
     assert_eq!(others[0]["message"], "preview-barrier");
 }
 
-/// Previews with a canary in every input position, accepted, repaired and
-/// rejected, plus refused ones (body limit, position limit, gzip, a
-/// framing error, a bad `peer_ip`), change nothing a real ingest changes,
-/// reach no stream subscriber, and leave no canary in trawld's persisted
-/// telemetry or its log lines.
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_with_canaries_everywhere_stores_and_logs_none_of_them() {
     let server = setup_with_rate_limit(UNLIMITED).await;
@@ -574,7 +511,6 @@ async fn preview_with_canaries_everywhere_stores_and_logs_none_of_them() {
         "a preview changed what ingest changes"
     );
 
-    // Barrier: a real event reaches the tail, and nothing reached it first.
     ingest(
         &server,
         &[json!({"service": "barrier", "host": "h", "message": "preview-barrier"})],
@@ -583,7 +519,6 @@ async fn preview_with_canaries_everywhere_stores_and_logs_none_of_them() {
     assert_only_the_barrier_streamed(&read_stream_until(&mut stream, "preview-barrier").await);
     drop(stream);
 
-    // Persist everything the requests logged, then read it all back.
     telemetry.layer.flush_cycle().await;
     let wal = wal_lines(&server);
     let persisted: Vec<&String> = wal.iter().filter(|line| has_canary(line)).collect();
@@ -592,8 +527,6 @@ async fn preview_with_canaries_everywhere_stores_and_logs_none_of_them() {
     let logged: Vec<&str> = stdout.lines().filter(|line| has_canary(line)).collect();
     assert!(logged.is_empty(), "logged canaries: {logged:#?}");
 
-    // The capture saw the previews: each one's request lines are on
-    // stdout and in the persisted telemetry, debug lines included.
     for request_id in &request_ids {
         assert!(
             stdout.lines().any(|line| line.contains(request_id)),

@@ -19,12 +19,10 @@ use trawl_server::state::{open_query_scratch, open_results_root};
 const ID: &str = "0123456789abcdef0123456789abcdef";
 const OTHER: &str = "fedcba9876543210fedcba9876543210";
 
-/// The permission bits at `path`, not following a final symlink.
 fn mode_of(path: &Path) -> u32 {
     std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
 }
 
-/// Every name in `dir`, sorted.
 fn names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -34,21 +32,17 @@ fn names(dir: &Path) -> Vec<String> {
     names
 }
 
-/// A results root held in a fresh temporary directory, kept apart from
-/// nothing.
 fn root_in(tmp: &tempfile::TempDir) -> ResultsRoot {
     ResultsRoot::open_apart_from(&tmp.path().join("data.results"), &[]).unwrap()
 }
 
-/// Stage `bytes` and publish them as `id`.
 fn publish(root: &ResultsRoot, id: &str, bytes: &[u8]) -> trawl_server::results::root::Published {
     let staged = root.stage().unwrap();
     std::fs::write(staged.path(), bytes).unwrap();
     root.publish(staged, id).unwrap()
 }
 
-/// A configuration over `data`, with `[server]` settings `server`, parsed
-/// without validation so the hold's own checks are what refuses.
+/// Parsed without validation so the hold's own checks are what refuses.
 fn config(data: &Path, server: &str) -> Config {
     Config::parse_toml(&format!(
         "[data]\npath = {:?}\n[server]\n{server}\n",
@@ -249,8 +243,6 @@ fn list_ids_ignores_what_trawld_does_not_make() {
     std::fs::create_dir(root.path().join(".stage-0123456789abcdef.parquet")).unwrap();
 
     assert_eq!(root.list_ids().unwrap(), [ID, OTHER]);
-    // Only the real stage is removed; the directory with a stage's name is
-    // not one trawld made.
     drop(staged);
     assert_eq!(root.remove_stages().unwrap(), 0);
     assert!(root.path().join(".stage-0123456789abcdef.parquet").is_dir());
@@ -346,19 +338,14 @@ fn a_results_root_inside_the_data_root_refuses() {
 #[path = "common/userns.rs"]
 mod userns;
 
-/// Held roots and storage roots that alias through bind mounts (#314,
-/// ADR-0057 amendment of 2026-10-25), proved inside an unprivileged user
-/// and mount namespace.
+/// Held roots and storage roots that alias through bind mounts, proved
+/// inside an unprivileged user and mount namespace.
 ///
-/// The hold is a library call that must run where the mounts are, so each
-/// test re-executes this test binary inside the namespace, filtered to
-/// itself, with the case in the environment. The inner run makes the public
-/// call and checks the refusal word for word; it prints a sentinel only
-/// after its checks pass, which guards against a filter that matched
-/// nothing and exited 0. The outer run makes the tree, lists it, runs the
-/// inner one, and lists it again: a refusal leaves the tree as it was. The
-/// mounts are private to the namespace, so the outer listing reads the
-/// directories themselves, never the aliases.
+/// The hold must run where the mounts are, so each test re-executes this
+/// test binary inside the namespace, filtered to itself. The inner run
+/// prints a sentinel only after its checks pass, which guards against a
+/// filter that matched nothing and exited 0. The mounts are private to the
+/// namespace, so the outer listing reads the directories themselves.
 #[cfg(target_os = "linux")]
 mod bind_alias {
     use std::os::unix::fs::MetadataExt as _;
@@ -369,11 +356,8 @@ mod bind_alias {
 
     use crate::userns::Userns;
 
-    /// Names the case in the inner run. Unset, the test is the outer run.
     const CASE: &str = "TRAWL_TEST_BIND_ALIAS_CASE";
-    /// The fixture's base directory, which the outer run made and owns.
     const BASE: &str = "TRAWL_TEST_BIND_ALIAS_BASE";
-    /// What the inner run prints once its checks pass, before the case name.
     const SENTINEL: &str = "INNER_RAN";
 
     /// The refusal a case expects: the clause and roots, all paths relative
@@ -381,43 +365,29 @@ mod bind_alias {
     struct Refusal {
         /// `is inside` or `is above`.
         overlap: &'static str,
-        /// The storage root as the refusal names it.
         what: &'static str,
-        /// The storage root's configured path.
         root: &'static str,
-        /// The mount point the clause names.
         mount: &'static str,
     }
 
-    /// The call the inner run makes.
     enum Call {
-        /// `open_results_root` refuses.
         Results(Refusal),
-        /// `open_query_scratch` refuses.
         Scratch(Refusal),
-        /// `open_query_scratch`, then `open_results_root`, both open.
         Both,
     }
 
-    /// One fixture. Every path is relative to the base directory.
+    /// Every path is relative to the base directory.
     struct Case {
         name: &'static str,
-        /// Directories made before the run, mount points included.
         dirs: &'static [&'static str],
-        /// Files written before the run, so a listing has content to keep.
         files: &'static [&'static str],
-        /// `(source, mount point)` pairs bound read-write in the namespace.
         binds: &'static [(&'static str, &'static str)],
-        /// `[data] path`.
         data: &'static str,
         /// `[ingest] wal_dir`, or the default under the data root.
         wal: Option<&'static str>,
-        /// `[server] query_scratch_dir`, always explicit.
         scratch: &'static str,
-        /// `[server] results_dir`.
         results: &'static str,
         call: Call,
-        /// The directory whose listing must read the same afterward.
         unchanged: &'static str,
     }
 
@@ -427,7 +397,6 @@ mod bind_alias {
     const REPIN_SHADOW_ROOT: &str = "the repin shadow root (<[data] path>.repin-next)";
     const REPIN_ASIDE_ROOT: &str = "the repin aside root (<[data] path>.repin-aside)";
 
-    /// The configuration `case` describes, over `base`.
     fn config_of(case: &Case, base: &Path) -> Config {
         let path = |rel: &str| base.join(rel).to_str().unwrap().to_owned();
         let ingest = case.wal.map_or_else(String::new, |wal| {
@@ -442,8 +411,6 @@ mod bind_alias {
         Config::parse_toml(&toml).unwrap()
     }
 
-    /// The pinned overlap refusal with its mount clause, for the held
-    /// directory `held` named `noun` and moved by `setting`.
     fn refusal_text(
         refusal: &Refusal,
         base: &Path,
@@ -462,7 +429,6 @@ mod bind_alias {
         )
     }
 
-    /// Inside the namespace: make the case's call and check what it says.
     fn inner(case: &Case, base: &Path) {
         let config = config_of(case, base);
         match &case.call {
@@ -511,8 +477,6 @@ mod bind_alias {
         }
     }
 
-    /// Every entry at and below `dir`, as `(path below dir, kind, mode)`,
-    /// sorted, not following symlinks.
     fn tree(dir: &Path) -> Vec<(PathBuf, char, u32)> {
         fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, char, u32)>) {
             let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -547,9 +511,6 @@ mod bind_alias {
         out
     }
 
-    /// Outside the namespace: make `case`'s tree, run it inside as `test`,
-    /// and check the run reached its sentinel and changed nothing it must
-    /// keep.
     fn outer(userns: &Userns, test: &str, case: &Case) {
         let tmp = tempfile::tempdir().unwrap();
         // The mount table names canonical paths, and so does the clause.
@@ -607,8 +568,6 @@ mod bind_alias {
         );
     }
 
-    /// Run `cases` for the test `test`: inside the namespace when this is
-    /// the inner run, else each case through the namespace in turn.
     fn scenario(test: &str, cases: &[Case]) {
         if let Some(name) = std::env::var_os(CASE) {
             let case = cases

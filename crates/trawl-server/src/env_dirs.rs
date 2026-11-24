@@ -4,41 +4,16 @@
 
 //! The data root's layout (ADR-0009): `{env}/{date}/{HH}/{service}.parquet`,
 //! with daily rollups at `{env}/{date}/{service}.parquet`.
-//!
-//! The single definition of what counts as an env directory, a date
-//! directory and an hour directory, shared by the query planner
-//! (`source.rs`, which globs `data/{env}/…`), the compactor
-//! (`ingest::compaction`, which walks both `wal/{env}/` and `data/{env}/`),
-//! retention, conformance and the repin engine. They must all agree, so the
-//! grammar lives here once: [`parse_date`] and [`parse_hour`] accept only
-//! the spelling [`date_name`] and [`hour_name`] write, the path builders
-//! compose them, and [`layout_path`] is their inverse.
-//!
-//! [`date_partition`] extends env recognition one level down: which
-//! `{env}/{date}` directory is a date partition. Retention deletes by it and
-//! the storage scan buckets bytes by it (ADR-0042), so the two agree on what
-//! a partition is.
-//!
-//! The grammar functions do no IO. Each listing here keeps its own policy
-//! for absence and errors.
 
 use std::collections::BinaryHeap;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::NaiveDate;
 
-/// Whether a top-level directory name is an env: the env charset, with the
-/// reserved names (`wal`, `scheduled`, …) excluded.
 pub(crate) fn is_env_dir_name(name: &str) -> bool {
     trawl_config::is_valid_env_name(name) && !trawl_config::RESERVED_ENV_NAMES.contains(&name)
 }
 
-/// The date of the partition directory `{env}/{date}`, or `None` when the
-/// pair is not one: `env` must be an env directory name and `date` a
-/// canonical date name ([`parse_date`]).
-///
-/// The single env/date recognition rule. It says nothing about today:
-/// retention skips today's partition, the storage scan counts it.
 pub(crate) fn date_partition(env: &str, date: &str) -> Option<NaiveDate> {
     if !is_env_dir_name(env) {
         return None;
@@ -46,26 +21,19 @@ pub(crate) fn date_partition(env: &str, date: &str) -> Option<NaiveDate> {
     parse_date(date)
 }
 
-/// How a date directory is spelled: `YYYY-MM-DD`.
 const DATE_FORMAT: &str = "%Y-%m-%d";
 
-/// Extension of a partition file; the stem is the service name.
 const PARQUET_EXTENSION: &str = ".parquet";
 
-/// The name of `date`'s directory.
 pub(crate) fn date_name(date: NaiveDate) -> String {
     date.format(DATE_FORMAT).to_string()
 }
 
-/// The name of an hour directory, `00` to `23`.
 pub(crate) fn hour_name(hour: u8) -> String {
     debug_assert!(hour <= 23, "hour {hour} has no directory");
     format!("{hour:02}")
 }
 
-/// The date a date directory names, or `None` when `name` is not exactly
-/// what [`date_name`] writes for a calendar date.
-///
 /// `chrono` alone also reads `2026-2-01`, `+026-01-01` and `2026-01- 1`, so
 /// the parsed date must spell `name` back.
 pub(crate) fn parse_date(name: &str) -> Option<NaiveDate> {
@@ -76,8 +44,6 @@ pub(crate) fn parse_date(name: &str) -> Option<NaiveDate> {
     (date_name(date) == name).then_some(date)
 }
 
-/// The hour an hour directory names: exactly two ASCII digits, `00` to
-/// `23`.
 pub(crate) fn parse_hour(name: &str) -> Option<u8> {
     let &[tens, ones] = name.as_bytes() else {
         return None;
@@ -89,73 +55,42 @@ pub(crate) fn parse_hour(name: &str) -> Option<u8> {
     (hour <= 23).then_some(hour)
 }
 
-/// `date`'s directory under the env directory `env_root`.
 pub(crate) fn day_dir(env_root: &Path, date: NaiveDate) -> PathBuf {
     env_root.join(date_name(date))
 }
 
-/// The hour directory of `date` and `hour` under `env_root`.
 pub(crate) fn hour_dir(env_root: &Path, date: NaiveDate, hour: u8) -> PathBuf {
     day_dir(env_root, date).join(hour_name(hour))
 }
 
-/// The hourly file `service` writes for `date` and `hour` under `env_root`.
 pub(crate) fn hourly_file(env_root: &Path, date: NaiveDate, hour: u8, service: &str) -> PathBuf {
     hour_dir(env_root, date, hour).join(format!("{service}{PARQUET_EXTENSION}"))
 }
 
-/// The daily rollup of `service` in the day directory `day_dir` (see
-/// [`day_dir`]).
 pub(crate) fn daily_file(day_dir: &Path, service: &str) -> PathBuf {
     day_dir.join(format!("{service}{PARQUET_EXTENSION}"))
 }
 
-/// Where one standing file sits in trawl's own storage layout.
 pub(crate) struct LayoutPath {
-    /// The env directory the path sits under.
     pub(crate) env: String,
     /// The hour directory, or `None` for a daily rollup.
     pub(crate) hour: Option<u8>,
-    /// The service the path names — read off the layout, not guessed from a
-    /// file stem, so it is the same string ingest wrote verbatim.
     pub(crate) service: String,
     /// The instant this file's partition directory claims (see
     /// [`crate::ingest::compaction::ConformPolicy::StandingFile`]).
     pub(crate) instant: chrono::DateTime<chrono::Utc>,
 }
 
-/// Read `path` back as trawl's own storage layout — `{env}/{date}/{HH}/
-/// {service}.parquet`, or `{env}/{date}/{service}.parquet` for a daily
-/// rollup — relative to the data root. `None` = foreign, i.e. not ours.
-///
-/// This is the whole safety gate on an in-place, lossy, irreversible rewrite,
-/// so it is deliberately the strict inverse of the write path rather than a
-/// loose shape match: every component is checked against the same injective
-/// predicates ingest funnels names through ([`is_env_dir_name`],
-/// `is_valid_service_name`), and the date and hour must be the canonical
-/// names of a real instant ([`parse_date`], [`parse_hour`]). A file that
-/// ingest could not have produced this path for is not trawl's file,
-/// whatever it contains.
-///
-/// The boundary it can draw is "a path the writer could have produced", not
-/// provenance: a file planted at an exactly-valid layout path is ours as far
-/// as anything here can tell. Deliberately not tightened with the configured
-/// `[ingest] envs` allowlist — an env retired from the config still has a
-/// standing corpus that queries read and the invariant must therefore cover.
-///
-/// It doubles as the rewrite's never-NULL `_time` fallback: a standing file
-/// has no WAL filename to recover an ingest instant from, but it does sit in
-/// a directory that names the hour compaction wrote it, at or after the
-/// row's arrival — the closest honest answer available. That hour need not
-/// match any query window: a `last=` walk floors its start to the hour and
-/// pads it.
+/// Read `path` back as trawl's own storage layout, relative to the data root.
+/// `None` = foreign, i.e. not ours. This is the whole safety gate on an
+/// in-place, lossy, irreversible rewrite, so it is deliberately the strict
+/// inverse of the write path rather than a loose shape match.
 pub(crate) fn layout_path(data_root: &Path, path: &Path) -> Option<LayoutPath> {
     let rel = path.strip_prefix(data_root).ok()?;
     let mut parts: Vec<&str> = Vec::new();
     for component in rel.components() {
         match component {
             Component::Normal(part) => parts.push(part.to_str()?),
-            // `..`, a root, a prefix: not a path the writer can produce.
             _ => return None,
         }
     }
@@ -187,11 +122,7 @@ pub(crate) fn layout_path(data_root: &Path, path: &Path) -> Option<LayoutPath> {
     })
 }
 
-/// Whether a top-level directory name of an unmarked data root could be
-/// trawl's own residue: date-shaped, ten ASCII bytes `DDDD-DD-DD`, whether
-/// or not it names a calendar date (ADR-0036).
-///
-/// Never a partition test, and retention never uses it: it is deliberately
+/// Date-shaped, whether or not it names a calendar date (ADR-0036): deliberately
 /// looser than [`parse_date`], so boot refuses a root holding `2026-13-45`
 /// rather than reading it as a generic archive.
 pub(crate) fn is_owned_residue_dir_name(name: &str) -> bool {
@@ -251,26 +182,16 @@ pub(crate) fn is_absent(path: &Path) -> bool {
     }
 }
 
-/// Enumerate env directories under `root`, reporting an unreadable root.
-///
-/// A *missing* root is a legitimate cold start — no data has been written
-/// yet — and yields an empty list. A root that is, or is below, a symlink
-/// to nothing is not missing (see [`is_absent`]). Any other `read_dir`
-/// failure (permissions, I/O, a file where the root should be) is returned:
-/// it means the env set is unknown, not empty, and a caller that cannot
-/// tell the two apart reports a clean run while nothing gets done
-/// (ADR-0008: no silent loss).
-///
-/// Sorted by name for deterministic ordering (glob order, compaction order).
+/// A *missing* root is a legitimate cold start and yields an empty list. A
+/// root that is, or is below, a symlink to nothing is not missing (see
+/// [`is_absent`]). Any other `read_dir` failure is returned: it means the env
+/// set is unknown, not empty (ADR-0008: no silent loss).
 pub(crate) fn try_list_env_dirs(root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
     try_list_env_dirs_observed(root, || {})
 }
 
-/// Preserve the listing policy while observing otherwise skipped errors.
-///
 /// The callback observes non-`NotFound` entry and metadata errors only.
 /// Fatal root-listing errors are returned, without calling the observer.
-/// Callers can combine these observations into one failed scan attempt.
 pub(crate) fn try_list_env_dirs_observed(
     root: &Path,
     mut on_skipped_error: impl FnMut(),
@@ -289,9 +210,6 @@ pub(crate) fn try_list_env_dirs_observed(
     Ok(dirs)
 }
 
-/// The env directory one entry of the root is, or `None` when it is not
-/// one: the per-entry rule every listing here applies. `on_skipped_error`
-/// observes the non-`NotFound` entry and metadata errors it skips.
 fn env_entry(
     entry: std::io::Result<std::fs::DirEntry>,
     on_skipped_error: &mut impl FnMut(),
@@ -302,17 +220,11 @@ fn env_entry(
     })
 }
 
-/// Why [`read_env_entry`] could not tell whether an entry is an env.
 enum EntryError {
-    /// The root's listing failed reading the next entry.
     Listing(std::io::Error),
-    /// The entry's metadata could not be read.
     Metadata(PathBuf, std::io::Error),
 }
 
-/// [`env_entry`]'s rule, returning the errors it skips. An entry that is
-/// `NotFound` (it vanished between the listing and its metadata, or is a
-/// dangling symlink) is not an env, not an error.
 fn read_env_entry(
     entry: std::io::Result<std::fs::DirEntry>,
 ) -> Result<Option<(String, PathBuf)>, EntryError> {
@@ -322,7 +234,6 @@ fn read_env_entry(
         Err(error) => return Err(EntryError::Listing(error)),
     };
     let path = entry.path();
-    // Path::metadata follows symlinks, as the previous is_dir did.
     let metadata = match path.metadata() {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -341,11 +252,8 @@ fn read_env_entry(
 }
 
 /// Enumerate env directories under `root`, treating an unreadable root as
-/// empty. For callers where "no envs" and "cannot tell" are the same
-/// outcome — the query planner (a broader source is never incorrect) and
-/// best-effort housekeeping sweeps. The failure is logged rather than
-/// swallowed silently; anything that must not proceed on an unknown env set
-/// calls [`try_list_env_dirs`] instead.
+/// empty. Anything that must not proceed on an unknown env set calls
+/// [`try_list_env_dirs`] instead.
 pub(crate) fn list_env_dirs(root: &Path) -> Vec<(String, PathBuf)> {
     try_list_env_dirs(root).unwrap_or_else(|e| {
         warn_unlisted(root, &e);
@@ -353,7 +261,6 @@ pub(crate) fn list_env_dirs(root: &Path) -> Vec<(String, PathBuf)> {
     })
 }
 
-/// Log a root the listings that treat "cannot tell" as empty could not read.
 fn warn_unlisted(root: &Path, error: &std::io::Error) {
     tracing::debug!(
         dir = %root.display(),
@@ -367,7 +274,6 @@ fn warn_unlisted(root: &Path, error: &std::io::Error) {
     );
 }
 
-/// Env names under `root`, as [`list_env_dirs`] but dropping the paths.
 pub(crate) fn list_env_names(root: &Path) -> Vec<String> {
     list_env_dirs(root)
         .into_iter()
@@ -375,27 +281,18 @@ pub(crate) fn list_env_names(root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The first env names under a root, in name order, and how many envs it
-/// holds: [`first_env_names`]'s answer.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct FirstEnvNames {
-    /// The lexicographically first names, at most the cap asked for.
     pub(crate) names: Vec<String>,
-    /// Every env under the root, the named ones included.
     pub(crate) total: usize,
 }
 
-/// Why [`first_env_names`] could not say which envs a root holds.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FirstEnvNamesError {
-    /// The caller's `cancelled` returned true.
     #[error("env listing cancelled")]
     Cancelled,
-    /// The root could not be listed, for a reason other than not existing.
     #[error("failed to list env directories")]
     Root(#[source] std::io::Error),
-    /// One of the root's entries could not be read, for a reason other
-    /// than having vanished.
     #[error("failed to read env directory entry {}", path.display())]
     Entry {
         path: PathBuf,
@@ -407,23 +304,6 @@ pub(crate) enum FirstEnvNamesError {
 /// The first `cap` names [`list_env_names`] would list under `root`, and
 /// how many it would list, holding at most `cap + 1` names however many
 /// envs the root holds.
-///
-/// One pass over the root's entries: each env name goes into a max-heap,
-/// which drops its largest name once it holds more than `cap`, and what is
-/// left is sorted at the end. `cancelled` is read before each entry, so a
-/// cancelled walk stops at the next entry rather than finishing the root.
-///
-/// Unlike [`list_env_dirs`], an unreadable root is an error, not "no
-/// envs": a caller that reports on the envs it found cannot vouch for a
-/// set it could not read. A missing root is a cold start and holds none
-/// (a dangling symlink in its place, or above it, is not missing, see
-/// [`is_absent`]); an entry that vanished during the walk is skipped.
-///
-/// # Errors
-/// [`FirstEnvNamesError::Cancelled`] once `cancelled` returns true,
-/// [`FirstEnvNamesError::Root`] when the root's listing fails, a dangling
-/// symlink root or a root below a symlink to nothing included, and
-/// [`FirstEnvNamesError::Entry`] when an entry's metadata cannot be read.
 pub(crate) fn first_env_names(
     root: &Path,
     cap: usize,
@@ -466,8 +346,6 @@ pub(crate) fn first_env_names(
 mod tests {
     use super::*;
 
-    /// A date or hour directory parses only in the spelling the builders
-    /// write: a calendar date as `YYYY-MM-DD`, an hour as `00` to `23`.
     #[test]
     fn canonical_date_and_hour_matrix() {
         for name in ["2024-02-29", "2026-02-13", "1999-12-31", "0999-01-01"] {
@@ -514,8 +392,6 @@ mod tests {
         }
     }
 
-    /// The builders and [`layout_path`] are inverses on every canonical
-    /// path, and a path the builders cannot write does not parse.
     #[test]
     fn layout_paths_round_trip() {
         let root = PathBuf::from("/var/lib/trawl/data");
@@ -563,8 +439,6 @@ mod tests {
         }
     }
 
-    /// A date-shaped name is still a valid env: the layout tells env from
-    /// date by depth, not by spelling.
     #[test]
     fn date_shaped_env_stays_valid() {
         assert!(is_env_dir_name("2026-01-01"));
@@ -579,9 +453,6 @@ mod tests {
         assert_eq!((layout.env.as_str(), layout.hour), ("2026-01-01", Some(3)));
     }
 
-    /// Both of trawl's own layouts read back, service and instant intact —
-    /// the service off the path (verbatim, as ingest wrote it) and the
-    /// rewrite's never-NULL `_time` fallback off the partition directory.
     #[test]
     fn layout_path_reads_the_hour_and_the_daily_rollup() {
         let root = PathBuf::from("/var/lib/trawl/data");
@@ -596,27 +467,19 @@ mod tests {
         assert_eq!((daily.env.as_str(), daily.hour), ("prod", None));
     }
 
-    /// The gate on an in-place, lossy, irreversible rewrite: anything the
-    /// write path could not have produced is foreign, and a foreign file is
-    /// never scanned, never votes, and above all is never rewritten.
     #[test]
     fn layout_path_declines_everything_trawl_did_not_write() {
         let root = PathBuf::from("/var/lib/trawl/data");
         let foreign = [
-            // Depth: loose at the root, or nested past the layout.
             "svc-a.parquet",
             "prod/svc-a.parquet",
             "prod/2026-08-01/10/extra/svc-a.parquet",
-            // An operator's own tree that happens to sit under the data root.
             "backups/exports/10/svc-a.parquet",
             "prod/backup-2026-08-01/svc-a.parquet",
-            // Reserved env names are trawl's, but not the corpus.
             "wal/2026-08-01/10/svc-a.parquet",
             "scheduled/2026-08-01/10/svc-a.parquet",
-            // Names ingest's injective encoding cannot emit.
             "PROD/2026-08-01/10/svc-a.parquet",
             "prod/2026-08-01/10/Living Room AP.parquet",
-            // Not an instant.
             "prod/2026-08-01/99/svc-a.parquet",
             "prod/2026-08-01/1/svc-a.parquet",
             "prod/2026-13-01/10/svc-a.parquet",
@@ -627,7 +490,6 @@ mod tests {
                 "{rel} is not a path trawl wrote and must not be adopted"
             );
         }
-        // Outside the data root entirely.
         assert!(
             layout_path(
                 &root,
@@ -641,11 +503,9 @@ mod tests {
     fn date_partition_needs_an_env_and_a_calendar_date() {
         let date = NaiveDate::from_ymd_opt(2026, 2, 13).unwrap();
         assert_eq!(date_partition("prod", "2026-02-13"), Some(date));
-        // Reserved and out-of-charset env names are not envs.
         assert_eq!(date_partition("wal", "2026-02-13"), None);
         assert_eq!(date_partition("scheduled", "2026-02-13"), None);
         assert_eq!(date_partition("Prod", "2026-02-13"), None);
-        // Date-shaped but not a calendar date, and not date-shaped at all.
         assert_eq!(date_partition("prod", "2026-02-30"), None);
         assert_eq!(date_partition("prod", "2026-2-13"), None);
         assert_eq!(date_partition("prod", "00"), None);
@@ -654,8 +514,6 @@ mod tests {
     #[test]
     fn keeps_valid_envs_sorted_and_skips_the_rest() {
         let tmp = tempfile::tempdir().unwrap();
-        // Reserved names and a name outside the env charset must not
-        // surface as envs; a plain file must not either.
         for dir in ["prod", "lab", "wal", "scheduled", "Staging"] {
             std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
         }
@@ -684,8 +542,6 @@ mod tests {
         names
     }
 
-    /// Past the cap the walk keeps the first names in name order and still
-    /// counts every env.
     #[test]
     fn first_env_names_keeps_the_first_cap_names_and_counts_every_env() {
         let tmp = tempfile::tempdir().unwrap();
@@ -704,8 +560,6 @@ mod tests {
         assert_eq!(first, FirstEnvNames { names, total: 1024 });
     }
 
-    /// The listing's rule decides what is an env, for the names and for
-    /// the count.
     #[test]
     fn first_env_names_skips_what_is_not_an_env() {
         let tmp = tempfile::tempdir().unwrap();
@@ -726,8 +580,6 @@ mod tests {
         );
     }
 
-    /// The walk reads `cancelled` before each entry and stops at the
-    /// first read that says so, without finishing the root.
     #[test]
     fn first_env_names_stops_at_the_entry_cancelled_is_read_before() {
         let tmp = tempfile::tempdir().unwrap();
@@ -745,9 +597,6 @@ mod tests {
         assert_eq!(reads.get(), 4, "the walk stopped at the read");
     }
 
-    /// A missing root is a cold start with no envs; a root that is not a
-    /// directory cannot be listed and says so, where the planner's listing
-    /// still reads it as empty.
     #[test]
     fn first_env_names_reads_a_missing_root_as_no_envs_and_refuses_an_unreadable_one() {
         let tmp = tempfile::tempdir().unwrap();
@@ -766,9 +615,6 @@ mod tests {
         assert!(list_env_dirs(&root).is_empty());
     }
 
-    /// A dangling symlink where the root should be is not a cold start:
-    /// `read_dir` says `NotFound` for it as for a missing root, but something
-    /// is there, so the env set is unknown rather than empty.
     #[cfg(unix)]
     #[test]
     fn first_env_names_refuses_a_dangling_root_symlink() {
@@ -785,8 +631,6 @@ mod tests {
         assert!(!is_absent(&root));
     }
 
-    /// A root below a dangling symlink is not missing either: neither the
-    /// root nor the link's target exists, but the link does.
     #[cfg(unix)]
     #[test]
     fn first_env_names_refuses_a_root_below_a_dangling_symlink() {
@@ -801,8 +645,6 @@ mod tests {
         );
     }
 
-    /// No entry at the name, however deep, under a real directory is
-    /// absent: a cold start.
     #[test]
     fn a_missing_path_under_a_directory_is_absent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -810,8 +652,6 @@ mod tests {
         assert!(is_absent(&tmp.path().join("a/b/c")));
     }
 
-    /// A relative path resolves its ancestors from the working directory,
-    /// whose parent walk ends at `.`.
     #[test]
     fn a_missing_relative_path_is_absent() {
         let nanos = std::time::SystemTime::now()
@@ -823,9 +663,6 @@ mod tests {
         assert!(is_absent(&Path::new(&name).join("prod")));
     }
 
-    /// Below a symlink to nothing, at any depth, the name is not absent:
-    /// `lstat` says `NotFound` for it, but the nearest existing ancestor
-    /// is the link, which resolves to nothing.
     #[cfg(unix)]
     #[test]
     fn a_path_below_a_dangling_symlink_is_not_absent() {
@@ -843,8 +680,6 @@ mod tests {
         assert!(!is_absent(&deeper.join("prod/2024-01-19")));
     }
 
-    /// A trailing `/` or `.` would make `lstat` follow the final link;
-    /// the name is rebuilt from its components, so the link is seen.
     #[cfg(unix)]
     #[test]
     fn a_dangling_symlink_spelled_with_a_trailing_slash_is_not_absent() {
@@ -862,7 +697,6 @@ mod tests {
         assert!(!is_absent(&dot));
     }
 
-    /// Below a symlink to a directory is below a directory.
     #[cfg(unix)]
     #[test]
     fn a_missing_path_below_a_symlinked_directory_is_absent() {
@@ -874,8 +708,6 @@ mod tests {
         assert!(is_absent(&link.join("prod/2024-01-19")));
     }
 
-    /// Below a regular file, or a symlink to one, nothing can be created:
-    /// not absent.
     #[cfg(unix)]
     #[test]
     fn a_path_below_a_file_is_not_absent() {
@@ -889,7 +721,6 @@ mod tests {
         assert!(!is_absent(&link.join("prod")));
     }
 
-    /// A symlink loop above the name cannot be resolved: not absent.
     #[cfg(unix)]
     #[test]
     fn a_path_below_a_symlink_loop_is_not_absent() {
@@ -900,8 +731,6 @@ mod tests {
         assert!(!is_absent(&cycle.join("prod/2024-01-19")));
     }
 
-    /// Below a directory that cannot be searched, nothing can be told:
-    /// not absent.
     #[cfg(unix)]
     #[test]
     fn a_path_below_an_unsearchable_directory_is_not_absent() {
@@ -922,7 +751,6 @@ mod tests {
         assert!(!deep);
     }
 
-    /// A `..` component is never walked lexically: not absent.
     #[test]
     fn a_path_with_a_parent_component_is_not_absent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -931,8 +759,6 @@ mod tests {
         assert!(!is_absent(&tmp.path().join("missing/../other")));
     }
 
-    /// The fallible listing reads a missing root under a directory as a
-    /// cold start, and a root below a symlink to nothing as an error.
     #[cfg(unix)]
     #[test]
     fn try_list_refuses_a_root_below_a_dangling_symlink() {
@@ -957,9 +783,6 @@ mod tests {
         }
     }
 
-    /// An entry whose metadata cannot be read fails the walk naming it; a
-    /// dangling symlink has vanished as far as the walk can tell, and is
-    /// skipped while the rest are counted.
     #[cfg(unix)]
     #[test]
     fn first_env_names_refuses_an_unreadable_entry_and_skips_a_dangling_one() {
@@ -1048,9 +871,6 @@ mod tests {
         assert_eq!(try_list_env_dirs(&root).unwrap(), expected);
     }
 
-    /// The fallible listing separates "nothing written yet" from "cannot
-    /// tell": only the former is an empty list, so a caller that must not
-    /// proceed on an unknown env set can refuse to.
     #[test]
     fn try_list_separates_cold_start_from_unreadable_root() {
         let tmp = tempfile::tempdir().unwrap();

@@ -2,38 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! What trawld's queries may use, against the bundled `DuckDB` (ADR-0056):
-//! the query database spills, snapshots and stages exports only inside
-//! the query scratch directory, and a query that runs out of its spill cap
-//! or memory limit answers 503 `query_resource_exhausted` with a fixed
-//! sentence and nothing of `DuckDB`'s.
+//! What trawld's queries may use, against the bundled `DuckDB` (ADR-0056),
+//! and what their regexes may hold (ADR-0063).
 //!
-//! And what their regexes may hold (ADR-0063): a query over its regex
-//! budget, or one the server-wide regex reservation cannot hold, answers
-//! the same 503 with a regex cause, and the reservation is held by the
-//! work that matches, not by the request that waits for it. A batch
-//! statement holds an RE2 allowance from that reservation for every
-//! regex `DuckDB` binds, on every thread.
-//!
-//! And where their text is prepared (ADR-0063): every door parses,
-//! validates and builds on the blocking pool, behind the preparation
-//! allowance, never on a reactor thread.
-//!
-//! A scenario that needs its own process runs in a CHILD PROCESS: this
-//! test binary re-executes itself with the ignored
-//! [`query_resources_child`] test selected, the scenario named in
-//! [`CHILD_SCENARIO`] and a work directory the parent owns in
-//! [`CHILD_WORK`]. The child boots a server under that directory, drives
-//! it, and panics on a failed assertion; the parent asserts it exited
-//! cleanly. Two reasons need one: a private `TMPDIR`, and sampling the
-//! spill directory with the server's whole process stopped, so a sample is
-//! one state of the files rather than a sum over files `DuckDB` grows and
+//! A scenario runs in a CHILD PROCESS for a private `TMPDIR`, or to sample
+//! the spill directory with the server's whole process stopped, so a sample
+//! is one state of the files rather than a sum over files `DuckDB` grows and
 //! truncates while the directory is read.
-//!
-//! Every server here installs the production subscriber
-//! ([`telemetry::build_subscriber`]) with a stdout capture and a WAL
-//! layer, as `http_failure` does, so a test can read what trawld logged
-//! and stored about a request.
 
 mod common;
 
@@ -62,11 +37,8 @@ use trawl_server::telemetry::{self, LogSinks, WalHandle, WalLayer};
 use trawl_server::test_timing::{until, until_polling};
 use trawl_server::transport::failure::FAILURE_TARGET;
 
-/// Set only in the child: which scenario to run.
 const CHILD_SCENARIO: &str = "TRAWL_QUERY_RESOURCES_SCENARIO";
 
-/// Set only in the child: the directory the parent made for it. The
-/// child's server keeps its WAL, data root and query scratch here.
 const CHILD_WORK: &str = "TRAWL_QUERY_RESOURCES_WORK";
 
 /// The subprocess entry point. Without [`CHILD_SCENARIO`] it does nothing,
@@ -102,15 +74,10 @@ fn query_resources_child() {
     }
 }
 
-/// Run `scenario` in a child process over `work`, with `env` added to this
-/// process's environment, and fail with the child's output if it did not
-/// pass.
 fn run_child(scenario: &str, work: &Path, env: &[(&str, &Path)]) {
     finish_child(scenario, spawn_child(scenario, work, env));
 }
 
-/// Start `scenario` in a child process over `work`, with `env` added to
-/// this process's environment.
 fn spawn_child(scenario: &str, work: &Path, env: &[(&str, &Path)]) -> Child {
     let mut command = Command::new(std::env::current_exe().expect("locate this test binary"));
     command
@@ -133,8 +100,6 @@ fn spawn_child(scenario: &str, work: &Path, env: &[(&str, &Path)]) -> Child {
         .expect("start the child")
 }
 
-/// Wait for a child [`spawn_child`] started, and fail with its output if
-/// it did not pass.
 fn finish_child(scenario: &str, child: Child) {
     let output = child.wait_with_output().expect("wait for the child");
     assert!(
@@ -146,7 +111,6 @@ fn finish_child(scenario: &str, child: Child) {
     );
 }
 
-/// Every entry directly in `dir`, by name.
 fn entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
@@ -156,7 +120,6 @@ fn entries(dir: &Path) -> Vec<String> {
     names
 }
 
-/// A hot-buffer batch of `n` events for `service`.
 fn hot_batch(id: &str, service: &str, n: usize) -> Arc<IngestBatch> {
     let events = (0..n)
         .map(|i| {
@@ -176,15 +139,6 @@ fn hot_batch(id: &str, service: &str, n: usize) -> Arc<IngestBatch> {
     })
 }
 
-// -- AC9: nothing large in TMPDIR ---------------------------------------------
-
-/// Hot-buffer snapshots and Parquet export staging files are made inside
-/// the query scratch directory, and nothing trawld writes during a query,
-/// an export or a snapshot lands in `TMPDIR` (ADR-0056).
-///
-/// The child runs with `TMPDIR` pointed at a private empty directory, and
-/// its server keeps everything else under its work directory. The parent
-/// checks the directory is still empty once the child is gone.
 #[test]
 fn nothing_large_in_tmpdir() {
     let work = tempfile::tempdir().expect("work dir");
@@ -197,7 +151,6 @@ fn nothing_large_in_tmpdir() {
     );
 }
 
-/// The child half of [`nothing_large_in_tmpdir`].
 async fn tmpdir_child(work: &Path) {
     let tmpdir = std::env::temp_dir();
     assert_ne!(tmpdir, work, "the parent passed two directories");
@@ -297,11 +250,8 @@ async fn tmpdir_child(work: &Path) {
     );
 }
 
-// -- the production subscriber, captured ------------------------------------
-
 const ENV: &str = "default";
 
-/// Everything the global subscriber writes to stdout.
 #[derive(Clone, Default)]
 struct Stdout(Arc<Mutex<Vec<u8>>>);
 
@@ -330,9 +280,8 @@ struct Sinks {
     wal_dir: tempfile::TempDir,
 }
 
-/// The production subscriber under the default directives, installed once
-/// for the process. Its WAL lives in the child's work directory when there
-/// is one, so the subscriber writes nothing to `TMPDIR` either.
+/// Its WAL lives in the child's work directory when there is one, so the
+/// subscriber writes nothing to `TMPDIR` either.
 fn sinks() -> &'static Sinks {
     static SINKS: OnceLock<Sinks> = OnceLock::new();
     SINKS.get_or_init(|| {
@@ -369,7 +318,6 @@ fn sinks() -> &'static Sinks {
     })
 }
 
-/// Every stdout line so far.
 fn stdout_lines() -> Vec<String> {
     let bytes = sinks().stdout.0.lock().unwrap().clone();
     String::from_utf8(bytes)
@@ -379,7 +327,6 @@ fn stdout_lines() -> Vec<String> {
         .collect()
 }
 
-/// Every record the telemetry WAL holds so far.
 fn wal_records() -> Vec<serde_json::Value> {
     sinks().wal.flush();
     let Ok(entries) = std::fs::read_dir(sinks().wal_dir.path().join(ENV)) else {
@@ -398,7 +345,6 @@ fn wal_records() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The persisted `event_type` records for one request.
 fn records_for(event_type: &str, request_id: &str) -> Vec<serde_json::Value> {
     wal_records()
         .into_iter()
@@ -406,8 +352,6 @@ fn records_for(event_type: &str, request_id: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A field's value on a formatted stdout line: `name="quoted"` or
-/// `name=bare`.
 fn field(line: &str, name: &str) -> Option<String> {
     let at = line.find(&format!(" {name}="))? + name.len() + 2;
     let rest = &line[at..];
@@ -418,16 +362,10 @@ fn field(line: &str, name: &str) -> Option<String> {
     }
 }
 
-// -- a corpus that spills -----------------------------------------------------
-
 const MIB: u64 = 1024 * 1024;
 
-/// What the spill directory may hold past the cap on `DuckDB` 1.5.5: one
-/// block of each temp-file size class, 32 KiB to 256 KiB in 32 KiB steps
-/// (ADR-0056; `CLASS_SLACK` in trawl-engine's `query_budgets` tests). That
-/// is one block per class only while each class stays within one temp file,
-/// which holds at the small caps these tests use; at the 4 GiB default a
-/// class can hold several files, each overshooting by up to one block.
+/// What the spill directory may hold past the cap on `DuckDB` 1.5.5
+/// (ADR-0056).
 const CLASS_SLACK: u64 = 1_179_648;
 
 /// Rows in [`spill_corpus`]. With 128 MiB of memory and two threads,
@@ -438,12 +376,8 @@ const CORPUS_ROWS: usize = 1_000_000;
 /// message: it must hold or spill the whole input.
 const SPILLING: &str = "service=blob | dedup message | stats count()";
 
-/// A query over the same corpus that needs next to nothing.
 const SMALL: &str = "service=blob | stats count()";
 
-/// `DuckDB` text that must never reach a response, a log line or a
-/// stored record: its exception type, the settings its messages name, and
-/// the units its sizes are written in.
 const DUCKDB_TEXT: [&str; 8] = [
     "Out of Memory",
     "out of memory",
@@ -478,7 +412,6 @@ fn spill_corpus(data: &Path) {
     .unwrap();
 }
 
-/// The budgets a server under test runs with.
 fn knobs(permits: usize, spill: u64, memory: u64) -> common::QueryKnobs {
     common::QueryKnobs {
         max_concurrent_queries: permits,
@@ -488,8 +421,6 @@ fn knobs(permits: usize, spill: u64, memory: u64) -> common::QueryKnobs {
     }
 }
 
-/// A server over [`spill_corpus`] in `work`, with the production
-/// subscriber installed.
 async fn spill_server(
     work: &Path,
     timeout_secs: u64,
@@ -502,7 +433,6 @@ async fn spill_server(
         .await
 }
 
-/// One answer to a query: its status, request id and body.
 struct Answer {
     status: u16,
     request_id: String,
@@ -561,8 +491,6 @@ async fn send(server: &common::TestServer, request: reqwest::RequestBuilder) -> 
     }
 }
 
-/// `answer` is the 503 contract (ADR-0056): the code and the fixed
-/// sentence, nothing else.
 fn assert_exhausted(answer: &Answer) {
     assert_eq!(answer.status, 503, "{}", answer.body);
     let body: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
@@ -578,14 +506,10 @@ fn assert_exhausted(answer: &Answer) {
     );
 }
 
-/// The `http_failure` trawld logged and stored for an exhausted request on
-/// `route`: one record on each sink, a 503 `service_unavailable` with
-/// cause `duckdb_resource_exhausted`.
 fn assert_exhausted_failure(route: &str, request_id: &str) {
     assert_exhausted_cause(route, request_id, "duckdb_resource_exhausted");
 }
 
-/// [`assert_exhausted_failure`] with cause `cause`.
 fn assert_exhausted_cause(route: &str, request_id: &str, cause: &str) {
     let stored = records_for("http_failure", request_id);
     assert_eq!(stored.len(), 1, "one persisted failure: {stored:?}");
@@ -620,11 +544,8 @@ fn mark() -> Mark {
     }
 }
 
-/// Nothing trawld logged to stdout or stored since `mark` carries
-/// `DuckDB` text or a size, or names the query scratch, and nothing about
-/// the requests `request_ids` names any path under `work`. Boot records
-/// that land late may name the data directory; they are not about a
-/// query.
+/// Boot records that land late may name the data directory; they are not
+/// about a query.
 fn assert_nothing_leaked(work: &Path, mark: &Mark, request_ids: &[&str]) {
     let scratch = work.join("data.query-scratch");
     let scratch = scratch.to_str().unwrap();
@@ -671,10 +592,6 @@ fn assert_nothing_leaked(work: &Path, mark: &Mark, request_ids: &[&str]) {
     }
 }
 
-// -- the spill directory, sampled with the server stopped --------------------
-
-/// The largest byte totals the spill directory reached across samples:
-/// the sum of the files' lengths and of their allocated blocks.
 #[derive(Debug, Default, Clone, Copy)]
 struct Peak {
     length: u64,
@@ -683,17 +600,11 @@ struct Peak {
 }
 
 impl Peak {
-    /// The bytes the spill cap bounds: the files' lengths, which `DuckDB`
-    /// writes and counts. `allocated` is sampled for a failing run's
-    /// message and is not bounded: a filesystem that allocates ahead of
-    /// a growing file's end holds blocks `DuckDB` never asked for
-    /// (ADR-0056, amendment of 2026-11-10).
     fn held(self) -> u64 {
         self.length
     }
 }
 
-/// The spill directory's totals right now.
 fn totals(dir: &Path) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt as _;
     let (mut length, mut allocated) = (0, 0);
@@ -708,8 +619,6 @@ fn totals(dir: &Path) -> (u64, u64) {
     (length, allocated)
 }
 
-/// Whether every thread of `pid` has stopped, or the process has exited
-/// (a zombie never reads as stopped).
 fn stopped_or_gone(pid: u32) -> bool {
     let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
         return true;
@@ -723,15 +632,10 @@ fn stopped_or_gone(pid: u32) -> bool {
     })
 }
 
-/// Run `scenario` in a child process over `work` and sample the spill
-/// directory its server makes in `<work>/data.query-scratch` until it
-/// exits, then fail with the child's output if it did not pass.
-///
 /// Each sample sends `SIGSTOP`, waits until every thread is stopped, reads
-/// the directory, then sends `SIGCONT`. No thread moves a block while the
-/// directory is read, so a sample is one consistent state of the files.
-/// Sampling can still miss a peak between two samples, which weakens the
-/// check but never makes it fail falsely.
+/// the directory, then sends `SIGCONT`. Sampling can still miss a peak
+/// between two samples, which weakens the check but never makes it fail
+/// falsely.
 fn spill_peak_of_child(scenario: &str, work: &Path) -> Peak {
     use rustix::process::{Pid, Signal, kill_process};
 
@@ -809,18 +713,8 @@ async fn accounted_while<F: std::future::Future>(
     (output, most.load(Ordering::SeqCst))
 }
 
-// -- AC4: the spill cap -------------------------------------------------------
-
-/// The spill cap of [`spill_budget`]: well under what [`SPILLING`] spills.
 const SPILL_CAP: u64 = 24 * MIB;
 
-/// A query that spills past `[server] query_spill_max_bytes` answers 503
-/// `query_resource_exhausted` with cause `duckdb_resource_exhausted` and
-/// the fixed sentence (ADR-0056). The spill directory never holds more
-/// than the cap plus one block of each temp-file size class (one file per
-/// class, which holds at this test's small cap), the usage
-/// `DuckDB` accounts never passes the cap, and a small query on the same
-/// server then succeeds.
 #[test]
 fn spill_budget() {
     let work = tempfile::tempdir().expect("work dir");
@@ -838,7 +732,6 @@ fn spill_budget() {
     );
 }
 
-/// The child half of [`spill_budget`].
 async fn spill_budget_child(work: &Path) {
     let server = spill_server(work, 60, knobs(2, SPILL_CAP, 128 * MIB)).await;
     let before = mark();
@@ -859,15 +752,6 @@ async fn spill_budget_child(work: &Path) {
     assert_nothing_leaked(work, &before, &[&answer.request_id, &small.request_id]);
 }
 
-// -- AC5: the memory limit ----------------------------------------------------
-
-/// A query that runs out of `[server] query_memory_limit` answers the same
-/// 503 contract, on the query lane and the export lane alike, and the
-/// body, stdout and the stored `http_failure` carry no path, size or
-/// `DuckDB` text (ADR-0056).
-///
-/// The spill cap is the shipped default, far past what the query needs,
-/// and the spill directory stays empty: the memory limit stopped it.
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_limit() {
     let work = tempfile::tempdir().expect("work dir");
@@ -900,11 +784,6 @@ async fn memory_limit() {
     );
 }
 
-/// A stored run whose read runs out of the query budgets answers the same
-/// 503 contract, and nothing trawld logs about it names the stored file
-/// (ADR-0056). The saved-run read runs on a clone of the query database,
-/// so its budget failure is a query's, and a query's names no path.
-///
 /// The run is planted with a result file whose one row group is a 16 MiB
 /// column chunk, which the scan reads whole, outside what `DuckDB` can
 /// spill, against an 8 MiB memory limit.
@@ -989,8 +868,6 @@ async fn a_stored_run_read_past_the_budget_logs_no_path() {
     assert_nothing_leaked(work.path(), &before, &[&answer.request_id]);
 }
 
-// -- AC6: one budget, shared --------------------------------------------------
-
 /// The memory limit of [`clones_share_one_spill_budget`]. Under it four
 /// [`SPILLING`] queries at once all complete when spill is free; 128 MiB
 /// stopped two of four on memory alone.
@@ -1002,23 +879,10 @@ const SHARED_MEMORY: u64 = 256 * MIB;
 /// this cap.
 const SHARED_CAP: u64 = 128 * MIB;
 
-/// The spill cap of the calibration run, far past what four queries
-/// spill.
 const GENEROUS_CAP: u64 = 1024 * MIB;
 
-/// Concurrent queries, one per permit, in [`clones_share_one_spill_budget`].
 const SHARERS: usize = 4;
 
-/// Concurrent queries on clones of the query database share its one
-/// spill cap (ADR-0056). Four [`SPILLING`] queries started together all
-/// complete under [`SHARED_MEMORY`] when spill is free, and `DuckDB`
-/// accounts more spill for them than [`SHARED_CAP`]: memory alone does not
-/// stop them. Under the cap one query still completes alone, but four
-/// cannot all fit, so at least one answers 503 `query_resource_exhausted`,
-/// where a cap per clone would let all four complete. The same statements
-/// run raw on clones fail with `DuckDB`'s spill-cap message, not its
-/// memory one. Neither the spill `DuckDB` accounts nor the spill directory
-/// passes the one cap.
 #[test]
 fn clones_share_one_spill_budget() {
     let generous = tempfile::tempdir().expect("work dir");
@@ -1039,8 +903,6 @@ fn clones_share_one_spill_budget() {
     );
 }
 
-/// [`SHARERS`] [`SPILLING`] queries on `server`, every one started before
-/// any runs, and the most spill `DuckDB` accounted while they ran.
 async fn spill_together(server: &Arc<common::TestServer>) -> (Vec<Answer>, i64) {
     // Each parks at the work-start seam until the others have arrived.
     // The session releases its gates when dropped, so it lives as long as
@@ -1078,9 +940,6 @@ async fn spill_together(server: &Arc<common::TestServer>) -> (Vec<Answer>, i64) 
     all.await.unwrap()
 }
 
-/// A statement of [`SPILLING`]'s shape, written out over the file
-/// [`spill_corpus`] wrote under `work`: the same window over every
-/// distinct message, so it spills as the query does.
 fn spilling_sql(work: &Path) -> String {
     let corpus = work.join("data/prod/2026-01-02/10/blob.parquet");
     format!(
@@ -1094,10 +953,8 @@ fn spilling_sql(work: &Path) -> String {
     )
 }
 
-/// [`SHARERS`] copies of [`spilling_sql`] at once, each on its own clone
-/// of `server`'s query database, with the failures `DuckDB` raised. A 503
-/// names no cause, so this is where the test reads which budget stopped
-/// the work.
+/// A 503 names no cause, so this is where the test reads which budget
+/// stopped the work.
 fn spill_together_raw(server: &common::TestServer, work: &Path) -> Vec<Result<u64, duckdb::Error>> {
     let sql = spilling_sql(work);
     let barrier = Arc::new(std::sync::Barrier::new(SHARERS));
@@ -1119,8 +976,6 @@ fn spill_together_raw(server: &common::TestServer, work: &Path) -> Vec<Result<u6
     runs.into_iter().map(|run| run.join().unwrap()).collect()
 }
 
-/// The calibration half of [`clones_share_one_spill_budget`]: the same
-/// work under the same memory limit, with spill to spare.
 async fn shared_budget_generous_child(work: &Path) {
     let server =
         Arc::new(spill_server(work, 60, knobs(SHARERS, GENEROUS_CAP, SHARED_MEMORY)).await);
@@ -1141,7 +996,6 @@ async fn shared_budget_generous_child(work: &Path) {
     }
 }
 
-/// The capped half of [`clones_share_one_spill_budget`].
 async fn shared_budget_child(work: &Path) {
     let server = Arc::new(spill_server(work, 60, knobs(SHARERS, SHARED_CAP, SHARED_MEMORY)).await);
 
@@ -1183,27 +1037,17 @@ async fn shared_budget_child(work: &Path) {
     }
 }
 
-// -- AC8: the timeout verdict -------------------------------------------------
-
 /// The deadline of the servers below, in their config's whole seconds.
 const VERDICT_TIMEOUT_SECS: u64 = 1;
 
-/// Drive `request`, a [`SPILLING`] query, until its worker arrives at the
-/// `finished` hold with its spill failure in hand, failing if the request
-/// answers first.
-///
 /// The tests that use it run on one `current_thread` runtime with tokio's
-/// clock paused after boot: the server's tasks and the request share the
-/// thread, and the readiness probe's real timeout is behind them. Every
-/// wait from the pause on goes through the `test_timing` yield driver,
-/// which keeps the runtime busy so the paused clock never auto-advances.
-/// The request deadline then moves only when a test advances it, however
-/// long the spill takes on a loaded machine.
+/// clock paused after boot. Every wait from the pause on goes through the
+/// `test_timing` yield driver, which keeps the runtime busy so the paused
+/// clock never auto-advances.
 async fn park_spill_failure<F>(finished: &seam::Gate, request: &mut F)
 where
     F: Future<Output = Answer> + Unpin,
 {
-    // Waits for: the worker's arrival at Finished.
     if let Some(early) = until_polling("the spilling work reaches Finished", request, || {
         finished.arrivals() == 1
     })
@@ -1216,16 +1060,6 @@ where
     }
 }
 
-/// A query whose work fails with `Out of Memory` while its request times
-/// out keeps its 504 (ADR-0056): the work's failure is parked until the
-/// request has its answer, and does not replace it. `query_timing` records
-/// the timeout and `query_permit_reclaimed` the work's failure, as for any
-/// retained permit.
-///
-/// The order is fixed by events, not by the spill finishing inside a
-/// real second: the work parks at Finished with its failure, the clock
-/// then moves just past the deadline, and the 504 must arrive while the
-/// failure is still held.
 #[tokio::test]
 async fn timeout_verdict_survives_resource_failure() {
     let work = tempfile::tempdir().expect("work dir");
@@ -1250,7 +1084,6 @@ async fn timeout_verdict_survives_resource_failure() {
     // smallest one that expires the request.
     tokio::time::advance(Duration::from_secs(VERDICT_TIMEOUT_SECS) + Duration::from_millis(1))
         .await;
-    // Waits for: the request's answer, with the failed work still parked.
     let answer = until_polling("the request answers", &mut request, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -1264,10 +1097,7 @@ async fn timeout_verdict_survives_resource_failure() {
     assert_eq!(body["error"]["code"], "timeout");
 
     finished.release();
-    // Waits for: the worker's arrival at Released, after its cleanup.
     until("the work released everything", || released.arrivals() > 0).await;
-    // Waits for: the reclaim record, logged as the worker hands back its
-    // permit.
     until("the permit reclaim is recorded", || {
         !records_for("query_permit_reclaimed", &answer.request_id).is_empty()
     })
@@ -1297,10 +1127,8 @@ async fn timeout_verdict_survives_resource_failure() {
     );
 }
 
-/// The control for [`timeout_verdict_survives_resource_failure`]: the
-/// same parked spill failure, released before the deadline, is the
-/// request's answer, a 503 `query_resource_exhausted`. So the 504 there
-/// comes from the deadline passing first, not from the hold.
+/// The control for [`timeout_verdict_survives_resource_failure`]: the 504
+/// there comes from the deadline passing first, not from the hold.
 #[tokio::test]
 async fn resource_failure_released_before_the_deadline_is_the_answer() {
     let work = tempfile::tempdir().expect("work dir");
@@ -1320,8 +1148,6 @@ async fn resource_failure_released_before_the_deadline_is_the_answer() {
     let paused_at = tokio::time::Instant::now();
 
     finished.release();
-    // Waits for: the request's answer. The clock is never advanced, so
-    // the deadline cannot pass first.
     let answer = until_polling("the request answers", &mut request, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -1334,8 +1160,6 @@ async fn resource_failure_released_before_the_deadline_is_the_answer() {
     assert_exhausted_failure(QUERY_ROUTE, &answer.request_id);
     assert_eq!(released.arrivals(), 1, "the work released before answering");
 }
-
-// -- ADR-0063: regex memory ------------------------------------------------------
 
 const STREAM_ROUTE: &str = "/api/v1/stream";
 
@@ -1352,18 +1176,12 @@ const HEAVY: [&str; 7] = [
     r"(\pL{12})6",
 ];
 
-/// The pattern the reservation tests' streams and tails match the hot
-/// events with.
 const TAIL_PATTERN: &str = r"event \d+";
 
-/// A server over an empty data root in `work`, with the production
-/// subscriber installed and 20 events for service `fresh` in its hot
-/// buffer, whose queries time out after `timeout_secs`.
 async fn regex_server(work: &Path, timeout_secs: u64) -> common::TestServer {
     regex_server_with(work, timeout_secs, common::QueryKnobs::DEFAULT).await
 }
 
-/// [`regex_server`] with the query pool and budgets `knobs`.
 async fn regex_server_with(
     work: &Path,
     timeout_secs: u64,
@@ -1389,8 +1207,6 @@ async fn regex_server_with(
     server
 }
 
-/// A live stream of `dsl`, answered with a status: for a stream that
-/// setup refuses.
 async fn get_stream(server: &common::TestServer, dsl: &str) -> Answer {
     let request = common::harness_client_builder()
         .build()
@@ -1414,7 +1230,6 @@ async fn open_stream(server: &common::TestServer, dsl: &str) -> reqwest::Respons
         .unwrap()
 }
 
-/// ` | where message matches /…/` for each body.
 fn matches_stages(bodies: &[&str]) -> String {
     bodies.iter().fold(String::new(), |mut stages, body| {
         stages.push_str(" | where message matches /");
@@ -1424,13 +1239,6 @@ fn matches_stages(bodies: &[&str]) -> String {
     })
 }
 
-/// A query whose metered preparation needs more regex memory than one
-/// query may hold answers 503 `query_resource_exhausted` with the fixed
-/// sentence, and its `http_failure` names the regex budget as its cause
-/// (ADR-0063). Stream setup refuses it over the live filter and over a
-/// stage, and the batch lane over the Rust tail behind an `extract kv`.
-/// Nothing the server answers or records quotes a pattern, and an
-/// ordinary query answers afterwards.
 #[tokio::test(flavor = "multi_thread")]
 async fn regex_budget_refusal_is_typed() {
     let work = tempfile::tempdir().expect("work dir");
@@ -1483,28 +1291,15 @@ fn tail_charge() -> u64 {
     u64::try_from(pattern.charge().total()).unwrap()
 }
 
-/// The server-wide regex reservation follows the physical work, not the
-/// request (ADR-0063). The child lowers the reservation to one tail's
-/// charge and a build transient, less a byte, so while one stream or tail
-/// holds its charge no other build can start.
-///
-/// The child reads the reservation and its hold and release counters
-/// directly: the server runs in the child's own process, as the pool's
-/// seams the other tests here hold do.
-///
-/// - An open stream holds its charge, and returns it when it closes.
-/// - A request that cannot reserve, from stream setup or the batch tail,
-///   answers 503 with cause `regex_reservation_exhausted`.
-/// - A batch tail paused after its charge outlives its request's deadline:
-///   the client gets 504, the charge stays held, and another tail is
-///   refused, until the work exits and returns every byte.
+/// The child lowers the reservation to one tail's charge and a build
+/// transient, less a byte, so while one stream or tail holds its charge no
+/// other build can start.
 #[test]
 fn regex_reservation_follows_physical_work() {
     let work = tempfile::tempdir().expect("work dir");
     run_child("regex_reservation", work.path(), &[]);
 }
 
-/// The child half of [`regex_reservation_follows_physical_work`].
 #[allow(clippy::too_many_lines)] // one scenario, its steps in order
 async fn regex_reservation_child(work: &Path) {
     let reservation = memory::reservation();
@@ -1520,7 +1315,6 @@ async fn regex_reservation_child(work: &Path) {
         matches_stages(&[TAIL_PATTERN])
     );
 
-    // An open stream holds its charge.
     let stream = open_stream(&server, &live).await;
     assert_eq!(stream.status(), 200);
     assert_eq!(
@@ -1529,7 +1323,6 @@ async fn regex_reservation_child(work: &Path) {
         "the open stream holds its charge"
     );
 
-    // While it does, no other build can reserve its transient.
     let refused = get_stream(&server, &live).await;
     assert_exhausted(&refused);
     assert_exhausted_cause(
@@ -1546,9 +1339,8 @@ async fn regex_reservation_child(work: &Path) {
     );
     assert_eq!(reservation.reserved(), charge, "a refusal holds nothing");
 
-    // Closing the stream returns its charge. Events on the bus make the
-    // stream write, so the server finds the connection closed even if it
-    // never read the close.
+    // Events on the bus make the stream write, so the server finds the
+    // connection closed even if it never read the close.
     drop(stream);
     let bus = server
         .state
@@ -1568,13 +1360,11 @@ async fn regex_reservation_child(work: &Path) {
     .await;
     assert_eq!(reservation.holds(), reservation.releases());
 
-    // A batch tail paused once its charge is held, past its deadline.
     let seams = server.state.query.pool.seams();
     let released = seams.watch(Seam::Released);
     let pause = reservation.pause_after_charge();
     tokio::time::pause();
     let mut request = std::pin::pin!(post_query(&server, &tail));
-    // Waits for: the tail's arrival at the gate, its charge held.
     if let Some(early) = until_polling("the tail holds its charge", &mut request, || {
         pause.arrivals() == 1
     })
@@ -1589,7 +1379,6 @@ async fn regex_reservation_child(work: &Path) {
 
     tokio::time::advance(Duration::from_secs(VERDICT_TIMEOUT_SECS) + Duration::from_millis(1))
         .await;
-    // Waits for: the request's answer, with the work still at the gate.
     let answer = until_polling("the request answers", &mut request, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -1601,9 +1390,7 @@ async fn regex_reservation_child(work: &Path) {
         "the timed-out work still holds its charge"
     );
 
-    // The charge is the work's: another tail cannot reserve while it runs.
     let mut second = std::pin::pin!(post_query(&server, &tail));
-    // Waits for: the second tail's answer, refused at its reservation.
     let refused = until_polling("the second tail answers", &mut second, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -1619,15 +1406,12 @@ async fn regex_reservation_child(work: &Path) {
     // the work, returns the charge before the worker releases its slot.
     let ended = released.arrivals();
     pause.release();
-    // Waits for: the timed-out work's arrival at Released.
     until("the timed-out work ends", || released.arrivals() > ended).await;
     assert_eq!(reservation.reserved(), 0, "the work returned its charge");
     assert_eq!(reservation.holds(), reservation.releases());
     drop(pause);
 
-    // With the bytes back, the same tail answers.
     let mut again = std::pin::pin!(post_query(&server, &tail));
-    // Waits for: the tail's answer.
     let answer = until_polling("the tail answers", &mut again, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -1636,18 +1420,15 @@ async fn regex_reservation_child(work: &Path) {
     assert_eq!(reservation.holds(), reservation.releases());
 }
 
-/// A batch query of `n` regex sites: `n` `matches` stages, each a
-/// different pattern, so each binds one regex of its own. Beside the
-/// child's hot buffer each stage's filter runs in both branches of the
-/// hot+cold union, but a thread holds one branch's at a time, so a stage
-/// is still one site.
+/// Beside the child's hot buffer each stage's filter runs in both branches
+/// of the hot+cold union, but a thread holds one branch's at a time, so a
+/// stage is still one site.
 fn sites_query(n: usize) -> String {
     let bodies: Vec<String> = (0..n).map(|i| format!(r"event {i}\d*")).collect();
     let bodies: Vec<&str> = bodies.iter().map(String::as_str).collect();
     format!("service=fresh{}", matches_stages(&bodies))
 }
 
-/// The RE2 allowance of a statement of `n` `matches` sites on `threads`.
 fn matching_allowance(n: u64, threads: NonZeroU32) -> u64 {
     memory::RegexSites {
         extract: 0,
@@ -1657,30 +1438,12 @@ fn matching_allowance(n: u64, threads: NonZeroU32) -> u64 {
     .re2_allowance(threads)
 }
 
-/// A batch statement holds its RE2 allowance from the server-wide regex
-/// reservation, every regex site `DuckDB` binds times the query threads,
-/// taken before the statement binds and held for the physical work
-/// (ADR-0063).
-///
-/// The child runs at the shipped reservation, 1.25 GiB, and reads the
-/// reservation and its counters directly, as
-/// [`regex_reservation_follows_physical_work`]'s child does.
-///
-/// - A query with no regex site takes no hold.
-/// - A batch query paused once its allowance is held holds exactly that
-///   allowance, before its statement binds and past its request's
-///   deadline, until its work exits, and then returns every byte.
-/// - A query whose allowance passes the per-query cap can never run: 503,
-///   cause `regex_budget_exhausted`, and nothing held.
-/// - With the reservation filled by two held queries just under the cap,
-///   a third answers 503, cause `regex_reservation_exhausted`.
 #[test]
 fn regex_reservation_counts_batch_re2() {
     let work = tempfile::tempdir().expect("work dir");
     run_child("regex_batch_re2", work.path(), &[]);
 }
 
-/// The child half of [`regex_reservation_counts_batch_re2`].
 #[allow(clippy::too_many_lines)] // one scenario, its steps in order
 async fn regex_batch_re2_child(work: &Path) {
     let reservation = memory::reservation();
@@ -1694,12 +1457,10 @@ async fn regex_batch_re2_child(work: &Path) {
     let threads = knobs.threads;
     let server = regex_server_with(work, VERDICT_TIMEOUT_SECS, knobs).await;
 
-    // No regex site, no hold.
     let answer = post_query(&server, "service=fresh | stats count()").await;
     assert_eq!(answer.status, 200, "{}", answer.body);
     assert_eq!((reservation.holds(), reservation.reserved()), (0, 0));
 
-    // One site, held at the gate past the request's deadline.
     let one = matching_allowance(1, threads);
     let seams = server.state.query.pool.seams();
     let released = seams.watch(Seam::Released);
@@ -1711,7 +1472,6 @@ async fn regex_batch_re2_child(work: &Path) {
     let dsl = sites_query(1);
     let binds = prepare_probe::count();
     let mut request = std::pin::pin!(post_query(&server, &dsl));
-    // Waits for: the statement's arrival at the gate, its allowance held.
     if let Some(early) = until_polling("the statement holds its allowance", &mut request, || {
         pause.arrivals() == 1
     })
@@ -1731,7 +1491,6 @@ async fn regex_batch_re2_child(work: &Path) {
 
     tokio::time::advance(Duration::from_secs(VERDICT_TIMEOUT_SECS) + Duration::from_millis(1))
         .await;
-    // Waits for: the request's answer, with the work still at the gate.
     let answer = until_polling("the request answers", &mut request, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -1745,19 +1504,16 @@ async fn regex_batch_re2_child(work: &Path) {
 
     let ended = released.arrivals();
     pause.release();
-    // Waits for: the timed-out work's arrival at Released.
     until("the timed-out work ends", || released.arrivals() > ended).await;
     assert_eq!(reservation.reserved(), 0, "the work returned its allowance");
     assert_eq!(reservation.holds(), reservation.releases());
     drop(pause);
 
-    // Past the per-query cap: refused before anything is held.
     let per_cap = memory::QUERY_RESERVATION_CAP / matching_allowance(1, threads);
     assert!(matching_allowance(per_cap + 1, threads) > memory::QUERY_RESERVATION_CAP);
     let holds = reservation.holds();
     let over = sites_query(usize::try_from(per_cap).unwrap() + 1);
     let mut refused = std::pin::pin!(post_query(&server, &over));
-    // Waits for: the query's answer, refused at its per-query cap.
     let refused = until_polling("the over-cap query answers", &mut refused, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -1765,8 +1521,6 @@ async fn regex_batch_re2_child(work: &Path) {
     assert_exhausted_cause(QUERY_ROUTE, &refused.request_id, "regex_budget_exhausted");
     assert_eq!((reservation.holds(), reservation.reserved()), (holds, 0));
 
-    // Two queries just under the cap fill the reservation: a third that
-    // would fit the cap alone does not fit beside them.
     let big = matching_allowance(per_cap, threads);
     assert!(big <= memory::QUERY_RESERVATION_CAP);
     assert!(2 * big <= memory::REGEX_RESERVATION_BYTES);
@@ -1777,7 +1531,6 @@ async fn regex_batch_re2_child(work: &Path) {
     let mut held = std::pin::pin!(async {
         tokio::join!(post_query(&server, &big_dsl), post_query(&server, &big_dsl))
     });
-    // Waits for: both statements at the gate, their allowances held.
     if let Some(early) = until_polling("two statements hold their allowances", &mut held, || {
         pause.arrivals() == 2
     })
@@ -1792,7 +1545,6 @@ async fn regex_batch_re2_child(work: &Path) {
     assert_eq!(prepare_probe::count(), binds, "neither statement has bound");
 
     let mut third = std::pin::pin!(post_query(&server, &big_dsl));
-    // Waits for: the third query's answer, refused at its reservation.
     let refused = until_polling("the third query answers", &mut third, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -1805,7 +1557,6 @@ async fn regex_batch_re2_child(work: &Path) {
     assert_eq!(reservation.reserved(), 2 * big, "a refusal holds nothing");
 
     pause.release();
-    // Waits for: both held queries' answers.
     let (first, second) = until_polling("the held queries answer", &mut held, || false)
         .await
         .expect("until_polling returns only once both answer");
@@ -1816,7 +1567,6 @@ async fn regex_batch_re2_child(work: &Path) {
         "both statements bound once released"
     );
     drop(pause);
-    // Waits for: the work behind both answers to return its allowance.
     until("the held work returns its allowance", || {
         reservation.reserved() == 0
     })
@@ -1831,31 +1581,14 @@ async fn regex_batch_re2_child(work: &Path) {
 /// `DuckDB`'s plans as its shape `a few sev()`.
 const FEW_SEV: &str = "service=fresh | let a = sev(message), b = sev(host), c = sev(service)";
 
-/// The fixed regex calls [`FEW_SEV`] binds.
 const FEW_SEV_FIXED: u64 = 123;
 
-/// The regexes the emitter writes itself, the four `sev()` and a
-/// `SEVERITY` conform carry, take their RE2 allowance beside the query's
-/// own patterns: each call `DuckDB` binds, at
-/// [`memory::FIXED_SITE_RE2_BYTES`], once on each query thread (ADR-0063).
-///
-/// The child runs at the shipped reservation and the default four query
-/// threads, and reads the reservation directly, as
-/// [`regex_reservation_counts_batch_re2`]'s child does.
-///
-/// - An ordinary query of three `sev()` calls holds the allowance of
-///   their 123 fixed calls while its statement is paused, then answers
-///   200 and returns every byte.
-/// - A query of 1000 `sev()` calls, 41 000 fixed calls, about 1.4 GiB on
-///   four threads, passes the per-query cap and can never run: 503, cause
-///   `regex_budget_exhausted`, and nothing held.
 #[test]
 fn fixed_regex_sites_take_their_allowance() {
     let work = tempfile::tempdir().expect("work dir");
     run_child("regex_fixed_sites", work.path(), &[]);
 }
 
-/// The child half of [`fixed_regex_sites_take_their_allowance`].
 async fn regex_fixed_sites_child(work: &Path) {
     let reservation = memory::reservation();
     assert_eq!(reservation.limit(), memory::REGEX_RESERVATION_BYTES);
@@ -1872,12 +1605,10 @@ async fn regex_fixed_sites_child(work: &Path) {
         .re2_allowance(threads)
     };
 
-    // A few sev() calls: admitted, holding their allowance.
     let few = fixed(FEW_SEV_FIXED);
     assert!(few <= memory::QUERY_RESERVATION_CAP);
     let pause = reservation.pause_after_charge();
     let mut request = std::pin::pin!(post_query(&server, FEW_SEV));
-    // Waits for: the statement's arrival at the gate, its allowance held.
     if let Some(early) = until_polling("the statement holds its allowance", &mut request, || {
         pause.arrivals() == 1
     })
@@ -1894,20 +1625,17 @@ async fn regex_fixed_sites_child(work: &Path) {
         "{FEW_SEV_FIXED} fixed calls on {threads} threads"
     );
     pause.release();
-    // Waits for: the query's answer.
     let answer = until_polling("the query answers", &mut request, || false)
         .await
         .expect("until_polling returns only once the request answers");
     assert_eq!(answer.status, 200, "{}", answer.body);
     drop(pause);
-    // Waits for: the work behind the answer to return its allowance.
     until("the work returns its allowance", || {
         reservation.reserved() == 0
     })
     .await;
     assert_eq!(reservation.holds(), reservation.releases());
 
-    // A thousand: past the per-query cap, refused before anything is held.
     let lets: Vec<String> = (0..1000).map(|i| format!("s{i} = sev(message)")).collect();
     let thousand = format!("service=fresh | let {}", lets.join(", "));
     assert!(fixed(1000 * 41) > memory::QUERY_RESERVATION_CAP);
@@ -1918,13 +1646,6 @@ async fn regex_fixed_sites_child(work: &Path) {
     assert_eq!((reservation.holds(), reservation.reserved()), (holds, 0));
 }
 
-/// The admission bar of the RE2 allowance (ADR-0063): as many ordinary
-/// queries as `max_concurrent_queries`' default runs at most, each a
-/// search of five corpus patterns on the default query threads, fit the
-/// reservation together, and each fits the per-query cap. So do as many
-/// of the same search reading a `sev()` and filtering on it, over the
-/// corpus alone or beside a hot buffer whose `_severity` pin the hot
-/// branch conforms, as on every install that derives a severity.
 #[test]
 fn ordinary_queries_fit_the_reservation_together() {
     let five: Vec<String> = charge::LOG_REGEXES
@@ -1990,8 +1711,6 @@ fn ordinary_queries_fit_the_reservation_together() {
     }
 }
 
-// -- ADR-0063: preparation off the reactor ----------------------------------------
-
 /// The preparation tests' requests time out after this long: long enough
 /// that a loaded machine still gets a freed slot to its waiter in time.
 const WAIT_TIMEOUT_SECS: u64 = 3;
@@ -2022,7 +1741,6 @@ fn assert_off_the_reactor(door: &str, log: &ParseLog) -> Vec<(ThreadId, ParseKin
     parses
 }
 
-/// A JSON request to `path` with `method`, as the analyst.
 async fn send_json(
     server: &common::TestServer,
     method: reqwest::Method,
@@ -2037,7 +1755,6 @@ async fn send_json(
     send(server, request).await
 }
 
-/// `answer` is a success.
 fn assert_success(door: &str, answer: &Answer) {
     assert!(
         (200..300).contains(&answer.status),
@@ -2047,10 +1764,6 @@ fn assert_success(door: &str, answer: &Answer) {
     );
 }
 
-// Every door that takes query text prepares it on the blocking pool
-// (ADR-0063). One test per door: each watches a marker only its request
-// carries, from after the fixture is up until the door has answered.
-//
 // The MCP tools reach trawld's preparation through `/query` and
 // `/validate`, so the `query` and `validate` tests here cover their
 // authoritative preparation. Their local parses, which shape a tool's
@@ -2148,8 +1861,6 @@ async fn preparation_runs_off_the_reactor_saved_update() {
     assert_off_the_reactor("saved update", &log);
 }
 
-/// Capture planning: `POST /api/v1/results` admits the caller's text,
-/// resolves its bounds and admits the text it will run.
 #[tokio::test(flavor = "current_thread")]
 async fn preparation_runs_off_the_reactor_capture() {
     let server = common::setup().await;
@@ -2169,8 +1880,6 @@ async fn preparation_runs_off_the_reactor_capture() {
     assert_off_the_reactor("capture", &log);
 }
 
-/// A due schedule's run, driven by one scheduler tick as the scheduler
-/// loop drives it.
 #[tokio::test(flavor = "current_thread")]
 async fn preparation_runs_off_the_reactor_scheduler() {
     let server = common::setup().await;
@@ -2205,27 +1914,14 @@ async fn preparation_runs_off_the_reactor_scheduler() {
     assert_off_the_reactor("scheduler", &log);
 }
 
-/// A preparation job that outlives its request keeps its slot and its
-/// regex reservation until its closure exits, and each comes back exactly
-/// once (ADR-0063).
-///
-/// The child holds a stream setup's metered build once its charge is held,
-/// so the job is parked inside its work with both, and runs on a paused
-/// clock, so the request's deadline passes when the test says. It reads
-/// the allowance, the `trawl_query_preparation_in_use` gauge and the
-/// reservation's counters directly: the server runs in the child's own
-/// process.
 #[test]
 fn preparation_slot_follows_physical_work() {
     let work = tempfile::tempdir().expect("work dir");
     run_child("preparation_slot", work.path(), &[]);
 }
 
-/// The preparation gauge `/metrics` reports, as rendered, read while
-/// `server`'s runtime keeps running.
 async fn preparation_gauge(server: &common::TestServer) -> String {
     let mut scrape = std::pin::pin!(get(server, "/metrics"));
-    // Waits for: the scrape's answer.
     let answer = until_polling("the scrape answers", &mut scrape, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -2241,7 +1937,6 @@ async fn preparation_gauge(server: &common::TestServer) -> String {
         .expect("the scrape reports the preparation gauge")
 }
 
-/// The child half of [`preparation_slot_follows_physical_work`].
 async fn preparation_slot_child(work: &Path) {
     let reservation = memory::reservation();
     let server = regex_server(work, VERDICT_TIMEOUT_SECS).await;
@@ -2250,11 +1945,9 @@ async fn preparation_slot_child(work: &Path) {
     let charge = tail_charge();
     assert_eq!(reservation.reserved(), 0);
 
-    // The setup's build parks once its charge is held.
     let pause = reservation.pause_after_charge();
     tokio::time::pause();
     let mut request = std::pin::pin!(get_stream(&server, &live));
-    // Waits for: the setup job's arrival at the gate, its charge held.
     if let Some(early) = until_polling("the setup holds its charge", &mut request, || {
         pause.arrivals() == 1
     })
@@ -2269,10 +1962,8 @@ async fn preparation_slot_child(work: &Path) {
     assert_eq!(reservation.reserved(), charge, "the job holds its charge");
     assert_eq!(preparation_gauge(&server).await, "1");
 
-    // The request's deadline passes with the job still inside its work.
     tokio::time::advance(Duration::from_secs(VERDICT_TIMEOUT_SECS) + Duration::from_millis(1))
         .await;
-    // Waits for: the request's answer, with the job still at the gate.
     let answer = until_polling("the setup answers", &mut request, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -2290,7 +1981,6 @@ async fn preparation_slot_child(work: &Path) {
     // The job sees its stop once the gate opens, and its closure exits:
     // its ledger drops inside it, then its slot comes back.
     pause.release();
-    // Waits for: the retained job's closure to exit.
     until("the retained job's slot comes back", || {
         preparation.reclaimed() == 1
     })
@@ -2314,7 +2004,6 @@ async fn preparation_slot_child(work: &Path) {
     assert_eq!(preparation.reclaimed(), 1, "reclaimed once");
     assert_eq!(reservation.holds(), reservation.releases());
     let mut again = std::pin::pin!(open_stream(&server, &live));
-    // Waits for: the stream's head.
     let stream = until_polling("the stream opens", &mut again, || false)
         .await
         .expect("until_polling returns only once the request answers");
@@ -2323,8 +2012,6 @@ async fn preparation_slot_child(work: &Path) {
     drop(stream);
 }
 
-/// Hold every preparation slot of `server` with a `/query` parked at the
-/// preparation seam, and answer the requests' tasks.
 async fn fill_the_allowance(
     server: &Arc<common::TestServer>,
     parked: &seam::Gate,
@@ -2336,7 +2023,6 @@ async fn fill_the_allowance(
             tokio::spawn(async move { post_query(&server, "service=fresh | head 1").await })
         })
         .collect();
-    // Waits for: every holder's job parked at the seam, holding its slot.
     until("every preparation slot is held", || {
         parked.arrivals() == size
     })
@@ -2345,10 +2031,6 @@ async fn fill_the_allowance(
     holders
 }
 
-/// With the allowance full, a request waits for a slot within its
-/// deadline, then answers 503 `query_resource_exhausted` with cause
-/// `preparation_allowance_exhausted`, and its work never runs. A slot that
-/// frees before the deadline lets the waiting request run (ADR-0063).
 #[tokio::test(flavor = "multi_thread")]
 async fn preparation_waits_within_the_deadline() {
     let work = tempfile::tempdir().expect("work dir");
@@ -2405,9 +2087,6 @@ async fn preparation_waits_within_the_deadline() {
     assert_eq!(answer.status, 200, "{}", answer.body);
 }
 
-/// With every preparation slot held by a parked job, `/health` and
-/// `/metrics` still answer 200 on the runtime's only thread (ADR-0063).
-///
 /// A job that parked its reactor thread would leave nothing to answer the
 /// probes, or to release it, so a watchdog lets the jobs go after 20 s
 /// and says it had to.
@@ -2470,14 +2149,12 @@ fn kinds(door: &str, log: &ParseLog) -> (usize, usize) {
     (built, parses.len() - built)
 }
 
-/// The parse count of each request, pinned, and every parse off the
-/// reactor (ADR-0063). A built parse builds the query's patterns, an
-/// unbuilt one reads its grammar alone.
+/// A built parse builds the query's patterns, an unbuilt one reads its
+/// grammar alone.
 ///
 /// - `/query` with a pipe: admission (built), `source::select`
 ///   (unbuilt), the engine (built) and the severity presentation walk
-///   (unbuilt). With the query log on, its debug capture adds one
-///   unbuilt.
+///   (unbuilt).
 /// - CSV and JSON export: the same four. Parquet: three, with no
 ///   presentation walk.
 /// - A live stream: one at setup (admission; the live compile reuses its
@@ -2519,7 +2196,6 @@ async fn parse_count_per_request() {
     assert_eq!(stream.status(), 200);
     assert_eq!(kinds("stream setup", &log), (1, 0), "{:?}", log.parses());
 
-    // Events matched after setup parse nothing.
     let bus = server
         .state
         .ingest
@@ -2546,15 +2222,9 @@ async fn parse_count_per_request() {
     );
 }
 
-// -- guard ----------------------------------------------------------------------
-
-/// No trawld production path opens a `DuckDB` database outside the query
-/// database or makes a temp file in `TMPDIR` (ADR-0056).
-///
 /// `Executor::new` stays for embedded CLI mode and engine tests, and
 /// spills into `TMPDIR` with no budgets, so trawld's sources may name it
-/// only in test code. The scan drops `#[cfg(test)]` and test-support
-/// items, then looks for the constructors.
+/// only in test code.
 #[test]
 fn no_trawld_path_opens_an_unbudgeted_database_or_writes_tmpdir() {
     const FORBIDDEN: [&str; 6] = [
@@ -2623,7 +2293,6 @@ fn names(line: &str, needle: &str) -> bool {
     })
 }
 
-/// Every `.rs` file under `dir`.
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -2679,7 +2348,6 @@ fn production_lines(text: &str) -> (Vec<(usize, &str)>, Vec<String>) {
             gated_modules.push(module.to_owned());
         }
         let end = item_end(text, starts[i]);
-        // Skip every line up to and including the one holding the end.
         while i < lines.len() && starts[i] <= end {
             i += 1;
         }
@@ -2687,8 +2355,6 @@ fn production_lines(text: &str) -> (Vec<(usize, &str)>, Vec<String>) {
     (kept, gated_modules)
 }
 
-/// The byte offset of the character that ends the item starting at
-/// `start` (see [`production_lines`]).
 fn item_end(text: &str, start: usize) -> usize {
     let bytes = text.as_bytes();
     let head = text[start..].trim_start();

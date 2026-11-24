@@ -7,7 +7,7 @@
 //!
 //! The clients are explicit about connections: each HTTP/1.1 request is
 //! written by hand over a TLS stream of its own, and read back from it.
-//! The listener speaks HTTP/1.1 alone (ADR-0054, amended 2026-10-17), so
+//! The listener speaks HTTP/1.1 alone (ADR-0054), so
 //! one connection is one request in progress at most. reqwest is used only
 //! where any fresh connection will do.
 
@@ -32,10 +32,6 @@ use crate::support::{DEADLINE, REGULAR_MESSAGE};
 /// assertion on what the scrape rendered.
 pub static SCRAPE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// AC14: through the production TLS listener, separate connections share
-/// one count: N connections each holding a request at limit N meet exactly
-/// one refusal on the N+1th, and the count recovers afterwards.
-///
 /// Each held request is ingest or preview work held at the state's seam,
 /// which reports its entry, so a request is known to hold the count
 /// before the next one is sent.
@@ -47,7 +43,6 @@ async fn request_count_spans_connections() {
         .spawn_server_with(|http| http.max_concurrent_requests = usize::from(N), vec![])
         .await;
 
-    // Two connections each hold one request, and a third is refused.
     let mut parse = Held::next(&server, BodyWork::IngestParse);
     let mut report = Held::next(&server, BodyWork::Preview);
     let mut first = h1_send(&url, &Post::ingest(&server, "connection one")).await;
@@ -88,7 +83,6 @@ async fn request_count_spans_connections() {
     drop(first);
     drop(second);
 
-    // The count recovers: N connections at once are all admitted.
     let mut answers = Vec::new();
     for n in 0..N {
         let label = format!("recovered {n}");
@@ -101,9 +95,6 @@ async fn request_count_spans_connections() {
     task.abort();
 }
 
-/// A request refused at the count is answered from its headers alone,
-/// before its body is sent, and the listener then hangs up without
-/// reading the body (ADR-0054): the refusal is the whole exchange.
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_request_is_answered_before_its_body() {
     let server = common::setup().await;
@@ -138,12 +129,6 @@ async fn refused_request_is_answered_before_its_body() {
     task.abort();
 }
 
-/// A key without the route's permission is refused on its request head,
-/// so a body it never finishes holds no count (ADR-0059): with the limit
-/// at 1, a `POST /api/v1/query` from the ingest key, whose chunked body is
-/// begun and never ended, gets its 403 while the body is still open, and a
-/// request on a new connection is then admitted.
-///
 /// The count is released before the refusal's head is written, so reading
 /// the 403 orders the second request after the release.
 #[tokio::test(flavor = "multi_thread")]
@@ -169,8 +154,6 @@ async fn a_refused_unfinished_body_holds_no_count() {
         .unwrap();
     stalled.flush().await.unwrap();
 
-    // The body is still open: the client writes nothing more and never
-    // half-closes the connection.
     let (status, body) = h1_answer(&mut stalled).await;
     assert_eq!(
         status,
@@ -186,7 +169,6 @@ async fn a_refused_unfinished_body_holds_no_count() {
     task.abort();
 }
 
-/// `trawl_http_requests_in_progress{allowance="regular"}` in a scrape.
 fn regular_in_progress(scrape: &str) -> f64 {
     scrape
         .lines()
@@ -199,7 +181,6 @@ fn regular_in_progress(scrape: &str) -> f64 {
         .unwrap()
 }
 
-/// One POST, sent the same way over any of the clients here.
 #[derive(Clone)]
 pub struct Post {
     pub path: &'static str,
@@ -209,7 +190,6 @@ pub struct Post {
 }
 
 impl Post {
-    /// A real ingest request: gzip ndjson, as the fixture's ingest key.
     pub fn ingest(server: &TestServer, label: &str) -> Self {
         use std::io::Write as _;
         let event = serde_json::json!({
@@ -228,7 +208,6 @@ impl Post {
         }
     }
 
-    /// An ingest preview of one event, as the fixture's admin key.
     pub fn preview(server: &TestServer, label: &str) -> Self {
         let event = serde_json::json!({
             "service": "request-limit",
@@ -244,7 +223,6 @@ impl Post {
         }
     }
 
-    /// The request head for this post, `content-length` included.
     fn head(&self, url: &str) -> String {
         let host = url.strip_prefix("https://").unwrap();
         let encoding = if self.gzip {
@@ -262,8 +240,6 @@ impl Post {
     }
 }
 
-/// A TLS connection to `url` (`https://host:port`) that trusts the fixture
-/// certificate and offers `alpn` alone.
 pub async fn tls(url: &str, alpn: &[u8]) -> TlsStream<TcpStream> {
     use rustls::pki_types::pem::PemObject as _;
 
@@ -298,8 +274,6 @@ pub async fn tls(url: &str, alpn: &[u8]) -> TlsStream<TcpStream> {
     stream
 }
 
-/// Write `post` whole as one HTTP/1.1 request on a connection of its own,
-/// and hand back the open connection without reading the answer.
 pub async fn h1_send(url: &str, post: &Post) -> TlsStream<TcpStream> {
     let mut stream = h1_open(url, post).await;
     stream.write_all(&post.body).await.unwrap();
@@ -307,9 +281,6 @@ pub async fn h1_send(url: &str, post: &Post) -> TlsStream<TcpStream> {
     stream
 }
 
-/// Write `post`'s head alone, `content-length` included, on a connection
-/// of its own, and hand back the open connection: the server now waits
-/// for the body, or answers without it.
 pub async fn h1_open(url: &str, post: &Post) -> TlsStream<TcpStream> {
     let mut stream = tls(url, b"http/1.1").await;
     stream.write_all(post.head(url).as_bytes()).await.unwrap();
@@ -317,7 +288,6 @@ pub async fn h1_open(url: &str, post: &Post) -> TlsStream<TcpStream> {
     stream
 }
 
-/// A GET of `path` on a connection of its own, answered whole.
 pub async fn h1_get(url: &str, path: &str) -> (StatusCode, Bytes) {
     let mut stream = tls(url, b"http/1.1").await;
     let host = url.strip_prefix("https://").unwrap();
@@ -328,9 +298,6 @@ pub async fn h1_get(url: &str, path: &str) -> (StatusCode, Bytes) {
     h1_answer(&mut stream).await
 }
 
-/// The HTTP/1.1 response on `stream`: its status and whole body, within
-/// the deadline. The body must be delimited by `content-length`, as every
-/// answer here is.
 pub async fn h1_answer(stream: &mut TlsStream<TcpStream>) -> (StatusCode, Bytes) {
     tokio::time::timeout(DEADLINE, async {
         let mut raw = Vec::new();
@@ -372,7 +339,6 @@ pub async fn h1_answer(stream: &mut TlsStream<TcpStream>) -> (StatusCode, Bytes)
     .expect("the request was answered before the deadline")
 }
 
-/// Assert an answer is the regular refusal.
 pub fn assert_refused(status: StatusCode, body: &[u8]) {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = serde_json::from_slice(body).expect("a JSON refusal");
@@ -380,7 +346,6 @@ pub fn assert_refused(status: StatusCode, body: &[u8]) {
     assert_eq!(body["error"]["message"], REGULAR_MESSAGE, "{body}");
 }
 
-/// `post` on a fresh reqwest connection, answered whole.
 pub async fn fresh_post(url: &str, post: &Post) -> (StatusCode, Bytes) {
     let client = common::harness_client_builder()
         .timeout(DEADLINE)
@@ -398,26 +363,22 @@ pub async fn fresh_post(url: &str, post: &Post) -> (StatusCode, Bytes) {
     (status, response.bytes().await.unwrap())
 }
 
-/// Assert `post` on a fresh connection is the regular refusal.
 pub async fn assert_fresh_refused(url: &str, post: &Post) {
     let (status, body) = fresh_post(url, post).await;
     assert_refused(status, &body);
 }
 
-/// Assert `post` on a fresh connection is admitted and answered 200.
 pub async fn assert_fresh_admitted(url: &str, post: &Post) {
     let (status, body) = fresh_post(url, post).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }
 
-/// A pending hold on `work` in `server`'s state.
 pub struct Held {
     entered: Option<std::sync::mpsc::Receiver<HoldProbe>>,
     release: std::sync::mpsc::Sender<()>,
 }
 
 impl Held {
-    /// Hold the next `work` the server runs.
     pub fn next(server: &TestServer, work: BodyWork) -> Self {
         let (entered, release) = server.state.ingest.body_work_holds.hold_next(work);
         Self {
@@ -426,7 +387,6 @@ impl Held {
         }
     }
 
-    /// Wait until the held work is entered and answer its probe.
     pub async fn entered(&mut self) -> HoldProbe {
         let entered = self.entered.take().expect("entered once");
         tokio::task::spawn_blocking(move || entered.recv_timeout(DEADLINE))
@@ -435,14 +395,11 @@ impl Held {
             .expect("the held work was entered before the deadline")
     }
 
-    /// Let the held work go on.
     pub fn release(self) {
         let _ = self.release.send(());
     }
 }
 
-/// Wait until the count `probe` watches has exactly `holders` owners.
-///
 /// The count is shared through `Arc`s with no event of its own, so this
 /// polls it. The deadline is a failure deadline: the poll orders nothing.
 pub async fn until_holders(probe: &HoldProbe, holders: usize, what: &str) {

@@ -2,15 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Query lifecycle tracking — active queries, history ring buffer, and timeout recording.
-//!
-//! [`QueryTracker::start`] opens an entry and answers the request's hold on
-//! it, a [`Tracked`], which records the outcome and closes the entry. The
-//! transport drops a request's future at an await when its client goes
-//! away, past every outcome path the handler has; a [`Tracked`] dropped
-//! without an outcome records the query as [`ABANDONED`], so no entry
-//! outlives its request.
-
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -20,8 +11,6 @@ use dashmap::DashMap;
 use fleet_auth::VerifiedKey;
 use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot, QueryActiveEntry, QueryRecentEntry};
 
-/// Tracks active and recently completed queries.
-///
 /// Query ids are allocated by `ExecutorPool::allocate_query_id` — a single
 /// id space shared with the pool's interrupt map, so an id listed by
 /// `/queries` is the same id `cancel_by_id` interrupts.
@@ -32,10 +21,8 @@ pub struct QueryTracker {
     max_history: usize,
 }
 
-/// A currently executing query.
 #[derive(Debug, Clone)]
 pub struct ActiveQuery {
-    /// Monotonic query ID.
     pub id: u64,
     /// Fleet keystore id of the submitting key — the authorization anchor
     /// for non-admin cancellation (names are mutable and non-unique).
@@ -44,9 +31,7 @@ pub struct ActiveQuery {
     pub user: String,
     /// Comma-joined role names of the submitting key (display only).
     pub role: String,
-    /// The DSL query string.
     pub query: String,
-    /// When execution started.
     pub started_at: Instant,
 }
 
@@ -62,22 +47,16 @@ impl ActiveQuery {
     }
 }
 
-/// History keeps ownership private for reader-specific projections.
 #[derive(Debug)]
 struct CompletedQuery {
     key_id: i64,
     snapshot: CompletedQuerySnapshot,
 }
 
-/// The error history records for a query whose request was dropped before
-/// it recorded an outcome ([`Tracked`]).
 pub const ABANDONED: &str = "abandoned: the request ended before the query recorded an outcome";
 
-/// Default ring buffer capacity for query history.
 const DEFAULT_MAX_HISTORY: usize = crate::config::DEFAULT_MAX_QUERY_HISTORY;
 
-/// Convert an `Instant` elapsed time to milliseconds as u64.
-/// Saturates at `u64::MAX` (which is ~584 million years, so... fine).
 fn elapsed_ms(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -89,7 +68,6 @@ impl Default for QueryTracker {
 }
 
 impl QueryTracker {
-    /// Create a new tracker with the default history capacity.
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_MAX_HISTORY)
     }
@@ -102,9 +80,6 @@ impl QueryTracker {
         }
     }
 
-    /// Record the start of a query under a pool-allocated id
-    /// (`ExecutorPool::allocate_query_id`), and answer the request's hold
-    /// on its entry.
     pub fn start(self: &Arc<Self>, id: u64, verified: &VerifiedKey, query: &str) -> Tracked {
         self.active.insert(
             id,
@@ -124,7 +99,6 @@ impl QueryTracker {
         }
     }
 
-    /// Record successful completion of a query.
     fn complete(&self, id: u64, rows: usize) {
         if let Some((_, active)) = self.active.remove(&id) {
             self.push_history(CompletedQuery {
@@ -142,7 +116,6 @@ impl QueryTracker {
         }
     }
 
-    /// Record a failed query.
     fn fail(&self, id: u64, error: &str) {
         if let Some((_, active)) = self.active.remove(&id) {
             self.push_history(CompletedQuery {
@@ -160,7 +133,6 @@ impl QueryTracker {
         }
     }
 
-    /// Record a timed-out query.
     fn timeout(&self, id: u64) {
         if let Some((_, active)) = self.active.remove(&id) {
             self.push_history(CompletedQuery {
@@ -178,15 +150,12 @@ impl QueryTracker {
         }
     }
 
-    /// Fleet keystore id of the key that started the given active query.
-    ///
     /// `None` when the query is unknown or already finished — callers treat
     /// that as "not yours" (no information disclosure about live query ids).
     pub fn owner_key_id(&self, id: u64) -> Option<i64> {
         self.active.get(&id).map(|q| q.key_id)
     }
 
-    /// Snapshot of all currently active queries.
     pub fn active(&self) -> Vec<ActiveQuerySnapshot> {
         self.active
             .iter()
@@ -194,13 +163,11 @@ impl QueryTracker {
             .collect()
     }
 
-    /// Recent completed queries (most recent first).
     pub fn recent(&self) -> Vec<CompletedQuerySnapshot> {
         let history = self.history.lock();
         history.iter().rev().map(|q| q.snapshot.clone()).collect()
     }
 
-    /// Active queries with ownership read from the same locked map entry.
     pub fn active_for(&self, viewer_key_id: i64) -> Vec<QueryActiveEntry> {
         self.active
             .iter()
@@ -214,7 +181,6 @@ impl QueryTracker {
             .collect()
     }
 
-    /// Recent queries with ownership read under the history lock.
     pub fn recent_for(&self, viewer_key_id: i64) -> Vec<QueryRecentEntry> {
         self.history
             .lock()
@@ -227,7 +193,6 @@ impl QueryTracker {
             .collect()
     }
 
-    /// Push a completed query into the ring buffer, evicting the oldest if full.
     fn push_history(&self, entry: CompletedQuery) {
         let mut history = self.history.lock();
         if history.len() >= self.max_history {
@@ -237,9 +202,6 @@ impl QueryTracker {
     }
 }
 
-/// A request's hold on its query's tracker entry, from
-/// [`QueryTracker::start`].
-///
 /// Each outcome consumes it. Dropped before one, because the request future
 /// was dropped at an await, it records the query as failed with
 /// [`ABANDONED`]: an entry left open would be listed as running for the
@@ -249,24 +211,20 @@ impl QueryTracker {
 pub struct Tracked {
     tracker: Arc<QueryTracker>,
     id: u64,
-    /// No outcome recorded yet.
     open: bool,
 }
 
 impl Tracked {
-    /// Record successful completion of the query.
     pub fn complete(mut self, rows: usize) {
         self.open = false;
         self.tracker.complete(self.id, rows);
     }
 
-    /// Record a failed query.
     pub fn fail(mut self, error: &str) {
         self.open = false;
         self.tracker.fail(self.id, error);
     }
 
-    /// Record a timed-out query.
     pub fn timeout(mut self) {
         self.open = false;
         self.tracker.timeout(self.id);
@@ -367,7 +325,6 @@ mod tests {
                 assert_eq!(wire.as_object().unwrap().len(), 8);
             }
         }
-        // The collector's snapshots contain neither ownership nor key IDs.
         let dashboard_recent = serde_json::to_value(tracker.recent()).unwrap();
         assert!(dashboard_recent[0].get("own").is_none());
         assert!(dashboard_recent[0].get("key_id").is_none());
@@ -414,8 +371,6 @@ mod tests {
         assert!(recent[0].timed_out);
     }
 
-    /// A hold dropped before an outcome closes its entry as abandoned, and
-    /// one that recorded an outcome records nothing more when it drops.
     #[test]
     fn a_hold_dropped_without_an_outcome_records_the_query_abandoned() {
         let tracker = Arc::new(QueryTracker::new());
@@ -447,14 +402,12 @@ mod tests {
         let hold = tracker.start(qid, &key, "*");
         assert_eq!(tracker.owner_key_id(qid), Some(42));
 
-        // A different key id is not the owner — same name is irrelevant.
         let mut other = test_key();
         other.id = 43;
         let other_qid = 2;
         let _other = tracker.start(other_qid, &other, "*");
         assert_eq!(tracker.owner_key_id(other_qid), Some(43));
 
-        // Finished or unknown queries have no owner.
         hold.complete(0);
         assert_eq!(tracker.owner_key_id(qid), None);
         assert_eq!(tracker.owner_key_id(9999), None);
@@ -471,7 +424,6 @@ mod tests {
 
         let recent = tracker.recent();
         assert_eq!(recent.len(), 3);
-        // most recent first — IDs should be 5, 4, 3
         assert_eq!(recent[0].id, 5);
         assert_eq!(recent[2].id, 3);
     }

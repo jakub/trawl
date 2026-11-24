@@ -119,8 +119,6 @@ fn config_check_rejects_active_log_marker_collisions_without_side_effects() {
 #[test]
 fn config_check_names_the_log_path_when_resolution_fails() {
     for telemetry in [false, true] {
-        // The check helper creates trawld.toml as a regular file. Treating
-        // it as a parent must fail without creating data or other files.
         let output = check(&format!(
             "[server]\nlog_file='trawld.toml/server.log'\n[data]\npath='~/data'\n[ingest]\nenabled=true\ninternal_telemetry={telemetry}"
         ));
@@ -169,8 +167,6 @@ fn config_check_rejects_errors_without_echoing_config_values() {
     }
 }
 
-/// The syslog peer settings are checked with the listener disabled, and a
-/// refusal names the setting without the value (ADR-0050, ADR-0047).
 #[test]
 fn check_config_refuses_syslog_peer_faults() {
     for (syslog, setting) in [
@@ -236,7 +232,6 @@ fn config_check_rejects_zero_task_periods() {
         ("server", "schema_cache_ttl_secs"),
         ("server", "monitor_refresh_ms"),
     ] {
-        // `server` is already the first header, so its key goes under it.
         let document = if section == "server" {
             format!("[server]\n{key} = 0\n[data]\npath = '~/data'\n")
         } else {

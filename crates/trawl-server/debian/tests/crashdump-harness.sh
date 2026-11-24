@@ -3,59 +3,24 @@
 # crashdump-harness.sh — end-to-end proof that the .deb's crash-dump drop-in
 # works on a real systemd host.
 #
-# The unit tests in packaging.sh assert the packaging *contract* (the drop-in
-# ships inert, at the documented path, with the four expected directives).
-# They cannot tell you whether copying that file into place actually makes a
-# minidump appear when trawld faults. This harness does: it builds the .deb,
-# installs it into a privileged systemd container, crashes the daemon with a
-# real SIGSEGV, and looks at what landed in /var/lib/trawl/cores.
-#
-# Usage:
-#   crashdump-harness.sh [--packages DIRECTORY] [--scopes 1,2] [--allow-host-sysctl]
-#                        [--no-negative] [--keep] [--out FILE] [--allow-dirty]
-#
-#   --packages DIRECTORY  use the three distribution .debs in DIRECTORY
-#   --scopes LIST         yama ptrace_scope values to exercise (default 1,2)
-#   --allow-host-sysctl   permit RAISING the host's kernel.yama.ptrace_scope
-#   --no-negative         skip phase E (the capability-removed control)
-#   --keep                leave containers running after the run
-#   --out FILE            tee the transcript to FILE
-#   --allow-dirty         run against a dirty working tree
-#
 # The container shares the host kernel, so /proc/sys/kernel/yama/ptrace_scope
 # is the HOST's setting. The harness reads it first, never writes a value below
 # it, needs --allow-host-sysctl to raise it, and restores it from an EXIT/INT/
 # TERM trap — including under --keep.
 #
-# The build runs the release distribution and Debian packaging helpers inside
-# a pinned Rust container. They verify DuckDB, set a relocatable loader path,
-# and resolve system dependencies plus the exact trawl-runtime dependency.
-# The systemd assertions run on trixie; this is not the Bookworm portability test.
-# Build tools are pinned so reruns use the same packaging implementation.
 # Packaging copies current Git-tracked files into the container's /tmp.
 # Stage new source files first, including when using --allow-dirty.
 #
 #   * cargo-deb is pinned to 3.8.0. Updating it requires a full run because its
 #     generated maintainer-script behavior is part of what this tests.
 #
-#     3.8.0 is also why debian/trawl.sysusers and debian/trawl.tmpfiles are
-#     spelled without .conf. It generates `systemd-sysusers <name>` and
-#     `systemd-tmpfiles --create <name>` calls in postinst, deriving <name> from
-#     the asset's SOURCE path via with_extension("conf"). Under the old
-#     debian/trawl.sysusers.conf spelling the generated call named a file nobody
-#     installed, exited 1, and left the package half-configured. packaging.sh
-#     guards that statically now; this harness is what catches it end to end.
-#
-# WHAT THIS RUNS AS, an accepted risk rather than an oversight. The node
-# container is --privileged, which is root on the host kernel in every way that
-# matters, and inside it this harness runs the package's own maintainer scripts.
-# With --allow-host-sysctl it also raises the host's yama ptrace_scope. Point it
-# only at a tree and a .deb you trust. Running it to review an untrusted branch
-# is equivalent to running that branch's postinst as root on your machine.
+# WHAT THIS RUNS AS. The node container is --privileged, which is root on the
+# host kernel in every way that matters, and inside it this harness runs the
+# package's own maintainer scripts.
+# Point it only at a tree and a .deb you trust.
 
 set -Eeuo pipefail
 
-# ---------------------------------------------------------------- constants --
 
 readonly RUST_IMAGE="rust:1.98-trixie@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959"
 readonly DEBIAN_IMAGE="debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1"
@@ -76,14 +41,11 @@ readonly TRAWL_DSN="postgres://trawl:trawlpw@${PG}:5432/trawl"
 readonly YAMA="/proc/sys/kernel/yama/ptrace_scope"
 readonly CORES="/var/lib/trawl/cores"
 # The certificate trawld generates on its first start, which the packaged
-# [web] upstream_ca_path pins. trawl-web cannot start until it exists.
+# [web] upstream_ca_path pins.
 readonly WEB_UPSTREAM_CA="/var/lib/trawl/tls/cert.pem"
 
-# Distinct exit codes, so a caller can tell an assertion failure from the two
-# outcomes that need a human rather than a rerun.
 readonly EXIT_SYSCTL_RESTORE_FAILED=3
 readonly EXIT_PARTIAL=4
-# CAP_SYS_PTRACE is capability number 19.
 readonly PTRACE_CAP_BIT=19
 
 # docker cp cannot write into a tmpfs mount, and the node container runs with
@@ -94,11 +56,7 @@ readonly PACKAGES_IN_NODE="/root/trawl-packages"
 # also has to cover the restart that follows.
 readonly DUMP_WAIT_SECS=45
 readonly ACTIVE_WAIT_SECS=60
-# How long to wait for the daemon's own crash-dump verdict line after a
-# restart. See wait_verdict: this is the observable that says init() finished.
 readonly VERDICT_WAIT_SECS=60
-# Grace after the negative control's crash has fully played out (faulted pid
-# gone, unit restarted) before enumerating dumps.
 readonly NEG_SETTLE_SECS=15
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
@@ -117,7 +75,6 @@ sudo systemctl daemon-reload && sudo systemctl restart trawld'
 readonly DISABLE_CMD='sudo rm /etc/systemd/system/trawld.service.d/crashdump.conf
 sudo systemctl daemon-reload && sudo systemctl restart trawld'
 
-# ------------------------------------------------------------------- options --
 
 PACKAGES=""
 DEB=""
@@ -170,7 +127,6 @@ done
 # trap's restore back to the value the host started with.
 mapfile -t SCOPES < <(printf '%s\n' "${SCOPES[@]}" | sort -n -u)
 
-# --------------------------------------------------------------- transcript --
 
 TEE_FD_SAVED=0
 if [[ -n "$OUT" ]]; then
@@ -188,7 +144,6 @@ finish_transcript() {
   fi
 }
 
-# ------------------------------------------------------------------- the lock --
 
 # Container names, the network and the cargo volume are fixed strings, so two
 # concurrent runs would share them and the second one's teardown would tear down
@@ -196,16 +151,7 @@ finish_transcript() {
 # cleanup trap, so a refused run exits without running any teardown at all.
 #
 # The lock lives in the per-user runtime directory, which systemd creates 0700
-# and owns. /tmp is not usable for this: it is world-writable, so any check that
-# the path is a plain file races the open that follows it, and another user can
-# plant a symlink in between. A directory only this uid can write removes the
-# race rather than narrowing it.
-#
-# The trade is real and worth naming. Two runs as DIFFERENT users take different
-# lock files and neither sees the other, while the docker names they fight over
-# are global to the daemon. The stale-resource sweep below covers that half: it
-# refuses to touch a container that is still running, so a mislocked second run
-# stops instead of killing a live one.
+# and owns. /tmp is not usable for this: it is world-writable.
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 if [[ ! -d "$runtime_dir" ]]; then
   echo "no runtime directory at $runtime_dir; refusing to run without a lock on a directory only this user can write" >&2
@@ -222,7 +168,6 @@ if ! flock -n 9; then
   exit 2
 fi
 
-# --------------------------------------------------------------- output helpers --
 
 # Transcripts get committed as PR evidence, so the worktree's absolute path
 # stays out of them. $REPO is substituted into everything this prints; the
@@ -232,7 +177,6 @@ rel() { printf '%s' "${1//$repo_root/\$REPO}"; }
 phase() { printf '\n\n## phase %s\n\n' "$*"; }
 note()  { printf '  %s\n' "${*//$repo_root/\$REPO}"; }
 run()   { printf '\n$ %s\n' "${*//$repo_root/\$REPO}"; "$@"; }
-# Same, but the command's stdout is noise (image ids, container ids).
 runq()  { printf '\n$ %s\n' "${*//$repo_root/\$REPO}"; "$@" >/dev/null; }
 # Run a script inside the node container, echoing it line by line first: these
 # are multi-line, and %q would render them as one backslash-mangled blob.
@@ -241,23 +185,14 @@ nsh() {
   printf '%s\n' "$1" | sed 's/^/$ /'
   docker exec "$NODE" bash -c "$1"
 }
-# Same, silent: for values the caller formats itself.
 nshq()  { docker exec "$NODE" bash -c "$1"; }
 die()   { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 
-# ------------------------------------------------------------------ cleanup --
 
 ORIG_SCOPE=""
-# The stub SPA index.html, when this run is the one that created it. Removed on
-# the way out so a harness run leaves no file behind in the tree it tested.
 STUB_CREATED=""
 # Docker objects THIS run created, recorded as IDs from the create commands that
-# actually succeeded. Names are the wrong handle: they are fixed strings, so a
-# create that LOST a race to another run would still have left the name in a
-# list, and teardown would then remove the winner's container. An id names one
-# object, and every object this run makes carries RUN_LABEL, which teardown
-# re-checks before removing anything. Belt and braces, on purpose: teardown runs
-# `docker rm -f`, and being wrong there means killing somebody else's live run.
+# actually succeeded. Names are the wrong handle: they are fixed strings.
 readonly RUN_LABEL="trawl-crashdump-harness-run=$$-$(date +%s)"
 CREATED_CONTAINERS=()
 CREATED_NETWORK=""
@@ -265,11 +200,7 @@ CREATED_NETWORK=""
 # report, or a signal delivered mid-write, must still reach the restore path.
 SCOPE_MODIFIED=0
 # The value this run last ATTEMPTED to write, recorded before the write for the
-# same reason. Recording the readback instead would defeat the check it exists
-# for: if the write landed and the command then failed, or a signal arrived
-# between the write and the assignment, the variable would still hold the old
-# value and teardown would read the difference as somebody else's change. Intent
-# is knowable before the syscall; outcome is not.
+# same reason.
 SCOPE_EXPECTED=""
 
 set_host_scope() {
@@ -300,9 +231,6 @@ restore_host_scope() { # 0 restored or nothing to do, 1 needs a human
     return 0
   fi
   if [[ -n "$SCOPE_EXPECTED" && "$cur" != "$SCOPE_EXPECTED" ]]; then
-    # Not ours to write. It is neither the value this run tried to set nor the
-    # value it found, so something outside this run owns it now and a restore
-    # would be overwriting a stranger's decision with a stale one.
     printf '\n!! NOT RESTORING %s: it reads %s, this run last tried to set %s.\n' \
       "$YAMA" "$cur" "$SCOPE_EXPECTED"
     printf '!! Something else changed it. Decide by hand; it was %s before this run.\n' "$ORIG_SCOPE"
@@ -332,7 +260,6 @@ cleanup() {
   local restore_failed=0
   restore_host_scope || restore_failed=1
 
-  # Exactly the file this run wrote, never a dist/ that was already there.
   if [[ -n "$STUB_CREATED" && -f "$STUB_CREATED" ]]; then
     note "removing the stub SPA this run created: $(rel "$STUB_CREATED")"
     rm -f "$STUB_CREATED"
@@ -366,8 +293,6 @@ cleanup() {
   printf '\n$ cat %s   # host, after restore\n' "$YAMA"
   cat "$YAMA" 2>/dev/null || echo "(yama not present)"
 
-  # A leaked sysctl outranks whatever else went wrong: the machine is left in a
-  # state the operator did not ask for, and only a human can settle it.
   if (( restore_failed )); then
     rc="$EXIT_SYSCTL_RESTORE_FAILED"
     printf '\nexit status: %s (host ptrace_scope needs manual attention)\n' "$rc"
@@ -380,9 +305,7 @@ cleanup() {
 # INT and TERM get their own handlers, not a shared one with EXIT. A signal
 # delivered after a command that succeeded enters the trap with $? still 0, so a
 # single `trap cleanup EXIT INT TERM` tears the stack down and then reports
-# "exit status: 0" without ever reaching the result phase. A killed run that
-# claims success is the worst possible answer. These record the conventional
-# 128+signal status and hand it to cleanup through `exit`.
+# "exit status: 0".
 on_signal() { # on_signal <name> <status>
   trap - INT TERM
   printf '\n\n!! %s received. Tearing down and exiting %s.\n' "$1" "$2"
@@ -392,7 +315,6 @@ trap 'on_signal SIGINT 130' INT
 trap 'on_signal SIGTERM 143' TERM
 trap cleanup EXIT
 
-# ------------------------------------------------------------- small helpers --
 
 wait_for() { # wait_for <secs> <description> <bash test command>
   local secs="$1" what="$2" cmd="$3" i
@@ -435,7 +357,6 @@ find_monitor() {
   ' bash "$1"
 }
 
-# Print 0 or 1: is CAP_SYS_PTRACE set in <field> (CapEff/CapAmb/...) for <pid>?
 cap_bit() { # cap_bit <pid> <field>
   docker exec "$NODE" bash -c '
     v=$(awk "/^$2:/{print \$2}" "/proc/$1/status")
@@ -510,12 +431,6 @@ journal_crash_lines() {
   nsh "journalctl -u trawld --no-pager --since '-3min' | grep -iE 'crashdump|minidump|FATAL signal|Main process exited|Scheduled restart' | tail -12"
 }
 
-# The crash-dump verdict trawld logs once per start, for THIS daemon pid.
-#
-# Empty until the line is there. _SYSTEMD_UNIT and _PID are two different
-# fields, so journalctl ANDs them: an earlier start's verdict cannot answer for
-# this one.
-#
 # The sed is not cosmetic. trawld colours its output whether or not anything is
 # watching, journald stores those bytes, and the escapes land between the field
 # name and its value (`ESC[3mevent_type ESC[0m ESC[2m= ESC[0m"crash_dump"`), so
@@ -529,16 +444,8 @@ verdict_line() { # verdict_line <daemon pid>
 }
 
 # Wait until the daemon has published that verdict, and only then read anyone's
-# capability masks.
-#
-# Neither of the observables this replaces settles the seal. The unit is
-# Type=simple, so `systemctl is-active` says active the moment the daemon
-# execs, and a monitor process exists from the moment trawld spawns it, which
-# is BEFORE the parent has connected to it, probed it and dropped
-# CAP_SYS_PTRACE (ADR-0023 ruling 4). Asserting CapEff==0 on the daemon in that
-# window is a race the harness loses at random. log_crash_dump runs after
-# init() returned and therefore after the seal, so this line is proof that the
-# masks below are being read off a settled process.
+# capability masks. `systemctl is-active` and the monitor's existence both come
+# BEFORE the parent has dropped CAP_SYS_PTRACE (ADR-0023 ruling 4).
 wait_verdict() { # wait_verdict <daemon pid>
   if wait_for "$VERDICT_WAIT_SECS" "trawld logged its crash-dump verdict" \
     "[[ -n \$(verdict_line $1) ]]"; then
@@ -549,7 +456,6 @@ wait_verdict() { # wait_verdict <daemon pid>
   die "trawld pid $1 never logged a crash-dump verdict"
 }
 
-# ------------------------------------------------------- phase 1: the header --
 
 phase "1 header"
 
@@ -586,7 +492,6 @@ else
   printf '\n$ cat %s   # host, before anything runs\n%s\n' "$YAMA" "$ORIG_SCOPE"
 fi
 
-# -------------------------------------------------------- phase 2: the build --
 
 phase "2 build"
 
@@ -628,16 +533,13 @@ EOF
   note "CARGO_TARGET_DIR: $target_dir (inside the worktree; /tmp here is a 16G tmpfs)"
 
   # rust-embed scans this directory at macro-expansion time, so trawl-web will
-  # not compile without it. A real SPA needs trunk + a wasm toolchain, which
-  # this harness has no use for: nothing it asserts touches the web UI.
+  # not compile without it.
   dist="$repo_root/crates/trawl-web-ui/dist"
   if [[ -f "$dist/index.html" ]]; then
     note "SPA dist present at $dist (not stubbed)"
   else
     mkdir -p "$dist"
-    # Marked before the write, like SCOPE_MODIFIED: a run interrupted between
-    # the two would otherwise leave a half-written file in the tree with nothing
-    # recording that this run put it there.
+    # Marked before the write, like SCOPE_MODIFIED.
     STUB_CREATED="$dist/index.html"
     printf '%s\n' '<!doctype html><title>trawl</title><p>crashdump-harness stub SPA</p>' > "$dist/index.html"
     note "STUBBED the SPA: wrote a one-line placeholder to $dist/index.html"
@@ -653,15 +555,11 @@ EOF
     -v "$common_git:$common_git:ro"
     -v "$CARGO_VOLUME:/usr/local/cargo/registry"
     -e "CARGO_TARGET_DIR=$target_dir" -e "XDG_CACHE_HOME=$target_dir/cache" "$BUILDER_IMAGE")
-  # Build all five distribution executables, including the standalone CLI.
   run "${builder[@]}" bash scripts/release/build-distribution.sh \
     "$repo_root" "$build_target" "$target_dir/runtime"
 
   # The target directory is reused across runs, so a version bump leaves the
-  # previous release's .deb sitting beside the new one. Picking one of those with
-  # `find -print -quit` is picking by readdir order, which would happily certify
-  # a package this run did not build. Clear the output directory first, then
-  # require exactly the three matching distribution packages afterwards.
+  # previous release's .deb sitting beside the new one.
   if compgen -G "$PACKAGES/*.deb" >/dev/null; then
     note "clearing .deb files left in $PACKAGES by an earlier run"
     rm -f "$PACKAGES"/*.deb
@@ -670,8 +568,6 @@ EOF
   # cargo-deb variants temporarily modify manifests. Keep those writes in a
   # disposable source snapshot even if the builder is killed without cleanup.
   # The --rm container owns /tmp; interrupted snapshots cannot accumulate in target.
-  # Original sources and Git metadata are read-only during this step; the
-  # binaries keep the provenance embedded by the original-source build above.
   packager=(docker run --rm --user "$(id -u):$(id -g)"
     -v "$repo_root:$repo_root:ro" -v "$target_dir:$target_dir" -w "$repo_root"
     -v "$common_git:$common_git:ro"
@@ -714,21 +610,12 @@ for candidate in "${deb_candidates[@]}"; do
 done
 DEB="${package_paths[trawl-server]}"
 
-# ----------------------------------------------------------- phase 3: bring up --
 
 phase "3 up"
 
 # A stopped container with a prior harness label is debris from an interrupted
 # run or --keep. Clear it rather than reusing it: a container left
-# over from an earlier build would quietly test the wrong .deb, and
-# `docker network create` on an existing network is a hard failure that leaves
-# the operator to clean up by hand.
-#
-# A RUNNING container is not debris. The lock is per user, so a run under another
-# account holds no lock this one can see, and its containers are exactly what
-# this sweep would find. Removing one would kill a live run mid-crash. Refuse
-# instead and name it: either it belongs to someone else, or --keep left it and
-# the operator can remove it deliberately.
+# over from an earlier build would quietly test the wrong .deb.
 preflight=()
 for stale in "$NODE" "$PG"; do
   removed=$(remove_stopped_harness_container "$stale") || die "container preflight refused $stale"
@@ -755,9 +642,6 @@ note "container id ${pg_id:0:12}"
 wait_for 60 "postgres accepting connections" \
   "docker exec $PG pg_isready -U postgres" || die "postgres never came up"
 
-# trawld needs two databases: the fleet-auth keystore ([auth] database_url,
-# migrated by the packaged fleet-admin) and its own app-state database
-# ([storage] database_url, which trawld migrates itself at boot).
 run docker exec "$PG" psql -U postgres -v ON_ERROR_STOP=1 \
   -c "CREATE ROLE fleet LOGIN PASSWORD 'fleetpw';" \
   -c "CREATE DATABASE fleet OWNER fleet;" \
@@ -796,11 +680,9 @@ nsh "dpkg-query -W -f='  \${Package} \${Version}\n' systemd gdb sudo procps libc
 run docker exec "$PG" postgres --version
 install_dump_reader
 
-# --------------------------------------------------------- phase 4: install --
 
 phase "4 install"
 
-# /tmp in the node is a docker tmpfs, which docker cp cannot write into.
 run docker exec "$NODE" mkdir -p "$PACKAGES_IN_NODE"
 for name in trawl-runtime trawl-cli trawl-server; do
   run docker cp "${package_paths[$name]}" "$NODE:$PACKAGES_IN_NODE/$name.deb"
@@ -808,14 +690,10 @@ done
 
 # `set -o pipefail` inside the container: a bash -c does not inherit it, so
 # without this the pipeline reports tail's status and a failed configure would
-# read as a clean install. That is exactly how the cargo-deb 3.8 sysusers
-# regression could have slipped through every assertion below.
+# read as a clean install.
 nsh "set -o pipefail
 DEBIAN_FRONTEND=noninteractive apt-get install -y $PACKAGES_IN_NODE/*.deb 2>&1 | tail -8"
 
-# apt's exit status is one witness; dpkg's own record of the package state is a
-# second, independent one. A half-configured package is `install ok half-configured`
-# here, whatever apt returned.
 for name in trawl-runtime trawl-cli trawl-server; do
   install_status=$(nshq "dpkg-query -W -f='\${Status}' $name")
   printf '\n$ dpkg-query -W -f=%s %s\n%s\n' "'\${Status}'" "$name" "$install_status"
@@ -829,9 +707,6 @@ printf '\n$ dpkg-deb -c %s | grep examples/crashdump.conf\n' "$(basename "$DEB")
 dpkg-deb -c "$DEB" | grep 'examples/crashdump.conf' \
   || die "the .deb does not ship usr/share/doc/trawl-server/examples/crashdump.conf"
 
-# The packaged /etc/default/trawld documents FLEET_DATABASE_URL and
-# TRAWL_DATABASE_URL as the place DSNs belong, and the unit reads it as
-# EnvironmentFile. Both override the CHANGE_ME placeholders in trawld.toml.
 nsh "cat >> /etc/default/trawld <<'EOF'
 FLEET_DATABASE_URL=$FLEET_DSN
 TRAWL_DATABASE_URL=$TRAWL_DSN
@@ -846,7 +721,6 @@ run docker exec "$NODE" systemctl restart trawld
 wait_active
 run docker exec "$NODE" systemctl show trawld -p MainPID -p ActiveState -p SubState
 
-# ------------------------------------------------------- phase 5: A, inert --
 
 phase "5 A inert"
 
@@ -865,18 +739,13 @@ caps_report "$pid" "trawld"
 note "CAP_SYS_PTRACE (bit $PTRACE_CAP_BIT) is clear in both CapEff and CapAmb"
 
 # %F as well as the mode: stat follows symlinks, so a link pointing at some
-# other 0700 trawl-owned directory would satisfy owner and mode alone. postinst
-# creates this through systemd-tmpfiles precisely so it cannot be a link.
+# other 0700 trawl-owned directory would satisfy owner and mode alone.
 run docker exec "$NODE" stat -c '%F %U %G %a' "$CORES"
 [[ "$(nshq "stat -c '%F %U %G %a' $CORES")" == "directory trawl trawl 700" ]] \
   || die "$CORES is not a plain directory owned trawl:trawl mode 0700"
 
-# The tmpfiles entry is `d=`, and the `=` is the part that matters: it removes a
-# wrong-type object at the path instead of leaving it. Whether this systemd
-# honours the suffix is a question about the running version, not about the file
-# we shipped, so put a regular file where the directory belongs and re-run the
-# same command postinst does. Plain `d` would leave the file sitting there,
-# postinst would still succeed, and capture would die on EEXIST at crash time.
+# The tmpfiles entry is `d=`. Whether this systemd honours the suffix is a
+# question about the running version, not about the file we shipped.
 nsh "rmdir $CORES && : > $CORES && stat -c 'planted: %F' $CORES
 systemd-tmpfiles --create trawl.conf
 stat -c 'after tmpfiles: %F %U:%G %a' $CORES"
@@ -884,23 +753,13 @@ stat -c 'after tmpfiles: %F %U:%G %a' $CORES"
   || die "systemd-tmpfiles left a non-directory at $CORES; this systemd does not honour the 'd=' type suffix"
 note "systemd $(nshq "systemctl --version | head -1 | awk '{print \$2}'") replaced the planted file with the directory, so 'd=' is honoured here"
 
-# trawl-web runs as the same trawl user with /var/lib/trawl writable, so file
-# permissions alone leave the browser-facing proxy free to read every minidump.
-# The unit masks the directory. Checked three ways: systemd loaded the
-# directive, the proxy still starts (which means web.cookie and the pinned
-# certificate beside the masked directory are still readable), and the
-# directory really is empty inside the proxy's own mount namespace.
 run docker exec "$NODE" systemctl show trawl-web -p InaccessiblePaths
 web_masked=$(nshq "systemctl show trawl-web -p InaccessiblePaths --value")
 [[ "$web_masked" == *"$CORES"* ]] \
   || die "trawl-web.service does not mask $CORES (InaccessiblePaths='$web_masked')"
 
 # The start below is only evidence about the mask once the pinned certificate
-# exists. This is trawld's first start, and it writes $WEB_UPSTREAM_CA only
-# after connecting to both databases, while `systemctl is-active` said active
-# at exec. Without the file trawl-web starts anyway and waits for it, so the
-# checks below could not tell a hidden certificate from a late one. trawld
-# publishes the certificate with a rename, so a non-empty file is whole.
+# exists. Without the file trawl-web starts anyway and waits for it.
 printf '\n$ grep -Fx %s /etc/trawl/trawld.toml\n' "'upstream_ca_path = \"$WEB_UPSTREAM_CA\"'"
 nshq "grep -Fx 'upstream_ca_path = \"$WEB_UPSTREAM_CA\"' /etc/trawl/trawld.toml" \
   || die "the installed trawld.toml does not pin $WEB_UPSTREAM_CA for trawl-web"
@@ -914,12 +773,9 @@ wait_for "$ACTIVE_WAIT_SECS" "trawl-web is-active=active" \
   "[[ \$(docker exec $NODE systemctl is-active trawl-web 2>/dev/null) == active ]]" \
   || { docker exec "$NODE" journalctl -u trawl-web --no-pager -n 20 || true
        die "trawl-web did not start; the mask may be hiding web.cookie or $WEB_UPSTREAM_CA"; }
-# Type=simple reports active on exec, and trawl-web reads the cookie and the
-# pinned certificate during startup config resolution. It exits when either
-# read fails, except a certificate that is not there: then it logs
-# upstream_ca_pending and keeps running. So a still-active unit a few seconds
-# later, whose run logged no upstream_ca_pending, is the evidence that both
-# reads succeeded.
+# Type=simple reports active on exec. trawl-web exits when the cookie or the
+# pinned certificate read fails, except a certificate that is not there: then
+# it logs upstream_ca_pending and keeps running.
 sleep 3
 [[ "$(nshq "systemctl is-active trawl-web")" == "active" ]] \
   || { docker exec "$NODE" journalctl -u trawl-web --no-pager -n 20 || true
@@ -936,11 +792,6 @@ if grep -q upstream_ca_pending <<<"$web_journal"; then
   die "trawl-web started without $WEB_UPSTREAM_CA, which trawld had written; the mask may be hiding it"
 fi
 
-# The uid is the load-bearing part, not the mask. Read it off the running
-# process rather than off the unit file, and check the key's mode beside it:
-# the proxy reads that key through the trawl GROUP, which is the whole reason a
-# separate uid is possible at all. A still-active unit is the proof the read
-# worked, since trawl-web exits nonzero when it cannot load the key.
 nsh "ps -o pid,user,group,args -p \$(systemctl show trawld -p MainPID --value) -p \$(systemctl show trawl-web -p MainPID --value)
 id trawl-web
 stat -c '%n %U:%G %a' /var/lib/trawl /var/lib/trawl/web.cookie /var/lib/trawl/cores /etc/trawl/trawld.toml"
@@ -965,12 +816,9 @@ stat -c 'web.cookie in that namespace: %n %U %a' /proc/$web_pid/root/var/lib/tra
 note "the sentinel is invisible inside trawl-web's mount namespace, web.cookie is not"
 nshq "rm -f $CORES/sentinel-not-a-dump"
 
-# ------------------------------------------------------ phase 6: B, enable --
 
 phase "6 B enable"
 
-# Verbatim from the docs. If the page changes, this stops rather than silently
-# testing something the operator was never told to run.
 docs_block=$(awk '
   /^### Enable capture on Debian$/ { found = 1; next }
   found && /^   ```bash$/ { inblock = 1; next }
@@ -989,13 +837,10 @@ docker exec -i "$NODE" bash -s <<< "$ENABLE_CMD"
 wait_active
 run docker exec "$NODE" systemctl show trawld -p AmbientCapabilities -p Environment
 
-# ---------------------------------------------- phases C/D: a fault per scope --
 
-# Sets SCOPE_READY (1 usable, 0 skip) and SCOPE_SKIP_REASON. It reports through
-# variables rather than an exit status on purpose: a function called as an `if`
-# condition runs with errexit suppressed for its whole body, so a docker exec
-# that failed inside would fall through instead of aborting, and the run could
-# certify a scope it never actually set.
+# Sets SCOPE_READY (1 usable, 0 skip) and SCOPE_SKIP_REASON, rather than an exit
+# status: a function called as an `if` condition runs with errexit suppressed
+# for its whole body.
 SCOPE_READY=0
 SCOPE_SKIP_REASON=""
 
@@ -1022,10 +867,6 @@ ensure_scope() { # ensure_scope <wanted>
       return 0
     fi
     printf '\n$ docker exec %s bash -c '\''echo %s > %s'\''\n' "$NODE" "$want" "$YAMA"
-    # Both flags go up before the write, recording intent rather than outcome.
-    # A write that lands and then reports a failure, and a signal delivered
-    # between the write and the assignment, both leave teardown knowing exactly
-    # which value this run is responsible for.
     SCOPE_MODIFIED=1
     SCOPE_EXPECTED="$want"
     set_host_scope "$want"
@@ -1035,9 +876,6 @@ ensure_scope() { # ensure_scope <wanted>
     note "raised $cur -> $want, confirmed by readback (restored to $ORIG_SCOPE by the exit trap)"
   fi
 
-  # Whether we wrote it or found it already there, the case only runs against a
-  # kernel that reports the scope the case claims to be testing. A scope-1 run
-  # must never be filed as evidence for scope 2.
   readback=$(nshq "cat $YAMA")
   [[ "$readback" == "$want" ]] \
     || die "scope case $want would run against ptrace_scope=$readback"
@@ -1062,11 +900,6 @@ scope_case() { # scope_case <scope>
   printf '\ncapabilities (bit %s = CAP_SYS_PTRACE):\n' "$PTRACE_CAP_BIT"
   caps_report "$pid" "daemon"
   caps_report "$mon" "monitor"
-  # The drop-in's AmbientCapabilities= hands CAP_SYS_PTRACE to both processes at
-  # exec, and the daemon then drops it: once the monitor is up and classified,
-  # trawld clears the bit from its own effective and permitted sets and sets
-  # no_new_privs (ADR-0023 ruling 4). Only the monitor needs it, so a daemon
-  # still holding it here means the seal did not run.
   [[ "$(cap_bit "$pid" CapEff)" == 0 ]] || die "scope $scope: the daemon still holds CAP_SYS_PTRACE after startup"
   [[ "$(cap_bit "$mon" CapEff)" == 1 ]] || die "scope $scope: the monitor did not inherit CAP_SYS_PTRACE"
 
@@ -1099,8 +932,6 @@ scope_case() { # scope_case <scope>
   (( restarts_after > restarts_before )) || die "scope $scope: systemd did not restart trawld"
 }
 
-# A skipped case is a hole in the evidence, not a pass. Both get counted so the
-# result block can say which of the two it is.
 POSITIVE_REQUESTED=${#SCOPES[@]}
 POSITIVE_RUN=0
 NOT_RUN=()
@@ -1117,7 +948,6 @@ for scope in "${SCOPES[@]}"; do
   fi
 done
 
-# -------------------------------------------- phase E: the capability control --
 
 phase "E negative (capability removed)"
 
@@ -1130,22 +960,11 @@ else
     NEGATIVE_READY=1
   else
     note "skipped: $SCOPE_SKIP_REASON"
-    # --no-negative is an operator asking for less. This branch is the harness
-    # failing to deliver what it was asked for, which is a different thing.
     NOT_RUN+=("negative control at ptrace_scope=2 ($SCOPE_SKIP_REASON)")
   fi
 fi
 
 if (( NEGATIVE_READY )); then
-  # What this proves, and what it does NOT prove.
-  #
-  # The docs used to say a half-applied drop-in gives you the stderr breadcrumb
-  # and no .dmp. That is not what happens with minidump-writer 0.13. A failed
-  # PTRACE_ATTACH is a SOFT error there, so the thread is dropped from the dump
-  # and the writer still reports success. You get a file, you get "wrote
-  # minidump" in the journal, and only the contents give it away: zero threads,
-  # zero memory regions, about a tenth the size. Silent denial, worse than the
-  # documented kind, because the artifact looks fine until you open it.
   cat <<'EOF'
 
   Control: the same drop-in with AmbientCapabilities removed. The two
@@ -1182,9 +1001,8 @@ cat /etc/systemd/system/trawld.service.d/crashdump.conf"
 
   force_fault "$neg_pid"
 
-  # Judge only once the crash has fully played out. Sleeping a flat window and
-  # looking is how you end up asserting "no dump" against a process that had not
-  # died yet. The dump, if there is one, is written before the process dies:
+  # Judge only once the crash has fully played out.
+  # The dump, if there is one, is written before the process dies:
   # the crash handler blocks on the monitor's ack.
   wait_for "$DUMP_WAIT_SECS" "faulted pid $neg_pid is gone" \
     "! docker exec $NODE test -d /proc/$neg_pid" \
@@ -1195,8 +1013,6 @@ cat /etc/systemd/system/trawld.service.d/crashdump.conf"
   note "settling ${NEG_SETTLE_SECS}s before judging (a working capture lands within a second of the fault)"
   sleep "$NEG_SETTLE_SECS"
 
-  # Every file this crash produced, not just the newest. If the monitor wrote
-  # more than one, a single good dump among them still disproves the control.
   mapfile -t neg_after_paths < <(dump_paths)
   neg_new_paths=()
   for p in "${neg_after_paths[@]}"; do
@@ -1218,10 +1034,6 @@ cat /etc/systemd/system/trawld.service.d/crashdump.conf"
       neg_mem=$(dump_field "$p" memory_regions)
       (( neg_threads == 0 )) \
         || die "negative control: $p captured $neg_threads threads without CAP_SYS_PTRACE — the capability line is not load-bearing, or the drop-in did not take effect"
-      # Both streams, because the outcome line below claims both. Thread state
-      # and memory ranges are separate ptrace reads, and a dump carrying stacks
-      # without a thread list would still be a dump the denial should have
-      # prevented.
       (( neg_mem == 0 )) \
         || die "negative control: $p captured $neg_mem memory regions without CAP_SYS_PTRACE"
     done
@@ -1235,25 +1047,13 @@ cat /etc/systemd/system/trawld.service.d/crashdump.conf"
   run docker exec "$NODE" systemctl show trawld -p AmbientCapabilities
 fi
 
-# ------------------------------- phase F: can the proxy reach the dumps at all --
 
 phase "F attack direction (trawl-web against the dumps)"
 
 if (( POSITIVE_RUN == 0 )); then
   note "skipped: no crash case ran, so there are no dumps to try to reach"
 else
-# The state that makes this sharp: capture disabled, so trawld is running
-# without CAP_SYS_PTRACE, while the dumps the earlier phases produced are still
-# sitting in the directory. Nothing about the daemon is privileged any more, and
-# the only thing standing between the browser-facing proxy and a verbatim copy
-# of trawld's memory is the uid split plus the directory mode.
-#
-# Before the split this was a real hole. Running the proxy as trawl meant
-# /proc/<trawld-pid>/root passed the kernel's ptrace check on uid alone, and
-# inside trawld's own mount namespace InaccessiblePaths does not apply, so the
-# mask in trawl-web.service could be walked straight around.
 
-# Verbatim from the docs, same drift guard as the enable command.
 docs_disable=$(awk '
   /^### Disable capture and delete dumps$/ { found = 1; next }
   found && /^   ```bash$/ { inblock = 1; next }
@@ -1284,11 +1084,7 @@ note "capture is off, trawld is cap-less, and $(basename "$attack_dump") is stil
 # service does. That is the strongest form of the question: even holding the
 # group, can this uid reach a dump?
 # stdout goes to /dev/null and never to the transcript. Two of these probes cat
-# a minidump, so on the day the access control regresses, echoing what came back
-# would paste trawld's memory, TLS key and postgres password included, into a
-# file that gets committed as PR evidence. A test for a leak must not be the
-# leak. Only stderr is captured, and only the first line of it, which is where
-# the permission error lives.
+# a minidump, and the transcript gets committed as PR evidence.
 probe() { # probe <label> <command...>; expects a permission denial
   local label="$1"; shift
   printf '\n$ runuser -u trawl-web -- %s\n' "$*"
@@ -1309,8 +1105,6 @@ probe "reading a dump directly" cat "$attack_dump"
 probe "listing the dump directory through /proc/$attack_pid/root" ls -l "/proc/$attack_pid/root$CORES"
 probe "reading a dump through /proc/$attack_pid/root" cat "/proc/$attack_pid/root$attack_dump"
 
-# The control. Same commands as the trawl user succeed, so the denials above
-# are about who is asking, not about the files having gone away.
 printf '\n$ runuser -u trawl -- ls -l %s   # control: the owner can still read them\n' "$CORES"
 docker exec "$NODE" runuser -u trawl -- ls -l "$CORES"
 note "the trawl user reads its own dumps; the denials above are the uid split and the 0700 mode, not missing files"

@@ -4,21 +4,6 @@
 
 //! The Health page's capacity fixtures are producer output (ADR-0042).
 //!
-//! Each scenario plants its partitions as sparse `.parquet` files of the
-//! scenario's byte sizes under a temporary data root, then reads them the
-//! way the dashboard does: the Parquet attempt ([`super::scan_parquet`],
-//! its repin fence included) through a [`super::StorageCache`] read back by
-//! [`super::read_parquet_scan`], the reader behind the dashboard's
-//! Parquet totals. A headroom attempt through `capacity::sample_headroom`
-//! runs over a stat seam on the same data root, retention evidence is
-//! recorded through `retention::RetentionEvidence`, and the headroom and
-//! WAL measurements are fixed inputs. `capacity::assemble` turns them into
-//! the capacity object on 2026-09-27, the same call the dashboard snapshot
-//! makes. The test serializes each scenario's snapshot slice and compares
-//! it with the committed fixture the e2e harness loads, so a fixture is a
-//! state the server can emit by construction, and a storage scan
-//! regression fails it.
-//!
 //! A lib unit test rather than an integration test: as a child of
 //! `metrics`, it reaches the private scan and cache without widening
 //! their visibility.
@@ -52,19 +37,15 @@ fn date(month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(2026, month, day).unwrap()
 }
 
-/// The UTC date every fixture is assembled on.
 fn today() -> NaiveDate {
     date(9, 27)
 }
 
-/// The oldest observed day: today − 8.
 fn window_start() -> NaiveDate {
     date(9, 19)
 }
 
-/// The snapshot slice a capacity fixture carries: the capacity object
-/// with the Parquet and WAL fields it was assembled beside, each the
-/// `DashboardSnapshot` field of the same name, in its order.
+/// Each field is the `DashboardSnapshot` field of the same name, in its order.
 #[derive(serde::Serialize)]
 struct CapacitySnapshotPart {
     parquet_files: u64,
@@ -79,9 +60,8 @@ struct CapacitySnapshotPart {
 /// One filesystem as the stat seam reports it: `(device, total, available)`.
 type Stat = (u64, u64, u64);
 
-/// A headroom attempt: each role's filesystem, and whether a repin marker
-/// stands in the data root while the fence reads it. The marker is planted
-/// after the Parquet attempt, so only the headroom sample sees it.
+/// The repin marker is planted after the Parquet attempt, so only the
+/// headroom sample sees it.
 struct Headroom {
     data: Stat,
     /// `None` when ingest is off.
@@ -90,7 +70,6 @@ struct Headroom {
     repin: bool,
 }
 
-/// Retention's evidence as the loop records it.
 struct Evidence {
     removals_age: u64,
     removals_disk_pressure: u64,
@@ -108,21 +87,20 @@ impl Evidence {
     };
 }
 
-/// What the Parquet cache holds when the snapshot reads it.
 #[derive(Clone, Copy)]
 enum Parquet {
-    /// No attempt yet.
     NotSampled,
     /// One attempt over the planted data root, `age` seconds before the
     /// read.
-    Complete { age: u64 },
+    Complete {
+        age: u64,
+    },
     /// One attempt over a data root that does not exist, with no complete
     /// scan before it.
     FailedFirst,
 }
 
 struct Scenario {
-    /// The partitions planted in the data root; `None` plants none.
     partitions: Option<EnvDateBytes>,
     parquet: Parquet,
     headroom_measurement: StorageMeasurement,
@@ -131,7 +109,6 @@ struct Scenario {
     wal: (u64, u64, StorageMeasurement),
     evidence: Evidence,
     floor: u64,
-    /// Per-env `max_age_days` overrides of the 90-day default.
     env_max_age: &'static [(&'static str, u64)],
 }
 
@@ -146,7 +123,6 @@ fn complete(age: u64) -> StorageMeasurement {
     measurement(Status::Complete, Some(age))
 }
 
-/// `env`'s partitions from `from` through `to`, each of `bytes(date)`.
 fn fill(
     partitions: &mut EnvDateBytes,
     env: &str,
@@ -161,9 +137,7 @@ fn fill(
     }
 }
 
-/// Plant each partition as one sparse `.parquet` file of its bytes under
-/// `data_root/{env}/{date}/`. `set_len` writes no data, so a scenario's
-/// gigabytes cost no disk.
+/// `set_len` writes no data, so a scenario's gigabytes cost no disk.
 fn plant(data_root: &Path, partitions: &EnvDateBytes) {
     for ((env, date), bytes) in partitions {
         let dir = data_root.join(env).join(date.to_string());
@@ -175,8 +149,6 @@ fn plant(data_root: &Path, partitions: &EnvDateBytes) {
     }
 }
 
-/// The Parquet cache after the scenario's attempts, read back the way the
-/// dashboard reads it.
 fn parquet_reading(
     parquet: Parquet,
     data_root: &Path,
@@ -203,8 +175,6 @@ fn parquet_reading(
     read_parquet_scan(&cache, read_at)
 }
 
-/// One headroom attempt through the real sampling function and repin
-/// fence, on the scenario's data root.
 fn sample(
     headroom: &Headroom,
     tmp: &Path,
@@ -236,8 +206,6 @@ fn sample(
     .unwrap()
 }
 
-/// Retention's evidence, recorded through the loop's own methods and read
-/// back through the snapshot the dashboard takes.
 fn pressure(evidence: &Evidence) -> trawl_api::PressureEvidence {
     let recorded = RetentionEvidence::default();
     for _ in 0..evidence.removals_age {
@@ -553,13 +521,8 @@ fn pretty(value: &impl serde::Serialize) -> String {
     serde_json::to_string_pretty(value).unwrap() + "\n"
 }
 
-/// Unchanged lines kept around each change in [`unified_diff`].
 const DIFF_CONTEXT: usize = 3;
 
-/// A line diff of `expected` against `actual` over their longest common
-/// subsequence: removed lines marked `-`, added lines `+`, and up to
-/// [`DIFF_CONTEXT`] unchanged lines around each change, with `@@` between
-/// runs of change that are further apart.
 fn unified_diff(expected: &str, actual: &str) -> String {
     let (a, b): (Vec<_>, Vec<_>) = (expected.lines().collect(), actual.lines().collect());
     let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
@@ -603,11 +566,8 @@ fn unified_diff(expected: &str, actual: &str) -> String {
     out
 }
 
-/// Compare the `produced` slice with the `committed` one as JSON values.
-/// On a mismatch, `write` the produced fixture when regenerating, and
-/// otherwise panic with a line diff of the two pretty forms. A fixture
-/// that already matches is never rewritten, so regenerating does not
-/// reformat an unchanged file.
+/// A fixture that already matches is never rewritten, so regenerating does
+/// not reformat an unchanged file.
 fn check_or_regenerate(
     path: &Path,
     committed: &serde_json::Value,
@@ -656,9 +616,6 @@ fn capacity_fixtures_are_producer_output() {
     }
 }
 
-/// The base snapshot's capacity slice is producer output too. Only the
-/// slice's fields are compared and rewritten; the rest of the snapshot is
-/// the harness's own.
 #[test]
 fn base_dashboard_capacity_is_producer_output() {
     let path = wire_dir().join("health-dashboard.json");
@@ -685,14 +642,12 @@ fn base_dashboard_capacity_is_producer_output() {
     );
 }
 
-/// The diff names the lines that differ and keeps the ones that match.
 #[test]
 fn the_fixture_diff_marks_changed_lines() {
     assert_eq!(
         unified_diff("a\nb\nc\n", "a\nx\nc\n"),
         "  a\n- b\n+ x\n  c\n"
     );
-    // Unchanged runs longer than the context collapse to `@@`.
     let expected = (0..20).map(|n| n.to_string() + "\n").collect::<String>();
     let actual = (0..20)
         .map(|n| match n {

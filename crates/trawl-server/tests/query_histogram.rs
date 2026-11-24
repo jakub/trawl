@@ -2,12 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The whole-result histogram over a real server (#197).
-//!
-//! Events go in through `/api/v1/ingest` and come back through
-//! `/api/v1/query`, read by real `DuckDB` over the hot buffer. A request
-//! that asks with `histogram: true` gets every row of the execution
-//! counted by `_time`, in the same response as its page.
+//! The whole-result histogram over a real server.
 
 mod common;
 
@@ -19,8 +14,6 @@ use trawl_server::config::RateLimitConfig;
 /// 2026-01-15T09:00:00Z, the first seeded event's `_time`, in microseconds.
 const BASE_MICROS: i64 = 1_768_467_600_000_000;
 
-/// A server over an empty data root, so `*` reads only what a test
-/// ingests.
 async fn server() -> TestServer {
     let tmp = tempfile::tempdir().expect("tempdir");
     let data = tmp.path().join("data");
@@ -36,7 +29,6 @@ async fn server() -> TestServer {
     server
 }
 
-/// Accept `events` through `/api/v1/ingest` as the ingest key.
 async fn ingest(server: &TestServer, events: &[serde_json::Value]) {
     let client = trawl_client::HttpClient::new_insecure(&server.url, &server.ingest_token)
         .expect("an ingest client");
@@ -44,14 +36,10 @@ async fn ingest(server: &TestServer, events: &[serde_json::Value]) {
     assert_eq!(answer.accepted, events.len(), "{answer:?}");
 }
 
-/// The `_time` text of the `i`th seeded event: `i` seconds past
-/// [`BASE_MICROS`].
 fn sent_at(i: usize) -> String {
     format!("2026-01-15T09:{:02}:{:02}Z", i / 60, i % 60)
 }
 
-/// `count` events one second apart, oldest first, on hosts `h0`-`h2`.
-/// Event `i` carries `level=error` when `error(i)`, else `level=info`.
 fn events(count: usize, error: impl Fn(usize) -> bool) -> Vec<serde_json::Value> {
     (0..count)
         .map(|i| {
@@ -66,7 +54,6 @@ fn events(count: usize, error: impl Fn(usize) -> bool) -> Vec<serde_json::Value>
         .collect()
 }
 
-/// `count` kv-shaped events, one second apart from [`BASE_MICROS`].
 fn kv_events(count: usize) -> Vec<serde_json::Value> {
     (0..count)
         .map(|i| {
@@ -80,7 +67,6 @@ fn kv_events(count: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A request for `dsl` that asks for the histogram.
 fn asking(dsl: &str, limit: Option<usize>, offset: Option<usize>) -> QueryRequest {
     QueryRequest {
         query: dsl.to_owned(),
@@ -90,8 +76,6 @@ fn asking(dsl: &str, limit: Option<usize>, offset: Option<usize>) -> QueryReques
     }
 }
 
-/// POST `body` to `/api/v1/query` as the analyst: the status and the body
-/// text.
 async fn post(server: &TestServer, body: &serde_json::Value) -> (u16, String) {
     let response = common::harness_client_builder()
         .build()
@@ -106,8 +90,6 @@ async fn post(server: &TestServer, body: &serde_json::Value) -> (u16, String) {
     (status, response.text().await.unwrap())
 }
 
-/// Run `request`, require a 200, and decode the answer. The raw JSON comes
-/// back beside it, for the keys a test checks are absent.
 async fn query(server: &TestServer, request: &QueryRequest) -> (QueryResponse, serde_json::Value) {
     let (status, body) = post(server, &serde_json::to_value(request).unwrap()).await;
     assert_eq!(status, 200, "{}: {body}", request.query);
@@ -117,8 +99,6 @@ async fn query(server: &TestServer, request: &QueryRequest) -> (QueryResponse, s
     (answer, raw)
 }
 
-/// A ready histogram's fields, after checking it against the answer's
-/// own `total`.
 struct Ready {
     start: i64,
     end: i64,
@@ -183,10 +163,9 @@ fn reason(dsl: &str, answer: &QueryResponse) -> HistogramReason {
     }
 }
 
-/// The premise of #197: a Rust-tail result keeps `_time` typed
-/// `timestamp`, with every non-null cell in the wire spelling
-/// `wire_micros` reads, so the counter needs no reader for `DuckDB`'s
-/// cast text. A kv tail asked for its histogram is counted whole.
+/// A Rust-tail result keeps `_time` typed `timestamp`, with every non-null cell
+/// in the wire spelling `wire_micros` reads, so the counter needs no reader
+/// for `DuckDB`'s cast text.
 #[tokio::test(flavor = "multi_thread")]
 async fn histogram_reads_a_rust_tail_result() {
     let server = server().await;
@@ -230,9 +209,6 @@ async fn histogram_reads_a_rust_tail_result() {
     assert!(counted.end > BASE_MICROS + 11_000_000);
 }
 
-/// 120 events whose 20 errors are all older than the newest 60: every
-/// page of 50 answers the same whole-result count, errors included, and
-/// only its own rows. The page past the end still counts the result.
 #[tokio::test(flavor = "multi_thread")]
 async fn histogram_counts_rows_before_the_page_is_cut() {
     let server = server().await;
@@ -298,8 +274,6 @@ async fn histogram_counts_rows_before_the_page_is_cut() {
     }
 }
 
-/// The count is of the final result: `head`, `tail` and `dedup` count
-/// what they kept and say so, and `sort` keeps every row.
 #[tokio::test(flavor = "multi_thread")]
 async fn histogram_counts_the_final_result() {
     let server = server().await;
@@ -320,10 +294,6 @@ async fn histogram_counts_the_final_result() {
     }
 }
 
-/// A sampled result is refused by name in both forms; a result without a
-/// timestamp `_time` names that; a projection that keeps `_time` but drops
-/// `_severity` is counted without severity; an aggregation carries no
-/// histogram key at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn histogram_refuses_shapes_with_a_reason() {
     let server = server().await;
@@ -353,8 +323,6 @@ async fn histogram_refuses_shapes_with_a_reason() {
     }
 }
 
-/// The flag is opt-in: a request without it, or with it false, gets no
-/// histogram key, and a false flag is not sent.
 #[tokio::test(flavor = "multi_thread")]
 async fn histogram_is_absent_unless_asked() {
     let server = server().await;
@@ -394,8 +362,6 @@ async fn histogram_is_absent_unless_asked() {
     assert_eq!(ready("*", &answer).events(), 6);
 }
 
-/// A result at `max_result_rows` is counted. One row more is refused as
-/// too large, as it always was, and the refusal carries no histogram.
 #[tokio::test(flavor = "multi_thread")]
 async fn histogram_obeys_the_row_cap() {
     let server = common::setup_with_row_caps(common::RowCaps {

@@ -63,23 +63,15 @@ struct Cli {
     no_monitor: bool,
 }
 
-/// Wall-clock cap on how long process exit waits for blocking-pool work
-/// that has already started — chiefly the telemetry/WAL durability
-/// barriers (fsync, dir-fsync). Dropping a Tokio runtime normally waits on
-/// those forever, so a frozen volume would stall restarts and rolling
-/// deployments indefinitely; past this budget the runtime is abandoned and
-/// the process exits with the wedged thread still parked in the kernel.
+/// How long process exit waits for blocking-pool work that has already
+/// started. Dropping a Tokio runtime normally waits on those forever, so a
+/// frozen volume would stall restarts; past this budget the runtime is
+/// abandoned.
 const RUNTIME_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stored data is owner-only (ADR-0052). Setting the umask here, first,
-    // puts it ahead of every file and thread trawld's own code creates: the
-    // crash-dump monitor re-execs into this line, the runtime's workers are
-    // built below, and DuckDB's `COPY ... TO` Parquet takes `0666 & !umask`
-    // with no other creation-time control. It is never restored. It cannot
-    // reach work a linked library does in a constructor before `main`. Paths
-    // whose modes must differ (`tls/`, `cert.pem`, the query log, `cores/`)
-    // set them explicitly, and the check modes create nothing.
+    // puts it ahead of every file and thread trawld's own code creates.
     #[cfg(unix)]
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
     // Inspect only arguments before choosing the seal. The monitor re-exec
@@ -118,31 +110,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // monitor mode this never returns. The report owns the handler guard, so it
     // lives in this frame for the whole run; `status` is the copy of the
     // verdict `async_main` logs once a subscriber exists (ADR-0023 ruling 6).
-    //
-    // The seal is the one verdict decided here rather than there. A capability
-    // set belongs to a thread, and a new thread starts from the set of the
-    // thread that spawned it, so answering a failed seal after the runtime is
-    // built means every tokio worker already carries the `CAP_SYS_PTRACE` the
-    // seal was supposed to drop. Everything on the way there runs holding it
-    // too, including reading a config file that turns out to be a FIFO nobody
-    // writes to, which parks the process with the capability live and no bound
-    // on how long. So the check runs first, before the runtime and before there
-    // is a second thread to inherit anything, and it prints to stderr because
-    // no subscriber exists yet. Every other verdict is advisory and reaches the
-    // log in `async_main`.
     let crash_dump = trawl_crashdump::init();
     let status = crash_dump.status();
     if matches!(
         status,
         trawl_crashdump::Status::Failed(trawl_crashdump::FailureReason::Seal)
     ) {
-        // Boot-fatal (ADR-0023 ruling 4). `init()` is supposed to hand back a
-        // process with `CAP_SYS_PTRACE` gone from both its effective and its
-        // permitted set and `no_new_privs` on. A seal that did not take leaves
-        // the capability live and leaves the path back to the file capability
-        // through a re-exec open. That is a privilege boundary that failed to
-        // establish, not a degraded feature to serve past. The line names no
-        // OS message, matching the crate's own content-free reason.
+        // Boot-fatal (ADR-0023 ruling 4).
         eprintln!(
             "[trawld] crash-dump seal failed: refusing to start with an unsealed \
              capability set (ADR-0023 ruling 4)"
@@ -160,9 +134,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(async_main(status));
-    // Bounded exit: `async_main` has already run the graceful shutdown
-    // sequence (each task under its own budget), so anything still running
-    // here is a wedged blocking operation, not pending work worth waiting on.
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_BUDGET);
     // The handler has to outlive shutdown. A fatal signal raised while the
     // runtime drains is exactly the crash worth a dump, and dropping the report
@@ -172,7 +143,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-/// The usage line every `--doctor` usage error ends with.
 const DOCTOR_USAGE: &str = "Usage: trawld --doctor --config <PATH> [--format <table|json>]";
 
 /// `trawld --doctor`, in a process `main` already sealed, as `sealed`
@@ -232,7 +202,7 @@ fn doctor_usage_error(error: &clap::Error) -> u8 {
     2
 }
 
-#[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive
+#[allow(clippy::too_many_lines)]
 async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -240,9 +210,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
 
     let cli = Cli::parse();
     let config_path = resolve_path(cli.config.as_deref().unwrap_or("~/.trawl/trawld.toml"));
-    // Pre-tracing boundary: no subscriber exists yet, so a config failure
-    // here can only surface through stderr. Name the resolved path so the
-    // operator can tell which file failed.
     let config = Config::from_file(&config_path).map_err(|e| {
         eprintln!(
             "[trawld] failed to load configuration from {}: {e}",
@@ -255,13 +222,8 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     // initialization can change state. Telemetry-only configurations ignore it.
     validate_file_log_config(&config)?;
 
-    // Auto-detect TTY: monitor when interactive, log tail when piped.
     let monitor_active = std::io::IsTerminal::is_terminal(&std::io::stdout()) && !cli.no_monitor;
 
-    // Resolve the log filter explicitly: RUST_LOG is authoritative when
-    // valid; unset or invalid installs DEFAULT_LOG_FILTER, and the invalid
-    // case warns after the subscriber is up (visible because `trawld=info`
-    // is part of the default).
     let log_filter = telemetry::resolve_log_filter(std::env::var("RUST_LOG").ok().as_deref());
 
     // The derivation policy is resolved before the subscriber, because the
@@ -276,10 +238,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             e
         })?,
     );
-    // The syslog peer settings resolve on the same boundary and under the
-    // contract `--check-config` and the doctor run (ADR-0050), whether or
-    // not the listener is enabled, so a fault there never waits for the
-    // day someone turns syslog on.
     let syslog_peers = trawl_server::syslog::SyslogPeers::resolve(&config.syslog)
         .inspect_err(|e| eprintln!("[trawld] {e} — refusing to start"))?;
 
@@ -323,7 +281,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     #[cfg(unix)]
     raise_nofile_limit();
 
-    // Install the prometheus metrics recorder before building state.
     let metrics_handle = trawl_server::metrics::prometheus_builder()
         .install_recorder()
         .expect("failed to install prometheus recorder");
@@ -349,11 +306,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         }
     });
 
-    // Close the storage roots before anything waits on PostgreSQL, so a
-    // database that is down or slow never leaves the corpus open to other
-    // users while trawld waits or restarts (ADR-0052). The close only ever
-    // removes group and other bits, so it needs no sole-writer lock: a
-    // second trawld that runs it and then loses the lock has done no harm.
     #[cfg(unix)]
     close_storage_roots(
         &config.data.base_dir(),
@@ -363,17 +315,9 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     )?;
 
     // Lock and clear the query scratch directory before anything waits on
-    // PostgreSQL either (ADR-0056). Its own lock authorizes the clearing, so
-    // a second trawld on the same directory refuses here, before it touches
-    // the database, and boot never removes spill a live process still uses.
-    // The state holds the lock for the life of the process.
+    // PostgreSQL either (ADR-0056).
     let scratch = trawl_server::state::open_query_scratch(&config).map_err(|e| e.to_string())?;
 
-    // Hold the results root beside it (ADR-0057): made 0700 if missing,
-    // kept apart from the storage roots and the scratch directory, and
-    // locked, so a second trawld on the same root refuses here too. Unlike
-    // scratch it is not cleared: boot reconciles it against the metadata
-    // rows once the database is admitted.
     let results_root =
         trawl_server::state::open_results_root(&config).map_err(|e| e.to_string())?;
 
@@ -382,12 +326,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     // storage owner holds the sole-writer lock through recovery and serving.
     let (auth, storage) = AppState::connect_backends(&config).await?;
 
-    // Sole-writer guard: if the app-state advisory lock is ever lost (its
-    // session died and postgres freed the lock), a second trawld could
-    // acquire it and become a concurrent writer. Terminate immediately —
-    // split-brain is a correctness emergency, so a hard exit that stops all
-    // writes beats a graceful drain that keeps serving. The supervisor
-    // restarts us; boot re-acquires the lock or fails on the replacement.
     {
         let mut lock_lost = storage.lock_lost();
         tokio::spawn(async move {
@@ -417,7 +355,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         epoch = trawl_server::epoch::CURRENT_EPOCH,
         "storage epoch verified"
     );
-    // One listing of the data root feeds both warnings.
     if let Some(env_dirs) = on_disk_env_dirs(&config.data.base_dir()) {
         warn_unlisted_env_dirs(&config, &env_dirs);
         warn_retention_envs_without_dir(&config, &env_dirs);
@@ -447,7 +384,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     )
     .await?;
 
-    // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());
     if let Some(ref path) = query_log_path {
         let log =
@@ -465,26 +401,18 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         state.query.query_log = Some(Arc::new(log));
     }
 
-    // Make the corpus ready to serve before anything reads or writes it: on
-    // an ingest node, rollup-marker recovery, the ADR-0009 boot conformance
-    // pass and WAL hydration, in that order; on a query-only node, the
-    // archive identity gate (ADR-0041 slice 2). The integration fixture
-    // runs the same function, so the tests boot this sequence.
     trawl_server::boot::prepare_corpus(&state, &config).await?;
 
     // Recovery, conformance and hydration are complete. Telemetry can now
     // write to the WAL and hot buffer, alongside the other ingest
     // producers: a file it writes from here on is inserted, never hydrated.
-    // Activate internal telemetry by injecting the WAL writer.
     if let Some((handle, layer)) = &telemetry {
         if let Some(writer) = &state.ingest.wal_writer {
             handle.set(Arc::clone(writer), &config.ingest.default_env);
         }
-        // Activate event bus for real-time telemetry fanout (SSE streaming).
         if let Some(bus) = &state.ingest.event_bus {
             layer.set_bus(Arc::clone(bus));
         }
-        // Activate hot buffer for synchronous telemetry event insertion.
         if let Some(buf) = &state.query.hot_buffer {
             layer.set_hot_buffer(Arc::clone(buf));
         }
@@ -493,13 +421,8 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
 
     let compaction_handle = spawn_ingest_pipeline(&config, &state)?;
 
-    // Spawn syslog listeners if enabled (requires ingest to be enabled).
     let syslog_handle = if config.syslog.enabled && config.ingest.enabled {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        // Everything the listeners need to reach the one canonicalizer.
-        // The env allowlist, the relay CIDRs and the derivation policy all
-        // live on `IngestState`, resolved boot-fatally there; the per-peer
-        // zones come from the syslog peer settings resolved at boot.
         let door = Arc::new(trawl_server::syslog::convert::SyslogDoor {
             envs: Arc::clone(&state.ingest.envs),
             default_env: Arc::clone(&state.ingest.default_env),
@@ -530,7 +453,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         None
     };
 
-    // Spawn retention task (always-on with defaults).
     let retention_handle = {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = trawl_server::retention::spawn_retention(
@@ -542,7 +464,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         (handle, shutdown_tx)
     };
 
-    // Spawn key audit polling task if enabled.
     let audit_handle = if config.auth.audit_interval_secs > 0 {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let interval = std::time::Duration::from_secs(config.auth.audit_interval_secs);
@@ -556,7 +477,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         None
     };
 
-    // Spawn telemetry flush task.
     let flush_interval =
         std::time::Duration::from_secs(config.ingest.telemetry_flush_interval_secs);
     let telemetry_handle = telemetry.map(|(_, layer)| {
@@ -565,7 +485,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         (join, shutdown_tx)
     });
 
-    // Spawn periodic server stats emitter.
     let stats_interval = std::time::Duration::from_secs(config.ingest.stats_interval_secs);
     let stats_handle = {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -573,7 +492,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         (handle, shutdown_tx)
     };
 
-    // Spawn scheduled query executor.
     let scheduler_handle = if config.scheduler.enabled {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = trawl_server::scheduler::spawn_scheduler(
@@ -590,10 +508,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         None
     };
 
-    // Captured results expire on the scheduler's retention tick (ADR-0018 as
-    // amended by ADR-0057). Without the scheduler there is no tick, so a
-    // sweep task of its own stands in; with it, a second task would only
-    // repeat the same sweep.
     let results_sweep_handle = if config.scheduler.enabled {
         None
     } else {
@@ -608,7 +522,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
 
     let state_dir = config.state_dir();
 
-    // Pre-compute per-service schema metadata in the background.
     let _schema_refresh = trawl_server::schema_refresh::spawn_schema_refresh(state.clone());
 
     // Always collect dashboard snapshots (1s interval) so the
@@ -622,7 +535,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     );
 
     if monitor_active {
-        // Monitor mode: spawn HTTP server in background, run TUI on main.
         let (shutdown, http_shutdown) = trawl_server::shutdown::shutdown_channel();
 
         let http_state = state.clone();
@@ -650,11 +562,9 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             }
         });
 
-        // Run monitor on the main task — blocks until ctrl-c.
         if let Err(e) =
             trawl_server::monitor::run(state, config.server.monitor_refresh_ms, shutdown).await
         {
-            // Terminal restore happens via TerminalGuard drop, so just log.
             tracing::debug!(event_type = "lifecycle", error = %e, "monitor error");
             tracing::error!(
                 event_type = "lifecycle",
@@ -663,7 +573,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             );
         }
     } else {
-        // Traditional mode: HTTP server runs on main, handles its own shutdown.
         http::serve(state, &http_config, &config.server, &state_dir, None).await?;
     }
 
@@ -718,10 +627,6 @@ fn prepare_data_root(
     String,
 > {
     let epoch = trawl_server::epoch::ensure_current_epoch(data_root, wal_dir, ingest_enabled)?;
-    // The gate creates a data root that was absent, and the umask decides
-    // its mode only where the filesystem lets it: a fixed-mode mount or a
-    // default ACL on the parent does not. Check it now that it exists,
-    // before recovery or any writer uses it.
     #[cfg(unix)]
     if epoch == trawl_server::epoch::Outcome::FreshRoot {
         close_storage_roots(data_root, wal_dir, ingest_enabled, results_dir)?;
@@ -736,20 +641,6 @@ fn prepare_data_root(
 }
 
 /// Close every storage root to its owner, or refuse the start (ADR-0052).
-///
-/// Boot runs this once the configuration is loaded and before it waits on
-/// PostgreSQL, so a database that is down never keeps the corpus open. That
-/// is before the sole-writer lock, and safe there: the close only removes
-/// group and other bits, so a second trawld that runs it and then loses the
-/// lock has changed nothing the winner would not. It runs on ingest and
-/// query-only nodes alike, before the epoch gate, recovery or any reader
-/// touches the corpus, and before any listener binds. A root absent then is
-/// left for boot to create, and closed again once it exists: after the epoch
-/// gate creates the data root, and in [`create_wal_dir`]. A root that is
-/// already owner-only is only looked at, so a second pass changes nothing it
-/// did not have to. The results root is held right after the first close,
-/// which makes it 0700 when it is missing and closes it again
-/// ([`trawl_server::state::open_results_root`]).
 #[cfg(unix)]
 fn close_storage_roots(
     data_root: &std::path::Path,
@@ -767,14 +658,6 @@ fn close_storage_roots(
 
 /// Finish or roll back every compaction publish a crash interrupted, before
 /// any reader, producer or compaction tick exists.
-///
-/// No hot buffer exists yet, so a published marker has no batches to drain.
-/// A marker recovery cannot resolve is logged and counted on
-/// `trawl_publication_recovery_total` by outcome, and keeps its service out
-/// of compaction; each tick retries it. The boot conformance pass then
-/// leaves the files it claims alone, and hydration skips the services it
-/// blocks. Only an unreadable WAL root is fatal, as it is for the epoch
-/// gate's WAL validation.
 fn recover_publications_at_boot(
     wal_dir: &std::path::Path,
     data_root: &std::path::Path,
@@ -792,7 +675,6 @@ fn recover_publications_at_boot(
     Ok(())
 }
 
-/// Signal a background task to shut down and await its completion.
 async fn shutdown_task(task: Option<(JoinHandle<()>, watch::Sender<bool>)>, name: &str) {
     if let Some((handle, shutdown_tx)) = task {
         let _ = shutdown_tx.send(true);
@@ -802,12 +684,8 @@ async fn shutdown_task(task: Option<(JoinHandle<()>, watch::Sender<bool>)>, name
     }
 }
 
-/// A background task's join handle paired with its shutdown signal.
 type IngestHandles = (JoinHandle<()>, watch::Sender<bool>);
 
-/// Spawn the ingest pipeline tasks (compaction).
-///
-/// Returns handles for graceful shutdown, or `None` if ingest is disabled.
 fn spawn_ingest_pipeline(
     config: &Config,
     state: &AppState,
@@ -862,11 +740,6 @@ fn spawn_ingest_pipeline(
 
 /// Create the WAL directory if it is missing, then close the storage roots
 /// again, before any producer or listener exists.
-///
-/// The first close found a missing WAL directory absent and left it for
-/// this step. The umask makes a directory trawld creates owner-only, unless
-/// a fixed-mode mount or a default ACL on its parent overrides it, so the
-/// new directory goes through the same check as a root that existed.
 fn create_wal_dir(
     writer: &trawl_server::ingest::wal::WalWriter,
     data_root: &std::path::Path,
@@ -885,11 +758,6 @@ fn create_wal_dir(
     Ok(())
 }
 
-/// Directory names directly under the data root, or `None` when the root
-/// cannot be listed.
-///
-/// One `read_dir` feeds both boot warnings below. A non-directory entry is
-/// left out, so a stray file named `lab` counts as "no `data/lab/`".
 fn on_disk_env_dirs(data_dir: &std::path::Path) -> Option<Vec<String>> {
     let entries = std::fs::read_dir(data_dir).ok()?;
     Some(
@@ -901,7 +769,6 @@ fn on_disk_env_dirs(data_dir: &std::path::Path) -> Option<Vec<String>> {
     )
 }
 
-/// On-disk env directories missing from the current allowlist.
 fn unlisted_env_dirs<'a>(allowed: &[String], on_disk: &'a [String]) -> Vec<&'a str> {
     on_disk
         .iter()
@@ -914,7 +781,6 @@ fn unlisted_env_dirs<'a>(allowed: &[String], on_disk: &'a [String]) -> Vec<&'a s
         .collect()
 }
 
-/// `[retention.env.<name>]` keys with no `data/<name>/` directory.
 fn retention_envs_without_dir<'a>(
     retention: &'a trawl_server::config::RetentionConfig,
     on_disk: &[String],
@@ -927,11 +793,6 @@ fn retention_envs_without_dir<'a>(
         .collect()
 }
 
-/// Warn about on-disk env directories missing from the current allowlist.
-///
-/// The allowlist gates writes, not reads: removing an env stops new ingest
-/// for it, while its directories stay queryable and age out under retention
-/// (ADR-0009).
 fn warn_unlisted_env_dirs(config: &Config, on_disk: &[String]) {
     for name in unlisted_env_dirs(&config.ingest.effective_envs(), on_disk) {
         tracing::warn!(
@@ -997,26 +858,6 @@ struct Tracing {
     file_log: Option<FileLog>,
 }
 
-/// Initialize the tracing subscriber.
-///
-/// When internal telemetry is enabled, registers a [`WalLayer`] in place of
-/// the JSON file logger and returns both the [`WalHandle`] (for deferred
-/// writer injection) and a [`WalLayer`] clone (sharing the same buffer) for
-/// the flush task.
-///
-/// When telemetry is disabled and `log_file` is configured, falls back
-/// to a JSON layer that writes to stderr until the caller opens the file
-/// after storage admission.
-///
-/// When `monitor_active` is true, the stdout `fmt::layer()` is omitted
-/// to avoid corrupting the TUI with interleaved log output.
-///
-/// Once the subscriber is installed, replaces the panic hook with one that
-/// logs a panic's location and never its payload
-/// ([`telemetry::install_panic_hook`]). In monitor mode with no `log_file`
-/// logger, or when the filter disables the panic target, no sink records
-/// that event, so the hook also writes the location to stderr; the TUI draws
-/// on stdout.
 fn init_tracing(
     config: &Config,
     monitor_active: bool,
@@ -1034,14 +875,12 @@ fn init_tracing(
         );
         (handle, wal_layer)
     });
-    // The WAL layer replaces the JSON file logger when telemetry is on.
     let file_log_path = config
         .server
         .log_file
         .as_ref()
         .filter(|_| telemetry.is_none());
 
-    // Skip stdout while the monitor TUI owns the terminal.
     let stdout = (!monitor_active).then_some(std::io::stdout);
     // Whether a text logger exists to record the panic diagnostic. Without
     // one, or when the filter disables its target, the panic hook writes its
@@ -1073,27 +912,12 @@ fn init_tracing(
     }
 }
 
-/// Which of [`log_crash_dump`]'s two call sites prints the verdict.
-///
-/// The level is picked before the field list so that each level keeps exactly
-/// one `tracing` call site, and a class is never split across two of them.
 enum Emit {
     Info,
     Warn,
 }
 
 /// Log the crash-dump verdict, once, now that a subscriber exists.
-///
-/// The crate prints nothing itself (ADR-0023 ruling 6): `init()` has to run
-/// before tracing exists, so it hands its verdict back as data and this is
-/// where the verdict becomes an event. That puts it in self-telemetry with
-/// everything else, so an operator can query why a crash produced an empty
-/// dump. `Status::Disabled` says nothing at all: no dump directory was
-/// configured, which is a choice rather than a finding.
-///
-/// One verdict never arrives here: a failed seal. `main` refuses the boot on
-/// that one before the runtime exists, so its only diagnostic is the stderr
-/// line written there (ADR-0023 ruling 4).
 ///
 /// Both call sites below print the same field list, so a query on
 /// `event_type = "crash_dump"` reads the same names whatever the verdict was.
@@ -1169,7 +993,6 @@ fn log_crash_dump(status: &trawl_crashdump::Status) {
     }
 
     let (emit, message) = match status {
-        // Returned above. The arm exists because the match must be total.
         Status::Disabled => return,
         Status::Armed(readiness) => match readiness.class {
             ReadinessClass::Ready => (
@@ -1186,11 +1009,6 @@ fn log_crash_dump(status: &trawl_crashdump::Status) {
                  write a minidump with no threads",
             ),
         },
-        // A failed seal never reaches this match: `main` returns before the
-        // subscriber is built. Every other reason (dump directory, monitor
-        // spawn, socket connect, monitor identity, handler install) is reported
-        // by a process that DID seal, so capture is off and the capability is
-        // gone, which is a warning rather than a refused boot.
         Status::Failed(_) => (Emit::Warn, FAILED),
     };
 
@@ -1202,12 +1020,9 @@ fn log_crash_dump(status: &trawl_crashdump::Status) {
 
 /// Raises the soft `RLIMIT_NOFILE` to the hard limit and logs both once.
 ///
-/// Every query, maintenance pass and ingest connection holds descriptors,
-/// and the query engine opens one per Parquet file it scans, so the 1024
-/// soft limit systemd and most shells hand out runs short well before
-/// memory or disk do. The hard limit is the operator's ceiling (`LimitNOFILE=` in the
-/// Debian unit); trawld only stops leaving headroom under it unused. A
-/// refusal is logged with the inherited values and trawld runs on them.
+/// The query engine opens one descriptor per Parquet file it scans, so the
+/// 1024 soft limit systemd and most shells hand out runs short well before
+/// memory or disk do.
 #[cfg(unix)]
 fn raise_nofile_limit() {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
@@ -1270,7 +1085,6 @@ fn rlimit_text(limit: Option<u64>) -> String {
     limit.map_or_else(|| "unlimited".to_owned(), |n| n.to_string())
 }
 
-/// Resolve a path, expanding `~` to the home directory.
 fn resolve_path(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).as_ref())
 }
@@ -1282,12 +1096,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nofile_soft_limit_rises_to_a_finite_hard_limit_only() {
-        // The systemd default: soft 1024 under a much higher hard limit.
         assert_eq!(raised_nofile_soft(Some(1024), Some(524_288)), Some(524_288));
-        // The unit's LimitNOFILE=65536 sets both: nothing to raise.
         assert_eq!(raised_nofile_soft(Some(65_536), Some(65_536)), None);
-        // An unlimited hard limit is above the kernel's nr_open, so a soft
-        // limit of infinity would be refused; keep what was inherited.
         assert_eq!(raised_nofile_soft(Some(1024), None), None);
         assert_eq!(raised_nofile_soft(None, None), None);
         assert_eq!(raised_nofile_soft(None, Some(4096)), None);
@@ -1386,7 +1196,6 @@ mod tests {
         assert_eq!(mode(&results), 0o700);
         assert_eq!(mode(&data.join("EPOCH")), 0o644, "nothing beneath a root");
 
-        // A symlinked data root refuses, so the gate never follows it.
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&data, &link).unwrap();
         set(&data, 0o755);
@@ -1509,8 +1318,6 @@ path = "/data"
 
     #[test]
     fn retention_env_without_dir_flags_the_entry_with_no_directory() {
-        // The typo case: `labb` governs nothing, and `lab` keeps the
-        // global 90 days while the operator thinks it keeps 7.
         let config = config_with(
             r"
 max_age_days = 90

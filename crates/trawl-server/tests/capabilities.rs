@@ -2,10 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `GET /api/v1/capabilities` against a booted trawld (ADR-0058): any key
-//! with a trawl grant reads it, a key without one is refused, and every
-//! number is the configuration the server was built from, the evidence
-//! policy of investigations (ADR-0059) included.
+//! `GET /api/v1/capabilities` against a booted trawld (ADR-0058).
 
 mod common;
 
@@ -25,7 +22,6 @@ use trawl_server::config::RateLimitConfig;
 
 use common::TestServer;
 
-/// A fixture over the default `[capture]` limits and rate limits.
 async fn setup() -> TestServer {
     setup_with(
         CaptureConfig::default(),
@@ -50,7 +46,6 @@ async fn setup_with(
     server
 }
 
-/// `GET {path}` as `token`, raw: the status and the JSON body.
 async fn get_json(
     server: &TestServer,
     path: &str,
@@ -188,8 +183,6 @@ async fn a_request_without_a_key_is_refused() {
     assert_eq!(body["error"]["code"], "auth_error", "{body}");
 }
 
-/// Every configured number comes back exactly, and the capture deadline
-/// comes back capped by the query timeout, as captures apply it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_non_default_config_is_reflected_exactly() {
     let capture = CaptureConfig {
@@ -252,9 +245,6 @@ async fn a_non_default_config_is_reflected_exactly() {
     );
 }
 
-/// A role's `rate_rpm` replaces the class default for its key, and a key
-/// on a zero default with no role rate is unlimited, as the limiter
-/// resolves them.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_rate_is_the_one_the_limiter_applies_to_the_key() {
     let server = setup_with(
@@ -296,9 +286,6 @@ async fn the_rate_is_the_one_the_limiter_applies_to_the_key() {
     assert_eq!(unlimited.admission.rate_rpm, None);
 }
 
-/// The configured origin is advertised as the state holds it. The origin
-/// lives in the state rather than the HTTP config, so the router is built
-/// over a clone of the fixture's state with it set.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_configured_link_origin_is_advertised() {
     let server = setup().await;
@@ -330,9 +317,6 @@ async fn a_configured_link_origin_is_advertised() {
     );
 }
 
-/// The configured evidence policy is advertised exactly. The policy lives
-/// in the results state, so the router is built over a clone of the
-/// fixture's state whose results carry it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_configured_evidence_policy_is_advertised() {
     use std::sync::Arc;

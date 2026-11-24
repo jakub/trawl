@@ -13,71 +13,40 @@
 //! before any commit, its locks would stay held, and unrelated work would
 //! later commit or roll them back.
 //!
-//! No pooled connection returns inside a transaction. The app-state pool
-//! checks every connection it takes back and closes one still inside a
-//! transaction ([`super`] module docs), at one round trip per release; that
-//! catches every path, a raw `pool.begin()` included. [`PooledTransaction`]
-//! does not wait for the check: it opens its transaction on a connection
-//! already acquired, and from the moment it sends `BEGIN` until Postgres
+//! No pooled connection returns inside a transaction: the app-state pool
+//! closes one still inside a transaction ([`super`] module docs).
+//! From the moment [`PooledTransaction`] sends `BEGIN` until Postgres
 //! answers its `COMMIT` or `ROLLBACK`, dropping it closes the connection
-//! instead of returning it. Postgres ends the transaction with the
-//! session, and nothing waits for an answer still on its way.
-//!
-//! The rule for a pooled connection: a client-side bound may cut short the
-//! acquire, where nothing has been sent, or an autocommit statement, which
-//! leaves no transaction behind (the return path waits for its answer).
-//! A transaction is opened as a [`PooledTransaction`], its statements are
-//! bounded in Postgres, and it ends with an awaited `COMMIT` or
-//! `ROLLBACK`. A client-side bound may cut short its `BEGIN`, a statement
-//! or its `ROLLBACK` only because the drop closes the connection, and a
-//! transaction cut short so ends by that close, never by a later
-//! `ROLLBACK`: the connection would first have to read the answer the
-//! bound stopped awaiting. A `COMMIT` already sent is never cut short.
-//! A raw `pool.begin()` on the storage pool is allowed for a transaction
-//! that no client-side bound cuts short. A caller cancelled while its
-//! `BEGIN` is in flight returns the connection inside a transaction, and
-//! the return check closes it: one reconnect, and one
-//! `pool_connection_returned_in_transaction` event when the check finds
-//! the transaction open. The check keeps that transaction from reaching
-//! another caller. It does not close the session while Postgres withholds
-//! an answer, it promises no reconnect latency, and it does not help
-//! during a database outage.
+//! instead of returning it. A transaction cut short ends by that close,
+//! never by a later `ROLLBACK`: the connection would first have to read
+//! the answer the bound stopped awaiting. A `COMMIT` already sent is never
+//! cut short. A raw `pool.begin()` on the storage pool is allowed for a
+//! transaction that no client-side bound cuts short.
 
 use std::ops::{Deref, DerefMut};
 
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnection, Postgres};
 
-/// A transaction on a pooled connection (module docs). Statements run on
-/// the connection it dereferences to.
 #[derive(Debug)]
 pub(crate) struct PooledTransaction {
     conn: PoolConnection<Postgres>,
-    /// From before `BEGIN` is sent until Postgres has answered `COMMIT` or
-    /// `ROLLBACK`: while it holds, a drop closes the connection.
     open: bool,
 }
 
 impl PooledTransaction {
-    /// Begin a transaction on `conn`, awaiting Postgres' answer. A failed
-    /// `BEGIN` closes the connection.
     pub(crate) async fn begin(conn: PoolConnection<Postgres>) -> Result<Self, sqlx::Error> {
         let mut tx = Self { conn, open: true };
         sqlx::raw_sql("BEGIN").execute(&mut *tx.conn).await?;
         Ok(tx)
     }
 
-    /// Commit, and give the connection back to the pool once Postgres has
-    /// answered. A failed commit closes the connection.
     pub(crate) async fn commit(mut self) -> Result<(), sqlx::Error> {
         sqlx::raw_sql("COMMIT").execute(&mut *self.conn).await?;
         self.open = false;
         Ok(())
     }
 
-    /// Roll back, and give the connection back to the pool once Postgres
-    /// has answered. A failed rollback closes the connection, which ends
-    /// the transaction too.
     pub(crate) async fn rollback(mut self) -> Result<(), sqlx::Error> {
         sqlx::raw_sql("ROLLBACK").execute(&mut *self.conn).await?;
         self.open = false;
@@ -128,9 +97,6 @@ mod pg_tests {
         (row.get(0), row.get(1))
     }
 
-    /// A transaction dropped open never reaches the pool again: the next
-    /// acquire gets another session, outside any transaction, and the
-    /// dropped one's transaction-scoped lock is gone with it.
     #[sqlx::test(migrations = false)]
     async fn a_transaction_dropped_open_closes_its_connection(pool: PgPool) {
         let mut tx = PooledTransaction::begin(pool.acquire().await.unwrap())
@@ -171,8 +137,6 @@ mod pg_tests {
         assert!(gone.is_ok(), "the closed session's lock outlived it");
     }
 
-    /// A committed transaction gives its session back to the pool, outside
-    /// any transaction.
     #[sqlx::test(migrations = false)]
     async fn a_committed_transaction_returns_its_connection(pool: PgPool) {
         let mut tx = PooledTransaction::begin(pool.acquire().await.unwrap())

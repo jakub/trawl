@@ -11,11 +11,7 @@
 //! waiting out the drain timeout.
 //!
 //! The listener speaks HTTP/1.1 only, and holds every connection to the
-//! fixed deadlines in [`ConnectionTimeouts`] (ADR-0054, amended
-//! 2026-10-17): the TLS handshake from accept, and a request's headers,
-//! which is also the bound on an idle keep-alive connection. Neither timer
-//! runs while a request body is read or a response, a server-sent event
-//! stream included, is written.
+//! fixed deadlines in [`ConnectionTimeouts`] (ADR-0054).
 
 use std::any::Any;
 #[cfg(any(test, feature = "test-support"))]
@@ -46,7 +42,6 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use ulid::Ulid;
 
-/// ULID-based request ID stored in request extensions for tracing and response headers.
 #[derive(Clone, Debug)]
 pub struct RequestId(pub(crate) String);
 
@@ -64,7 +59,6 @@ use crate::shutdown::{ACCEPT_ERROR_BACKOFF, ShutdownRx, shutdown_observed, shutd
 use crate::state::{AppState, HttpConfig};
 use crate::tls;
 
-/// Build the axum router with all routes and middleware.
 #[allow(clippy::too_many_lines)]
 pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let max_body = http.max_request_body_bytes;
@@ -73,12 +67,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let ingest_rate_state = RateLimitState::ingest(&http.rate_limit, &interactive_rate_state);
     let bearer_state = state.auth.bearer_state.clone();
 
-    // Query routes. Onion (first .layer() = innermost): preview no-store →
-    // envelope normalization → require_bearer_only (fleet-auth authn) →
-    // require_trawl_grant (mandatory trawl policy) → rate limit → lazy body
-    // limit → axum's default limit off → handler. The body limit fails the
-    // handler's body read, and the handler answers it after its authority
-    // check (`body_limit`).
+    // Query routes. Onion (first .layer() = innermost).
     let authenticated = Router::new()
         .route("/query", post(handlers::query))
         .route("/validate", post(handlers::validate_query))
@@ -127,8 +116,6 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/saved/{id}/runs/{run_id}", get(handlers::get_report_run))
         .route("/export", post(handlers::export))
         .route("/stream", get(handlers::stream_query))
-        // Captured results (ADR-0057): the regular request count, no
-        // control allowance.
         .route("/results", post(routes::capture).get(routes::list))
         // The correlation reads (ADR-0058): static paths, which win over
         // `/results/{id}`, so a GET on one is a 405.
@@ -137,8 +124,6 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/results/compare", post(routes::compare))
         .route("/results/{id}", get(routes::page))
         .route("/results/{id}/cells/{row}/{column}", get(routes::cell))
-        // Investigations (ADR-0059): grant-visible, the regular request
-        // count.
         .route("/investigations", get(investigations::list))
         .route(
             "/investigations/{id}",
@@ -192,8 +177,6 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         // the preview are covered too.
         .layer(middleware::from_fn(no_store_on_preview));
 
-    // Ingest route: same auth stack and lazy body limit, separate (larger)
-    // limit. The handler takes the raw body, read through the same limit.
     let ingest_routes = if ingest_enabled {
         let ingest_body_limit = http
             .ingest_max_body_bytes
@@ -238,15 +221,8 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     with_edge_layers(app, http).with_state(state)
 }
 
-/// The ingest preview's route as the router matched it, prefix included.
 const INGEST_PREVIEW_ROUTE: &str = "/api/v1/ingest/preview";
 
-/// Mark every response to the ingest preview `Cache-Control: no-store`.
-///
-/// A report quotes the sample, and a refusal is no less the route's
-/// answer, so the header goes on whatever comes back, from the handler or
-/// from any layer inside this one (ADR-0049). No other route is touched.
-///
 /// The route is recognised by its [`MatchedPath`], which the outer router
 /// sets before any per-route layer runs. The request's own URI cannot be
 /// used here: `nest` strips `/api/v1` from it before these layers see it.
@@ -264,31 +240,11 @@ async fn no_store_on_preview(request: Request, next: middleware::Next) -> Respon
     response
 }
 
-/// Wrap `app` in trawld's edge layers, the ones every route shares.
-///
-/// Onion, innermost first: panic catcher → request count → `nosniff` and
-/// HSTS headers → CORS (only with configured origins) → request span
-/// (`TraceLayer`) → failure observer → request id → connection gauge.
-///
-/// The request count ([`request_limit::count_request`], ADR-0054) sits
-/// outside the panic catcher and every layer of the nested routers, so it
-/// also bounds how many authentication checks and body reads run at once,
-/// and a caught panic still ends its count. Every layer outside it wraps
-/// its refusal: the refusal carries a request id, `nosniff`, HSTS and CORS
-/// headers, and gets its one `http_failure`. A CORS preflight the CORS
-/// layer answers never reaches it. The count is built once, here, before
-/// any layer: axum clones each layer per route and per method, and every
-/// clone shares this one.
-///
-/// The failure observer sits directly inside `request_id_middleware`: the
-/// request id exists when it starts, and every other layer runs inside the
-/// record it scopes. It is outside the `TraceLayer` on purpose, so its one
-/// event per 5xx is emitted after the request span has closed and carries
-/// only the fields it names (ADR-0040). The `TraceLayer` therefore logs no
-/// failure of its own.
+/// The failure observer is outside the `TraceLayer` on purpose, so its one
+/// event per 5xx is emitted after the request span has closed (ADR-0040).
 ///
 /// Public so a test can mount a route of its own under exactly the layers
-/// production uses; [`router`] is the one production caller.
+/// production uses.
 pub fn with_edge_layers<S>(app: Router<S>, http: &HttpConfig) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -296,7 +252,6 @@ where
     let cors_origins = &http.cors_allowed_origins;
     let limit = RequestLimit::new(http.max_concurrent_requests);
     let mut app = app
-        // -- security hardening layers (first .layer() = innermost) --
         .layer(CatchPanicLayer::custom(panic_response))
         .layer(middleware::from_fn_with_state(
             limit,
@@ -311,8 +266,6 @@ where
             HeaderValue::from_static("max-age=63072000; includeSubDomains"),
         ));
 
-    // Only add CORS headers when origins are explicitly configured.
-    // Empty list = no CORS layer = browser same-origin policy denies cross-origin.
     if !cors_origins.is_empty() {
         let origins: Vec<HeaderValue> =
             cors_origins.iter().filter_map(|o| o.parse().ok()).collect();
@@ -372,10 +325,6 @@ where
 /// The response for a panic the outer catcher caught: the same 500 and
 /// plain-text body `CatchPanicLayer`'s default gives, minus the default's
 /// log line, which quotes the panic's payload.
-///
-/// The payload is dropped unread; it can quote anything the panicking code
-/// had in hand (ADR-0040). What the request's failure event needs, that a
-/// panic was caught, goes into its record instead.
 fn panic_response(_payload: Box<dyn Any + Send + 'static>) -> Response {
     failure::record_panic();
     let mut response = Response::new(axum::body::Body::from("Service panicked"));
@@ -387,7 +336,6 @@ fn panic_response(_payload: Box<dyn Any + Send + 'static>) -> Response {
     response
 }
 
-/// Generate a ULID request ID, stash it in extensions, and set `X-Request-Id` on the response.
 async fn request_id_middleware(mut request: Request, next: middleware::Next) -> Response {
     let id = Ulid::generate().to_string();
     request.extensions_mut().insert(RequestId(id.clone()));
@@ -401,7 +349,6 @@ async fn request_id_middleware(mut request: Request, next: middleware::Next) -> 
     response
 }
 
-/// Track active HTTP connections via the `trawl_active_connections` gauge.
 async fn connection_gauge_middleware(request: Request, next: middleware::Next) -> Response {
     metrics::gauge!(crate::metrics::ACTIVE_CONNECTIONS).increment(1.0);
     let response = next.run(request).await;
@@ -409,8 +356,6 @@ async fn connection_gauge_middleware(request: Request, next: middleware::Next) -
     response
 }
 
-/// Build the TLS acceptor for a serve path, warning when the certificate was
-/// auto-generated.
 fn build_tls_acceptor(
     config: &ServerConfig,
     state_dir: &Path,
@@ -432,20 +377,8 @@ fn build_tls_acceptor(
     Ok(TlsAcceptor::from(tls_config))
 }
 
-/// The fixed deadlines the listener holds every connection to (ADR-0054,
-/// amended 2026-10-17).
-///
-/// Constants, not settings: no operator has a reason to tune them, and
-/// the one place that shortens them is a test, through
-/// [`serve_with_listener_and_timeouts`]. Neither covers a request body
-/// after its headers or a response body, so a slow ingest upload and a
-/// quiet server-sent event stream are bounded by the request count and
-/// the stream limits, not by these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionTimeouts {
-    /// From `accept()` to the end of the TLS handshake. A connection that
-    /// has not finished its handshake by then is dropped, and the shutdown
-    /// signal drops it earlier.
     pub tls_handshake: Duration,
     /// From the moment hyper waits for a request's first byte to the end
     /// of its headers. Bytes that arrive do not move the deadline. The
@@ -455,48 +388,32 @@ pub struct ConnectionTimeouts {
 }
 
 impl ConnectionTimeouts {
-    /// Production: 10 s for the handshake, 30 s for the headers.
     pub const DEFAULT: Self = Self {
         tls_handshake: Duration::from_secs(10),
         header_read: Duration::from_secs(30),
     };
 }
 
-/// What the accept loop has done with its connections, for a test that
-/// reads it through [`serve_with_listener_and_timeouts`].
-///
-/// The loop writes it; nothing in production reads it.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct ListenerProbe {
-    /// Connection tasks the loop still holds after its latest reap.
     tracked: AtomicUsize,
-    /// Handshakes the loop dropped at their deadline.
     handshake_timeouts: AtomicUsize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl ListenerProbe {
-    /// Connection tasks the loop holds: every connection accepted whose
-    /// task has not been reaped yet.
     #[must_use]
     pub fn tracked_connections(&self) -> usize {
         self.tracked.load(Ordering::SeqCst)
     }
 
-    /// Handshakes dropped at their deadline since the loop started.
     #[must_use]
     pub fn handshake_timeouts(&self) -> usize {
         self.handshake_timeouts.load(Ordering::SeqCst)
     }
 }
 
-/// Start the HTTPS server with graceful shutdown.
-///
-/// Binds a TCP listener, wraps connections in TLS via `tokio-rustls`,
-/// and serves each connection through hyper + axum. On shutdown signal,
-/// stops accepting new connections and drains in-flight requests up to
-/// `shutdown_drain_secs`.
 pub async fn serve(
     state: AppState,
     http: &HttpConfig,
@@ -506,7 +423,6 @@ pub async fn serve(
 ) -> Result<(), crate::error::ServerError> {
     let addr = &config.http_addr;
 
-    // Build TLS config (loads or auto-generates cert).
     let tls_acceptor = build_tls_acceptor(config, state_dir)?;
 
     let listener = TcpListener::bind(addr)
@@ -539,11 +455,6 @@ pub async fn serve(
 /// consulted on this path, it is informational only, and the address logged
 /// at startup is the listener's own `local_addr`. That is the point — a
 /// caller binding port 0 to get a free port keeps the socket it tested.
-///
-/// This entry exists for callers that must own the bound socket, which today
-/// means the test fixture; production binds through [`serve`]. A caller that
-/// adopts a listener therefore decides where that socket is bound, and
-/// nothing on this path checks that decision against `config.http_addr`.
 pub async fn serve_with_listener(
     listener: std::net::TcpListener,
     state: AppState,
@@ -608,11 +519,6 @@ pub async fn serve_with_listener_failing_accepts(
 /// HTTP/2 server has no header deadline, and protocol detection waits
 /// without bound for a preface. It reloads no certificate, and a failed
 /// `accept()` ends it instead of backing off.
-///
-/// Shutdown is the production drain: the signal stops the accept loop,
-/// interrupts the pool's work, asks every connection to finish, and
-/// aborts what is left after `shutdown_drain_secs`. Without
-/// `external_shutdown` it serves until its task is dropped.
 #[cfg(any(test, feature = "test-support"))]
 pub async fn serve_with_listener_h2_for_tests(
     listener: std::net::TcpListener,
@@ -736,8 +642,6 @@ pub async fn serve_with_listener_and_timeouts(
     .await
 }
 
-/// Register a listener the caller bound with the runtime, and log the
-/// address it listens on.
 fn adopt_listener(
     listener: std::net::TcpListener,
 ) -> Result<TcpListener, crate::error::ServerError> {
@@ -760,12 +664,6 @@ fn adopt_listener(
     Ok(listener)
 }
 
-/// The listener the accept loop reads.
-///
-/// With `test-support`, a queue of errors the next `accept()` calls answer
-/// before the listener is asked (see
-/// [`serve_with_listener_failing_accepts`]), and the probe the loop
-/// reports to (see [`serve_with_listener_and_timeouts`]).
 struct Incoming {
     listener: TcpListener,
     #[cfg(any(test, feature = "test-support"))]
@@ -793,7 +691,6 @@ impl Incoming {
         self.listener.accept().await
     }
 
-    /// Report how many connection tasks the loop holds.
     // The probe lives on `self` only under `test-support`; the signature stays
     // the same in every build so the accept loop's call sites carry no cfg.
     #[cfg_attr(not(any(test, feature = "test-support")), allow(clippy::unused_self))]
@@ -806,16 +703,12 @@ impl Incoming {
         let _ = tracked;
     }
 
-    /// The counter a connection task bumps when its handshake times out,
-    /// or `None` outside a probed server.
     #[cfg(any(test, feature = "test-support"))]
     fn handshake_timeouts(&self) -> Option<Arc<ListenerProbe>> {
         self.probe.clone()
     }
 }
 
-/// The shared tail of both serve paths: cert hot-reload, the TLS accept loop,
-/// and the graceful shutdown drain.
 #[allow(clippy::too_many_lines)] // accept loop + shutdown drain are cohesive
 async fn accept_loop(
     mut incoming: Incoming,
@@ -830,11 +723,8 @@ async fn accept_loop(
     let pool = state.query.pool.clone();
     let app = router(state, http);
 
-    // Watch channel for cert hot-reload. The accept loop reads the latest
-    // acceptor from the receiver before each TLS handshake.
     let (tls_tx, tls_rx) = tokio::sync::watch::channel(tls_acceptor);
 
-    // Spawn cert file watcher if reload is enabled and cert paths are configured.
     let reload_interval = config.tls_reload_interval_secs;
     if reload_interval > 0
         && let (Some(cert), Some(key)) = (&config.tls_cert_path, &config.tls_key_path)
@@ -849,8 +739,6 @@ async fn accept_loop(
         ));
     }
 
-    // Shutdown coordination: use the caller's channel (from monitor, or a
-    // test) or spawn our own signal listener for the non-monitor path.
     let mut accept_rx = if let Some(ext) = external_shutdown {
         ext
     } else {
@@ -862,9 +750,6 @@ async fn accept_loop(
         rx
     };
 
-    // Track spawned connection tasks for graceful drain. Finished tasks
-    // are reaped by the loop below as they end, so the set holds only
-    // open connections and never grows with the connections served.
     let mut connections = JoinSet::new();
 
     // One receiver the connection tasks clone from. It is a separate handle
@@ -874,15 +759,9 @@ async fn accept_loop(
     // The same reason: the accept arm waits out its backoff on this one.
     let mut backoff_rx = accept_rx.clone();
 
-    // Accept loop — runs until shutdown signal.
     loop {
         tokio::select! {
             result = incoming.accept() => {
-                // A failed accept, such as EMFILE when the process is out
-                // of file descriptors, ends nothing: log it, wait out the
-                // backoff, and accept again. Under the pre-auth target, like
-                // every accept-loop diagnostic, because a connection flood
-                // can provoke it.
                 let (tcp_stream, peer_addr) = match result {
                     Ok(accepted) => accepted,
                     Err(e) => {
@@ -907,13 +786,6 @@ async fn accept_loop(
 
                 let mut conn_shutdown = conn_rx.clone();
                 connections.spawn(async move {
-                    // Accept-loop diagnostics carry PREAUTH_TRANSPORT_TARGET,
-                    // not this module's path: a bare TCP connect-and-close
-                    // provokes one, so persisting them would make an
-                    // unauthenticated connection flood a durable-write
-                    // amplifier. The target is in `UNMETERED_TARGETS`, so the
-                    // WAL layer refuses it while stdout keeps it.
-                    //
                     // The handshake is raced with the shutdown signal, so a
                     // peer that stalls in it never holds the drain.
                     let tls_stream = tokio::select! {
@@ -959,10 +831,6 @@ async fn accept_loop(
                     let conn_fut = builder.serve_connection(io, hyper_service);
                     let mut conn = std::pin::pin!(conn_fut);
 
-                    // Poll the connection, but initiate graceful shutdown
-                    // when the server-wide signal fires. This closes idle
-                    // keep-alive connections instead of waiting for the
-                    // drain timeout.
                     tokio::select! {
                         result = conn.as_mut() => {
                             if let Err(e) = result {
@@ -985,8 +853,6 @@ async fn accept_loop(
             // once and spin the loop.
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(e) = joined && e.is_panic() {
-                    // The payload is dropped unread (ADR-0040); the fact
-                    // is what the operator needs.
                     tracing::error!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "connection_task_panicked", "a connection task panicked");
                 }
                 incoming.note_tracked(connections.len());
@@ -1001,7 +867,6 @@ async fn accept_loop(
     // Interrupt active DuckDB queries so they don't block the drain.
     pool.cancel_all();
 
-    // Drain in-flight connections with a deadline.
     tracing::info!(
         event_type = "lifecycle",
         drain_secs,
@@ -1032,7 +897,6 @@ async fn accept_loop(
 mod tests {
     use super::*;
 
-    /// The production deadlines ADR-0054's amendment states.
     #[test]
     fn connection_timeouts_default_to_the_decided_deadlines() {
         assert_eq!(

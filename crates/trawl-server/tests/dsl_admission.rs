@@ -3,18 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! One admission contract at every door that takes DSL (ADR-0024).
-//!
-//! The bind-time expansion budget, the field-list limit and the tree
-//! depth limit live in `trawl-core` and are proven there. What this file proves is reach: the
-//! same over-budget text is
-//! refused with the same sentence whether it arrives as a query, an
-//! export, a live tail, a validation call or a saved-query write, and a
-//! refused write leaves the store exactly as it was. A call that emit
-//! would refuse (an unknown name, a wrong argument count, a bad literal
-//! argument) reaches the same doors, with its hint as a detail. The last
-//! tests cover the row that is already out there — a saved query stored
-//! before this door existed, which the scheduler must refuse per attempt
-//! without turning the schedule off.
 
 mod common;
 
@@ -38,24 +26,18 @@ fn over_budget_dsl() -> String {
     dsl
 }
 
-/// The part of `trawl-core`'s refusal every door must be saying.
 const SENTENCE: &str = "alias-expansion budget";
 
-/// A call to `match`, which is an operator: the shared call check refuses
-/// it in every stage, with the hint that names the operator.
 const MATCH_CALL_DSL: &str = r#"last=1h | where match(message, "x")"#;
 
-/// The sentence and the hint `trawl-core` refuses [`MATCH_CALL_DSL`] with.
 const MATCH_CALL_SENTENCE: &str = "unknown function: match";
 const MATCH_CALL_HINT: &str = "matches is an operator, not a function: where message matches /re/";
 
-/// A `dedup` naming one field over the field-list limit of 64.
 fn wide_dedup_dsl() -> String {
     let fields = (0..65).map(|i| format!("f{i}")).collect::<Vec<_>>();
     format!("* | dedup {}", fields.join(", "))
 }
 
-/// The whole sentence `trawl-core` refuses [`wide_dedup_dsl`] with.
 const WIDE_SENTENCE: &str = "pipeline stage 1 (`dedup`) names 65 fields, over the limit of 64 for one `sort` or `dedup` stage";
 
 fn raw_client() -> reqwest::Client {
@@ -64,7 +46,6 @@ fn raw_client() -> reqwest::Client {
         .expect("build the test HTTP client")
 }
 
-/// The message an error response carries, or a panic naming the body.
 fn envelope_message(body: &str) -> String {
     let value: serde_json::Value = serde_json::from_str(body)
         .unwrap_or_else(|e| panic!("error body is not JSON ({e}): {body}"));
@@ -76,25 +57,16 @@ fn envelope_message(body: &str) -> String {
         .to_owned()
 }
 
-// ---------------------------------------------------------------------------
-// the HTTP doors
-// ---------------------------------------------------------------------------
-
-/// Query, both export formats, the SSE stream and both saved-query writes
-/// refuse the same text, and every one of them says the same thing.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_entry_point_refuses_the_same_over_budget_dsl() {
     every_entry_point_refuses(&over_budget_dsl(), SENTENCE, None).await;
 }
 
-/// The field-list limit reaches the same doors, with its whole sentence.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_entry_point_refuses_a_wide_field_list() {
     every_entry_point_refuses(&wide_dedup_dsl(), WIDE_SENTENCE, None).await;
 }
 
-/// `GET /api/v1/stream?query=<dsl>`, encoded by hand.
-///
 /// Form encoding keeps only `[A-Za-z0-9*-._]` raw, so a 64 KiB query of
 /// brackets or `+` would grow past http's 65 534-byte URI limit and never
 /// reach the door. A URI query may carry `( ) * =` raw, and the server's
@@ -113,11 +85,6 @@ fn stream_url(base: &str, dsl: &str) -> String {
     url
 }
 
-/// A call the run would refuse is refused before it runs, at every door
-/// (#435). `match` is refused everywhere, with its hint as a detail. A
-/// wrong argument count and a bad call after `extract kv`, which once
-/// passed validation and failed only when the run compiled, are invalid
-/// at `/validate`.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_entry_point_refuses_an_invalid_call() {
     every_entry_point_refuses(MATCH_CALL_DSL, MATCH_CALL_SENTENCE, Some(MATCH_CALL_HINT)).await;
@@ -146,8 +113,6 @@ async fn every_entry_point_refuses_an_invalid_call() {
     }
 }
 
-/// Send `dsl` to every door and require each to refuse it as a
-/// `validation_error` that carries `sentence` and, as a detail, `hint`.
 async fn every_entry_point_refuses(dsl: &str, sentence: &str, hint: Option<&str>) {
     let server = common::setup().await;
     for (door, body) in every_entry_point_refuses_on(&server, dsl, sentence).await {
@@ -160,9 +125,6 @@ async fn every_entry_point_refuses(dsl: &str, sentence: &str, hint: Option<&str>
         );
     }
 
-    // Validation reports the same refusal as its own successful answer:
-    // being told the query is invalid is what a client asked this route
-    // for, so it is a 200 whose body says no.
     let http = raw_client();
     assert_validate_refuses(
         &http,
@@ -175,9 +137,6 @@ async fn every_entry_point_refuses(dsl: &str, sentence: &str, hint: Option<&str>
     .await;
 }
 
-/// Send `dsl` to every door but `/validate` and require each to refuse it
-/// with 400 and `sentence`. Each door's JSON body is returned beside its
-/// name.
 async fn every_entry_point_refuses_on(
     server: &common::TestServer,
     dsl: &str,
@@ -186,7 +145,6 @@ async fn every_entry_point_refuses_on(
     let http = raw_client();
     let token = &server.analyst_token;
 
-    // A saved query to aim the update at. Its own DSL is admitted.
     let created: serde_json::Value = http
         .post(format!("{}/api/v1/saved", server.url))
         .bearer_auth(token)
@@ -268,9 +226,6 @@ async fn every_entry_point_refuses_on(
     answers
 }
 
-/// `/validate` answers `dsl` with HTTP 200, `valid: false` and one error
-/// that carries `sentence` and, as its own field, `hint`. The answer is
-/// returned.
 async fn assert_validate_refuses(
     http: &reqwest::Client,
     url: &str,
@@ -305,13 +260,6 @@ async fn assert_validate_refuses(
     validation
 }
 
-/// A time clause neither lane can hold is a parse error over that clause
-/// (ADR-0017 and ADR-0061, amendments of 2026-11-08), and every door says
-/// so the same way: `/query` and stream setup answer 400 with one body,
-/// and `/validate`, whose refusal is its own 200 answer, carries that
-/// body's detail as its error. Before the parser owned these refusals the
-/// stream opened a live tail on `last=1h earliest="…"`, which `/query`
-/// refused, and dropped a bound it could not read.
 #[tokio::test(flavor = "multi_thread")]
 async fn time_clause_refusals_match_across_doors() {
     let server = common::setup().await;
@@ -320,7 +268,6 @@ async fn time_clause_refusals_match_across_doors() {
 
     let unreadable = "cannot read this time bound as a timestamp";
     let with_last = "cannot combine 'last=' with 'earliest='/'latest='";
-    // (query, the clause the refusal covers, its sentence)
     let cases = [
         (
             r#"earliest="yesterday" service=api"#,
@@ -416,8 +363,6 @@ async fn time_clause_refusals_match_across_doors() {
     }
 }
 
-/// A refused write is not a partial write: the create leaves no row and
-/// the update leaves the stored text alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_saved_write_leaves_the_store_untouched() {
     refused_saved_write_leaves_the_store_untouched(&over_budget_dsl()).await;
@@ -428,15 +373,11 @@ async fn a_refused_wide_saved_write_leaves_the_store_untouched() {
     refused_saved_write_leaves_the_store_untouched(&wide_dedup_dsl()).await;
 }
 
-/// A saved write whose text calls a function the run would refuse is
-/// refused before it is stored (#435).
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_call_writes_leave_saved_queries_unchanged() {
     refused_saved_write_leaves_the_store_untouched(MATCH_CALL_DSL).await;
 }
 
-/// Create and update a saved query with `dsl`, which the door refuses,
-/// and require the store to read as it did before.
 async fn refused_saved_write_leaves_the_store_untouched(dsl: &str) {
     let server = common::setup().await;
     let http = raw_client();
@@ -501,10 +442,6 @@ async fn refused_saved_write_leaves_the_store_untouched(dsl: &str) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// the scheduler
-// ---------------------------------------------------------------------------
-
 /// Everything one scheduler tick needs, and nothing this file does not
 /// assert on: no fixture corpus, because a refused query never reaches
 /// `DuckDB`, and a sound one finds no files and succeeds with no rows.
@@ -531,9 +468,6 @@ async fn scheduled_leases_free(pool: &ExecutorPool) {
     .await;
 }
 
-/// Tick the scheduler at `now` until each of `scheduled` has its run row,
-/// awaiting every run a tick starts.
-///
 /// The harness pool leases one scheduled run at a time, so a tick claims
 /// at most one due schedule, and a tick can claim none while one is still
 /// due: a claim can give up, or the last run's lease can still be held.
@@ -613,10 +547,6 @@ async fn scheduler_harness() -> SchedulerHarness {
     }
 }
 
-/// A saved query stored before the door existed still runs on a schedule.
-/// The attempt fails with the diagnostic, and the schedule survives it:
-/// disabling it would be the server editing an operator's configuration
-/// over a query the operator can repair.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stored_over_budget_query_fails_its_attempt_and_keeps_its_schedule() {
     stored_query_fails_its_attempt_and_keeps_its_schedule(&over_budget_dsl(), SENTENCE).await;
@@ -627,16 +557,12 @@ async fn a_stored_wide_query_fails_its_attempt_and_keeps_its_schedule() {
     stored_query_fails_its_attempt_and_keeps_its_schedule(&wide_dedup_dsl(), WIDE_SENTENCE).await;
 }
 
-/// A saved query stored before the call check existed calls `match`. Its
-/// next attempt fails with the diagnostic, and its schedule survives.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stored_invalid_call_fails_its_attempt_and_keeps_its_schedule() {
     stored_query_fails_its_attempt_and_keeps_its_schedule(MATCH_CALL_DSL, MATCH_CALL_SENTENCE)
         .await;
 }
 
-/// Store `dsl` behind the write-time door, schedule it, run one tick, and
-/// require a failed run carrying `sentence` and a schedule still enabled.
 async fn stored_query_fails_its_attempt_and_keeps_its_schedule(dsl: &str, sentence: &str) {
     let h = scheduler_harness().await;
     let t0 = Utc.with_ymd_and_hms(2026, 3, 14, 3, 0, 0).unwrap();
@@ -700,11 +626,6 @@ async fn stored_query_fails_its_attempt_and_keeps_its_schedule(dsl: &str, senten
     );
 }
 
-// ---------------------------------------------------------------------------
-// the tree depth limit (#447)
-// ---------------------------------------------------------------------------
-
-/// What every tree depth refusal says, search or expression.
 const DEPTH_SENTENCE: &str = "deeper than 64 levels";
 
 /// `a == 0 or a == 1 …`: `n` comparisons, `n` levels deep.
@@ -715,7 +636,6 @@ fn or_chain(n: usize) -> String {
         .join(" or ")
 }
 
-/// A `where` one level over the limit.
 fn deep_where_dsl() -> String {
     format!("* | where {}", or_chain(65))
 }
@@ -731,8 +651,6 @@ fn long_chain_dsl() -> String {
     format!("* | where {} > 0", vec!["1"; 32_000].join("*"))
 }
 
-/// The three over-deep texts, each with the sentence its refusal starts
-/// with.
 fn deep_dsls() -> [(String, &'static str); 3] {
     [
         (deep_where_dsl(), "expression is deeper than 64 levels"),
@@ -741,10 +659,6 @@ fn deep_dsls() -> [(String, &'static str); 3] {
     ]
 }
 
-/// Every door refuses a tree over the limit as a parse error with the
-/// depth sentence, `/validate` reports the same detail as its 200 answer,
-/// and trawld answers an ordinary query afterwards: the refusal costs a
-/// parse, not the process.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_entry_point_refuses_deep_query_trees() {
     for (dsl, message) in deep_dsls() {
@@ -756,7 +670,6 @@ async fn every_entry_point_refuses_deep_query_trees() {
         let head = &dsl[..dsl.len().min(24)];
         let mut answers = every_entry_point_refuses_on(&server, &dsl, DEPTH_SENTENCE).await;
 
-        // A capture parses its query at the same door.
         let (status, _, capture) = common::captured::capture(
             &server,
             &server.analyst_token,
@@ -803,8 +716,6 @@ async fn every_entry_point_refuses_deep_query_trees() {
     }
 }
 
-/// A refused deep write leaves the store as it was, for each over-deep
-/// text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_deep_saved_write_leaves_the_store_untouched() {
     for (dsl, _) in deep_dsls() {
@@ -812,9 +723,7 @@ async fn a_refused_deep_saved_write_leaves_the_store_untouched() {
     }
 }
 
-/// The queries [`queries_at_the_tree_depth_limit_run_in_trawld`] runs,
-/// each with its deepest tree `d` levels deep, beside a shallow query that
-/// selects the same rows. The comments count the levels at `d` = 64; each
+/// The comments count the levels at `d` = 64; each
 /// shape keeps its truth at any `d` of the same parity.
 fn limit_queries(d: usize) -> [(String, &'static str); 5] {
     [
@@ -839,11 +748,8 @@ fn limit_queries(d: usize) -> [(String, &'static str); 5] {
     ]
 }
 
-/// At exactly 64 levels, `/query` returns the rows the shallow form of
-/// each query returns, and `/stream` opens its event stream. The parse
-/// and every walk after it run on trawld's own threads, so this is the
-/// check of trawld's base stack at the limit. The same shapes at 65 are
-/// refused, which pins each one at the limit rather than under it.
+/// The parse and every walk after it run on trawld's own threads, so this
+/// is the check of trawld's base stack at the limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn queries_at_the_tree_depth_limit_run_in_trawld() {
     let server = common::setup().await;
@@ -897,14 +803,6 @@ async fn queries_at_the_tree_depth_limit_run_in_trawld() {
     }
 }
 
-/// A deep query stored before the limit existed fails each attempt with
-/// the depth diagnostic and keeps its schedule: the attempt is recorded,
-/// the schedule stays enabled and its cursor moves on. A manual run fails
-/// the same way, and a sound query scheduled beside it still succeeds.
-///
-/// The scheduler is ticked at fixed instants. The manual run executes on
-/// a spawned task, so its end is waited for as an event, under the hang
-/// guard.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stored_deep_query_fails_its_attempt_and_keeps_its_schedule() {
     let h = scheduler_harness().await;
@@ -984,17 +882,13 @@ async fn a_stored_deep_query_fails_its_attempt_and_keeps_its_schedule() {
     manual_run_of_a_stored_deep_query_fails().await;
 }
 
-/// The manual-run half of the stored-query test: `POST /saved/{id}/run`
-/// on a deep query stored straight through the store records a failed run
-/// with the depth diagnostic. The fixture spawns no scheduler loop, so the
-/// only run is the one this asks for.
+/// The fixture spawns no scheduler loop, so the only run is the one this
+/// asks for.
 async fn manual_run_of_a_stored_deep_query_fails() {
     let server = common::setup().await;
     let client = trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token)
         .expect("build the client");
 
-    // The analyst key's id, read from the row a write through the door
-    // records.
     let probe = client
         .create_saved("probe", "* | head 1")
         .await

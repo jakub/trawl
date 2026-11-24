@@ -84,8 +84,6 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         )
         .await
     });
-    // The channel is the event: the compaction's publication arrived at the
-    // pause. The bound only names a hang.
     tokio::task::spawn_blocking(move || entered.recv_timeout(HANG_GUARD).unwrap())
         .await
         .unwrap();
@@ -100,9 +98,6 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
             WorkContext::system(WorkKind::Query),
         )
         .await;
-    // The publication gate is a wait before any work starts, so a budget
-    // that runs out there is a capacity refusal, not a query timeout
-    // (ADR-0024).
     assert!(matches!(
         blocked.result,
         Err(ServerError::CapacityNotStarted)
@@ -136,7 +131,6 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
     );
 
     release.send(()).unwrap();
-    // The compaction finishing is the event; the bound only names a hang.
     let compacted = tokio::time::timeout(HANG_GUARD, compact)
         .await
         .expect("the compaction did not finish after the publication was released");
@@ -232,8 +226,6 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
     assert!(pool.publication().read().await.is_ok());
 }
 
-/// Whether `publication.write()` is still pending after one poll: a writer
-/// that would change files the blocking reader still has open.
 async fn writer_waits(publication: &PublicationGate) -> bool {
     until_polling(
         "one poll of the writer",
@@ -244,11 +236,6 @@ async fn writer_waits(publication: &PublicationGate) -> bool {
     .is_none()
 }
 
-/// A request that times out answers at once, but the `DuckDB` worker keeps
-/// the publication guard until it really finishes. The worker is held
-/// past its work-start transition, so the deadline lands on running work,
-/// and the paused clock reaches the deadline only when the test advances
-/// it. Residual exposure: the real-clock hang guard on each wait.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn query_timeout_keeps_publication_guard_until_duckdb_task_finishes() {
     const DEADLINE: Duration = Duration::from_secs(1);
@@ -271,7 +258,6 @@ async fn query_timeout_keeps_publication_guard_until_duckdb_task_finishes() {
             )
             .await
     });
-    // The worker is past its work-start transition and parked.
     until("the reader started", || started.arrivals() == 1).await;
     tokio::time::advance(DEADLINE + Duration::from_millis(1)).await;
     let result = frozen("the timed-out request", &mut request).await.unwrap();
@@ -287,15 +273,9 @@ async fn query_timeout_keeps_publication_guard_until_duckdb_task_finishes() {
     );
     started.release();
     drop(frozen("the writer after the reader", publication.write()).await);
-    // The worker has dropped everything it held.
     until("the worker released its work", || released.arrivals() == 1).await;
 }
 
-/// Aborting the request that started a read leaves the `DuckDB` worker
-/// running and holding the publication guard until it finishes. The
-/// worker is held past its work-start transition, so the abort lands on
-/// running work. Residual exposure: the real-clock hang guard on each
-/// wait.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn aborting_request_keeps_running_reader_protected() {
     let root = tempfile::tempdir().unwrap();
@@ -317,10 +297,8 @@ async fn aborting_request_keeps_running_reader_protected() {
             )
             .await
     });
-    // Wait for the reader to actually be reading. A registered slot is not
-    // enough: work that has not passed its work-start transition holds no
-    // files open, and cancelling it there would end it before the abort
-    // could prove anything (ADR-0024).
+    // A registered slot is not enough: work that has not passed its work-start
+    // transition holds no files open.
     until("the reader started", || started.arrivals() == 1).await;
     request.abort();
     assert!(
@@ -336,6 +314,5 @@ async fn aborting_request_keeps_running_reader_protected() {
     );
     started.release();
     drop(frozen("the writer after the reader", publication.write()).await);
-    // The worker has dropped everything it held.
     until("the worker released its work", || released.arrivals() == 1).await;
 }

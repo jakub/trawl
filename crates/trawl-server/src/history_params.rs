@@ -3,10 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Raw admission for History. Called only after Query permission is checked.
-//!
-//! Names and the filter use strict form decoding. Pagination retains Axum's
-//! existing Serde admission, but sees only selected numeric pairs after the
-//! entire raw request has passed the strict checks. Unknown values are opaque.
 
 use axum::extract::Query;
 use axum::http::Uri;
@@ -15,10 +11,7 @@ use crate::error::ServerError;
 use crate::handlers::HistoryParams;
 
 const MAX_FILTER_BYTES: usize = 32768;
-// Axum RawQuery supplies the payload after the URL's separator. Any '?' in
-// that payload is literal name/value data and counts toward this cap. The
-// http::Uri transport ceiling is 65534 bytes for the whole URI; larger payload
-// bounds are also exercised directly through the actual handler in tests.
+// The http::Uri transport ceiling is 65534 bytes for the whole URI.
 const MAX_RAW_BYTES: usize = 3 * MAX_FILTER_BYTES + 128;
 const MAX_PAIRS: usize = 64;
 
@@ -165,7 +158,6 @@ mod tests {
             Some(filter)
         );
         assert!(parse(&format!("filter={}x", "x".repeat(MAX_FILTER_BYTES))).is_err());
-        // Three-byte characters measure UTF-8 bytes, not character count.
         let unicode = format!("{}xx", "日".repeat(MAX_FILTER_BYTES / 3));
         assert_eq!(unicode.len(), MAX_FILTER_BYTES);
         assert!(parse(&format!("filter={unicode}")).is_ok());

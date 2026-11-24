@@ -6,12 +6,6 @@
 //! report runs, the field catalog, repin jobs (ADR-0004), captured-result
 //! metadata (ADR-0057), and investigations (ADR-0059).
 //!
-//! trawld owns the dedicated `trawl` database outright: it takes a session
-//! advisory lock at boot (sole-writer enforcement), then auto-migrates via
-//! [`sqlx::migrate!`]. The fleet keystore database forbids auto-migration
-//! because two binaries share it; the rationale doesn't transfer here —
-//! single-replica trawld is the only writer by design.
-//!
 //! The advisory lock is *session*-scoped: postgres releases it the instant
 //! the holding connection dies (pg restart, an idle-timeout device culling
 //! the socket, a `pg_terminate_backend`). A background guard task therefore
@@ -22,18 +16,11 @@
 //!
 //! No pooled connection goes back to the pool inside a transaction. A
 //! transaction sqlx begins counts only once Postgres has answered its
-//! `BEGIN`, so a request dropped while that answer is on its way (a client
-//! that hangs up at the wrong moment) leaves the session inside a
-//! transaction sqlx never queued a `ROLLBACK` for, and the pool's own
-//! return check accepts it. The next caller would then run inside it: its
-//! writes would report success before any commit, and its locks would
-//! stay held until unrelated work ended the transaction. The pool checks
-//! every connection it takes back ([`released_outside_transaction`]) and
-//! closes one still inside a transaction, which ends it in Postgres with
-//! the session. A [`pooled::PooledTransaction`] closes its own connection
-//! when dropped open, so its paths never reach that check inside a
-//! transaction; every other path, a raw `pool.begin()` included, is
-//! caught there.
+//! `BEGIN`, so a request dropped while that answer is on its way leaves the
+//! session inside a transaction sqlx never queued a `ROLLBACK` for, and the
+//! pool's own return check accepts it. The pool checks every connection it
+//! takes back ([`released_outside_transaction`]) and closes one still inside
+//! a transaction.
 
 pub mod catalog;
 pub mod error;
@@ -85,35 +72,20 @@ pub use status::{RunOrigin, RunStatus};
 
 use crate::ping::{PingCache, ping_cached_with};
 
-/// Embedded schema migrations for the trawl app-state database, applied by
-/// trawld at boot (after the advisory lock, before the stores open).
 pub mod migrations;
 
-/// Application-wide advisory lock key on the `trawl` database.
-///
-/// Arbitrary but fixed: any second trawld pointed at the same database fails
-/// startup instead of racing boot-time migration or letting
-/// `cleanup_stale_runs` stomp a live sibling's runs.
 const ADVISORY_LOCK_KEY: i64 = 0x0074_7261_776c_2131; // "trawl!1"
 
-/// Whether some session holds trawld's sole-writer lock
-/// ([`ADVISORY_LOCK_KEY`]) on the database `conn` is connected to.
 /// Observed in `pg_locks`, never taken (`trawld --doctor`, ADR-0047). A
 /// held lock says some trawld owns this database, not that it runs on this
 /// host.
-///
-/// # Errors
-/// Database errors.
 pub async fn writer_lock_held(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
     advisory_lock_granted(conn, ADVISORY_LOCK_KEY).await
 }
 
-/// Whether a session holds the session- or transaction-level advisory
-/// lock `key` on the database `conn` is connected to, as `pg_locks` shows
-/// it now. A single `bigint` key appears with its high 32 bits in
-/// `classid`, its low 32 bits in `objid`, and `objsubid` 1; `pg_locks`
-/// lists every database's locks, so the row must also name this one.
-/// Waiters (`granted = false`) do not hold it.
+/// A single `bigint` key appears with its high 32 bits in `classid`, its low
+/// 32 bits in `objid`, and `objsubid` 1; `pg_locks` lists every database's
+/// locks, so the row must also name this one.
 pub(crate) async fn advisory_lock_granted(
     conn: &mut PgConnection,
     key: i64,
@@ -136,23 +108,12 @@ pub(crate) async fn advisory_lock_granted(
 /// fields the catalog pins: a repin's claim ([`RepinStore::claim`]) and pin
 /// gc's purge ([`CatalogStore::delete_pins`]).
 ///
-/// Both are check-then-act across process boundaries. gc reads its
-/// candidates, proves them dead against the corpus, then deletes; a repin
-/// reads a field's pin from the in-process cache, then claims a job that
-/// will later flip that very row. Without a shared lock the two interleave:
-/// a claim landing after gc's last look leaves `finish_cutover` updating a
-/// `field_types` row gc has deleted, a zero-row UPDATE that restores the pin
-/// in memory only, so the type authority dies with the process. Taken as an
-/// `xact` lock, postgres releases it at commit or rollback, so neither side
-/// can strand it.
-///
 /// A DIFFERENT key from [`ADVISORY_LOCK_KEY`] on purpose: session and
 /// transaction advisory locks share one lock space, and trawld holds the
 /// session lock for its whole life, so reusing that key would deadlock
 /// every claim and every purge.
 pub(crate) const CATALOG_LIFECYCLE_LOCK_KEY: i64 = 0x0074_7261_776c_2143; // "trawl!C"
 
-/// Take [`CATALOG_LIFECYCLE_LOCK_KEY`] for the rest of `tx`.
 pub(crate) async fn lock_catalog_lifecycle(tx: &mut PgConnection) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(CATALOG_LIFECYCLE_LOCK_KEY)
@@ -161,16 +122,10 @@ pub(crate) async fn lock_catalog_lifecycle(tx: &mut PgConnection) -> Result<(), 
         .map(|_| ())
 }
 
-/// Whether a connection coming back to the app-state pool is outside any
-/// transaction, so the pool may give it out again (module docs).
-///
 /// One simple-protocol query, so it starts the transaction it runs in
 /// unless one is open already: the start of its transaction is the start
 /// of the statement only in autocommit. A failed transaction refuses the
-/// query with `in_failed_sql_transaction`, and is inside one too. A
-/// session inside a transaction answers `false`, closed by the pool,
-/// counted and logged once; any other failure closes the connection as
-/// broken.
+/// query with `in_failed_sql_transaction`, and is inside one too.
 async fn released_outside_transaction(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
     use sqlx::Row as _;
     let outside = match sqlx::raw_sql("SELECT transaction_timestamp() = statement_timestamp()")
@@ -196,24 +151,17 @@ async fn released_outside_transaction(conn: &mut PgConnection) -> Result<bool, s
     Ok(outside)
 }
 
-/// Maximum connections in the app-state pool. Small on purpose: trawld is
-/// the sole writer and the workload is light CRUD.
 const MAX_CONNECTIONS: u32 = 8;
 
-/// Bound on the boot-time connection attempt (see `connect`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often the guard task probes the lock-holding session. Doubles as a
-/// keepalive that stops an idle-timeout network device from culling the
-/// connection, and as the upper bound on how long a genuinely lost lock
-/// goes undetected — kept short because every second of an undetected loss
-/// is a second in which a second writer could start.
+/// The upper bound on how long a genuinely lost lock goes undetected, kept
+/// short because every second of an undetected loss is a second in which a
+/// second writer could start.
 const LOCK_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Owns the guard task that keepalive-probes the lock connection. Aborting
-/// the task on drop drops the lock connection with it, so a graceful
-/// shutdown (the last `StorageState` clone dropping) releases the advisory
-/// lock — the behaviour the boot-idempotency path depends on.
+/// Aborting the task on drop drops the lock connection with it, so a graceful
+/// shutdown releases the advisory lock.
 #[derive(Debug)]
 struct LockGuard(JoinHandle<()>);
 
@@ -223,45 +171,21 @@ impl Drop for LockGuard {
     }
 }
 
-/// App-state storage: one shared pool, seven store facades, and the guard
-/// holding the sole-writer advisory lock. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct StorageState {
-    /// Shared app-state pool. Private: the store facades each hold their own
-    /// clone, and `ping`/`ping_cached` reach it in-module — nothing outside
-    /// this crate bypasses a facade to run raw SQL against it.
     pool: PgPool,
-    /// Query history store.
     pub history: HistoryStore,
-    /// Saved queries store.
     pub saved: SavedQueryStore,
-    /// Schedules + report runs store.
     pub schedule: ScheduleStore,
-    /// Field catalog: type pins, per-service observations, conflicts.
     pub catalog: CatalogStore,
-    /// Repin jobs: the persisted one-at-a-time operator-triggered field
-    /// repin.
     pub repin: RepinStore,
-    /// Captured-result metadata (ADR-0057).
     pub results: ResultsStore,
-    /// Investigations and their logs (ADR-0059).
     pub investigations: InvestigationStore,
-    /// Guard task owning the dedicated session connection that holds
-    /// `pg_advisory_lock`. Lives exactly as long as the state; its `Drop`
-    /// aborts the task, dropping the connection and releasing the lock.
     _lock_guard: Arc<LockGuard>,
-    /// Watch flipped to `true` the moment the guard detects the lock is
-    /// gone. Surfaced by `ping_cached` (so `/health` reports it) and awaited
-    /// by `main` to terminate the daemon before a second writer can start.
     lock_lost_rx: watch::Receiver<bool>,
-    /// Memoised storage liveness ping shared by every `/health` probe.
     storage_ping: Arc<PingCache>,
 }
 
-/// Keepalive-probe the lock-holding session forever. The first probe failure
-/// means the connection — and with it the session-scoped advisory lock — is
-/// gone; flip the watch and return so the socket drops.
-///
 /// A raw [`PgConnection`] never reconnects, so a failed probe is proof the
 /// original session died: the lock is definitively released and this
 /// instance must stop writing.
@@ -298,10 +222,6 @@ async fn guard_advisory_lock(mut conn: PgConnection, lost_tx: watch::Sender<bool
 }
 
 impl StorageState {
-    /// Connect to the trawl app-state database and prepare it for use.
-    ///
-    /// Builds the pool, then hands it to [`Self::from_pool`], which owns the
-    /// load-bearing part of the boot order.
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
         // StorageState::connect is the named production pool owner for
         // trawld's app-state database (ADR-0021 ruling 3).
@@ -321,41 +241,14 @@ impl StorageState {
         Self::from_pool(pool).await
     }
 
-    /// Prepare an already-built pool for use: advisory lock, migrate, open
-    /// the stores.
-    ///
-    /// The pool is the only input, and that is the whole point: the
-    /// sole-writer lock is taken on a connection acquired from THIS pool,
-    /// so nothing here can name a different database than the writes do. A
-    /// second parameter naming a DSN could disagree with the pool, and two
-    /// processes locking two different databases both believe they are the
-    /// sole writer.
-    ///
-    /// The contract that makes it airtight is on the CALLER, and it runs
-    /// for the LIFETIME of the returned [`StorageState`], not just for the
-    /// duration of this call: the pool's connect target must never be
-    /// reconfigured. A sqlx 0.9 `Pool` clone shares one `Arc`, so
+    /// The pool's connect target must never be reconfigured for the LIFETIME of
+    /// the returned [`StorageState`]. A sqlx 0.9 `Pool` clone shares one `Arc`, so
     /// `set_connect_options` on a clone the caller kept repoints every
     /// connection the stores open from then on, while the detached lock
-    /// session below stays on the old database. The result is a process
-    /// holding the sole-writer lock on one database and writing to
-    /// another. Repointing mid-call splits the lock from the migration the
-    /// same way.
-    ///
-    /// Every in-repo caller MOVES a pool it just built into this function
-    /// and keeps no clone of its own, so no runtime check is worth adding
-    /// for a shape nothing writes.
-    ///
-    /// The connection is then detached ([`sqlx::pool::PoolConnection::detach`]):
-    /// it leaves pool management entirely and is never recycled, so the
-    /// session-scoped `pg_advisory_lock` cannot be released underneath us
-    /// by a pooled connection going back on the idle list. The pool refills
-    /// the slot on demand, so the process ceiling is `max_connections` plus
-    /// this one dedicated session.
+    /// session below stays on the old database.
     ///
     /// Boot order is load-bearing here, not in the caller: take the session
-    /// advisory lock BEFORE migrate — the lock exists to prevent two
-    /// instances racing boot-time migration.
+    /// advisory lock BEFORE migrate.
     pub async fn from_pool(pool: PgPool) -> Result<Self, StoreError> {
         // Sole-writer enforcement on a dedicated session connection, minted
         // from the pool and detached so nothing can recycle it.
@@ -375,8 +268,6 @@ impl StorageState {
 
         migrations::migrate(&pool).await?;
 
-        // Guard the lock for the process lifetime: keepalive-probe its
-        // session and flip `lock_lost_rx` the instant it dies.
         let (lost_tx, lock_lost_rx) = watch::channel(false);
         let guard = tokio::spawn(guard_advisory_lock(lock_conn, lost_tx));
 
@@ -401,15 +292,11 @@ impl StorageState {
         })
     }
 
-    /// A receiver that flips to `true` when the sole-writer advisory lock is
-    /// lost. `main` awaits this to terminate the daemon before a second
-    /// instance can acquire the freed lock.
     #[must_use]
     pub fn lock_lost(&self) -> watch::Receiver<bool> {
         self.lock_lost_rx.clone()
     }
 
-    /// Raw liveness ping against the app-state pool.
     pub async fn ping(&self) -> Result<(), sqlx::Error> {
         sqlx::query("SELECT 1")
             .execute(&self.pool)
@@ -417,10 +304,6 @@ impl StorageState {
             .map(|_| ())
     }
 
-    /// Liveness ping memoised behind a TTL and bounded by a timeout —
-    /// mirrors the fleet-keystore ping guarding `/health` (see
-    /// [`crate::ping`] for the rationale).
-    ///
     /// A lost sole-writer lock short-circuits to an error *before* the cache:
     /// the pool itself may still ping fine (it reconnects transparently),
     /// which is precisely the split-brain hazard `/health` must expose.
@@ -442,11 +325,8 @@ impl StorageState {
         .await
     }
 
-    /// Upper bound on a single storage liveness ping (matches the keystore
-    /// bound: non-critical → `Degraded` → HTTP 200, never a stall).
     const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
-    /// How long a storage ping outcome is reused before a fresh probe.
     const PING_CACHE_TTL: Duration = Duration::from_secs(5);
 }
 
@@ -458,7 +338,6 @@ mod pg_tests {
 
     use super::StorageState;
 
-    /// Whether some session of this database holds advisory lock 310.
     async fn lock_held(pool: &PgPool) -> bool {
         sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_locks
@@ -471,13 +350,6 @@ mod pg_tests {
         .unwrap()
     }
 
-    /// A raw `pool.begin()` dropped while Postgres' answer to its `BEGIN`
-    /// is on the way leaves its session inside a transaction sqlx never
-    /// counted. The app-state pool closes that session when it comes back
-    /// instead of reusing it: the lock the transaction took is gone with
-    /// it, the pool's next statement runs outside any transaction, and the
-    /// event is counted once. The answer is held back by a proxy until the
-    /// `BEGIN` has been dropped.
     #[sqlx::test(migrations = false)]
     async fn a_connection_returned_inside_a_transaction_is_closed(pool: PgPool) {
         let recorder = crate::metrics::prometheus_builder().build_recorder();
@@ -518,8 +390,6 @@ mod pg_tests {
         })
         .await;
         assert!(settled.is_ok(), "a connection never finished coming back");
-        // One simple-protocol query: it starts the transaction it runs in
-        // unless one is open already.
         let outside: bool = sqlx::Row::get(
             &sqlx::raw_sql("SELECT transaction_timestamp() = statement_timestamp()")
                 .fetch_one(&state.pool)

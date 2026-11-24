@@ -6,17 +6,6 @@
 //! becomes a declared-envelope event (ADR-0009) or is rejected with a typed
 //! reason.
 //!
-//! Principle: **repair when the server has an honest answer; reject when it
-//! would guess.** Every repair is recorded as a [`RepairCode`] in the
-//! event's `_repairs` column and counted per `(code, service)`.
-//!
-//! Three producers feed events through here as profiles (ADR-0013): the
-//! HTTP ingest handler, the syslog listener, and internal telemetry
-//! (`service:trawld`). A profile asserts the identity it can prove and
-//! contributes fixed derivation sources ([`crate::ingest::producer`]); it
-//! bypasses no gate here. Producers contribute repair codes, but this door
-//! is the only place `_repairs` is assembled.
-//!
 //! This module never calls `tracing`. Telemetry's own events pass through
 //! it on their way to the WAL, so a log line emitted from inside would be
 //! an ingestion loop; pinned by `tests/canonicalize_no_tracing.rs`.
@@ -28,9 +17,6 @@ use serde_json::{Map, Value, json};
 use crate::ingest::pipeline;
 use crate::ingest::producer::{self, Asserted, Derivation, Producer};
 
-// Declares a wire-coded enum together with its `ALL` list and `as_str`
-// from one `Variant => "wire.code"` list, so `ALL` is complete by
-// construction: a variant cannot exist without being listed and labelled.
 macro_rules! wire_enum {
     (
         $(#[$meta:meta])*
@@ -44,107 +30,39 @@ macro_rules! wire_enum {
         }
 
         impl $name {
-            /// The wire/metric label spelling.
             pub const fn as_str(self) -> &'static str {
                 match self {
                     $( Self::$variant => $wire, )+
                 }
             }
 
-            /// Every variant, in declaration order, for exhaustive iteration.
             pub const ALL: &'static [Self] = &[ $( Self::$variant, )+ ];
         }
     };
 }
 
 wire_enum! {
-    /// What the server changed about an accepted event — a closed enum, same
-    /// principle as ADR-0006's "roles are data, permissions are code": codes
-    /// are code, so `_repairs` cannot become a junk drawer.
-    ///
-    /// "Findable in `_raw`" below means the `_raw` trawld captures, up to its
-    /// cap. On a door that admits the proposal, a sender-supplied string
-    /// `_raw` replaces that capture (see `capture_raw`), so a dropped value
+    /// On a door that admits the proposal, a sender-supplied string `_raw`
+    /// replaces trawld's capture (see `capture_raw`), so a dropped value
     /// may survive nowhere.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum RepairCode {
-        /// `host` was missing; filled from the sender IP.
         HostFromPeer => "host.from_peer",
-        /// `env` was missing; filled from `default_env`.
         EnvDefaulted => "env.defaulted",
-        /// no configured `_time` source was present; used arrival time.
         TimeFromIngest => "time.from_ingest",
-        /// the first present `_time` source failed to parse (a JSON `null`
-        /// counts as present); used arrival time. Derivation leaves a bare
-        /// source in place. A `_time` proposal is consumed, and trawld
-        /// keeps no copy of it outside `_raw`.
         TimeUnparseable => "time.unparseable",
-        /// `_time` was more than ten years before arrival; kept, but flagged.
         TimeOutOfRange => "time.out_of_range",
-        /// the first present `_time` source parsed to more than
-        /// [`MAX_TIME_LEAD`] after arrival; used arrival time (ADR-0013,
-        /// amendment of 2026-11-08). Derivation leaves a bare source in
-        /// place. A `_time` proposal is consumed, and trawld keeps no copy
-        /// of it outside `_raw`.
         TimeAheadOfArrival => "time.ahead_of_arrival",
-        /// a stored string value, `_raw` included, exceeded
-        /// [`MAX_RAW_CHARS`] characters and was cut to that many, on a
-        /// character boundary.
         FieldTruncated => "field.truncated",
-        /// a field name arrived in trawl's `_` namespace and is not a slot the
-        /// sender may propose (ADR-0013 §5). The leading underscore run was
-        /// stripped and the value stored under the bare remainder
-        /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`). The original
-        /// name and value stay findable in `_raw`.
         ReservedPrefix => "field.reserved_prefix",
-        /// a field name was made only of underscores (`_`, `___`), so the
-        /// reserved-prefix strip left no name to store under and the field
-        /// was dropped. Its value stays findable in `_raw`.
         FieldNameEmpty => "field.name_empty",
-        /// a field arrived under one of trawl's stamp names
-        /// ([`trawl_core::schema::STAMP_NAMES`]: `_ingested`, `_repairs`,
-        /// `_producer`, `_trawl_wal_file`). It took the reserved-prefix strip
-        /// to its bare name, or was dropped with
-        /// `field.reserved_prefix_collision` when that name was taken, and the
-        /// server's stamp still won.
         FieldStampClaimed => "field.stamp_claimed",
-        /// stripping a reserved prefix produced a name the same event already
-        /// carries bare, so the prefixed loser was dropped (the case-collision
-        /// precedent). Its value stays findable in `_raw`.
         ReservedPrefixCollision => "field.reserved_prefix_collision",
-        /// a field's name exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
-        /// the field was dropped (its value stays findable in `_raw`).
         FieldNameTooLong => "field.name_too_long",
-        /// a field's name carried ASCII uppercase and was folded to lowercase —
-        /// `DuckDB` identifiers are ASCII case-insensitive, so the lowercase
-        /// form is the one spelling every downstream layer (catalog, parquet,
-        /// hot snapshot) agrees on. The original spelling stays in `_raw`.
         FieldNameCaseFolded => "field.name_case_folded",
-        /// two field names in one event differed only in ASCII case — one
-        /// column as far as `DuckDB` is concerned — so the losing key was
-        /// dropped (its value stays findable in `_raw`). The exact-lowercase
-        /// spelling wins when present; otherwise the ASCII-lexicographically
-        /// first variant does.
         FieldNameCaseCollision => "field.name_case_collision",
-        /// a payload key named a slot the producer asserts (`env`, `service`,
-        /// `host`, `message`) and carried a different value, so the assertion
-        /// won (ADR-0013). Identity is protected by precedence, not by a
-        /// namespace: telemetry's own fields are ordinary sender vocabulary,
-        /// and the displaced value stays findable in `_raw`. An identical
-        /// value is not a collision and earns no code, and neither is a JSON
-        /// `null`, which is absence rather than a competing claim.
         ProducerAsserted => "field.producer_asserted",
-        /// the producer had no honest `host` to assert, so the event was kept
-        /// with `host` absent (ADR-0013). Reached by a hostname-less syslog
-        /// frame behind a trusted relay and by a failed hostname lookup for
-        /// trawld: absent but honest beats both the peer-fill lie and dropping
-        /// the event. The HTTP door never gets here, since an HTTP sender can
-        /// be rejected and resend.
         HostOmitted => "host.omitted",
-        /// the producer could not derive a usable `service` from the frame
-        /// and fell back to its profile's configured default (a syslog
-        /// APP-NAME that fails the service charset). The original stays
-        /// findable in `_raw`.
         ServiceFromProfile => "service.from_profile",
     }
 }
@@ -156,22 +74,14 @@ impl fmt::Display for RepairCode {
 }
 
 wire_enum! {
-    /// Whether a repair needs anyone to look at the sender (ADR-0055).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum RepairClass {
-        /// the contract working as designed: an absence was filled or a name
-        /// adapted without loss.
         Routine => "routine",
-        /// someone should inspect the sender: a value was dropped, cut,
-        /// replaced or flagged as implausible, a field conflicted with an
-        /// asserted value, or a sender claimed one of trawl's stamps.
         Actionable => "actionable",
     }
 }
 
 impl RepairCode {
-    /// The code's class (ADR-0055). One exhaustive match with no wildcard
-    /// arm, so a new code cannot compile without choosing a class.
     pub const fn class(self) -> RepairClass {
         match self {
             Self::HostFromPeer
@@ -196,33 +106,20 @@ impl RepairCode {
 }
 
 wire_enum! {
-    /// Why an event was rejected — used as a prometheus label value.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum RejectReason {
         MissingService => "missing_service",
-        /// `service` present but not a JSON string — type-specific, never
-        /// conflated with [`Self::MissingService`].
         ServiceNotString => "service_not_string",
         EmptyService => "empty_service",
         ServiceTooLong => "service_too_long",
         InvalidChars => "invalid_chars",
-        /// `env` present but not a string, or failing the env charset.
         InvalidEnv => "invalid_env",
-        /// `env` valid in shape but not in the configured allowlist —
-        /// repairing it into `default_env` would misfile data in the wrong
-        /// path root permanently.
         EnvNotAllowed => "env_not_allowed",
-        /// `host` missing and the peer is a configured trusted relay: filling
-        /// from the peer would stamp the relay's address as the origin.
         HostMissingFromRelay => "host_missing_from_relay",
         NotObject => "not_object",
         InvalidJson => "invalid_json",
         WalFailure => "wal_failure",
-        /// A valid event in an HTTP request the hot buffer refused for lack of
-        /// free space (503 `hot_buffer_full`, ADR-0043). Nothing was written.
         HotBufferFull => "hot_buffer_full",
-        /// A valid event in an HTTP request larger than the hot buffer admits
-        /// for one request (413 `ingest_batch_too_large`, ADR-0043).
         IngestBatchTooLarge => "ingest_batch_too_large",
     }
 }
@@ -233,20 +130,9 @@ impl fmt::Display for RejectReason {
     }
 }
 
-/// Why [`canonicalize`] refused an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejection {
-    /// The typed reason, a closed label set.
     pub reason: RejectReason,
-    /// The human-readable explanation. It may quote a client value, always
-    /// a bounded one: a service name only after the length check (at most
-    /// 128 bytes), an `env` only after the 32-character rule or cut by
-    /// `echo` at 64 characters, and a wrong-typed value by its JSON type
-    /// alone. An unparseable line is serde's position text, and the line is
-    /// not quoted. The message belongs in the response to that client. The
-    /// one log line that may carry it is the `ingest_rejections` warning,
-    /// whose `samples` field quotes up to five of these messages
-    /// (ADR-0053); no other log line takes one.
     pub message: String,
     /// The event had no `host` (absent or JSON `null`) once its names were
     /// normalized, under the same rule [`Canonical::host_absent`] uses.
@@ -255,61 +141,34 @@ pub struct Rejection {
     pub host_absent: bool,
 }
 
-/// How an accepted event's `_time` was decided, recorded as
-/// [`derive_time`] decided it.
-///
 /// Sources are positions in the profile's `time_from` list
-/// ([`Derivation::time_from`]), not names, so recording a decision on the
-/// ingest hot path copies nothing. [`Derivation::time_field`] names them.
+/// ([`Derivation::time_from`]), not names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimeSource {
-    /// The first present source parsed; `_time` is its canonical spelling.
     Field(usize),
-    /// Arrival time filled `_time`. `unparseable` is the first present
-    /// source when one claimed the derivation and failed to parse (a JSON
-    /// `null` included), which earns `time.unparseable`; `None` means no
-    /// source was present, which earns `time.from_ingest`.
     Arrival { unparseable: Option<usize> },
-    /// The first present source parsed to more than [`MAX_TIME_LEAD`]
-    /// after arrival, so arrival time filled `_time`, which earns
-    /// `time.ahead_of_arrival`.
     AheadOfArrival(usize),
 }
 
-/// How an accepted event's `_severity` was decided, recorded as
-/// [`derive_severity`] decided it.
-///
 /// Sources are positions in the profile's `severity_from` list
-/// ([`Derivation::severity_from`]), not names, so recording a decision
-/// allocates nothing unless a present source failed to map.
-/// [`Derivation::severity_field`] names them.
+/// ([`Derivation::severity_from`]), not names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeveritySource {
-    /// The source at `index` mapped and fed `_severity`.
-    /// `skipped_unmappable` lists the earlier sources that were present but
-    /// mapped to nothing, in the order the derivation consulted them.
     Field {
         index: usize,
         skipped_unmappable: Vec<usize>,
     },
-    /// No source in the profile's `severity_from` list was present.
     Missing,
-    /// Sources were present and none mapped, so `_severity` was omitted
-    /// (the `trawl_severity_unmapped_total` signal). `sources` lists them
-    /// in consultation order.
-    Unmapped { sources: Vec<usize> },
+    Unmapped {
+        sources: Vec<usize>,
+    },
 }
 
-/// What one canonicalization step did to one field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldChangeKind {
-    /// The value now lives under `to`.
     Renamed { to: String },
-    /// The field is gone from the event (its value stays in `_raw`).
     Dropped,
-    /// The value was cut to a length cap.
     Truncated,
-    /// An object or array value became its JSON text.
     Stringified,
 }
 
@@ -320,64 +179,38 @@ pub enum FieldChangeKind {
 pub struct FieldChange {
     pub field: String,
     pub kind: FieldChangeKind,
-    /// The repair the decision earned. `None` for stringification, which
-    /// is canonicalization rather than a repair.
     pub code: Option<RepairCode>,
 }
 
-/// Where an accepted event's derived values came from and what happened to
-/// its fields, recorded by each decision as the canonicalizer makes it.
-/// Real ingest ignores it; the ingest preview reports it (ADR-0049).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lineage {
     pub time: TimeSource,
     pub severity: SeveritySource,
-    /// Field changes in decision order.
     pub fields: Vec<FieldChange>,
 }
 
-/// Per-event context the canonicalizer needs: arrival instant, which door
-/// the event came in at, the env allowlist, and the derivation policy.
-/// Threaded through every call rather than read from a global, so the
-/// config a canonicalization depends on is visible at the call site.
 #[derive(Debug)]
 pub struct EnvelopeContext<'a> {
     /// RFC 3339 UTC arrival time at microsecond precision — stamped as
     /// `_ingested` and substituted for a missing/unparseable `_time`.
     pub arrival: &'a str,
-    /// The same arrival instant, for plausibility windows.
     pub arrival_instant: chrono::DateTime<chrono::Utc>,
     /// The effective env allowlist (never empty).
     pub envs: &'a [String],
-    /// Fills a missing `env` (recorded as `env.defaulted`). Unreachable
-    /// for a profile producer, which asserts a boot-validated env.
     pub default_env: &'a str,
-    /// Which door this event arrived at, with whatever that door asserts
-    /// (ADR-0013). Only the HTTP variant carries a peer identity, and it
-    /// is evidence for a fill rather than an assertion.
     pub producer: Producer<'a>,
-    /// The boot-resolved, per-profile `_severity`/`_time` source lists.
-    /// Borrowed, because one resolved policy serves every event on every
-    /// door for the life of the process.
     pub derivation: &'a Derivation,
 }
 
-/// A canonicalized event: the declared envelope plus the client's own
-/// fields, ready for WAL serialization.
 #[derive(Debug)]
 pub struct Canonical {
-    /// Path segment 1 (validated against the allowlist).
     pub env: String,
-    /// Path segment 2 (validated against the service charset).
     pub service: String,
     /// The full event object, envelope fields canonicalized. Optional
     /// envelope fields are omitted when absent, never written as JSON
     /// null — `DuckDB` infers JSON for an all-null column (ADR-0009).
     pub obj: Map<String, Value>,
-    /// Repair codes applied, in application order (also joined into the
-    /// object's `_repairs`).
     pub repairs: Vec<RepairCode>,
-    /// Where `_time` and `_severity` came from and every field change.
     pub lineage: Lineage,
     /// The event had no `host` (absent or JSON `null`) once its names were
     /// normalized: the HTTP door filled it from the peer, a profile door
@@ -386,34 +219,15 @@ pub struct Canonical {
 }
 
 impl Canonical {
-    /// The event carried a severity source that mapped to nothing on the
-    /// `OTel` ladder, so `_severity` was omitted (ADR-0013 §2).
-    ///
-    /// Not a repair: derivation into the `_` namespace is an annotation,
-    /// and nothing sender-visible was touched — the source column is
-    /// stored verbatim. The ops signal is a metrics counter instead.
     pub const fn severity_unmapped(&self) -> bool {
         matches!(self.lineage.severity, SeveritySource::Unmapped { .. })
     }
 }
 
-/// Maximum preserved length (chars) of `_raw` and of every other stored
-/// string value (ADR-0063). Generous — `_raw` is the re-extraction
-/// lifeline — but bounded, so one pathological event cannot dominate a
-/// parquet row group, and one regex call over one stored value stays
-/// bounded. Truncation is recorded as `field.truncated`.
 pub const MAX_RAW_CHARS: usize = 65_536;
 
-/// How far in the past a parsed `_time` may sit before it is flagged
-/// `time.out_of_range` (kept, never substituted).
-const OUT_OF_RANGE_PAST_DAYS: i64 = 3653; // ~10 years
+const OUT_OF_RANGE_PAST_DAYS: i64 = 3653;
 
-/// How far after arrival a parsed `_time` may sit and still be kept. A later
-/// one is replaced by arrival time and flagged `time.ahead_of_arrival`
-/// (ADR-0013, amendment of 2026-11-08). Compaction files a row in the hour
-/// directory of its own clock, after arrival, so this bound is what lets a
-/// `last=` walk over hour directories reach every row (ADR-0008, amendment
-/// of 2026-11-08); source selection asserts its padding covers it.
 pub const MAX_TIME_LEAD: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
 /// Date-time formats carrying an explicit UTC offset, tried after RFC 3339.
@@ -446,15 +260,9 @@ const NAIVE_TIMESTAMP_FORMATS: [&str; 6] = [
     "%Y/%m/%d %H:%M",
 ];
 
-/// Date-only formats, read as midnight UTC.
 const DATE_ONLY_TIMESTAMP_FORMATS: [&str; 2] = ["%Y-%m-%d", "%Y/%m/%d"];
 
 /// Parse a time value per the ADR-0008 grammar.
-///
-/// A value is valid iff it is a JSON string that — after trimming
-/// surrounding whitespace — chrono parses as RFC 3339, as one of
-/// [`OFFSET_TIMESTAMP_FORMATS`], [`NAIVE_TIMESTAMP_FORMATS`] or
-/// [`DATE_ONLY_TIMESTAMP_FORMATS`]. Returns `None` for anything malformed.
 fn parse_event_time(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
     let s = v.as_str()?.trim();
     let utc: chrono::DateTime<chrono::Utc> = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
@@ -480,8 +288,6 @@ fn parse_event_time(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
     Some(utc)
 }
 
-/// Truncate a string to `max_chars` on a char boundary. Returns the
-/// original when it fits.
 fn truncate_chars(s: String, max_chars: usize) -> (String, bool) {
     if s.chars().count() > max_chars {
         (s.chars().take(max_chars).collect(), true)
@@ -490,16 +296,8 @@ fn truncate_chars(s: String, max_chars: usize) -> (String, bool) {
     }
 }
 
-/// Maximum length (chars) of a client-supplied value quoted back inside a
-/// reject message. The handler returns one message per rejected event,
-/// uncapped in count, so a message that echoes its input verbatim makes the
-/// response an amplifier of whatever the client sent: every other reject
-/// message on this path is bounded, and this keeps the echoing ones so.
 const MAX_REJECT_ECHO_CHARS: usize = 64;
 
-/// A client value as it may appear in a reject message: bounded, cut on a
-/// char boundary, and marked when cut. Enough to recognize the offending
-/// value without repeating it back wholesale.
 fn echo(value: &str) -> String {
     let (shown, truncated) = truncate_chars(value.to_owned(), MAX_REJECT_ECHO_CHARS);
     if truncated {
@@ -523,11 +321,6 @@ const fn json_type_name(v: &Value) -> &'static str {
     }
 }
 
-/// Validate the `service` value: present, a string, non-empty, within the
-/// length cap, charset-clean, and not a dot-name (`.`, `..`, dot-leading).
-///
-/// Path encoding is injective by validation (ADR-0009): the on-disk name
-/// is the value, so the constraints here are the whole safety argument.
 fn validate_service(obj: &Map<String, Value>) -> Result<String, (String, RejectReason)> {
     let v = obj.get("service").ok_or_else(|| {
         (
@@ -577,8 +370,6 @@ fn validate_service(obj: &Map<String, Value>) -> Result<String, (String, RejectR
     Ok(svc.to_owned())
 }
 
-/// Validate/derive the `env` value against the allowlist. Returns the env
-/// and whether it was defaulted.
 fn resolve_env(
     obj: &Map<String, Value>,
     ctx: &EnvelopeContext<'_>,
@@ -587,9 +378,6 @@ fn resolve_env(
         None | Some(Value::Null) => Ok((ctx.default_env.to_owned(), true)),
         Some(Value::String(env)) => {
             if !trawl_config::is_valid_env_name(env) {
-                // The value failed the charset/length rule, so it is exactly
-                // the case where the original may be arbitrarily long —
-                // echo a bounded prefix, never the whole thing.
                 return Err((
                     format!(
                         "env '{}' is not a valid env name (must match [a-z0-9_-]{{1,32}})",
@@ -616,34 +404,7 @@ fn resolve_env(
     }
 }
 
-/// Derive `_severity` from the event's own fields, reading and never
-/// consuming them.
-///
-/// The first mappable source wins, over the list this profile reads
-/// (ADR-0013 §2): the configured `[ingest] severity_from` chain with the
-/// profile's fixed sources prepended. Every source stays exactly where it
-/// is, so `{"service":"game","level":"gold"}` keeps a queryable
-/// `level="gold"` column and simply gets no `_severity`. Returns which
-/// source fed `_severity` and which present sources it skipped as
-/// unmappable, or that none was present, or that some were and none
-/// mapped (the ops counter's input). An unmapped severity is not a
-/// repair, because nothing sender-visible was touched.
-///
-/// Each source carries its own dialect and every value goes through
-/// `trawl_core::severity`. A word maps through the token table (`error` →
-/// 17) or the `OTel` exact short names (`error2` → 18); a number maps as
-/// that source's dialect says, `OTel` 1-24 by default (so `3` is trace),
-/// and syslog's inverted 0-7 only where the source declares it. The two
-/// numeric ranges overlap, so no value-shape rule could tell the dialects
-/// apart; provenance is asserted in config, or by the syslog profile's
-/// fixed source, and never guessed.
-///
-/// Ingest and the `sev()` query function read through that same code, so
-/// the number a query computes from a raw `level` is the number derivation
-/// would have stored for it.
 fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -> SeveritySource {
-    // Positions, not names: an event whose first present source maps
-    // allocates nothing for its lineage (an empty `Vec` is free).
     let mut skipped: Vec<usize> = Vec::new();
     for (index, source) in sources.iter().enumerate() {
         let Some(value) = out.get(&source.field) else {
@@ -665,23 +426,11 @@ fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -
     }
 }
 
-/// Stamp what the producer asserts over the payload, returning whether any
-/// payload value was displaced (ADR-0013). Each displaced payload value is
-/// recorded in `changes` as a drop earning `field.producer_asserted`: the
-/// payload's value is gone from its slot (it stays in `_raw`), whether the
-/// assertion replaced it or emptied the slot.
-///
 /// Runs after the reserved-prefix strip and before the validators, so a
 /// stripped `_service` has already landed on its bare slot and the
 /// assertion overrides that too, and so `validate_service`/`resolve_env`
 /// run on the asserted values, giving the profile doors exactly the
 /// checks the HTTP door gets.
-///
-/// Identity is protected by precedence, not by a namespace: telemetry's
-/// `service` field is ordinary sender vocabulary that happens to collide,
-/// and it loses. An identical value is not a collision, because the sender
-/// agreed with the profile and a repair code for that would land on every
-/// well-formed syslog frame.
 ///
 /// The two `None`s mean different things, deliberately:
 /// - `host: None` asserts absence (the producer knows it has no honest
@@ -715,17 +464,11 @@ fn apply_assertions(
     displaced
 }
 
-/// Claim one asserted slot. `Some` stamps the value, `None` empties the
-/// slot. Returns whether a different payload value was displaced.
-///
 /// A JSON `null` counts as absence everywhere the collision is judged:
 /// `{"host": null}` asserts nothing, so it displaces nothing and earns no
 /// `field.producer_asserted`. It is still removed, because an optional
 /// envelope field is omitted rather than written as JSON null (`DuckDB`
-/// infers JSON for an all-null column, ADR-0009), and the whole payload
-/// stays in `_raw` either way. The alternative would put a repair code on
-/// every sender whose serializer emits explicit nulls for unset fields,
-/// which is most of them.
+/// infers JSON for an all-null column, ADR-0009).
 fn claim_slot(out: &mut Map<String, Value>, key: &str, value: Option<&str>) -> bool {
     match value {
         Some(value) => {
@@ -741,19 +484,9 @@ fn claim_slot(out: &mut Map<String, Value>, key: &str, value: Option<&str>) -> b
     }
 }
 
-/// Stringify top-level object/array values to their JSON text (ADR-0009):
-/// with nothing left to flatten, a `read_json` "Duplicate name" collision
-/// is structurally impossible, so compaction never has to choose between
-/// draining a batch and keeping its columns.
-///
 /// Runs after the `_raw` capture (the nesting stays findable there) and
 /// after the reserved-prefix strip (a forged object `_raw` must strip like
-/// any other reserved name rather than be laundered into a string). This
-/// is a canonicalization like RFC 3339 time reformatting, not a repair: a
-/// code firing on every k8s event would fill `_repairs` on most of the
-/// corpus, and its value is that it is almost always null. Reach nested
-/// values with `json_extract_string(k8s, '$.pod')`. Each stringified field
-/// is recorded in `changes`, with no repair code.
+/// any other reserved name rather than be laundered into a string).
 fn stringify_nested_values(out: &mut Map<String, Value>, changes: &mut Vec<FieldChange>) {
     for (key, value) in out.iter_mut() {
         if value.is_object() || value.is_array() {
@@ -767,15 +500,9 @@ fn stringify_nested_values(out: &mut Map<String, Value>, changes: &mut Vec<Field
     }
 }
 
-/// Cut every stored string value to [`MAX_RAW_CHARS`] characters on a
-/// character boundary (ADR-0063), recording one `field.truncated` change
-/// per cut field. Returns whether anything was cut.
-///
 /// Runs after every step that stores a value, so a nested value is cut as
-/// its final JSON text. A cut may leave text that no longer parses as
-/// JSON; the prefix is kept (human ruling, 2026-11-02). `_raw` is skipped:
-/// [`capture_raw`] owns its cut, and a proposal still sitting in the map
-/// is replaced by that capture.
+/// its final JSON text. `_raw` is skipped: [`capture_raw`] owns its cut,
+/// and a proposal still sitting in the map is replaced by that capture.
 fn cap_string_values(out: &mut Map<String, Value>, changes: &mut Vec<FieldChange>) -> bool {
     let mut cut = false;
     for (key, value) in out.iter_mut() {
@@ -804,40 +531,15 @@ fn cap_string_values(out: &mut Map<String, Value>, changes: &mut Vec<FieldChange
     cut
 }
 
-/// What the reserved-prefix strip did to one event. Each flag is set only
-/// by the key that earned it, so one event can carry any combination.
 #[derive(Default)]
-#[allow(clippy::struct_excessive_bools)] // four independent repair outcomes
+#[allow(clippy::struct_excessive_bools)]
 struct PrefixStrip {
-    /// At least one ordinary `_x` key (not a stamp name, not all
-    /// underscores) was stripped or collided out (`field.reserved_prefix`).
     reserved_prefix: bool,
-    /// At least one all-underscore key was dropped (`field.name_empty`).
     name_empty: bool,
-    /// At least one stamp name was claimed (`field.stamp_claimed`).
     stamp_claimed: bool,
-    /// A stripped name collided with a bare name the same event carries,
-    /// so the prefixed loser was dropped
-    /// (`field.reserved_prefix_collision`).
     collided: bool,
 }
 
-/// Whether this profile lets the payload propose `_raw`.
-///
-/// `_raw` is the re-extraction lifeline, and what makes it one differs by
-/// door. A remote sender (HTTP) or a transport frame (syslog) has an
-/// original form trawl never saw, the collector's pre-parse line or the
-/// wire datagram, so a string `_raw` it supplies is the most original form
-/// available and is honoured verbatim.
-///
-/// Trawld's own telemetry has no such thing: the payload is the original,
-/// and a tracing field named `_raw` is ordinary application vocabulary
-/// that would shadow the lifeline. The pre-repair serialization carries
-/// the values assertions and collisions displace, so letting a field claim
-/// the slot would make "a displaced value stays findable in `_raw`" false
-/// on exactly the door that asserts identity hardest. Non-proposable
-/// means the standard reserved-prefix strip applies: the payload key lands
-/// on bare `raw`, value intact, and the door writes the serialization.
 const fn raw_is_proposable(kind: producer::ProducerKind) -> bool {
     match kind {
         producer::ProducerKind::Http | producer::ProducerKind::Syslog => true,
@@ -845,51 +547,16 @@ const fn raw_is_proposable(kind: producer::ProducerKind) -> bool {
     }
 }
 
-/// Whether a `_`-prefixed key is one the sender may propose.
-///
-/// At most two slots (ADR-0013 §3): `_time`, always — it is the event
-/// time proposal, canonicalized downstream — and `_raw`, when the value
-/// is a string and this door admits a proposal at all
-/// ([`raw_is_proposable`]). Everything else in the namespace is trawl's:
-/// server-stamped (`_ingested`, `_repairs`), derivation-only
-/// (`_severity`), internal (`_trawl_wal_file`), or a slot that does not
-/// exist yet.
 fn is_proposable(key: &str, value: &Value, raw_proposable: bool) -> bool {
     key == trawl_core::schema::TIME
         || (raw_proposable && key == trawl_core::schema::RAW && value.is_string())
 }
 
-/// Seal the `_` namespace at the ingest door (ADR-0013 §5): a
-/// non-proposable `_x` has its leading underscore run stripped and its
-/// value stored under the bare remainder.
+/// Seal the `_` namespace at the ingest door (ADR-0013 §5).
 ///
-/// One rule covers every shape, including the journald/prometheus names
-/// (`_HOSTNAME` → `hostname`, `_SYSTEMD_UNIT` → `systemd_unit`,
-/// `__name__` → `name__`), and it keeps the promise that every accepted
-/// field stays structurally queryable.
-///
-/// The key's code is settled on its folded full name, before trimming
-/// (ADR-0013, 2026-10-14 amendment): an exact stamp name
-/// ([`trawl_core::schema::STAMP_NAMES`], so `_INGESTED` once folded, but
-/// not `__ingested`) earns `field.stamp_claimed` instead of
-/// `field.reserved_prefix`; every other key with a nonempty remainder earns
-/// `field.reserved_prefix`.
-///
-/// Three sub-cases, all deterministic:
-///
-/// - the bare remainder is empty (`_`, `___`): there is no name to store
-///   under, so the field is dropped with `field.name_empty` alone — its
-///   value survives only in `_raw`, under the caveat on [`RepairCode`];
-/// - the bare name already exists in this event: the prefixed loser is
-///   dropped (`field.reserved_prefix_collision`), the same tiebreak the
-///   case-fold uses, and the key still earns its own code;
-/// - two prefixed claimants for one bare name: the first in map order
-///   wins (`serde_json::Map` iterates sorted, so that is the
-///   ASCII-lexicographically first spelling), the rest collide out.
-///
-/// Each key is recorded in `changes`: renamed to its bare remainder under
-/// its own code, or dropped as `field.name_empty` (no remainder) or
-/// `field.reserved_prefix_collision` (the bare name was taken).
+/// Two prefixed claimants for one bare name: the first in map order
+/// wins (`serde_json::Map` iterates sorted, so that is the
+/// ASCII-lexicographically first spelling), the rest collide out.
 fn strip_reserved_prefixes(
     out: &mut Map<String, Value>,
     raw_proposable: bool,
@@ -906,8 +573,6 @@ fn strip_reserved_prefixes(
         let value = out.remove(&key).expect("key came from this map");
         let bare = key.trim_start_matches('_');
         if bare.is_empty() {
-            // No name to store under: drop the value. Only a captured
-            // `_raw` still carries it (see the caveat on `RepairCode`).
             strip.name_empty = true;
             changes.push(FieldChange {
                 field: key,
@@ -924,8 +589,6 @@ fn strip_reserved_prefixes(
             RepairCode::ReservedPrefix
         };
         if out.contains_key(bare) {
-            // The bare name is already taken: drop the prefixed value. Only a
-            // captured `_raw` still carries it (see the caveat on `RepairCode`).
             strip.collided = true;
             changes.push(FieldChange {
                 field: key,
@@ -945,45 +608,16 @@ fn strip_reserved_prefixes(
     strip
 }
 
-/// One event's field names after ASCII case-folding ([`fold_field_names`]).
 struct FoldedNames {
-    /// The event with every field name ASCII-lowercased.
     obj: Map<String, Value>,
-    /// Whether any name was actually folded (the `field.name_case_folded`
-    /// repair — recorded only when folding changed something).
     folded: bool,
-    /// Whether any key was dropped because another key claims the same
-    /// folded name (the `field.name_case_collision` repair).
     collided: bool,
 }
 
-/// ASCII-lowercase every field name, dropping the losers of any resulting
-/// collision.
-///
-/// `DuckDB` identifiers are ASCII case-insensitive while JSON keys are not,
-/// so `Dur` and `dur`, or `_Time` and `_time`, name one column downstream,
-/// while every layer that keys on the exact string (the postgres field
-/// catalog, the envelope's own reserved-name handling, the hot snapshot's
-/// key set) would treat them as two. Folding at the door means exactly one
-/// code path ever sees one spelling: a client `_Time` becomes the `_time`
-/// wire input, `_Ingested` strips to bare `ingested`, `Service` validates
-/// as `service`, and a custom `Dur` pins and stores as `dur`.
 /// Per-character ASCII lowercase is precisely `DuckDB`'s identifier
 /// equivalence: `CAFÉ` folds to `cafÉ` (its class's canonical form) while
 /// the distinct identifier `café` is untouched (probed in
 /// `trawl-engine/tests/duckdb_probe.rs`).
-///
-/// In-event collisions after folding keep one value, deterministically: the
-/// exact (already-lowercase) spelling wins when the event carries it;
-/// otherwise the ASCII-lexicographically first variant does
-/// (`serde_json::Map` iterates sorted, so "first in map order" is exactly
-/// that). Nothing honest can be done with two values for what `DuckDB`
-/// reads as one column; the dropped key and its value stay findable in
-/// `_raw`, which is captured from the pre-fold object.
-///
-/// Each folded key is recorded in `changes` as renamed to its lowercase
-/// spelling (`field.name_case_folded`), each collision loser as dropped
-/// (`field.name_case_collision`).
 fn fold_field_names(obj: &Map<String, Value>, changes: &mut Vec<FieldChange>) -> FoldedNames {
     let mut out = Map::new();
     // Pass 1: exact (already-folded) spellings — the collision winners.
@@ -1024,29 +658,14 @@ fn fold_field_names(obj: &Map<String, Value>, changes: &mut Vec<FieldChange>) ->
     }
 }
 
-/// Whether `name` is already in its folded spelling: it carries no ASCII
-/// uppercase letter, so [`fold_field_names`] keeps it as it is. Every
-/// field name a canonical event carries passes; boot hydration (ADR-0041)
-/// accepts a WAL line only if all of its names do.
 pub(crate) fn is_folded_name(name: &str) -> bool {
     !name.bytes().any(|b| b.is_ascii_uppercase())
 }
 
-/// Drop every field whose name cannot be a field-catalog key, returning
-/// whether any were dropped (the `field.name_too_long` repair).
-///
-/// This is the only seam that sees a client-chosen key before it becomes a
-/// column. Compaction pins every dynamic column in postgres before writing
-/// the parquet that carries it, and an over-long name overflows the btree
-/// key behind `field_types.field`: the insert errors, the batch is retained
-/// for retry, and the same WAL re-fails on every tick — permanently, for
-/// that service. Bounding the name here is what keeps that unreachable.
-///
-/// Dropping the field is a repair with an honest answer rather than a
-/// guess: `_raw` is captured before this runs, so the name and its value
-/// both stay recoverable, and no other field in the event is punished for
-/// one bad key (rejecting the event would throw away good data). Each
-/// dropped key is recorded in `changes`.
+/// Compaction pins every dynamic column in postgres before writing the
+/// parquet that carries it, and an over-long name overflows the btree key
+/// behind `field_types.field`: the insert errors, and the same WAL re-fails
+/// on every tick, permanently, for that service.
 fn drop_unstorable_names(out: &mut Map<String, Value>, changes: &mut Vec<FieldChange>) -> bool {
     let unstorable: Vec<String> = out
         .keys()
@@ -1065,17 +684,6 @@ fn drop_unstorable_names(out: &mut Map<String, Value>, changes: &mut Vec<FieldCh
     dropped
 }
 
-/// Decide what to do about `host`, per door (ADR-0013).
-///
-/// `host_missing` is [`host_absent`] of the normalized event. Returns the
-/// peer address to fill a missing host from, if any.
-///
-/// Only the HTTP door has a peer to fill from or to refuse behind: an
-/// HTTP sender can be rejected and resend, so trawl holds out for an
-/// honest answer rather than stamping a relay's address as the origin. A
-/// profile producer cannot reject to anyone, so its absent host stays
-/// absent and the caller confesses `host.omitted`: absent but honest beats
-/// both the peer-fill lie and dropping the event.
 fn decide_host<'a>(
     host_missing: bool,
     producer: &Producer<'a>,
@@ -1101,31 +709,10 @@ fn decide_host<'a>(
     Ok(peer_fill)
 }
 
-/// Whether the event has no `host`: the key is absent or JSON `null`,
-/// which is absence rather than a value. The one rule behind the peer
-/// fill, the relay refusal, `host.omitted` and the reported `host_absent`.
 fn host_absent(out: &Map<String, Value>) -> bool {
     matches!(out.get(trawl_core::schema::HOST), None | Some(Value::Null))
 }
 
-/// Derive `_time` from the first present source in this profile's
-/// `time_from` list, returning the canonical RFC 3339 UTC-microsecond
-/// text and the repair it earned, if any (ADR-0013 §2, ADR-0008 grammar):
-/// `time.from_ingest` when no source is present, `time.unparseable` when
-/// the first present one fails to parse, `time.ahead_of_arrival` when it
-/// parses to more than [`MAX_TIME_LEAD`] after arrival, and
-/// `time.out_of_range` when it parses to more than ten years before it.
-///
-/// Derivation observes, it never consumes. Only `_time` itself is removed,
-/// being the proposal slot the canonical value replaces;
-/// `timestamp`/`@timestamp`, and the syslog profile's own
-/// `syslog_timestamp`, stay as ordinary columns.
-///
-/// First present, not first parseable: an unparseable value claims the
-/// derivation and falls to arrival time rather than reaching past itself
-/// to a lower-precedence source, so what `_time` holds is always
-/// explicable from one input. An ahead value claims it the same way. The returned [`TimeSource`] names that
-/// input, including when it claimed the derivation and failed to parse.
 fn derive_time(
     out: &mut Map<String, Value>,
     ctx: &EnvelopeContext<'_>,
@@ -1154,8 +741,6 @@ fn derive_time(
         ),
         Some(dt) => {
             let past = ctx.arrival_instant - chrono::Duration::days(OUT_OF_RANGE_PAST_DAYS);
-            // Implausible, but parseable: kept — flagged, never
-            // substituted (the client said what it said).
             let repair = (dt < past).then_some(RepairCode::TimeOutOfRange);
             (
                 dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
@@ -1173,14 +758,6 @@ fn derive_time(
     }
 }
 
-/// Capture `_raw`, cut to [`MAX_RAW_CHARS`], returning it and whether it
-/// was cut (recorded in `changes` as `field.truncated`).
-///
-/// On a door that admits the proposal a client-supplied string `_raw` is
-/// kept verbatim; otherwise the pre-repair serialization of the pre-fold
-/// `obj` is the most original form available, since wire-exact bytes do
-/// not exist (events arrive inside JSON arrays and the WAL re-serializes
-/// anyway).
 fn capture_raw(
     obj: &Map<String, Value>,
     folded: &Map<String, Value>,
@@ -1202,73 +779,42 @@ fn capture_raw(
     (raw_string, truncated)
 }
 
-/// Canonicalize one parsed event object into the declared envelope.
-///
 /// Field order of operations is load-bearing:
 /// 0. Field-name ASCII case-fold ([`fold_field_names`]), before anything
 ///    that keys on a name (service validation, reserved-prefix strip,
-///    stringification), so one code path sees one spelling. Recorded as
-///    `field.name_case_folded` / `field.name_case_collision` only when it
-///    changed something.
+///    stringification), so one code path sees one spelling.
 /// 1. `_raw` capture, before the strip and every repair, so the server's
-///    own fills never appear inside "what arrived" (the serialization
-///    fallback uses the pre-fold object, so dropped and folded spellings
-///    stay findable). Whether the payload may propose `_raw` is
-///    per-profile ([`raw_is_proposable`]): trawld's own door never lets a
-///    field claim the lifeline.
-/// 2. Reserved-prefix strip ([`strip_reserved_prefixes`],
-///    `field.reserved_prefix` / `field.name_empty` / `field.stamp_claimed` /
-///    `field.reserved_prefix_collision`).
-///    2.5. Producer assertions ([`apply_assertions`],
-///    `field.producer_asserted`), after the strip, so a stripped
-///    `_service` has already landed on its bare slot and the profile
-///    overrides that too, and before the validators, so an asserted
+///    own fills never appear inside "what arrived".
+/// 2. Reserved-prefix strip ([`strip_reserved_prefixes`]).
+///    2.5. Producer assertions ([`apply_assertions`]), after the strip, so
+///    a stripped `_service` has already landed on its bare slot and the
+///    profile overrides that too, and before the validators, so an asserted
 ///    `service`/`env` faces exactly the checks an HTTP sender's does.
-///    The HTTP door asserts nothing and skips this.
 /// 3. `service` validation (reject path), `env` and `host` resolution,
-///    after the strip, because a stripped `_service`/`_env`/`_host` lands
-///    on exactly the bare slot these read, the same way a stripped
-///    `_severity` lands where derivation reads it (ADR-0013 §5). Resolving
-///    first would let step 6 overwrite the stripped value and then confess
-///    `env.defaulted`/`host.from_peer` about a sender that did assert one.
-///    Over-long field-name drop (`field.name_too_long`) follows.
-/// 4. `_time` derived from the first present source in this profile's
-///    `time_from` list, ADR-0008 grammar, `time.from_ingest` /
-///    `time.unparseable` / `time.out_of_range`. Only `_time` is consumed.
-/// 5. `_ingested` stamp.
+///    after the strip. Resolving first would let step 6 overwrite the
+///    stripped value and then confess `env.defaulted`/`host.from_peer`
+///    about a sender that did assert one.
 /// 6. `env` default-or-reject, `host` peer-fill / relay-reject / omit.
-/// 7. `_severity` derived from the first mappable source in this profile's
-///    `severity_from` list, read-only: every source stays where it is, and
-///    no mappable one means no key and no repair.
 ///    7.5. `_producer` stamp, after the strip, so an incoming `_producer`
 ///    has already become a bare `producer` and the column is unforgeable.
 ///    7.6. Every stored string value but `_raw` cut to [`MAX_RAW_CHARS`]
-///    ([`cap_string_values`], `field.truncated`). After stringification,
-///    so nested values are cut as their final text, and after every
-///    other step that stores or reads a value, so derivation reads the
-///    whole value and a consumed `_time` proposal is never cut.
-/// 8. `_raw` insertion and `_repairs` assembly (omitted when clean).
-///
-/// Each step records its own decision in the [`Lineage`] as it makes it,
-/// so the lineage is never reconstructed from the rules afterwards.
-#[allow(clippy::too_many_lines)] // one ordered pipeline, each step listed above
+///    after every other step that stores or reads a value, so derivation
+///    reads the whole value and a consumed `_time` proposal is never cut.
+#[allow(clippy::too_many_lines)]
 pub fn canonicalize(
     obj: &Map<String, Value>,
     ctx: &EnvelopeContext<'_>,
 ) -> Result<Canonical, Rejection> {
     let mut changes: Vec<FieldChange> = Vec::new();
 
-    // 0. One spelling per DuckDB identifier, before anything reads a name.
     let fold = fold_field_names(obj, &mut changes);
     let folded_obj = fold.obj;
 
-    // 1. Capture `_raw` before anything is stripped or repaired.
     let raw_proposable = raw_is_proposable(ctx.producer.kind());
     let (raw_string, truncated) = capture_raw(obj, &folded_obj, raw_proposable, &mut changes);
 
     let mut out = folded_obj;
 
-    // 2. The `_` namespace is trawl's: strip the prefix, keep the data.
     let strip = strip_reserved_prefixes(&mut out, raw_proposable, &mut changes);
 
     let mut repairs: Vec<RepairCode> = Vec::new();
@@ -1278,7 +824,6 @@ pub fn canonicalize(
         }
     };
 
-    // 2.5. What the producer asserts wins over what the payload carries.
     // The codes the producer itself contributed lead `_repairs`: they
     // describe what happened to the event before it reached this door.
     if let Some(asserted) = ctx.producer.asserted() {
@@ -1290,13 +835,8 @@ pub fn canonicalize(
         }
     }
 
-    // 3. Identity, read from the post-strip, post-assertion event: a
-    // `_host`/`_env`/`_service` has landed on its bare slot by now, so it
-    // is ordinary sender-asserted data and the fills below cannot
-    // overwrite it (nor claim in `_repairs` that the sender asserted
-    // nothing). A profile's assertion sits in those same slots, so it
-    // faces exactly these validators. Whether `host` is absent is settled
-    // first, so a rejection reports it too.
+    // Whether `host` is absent is settled first, so a rejection reports
+    // it too.
     let host_missing = host_absent(&out);
     let reject = |(message, reason): (String, RejectReason)| Rejection {
         reason,
@@ -1327,25 +867,20 @@ pub fn canonicalize(
         push_repair(&mut repairs, RepairCode::ReservedPrefixCollision);
     }
 
-    // 3.2. Names too long to be a catalog key never become columns.
     if drop_unstorable_names(&mut out, &mut changes) {
         push_repair(&mut repairs, RepairCode::FieldNameTooLong);
     }
 
-    // 3.5. Nested values become JSON text (see [`stringify_nested_values`]).
     stringify_nested_values(&mut out, &mut changes);
 
-    // 4. `_time` from this profile's own source list.
     let (canonical_time, time_repair, time_source) = derive_time(&mut out, ctx);
     if let Some(code) = time_repair {
         push_repair(&mut repairs, code);
     }
     out.insert(trawl_core::schema::TIME.into(), json!(canonical_time));
 
-    // 5. Server-stamped arrival time.
     out.insert(trawl_core::schema::INGESTED.into(), json!(ctx.arrival));
 
-    // 6. env / host.
     out.insert(trawl_core::schema::ENV.into(), json!(env));
     if env_defaulted {
         push_repair(&mut repairs, RepairCode::EnvDefaulted);
@@ -1359,22 +894,15 @@ pub fn canonicalize(
         push_repair(&mut repairs, RepairCode::HostOmitted);
     }
 
-    // 7. `_severity` derivation is read-only: every source stays where
-    // it is, and an event with no mappable one simply has no `_severity`.
     let severity_source =
         derive_severity(&mut out, ctx.derivation.severity_from(ctx.producer.kind()));
 
-    // 7.5. Provenance becomes data (ADR-0013). Stamped from the profile,
-    // never from the payload: an incoming `_producer` was stripped to a
-    // bare `producer` back at step 2, so the column cannot be forged.
     out.insert(
         trawl_core::schema::PRODUCER.into(),
         json!(ctx.producer.kind().as_str()),
     );
 
-    // 7.6. No stored string value outgrows the `_raw` cap.
     let values_cut = cap_string_values(&mut out, &mut changes);
-    // 8. `_raw` and `_repairs`.
     if truncated || values_cut {
         push_repair(&mut repairs, RepairCode::FieldTruncated);
     }
@@ -1416,17 +944,11 @@ mod tests {
 
     const ARRIVAL: &str = "2026-01-01T00:00:00.000000Z";
 
-    /// The default derivation policy, shared by every test that does not
-    /// configure its own. Held in a `OnceLock` so a test can borrow it for
-    /// the life of a context without threading an owner through every
-    /// helper.
     fn default_derivation() -> &'static Derivation {
         static DEFAULTS: std::sync::OnceLock<Derivation> = std::sync::OnceLock::new();
         DEFAULTS.get_or_init(Derivation::defaults)
     }
 
-    /// The HTTP door with the packaged derivation policy, which is what
-    /// every test below assumes unless it builds its own context.
     fn ctx_with(envs: &[String], relay: bool) -> EnvelopeContext<'_> {
         EnvelopeContext {
             arrival: ARRIVAL,
@@ -1468,8 +990,6 @@ mod tests {
         c.repairs.iter().map(|r| r.as_str()).collect()
     }
 
-    // --- the declared schema, enforced ---
-
     #[test]
     fn fully_specified_event_is_clean() {
         let c = canon(
@@ -1498,8 +1018,6 @@ mod tests {
         assert_eq!(c.obj["_repairs"], "time.from_ingest");
     }
 
-    /// An offset-less date-time from an HTTP sender reads as UTC
-    /// (ADR-0009). The syslog zone settings (ADR-0050) never reach it.
     #[test]
     fn http_offsetless_remains_utc() {
         for sent in [
@@ -1531,13 +1049,8 @@ mod tests {
         assert!(codes(&c).contains(&"host.from_peer"));
     }
 
-    // --- nested-value stringification (ADR-0009) ---
-
     #[test]
     fn object_values_are_stringified_to_json_text() {
-        // With nothing left to flatten, `read_json` can never raise a
-        // "Duplicate name" collision, so compaction needs no fallback that
-        // trades a batch's custom columns for draining it.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z",
@@ -1568,9 +1081,6 @@ mod tests {
 
     #[test]
     fn stringification_is_canonicalization_not_a_repair() {
-        // No repair code: this is a canonicalization like RFC 3339
-        // reformatting, and a code firing on every k8s event would leave
-        // `_repairs` almost never null.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","k8s":{"pod":"x"}}"#,
@@ -1598,8 +1108,6 @@ mod tests {
 
     #[test]
     fn raw_preserves_the_original_nesting() {
-        // `_raw` is captured before stringification, so the original
-        // structure stays findable there.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","k8s":{"pod":"x"}}"#,
@@ -1613,8 +1121,6 @@ mod tests {
 
     #[test]
     fn non_string_raw_is_still_stripped_before_stringification() {
-        // A client object `_raw` takes the reserved-prefix strip — the
-        // stringify pass must not first turn it into an honourable string.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","_raw":{"forged":true}}"#,
@@ -1633,8 +1139,6 @@ mod tests {
         assert_eq!(reason, RejectReason::MissingService);
         assert!(msg.contains("service"));
     }
-
-    // --- service type-specific rejection ---
 
     #[test]
     fn service_object_rejects_with_type_reason() {
@@ -1655,8 +1159,6 @@ mod tests {
         let (_, reason) = reject(r#"{"service":null}"#);
         assert_eq!(reason, RejectReason::ServiceNotString);
     }
-
-    // --- service charset (injective paths) ---
 
     #[test]
     fn service_dot_names_reject() {
@@ -1687,8 +1189,6 @@ mod tests {
             canon(r#"{"service":"api.v2","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z"}"#);
         assert_eq!(c.service, "api.v2");
     }
-
-    // --- host behind a trusted relay ---
 
     #[test]
     fn missing_host_behind_trusted_relay_rejects() {
@@ -1722,8 +1222,6 @@ mod tests {
         assert!(c.repairs.is_empty());
     }
 
-    // --- env allowlist: an unknown env hard-rejects ---
-
     #[test]
     fn unlisted_env_rejects() {
         let (msg, reason) = reject(r#"{"service":"s","env":"prdo"}"#);
@@ -1747,10 +1245,6 @@ mod tests {
         }
     }
 
-    /// Reject messages go back to the client one per rejected event, with no
-    /// cap on how many. Every message on this path is bounded, so no single
-    /// event can amplify a request into an arbitrarily large response (or an
-    /// arbitrarily large allocation on the way there).
     const MAX_REJECT_MSG_CHARS: usize = 256;
 
     fn reject_obj(obj: &Map<String, Value>) -> (String, RejectReason) {
@@ -1809,11 +1303,6 @@ mod tests {
         assert!(codes(&c).contains(&"env.defaulted"));
     }
 
-    // --- `_severity` derivation: observe, never consume (ADR-0013 §2) ---
-
-    /// The canonical example: a game server whose `level` means loot tier
-    /// keeps a queryable `level` column, gets no `_severity`, and is
-    /// repaired in no way at all.
     #[test]
     fn a_bare_level_that_is_not_a_severity_survives_untouched() {
         let c = canon(r#"{"service":"game","level":"gold"}"#);
@@ -1826,8 +1315,6 @@ mod tests {
             c.severity_unmapped(),
             "a source existed and mapped to nothing — the ops counter's input"
         );
-        // `env`/`host`/`_time` are filled, which is confessed; nothing
-        // about the severity derivation is.
         assert!(
             !codes(&c).iter().any(|code| code.starts_with("severity")),
             "derivation into the `_` namespace is never a repair: {:?}",
@@ -1835,9 +1322,6 @@ mod tests {
         );
     }
 
-    /// The other worked example: an OTel-native sender's `severity: 3`
-    /// stays verbatim and derives `_severity = 3` — trace on the `OTel`
-    /// ladder, never syslog's err. Both truths coexist.
     #[test]
     fn a_numeric_severity_is_stored_verbatim_and_derived_as_otel() {
         let c = canon(r#"{"service":"x","severity":3}"#);
@@ -1850,9 +1334,6 @@ mod tests {
         assert!(!c.severity_unmapped());
     }
 
-    /// The numeric dialect matrix (ADR-0013 §4): words map through the
-    /// token table, numerics map strictly as `OTel` 1-24, and everything
-    /// else has no reading.
     #[test]
     fn severity_numeric_dialect_matrix() {
         for (input, expected) in [
@@ -1880,31 +1361,23 @@ mod tests {
                 expected.is_none(),
                 "the counter fires exactly when a source mapped to nothing: {input}"
             );
-            // Whatever the reading, the source is never touched.
             assert!(c.obj.contains_key("severity"), "source kept: {input}");
         }
     }
 
-    /// Source precedence is `severity` → `severity_text` → `level`, first
-    /// mappable wins, and every source stays where it is.
     #[test]
     fn severity_source_precedence_is_first_mappable() {
         let cases: &[(&str, Option<i64>)] = &[
-            // severity leads.
             (
                 r#""severity":17,"severity_text":"info","level":"debug""#,
                 Some(17),
             ),
-            // an unmappable severity falls through to severity_text…
             (r#""severity":"gold","severity_text":"error""#, Some(17)),
-            // …and on to level.
             (
                 r#""severity":"gold","severity_text":"gold","level":"warn""#,
                 Some(13),
             ),
-            // severity_text leads level.
             (r#""severity_text":"error","level":"info""#, Some(17)),
-            // nothing mappable anywhere.
             (r#""severity":"gold","level":"silver""#, None),
         ];
         for (fields, expected) in cases {
@@ -1924,10 +1397,6 @@ mod tests {
         }
     }
 
-    /// An incoming `_severity` is derivation-only (ADR-0013 §3): it takes
-    /// the standard prefix strip and lands as bare `severity`, which
-    /// derivation then reads — so an OTel-native shipper still lands
-    /// correctly, with zero special-casing and an unforgeable verdict.
     #[test]
     fn a_forged_severity_strips_to_the_bare_name_and_is_then_derived() {
         let c = canon(r#"{"service":"s","_severity":17}"#);
@@ -1936,8 +1405,6 @@ mod tests {
         assert!(codes(&c).contains(&"field.reserved_prefix"));
     }
 
-    /// An event with no severity-ish field at all is silent on every
-    /// channel: no key, no repair, no counter.
     #[test]
     fn absent_severity_sources_are_silent() {
         let c = canon(r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z"}"#);
@@ -1946,7 +1413,6 @@ mod tests {
         assert!(c.repairs.is_empty());
     }
 
-    /// Token spellings and the ASCII fold both reach the derivation.
     #[test]
     fn severity_token_spellings_normalize() {
         for spelling in [r#""WARN""#, r#""warning""#, r#""Warn""#, r#""W""#] {
@@ -1959,10 +1425,6 @@ mod tests {
         }
     }
 
-    // --- the sealed `_` namespace at the ingest door (ADR-0013 §5) ---
-
-    /// One rule, every shape: journald names, a forged server slot, and
-    /// the internal provenance key alike.
     #[test]
     fn reserved_prefixes_strip_to_the_bare_remainder() {
         let c = canon(
@@ -1976,7 +1438,6 @@ mod tests {
         assert_eq!(c.obj["systemd_unit"], "sshd.service");
         assert_eq!(c.obj["trawl_wal_file"], "x", "no silent hand-written drop");
         assert_eq!(c.obj["keep"], "me");
-        // The server's own slots are stamped, never the client's values.
         assert_eq!(c.obj["_ingested"], ARRIVAL);
         assert_eq!(c.obj["ingested"], "1999-01-01T00:00:00Z");
         assert_eq!(c.obj["repairs"], "forged");
@@ -1984,9 +1445,6 @@ mod tests {
         assert!(codes(&c).contains(&"field.stamp_claimed"));
     }
 
-    /// The strip runs before identity resolution, so a stripped
-    /// `_host`/`_env`/`_service` is sender-asserted data the server's own
-    /// fills can neither overwrite nor misreport in `_repairs`.
     #[test]
     fn a_stripped_identity_name_is_sender_asserted_not_overwritten() {
         let c = canon(r#"{"service":"s","_host":"real-origin","message":"m"}"#);
@@ -2010,26 +1468,19 @@ mod tests {
             c.repairs
         );
 
-        // Case-folded first, so the prefixed spelling makes no difference.
         let c = canon(r#"{"service":"s","_HOST":"real-origin","message":"m"}"#);
         assert_eq!(c.obj["host"], "real-origin");
         assert!(!codes(&c).contains(&"host.from_peer"));
 
-        // And the stripped value is validated like any other: an env
-        // outside the allowlist rejects rather than silently defaulting.
         let (_, reason) = reject(r#"{"service":"s","host":"h","_env":"nope"}"#);
         assert!(matches!(reason, RejectReason::EnvNotAllowed), "{reason:?}");
 
-        // `_service` is the same rule: it lands bare and is the service.
         let c = canon(r#"{"_service":"other","message":"m"}"#);
         assert_eq!(c.service, "other");
         assert_eq!(c.obj["service"], "other");
         assert!(codes(&c).contains(&"field.reserved_prefix"));
     }
 
-    /// A key with no bare remainder has nowhere to land, so it is
-    /// dropped with `field.name_empty` alone — its value is still in
-    /// `_raw`.
     #[test]
     fn an_all_underscore_name_is_dropped_as_name_empty() {
         for (json, key) in [
@@ -2061,7 +1512,6 @@ mod tests {
             }
         }
 
-        // Both in one event earn the code once, beside an ordinary strip.
         let c = canon(r#"{"service":"s","_":"a","___":"b","_x":1}"#);
         assert!(codes(&c).contains(&"field.name_empty"));
         assert!(
@@ -2080,8 +1530,6 @@ mod tests {
         assert!(raw.contains("\"___\":\"b\""), "{raw}");
     }
 
-    /// The bare name already present in the same event wins; the
-    /// prefixed loser is dropped, deterministically.
     #[test]
     fn a_prefixed_name_loses_to_the_bare_one_it_would_shadow() {
         let c = canon(r#"{"service":"s","_dur":1,"dur":2}"#);
@@ -2097,8 +1545,6 @@ mod tests {
         assert!(codes(&c).contains(&"field.reserved_prefix_collision"));
     }
 
-    /// `_time` and a string `_raw` are the two slots a sender may
-    /// propose, so neither strips.
     #[test]
     fn the_two_proposable_slots_are_not_stripped() {
         let c =
@@ -2116,8 +1562,6 @@ mod tests {
         );
     }
 
-    /// A non-string `_raw` is not a proposal, so it takes the standard
-    /// strip and lands bare.
     #[test]
     fn a_non_string_raw_strips_like_any_other_reserved_name() {
         let c = canon(r#"{"service":"s","_raw":{"a":1},"keep":"me"}"#);
@@ -2129,11 +1573,6 @@ mod tests {
         assert!(codes(&c).contains(&"field.reserved_prefix"));
     }
 
-    // --- time derivation: observe, never consume (ADR-0013 §2) ---
-
-    /// `timestamp`/`@timestamp` are read for the derivation and stored
-    /// verbatim as ordinary columns; only `_time` — the proposal slot —
-    /// is consumed.
     #[test]
     fn time_alias_sources_are_stored_verbatim() {
         let c = canon(r#"{"service":"s","timestamp":"2025-06-01T12:00:00Z"}"#);
@@ -2148,10 +1587,6 @@ mod tests {
         assert_eq!(c.obj["@timestamp"], "2025-06-01T12:00:00Z");
     }
 
-    /// A source more than [`MAX_TIME_LEAD`] ahead of arrival loses the
-    /// derivation to arrival time, but an alias source is still the
-    /// sender's own column and keeps the sender's value. A `_time` proposal
-    /// is consumed, so its value survives only in the `_raw` trawld builds.
     #[test]
     fn ahead_alias_source_stays_as_a_column() {
         const AHEAD: &str = "2026-01-01T03:00:00Z";
@@ -2173,8 +1608,6 @@ mod tests {
             .collect();
         assert_eq!(holders, ["_raw"], "only the built `_raw` keeps a proposal");
 
-        // First present claims the derivation: an ahead `_time` does not
-        // fall through to a healthy alias below it.
         let c = canon(&format!(
             r#"{{"service":"s","_time":"{AHEAD}","timestamp":"2025-12-31T23:00:00Z"}}"#
         ));
@@ -2182,8 +1615,6 @@ mod tests {
         assert!(codes(&c).contains(&"time.ahead_of_arrival"));
         assert_eq!(c.obj["timestamp"], "2025-12-31T23:00:00Z", "still stored");
 
-        // A sender-supplied `_raw` replaces trawld's capture, so a consumed
-        // proposal survives nowhere.
         let c = canon(&format!(
             r#"{{"service":"s","_time":"{AHEAD}","_raw":"own line"}}"#
         ));
@@ -2198,9 +1629,6 @@ mod tests {
         );
     }
 
-    /// First present claims the derivation: an unparseable `_time` falls
-    /// to arrival time rather than reaching past itself to a
-    /// lower-precedence source.
     #[test]
     fn an_unparseable_time_proposal_does_not_fall_through_to_a_lower_source() {
         let c = canon(r#"{"service":"s","_time":"not a time","timestamp":"2025-06-01T12:00:00Z"}"#);
@@ -2209,18 +1637,14 @@ mod tests {
         assert!(!codes(&c).contains(&"time.from_ingest"));
         assert_eq!(c.obj["timestamp"], "2025-06-01T12:00:00Z", "still stored");
 
-        // An explicit null is present too: it hides the valid source below.
         let c = canon(r#"{"service":"s","_time":null,"timestamp":"2025-06-01T12:00:00Z"}"#);
         assert_eq!(c.obj["_time"], ARRIVAL);
         assert!(codes(&c).contains(&"time.unparseable"));
         assert!(!codes(&c).contains(&"time.from_ingest"));
     }
 
-    // --- _raw: pre-defaults capture, client honour ---
-
     #[test]
     fn raw_captured_before_host_fill() {
-        // No host: the server fills 10.0.4.55, but _raw must not contain it.
         let c = canon(r#"{"service":"s","env":"prod","_time":"2025-12-31T23:00:00Z"}"#);
         let raw = c.obj["_raw"].as_str().unwrap();
         assert!(
@@ -2254,8 +1678,6 @@ mod tests {
     /// [`trawl_core::schema::STAMP_NAMES`], the list under test.
     const SPEC_STAMP_NAMES: [&str; 4] = ["_ingested", "_repairs", "_producer", "_trawl_wal_file"];
 
-    /// [`trawl_core::schema::STAMP_NAMES`] holds exactly the four names the
-    /// amendment lists, no more and no fewer.
     #[test]
     fn stamp_claimed_names_are_exactly_the_amendment_list() {
         let mut listed: Vec<&str> = trawl_core::schema::STAMP_NAMES.to_vec();
@@ -2265,9 +1687,6 @@ mod tests {
         assert_eq!(listed, spec);
     }
 
-    /// Each stamp name earns `field.stamp_claimed` and not
-    /// `field.reserved_prefix` (ADR-0013, 2026-10-14 amendment): the value
-    /// lands under the bare name and the server's own stamp is untouched.
     #[test]
     fn each_stamp_name_is_stamp_claimed_not_reserved_prefix() {
         for stamp in SPEC_STAMP_NAMES {
@@ -2288,7 +1707,6 @@ mod tests {
                     Some(RepairCode::FieldStampClaimed)
                 )]
             );
-            // The server's stamps, never the client's values.
             assert_eq!(c.obj["_ingested"], ARRIVAL, "{stamp}");
             assert_eq!(c.obj["_repairs"], "field.stamp_claimed", "{stamp}");
             assert_eq!(c.obj["_producer"], "http", "{stamp}");
@@ -2299,8 +1717,6 @@ mod tests {
         }
     }
 
-    /// A stamp claim over a bare name the event already carries also
-    /// collides out, and still earns no `field.reserved_prefix`.
     #[test]
     fn a_stamp_claimed_over_a_present_bare_name_also_collides() {
         for stamp in SPEC_STAMP_NAMES {
@@ -2329,9 +1745,6 @@ mod tests {
         }
     }
 
-    /// The stamp rule is exact on the folded full name: an extra
-    /// underscore, a journald name, the derivation-only `_severity` and a
-    /// non-string `_raw` all keep the ordinary strip.
     #[test]
     fn only_an_exact_stamp_name_is_stamp_claimed() {
         for (json, bare) in [
@@ -2355,14 +1768,12 @@ mod tests {
                 c.repairs
             );
         }
-        // The server's own `_ingested` is untouched by `__ingested`.
         let c = canon(r#"{"service":"s","__ingested":"1999-01-01T00:00:00Z"}"#);
         assert_eq!(c.obj["_ingested"], ARRIVAL);
     }
 
     #[test]
     fn raw_contains_stripped_client_meta() {
-        // _raw is "what arrived" — including the forged fields.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_repairs":"forged"}"#,
         );
@@ -2381,8 +1792,6 @@ mod tests {
         assert_eq!(raw, "é".repeat(MAX_RAW_CHARS));
         assert!(codes(&c).contains(&"field.truncated"));
     }
-
-    // --- the stored-value cap (ADR-0063) ---
 
     /// An addressed, timed event plus `fields`. Its own short `_raw` is
     /// kept verbatim, so the capture never cuts anything and every cut
@@ -2408,8 +1817,6 @@ mod tests {
 
     #[test]
     fn every_string_value_is_capped() {
-        // `message` and a custom field one character over: each is cut to
-        // the cap with its own change, and the event earns one code.
         let over = "m".repeat(MAX_RAW_CHARS + 1);
         let c = canon_with(&[("message", json!(over)), ("detail", json!(over))]);
         assert_eq!(c.obj["message"], "m".repeat(MAX_RAW_CHARS));
@@ -2419,8 +1826,6 @@ mod tests {
         assert_eq!(c.obj["_repairs"], "field.truncated");
         assert_eq!(c.obj["_raw"], "line", "the capture is not the cap's");
 
-        // Exactly at the cap is untouched, counted in characters: the
-        // two-byte spelling is twice the cap in bytes.
         let ascii = "a".repeat(MAX_RAW_CHARS);
         let wide = "é".repeat(MAX_RAW_CHARS);
         let c = canon_with(&[("message", json!(ascii)), ("detail", json!(wide))]);
@@ -2430,8 +1835,6 @@ mod tests {
         assert!(c.repairs.is_empty(), "{:?}", c.repairs);
         assert!(!c.obj.contains_key("_repairs"));
 
-        // A 4-byte character straddling the cap's byte offset is kept
-        // whole, and one just past the cap is dropped whole.
         let straddling = format!("{}😀bc", "a".repeat(MAX_RAW_CHARS - 2));
         let past = format!("{}😀", "a".repeat(MAX_RAW_CHARS));
         let c = canon_with(&[("message", json!(straddling)), ("detail", json!(past))]);
@@ -2443,8 +1846,6 @@ mod tests {
         assert_eq!(c.lineage.fields, vec![cut("detail"), cut("message")]);
         assert_eq!(codes(&c), vec!["field.truncated"]);
 
-        // Nested values are cut as their final JSON text, which may then
-        // no longer parse (human ruling, 2026-11-02): the prefix is kept.
         let c = canon_with(&[
             ("nest", json!({ "k": "n".repeat(MAX_RAW_CHARS) })),
             ("list", json!(["l".repeat(MAX_RAW_CHARS)])),
@@ -2468,13 +1869,10 @@ mod tests {
         );
         assert_eq!(codes(&c), vec!["field.truncated"]);
 
-        // Non-string values are not the cap's business.
         let c = canon_with(&[("count", json!(u64::MAX)), ("ok", json!(true))]);
         assert!(c.repairs.is_empty(), "{:?}", c.repairs);
     }
 
-    /// The cut runs after derivation, so a long `_time` proposal is read
-    /// whole and then consumed, never cut and confessed about.
     #[test]
     fn a_consumed_time_proposal_is_not_cut() {
         let long_time = format!("2025-12-31T23:00:00Z{}", " ".repeat(MAX_RAW_CHARS));
@@ -2487,13 +1885,8 @@ mod tests {
         assert!(c.repairs.is_empty(), "{:?}", c.repairs);
     }
 
-    // --- field-name bound (catalog key safety) ---
-
     #[test]
     fn overlong_field_name_is_dropped_not_fatal() {
-        // An unbounded key would be proposed as a catalog pin and overflow
-        // the `field_types.field` btree, retaining the batch for retry on
-        // every compaction tick forever.
         let long = "k".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1);
         let c = canon(&format!(
             r#"{{"service":"s","env":"prod","host":"h",
@@ -2502,7 +1895,6 @@ mod tests {
         assert!(!c.obj.contains_key(&long), "over-long key must not survive");
         assert_eq!(c.obj["ok"], "kept", "other fields are untouched");
         assert!(codes(&c).contains(&"field.name_too_long"));
-        // The value stays recoverable: `_raw` is captured before the drop.
         let raw = c.obj["_raw"].as_str().unwrap();
         assert!(raw.contains(&long), "dropped key must remain in _raw");
     }
@@ -2520,21 +1912,13 @@ mod tests {
 
     #[test]
     fn field_name_bound_counts_bytes_not_chars() {
-        // The constraint respected is postgres' byte-sized btree key limit,
-        // so a multi-byte name under the char count still has to fit.
         let multibyte = "é".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES / 2 + 1);
         assert!(multibyte.chars().count() <= trawl_core::schema::MAX_FIELD_NAME_BYTES);
         assert!(!trawl_core::schema::is_storable_field_name(&multibyte));
     }
 
-    // --- field-name ASCII case-folding (DuckDB folds ASCII case) ---
-
     #[test]
     fn exact_envelope_keys_cannot_be_shadowed_by_case_variants() {
-        // A case-variant of an envelope column names the same DuckDB
-        // column; when the exact spelling is present too, the exact one
-        // wins and the variant's value is dropped — anything else would let
-        // a sender holding `ingest` forge `_time`/`service`/`host`/etc.
         let c = canon(
             r#"{"service":"realsvc","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","_Time":"1999-01-01T00:00:00Z",
@@ -2560,16 +1944,12 @@ mod tests {
         assert_eq!(c.obj["host"], "h");
         assert_eq!(c.obj["env"], "prod");
         assert!(codes(&c).contains(&"field.name_case_collision"));
-        // Nothing is lost: the dropped keys stay findable in `_raw`.
         let raw = c.obj["_raw"].as_str().unwrap();
         assert!(raw.contains("spoofed"), "got: {raw}");
     }
 
     #[test]
     fn lone_case_variant_envelope_keys_fold_and_are_consumed_canonically() {
-        // With no exact counterpart, a case-variant is the field: `_Time`
-        // becomes the `_time` wire input, `Message` becomes `message`,
-        // `SEVERITY` joins the severity chain — one code path, one spelling.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_Time":"2025-12-31T23:00:00Z","Message":"m",
@@ -2593,7 +1973,6 @@ mod tests {
             !codes(&c).contains(&"time.from_ingest"),
             "the folded _Time is a valid time input, not a repair"
         );
-        // The original spellings stay findable in `_raw`.
         let raw = c.obj["_raw"].as_str().unwrap();
         assert!(raw.contains("Custom_Field"), "got: {raw}");
     }
@@ -2617,8 +1996,6 @@ mod tests {
 
     #[test]
     fn in_event_collision_keeps_the_exact_spelling_deterministically() {
-        // {"Status":200,"status":"ok"}: one DuckDB column, two values. The
-        // exact-lowercase spelling wins; the variant is dropped with a code.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","Status":200,"status":"ok"}"#,
@@ -2648,10 +2025,6 @@ mod tests {
 
     #[test]
     fn folding_is_ascii_only_and_lowercase_names_are_untouched() {
-        // Per-character ASCII lowercase is exactly DuckDB's identifier
-        // equivalence: `CAFÉ` folds to `cafÉ` (same DuckDB identifier),
-        // which stays distinct from an all-lowercase `café`. Names with no
-        // ASCII uppercase are untouched and record nothing.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","message":"m",
@@ -2677,8 +2050,6 @@ mod tests {
 
     #[test]
     fn folded_severity_inputs_join_the_derivation_chain() {
-        // `Severity` is `severity` and `LEVEL` is `level`: one spelling
-        // reaches the derivation, and both sources are stored verbatim.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","Severity":"error","LEVEL":"warn"}"#,
@@ -2711,8 +2082,6 @@ mod tests {
         assert_eq!(c.obj["_raw"], "<134>1 the wire line");
         assert!(codes(&c).contains(&"field.name_case_folded"));
     }
-
-    // --- _time grammar (the ADR-0008 corpus) ---
 
     #[test]
     fn time_valid_values_canonicalized() {
@@ -2795,12 +2164,6 @@ mod tests {
         }
     }
 
-    /// A parsed `_time` more than [`MAX_TIME_LEAD`] after arrival is
-    /// replaced by arrival time and flagged `time.ahead_of_arrival`
-    /// (ADR-0013, amendment of 2026-11-08); one at most that far ahead is
-    /// kept. The bound compares parsed instants, so a lead past it by a
-    /// nanosecond is replaced even though its microsecond spelling would
-    /// equal the bound.
     #[test]
     fn time_ahead_of_arrival_is_replaced_by_arrival() {
         for input in [
@@ -2829,8 +2192,6 @@ mod tests {
             assert_eq!(c.lineage.time, TimeSource::Field(0), "{input}");
         }
 
-        // A fractional arrival: the bound is measured from the instant,
-        // not from its whole second.
         let arrival = "2026-01-01T00:00:00.500000Z";
         let e = envs(&["prod"]);
         let ctx = EnvelopeContext {
@@ -2857,9 +2218,6 @@ mod tests {
         }
     }
 
-    /// `time.out_of_range` is past-only: a time more than ten years before
-    /// arrival is kept and flagged, and no future time earns it (a future
-    /// time is either within [`MAX_TIME_LEAD`] or replaced).
     #[test]
     fn time_out_of_range_flags_only_the_past() {
         for (input, kept) in [
@@ -2892,8 +2250,6 @@ mod tests {
 
     #[test]
     fn time_sources_are_read_in_precedence_order_and_kept() {
-        // _time wins over timestamp wins over @timestamp; only `_time` —
-        // the proposal slot — is consumed (ADR-0013 §2).
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-06-01T10:00:00Z",
@@ -2918,8 +2274,6 @@ mod tests {
         assert_eq!(c.obj["_time"], "2025-06-01T12:00:00.000000Z");
     }
 
-    // --- multiple repairs aggregate ---
-
     #[test]
     fn multiple_repairs_join_comma_separated() {
         let e = envs(&["prod"]);
@@ -2937,12 +2291,6 @@ mod tests {
         assert!(repairs.contains(','));
     }
 
-    // --- producer profiles (ADR-0013) ---
-    //
-    // The matrix above covers the HTTP door; these cover what a profile
-    // door adds on top of it.
-
-    /// A profile context: asserted identity plus the packaged derivation.
     fn profile_ctx<'a>(
         envs: &'a [String],
         producer: Producer<'a>,
@@ -2974,7 +2322,6 @@ mod tests {
         }
     }
 
-    /// Canonicalize a payload through a non-HTTP door.
     fn canon_profile(json: &str, producer: Producer<'_>) -> Canonical {
         let e = envs(&["prod", "lab"]);
         let d = default_derivation();
@@ -2983,8 +2330,6 @@ mod tests {
 
     #[test]
     fn every_door_stamps_its_own_producer() {
-        // One spelling, the one `ProducerKind` publishes, so a query and
-        // a metric label can never disagree about what to call a door.
         let http = canon(r#"{"service":"s","env":"prod","host":"h"}"#);
         assert_eq!(http.obj["_producer"], "http");
 
@@ -3002,9 +2347,6 @@ mod tests {
 
     #[test]
     fn an_incoming_producer_key_cannot_forge_the_column() {
-        // `_producer` is server-stamped, so a client's copy takes the
-        // standard reserved-prefix strip (ADR-0013 §5) and lands as a
-        // bare `producer` column — queryable, but not the envelope slot.
         let c = canon(r#"{"service":"s","env":"prod","host":"h","_producer":"syslog"}"#);
         assert_eq!(
             c.obj["_producer"], "http",
@@ -3017,8 +2359,6 @@ mod tests {
         assert!(codes(&c).contains(&"field.stamp_claimed"));
         assert!(!codes(&c).contains(&"field.reserved_prefix"));
 
-        // Same rule on a profile door, and the assertion order holds:
-        // the strip runs before the stamp, so the two never race.
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(r#"{"_PRODUCER":"http","msg":"x"}"#, Producer::Syslog(a));
         assert_eq!(c.obj["_producer"], "syslog");
@@ -3029,9 +2369,6 @@ mod tests {
 
     #[test]
     fn a_profile_assertion_beats_a_colliding_payload_key() {
-        // Telemetry's own `service`/`host` fields are ordinary sender
-        // vocabulary, with no `trawld_` prefix: identity is protected by
-        // precedence. The displaced values stay in `_raw`.
         let a = asserted("prod", "trawld", Some("box"), None, &[]);
         let c = canon_profile(
             r#"{"service":"nginx","host":"web01","env":"lab","message":"boom"}"#,
@@ -3042,7 +2379,6 @@ mod tests {
         assert_eq!(c.obj["host"], "box");
         assert_eq!(c.env, "prod");
         assert_eq!(c.obj["env"], "prod");
-        // `message: None` asserts nothing: the payload is the message.
         assert_eq!(c.obj["message"], "boom");
         assert!(codes(&c).contains(&"field.producer_asserted"));
         let raw = c.obj["_raw"].as_str().unwrap();
@@ -3056,8 +2392,6 @@ mod tests {
 
     #[test]
     fn an_identical_payload_value_is_not_a_collision() {
-        // A code on every well-formed frame would leave `_repairs` almost
-        // never null, and nothing was displaced: the sender agreed.
         let a = asserted("prod", "unifi", Some("gw"), Some("link down"), &[]);
         let c = canon_profile(
             r#"{"service":"unifi","host":"gw","env":"prod","message":"link down",
@@ -3070,11 +2404,6 @@ mod tests {
 
     #[test]
     fn trawld_never_lets_a_payload_field_claim_the_raw_lifeline() {
-        // `_raw` proposability is per-profile: HTTP and syslog have an
-        // original form trawl never saw, while trawld's payload is that
-        // original. Letting a tracing field claim the slot would make "a
-        // displaced value stays findable in `_raw`" false on the door that
-        // asserts identity hardest.
         let a = asserted("prod", "trawld", Some("box"), None, &[]);
         let c = canon_profile(
             r#"{"_raw":"a tracing field, not a wire line","service":"nginx","message":"boom"}"#,
@@ -3094,8 +2423,6 @@ mod tests {
             assert!(codes(&c).contains(&code), "missing {code}: {:?}", codes(&c));
         }
 
-        // On the other two doors a string `_raw` is the sender's own
-        // pre-parse line (or the listener's frame) verbatim.
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(r#"{"_raw":"<13>the frame","msg":"x"}"#, Producer::Syslog(a));
         assert_eq!(c.obj["_raw"], "<13>the frame");
@@ -3106,12 +2433,6 @@ mod tests {
 
     #[test]
     fn a_payload_null_in_an_asserted_slot_is_absence_not_a_collision() {
-        // An explicit null is what most serializers emit for an unset
-        // field. Reading it as a competing claim would put
-        // `field.producer_asserted` on a huge share of well-formed
-        // events, so null counts as absence in the collision judgement,
-        // and is still removed, because an optional envelope field is
-        // omitted, never written as JSON null (ADR-0009).
         let a = asserted("prod", "unifi", None, None, &[]);
         let c = canon_profile(
             r#"{"host":null,"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
@@ -3123,7 +2444,6 @@ mod tests {
         );
         assert_eq!(codes(&c), vec!["host.omitted"]);
 
-        // Same rule on a slot the profile does assert.
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(
             r#"{"host":null,"service":null,"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
@@ -3140,8 +2460,6 @@ mod tests {
 
     #[test]
     fn a_profile_with_no_honest_host_keeps_the_event_and_omits_it() {
-        // Absent but honest beats both the peer-fill lie and dropping the
-        // event, so a hostname-less frame behind a trusted relay lands.
         let a = asserted("prod", "unifi", None, None, &[]);
         let c = canon_profile(
             r#"{"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
@@ -3152,10 +2470,8 @@ mod tests {
             "host must be OMITTED, not null"
         );
         assert_eq!(codes(&c), vec!["host.omitted"]);
-        // Nothing peer-fills a profile door: there is no peer on it.
         assert!(!codes(&c).contains(&"host.from_peer"));
 
-        // And a payload key cannot supply what the profile denied.
         let a = asserted("prod", "unifi", None, None, &[]);
         let c = canon_profile(
             r#"{"host":"whatever","_time":"2025-12-31T23:00:00Z"}"#,
@@ -3168,9 +2484,6 @@ mod tests {
 
     #[test]
     fn producer_contributed_codes_lead_the_repairs_list() {
-        // Producers contribute codes; only the door assembles `_repairs`.
-        // The producer's own codes describe what happened before the door,
-        // so they come first.
         let a = asserted(
             "prod",
             "syslog",
@@ -3188,9 +2501,6 @@ mod tests {
 
     #[test]
     fn a_profile_never_defaults_its_env() {
-        // Env comes from boot-validated config, so `env.defaulted` is
-        // structurally unreachable on a profile door, even when the payload
-        // carries no env at all.
         let a = asserted("lab", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(
             r#"{"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
@@ -3202,8 +2512,6 @@ mod tests {
 
     #[test]
     fn a_profile_faces_every_universal_gate() {
-        // No profile bypasses the fold, the strip, the name-length drop,
-        // the nested stringify or the `_raw` cap.
         let long = "k".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1);
         let payload = format!(
             r#"{{"_HOSTNAME":"box","Dur":12,"nest":{{"a":1}},"{long}":"x",
@@ -3233,9 +2541,6 @@ mod tests {
 
     #[test]
     fn an_invalid_asserted_service_rejects_through_the_doors_own_validator() {
-        // Step 2.5 stamps the assertion into the same slot the validator
-        // reads, so a profile gets exactly the HTTP door's checks. The
-        // caller counts the drop; the door only refuses.
         let e = envs(&["prod"]);
         let d = default_derivation();
         let a = asserted("prod", "../escaped", Some("gw"), None, &[]);
@@ -3247,20 +2552,13 @@ mod tests {
         assert_eq!(reason, RejectReason::InvalidChars);
     }
 
-    // --- per-profile derivation (ADR-0013) ---
-
     #[test]
     fn the_syslog_profile_derives_severity_from_its_own_artifact() {
-        // The listener writes no `_severity`. It publishes the raw 0-7
-        // numeral and the profile's fixed source inverts it: syslog 3 (err)
-        // is OTel 17, not OTel 3 (trace3).
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(r#"{"syslog_severity":3}"#, Producer::Syslog(a));
         assert_eq!(c.obj["_severity"], 17);
         assert_eq!(c.obj["syslog_severity"], 3, "the artifact stays queryable");
 
-        // The very same value on the HTTP door reads as OTel, because
-        // nothing there proves the provenance (ADR-0013 §4).
         let c = canon(r#"{"service":"s","env":"prod","host":"h","syslog_severity":3}"#);
         assert!(
             !c.obj.contains_key("_severity"),
@@ -3281,9 +2579,6 @@ mod tests {
             "derivation observes; the artifact stays"
         );
 
-        // An omitted artifact (no frame timestamp, or an unparseable one)
-        // falls through the configured chain honestly — no listener-side
-        // `now()` substitution can hide behind it.
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(r#"{"msg":"x"}"#, Producer::Syslog(a));
         assert_eq!(c.obj["_time"], ARRIVAL);
@@ -3292,9 +2587,6 @@ mod tests {
 
     #[test]
     fn a_syslog_over_http_forwarder_inverts_through_the_configured_dialect() {
-        // The native listener and a collector forwarding syslog over HTTP
-        // reach the same mechanism: configure the artifact as a
-        // syslog-dialect source and the HTTP door inverts it too.
         let derivation = Derivation::resolve(&trawl_config::IngestConfig {
             severity_from: vec![
                 trawl_config::DerivationSourceSpec::Typed {
@@ -3324,8 +2616,6 @@ mod tests {
         assert_eq!(c.obj["_severity"], 17, "syslog 3 is err, which is OTel 17");
         assert_eq!(c.obj["_producer"], "http");
 
-        // Precedence is the configured order, and the lower-priority
-        // source is still read when the first does not map.
         let c = canonicalize(
             &event(
                 r#"{"service":"rsyslog","env":"prod","host":"relay",
@@ -3366,15 +2656,11 @@ mod tests {
             "no source was CONSULTED, so nothing was unmapped"
         );
 
-        // The syslog profile's fixed source is trawl's, not the
-        // operator's, and survives an empty configured list.
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let ctx = profile_ctx(&e, Producer::Syslog(a), &derivation);
         let c = canonicalize(&event(r#"{"syslog_severity":4}"#), &ctx).unwrap();
         assert_eq!(c.obj["_severity"], 13, "syslog 4 is warning, OTel 13");
     }
-
-    // --- lineage (ADR-0049): each decision records itself ---
 
     fn change(field: &str, kind: FieldChangeKind, code: Option<RepairCode>) -> FieldChange {
         FieldChange {
@@ -3388,14 +2674,11 @@ mod tests {
         FieldChangeKind::Renamed { to: to.to_owned() }
     }
 
-    /// The position of `field` in the HTTP door's default `time_from` list.
     fn time_at(field: &str) -> usize {
         let sources = default_derivation().time_from(producer::ProducerKind::Http);
         sources.iter().position(|s| s.field == field).unwrap()
     }
 
-    /// The position of `field` in the HTTP door's default `severity_from`
-    /// list.
     fn severity_at(field: &str) -> usize {
         let sources = default_derivation().severity_from(producer::ProducerKind::Http);
         sources.iter().position(|s| s.field == field).unwrap()
@@ -3418,8 +2701,6 @@ mod tests {
 
     #[test]
     fn time_lineage_names_a_first_present_but_invalid_source() {
-        // `_time` claims the derivation and fails; the valid `timestamp`
-        // below it is never reached, and the lineage says which input lost.
         let c = canon(r#"{"service":"s","_time":"garbage","timestamp":"2025-12-31T23:00:00Z"}"#);
         assert_eq!(
             c.lineage.time,
@@ -3430,7 +2711,6 @@ mod tests {
         assert_eq!(c.obj["_time"], ARRIVAL);
         assert!(codes(&c).contains(&"time.unparseable"));
 
-        // A present JSON null claims precedence the same way.
         let c = canon(r#"{"service":"s","_time":null,"timestamp":"2025-12-31T23:00:00Z"}"#);
         assert_eq!(
             c.lineage.time,
@@ -3460,7 +2740,6 @@ mod tests {
         assert_eq!(c.obj["_severity"], 13);
         assert!(!c.severity_unmapped());
 
-        // The preview names the positions through the same derivation.
         let SeveritySource::Field {
             index,
             skipped_unmappable,
@@ -3476,7 +2755,6 @@ mod tests {
             ["severity", "severity_text"]
         );
 
-        // The first source mapping skips nothing.
         let c = canon(r#"{"service":"s","severity":17,"level":"debug"}"#);
         assert_eq!(
             c.lineage.severity,
@@ -3506,8 +2784,6 @@ mod tests {
 
     #[test]
     fn case_fold_collision_drops_the_loser_and_keeps_the_exact_spelling() {
-        // The exact spelling wins untouched, so it earns no entry; the
-        // variant is the dropped loser.
         let c = canon(r#"{"service":"s","FOO":1,"foo":2}"#);
         assert_eq!(
             c.lineage.fields,
@@ -3519,8 +2795,6 @@ mod tests {
         );
         assert_eq!(c.obj["foo"], 2);
 
-        // Variants only: the lexicographically first is folded (the
-        // winner's rename), the other dropped.
         let c = canon(r#"{"service":"s","Foo":1,"FOO":2}"#);
         assert_eq!(
             c.lineage.fields,
@@ -3542,13 +2816,11 @@ mod tests {
         assert_eq!(
             c.lineage.fields,
             vec![
-                // Step 0: the fold sees the arriving spelling.
                 change(
                     "_HOSTNAME",
                     renamed("_hostname"),
                     Some(RepairCode::FieldNameCaseFolded)
                 ),
-                // Step 2: the strip sees folded names, in map order.
                 change(
                     "_",
                     FieldChangeKind::Dropped,
@@ -3612,8 +2884,6 @@ mod tests {
 
     #[test]
     fn producer_assertions_record_each_displaced_payload_value() {
-        // Overwritten and emptied slots are both drops: the payload's
-        // value is gone from the event (it stays in `_raw`).
         let a = asserted("prod", "trawld", None, Some("asserted"), &[]);
         let c = canon_profile(
             r#"{"service":"nginx","host":"web01","env":"lab","message":"boom"}"#,
@@ -3639,7 +2909,6 @@ mod tests {
         assert_eq!(c.obj["env"], "prod");
         assert!(!c.obj.contains_key("host"));
 
-        // An identical value or a null displaces nothing.
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(
             r#"{"service":"unifi","host":null,"env":"lab","msg":"x"}"#,
@@ -3651,7 +2920,6 @@ mod tests {
     #[test]
     fn host_absent_is_reported_on_accepted_events() {
         assert!(!canon(r#"{"service":"s","host":"h"}"#).host_absent);
-        // A stripped `_host` lands on the bare slot before the check.
         assert!(!canon(r#"{"service":"s","_host":"h"}"#).host_absent);
 
         let filled = canon(r#"{"service":"s"}"#);
@@ -3659,7 +2927,6 @@ mod tests {
         assert_eq!(filled.obj["host"], "10.0.4.55");
         assert!(canon(r#"{"service":"s","host":null}"#).host_absent);
 
-        // A profile door's omitted host is absent too.
         let a = asserted("prod", "unifi", None, None, &[]);
         assert!(canon_profile(r#"{"msg":"x"}"#, Producer::Syslog(a)).host_absent);
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
@@ -3671,8 +2938,6 @@ mod tests {
         let e = envs(&["prod", "lab"]);
         let ctx = ctx_with(&e, false);
 
-        // Service validation refuses before the host is decided, and the
-        // rejection still says whether the host was there.
         let r = canonicalize(&event(r#"{"msg":"x"}"#), &ctx).unwrap_err();
         assert_eq!(r.reason, RejectReason::MissingService);
         assert!(r.host_absent);
@@ -3767,11 +3032,6 @@ mod tests {
         }
     }
 
-    /// Every trawl-owned `_` name declares exactly one class (ADR-0013,
-    /// 2026-10-14 amendment): a slot the sender may propose, a
-    /// derivation-only slot, or a stamp name. The inventory is the stored
-    /// envelope plus compaction's provenance column, so a new `_` slot in
-    /// either fails here until it is declared.
     #[test]
     fn every_reserved_slot_declares_its_class() {
         use trawl_core::schema::{DERIVATION_ONLY_NAMES, ENVELOPE_TYPES, STAMP_NAMES, WAL_FILE};
@@ -3828,8 +3088,6 @@ mod tests {
                     || (code == RepairCode::FieldStampClaimed && stamp)))
     }
 
-    /// Each time repair code appears exactly when the time lineage records
-    /// the decision that earns it.
     fn assert_time_lineage_agrees(label: &str, c: &Canonical) {
         let time = &c.lineage.time;
         for (code, decided) in [
@@ -3891,8 +3149,6 @@ mod tests {
             format!(r#"{{"service":"s","_raw":"line","message":"{long_raw}"}}"#),
             format!(r#"{{"Service":"s","_X":{{"a":1}},"{long_name}":1,"_raw":"{long_raw}"}}"#),
         ];
-        // Profile doors: displaced and emptied asserted slots, plus an
-        // identical value and a null that displace nothing.
         let trawld = asserted("prod", "trawld", Some("box"), None, &[]);
         let syslog = asserted("prod", "unifi", Some("gw"), Some("link down"), &[]);
         let hostless = asserted("prod", "unifi", None, None, &[]);

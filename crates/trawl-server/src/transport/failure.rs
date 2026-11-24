@@ -4,28 +4,6 @@
 
 //! The failure observer: one `http_failure` event for every server 5xx,
 //! naming its request, route, stage and cause (ADR-0040).
-//!
-//! The observer does not learn any of that from the response, and not from
-//! the request span either. A panic unwinds past every layer that would have
-//! stamped a response, [`normalize_auth_errors`] replaces responses, and span
-//! inheritance is the carrier that failed on the homelab. Instead the
-//! observer creates a [`RequestRecord`] at entry, scopes it as a task-local
-//! around the rest of the request, and inner layers write to it as the
-//! request passes them:
-//!
-//! - [`rate_limit_middleware`] records that the request was metered, and
-//!   for which key;
-//! - [`mark_handler`] records that routing reached the handler;
-//! - the query, export and stream handlers record their `query_id`;
-//! - [`ServerError`]'s response and the panic catcher record the class and
-//!   cause kind of what failed.
-//!
-//! When the response is a 5xx, the observer reads that record and the final
-//! status, and nothing else. It never reads error text: display text can
-//! hold generated SQL, event values, the caller's DSL and file paths.
-//!
-//! [`normalize_auth_errors`]: crate::policy::normalize_auth_errors
-//! [`rate_limit_middleware`]: crate::rate_limit::rate_limit_middleware
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -40,51 +18,24 @@ use axum::response::Response;
 use super::http::RequestId;
 use crate::error::{CauseKind, ServerError};
 
-/// Target of the failure events for requests a per-key rate limiter
-/// metered. They persist: the limiter already bounds how many one client
-/// can cause.
 pub const FAILURE_TARGET: &str = "trawl_server::transport::failure";
 
-/// Target of the failure events for requests no limiter metered: a server
-/// fault before any key was checked, or on a route without a limiter
-/// (`/api/v1/health`, `/metrics`). They carry `peer_addr`, the only lead
-/// when no key is known. A client the limiter cannot slow must get no
-/// durable-write amplifier out of them, so the WAL layer persists them only
-/// under the process-wide
-/// [`UNMETERED_FAILURE_CAP_PER_MINUTE`](crate::telemetry::UNMETERED_FAILURE_CAP_PER_MINUTE);
-/// past it they reach stdout only (ADR-0040).
 pub const UNMETERED_FAILURE_TARGET: &str = "trawl_server::transport::failure::unmetered";
 
-/// The `route` a failure event carries when no route matched. Never the raw
-/// path, which is the caller's text.
 pub const UNMATCHED_ROUTE: &str = "<unmatched>";
 
-/// How far a failed request got, and what was recorded about its failure.
-///
-/// A closed set of literals, safe to persist beside the class and the
-/// cause kind. Read off the [`RequestRecord`], never off the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FailureStage {
-    /// A failure was recorded before any rate limiter admitted the request:
-    /// the auth backend was down, say.
     PreAdmission,
-    /// A failure was recorded after the rate limiter admitted the request,
-    /// and before the handler was reached.
     Admitted,
-    /// The handler was reached and returned a typed error.
     HandlerError,
     /// A panic was caught: by the outer panic catcher, or by the pool's own
     /// catch on a blocking worker.
     Panicked,
-    /// The response is a 5xx, but its producer recorded nothing. The event
-    /// still names the request and the route, and carries `reached`, the
-    /// furthest [`Progress`] mark the request passed; the producer is the
-    /// thing to fix.
     Unrecorded,
 }
 
 impl FailureStage {
-    /// Every stage, for closed-set checks and for consumers that enumerate.
     pub const ALL: [Self; 5] = [
         Self::PreAdmission,
         Self::Admitted,
@@ -93,7 +44,6 @@ impl FailureStage {
         Self::Unrecorded,
     ];
 
-    /// The fixed `snake_case` literal this stage is recorded as.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -106,27 +56,17 @@ impl FailureStage {
     }
 }
 
-/// How far a request has got. Only ever moves forward.
-///
-/// A closed set of literals. A [`FailureStage::Unrecorded`] event carries
-/// it as `reached`: its producer recorded nothing, so how far the request
-/// got is the only lead to that producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Progress {
-    /// No rate limiter has admitted the request yet.
     PreAdmission = 0,
-    /// A rate limiter admitted the request for a verified key.
     Admitted = 1,
-    /// Routing reached the handler.
     Handler = 2,
 }
 
 impl Progress {
-    /// Every mark, for closed-set checks and for consumers that enumerate.
     pub const ALL: [Self; 3] = [Self::PreAdmission, Self::Admitted, Self::Handler];
 
-    /// The fixed `snake_case` literal this mark is recorded as.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -144,7 +84,6 @@ impl Progress {
         }
     }
 
-    /// The stage a failure recorded at this point is reported as.
     const fn failure_stage(self) -> FailureStage {
         match self {
             Self::PreAdmission => FailureStage::PreAdmission,
@@ -154,8 +93,6 @@ impl Progress {
     }
 }
 
-/// A failure's class and cause kind, and how far the request had got when
-/// it was recorded.
 #[derive(Debug, Clone, Copy)]
 struct Recorded {
     class: &'static str,
@@ -163,17 +100,9 @@ struct Recorded {
     at: Progress,
 }
 
-/// What the layers a request passes have recorded about it.
-///
-/// Created by [`failure_observer`] at entry and reachable only through the
-/// task-local the observer scopes around the rest of the request, which is
-/// how the producers below write to it. Every field holds a closed-set
-/// literal or a number, never text from the request or from an error.
 #[derive(Debug)]
 pub struct RequestRecord {
     progress: AtomicU8,
-    /// The key a rate limiter metered this request against. Set means
-    /// metered.
     key_id: OnceLock<i64>,
     query_id: OnceLock<u64>,
     failure: parking_lot::Mutex<Option<Recorded>>,
@@ -187,7 +116,6 @@ impl Default for RequestRecord {
 }
 
 impl RequestRecord {
-    /// A record for a request nothing has admitted or failed yet.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -207,13 +135,11 @@ impl RequestRecord {
         Progress::from_u8(self.progress.load(Ordering::Acquire))
     }
 
-    /// Whether a rate limiter metered this request.
     #[must_use]
     pub fn metered(&self) -> bool {
         self.key_id.get().is_some()
     }
 
-    /// The stage a failure of this request is reported as.
     #[must_use]
     pub fn stage(&self) -> FailureStage {
         if self.panicked.load(Ordering::Acquire) {
@@ -225,7 +151,6 @@ impl RequestRecord {
         })
     }
 
-    /// The recorded class, and the cause kind beneath it.
     fn cause(&self) -> Option<(&'static str, CauseKind)> {
         if self.panicked.load(Ordering::Acquire) {
             return Some(("panic", CauseKind::None));
@@ -241,19 +166,13 @@ impl RequestRecord {
 }
 
 tokio::task_local! {
-    /// The record of the request this task is serving, when a
-    /// [`failure_observer`] is serving it.
     static RECORD: Arc<RequestRecord>;
 }
 
-/// Run `f` on the current request's record. A no-op outside a request the
-/// observer serves: a background task, a unit test, a spawned task.
 fn with_record(f: impl FnOnce(&RequestRecord)) {
     let _ = RECORD.try_with(|record| f(record));
 }
 
-/// Record that a rate limiter admitted this request for `key_id`.
-///
 /// Called for every verified key the limiter lets through, a key whose
 /// limit is disabled (`rpm` 0) included: the operator chose to lift that
 /// bound, and the request still passed the limiter.
@@ -264,18 +183,12 @@ pub(crate) fn record_metered(key_id: i64) {
     });
 }
 
-/// Record the `query_id` this request allocated.
 pub(crate) fn record_query_id(query_id: u64) {
     with_record(|record| {
         let _ = record.query_id.set(query_id);
     });
 }
 
-/// Record the class and cause kind of the error this request answers with.
-///
-/// Called from [`ServerError`]'s response, for every status: the observer
-/// only reads it when the final status is a 5xx. A [`ServerError::Panicked`]
-/// records the panic stage.
 pub(crate) fn record_error(err: &ServerError) {
     with_record(|record| {
         if matches!(err, ServerError::Panicked(_)) {
@@ -291,13 +204,10 @@ pub(crate) fn record_class(class: &'static str, cause: CauseKind) {
     with_record(|record| record.record_failure(class, cause));
 }
 
-/// Record that the outer panic catcher caught a panic.
 pub(crate) fn record_panic() {
     with_record(|record| record.panicked.store(true, Ordering::Release));
 }
 
-/// Axum middleware: record that routing reached the handler.
-///
 /// Mounted with `route_layer` innermost on every router, so it runs after
 /// authentication and rate limiting and directly before the handler's
 /// extractors. A failure recorded from here on is the handler's.
@@ -323,7 +233,6 @@ fn method_label(method: &Method) -> &'static str {
     }
 }
 
-/// Everything one failure event carries.
 struct Failure {
     request_id: String,
     method: &'static str,
@@ -331,7 +240,6 @@ struct Failure {
     status: u16,
     latency_ms: u64,
     stage: &'static str,
-    /// How far the request got, on an unrecorded failure only.
     reached: Option<&'static str>,
     error_class: &'static str,
     cause_kind: &'static str,
@@ -340,8 +248,6 @@ struct Failure {
     peer_addr: Option<SocketAddr>,
 }
 
-/// Axum middleware: emit one `http_failure` for every 5xx response.
-///
 /// Mounted between `request_id_middleware` and the `TraceLayer`, so the
 /// request id already exists and every other layer, the panic catcher,
 /// authentication, the rate limiter and the handlers, runs inside the
@@ -388,14 +294,11 @@ pub async fn failure_observer(request: Request, next: Next) -> Response {
     response
 }
 
-/// Whether a 5xx is an expected pressure outcome (ADR-0024) and so logs at
-/// WARN. Every other 5xx is the server's own failure and logs at ERROR.
 const fn is_pressure(status: u16) -> bool {
     status == StatusCode::SERVICE_UNAVAILABLE.as_u16()
         || status == StatusCode::GATEWAY_TIMEOUT.as_u16()
 }
 
-/// The one emitter. Each call site differs only in level and target;
 /// `parent: None` keeps every field explicit, so the event inherits no
 /// span's path or user agent.
 fn emit(f: &Failure) {

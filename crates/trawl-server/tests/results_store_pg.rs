@@ -3,10 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Postgres tests for the captured-result metadata store (ADR-0057).
-//!
-//! Plain `#[sqlx::test]` applies `crates/trawl-server/migrations/` to each
-//! per-test database. Every case runs against a fixed `NOW`, which the store
-//! takes as a parameter: nothing here depends on the wall clock.
 
 use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use sqlx::PgPool;
@@ -29,8 +25,6 @@ fn id(n: u32) -> String {
     format!("{n:032x}")
 }
 
-/// A live, temporary, one-column capture made `age` before `now()` by
-/// `key_id`, expiring 15 minutes after it was made.
 fn capture(n: u32, key_id: i64, age: Duration, file_bytes: u64) -> NewCapture {
     let created_at = now() - age;
     NewCapture {
@@ -75,13 +69,11 @@ async fn insert(store: &ResultsStore, row: &NewCapture) {
     assert_eq!(store.insert(row).await.unwrap(), CaptureInsert::Inserted);
 }
 
-/// The investigation [`keep`] attaches rows to.
 fn investigation_id() -> InvestigationId {
     InvestigationId::parse("feedfacefeedfacefeedfacefeedface").unwrap()
 }
 
-/// Keep a row for [`investigation_id`], creating that investigation on
-/// first use. Written directly, so a row of any age or owner can be kept;
+/// Written directly, so a row of any age or owner can be kept;
 /// `promote` and its conditions have their own tests.
 async fn keep(pool: &PgPool, id: &str) {
     let created = InvestigationStore::new(pool.clone())
@@ -123,7 +115,6 @@ async fn state_of(pool: &PgPool, id: &str) -> (String, Option<DateTime<Utc>>) {
         .unwrap()
 }
 
-/// The constraint a refused insert names.
 fn violated(err: StoreError) -> String {
     match err {
         StoreError::Unavailable(sqlx::Error::Database(db)) => {
@@ -167,7 +158,6 @@ async fn insert_and_get_round_trip_every_column(pool: PgPool) {
     row.captured_rows = 5000;
     row.total_rows = 20_000;
     row.digest = Some(*b"0123456789abcdef0123456789abcdef");
-    // Microsecond precision survives every timestamp column.
     let micros = Duration::microseconds(250_001);
     row.created_at += micros;
     row.expires_at += micros;
@@ -215,8 +205,6 @@ async fn insert_and_get_round_trip_every_column(pool: PgPool) {
     assert_eq!(wire.column_facts, row.column_facts);
 }
 
-/// A stored source has no bounds, and a capture with no columns has no
-/// file (D3): both read back as absent, and a kept row has no deadline.
 #[sqlx::test]
 async fn a_stored_zero_column_capture_round_trips_without_bounds_or_file(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -284,7 +272,6 @@ async fn get_answers_only_the_owner(pool: PgPool) {
     assert_eq!(store.get(&id(5), 7).await.unwrap(), None);
 }
 
-/// `get` answers every state, so the service can tell gone from absent.
 #[sqlx::test]
 async fn get_answers_a_row_in_any_state(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -296,8 +283,6 @@ async fn get_answers_a_row_in_any_state(pool: PgPool) {
     assert_eq!(got.to_wire().state, ResultState::Expired);
 }
 
-/// The list is the owner's temporary recovery list: a kept result is
-/// reached through its investigation.
 #[sqlx::test]
 async fn list_is_newest_first_and_live_temporary_only(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -337,7 +322,6 @@ async fn mark_expired_sets_gone_at_to_the_deadline_and_is_idempotent(pool: PgPoo
         ("expired".to_owned(), Some(due.expires_at))
     );
     assert!(!store.mark_expired(&due.id, now()).await.unwrap());
-    // A later call does not move the tombstone clock.
     assert!(
         !store
             .mark_expired(&due.id, now() + Duration::hours(1))
@@ -346,7 +330,6 @@ async fn mark_expired_sets_gone_at_to_the_deadline_and_is_idempotent(pool: PgPoo
     );
     assert_eq!(state_of(&pool, &due.id).await.1, Some(due.expires_at));
 
-    // A result inside its deadline is never retired early.
     assert!(!store.mark_expired(&live.id, now()).await.unwrap());
     assert_eq!(
         state_of(&pool, &live.id).await,
@@ -417,8 +400,6 @@ async fn delete_tombstones_removes_only_rows_gone_by_the_cutoff(pool: PgPool) {
     assert_eq!(store.delete_tombstones(cutoff).await.unwrap(), 0);
 }
 
-/// Usage is what the capture quotas count: live temporary rows only. A
-/// kept row is evidence and counts against the evidence budget instead.
 #[sqlx::test]
 async fn usage_counts_live_temporary_rows_only(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -462,7 +443,6 @@ async fn usage_counts_live_temporary_rows_only(pool: PgPool) {
             bytes: 3300
         }
     );
-    // An hour on, no temporary row is live, and the kept one never counts.
     let later = now() + Duration::hours(1);
     assert_eq!(
         store.installation_usage(later).await.unwrap(),
@@ -494,8 +474,6 @@ async fn earliest_expiry_names_the_first_live_temporary_deadline(pool: PgPool) {
         store.installation_earliest_expiry(now()).await.unwrap(),
         Some(other.expires_at)
     );
-    // Key 9 holds nothing; key 7 holds only its kept row, which has no
-    // deadline, once both temporary rows are due.
     assert_eq!(store.earliest_expiry(9, now()).await.unwrap(), None);
     let later = now() + Duration::minutes(14);
     assert_eq!(store.earliest_expiry(7, later).await.unwrap(), None);
@@ -587,7 +565,6 @@ async fn prune_oldest_stops_when_the_result_count_fits(pool: PgPool) {
     }
     assert_eq!(state_of(&pool, &other.id).await.0, "temporary");
     assert_eq!(store.usage(7, now()).await.unwrap().results, 2);
-    // Already inside the limits: nothing more goes.
     assert!(
         store
             .prune_oldest(7, 2, u64::MAX, now())
@@ -630,7 +607,6 @@ async fn prune_oldest_stops_when_the_bytes_fit(pool: PgPool) {
     );
 }
 
-/// Kept rows and rows past their deadline are neither counted nor pruned.
 #[sqlx::test]
 async fn prune_oldest_never_counts_or_prunes_kept_or_due_rows(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -658,8 +634,6 @@ async fn prune_oldest_never_counts_or_prunes_kept_or_due_rows(pool: PgPool) {
     assert_eq!(store.usage(7, now()).await.unwrap(), Usage::default());
 }
 
-/// Boot walks the keys holding live temporary results for the per-key
-/// quota pass: a kept, past-deadline or expired row does not count.
 #[sqlx::test]
 async fn live_keys_names_each_key_holding_a_live_result_once(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -680,9 +654,6 @@ async fn live_keys_names_each_key_holding_a_live_result_once(pool: PgPool) {
     assert_eq!(store.live_keys(now()).await.unwrap(), [7, 9]);
 }
 
-/// The installation prune takes the oldest temporary rows across keys
-/// until both installation limits fit, and neither counts nor touches
-/// kept rows.
 #[sqlx::test]
 async fn prune_oldest_installation_prunes_across_keys_until_both_limits_fit(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -773,8 +744,6 @@ async fn an_id_that_is_not_32_lowercase_hex_digits_is_refused(pool: PgPool) {
     }
 }
 
-/// A row whose metadata does not decode is a store error naming the
-/// column, never a panic.
 #[sqlx::test]
 async fn corrupt_metadata_is_an_error_not_a_panic(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -799,7 +768,6 @@ async fn corrupt_metadata_is_an_error_not_a_panic(pool: PgPool) {
     }
 }
 
-/// The facts of a sightings read over `literal`, enough to round-trip.
 fn sightings(literal: &str) -> Correlation {
     Correlation::Sightings(SightingsFacts {
         literal: literal.to_owned(),
@@ -827,9 +795,7 @@ fn sightings(literal: &str) -> Correlation {
     })
 }
 
-/// A correlation read's kind and facts round-trip through insert, get and
-/// list to the wire. The facts are TEXT, so a literal holding U+0000
-/// commits like any other; a search reads back as a search with no facts.
+/// The facts are TEXT, so a literal holding U+0000 commits like any other.
 #[sqlx::test]
 async fn a_correlation_capture_round_trips_its_kind_and_facts(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -865,10 +831,6 @@ async fn a_correlation_capture_round_trips_its_kind_and_facts(pool: PgPool) {
     assert!(spelled.get("kind").is_none() && spelled.get("correlation").is_none());
 }
 
-/// A capture's facts document counts in its bytes: the row records its
-/// length as `metadata_bytes`, the key's and the installation's usage add
-/// it to `file_bytes`, and the prune counts both. The file's size stays
-/// what it is.
 #[sqlx::test]
 async fn usage_and_the_prune_count_the_facts_document(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -917,8 +879,6 @@ async fn usage_and_the_prune_count_the_facts_document(pool: PgPool) {
     );
 }
 
-/// Every kind the wire names is one the table takes, and the table refuses
-/// any other under its named constraint.
 #[sqlx::test]
 async fn every_capture_kind_is_stored_and_no_other(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -953,8 +913,6 @@ async fn every_capture_kind_is_stored_and_no_other(pool: PgPool) {
     );
 }
 
-/// Stored facts that no longer decode are a store error naming the column,
-/// never a panic.
 #[sqlx::test]
 async fn corrupt_correlation_facts_are_an_error_not_a_panic(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -983,8 +941,6 @@ async fn corrupt_correlation_facts_are_an_error_not_a_panic(pool: PgPool) {
     }
 }
 
-/// A sightings capture `n` of key 7 made `age` before `now()`, with a file
-/// of `file_bytes` and its facts document.
 fn correlated(n: u32, age: Duration, file_bytes: u64) -> NewCapture {
     NewCapture {
         kind: CaptureKind::Sightings,
@@ -993,7 +949,6 @@ fn correlated(n: u32, age: Duration, file_bytes: u64) -> NewCapture {
     }
 }
 
-/// The stored facts text and `metadata_bytes` of row `id`.
 async fn facts_of(pool: &PgPool, id: &str) -> (Option<String>, i64) {
     sqlx::query_as("SELECT correlation, metadata_bytes FROM captured_results WHERE id = $1")
         .bind(id)
@@ -1002,9 +957,6 @@ async fn facts_of(pool: &PgPool, id: &str) -> (Option<String>, i64) {
         .unwrap()
 }
 
-/// A read's expiry drops the facts document with the file: the row stays
-/// an expired sightings result, its tombstone clock at the deadline, with
-/// no facts stored or counted.
 #[sqlx::test]
 async fn mark_expired_drops_the_facts_document(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -1022,8 +974,6 @@ async fn mark_expired_drops_the_facts_document(pool: PgPool) {
     assert_eq!(row.gone_at, Some(due.expires_at));
 }
 
-/// The sweep's expiry drops the facts document with the file and answers
-/// the file's own size to unlink; a live result keeps its facts.
 #[sqlx::test]
 async fn expire_due_drops_the_facts_document(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -1062,8 +1012,6 @@ async fn expire_due_drops_the_facts_document(pool: PgPool) {
     );
 }
 
-/// The quota prune drops the facts document of each result it prunes, and
-/// usage falls by the file and the facts together.
 #[sqlx::test]
 async fn the_quota_prune_drops_the_facts_document(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -1104,8 +1052,6 @@ async fn the_quota_prune_drops_the_facts_document(pool: PgPool) {
     );
 }
 
-/// The evidence prune drops the facts document of each kept result it
-/// prunes; the row stays with its investigation, pruned.
 #[sqlx::test]
 async fn the_evidence_prune_drops_the_facts_document(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());

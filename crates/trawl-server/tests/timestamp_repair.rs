@@ -2,15 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end tests for malformed-time handling (ADR-0008): every bad-time
-//! variant ingests through the real handler, is queryable from the hot
-//! buffer, compacts to parquet without wedging, and stays queryable, with
-//! `_time` set to the arrival time, the original value findable in `_raw`,
-//! and `_repairs` naming why (ADR-0013, 2026-10-14 amendment):
-//! `time.unparseable` when the first present source failed to parse, a
-//! JSON `null` included, and `time.from_ingest` when no source was
-//! present. Canonicalization of a valid timestamp is covered at the API
-//! level too.
+//! End-to-end tests for malformed-time handling (ADR-0008).
 
 mod common;
 
@@ -31,13 +23,8 @@ fn first_row_string(result: &trawl_api::value::QueryResult, column: &str) -> Opt
     }
 }
 
-/// The four unparseable trigger variants, a `_time: null` that hides a
-/// valid `timestamp`, and an event with no time source at all: ingested
-/// via the handler, visible in the hot buffer, compacted without errors,
-/// and returned by a `last=1h` query afterwards — original preserved,
-/// timestamp at arrival, and the code telling the two causes apart.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+#[allow(clippy::too_many_lines)]
 async fn trigger_variants_survive_ingest_compact_query() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
@@ -47,7 +34,6 @@ async fn trigger_variants_survive_ingest_compact_query() {
     let data_path = data_dir.to_str().unwrap().to_owned();
 
     let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
-    // Leak the tempdir so it survives the server (cleaned up by OS).
     std::mem::forget(tmp);
 
     let ingest_client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
@@ -79,7 +65,6 @@ async fn trigger_variants_survive_ingest_compact_query() {
             "time.unparseable",
             r#""_time":null"#,
         ),
-        // No source at all.
         (json!({}), "time.from_ingest", "variant 5"),
     ];
 
@@ -101,7 +86,6 @@ async fn trigger_variants_survive_ingest_compact_query() {
     }
     let after_ingest = chrono::Utc::now() + chrono::Duration::minutes(1);
 
-    // Phase 1: hot buffer, visible to a last=1h query before compaction.
     for (i, (bad, code, preserved)) in variants.iter().enumerate() {
         let result = query_client
             .query_paginated(&format!("service=svc{i} last=1h"), None, None)
@@ -125,7 +109,6 @@ async fn trigger_variants_survive_ingest_compact_query() {
         );
     }
 
-    // Phase 2: compaction tick over the server's WAL — no errors, WAL drains.
     let hot_buffer = server
         .state
         .query
@@ -154,8 +137,6 @@ async fn trigger_variants_survive_ingest_compact_query() {
         .collect();
     assert!(leftover.is_empty(), "WAL directory must be empty");
 
-    // Phase 3: parquet — still returned by a last=1h query, original still
-    // preserved, timestamp at arrival time.
     for (i, (bad, code, preserved)) in variants.iter().enumerate() {
         let result = query_client
             .query_paginated(&format!("service=svc{i} last=1h"), None, None)
@@ -179,7 +160,6 @@ async fn trigger_variants_survive_ingest_compact_query() {
         );
         let ts = first_row_string(&result.result, "_time")
             .unwrap_or_else(|| panic!("variant {bad}: _time column present"));
-        // The result wire spells a timestamp in RFC 3339 with its offset.
         let parsed = chrono::DateTime::parse_from_rfc3339(&ts)
             .unwrap_or_else(|e| panic!("variant {bad}: timestamp {ts} must parse: {e}"))
             .with_timezone(&chrono::Utc);
@@ -190,10 +170,6 @@ async fn trigger_variants_survive_ingest_compact_query() {
     }
 }
 
-/// Canonicalization acceptance criterion at the API level: an RFC 3339
-/// value with a +05:30 offset lands as the same instant in UTC with
-/// sub-second precision preserved, and an offset-less ISO 8601 value keeps
-/// its event time instead of being repaired to arrival time.
 #[tokio::test(flavor = "multi_thread")]
 async fn offset_timestamp_canonicalized_to_utc_instant() {
     let server = setup().await;
@@ -226,8 +202,6 @@ async fn offset_timestamp_canonicalized_to_utc_instant() {
         "a valid offset timestamp is canonicalized, not repaired"
     );
 
-    // Offset-less ISO 8601 (Python `datetime.isoformat()`, Java
-    // `LocalDateTime`) is read as UTC, not demoted to arrival time.
     let record = json!({
         "service": "canon-naive",
         "env": "prod",

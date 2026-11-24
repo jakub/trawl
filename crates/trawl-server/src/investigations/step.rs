@@ -5,81 +5,9 @@
 //! The step an attached capture appends to its investigation, and the
 //! completion that writes the step's terminal outcome (ADR-0059).
 //!
-//! A capture that names an investigation appends one `step` entry at
-//! admission, with no outcome, and writes the outcome once when its work
-//! ends: one step, two moments. The second moment belongs to a
-//! [`StepCompletion`], a handle whose clones ride everything that can
-//! outlive the request. The admission builds it in a task of its own the
-//! moment the step commits ([`begin`]), so a request that goes away before
-//! it takes the handle leaves the handle there, and the task writes
-//! `aborted` inside the request's count, which it gives back no later than
-//! the capture's deadline ([`StepCompletion::finish`]). From then on:
-//!
-//! - one rides the executor slot's holds beside the admission
-//!   ([`crate::pool::WorkContext::holding`]), so it lives until the work
-//!   physically stops, however the request ends;
-//! - one rides the request, and passes to the commit task once the work
-//!   has produced a result.
-//!
-//! Whoever learns how the work ended records it ([`StepCompletion::record`]).
-//! The first record wins and later ones change nothing. A success is
-//! written by the transaction that keeps the result
-//! ([`crate::store::ResultsStore::insert_kept`]), which then marks the
-//! completion [`StepCompletion::written`]. When the last
-//! handle drops, the outcome joins the queue of the one [`StepWriter`], so
-//! a drop on the pool's blocking thread still writes it. A completion
-//! dropped with nothing recorded writes `aborted`: the client went away
-//! before the commit task took over, and the work stopped. The store
-//! writes an outcome only on a step that has none, so the fill never runs
-//! twice.
-//!
-//! The writer writes the outcomes no request waits for, in turn: those the
-//! last handle's drop leaves, and those a bounded write handed over past
-//! its capture's deadline ([`StepCompletion::finish`]). One task takes them
-//! from one queue and writes each in a transaction bounded by `[capture]
-//! deadline_secs`, so however many steps are abandoned at once, their
-//! writes hold at most one connection and wait on at most one lock. An
-//! attempt that reaches its bound, or the pool's own acquire timeout,
-//! writes nothing and goes to the back of the queue to be tried again:
-//! the fill is written once, whenever the lock it waits on is released.
-//! The one wait the bound leaves alone is a `COMMIT` already sent, awaited
-//! until it is answered, since cutting it short would leave the outcome
-//! unknown; the queue waits with it.
-//! A write that fails otherwise is logged.
-//!
-//! Each key's share of places bounds the writer's queue, since a drop
-//! cannot wait to join it. A step takes a place in its key's share before
-//! it is appended ([`StepWriter::admit`]), and a capture whose key's share
-//! is full answers 429 `capture_busy` at once, with a retry of one second
-//! and no step written. It does not wait for a place, so however many of
-//! one key's captures arrive while its share is full, none holds a request
-//! slot (ADR-0054) past its refusal, and every other key's requests still
-//! reach their own share. The place rides the completion and then its
-//! write, and goes back only once the outcome is written, or its write has
-//! failed for good: never when a write is handed over or put back in the
-//! queue. A completion whose outcome the kept transaction wrote gives it
-//! back with its last handle.
-//!
-//! A key's share is `[capture] per_key_running + queue_depth` places, the
-//! size of its lane, so however long a sent `COMMIT` waits for its answer,
-//! at most that many of the key's outcomes wait for the writer, the one it
-//! awaits included. A key whose outcome writes stall holds no more than
-//! its share and leaves every other key its own. Otherwise the share is
-//! full only when the key's lane is, or an outcome is a moment from being
-//! written, which the retry of one second covers. The writer keeps no
-//! count across keys: the outcomes waiting for it number at most a share
-//! for each key that writes, and the operator mints the keys. A key's
-//! share is kept only while one of its steps asks for a place or holds
-//! one.
-//!
-//! A runtime that shuts down drops the writer with its queue; boot records
-//! `interrupted` on every step left without an outcome
-//! ([`crate::store::InvestigationStore::interrupt_running_steps`]), and so
-//! it does for a write that failed. Those writes do not go through the
-//! writer and take no place.
-//!
-//! Each written outcome logs one `investigation_step` line. The capture's
-//! ADR-0046 timing event gains no field.
+//! When the last handle drops, the outcome joins the queue of the one
+//! [`StepWriter`], so a drop on the pool's blocking thread still writes it.
+//! A completion dropped with nothing recorded writes `aborted`.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -103,8 +31,6 @@ use crate::state::AppState;
 use crate::store::{Appended, InvestigationStore, RetentionRule, StoreActor, StoreError};
 use crate::transport::request_limit::{self, Lease};
 
-/// How far each change slides the evidence clock: `[investigation]
-/// evidence_idle_secs`, as the investigation routes slide it.
 #[must_use]
 pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
     RetentionRule {
@@ -115,43 +41,7 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
     }
 }
 
-/// Append the step of an attached capture at admission: the executed text,
-/// its bounds (none for a stored source), the request and query ids and the
-/// caller's purpose, with no outcome. Unlinks the evidence the due-write
-/// rule pruned before the append. Answers the step's completion, made on
-/// this runtime.
-///
-/// The request first takes a place in its key's share of the
-/// [`StepWriter`]'s, at once: a key whose share is full is refused without
-/// a wait, and nothing is left behind. The admission takes the place, and
-/// the step's completion holds it once the step commits.
-///
-/// The admission runs in a task of its own, which builds the completion as
-/// soon as the step commits and hands it to the request. A request that
-/// goes away during the append or the unlink cuts neither short: the
-/// handover finds no one, and the task writes `aborted` at once
-/// ([`StepCompletion::finish`]), since the request that would have run the
-/// work is gone. The promotion of a cited result runs the same way, for
-/// the same reason ([`crate::investigations::service`]).
-///
-/// The task keeps the request's count ([`request_limit::current`]) on a
-/// [`Lease`] from the moment it is spawned until the admission and that
-/// write end, and no later than the capture's `deadline` whatever it
-/// awaits then, an unlink included, so an admission that outlives its
-/// request still counts against `[server] max_concurrent_requests`
-/// (ADR-0054) and never past its deadline. The admission's
-/// waits, for a connection, the investigation, its evidence, its log and
-/// each answer alike, end together at `deadline` with nothing written,
-/// and so do the `aborted` write's, which the [`StepWriter`] then
-/// finishes outside the count, a rollback's wait included. No commit is
-/// cut short, and none is sent after the deadline: a commit sent before
-/// it lands, and the unlink may end after it, outside the count.
-///
-/// # Errors
-/// 404 for an unknown investigation, 409 `investigation_closed`, 429
-/// `capture_busy` when the key's share is full or the admission's waits
-/// reached `deadline`, or a store failure.
-#[allow(clippy::too_many_arguments)] // one admission, each part named
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn begin(
     state: &AppState,
     verified: &VerifiedKey,
@@ -176,9 +66,6 @@ pub(crate) async fn begin(
         name: verified.name.clone(),
     };
     let results = Arc::clone(&state.results);
-    // The key's share is full: the capture never started, so busy, as a
-    // full lane in the gate's admission is, and at once, so the refusal
-    // holds no request slot while the key's outcomes wait for the writer.
     let place = results
         .steps
         .admit(verified.id)
@@ -242,11 +129,6 @@ pub(crate) async fn begin(
         })
 }
 
-/// 400 unless the attachment's purpose is within its bound and free of
-/// NUL, which the store's text refuses.
-///
-/// # Errors
-/// 400 naming the purpose and the rule it breaks.
 pub(crate) fn check_attach(attach: &Attach) -> Result<(), ServerError> {
     let Some(purpose) = &attach.purpose else {
         return Ok(());
@@ -265,9 +147,6 @@ pub(crate) fn check_attach(attach: &Attach) -> Result<(), ServerError> {
     Ok(())
 }
 
-/// The outcome of work that ended with `error` after `duration_ms`: a
-/// timeout, a refusal by a limit or a budget, or a failure, each with the
-/// error's wire code.
 #[must_use]
 pub(crate) fn outcome_of(error: &ServerError, duration_ms: Option<u64>) -> StepOutcome {
     let outcome = match error {
@@ -306,18 +185,14 @@ pub(crate) fn success(
     }
 }
 
-/// What the last handle's drop writes.
 #[derive(Debug)]
 enum Fill {
-    /// Nothing recorded: the work was abandoned.
     Pending,
-    /// The outcome to write.
     Recorded(StepOutcome),
-    /// A transaction of the caller's wrote it already.
     Written,
 }
 
-/// The completion of one step (module docs). Clones share it; the last to
+/// The completion of one step. Clones share it; the last to
 /// drop writes the outcome.
 #[derive(Debug, Clone)]
 pub struct StepCompletion(Arc<Inner>);
@@ -329,21 +204,14 @@ struct Inner {
     retention: RetentionRule,
     investigation: InvestigationId,
     seq: u64,
-    /// When the step was appended, for an abandoned step's duration.
     began: Instant,
     /// Where the last handle's write goes, whatever thread drops it.
     writer: StepWriter,
-    /// The step's place in its key's share, until its write takes it
-    /// ([`Inner::take_write`]).
     place: Option<Place>,
     fill: Mutex<Fill>,
 }
 
 impl StepCompletion {
-    /// The completion of step `seq` of `investigation`, writing through
-    /// `store` at `clock`'s time under `retention`, its last handle's
-    /// write handed to `writer`, holding `place` in its key's share of
-    /// `writer`'s ([`StepWriter::admit`]) until the outcome is written.
     #[must_use]
     pub(crate) fn new(
         store: InvestigationStore,
@@ -376,13 +244,11 @@ impl StepCompletion {
         }
     }
 
-    /// The step's entry in its investigation's log.
     #[must_use]
     pub(crate) fn seq(&self) -> u64 {
         self.0.seq
     }
 
-    /// How far the outcome's write slides the evidence clock.
     #[must_use]
     pub(crate) fn retention(&self) -> RetentionRule {
         self.0.retention
@@ -406,14 +272,6 @@ impl StepCompletion {
     /// Drop this handle, and when it is the last, write the outcome on this
     /// task and wait for the write, instead of in a task of its own: the
     /// write the drop would make, ended before the caller goes on.
-    ///
-    /// `count` is the request's, leased no later than `deadline`
-    /// (ADR-0059). Until then the write waits for a connection and its
-    /// locks inside it, through the pool's own acquire timeout if that
-    /// ends first. Past the deadline the count is back, one line says so,
-    /// and the write joins the [`StepWriter`]'s queue, outside the count,
-    /// as any abandoned step's does: the step never stays running for want
-    /// of a deadline.
     pub(crate) async fn finish(self, deadline: Deadline, count: Lease) {
         if let Ok(mut inner) = Arc::try_unwrap(self.0)
             && let Some(write) = inner.take_write()
@@ -423,7 +281,6 @@ impl StepCompletion {
     }
 }
 
-/// The outcome the last handle writes, once ([`Inner::take_write`]).
 struct Write {
     store: InvestigationStore,
     investigation: InvestigationId,
@@ -437,8 +294,6 @@ struct Write {
 }
 
 impl Write {
-    /// Write the outcome, waiting for a connection and the locks no later
-    /// than `deadline`.
     async fn attempt(&self, deadline: Deadline) -> Result<bool, StoreError> {
         self.store
             .complete_step_until(
@@ -548,25 +403,16 @@ impl Drop for Inner {
     }
 }
 
-/// The one writer of the step outcomes no request waits for (module docs).
+/// The one writer of the step outcomes no request waits for.
 /// Clones share its queue and its keys' shares.
 #[derive(Debug, Clone)]
 pub struct StepWriter {
     queue: mpsc::UnboundedSender<Write>,
-    /// Each key's share, by key id, while one of the key's steps asks for
-    /// a place or holds one ([`Claim`]): a place per step of the key's
-    /// appended whose outcome is not yet written.
     shares: Arc<DashMap<i64, KeyShare>>,
-    /// The places of each key's share.
     share: usize,
 }
 
 impl StepWriter {
-    /// Start the writer on this runtime, each attempt bounded by `budget`:
-    /// `[capture] deadline_secs`, with `share` places for each key's steps
-    /// whose outcome is not yet written: `[capture] per_key_running +
-    /// queue_depth`, the size of the key's lane.
-    ///
     /// # Panics
     /// Outside a Tokio runtime.
     #[must_use]
@@ -580,12 +426,6 @@ impl StepWriter {
         }
     }
 
-    /// Take a place in `key_id`'s share for one step of the key's about to
-    /// be appended, at once, without waiting for one (module docs).
-    ///
-    /// # Errors
-    /// [`ShareFull`] when every place in the key's share is held; the
-    /// admission's claim on the share goes back.
     pub(crate) fn admit(&self, key_id: i64) -> Result<Place, ShareFull> {
         let (claim, places) = Claim::on(self, key_id);
         match places.try_acquire_owned() {
@@ -599,21 +439,17 @@ impl StepWriter {
         }
     }
 
-    /// Queue `write` behind every write already waiting. The channel is
-    /// unbounded, since a drop cannot wait; the place each write carries
-    /// bounds the queue (module docs). A writer that has stopped went with
+    /// The channel is unbounded, since a drop cannot wait; the place each
+    /// write carries bounds the queue. A writer that has stopped went with
     /// its runtime, and boot records the step `interrupted`.
     fn enqueue(&self, write: Write) {
         let _ = self.queue.send(write);
     }
 }
 
-/// Every place in a key's share is held: that many of its outcomes wait
-/// for the writer ([`StepWriter::admit`]).
 #[derive(Debug)]
 pub(crate) struct ShareFull;
 
-/// A step's place in its key's share of the writer's (module docs).
 #[derive(Debug)]
 pub(crate) struct Place {
     /// Declared first, so it goes back before the claim.
@@ -621,12 +457,9 @@ pub(crate) struct Place {
     _claim: Claim,
 }
 
-/// One key's share of the writer's places, kept while a claim on it lives.
 #[derive(Debug)]
 struct KeyShare {
-    /// One permit per place.
     places: Arc<Semaphore>,
-    /// The key's steps asking for a place or holding one.
     claims: usize,
 }
 
@@ -642,8 +475,6 @@ struct Claim {
 }
 
 impl Claim {
-    /// Claim `key_id`'s share of `writer`'s places, made on first use, and
-    /// answer the claim and the share's places.
     fn on(writer: &StepWriter, key_id: i64) -> (Self, Arc<Semaphore>) {
         let mut share = writer.shares.entry(key_id).or_insert_with(|| KeyShare {
             places: Arc::new(Semaphore::new(writer.share)),
@@ -671,9 +502,6 @@ impl Drop for Claim {
     }
 }
 
-/// The writer's task: take the writes in arrival order, one at a time, and
-/// put each attempt that reached `budget` behind the writes that arrived
-/// meanwhile, its place with it.
 async fn write_in_turn(mut writes: mpsc::UnboundedReceiver<Write>, budget: Duration) {
     let mut queue = VecDeque::new();
     loop {
@@ -702,7 +530,6 @@ async fn write_in_turn(mut writes: mpsc::UnboundedReceiver<Write>, budget: Durat
     }
 }
 
-/// The outcome's wire spelling, for the log line.
 const fn outcome_name(outcome: StepOutcomeKind) -> &'static str {
     match outcome {
         StepOutcomeKind::Success => "success",
@@ -739,7 +566,6 @@ mod pg_tests {
     /// any test here holds at once.
     const SHARE: usize = 4;
 
-    /// A place in [`agent`]'s share of `writer`'s, free at once.
     fn place(writer: &StepWriter) -> Place {
         writer.admit(agent().key_id).expect("a free place")
     }
@@ -756,7 +582,6 @@ mod pg_tests {
         }
     }
 
-    /// Sessions of this database waiting on a lock.
     async fn lock_waiters(pool: &PgPool) -> i64 {
         sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity
@@ -767,7 +592,6 @@ mod pg_tests {
         .unwrap()
     }
 
-    /// Wait, bounded, until `count` sessions wait on a lock.
     async fn until_waiters(pool: &PgPool, count: i64) {
         tokio::time::timeout(Duration::from_secs(30), async {
             while lock_waiters(pool).await != count {
@@ -778,13 +602,6 @@ mod pg_tests {
         .unwrap_or_else(|_| panic!("{count} sessions never waited on a lock"));
     }
 
-    /// A write handed over past its deadline and one a last handle's drop
-    /// leaves go to the same writer, in the order they arrive. With the
-    /// investigation's lock held, the first step's bounded write reaches
-    /// its deadline and is handed over, and the writer's attempt waits on
-    /// the lock; the second step's completion then drops. One session
-    /// still waits, and once the lock goes the first is written before the
-    /// second.
     #[sqlx::test]
     async fn a_handed_over_write_and_a_dropped_one_share_one_writer(pool: PgPool) {
         let store = InvestigationStore::new(pool.clone());
@@ -897,8 +714,6 @@ mod pg_tests {
         );
     }
 
-    /// Investigation `n` with one running step, through `store`. Answers
-    /// the investigation and the step's sequence.
     async fn running_step(store: &InvestigationStore, n: u32) -> (InvestigationId, u64) {
         let id = InvestigationId::parse(&format!("{n:032x}")).unwrap();
         store
@@ -938,7 +753,6 @@ mod pg_tests {
         (id, begun.entry.seq)
     }
 
-    /// The outcome step `seq` of `id` holds, if any.
     async fn outcome(
         store: &InvestigationStore,
         id: &InvestigationId,
@@ -954,8 +768,6 @@ mod pg_tests {
         })
     }
 
-    /// Wait until step `seq` of `id` holds an outcome, no later than
-    /// `give_up`.
     async fn until_written(
         store: &InvestigationStore,
         id: &InvestigationId,
@@ -985,9 +797,6 @@ mod pg_tests {
         .await;
     }
 
-    /// A one-connection pool through which every wait for a connection
-    /// gives up after 300 ms, the pool's own acquire timeout, well before
-    /// a test's deadline.
     async fn impatient(pool: &PgPool) -> PgPool {
         #[allow(clippy::disallowed_methods)] // a pool whose timeout is the test's
         let impatient = sqlx::postgres::PgPoolOptions::new()
@@ -999,11 +808,6 @@ mod pg_tests {
         impatient
     }
 
-    /// A step's outcome written inside the request's count waits for a
-    /// connection until the capture's deadline, not until the pool's own
-    /// acquire timeout: with the pool's one connection held past two of
-    /// those timeouts and let go before the deadline, the outcome is
-    /// written before `finish` returns, inside the count.
     #[sqlx::test]
     async fn a_pool_timeout_before_the_deadline_is_waited_out_inside_the_count(pool: PgPool) {
         let store = InvestigationStore::new(pool.clone());
@@ -1037,10 +841,6 @@ mod pg_tests {
         );
     }
 
-    /// With the pool's one connection held past the capture's deadline,
-    /// the count is kept until the deadline, not given back at the pool's
-    /// first acquire timeout, and the outcome then lands through the
-    /// writer once the connection is free.
     #[sqlx::test]
     async fn a_pool_timeout_at_the_deadline_hands_the_outcome_to_the_writer(pool: PgPool) {
         let store = InvestigationStore::new(pool.clone());
@@ -1086,11 +886,6 @@ mod pg_tests {
         .await;
     }
 
-    /// An attempt whose answer never comes ends at the writer's bound like
-    /// one that waits on a lock: the outcome queued behind it is written
-    /// within the bound and a second, and the stalled one, tried again on
-    /// a new session, after it. The stalled attempt's `BEGIN` answer is
-    /// held back by a proxy until the end of the test.
     #[sqlx::test]
     async fn a_stalled_attempt_does_not_stop_the_writer(pool: PgPool) {
         let store = InvestigationStore::new(pool.clone());
@@ -1146,15 +941,6 @@ mod pg_tests {
         proxy.release();
     }
 
-    /// An attempt Postgres refuses before the writer's bound, whose
-    /// `ROLLBACK` answer never comes, ends at the bound too: once the clock
-    /// passes the bound, and with no further time, the outcome queued
-    /// behind it is written, the stalled attempt's session is closed while
-    /// its answer is held, and the stalled outcome lands on a new session
-    /// once its investigation's lock is free. Another session holds that
-    /// lock, and the stalled writes' sessions wait for it no longer than a
-    /// 50 ms `lock_timeout`.
-    ///
     /// The writer's bound is a tokio deadline, so the sessions are set up
     /// on the live clock and the clock is then paused: it moves only by
     /// the one advance past the bound. Every wait from the pause on runs
@@ -1258,8 +1044,6 @@ mod pg_tests {
         tokio::time::resume();
     }
 
-    /// Wait, bounded, until `writer` keeps no key's share: every place has
-    /// gone back, and every claim with it.
     async fn until_free(writer: &StepWriter) {
         tokio::time::timeout(Duration::from_secs(30), async {
             while !writer.shares.is_empty() {
@@ -1270,20 +1054,6 @@ mod pg_tests {
         .unwrap_or_else(|_| panic!("the keys' places never all came back"));
     }
 
-    /// A key's share bounds its outcomes waiting for the writer, however
-    /// long a `COMMIT` the writer sent waits for its answer, and leaves
-    /// every other key its own. With a share of two places, key A's first
-    /// step's abandoned outcome is written through a proxy that holds back
-    /// its `COMMIT`'s answer, so the writer awaits it, and key A's second
-    /// step is admitted and abandoned behind it. Key A's third admission is
-    /// refused at once, so its step is never appended, and the refused
-    /// admission keeps no claim: key A's share still counts its two steps
-    /// alone. Key B is
-    /// admitted at once and its step appended while the writer still awaits
-    /// the answer: Postgres committed the first outcome, and the writer has
-    /// written neither queued one. Once the answer comes, every admitted
-    /// outcome lands, every place goes back and the writer keeps no share;
-    /// key A's whole share is its own again.
     #[sqlx::test]
     async fn a_key_holds_no_more_unwritten_outcomes_than_its_share(pool: PgPool) {
         const PLACES: u32 = 2;

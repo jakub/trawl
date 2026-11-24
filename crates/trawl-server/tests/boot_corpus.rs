@@ -2,17 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The boot steps that make the corpus ready to serve (ADR-0041 slice 2),
-//! through `boot::prepare_corpus` over a real `AppState`: rollup-marker
-//! recovery, then conformance, then WAL hydration; and, on every node, the
-//! marking of report runs a process that ended left `running` (ADR-0018,
-//! amended 2026-11-06).
-//!
-//! Each corpus test plants WAL or markers in its own directories before the
-//! fixture boots, observes the state before the boot through the fixture's
-//! hook, and then checks what the boot left. Each report-run test plants a
-//! run over a first boot and reboots over the same databases. No fixture
-//! spawns compaction.
+//! The boot steps that make the corpus ready to serve (ADR-0041 slice 2), and
+//! the marking of report runs a process that ended left `running` (ADR-0018).
 
 mod common;
 
@@ -34,8 +25,6 @@ use trawl_server::store::ManualRunClaim;
 /// Every planted event's service, so counts see no seed row.
 const SERVICE: &str = "boothydrated";
 
-/// A WAL file in the live writer's name and line format, planted under
-/// `dir/wal/prod`, holding `count` events of [`SERVICE`].
 fn plant_wal(dir: &Path, count: usize) -> PathBuf {
     let time = (chrono::Utc::now() - chrono::Duration::minutes(5))
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
@@ -61,7 +50,6 @@ fn client(server: &TestServer) -> trawl_client::HttpClient {
     trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap()
 }
 
-/// `stats count()` over `dsl` through the query API.
 async fn count(server: &TestServer, dsl: &str) -> i64 {
     let dsl = format!("{dsl} | stats count()");
     let result = client(server)
@@ -74,7 +62,6 @@ async fn count(server: &TestServer, dsl: &str) -> i64 {
     }
 }
 
-/// A query answers 503 `corpus_recovering`, with no `Retry-After`.
 async fn assert_query_refused(server: &TestServer) {
     let response = common::harness_client_builder()
         .build()
@@ -94,7 +81,6 @@ async fn assert_query_refused(server: &TestServer) {
     assert_eq!(body["error"]["code"], "corpus_recovering", "{body}");
 }
 
-/// `/api/v1/health`: HTTP 200 with `status` and `checks.corpus`.
 async fn health(server: &TestServer) -> (String, String) {
     let response = common::harness_client_builder()
         .build()
@@ -111,17 +97,10 @@ async fn health(server: &TestServer) -> (String, String) {
     )
 }
 
-/// The gate an ingest node's state reads through.
 fn unsettled(state: &AppState) -> Option<CorpusUnsettled> {
     state.query.pool.publication().unsettled()
 }
 
-/// Boot hydrates WAL that survived a restart: a query counts every planted
-/// event exactly once, before and after the compaction pass that drains
-/// it, the gate settles without a coverage proof, and nothing reaches the
-/// app's event bus, which was subscribed before the boot. The same
-/// subscriber then receives an event ingested over HTTP, so its silence
-/// during the boot is no dead subscription.
 #[tokio::test(flavor = "multi_thread")]
 async fn boot_hydration_counts_planted_wal_once_and_publishes_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -163,7 +142,6 @@ async fn boot_hydration_counts_planted_wal_once_and_publishes_nothing() {
         "hydration is not ingested traffic"
     );
 
-    // The hydrated batch ids are the ones compaction drains.
     trawl_server::ingest::compaction::compact_once(
         &dir.path().join("wal"),
         Path::new(&data),
@@ -199,8 +177,6 @@ async fn boot_hydration_counts_planted_wal_once_and_publishes_nothing() {
     assert_eq!(batch.events.len(), 1);
 }
 
-/// WAL the caps cannot hold is overhang: reads refuse `restart_backlog`
-/// and health degrades at HTTP 200, so probes do not restart the server.
 #[tokio::test(flavor = "multi_thread")]
 async fn boot_hydration_above_the_caps_leaves_overhang() {
     let dir = tempfile::tempdir().unwrap();
@@ -244,8 +220,6 @@ fn plant_rollup(data: &Path) -> (PathBuf, PathBuf, PathBuf) {
     (day, hourly, marker)
 }
 
-/// A marker body for nginx in `day` that lists `10/nginx.parquet` at its
-/// identity, with no prior daily file recorded.
 fn nginx_marker(day: &Path, replacement: OutputIdentity) -> String {
     let input = identity_of(&day.join("10/nginx.parquet")).unwrap();
     RollupMarker::new(
@@ -258,10 +232,6 @@ fn nginx_marker(day: &Path, replacement: OutputIdentity) -> String {
     .encode()
 }
 
-/// A pending rollup marker is recovered by the boot, before the listener:
-/// the daily file carries the replacement identity the marker recorded
-/// (case a), so the hourly input it already holds is retired, and each row
-/// is counted once.
 #[tokio::test(flavor = "multi_thread")]
 async fn rollup_boot_recovery_recovers_a_pending_marker_before_serving() {
     let dir = tempfile::tempdir().unwrap();
@@ -290,18 +260,14 @@ async fn rollup_boot_recovery_recovers_a_pending_marker_before_serving() {
     assert_eq!(health(&server).await, ("ok".to_owned(), "ok".to_owned()));
 }
 
-/// A rollup recovery that cannot prove the state does not stop the boot.
 /// Here the daily file is present, carries neither the replacement
 /// identity nor a recorded prior (the marker records none), and no
-/// temporary file exists: case d, a prior mismatch. Every file and the
-/// marker stay as they were, reads refuse `rollup_pending`, and health
-/// names it.
+/// temporary file exists: case d, a prior mismatch.
 #[tokio::test(flavor = "multi_thread")]
 async fn rollup_boot_recovery_failure_refuses_reads_as_rollup_pending() {
     let dir = tempfile::tempdir().unwrap();
     let data = seed_data_root(dir.path());
     let (day, hourly, marker) = plant_rollup(Path::new(&data));
-    // A replacement that no file on disk carries.
     let replacement = OutputIdentity {
         size: 1,
         hash: blake3::hash(b"a replacement that was never written"),
@@ -334,8 +300,6 @@ async fn rollup_boot_recovery_failure_refuses_reads_as_rollup_pending() {
     );
 }
 
-/// A query-only node has no hot buffer and a settled gate: it never
-/// hydrates, so nothing holds its reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_only_state_is_born_settled() {
     let dir = tempfile::tempdir().unwrap();
@@ -345,20 +309,9 @@ async fn query_only_state_is_born_settled() {
     assert_eq!(count(&server, "service=nginx").await, 2);
 }
 
-// ---------------------------------------------------------------------------
-// Stale report runs (ADR-0018, amended 2026-11-06): every run a process that
-// ended left `running` reads `error` once `boot::prepare_corpus` returns,
-// whatever node type or `[scheduler] enabled` the boot runs under. These
-// tests reboot over the same databases (`common::captured::Restartable`) so
-// a run planted under one boot is stale for the next.
-// ---------------------------------------------------------------------------
-
-/// What `cleanup_stale_runs` writes into a run it marks.
 const INTERRUPTED: &str = "interrupted by server restart";
 
-/// A saved query owned by the analyst key, with a schedule created through
-/// the store door whose fire cursor starts at `fires_at` (query mode when
-/// `window` is `None`). Returns the saved query and schedule ids.
+/// Returns the saved query and schedule ids.
 async fn net(
     server: &TestServer,
     name: &str,
@@ -380,9 +333,6 @@ async fn net(
     (saved.id, schedule.id)
 }
 
-/// Claim a manual run on `saved_id` through the store and execute nothing:
-/// a `running` row no process owns, which is what a process that ended
-/// mid-run leaves.
 async fn plant_running(server: &TestServer, saved_id: i64) -> i64 {
     let key_id = captured::key_id(server, &server.analyst_token).await;
     match server
@@ -398,12 +348,10 @@ async fn plant_running(server: &TestServer, saved_id: i64) -> i64 {
     }
 }
 
-/// The app-state database, for what no API reports byte for byte.
 async fn app_db(app_db_url: &str) -> sqlx::PgPool {
     common::fixture_pool(app_db_url, 1).await
 }
 
-/// A report run's status, error message, and whether `finished_at` is set.
 async fn run_state(db: &sqlx::PgPool, run_id: i64) -> (String, Option<String>, bool) {
     sqlx::query_as(
         "SELECT status, error_message, finished_at IS NOT NULL
@@ -415,7 +363,6 @@ async fn run_state(db: &sqlx::PgPool, run_id: i64) -> (String, Option<String>, b
     .unwrap()
 }
 
-/// A report run as Postgres renders it, every column byte for byte.
 async fn run_json(db: &sqlx::PgPool, run_id: i64) -> String {
     sqlx::query_scalar("SELECT row_to_json(r)::text FROM report_runs r WHERE id = $1")
         .bind(run_id)
@@ -424,7 +371,6 @@ async fn run_json(db: &sqlx::PgPool, run_id: i64) -> String {
         .unwrap()
 }
 
-/// A schedule as Postgres renders it, every column byte for byte.
 async fn schedule_json(db: &sqlx::PgPool, schedule_id: i64) -> String {
     sqlx::query_scalar("SELECT row_to_json(s)::text FROM schedules s WHERE id = $1")
         .bind(schedule_id)
@@ -433,7 +379,6 @@ async fn schedule_json(db: &sqlx::PgPool, schedule_id: i64) -> String {
         .unwrap()
 }
 
-/// Assert `run_id` reads what the boot's stale-run marking writes.
 async fn assert_interrupted(db: &sqlx::PgPool, run_id: i64) {
     assert_eq!(
         run_state(db, run_id).await,
@@ -442,8 +387,6 @@ async fn assert_interrupted(db: &sqlx::PgPool, run_id: i64) {
     );
 }
 
-/// Wait until `run_id` leaves `running`, under the hang guard, and return
-/// the status it finished with.
 async fn finished_status(db: &sqlx::PgPool, run_id: i64) -> String {
     let deadline = std::time::Instant::now() + trawl_server::test_timing::HANG_GUARD;
     loop {
@@ -459,7 +402,6 @@ async fn finished_status(db: &sqlx::PgPool, run_id: i64) -> String {
     }
 }
 
-/// Reboot `fixture` over `server` and require the boot to prepare.
 async fn prepared(fixture: &Restartable, server: TestServer) -> Unserved {
     match fixture.try_reboot(server).await {
         Ok(unserved) => unserved,
@@ -467,12 +409,8 @@ async fn prepared(fixture: &Restartable, server: TestServer) -> Unserved {
     }
 }
 
-/// One cell of AC1: plant a stale run over a first boot, reboot as the
-/// cell's node, and check the row before the listener has served anything.
-/// With the scheduler on, the real loop is spawned between preparation and
-/// serve, as trawld's `main` does; the target schedule's fire cursor is a
-/// day out, so the loop never claims it. Then a manual run on the same
-/// schedule is accepted and finishes `success`.
+/// The target schedule's fire cursor is a day out, so the loop never claims
+/// it.
 async fn stale_run_marked_before_serving(ingest_enabled: bool, scheduler_enabled: bool) {
     let (mut fixture, server) =
         Restartable::boot(RateLimitConfig::default(), CaptureConfig::default(), |_| {}).await;
@@ -533,8 +471,6 @@ async fn boot_marks_stale_report_runs_before_serving_on_an_ingest_node_with_the_
     stale_run_marked_before_serving(true, true).await;
 }
 
-/// The row count of every UPDATE statement on `report_runs`, in order, as
-/// the test-only trigger [`record_report_run_updates`] recorded them.
 async fn recorded_updates(db: &sqlx::PgPool) -> Vec<i64> {
     sqlx::query_scalar("SELECT changed FROM report_run_updates ORDER BY seq")
         .fetch_all(db)
@@ -561,10 +497,6 @@ async fn record_report_run_updates(db: &sqlx::PgPool) {
     }
 }
 
-/// A second boot over the same database changes no row: the boot's
-/// UPDATE changes one row the first time and none the second, the marked
-/// run reads byte for byte what the first boot wrote, and a run that had
-/// already finished is untouched by both.
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_report_run_recovery_is_idempotent() {
     let (mut fixture, server) =
@@ -609,9 +541,8 @@ async fn stale_report_run_recovery_is_idempotent() {
     drop(server);
 }
 
-/// Marking a run moves neither the watermark nor the fire cursor (ruling
-/// 9), for a `since_last` and a fixed-window schedule. Both cursors are set
-/// to real instants first, so a NULL-equals-NULL pass is impossible.
+/// Both cursors are set to real instants first, so a NULL-equals-NULL pass
+/// is impossible.
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_report_run_recovery_moves_no_cursor() {
     let (fixture, server) =
@@ -664,9 +595,6 @@ async fn stale_report_run_recovery_moves_no_cursor() {
     drop(unserved);
 }
 
-/// A real database failure in the marking refuses the boot: the error names
-/// the step, the boot never serves and its port accepts no connection, and
-/// the planted run is still `running` because the UPDATE rolled back.
 #[tokio::test(flavor = "multi_thread")]
 async fn boot_refuses_when_stale_report_run_recovery_fails() {
     let (fixture, server) =

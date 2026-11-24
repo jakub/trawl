@@ -35,7 +35,6 @@ use crate::transport::request_limit::body_work::BodyWork;
 use crate::transport::request_limit::{self, RequestInProgress};
 use trawl_api::{IngestEventError, IngestResponse};
 
-/// Per-reason rejection counts for labeled prometheus metrics.
 #[derive(Debug, Default)]
 struct RejectCounts(IndexMap<RejectReason, u64>);
 
@@ -58,7 +57,6 @@ impl RejectCounts {
         self.0.values().sum()
     }
 
-    /// Format non-zero counts as a compact summary (e.g. `"invalid_chars:3, missing_service:1"`).
     fn summary(&self) -> String {
         let mut parts = Vec::new();
         for (reason, count) in &self.0 {
@@ -69,7 +67,6 @@ impl RejectCounts {
         parts.join(", ")
     }
 
-    /// Emit non-zero counts as labeled prometheus counters.
     fn emit_metrics(&self) {
         for (reason, count) in &self.0 {
             if *count > 0 {
@@ -83,51 +80,28 @@ impl RejectCounts {
     }
 }
 
-/// How many `(code, service)` pairs a repair log line lists (ADR-0055).
-/// Per-code totals are always complete; this only bounds the detail.
 const REPAIR_DETAIL_PAIRS: usize = 8;
 
-/// One `(env, service)` group's repair and unmapped-severity tallies, held
-/// until that group's WAL write returns (ADR-0055).
 #[derive(Debug, Default)]
 struct GroupTally {
-    /// Per-code repair counts: occurrences of one code on one event.
     repairs: IndexMap<RepairCode, u64>,
-    /// Accepted events whose severity source maps to nothing on the `OTel`
-    /// ladder (ADR-0013 §2).
     severity_unmapped: u64,
 }
 
-/// The repairs and unmapped severities of a request's acknowledged groups,
-/// the only source of their metrics and log lines (ADR-0055). A group whose
-/// WAL write failed never enters it.
 #[derive(Debug, Default)]
 struct RepairLedger {
-    /// Per-`(code, service)` repair counts, feeding
-    /// `trawl_ingest_repairs_total{code,service}`. The same service written
-    /// under two envs shares one entry.
     repairs: IndexMap<(RepairCode, String), u64>,
-    /// Per-service unmapped-severity counts, feeding
-    /// `trawl_severity_unmapped_total{service}`.
     severity_unmapped: IndexMap<String, u64>,
 }
 
-/// A bounded per-service detail: the listed pairs and what was left out.
 #[derive(Debug, PartialEq, Eq)]
 struct RepairDetail {
-    /// `service/code:n` for at most [`REPAIR_DETAIL_PAIRS`] pairs, joined
-    /// with `", "`. Empty when nothing matched.
     text: String,
-    /// Pairs past the bound.
     omitted_pairs: u64,
-    /// Occurrences those omitted pairs held.
     omitted_occurrences: u64,
 }
 
 impl RepairLedger {
-    /// Fold the acknowledged groups' tallies. `wal_paths` is the list of
-    /// groups whose write succeeded, the same list publication walks, so
-    /// what is counted and what is published cannot diverge.
     fn acknowledged(
         tallies: &IndexMap<BatchKey, GroupTally>,
         wal_paths: &[(BatchKey, PathBuf)],
@@ -153,8 +127,6 @@ impl RepairLedger {
         }
     }
 
-    /// The repairs of `class`, or of both classes for `None`, as
-    /// `(code, service, count)`.
     fn pairs(&self, class: Option<RepairClass>) -> impl Iterator<Item = (RepairCode, &str, u64)> {
         self.repairs
             .iter()
@@ -162,13 +134,10 @@ impl RepairLedger {
             .map(|((code, service), count)| (*code, service.as_str(), *count))
     }
 
-    /// Total repair occurrences of `class`, or of both classes for `None`.
     fn total(&self, class: Option<RepairClass>) -> u64 {
         self.pairs(class).map(|(_, _, count)| count).sum()
     }
 
-    /// Exact non-zero per-code totals as `code:n, code:n`, in
-    /// [`RepairCode::ALL`] order, the same shape as [`RejectCounts::summary`].
     fn codes(&self, class: Option<RepairClass>) -> String {
         let mut totals: IndexMap<RepairCode, u64> = IndexMap::new();
         for (code, _, count) in self.pairs(class) {
@@ -181,8 +150,6 @@ impl RepairLedger {
             .join(", ")
     }
 
-    /// At most [`REPAIR_DETAIL_PAIRS`] pairs, by count, highest first, then
-    /// by code, then by service, with exact counts of what was left out.
     fn detail(&self, class: Option<RepairClass>) -> RepairDetail {
         let mut pairs: Vec<_> = self.pairs(class).collect();
         pairs.sort_by(
@@ -205,12 +172,8 @@ impl RepairLedger {
         }
     }
 
-    /// Emit the repair and unmapped-severity counters.
     fn emit_metrics(&self) {
         for (service, count) in &self.severity_unmapped {
-            // Same label discipline as the repair counter: `service` is a
-            // client-chosen data dimension trawl publishes deliberately, run
-            // through the same bounded label helper.
             metrics::counter!(
                 crate::metrics::SEVERITY_UNMAPPED_TOTAL,
                 "service" => crate::metrics::repair_service_label(service)
@@ -218,14 +181,6 @@ impl RepairLedger {
             .increment(*count);
         }
         for ((code, service), count) in &self.repairs {
-            // SECURITY: `service` is client-supplied and `/metrics` is
-            // unauthenticated. It is a data dimension ADR-0009 publishes
-            // deliberately (alerting per repair code and sender), unlike the
-            // principal-derived labels `handlers.rs` forbids — but the
-            // recorder never evicts a series, so the distinct label values are
-            // capped and per-key attribution stays in the authenticated log.
-            // Only acknowledged groups get here, so a failed write never
-            // spends one of those capped label slots.
             metrics::counter!(
                 crate::metrics::INGEST_REPAIRS_TOTAL,
                 "code" => code.as_str(),
@@ -236,18 +191,11 @@ impl RepairLedger {
     }
 }
 
-/// Parsed ingest payload, grouped by `(env, service)`.
 #[derive(Debug)]
 struct ParsedEvents {
-    /// Service batches keyed by `(env, service)`, insertion-order preserved.
     batches: IndexMap<BatchKey, ServiceBatch>,
-    /// Per-event validation errors accumulated during parsing.
     errors: Vec<IngestEventError>,
-    /// Per-reason rejection counts for prometheus labels.
     reject_counts: RejectCounts,
-    /// Repair and unmapped-severity tallies of the groups that have any,
-    /// keyed like `batches`. Only the groups whose WAL write succeeds are
-    /// counted ([`RepairLedger::acknowledged`]).
     tallies: IndexMap<BatchKey, GroupTally>,
 }
 
@@ -261,8 +209,6 @@ impl ParsedEvents {
         }
     }
 
-    /// Take one position's outcome from the shared step: batch an accepted
-    /// event, record a rejected one. Never stops the visit.
     fn record(&mut self, report: EventReport<'_>) -> ControlFlow<()> {
         match report.outcome {
             EventOutcome::Accepted(canonical) => {
@@ -287,9 +233,7 @@ impl ParsedEvents {
         ControlFlow::Continue(())
     }
 
-    /// The hot-buffer charge of every valid event, across all groups: what
-    /// the request reserves as a whole. Saturates on the (unreachable)
-    /// overflow, which then refuses as oversized.
+    /// Saturates on the (unreachable) overflow, which then refuses as oversized.
     fn charge(&self) -> Charge {
         self.batches
             .values()
@@ -303,18 +247,11 @@ impl ParsedEvents {
     }
 }
 
-/// The caller's key, holding `Permission::Ingest`.
-///
 /// A parts extractor because axum runs those before the body extractor:
 /// a key without the grant is refused on its request head, before trawld
-/// collects up to `[ingest] max_body_bytes` it would discard. Extractors
-/// run inside the router's layers, so the rate limiter still sees the
-/// request first. The refusal is a [`ServerError`] like any the handler
-/// returns, so it keeps the envelope, and `failure::mark_handler`, which
-/// runs before every extractor, still classifies it as the handler's.
+/// collects up to `[ingest] max_body_bytes` it would discard.
 pub struct IngestKey(VerifiedKey);
 
-// `VerifiedKey` has no `Debug`, so neither does the key here.
 impl std::fmt::Debug for IngestKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IngestKey").finish_non_exhaustive()
@@ -324,7 +261,6 @@ impl std::fmt::Debug for IngestKey {
 impl<S: Sync> FromRequestParts<S> for IngestKey {
     type Rejection = ServerError;
 
-    // Not `async fn`: nothing here awaits.
     fn from_request_parts(
         parts: &mut Parts,
         _state: &S,
@@ -334,7 +270,6 @@ impl<S: Sync> FromRequestParts<S> for IngestKey {
 }
 
 impl IngestKey {
-    /// Admit `verified` to ingest, or refuse it with a 403.
     pub fn new(verified: VerifiedKey) -> Result<Self, ServerError> {
         if !verified.has_permission(Permission::Ingest) {
             return Err(ServerError::Forbidden("insufficient permissions".into()));
@@ -353,35 +288,6 @@ fn ingest_key(parts: &Parts) -> Result<IngestKey, ServerError> {
     IngestKey::new(verified)
 }
 
-/// `POST /api/v1/ingest` — accept ndjson events into the WAL.
-///
-/// Expects `Content-Type: application/x-ndjson` (or `application/json`).
-/// Supports `Content-Encoding: gzip` for compressed payloads.
-///
-/// The request is admitted against hot-buffer capacity as a whole before
-/// anything is written (ADR-0043), in this order:
-///
-/// 1. With no free space at all for HTTP, refuse before decompressing
-///    anything: 503 `hot_buffer_full`.
-/// 2. Decompress, parse and canonicalize on a blocking thread.
-/// 3. Reserve the exact charge of every valid event, synchronously. A
-///    request over the per-request ceiling is 413 `ingest_batch_too_large`
-///    whatever the buffer holds; one that fits the ceiling but not the free
-///    space is 503 `hot_buffer_full` with `Retry-After` set to the
-///    compaction interval. A refusal writes nothing and never touches the
-///    publication gate, which compaction needs to drain.
-/// 4. Take the publication gate's ingest side, then write and publish on a
-///    second blocking thread that owns the reservation and the guard.
-///
-/// If any `(env, service)` group's WAL write fails, the request answers a
-/// redacted 500. The groups that did write are still published and
-/// counted first: they are durable, and compaction will merge them. A 500
-/// is therefore not an atomic rollback. The failed groups' share of the
-/// reservation is released.
-///
-/// Both blocking tasks hold the request's body, so each keeps the
-/// request's count until it ends, even after the client hangs up
-/// (ADR-0054). The wait for the publication gate between them does not.
 pub async fn ingest(
     State(state): State<AppState>,
     IngestKey(verified): IngestKey,
@@ -400,7 +306,6 @@ pub async fn ingest(
         .map(Arc::clone)
         .ok_or_else(|| ServerError::Internal("ingest not enabled".into()))?;
 
-    // Step 1: refuse a full buffer before spending CPU on the body.
     if let Some(buf) = &state.query.hot_buffer {
         buf.ensure_free_space(ProducerKind::Http)
             .map_err(|refusal| refusal_error(&state, &pipeline, refusal, None))?;
@@ -412,7 +317,6 @@ pub async fn ingest(
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let request_span = tracing::Span::current();
 
-    // Step 2: decompress and parse. No guard is held here.
     let parsed = parse_request(
         &state,
         peer_addr,
@@ -430,7 +334,6 @@ pub async fn ingest(
         parse_ms,
     } = parsed;
 
-    // Step 3: admit the whole request, or none of it.
     let requested = parsed.charge();
     let reservation = match pipeline.reserve(ProducerKind::Http, requested) {
         Ok(reservation) => reservation,
@@ -440,7 +343,7 @@ pub async fn ingest(
         }
     };
 
-    // Step 4: wait for the gate before dispatching blocking work. Requests
+    // Wait for the gate before dispatching blocking work. Requests
     // waiting behind a compactor must leave blocking threads available to
     // existing readers. Nothing waits for capacity past this point.
     let publication = state.query.hot_buffer.as_ref().map(|buf| buf.publication());
@@ -488,7 +391,6 @@ pub async fn ingest(
             parse_ms,
             wal_ms,
         );
-        // What is left is the failed groups' share: released here.
         drop(reservation);
         if wal_failed {
             // A failed group was never acknowledged, so the request fails
@@ -505,7 +407,6 @@ pub async fn ingest(
     Ok(Json(result))
 }
 
-/// What the parse task hands back: the events and its timings.
 #[derive(Debug)]
 struct Parsed {
     events: ParsedEvents,
@@ -514,9 +415,6 @@ struct Parsed {
     parse_ms: u128,
 }
 
-/// Decompress and parse the body on a blocking thread, so CPU-bound gzip
-/// and JSON work does not hog tokio workers. The thread keeps `count`, the
-/// request's count, for as long as it holds the body.
 async fn parse_request(
     state: &AppState,
     peer_addr: SocketAddr,
@@ -526,8 +424,6 @@ async fn parse_request(
     dispatch: tracing::Dispatch,
     span: tracing::Span,
 ) -> Result<Parsed, ServerError> {
-    // One arrival instant and one peer reading for the whole request,
-    // captured before moving into the blocking task.
     let request = HttpRequestContext::new(&state.ingest, peer_addr.ip());
     let max_body_bytes = state.ingest.max_body_bytes;
     #[cfg(any(test, feature = "test-support"))]
@@ -567,8 +463,6 @@ async fn parse_request(
     .map_err(|e| ServerError::from_join("ingest", e))?
 }
 
-/// The response for a refused request. `requested` is `None` for the early
-/// refusal, which runs before the body is parsed.
 fn refusal_error(
     state: &AppState,
     pipeline: &PipelineWriter,
@@ -586,11 +480,8 @@ fn refusal_error(
     }
 }
 
-/// Account a parsed request the hot buffer refused: its valid events count
-/// under the refusal's reject reason, its per-event validation rejects
-/// under their own. Nothing was written, so nothing counts as accepted,
-/// repaired or severity-unmapped. No log line: the failure observer's one
-/// `http_failure` is the record of a 503, and a 413 is the client's.
+/// No log line: the failure observer's one `http_failure` is the record of
+/// a 503, and a 413 is the client's.
 fn record_refused(state: &AppState, parsed: &mut ParsedEvents, refusal: Refusal) {
     let reason = match refusal {
         Refusal::Full => RejectReason::HotBufferFull,
@@ -605,11 +496,6 @@ fn record_refused(state: &AppState, parsed: &mut ParsedEvents, refusal: Refusal)
     );
 }
 
-/// Write one WAL file per `(env, service)` group. Every group is attempted,
-/// and successful groups are durable. Failed groups are counted as
-/// `wal_failure` rejections and removed from `parsed.batches` so they are
-/// never published. The returned flag is true when any group failed, which
-/// fails the request after the successful groups are finalized.
 fn write_wal_batches(
     wal_writer: &crate::ingest::wal::WalWriter,
     parsed: &mut ParsedEvents,
@@ -664,7 +550,6 @@ fn write_wal_batches(
 }
 
 /// Finish within the blocking task while its publication read guard is held.
-/// Update metrics, publish to the hot buffer and bus, and build the response.
 /// Each published group moves its charge out of `reservation`; what is left
 /// belongs to groups that were not written.
 #[allow(clippy::too_many_arguments)]
@@ -705,8 +590,6 @@ fn finalize_ingest(
         );
     }
 
-    // Only the groups whose WAL write succeeded count. Fold them before
-    // publication drains the batches.
     let ledger = RepairLedger::acknowledged(&parsed.tallies, wal_paths);
     ledger.emit_metrics();
     let repairs = ledger.total(None);
@@ -714,7 +597,6 @@ fn finalize_ingest(
     let repairs_actionable = ledger.total(Some(RepairClass::Actionable));
     if repairs_actionable > 0 {
         let actionable = ledger.detail(Some(RepairClass::Actionable));
-        // Not "lost": `time.out_of_range` keeps the value it flags.
         tracing::warn!(
             event_type = "ingest_repairs",
             user = %verified.name,
@@ -729,9 +611,6 @@ fn finalize_ingest(
         );
     }
 
-    // Publish each successfully-written batch to hot buffer + event bus
-    // so events are visible to queries and SSE streams immediately. Each
-    // takes its own share of the request's reservation.
     for (key, wal_path) in wal_paths {
         if let Some(batch) = parsed.batches.swap_remove(key) {
             let share = reservation.take(batch.charge());
@@ -742,7 +621,6 @@ fn finalize_ingest(
     let duration_ms = decompress_ms + parse_ms + wal_ms;
     let services = wal_paths.len();
     let detail = ledger.detail(None);
-    // The per-key record of every repair, routine ones included (ADR-0055).
     tracing::info!(
         event_type = "ingest_complete",
         user = %verified.name,
@@ -781,28 +659,15 @@ fn is_gzip(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("gzip"))
 }
 
-/// Decompress a gzip body, refusing one that decompresses past
-/// `max_body_bytes` (`[ingest] max_body_bytes`, the same limit the wire
-/// body is held to).
-///
-/// The bound is on decompressed size, not on the wire-to-decompressed
-/// ratio: repetitive log batches routinely expand past 20x, and a ratio cap
-/// refused them with a 400 the sender does not retry. Decoding reads at
-/// most `max_body_bytes + 1` bytes, so a gzip bomb costs no more memory
-/// than the largest body trawld accepts.
 fn decompress_gzip(data: &[u8], max_body_bytes: usize) -> Result<Vec<u8>, ServerError> {
     let decoder = flate2::read::GzDecoder::new(data);
-    // Read up to limit + 1: if we get more than limit bytes, the payload
-    // exceeds the cap and we reject it before allocating further. The
-    // buffer grows with what is actually decoded; nothing is sized from
-    // the request up front.
     let mut decompressed = Vec::new();
     decoder
         .take(u64::try_from(max_body_bytes.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut decompressed)
         .map_err(|e| {
-            // The refusal is a public message (ADR-0040, amendment of
-            // 2026-11-08): the error's kind, never its text.
+            // The refusal is a public message (ADR-0040): the error's kind,
+            // never its text.
             tracing::debug!(
                 event_type = "ingest_gzip_failed",
                 error = %e,
@@ -824,12 +689,6 @@ fn decompress_gzip(data: &[u8], max_body_bytes: usize) -> Result<Vec<u8>, Server
     Ok(decompressed)
 }
 
-/// Log one request's rejections: the per-reason counts and up to 5 sampled
-/// messages, so rejection causes are queryable without flooding telemetry
-/// with per-event detail. A message may quote a bounded client value
-/// (`Rejection::message`), which is why this is the one log line allowed to
-/// carry one. An unparseable line's message ends in `serde_json`'s own
-/// wording, so its sample is the fixed part and the wording goes to DEBUG.
 fn log_rejections(user: &str, rejected: usize, reasons: &str, errors: &[IngestEventError]) {
     let invalid_json = RejectReason::InvalidJson.as_str();
     let first_five = || errors.iter().take(5);
@@ -863,8 +722,6 @@ fn log_rejections(user: &str, rejected: usize, reasons: &str, errors: &[IngestEv
     );
 }
 
-/// One per-event error, as both ingest routes report it: the position, the
-/// reason's wire code and the human-readable message.
 fn event_error(index: usize, reason: RejectReason, message: String) -> IngestEventError {
     IngestEventError {
         index,
@@ -873,13 +730,8 @@ fn event_error(index: usize, reason: RejectReason, message: String) -> IngestEve
     }
 }
 
-/// Parse and canonicalize a body through the shared step, grouping the
-/// accepted events by `(env, service)` with canonical maps and ndjson
-/// bytes. The ndjson bytes are always ndjson regardless of input format,
-/// ready for the WAL.
 fn parse_events(data: &[u8], ctx: &EnvelopeContext<'_>) -> Result<ParsedEvents, ServerError> {
     let mut events = ParsedEvents::new();
-    // `record` never breaks, so the visit always reaches the end.
     let _: ControlFlow<()> = visit_events(data, ctx, |report| events.record(report))?;
     Ok(events)
 }
@@ -892,7 +744,6 @@ mod tests {
 
     const ARRIVAL: &str = "2026-01-01T00:00:00.000000Z";
 
-    /// Parse with a default single-env ("prod") context, no trusted relay.
     fn parse(data: &[u8]) -> Result<ParsedEvents, ServerError> {
         parse_with(data, &["prod"], false)
     }
@@ -916,12 +767,10 @@ mod tests {
         parse_events(data, &ctx)
     }
 
-    /// Total accepted event count across all service batches.
     fn total_accepted(parsed: &ParsedEvents) -> usize {
         parsed.batches.values().map(|b| b.maps.len()).sum()
     }
 
-    /// Get the maps for `(env, service)`, panicking if absent.
     fn batch_maps<'a>(
         parsed: &'a ParsedEvents,
         env: &str,
@@ -940,7 +789,6 @@ mod tests {
             .contains_key(&(env.to_string(), svc.to_string()))
     }
 
-    /// The `(env, service)` group's tally, panicking if it has none.
     fn tally<'a>(parsed: &'a ParsedEvents, env: &str, svc: &str) -> &'a GroupTally {
         parsed
             .tallies
@@ -948,7 +796,6 @@ mod tests {
             .unwrap_or_else(|| panic!("no tally for ({env}, {svc})"))
     }
 
-    /// One code's count in the `(env, service)` group's tally.
     fn repairs_of(parsed: &ParsedEvents, env: &str, svc: &str, code: RepairCode) -> u64 {
         parsed
             .tallies
@@ -957,8 +804,6 @@ mod tests {
             .copied()
             .unwrap_or(0)
     }
-
-    // --- happy path tests ---
 
     #[test]
     fn parse_ndjson_format() {
@@ -978,7 +823,6 @@ mod tests {
         assert!(has_batch(&parsed, "prod", "nginx"));
         assert_eq!(total_accepted(&parsed), 2);
         assert!(parsed.errors.is_empty());
-        // WAL output should be ndjson, not a JSON array.
         let ndjson = &parsed.batches[&("prod".to_string(), "nginx".to_string())].ndjson;
         let text = std::str::from_utf8(ndjson).unwrap();
         assert!(!text.starts_with('['));
@@ -1029,8 +873,6 @@ mod tests {
 
     #[test]
     fn parse_json_array_derives_severity() {
-        // `level` is observed, never consumed: the source stays as the
-        // sender's own column and `_severity` is derived beside it.
         let data = br#"[{"service":"nginx","level":"error"},{"service":"nginx","level":"warn"}]"#;
         let parsed = parse(data).unwrap();
         let maps = batch_maps(&parsed, "prod", "nginx");
@@ -1051,15 +893,12 @@ mod tests {
         assert_eq!(sev(&maps[1]), Some(13));
     }
 
-    /// A sender whose severity source maps to nothing is counted, never
-    /// repaired (ADR-0013 §2) — the counter's input, per service.
     #[test]
     fn unmappable_severity_sources_are_counted_per_service() {
         let data = br#"[{"service":"game","level":"gold"},{"service":"game","level":"silver"},{"service":"nginx","level":"error"}]"#;
         let parsed = parse(data).unwrap();
         assert_eq!(tally(&parsed, "prod", "game").severity_unmapped, 2);
         assert_eq!(tally(&parsed, "prod", "nginx").severity_unmapped, 0);
-        // Counted, never repaired: no code on any event says so.
         let codes: Vec<&str> = parsed
             .tallies
             .values()
@@ -1083,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)] // one scenario, stated in order
+    #[allow(clippy::too_many_lines)]
     fn http_wal_failure_rejects_only_failed_group_and_preserves_successes() {
         use crate::metrics::test_support::sample;
         let recorder = crate::metrics::prometheus_builder().build_recorder();
@@ -1095,7 +934,6 @@ mod tests {
             writer.ensure_dir().unwrap();
             std::fs::write(writer.dir().join("blocked"), b"keep").unwrap();
             let mut parsed = ParsedEvents::new();
-            // `shared` sits in both a written env and the failed one.
             for (env, service, count) in [
                 ("prod", "before", 1),
                 ("blocked", "shared", 3),
@@ -1136,8 +974,6 @@ mod tests {
                     .contains_key(&("blocked".to_owned(), "shared".to_owned()))
             );
 
-            // Only the written groups reach the ledger: the failed group's
-            // repairs and unmapped severities are unacknowledged.
             let ledger = RepairLedger::acknowledged(&parsed.tallies, &written);
             assert_eq!(
                 ledger.repairs,
@@ -1169,7 +1005,6 @@ mod tests {
                 handle.render()
             );
 
-            // finalize_ingest emits this same per-reason accounting once.
             parsed.reject_counts.emit_metrics();
             assert_eq!(
                 sample(
@@ -1198,7 +1033,6 @@ mod tests {
         });
     }
 
-    /// Every group failed: nothing reaches the ledger.
     #[test]
     fn a_ledger_over_no_written_group_counts_nothing() {
         let mut tallies = IndexMap::new();
@@ -1215,8 +1049,6 @@ mod tests {
         assert_eq!(ledger.total(None), 0);
     }
 
-    // --- the repair ledger's log text (ADR-0055) ---
-
     fn ledger(pairs: &[(RepairCode, &str, u64)]) -> RepairLedger {
         RepairLedger {
             repairs: pairs
@@ -1227,7 +1059,6 @@ mod tests {
         }
     }
 
-    /// A clean request: zero totals and empty strings, never a missing field.
     #[test]
     fn a_clean_ledger_reports_zeroes_and_empty_detail() {
         let ledger = RepairLedger::default();
@@ -1249,7 +1080,6 @@ mod tests {
         }
     }
 
-    /// Ties on count break by code, then by service, both ascending.
     #[test]
     fn repair_detail_orders_by_count_then_code_then_service() {
         let ledger = ledger(&[
@@ -1266,7 +1096,6 @@ mod tests {
         );
     }
 
-    /// At most eight pairs; the rest are counted, never listed.
     #[test]
     fn repair_detail_lists_eight_pairs_and_counts_the_rest() {
         let services: Vec<String> = (0..11).map(|i| format!("s{i:02}")).collect();
@@ -1280,13 +1109,10 @@ mod tests {
         assert_eq!(listed.len(), REPAIR_DETAIL_PAIRS);
         assert_eq!(listed[0], "s00/env.defaulted:20");
         assert_eq!(listed[7], "s07/env.defaulted:13");
-        // s08..s10 hold 12 + 11 + 10.
         assert_eq!(detail.omitted_pairs, 3);
         assert_eq!(detail.omitted_occurrences, 33);
     }
 
-    /// Per-code totals are exact over the whole ledger, in declaration
-    /// order, and the class filter keeps each line to its own codes.
     #[test]
     fn repair_codes_are_exact_and_filtered_by_class() {
         let ledger = ledger(&[
@@ -1324,16 +1150,12 @@ mod tests {
         );
     }
 
-    // --- batch-level errors ---
-
     #[test]
     fn parse_empty_json_array_rejected() {
         let data = b"[]";
         let err = parse(data).unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
-
-    // --- per-event errors ---
 
     #[test]
     fn parse_missing_service() {
@@ -1391,8 +1213,6 @@ mod tests {
 
     #[test]
     fn parse_rejects_space_in_service() {
-        // The service name is written to the path verbatim (ADR-0009), so
-        // the charset excludes spaces.
         let data = br#"{"service":"Activity Monitor","message":"nope"}"#;
         let parsed = parse(data).unwrap();
         assert!(parsed.batches.is_empty());
@@ -1427,12 +1247,8 @@ mod tests {
         assert!(parsed.errors[0].message.contains("invalid characters"));
     }
 
-    // --- env allowlist (ADR-0009) ---
-
     #[test]
     fn parse_unlisted_env_rejected_per_event() {
-        // The sibling with a good env still lands; the batch never gains a
-        // (nope, svc) key, so no data/nope/ path can ever be created.
         let data = br#"{"service":"svc","env":"nope","message":"bad"}
 {"service":"svc","env":"lab","message":"good"}"#;
         let parsed = parse_with(data, &["prod", "lab"], false).unwrap();
@@ -1465,8 +1281,6 @@ mod tests {
         assert!(has_batch(&parsed, "lab", "svc"));
     }
 
-    // --- trusted relay ---
-
     #[test]
     fn parse_hostless_event_from_trusted_relay_rejected() {
         let data = br#"{"service":"svc","message":"no host"}"#;
@@ -1477,7 +1291,6 @@ mod tests {
             1
         );
 
-        // The same event from a non-relay peer lands with host.from_peer.
         let parsed = parse_with(data, &["prod"], false).unwrap();
         assert_eq!(total_accepted(&parsed), 1);
         assert_eq!(
@@ -1485,8 +1298,6 @@ mod tests {
             1
         );
     }
-
-    // --- partial-success tests ---
 
     #[test]
     fn parse_partial_ndjson_bad_middle() {
@@ -1539,7 +1350,6 @@ mod tests {
 
     #[test]
     fn parse_ndjson_mixed_validity() {
-        // 5 lines: index 0 good, 1 bad json, 2 good, 3 missing service, 4 good
         let data = b"{\"service\":\"nginx\",\"message\":\"a\"}\nnot json\n{\"service\":\"nginx\",\"message\":\"c\"}\n{\"no_service\":true}\n{\"service\":\"nginx\",\"message\":\"e\"}";
         let parsed = parse(data).unwrap();
         assert_eq!(total_accepted(&parsed), 3);
@@ -1548,28 +1358,18 @@ mod tests {
         assert_eq!(parsed.errors[1].index, 3);
     }
 
-    // --- depth-limit regression tests ---
-
     // DuckDB's `read_json` is a recursive-descent parser: JSON nested past
-    // ~500 levels overflows the (2 MB) `spawn_blocking` stack and the C++
-    // frames can leap the guard page into a raw SIGSEGV. `maximum_depth=2`
-    // does not protect against this — that param caps schema-inference
-    // flattening, not parse recursion. What actually keeps adversarially-deep
-    // JSON away from `read_json` is that ingest re-serializes every event
-    // through `serde_json`, whose default recursion limit (128) rejects it at
-    // the door, before it is ever written to the WAL. These tests pin that
-    // invariant: if a refactor ever calls `Deserializer::disable_recursion_limit()`
-    // (or enables serde_json's `unbounded_depth`), they break loudly.
+    // ~500 levels overflows the (2 MB) `spawn_blocking` stack. Ingest
+    // re-serializes every event through `serde_json`, whose default
+    // recursion limit (128) rejects it at the door. These tests pin that
+    // invariant.
 
-    /// A pathologically-deep ndjson line is rejected per-line and never reaches
-    /// a WAL batch; sibling good lines on the same request still survive.
     #[test]
     fn parse_ndjson_rejects_deeply_nested_event() {
-        const DEPTH: usize = 1000; // well past serde_json's 128 limit
+        const DEPTH: usize = 1000;
         let deep = format!("{}1{}", "{\"a\":".repeat(DEPTH), "}".repeat(DEPTH));
         let data = format!("{deep}\n{{\"service\":\"nginx\",\"message\":\"ok\"}}");
         let parsed = parse(data.as_bytes()).unwrap();
-        // Deep line (index 0) rejected; good line (index 1) accepted.
         assert_eq!(total_accepted(&parsed), 1);
         assert_eq!(parsed.errors.len(), 1);
         assert_eq!(parsed.errors[0].index, 0);
@@ -1580,8 +1380,6 @@ mod tests {
         );
     }
 
-    /// A deeply-nested event in a JSON array aborts the whole request at parse
-    /// time (the array path has no per-event isolation), so nothing is written.
     #[test]
     fn parse_json_array_rejects_deeply_nested_event() {
         const DEPTH: usize = 1000;
@@ -1594,8 +1392,6 @@ mod tests {
             "expected a serde recursion-limit rejection, got: {msg}"
         );
     }
-
-    // --- envelope stamping through the parse paths ---
 
     #[test]
     fn envelope_stamped_when_missing_ndjson() {
@@ -1628,16 +1424,12 @@ mod tests {
         let data = br#"{"service":"test","timestamp":"2025-12-31T12:00:00Z","host":"myhost","message":"hello"}"#;
         let parsed = parse(data).unwrap();
         let event = &batch_maps(&parsed, "prod", "test")[0];
-        // The `timestamp` source is read for `_time` and stored verbatim
-        // as the sender's own column (ADR-0013 §2).
         assert_eq!(event["_time"], "2025-12-31T12:00:00.000000Z");
         assert_eq!(event["timestamp"], "2025-12-31T12:00:00Z");
         assert_eq!(event["host"], "myhost");
         assert_eq!(event["message"], "hello");
     }
 
-    /// Repairs are tallied per code within each `(env, service)` group, one
-    /// per event that earned the code.
     #[test]
     fn repairs_counted_per_code_and_service() {
         let data = br#"{"service":"a"}
@@ -1674,7 +1466,6 @@ mod tests {
         assert_eq!(parsed.errors.len(), 0, "repair is not a rejection");
     }
 
-    /// The substituted time and canonical `_raw` reach the WAL bytes.
     #[test]
     fn substituted_time_appears_in_wal_ndjson() {
         let data = br#"{"service":"test","timestamp":"not-a-date"}"#;
@@ -1695,11 +1486,6 @@ mod tests {
         );
     }
 
-    /// A client-supplied `_trawl_wal_file` never reaches the WAL: compaction
-    /// projects that name as its synthetic provenance column, so a row
-    /// carrying it collides with `read_json`'s `filename=` option and costs
-    /// the batch a retry under a renamed provenance column. The event
-    /// itself is still accepted.
     #[test]
     fn reserved_wal_file_key_stripped_from_events() {
         let data = br#"{"service":"test","timestamp":"2025-12-31T12:00:00Z","_trawl_wal_file":"x","keep":"me"}"#;
@@ -1721,8 +1507,6 @@ mod tests {
         let wal_text =
             std::str::from_utf8(&parsed.batches[&("prod".to_string(), "test".to_string())].ndjson)
                 .unwrap();
-        // The stripped key survives only inside the _raw string (escaped),
-        // never as a JSON key of the WAL event.
         let wal_event: serde_json::Value = serde_json::from_str(wal_text.trim()).unwrap();
         assert!(wal_event.get(compaction::WAL_FILE_COL).is_none());
     }
@@ -1739,8 +1523,6 @@ mod tests {
         assert_eq!(wal_event["host"], "127.0.0.1");
         assert_eq!(wal_event["env"], "prod");
     }
-
-    // --- mixed-service tests ---
 
     #[test]
     fn parse_three_services_ndjson() {
@@ -1775,7 +1557,6 @@ mod tests {
     fn parse_ndjson_per_service_wal_bytes() {
         let data = b"{\"service\":\"a\",\"x\":1}\n{\"service\":\"b\",\"x\":2}\n{\"service\":\"a\",\"x\":3}";
         let parsed = parse(data).unwrap();
-        // Each service batch's ndjson should only contain its own events.
         let a_lines: Vec<_> =
             std::str::from_utf8(&parsed.batches[&("prod".to_string(), "a".to_string())].ndjson)
                 .unwrap()
@@ -1794,8 +1575,6 @@ mod tests {
 
     #[test]
     fn reject_counts_accuracy() {
-        // 1 invalid json, 1 missing service, 1 empty service, 1 bad chars,
-        // 1 non-string service, 1 valid
         let data = b"not json\n{\"no_svc\":1}\n{\"service\":\"\",\"m\":\"x\"}\n{\"service\":\"a/b\",\"m\":\"x\"}\n{\"service\":7,\"m\":\"x\"}\n{\"service\":\"ok\",\"m\":\"x\"}";
         let parsed = parse(data).unwrap();
         assert_eq!(parsed.reject_counts.get(RejectReason::InvalidJson), 1);
@@ -1807,10 +1586,6 @@ mod tests {
         assert_eq!(total_accepted(&parsed), 1);
     }
 
-    // --- gzip decompression bound ---
-
-    /// `len` bytes of ndjson lines of one repetitive shape: journald-like JSON
-    /// compresses far past 10x, as Vector's batches do.
     fn repetitive_ndjson(len: usize) -> Vec<u8> {
         let line = br#"{"service":"sshd","message":"session opened for user root by (uid=0)","_SYSTEMD_UNIT":"ssh.service"}"#;
         let mut body = Vec::with_capacity(len);
@@ -1829,8 +1604,6 @@ mod tests {
         encoder.finish().unwrap()
     }
 
-    /// A body that expands ~25x is accepted while its decompressed size
-    /// stays under the limit: the wire-to-decompressed ratio is not a limit.
     #[test]
     fn gzip_expanding_far_past_ten_times_is_accepted_under_the_limit() {
         let raw = repetitive_ndjson(64 * 1024);
@@ -1844,8 +1617,6 @@ mod tests {
         assert_eq!(decompressed, raw);
     }
 
-    /// A broken stream is refused by the error's kind, not its text: the
-    /// refusal reaches the wire and every record of the failure.
     #[test]
     fn a_broken_gzip_stream_is_refused_by_error_kind() {
         let mut wire = gzip(&repetitive_ndjson(4096));
@@ -1858,7 +1629,6 @@ mod tests {
         assert_eq!(err.safe_message(), *msg);
     }
 
-    /// A body that decompresses to exactly the limit is accepted.
     #[test]
     fn gzip_decompressing_to_exactly_the_limit_is_accepted() {
         let raw = repetitive_ndjson(4096);
@@ -1884,10 +1654,8 @@ mod tests {
         encoder.write_all(&raw[64 * 1024..]).unwrap();
         let mut wire = encoder.finish().unwrap();
         wire.truncate(prefix);
-        // The truncated stream is broken when read to the end.
         assert!(decompress_gzip(&wire, usize::MAX / 2).is_err());
 
-        // Exactly limit + 1 decompressed bytes, from a complete stream.
         let over = decompress_gzip(&gzip(&raw[..=limit]), limit).unwrap_err();
         let response = over.into_response();
         assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);

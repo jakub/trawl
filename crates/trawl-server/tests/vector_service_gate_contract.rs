@@ -4,53 +4,21 @@
 
 //! The shipped Debian Vector configs and trawld's service rule (ADR-0053).
 //!
-//! VRL has no functions, so every transform that derives `service` from
-//! event data carries its own copy of the gate regex and falls back to a
-//! marked name when no candidate passes. These tests keep every copy equal
-//! to one pinned literal, keep that literal equal to
-//! `trawl_config::is_valid_service_name`, and notice a transform that
-//! derives `service` without a gate. The behaviour of the configs runs
-//! under the real Vector binary in `scripts/test-vector-collector.py`.
-//!
-//! # Threat model
-//!
-//! The test guards plausible maintainer edits to the shipped configs: a new
-//! transform that derives `service`, a gate copy that is dropped or drifts
-//! from the pinned literal, and a literal service name trawld refuses.
-//!
-//! It is not a VRL verifier, and it does not try to resist an author who
-//! spells a write to evade it (Unicode whitespace inside a path, say). It
+//! The test is not a VRL verifier, and it does not try to resist an author
+//! who spells a write to evade it (Unicode whitespace inside a path, say). It
 //! does not follow control flow either: a top-level write counts as
 //! unconditional even when an earlier `return` can skip it and send the
 //! source event on as it came. No shipped remap returns early.
 //!
-//! The scanner lexes each remap and finds writes to `.service`. It accepts
-//! only an assignment to exactly `.service` of a literal name trawld takes
-//! or of the gated `service` variable, and one whole-event form,
-//! `. = filter(.) -> |k, v| { ... }`, only after such a write at the
-//! transform's top level and only with no assignment in the closure:
-//! filtering the event itself keeps or drops fields it already has, so it
-//! can no more set `service` than `del` can, and a closure that assigns
-//! nothing cannot change the gated variable (VRL closures can assign to the
-//! variables around them). It refuses what it cannot classify instead of
-//! guessing: operator, destructuring and other
-//! whole-event assignments, `set` and `merge` calls, paths below `.service`,
-//! and any quoted path segment with a backslash (it does not decode
-//! escapes). The shipped configs use none of these.
-//!
-//! Runtime behaviour has other evidence. The collector fixtures run the
-//! configs under the real Vector 0.57.0 in `scripts/test-vector-collector.py`.
-//! `tests/ingest_preview.rs` previews the committed capture against the real
-//! trawld.
+//! A closure that assigns nothing cannot change the gated variable (VRL
+//! closures can assign to the variables around them).
 
 use std::collections::BTreeSet;
 
 use regex_automata::{Input, meta};
 use trawl_config::is_valid_service_name;
 
-/// The gate, as it appears in every deriving transform. VRL `match` reads
-/// it with the `regex` crate, and this test with the meta engine under it,
-/// configured as `regex::Regex::new` configures it.
+/// VRL `match` reads it with the `regex` crate.
 const GATE: &str = r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$";
 
 const SHIPPED: [(&str, &str); 9] = [
@@ -114,13 +82,11 @@ fn remap_sources() -> Vec<(&'static str, String, String)> {
     sources
 }
 
-/// A lexed VRL token. Comments and whitespace are dropped.
 #[derive(Debug, PartialEq)]
 enum Tok {
     Ident(String),
     /// A `"..."` string, escapes unprocessed.
     Str(String),
-    /// A `r'...'`, `s'...'` or `t'...'` literal.
     Raw(String),
     Punct(String),
 }
@@ -135,7 +101,6 @@ struct Token {
 
 const OPERATORS: [&str; 9] = ["??=", "==", "!=", "<=", ">=", "??", "|=", "&&", "||"];
 
-/// Assignment operators. `==` and `!=` are comparisons and lex apart.
 const ASSIGN: [&str; 3] = ["=", "|=", "??="];
 
 fn lex(source: &str) -> Vec<Token> {
@@ -217,13 +182,10 @@ fn is_punct(tokens: &[Token], i: usize, text: &str) -> bool {
     matches!(tokens.get(i), Some(Token { tok: Tok::Punct(p), .. }) if p == text)
 }
 
-/// Token `i` starts where token `i - 1` ends, with no whitespace between.
 fn adjacent(tokens: &[Token], i: usize) -> bool {
     i > 0 && tokens.get(i).is_some_and(|t| t.start == tokens[i - 1].end)
 }
 
-/// The dot at `i` continues a path (`foo.service`, `.a.service`, `x().y`)
-/// rather than starting one at the event root.
 fn continues_path(tokens: &[Token], i: usize) -> bool {
     adjacent(tokens, i)
         && match &tokens[i - 1].tok {
@@ -233,8 +195,6 @@ fn continues_path(tokens: &[Token], i: usize) -> bool {
         }
 }
 
-/// The index after the path segments (`.name`, `."name"`, `[..]`) that
-/// follow, with no whitespace, from `j`.
 fn path_end(tokens: &[Token], mut j: usize) -> usize {
     loop {
         if adjacent(tokens, j)
@@ -265,10 +225,7 @@ fn path_end(tokens: &[Token], mut j: usize) -> usize {
 }
 
 /// From token `k`, exactly `filter(.) -> |a, b| { ... }` ending its
-/// statement: a filter over the event itself, never over a path below it,
-/// whose result is the whole right-hand side, and whose closure assigns
-/// nothing, not even a local. The closure's tokens are still scanned for
-/// writes of their own.
+/// statement. The closure's tokens are still scanned for writes of their own.
 fn filters_the_event(tokens: &[Token], k: usize) -> bool {
     let head = matches!(tokens.get(k).map(|t| &t.tok), Some(Tok::Ident(f)) if f == "filter")
         && is_punct(tokens, k + 1, "(")
@@ -326,11 +283,9 @@ fn destructures(tokens: &[Token], comma: usize) -> bool {
 
 #[derive(Debug, PartialEq)]
 enum Write {
-    /// `.service = "name"`
     Literal(String),
     /// `.service = service`, the variable the transform's gate checks.
     Derived,
-    /// A write the scanner cannot classify, and why.
     Refused(&'static str),
 }
 
@@ -343,8 +298,6 @@ struct ServiceWrite {
 const NOT_CLASSIFIABLE: &str = "`.service` is assigned something other than a string literal \
      or the gated `service` variable";
 
-/// The right-hand side starting at token `k`: a lone string literal or a
-/// lone `service`, ending its statement.
 fn classify_rhs(tokens: &[Token], k: usize) -> Write {
     let Some(first) = tokens.get(k) else {
         return Write::Refused(NOT_CLASSIFIABLE);
@@ -359,9 +312,6 @@ fn classify_rhs(tokens: &[Token], k: usize) -> Write {
     }
 }
 
-/// Every write to the event's `service` field in a remap `source`, and every
-/// construct that could write it without the scanner seeing which field.
-/// Comparisons, reads and writes to other fields are not writes.
 fn service_writes(source: &str) -> Vec<ServiceWrite> {
     let tokens = lex(source);
     let mut writes = Vec::new();
@@ -407,7 +357,6 @@ fn service_writes(source: &str) -> Vec<ServiceWrite> {
                     }
                     None => (true, i + 1),
                 };
-                // The target continues below `.service`: `.service.x`, `.service[0]`.
                 let descends = !whole_event && end > i + 2;
                 match tokens.get(end).map(|t| &t.tok) {
                     Some(Tok::Punct(op)) if op == "=" && !whole_event && !descends => {
@@ -455,8 +404,6 @@ fn service_writes(source: &str) -> Vec<ServiceWrite> {
     writes
 }
 
-/// The contents of every `r'...'` regex literal in `source`: each `r'`
-/// up to the next `'`, left to right.
 fn regex_literals(source: &str) -> Vec<String> {
     let mut literals = Vec::new();
     let mut rest = source;
@@ -636,8 +583,6 @@ fn the_scanner_accepts_the_shipped_shapes() {
         ),
         vec![Write::Derived]
     );
-    // The shipped underscore drop: a filter over the event, after the gated
-    // write, whose closure assigns nothing.
     assert_eq!(
         writes(".service = service\n. = filter(.) -> |key, _value| { !starts_with(key, \"_\") }"),
         vec![Write::Derived]

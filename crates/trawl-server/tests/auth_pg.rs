@@ -4,20 +4,6 @@
 
 //! Pg-backed auth integration matrix over the fleet-auth keystore
 //! (ADR-0004).
-//!
-//! - AC1: fleet-minted key round-trip (create → whoami → revoke → 401)
-//! - AC3: route matrix (public probes, per-role denials, grantless 403
-//!   everywhere, no rate-limiter bypass)
-//! - AC4: frozen /whoami wire shape per role (golden JSON)
-//! - AC5: error envelope per failure class (401 credential, 403 authorization,
-//!   503 pg-down without backend detail)
-//! - AC6: scheduler skips revoked / expired / grant-stripped keys
-//! - AC8: audit poller sees out-of-process key mutations, keeps its
-//!   baseline across a failed poll, retries a failed first snapshot and
-//!   stops on shutdown mid-init (#353). These tests capture a global
-//!   subscriber and need nextest's process per test.
-//! - SSE: revoked-before-connect → 401 (handshake-only auth is accepted
-//!   policy)
 
 mod common;
 
@@ -31,12 +17,10 @@ use sqlx::PgPool;
 use trawl_server::audit;
 use trawl_server::config::RateLimitConfig;
 
-/// Raw reqwest client that trusts the self-signed harness cert.
 fn raw_client() -> reqwest::Client {
     common::harness_client_builder().build().unwrap()
 }
 
-/// Issue a request with an optional bearer token; return (status, json body).
 async fn request(
     server_url: &str,
     method: reqwest::Method,
@@ -64,7 +48,6 @@ async fn request(
     (status, body)
 }
 
-/// Every authenticated route class (method, path).
 fn authenticated_routes() -> Vec<(reqwest::Method, &'static str)> {
     use reqwest::Method;
     vec![
@@ -99,16 +82,11 @@ fn authenticated_routes() -> Vec<(reqwest::Method, &'static str)> {
     ]
 }
 
-// ---------------------------------------------------------------------------
-// AC1: fleet-minted key round-trip
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread")]
 async fn ac1_key_roundtrip_create_whoami_revoke_401() {
     let server = setup().await;
     let store = KeyStore::from_pool(server.fleet_pool.clone());
 
-    // create (what fleet-admin does)
     let created = store
         .create_key(
             "roundtrip",
@@ -120,7 +98,6 @@ async fn ac1_key_roundtrip_create_whoami_revoke_401() {
         .unwrap();
     let token = created.plaintext_token.to_string();
 
-    // whoami works
     let (status, body) = request(
         &server.url,
         reqwest::Method::GET,
@@ -132,7 +109,6 @@ async fn ac1_key_roundtrip_create_whoami_revoke_401() {
     assert_eq!(body["name"], "roundtrip");
     assert_eq!(body["prefix"], created.info.prefix.as_str());
 
-    // revoke → immediate 401 (per-request liveness, no TTL cache)
     store.revoke_key(&created.info.prefix).await.unwrap();
     let (status, body) = request(
         &server.url,
@@ -144,10 +120,6 @@ async fn ac1_key_roundtrip_create_whoami_revoke_401() {
     assert_eq!(status, 401);
     assert_eq!(body["error"]["code"], "auth_error");
 }
-
-// ---------------------------------------------------------------------------
-// AC3: route matrix
-// ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ac3_public_probes_unauthenticated() {
@@ -204,7 +176,6 @@ async fn ac3_reader_blocked_from_export_stream_manage() {
 async fn ac3_ingest_only_key_can_ingest_but_nothing_else() {
     let server = setup().await;
 
-    // Can ingest.
     let resp = raw_client()
         .post(format!("{}/api/v1/ingest", server.url))
         .header("authorization", format!("Bearer {}", server.ingest_token))
@@ -215,7 +186,6 @@ async fn ac3_ingest_only_key_can_ingest_but_nothing_else() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 
-    // Nothing else.
     for (method, path) in [
         (reqwest::Method::POST, "/api/v1/query"),
         (reqwest::Method::POST, "/api/v1/export"),
@@ -293,9 +263,6 @@ async fn ac3_grantless_key_403_on_every_authenticated_route() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ac3_grantless_key_never_reaches_rate_limiter() {
-    // Tight bucket for every key. A grantless key never reaches the rate
-    // limiter (mandatory policy 403s it first) — so no request can ever be
-    // 429, and none can succeed.
     let server = common::setup_with_rate_limit(RateLimitConfig {
         default_rpm: 1,
         ..RateLimitConfig::default()
@@ -314,9 +281,6 @@ async fn ac3_grantless_key_never_reaches_rate_limiter() {
     }
 }
 
-/// Roles-as-data addition to the grantless matrix: a key whose role EXISTS
-/// but resolves zero permissions anywhere is still 403 on every
-/// authenticated route — holding a role is not capability, permissions are.
 #[tokio::test(flavor = "multi_thread")]
 async fn ac3_zero_permission_role_key_403_everywhere() {
     let server = setup().await;
@@ -355,15 +319,8 @@ async fn ac3_zero_permission_role_key_403_everywhere() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// AC5 (rate_rpm): a role ceiling overrides the class defaults end-to-end,
-// spent separately on the interactive and ingest classes.
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread")]
 async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class() {
-    // Generous class defaults so any 429 observed can only come from the
-    // role's rate_rpm override — proving override-not-max.
     let server = common::setup_with_rate_limit(RateLimitConfig {
         default_rpm: 10_000,
         ingest_rpm: 10_000,
@@ -390,7 +347,6 @@ async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class() {
         .unwrap();
     let token = created.plaintext_token.to_string();
 
-    // Interactive class: burst of 2, then 429 — despite default_rpm 10_000.
     let mut statuses = Vec::new();
     for _ in 0..4 {
         let (status, _) = request(
@@ -412,8 +368,6 @@ async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class() {
         "role rate_rpm=2 must cap /query despite the huge class default: {statuses:?}"
     );
 
-    // Ingest class: its own budget of 2 — the interactive spend above must
-    // not have consumed it.
     let client = raw_client();
     let mut ingest_statuses = Vec::new();
     for _ in 0..4 {
@@ -439,15 +393,10 @@ async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// AC4: /whoami wire shape frozen (golden JSON per role)
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread")]
 async fn ac4_whoami_golden_json_per_role() {
     let server = setup().await;
 
-    // The frozen permission set each seeded role resolves to.
     let cases = [
         (
             &server.admin_token,
@@ -502,8 +451,7 @@ async fn ac4_whoami_golden_json_per_role() {
         .await;
         assert_eq!(status, 200);
 
-        // The prefix is dynamic (first 8 chars of the token body); everything
-        // else is asserted as the exact frozen wire shape.
+        // The prefix is dynamic (first 8 chars of the token body).
         let prefix = &token[4..12];
         let expected = serde_json::json!({
             "prefix": prefix,
@@ -516,11 +464,6 @@ async fn ac4_whoami_golden_json_per_role() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// AC5: error envelope per failure class
-// ---------------------------------------------------------------------------
-
-/// The exact opaque 401 body for every credential-failure class.
 fn opaque_401() -> serde_json::Value {
     serde_json::json!({ "error": { "code": "auth_error", "message": "authentication failed" } })
 }
@@ -529,12 +472,10 @@ fn opaque_401() -> serde_json::Value {
 async fn ac5_envelope_missing_and_malformed_and_invalid_tokens() {
     let server = setup().await;
 
-    // missing
     let (status, body) = request(&server.url, reqwest::Method::GET, "/api/v1/whoami", None).await;
     assert_eq!(status, 401);
     assert_eq!(body, opaque_401());
 
-    // malformed scheme
     let resp = raw_client()
         .get(format!("{}/api/v1/whoami", server.url))
         .header("authorization", "Basic dXNlcjpwYXNz")
@@ -547,7 +488,6 @@ async fn ac5_envelope_missing_and_malformed_and_invalid_tokens() {
         opaque_401()
     );
 
-    // not a flt_ token at all
     let (status, body) = request(
         &server.url,
         reqwest::Method::GET,
@@ -558,7 +498,6 @@ async fn ac5_envelope_missing_and_malformed_and_invalid_tokens() {
     assert_eq!(status, 401);
     assert_eq!(body, opaque_401());
 
-    // well-formed but unknown token
     let (status, body) = request(
         &server.url,
         reqwest::Method::GET,
@@ -575,7 +514,6 @@ async fn ac5_envelope_revoked_and_expired_tokens() {
     let server = setup().await;
     let store = KeyStore::from_pool(server.fleet_pool.clone());
 
-    // revoked
     let revoked = store
         .create_key(
             "rev",
@@ -596,7 +534,6 @@ async fn ac5_envelope_revoked_and_expired_tokens() {
     assert_eq!(status, 401);
     assert_eq!(body, opaque_401());
 
-    // expired
     let expiring = store
         .create_key(
             "exp",
@@ -668,7 +605,6 @@ async fn ac5_health_and_envelope_pg_down_without_backend_detail() {
         })
     );
 
-    // Kill the auth backend under the running server.
     server.kill_fleet_database().await;
     *server.state.auth.auth_ping.lock().await = None;
 
@@ -713,14 +649,6 @@ async fn ac5_health_and_envelope_pg_down_without_backend_detail() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// AC6: scheduler gates on key liveness + usable trawl grant
-// ---------------------------------------------------------------------------
-
-/// Drive the real scheduler over pg schedule state and a pg keystore,
-/// applying `mutate` to the owning key before the scheduler polls.
-/// Returns the number of runs recorded after ~2.5s of 1s polling.
-///
 /// `key_ttl`/`pre_sleep_ms` support the expiry case (expiry can't be set
 /// post-hoc through the public API).
 async fn scheduler_runs_after(
@@ -740,13 +668,6 @@ async fn scheduler_runs_after(
         .await
         .unwrap();
 
-    // Dedicated app-state database, migrated via the real boot path
-    // (`from_pool` is where the advisory lock and the migration live;
-    // `connect` only adds the pool). The pool is the fixture's, sized by
-    // `APP_POOL_MAX`: `StorageState::connect` would build trawld's
-    // PRODUCTION pool of 8 on top of the 5 this test already holds from
-    // `#[sqlx::test]`, which is most of a per-test connection budget spent
-    // on a scheduler that runs one query.
     let app_db_url = common::create_app_database().await;
     let storage = trawl_server::store::StorageState::from_pool(common::app_pool(&app_db_url).await)
         .await
@@ -759,8 +680,8 @@ async fn scheduler_runs_after(
         .unwrap();
     let schedule = storage
         .schedule
-        // 60s is the store minimum; the first poll runs regardless of interval
-        // (never-run schedules are always due), so cadence is immaterial here.
+        // 60s is the store minimum; the first poll runs regardless of interval,
+        // so cadence is immaterial here.
         .create_schedule(saved.id, created.info.id, 60, None, None, 0, chrono::Utc::now())
         .await
         .unwrap();
@@ -771,14 +692,11 @@ async fn scheduler_runs_after(
         tokio::time::sleep(Duration::from_millis(pre_sleep_ms)).await;
     }
 
-    // Real parquet fixtures so a permitted run actually succeeds. The
-    // root is this test's own copy: the scheduler WRITES report output
+    // The root is this test's own copy: the scheduler WRITES report output
     // under `scheduled/`, which no other test may see.
     let data_dir = tempfile::tempdir().expect("scheduler data root");
     let base_dir = seed_data_root(data_dir.path());
     let exec_pool = trawl_server::pool::ExecutorPool::for_test(base_dir, 1, 1000, None).unwrap();
-    // The scheduler sweeps captured results on its hourly retention tick,
-    // which this test never reaches; it still needs a root to hold.
     let results_root = std::sync::Arc::new(
         trawl_server::results::root::ResultsRoot::open_apart_from(
             &data_dir.path().join("data.results"),
@@ -854,7 +772,6 @@ async fn ac6_scheduler_skips_revoked_key(pool: PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn ac6_scheduler_skips_expired_key(pool: PgPool) {
-    // Short-lived key + a sleep past its expiry before the scheduler starts.
     let runs = scheduler_runs_after(
         pool,
         Some(Duration::from_millis(100)),
@@ -882,9 +799,6 @@ async fn ac6_scheduler_skips_role_stripped_key(pool: PgPool) {
     assert_eq!(runs, 0, "role-stripped key must not execute schedules");
 }
 
-/// A live key whose role set is downgraded from analyst to a role lacking
-/// saved-query authority must stop running its schedules — otherwise removing
-/// a role leaves durable execution privilege behind.
 async fn assert_downgrade_stops_schedules(pool: PgPool, new_role: &'static str) {
     let runs = scheduler_runs_after(
         pool,
@@ -907,20 +821,14 @@ async fn assert_downgrade_stops_schedules(pool: PgPool, new_role: &'static str) 
 
 #[sqlx::test(migrations = false)]
 async fn ac6_scheduler_skips_analyst_downgraded_to_reader(pool: PgPool) {
-    // Reader holds Query but not SavedQuery: it cannot manage saved queries
-    // interactively, so it must not keep running them on a schedule.
     assert_downgrade_stops_schedules(pool, "trawl-reader").await;
 }
 
 #[sqlx::test(migrations = false)]
 async fn ac6_scheduler_skips_analyst_downgraded_to_ingest(pool: PgPool) {
-    // Ingest holds neither Query nor SavedQuery.
     assert_downgrade_stops_schedules(pool, "trawl-ingest").await;
 }
 
-/// The key keeps its role; the role itself loses `saved_query`. The
-/// scheduler's Query-AND-SavedQuery gate must observe the mutation on its
-/// next liveness poll.
 #[sqlx::test(migrations = false)]
 async fn ac6_scheduler_stops_when_role_loses_saved_query_permission(pool: PgPool) {
     let runs = scheduler_runs_after(
@@ -947,11 +855,6 @@ async fn ac6_scheduler_stops_when_role_loses_saved_query_permission(pool: PgPool
     );
 }
 
-// ---------------------------------------------------------------------------
-// AC8: audit poller sees out-of-process mutations
-// ---------------------------------------------------------------------------
-
-/// `std::io::Write` sink capturing tracing output for assertions.
 #[derive(Clone)]
 struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -965,12 +868,9 @@ impl std::io::Write for CaptureWriter {
     }
 }
 
-/// Capture this process's tracing output as plain text.
-///
 /// The subscriber is global (`try_init`), so the capture holds one test's
-/// log only because nextest runs each test in its own process. Under
-/// `cargo test` the first test to install it would capture every test's
-/// events, and the others would capture nothing. Run these with nextest.
+/// log only because nextest runs each test in its own process. Run these
+/// with nextest.
 fn capture_logs() -> Arc<Mutex<Vec<u8>>> {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let writer = CaptureWriter(Arc::clone(&buf));
@@ -988,16 +888,14 @@ fn log_text(buf: &Mutex<Vec<u8>>) -> String {
     String::from_utf8(buf.lock().clone()).unwrap()
 }
 
-/// Lines the audit poller emitted for a change it detected. fleet-auth logs
-/// its own `key_created` and `key_revoked` for mutations made in this
-/// process; only the poller's lines carry this suffix.
+/// fleet-auth logs its own `key_created` and `key_revoked` for mutations
+/// made in this process; only the poller's lines carry this suffix.
 fn detected(log: &str) -> Vec<&str> {
     log.lines()
         .filter(|l| l.contains("detected by audit"))
         .collect()
 }
 
-/// Detected lines of `event_type` that name `needle`.
 fn detected_events<'a>(log: &'a str, event_type: &str, needle: &str) -> Vec<&'a str> {
     let field = format!("event_type=\"{event_type}\"");
     detected(log)
@@ -1006,8 +904,6 @@ fn detected_events<'a>(log: &'a str, event_type: &str, needle: &str) -> Vec<&'a 
         .collect()
 }
 
-/// Bounds a wait for a step that must happen. It never paces the test:
-/// a pass never waits for it, a hang fails on it.
 const HANG_GUARD: Duration = Duration::from_secs(10);
 
 async fn wait_parked(parked: tokio::sync::oneshot::Receiver<()>, what: &str) {
@@ -1062,7 +958,6 @@ async fn stop_audit(
         .unwrap();
 }
 
-/// The rfc3339 value of `field` in `line`.
 fn timestamp_field(line: &str, field: &str) -> chrono::DateTime<chrono::Utc> {
     let start = line
         .find(&format!("{field}="))
@@ -1080,7 +975,6 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
     let buf = capture_logs();
     let key_store = common::fleet_keystore(&pool).await;
 
-    // Baseline key so the initial snapshot is non-trivial.
     let baseline = key_store
         .create_key(
             "baseline",
@@ -1097,10 +991,6 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
 
     // Out-of-process mutation: a second connection to the same database
     // (what fleet-admin does).
-    // A SECOND pool on the same database, sized by the fixture rather than
-    // by `KeyStore::connect`'s production ceiling of 8: what the test needs
-    // is a connection the audit poller does not own, not a daemon's worth
-    // of them.
     let second = KeyStore::from_pool(common::fleet_pool(&common::fleet_database_url(&pool)).await);
     let created = second
         .create_key(
@@ -1113,8 +1003,6 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         .unwrap();
     let held = next_poll(&hooks, held).await;
 
-    // Privilege escalation with no key mutation at all: the role the baseline
-    // key already holds gains a permission. Plus a role assignment.
     second
         .add_role_permissions(
             "trawl-reader",
@@ -1131,8 +1019,6 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         .unwrap();
     let held = next_poll(&hooks, held).await;
 
-    // Created and revoked while the poller is held between two polls: the
-    // next poll first sees the key already inactive.
     let fleeting = second
         .create_key(
             "created-and-revoked",
@@ -1159,7 +1045,6 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         1,
         "audit must emit key_created once for the new key; log:\n{log}"
     );
-    // The effective capability, not just the mutable role name, is recorded.
     assert!(
         created_lines[0].contains("permissions=") && created_lines[0].contains("trawl:"),
         "key_created must record resolved permissions; line:\n{}",
@@ -1170,7 +1055,6 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         1,
         "audit must emit key_revoked once for the revoked key; log:\n{log}"
     );
-    // Mutating a role escalates every key holding it — that must be audited.
     let role_lines = detected_events(&log, "role_changed", "trawl-reader");
     assert!(
         role_lines.len() == 1 && role_lines[0].contains("trawl:server_manage"),
@@ -1181,7 +1065,6 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         assign_lines.len() == 1 && assign_lines[0].contains("trawl-admin"),
         "audit must emit key_roles_changed for the reassigned key; log:\n{log}"
     );
-    // A key the poller first sees inactive reports both events, in order.
     let fleeting_lines: Vec<&str> = detected(&log)
         .into_iter()
         .filter(|l| l.contains(&fleeting.info.prefix))
@@ -1196,8 +1079,6 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
     );
 }
 
-/// AC2: a poll that fails after a real `list_keys` emits nothing and keeps
-/// its baseline, and the next poll reports the change exactly once.
 #[sqlx::test(migrations = false)]
 async fn audit_poll_failure_between_reads_keeps_baseline(pool: PgPool) {
     let buf = capture_logs();
@@ -1262,9 +1143,6 @@ async fn audit_poll_failure_between_reads_keeps_baseline(pool: PgPool) {
     drop(held);
 }
 
-/// AC3: the first snapshot fails three times, then succeeds. The task logs
-/// one sanitized `audit_error` per failure, then `audit_gap`, then
-/// `audit_start`, and audits a mutation made after it recovered.
 #[sqlx::test(migrations = false)]
 async fn audit_init_recovers_after_failures(pool: PgPool) {
     let buf = capture_logs();
@@ -1284,7 +1162,6 @@ async fn audit_init_recovers_after_failures(pool: PgPool) {
         hooks.clone(),
     );
     wait_parked(first_attempt.parked, "the first init attempt").await;
-    // The first attempt is under way at this instant.
     let during_first_attempt = chrono::Utc::now();
     let held = next_poll(&hooks, first_attempt.release).await;
 
@@ -1361,8 +1238,7 @@ async fn audit_init_recovers_after_failures(pool: PgPool) {
     drop(held);
 }
 
-/// AC4: shutdown ends the task while an init fetch is held between its two
-/// reads. The hold is never released, so only the shutdown race can end it.
+/// The hold is never released, so only the shutdown race can end it.
 #[sqlx::test(migrations = false)]
 async fn audit_shutdown_while_init_fetch_is_held(pool: PgPool) {
     let buf = capture_logs();
@@ -1386,9 +1262,8 @@ async fn audit_shutdown_while_init_fetch_is_held(pool: PgPool) {
     assert!(!log.contains("action=\"audit_start\""), "log:\n{log}");
 }
 
-/// AC4: shutdown ends the task while it sleeps between init attempts. The
-/// interval is an hour, so a sleep outside the shutdown race would trip the
-/// hang guard.
+/// The interval is an hour, so a sleep outside the shutdown race would trip
+/// the hang guard.
 #[sqlx::test(migrations = false)]
 async fn audit_shutdown_while_waiting_between_init_attempts(pool: PgPool) {
     let buf = capture_logs();
@@ -1421,10 +1296,6 @@ async fn audit_shutdown_while_waiting_between_init_attempts(pool: PgPool) {
     assert!(!log.contains("action=\"audit_start\""), "log:\n{log}");
 }
 
-// ---------------------------------------------------------------------------
-// SSE: revoked-before-connect → 401 (handshake-only auth, accepted policy)
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread")]
 async fn sse_stream_rejects_revoked_key_at_handshake() {
     let server = setup().await;
@@ -1453,13 +1324,6 @@ async fn sse_stream_rejects_revoked_key_at_handshake() {
     assert_eq!(resp.status().as_u16(), 401);
 }
 
-// ---------------------------------------------------------------------------
-// AC9: storage-loss observability + redacted store errors
-// ---------------------------------------------------------------------------
-
-/// Killing the app-state database under a running server degrades /health
-/// (HTTP 200 — queries still serve) and turns store-backed endpoints into
-/// redacted 503s. Never a pg diagnostic on the wire.
 #[tokio::test(flavor = "multi_thread")]
 async fn storage_loss_degrades_health_and_503s_store_endpoints() {
     let server = setup().await;
@@ -1468,8 +1332,7 @@ async fn storage_loss_degrades_health_and_503s_store_endpoints() {
     server.kill_app_database().await;
 
     // The storage ping is memoised (~5s TTL) — poll until degradation
-    // propagates. The HTTP status must stay 200 throughout: app-state loss
-    // is non-critical (degraded), never a liveness failure.
+    // propagates.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         let resp = client
@@ -1505,7 +1368,6 @@ async fn storage_loss_degrades_health_and_503s_store_endpoints() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    // Store-backed endpoint: 503 with the fixed redacted envelope.
     let (status, body) = request(
         &server.url,
         reqwest::Method::GET,
@@ -1526,15 +1388,11 @@ async fn storage_loss_degrades_health_and_503s_store_endpoints() {
     );
 }
 
-/// `/api/v1/dashboard` reports the enabled-schedule count from postgres:
-/// the async snapshot collector polls the store and the sync snapshot
-/// carries it onto the wire.
 #[tokio::test(flavor = "multi_thread")]
 async fn dashboard_reports_schedule_count_from_pg() {
     let server = setup().await;
     let client = raw_client();
 
-    // Create a saved query + schedule through the API.
     let resp = client
         .post(format!("{}/api/v1/saved", server.url))
         .header("authorization", format!("Bearer {}", server.analyst_token))
@@ -1555,8 +1413,6 @@ async fn dashboard_reports_schedule_count_from_pg() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 
-    // The collector ticks every second; poll the dashboard until the count
-    // lands.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let (status, body) = request(
@@ -1710,7 +1566,6 @@ async fn history_filter_permission_and_raw_refusal_precede_history_sql() {
                 "code": "bad_request", "message": "invalid history parameters"
             }})
         );
-        // The same malformed representation must not override authorization.
         let (status, body) = request(
             &server.url,
             reqwest::Method::GET,

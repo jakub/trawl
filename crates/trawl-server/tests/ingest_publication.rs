@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Durable WAL batches must enter hot memory before compaction can drain them.
-
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -159,8 +157,6 @@ fn counter(handle: &metrics_exporter_prometheus::PrometheusHandle, series: &str)
         .unwrap_or_else(|| panic!("missing series {series} in {rendered}"))
 }
 
-/// Render a handler failure the way the router does and return its status
-/// and body text.
 async fn rendered(error: trawl_server::error::ServerError) -> (axum::http::StatusCode, String) {
     use axum::response::IntoResponse;
     let response = error.into_response();
@@ -171,8 +167,6 @@ async fn rendered(error: trawl_server::error::ServerError) -> (axum::http::Statu
     (status, String::from_utf8(body.to_vec()).unwrap())
 }
 
-/// A failed group fails the whole request with a redacted 500, after the
-/// groups that did write are published and counted.
 async fn assert_redacted_wal_500(error: trawl_server::error::ServerError, private: &[&str]) {
     let (status, body) = rendered(error).await;
     assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -182,8 +176,6 @@ async fn assert_redacted_wal_500(error: trawl_server::error::ServerError, privat
     }
 }
 
-/// Exercise the actual handler and its blocking finalization, rather than
-/// manually emitting parsed rejection counts. This is not a socket request.
 #[tokio::test]
 async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful_groups() {
     let root = tempfile::tempdir().unwrap();
@@ -200,8 +192,6 @@ async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful
         .await
         .unwrap();
     let mut state = server.state.clone();
-    // This handler invocation admits both environments. Only the blocked
-    // environment's WAL path fails; the shared fixture needs no new option.
     state.ingest.envs = vec!["prod".to_owned(), "blocked".to_owned()].into();
     let hot = state.query.hot_buffer.as_ref().unwrap().clone();
     let wal = state.ingest.wal_writer.as_ref().unwrap().clone();
@@ -232,9 +222,6 @@ async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful
     )
     .await
     .unwrap_err();
-    // Any failed WAL group fails the request, and the filesystem error
-    // never reaches the body. The rejection metric still records all
-    // three events of the failed group.
     assert_redacted_wal_500(error, &["blocked", "WAL", "os error"]).await;
     assert_eq!(counter(&metrics, rejected_series) - rejected_before, 3);
     assert_eq!(
@@ -287,9 +274,6 @@ async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful
     );
 }
 
-/// A failed WAL directory fsync is a failed ack: the handler answers a
-/// redacted 500, the failed group leaves no WAL file, and the group that
-/// wrote before it failed is still published.
 #[tokio::test]
 async fn http_handler_directory_sync_failure_is_a_redacted_500_after_publishing_written_groups() {
     let root = tempfile::tempdir().unwrap();
@@ -452,8 +436,6 @@ async fn pending_rollup_does_not_reject_ingest() {
     assert!(publication.read().await.is_err());
 }
 
-/// One `/api/v1/query` answer as rows of column name to value, read with
-/// real `DuckDB` over the hot buffer and the selected parquet files.
 async fn query_rows(server: &common::TestServer, dsl: &str) -> Vec<Row> {
     let response = common::harness_client_builder()
         .build()
@@ -485,7 +467,6 @@ async fn query_rows(server: &common::TestServer, dsl: &str) -> Vec<Row> {
 
 type Row = std::collections::BTreeMap<String, Value>;
 
-/// The instant a query answer spells as RFC 3339 UTC text.
 fn instant(value: &Value) -> DateTime<Utc> {
     match value {
         Value::String(text) => DateTime::parse_from_rfc3339(text)
@@ -495,7 +476,6 @@ fn instant(value: &Value) -> DateTime<Utc> {
     }
 }
 
-/// The repair codes a row's `_repairs` lists.
 fn repairs(row: &Row) -> Vec<&str> {
     match row.get("_repairs") {
         Some(Value::String(codes)) => codes.split(',').collect(),
@@ -503,7 +483,6 @@ fn repairs(row: &Row) -> Vec<&str> {
     }
 }
 
-/// Every file named `name` under `root`, at any depth.
 fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -520,8 +499,6 @@ fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {
     found
 }
 
-/// The one `ahead` row, stored at its arrival with the repair, and the
-/// sender's time still in its `timestamp` column.
 fn assert_stored_at_arrival(
     rows: &[Row],
     sent: DateTime<Utc>,
@@ -546,17 +523,9 @@ fn assert_stored_at_arrival(
     );
 }
 
-/// An event whose sender stamps it three hours ahead is stored at its
-/// arrival with `time.ahead_of_arrival`, so `last=15m` returns it exactly
-/// once, from its hourly file and from its day file.
-///
 /// The real rollup skips today and compaction has no clock seam, so the
 /// day-file leg moves the compacted hourly file to the name the rollup
-/// writes, `{day}/{service}.parquet`. The aged-directory property, where
-/// the walk must still reach a directory older than an hour, is
-/// `source::tests::last_window_reaches_every_row_within_the_lead`. A
-/// `recent` service keeps its hourly file in the same hour, so the walk
-/// has a recent directory and the day holds daily and hourly files.
+/// writes, `{day}/{service}.parquet`.
 #[tokio::test(flavor = "multi_thread")]
 async fn ahead_of_arrival_event_is_found_by_last_after_compaction_and_rollup() {
     let (fixture, server) =
@@ -603,11 +572,6 @@ async fn ahead_of_arrival_event_is_found_by_last_after_compaction_and_rollup() {
     }
 }
 
-/// Rows stored before the bound keep the `_time` they were written with. A
-/// WAL batch in the writer's own format, planted before boot with a `_time`
-/// three hours ahead, keeps it through hydration and compaction, since
-/// neither canonicalizes again, and a parquet file holding such a `_time`
-/// reads as it is. Neither earns `time.ahead_of_arrival`.
 #[tokio::test(flavor = "multi_thread")]
 async fn preexisting_future_time_is_not_rewritten() {
     let now = Utc::now().trunc_subsecs(6);
@@ -617,8 +581,6 @@ async fn preexisting_future_time_is_not_rewritten() {
         RateLimitConfig::default(),
         CaptureConfig::default(),
         |data| {
-            // What the canonicalizer wrote before the bound for a sender
-            // three hours ahead: a clean event with that `_time`.
             let arrival = now.to_rfc3339_opts(SecondsFormat::Micros, true);
             let envs = ["prod".to_owned()];
             let derivation = Derivation::defaults();

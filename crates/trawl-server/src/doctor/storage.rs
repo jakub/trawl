@@ -5,22 +5,14 @@
 //! The `trawld --doctor` checks of the data root and its recovery markers.
 //!
 //! Every check asks the question boot's gate asks, through the classifier
-//! boot itself calls, so the two cannot drift: the storage epoch through
-//! [`epoch::classify_data_root`], catalog identity through
-//! [`conform::judge_archive_identity`], conformance through
-//! [`conform::conformance_recorded`], the repin marker through
-//! [`marker::parse_marker`] and [`marker::RepinPhase::query_only_refuses`],
-//! the publication and rollup markers through the decoders boot's recovery
-//! reads them with, and each rollup marker's fate through recovery's own
-//! [`rollup_marker::classify`]. Where boot reads a small file its own way, the
-//! doctor injects [`super::fsread`] instead, so a FIFO, a symlink or an
-//! oversized file under the data root costs a row, never the run.
+//! boot itself calls, so the two cannot drift. Where boot reads a small file
+//! its own way, the doctor injects [`super::fsread`] instead, so a FIFO, a
+//! symlink or an oversized file under the data root costs a row, never the
+//! run.
 //!
-//! Nothing under the data root is created, renamed, or removed. The group
-//! reads [`Ctx::app`], which the database group filled, and no row names
-//! the data root, the WAL directory, a marker's content or a catalog
-//! identifier: rows say what boot will do, in fixed sentences. The one
-//! exception is an unresolved rollup marker, which the row names by the
+//! No row names the data root, the WAL directory, a marker's content or a
+//! catalog identifier: rows say what boot will do, in fixed sentences. The
+//! one exception is an unresolved rollup marker, which the row names by the
 //! env, day and service its path spells, each shown only once valid.
 
 use std::path::{Path, PathBuf};
@@ -48,24 +40,16 @@ pub(super) const CHECKS: [ServerCheck; 6] = [
     ServerCheck::RecoveryPublication,
 ];
 
-/// How long one look at the data tree may take: a stat, a listing, a few
-/// small reads, or the parquet walk catalog identity makes when the marker
-/// does not prove the pairing. Each file read inside it has its own
-/// [`fsread::READ_DEADLINE`].
 const LOOK_DEADLINE: Duration = Duration::from_secs(10);
 
-/// What a data-root check's source names.
 fn data_source(ctx: &Ctx) -> Text {
     Text::new("[data] path in ").path(&ctx.config_path)
 }
 
-/// Where the settings of every storage check come from.
 fn storage_source(ctx: &Ctx) -> Text {
     Text::new("[data] path and [ingest] in ").path(&ctx.config_path)
 }
 
-/// Run this group's checks through `runner`, in [`CHECKS`] order. A check
-/// the runner blocks never looks.
 pub(super) async fn run(ctx: &mut Ctx, runner: &mut Runner) {
     let data_root = ctx.config.data.base_dir();
     let wal_dir = ctx.config.wal_dir();
@@ -114,12 +98,9 @@ pub(super) async fn run(ctx: &mut Ctx, runner: &mut Runner) {
     }
 }
 
-/// Why a look at the data tree gave no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Missed {
-    /// It ran past [`LOOK_DEADLINE`].
     TimedOut,
-    /// Its task did not finish.
     Lost,
 }
 
@@ -135,7 +116,6 @@ async fn look<T: Send + 'static>(look: impl FnOnce() -> T + Send + 'static) -> R
     }
 }
 
-/// The row of a check whose look gave no answer.
 fn missed(check: ServerCheck, missed: Missed) -> Row {
     match missed {
         Missed::TimedOut => Row::not_sampled(check, reason::TIMED_OUT),
@@ -143,23 +123,14 @@ fn missed(check: ServerCheck, missed: Missed) -> Row {
     }
 }
 
-// ---------------------------------------------------------------------------
-// server.data.root
-// ---------------------------------------------------------------------------
-
 /// What the running user may do with a directory, from `accessat` with the
 /// effective ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Access {
-    /// Everything asked for.
     Granted,
-    /// Reading or searching it is denied.
     NoRead,
-    /// Writing it is denied.
     NoWrite,
-    /// It is on a read-only filesystem.
     ReadOnlyFs,
-    /// The question itself failed.
     Unknown,
     /// Not asked: the doctor runs as root, whose answer says nothing about
     /// the service user's, so no `accessat` ran and no answer, not even
@@ -171,25 +142,19 @@ pub(super) enum Access {
 /// [`observe_created`] saw at another directory boot creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RootSeen {
-    /// A directory, and what the running user may do with it.
     Directory(Access),
     /// Nothing. For an ingest node, what the running user may do with the
     /// nearest directory that exists above it, where boot creates it.
     Absent(Option<Access>),
-    /// Something that is not a directory.
     NotADirectory,
-    /// A directory above it is not a directory.
     AncestorNotADirectory,
     /// A directory above it is a symlink to nothing, which boot's create
     /// path meets as an existing entry and refuses.
     AncestorDangling,
-    /// A symlink to nothing.
     Dangling,
     /// Something that was there at the first look and gone at the second.
     Vanished,
-    /// The running user may not look up the path.
     Denied,
-    /// Inspecting it failed otherwise.
     Unreadable,
 }
 
@@ -205,26 +170,10 @@ impl RootSeen {
     }
 }
 
-/// `server.data.root`: the root is a directory, or boot creates it, and the
-/// running user may read it and, on an ingest node, write it. On an ingest
-/// node the same holds for the effective WAL directory, which boot creates
-/// when it is absent, wherever it is: a path under the data root may leave
-/// it through `..` or a symlink, and access to the root proves nothing
-/// about a child that exists. The row reports the root's failure first and
-/// looks at the WAL directory only when the root holds. Unless
-/// `ask_access`, as in a root run, only the structural half of each access
-/// check is evaluated: each directory is a directory, or absent below a
-/// directory boot could create it in. When that holds the row is
-/// `not_sampled`, reason `ran_as_root`, and the checks that wait on it
-/// still look.
-///
-/// When both hold, the row predicts what boot's closing of the storage
-/// roots does (ADR-0052), through [`owner_only::predict`] over the roots
-/// boot closes; see [`closing`]. A root boot would refuse fails the
-/// row. Otherwise the results root is judged as the WAL directory is, on
-/// every node, since every node makes it and writes captures into it
-/// ([`results_row`]). Last, a root boot would close makes the row
-/// `complete`, reason `will_tighten`.
+/// On an ingest node the same holds for the effective WAL directory, which
+/// boot creates when it is absent, wherever it is: a path under the data root
+/// may leave it through `..` or a symlink, and access to the root proves
+/// nothing about a child that exists.
 async fn check_root(
     data_root: PathBuf,
     wal_dir: PathBuf,
@@ -259,8 +208,6 @@ async fn check_root(
     }
 }
 
-/// The `server.data.root` row for boot's closing of the storage roots, or
-/// `None` when it changes nothing.
 #[cfg(unix)]
 fn closing(
     data_root: &Path,
@@ -278,41 +225,28 @@ fn closing(
     ))
 }
 
-/// Off Unix there are no modes to close.
 #[cfg(not(unix))]
 fn closing(_: &Path, _: &Path, _: &Path, _: bool, _: bool) -> Option<Row> {
     None
 }
 
-/// What boot's closing of the storage roots would do, predicted without
-/// changing anything.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Closing {
-    /// Every root is owner-only, absent, or another check's to judge.
     Unchanged,
-    /// Boot would remove group and other permissions from these roots.
     WillTighten(Vec<RootKind>),
-    /// Boot would refuse to start over this root.
     Refused(RootKind, Unclosable),
 }
 
-/// Why boot could not keep a root owner-only. It carries no path and no
-/// uid, so no row can name one.
+/// It carries no path and no uid, so no row can name one.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unclosable {
-    /// The final component is a symbolic link.
     Symlink,
-    /// The configured path does not end in a directory name.
     BadPath,
-    /// Something other than a directory is there.
     NotDirectory,
-    /// Another user owns it.
     ForeignOwner,
-    /// It needs closing and sits on a read-only mount.
     ReadOnlyFilesystem,
-    /// It could not be opened to read its owner and mode.
     Uninspectable,
 }
 
@@ -339,11 +273,6 @@ impl Unclosable {
     }
 }
 
-/// Predict boot's closing of the roots [`owner_only::protected_roots`]
-/// lists, in its order, with [`owner_only::predict`], which opens and stats
-/// and never changes a mode. The first root boot would refuse is the
-/// answer; otherwise every root it would close. Unless `ask_access`, only a
-/// [structural](Unclosable::structural) refusal counts.
 #[cfg(unix)]
 fn predict_closing(
     data_root: &Path,
@@ -379,7 +308,6 @@ fn predict_closing(
     }
 }
 
-/// A root's name in a row's fixed text.
 #[cfg(unix)]
 const fn root_name(kind: RootKind) -> &'static str {
     match kind {
@@ -391,9 +319,7 @@ const fn root_name(kind: RootKind) -> &'static str {
     }
 }
 
-/// The `server.data.root` row for what boot's closing would do, or `None`
-/// when it changes nothing. Its sentences name the root by kind, never by
-/// path, and never an owner.
+/// Its sentences name the root by kind, never by path, and never an owner.
 #[cfg(unix)]
 #[allow(
     clippy::too_many_lines,
@@ -505,10 +431,6 @@ fn closing_row(closing: Closing) -> Option<Row> {
     Some(row)
 }
 
-/// The `server.data.root` row for what was seen at the WAL directory, or
-/// `None` when it [holds](RootSeen::holds). Boot creates
-/// it as it creates the data root, so it is judged the same way: R, W and
-/// X on it, or W and X on the nearest directory above it.
 fn wal_row(seen: RootSeen) -> Option<Row> {
     let check = ServerCheck::DataRoot;
     let access = || Text::new("give the service user access to the WAL directory, or run as it");
@@ -556,13 +478,8 @@ fn wal_row(seen: RootSeen) -> Option<Row> {
     Some(row)
 }
 
-/// The `server.data.root` row for what was seen at the results root, or
-/// `None` when it [holds](RootSeen::holds). Every node makes it at its
-/// start, with any missing parents, and writes captures into it
-/// (ADR-0057), so it is judged as the WAL directory is: R, W and X on it,
-/// or W and X on the nearest directory above it that exists. A symlink, a
-/// non-directory or another owner there is boot's closing's to report
-/// first ([`closing`]).
+/// A symlink, a non-directory or another owner there is boot's closing's to
+/// report first ([`closing`]).
 fn results_row(seen: RootSeen) -> Option<Row> {
     let check = ServerCheck::DataRoot;
     let access = || Text::new("give the service user access to the results root, or run as it");
@@ -618,7 +535,6 @@ fn results_row(seen: RootSeen) -> Option<Row> {
     Some(row)
 }
 
-/// The `server.data.root` row for what was seen at the configured path.
 fn root_row(seen: RootSeen, ingest: bool) -> Row {
     let check = ServerCheck::DataRoot;
     let detail = |text: &'static str| Text::new(text);
@@ -665,9 +581,6 @@ fn root_row(seen: RootSeen, ingest: bool) -> Row {
     }
 }
 
-/// The row of a root whose structure holds and whose access was not asked
-/// about, because a root run's access proves nothing about the service
-/// user's.
 fn not_asked(check: ServerCheck, seen: &'static str) -> Row {
     Row::not_sampled(check, reason::RAN_AS_ROOT)
         .detail(Text::new(seen))
@@ -676,8 +589,6 @@ fn not_asked(check: ServerCheck, seen: &'static str) -> Row {
         ))
 }
 
-/// The row for access the running user lacks, at the root or, when
-/// `absent`, at the directory boot would create it in.
 fn access_row(check: ServerCheck, access: Access, absent: bool) -> Row {
     let next = Text::new("give the service user access to the data root, or run as it");
     match (access, absent) {
@@ -720,10 +631,6 @@ fn observe_root(data_root: &Path, ingest: bool, ask_access: bool) -> RootSeen {
     }
 }
 
-/// Look at `dir`, a directory boot writes and creates when it is absent,
-/// as [`observe_root`] looks at an ingest node's root: what the running
-/// user may do with it, or, when it is absent, with the nearest directory
-/// above it that exists, reached by the same walk.
 pub(super) fn observe_created(dir: &Path) -> RootSeen {
     observe_root(dir, true, true)
 }
@@ -742,15 +649,10 @@ fn inspect_seen(kind: std::io::ErrorKind, linked: bool) -> RootSeen {
     }
 }
 
-/// Whether `path` is a symlink, without following it.
 fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
-/// For an absent root on an ingest node: whether the running user may
-/// create entries in the nearest directory above it that exists, asked
-/// only when `ask_access`.
-///
 /// Each ancestor is looked at without following its final symlink, so an
 /// ancestor that exists as a symlink to nothing is not mistaken for one
 /// boot creates: boot's exclusive create meets it as an existing entry and
@@ -784,8 +686,6 @@ fn nearest_ancestor(data_root: &Path, ask_access: bool) -> RootSeen {
     }
 }
 
-/// What the running user may do with the existing root: read and search
-/// it, and on an ingest node also write it.
 #[cfg(unix)]
 fn access(dir: &Path, ingest: bool) -> Access {
     use rustix::fs::Access as Mode;
@@ -795,7 +695,6 @@ fn access(dir: &Path, ingest: bool) -> Access {
     }
 }
 
-/// Whether the running user may create entries in `dir`.
 #[cfg(unix)]
 fn write_access(dir: &Path) -> Access {
     use rustix::fs::Access as Mode;
@@ -818,7 +717,6 @@ fn access_at(dir: &Path, mode: rustix::fs::Access) -> Access {
     }
 }
 
-/// Off Unix there are no effective ids to ask about.
 #[cfg(not(unix))]
 fn access(_dir: &Path, _ingest: bool) -> Access {
     Access::Unknown
@@ -829,16 +727,9 @@ fn write_access(_dir: &Path) -> Access {
     Access::Unknown
 }
 
-// ---------------------------------------------------------------------------
-// server.data.epoch
-// ---------------------------------------------------------------------------
-
-/// Why the doctor's reads of a small marker returned no text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unread {
-    /// The bounded reader refused or failed.
     Fault(ReadFault),
-    /// It holds bytes that are not UTF-8 text.
     NotText,
 }
 
@@ -864,7 +755,6 @@ impl RootReader for DoctorReader {
     }
 }
 
-/// Classify the data root as boot's gate does, with the doctor's reader.
 fn classify(
     data_root: &Path,
     wal_dir: &Path,
@@ -873,8 +763,6 @@ fn classify(
     epoch::classify_data_root(data_root, wal_dir, ingest, &mut DoctorReader)
 }
 
-/// `server.data.epoch`: the epoch is current, or boot initializes the root,
-/// or a query-only node reads it as an unversioned archive.
 async fn check_epoch(data_root: PathBuf, wal_dir: PathBuf, ingest: bool) -> Row {
     let check = ServerCheck::DataEpoch;
     let observed = look(move || {
@@ -904,10 +792,6 @@ fn fault_names_symlink(state: &Result<DataRootState, RootFault<Unread>>) -> bool
     }
 }
 
-/// The `server.data.epoch` row for what the classifier decided. `linked`
-/// is [`fault_names_symlink`]: the marker it could not read is a symlink,
-/// which the doctor does not follow under the data root, or the path it
-/// did not find is a symlink to nothing.
 fn epoch_row(state: Result<DataRootState, RootFault<Unread>>, linked: bool) -> Row {
     let check = ServerCheck::DataEpoch;
     let restore = Text::new(
@@ -1034,12 +918,6 @@ fn marker_fault_row(
     }
 }
 
-// ---------------------------------------------------------------------------
-// server.data.identity and server.data.conformance
-// ---------------------------------------------------------------------------
-
-/// Read the `CATALOG` marker with the bounded reader. `Ok(None)` when there
-/// is none.
 fn read_catalog_marker(data_root: &Path) -> Result<Option<String>, Unread> {
     conform::read_marker_with(data_root, |path| {
         match fsread::read_bounded(path, fsread::cap::CATALOG, Links::NoFollow) {
@@ -1052,23 +930,16 @@ fn read_catalog_marker(data_root: &Path) -> Result<Option<String>, Unread> {
     })
 }
 
-/// What `server.data.identity` saw.
 #[derive(Debug)]
 struct IdentitySeen {
-    /// The marker, as read, or why it was not.
     marker: Result<Option<String>, Unread>,
-    /// Whether it is a symlink, when it was not read.
     linked: bool,
-    /// The judgement, when the marker was read.
     judgement: Option<IdentityJudgement>,
-    /// What the walk for parquet saw, when the judgement needed one.
     walked: Option<ArchiveSeen>,
 }
 
-/// What the doctor's walk of the data root for parquet saw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchiveSeen {
-    /// No parquet, and nothing the walk could not enumerate.
     Empty,
     /// A parquet file, whether or not the walk enumerated everything.
     Parquet,
@@ -1099,16 +970,6 @@ fn see_archive(data_root: &Path) -> ArchiveSeen {
     }
 }
 
-/// `server.data.identity`: the data root's `CATALOG` marker names the
-/// app-state database's catalog, or the root holds no parquet.
-///
-/// Stricter than boot (#269 H1): a marker naming another catalog fails on
-/// every node type. A query-only boot refuses it; an ingest boot adopts
-/// the archive through the lossy, irreversible conformance pass, and the
-/// doctor catches a wrong database URL or a mismatched restore before that
-/// makes it permanent. Neither identifier is shown.
-///
-/// Also returns the marker it read, for `server.data.conformance`.
 async fn check_identity(
     data_root: PathBuf,
     catalog_id: Option<String>,
@@ -1172,7 +1033,6 @@ fn unwalked_row() -> Row {
         .next(Text::new("rerun as the service user"))
 }
 
-/// The `server.data.identity` row for a judgement.
 fn identity_row(judgement: IdentityJudgement, fresh_catalog: bool, ingest: bool) -> Row {
     let check = ServerCheck::DataIdentity;
     match judgement {
@@ -1214,8 +1074,6 @@ fn identity_row(judgement: IdentityJudgement, fresh_catalog: bool, ingest: bool)
     }
 }
 
-/// `server.data.conformance`: conformance is recorded for this catalog and
-/// data root, or boot runs the pass. A query-only node runs no pass.
 fn check_conformance(ctx: &Ctx, ingest: bool, marker: Option<&str>) -> Row {
     let check = ServerCheck::DataConformance;
     if !ingest {
@@ -1241,25 +1099,15 @@ fn check_conformance(ctx: &Ctx, ingest: bool, marker: Option<&str>) -> Row {
     }
 }
 
-// ---------------------------------------------------------------------------
-// server.recovery.repin
-// ---------------------------------------------------------------------------
-
-/// What `server.recovery.repin` read.
 #[derive(Debug)]
 enum RepinSeen {
-    /// No marker.
     Absent,
-    /// A marker that parses.
     Marker(marker::RepinMarker),
-    /// Bytes that are not text, or text that is not a marker.
     Malformed,
     /// The bounded reader did not read it; whether it is a symlink.
     Fault(ReadFault, bool),
 }
 
-/// `server.recovery.repin`: no repin marker, or one whose phase boot
-/// finishes. A query-only node refuses a marker past `building`.
 async fn check_repin(data_root: PathBuf, ingest: bool) -> Row {
     let check = ServerCheck::RecoveryRepin;
     let seen = look(move || {
@@ -1299,7 +1147,6 @@ async fn check_repin(data_root: PathBuf, ingest: bool) -> Row {
     }
 }
 
-/// The `server.recovery.repin` row for a marker that parsed.
 fn repin_row(found: &marker::RepinMarker, ingest: bool) -> Row {
     let check = ServerCheck::RecoveryRepin;
     let phase = match found.phase {
@@ -1337,26 +1184,17 @@ fn repin_row(found: &marker::RepinMarker, ingest: bool) -> Row {
     )
 }
 
-// ---------------------------------------------------------------------------
-// server.recovery.publication
-// ---------------------------------------------------------------------------
-
-/// The publication markers `server.recovery.publication` counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Publications {
     /// A query-only node: its boot recovers no publication marker and
     /// never reads the WAL, so none are counted.
     NotCounted,
-    /// The WAL root could not be listed.
     Unlisted,
-    /// What the census of the WAL root found.
     Counted(publication_marker::MarkerCensus),
 }
 
-/// What `server.recovery.publication` counted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MarkersSeen {
-    /// The publication markers under the WAL root.
     publication: Publications,
     /// Whether the data root's day directories could all be listed.
     rollup_listed: bool,
@@ -1401,17 +1239,11 @@ impl UnresolvedRollup {
     }
 }
 
-/// What the doctor saw of one rollup marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RollupSeen {
-    /// It went away before it was read.
     Gone,
-    /// Boot's recovery finishes it.
     Pending,
-    /// Boot's recovery keeps it, because this proof failed.
     Unresolved(rollup_marker::Proof),
-    /// The doctor could not look at it, or at a file its classification
-    /// depends on.
     NotLooked,
 }
 
@@ -1454,11 +1286,7 @@ fn observe_rollup_path(path: &Path, blind: &mut bool) -> rollup_marker::Observat
 
 /// Read the rollup marker at `path` with the decoder boot's recovery reads
 /// it with, then classify it with recovery's own [`rollup_marker::classify`],
-/// read-only. The hashing counts against the look's deadline: a look that
-/// runs out reports the row not sampled, never a mismatch.
-///
-/// Like recovery, it first refuses a marker whose directory is not named
-/// as a canonical date, without reading it.
+/// read-only.
 fn see_rollup(path: &Path) -> RollupSeen {
     let canonical_day = path
         .parent()
@@ -1493,12 +1321,6 @@ fn see_rollup(path: &Path) -> RollupSeen {
     }
 }
 
-/// Count the rollup markers in the data root's day directories and, on an
-/// ingest node, the publication markers under the WAL root, each by the
-/// decoder boot recovers it with, opened by the doctor's
-/// [`fsread::open_for_decoder`]. Each rollup marker is classified the way
-/// boot's recovery classifies it ([`see_rollup`]).
-///
 /// The rollup census runs on every node type: the publication gate's boot
 /// scan registers every rollup marker on a query-only node too, and its
 /// reads refuse `rollup_pending` while one remains. Publication markers
@@ -1534,10 +1356,6 @@ fn count_markers(data_root: &Path, wal_dir: &Path, ingest: bool) -> MarkersSeen 
     seen
 }
 
-/// `server.recovery.publication`: the rollup markers and, on an ingest
-/// node, the publication markers are readable and well formed, and boot's
-/// recovery can finish every rollup marker. A pending one is boot's to
-/// finish.
 async fn check_markers(data_root: PathBuf, wal_dir: PathBuf, ingest: bool) -> Row {
     let check = ServerCheck::RecoveryPublication;
     match look(move || count_markers(&data_root, &wal_dir, ingest)).await {
@@ -1546,11 +1364,8 @@ async fn check_markers(data_root: PathBuf, wal_dir: PathBuf, ingest: bool) -> Ro
     }
 }
 
-/// The most unresolved rollup markers one row names.
 const UNRESOLVED_LISTED: usize = 10;
 
-/// `text`, then each unresolved rollup marker's env, day, service and
-/// failed proof, up to [`UNRESOLVED_LISTED`] of them.
 fn list_unresolved(mut text: Text, unresolved: &[UnresolvedRollup]) -> Text {
     text = text.lit("; unresolved: ");
     for (i, marker) in unresolved.iter().take(UNRESOLVED_LISTED).enumerate() {
@@ -1576,9 +1391,6 @@ fn list_unresolved(mut text: Text, unresolved: &[UnresolvedRollup]) -> Text {
     text
 }
 
-/// The `server.recovery.publication` row for what was counted. A malformed
-/// publication marker outweighs an unresolved rollup marker, which
-/// outweighs one that could not be read, which outweighs pending ones.
 fn markers_row(seen: &MarkersSeen) -> Row {
     let check = ServerCheck::RecoveryPublication;
     let rollups = |text: Text| {
@@ -1587,7 +1399,6 @@ fn markers_row(seen: &MarkersSeen) -> Row {
             .int(seen.rollup_unresolved.len() as u64)
             .lit(" unresolved rollup marker(s)")
     };
-    // `None` on a query-only node, which counts no publication marker.
     let census = match seen.publication {
         Publications::NotCounted => None,
         Publications::Unlisted => Some(publication_marker::MarkerCensus::default()),
@@ -1665,7 +1476,6 @@ mod tests {
     use super::*;
     use trawl_api::doctor::Outcome;
 
-    /// One data-root state: what to plant, and on which node type.
     struct Case {
         name: &'static str,
         ingest: bool,
@@ -1677,7 +1487,7 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    #[allow(clippy::too_many_lines)] // one table of states, clearer unsplit
+    #[allow(clippy::too_many_lines)]
     fn cases() -> Vec<Case> {
         let mut cases = Vec::new();
         for ingest in [false, true] {
@@ -1834,12 +1644,6 @@ mod tests {
         )
     }
 
-    /// For every data-root state, the doctor's classification (with its
-    /// bounded reader) is the decision boot's gate then makes: the same
-    /// admission, or a refusal, with boot's own message word for word from
-    /// the same classifier. The doctor's row is `complete` for every
-    /// admission and `failed` for every refusal, and classifying writes
-    /// nothing.
     #[test]
     fn classify_agrees_with_admission() {
         for case in cases() {
@@ -1887,7 +1691,6 @@ mod tests {
         }
     }
 
-    /// Every entry under `root` with its bytes, and its kind.
     fn tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         let mut found = Vec::new();
         let mut stack = vec![root.to_owned()];
@@ -1909,8 +1712,6 @@ mod tests {
         found
     }
 
-    /// Where the doctor does not follow what boot follows or reads past its
-    /// cap, it says it could not look: never that boot admits or refuses.
     #[cfg(unix)]
     #[test]
     fn what_the_doctor_does_not_read_is_not_sampled() {
@@ -1981,8 +1782,6 @@ mod tests {
         }
     }
 
-    /// The judgement is the one boot's gate makes, including for a
-    /// catalog not created yet, which no marker can name.
     #[test]
     fn identity_is_judged_as_boot_judges_it() {
         use IdentityJudgement as J;
@@ -2132,7 +1931,6 @@ mod tests {
             (Outcome::NotSampled, Some(reason::UNREADABLE))
         );
 
-        // The listing stops at a bound and counts the rest.
         let many = MarkersSeen {
             rollup_unresolved: unresolved(UNRESOLVED_LISTED + 3),
             ..seen(census(0, 0, 0), 0, 0, 0)
@@ -2161,8 +1959,6 @@ mod tests {
         publication_marker::identity_of(path).unwrap()
     }
 
-    /// Where a rollup of `service` in `day` stops, and so which recovery
-    /// case its marker leaves.
     #[derive(Clone, Copy)]
     enum Crash {
         /// After the rename: the canonical is the replacement and the hourly
@@ -2177,8 +1973,6 @@ mod tests {
         PriorReplaced,
     }
 
-    /// Plant a rollup of `service` in `day` that stopped at `crash`, with
-    /// real Parquet and this release's marker. Returns the marker's path.
     fn plant_rollup(day: &Path, service: &str, crash: Crash) -> PathBuf {
         let hourly = day.join(format!("07/{service}.parquet"));
         let canonical = day.join(format!("{service}.parquet"));
@@ -2212,11 +2006,6 @@ mod tests {
         path
     }
 
-    /// `server.recovery.publication` runs recovery's classification over
-    /// each rollup marker, read-only. One recovery can finish is pending;
-    /// one it would keep, an old-format marker included, fails the row,
-    /// which names its env, day, service and the proof that failed, and no
-    /// path.
     #[test]
     fn unresolved_rollup_markers_name_service_day_and_proof() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2288,7 +2077,6 @@ mod tests {
         }
         assert_eq!(before(&watched), bytes, "the doctor changed a file");
 
-        // Without the unresolved ones, the recoverable marker is pending.
         std::fs::remove_file(&mismatch).unwrap();
         std::fs::remove_file(&old_format).unwrap();
         let row = markers_row(&count_markers(&data, &wal, true));
@@ -2298,11 +2086,6 @@ mod tests {
         );
     }
 
-    /// Boot's recovery refuses a rollup marker under an env child that is
-    /// not a canonical date before it reads the marker, so the doctor
-    /// reports it unresolved with `day_not_canonical`, never pending, and
-    /// shows the day as invalid. Under a canonical date, the same files
-    /// would be case b.
     #[test]
     fn a_rollup_marker_under_a_noncanonical_day_is_unresolved() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2342,9 +2125,6 @@ mod tests {
         }
     }
 
-    /// A marker whose classification depends on a file the doctor may not
-    /// read is not sampled, never unresolved: the service user's recovery
-    /// may read it.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_rollup_input_the_doctor_may_not_read_is_not_sampled() {
@@ -2375,8 +2155,6 @@ mod tests {
         );
     }
 
-    /// The rollup and publication census read what is on disk with the
-    /// decoders boot recovers with.
     #[test]
     fn markers_are_counted_by_what_boot_recovery_reads() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2405,10 +2183,6 @@ mod tests {
         assert_eq!(markers_row(&seen).outcome(), Outcome::Failed);
     }
 
-    /// A query-only node's publication gate registers every rollup marker
-    /// its boot scan finds and refuses corpus reads while one remains, so
-    /// the census counts them there too. Publication markers are an ingest
-    /// node's: a query-only node never reads the WAL and counts none.
     #[test]
     fn a_query_only_node_counts_rollup_markers_and_no_publication_marker() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2458,10 +2232,6 @@ mod tests {
         assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
     }
 
-    /// A path the classifier saw and then did not find is a symlink to
-    /// nothing only when it is a symlink; otherwise it went away between
-    /// two looks, which says nothing about the next boot. Only the first
-    /// fails, for the data root and for `server.data.epoch`.
     #[test]
     fn a_path_gone_between_two_looks_is_not_a_dangling_symlink() {
         let gone = |linked| {
@@ -2498,9 +2268,6 @@ mod tests {
         }
     }
 
-    /// A walk that could not enumerate part of the root and found no
-    /// parquet is kept apart from an empty archive and from one holding
-    /// parquet; boot's reading of the same walk stays conservative.
     #[cfg(unix)]
     #[test]
     fn a_walk_that_did_not_finish_is_not_standing_data() {
@@ -2562,15 +2329,11 @@ mod tests {
         data_root.with_extension("results-absent")
     }
 
-    /// `server.data.root` over `data_root`, with the WAL directory at its
-    /// default place inside it.
     async fn root_check(data_root: PathBuf, ingest: bool, ask_access: bool) -> Row {
         let wal_dir = data_root.join("wal");
         root_and_wal_check(data_root, wal_dir, ingest, ask_access).await
     }
 
-    /// `server.data.root` over `data_root` and `wal_dir`, with no results
-    /// root made, so the closing prediction skips it.
     async fn root_and_wal_check(
         data_root: PathBuf,
         wal_dir: PathBuf,
@@ -2610,11 +2373,6 @@ mod tests {
         assert_eq!(row.outcome(), Outcome::Failed, "{row:?}");
     }
 
-    /// Above an absent root, an ancestor that is a symlink to nothing is
-    /// not one boot creates: boot's exclusive create meets the symlink as
-    /// an existing entry and refuses, so the row fails. A symlink to a
-    /// directory counts as that directory, and boot creates the root
-    /// through it.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_absent_root_below_a_dangling_symlink_fails_as_boot_does() {
@@ -2660,10 +2418,6 @@ mod tests {
         assert!(real.join("data").is_dir());
     }
 
-    /// Unless the doctor asks about access, as in a root run, a structure
-    /// that holds is `ran_as_root`, whatever `accessat` would have said: a
-    /// root no one may enter, and one below a directory no one may write,
-    /// are not failed. A structure that does not hold still fails.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_root_run_asks_nothing_about_access() {
@@ -2705,8 +2459,6 @@ mod tests {
         }
     }
 
-    /// Whether the running user reads a directory its mode forbids, as root
-    /// or a holder of `CAP_DAC_OVERRIDE` does.
     #[cfg(unix)]
     fn privileged_over(tmp: &tempfile::TempDir) -> bool {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2718,9 +2470,6 @@ mod tests {
         privileged
     }
 
-    /// Mode 0500 lets the running user read the root but not write it. A
-    /// privileged user (root, or one holding `CAP_DAC_OVERRIDE`) may do
-    /// both; the test asserts whichever the running user is.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_ingest_root_the_user_cannot_write_fails() {
@@ -2755,13 +2504,6 @@ mod tests {
         epoch::create_dir_all_durably(&wal_dir.join("prod"), |_| Ok(())).is_ok()
     }
 
-    /// A WAL directory outside the data root is judged as the root is:
-    /// boot creates it at its start, so the running user must read, write
-    /// and search it, or create it in the nearest directory above it. Each
-    /// state is checked against boot's own create. A privileged user may
-    /// do everything its modes forbid; the test asserts whichever the
-    /// running user is. A query-only node never looks at it, and a root run
-    /// asks only about its structure.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_wal_directory_outside_the_root_is_judged_as_the_root_is() {
@@ -2830,8 +2572,6 @@ mod tests {
             );
         }
 
-        // What boot's create refuses whoever runs it fails even when access
-        // is not asked about.
         let file = tmp.path().join("file");
         std::fs::write(&file, b"x").unwrap();
         let dangling = tmp.path().join("dangling");
@@ -2865,13 +2605,6 @@ mod tests {
         }
     }
 
-    /// A WAL path that starts with the data root is judged on its own: `..`
-    /// or a symlink takes it out of the root, and a child that exists has
-    /// its own modes. A symlink there is also a storage root of its own,
-    /// which boot refuses whoever runs it, so a root run fails it too. When
-    /// the root fails too, the row reports the root's failure once. A
-    /// privileged user may do everything the modes forbid; the test asserts
-    /// whichever the running user is.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_wal_directory_under_the_root_path_is_judged_on_its_own() {
@@ -2927,7 +2660,6 @@ mod tests {
             let root_run = root_and_wal_check(data.clone(), wal.clone(), true, false).await;
             seen.push((*name, asked, root_run));
         }
-        // The data root fails as well: its failure is the row's.
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
         let both = root_and_wal_check(data.clone(), data.join("../unwritable"), true, true).await;
         for dir in [&data, &unwritable, &sealed, &child] {
@@ -2957,7 +2689,6 @@ mod tests {
         assert_eq!((both.outcome(), both.reason()), expected, "{both:?}");
     }
 
-    /// Give `dir` mode `mode`.
     #[cfg(unix)]
     fn set_mode(dir: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2972,8 +2703,6 @@ mod tests {
         set_mode(dir, 0o700);
     }
 
-    /// The permission bits of `root` and of everything beneath it, read
-    /// without following a symlink.
     #[cfg(unix)]
     fn modes(root: &Path) -> Vec<(PathBuf, u32)> {
         use std::os::unix::fs::MetadataExt as _;
@@ -2990,9 +2719,6 @@ mod tests {
         found
     }
 
-    /// `server.data.root` over `data_root` and `wal_dir`, asserting that the
-    /// look changed no mode anywhere under `tmp` (AC6: the doctor predicts
-    /// boot's closing and never closes anything itself).
     #[cfg(unix)]
     async fn unchanged(
         tmp: &tempfile::TempDir,
@@ -3005,7 +2731,6 @@ mod tests {
         unchanged_with_results(tmp, data_root, wal_dir, &results_dir, ingest, ask_access).await
     }
 
-    /// [`unchanged`], with the results root at `results_dir`.
     #[cfg(unix)]
     async fn unchanged_with_results(
         tmp: &tempfile::TempDir,
@@ -3041,11 +2766,6 @@ mod tests {
     const RESULTS_LINK: &str = "the results root is a symlink, and trawld does not follow one at \
                                 a storage root";
 
-    /// An owner-only root is `complete` with no reason. One with a group or
-    /// other bit is `complete`, `will_tighten`, on both node types: boot
-    /// closes the data root of a query-only node too. A root run reports
-    /// `ran_as_root` either way, since the service user, not root, is the
-    /// owner boot compares against. No mode changes.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_root_boot_would_close_is_will_tighten() {
@@ -3090,12 +2810,6 @@ mod tests {
         assert!(!detail.contains(tmp.path().to_str().unwrap()), "{detail}");
     }
 
-    /// A WAL directory outside the data root is closed on its own, and a
-    /// real directory nested in it is covered by the root and never judged.
-    /// One reached through a symlink under the root is outside it, and is
-    /// closed on its own too. The repin
-    /// siblings are closed when they exist. Every root boot would close is
-    /// named, and a refusal anywhere beats them. No mode changes.
     #[cfg(unix)]
     #[tokio::test]
     async fn every_root_boot_closes_is_predicted() {
@@ -3154,7 +2868,6 @@ mod tests {
             )
         );
 
-        // A symlinked sibling refuses, and beats every root boot would close.
         let real = tmp.path().join("real");
         std::fs::create_dir(&real).unwrap();
         owner_only_mode(&real);
@@ -3168,12 +2881,6 @@ mod tests {
         }
     }
 
-    /// The results root is predicted as the repin roots are (ADR-0057):
-    /// absent before the first boot is no fault, an owner-only one is
-    /// `complete`, and one with a group or other bit is `complete`,
-    /// `will_tighten`, on both node types, named by kind. A symlink, dangling
-    /// or not, and a file refuse at boot whoever runs trawld, so those rows
-    /// fail in a root run too. No mode changes.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_results_root_is_predicted_as_the_other_roots_are() {
@@ -3252,17 +2959,6 @@ mod tests {
         assert_eq!(std::fs::read(&results).unwrap(), b"not a directory");
     }
 
-    /// Every node makes the results root at its start and writes captures
-    /// into it (ADR-0057), so the running user must read, write and search
-    /// it, or create it and its missing parents in the nearest directory
-    /// above it. Absent below a directory the user may search but not
-    /// write, the daemon's own open fails on the create, so the row fails
-    /// on both node types and says where the access is missing; a root the
-    /// user cannot write fails too. A root run asks only about the
-    /// structure. A privileged user may do everything the modes forbid; the
-    /// test asserts whichever the running user is, and the daemon's open
-    /// judges each absent root. Modes are restored before the tempdir goes,
-    /// and the doctor changes none.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_results_root_the_running_user_cannot_create_or_write_fails() {
@@ -3358,10 +3054,6 @@ mod tests {
         }
     }
 
-    /// A repin sibling that is not a directory refuses at boot whoever runs
-    /// trawld, so the row fails in a root run too, and the file is left as
-    /// it was. A data root that is not a directory stays the structural
-    /// check's to report.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_repin_sibling_that_is_not_a_directory_fails() {
@@ -3385,10 +3077,6 @@ mod tests {
         assert_eq!(std::fs::read(&shadow).unwrap(), b"not a directory");
     }
 
-    /// A storage root whose final component is a symlink refuses at boot,
-    /// so the row fails, in a root run too: boot refuses it whoever runs
-    /// trawld. The link and its target are left as they were. A symlink
-    /// above the root is trusted storage and followed.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_symlinked_root_fails() {
@@ -3410,7 +3098,6 @@ mod tests {
         }
         assert!(std::fs::symlink_metadata(&data).unwrap().is_symlink());
 
-        // Reached through a symlinked parent, the root itself is judged.
         owner_only_mode(&real);
         let parent = tmp.path().join("parent");
         std::os::unix::fs::symlink(tmp.path(), &parent).unwrap();
@@ -3420,8 +3107,6 @@ mod tests {
             (Outcome::Complete, None)
         );
 
-        // An out-of-root WAL directory that is a symlink fails on an ingest
-        // node, and a query-only node does not look at it.
         let wal_real = tmp.path().join("wal-real");
         std::fs::create_dir(&wal_real).unwrap();
         owner_only_mode(&wal_real);
@@ -3440,11 +3125,8 @@ mod tests {
         );
     }
 
-    /// A root another user owns refuses at boot, even for root, so the row
-    /// fails when the doctor asks as the service user. A root run does not
-    /// judge ownership: the owner boot compares against is the service
-    /// user. `/usr` stands in for a foreign root where the test is not run
-    /// by its owner.
+    /// `/usr` stands in for a foreign root where the test is not run by its
+    /// owner.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_root_another_user_owns_fails() {
@@ -3472,8 +3154,6 @@ mod tests {
         );
     }
 
-    /// Every refusal row is a fixed sentence and a fix that name the root
-    /// by kind, never by path or uid.
     #[cfg(unix)]
     #[test]
     fn refusal_rows_name_the_root_by_kind_only() {

@@ -2,16 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! trawld's one count of requests in progress (ADR-0054, #293).
-//!
-//! The tests are grouped by where they reach the count:
-//!
-//! - [`edge`]: test routes under the production edge layers.
-//! - [`listener`]: the accept loop behind the production TLS listener.
-//! - [`body_work`]: ingest and preview work that keeps its count after
-//!   the client leaves.
-//! - [`transport`]: connections through the production TLS listener.
-//! - [`routes`]: the production router.
+//! trawld's one count of requests in progress (ADR-0054).
 //!
 //! The listener, body-work, transport and route tests run against real
 //! Postgres through the shared fixtures in `common`, so this binary is in

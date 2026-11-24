@@ -4,15 +4,6 @@
 
 //! `POST /api/v1/results/context` end to end (ADR-0058): the rows around
 //! a focus row, read again as a capture of kind `context`.
-//!
-//! The corpus sits on 2024-01-17, which no other seed touches: one event a
-//! second on `prod`/`web01` from 10:00:00 to 10:00:59, two more at the
-//! focus instant 10:00:30 ingested later, and neighbours on another host
-//! and another env, so each scope selects a different population. Hosts
-//! `007`, `7` and `07` on `prod` late in the minute share a decimal
-//! reading but not a text. Every row carries its own `seq`.
-//!
-//! The binary is in the ADR-0021 `postgres` nextest group.
 
 mod common;
 
@@ -37,11 +28,6 @@ fn row(seconds: i64, env: &str, host: &str, seq: &str) -> Row {
     Row::new(second(seconds), env, SERVICE, host, &format!("ctx {seq}")).field("seq", seq)
 }
 
-/// The corpus (module docs). `seq` names each row: `w1-<second>` on
-/// `prod`/`web01`, `dup-a` and `dup-b` at the focus instant beside
-/// `w1-30`, `w2-<second>` on `prod`/`web02`, `st-<second>` on
-/// `staging`/`web01`, `nohost` on `prod` without a host, and
-/// `h<host>-<second>` on `prod` with a numeric-looking host.
 fn corpus() -> Vec<Row> {
     let mut rows: Vec<Row> = (0..60)
         .map(|s| row(s, "prod", "web01", &format!("w1-{s}")))
@@ -81,7 +67,6 @@ fn permits(server: &TestServer) -> usize {
     server.state.query.pool.available_permits()
 }
 
-/// Capture `query` over the corpus minute, as `token`.
 async fn capture(server: &TestServer, token: &str, query: &str) -> CapturedResult {
     let body = json!({
         "query": query,
@@ -93,14 +78,12 @@ async fn capture(server: &TestServer, token: &str, query: &str) -> CapturedResul
     captured::captured(server, token, &body).await.result
 }
 
-/// Every row of capture `id`.
 async fn page(server: &TestServer, token: &str, id: &str) -> ResultPage {
     let (status, _, body) = captured::page(server, token, id, "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     serde_json::from_value(body).expect("a result page")
 }
 
-/// The text cell of column `name` in each row of `page`.
 fn column(page: &ResultPage, name: &str) -> Vec<Option<String>> {
     let index = page
         .page
@@ -119,7 +102,6 @@ fn column(page: &ResultPage, name: &str) -> Vec<Option<String>> {
         .collect()
 }
 
-/// The row of `page` whose `seq` is `seq`.
 fn row_of(page: &ResultPage, seq: &str) -> u64 {
     let seqs = column(page, "seq");
     let index = seqs
@@ -129,7 +111,6 @@ fn row_of(page: &ResultPage, seq: &str) -> u64 {
     u64::try_from(index).unwrap()
 }
 
-/// A focus capture of the whole corpus service and the row of `w1-30`.
 async fn focus(server: &TestServer) -> (String, u64) {
     let result = capture(server, &server.analyst_token, &format!("service={SERVICE}")).await;
     let rows = page(server, &server.analyst_token, &result.id).await;
@@ -143,7 +124,6 @@ fn facts(result: &CapturedResult) -> &ContextFacts {
     }
 }
 
-/// The `seq`s of a context capture, split into its three groups.
 async fn groups(server: &TestServer, result: &CapturedResult) -> [Vec<String>; 3] {
     let rows = page(server, &server.analyst_token, &result.id).await;
     let seqs: Vec<String> = column(&rows, "seq").into_iter().flatten().collect();
@@ -172,14 +152,6 @@ fn sorted(mut values: Vec<String>) -> Vec<String> {
     values
 }
 
-// -- the read -----------------------------------------------------------------
-
-/// AC1, AC2: on the default scope the read returns the ten rows before,
-/// every row at the focus instant and the ten rows after, on the focus
-/// row's env and host, as three groups ordered by `_time`. The duplicates
-/// at the focus instant stay distinct rows, the focus row is named and not
-/// copied, and the facts say this is a new read whose equal timestamps
-/// establish no order.
 #[tokio::test(flavor = "multi_thread")]
 async fn context_returns_earlier_equal_and_later_rows_with_the_duplicates_distinct() {
     let server = boot().await;
@@ -224,7 +196,6 @@ async fn context_returns_earlier_equal_and_later_rows_with_the_duplicates_distin
     assert_eq!(later, seqs("w1", 31..41));
     assert_eq!(result.captured_rows, 23);
 
-    // Ordered by `_time` across the groups.
     let rows = page(&server, &server.analyst_token, &result.id).await;
     let times: Vec<String> = column(&rows, "_time").into_iter().flatten().collect();
     let mut ascending = times.clone();
@@ -237,8 +208,6 @@ async fn context_returns_earlier_equal_and_later_rows_with_the_duplicates_distin
     );
 }
 
-/// `before` and `after` choose how many rows either side; the nearest are
-/// kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn before_and_after_keep_the_nearest_rows() {
     let server = boot().await;
@@ -257,8 +226,6 @@ async fn before_and_after_keep_the_nearest_rows() {
     assert_eq!(facts(&answer.result).scope_used.seconds, 5);
 }
 
-/// `scope: env` holds the read to the focus row's env across its hosts, and
-/// reports the host it did not hold.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_env_scope_reads_every_host_of_the_focus_env() {
     let server = boot().await;
@@ -292,7 +259,6 @@ async fn the_env_scope_reads_every_host_of_the_focus_env() {
     assert_eq!(sorted(later), vec!["w1-31".to_owned(), "w2-31".into()]);
 }
 
-/// `scope: host` holds the read to the focus row's host across its envs.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_host_scope_reads_every_env_of_the_focus_host() {
     let server = boot().await;
@@ -327,8 +293,6 @@ async fn the_host_scope_reads_every_env_of_the_focus_host() {
     );
 }
 
-/// The stored row is a `context` capture whose facts come back on every
-/// page, the single copy the response carried.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_stored_context_capture_carries_its_facts_on_every_page() {
     let server = boot().await;
@@ -358,10 +322,6 @@ async fn the_stored_context_capture_carries_its_facts_on_every_page() {
     );
 }
 
-/// A kept focus row whose env retention has since emptied reads a source
-/// that holds no files: with the hot buffer empty too, the engine answers
-/// no columns at all, and the read answers three empty groups, not an
-/// internal error.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_context_read_whose_window_has_left_the_corpus_answers_empty_groups() {
     let server = boot().await;
@@ -435,9 +395,6 @@ async fn a_numeric_looking_focus_key_matches_its_text_only() {
     assert_eq!(answer.result.captured_rows, 2);
 }
 
-// -- refusals -----------------------------------------------------------------
-
-/// A refused read took nothing and left no capture beyond the focus one.
 async fn assert_refused(
     server: &TestServer,
     body: serde_json::Value,
@@ -459,7 +416,6 @@ async fn assert_refused(
     answer["error"]["message"].as_str().unwrap().to_owned()
 }
 
-/// Rows either side are capped at 50, named with the value sent.
 #[tokio::test(flavor = "multi_thread")]
 async fn more_than_fifty_rows_either_side_are_refused() {
     let server = boot().await;
@@ -482,8 +438,6 @@ async fn more_than_fifty_rows_either_side_are_refused() {
     assert_eq!(status, StatusCode::OK, "fifty is the cap: {answer}");
 }
 
-/// A window over the capture span limit is the bounds' refusal, as for any
-/// capture: `seconds` has no cap of its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_window_over_seven_days_is_refused_as_any_capture_is() {
     let server = boot().await;
@@ -502,8 +456,6 @@ async fn a_window_over_seven_days_is_refused_as_any_capture_is() {
     assert_eq!(status, StatusCode::OK, "{answer}");
 }
 
-/// A row past the end is `focus_incomplete`, naming the result's row
-/// count.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_row_past_the_end_is_refused_with_the_row_count() {
     let server = boot().await;
@@ -523,8 +475,6 @@ async fn a_row_past_the_end_is_refused_with_the_row_count() {
     }
 }
 
-/// A focus row without the host the scope holds the read to is refused by
-/// name, never widened; a scope without the host reads it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_focus_row_without_its_scoped_key_is_refused_by_name() {
     let server = boot().await;
@@ -554,7 +504,6 @@ async fn a_focus_row_without_its_scoped_key_is_refused_by_name() {
     assert_eq!(facts.focus.host, None);
     assert_eq!(facts.scope_used.env.as_deref(), Some("prod"));
 
-    // A focus result that dropped the column refuses alike.
     let dropped = capture(
         &server,
         &server.analyst_token,
@@ -566,8 +515,6 @@ async fn a_focus_row_without_its_scoped_key_is_refused_by_name() {
     assert!(message.contains("`host`"), "{message}");
 }
 
-/// A focus result without `_time` refuses on every scope; any other shape
-/// that carries the fields is accepted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_focus_row_without_time_is_refused_and_any_shape_with_the_fields_is_read() {
     let server = boot().await;
@@ -603,14 +550,9 @@ async fn a_focus_row_without_time_is_refused_and_any_shape_with_the_fields_is_re
     assert_eq!(later, vec!["w1-31".to_owned()]);
 }
 
-/// Two columns of a name the read needs are `focus_ambiguous`.
-///
 /// No query makes two columns of one name, so the fixture captures a
 /// suffixed copy of `host` under its own name and records it as
-/// `host` ([`captured::rename_column`]), each position holding its own
-/// cell ([`captured::assert_own_cells`]). The read still meets a capture
-/// whose names repeat (ADR-0057). A scope that does not need `host`
-/// reads, and reports no `host`, since the row holds two.
+/// `host` ([`captured::rename_column`]).
 #[tokio::test(flavor = "multi_thread")]
 async fn two_columns_of_a_focus_key_are_ambiguous() {
     let server = boot().await;
@@ -635,7 +577,6 @@ async fn two_columns_of_a_focus_key_are_ambiguous() {
     let message = assert_refused(&server, body, StatusCode::BAD_REQUEST, "focus_ambiguous").await;
     assert!(message.contains("`host`"), "{message}");
 
-    // A scope that does not hold the read to the doubled key reads it.
     let answer = captured::correlated(
         &server,
         &server.analyst_token,
@@ -648,8 +589,6 @@ async fn two_columns_of_a_focus_key_are_ambiguous() {
     assert_eq!(facts.focus.env, column(&stored, "env")[0]);
 }
 
-/// Another key's result is not found, as a page of it is; a key without
-/// `query` is refused first.
 #[tokio::test(flavor = "multi_thread")]
 async fn another_keys_result_is_not_found_and_query_is_required() {
     let server = boot().await;

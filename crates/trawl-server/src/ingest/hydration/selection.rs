@@ -3,45 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Which surviving WAL files boot hydration loads (ADR-0041 slice 2).
-//!
-//! The scope is the WAL that compaction's zero-age scan takes: every env
-//! directory [`try_list_env_dirs_observed`] finds, environments outside the
-//! ingest allowlist included, and every `.ndjson` entry
-//! [`compaction::scan_wal_files`] lists in it, grouped by service as
-//! [`compaction::group_by_service`] groups them. A service that a
-//! publication marker blocks ([`PublicationClaims::blocks_service`]) is
-//! left out and its files count as `claimed`. A scope that cannot be listed
-//! counts once as `unlisted`: the WAL root, a root entry that cannot be
-//! inspected, or an env directory.
-//!
-//! Listing names costs what one compaction scan costs. Examining files is
-//! bounded: a max-heap keeps the oldest `max_events + 1` writer-named
-//! candidates by `(millis, env, file name)`, and only those are opened.
-//! More candidates than that is overhang (`examine_bound_hit`), since at
-//! most `max_events` non-empty files fit. A `.ndjson` entry without a
-//! writer name is `undecodable` without being opened.
-//!
-//! The kept candidates are tried oldest first, first fit, against the full
-//! caps and a read budget of `max_bytes`. Every byte read counts against the
-//! budget, a rejected file's included. A file that does not fit is skipped,
-//! and later files are still tried:
-//!
-//! - longer than the full byte cap: `oversized`, not read;
-//! - longer than the remaining budget or byte capacity: `capacity`, not read;
-//! - not a regular file, a symlink, or a read that failed or changed
-//!   length: `unreadable`;
-//! - more lines than the full event cap: `oversized`, not parsed;
-//! - more lines than the remaining event capacity: `capacity`, not parsed;
-//! - not writer output ([`recognizer::recognize`]): `undecodable`;
-//! - otherwise `hydrated`.
-//!
-//! Lines are counted before any is parsed, so at most the event capacity
-//! left is ever built as events, however small the lines. Writer output
-//! has one event per line, so for a recognized file the line count is its
-//! event count.
-//!
-//! The same WAL gives the same selection: the order is total and the
-//! decisions depend only on the files' bytes.
 
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
@@ -55,7 +16,6 @@ use crate::ingest::compaction;
 use crate::ingest::publication_marker::{self, PublicationClaims};
 use crate::ingest::wal::WalName;
 
-/// What [`select`] found in the WAL.
 #[derive(Debug, Default)]
 pub(crate) struct Selection {
     /// The files to hydrate, oldest first.
@@ -69,7 +29,6 @@ pub(crate) struct Selection {
     pub bytes_read: u64,
 }
 
-/// One WAL file recognized in full, which fits.
 #[derive(Debug)]
 pub(crate) struct Selected {
     /// The file's hot batch id ([`compaction::wal_batch_id`]), the key the
@@ -136,7 +95,6 @@ pub(crate) fn select(wal_dir: &Path, caps: Charge) -> Selection {
     selection
 }
 
-/// What [`walk_wal`] saw of the WAL besides its files.
 #[derive(Debug)]
 pub(crate) struct WalWalk {
     /// Scopes that could not be listed, each counted once: a WAL root entry
@@ -146,17 +104,9 @@ pub(crate) struct WalWalk {
     pub claims: PublicationClaims,
 }
 
-/// Walk the WAL under `wal_dir` in compaction's zero-age scope: every env
-/// directory [`try_list_env_dirs_observed`] finds and every `.ndjson`
-/// entry [`compaction::scan_wal_files`] lists in it. `visit` gets each
-/// `(env, service)` group, grouped as [`compaction::group_by_service`]
-/// groups it, and whether a publication marker blocks the service
-/// ([`PublicationClaims::blocks_service`]).
-///
 /// This one listing is the WAL boot hydration selects from and the WAL
 /// compaction's coverage proof checks (ADR-0041 slice 2), so the two agree
-/// on what existed. Listing names costs what one compaction scan costs;
-/// nothing is opened.
+/// on what existed.
 ///
 /// `None` when the WAL root or its publication markers could not be
 /// listed: that hides every scope, and nothing was visited. A missing root
@@ -181,11 +131,9 @@ pub(crate) fn walk_wal(
     Some(WalWalk { unlisted, claims })
 }
 
-/// List the WAL in compaction's zero-age scope ([`walk_wal`]) and keep the
-/// oldest `bound` writer-named candidates, oldest first. Every other entry
-/// is counted here: `claimed`, `unlisted` and non-writer names as
-/// `undecodable`. Candidates beyond the bound set `bound_hit` and are not
-/// counted.
+/// Every other entry is counted here: `claimed`, `unlisted` and non-writer
+/// names as `undecodable`. Candidates beyond the bound set `bound_hit` and
+/// are not counted.
 fn list(
     wal_dir: &Path,
     bound: usize,
@@ -208,8 +156,6 @@ fn list(
     heap.into_sorted_vec()
 }
 
-/// Push one unclaimed service's writer-named files into `heap`, dropping
-/// the newest candidate whenever it holds more than `bound`.
 fn keep_oldest(
     env: &str,
     files: Vec<PathBuf>,
@@ -249,8 +195,6 @@ mod tests {
     const HOUR_MS: u64 = 3_600_000;
     const BASE: u64 = 1_790_000_000_000;
 
-    /// `count` events from the live writer, each padded with `pad` bytes
-    /// of message text.
     fn batch(count: usize, pad: usize) -> ServiceBatch {
         let mut batch = ServiceBatch::default();
         for n in 0..u32::try_from(count).unwrap() {
@@ -263,7 +207,6 @@ mod tests {
         batch
     }
 
-    /// Write `batch` as the WAL file `wal/{env}/{service}_{millis}_{nonce}`.
     fn plant(wal: &Path, env: &str, service: &str, millis: u64, batch: &ServiceBatch) -> String {
         let name = WalName {
             service: service.into(),
@@ -294,7 +237,6 @@ mod tests {
         selection.counts.get(outcome)
     }
 
-    /// Every outcome's count, in [`HydrationOutcome::ALL`] order.
     fn counts(selection: &Selection) -> Vec<(&'static str, u64)> {
         HydrationOutcome::ALL
             .iter()
@@ -379,7 +321,6 @@ mod tests {
         assert_eq!(selection.bytes_read, 2 * small.ndjson.len() as u64);
     }
 
-    /// Write `bytes` as the writer-named WAL file of `service`.
     fn plant_bytes(wal: &Path, service: &str, millis: u64, bytes: &[u8]) {
         let name = WalName {
             service: service.into(),
@@ -393,8 +334,6 @@ mod tests {
 
     /// Materializing a file's events before checking their count would let
     /// a file of tiny lines inside the byte budget build millions of maps.
-    /// A file with more lines than fit is refused before any line is
-    /// parsed.
     #[test]
     fn a_file_with_more_lines_than_fit_is_refused_before_any_is_parsed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -540,7 +479,6 @@ mod tests {
         assert!(selection.bytes_read <= cap as u64);
     }
 
-    /// Plant the same WAL in `wal`, in the given file order.
     fn plant_mixed(wal: &Path, order: impl Iterator<Item = usize>) {
         for n in order {
             let env = ["lab", "prod", "stage"][n % 3];

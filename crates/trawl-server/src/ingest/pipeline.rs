@@ -6,13 +6,6 @@
 //!
 //! Events are durable before they are visible: only a batch whose WAL write
 //! succeeded reaches the hot buffer and the event bus.
-//!
-//! Admission comes first (ADR-0043): a producer reserves hot-buffer space
-//! for the exact [`ServiceBatch::charge`] before it takes the publication
-//! gate or writes anything, and hands the [`Reservation`] to
-//! [`PipelineWriter::write`] or [`PipelineWriter::publish`]
-//! with the batch. A group whose write fails drops its reservation, which
-//! releases the space.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -25,18 +18,11 @@ use crate::ingest::producer::ProducerKind;
 use crate::ingest::wal::WalWriter;
 
 /// The service-name rule (ADR-0009), re-exported from `trawl-config` so
-/// that every ingestion path decides from one definition: HTTP ingest
-/// rejects a violation, syslog ingest falls back to its configured default
-/// service, and config load refuses to start.
+/// that every ingestion path decides from one definition.
 pub use trawl_config::{MAX_SERVICE_NAME_LEN, is_valid_service_char, is_valid_service_name};
 
-/// The batch key: `(env, service)`.
-///
-/// Two envs must never share a WAL batch, a hot-buffer drain key or a
-/// parquet partition (ADR-0009), so the env is part of the key on every
-/// lane, the HTTP handler's and the syslog batcher's alike. The type lives
-/// next to the writer that consumes it: a batcher holding its own key type
-/// is how a lane starts filing two envs under one name.
+/// The batch key: `(env, service)`. Two envs must never share a WAL batch,
+/// a hot-buffer drain key or a parquet partition (ADR-0009).
 pub type BatchKey = (String, String);
 
 /// Events for a single service within a batch, ready for WAL writing.
@@ -45,16 +31,11 @@ pub type BatchKey = (String, String);
 /// and equals the [`IngestBatch`] the batch publishes as.
 #[derive(Debug, Default)]
 pub struct ServiceBatch {
-    /// Parsed event maps (for hot buffer / event bus).
     pub maps: Vec<Map<String, serde_json::Value>>,
-    /// Serialized ndjson bytes (for WAL file writing).
     pub ndjson: Vec<u8>,
 }
 
 impl ServiceBatch {
-    /// Add an event to this batch, serializing it to ndjson in the WAL's
-    /// line format ([`encode_line`](crate::ingest::wal::encode_line)).
-    ///
     /// The map is kept only if its line was written, so maps and lines stay
     /// one to one. Serializing a `Map<String, Value>` into a `Vec` cannot
     /// fail (string keys, an infallible writer, and `Value` never refuses
@@ -71,8 +52,6 @@ impl ServiceBatch {
         self.maps.push(map);
     }
 
-    /// The hot-buffer charge this batch publishes: `(maps, ndjson bytes)`,
-    /// exactly `(IngestBatch::events.len(), IngestBatch::byte_size)`.
     pub fn charge(&self) -> Charge {
         Charge {
             events: self.maps.len(),
@@ -81,7 +60,6 @@ impl ServiceBatch {
     }
 }
 
-/// One `(env, service)` group whose hot-buffer space is already admitted.
 #[derive(Debug)]
 pub struct AdmittedGroup {
     pub key: BatchKey,
@@ -90,9 +68,6 @@ pub struct AdmittedGroup {
     pub reservation: Reservation,
 }
 
-/// Shared pipeline writer that encapsulates WAL + hot buffer + event bus.
-///
-/// Used by both the syslog batcher and the HTTP ingest handler.
 #[derive(Debug)]
 pub struct PipelineWriter {
     wal_writer: Arc<WalWriter>,
@@ -122,13 +97,9 @@ impl PipelineWriter {
         &self.wal_writer
     }
 
-    /// Reserve hot-buffer space for `charge` on behalf of `producer`
-    /// ([`HotBuffer::reserve`]).
-    ///
     /// A pipeline without a hot buffer (embedded and test wiring) meters
     /// nothing: it always admits, with an unmetered reservation whose drop
-    /// releases nothing. There is no buffer to protect and no drain to
-    /// wait for.
+    /// releases nothing.
     pub(crate) fn reserve(
         &self,
         producer: ProducerKind,
@@ -148,8 +119,6 @@ impl PipelineWriter {
         self.hot_buffer.as_ref().map(|buf| buf.subscribe_released())
     }
 
-    /// The most `producer` may have charged at once
-    /// ([`HotBuffer::ceiling`]); unbounded without a hot buffer.
     pub(crate) fn ceiling(&self, producer: ProducerKind) -> Charge {
         self.hot_buffer.as_ref().map_or(
             Charge {
@@ -160,16 +129,6 @@ impl PipelineWriter {
         )
     }
 
-    /// Write admitted groups through the pipeline: WAL → hot buffer → event
-    /// bus, each group under its own publication read guard.
-    ///
-    /// Returns the number of events successfully written. A group whose
-    /// WAL write fails, a failed directory fsync included, is dropped
-    /// (logged, counted, not published) and its reservation released; that
-    /// holds for a file left visible to compaction too (ADR-0043), because
-    /// it was never acknowledged.
-    ///
-    /// The env comes from the key, never from a writer-held default.
     /// Call from a blocking thread because WAL I/O and the publication
     /// read guard can wait; the caller must not wait for capacity while
     /// holding the gate, which is why admission happened before this call.
@@ -230,12 +189,6 @@ impl PipelineWriter {
         );
     }
 
-    /// Publish a successfully-written, admitted batch to the hot buffer and
-    /// event bus: the reservation's charge moves into the resident batch.
-    /// Without a hot buffer the (unmetered) reservation is simply dropped.
-    ///
-    /// Called after WAL writing succeeds to make events immediately
-    /// visible to queries (via hot buffer) and SSE streams (via event bus).
     /// The caller holds the publication read guard from before the WAL
     /// write through this call. Reacquiring here can deadlock behind a
     /// queued compactor waiting for the caller's existing read guard.
@@ -334,8 +287,6 @@ impl PipelineWriter {
 mod tests {
     use super::*;
     use crate::metrics::test_support::sample;
-
-    // -- admitted writes (ADR-0043) -------------------------------------------
 
     use crate::hot_buffer::Charge;
 

@@ -2,20 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Evidence (ADR-0059): an attached capture's result is kept from birth,
-//! under the evidence budgets instead of the temporary quota, in one
-//! transaction with its step's success; the response carries what other
-//! keys wrote since the caller last looked. A keep that cites the caller's
-//! own temporary result promotes the whole result in place, charged once.
-//! A write to an investigation past its deadline prunes its evidence first.
+//! Evidence (ADR-0059).
 //!
-//! Through the fixture's HTTPS listener with real fleet keys: an agent key
-//! that writes (`query`, `investigation_read`, `investigation_write`) and a
-//! human key that reads (`query`, `investigation_read`). Captures resolve
-//! their window at the fixture's results clock, set onto the capture corpus
-//! of `common::captured`. The process's tracing events are recorded, so
-//! each test runs in its own process: nextest's. The binary is in the
-//! ADR-0021 `postgres` nextest group.
+//! The process's tracing events are recorded, so each test runs in its own
+//! process: nextest's. The binary is in the ADR-0021 `postgres` nextest group.
 
 mod common;
 
@@ -55,16 +45,13 @@ use trawl_server::store::{
 /// capture corpus's hour.
 const START: &str = "2024-01-16T10:30:00Z";
 
-/// The two principals.
 struct Keys {
-    /// Reads and writes.
     agent: MintedKey,
-    /// Reads only.
     human: MintedKey,
 }
 
-/// The tracing events of the whole process. Installed once: the server
-/// logs from every tokio worker and blocking thread.
+/// Installed once: the server logs from every tokio worker and blocking
+/// thread.
 fn telemetry() -> &'static Capture {
     static CAPTURE: OnceLock<Capture> = OnceLock::new();
     CAPTURE.get_or_init(|| {
@@ -78,8 +65,6 @@ fn telemetry() -> &'static Capture {
     })
 }
 
-/// A fixture over the capture corpus with `capture` and `investigation`,
-/// its clock at [`START`].
 async fn boot(
     capture: CaptureConfig,
     investigation: InvestigationConfig,
@@ -87,7 +72,6 @@ async fn boot(
     boot_timing_out(capture, investigation, 60).await
 }
 
-/// [`boot`] whose queries, and promotions, time out after `timeout_secs`.
 async fn boot_timing_out(
     capture: CaptureConfig,
     investigation: InvestigationConfig,
@@ -121,12 +105,10 @@ async fn boot_timing_out(
     (Arc::new(server), keys)
 }
 
-/// [`boot`] with the default limits.
 async fn boot_default() -> (Arc<TestServer>, Keys) {
     boot(CaptureConfig::default(), InvestigationConfig::default()).await
 }
 
-/// The capture corpus's 20 events.
 fn corpus_query() -> String {
     format!("service={}", captured::SERVICE)
 }
@@ -137,12 +119,10 @@ fn max_file_bytes() -> u64 {
     CaptureConfig::default().max_file_bytes
 }
 
-/// Investigation `n`'s id, typed.
 fn investigation(n: u32) -> InvestigationId {
     InvestigationId::parse(&id(n)).unwrap()
 }
 
-/// Wait up to a minute for `done`, failing by `what`.
 async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let give_up = std::time::Instant::now() + Duration::from_mins(1);
     while !done() {
@@ -154,7 +134,6 @@ async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// Start a capture of `body` as `token` on a task of its own.
 fn spawn_capture(
     server: &Arc<TestServer>,
     token: &str,
@@ -165,7 +144,6 @@ fn spawn_capture(
     tokio::spawn(async move { captured::capture(&server, &token, &body).await })
 }
 
-/// Tracing events whose `event_type` is `name`.
 fn events_of(name: &str) -> Vec<common::audit_capture::Captured> {
     let quoted = format!("\"{name}\"");
     telemetry()
@@ -175,7 +153,6 @@ fn events_of(name: &str) -> Vec<common::audit_capture::Captured> {
         .collect()
 }
 
-/// The `query_start` events of query `query_id`.
 fn query_starts(query_id: u64) -> usize {
     events_of("query_start")
         .into_iter()
@@ -183,7 +160,6 @@ fn query_starts(query_id: u64) -> usize {
         .count()
 }
 
-/// The query id step `step` names.
 fn step_query_id(step: &trawl_api::investigations::LogEntry) -> u64 {
     let EntryPayload::Step { query_id, .. } = &step.payload else {
         panic!("not a step: {step:?}");
@@ -191,8 +167,6 @@ fn step_query_id(step: &trawl_api::investigations::LogEntry) -> u64 {
     query_id.expect("the step names its query")
 }
 
-/// The committed evidence bytes of investigation `n` and of the
-/// installation: every kept row.
 async fn evidence(server: &TestServer, n: u32) -> (u64, u64) {
     let store = &server.state.storage.investigations;
     (
@@ -201,8 +175,6 @@ async fn evidence(server: &TestServer, n: u32) -> (u64, u64) {
     )
 }
 
-/// The refusal message of an evidence budget, named as `budget`, with
-/// `used` of `limit` bytes counted against it.
 fn budget_refusal(budget: &str, used: u64, limit: u64) -> String {
     format!(
         "keeping this result would exceed {budget}: {used} of {limit} bytes are counted \
@@ -211,7 +183,6 @@ fn budget_refusal(budget: &str, used: u64, limit: u64) -> String {
     )
 }
 
-/// The `scope` of every `capture_refused` event for an evidence budget.
 fn evidence_refusal_scopes() -> Vec<String> {
     events_of("capture_refused")
         .into_iter()
@@ -220,7 +191,6 @@ fn evidence_refusal_scopes() -> Vec<String> {
         .collect()
 }
 
-/// Rows of `captured_results` attached to investigation `n`.
 async fn kept_rows(server: &TestServer, n: u32) -> i64 {
     let pool = common::fixture_pool(&server.app_db_url, 1).await;
     let rows =
@@ -233,13 +203,6 @@ async fn kept_rows(server: &TestServer, n: u32) -> i64 {
     rows
 }
 
-// -- kept from birth -----------------------------------------------------------
-
-/// An attached capture's result is the investigation's from its commit:
-/// `kept`, no deadline, naming the investigation, one file in the root. It
-/// is not the agent's temporary result, so the temporary list and the
-/// capture quota do not count it, and the evidence account counts its file
-/// once. The human, who reads the investigation, pages it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_is_kept_from_birth() {
     let (server, keys) = boot_default().await;
@@ -297,7 +260,6 @@ async fn an_attached_capture_is_kept_from_birth() {
         "{page}"
     );
 
-    // One step, filled once, in the transaction that kept the row.
     let step = settled(&server, &keys.human, 1, 1).await;
     let recorded = outcome(&step).unwrap();
     assert_eq!(recorded.outcome, StepOutcomeKind::Success);
@@ -307,13 +269,6 @@ async fn an_attached_capture_is_kept_from_birth() {
     assert_eq!(kept_rows(&server, 1).await, 1);
 }
 
-// -- the evidence budget -----------------------------------------------------
-
-/// A per-investigation evidence budget below `max_file_bytes` refuses an
-/// attached capture before any permit: 409 `evidence_budget_exceeded`
-/// naming this investigation's budget, the bytes counted against it and
-/// its size, no query started, the step `refused` with the code, and
-/// nothing held. The `capture_refused` event logs the scope.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_investigations_budget_refuses_an_attached_capture_before_any_permit() {
     let limit = max_file_bytes() - 1;
@@ -353,9 +308,6 @@ async fn the_investigations_budget_refuses_an_attached_capture_before_any_permit
     assert!(captured::root_names(&server).is_empty());
 }
 
-/// The installation's evidence budget refuses the same way, whichever
-/// investigation the capture names, and its message and event name the
-/// installation's budget.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_installations_budget_refuses_an_attached_capture_before_any_permit() {
     let limit = max_file_bytes() - 1;
@@ -392,9 +344,6 @@ async fn the_installations_budget_refuses_an_attached_capture_before_any_permit(
     assert_eq!(query_starts(step_query_id(&step)), 0);
 }
 
-/// One attached request body per correlation read, attached to
-/// investigation 1: a context read around row 0 of `focus`, the sightings
-/// of the corpus's message word, and the corpus's per-host rates.
 fn attached_correlation_reads(focus: &str) -> [(&'static str, Value); 3] {
     let investigation = json!({ "id": id(1) });
     [
@@ -418,11 +367,6 @@ fn attached_correlation_reads(focus: &str) -> [(&'static str, Value); 3] {
     ]
 }
 
-/// Each attached correlation read refused by an evidence budget below
-/// `max_file_bytes`, configured by `budget`: 409 `evidence_budget_exceeded`
-/// before any permit, nothing held, its step `refused` with the code and no
-/// query started for it, no row kept, and nothing new in the results root
-/// beside the focus result's file.
 async fn assert_budget_refuses_correlation_reads(budget: impl FnOnce(u64) -> InvestigationConfig) {
     let limit = max_file_bytes() - 1;
     let (server, keys) = boot(CaptureConfig::default(), budget(limit)).await;
@@ -470,8 +414,6 @@ async fn assert_budget_refuses_correlation_reads(budget: impl FnOnce(u64) -> Inv
     assert_eq!(captured::root_names(&server), [format!("{focus}.parquet")]);
 }
 
-/// The investigation's evidence budget refuses an attached correlation
-/// read as it refuses an attached search, before any permit or scan.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_investigations_budget_refuses_an_attached_correlation_read_before_any_permit() {
     assert_budget_refuses_correlation_reads(|limit| InvestigationConfig {
@@ -481,8 +423,6 @@ async fn the_investigations_budget_refuses_an_attached_correlation_read_before_a
     .await;
 }
 
-/// The installation's evidence budget refuses an attached correlation read
-/// the same way.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_installations_budget_refuses_an_attached_correlation_read_before_any_permit() {
     assert_budget_refuses_correlation_reads(|limit| InvestigationConfig {
@@ -492,11 +432,6 @@ async fn the_installations_budget_refuses_an_attached_correlation_read_before_an
     .await;
 }
 
-/// An attached capture in flight holds `max_file_bytes` of the budget, and
-/// settles to its file's size once kept. With a budget of one and a half
-/// reservations: a second capture while the first is held is refused, its
-/// usage naming the first's reservation; once the first commits its small
-/// file, a third is admitted.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_holds_its_reservation_until_it_settles() {
     let limit = max_file_bytes() / 2 * 3;
@@ -559,11 +494,6 @@ async fn an_attached_capture_holds_its_reservation_until_it_settles() {
     );
 }
 
-/// A reservation not yet kept is counted against the budget, and the
-/// message says so rather than calling it kept. The first capture's kept
-/// insert is held before its statement, so its reservation is in the book
-/// and no row of it exists; a second capture is refused with the first's
-/// reservation in its count. Released, the first capture commits.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_reservation_is_counted_not_called_kept() {
     let limit = max_file_bytes() / 2 * 3;
@@ -625,13 +555,6 @@ async fn a_pending_reservation_is_counted_not_called_kept() {
     assert_eq!(evidence(&server, 1).await, (file_bytes, file_bytes));
 }
 
-// -- the fence ---------------------------------------------------------------
-
-/// A kept insert whose answer is lost after it committed is fenced by the
-/// same transaction, which finds the id taken and writes nothing: one kept
-/// row, one step fill, the investigation advanced once for the step and
-/// once for its fill. Its warning names the insert's error by its class
-/// alone, never by its text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fenced_kept_insert_commits_the_row_and_the_step_once() {
     let (server, keys) = boot_default().await;
@@ -676,11 +599,6 @@ async fn a_fenced_kept_insert_commits_the_row_and_the_step_once() {
     );
 }
 
-/// An investigation pinned at its ceiling past its deadline prunes an
-/// attached capture's row in the transaction that keeps it. Fenced or
-/// not, the capture answers the row as stored, `pruned`, and its file
-/// leaves the root with it: a fence that finds the id taken learned
-/// nothing of that prune from the lost answer, so it reads the row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kept_insert_past_the_ceiling_answers_pruned_even_when_fenced() {
     let (server, keys) = boot_default().await;
@@ -732,12 +650,6 @@ async fn a_kept_insert_past_the_ceiling_answers_pruned_even_when_fenced() {
     assert_eq!(outcome(&step).unwrap().outcome, StepOutcomeKind::Success);
 }
 
-/// A fenced kept insert whose read back fails answers that failure. The
-/// fence proved the row committed, but only the stored row says whether the
-/// transaction that kept it also pruned it, so the capture claims no kept
-/// row it could not read. The row and the step's success are there all the
-/// same, and the file stays: its row is live, and the sweep's orphan pass
-/// removes a file only once no live row names it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fenced_kept_insert_whose_read_back_fails_answers_the_failure() {
     let (server, keys) = boot_default().await;
@@ -768,9 +680,6 @@ async fn a_fenced_kept_insert_whose_read_back_fails_answers_the_failure() {
     assert_eq!(captured::root_names(&server), [format!("{id}.parquet")]);
 }
 
-/// The kept insert writes nothing unless its step is still running: a
-/// step whose outcome is already written is [`KeptInsert::StepSettled`],
-/// with no row, and the investigation does not move.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_kept_insert_writes_nothing_once_its_step_has_an_outcome() {
     let (server, keys) = boot_default().await;
@@ -847,14 +756,6 @@ async fn the_kept_insert_writes_nothing_once_its_step_has_an_outcome() {
     ));
 }
 
-// -- activity ----------------------------------------------------------------
-
-/// With `seen_seq`, an attached capture answers what other keys wrote
-/// since: a colleague's note between the agent's two captures, and none of
-/// the agent's own step entries. Without it, no activity. Every attached
-/// capture answers the seq of the step it appended, where a session that
-/// saw nothing starts following; an unattached capture answers none. (The
-/// human key only reads, so a second writing key makes the note.)
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_answers_the_activity_since_seen() {
     let (server, keys) = boot_default().await;
@@ -919,8 +820,6 @@ async fn an_attached_capture_answers_the_activity_since_seen() {
     assert!(unattached.get("step_seq").is_none(), "{unattached}");
 }
 
-/// A refused attached capture carries no activity: its answer is the
-/// error.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_attached_capture_carries_no_activity() {
     let (server, keys) = boot(
@@ -943,9 +842,6 @@ async fn a_refused_attached_capture_carries_no_activity() {
     assert!(body.get("error").is_some(), "{body}");
 }
 
-// -- promotion by reference --------------------------------------------------
-
-/// A temporary capture of the corpus as `key`; its result.
 async fn temporary(server: &TestServer, key: &MintedKey) -> trawl_api::results::CapturedResult {
     let result = captured::captured(
         server,
@@ -958,7 +854,6 @@ async fn temporary(server: &TestServer, key: &MintedKey) -> trawl_api::results::
     result
 }
 
-/// A keep of row 0 of `result` into investigation `n` as `key`.
 async fn keep(server: &TestServer, key: &MintedKey, n: u32, result: &str) -> (StatusCode, Value) {
     call(
         server,
@@ -975,7 +870,6 @@ async fn keep(server: &TestServer, key: &MintedKey, n: u32, result: &str) -> (St
     .await
 }
 
-/// A note into investigation `n` as `key`.
 async fn note(server: &TestServer, key: &MintedKey, n: u32, text: &str) -> (StatusCode, Value) {
     call(
         server,
@@ -987,7 +881,6 @@ async fn note(server: &TestServer, key: &MintedKey, n: u32, text: &str) -> (Stat
     .await
 }
 
-/// The path, size and inode of result `id`'s file.
 fn file_of(server: &TestServer, id: &str) -> (std::path::PathBuf, u64, u64) {
     use std::os::unix::fs::MetadataExt as _;
     let path = server
@@ -1000,11 +893,6 @@ fn file_of(server: &TestServer, id: &str) -> (std::path::PathBuf, u64, u64) {
     (path, meta.len(), meta.ino())
 }
 
-/// A keep that cites a row of the agent's own temporary result promotes
-/// the whole result in place: the same file, the same size, the same
-/// inode, and still one file. It leaves the temporary list and the capture
-/// quota and joins the evidence account once; a second keep citing it
-/// charges nothing more.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keep_citing_the_callers_temporary_result_promotes_it_in_place() {
     let (server, keys) = boot_default().await;
@@ -1070,9 +958,6 @@ async fn a_keep_citing_the_callers_temporary_result_promotes_it_in_place() {
     );
 }
 
-/// A citation the agent may not promote is 400 with the words an absent
-/// result gets: the human's temporary result, and the agent's own past its
-/// deadline. One kept by another investigation is 409. None writes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_citation_that_cannot_be_promoted_is_refused_without_an_oracle() {
     let (server, keys) = boot_default().await;
@@ -1118,10 +1003,6 @@ async fn a_citation_that_cannot_be_promoted_is_refused_without_an_oracle() {
     assert_eq!(evidence(&server, 1).await.0, 0);
 }
 
-/// A result a read or reconciliation found without its file cannot become
-/// evidence: a keep of it is 400 with the words an absent result gets,
-/// nothing is charged or written, and it stays the agent's temporary
-/// result.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_result_whose_file_is_missing_cannot_become_evidence() {
     let (server, keys) = boot_default().await;
@@ -1152,9 +1033,6 @@ async fn a_result_whose_file_is_missing_cannot_become_evidence() {
     assert_eq!(page.investigation.seq, 0, "nothing written");
 }
 
-/// A promotion the investigation's evidence budget cannot hold is 409
-/// `evidence_budget_exceeded`, and the result stays the agent's temporary
-/// result, with nothing written.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotion_over_the_budget_leaves_the_result_temporary() {
     let (server, keys) = boot(
@@ -1193,15 +1071,8 @@ async fn a_promotion_over_the_budget_leaves_the_result_temporary() {
     assert_eq!(read(&server, &keys.human, 1, "").await.investigation.seq, 0);
 }
 
-// -- a correlation result's facts document ----------------------------------
-
-/// The size of the file each [`correlation_capture`] claims.
 const CORRELATION_FILE_BYTES: u64 = 4096;
 
-/// A one-row sightings capture `n` of `key_id`, made at [`START`] and
-/// expiring 15 minutes later: its row only, with a file of
-/// [`CORRELATION_FILE_BYTES`] and the facts document a sightings read
-/// stores beside it. Kept by `investigation` when one is named.
 fn correlation_capture(n: u32, key_id: i64, investigation: Option<InvestigationId>) -> NewCapture {
     let created_at = at(START);
     NewCapture {
@@ -1257,10 +1128,6 @@ fn correlation_capture(n: u32, key_id: i64, investigation: Option<InvestigationI
     }
 }
 
-/// A kept correlation result counts its facts document with its file in
-/// both evidence budgets. With the investigation's budget at the file's
-/// size alone, the kept result already holds more than the budget, and
-/// the next attached capture is refused naming the file and the facts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kept_correlation_result_counts_its_facts_document_in_the_evidence_budget() {
     let limit = CORRELATION_FILE_BYTES;
@@ -1304,11 +1171,6 @@ async fn a_kept_correlation_result_counts_its_facts_document_in_the_evidence_bud
     assert_eq!(kept_rows(&server, 1).await, 1);
 }
 
-/// A keep that promotes a correlation result charges its file and its
-/// facts document: a budget that holds the file but not both refuses it,
-/// 409 `evidence_budget_exceeded`, and the result stays temporary. Past
-/// its deadline a read answers 410 as for any expired result, and the
-/// row keeps no facts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotion_of_a_correlation_result_charges_its_facts_document() {
     let facts = correlation_capture(0, 0, None).metadata_bytes();
@@ -1353,10 +1215,6 @@ async fn a_promotion_of_a_correlation_result_charges_its_facts_document() {
     );
 }
 
-/// A read that found a temporary result past its deadline expires it, but
-/// unlinks its file only if that expiry marked the row. Here the result is
-/// promoted between the read and its expiry: the expiry changes nothing,
-/// the file stays, and the result reads as the investigation's evidence.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_expiry_that_loses_the_row_to_a_promotion_leaves_its_file() {
     let (server, keys) = boot_default().await;
@@ -1402,10 +1260,6 @@ async fn an_expiry_that_loses_the_row_to_a_promotion_leaves_its_file() {
     );
 }
 
-// -- a promotion's charge outlives its request ---------------------------------
-
-/// `key` as the server verifies it, for a call into the service past the
-/// transport, whose future a test can drop at a chosen await.
 async fn verified(server: &TestServer, key: &MintedKey) -> fleet_auth::VerifiedKey {
     fleet_auth::KeyStore::from_pool(server.fleet_pool.clone())
         .verify_key(&key.token)
@@ -1413,7 +1267,6 @@ async fn verified(server: &TestServer, key: &MintedKey) -> fleet_auth::VerifiedK
         .expect("a fixture token verifies")
 }
 
-/// [`keep`]'s entry, as the service takes it.
 fn keep_entry(result: &str) -> AppendEntry {
     serde_json::from_value(json!({
         "kind": "keep",
@@ -1424,9 +1277,6 @@ fn keep_entry(result: &str) -> AppendEntry {
     .unwrap()
 }
 
-/// A connection outside the server's pool, holding result `id`'s row lock
-/// in a transaction it leaves open: a promotion of it waits on the lock
-/// inside its own transaction, after it locked the investigation.
 async fn hold_result_row(server: &TestServer, id: &str) -> sqlx::PgConnection {
     use sqlx::Connection as _;
     let mut conn = sqlx::PgConnection::connect(&server.app_db_url)
@@ -1441,13 +1291,6 @@ async fn hold_result_row(server: &TestServer, id: &str) -> sqlx::PgConnection {
     conn
 }
 
-/// A keep whose request goes away while its promotion's transaction is
-/// open keeps its charge: the transaction is parked on the promoted
-/// result's row lock, after it locked the investigation, and the request's
-/// future is dropped there. The charge stays on the book, so an attached
-/// capture into another investigation is refused with the held bytes in
-/// its usage. Released, the transaction commits, the result is kept by the
-/// investigation, the entry is in its log, and the charge settles.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotion_whose_request_goes_away_holds_its_charge_until_it_commits() {
     let (server, keys) = boot(
@@ -1531,11 +1374,6 @@ async fn a_promotion_whose_request_goes_away_holds_its_charge_until_it_commits()
     );
 }
 
-/// A promotion whose commit answer is lost answers the store's 503 and
-/// holds its charge for the grace: the row has committed, so an attached
-/// capture into another investigation is refused with both the kept bytes
-/// and the held charge in its usage. Once the grace ends, the promoted
-/// result reads as the investigation's, and the charge settles.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotion_whose_commit_is_in_doubt_holds_its_charge_for_the_grace() {
     let (server, keys) = boot(
@@ -1588,8 +1426,6 @@ async fn a_promotion_whose_commit_is_in_doubt_holds_its_charge_for_the_grace() {
     assert_eq!(page.investigation.seq, 1, "{page:?}");
 }
 
-/// The keep of `result` [`keep`] sends, as `token`, into investigation
-/// `n` through an in-process router.
 fn routed_keep(token: &str, n: u32, result: &str) -> axum::http::Request<axum::body::Body> {
     routed(
         token,
@@ -1599,10 +1435,6 @@ fn routed_keep(token: &str, n: u32, result: &str) -> axum::http::Request<axum::b
     )
 }
 
-/// A promotion that outlives its request keeps the request's count
-/// (ADR-0054) until its transaction ends: with a count of one, a request
-/// is refused while the promotion waits on the investigation's lock, and
-/// admitted once the keep has committed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotion_whose_request_goes_away_keeps_its_request_count() {
     let (server, keys) = boot_default().await;
@@ -1638,13 +1470,6 @@ async fn a_promotion_whose_request_goes_away_keeps_its_request_count() {
     );
 }
 
-/// A promotion waits for its investigation no later than its deadline,
-/// the query timeout. A keep whose promotion reaches it answers 429
-/// `capture_busy` with a retry of one second and writes nothing: the
-/// result stays temporary, the charge is gone, and by then no session
-/// waits on the lock: Postgres ends its wait at the deadline too. One
-/// whose request went away frees the request's count at the deadline,
-/// while the lock is still held, and Postgres has stopped waiting.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotion_waits_for_its_investigation_no_later_than_its_deadline() {
     // Long enough for the capture before it, and for the test to see the
@@ -1688,15 +1513,6 @@ async fn a_promotion_waits_for_its_investigation_no_later_than_its_deadline() {
     assert_eq!(page["result"]["state"], "temporary", "{page}");
 }
 
-/// A promotion's lock waits together end at its deadline, and so does its
-/// hold on the request's count. Postgres bounds each statement of the
-/// promotion by a `statement_timeout` set from what remains before it:
-/// here it waits most of its budget for the investigation, then for the
-/// cited result, and the result's wait still ends at the deadline. The
-/// keep answers 429 `capture_busy` by then, and no session is left waiting
-/// on the result. One whose request went away frees the request's count
-/// at the deadline, on its lease, and Postgres has stopped waiting on the
-/// result within a second of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotions_lock_waits_together_end_at_its_deadline() {
     const BUDGET: Duration = Duration::from_secs(5);
@@ -1793,12 +1609,6 @@ async fn a_promotions_lock_waits_together_end_at_its_deadline() {
     assert_eq!(page["result"]["state"], "temporary", "{page}");
 }
 
-// -- concurrent keeps of one result ------------------------------------------------
-
-/// [`boot`] with an investigation budget that holds exactly one temporary
-/// capture of the corpus, investigation 1 created, and the agent's
-/// temporary result to keep. A capture of the corpus at [`START`] is the
-/// same size every time, so a first fixture measures it.
 async fn boot_with_room_for_one() -> (Arc<TestServer>, Keys, trawl_api::results::CapturedResult) {
     let bytes = {
         let (server, keys) = boot_default().await;
@@ -1821,9 +1631,6 @@ async fn boot_with_room_for_one() -> (Arc<TestServer>, Keys, trawl_api::results:
     (server, keys, result)
 }
 
-/// Two keeps of `result` landed in investigation 1: the result is its
-/// evidence, its bytes charged once, nothing left on the book, and both
-/// keeps in the log.
 async fn kept_once(server: &TestServer, keys: &Keys, result: &trawl_api::results::CapturedResult) {
     let key_id = captured::key_id(server, &keys.agent.token).await;
     let row = server
@@ -1854,14 +1661,6 @@ async fn kept_once(server: &TestServer, keys: &Keys, result: &trawl_api::results
     );
 }
 
-/// A keep refused while another keep is promoting the same result into the
-/// same investigation waits for that promotion, then cites the result at
-/// no charge. The budget holds one copy. The first keep's promotion is
-/// parked on the result's row lock with its charge on the book; the second
-/// resolves the result while it is still temporary, and the budget refuses
-/// its charge. Once the first commits, the second reads the result again,
-/// finds it the investigation's evidence, and appends without a charge:
-/// both are 201, and the bytes are charged once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keep_that_resolves_before_another_promotion_commits_cites_it_at_no_charge() {
     let (server, keys, result) = boot_with_room_for_one().await;
@@ -1905,15 +1704,6 @@ async fn a_keep_that_resolves_before_another_promotion_commits_cites_it_at_no_ch
     kept_once(&server, &keys, &result).await;
 }
 
-/// A finding refused while a keep is promoting one of its results waits
-/// for that promotion, then promotes what is left. The budget holds two
-/// copies. The keep's promotion of R1 is parked on R1's row lock with its
-/// charge on the book; the finding resolves R1 and R2 while both are
-/// temporary, and its charge of both, beside the keep's charge of R1,
-/// counts R1 twice and is refused. Once the keep commits, the finding reads
-/// its citations again, finds R1 the investigation's evidence, and charges
-/// R2 alone, which fits: both are 201, and each result's bytes are charged
-/// once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_finding_refused_beside_a_keep_of_one_of_its_results_promotes_the_rest() {
     let bytes = {
@@ -2011,10 +1801,6 @@ async fn a_finding_refused_beside_a_keep_of_one_of_its_results_promotes_the_rest
     );
 }
 
-/// Two keeps of one temporary result into one investigation, sent at once,
-/// with a budget that holds one copy: whichever promotes the result, the
-/// other cites it as the investigation's evidence, so both are 201 and the
-/// bytes are charged once.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_concurrent_keeps_of_one_result_charge_its_bytes_once() {
     let (server, keys, result) = boot_with_room_for_one().await;
@@ -2027,9 +1813,6 @@ async fn two_concurrent_keeps_of_one_result_charge_its_bytes_once() {
     kept_once(&server, &keys, &result).await;
 }
 
-/// The due-write rule over HTTP: a note on an investigation past its
-/// deadline prunes its kept evidence first, unlinks the files, and only
-/// then slides the deadline. The evidence then reads as pruned.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_note_on_a_due_investigation_unlinks_its_pruned_evidence() {
     let (server, keys) = boot_default().await;
@@ -2069,13 +1852,6 @@ async fn a_note_on_a_due_investigation_unlinks_its_pruned_evidence() {
     assert_eq!(evidence(&server, 1).await.0, 0);
 }
 
-// -- dead evidence and the budgets ---------------------------------------------
-
-/// [`boot`] whose evidence stays a minute after the last change, with the
-/// budget `budget` picks set to exactly one temporary capture of the
-/// corpus, investigation 1 created, and the agent's temporary result to
-/// keep. A capture of the corpus at [`START`] is the same size every time,
-/// so a first fixture measures it.
 async fn boot_with_a_minute_of_room_for_one(
     budget: impl FnOnce(&mut InvestigationConfig, u64),
 ) -> (Arc<TestServer>, Keys, trawl_api::results::CapturedResult) {
@@ -2098,7 +1874,6 @@ async fn boot_with_a_minute_of_room_for_one(
     (server, keys, result)
 }
 
-/// The state of result `id`'s row.
 async fn row_state(server: &TestServer, id: &str) -> String {
     let pool = common::fixture_pool(&server.app_db_url, 1).await;
     let state = sqlx::query_scalar("SELECT state FROM captured_results WHERE id = $1")
@@ -2110,8 +1885,6 @@ async fn row_state(server: &TestServer, id: &str) -> String {
     state
 }
 
-/// Keep `result` into investigation 1, then move the clock to the
-/// investigation's deadline, where its evidence is due, without a sweep.
 async fn keep_until_due(server: &TestServer, keys: &Keys, result: &str) {
     let (status, body) = keep(server, &keys.agent, 1, result).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -2122,12 +1895,6 @@ async fn keep_until_due(server: &TestServer, keys: &Keys, result: &str) {
     server.results_clock.set(at(&retain_until));
 }
 
-/// Evidence past its investigation's deadline counts against no budget,
-/// though the sweep has not pruned it yet: a keep of a fresh temporary
-/// result into a due investigation whose dead evidence fills its budget
-/// succeeds. The keep's binding pass prunes the dead evidence before it
-/// counts and unlinks its file once released, and the budget then holds
-/// only the new result.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_due_investigations_evidence_does_not_count_against_its_budget() {
     let (server, keys, old) = boot_with_a_minute_of_room_for_one(|config, bytes| {
@@ -2153,11 +1920,6 @@ async fn a_due_investigations_evidence_does_not_count_against_its_budget() {
     );
 }
 
-/// The installation's budget counts no due investigation's evidence
-/// either: investigation 1's dead evidence fills it, and a keep into a
-/// live investigation 2 succeeds. Investigation 1 is not written: the
-/// keep's binding pass prunes its evidence, installation-wide, and unlinks
-/// its file once released.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_due_investigations_evidence_does_not_count_against_the_installations_budget() {
     let (server, keys, old) = boot_with_a_minute_of_room_for_one(|config, bytes| {
@@ -2183,12 +1945,8 @@ async fn a_due_investigations_evidence_does_not_count_against_the_installations_
     );
 }
 
-/// The statement the binding evidence pass locks the due investigations
-/// with, to prune them before it counts.
 const PRUNE_LOCK: &str = "SELECT i.id FROM investigations AS i%";
 
-/// The file bytes of every kept row, whatever its investigation's
-/// deadline: what the installation's evidence budget must hold.
 async fn installation_kept(server: &TestServer) -> i64 {
     let pool = common::fixture_pool(&server.app_db_url, 1).await;
     let bytes = sqlx::query_scalar(
@@ -2202,16 +1960,6 @@ async fn installation_kept(server: &TestServer) -> i64 {
     bytes
 }
 
-/// A write dated before a deadline the gate has crossed never lifts the
-/// installation over its budget. Investigation 1's evidence fills the
-/// installation's budget and is due at the clock. A note into it took its
-/// `now` a microsecond before the deadline and waits for the
-/// investigation's lock. A keep into investigation 2 then meets a binding
-/// pass that prunes investigation 1 behind that lock. Whichever gets the
-/// lock first, the installation keeps no more than its budget: the note
-/// slides the deadline before the pass looks again, so the old evidence is
-/// live and counted and the keep is refused; or the pass prunes it first,
-/// so the note's slide revives nothing and the keep fits.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_dated_before_the_deadline_never_lifts_the_installation_over_its_budget() {
     let (server, keys, old) = boot_with_a_minute_of_room_for_one(|config, bytes| {

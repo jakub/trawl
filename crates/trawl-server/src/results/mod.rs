@@ -5,22 +5,6 @@
 //! Captured results (ADR-0057): a search executed once and kept as an
 //! immutable, typed, expiring file that later reads page without
 //! re-running anything.
-//!
-//! `bounds` decides what a capture executes: the one window it covers,
-//! the text with that window spliced in, and whether the result is
-//! event-shaped. [`root`] holds the results root, where each capture's
-//! file is staged and published. [`sweep`] keeps the root and the rows in
-//! agreement: once at boot, then on the scheduler's hourly retention tick, or
-//! on a tick of its own every `ttl_secs` (1 s to 1 h) when
-//! `[scheduler] enabled = false`.
-//! [`charge`] admits each capture: per-key and installation-wide running
-//! slots, and the binding quota reservations. [`service`] is the
-//! capability itself, transport-free: capture, list, page and cell.
-//! `context`, `sightings` and `compare` are the correlation reads of
-//! ADR-0058, each a spec run through the service's capture core. `routes` adapts them to HTTP. [`ResultsState`] is what
-//! every part of the capability shares: the root, the metadata store, the
-//! limits, the clock every lifecycle decision reads, the gate, and the
-//! captures in flight between their file and their row.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -43,30 +27,22 @@ pub mod service;
 pub(crate) mod sightings;
 pub mod sweep;
 
-/// The clock every lifecycle decision about captured results reads:
-/// expiry, tombstone age, quota usage, the sweep and boot reconciliation.
 /// Each reading is passed to SQL as a parameter, never replaced by SQL
 /// `now()`, so a test that moves this clock moves every decision with it.
-///
 /// Readings are truncated to the microsecond, `TIMESTAMPTZ`'s precision, so
 /// an instant compared in Rust is the instant `PostgreSQL` stores.
 #[derive(Debug, Clone)]
 pub enum ResultsClock {
-    /// The system's clock, as trawld runs.
     System,
-    /// A clock that reads what it was last set to, shared by every clone,
-    /// for tests.
     Fixed(Arc<Mutex<DateTime<Utc>>>),
 }
 
 impl ResultsClock {
-    /// A fixed clock reading `at`.
     #[must_use]
     pub fn fixed(at: DateTime<Utc>) -> Self {
         Self::Fixed(Arc::new(Mutex::new(truncate_to_micros(at))))
     }
 
-    /// The current instant, to the microsecond.
     #[must_use]
     pub fn now(&self) -> DateTime<Utc> {
         match self {
@@ -75,8 +51,6 @@ impl ResultsClock {
         }
     }
 
-    /// Move a fixed clock to `at`, for every clone of it.
-    ///
     /// # Panics
     /// On [`Self::System`], which only the operating system moves.
     pub fn set(&self, at: DateTime<Utc>) {
@@ -87,27 +61,15 @@ impl ResultsClock {
     }
 }
 
-/// What the captured-results capability shares across requests, the
-/// scheduler's sweep and boot.
 #[derive(Debug)]
 pub struct ResultsState {
-    /// The results root, held for the life of the process.
     pub root: Arc<root::ResultsRoot>,
-    /// The metadata rows.
     pub store: ResultsStore,
-    /// The `[capture]` limits.
     pub capture: CaptureConfig,
-    /// The `[investigation]` evidence clocks and budgets (ADR-0059).
     pub investigation: InvestigationConfig,
-    /// The clock every lifecycle decision reads.
     pub clock: ResultsClock,
-    /// Capture admission, built from the same limits, store, root and
-    /// clock.
     pub gate: charge::CaptureGate,
-    /// The captures between their file and their row.
     pub in_flight: Arc<InFlight>,
-    /// The one writer of the attached steps' outcomes no request waits for
-    /// (ADR-0059).
     pub steps: StepWriter,
 }
 
@@ -115,21 +77,13 @@ pub struct ResultsState {
 /// whose row's insert has not been decided (ADR-0057). The sweep never
 /// unlinks the file of one, however long its insert takes
 /// ([`sweep::sweep`]).
-///
-/// A capture enters before it publishes and leaves once its insert is
-/// decided: committed, or failed with the file unlinked. A capture whose
-/// insert failed stays while its fence waits on the first insert's row. One
-/// whose fence failed too stays through its grace
+/// One whose fence failed too stays through its grace
 /// ([`service::COMMIT_GRACE`]), so no sweep judges its file while the row
-/// may still land; it leaves with the file kept, unlinked, or left for
-/// boot and the sweep when its row cannot be read. A commit task dropped
-/// before its insert is decided, as at shutdown, leaves with its file left
-/// for them too. Boot reconciliation runs before any capture can enter.
+/// may still land.
 #[derive(Debug, Default)]
 pub struct InFlight(Mutex<HashSet<String>>);
 
 impl InFlight {
-    /// Hold `id` in flight until the returned registration drops.
     pub(crate) fn enter(self: &Arc<Self>, id: &str) -> Entered {
         self.0.lock().insert(id.to_owned());
         Entered {
@@ -138,14 +92,12 @@ impl InFlight {
         }
     }
 
-    /// The ids in flight now.
     #[must_use]
     pub fn snapshot(&self) -> HashSet<String> {
         self.0.lock().clone()
     }
 }
 
-/// One capture's place in [`InFlight`]; dropping it leaves.
 #[derive(Debug)]
 pub(crate) struct Entered {
     set: Arc<InFlight>,
@@ -158,17 +110,12 @@ impl Drop for Entered {
     }
 }
 
-/// What a warning logs, for the tests that prove a store error goes into
-/// an event by its closed class and none of its text: the text can carry
-/// the backend's diagnostics, and the event lands in the retained
-/// `service=trawld` corpus.
 #[cfg(test)]
 pub(crate) mod logged {
     use std::sync::{Arc, Mutex};
 
     use crate::store::StoreError;
 
-    /// What `log` logs, as text, under a subscriber of its own.
     pub(crate) fn logged(log: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Sink(Arc<Mutex<Vec<u8>>>);
@@ -193,13 +140,10 @@ pub(crate) mod logged {
         String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
     }
 
-    /// A store error whose text carries a backend diagnostic.
     pub(crate) fn sentinel() -> StoreError {
         StoreError::Unavailable(sqlx::Error::Protocol("SENTINEL-backend-diagnostic".into()))
     }
 
-    /// Assert that `logged` holds an `event_type` event naming `error`'s
-    /// class and nothing of its text.
     pub(crate) fn assert_class_only(logged: &str, event_type: &str, error: &StoreError) {
         assert!(
             logged.contains(&format!("event_type=\"{event_type}\"")),

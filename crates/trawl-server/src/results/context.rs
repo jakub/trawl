@@ -4,25 +4,6 @@
 
 //! The `context` read (ADR-0058): the rows around one captured row, read
 //! again as a capture of their own.
-//!
-//! The request names a focus row, row `row` of the caller's capture
-//! `result_id`. The read covers `seconds` either side of the focus row's
-//! `_time` (`[F − seconds, F + seconds + 1 µs)`, so the focus instant
-//! itself is inside) on the focus keys `scope` names, with the values the
-//! focus row holds. It answers three groups of rows, each ordered by
-//! `_time`: up to `before` rows strictly earlier than `F`, up to
-//! [`CONTEXT_SAME_TIME_ROWS`] rows at exactly `F`, and up to `after` rows
-//! strictly later. The earlier rows are the ones nearest `F`, as are the
-//! later ones. A window that holds no rows, such as one whose source logs
-//! retention has since removed, answers three empty groups.
-//!
-//! The focus row is not copied into the answer. Its facts name it, by
-//! result id and row, with the time, env and host the read took from it,
-//! and the same-time group lists every row the new read found at `F`. The
-//! focus event's own record is among them, indistinguishable by design:
-//! this is a new read, and equal timestamps establish no order
-//! ([`CONTEXT_STATEMENT`]).
-//!
 //! # Exact keys
 //!
 //! The composed statement matches each scoped key with `=`, and under a
@@ -39,39 +20,9 @@
 //!
 //! Everything that can refuse the request runs before [`service::run`], so
 //! a refused read takes no permit, no slot and no reservation, and writes
-//! nothing:
-//!
-//! 1. The authority ([`service::authorize`]): the `query` permission and,
-//!    for a read attached to an investigation (ADR-0059), the write
-//!    authority and the purpose's bound.
-//! 2. The caps: `before` and `after` at most [`CONTEXT_MAX_SIDE_ROWS`].
-//! 3. The focus lookup: one row of the caller's capture, read as
-//!    [`service::page`] reads it, ownership and lifecycle included, so
-//!    another key's temporary result is not found; another key's kept
-//!    evidence is, for a key that reads investigations. A row past the end, a `_time`
-//!    that is missing, null or not a timestamp, or a key the scope
-//!    constrains that is missing or null is `focus_incomplete`; two
-//!    columns of a name the read needs are `focus_ambiguous`. Any result
-//!    shape is accepted when the row carries the fields.
-//! 4. The window arithmetic. `seconds` has no cap of its own: the window
-//!    meets the same limits as any capture's, so a span over
-//!    `max_span_secs` is the bounds' `SpanTooLong`.
-//!
-//! The focus lookup precedes the read's timing account, which `run` opens.
-//! It is a page read of a capture that already exists, outside the
-//! executor permits, as every `GET /api/v1/results/{id}` is, and a page
-//! read opens no timing account. Booking it under `dsl_check` would move
-//! the composition of the read's text inside the capture core, which takes
-//! that text as its input; a refused lookup is the caller's input
-//! refused, like the request-shape check that also opens no account.
-//!
-//! # Attached
-//!
-//! A read naming an investigation is attached as a search capture is
-//! ([`service`]'s module docs, "An attached capture"): its step is
-//! appended once the capture core has planned it, so a refusal above
-//! records none, and its result is kept as the investigation's evidence.
-//! The focus result is not promoted: attaching is the read's own choice.
+//! nothing. `seconds` has no cap of its own: the window
+//! meets the same limits as any capture's, so a span over
+//! `max_span_secs` is the bounds' `SpanTooLong`.
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use fleet_auth::VerifiedKey;
@@ -91,14 +42,6 @@ use super::service::{self, Selection, Spec};
 use crate::error::ServerError;
 use crate::state::AppState;
 
-/// Read the rows around a focus row (module docs).
-///
-/// # Errors
-/// 403 without the `query` permission, or attached without write
-/// authority on investigations; 400 for the attachment's purpose, a cap,
-/// `focus_incomplete` or `focus_ambiguous`; the page read's 404, 410, 409
-/// and 500 for the focus result; then every refusal a capture makes, an
-/// attached capture's included.
 pub async fn context(
     state: &AppState,
     verified: &VerifiedKey,
@@ -155,9 +98,7 @@ pub async fn context(
         .map(CorrelationResponse::from)
 }
 
-/// What the read takes from the focus row.
 struct Focus {
-    /// The focus row's `_time`.
     time: DateTime<Utc>,
     /// The `env` the read is held to: the focus row's, when the scope
     /// names it.
@@ -170,8 +111,6 @@ struct Focus {
     row_host: Option<String>,
 }
 
-/// Step 3: read the focus row and take its `_time` and the keys `scope`
-/// constrains.
 async fn focus(
     state: &AppState,
     verified: &VerifiedKey,
@@ -222,8 +161,6 @@ async fn focus(
     })
 }
 
-/// The type and cell of the one column named `name` in `cells`: `None`
-/// when the result has no such column, `focus_ambiguous` when it has two.
 fn single<'a>(
     result: &'a QueryResult,
     cells: &'a [Value],
@@ -285,8 +222,6 @@ fn not_a_timestamp(row: u64) -> ServerError {
     ))
 }
 
-/// Step 4: `[F − seconds, F + seconds + 1 µs)` as a capture window, so the
-/// bounds measure it as they measure any capture's.
 fn window(focus: DateTime<Utc>, seconds: u64) -> Result<WindowInput, ServerError> {
     let span = i64::try_from(seconds).ok().and_then(TimeDelta::try_seconds);
     let bounds = span.and_then(|span| {
@@ -309,7 +244,6 @@ fn window(focus: DateTime<Utc>, seconds: u64) -> Result<WindowInput, ServerError
     })
 }
 
-/// An instant as the wire spells it: RFC 3339 UTC with microseconds.
 fn micros(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
@@ -319,7 +253,6 @@ fn side_rows(rows: u64) -> usize {
     usize::try_from(rows).unwrap_or(usize::MAX)
 }
 
-/// Where a row sits against the focus instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Side {
     Earlier,
@@ -327,7 +260,6 @@ enum Side {
     Later,
 }
 
-/// The context read's selection (module docs).
 struct Around {
     focus: DateTime<Utc>,
     before: usize,
@@ -337,7 +269,6 @@ struct Around {
 }
 
 impl Around {
-    /// The position of the result's `_time` column.
     fn time_column(result: &QueryResult) -> Result<usize, ServerError> {
         result
             .columns
@@ -346,8 +277,6 @@ impl Around {
             .ok_or_else(|| ServerError::Internal("a context read's result has no `_time`".into()))
     }
 
-    /// Where `row` sits, by its `_time`; `None` for a cell no instant
-    /// reads from, which no group holds.
     fn side(&self, row: &[Value], time: usize) -> Option<(DateTime<Utc>, Side)> {
         let Value::String(text) = &row[time] else {
             return None;
@@ -361,8 +290,6 @@ impl Around {
         Some((at, side))
     }
 
-    /// The position and the focus row's text of each key the scope holds
-    /// the read to.
     fn scoped_keys<'a>(
         &'a self,
         result: &QueryResult,
@@ -386,8 +313,6 @@ impl Around {
             .collect()
     }
 
-    /// How many of `kept`'s rows sit in each group, checking that they
-    /// keep the groups' order.
     fn counts(&self, kept: &QueryResult) -> Result<[u64; 3], ServerError> {
         let time = Self::time_column(kept)?;
         let mut counts = [0_u64; 3];
@@ -409,12 +334,6 @@ impl Around {
 }
 
 impl Selection for Around {
-    /// Keep the `before` rows nearest before the focus instant, the rows
-    /// at it up to [`CONTEXT_SAME_TIME_ROWS`] and the `after` rows nearest
-    /// after it, in that order and each ascending by `_time`, of the rows
-    /// whose scoped keys hold the focus row's exact text (module docs,
-    /// "Exact keys").
-    ///
     /// The capture's order is `_time DESC, _ingested DESC`; reversed it is
     /// ascending in both, and a stable sort on the instant alone keeps it
     /// so whatever the engine's text order of equal instants.
@@ -638,8 +557,6 @@ mod tests {
         assert_eq!(facts.groups.later, RowRange { start: 3, end: 3 });
     }
 
-    /// Under a VARCHAR pin `host="007"` also matches `7`, `07` and `7.0`
-    /// by their decimal reading; the read keeps only the focus row's text.
     #[test]
     fn a_scoped_key_keeps_only_rows_holding_its_exact_text() {
         let mut selection = around(10, 10);
@@ -661,7 +578,6 @@ mod tests {
                 Column::new("env", ColumnType::String),
                 Column::new("host", ColumnType::String),
             ],
-            // Newest first, as the capture orders them.
             rows: vec![
                 row(12, "prod", text("007"), 6),
                 row(11, "prod", text("7.0"), 5),
@@ -679,7 +595,6 @@ mod tests {
         assert_eq!(groups.later, RowRange { start: 1, end: 2 });
     }
 
-    /// A key the scope does not hold the read to is not filtered.
     #[test]
     fn a_key_outside_the_scope_is_not_filtered() {
         let mut selection = around(10, 10);
@@ -712,8 +627,6 @@ mod tests {
 
     #[test]
     fn a_read_with_no_columns_selects_three_empty_groups() {
-        // The engine's answer when no file matches the source and the hot
-        // buffer holds nothing: no columns and no rows.
         let mut result = QueryResult {
             columns: vec![],
             rows: vec![],

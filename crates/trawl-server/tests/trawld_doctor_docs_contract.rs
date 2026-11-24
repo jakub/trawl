@@ -2,19 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The configuration reference documents `trawld --doctor` from the names
-//! the code uses: every check id, the four outcomes, and each verdict with its
-//! exit status. The names are imported, not copied, so a renamed check or a
-//! new outcome fails here until the reference names it.
-
 use trawl_api::doctor::{Outcome, Verdict};
 use trawl_server::doctor::ServerCheck;
 
 const CONFIGURATION: &str =
     include_str!("../../../docs/src/content/docs/reference/configuration.md");
 
-/// The section headed "Check the installation with `trawld --doctor`", up
-/// to the next heading of the same or a higher level.
 fn doctor_section() -> &'static str {
     let start = CONFIGURATION
         .find("\n### Check the installation with `trawld --doctor`\n")
@@ -36,7 +29,6 @@ fn assert_documented(text: &str, what: &str) {
     );
 }
 
-/// The name serde gives a value, without its JSON quotes.
 fn serde_name(value: impl serde::Serialize) -> String {
     match serde_json::to_value(value).expect("serializes") {
         serde_json::Value::String(name) => name,

@@ -4,11 +4,6 @@
 
 //! Postgres tests for the investigation store and the kept-evidence side of
 //! the captured-result store (ADR-0059).
-//!
-//! Plain `#[sqlx::test]` applies `crates/trawl-server/migrations/` to each
-//! per-test database. Every instant is a parameter from a fixed `T0`:
-//! nothing here depends on the wall clock. Races are staged with a held
-//! transaction and observed through `pg_stat_activity`, never retried.
 
 use std::sync::Arc;
 
@@ -82,8 +77,6 @@ fn creation(title: &str) -> CreateInvestigation {
     }
 }
 
-/// An investigation `n` created by `actor` at `T0`, with the default
-/// clocks: evidence 7 days, ceiling 30.
 fn new_investigation(n: u32, actor: StoreActor, title: &str) -> NewInvestigation {
     NewInvestigation {
         id: inv(n),
@@ -147,8 +140,6 @@ async fn head_seq(store: &InvestigationStore, id: &InvestigationId) -> u64 {
     store.get(id).await.unwrap().expect("the investigation").seq
 }
 
-/// A live temporary capture `n` of `key_id`, made `age` before `T0` and
-/// expiring 15 minutes after it was made.
 fn capture(n: u32, key_id: i64, age: Duration, file_bytes: u64) -> NewCapture {
     let created_at = t0() - age;
     NewCapture {
@@ -187,8 +178,6 @@ fn capture(n: u32, key_id: i64, age: Duration, file_bytes: u64) -> NewCapture {
     }
 }
 
-/// Record `row`: temporary, or kept inside its investigation's lock with
-/// no step, the fixture form of an attached capture's kept insert.
 async fn insert(results: &ResultsStore, row: &NewCapture) {
     let inserted = if row.investigation_id.is_some() {
         results.insert_kept_unlogged(row).await
@@ -209,22 +198,16 @@ async fn state_of(
         .unwrap()
 }
 
-/// Wait, bounded, until `count` sessions of this database wait on a lock
-/// in the investigation row lock every write takes. A second writer queues
-/// behind the first waiter rather than the holder, so this counts lock
-/// waits on the statement, not the holder's blocked pids.
+/// A second writer queues behind the first waiter rather than the holder, so
+/// this counts lock waits on the statement, not the holder's blocked pids.
 async fn writers_waiting(probe: &PgPool, count: i64) {
     lock_waits(probe, "SELECT status, seq FROM investigations%", count).await;
 }
 
-/// Wait, bounded, until `count` evidence prunes wait to lock the due
-/// investigations.
 async fn prunes_waiting(probe: &PgPool, count: i64) {
     lock_waits(probe, "SELECT i.id FROM investigations AS i%", count).await;
 }
 
-/// Wait, bounded, until `count` sessions of this database wait on a lock
-/// in a statement that starts like `pattern`.
 async fn lock_waits(probe: &PgPool, pattern: &str, count: i64) {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
@@ -247,12 +230,6 @@ async fn lock_waits(probe: &PgPool, pattern: &str, count: i64) {
     .expect("the statements queue behind the held lock");
 }
 
-// -- the schema --------------------------------------------------------------
-
-/// The dormant BIGINT column is now the investigation id, with a foreign
-/// key to the investigations. A kept row that names no investigation is
-/// refused: the plain insert records temporary rows only, and the kept
-/// insert finds no investigation to lock.
 #[sqlx::test]
 async fn the_attachment_column_is_an_investigation_id_with_a_foreign_key(pool: PgPool) {
     let ty: String = sqlx::query_scalar(
@@ -344,10 +321,6 @@ async fn the_largest_step_fits_the_payload_bound(pool: PgPool) {
     );
 }
 
-// -- attribution ---------------------------------------------------------------
-
-/// Every write snapshots the writer's prefix and name beside the key id,
-/// and what leaves the store carries the prefix and name only.
 #[sqlx::test]
 async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -357,14 +330,12 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
         name: a.name.clone(),
     };
 
-    // Creation: the creator is both creator and last writer.
     let row = store.get(&id).await.unwrap().unwrap();
     assert_eq!((&row.created_by, &row.updated_by), (&agent(), &agent()));
     assert_eq!(row.to_wire().created_by, wire(&agent()));
     assert_eq!(row.to_wire().updated_by, wire(&agent()));
     assert_eq!(row.to_summary().created_by, wire(&agent()));
 
-    // Append.
     let finding_entry = store
         .append(&id, &human(), &finding(), t0(), RULE)
         .await
@@ -372,7 +343,6 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
         .entry;
     assert_eq!(finding_entry.actor, wire(&human()));
 
-    // Overwrite.
     let titled = store
         .overwrite(
             &id,
@@ -387,7 +357,6 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
     assert_eq!(titled.entry.actor, wire(&agent()));
     assert_eq!(titled.investigation.updated_by, agent());
 
-    // Finding status.
     let status = store
         .set_finding_status(
             &id,
@@ -402,7 +371,6 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
         .unwrap();
     assert_eq!(status.actor, wire(&human()));
 
-    // Step completion: the step's own actor becomes the last writer.
     let begun = store
         .begin_step(&id, &agent(), &step("req-1"), t0(), RULE, patience())
         .await
@@ -426,7 +394,6 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
     assert_eq!(row.updated_by, agent());
     assert_eq!(row.created_by, agent());
 
-    // Read back: every entry carries the prefix and name of its writer.
     let page = store.read_since(&id, 0, 20).await.unwrap().unwrap();
     let actors: Vec<_> = page.entries.iter().map(|e| e.actor.clone()).collect();
     assert_eq!(
@@ -438,7 +405,6 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
             wire(&agent())
         ]
     );
-    // The server keeps the key ids for ownership; they are columns, not wire.
     let ids: Vec<i64> = sqlx::query_scalar(
         "SELECT actor_key_id FROM investigation_log WHERE investigation_id = $1 ORDER BY seq",
     )
@@ -451,7 +417,6 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
         + &serde_json::to_string(&row.to_wire()).unwrap();
     assert!(!text.contains("key_id"), "{text}");
 
-    // A prefix wider than a fleet prefix is refused by the schema.
     assert!(
         store
             .append(
@@ -470,11 +435,6 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
     );
 }
 
-// -- create ------------------------------------------------------------------
-
-/// The same creator with the same request gets the existing investigation
-/// and advances nothing; another request or another creator on the id is a
-/// mismatch.
 #[sqlx::test]
 async fn create_if_absent_replays_only_the_same_creator_and_request(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -496,8 +456,6 @@ async fn create_if_absent_replays_only_the_same_creator_and_request(pool: PgPool
         (t0() + Duration::days(7), t0() + Duration::days(30))
     );
 
-    // A replay a day later, after a title overwrite: the comparison is
-    // against the request that created it, and nothing slides.
     store
         .overwrite(
             &first.id,
@@ -536,7 +494,6 @@ async fn create_if_absent_replays_only_the_same_creator_and_request(pool: PgPool
     assert_eq!(head_seq(&store, &first.id).await, 1);
 }
 
-/// Two creates of one id race: one creates, the other replays it.
 #[sqlx::test]
 async fn concurrent_identical_creates_create_once(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -566,10 +523,6 @@ async fn concurrent_identical_creates_create_once(pool: PgPool) {
     assert_eq!((created, existing), (1, 1));
 }
 
-// -- appends and overwrites --------------------------------------------------
-
-/// Two appends from two connections, queued behind a held lock on the
-/// investigation, both commit: one at seq 1, the other at seq 2.
 #[sqlx::test]
 async fn concurrent_appends_both_commit_in_sequence(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -611,9 +564,6 @@ async fn concurrent_appends_both_commit_in_sequence(pool: PgPool) {
     assert_eq!(page.entries.len(), 2);
 }
 
-/// An overwrite carries the sequence it saw: a stale one fails with both
-/// numbers and writes nothing; a current one advances and records its
-/// entry.
 #[sqlx::test]
 async fn a_stale_overwrite_conflicts_with_expected_and_current(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -666,8 +616,6 @@ async fn a_stale_overwrite_conflicts_with_expected_and_current(pool: PgPool) {
             }
         )
     );
-    // The overwrite answers the investigation as its own transaction left
-    // it: the committed row, at the entry's sequence.
     let row = store.get(&id).await.unwrap().unwrap();
     assert_eq!(
         (row.seq, row.status, &row.updated_by),
@@ -704,7 +652,6 @@ async fn a_stale_overwrite_conflicts_with_expected_and_current(pool: PgPool) {
     );
 }
 
-/// Only keeps, findings and notes append; the rest have their own paths.
 #[sqlx::test]
 async fn append_refuses_the_kinds_with_their_own_path(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -747,8 +694,6 @@ async fn append_refuses_the_kinds_with_their_own_path(pool: PgPool) {
     ));
 }
 
-/// A finding's status is overwritten by a `finding_status` entry naming
-/// the finding's seq, under the same sequence check.
 #[sqlx::test]
 async fn a_finding_status_names_a_finding_of_this_investigation(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -828,10 +773,6 @@ async fn a_finding_status_names_a_finding_of_this_investigation(pool: PgPool) {
     );
 }
 
-/// A closed investigation accepts nothing new but a reopen, and a step
-/// admitted while it was open still completes. Another close is refused
-/// before the sequence check and changes nothing: no entry, no sequence,
-/// no timestamp, no retention slide.
 #[sqlx::test]
 async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -966,14 +907,9 @@ async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(poo
     let row = store.get(&id).await.unwrap().expect("the investigation");
     assert_eq!(row.status, InvestigationStatus::Closed);
     assert_eq!(row.retain_until, later + RULE.idle);
-    // The answered header already carries the slid clock.
     assert_eq!(closed.investigation, row);
 }
 
-// -- reads -------------------------------------------------------------------
-
-/// A read since a sequence pages the entries changed after it, in
-/// `updated_seq` order, with `more` and the sequence to read from next.
 #[sqlx::test]
 async fn read_since_pages_the_interval_with_more(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1016,7 +952,6 @@ async fn read_since_pages_the_interval_with_more(pool: PgPool) {
     assert_eq!(store.read_since(&inv(9), 0, 10).await.unwrap(), None);
 }
 
-/// Activity is the entries other keys changed since the caller looked.
 #[sqlx::test]
 async fn activity_excludes_the_callers_own_entries(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1068,8 +1003,6 @@ async fn activity_excludes_the_callers_own_entries(pool: PgPool) {
     assert_eq!((for_human.entries.len(), for_human.through_seq), (1, 4));
 }
 
-/// Open investigations come first, then closed ones, each group most
-/// recently changed first.
 #[sqlx::test]
 async fn list_puts_open_first_then_most_recently_changed(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1110,15 +1043,6 @@ async fn list_puts_open_first_then_most_recently_changed(pool: PgPool) {
     assert_eq!(store.list(2).await.unwrap().len(), 2);
 }
 
-// -- steps -------------------------------------------------------------------
-
-/// A step's admission waits for its investigation no later than its
-/// deadline: behind a held lock it answers `WaitExpired` and writes
-/// nothing, and Postgres stops waiting at the deadline too, by the
-/// `statement_timeout` set for the lock, whichever side ends the wait
-/// first: no session waits on the lock moments later, though the lock is
-/// still held. A deadline a year away, past what `statement_timeout` can
-/// hold, still admits.
 #[sqlx::test]
 async fn a_step_admission_waits_no_later_than_its_deadline(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1170,10 +1094,6 @@ async fn a_step_admission_waits_no_later_than_its_deadline(pool: PgPool) {
 #[path = "../../fleet-auth/tests/support/answer_hold.rs"]
 mod answer_hold;
 
-/// A bounded write whose `BEGIN` answer is held past its deadline answers
-/// `WaitExpired` at the deadline, while the answer is still held, and
-/// closes its session instead of giving it back to the pool
-/// ([`held_past_the_deadline`]).
 #[sqlx::test]
 async fn a_bounded_writes_begin_held_past_its_deadline_closes_its_session(pool: PgPool) {
     held_past_the_deadline(pool, b"BEGIN", false).await;
@@ -1186,25 +1106,11 @@ async fn a_bounded_writes_statement_held_past_its_deadline_closes_its_session(po
     held_past_the_deadline(pool, b"set_config", false).await;
 }
 
-/// The same for the answer to the `ROLLBACK` of a write Postgres refused
-/// before its deadline: the rollback is an await of the write too, and
-/// the deadline ends it.
 #[sqlx::test]
 async fn a_bounded_writes_rollback_held_past_its_deadline_closes_its_session(pool: PgPool) {
     held_past_the_deadline(pool, b"ROLLBACK", true).await;
 }
 
-/// A step admission through a one-session pool, whose answers from the
-/// first message containing `pattern` on are held back past the
-/// admission's deadline. The admission answers `WaitExpired` by the
-/// deadline, before the answers are let through, and the client closes
-/// the session while they are held: Postgres ends the session and the
-/// transaction with it. Nothing is written, and the pool's next statement
-/// runs on a new session outside any transaction.
-///
-/// When `refused`, Postgres refuses the write first, well before the
-/// deadline: another session holds the investigation's lock, and the
-/// write's session waits for it no longer than a 50 ms `lock_timeout`.
 async fn held_past_the_deadline(pool: PgPool, pattern: &'static [u8], refused: bool) {
     let id = create(&InvestigationStore::new(pool.clone()), 1).await;
     let proxy = answer_hold::Proxy::start(&pool.connect_options()).await;
@@ -1298,9 +1204,6 @@ async fn held_past_the_deadline(pool: PgPool, pattern: &'static [u8], refused: b
     );
 }
 
-/// A step's outcome is written once: the completion moves the step's
-/// `updated_seq` to a new sequence, and a second completion changes
-/// nothing.
 #[sqlx::test]
 async fn a_step_completes_once(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1370,7 +1273,6 @@ async fn a_step_completes_once(pool: PgPool) {
             .await
             .unwrap()
     );
-    // A seq that is not a step, and one past the log, change nothing.
     assert!(
         !store
             .complete_step_until(&id, 2, &refused, later, RULE, patience())
@@ -1392,8 +1294,6 @@ async fn a_step_completes_once(pool: PgPool) {
     assert_eq!(head_seq(&store, &id).await, 3);
 }
 
-/// Boot records `interrupted` on every running step, once, through the
-/// one-shot completion.
 #[sqlx::test]
 async fn boot_interrupts_every_running_step_once(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1435,9 +1335,6 @@ async fn boot_interrupts_every_running_step_once(pool: PgPool) {
     );
 }
 
-/// An interruption is bookkeeping, not a principal's change: it writes the
-/// outcome and advances the sequence, and leaves both evidence deadlines
-/// where the last change put them, however late the boot runs.
 #[sqlx::test]
 async fn a_boot_interruption_leaves_the_evidence_clock_where_it_was(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1465,11 +1362,6 @@ async fn a_boot_interruption_leaves_the_evidence_clock_where_it_was(pool: PgPool
     assert_eq!(outcome.as_deref(), Some("interrupted"));
 }
 
-// -- retention ---------------------------------------------------------------
-
-/// Every change slides the evidence deadline to `now + idle`, never past
-/// the ceiling and never back; an extension raises both and never
-/// shortens either.
 #[sqlx::test]
 async fn retention_slides_with_changes_stops_at_the_ceiling_and_extends(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1495,7 +1387,6 @@ async fn retention_slides_with_changes_stops_at_the_ceiling_and_extends(pool: Pg
         deadlines(store.clone(), id.clone()).await,
         (Duration::days(30), Duration::days(30))
     );
-    // A change stamped earlier never moves the deadline back.
     store
         .append(&id, &agent(), &note("d2"), t0() + Duration::days(2), RULE)
         .await
@@ -1554,7 +1445,6 @@ async fn retention_slides_with_changes_stops_at_the_ceiling_and_extends(pool: Pg
         deadlines(store.clone(), id.clone()).await,
         (Duration::days(40), Duration::days(40))
     );
-    // Past the old ceiling, changes slide toward the raised one.
     store
         .append(&id, &agent(), &note("d36"), t0() + Duration::days(36), RULE)
         .await
@@ -1564,7 +1454,6 @@ async fn retention_slides_with_changes_stops_at_the_ceiling_and_extends(pool: Pg
         (Duration::days(40), Duration::days(40))
     );
 
-    // Reads and refused writes slide nothing.
     let before = store.get(&id).await.unwrap().unwrap();
     store.read_since(&id, 0, 10).await.unwrap();
     let _ = store
@@ -1581,9 +1470,6 @@ async fn retention_slides_with_changes_stops_at_the_ceiling_and_extends(pool: Pg
     assert_eq!(store.get(&id).await.unwrap().unwrap(), before);
 }
 
-// -- kept evidence -----------------------------------------------------------
-
-/// A keep of `result`'s first row.
 fn keep(result: &str) -> EntryPayload {
     EntryPayload::Keep {
         result_id: result.into(),
@@ -1592,11 +1478,6 @@ fn keep(result: &str) -> EntryPayload {
     }
 }
 
-/// A keep that cites the caller's own live temporary result promotes it,
-/// once, in the append's transaction. Another key's, past its deadline, or
-/// kept by another investigation, it promotes nothing and writes nothing;
-/// one already kept by this investigation is cited as it is; an unknown
-/// investigation is refused.
 #[sqlx::test]
 async fn promote_succeeds_once_and_only_for_the_owners_live_temporary_result(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1669,7 +1550,6 @@ async fn promote_succeeds_once_and_only_for_the_owners_live_temporary_result(poo
     assert_eq!(state_of(&pool, &due.id).await.0, "temporary");
 }
 
-/// A finding citing row 0 of each of `results`, in that order.
 fn finding_citing(results: &[&str]) -> EntryPayload {
     EntryPayload::Finding {
         statement: "the upstream pool is exhausted".into(),
@@ -1686,8 +1566,6 @@ fn finding_citing(results: &[&str]) -> EntryPayload {
     }
 }
 
-/// A session of its own that holds result `id`'s row lock until
-/// `COMMIT`, and its backend pid.
 async fn hold_result(pool: &PgPool, id: &str) -> (sqlx::PgConnection, i32) {
     let mut holder = pool.acquire().await.unwrap().detach();
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -1730,13 +1608,6 @@ async fn promotions_waiting_past(probe: &PgPool, released: i32, count: i64) {
     .expect("the promotions queue behind the remaining lock");
 }
 
-/// Two findings cite the caller's live temporary results `a` and `b` into
-/// two investigations, one as `[a, b]` and the other as `[b, a]`. Each
-/// append locks the results it promotes in one order, so the second
-/// queues behind the first instead of closing a cycle with it: the first
-/// commits both promotions and the second is refused as kept elsewhere,
-/// never a deadlock victim.
-///
 /// The held rows choose the interleaving a caller-order lock would
 /// deadlock in: the `[a, b]` writer takes `a` and waits on `b` while the
 /// `[b, a]` writer waits to take `b` first.
@@ -1800,10 +1671,8 @@ async fn citations_in_opposite_orders_lock_their_results_in_one_order(pool: PgPo
 }
 
 /// Run a bulk expiry at `now` beside a promotion that waits on a held
-/// result, then release the hold. The expiry either finishes on its own or
-/// queues on a lock behind the promotion; either way the hold is released
-/// next, and both answers are returned with whether the expiry finished
-/// before the release.
+/// result, then release the hold. Both answers are returned with whether the
+/// expiry finished before the release.
 async fn expiry_beside_a_waiting_promotion(
     pool: &PgPool,
     results: &ResultsStore,
@@ -1834,7 +1703,6 @@ async fn expiry_beside_a_waiting_promotion(
     (before_release, expired, cite.await.unwrap())
 }
 
-/// The append citing `[a, b]` into `into` at `T0`, spawned.
 fn spawn_cite(
     store: &InvestigationStore,
     into: &InvestigationId,
@@ -1860,19 +1728,10 @@ fn spawn_cite(
     })
 }
 
-/// Bulk expiry locks its due results in id order, the order a promotion
-/// locks the results it cites, and skips any row another transaction
-/// holds, so it never waits on a promotion that waits on it: neither is a
-/// deadlock victim.
-///
 /// The held row chooses the interleaving an expiry that locks in scan
 /// order deadlocks in: a promotion of `[a, b]` queues on `a`, and the
 /// expiry reaches `b` first (made first, so first on the heap, and due
-/// first) and takes it before it reaches `a`. Released, the promotion
-/// takes `a` and waits on `b` while the expiry waits on `a`. Here the
-/// expiry skips `a`, retires `b` and commits; the promotion then finds
-/// `b` gone, as it would after any expiry that came first, and writes
-/// nothing. `a` stays due and the next pass retires it.
+/// first) and takes it before it reaches `a`.
 #[sqlx::test]
 async fn bulk_expiry_never_deadlocks_a_sorted_promotion(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1913,9 +1772,6 @@ async fn bulk_expiry_never_deadlocks_a_sorted_promotion(pool: PgPool) {
     );
 }
 
-/// A row a promotion holds is becoming kept: bulk expiry skips it without
-/// waiting and retires the other due rows, and the promotion commits it
-/// kept. The promotion of `[a, b]` holds `a` and waits on a held `b`.
 #[sqlx::test]
 async fn bulk_expiry_skips_the_rows_a_promotion_holds(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1950,9 +1806,6 @@ async fn bulk_expiry_skips_the_rows_a_promotion_holds(pool: PgPool) {
     assert!(results.expire_due(due).await.unwrap().is_empty());
 }
 
-/// A temporary result marked `file_missing` is not promoted, even by an
-/// append that classified it before the mark: the promotion's own
-/// statement refuses it under the lock, and nothing is written.
 #[sqlx::test]
 async fn a_result_whose_file_is_missing_is_not_promoted(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1983,9 +1836,6 @@ async fn a_result_whose_file_is_missing_is_not_promoted(pool: PgPool) {
     );
 }
 
-/// Kept rows leave the capture quota: usage, the installation usage, the
-/// owner's list, the boot key walk and the quota prune ignore them, while
-/// boot reconciliation still expects their files.
 #[sqlx::test]
 async fn kept_rows_leave_the_quota_and_stay_live_for_reconciliation(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -2044,7 +1894,6 @@ async fn kept_rows_leave_the_quota_and_stay_live_for_reconciliation(pool: PgPool
     let mut live = results.live_ids().await.unwrap();
     live.sort();
     assert_eq!(live, [(kept.id.clone(), 1000), (attached.id.clone(), 500)]);
-    // Past every temporary deadline, both kept rows are still expected.
     assert!(
         results
             .expire_due(t0() + Duration::days(1))
@@ -2055,8 +1904,6 @@ async fn kept_rows_leave_the_quota_and_stay_live_for_reconciliation(pool: PgPool
     assert_eq!(results.live_ids().await.unwrap().len(), 2);
 }
 
-/// Evidence usage counts each kept result's file once, per investigation
-/// and across the installation, and nothing temporary or pruned.
 #[sqlx::test]
 async fn evidence_usage_counts_each_kept_file_once(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -2084,7 +1931,6 @@ async fn evidence_usage_counts_each_kept_file_once(pool: PgPool) {
     assert_eq!(store.evidence_usage(&inv(9)).await.unwrap(), 0);
     assert_eq!(store.installation_evidence_usage().await.unwrap(), 700);
 
-    // At both deadlines, every kept file is pruned and counts no more.
     let pruned = results
         .prune_evidence(t0() + Duration::days(7))
         .await
@@ -2095,16 +1941,12 @@ async fn evidence_usage_counts_each_kept_file_once(pool: PgPool) {
     assert_eq!(store.installation_evidence_usage().await.unwrap(), 0);
 }
 
-/// The pre-check's live usage leaves out the kept rows of an investigation
-/// whose deadline is at or before `now`, though no prune has run. The
-/// binding usage counts every kept row until a prune retires it.
 #[sqlx::test]
 async fn live_evidence_usage_skips_a_due_investigations_rows(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
     let results = ResultsStore::new(pool.clone());
     // Due at T0 + 7 days.
     let a = create(&store, 1).await;
-    // Due a day later.
     let outcome = store
         .create_if_absent(&NewInvestigation {
             retain_until: t0() + Duration::days(8),
@@ -2155,10 +1997,6 @@ async fn live_evidence_usage_skips_a_due_investigations_rows(pool: PgPool) {
     assert_eq!(store.installation_evidence_usage().await.unwrap(), 400);
 }
 
-/// The read door ends one investigation's evidence under its lock: not
-/// while its deadline is ahead, even when the caller read an older one (a
-/// write slid it since), then once, with the files to unlink; again finds
-/// nothing left to unlink, and an unknown investigation answers `None`.
 #[sqlx::test]
 async fn a_read_ends_one_investigation_s_evidence_only_once_its_deadline_passed(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -2208,10 +2046,6 @@ async fn a_read_ends_one_investigation_s_evidence_only_once_its_deadline_passed(
     );
 }
 
-/// The evidence prune retires the kept rows of investigations past their
-/// deadline, at that deadline; the tombstone sweep leaves them while the
-/// investigation exists, and deleting it prunes the rest and lets every
-/// row age out.
 #[sqlx::test]
 async fn pruned_evidence_stays_with_its_investigation_until_deleted(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -2259,14 +2093,12 @@ async fn pruned_evidence_stays_with_its_investigation_until_deleted(pool: PgPool
     assert!(results.prune_evidence(deadline).await.unwrap().is_empty());
     assert_eq!(state_of(&pool, &young.id).await.0, "kept");
 
-    // A year on, only the unattached tombstone goes.
     let much_later = t0() + Duration::days(365);
     assert_eq!(results.delete_tombstones(much_later).await.unwrap(), 1);
     assert_eq!(state_of(&pool, &old.id).await.0, "pruned");
     let row = results.get(&old.id, 7).await.unwrap().unwrap();
     assert_eq!(row.investigation_id.as_ref(), Some(&stale));
 
-    // A running step holds the delete off; nothing changes.
     store
         .begin_step(&fresh, &agent(), &step("r"), t0(), RULE, patience())
         .await
@@ -2308,7 +2140,6 @@ async fn pruned_evidence_stays_with_its_investigation_until_deleted(pool: PgPool
         DeleteOutcome::NotFound
     );
 
-    // Detached by the delete, the row ages out like any tombstone.
     assert_eq!(
         results.delete_tombstones(much_later).await.unwrap(),
         1,
@@ -2321,12 +2152,8 @@ async fn pruned_evidence_stays_with_its_investigation_until_deleted(pool: PgPool
     assert_eq!(results.delete_tombstones(much_later).await.unwrap(), 1);
 }
 
-/// An extension that holds the investigation when the evidence prune
-/// arrives wins: the prune waits for the row, reads the deadline the
-/// extension committed, and keeps that investigation's evidence, while it
-/// still prunes another investigation that is due. The extension is made
-/// a second before the deadline: one made at it is itself due, and the
-/// due-write rule prunes first.
+/// The extension is made a second before the deadline: one made at it is
+/// itself due, and the due-write rule prunes first.
 #[sqlx::test]
 async fn an_extension_committed_while_the_prune_waits_keeps_the_evidence(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -2346,8 +2173,6 @@ async fn an_extension_committed_while_the_prune_waits_keeps_the_evidence(pool: P
     let deadline = t0() + Duration::days(7);
     let later = t0() + Duration::days(60);
 
-    // The extension takes the row first and queues behind a held lock; the
-    // prune queues behind the extension.
     let mut holder = pool.acquire().await.unwrap().detach();
     let mut held = holder.begin().await.unwrap();
     sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
@@ -2386,9 +2211,6 @@ async fn an_extension_committed_while_the_prune_waits_keeps_the_evidence(pool: P
     );
 }
 
-/// A prune that holds the investigation when an extension arrives wins:
-/// the extension waits for the row and commits its later deadline over
-/// evidence already pruned, which stays pruned at the deadline it passed.
 #[sqlx::test]
 async fn an_extension_behind_the_prune_arrives_too_late(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -2431,15 +2253,10 @@ async fn an_extension_behind_the_prune_arrives_too_late(pool: PgPool) {
     assert!(results.prune_evidence(later).await.unwrap().is_empty());
 }
 
-// -- the due-write rule and attaching races ----------------------------------
-
-/// The deadline every fixture investigation's evidence clock starts at.
 fn deadline() -> DateTime<Utc> {
     t0() + Duration::days(7)
 }
 
-/// How many kept rows belong to an investigation whose deadline is at or
-/// before `at`: evidence that should be gone.
 async fn kept_past_deadline(pool: &PgPool, at: DateTime<Utc>) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM captured_results c JOIN investigations i
@@ -2452,9 +2269,6 @@ async fn kept_past_deadline(pool: &PgPool, at: DateTime<Utc>) -> i64 {
     .unwrap()
 }
 
-/// A write to an investigation past its deadline prunes its kept evidence
-/// first, exactly as the sweep would, and answers the files; only then
-/// does it write and slide the clock.
 #[sqlx::test]
 async fn a_note_on_a_due_investigation_prunes_its_evidence_before_it_slides(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -2488,11 +2302,6 @@ async fn a_note_on_a_due_investigation_prunes_its_evidence_before_it_slides(pool
     assert!(results.prune_evidence(later).await.unwrap().is_empty());
 }
 
-/// A promotion that arrives while the evidence prune holds its due
-/// investigation waits for it, then attaches into the window its own
-/// write slides: the old evidence stays pruned at the deadline it passed,
-/// exactly the files the prune returned, and the promoted result is kept
-/// under the new deadline. Nothing kept is left past its deadline.
 #[sqlx::test]
 async fn a_promotion_behind_the_prune_attaches_into_the_window_it_slides(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -2558,9 +2367,6 @@ async fn a_promotion_behind_the_prune_attaches_into_the_window_it_slides(pool: P
     assert_eq!(kept_past_deadline(&pool, deadline()).await, 0);
 }
 
-/// An attached capture's kept insert behind the prune likewise waits, then
-/// keeps its row, fills its step and slides the window; the old evidence
-/// stays pruned.
 #[sqlx::test]
 async fn a_kept_insert_behind_the_prune_attaches_into_the_window_it_slides(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -2627,12 +2433,8 @@ async fn a_kept_insert_behind_the_prune_attaches_into_the_window_it_slides(pool:
     assert_eq!(kept_past_deadline(&pool, deadline()).await, 0);
 }
 
-/// The reverse order: a promotion that holds the investigation when the
-/// prune arrives commits first, and the prune that waited for it prunes
-/// the promoted result too. The investigation's deadline is pinned at its
-/// ceiling, so the promotion's write cannot slide it; one that can slide
-/// it keeps its evidence, as an extension does
-/// ([`an_extension_committed_while_the_prune_waits_keeps_the_evidence`]).
+/// The investigation's deadline is pinned at its ceiling, so the promotion's
+/// write cannot slide it.
 #[sqlx::test]
 async fn a_promotion_ahead_of_the_prune_at_its_ceiling_is_pruned_with_the_rest(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -2713,10 +2515,6 @@ async fn a_promotion_ahead_of_the_prune_at_its_ceiling_is_pruned_with_the_rest(p
     assert_eq!(kept_past_deadline(&pool, deadline()).await, 0);
 }
 
-// -- the binding evidence pass -------------------------------------------------
-
-/// A capture gate over `results` whose clock stands at `now`, and the
-/// directory its results root lives in.
 fn gate_at(results: &ResultsStore, now: DateTime<Utc>) -> (CaptureGate, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let root = Arc::new(ResultsRoot::open_apart_from(&dir.path().join("results"), &[]).unwrap());
@@ -2729,8 +2527,6 @@ fn gate_at(results: &ResultsStore, now: DateTime<Utc>) -> (CaptureGate, tempfile
     (gate, dir)
 }
 
-/// The file bytes of every kept row of `investigation`, whatever its
-/// deadline: what the evidence budget must hold.
 async fn kept_bytes(pool: &PgPool, investigation: &InvestigationId) -> i64 {
     sqlx::query_scalar(
         "SELECT COALESCE(sum(file_bytes), 0)::bigint FROM captured_results
@@ -2742,15 +2538,6 @@ async fn kept_bytes(pool: &PgPool, investigation: &InvestigationId) -> i64 {
     .unwrap()
 }
 
-/// A promotion takes its `now` before the evidence reservation reads the
-/// gate's clock, as the append service does: `now`, then the binding pass,
-/// then the write at that `now`. Here `now` is a microsecond before the
-/// investigation's deadline and the gate's clock is at it. The pass prunes
-/// the old evidence, due at its clock, before it counts, and the write
-/// finds nothing due at its own `now` and slides the deadline over
-/// evidence that stays pruned. Had the pass left the due rows out of its
-/// count without pruning them, the slide would have revived them beside
-/// the result it admitted in their place: twice the budget kept.
 #[sqlx::test]
 async fn a_promotion_dated_before_the_deadline_the_gate_has_crossed_stays_within_budget(
     pool: PgPool,
@@ -2833,12 +2620,6 @@ async fn a_promotion_dated_before_the_deadline_the_gate_has_crossed_stays_within
     );
 }
 
-/// The binding evidence pass prunes behind the investigations' locks, as
-/// the sweep does, and waits for them no later than the reservation's
-/// deadline. With a due investigation held by another session, the pass
-/// waits on it, then refuses the charge busy with nothing pruned, and
-/// Postgres has stopped waiting too. Once the lock is free, the next pass
-/// prunes the evidence before it counts.
 #[sqlx::test]
 async fn the_binding_pass_waits_for_a_held_due_investigation_no_later_than_its_deadline(
     pool: PgPool,
@@ -2904,11 +2685,6 @@ async fn the_binding_pass_waits_for_a_held_due_investigation_no_later_than_its_d
     drop(reservation);
 }
 
-/// The binding pass locks only the due investigations that still hold
-/// kept evidence. Once a pass has pruned a due investigation, a later pass
-/// has nothing to prune there and never waits on it: with that
-/// investigation held by another session, the next reservation is
-/// admitted at once instead of waiting to its deadline.
 #[sqlx::test]
 async fn the_binding_pass_never_waits_on_a_due_investigation_with_nothing_left_to_prune(
     pool: PgPool,
@@ -2964,8 +2740,6 @@ async fn the_binding_pass_never_waits_on_a_due_investigation_with_nothing_left_t
 /// kept evidence pruned: what no event at INFO or above may carry.
 const PRUNE_FAULT: &str = "trawl-411-evidence-prune-fault-sentinel";
 
-/// One event a capture saw: its level and every field as text, the
-/// message among them.
 #[derive(Debug)]
 struct SeenEvent {
     level: tracing::Level,
@@ -2981,8 +2755,6 @@ impl SeenEvent {
     }
 }
 
-/// A layer that records every event at every level and target, scoped to
-/// the futures [`EventCapture::dispatch`] is attached to.
 #[derive(Clone, Default)]
 struct EventCapture(Arc<std::sync::Mutex<Vec<SeenEvent>>>);
 
@@ -3047,12 +2819,7 @@ impl log::Log for LogCapture {
     fn flush(&self) {}
 }
 
-/// With a trigger refusing every prune of kept evidence, a reservation of
-/// 100 bytes for `reserving` is refused by `scope`'s budget of 150 with
-/// `due`'s 100 bytes counted: `due` stays kept, the failure is logged once
-/// by class, and the trigger's text reaches no event or `log` record at
-/// INFO or above. [`LogCapture`] must be this process's logger.
-/// Without the trigger, the same reservation prunes `due` and is admitted.
+/// [`LogCapture`] must be this process's logger.
 async fn a_failed_prune_counts_in_full(
     pool: &PgPool,
     gate: &CaptureGate,
@@ -3138,14 +2905,6 @@ async fn a_failed_prune_counts_in_full(
     drop(admitted);
 }
 
-/// A binding pass whose prune the store fails, for a reason other than a
-/// lock wait reaching its deadline, prunes nothing and counts every kept
-/// row, so it refuses a charge that pruning would have let fit: against
-/// the investigation's budget when the due evidence is its own, and
-/// against the installation's when it is another investigation's. The
-/// usage reads after the failed prune still answer, so the refusal is the
-/// budget's, never a store fault. Once the prune succeeds, the same charge
-/// is admitted.
 #[sqlx::test]
 async fn the_binding_pass_counts_every_kept_byte_when_pruning_fails(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -3180,7 +2939,6 @@ async fn the_binding_pass_counts_every_kept_byte_when_pruning_fails(pool: PgPool
     )
     .await;
 
-    // A holds nothing kept now; another due investigation holds the bytes.
     let b = create(&store, 2).await;
     let b_old = NewCapture {
         investigation_id: Some(b.clone()),
@@ -3202,8 +2960,6 @@ async fn the_binding_pass_counts_every_kept_byte_when_pruning_fails(pool: PgPool
     .await;
 }
 
-/// Capture `n` of key 7 kept by `investigation`, a sightings read's: a
-/// file of `file_bytes` and its facts document.
 fn kept_correlation(n: u32, investigation: &InvestigationId, file_bytes: u64) -> NewCapture {
     let facts = Correlation::Sightings(SightingsFacts {
         literal: "10.0.4.17".into(),
@@ -3228,7 +2984,6 @@ fn kept_correlation(n: u32, investigation: &InvestigationId, file_bytes: u64) ->
     }
 }
 
-/// The stored facts text and `metadata_bytes` of row `id`.
 async fn facts_of(pool: &PgPool, id: &str) -> (Option<String>, i64) {
     sqlx::query_as("SELECT correlation, metadata_bytes FROM captured_results WHERE id = $1")
         .bind(id)
@@ -3237,9 +2992,6 @@ async fn facts_of(pool: &PgPool, id: &str) -> (Option<String>, i64) {
         .unwrap()
 }
 
-/// The due-write rule drops the facts document of each kept result it
-/// prunes, with the file it answers to unlink; the investigation's
-/// evidence usage falls by both.
 #[sqlx::test]
 async fn a_due_writes_prune_drops_the_facts_document(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -3269,8 +3021,6 @@ async fn a_due_writes_prune_drops_the_facts_document(pool: PgPool) {
     assert_eq!(store.evidence_usage(&id).await.unwrap(), 0);
 }
 
-/// Deleting an investigation drops the facts document of each kept result
-/// it prunes, with the file it answers to unlink.
 #[sqlx::test]
 async fn an_investigation_delete_drops_the_facts_document(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());

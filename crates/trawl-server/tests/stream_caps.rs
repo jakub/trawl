@@ -3,15 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! A live aggregate discloses the caps that dropped its input (ADR-0001).
-//!
-//! Every snapshot of an aggregate stream carries `capped`, one
-//! `{cap, limit}` per cap that dropped input since the stream started, and
-//! omits the field when nothing was dropped. These run the real SSE loop on
-//! a live server with real ingest, because the property lives in the wiring:
-//! the dropped event has to count toward the next snapshot, and the report
-//! has to ride every snapshot after it. The batch lane's Rust tail runs the
-//! same accumulators and has no snapshot to carry a report, so it refuses
-//! instead; the last test pins that answer over HTTP.
 
 mod common;
 
@@ -21,10 +12,8 @@ use common::setup;
 use serde_json::{Value, json};
 use trawl_client::HttpClient;
 
-/// The live group cap, as the wire states it.
 const MAX_GROUPS: usize = 10_000;
 
-/// One open aggregate stream and the bytes read off it so far.
 struct SnapshotReader {
     resp: reqwest::Response,
     buf: Vec<u8>,
@@ -48,8 +37,6 @@ impl SnapshotReader {
         }
     }
 
-    /// The next complete `snapshot` frame that satisfies `wanted`, skipping
-    /// the ones before it. Panics after 30 s, naming what did arrive.
     async fn snapshot_where(&mut self, wanted: impl Fn(&Value) -> bool) -> Value {
         let mut seen = Vec::new();
         let read = tokio::time::timeout(Duration::from_secs(30), async {
@@ -94,8 +81,6 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// A snapshot's row count and `capped` field, for failure messages: a
-/// 10,000-row payload is not worth printing whole.
 fn summary(payload: &Value) -> String {
     format!(
         "rows={} capped={:?}",
@@ -108,8 +93,6 @@ fn rows(payload: &Value) -> &Vec<Value> {
     payload["rows"].as_array().expect("rows is an array")
 }
 
-/// The count a snapshot holds for `host`, read through the shared frame
-/// type: the rows are positional and the counts typed `integer`.
 fn count_of(payload: &Value, host: &str) -> Option<u64> {
     use trawl_api::value::Value as Cell;
 
@@ -142,7 +125,6 @@ fn groups_cap() -> Value {
     json!([{"cap": "groups", "limit": MAX_GROUPS}])
 }
 
-/// `count` events for `service`, one per host `{prefix}{i}`.
 fn hosts(service: &str, prefix: &str, range: std::ops::Range<usize>) -> Vec<Value> {
     range
         .map(|i| json!({"service": service, "host": format!("{prefix}{i}"), "message": "m"}))
@@ -195,10 +177,6 @@ async fn sse_snapshot_omits_capped_under_limits() {
     assert_eq!(object.len(), 2, "columns and rows only: {snapshot}");
 }
 
-/// Reaching the cap exactly reports nothing. The one event that is then
-/// dropped is the last matching input, and no threshold of further events
-/// follows it, so only the scheduled snapshot can disclose it, and it
-/// must. A later event that drops nothing still sees the report.
 #[tokio::test(flavor = "multi_thread")]
 async fn sse_scheduled_snapshot_discloses_a_cap_with_no_later_input() {
     let server = setup().await;
@@ -217,8 +195,6 @@ async fn sse_scheduled_snapshot_discloses_a_cap_with_no_later_input() {
         summary(&at_cap)
     );
 
-    // One new group, far below the event threshold: the dropped event is
-    // the last input this stream sees.
     let overflow = hosts("caps-svc", "late", 0..1);
     assert_eq!(ingest.ingest(&overflow).await.unwrap().accepted, 1);
     let disclosed = stream
@@ -228,7 +204,6 @@ async fn sse_scheduled_snapshot_discloses_a_cap_with_no_later_input() {
     assert_eq!(rows(&disclosed).len(), MAX_GROUPS);
     assert_eq!(count_of(&disclosed, "late0"), None, "the new group dropped");
 
-    // A known group still counts, and the report stays.
     let known = hosts("caps-svc", "h", 0..1);
     assert_eq!(ingest.ingest(&known).await.unwrap().accepted, 1);
     let later = stream
@@ -237,9 +212,6 @@ async fn sse_scheduled_snapshot_discloses_a_cap_with_no_later_input() {
     assert_eq!(later["capped"], groups_cap(), "{}", summary(&later));
 }
 
-/// The batch lane has no snapshot to carry a report, so a Rust-tail
-/// aggregation that would drop input refuses with the row cap's contract:
-/// 400 `result_too_large`, naming the cap and its limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_tail_over_group_cap_refuses_over_http() {
     let server = setup().await;

@@ -4,16 +4,9 @@
 
 //! The in-process repin job generation: how a capacity sample learns that
 //! a repin job overlapped it (ADR-0042).
-//!
-//! A repin job's disk work (the marker, the shadow build, the swap, the
-//! sweeps) all runs inside the engine's background half, and every exit
-//! from that half ends its [`JobGuard`]. So the question "did a repin job
-//! touch the data root while I measured it" has an exact in-process
-//! answer, with no need to infer one from what the job left on disk.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// One generation step, in the high half of the word.
 const GENERATION_STEP: u64 = 1 << 32;
 
 /// Every repin job in this process, packed into one atomic word: how many
@@ -26,17 +19,12 @@ const GENERATION_STEP: u64 = 1 << 32;
 /// still answers "is a job in flight" and the generation "did a job begin
 /// or end since" without that assumption.
 ///
-/// One word, so a reader gets both halves from one atomic load. The
-/// generation wraps after 2^32 steps; a reader would need a measurement
-/// spanning exactly 2^31 jobs to read two equal generations across a
-/// change.
+/// One word, so a reader gets both halves from one atomic load.
 #[derive(Debug, Default)]
 pub struct JobGeneration {
     word: AtomicU64,
 }
 
-/// One read of a [`JobGeneration`]. The default is a fresh generation's
-/// read: no job running, none ever begun.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JobReading {
     running: u32,
@@ -44,9 +32,8 @@ pub struct JobReading {
 }
 
 impl JobGeneration {
-    /// Read the running count and the generation at once.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)] // splitting the word into its halves
+    #[allow(clippy::cast_possible_truncation)]
     pub fn read(&self) -> JobReading {
         let word = self.word.load(Ordering::SeqCst);
         JobReading {
@@ -55,11 +42,6 @@ impl JobGeneration {
         }
     }
 
-    /// Begin a job: count it running and advance the generation. The job
-    /// ends when the guard drops, on every path, unwinding included.
-    ///
-    /// Take the guard before the job's first write under the data root,
-    /// and hold it until its last cleanup.
     pub(crate) fn begin(&self) -> JobGuard<'_> {
         self.word.fetch_add(GENERATION_STEP + 1, Ordering::SeqCst);
         JobGuard { jobs: self }
@@ -67,27 +49,22 @@ impl JobGeneration {
 }
 
 impl JobReading {
-    /// Whether a job was running at this read.
     #[must_use]
     pub fn in_flight(self) -> bool {
         self.running > 0
     }
 
-    /// How many jobs run at this read.
     #[must_use]
     pub fn running(self) -> u32 {
         self.running
     }
 
-    /// How many job begins and ends happened between `earlier` and this
-    /// read. Zero means no job began or ended in between.
     #[must_use]
     pub fn changes_since(self, earlier: Self) -> u32 {
         self.generation.wrapping_sub(earlier.generation)
     }
 }
 
-/// A running repin job. Dropping it ends the job.
 #[must_use = "the job ends when the guard drops"]
 #[derive(Debug)]
 pub struct JobGuard<'a> {
@@ -128,8 +105,6 @@ mod tests {
         assert_eq!(ended.changes_since(ended), 0);
     }
 
-    /// The overlap a parity bit misreads: two jobs running reads as two
-    /// generation steps, which parity would call idle.
     #[test]
     fn overlapping_jobs_stay_in_flight_until_the_last_one_ends() {
         let jobs = JobGeneration::default();
@@ -143,7 +118,6 @@ mod tests {
         assert_eq!(jobs.read().changes_since(JobReading::default()), 4);
     }
 
-    /// A panicking job still ends: the guard drops during the unwind.
     #[test]
     fn a_job_that_panics_ends_during_the_unwind() {
         let jobs = JobGeneration::default();

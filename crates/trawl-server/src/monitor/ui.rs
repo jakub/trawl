@@ -2,11 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Monitor dashboard rendering tests.
-//!
-//! Tests the `MonitorSnapshot → DashboardSnapshot → render_dashboard` pipeline
-//! used by [`spawn_snapshot_collector`](super::spawn_snapshot_collector).
-
 #[cfg(test)]
 mod tests {
     use crate::monitor::state::MonitorSnapshot;
@@ -15,17 +10,12 @@ mod tests {
     use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot};
     use trawl_dashboard::DashboardOptions;
 
-    /// Render a `MonitorSnapshot` through the full server-side pipeline:
-    /// `MonitorSnapshot → DashboardSnapshot → render_dashboard`.
     fn render(snapshot: &MonitorSnapshot, f: &mut ratatui::Frame<'_>) {
         let ds = snapshot.to_dashboard_snapshot();
         let opts = DashboardOptions::default();
         trawl_dashboard::render_dashboard(&ds, f, f.area(), &opts);
     }
 
-    /// A complete headroom sample: data and spill share a 500 GB device
-    /// with 120 GB free above a 1 GB floor, and the WAL has its own. One
-    /// pressure-deleting sweep has run.
     fn test_capacity() -> trawl_api::Capacity {
         use trawl_api::{
             Capacity, DeletionFloor, EnvironmentCapacity, FilesystemHeadroom, FilesystemRole,
@@ -87,7 +77,7 @@ mod tests {
         MonitorSnapshot {
             hostname: "test-host".into(),
             listen_addr: "127.0.0.1:5514".into(),
-            uptime: std::time::Duration::from_mins(154), // 2h 34m
+            uptime: std::time::Duration::from_mins(154),
             version: "0.1.0",
             healthy: true,
             pool_capacity: 4,
@@ -95,8 +85,8 @@ mod tests {
             pool_retained: 0,
             hot_buffer_events: 12_847,
             hot_buffer_max_events: 100_000,
-            hot_buffer_bytes: 4_404_019,       // ~4.2 MB
-            hot_buffer_max_bytes: 104_857_600, // 100 MB
+            hot_buffer_bytes: 4_404_019,
+            hot_buffer_max_bytes: 104_857_600,
             hot_buffer_batches: 23,
             total_queries: 1247,
             query_rate: 2.1,
@@ -231,8 +221,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// The whole capacity line (ADR-0042), unclipped: a monitor wide
-    /// enough to show every field of the data pipeline panel.
     #[test]
     fn render_dashboard_capacity_wide() {
         let snapshot = test_snapshot();
@@ -251,8 +239,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// `trawld monitor` draws other principals' text through the sanitize
-    /// rule, while the snapshot it converts keeps that text exact.
     #[test]
     fn monitor_dashboard_sanitizes_remote_text() {
         let mut monitor = test_snapshot();

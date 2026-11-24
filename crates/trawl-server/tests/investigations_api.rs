@@ -3,21 +3,15 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The investigation routes end to end (ADR-0059), through the fixture's
-//! HTTPS listener with real fleet keys: an agent key that writes, a human
-//! key that only reads, an operator key with `server_manage`, a key with
-//! `query` alone and one with every investigation permission but `query`.
+//! HTTPS listener with real fleet keys.
 //!
 //! Kept evidence is made in two halves: the agent captures over HTTP, then
 //! the store's fixture promotion moves the capture into the investigation
 //! inside its lock, with no log entry, so each test's sequences count its
-//! own writes alone. Promotion through a keep, and attached captures, have
-//! their own suites (`investigations_evidence`, `investigations_attach`).
-//! Captures resolve their window at the fixture's results clock, set onto
-//! the capture corpus of `common::captured`, 2024-01-16.
+//! own writes alone.
 //!
 //! A test that asserts a warning records the process's tracing events, so
-//! each test runs in its own process: nextest's. The binary is in the
-//! ADR-0021 `postgres` nextest group.
+//! each test runs in its own process: nextest's.
 
 mod common;
 
@@ -48,17 +42,11 @@ use trawl_server::store::{InvestigationStore, RetentionRule, StoreActor};
 /// capture corpus's hour.
 const START: &str = "2024-01-16T10:30:00Z";
 
-/// The keys a test speaks as.
 struct Keys {
-    /// Reads and writes.
     agent: MintedKey,
-    /// Reads only.
     human: MintedKey,
-    /// Writes, extends and deletes.
     operator: MintedKey,
-    /// `query` alone.
     query_only: MintedKey,
-    /// Every investigation permission and `server_manage`, but no `query`.
     no_query: MintedKey,
 }
 
@@ -156,8 +144,7 @@ const STALLED_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_sec
 
 /// `method path` as `token` with a JSON body that never ends: a chunk that
 /// announces 16 bytes and sends 8, then nothing, on a connection the
-/// client keeps open. The status and body, or `None` when no answer came
-/// while the body was open.
+/// client keeps open.
 async fn stalled(
     server: &TestServer,
     token: &str,
@@ -179,13 +166,11 @@ async fn stalled(
     ))
 }
 
-/// The ADR error envelope `text` is, or a failure naming what came instead.
 fn envelope(text: &str, what: &str) -> Value {
     serde_json::from_str(text)
         .unwrap_or_else(|e| panic!("{what}: the answer is not the JSON envelope ({e}): {text}"))
 }
 
-/// Append `entry` to investigation `n` as `key`.
 async fn append(
     server: &TestServer,
     key: &MintedKey,
@@ -202,14 +187,12 @@ async fn append(
     .await
 }
 
-/// [`append`] that must answer 201.
 async fn appended(server: &TestServer, key: &MintedKey, n: u32, entry: &Value) -> AppendResponse {
     let (status, body) = append(server, key, n, entry).await;
     assert_eq!(status, StatusCode::CREATED, "{entry}: {body}");
     serde_json::from_value(body).expect("an append response")
 }
 
-/// A capture of the corpus's 20 rows as `key`; its result id.
 async fn capture(server: &TestServer, key: &MintedKey) -> String {
     let query = format!("service={} last=1h", captured::SERVICE);
     let result = captured::captured(server, &key.token, &json!({ "query": query }))
@@ -219,7 +202,6 @@ async fn capture(server: &TestServer, key: &MintedKey) -> String {
     result.id
 }
 
-/// A capture as `key` promoted into investigation `n`: kept evidence.
 async fn kept(server: &TestServer, key: &MintedKey, n: u32) -> String {
     let result = capture(server, key).await;
     let key_id = captured::key_id(server, &key.token).await;
@@ -239,7 +221,6 @@ async fn kept(server: &TestServer, key: &MintedKey, n: u32) -> String {
     result
 }
 
-/// The store's actor for `key`, for writes a test makes directly.
 async fn store_actor(server: &TestServer, key: &MintedKey) -> StoreActor {
     StoreActor {
         key_id: captured::key_id(server, &key.token).await,
@@ -264,11 +245,6 @@ fn instant(text: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-// -- authority ----------------------------------------------------------------
-
-/// Every route against an id no investigation has, as every key: a key
-/// without the route's authority gets 403, never 404, so it learns nothing
-/// about which ids exist; a key with it reaches the lookup and gets 404.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_route_refuses_a_key_without_its_authority_before_any_lookup() {
     let (server, keys) = boot().await;
@@ -345,7 +321,6 @@ async fn every_route_refuses_a_key_without_its_authority_before_any_lookup() {
                 assert_eq!(code(&answer), "forbidden", "{who} {route}: {answer}");
             }
         }
-        // Create on a fresh id: 403 without write, 201 with it.
         let fresh = format!(
             "/investigations/{:032x}",
             0xc0de_u32 + u32::from(holds.unwrap_or(9))
@@ -360,8 +335,6 @@ async fn every_route_refuses_a_key_without_its_authority_before_any_lookup() {
     }
 }
 
-/// A malformed id is refused for its shape, after the authority check: 400
-/// for a writer, 403 for a key without the authority, whatever it sent.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_malformed_id_is_judged_only_after_the_authority() {
     let (server, keys) = boot().await;
@@ -390,17 +363,6 @@ async fn a_malformed_id_is_judged_only_after_the_authority() {
     );
 }
 
-/// Authority first, shape second, lookup third, on every investigation
-/// route: a key without the route's authority gets the 403 envelope for a
-/// path, query or body that does not parse (an id that is not UTF-8 once
-/// decoded, a segment or parameter of the wrong type, a body that is not
-/// JSON or not the route's shape), so it never learns whether its request
-/// parsed. A key with the authority gets the 400 envelope for the same
-/// request, never axum's plain-text rejection.
-///
-/// On a route that reads a body, a key without the authority gets the 403
-/// envelope before the body is read at all: a body that never ends is
-/// refused while it is still open.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_without_the_authority_never_learns_whether_its_request_parsed() {
@@ -465,7 +427,6 @@ async fn a_key_without_the_authority_never_learns_whether_its_request_parsed() {
             2,
         ),
     ];
-    // (what is malformed, route, method, path, body)
     let mut cases: Vec<(String, Method, String, Option<String>, u8)> = Vec::new();
     for (route, method, path, body, needs) in &routes {
         // The id: invalid UTF-8 once decoded.
@@ -556,10 +517,6 @@ async fn a_key_without_the_authority_never_learns_whether_its_request_parsed() {
     }
 }
 
-/// The same two-sided check for the evidence readers and the capture route:
-/// a key without `query` gets the 403 envelope whatever its path, query
-/// string or body, a key with it the 400 envelope. A capture whose body
-/// never ends gets the 403 from a key without `query` while it is open.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_results_routes_judge_query_authority_before_request_shape() {
@@ -622,7 +579,6 @@ async fn the_results_routes_judge_query_authority_before_request_shape() {
             Some("[1]"),
         ),
     ];
-    // (key, holds `query`)
     let principals: [(&str, &str, bool); 6] = [
         ("grantless", &server.coastwatch_only_token, false),
         ("no query", &keys.no_query.token, false),
@@ -667,8 +623,6 @@ async fn the_results_routes_judge_query_authority_before_request_shape() {
     }
 }
 
-/// The agent key writes, the human key reads the same investigation and its
-/// log under each writer's attribution, and the human key cannot write.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_agent_writes_and_the_human_reads_the_same_investigation() {
     let (server, keys) = boot().await;
@@ -723,7 +677,6 @@ async fn the_agent_writes_and_the_human_reads_the_same_investigation() {
         &page.entries[1].payload,
         EntryPayload::Finding { .. }
     ));
-    // The wire carries no key id anywhere.
     let raw = call(
         &server,
         &keys.human.token,
@@ -736,18 +689,14 @@ async fn the_agent_writes_and_the_human_reads_the_same_investigation() {
     .to_string();
     assert!(!raw.contains("key_id"), "{raw}");
 
-    // The human reads the kept rows the finding cites.
     let (status, _, body) =
         captured::page(&server, &keys.human.token, &result, "?offset=3&limit=1").await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // And cannot write.
     let (status, body) = append(&server, &keys.human, 1, &note("mine")).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
-/// Revoking the agent's key fails its next append, and the investigation
-/// still reads with the creator's name snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revoked_writer_cannot_append_and_its_investigation_still_reads() {
     let (server, keys) = boot().await;
@@ -768,10 +717,6 @@ async fn a_revoked_writer_cannot_append_and_its_investigation_still_reads() {
     assert_eq!(page.entries[0].actor.name, "agent");
 }
 
-// -- create -------------------------------------------------------------------
-
-/// The same creator with the same request gets the same investigation, with
-/// nothing advanced; another request or another creator is 409.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_is_create_if_absent_on_the_creator_and_the_payload() {
     let (server, keys) = boot().await;
@@ -810,7 +755,6 @@ async fn create_is_create_if_absent_on_the_creator_and_the_payload() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(code(&body), "investigation_exists", "{body}");
 
-    // The evidence clock starts from the configured idle and ceiling.
     let config = &server.state.results.investigation;
     let start = at(START);
     let until = start + TimeDelta::seconds(i64::try_from(config.evidence_idle_secs).unwrap());
@@ -819,8 +763,6 @@ async fn create_is_create_if_absent_on_the_creator_and_the_payload() {
     assert_eq!(instant(&created.retain_ceiling), ceiling);
 }
 
-/// The create bounds: each text field at its limit and one byte over, a
-/// blank title, NUL, and an unknown field.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_refuses_fields_out_of_bounds() {
     let (server, keys) = boot().await;
@@ -879,10 +821,6 @@ async fn create_refuses_fields_out_of_bounds() {
     }
 }
 
-// -- read ---------------------------------------------------------------------
-
-/// A read pages the log by `since` and `limit`, with `more` and
-/// `through_seq` pointing at the next page.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_pages_the_log_since_a_sequence() {
     let (server, keys) = boot().await;
@@ -933,9 +871,6 @@ async fn a_read_pages_the_log_since_a_sequence() {
     }
 }
 
-// -- append -------------------------------------------------------------------
-
-/// Concurrent appends by two writers both commit, each at its own sequence.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_appends_by_two_writers_both_commit() {
     let (server, keys) = boot().await;
@@ -951,7 +886,6 @@ async fn concurrent_appends_by_two_writers_both_commit() {
     assert_eq!(read(&server, &keys.human, 1, "").await.investigation.seq, 2);
 }
 
-/// Each append bound at its limit and one over, through the route.
 #[tokio::test(flavor = "multi_thread")]
 async fn appends_are_held_to_every_bound() {
     let (server, keys) = boot().await;
@@ -1039,11 +973,6 @@ async fn appends_are_held_to_every_bound() {
     );
 }
 
-/// A citation names a row of a result this investigation may cite: another
-/// key's temporary result and an absent one are each 400 naming the
-/// citation, in the same words; another investigation's evidence is 409;
-/// a row past the result's rows is 400. (A citation of the caller's own
-/// temporary result promotes it: `investigations_evidence.rs`.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_citation_must_name_a_row_of_this_investigations_kept_evidence() {
     let (server, keys) = boot().await;
@@ -1124,8 +1053,6 @@ async fn a_citation_must_name_a_row_of_this_investigations_kept_evidence() {
     assert_eq!(seq, 1, "no refused citation appended");
 }
 
-/// An append with a `seen_seq` carries the other actors' entries since it,
-/// never the caller's own, bounded with `more`; one without carries none.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_append_carries_the_other_actors_activity_since_its_seen_seq() {
     let (server, keys) = boot().await;
@@ -1157,7 +1084,6 @@ async fn an_append_carries_the_other_actors_activity_since_its_seen_seq() {
     assert!(!activity.more);
     assert_eq!(activity.through_seq, 5);
 
-    // More than the allowance: cut, with `more` and the last entry's seq.
     let operator = store_actor(&server, &keys.operator).await;
     let store = &server.state.storage.investigations;
     let investigation = InvestigationId::parse(&id(1)).unwrap();
@@ -1188,13 +1114,9 @@ async fn an_append_carries_the_other_actors_activity_since_its_seen_seq() {
     assert_eq!(activity.through_seq, 5 + ACTIVITY_LIMIT);
 }
 
-/// The append commits before its activity is read, so a read that fails
-/// answers the written entry with no activity and `more` set, through the
-/// caller's `seen_seq`, and a warning: the caller reads the investigation
-/// for the rest and never writes the entry again (ADR-0059). The read's
-/// session runs through the answer-holding proxy, which holds Postgres's
-/// answer to the activity statement; the test terminates that session
-/// before letting the answer through, so the read meets a closed
+/// The read's session runs through the answer-holding proxy, which holds
+/// Postgres's answer to the activity statement; the test terminates that
+/// session before letting the answer through, so the read meets a closed
 /// connection after the commit landed.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_append_whose_activity_read_fails_answers_the_written_entry() {
@@ -1293,11 +1215,6 @@ async fn an_append_whose_activity_read_fails_answers_the_written_entry() {
     assert_eq!(warned, ["\"store\""], "one warning names the failed read");
 }
 
-// -- overwrites ----------------------------------------------------------------
-
-/// A stale close is 409 `sequence_conflict` with both sequences; a current
-/// one closes. A closed investigation refuses notes, keeps, findings, a
-/// title and a question, and accepts a reopen.
 #[tokio::test(flavor = "multi_thread")]
 async fn overwrites_check_the_sequence_and_a_closed_investigation_takes_only_a_reopen() {
     let (server, keys) = boot().await;
@@ -1363,7 +1280,6 @@ async fn overwrites_check_the_sequence_and_a_closed_investigation_takes_only_a_r
     assert_eq!(body["investigation"]["seq"], 4);
     assert_eq!(body["entry"]["seq"], 4);
 
-    // A patch changes exactly one field.
     let (status, body) = patch(json!({ "expected_seq": 4 })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(message(&body).contains("changes nothing"), "{body}");
@@ -1382,8 +1298,6 @@ async fn overwrites_check_the_sequence_and_a_closed_investigation_takes_only_a_r
     );
 }
 
-/// A finding's status is overwritten under the sequence; a seq that names
-/// no finding is 404.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_finding_status_overwrites_only_a_finding() {
     let (server, keys) = boot().await;
@@ -1455,7 +1369,6 @@ async fn a_finding_status_overwrites_only_a_finding() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
-/// `PATCH` investigation `n` as `key` with `body`.
 async fn patch_as(
     server: &TestServer,
     key: &MintedKey,
@@ -1472,7 +1385,6 @@ async fn patch_as(
     .await
 }
 
-/// [`patch_as`] that must answer 200.
 async fn patched(server: &TestServer, key: &MintedKey, n: u32, body: &Value) -> PatchResponse {
     let (status, answer) = patch_as(server, key, n, body).await;
     assert_eq!(status, StatusCode::OK, "{body}: {answer}");
@@ -1484,8 +1396,6 @@ async fn patched(server: &TestServer, key: &MintedKey, n: u32, body: &Value) -> 
     patched
 }
 
-/// `PUT` the status of the finding at `finding` in investigation `n` as
-/// `key` with `body`.
 async fn finding_status_as(
     server: &TestServer,
     key: &MintedKey,
@@ -1503,7 +1413,6 @@ async fn finding_status_as(
     .await
 }
 
-/// The seqs of `activity`'s entries, each of which `key` wrote.
 fn written_by(activity: &Activity, key: &MintedKey) -> Vec<u64> {
     assert!(
         activity
@@ -1515,13 +1424,6 @@ fn written_by(activity: &Activity, key: &MintedKey) -> Vec<u64> {
     activity.entries.iter().map(|e| e.seq).collect()
 }
 
-/// An overwrite with a `seen_seq` answers the other keys' entries since it,
-/// never the caller's own nor the entry it wrote, as an append does: a
-/// title, a question, a finding status, a close and a reopen. One without
-/// answers no `activity` at all. The cursor is bookkeeping: with it, a
-/// stale sequence, a closed investigation, a key without
-/// `investigation_write` and a patch of two fields are refused as before,
-/// and nothing refused is written.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, stated in order
 async fn overwrites_return_activity_without_changing_conflict_rules() {
@@ -1537,8 +1439,6 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
     .entry;
     assert_eq!(finding.seq, 1);
 
-    // From 0, the window holds the agent's own finding, the operator's
-    // note and the title the agent writes: only the note comes back.
     appended(&server, &keys.operator, 1, &note("before the title")).await;
     let titled = patched(
         &server,
@@ -1591,8 +1491,6 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
     assert_eq!(written_by(&activity, &keys.operator), [6]);
     assert_eq!((activity.through_seq, activity.more), (7, false));
 
-    // A finding status from 0 also answers only the other key's notes,
-    // never the agent's own finding, title, question or earlier status.
     appended(&server, &keys.operator, 1, &note("before the unresolved")).await;
     let (status, body) = finding_status_as(
         &server,
@@ -1623,8 +1521,6 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
     assert_eq!(written_by(&activity, &keys.operator), [10]);
     assert_eq!((activity.through_seq, activity.more), (11, false));
 
-    // The operator reopens, notes and closes; the agent's reopen answers
-    // all three.
     patched(
         &server,
         &keys.operator,
@@ -1653,9 +1549,7 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
     assert_eq!(written_by(&activity, &keys.operator), [12, 13, 14]);
     assert_eq!((activity.through_seq, activity.more), (15, false));
 
-    // Without a `seen_seq`, no overwrite answers activity, whatever the
-    // operator wrote. A closed investigation takes no note before the
-    // reopen.
+    // A closed investigation takes no note before the reopen.
     let mut seq = 15;
     for (body, noted) in [
         (json!({ "title": "plain" }), true),
@@ -1691,8 +1585,6 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
     assert_eq!(answer["entry"]["seq"], seq, "{answer}");
     assert!(answer.get("activity").is_none(), "{answer}");
 
-    // A `seen_seq` past the current sequence answers the write with no
-    // entries.
     let ahead = patched(
         &server,
         &keys.agent,
@@ -1721,7 +1613,6 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
     assert!(activity.entries.is_empty(), "{activity:?}");
     assert!(!activity.more, "{activity:?}");
 
-    // With a `seen_seq`, every refusal stands as it did without one.
     let current = seq;
     let stale = current - 1;
     let (status, body) = patch_as(
@@ -1817,7 +1708,6 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(code(&body), "investigation_closed", "{body}");
 
-    // The close is the only entry since the refusals began.
     let page = read(&server, &keys.human, 1, &format!("?since={}", current - 1)).await;
     assert_eq!(page.investigation.seq, current);
     let kinds: Vec<_> = page
@@ -1828,9 +1718,6 @@ async fn overwrites_return_activity_without_changing_conflict_rules() {
     assert_eq!(kinds, [(current, EntryKind::Status)]);
 }
 
-/// A router over the fixture's state whose investigation store speaks
-/// through `proxy` on a single session, and a handle on that session's
-/// pool, for its backend's pid.
 async fn proxied(server: &TestServer, proxy: &answer_hold::Proxy) -> (axum::Router, sqlx::PgPool) {
     let base: sqlx::postgres::PgConnectOptions = server.app_db_url.parse().unwrap();
     #[allow(clippy::disallowed_methods)] // one session, through the proxy
@@ -1844,7 +1731,6 @@ async fn proxied(server: &TestServer, proxy: &answer_hold::Proxy) -> (axum::Rout
     (server.router_over(state, |_| {}), through)
 }
 
-/// The pid of the backend behind `pool`'s one session.
 async fn backend_pid(pool: &sqlx::PgPool) -> i32 {
     sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(pool)
@@ -1852,7 +1738,6 @@ async fn backend_pid(pool: &sqlx::PgPool) -> i32 {
         .unwrap()
 }
 
-/// End backend `pid` from a session of its own.
 async fn terminate(server: &TestServer, pid: i32) {
     use sqlx::Connection as _;
     let mut probe = sqlx::PgConnection::connect(&server.app_db_url)
@@ -1884,9 +1769,7 @@ fn answer_of(
     })
 }
 
-/// The `investigation_activity_failed` warnings `capture` holds, by
-/// error class. The capture records each field's `Debug`, so a string is
-/// quoted.
+/// The capture records each field's `Debug`, so a string is quoted.
 fn activity_failures(capture: &Capture) -> Vec<String> {
     capture
         .events()
@@ -1900,15 +1783,9 @@ fn activity_failures(capture: &Capture) -> Vec<String> {
         .collect()
 }
 
-/// An overwrite commits before its activity is read, so a read that fails
-/// answers 200 with the written entry, and for a `PATCH` the
-/// investigation, with no activity entries and `more` set through the
-/// caller's `seen_seq`, and a warning: the caller reads the investigation
-/// for the rest and never writes again (ADR-0059). The finding-status
-/// `PUT` first, then a close. Each activity read's session runs through
-/// the answer-holding proxy, which holds Postgres's answer to the activity
-/// statement; the test terminates that session before letting the answer
-/// through.
+/// Each activity read's session runs through the answer-holding proxy, which
+/// holds Postgres's answer to the activity statement; the test terminates
+/// that session before letting the answer through.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, stated in order
 async fn an_overwrite_whose_activity_read_fails_stays_acknowledged() {
@@ -2032,17 +1909,10 @@ async fn an_overwrite_whose_activity_read_fails_stays_acknowledged() {
     );
 }
 
-/// An investigation deleted the moment an overwrite commits still answers
-/// 200 with the header and the entry the write's own transaction saw, and
-/// activity through the written entry with nothing more: no read after the
-/// commit can turn the landed write into a 404.
-///
 /// The proxy holds Postgres's answer to the write's `COMMIT`. Postgres has
 /// committed by the time it answers, so while the answer is held the test
 /// reads the written entry and deletes the investigation from sessions of
-/// its own. The handler learns that its commit landed only after the
-/// investigation is gone, so any read it sends after the commit, wherever
-/// in the handler, finds nothing.
+/// its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_overwrite_answers_its_header_when_deleted_after_commit() {
     let capture = telemetry();
@@ -2078,8 +1948,6 @@ async fn an_overwrite_answers_its_header_when_deleted_after_commit() {
         .map(|e| e.seq)
         .collect();
     assert_eq!(written, [other.entry.seq + 1], "the close is written once");
-    // The write's row lock went with its commit, so the delete does not
-    // wait for the held answer.
     let (status, body) = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         call(
@@ -2121,10 +1989,6 @@ async fn an_overwrite_answers_its_header_when_deleted_after_commit() {
     assert!(activity_failures(capture).is_empty());
 }
 
-// -- retention and deletion -------------------------------------------------------
-
-/// An extension needs `server_manage`, never shortens, and raises the
-/// ceiling past the configured one.
 #[tokio::test(flavor = "multi_thread")]
 async fn only_server_manage_extends_and_an_extension_never_shortens() {
     let (server, keys) = boot().await;
@@ -2197,8 +2061,6 @@ async fn only_server_manage_extends_and_an_extension_never_shortens() {
     assert_eq!(extended.updated_by.prefix, keys.operator.prefix);
 }
 
-/// A delete needs `server_manage`, refuses while admitted work runs, and
-/// once it goes, unlinks the evidence file and leaves nothing to read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delete_unlinks_the_evidence_and_waits_for_running_work() {
     let (server, keys) = boot().await;
@@ -2273,17 +2135,10 @@ async fn a_delete_unlinks_the_evidence_and_waits_for_running_work() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     let (status, body) = call(&server, &keys.operator.token, Method::DELETE, &path, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    // The result reads gone, not as a page of a missing file.
     let (status, _, body) = captured::page(&server, &keys.agent.token, &result, "").await;
     assert_eq!(status, StatusCode::GONE, "{body}");
 }
 
-/// Evidence of a deleted investigation reads gone because the
-/// investigation was deleted, not as a quota prune. That holds for evidence
-/// the delete pruned and for evidence the retention had pruned before the
-/// delete: neither has an investigation left, and no finding cites it.
-/// Only the owner can still read such a result, within its tombstone; an
-/// investigation reader finds no result.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_result_whose_investigation_was_deleted_reads_gone_for_that_reason() {
     const DELETED: &str =
@@ -2335,13 +2190,6 @@ async fn a_result_whose_investigation_was_deleted_reads_gone_for_that_reason() {
     reads_deleted(&pruned_before).await;
 }
 
-// -- evidence readers ------------------------------------------------------------
-
-/// Another key with `investigation_read` pages a kept result it did not
-/// capture, reads it as pruned once its retention ends, and still cannot
-/// tell another key's temporary result from no result. The owner still
-/// pages its own temporary result, and a key without `investigation_read`
-/// keeps the owner-only rule.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_investigation_reader_pages_kept_evidence_and_only_kept_evidence() {
     let (server, keys) = boot().await;
@@ -2379,8 +2227,6 @@ async fn every_investigation_reader_pages_kept_evidence_and_only_kept_evidence()
         "the owner's temporary result: {body}"
     );
 
-    // Past the investigation's retention the evidence is pruned: 410, for
-    // as long as the investigation exists, tombstone age or not.
     let past = instant(&created.retain_until) + TimeDelta::seconds(1);
     server.results_clock.set(past);
     let pruned = server
@@ -2406,10 +2252,6 @@ async fn every_investigation_reader_pages_kept_evidence_and_only_kept_evidence()
     }
 }
 
-/// A kept result whose investigation's retention ended reads gone for that
-/// reason on the spot, with no sweep between: the read prunes that
-/// investigation's evidence under its lock, as a write would, and unlinks
-/// the file. Evidence whose investigation changed since stays readable.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_past_the_retention_ends_the_evidence_on_the_spot() {
     let (server, keys) = boot().await;

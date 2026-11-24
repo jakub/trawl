@@ -4,35 +4,6 @@
 
 //! Compaction's coverage proof (ADR-0041 slice 2): the only way the restart
 //! overhang clears.
-//!
-//! Boot hydration leaves overhang when some WAL that survived the restart
-//! did not become resident. Overhang is a state of the publication gate,
-//! not a list of files, so the proof asks the WAL itself: every `.ndjson`
-//! file in the scope hydration listed ([`walk_wal`]) must be resident in
-//! the hot buffer, or gone because compaction published and retired it.
-//!
-//! The listing takes no guard, so it may see a file a producer has
-//! published and not yet inserted. Every producer holds the publication
-//! read guard from before its WAL write through its hot insert, so the
-//! files the listing found not resident are checked again under the write
-//! guard: by then each is resident or gone, unless it really is left over.
-//! The overhang clears under that same guard. A file written after the
-//! listing needs no check, because its producer inserts it.
-//!
-//! The proof fails, and overhang stays, when:
-//!
-//! - some scope could not be listed ([`ProofOutcome::Incomplete`]);
-//! - a publication marker is pending, even one whose files are gone
-//!   ([`ProofOutcome::MarkerPending`]): its recovery may still retire or
-//!   keep WAL, and the scopes it blocks were not hydrated;
-//! - more than [`MAX_PROOF_CANDIDATES`] files are not resident
-//!   ([`ProofOutcome::TooManyCandidates`]): the write guard holds off
-//!   ingest and every read, so the re-check is bounded;
-//! - a file is neither resident nor gone under the guard
-//!   ([`ProofOutcome::NotResident`]).
-//!
-//! [`prove_coverage`] runs the whole sequence and returns only its outcome,
-//! so no proof can be kept and applied after the WAL has changed.
 
 use std::path::{Path, PathBuf};
 
@@ -41,30 +12,18 @@ use crate::ingest::compaction::wal_batch_id;
 use crate::ingest::hydration::walk_wal;
 use crate::publication::PublicationGate;
 
-/// The most WAL files that are not resident which the proof re-checks
-/// under the publication write guard. More than this fails the proof
-/// before it takes the guard.
 pub(crate) const MAX_PROOF_CANDIDATES: usize = 1024;
 
-/// What one coverage proof found. Only [`Settled`](Self::Settled) clears
-/// the overhang.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProofOutcome {
-    /// Every listed WAL file was resident or gone: the overhang is cleared.
     Settled,
-    /// The WAL root, a root entry or an env directory could not be listed.
     Incomplete,
-    /// A publication marker is pending, or the marker scan could not rule
-    /// one out.
     MarkerPending,
-    /// More than [`MAX_PROOF_CANDIDATES`] listed files were not resident.
     TooManyCandidates,
-    /// A listed file was neither resident nor gone under the write guard.
     NotResident,
 }
 
 impl ProofOutcome {
-    /// The `snake_case` literal the compaction pass logs.
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Settled => "settled",
@@ -90,8 +49,6 @@ pub(crate) fn prove_coverage(
     prove(wal_dir, hot, gate, |_| {})
 }
 
-/// [`prove_coverage`], calling `listed` with the number of candidates after
-/// the unguarded listing and before the write guard is taken.
 fn prove(
     wal_dir: &Path,
     hot: &HotBuffer,
@@ -100,9 +57,7 @@ fn prove(
 ) -> ProofOutcome {
     // List without a guard. A file resident now stays resident until
     // compaction drains it after publishing it, and compaction is the
-    // caller, so only the files not resident need the re-check. Each
-    // candidate keeps its batch id (`None` for a stem that is not UTF-8,
-    // which no batch carries) and its path.
+    // caller, so only the files not resident need the re-check.
     let mut candidates: Vec<(Option<String>, PathBuf)> = Vec::new();
     let mut too_many = false;
     let walk = walk_wal(wal_dir, |env, _service, files, _blocked| {
@@ -164,7 +119,6 @@ mod tests {
 
     const BASE: u64 = 1_790_000_000_000;
 
-    /// A hot buffer whose gate hydration left in overhang.
     fn overhang() -> (Arc<HotBuffer>, Arc<PublicationGate>) {
         let gate = Arc::new(PublicationGate::starting());
         gate.finish_hydration(true).unwrap();
@@ -176,8 +130,6 @@ mod tests {
         (Arc::new(hot), gate)
     }
 
-    /// A writer-named WAL file `wal/{env}/{service}_{millis}_0001.ndjson`
-    /// holding one event, and its batch id.
     fn plant(wal: &Path, env: &str, service: &str, millis: u64) -> (PathBuf, String) {
         let name = WalName {
             service: service.into(),
@@ -193,7 +145,6 @@ mod tests {
         (path, id)
     }
 
-    /// Make `batch_id` resident, as a producer's insert does.
     fn make_resident(hot: &HotBuffer, batch_id: &str, service: &str) {
         let mut event = serde_json::Map::new();
         event.insert("n".into(), 1.into());
@@ -227,15 +178,11 @@ mod tests {
         assert_eq!(prove_coverage(wal, &hot, &gate), ProofOutcome::NotResident);
         assert_overhang(&gate);
 
-        // Compaction published and retired it: gone is covered.
         std::fs::remove_file(left_over).unwrap();
         assert_eq!(prove_coverage(wal, &hot, &gate), ProofOutcome::Settled);
         assert_settled(&gate);
     }
 
-    /// A file the listing saw, which is gone by the re-check: a write whose
-    /// directory sync failed withdraws its name and inserts nothing. Gone
-    /// is covered, so the proof settles.
     #[test]
     fn a_candidate_gone_by_the_re_check_is_covered() {
         let tmp = tempfile::tempdir().unwrap();
@@ -250,11 +197,6 @@ mod tests {
         assert_settled(&gate);
     }
 
-    /// Only a candidate confirmed absent is gone: no entry, below a
-    /// directory. A file removed, or its whole env directory, settles. A
-    /// candidate below a dangling link or a regular file answers no entry
-    /// too, or a different error, but nothing established that it is
-    /// gone, so the overhang stays and the next pass retries.
     #[cfg(unix)]
     #[test]
     fn coverage_proof_needs_confirmed_absence() {
@@ -325,8 +267,7 @@ mod tests {
         assert_settled(&gate);
     }
 
-    /// A scope that cannot be listed may hold WAL that is not resident. A
-    /// symlink loop at the WAL root fails for any user.
+    /// A symlink loop at the WAL root fails for any user.
     #[cfg(unix)]
     #[test]
     fn an_incomplete_listing_keeps_overhang() {
@@ -341,7 +282,6 @@ mod tests {
         assert_overhang(&gate);
         std::fs::remove_file(&cycle).unwrap();
 
-        // A WAL root that is not a directory.
         assert_eq!(
             prove_coverage(&planted, &hot, &gate),
             ProofOutcome::Incomplete
@@ -381,8 +321,6 @@ mod tests {
         assert_settled(&gate);
     }
 
-    /// A marker whose WAL files are all gone still stops the proof: its
-    /// recovery has not run, and the scope it blocks was not hydrated.
     #[test]
     fn a_pending_marker_keeps_overhang_though_its_files_are_gone() {
         let tmp = tempfile::tempdir().unwrap();
@@ -419,7 +357,6 @@ mod tests {
         );
         assert_overhang(&gate);
 
-        // A marker that cannot be read claims as much.
         let marker_path = marker.marker_path(wal);
         std::fs::write(&marker_path, b"not a marker").unwrap();
         assert_eq!(
@@ -433,9 +370,6 @@ mod tests {
         assert_settled(&gate);
     }
 
-    /// More candidates than the bound fail the proof before it takes the
-    /// write guard, so a proof that cannot succeed never holds off ingest.
-    /// Exactly the bound is re-checked; resident files are no candidates.
     #[test]
     fn more_candidates_than_the_bound_keeps_overhang() {
         let tmp = tempfile::tempdir().unwrap();
@@ -465,7 +399,6 @@ mod tests {
         assert_eq!(prove_coverage(wal, &hot, &gate), ProofOutcome::NotResident);
         assert_overhang(&gate);
 
-        // One more file, but every one of them resident.
         files.push(plant(wal, "lab", "extra", BASE));
         for (path, id) in &files {
             let service = path.file_name().unwrap().to_str().unwrap();
@@ -475,12 +408,6 @@ mod tests {
         assert_settled(&gate);
     }
 
-    /// A producer paused after its WAL file is published and before its
-    /// hot insert, holding the ingest read guard as the pipeline does. The
-    /// unguarded listing sees that file as not resident, so the proof waits
-    /// for the write guard, then finds it resident and settles. Deciding
-    /// from the unguarded listing alone would leave overhang behind every
-    /// write in flight.
     #[test]
     fn a_producer_between_publish_and_insert_makes_the_proof_wait_then_settle() {
         let tmp = tempfile::tempdir().unwrap();

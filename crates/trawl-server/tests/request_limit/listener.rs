@@ -7,9 +7,6 @@
 use crate::common;
 use crate::support::{capture_logs, field, stdout_lines};
 
-/// An `accept()` error ends nothing: it is logged under the pre-auth
-/// transport target, and the next connection is still served.
-///
 /// The fault is EMFILE, the error a connection flood against a process
 /// out of file descriptors produces. It is answered by the second
 /// server's first `accept()`, before any connection exists, so the
@@ -37,7 +34,6 @@ async fn accept_error_does_not_end_the_serve_loop() {
     // `Display` fields are written bare, so the error is the line's tail.
     assert!(line.ends_with(&format!(" error={expected}")), "{line}");
 
-    // A fresh connection, after the one the readiness poll used.
     let client = common::harness_client_builder().build().unwrap();
     let response = client
         .get(format!("{url}/api/v1/health"))

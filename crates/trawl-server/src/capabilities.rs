@@ -4,16 +4,6 @@
 
 //! What this server offers a client before it sends anything (ADR-0058):
 //! the capability behind `GET /api/v1/capabilities`, transport-free.
-//!
-//! The route sits on the authenticated router and checks no permission
-//! beyond the trawl grant, as `whoami` does: every key that may call
-//! trawld may learn the bounds it will be held to. The report reads
-//! in-process state only. The version and the DSL lists are compiled in,
-//! the bounds, quotas, admission numbers, evidence policy and origin are the
-//! configuration the state was built from, and the health block is
-//! `handlers::health_report`, the computation
-//! `GET /api/v1/health` answers with. Retention reach is not here: it stays
-//! on the `server_manage` dashboard.
 
 use fleet_auth::VerifiedKey;
 use trawl_api::capabilities::{
@@ -26,10 +16,6 @@ use trawl_core::parser::suggest::{KNOWN_FUNCTIONS, KNOWN_PIPE_STAGES};
 
 use crate::state::AppState;
 
-/// The capabilities report for `key`.
-///
-/// Only the rate in `admission` depends on the key: the one the rate
-/// limiter applies to its interactive requests.
 pub async fn report(state: &AppState, key: &VerifiedKey) -> CapabilitiesResponse {
     let (_, health) = crate::handlers::health_report(state).await;
     let capture = &state.results.capture;
@@ -71,8 +57,6 @@ pub async fn report(state: &AppState, key: &VerifiedKey) -> CapabilitiesResponse
     }
 }
 
-/// The DSL trawl-core parses: its stage and function tables and its two
-/// size limits.
 fn dsl() -> DslCapabilities {
     let names = |table: &[&str]| table.iter().map(|&name| name.to_owned()).collect();
     DslCapabilities {

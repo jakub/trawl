@@ -4,18 +4,7 @@
 
 //! Time/count micro-batcher for syslog events.
 //!
-//! Accumulates individual syslog events and flushes them through the
-//! WAL pipeline in batches, matching the pattern used by HTTP ingest.
-//!
-//! # Backpressure (ADR-0043)
-//!
-//! Every flushed group is admitted against the hot buffer before it is
-//! written. A group the buffer refuses as full stays at the front of the
-//! batcher's queue, with every group behind it, and the batcher stops
-//! taking events from its channel until charge is released. The channel
-//! then fills: a TCP listener waits in [`SyslogSender::send`], holding its
-//! connection open, and a UDP listener drops the datagram, counted as
-//! `backpressure` rather than `queue_full` while the batcher is blocked.
+//! Backpressure (ADR-0043).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -35,45 +24,26 @@ use crate::ingest::producer::ProducerKind;
 use crate::metrics::SyslogDropReason;
 use crate::state::SyslogStats;
 
-/// A single canonicalized syslog event ready for batching.
-///
-/// `env` and `service` are the door's own verdict (`Canonical::env` /
-/// `Canonical::service`), not the listener's guess, and together they are
-/// the batch key: two envs must never share a WAL file, a hot-buffer
-/// drain key or a parquet partition (ADR-0009).
 #[derive(Debug)]
 pub struct SyslogEvent {
-    /// The env the door filed this event under.
     pub env: String,
-    /// The service the door validated.
     pub service: String,
-    /// The canonicalized event map — the full declared envelope.
     pub map: Map<String, serde_json::Value>,
     /// Transport that received this event ("udp" or "tcp").
     pub transport: &'static str,
 }
 
-/// Sender half for submitting events to the batcher: the shared TCP/UDP
-/// queue boundary.
-///
-/// `backpressure` is set by the batcher while hot-buffer admission refuses
-/// its front group and it has stopped receiving, so a full queue can be
-/// told apart from one that is merely slow.
 #[derive(Debug, Clone)]
 pub struct SyslogSender {
     tx: mpsc::Sender<SyslogEvent>,
     backpressure: Arc<AtomicBool>,
-    /// Sends that found the channel full and had to wait: counted once per
-    /// [`send`](Self::send), after its channel send was first polled
-    /// Pending. Shared by clones (#316).
+    /// Counted once per [`send`](Self::send), after its channel send was
+    /// first polled Pending. Shared by clones.
     #[cfg(test)]
     send_pending: Arc<AtomicU64>,
 }
 
 impl SyslogSender {
-    /// Enqueue without waiting (UDP). A full or closed queue abandons
-    /// exactly this event, counted once; transport-specific logging stays
-    /// with the listener.
     pub(super) fn try_enqueue(&self, event: SyslogEvent, stats: Option<&Arc<SyslogStats>>) -> bool {
         match self.tx.try_send(event) {
             Ok(()) => true,
@@ -89,11 +59,6 @@ impl SyslogSender {
         }
     }
 
-    /// Enqueue, waiting for room (TCP). The wait is the backpressure a TCP
-    /// sender feels: the connection stays open and unread while the queue
-    /// is full. Returns `false`, counting the event dropped, only if the
-    /// batcher has gone away.
-    ///
     /// Cancel-safe in the sense the listener needs: dropping the future
     /// abandons only this event, which the caller then counts with
     /// [`abandon`](Self::abandon).
@@ -108,13 +73,10 @@ impl SyslogSender {
         false
     }
 
-    /// Count one event a listener gave up on while waiting for room (a TCP
-    /// send cancelled by shutdown).
     pub(super) fn abandon(&self, stats: Option<&Arc<SyslogStats>>) {
         record_dropped(self.full_reason(), 1, stats);
     }
 
-    /// Why a full queue is full, sampled once per drop.
     fn full_reason(&self) -> SyslogDropReason {
         if self.backpressure.load(Ordering::Acquire) {
             SyslogDropReason::Backpressure
@@ -126,7 +88,6 @@ impl SyslogSender {
 
 #[cfg(test)]
 impl SyslogSender {
-    /// A sender on a bare channel, with no batcher behind it.
     pub(super) fn channel_for_test(capacity: usize) -> (Self, mpsc::Receiver<SyslogEvent>) {
         let (tx, rx) = mpsc::channel(capacity);
         (
@@ -143,9 +104,6 @@ impl SyslogSender {
         self.backpressure.load(Ordering::Acquire)
     }
 
-    /// How many sends have waited in the channel: each one was polled and
-    /// returned Pending, so it is parked on channel capacity right now or
-    /// was at some point.
     pub(super) fn send_pending_for_test(&self) -> u64 {
         self.send_pending.load(Ordering::Acquire)
     }
@@ -213,7 +171,6 @@ fn split_to_fit(batch: ServiceBatch, ceiling: Charge) -> Vec<ServiceBatch> {
     chunks
 }
 
-/// Accumulates syslog events and flushes to the ingest pipeline.
 #[derive(Debug)]
 pub struct SyslogBatcher {
     rx: mpsc::Receiver<SyslogEvent>,
@@ -234,8 +191,6 @@ pub struct SyslogBatcher {
 }
 
 impl SyslogBatcher {
-    /// `blocked_poll` bounds how long a batcher blocked on hot-buffer
-    /// admission waits between retries when no release wakes it.
     pub fn new(
         config: &SyslogConfig,
         pipeline: Arc<PipelineWriter>,
@@ -266,14 +221,6 @@ impl SyslogBatcher {
         self.sender.clone()
     }
 
-    /// Run the batcher loop until shutdown.
-    ///
-    /// While a flush is in progress (awaiting `spawn_blocking`), the
-    /// channel buffers incoming events (`channel_capacity`, 10k by
-    /// default). While hot-buffer admission refuses the front group, the
-    /// batcher stops receiving altogether and waits for a release, a
-    /// shutdown, or the `blocked_poll` fallback; the batch interval does
-    /// not tick in that state.
     pub async fn run(mut self, mut shutdown_rx: watch::Receiver<bool>) {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_millis(self.batch_interval_ms));
@@ -308,7 +255,6 @@ impl SyslogBatcher {
 
                 event = self.rx.recv() => {
                     let Some(evt) = event else {
-                        // All senders dropped — flush and exit
                         if pending_count > 0 {
                             self.flush(&mut pending, &mut pending_count, udp_count, tcp_count).await;
                         }
@@ -345,9 +291,6 @@ impl SyslogBatcher {
         }
     }
 
-    /// Wait, while admission refuses the front group, for a release, the
-    /// fallback poll, or shutdown. Returns `true` on shutdown.
-    ///
     /// The released generation was marked seen before the refused attempt
     /// (in [`admit_and_write`](Self::admit_and_write)), so a release that
     /// raced the refusal still wakes this wait.
@@ -375,9 +318,6 @@ impl SyslogBatcher {
         }
     }
 
-    /// Stop: take whatever is still queued in the channel, make one final
-    /// ordered attempt at everything pending, and count what admission
-    /// still refuses as dropped for backpressure.
     async fn shut_down(
         &mut self,
         pending: &mut IndexMap<BatchKey, ServiceBatch>,
@@ -411,7 +351,6 @@ impl SyslogBatcher {
         );
     }
 
-    /// Count everything still refused as dropped for backpressure.
     fn drop_refused(&mut self) {
         let refused: usize = self
             .queue
@@ -432,8 +371,6 @@ impl SyslogBatcher {
         }
     }
 
-    /// Move pending batches behind the admission queue, split to fit the
-    /// syslog ceiling, and admit and write what the hot buffer accepts.
     async fn flush(
         &mut self,
         pending: &mut IndexMap<BatchKey, ServiceBatch>,
@@ -472,11 +409,6 @@ impl SyslogBatcher {
         self.admit_and_write().await;
     }
 
-    /// Reserve hot-buffer space for queued groups front first, then write
-    /// the admitted ones. A `Full` refusal stops at that group, keeping it
-    /// and everything behind it, and raises the backpressure flag; a queue
-    /// admitted to the end clears it.
-    ///
     /// The released generation is marked seen before the first attempt, so
     /// a release after a refusal is never missed by the blocked wait.
     async fn admit_and_write(&mut self) {
@@ -534,12 +466,6 @@ impl SyslogBatcher {
         }
     }
 
-    /// Write admitted groups through the pipeline in a blocking task.
-    ///
-    /// WAL writes (staged write, fsyncs, `std::fs::hard_link`) are synchronous
-    /// I/O, and the pipeline takes the publication gate per group, so we
-    /// run them on the blocking thread pool to avoid stalling the tokio
-    /// runtime.
     async fn write(&self, groups: Vec<AdmittedGroup>) {
         let group_count = groups.len();
         let events: usize = groups.iter().map(|g| g.batch.maps.len()).sum();
@@ -571,7 +497,6 @@ impl SyslogBatcher {
     }
 }
 
-/// Admission fixtures shared by the syslog listener tests.
 #[cfg(test)]
 pub(super) mod test_support {
     use std::sync::Arc;
@@ -581,7 +506,6 @@ pub(super) mod test_support {
     use crate::ingest::pipeline::PipelineWriter;
     use crate::ingest::wal::WalWriter;
 
-    /// The drain key of the [`admission_pipeline`] filler batch.
     pub const FILLER_ID: &str = "prod/filler";
 
     /// A real pipeline over a real WAL in `tmp` and a hot buffer of
@@ -611,7 +535,6 @@ pub(super) mod test_support {
         (pipeline, hot)
     }
 
-    /// Poll `condition` until it holds, failing after five seconds.
     pub async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while !condition() {
@@ -620,7 +543,6 @@ pub(super) mod test_support {
         }
     }
 
-    /// Every WAL line under `root/env`, across files.
     pub fn wal_lines(root: &std::path::Path, env: &str) -> Vec<String> {
         let Ok(dir) = std::fs::read_dir(root.join(env)) else {
             return Vec::new();
@@ -697,9 +619,6 @@ mod tests {
         });
     }
 
-    /// The send-pending observation counts a send only once its channel
-    /// send has been polled Pending, once per send, and leaves cancellation
-    /// alone: a parked send dropped unfinished enqueues nothing.
     #[test]
     fn send_pending_counts_a_send_once_it_has_waited() {
         use crate::test_timing::until_polling;
@@ -743,10 +662,6 @@ mod tests {
         });
     }
 
-    /// AC12: a UDP datagram dropped on a full queue is `backpressure` while
-    /// the batcher is blocked on hot-buffer admission and `queue_full`
-    /// otherwise. The flag is the real batcher's, raised by a real `Full`
-    /// refusal and cleared by a real drain.
     #[test]
     fn udp_drop_reason_is_backpressure_only_while_admission_blocks_the_batcher() {
         use crate::metrics::test_support::sample;
@@ -804,9 +719,6 @@ mod tests {
         });
     }
 
-    /// Shutdown makes one final ordered attempt, taking what the channel
-    /// still holds; whatever admission still refuses is counted dropped
-    /// for backpressure, and nothing reaches the WAL.
     #[test]
     fn shutdown_counts_events_still_refused_as_backpressure_drops() {
         use crate::metrics::test_support::sample;
@@ -923,9 +835,6 @@ mod tests {
         assert_eq!(got, [vec!["a".to_owned()], vec![big], vec!["b".to_owned()]]);
     }
 
-    /// An oversized group is split to fit the syslog ceiling; the lone
-    /// event that cannot fit at all is dropped and counted as an
-    /// `oversized` refusal, and its neighbours still land.
     #[test]
     fn oversized_group_is_split_and_a_lone_oversized_event_is_dropped_and_counted() {
         use crate::metrics::test_support::sample;
@@ -1041,7 +950,6 @@ mod tests {
         });
     }
 
-    /// Create a batcher with a real WAL writer pointing at a temp dir.
     fn test_batcher(
         batch_interval_ms: u64,
         batch_max_events: usize,
@@ -1080,7 +988,7 @@ mod tests {
 
     #[tokio::test]
     async fn batcher_timer_flush() {
-        let (batcher, tmp) = test_batcher(10, 1000); // 10ms interval, high max
+        let (batcher, tmp) = test_batcher(10, 1000);
         let sender = batcher.sender();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -1090,7 +998,6 @@ mod tests {
 
         assert!(sender.send(make_event("test-svc"), None).await);
 
-        // Wait for timer flush (~10ms + some margin)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let _ = shutdown_tx.send(true);
@@ -1106,7 +1013,7 @@ mod tests {
 
     #[tokio::test]
     async fn batcher_max_events_flush() {
-        let (batcher, tmp) = test_batcher(60_000, 3); // long interval, max 3 events
+        let (batcher, tmp) = test_batcher(60_000, 3);
         let sender = batcher.sender();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -1114,7 +1021,6 @@ mod tests {
             batcher.run(shutdown_rx).await;
         });
 
-        // Send exactly 3 events — should trigger immediate flush
         for _ in 0..3 {
             assert!(sender.send(make_event("test-svc"), None).await);
         }
@@ -1138,7 +1044,7 @@ mod tests {
 
     #[tokio::test]
     async fn batcher_shutdown_flushes_remaining() {
-        let (batcher, tmp) = test_batcher(60_000, 10_000); // long interval, high max
+        let (batcher, tmp) = test_batcher(60_000, 10_000);
         let sender = batcher.sender();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -1146,11 +1052,9 @@ mod tests {
             batcher.run(shutdown_rx).await;
         });
 
-        // Send events (won't trigger timer or max events flush)
         assert!(sender.send(make_event("svc-a"), None).await);
         assert!(sender.send(make_event("svc-b"), None).await);
 
-        // Small delay to ensure events are received
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         let _ = shutdown_tx.send(true);
@@ -1168,7 +1072,6 @@ mod tests {
         );
     }
 
-    /// WAL files under one env dir, by service-name prefix.
     fn wal_files(root: &std::path::Path, env: &str) -> Vec<String> {
         std::fs::read_dir(root.join(env))
             .map(|dir| {
@@ -1180,7 +1083,6 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Drive the batcher to a flush and return once it has settled.
     async fn drain(batcher: SyslogBatcher, events: Vec<SyslogEvent>) {
         let sender = batcher.sender();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1204,7 +1106,6 @@ mod tests {
         )
         .await;
 
-        // One WAL file per service, both under the one env.
         let files = wal_files(tmp.path(), "prod");
         assert_eq!(
             files.iter().filter(|f| f.starts_with("nginx")).count(),
@@ -1218,10 +1119,6 @@ mod tests {
         );
     }
 
-    /// The batch key is `(env, service)`, not service alone: one service
-    /// name arriving under two envs in one interval must not be
-    /// concatenated into a single WAL file under a single path root, which
-    /// would be a misfile no error and no repair code ever mentions.
     #[tokio::test]
     async fn batcher_keys_on_env_and_service_together() {
         let (batcher, tmp) = test_batcher(60_000, 10_000);

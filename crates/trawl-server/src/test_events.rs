@@ -1,11 +1,9 @@
-//! Test-only capture of the tracing events a closure emits, with each
-//! event's level, for the tests that pin what default-level events may
-//! carry (ADR-0040, amended 2026-11-08).
+//! Test-only capture of tracing events, for the tests that pin what
+//! default-level events may carry (ADR-0040).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// One captured event: its level and every field, the message among them.
 #[derive(Debug)]
 pub(crate) struct LoggedEvent {
     pub(crate) level: tracing::Level,
@@ -18,7 +16,6 @@ impl LoggedEvent {
         self.level <= tracing::Level::INFO
     }
 
-    /// Every field value, joined, for a marker search.
     pub(crate) fn text(&self) -> String {
         self.fields.values().cloned().collect::<Vec<_>>().join(" ")
     }

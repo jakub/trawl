@@ -10,30 +10,7 @@
 //! tracing events that flow through the [`WalLayer`] into parquet, providing
 //! an audit trail even though fleet-admin has no WAL subscriber.
 //!
-//! Under ADR-0006 a role name alone says nothing durable about capability:
-//! `fleet-admin roles add-perm` mutates what a role grants without touching
-//! any key. So the snapshot covers *both* sides of the grant: each key's role
-//! set and each role's `(app, permission)` bundle plus `rate_rpm`. Every event
-//! that names a key also carries its roles and the permissions they resolve
-//! to in the role catalog of the same poll. That is the catalog the poll
-//! observed, not proof of what the key could do at the instant of a change:
-//! a role edited and a key revoked between two polls both land in one poll.
-//!
-//! The trail reports observed changes, not reconstructed history (ADR-0004,
-//! 2026-11-06 amendment). Each poll diffs the fetched state against the last
-//! whole snapshot and reports the differences in a fixed reporting order:
-//! role-catalog events first, then keys in ascending id order (see [`diff`]).
-//! That order is not the order the mutations happened in. Several mutations
-//! between two polls collapse into one difference, and the poll cannot tell
-//! which came first.
-//!
-//! The first snapshot is the baseline: the task emits nothing for the state
-//! it finds there and does not replay history. A failed first snapshot is
-//! retried every interval until one succeeds. If any attempt failed, the
-//! task logs `audit_gap` with the unaudited window before `audit_start`.
-//! Changes made before the baseline, inside that window included, are not
-//! backfilled. A failed later poll keeps the last whole snapshot, so the
-//! next successful poll reports what changed since it.
+//! The trail reports observed changes, not reconstructed history (ADR-0004).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -49,11 +26,6 @@ mod test_hooks;
 pub use test_hooks::{AuditHold, AuditHooks, INJECTED_ERROR_TEXT, Point, Step};
 
 /// Spawn the key audit polling task.
-///
-/// Polls the `KeyStore` every `interval` for key and role changes and emits
-/// tracing events. Returns a `JoinHandle` for shutdown coordination: the task
-/// ends with `audit_stop` once `shutdown` holds `true` or its sender is gone,
-/// including while the first snapshot is still being retried.
 pub fn spawn_audit_task(
     key_store: KeyStore,
     interval: Duration,
@@ -166,10 +138,6 @@ impl Audit {
 
     /// Take the first snapshot, retrying every `interval` until it succeeds.
     /// `None` means shutdown came first.
-    ///
-    /// A recovery after failed attempts logs `audit_gap`: the window from
-    /// the first attempt to the accepted baseline is unaudited, and nothing
-    /// reconstructs it.
     async fn baseline(&self, shutdown: &mut watch::Receiver<bool>) -> Option<Snapshot> {
         // Before the first await: a change made from here on, before a fetch
         // succeeds, is in no snapshot the diff ever compares.
@@ -207,8 +175,6 @@ impl Audit {
         }
     }
 
-    /// Fetch the current keystore state. Both reads must succeed for the
-    /// caller to get anything, so a poll never diffs half a snapshot.
     #[cfg_attr(
         not(any(test, feature = "test-support")),
         expect(unused_variables, reason = "phase selects test hooks only")
@@ -245,7 +211,6 @@ impl Audit {
         Ok((keys, roles))
     }
 
-    /// Sleep one interval.
     #[cfg_attr(
         not(any(test, feature = "test-support")),
         expect(unused_variables, reason = "phase selects test hooks only")
@@ -265,7 +230,6 @@ async fn stopped(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|stop| *stop).await;
 }
 
-/// Run `work` unless shutdown comes first, in which case `None`.
 async fn unless_stopped<T>(
     shutdown: &mut watch::Receiver<bool>,
     work: impl Future<Output = T>,
@@ -285,27 +249,23 @@ fn log_stop() {
     );
 }
 
-/// State tracked per key for change detection.
 struct KeySnapshot {
     active: bool,
     /// Role names held by the key, sorted (as `list_keys` returns them).
     roles: Vec<String>,
 }
 
-/// State tracked per role for change detection: what the role actually grants.
 struct RoleSnapshot {
     rate_rpm: Option<u32>,
     /// `app:permission` strings, sorted and deduped.
     permissions: Vec<String>,
 }
 
-/// Both halves of the grant model, as of one poll.
 struct Snapshot {
     keys: HashMap<i64, KeySnapshot>,
     roles: BTreeMap<String, RoleSnapshot>,
 }
 
-/// Render a role's bundle as sorted, deduped `app:permission` strings.
 fn permission_strings(role: &Role) -> Vec<String> {
     let mut perms: Vec<String> = role
         .permissions
@@ -317,8 +277,6 @@ fn permission_strings(role: &Role) -> Vec<String> {
     perms
 }
 
-/// Resolve a key's role names against the role catalog: the union of every
-/// permission its roles grant, sorted and deduped.
 fn effective_permissions(
     roles: &[String],
     catalog: &BTreeMap<String, RoleSnapshot>,
@@ -333,7 +291,6 @@ fn effective_permissions(
     perms
 }
 
-/// Collapse fetched state into the diffable snapshot.
 fn snapshot_of(keys: &[ApiKeyInfo], roles: &[Role]) -> Snapshot {
     Snapshot {
         keys: keys
@@ -363,10 +320,6 @@ fn snapshot_of(keys: &[ApiKeyInfo], roles: &[Role]) -> Snapshot {
     }
 }
 
-/// One audit event, as the diff of two snapshots reports it.
-///
-/// Each variant is one `event_type`. [`emit`] turns it into the tracing event
-/// the WAL records.
 #[derive(Debug, Clone, PartialEq)]
 enum AuditEvent {
     RoleCreated {
@@ -416,14 +369,6 @@ enum AuditEvent {
 
 /// The events one poll observes between `prev` and the fetched state, and
 /// the snapshot that replaces `prev` once they are emitted.
-///
-/// Role-catalog events come first, then each key in ascending id order:
-/// `key_created` when the key is new, `key_roles_changed` when `prev` holds
-/// it with other roles, and `key_revoked` when it is inactive and was new or
-/// active in `prev`. The three checks are independent, so a key first seen
-/// inactive reports created then revoked, and a revoke never hides a role
-/// change. A key missing from the fetch reports nothing, and so does a key
-/// that turns active again.
 fn diff(prev: &Snapshot, keys: &[ApiKeyInfo], roles: &[Role]) -> (Vec<AuditEvent>, Snapshot) {
     let current = snapshot_of(keys, roles);
     let mut events = diff_roles(&prev.roles, &current.roles);
@@ -696,8 +641,6 @@ mod tests {
         }
     }
 
-    /// The events of one poll from `prev_keys` to `keys`, over an unchanged
-    /// role catalog.
     fn events(prev_keys: &[ApiKeyInfo], keys: &[ApiKeyInfo]) -> Vec<AuditEvent> {
         let prev = snapshot_of(prev_keys, &catalog());
         diff(&prev, keys, &catalog()).0

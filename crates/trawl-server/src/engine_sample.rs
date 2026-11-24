@@ -3,24 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The engine sample: what the `duckdb` health check reads (ADR-0056).
-//!
-//! One diagnostic connection, cloned from the query database, sits outside
-//! the executor pool: it takes no permit and never appears in the query
-//! listing. A dedicated OS thread, not tokio's blocking pool, owns it and
-//! runs `SELECT 1` on it every [`SAMPLE_INTERVAL`], so a blocking pool full
-//! of query work cannot starve the sample. A second thread watches each
-//! probe: when one runs past [`SAMPLE_BUDGET`] it publishes the overrun at
-//! once and interrupts the probe. The probe loop is sequential, so no new
-//! probe starts until the interrupted one returns. An answer counts as a
-//! success only if the probe's own elapsed time is within the budget, so a
-//! watchdog that runs late cannot let a late answer pass as on time. The
-//! diagnostic connection shares the query database's budgets, so a probe
-//! can find them full while queries hold them; that reads as an overrun
-//! does, not as a broken engine.
-//!
-//! `/api/v1/health` only reads the latest sample ([`EngineSample::read`]).
-//! It never waits for a probe and never starts one, so no number of health
-//! requests, and no state of the executor pool, makes `DuckDB` work.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -28,36 +10,20 @@ use std::time::{Duration, Instant};
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::DiagnosticConnection;
 
-/// How often the sampler starts a probe. A probe that runs into the next
-/// start skips it: the next probe starts at the first start time after
-/// the late one returns.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How long one probe may run before it counts as past its budget and is
-/// interrupted.
 pub const SAMPLE_BUDGET: Duration = Duration::from_millis(250);
 
-/// How recent the latest within-budget success must be for the check to
-/// read anything but `error`.
 pub const SUCCESS_WINDOW: Duration = Duration::from_secs(60);
 
-/// What the `duckdb` health check reads from the latest engine sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineCheck {
-    /// The latest sample succeeded within its budget.
     Ok,
-    /// The latest sample ran past its budget or found the query budgets
-    /// full, and a sample succeeded within the last [`SUCCESS_WINDOW`].
-    /// Health reads `degraded`, 200.
     Slow,
-    /// The latest sample returned any other `DuckDB` error, or no sample
-    /// succeeded within the last [`SUCCESS_WINDOW`], or none has since
-    /// boot. Health reads `unavailable`, 503.
     Error,
 }
 
 impl EngineCheck {
-    /// The `duckdb` check's wire value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -68,27 +34,14 @@ impl EngineCheck {
     }
 }
 
-/// How the latest sample ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
-    /// `SELECT 1` answered within the budget.
     Succeeded,
-    /// The probe ran past the budget: it is still running, it answered
-    /// late, or it returned the interrupt the watchdog raised on it.
     Overran,
-    /// The probe found the query database's budgets full: `DuckDB` raised
-    /// `Out of Memory` on it. The diagnostic connection shares those
-    /// budgets with every query, and busy queries are not a broken engine
-    /// (ADR-0056), so this reads as an overrun does: `slow` while a
-    /// success is recent.
     Exhausted,
-    /// The probe returned a `DuckDB` error of its own, or the sampler
-    /// panicked.
     Failed,
 }
 
-/// The configuration a sampler runs on. Production uses
-/// [`SampleConfig::DEFAULT`]; tests shorten the periods.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SampleConfig {
     pub(crate) interval: Duration,
@@ -104,17 +57,14 @@ impl SampleConfig {
     };
 }
 
-/// Where the published sample's instants come from. The instants that
-/// [`EngineSample::read`] compares come from here, and so does the probe's
-/// own elapsed time, which decides whether its answer was within budget.
-/// The threads' own waits run on the monotonic clock, so a test can age the
-/// latest success without waiting a minute, and make a probe late without
-/// the watchdog seeing it.
+/// The instants [`EngineSample::read`] compares, and the probe's own
+/// elapsed time, come from here. The threads' own waits run on the monotonic
+/// clock, so a test can age the latest success without waiting a minute,
+/// and make a probe late without the watchdog seeing it.
 pub(crate) trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
 }
 
-/// The monotonic clock.
 #[derive(Debug)]
 pub(crate) struct MonotonicClock;
 
@@ -124,7 +74,6 @@ impl Clock for MonotonicClock {
     }
 }
 
-/// Stops one running probe from another thread.
 pub(crate) trait Interrupt: Send + Sync {
     fn interrupt(&self);
 }
@@ -135,17 +84,12 @@ impl Interrupt for duckdb::InterruptHandle {
     }
 }
 
-/// One probe the sampler thread owns and runs.
 pub(crate) trait Probe: Send + 'static {
-    /// Run the probe once, blocking until it answers.
     fn run(&mut self) -> Result<(), EngineError>;
 
-    /// A handle that stops [`Self::run`] from another thread.
     fn interrupt_handle(&self) -> Arc<dyn Interrupt>;
 }
 
-/// The production probe: `SELECT 1` on the diagnostic connection.
-///
 /// The connection holds the query scratch lock until it closes, so a
 /// sampler that outlives the pool keeps the directory its database spills
 /// into locked.
@@ -163,38 +107,29 @@ impl Probe for DiagnosticProbe {
     }
 }
 
-/// The probe the sampler thread is running right now.
 #[derive(Debug, Clone, Copy)]
 struct InFlight {
-    /// Which probe, counted from 1.
     number: u64,
     /// When it started, on the monotonic clock, for the watchdog's budget.
     started: Instant,
-    /// Whether the watchdog found it past its budget.
     overran: bool,
 }
 
-/// The sampler's state, under one lock shared by both threads and every
-/// reader.
 #[derive(Debug)]
 struct State {
-    /// How the latest sample ended, once one has ended or overrun.
     latest: Option<Outcome>,
     /// When the latest within-budget success answered, on the sample clock.
     last_success: Option<Instant>,
     /// When the latest probe started, on the sample clock; when the
     /// sampler started, before its first probe.
     latest_start: Instant,
-    /// The probe running now, if one is.
     in_flight: Option<InFlight>,
-    /// Probes started since the sampler started.
     probes_started: u64,
     /// Samples published, counting an overrun as one when it is found.
     published: u64,
     /// Set when the last handle drops or the sampler panicked: both
     /// threads leave at their next look.
     stopped: bool,
-    /// While set, the sampler thread starts no probe (test seam).
     #[cfg(any(test, feature = "test-support"))]
     held: bool,
 }
@@ -206,7 +141,6 @@ impl State {
     }
 }
 
-/// What both threads and every handle share.
 struct Shared {
     state: Mutex<State>,
     /// Signalled on every change to [`State`].
@@ -242,7 +176,6 @@ impl Shared {
             .0
     }
 
-    /// The `duckdb` check, read at `now` on the sample clock.
     fn check(&self, state: &State, now: Instant) -> EngineCheck {
         let recent = state
             .last_success
@@ -256,7 +189,6 @@ impl Shared {
     }
 }
 
-/// Stops both threads when the last [`EngineSample`] handle drops.
 struct Owner(Arc<Shared>);
 
 impl Drop for Owner {
@@ -273,8 +205,6 @@ impl Drop for Owner {
     }
 }
 
-/// The handle health and `/metrics` read the engine sample through.
-///
 /// Cheap to clone. When the last clone drops, the sampler stops: it
 /// interrupts a running probe and its threads exit on their own.
 #[derive(Clone)]
@@ -294,12 +224,6 @@ impl std::fmt::Debug for EngineSample {
 }
 
 impl EngineSample {
-    /// Start sampling the query database `pool` runs on, on a diagnostic
-    /// connection cloned from it.
-    ///
-    /// # Errors
-    /// The diagnostic connection could not be cloned, or a thread could
-    /// not be spawned.
     pub fn start(pool: &crate::pool::ExecutorPool) -> std::io::Result<Self> {
         let probe = DiagnosticProbe {
             connection: pool
@@ -309,10 +233,6 @@ impl EngineSample {
         Self::spawn(probe, SampleConfig::DEFAULT, Arc::new(MonotonicClock))
     }
 
-    /// Start a sampler over `probe`.
-    ///
-    /// # Errors
-    /// A thread could not be spawned.
     pub(crate) fn spawn(
         probe: impl Probe,
         config: SampleConfig,
@@ -354,8 +274,6 @@ impl EngineSample {
         })
     }
 
-    /// The `duckdb` check, from the latest sample. Never waits for a probe
-    /// and never starts one.
     #[must_use]
     pub fn read(&self) -> EngineCheck {
         let now = self.shared.clock.now();
@@ -382,7 +300,6 @@ impl EngineSample {
     }
 }
 
-/// The sampler thread: one probe at a time, every interval, until stopped.
 fn sample(shared: &Shared, mut probe: impl Probe) {
     let mut next = Instant::now();
     loop {
@@ -432,14 +349,8 @@ fn sample(shared: &Shared, mut probe: impl Probe) {
             flagged || answered.saturating_duration_since(started_at) >= shared.config.budget;
         let outcome = match &result {
             Ok(Ok(())) if !late => Outcome::Succeeded,
-            // A late answer, or the interrupt the watchdog raised on this
-            // probe for running past its budget: slow, not broken.
             Ok(Ok(())) => Outcome::Overran,
             Ok(Err(error)) if late && error.is_interrupt() => Outcome::Overran,
-            // The queries hold the budgets the probe shares with them:
-            // busy, not broken. No success either, so an engine they
-            // starve for good still reads `error` once the success window
-            // passes.
             Ok(Err(EngineError::ResourceExhausted)) => Outcome::Exhausted,
             Ok(Err(_)) | Err(_) => Outcome::Failed,
         };
@@ -463,7 +374,6 @@ fn sample(shared: &Shared, mut probe: impl Probe) {
             return;
         }
 
-        // Skip every start time the probe ran past.
         next = start + shared.config.interval;
         let now = Instant::now();
         while next <= now {
@@ -472,8 +382,6 @@ fn sample(shared: &Shared, mut probe: impl Probe) {
     }
 }
 
-/// The watchdog thread: publishes and interrupts a probe that runs past
-/// its budget, once per probe.
 fn watch(shared: &Shared) {
     let mut state = shared.lock();
     loop {
@@ -489,8 +397,6 @@ fn watch(shared: &Shared) {
             state = shared.wait_until(state, deadline);
             continue;
         }
-        // Still the same probe, past its budget: it is slow now, whatever
-        // it returns later.
         if let Some(running) = state.in_flight.as_mut() {
             running.overran = true;
         }
@@ -516,7 +422,6 @@ impl EngineSample {
         SampleHold(Arc::clone(&self.shared))
     }
 
-    /// Probes started since the sampler started.
     #[must_use]
     pub fn probes_started(&self) -> u64 {
         self.shared.lock().probes_started
@@ -558,7 +463,6 @@ impl EngineSample {
     }
 }
 
-/// Keeps a sampler from starting probes ([`EngineSample::hold`]).
 #[cfg(any(test, feature = "test-support"))]
 pub struct SampleHold(Arc<Shared>);
 
@@ -582,7 +486,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    /// A clock a test moves by hand.
     struct TestClock {
         base: Instant,
         offset: Mutex<Duration>,
@@ -607,24 +510,17 @@ mod tests {
         }
     }
 
-    /// What one scripted probe does when it runs.
     #[derive(Debug, Clone, Copy)]
     enum Step {
-        /// Answer at once.
         Answer,
-        /// Return a `DuckDB` error of its own.
         Fail,
-        /// Return `DuckDB`'s `Out of Memory`: the query database's budgets
-        /// were full when the probe needed some of them.
         Exhaust,
         /// Block until interrupted, then until the test releases it, then
         /// return the interrupt.
         Wedge,
-        /// Panic.
         Panic,
     }
 
-    /// The probe's side of the script, shared with the test.
     #[derive(Default)]
     struct Script {
         steps: Mutex<std::collections::VecDeque<Step>>,
@@ -719,7 +615,6 @@ mod tests {
         success_window: SUCCESS_WINDOW,
     };
 
-    /// Poll `cond` on the real clock, failing after a generous bound.
     fn until(what: &str, cond: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !cond() {
@@ -732,10 +627,6 @@ mod tests {
         sample.shared.lock().published
     }
 
-    /// The check reads off the latest sample and the latest success alone:
-    /// no sample yet is `error`; a success is `ok`; an overrun or an
-    /// exhausted budget after a success is `slow`; another `DuckDB` error
-    /// is `error`, even right after a success.
     #[test]
     fn engine_sample_maps_each_outcome_to_its_check() {
         let script = Script::new(&[], Step::Answer);
@@ -777,9 +668,6 @@ mod tests {
         );
     }
 
-    /// A first probe that answers reads `ok`, and a `DuckDB` error of the
-    /// probe's own reads `error` at once, right after that success. The
-    /// scripted probe runs on the sampler's own threads, end to end.
     #[test]
     fn engine_sample_reads_ok_then_error_on_a_duckdb_error() {
         let script = Script::new(&[Step::Answer], Step::Fail);
@@ -793,11 +681,6 @@ mod tests {
         assert_eq!(script.interrupts.load(Ordering::SeqCst), 0);
     }
 
-    /// A probe that finds the query budgets full reads `slow` right after a
-    /// success, not `error`: the diagnostic connection shares the query
-    /// database's memory and spill budgets, and exhausted budgets never
-    /// change the status (ADR-0056). It is no success either, so the
-    /// success before it stays the latest.
     #[test]
     fn engine_sample_reads_an_exhausted_budget_as_slow() {
         let script = Script::new(&[Step::Answer], Step::Exhaust);
@@ -821,9 +704,6 @@ mod tests {
         assert_eq!(script.interrupts.load(Ordering::SeqCst), 0);
     }
 
-    /// Sixty seconds of nothing but exhausted probes after one success turn
-    /// `slow` into `error`, as sixty seconds of overruns do: an engine the
-    /// queries starve for good still fails health.
     #[test]
     fn engine_sample_reads_error_after_sixty_seconds_of_exhausted_budgets() {
         let script = Script::new(&[Step::Answer], Step::Exhaust);
@@ -845,11 +725,6 @@ mod tests {
         assert_eq!(sample.read(), EngineCheck::Error, "60 s without success");
     }
 
-    /// A wedged probe: past its budget the check reads `slow` while it is
-    /// still running, the watchdog interrupts it exactly once, and no
-    /// second probe starts, across many intervals, until it returns. The
-    /// interrupt it then returns is the sampler's own doing and still
-    /// reads `slow`, not `error`. Once it returns, sampling resumes.
     #[test]
     fn engine_sample_interrupts_a_wedged_probe_and_starts_no_second() {
         let script = Script::new(&[Step::Answer, Step::Wedge], Step::Answer);
@@ -864,7 +739,6 @@ mod tests {
         });
         assert_eq!(sample.read(), EngineCheck::Slow, "slow while it runs");
         assert_eq!(sample.probes_started(), 2);
-        // Ten intervals and more: still the one probe, interrupted once.
         std::thread::sleep(FAST.interval * 10 + FAST.budget * 2);
         assert_eq!(sample.probes_started(), 2, "no second probe while one runs");
         assert_eq!(script.running.load(Ordering::SeqCst), 1);
@@ -923,12 +797,8 @@ mod tests {
         }
     }
 
-    /// A probe that answers past its budget is `slow`, and its answer is
-    /// no success, even when the watchdog has not flagged it yet: under
-    /// the CPU starvation `slow` describes, the watchdog thread can be the
-    /// one that runs late. The budget here is an hour of real time, so the
-    /// watchdog never fires; the probe's own elapsed time on the sample
-    /// clock is what runs past it. The success before it stays the latest.
+    /// The budget here is an hour of real time, so the watchdog never fires;
+    /// the probe's own elapsed time on the sample clock is what runs past it.
     #[test]
     fn engine_sample_judges_a_late_answer_by_its_own_elapsed_time() {
         const PATIENT: SampleConfig = SampleConfig {
@@ -965,10 +835,6 @@ mod tests {
         gate.release();
     }
 
-    /// Sixty seconds with no success turn `slow` into `error`, on the
-    /// injected clock: a probe that keeps overrunning after one success
-    /// reads `slow` for the first 60 s and `error` from then on, and the
-    /// age keeps growing while the wedged probe runs.
     #[test]
     fn engine_sample_reads_error_after_sixty_seconds_without_success() {
         let script = Script::new(&[Step::Answer], Step::Wedge);
@@ -993,8 +859,6 @@ mod tests {
         script.release();
     }
 
-    /// A success that is not recent enough reads `error` even when it is
-    /// the latest sample, as when the sampler has stopped.
     #[test]
     fn engine_sample_ages_out_a_stale_success() {
         let script = Script::new(&[], Step::Answer);
@@ -1012,8 +876,6 @@ mod tests {
         assert_eq!(sample.read(), EngineCheck::Error);
     }
 
-    /// A panic in the sampler publishes `error` and stops it: no probe
-    /// starts after it, and the check never recovers.
     #[test]
     fn engine_sample_panic_publishes_error_and_stops() {
         let script = Script::new(&[Step::Answer, Step::Panic], Step::Answer);
@@ -1029,8 +891,6 @@ mod tests {
         assert_eq!(sample.read(), EngineCheck::Error);
     }
 
-    /// Reading starts no probe: 50 concurrent readers, with the sampler
-    /// held so only a reader could start one, leave the count unchanged.
     #[test]
     fn engine_sample_reads_start_no_probe() {
         let script = Script::new(&[], Step::Answer);
@@ -1046,7 +906,6 @@ mod tests {
         assert_eq!(sample.probes_started(), started);
     }
 
-    /// Answers once, then runs a statement far past any budget.
     struct Endless {
         connection: DiagnosticConnection,
         answered: bool,
@@ -1066,10 +925,6 @@ mod tests {
         }
     }
 
-    /// The production probe on a real query database answers `ok`. Then a
-    /// probe on the same database whose statements run far past the
-    /// budget, after one success: the watchdog interrupts each, and the
-    /// interrupt `DuckDB` returns reads `slow`, not `error`.
     #[test]
     fn engine_sample_reads_duckdb_s_own_interrupt_as_slow() {
         let pool = crate::pool::ExecutorPool::for_test(String::new(), 1, 10, None).unwrap();
@@ -1097,8 +952,6 @@ mod tests {
         assert_eq!(sample.shared.lock().latest, Some(Outcome::Overran));
     }
 
-    /// Answers once, then runs a statement the query database's memory
-    /// limit cannot hold.
     struct Starved {
         connection: DiagnosticConnection,
         answered: bool,
@@ -1121,10 +974,8 @@ mod tests {
         }
     }
 
-    /// `DuckDB`'s own `Out of Memory` on the diagnostic connection of a
-    /// real query database reads `slow` after a success. The budget is
-    /// generous, so the probe fails within it and the watchdog never runs:
-    /// the exhausted budget alone is what reads `slow`.
+    /// The budget is generous, so the probe fails within it and the watchdog
+    /// never runs: the exhausted budget alone is what reads `slow`.
     #[test]
     fn engine_sample_reads_duckdb_s_own_out_of_memory_as_slow() {
         const PATIENT: SampleConfig = SampleConfig {

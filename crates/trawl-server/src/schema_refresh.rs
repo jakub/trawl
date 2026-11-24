@@ -2,31 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Background schema refresh job.
-//!
-//! Pre-computes per-service schema metadata from parquet file footers on a
-//! periodic interval. The `/api/v1/schema/services` endpoint is a pure cache
-//! read — no query execution or file I/O on the request path.
-//!
-//! Per-column statistics are read from parquet footers in safe Rust (see
-//! [`trawl_engine::parquet_stats`]) rather than via `DuckDB`'s
-//! `parquet_metadata()` table function, which can `SIGSEGV` on some files and
-//! take the whole daemon down. Because the footer reader turns a poisoned file
-//! into a catchable [`Err`] rather than an uncatchable crash, a bad file is
-//! simply skipped for that pass and retried on the next one — no daemon death,
-//! no persistent quarantine to drift out of sync. The skip is logged loudly so
-//! the offending file can be identified, deduplicated across passes (via the
-//! `warned` set) so a persistently-broken file doesn't spam the log every tick.
-//!
-//! The same tick also reloads the degraded-field snapshot the query path
-//! stamps its incomplete-results notice from and `/schema/services` stamps
-//! its per-service badge from (ADR-0011) — the one part of this job that
-//! reads postgres, and the reason the "footer stats need neither postgres
-//! nor `DuckDB`" claim above covers the schema half only. That half is a
-//! single query on a healthy install; the attribution read behind it runs
-//! only once something is actually degraded.
-//!
-//! Follows the same pattern as [`crate::monitor::spawn_snapshot_collector`].
+//! Per-column statistics are read from parquet footers in safe Rust rather
+//! than via `DuckDB`'s `parquet_metadata()` table function, which can
+//! `SIGSEGV` on some files and take the whole daemon down. A bad file is
+//! skipped for that pass and retried on the next one.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -42,24 +21,14 @@ use trawl_engine::parquet_stats::{self, StatsAccumulator};
 use crate::catalog::FieldCatalog;
 use crate::state::{AppState, CachedServiceSchema, DegradedSnapshot};
 
-/// Spawn the background schema refresh task.
-///
-/// Runs immediately on startup, then repeats on `schema_cache_ttl_secs`
-/// interval. Results are stored in `state.query.service_schema_cache`.
 pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
         let ttl = Duration::from_secs(state.query.schema_cache_ttl_secs);
         let mut interval = tokio::time::interval(ttl);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Files skipped (unreadable) on the previous pass, so we log each newly
-        // broken file once rather than every tick. Shared with the blocking
-        // refresh closure; lives for the process. `warned_unpinned` plays the
-        // same role for columns with no catalog pin.
         let warned: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
         let warned_unpinned: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        // Types come from the in-process pin cache — the schema half needs
-        // neither postgres nor DuckDB (ADR-0009).
         let catalog = Arc::clone(&state.query.field_catalog);
 
         loop {
@@ -112,35 +81,13 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
     })
 }
 
-/// Reload the degraded-field snapshot and publish the gauge (ADR-0011).
+/// Runs on every node, ingesting or not: a query-only node serves both the
+/// notice and the badge.
 ///
-/// Runs on every node, ingesting or not: the notice is stamped by the query
-/// path and the badge by `/schema/services`, and a query-only node serves
-/// both.
-///
-/// Two reads, one generation, and — when there is anything to attribute —
-/// one postgres snapshot: [`crate::store::CatalogStore::degraded_snapshot`]
-/// runs both under a single `REPEATABLE READ` transaction, so a repin
-/// clearing a field's evidence between them cannot publish a generation
-/// whose notice stands while its badges are gone. A healthy install pays
-/// one query: the degraded set is empty, so no second read and no
-/// transaction happen at all.
-///
-/// The attribution read is keyed on that (pin-capped) set and on the service
-/// names the schema cache can currently render, so neither axis can widen it
-/// into a scan of a table whose service axis is client-chosen. A tick whose
-/// service cache has not filled yet (boot) passes an empty service list and
-/// publishes an unattributed generation — one tick of missing badges,
-/// accepted.
-///
-/// A store error keeps the entire previous snapshot rather than clearing it,
-/// and never publishes a half-built one. An empty set on a postgres blip
-/// would silently un-badge every degraded field on the install for as long
-/// as the blip lasts, which is the one failure mode a notice must not have;
-/// and a snapshot with fields but no pairs is worse than stale, since it
-/// would un-badge every service while leaving the notice standing. The gauge
-/// is left alone for the same reason: it would otherwise read as a fixed
-/// catalog.
+/// A store error keeps the entire previous snapshot rather than clearing it.
+/// An empty set on a postgres blip would silently un-badge every degraded
+/// field on the install for as long as the blip lasts. The gauge is left
+/// alone for the same reason.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; the pin cap is exact
 pub async fn refresh_degraded_fields(state: &AppState) {
     // Taken before the await: the schema cache is a sync mutex, and it is
@@ -176,21 +123,12 @@ pub async fn refresh_degraded_fields(state: &AppState) {
     *state.query.degraded_fields.lock() = Arc::new(DegradedSnapshot::new(degraded, pairs));
 }
 
-/// Collected metadata for a single parquet file.
 struct FileInfo {
     path: PathBuf,
     size: u64,
     date: Option<String>,
 }
 
-/// Perform the full service schema refresh.
-///
-/// Walks the parquet files under the data root `base`, groups them by
-/// service, then for each service reads parquet footers for column stats
-/// and row counts; column types come from `catalog` (the in-process pin
-/// cache — no `DuckDB`, no postgres). `warned` carries the
-/// set of files that failed to read on the previous pass so each break is
-/// logged once; `warned_unpinned` does the same for columns with no pin.
 fn refresh_service_schema(
     base: &Path,
     warned: &Mutex<HashSet<PathBuf>>,
@@ -201,14 +139,11 @@ fn refresh_service_schema(
         return Ok(Vec::new());
     }
 
-    // Files we'd already warned about (snapshot of last pass), and the files we
-    // skip this pass — used to log each newly-broken file exactly once.
     let prev_warned = warned.lock().clone();
     let mut skipped_now: HashSet<PathBuf> = HashSet::new();
 
     let entries = crate::metrics::walk_parquet_files(base)?;
 
-    // Group files by service, collecting per-file metadata.
     let mut by_service: BTreeMap<String, Vec<FileInfo>> = BTreeMap::new();
 
     for (path, size) in entries {
@@ -240,11 +175,6 @@ fn refresh_service_schema(
         ));
     }
 
-    // Warn once per newly-unpinned column (deduped across passes, like the
-    // unreadable-file skips): an unpinned column can only arise from
-    // foreign/boot-skipped parquet — the condition `catalog_conform_skip` /
-    // `catalog_conform_incomplete` already flags — or transiently during the
-    // boot-conformance window, where it self-heals next tick.
     {
         let prev_unpinned = warned_unpinned.lock().clone();
         let newly: Vec<&String> = unpinned_now.difference(&prev_unpinned).collect();
@@ -259,18 +189,11 @@ fn refresh_service_schema(
         *warned_unpinned.lock() = unpinned_now;
     }
 
-    // Remember this pass's skips: files that recovered drop out of the set, so a
-    // future re-break is logged again.
     *warned.lock() = skipped_now;
 
     Ok(result)
 }
 
-/// Build schema for a single service from its file list.
-///
-/// `prev_warned` is the read-only set of files already logged as broken;
-/// `skipped_now` accumulates the files skipped this pass; `unpinned_now`
-/// accumulates columns seen without a catalog pin.
 fn build_service_schema(
     service: &str,
     files: &[FileInfo],
@@ -279,14 +202,8 @@ fn build_service_schema(
     unpinned_now: &mut HashSet<String>,
     catalog: &FieldCatalog,
 ) -> ServiceSchema {
-    // Aggregate file-level metadata. `daily_counts` is seeded with every date
-    // seen in the directory tree (so a date whose only files are skipped this
-    // pass still appears, with a count of 0) and filled with exact per-file row
-    // counts from the footers below.
-    //
-    // Note: a parquet file directly under `base` with no YYYY-MM-DD ancestor
-    // contributes to `total_events` but not to any daily bucket — the two
-    // totals can legitimately diverge for date-less files.
+    // A parquet file with no YYYY-MM-DD ancestor contributes to `total_events`
+    // but not to any daily bucket.
     let mut dates: BTreeSet<String> = BTreeSet::new();
     let mut total_bytes: u64 = 0;
     let mut daily_counts: BTreeMap<String, u64> = BTreeMap::new();
@@ -303,9 +220,6 @@ fn build_service_schema(
     let earliest_date = dates.iter().next().cloned();
     let latest_date = dates.iter().next_back().cloned();
 
-    // Read per-column stats + row counts from each file's footer (pure Rust, no
-    // DuckDB). An unreadable file (corrupt, truncated, or caught mid-write) is a
-    // catchable `Err`, never a crash: skip it this pass and retry next time.
     let mut acc = StatsAccumulator::default();
     for f in files {
         match parquet_stats::read_file_stats(&f.path) {
@@ -316,9 +230,6 @@ fn build_service_schema(
                 acc.add_file(stats);
             }
             Err(e) => {
-                // Log once per break (the file wasn't already on the warned
-                // list), so a persistently-broken file doesn't spam every tick.
-                //
                 // A footer error quotes the parquet crate's text, so the
                 // text goes to DEBUG; only an open failure has a typed cause.
                 if !prev_warned.contains(&f.path) {
@@ -350,11 +261,6 @@ fn build_service_schema(
     let total_events = acc.total_rows();
     let column_stats = acc.finish();
 
-    // Columns are driven by the footer stats accumulator (the union of every
-    // column name across the service's files) and typed by the catalog pin;
-    // no DuckDB DESCRIBE runs here (ADR-0009). A physically-present column
-    // with no pin reports the UNPINNED sentinel: it can only arise from
-    // foreign or boot-skipped parquet.
     let mut columns: Vec<ServiceColumnStats> = column_stats
         .iter()
         .map(|cs| {
@@ -399,7 +305,6 @@ fn build_service_schema(
     }
 }
 
-/// Walk ancestors of a path looking for a YYYY-MM-DD directory component.
 fn find_date_ancestor(path: &Path) -> Option<String> {
     for ancestor in path.ancestors().skip(1) {
         if let Some(name) = ancestor.file_name().and_then(|n| n.to_str())
@@ -415,7 +320,6 @@ fn find_date_ancestor(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A DuckDB-written parquet under `<base>/<date>/<service>.parquet`.
     fn write_service_parquet(base: &Path, date: &str, service: &str, select: &str) -> PathBuf {
         let dir = base.join(date);
         std::fs::create_dir_all(&dir).unwrap();
@@ -449,7 +353,6 @@ mod tests {
 
         let warned = Mutex::new(HashSet::new());
         let warned_unpinned = Mutex::new(HashSet::new());
-        // With and without a trailing separator.
         for root in [root.clone(), root.join("")] {
             let services =
                 refresh_service_schema(&root, &warned, &warned_unpinned, &empty_catalog()).unwrap();
@@ -460,10 +363,6 @@ mod tests {
 
     #[test]
     fn catalog_pin_wins_over_footer_type_while_stats_stay_footer_true() {
-        // A catalog pin that disagrees with the file's physical type —
-        // DuckDB writes `VALUES (200)` as INTEGER, the pin says BIGINT —
-        // must be reported as the catalog type, while null/min/max/byte
-        // stats still match the footers. No DuckDB DESCRIBE runs at all.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         write_service_parquet(
@@ -497,10 +396,6 @@ mod tests {
 
     #[test]
     fn severity_pin_reports_the_catalog_spelling_not_the_physical_one() {
-        // `_severity` is SEVERITY on the wire and BIGINT on disk (ADR-0013):
-        // this endpoint is the one place a non-injective pin is rendered,
-        // so pin the semantic spelling. Reverting to the physical type
-        // would expose `_severity` as BIGINT here.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         write_service_parquet(
@@ -535,10 +430,6 @@ mod tests {
 
     #[test]
     fn unpinned_column_reports_unpinned_with_stats() {
-        // A physically-present column with no pin can only arise from
-        // foreign/boot-skipped parquet (catalog_conform_incomplete already
-        // flags that condition). It reports the sentinel type, keeps its
-        // stats, and is warn-logged once — not silently dropped.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         write_service_parquet(
@@ -565,8 +456,6 @@ mod tests {
 
     #[test]
     fn columns_follow_field_display_rank() {
-        // Envelope columns lead, custom columns follow alphabetically,
-        // mirroring query-result ordering.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         write_service_parquet(
@@ -615,7 +504,6 @@ mod tests {
         let nginx = services.iter().find(|s| s.name == "nginx").unwrap();
         assert_eq!(nginx.file_count, 2);
         assert_eq!(nginx.total_events, 5);
-        // Exact per-day counts from footer row counts, not a size estimate.
         let day0 = nginx
             .daily_event_counts
             .iter()
@@ -645,33 +533,26 @@ mod tests {
             "good",
             "SELECT * FROM (VALUES (1)) t(n)",
         );
-        // A bogus ".parquet" that the footer reader will reject.
         let bad = base.join("2026-06-20").join("bad.parquet");
         std::fs::write(&bad, b"not parquet at all").unwrap();
 
-        // Refresh succeeds despite the bad file...
         let warned = Mutex::new(HashSet::new());
         let warned_unpinned = Mutex::new(HashSet::new());
         let services =
             refresh_service_schema(base, &warned, &warned_unpinned, &empty_catalog()).unwrap();
         assert!(services.iter().any(|s| s.name == "good"));
 
-        // ...the bad file's service has zero events (it was skipped)...
         let bad_svc = services.iter().find(|s| s.name == "bad").unwrap();
         assert_eq!(bad_svc.total_events, 0);
 
-        // ...the skip is recorded for log-dedup across passes...
         assert!(warned.lock().contains(&bad));
 
-        // ...and no persistent quarantine/marker artifact is written to disk.
         assert!(!base.join(".trawl-schema-quarantine").exists());
         assert!(!base.join(".trawl-schema-refresh.inflight").exists());
     }
 
     #[test]
     fn recovered_file_is_picked_up_next_pass() {
-        // A file that fails one pass but reads on the next must not be lost
-        // permanently: a skip lasts one pass, it is not a quarantine.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         let svc = base.join("2026-06-20").join("svc.parquet");
@@ -682,13 +563,11 @@ mod tests {
         let warned_unpinned = Mutex::new(HashSet::new());
         let catalog = empty_catalog();
 
-        // Pass 1: file is garbage → skipped, zero events, recorded in warned.
         let pass1 = refresh_service_schema(base, &warned, &warned_unpinned, &catalog).unwrap();
         let svc1 = pass1.iter().find(|s| s.name == "svc").unwrap();
         assert_eq!(svc1.total_events, 0);
         assert!(warned.lock().contains(&svc));
 
-        // The file becomes valid (e.g. compaction finished writing it).
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(&format!(
             "COPY (SELECT * FROM (VALUES (1), (2)) t(n)) TO '{}' (FORMAT PARQUET)",
@@ -696,7 +575,6 @@ mod tests {
         ))
         .unwrap();
 
-        // Pass 2: it reads cleanly and its rows are counted; warned set clears.
         let pass2 = refresh_service_schema(base, &warned, &warned_unpinned, &catalog).unwrap();
         let svc2 = pass2.iter().find(|s| s.name == "svc").unwrap();
         assert_eq!(svc2.total_events, 2);

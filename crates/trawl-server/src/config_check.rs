@@ -3,18 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `trawld --check-config`: the local configuration checks.
-//!
-//! These checks read the configuration and path metadata only. They connect
-//! to nothing and create nothing. `trawld --check-config` runs them on a
-//! file it loads, the normal boot runs the file-log validators before it
-//! opens the log, and `trawld --doctor` runs [`check_loaded`] on a file it
-//! read through its own bounded reader, so the three agree on what a valid
-//! configuration is.
-//!
-//! After the file parses, [`check_loaded`] checks `server.log_file`, the
-//! Fleet and app-state database URLs, the ingest derivation settings and
-//! the syslog peer settings (zones, peer-keyed maps and `allow_cidrs`), the
-//! last two through the same resolvers boot runs.
 
 use std::path::{Path, PathBuf};
 
@@ -22,36 +10,18 @@ use trawl_config::STORAGE_MARKERS;
 
 use crate::config::{Config, ConfigError};
 
-/// Validate local configuration only. Database URLs are required, but no
-/// network connectivity, credentials, or stored data contents are inspected.
-/// File-log validation reads path metadata to detect marker aliases.
-///
-/// # Errors
-/// The first check that refuses the file, with the text `--check-config`
-/// prints.
 pub fn check_config(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_file(path)?;
     check_loaded(&config)?;
     Ok(())
 }
 
-/// A loaded configuration that the checks after parsing refuse.
-///
-/// Its `Display` is the text `--check-config` prints for that refusal. The
-/// doctor matches on the variant and never shows the text.
 #[derive(Debug)]
 pub enum LoadedFault {
-    /// `server.log_file` aliases a reserved storage marker, or could not be
-    /// resolved.
     LogFile(std::io::Error),
-    /// No Fleet database URL is set.
     FleetUrl(ConfigError),
-    /// No app-state database URL is set.
     AppUrl(ConfigError),
-    /// The ingest derivation settings do not resolve.
     Ingest,
-    /// The syslog peer settings do not resolve, whether or not the
-    /// listener is enabled.
     Syslog(crate::syslog::SyslogPeerFault),
 }
 
@@ -70,10 +40,6 @@ impl std::fmt::Display for LoadedFault {
 
 impl std::error::Error for LoadedFault {}
 
-/// The checks `--check-config` runs after the file parses, in its order.
-///
-/// # Errors
-/// The first check that refuses the configuration.
 pub fn check_loaded(config: &Config) -> Result<(), LoadedFault> {
     validate_file_log_config(config).map_err(LoadedFault::LogFile)?;
     config
@@ -90,24 +56,15 @@ pub fn check_loaded(config: &Config) -> Result<(), LoadedFault> {
     Ok(())
 }
 
-/// What a [`LoadedFault::LogFile`] error proves about the destination, for
-/// a caller that reports the refusal without its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFileRefusal {
-    /// It is, or resolves to, a reserved storage marker.
     MarkerOverlap,
-    /// Its path can name no file: a component is not a directory, a name is
-    /// too long, or the symlinks loop.
     Invalid,
-    /// The running user may not inspect a path on the way.
     PermissionDenied,
-    /// Inspecting it failed for another reason, which proves nothing about
-    /// the destination.
     Unobserved,
 }
 
 impl LogFileRefusal {
-    /// Classify an error from [`validate_file_log_config`].
     #[must_use]
     pub fn of(error: &std::io::Error) -> Self {
         use std::io::ErrorKind;
@@ -143,10 +100,6 @@ fn is_symlink_loop(kind: std::io::ErrorKind) -> bool {
     }
 }
 
-/// The refusal of a log path that is a reserved storage marker, carried in
-/// the `io::Error` so [`LogFileRefusal::of`] can tell it from a failure to
-/// inspect. `Display` and `Debug` are the message's own, as a `String`
-/// payload's are, so what boot and `--check-config` print is unchanged.
 struct MarkerOverlap(String);
 
 impl std::fmt::Display for MarkerOverlap {
@@ -163,11 +116,6 @@ impl std::fmt::Debug for MarkerOverlap {
 
 impl std::error::Error for MarkerOverlap {}
 
-/// Refuse a `server.log_file` that aliases a reserved storage marker, when
-/// the file logger is the one in use (internal telemetry off).
-///
-/// # Errors
-/// The first alias or resolution failure found.
 pub fn validate_file_log_config(config: &Config) -> std::io::Result<()> {
     if !config.internal_telemetry_enabled()
         && let Some(path) = &config.server.log_file
@@ -229,11 +177,6 @@ fn marker_log_error(marker: &Path) -> std::io::Error {
     )
 }
 
-/// Resolve `path` without creating anything and refuse it when it aliases
-/// a reserved storage marker under `data_root`.
-///
-/// # Errors
-/// An alias, or a resolution failure naming the path.
 pub fn validate_log_destination(path: &Path, data_root: &Path) -> std::io::Result<PathBuf> {
     let with_context = |error: std::io::Error| {
         std::io::Error::new(
@@ -270,11 +213,6 @@ pub fn validate_log_destination(path: &Path, data_root: &Path) -> std::io::Resul
     Ok(resolved)
 }
 
-/// Refuse an opened or existing file that is one of the reserved storage
-/// markers under `data_root`, by device and inode.
-///
-/// # Errors
-/// The marker it aliases, or a marker that could not be inspected.
 #[cfg(unix)]
 pub fn validate_log_identity(
     metadata: &std::fs::Metadata,
@@ -357,9 +295,6 @@ mod tests {
         );
     }
 
-    /// A marker refusal prints exactly as the `String` error it replaced,
-    /// through `Display` and through `Debug` (what `main`'s `Termination`
-    /// prints), and only it classifies as a marker overlap.
     #[test]
     fn marker_refusals_print_as_before_and_classify_apart() {
         let typed = marker_log_error(Path::new("/srv/trawl/data/EPOCH"));
@@ -373,14 +308,9 @@ mod tests {
         assert_eq!(format!("{boxed:?}"), format!("{boxed_plain:?}"));
         assert_eq!(format!("{boxed}"), format!("{boxed_plain}"));
         assert_eq!(LogFileRefusal::of(&typed), LogFileRefusal::MarkerOverlap);
-        // An `EINVAL`, such as `readlink` on a link replaced after `lstat`,
-        // proves nothing.
         assert_eq!(LogFileRefusal::of(&plain), LogFileRefusal::Unobserved);
     }
 
-    /// Each refusal the validator produces classifies by what it proves:
-    /// an overlap and a path that can name no file are invalid, a denied
-    /// traversal and any other failure to inspect are not.
     #[cfg(unix)]
     #[test]
     fn log_file_refusals_classify_by_what_they_prove() {
@@ -399,8 +329,6 @@ mod tests {
         assert_eq!(of(&file.join("log"), &data), LogFileRefusal::Invalid);
         let cycle = tmp.path().join("cycle");
         symlink("cycle", &cycle).unwrap();
-        // The resolver's own link limit, and the kernel's ELOOP from a loop
-        // on the way to the last component.
         assert_eq!(of(&cycle, &data), LogFileRefusal::Invalid);
         assert_eq!(
             of(&cycle.join("server.log"), &data),

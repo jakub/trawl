@@ -4,17 +4,6 @@
 
 //! `POST /api/v1/ingest/preview`: canonicalize a sample exactly as
 //! `POST /api/v1/ingest` would, and store nothing of it (ADR-0049).
-//!
-//! The preview is a second consumer of the one parse-and-canonicalize step
-//! in [`super::body`]. It builds the same [`HttpRequestContext`] real ingest
-//! builds, from the given `peer_ip` or the documentation placeholder, and
-//! turns each visited outcome into its wire report, in input order.
-//!
-//! What it never does is the point of the route: it takes no free-space,
-//! reservation or publication step, writes no WAL, publishes nothing,
-//! touches no counter or metric label, and logs nothing. Reject messages
-//! quote sample values, so they go to the caller and nowhere else.
-//! `tests/ingest_preview_touches_nothing.rs` holds this file to that.
 
 use std::net::IpAddr;
 use std::ops::ControlFlow;
@@ -52,18 +41,6 @@ pub struct PreviewParams {
     pub peer_ip: Option<String>,
 }
 
-/// `POST /api/v1/ingest/preview` — the per-event report for a sample.
-///
-/// The route's refusals, in the order they are checked, after
-/// authentication, the trawl grant and the rate limit: a key without
-/// `server_manage` is 403, before any of the body is read; a body past
-/// `[server] max_request_body_bytes` is 413 `request_too_large`;
-/// a `Content-Encoding` other than `identity` is 415, before the body is
-/// read as anything; a bad query string or `peer_ip` is 400; a framing
-/// error is 400 (the shared step's own); more than
-/// [`MAX_PREVIEW_EVENTS`] non-blank positions is 413 `preview_too_large`.
-/// An all-rejected sample is a 200.
-///
 /// The report's blocking task holds the sample, so it keeps the request's
 /// count until it ends, even after the client hangs up (ADR-0054).
 pub async fn preview(
@@ -89,8 +66,6 @@ pub async fn preview(
         ),
     };
 
-    // The same context real ingest builds: one arrival instant, the peer
-    // through `canonical_peer`, relay membership from server config.
     let request = HttpRequestContext::new(&state.ingest, peer);
     let count = request_limit::current();
     #[cfg(any(test, feature = "test-support"))]
@@ -111,8 +86,6 @@ pub async fn preview(
     .map(Json)
 }
 
-/// Whether every `Content-Encoding` coding is `identity` (or there is
-/// none). Anything else is refused, never decoded.
 fn identity_encoded(headers: &HeaderMap) -> bool {
     headers
         .get_all(header::CONTENT_ENCODING)
@@ -125,8 +98,6 @@ fn identity_encoded(headers: &HeaderMap) -> bool {
         })
 }
 
-/// Visit the sample and build the report, refusing it whole past the
-/// position limit.
 fn report(
     request: &HttpRequestContext,
     given: bool,
@@ -191,7 +162,6 @@ fn wire_derivation(derivation: &Derivation) -> PreviewDerivation {
     }
 }
 
-/// One visited position as its wire report.
 fn wire_event(position: EventReport<'_>, given: bool, derivation: &Derivation) -> PreviewEvent {
     let EventReport {
         index,

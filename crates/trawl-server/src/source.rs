@@ -3,16 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Source glob computation for parquet file selection.
-//!
-//! Narrows the `read_parquet()` source argument based on time filters
-//! and service names extracted from the DSL query, avoiding full-directory
-//! scans when possible.
-//!
-//! [`select`] computes the selection and [`compute_source`] renders it for
-//! `/query`. A capture (ADR-0057) reads the same selection for the same
-//! text, so it reads what `/query` of its recorded text reads, and
-//! [`selection_bytes`] measures the part of it that can hold the
-//! capture's window.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -34,16 +24,9 @@ use crate::env_dirs::{date_name, hour_name, parse_date, parse_hour};
 use crate::ingest::envelope::MAX_TIME_LEAD;
 
 /// How far before `now - N` a `last=N` walk over hour directories starts,
-/// in seconds: room for the `_time` lead ingest allows.
-///
-/// Compaction files a row in the hour directory of its own clock, at or
-/// after the row's arrival, and ingest replaces a `_time` more than
-/// [`MAX_TIME_LEAD`] after arrival (ADR-0008 and ADR-0013, amendments of
-/// 2026-11-08). So a row in hour directory H has a `_time` at most
-/// `MAX_TIME_LEAD` past the end of H, and a row the query matches sits in a
-/// directory no older than the hour of `now - N - MAX_TIME_LEAD`. A delayed
-/// compaction only moves a row into a later directory, which the walk to
-/// `now` covers. One hour is more than the bound needs: it keeps rows
+/// in seconds: room for the `_time` lead ingest allows (ADR-0008, ADR-0013).
+/// A row in hour directory H has a `_time` at most `MAX_TIME_LEAD` past the
+/// end of H. One hour is more than the bound needs: it keeps rows
 /// stored before the bound, with a lead under an hour, visible.
 const TIME_FILTER_PADDING_SECS: u64 = 3600;
 const _: () = {
@@ -51,24 +34,17 @@ const _: () = {
     assert!(MAX_TIME_LEAD.num_seconds() <= TIME_FILTER_PADDING_SECS.cast_signed());
 };
 
-/// The file pattern that selects every service's file in a directory.
 const ANY_SERVICE: &str = "*.parquet";
 
-/// Which service files a selection reads in each of its directories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Services {
-    /// Every service's file: [`ANY_SERVICE`].
     Any,
-    /// Only these services' files, `{service}.parquet` each, in name
-    /// order. Empty when the search stage is a contradiction
-    /// (`service=a service=b`), so no stored file can match. Only
-    /// [`service_pins`] builds it.
+    /// Only these services' files, in name order. Empty when the search stage
+    /// is a contradiction (`service=a service=b`), so no stored file can match.
     Only(BTreeSet<String>),
 }
 
 impl Services {
-    /// The file pattern of each service file, in the order a source lists
-    /// them within a directory: none for the empty set.
     fn file_patterns(&self) -> Vec<String> {
         match self {
             Self::Any => vec![ANY_SERVICE.to_owned()],
@@ -83,31 +59,16 @@ impl Services {
 const MAX_PINNED_SERVICES: usize = 32;
 
 /// How deep in parenthesised groups a `service=` filter can sit and still
-/// pin. The walk recurses once per level. The parser refuses a search
-/// deeper than [`trawl_core::parser::MAX_TREE_DEPTH`], and this bound is
-/// tighter still, so a deeper group pins nothing instead of spending the
-/// worker's stack.
+/// pin. The walk recurses once per level, so a deeper group pins nothing
+/// instead of spending the worker's stack.
 const MAX_PIN_NESTING: usize = 32;
 
-/// The services a search stage pins: the service files every event it
-/// matches is stored in.
-///
 /// The SQL filter still decides every row, so a pin only has to name each
-/// file a matching row can be in. `service=a` pins `{a}` and `service=a,b`
-/// pins `{a, b}`. An AND pins what its pinning tokens pin in common, and a
-/// token that pins nothing does not narrow it. An OR pins the union of its
-/// branches when every branch pins. Everything else pins nothing: an AND
-/// with no pinning token (an empty AND, which is true, included), an OR of
-/// no branch, `NOT`, `!=` and every other operator, any other field, a
-/// pattern, and a value that does not compare as text ([`pinned_name`]).
-///
+/// file a matching row can be in.
 /// Each name is interpolated verbatim into a single-quoted glob entry, so
-/// the final set, after every intersection and union, must pass the same
-/// `is_valid_service_name` predicate ingest enforces: anything outside the
-/// ingest-side charset (quotes, separators, slashes, dots at the front)
-/// reads every service rather than being allowed to close one path and
-/// open another. A name an intersection removed reaches no path. A final
-/// set over [`MAX_PINNED_SERVICES`] reads every service too.
+/// the final set must pass the same `is_valid_service_name` predicate
+/// ingest enforces, rather than being allowed to close one path and
+/// open another.
 fn service_pins(search: &SearchStage) -> Services {
     match disjunction_pins(&search.groups, 0) {
         Some(services)
@@ -122,13 +83,6 @@ fn service_pins(search: &SearchStage) -> Services {
     }
 }
 
-/// What an OR of `branches` pins ([`service_pins`]): nothing unless every
-/// branch pins, and nothing for no branch at all.
-///
-/// Each union merges the smaller set into the larger, so a group of one
-/// branch hands its set up unchanged and nesting adds no insertions.
-///
-/// `nesting` counts the groups around `branches`.
 fn disjunction_pins(
     branches: &[Vec<Spanned<SearchToken>>],
     nesting: usize,
@@ -147,11 +101,6 @@ fn disjunction_pins(
     Some(union)
 }
 
-/// What an AND of `tokens` pins ([`service_pins`]): nothing when no token
-/// pins, an empty AND included.
-///
-/// Each intersection keeps the smaller set and drops from it what the
-/// larger lacks, so it never copies the larger.
 fn conjunction_pins(tokens: &[Spanned<SearchToken>], nesting: usize) -> Option<BTreeSet<&str>> {
     let mut common: Option<BTreeSet<&str>> = None;
     for token in tokens {
@@ -169,8 +118,6 @@ fn conjunction_pins(tokens: &[Spanned<SearchToken>], nesting: usize) -> Option<B
     common
 }
 
-/// What one search token pins ([`service_pins`]). A group nested past
-/// [`MAX_PIN_NESTING`] pins nothing.
 fn token_pins(token: &SearchToken, nesting: usize) -> Option<BTreeSet<&str>> {
     match token {
         SearchToken::FieldFilter(FieldFilter {
@@ -185,17 +132,13 @@ fn token_pins(token: &SearchToken, nesting: usize) -> Option<BTreeSet<&str>> {
         SearchToken::Group(branches) if nesting < MAX_PIN_NESTING => {
             disjunction_pins(branches, nesting + 1)
         }
-        // `NOT`, text and time tokens, and every other filter.
         _ => None,
     }
 }
 
-/// The one service whose file holds every row `service=` `scalar` matches:
-/// an exact value the `service` pin compares as text, which only a stored
-/// service of the same bytes matches, and which no other name is stored as
-/// ([`compaction_can_store_another_name_as`]). A numeric value also matches
-/// the same number spelled another way (`service=1` matches a stored `01`,
-/// in `01.parquet`), and a pattern matches many names, so neither pins.
+/// A numeric value also matches the same number spelled another way
+/// (`service=1` matches a stored `01`, in `01.parquet`), and a pattern
+/// matches many names, so neither pins.
 fn pinned_name(scalar: &Scalar) -> Option<&str> {
     let Scalar::Exact(value) = scalar else {
         return None;
@@ -250,17 +193,10 @@ fn compaction_can_store_another_name_as(value: &str) -> bool {
     date || uuid
 }
 
-/// Extract an exact value for `field` from the search stage, if present.
-///
-/// Only returns `Some` for single-group queries with a simple equality
-/// filter (`env=prod`). Multi-group (OR) queries can't be narrowed to one
-/// value safely, and glob/regex values are also ignored. Services are
-/// narrowed to a set instead, by [`service_pins`].
 fn extract_eq_filter<'a>(
     search: &'a trawl_core::ast::SearchStage,
     field_name: &str,
 ) -> Option<&'a str> {
-    // Can't narrow when OR is involved — different groups may target different values.
     if search.groups.len() != 1 {
         return None;
     }
@@ -281,28 +217,12 @@ fn extract_eq_filter<'a>(
 /// Compute the `read_parquet()` source argument over the two path
 /// dimensions (ADR-0009): `data/{env}/{date}/{HH}/{service}.parquet`,
 /// day-level `data/{env}/{date}/{service}.parquet` after rollup.
-///
-/// `env=X` pins the outer directory; otherwise every env directory on
-/// disk is searched. A `service=` filter narrows every directory to the
-/// files of the services the search stage pins ([`service_pins`]): one for
-/// `service=a`, several for `service=a,b` or `service=a OR service=b`, and
-/// none for a contradiction such as `service=a service=b`, which reads no
-/// stored file. Each name is the file's verbatim (path encoding is
-/// injective by validation, so `api.v2` and `api_v2` are distinct files
-/// and pruning is exact). A time filter scopes to the relevant date/hour
-/// directories; without one, date-formatted dirs are enumerated per env.
-///
-/// Returns a `DuckDB` list literal like
-/// `['data/prod/2026-08-02/14/*.parquet', ...]` when scoping is
-/// possible. Pruning is an optimization only: the SQL WHERE clause always
+/// Pruning is an optimization only: the SQL WHERE clause always
 /// re-filters, so a broader source is never incorrect. No exit may widen
 /// to `{base}/**/*.parquet`, though, which reaches past the env dimension
 /// into `scheduled/` (materialized saved-query output, whose schema is a
 /// query's rather than an event's, so a union over it is a hard error
-/// under ADR-0008). Every "nothing to read" exit is [`no_match_source`],
-/// including unparseable DSL: the executor parses the same text with the
-/// same parser before it reads, so a source built from DSL that does not
-/// parse never reaches `read_parquet` at all.
+/// under ADR-0008).
 ///
 /// # Errors
 /// As [`select`].
@@ -314,9 +234,6 @@ pub(crate) fn compute_source(
     Ok(select(base_dir, dsl, cancel)?.source())
 }
 
-/// The selection [`compute_source`] renders, before it is rendered: the
-/// rules are [`compute_source`]'s.
-///
 /// # Errors
 /// [`EngineError::Cancelled`] once `cancel` is latched during the parse.
 pub(crate) fn select(
@@ -355,11 +272,6 @@ pub(crate) fn select(
         }
     }
 
-    // No elements is every env existing with no matching date directory,
-    // or no env at all: the same "nothing to read" state as a cold start,
-    // and the same reason not to fall back to `{base}/**/` over
-    // `scheduled/`. [`SourceSelection::source`] renders it as
-    // [`no_match_source`].
     Ok(SourceSelection {
         base,
         services,
@@ -368,16 +280,9 @@ pub(crate) fn select(
 }
 
 /// The env directories a query's `env=` filter selects, by
-/// [`compute_source`]'s rules, and how many: the one its `env=` pins, none
-/// for a value no env can carry, else every env on disk. Unparseable DSL
-/// selects none, as it reads nothing. A service contradiction, which reads
-/// no env's files, still selects its envs here: this is the env pin alone.
-///
-/// Only the first `cap` names in name order are kept. With no pin the envs
-/// come from [`env_dirs::first_env_names`](crate::env_dirs::first_env_names),
-/// which holds no more than that however many envs there are and reads
-/// `cancel` between the root's entries.
-///
+/// [`compute_source`]'s rules, and how many. A service contradiction, which
+/// reads no env's files, still selects its envs here: this is the env pin
+/// alone. Only the first `cap` names in name order are kept.
 /// # Errors
 /// [`FirstEnvNamesError`](crate::env_dirs::FirstEnvNamesError) from the
 /// walk or the parse: cancelled once `cancel` is latched during either, or
@@ -431,15 +336,11 @@ fn no_match_source(base: &str) -> String {
     format!("{base}/.no-such-env/{ANY_SERVICE}")
 }
 
-/// What a query's equality filters pin: the service files and the env
-/// directories to search. No envs means nothing on disk can match.
 struct Narrowing {
     services: Services,
     envs: Vec<String>,
 }
 
-/// Read the `service=` and `env=` pins off a parsed query (see
-/// [`compute_source`] for the rules).
 fn narrowing(base: &str, ast: &Query) -> Narrowing {
     let services = service_pins(&ast.search);
 
@@ -449,26 +350,18 @@ fn narrowing(base: &str, ast: &Query) -> Narrowing {
         // directory.
         _ if services == Services::Only(BTreeSet::new()) => Vec::new(),
         EnvPin::One(env) => vec![env.to_owned()],
-        // The executor treats "no files" as an empty result and the SQL
-        // filter keeps hot rows correct.
         EnvPin::Nothing => Vec::new(),
-        // Cold start (no env directories yet) lists none: nothing to
-        // read, and no widening to `{base}/**/`, which would reach
-        // `scheduled/`.
         EnvPin::Every => crate::env_dirs::list_env_names(Path::new(base)),
     };
 
     Narrowing { services, envs }
 }
 
-/// What a query's `env=` filter selects (see [`compute_source`]).
 enum EnvPin<'a> {
-    /// The one env it pins.
     One(&'a str),
     /// No env: the value is one no on-disk env can carry, since they were
     /// validated at ingest.
     Nothing,
-    /// No pin: every env on disk.
     Every,
 }
 
@@ -485,27 +378,20 @@ fn env_pin(ast: &Query) -> EnvPin<'_> {
     }
 }
 
-/// What one `read_parquet()` source reads: the partition directories and
-/// the service files every directory is read for.
-///
 /// It is structured rather than a source string because a capture needs
-/// two things from it: the `read_parquet()` argument ([`Self::source`]) and
-/// the bytes behind it ([`selection_bytes`]), and the second must expand
-/// exactly the directories and service files the first names.
+/// both the `read_parquet()` argument ([`Self::source`]) and the bytes
+/// behind it ([`selection_bytes`]), and the second must expand exactly the
+/// directories and service files the first names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceSelection {
     /// The data root, without a trailing slash.
     base: String,
-    /// The service files read in each directory.
     services: Services,
-    /// The directories, in the order the source lists them.
     elements: Vec<Element>,
 }
 
-/// One directory of a [`SourceSelection`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Element {
-    /// The directory's path.
     dir: String,
     /// Read through `**`: the pattern matches files at any depth under
     /// `dir`, `dir` itself included. Otherwise only the files directly in
@@ -528,7 +414,6 @@ impl Element {
         }
     }
 
-    /// The element's `read_parquet()` list entry.
     fn glob(&self, file_pattern: &str) -> String {
         if self.recursive {
             format!("'{}/**/{file_pattern}'", self.dir)
@@ -539,10 +424,6 @@ impl Element {
 }
 
 impl SourceSelection {
-    /// The `read_parquet()` source argument: a `DuckDB` list literal with
-    /// one entry per directory and service file, by directory and then by
-    /// service name, or [`no_match_source`] when that is no entry: no
-    /// directory was selected, or no service can match.
     pub(crate) fn source(&self) -> String {
         let patterns = self.services.file_patterns();
         let globs: Vec<String> = self
@@ -575,43 +456,17 @@ impl SourceSelection {
 /// The bytes of parquet `selection` reaches that can hold an event of the
 /// window `[start, end)`: the summed size of every regular file one of its
 /// file patterns matches in its directories, less each file whose footer
-/// statistics put every row group's `_time` outside the window. Each
-/// directory is walked once, whatever the number of services.
-///
-/// Partitions are named by when compaction wrote them and ingest keeps the
-/// `_time` a sender says (`ingest::envelope`), so no directory name bounds
-/// the `_time` of what it holds: the selection is the whole of what
-/// `/query` reads for the same text, and only the files themselves can say
-/// they hold nothing in the window. The engine's `_time` bounds skip the
-/// same row groups by the same statistics, so a file left out here is one
-/// whose rows the read would not keep. The proof is per row group and must
-/// cover every one ([`read_row_group_bounds`]): a file counts whole when its
-/// footer gives none, which is no `_time` column, a row group whose `_time`
-/// chunk has no min or max, `_time` not a timestamp, one row group whose
-/// bounds reach into the window, or a footer the reader refuses. Ticks are
+/// statistics put every row group's `_time` outside the window.
+/// No directory name bounds the `_time` of what it holds, so only the files
+/// themselves can say they hold nothing in the window. Ticks are
 /// read as UTC whether or not the file marks the column UTC-adjusted, as
 /// the engine's UTC session casts them.
-///
-/// The walk lists the directories on disk; it never builds a path the disk
-/// does not hold. It checks `cancel` before each entry and stops with
-/// [`EngineError::Cancelled`] once the work is cancelled, so an abandoned
-/// capture stops walking.
-///
-/// This is a budget estimate, not a promise. The caller takes it under the
-/// publication read guard, before the engine runs, so no canonical Parquet
-/// publication in this process lands between the measurement and the read.
-/// Retention takes no such guard: a directory that is gone, or a file that
-/// vanishes between the listing and its footer, counts as zero.
-/// [`crate::env_dirs::is_absent`] is not asked here, because `DuckDB` reads
-/// nothing at a path that is gone or dangles, so zero is the read's own
-/// answer for a budget estimate. Any other IO error is returned, so the
+/// A directory that is gone, or a file that vanishes between the listing
+/// and its footer, counts as zero: `DuckDB` reads nothing at a path that is
+/// gone. Any other IO error is returned, so the
 /// caller cannot mistake an unreadable directory for an empty one.
-///
-/// Symlinks are not followed and count as zero. `DuckDB` would read
-/// through a live link to a file, but trawld never writes a symlink into
-/// the data root, which is owner-only (ADR-0052), so a link there is not
-/// data this budget measures. A dangling link matches nothing in `DuckDB`
-/// either.
+/// Symlinks are not followed and count as zero: trawld never writes a
+/// symlink into the data root (ADR-0052).
 pub(crate) fn selection_bytes(
     selection: &SourceSelection,
     start: DateTime<Utc>,
@@ -643,7 +498,6 @@ struct Window {
     end: i128,
 }
 
-/// The bytes under one directory of `selection`, for [`selection_bytes`].
 fn dir_bytes(
     selection: &SourceSelection,
     dir: &Path,
@@ -686,8 +540,6 @@ fn dir_bytes(
     Ok(total)
 }
 
-/// One matching regular file's bytes, or zero when its footer proves it
-/// holds no `_time` in `window` or it vanished (see [`selection_bytes`]).
 fn file_bytes(entry: &std::fs::DirEntry, window: Window) -> Result<u64, EngineError> {
     let len = match entry.metadata() {
         Ok(meta) => meta.len(),
@@ -713,11 +565,9 @@ fn file_bytes(entry: &std::fs::DirEntry, window: Window) -> Result<u64, EngineEr
     }
 }
 
-/// Whether a column whose values lie in `[min, max]` holds nothing in
-/// `window`: both bounds are timestamps, and the latest is before the
-/// window or the earliest at or after its end. A bound read at a finer unit
-/// than the microsecond is widened outward to whole microseconds, so a cast
-/// that truncates or rounds it cannot move a value across the window.
+/// A bound read at a finer unit than the microsecond is widened outward to
+/// whole microseconds, so a cast that truncates or rounds it cannot move a
+/// value across the window.
 fn outside_window(min: Option<&StatVal>, max: Option<&StatVal>, window: Window) -> bool {
     let (Some(min), Some(max)) = (
         min.and_then(|min| micros(min, false)),
@@ -745,11 +595,6 @@ fn micros(sample: &StatVal, ceil: bool) -> Option<i128> {
     })
 }
 
-/// Time-scoped directories for one env root at `now`: hour-level for
-/// today, day-level and/or hour-level for historical dates,
-/// existence-filtered. Returns an empty vec when nothing on disk matches
-/// the window.
-///
 /// A historical start day is selected whole, every hour of it: the walk
 /// starts at that day's midnight rather than at the padded start's hour.
 fn time_scoped_dirs(
@@ -778,15 +623,9 @@ fn time_scoped_dirs(
         .collect()
 }
 
-/// The existing partition directories of one env root from `from`'s hour
-/// through `now`'s, in walk order: per date, the date directory when it
-/// holds day-level files, then its hour directories.
-///
-/// Today's hours are listed up to `now`'s. A historical date is checked
-/// for a consolidated day-level file and for remaining hour directories,
-/// since both coexist during a partial rollup (one service consolidated,
-/// another not). `from`'s own date is listed from `from`'s hour, every
-/// later date from midnight.
+/// A historical date is checked for a consolidated day-level file and for
+/// remaining hour directories, since both coexist during a partial rollup
+/// (one service consolidated, another not).
 fn partition_dirs(
     base: &str,
     from: NaiveDateTime,
@@ -829,7 +668,6 @@ fn partition_dirs(
                 }
             }
 
-            // Skip to next day (advance cursor past remaining hours of this day).
             cursor = (cursor.date() + chrono::Duration::days(1))
                 .and_hms_opt(0, 0, 0)
                 .expect("valid midnight from date + 1 day");
@@ -840,16 +678,10 @@ fn partition_dirs(
     dirs
 }
 
-/// The hour of `cursor`, as an hour directory counts it.
 fn cursor_hour(cursor: NaiveDateTime) -> u8 {
     u8::try_from(cursor.hour()).expect("Timelike::hour() is below 24")
 }
 
-/// Date-scoped directories for one env root, for queries without a
-/// `last=` filter.
-///
-/// Enumerates the date directories ([`parse_date`]) in the env base, each read
-/// through `**`. Returns an empty vec when the env base holds no date dirs.
 fn date_scoped_dirs(base: &str) -> Vec<Element> {
     let Ok(entries) = std::fs::read_dir(base) else {
         return Vec::new();
@@ -872,17 +704,11 @@ fn date_scoped_dirs(base: &str) -> Vec<Element> {
     dirs.into_iter().map(Element::date).collect()
 }
 
-/// Check if a date directory has day-level parquet files (consolidated).
-///
-/// For pinned services, does one `stat()` per service until one has its
-/// day file, and none for the empty set. For every service, checks if the
-/// date directory contains any direct `.parquet` files.
 fn has_day_level_files(base: &str, day: &str, services: &Services) -> bool {
     let day_dir = std::path::Path::new(base).join(day);
 
     match services {
         Services::Any => {
-            // Wildcard: check if any .parquet files exist directly in date dir.
             let Ok(entries) = std::fs::read_dir(&day_dir) else {
                 return false;
             };
@@ -899,10 +725,6 @@ fn has_day_level_files(base: &str, day: &str, services: &Services) -> bool {
     }
 }
 
-/// Check if a date directory still has hourly subdirectories (00-23).
-///
-/// Used to detect mixed-state dirs where some services are consolidated
-/// at day level while others remain in hourly dirs.
 fn has_hour_dirs(base: &str, day: &str) -> bool {
     let day_dir = std::path::Path::new(base).join(day);
     let Ok(entries) = std::fs::read_dir(&day_dir) else {
@@ -937,8 +759,6 @@ mod tests {
             .collect()
     }
 
-    /// A date-shaped directory that names no calendar date is not a date
-    /// partition: a query without `last=` does not read it.
     #[test]
     fn date_scoped_dirs_skips_noncalendar_dates() {
         let tmp = tempfile::tempdir().unwrap();
@@ -958,14 +778,12 @@ mod tests {
 
     #[test]
     fn no_time_filter_over_empty_root_matches_nothing() {
-        // No env directory on disk → nothing to read.
         let source = compute_source("/data", "_severity=error", &running()).unwrap();
         assert_eq!(source, "/data/.no-such-env/*.parquet");
     }
 
     #[test]
     fn service_filter_narrows_glob() {
-        // Exact service filter → narrow to service-specific file.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         mkdir(tmp.path(), "prod/2026-01-15");
@@ -978,7 +796,6 @@ mod tests {
 
     #[test]
     fn service_glob_keeps_wildcard() {
-        // Glob operator on service → can't narrow, keep *.parquet.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         mkdir(tmp.path(), "prod/2026-01-15");
@@ -988,9 +805,6 @@ mod tests {
 
     #[test]
     fn bad_dsl_matches_nothing() {
-        // Unparseable DSL takes the no-match shape like every other
-        // "nothing to read" exit, never the `**` glob that reaches
-        // `scheduled/`. The executor rejects the same text before it reads.
         let source = compute_source("/data", "| | invalid", &running()).unwrap();
         assert_eq!(source, "/data/.no-such-env/*.parquet");
         assert!(!source.contains("**"));
@@ -998,7 +812,6 @@ mod tests {
 
     #[test]
     fn with_time_filter_returns_list() {
-        // Create temp dir with today's hour directories so the filter doesn't prune them.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let now = chrono::Utc::now();
@@ -1011,7 +824,6 @@ mod tests {
             std::fs::create_dir_all(tmp.path().join("prod").join(&date).join(&hour)).unwrap();
         }
         let source = compute_source(base, "last=1h", &running()).unwrap();
-        // Should be a list of hour-directory globs, not the fallback.
         assert!(
             source.starts_with('['),
             "expected list format, got: {source}"
@@ -1047,7 +859,6 @@ mod tests {
             source.starts_with('['),
             "expected list format, got: {source}"
         );
-        // Should narrow to nginx.parquet, not *.parquet.
         assert!(
             source.contains("nginx.parquet"),
             "expected service-scoped globs, got: {source}"
@@ -1066,7 +877,6 @@ mod tests {
 
     #[test]
     fn prefers_day_level_for_historical_service() {
-        // Create a temp data dir with a consolidated day-level file.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
@@ -1078,7 +888,6 @@ mod tests {
 
         let source = compute_source(base, "service=nginx last=48h", &running()).unwrap();
 
-        // Should include day-level path for yesterday (no /HH/ component).
         let expected_day_glob = format!("'{base}/prod/{yesterday}/nginx.parquet'");
         assert!(
             source.contains(&expected_day_glob),
@@ -1088,13 +897,11 @@ mod tests {
 
     #[test]
     fn falls_back_to_hourly_when_no_day_file() {
-        // Create a temp data dir with only hourly files (no day-level).
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
-        // Create hour dirs but no day-level file.
         let hour_dir = tmp.path().join("prod").join(&yesterday).join("14");
         std::fs::create_dir_all(&hour_dir).unwrap();
         std::fs::write(hour_dir.join("nginx.parquet"), b"data").unwrap();
@@ -1111,7 +918,6 @@ mod tests {
 
     #[test]
     fn wildcard_detects_day_level() {
-        // Wildcard service with consolidated day-level files.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
@@ -1124,7 +930,6 @@ mod tests {
 
         let source = compute_source(base, "last=48h", &running()).unwrap();
 
-        // Should use day-level glob (*.parquet at date level).
         let expected_day_glob = format!("'{base}/prod/{yesterday}/*.parquet'");
         assert!(
             source.contains(&expected_day_glob),
@@ -1146,7 +951,6 @@ mod tests {
             "2026-01-15",
             &only(&["postgres"])
         ));
-        // Any member's day file counts, wherever it sorts.
         assert!(has_day_level_files(
             base,
             "2026-01-15",
@@ -1161,14 +965,12 @@ mod tests {
         let day_dir = tmp.path().join("2026-01-15");
         std::fs::create_dir_all(&day_dir).unwrap();
 
-        // No files yet.
         assert!(!has_day_level_files(
             tmp.path().to_str().unwrap(),
             "2026-01-15",
             &Services::Any
         ));
 
-        // Add a parquet file.
         std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
         assert!(has_day_level_files(
             tmp.path().to_str().unwrap(),
@@ -1185,7 +987,6 @@ mod tests {
         std::fs::create_dir_all(&hour_dir).unwrap();
         std::fs::write(hour_dir.join("nginx.parquet"), b"data").unwrap();
 
-        // Hour subdir files should not count as day-level.
         assert!(!has_day_level_files(
             tmp.path().to_str().unwrap(),
             "2026-01-15",
@@ -1198,21 +999,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let day_dir = tmp.path().join("2026-01-15");
 
-        // No dir at all.
         assert!(!has_hour_dirs(tmp.path().to_str().unwrap(), "2026-01-15"));
 
-        // Dir exists but empty.
         std::fs::create_dir_all(&day_dir).unwrap();
         assert!(!has_hour_dirs(tmp.path().to_str().unwrap(), "2026-01-15"));
 
-        // Hour subdir present.
         std::fs::create_dir_all(day_dir.join("01")).unwrap();
         assert!(has_hour_dirs(tmp.path().to_str().unwrap(), "2026-01-15"));
     }
 
     #[test]
     fn wildcard_mixed_state() {
-        // Mixed state: day-level file for one service + hourly dir for another.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
@@ -1221,17 +1018,14 @@ mod tests {
         let day_dir = tmp.path().join("prod").join(&yesterday);
         std::fs::create_dir_all(&day_dir).unwrap();
 
-        // nginx consolidated at day level.
         std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
 
-        // postgres still in hourly dirs.
         let hour_dir = day_dir.join("14");
         std::fs::create_dir_all(&hour_dir).unwrap();
         std::fs::write(hour_dir.join("postgres.parquet"), b"data").unwrap();
 
         let source = compute_source(base, "last=48h", &running()).unwrap();
 
-        // Should include both the day-level glob and the existing hourly dir.
         let day_glob = format!("'{base}/prod/{yesterday}/*.parquet'");
         let hourly_glob = format!("'{base}/prod/{yesterday}/14/*.parquet'");
         assert!(
@@ -1262,16 +1056,12 @@ mod tests {
 
     #[test]
     fn env_and_service_pruning_matrix() {
-        // Two envs on disk, one date dir each. env=X pins the env
-        // directory; service=Y pins the file pattern; both compose;
-        // neither searches every env.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         for env in ["prod", "lab"] {
             std::fs::create_dir_all(tmp.path().join(env).join("2026-01-15")).unwrap();
         }
 
-        // env only.
         let source = compute_source(base, "env=prod", &running()).unwrap();
         assert!(source.contains("/prod/"), "got: {source}");
         assert!(
@@ -1279,20 +1069,17 @@ mod tests {
             "env=prod must prune lab: {source}"
         );
 
-        // service only — both envs searched, file pattern pinned.
         let source = compute_source(base, "service=nginx", &running()).unwrap();
         assert!(source.contains("/prod/"), "got: {source}");
         assert!(source.contains("/lab/"), "got: {source}");
         assert!(source.contains("nginx.parquet"), "got: {source}");
         assert!(!source.contains("*.parquet"), "got: {source}");
 
-        // both.
         let source = compute_source(base, "env=lab service=nginx", &running()).unwrap();
         assert!(source.contains("/lab/"), "got: {source}");
         assert!(!source.contains("/prod/"), "got: {source}");
         assert!(source.contains("nginx.parquet"), "got: {source}");
 
-        // neither — every env, wildcard pattern.
         let source = compute_source(base, "_severity=error", &running()).unwrap();
         assert!(source.contains("/prod/"), "got: {source}");
         assert!(source.contains("/lab/"), "got: {source}");
@@ -1316,8 +1103,6 @@ mod tests {
 
     #[test]
     fn invalid_env_value_matches_nothing() {
-        // `env=../evil` can never match on-disk data (env names were
-        // validated at ingest) — the source must not glob anything real.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         std::fs::create_dir_all(tmp.path().join("prod").join("2026-01-15")).unwrap();
@@ -1332,9 +1117,6 @@ mod tests {
 
     /// A post-cutover install before its first compaction: `data/` holds the
     /// EPOCH marker and `scheduled/` report runs, and no env directory yet.
-    /// The source must not reach into `scheduled/` — those parquet files are
-    /// materialized saved-query output, not events, and unioning them into
-    /// the log side turns into a hard query error under ADR-0008.
     #[test]
     fn cold_start_source_never_reaches_scheduled_report_runs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1361,9 +1143,6 @@ mod tests {
         );
     }
 
-    /// Same, one dimension in: env directories exist, but none holds a date
-    /// directory the query could read. Still nothing to read, still no
-    /// excuse to glob the whole data root.
     #[test]
     fn no_matching_date_dir_never_reaches_scheduled_report_runs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1389,21 +1168,17 @@ mod tests {
 
     #[test]
     fn today_day_level_files_included() {
-        // When today's data is consolidated at day level (no hourly dirs),
-        // the time-scoped path should include the day-level glob.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let now = chrono::Utc::now();
         let today = now.format("%Y-%m-%d").to_string();
 
-        // Create day-level file only (no hourly subdirs).
         let day_dir = tmp.path().join("prod").join(&today);
         std::fs::create_dir_all(&day_dir).unwrap();
         std::fs::write(day_dir.join("trawld.parquet"), b"data").unwrap();
 
         let source = compute_source(base, "service=trawld last=1h", &running()).unwrap();
 
-        // Day-level glob must be present so the consolidated file is found.
         let day_glob = format!("'{base}/prod/{today}/trawld.parquet'");
         assert!(
             source.contains(&day_glob),
@@ -1413,7 +1188,6 @@ mod tests {
 
     #[test]
     fn today_mixed_day_and_hourly() {
-        // Today has both day-level files and hourly dirs — both should appear.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let now = chrono::Utc::now();
@@ -1442,8 +1216,6 @@ mod tests {
     #[test]
     fn invalid_service_value_cannot_inject_paths() {
         // A quoted DSL literal can carry `', '` — the list-item separator.
-        // It must never reach the glob list: the pattern falls back to the
-        // wildcard, so no attacker-chosen path is ever emitted.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         std::fs::create_dir_all(tmp.path().join("prod").join("2026-01-15")).unwrap();
@@ -1488,38 +1260,26 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Service pins: `service_pins`
-    // -----------------------------------------------------------------
-
-    /// The services `dsl`'s search stage pins.
     fn pins(dsl: &str) -> Services {
         let query = trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
         service_pins(&query.search)
     }
 
-    /// A pin of exactly `names`.
     fn only<S: AsRef<str>>(names: &[S]) -> Services {
         Services::Only(names.iter().map(|n| n.as_ref().to_owned()).collect())
     }
 
-    /// An OR pins the union of its branches only when every branch pins;
-    /// an AND intersects what its pinning tokens pin. Anything those rules
-    /// cannot prove reads every service.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn service_pins_boolean_matrix() {
         let any = Services::Any;
         for (dsl, expected) in [
-            // One equality, a list, and an OR of them: the union.
             ("service=a", only(&["a"])),
             ("service=a,b", only(&["a", "b"])),
             ("(service=a OR service=b)", only(&["a", "b"])),
             ("service=a OR service=b", only(&["a", "b"])),
             ("service=a OR service=b,c", only(&["a", "b", "c"])),
             ("service=a last=1h OR service=b", only(&["a", "b"])),
-            // An AND intersects the tokens that pin; one that pins
-            // nothing does not narrow it.
             ("service=a,b service=b,c", only(&["b"])),
             ("service=a service=b", only::<&str>(&[])),
             (
@@ -1528,7 +1288,6 @@ mod tests {
             ),
             ("service=a k8s_pod=b* host!=c NOT env=lab", only(&["a"])),
             ("service=a last=1h", only(&["a"])),
-            // Nested groups follow the same two rules.
             ("service=a,b (service=b OR service=c)", only(&["b"])),
             (
                 "((service=a OR service=b) OR (service=c env=prod))",
@@ -1539,11 +1298,9 @@ mod tests {
                 "(service=a OR service=b) (service=c OR k8s_pod=x)",
                 only(&["a", "b"]),
             ),
-            // One branch that pins nothing reads every service.
             ("(service=a OR k8s_pod=b*)", any.clone()),
             ("service=a OR _severity=error", any.clone()),
             ("service=a OR *", any.clone()),
-            // Negation, other operators and patterns never pin.
             ("NOT service=a", any.clone()),
             ("NOT (NOT service=a)", any.clone()),
             ("NOT (service=a OR service=b)", any.clone()),
@@ -1554,12 +1311,10 @@ mod tests {
             ("service=/a/", any.clone()),
             ("service=a,b*", any.clone()),
             ("service=a,/b/", any.clone()),
-            // Only the field `service`, spelled exactly.
             ("Service=a", any.clone()),
             ("SERVICE=a", any.clone()),
             ("_service=a", any.clone()),
             ("env=prod", any.clone()),
-            // No token pins, or there is no group at all (`last=1h`).
             ("*", any.clone()),
             ("last=1h", any.clone()),
             ("_severity=error", any.clone()),
@@ -1607,14 +1362,12 @@ mod tests {
             ("service=\"x', '/etc\"", any.clone()),
             ("service=a,\".x\" service=a", only(&["a"])),
             ("service=\"x'\" service=a", only::<&str>(&[])),
-            // A repeated name is one name.
             ("service=a,a", only(&["a"])),
             ("service=a OR service=a", only(&["a"])),
         ] {
             assert_eq!(pins(dsl), expected, "{dsl}");
         }
 
-        // At most 32 distinct names, counted on the final set.
         let names: Vec<String> = (0..34).map(|i| format!("svc{i:02}")).collect();
         let list = |names: &[String]| names.join(",");
         assert_eq!(
@@ -1677,8 +1430,7 @@ mod tests {
         assert_eq!(service_pins(&search), any, "nor does it pin an OR branch");
     }
 
-    /// A `service=` filter pins through [`MAX_PIN_NESTING`] groups and no
-    /// deeper. Past the bound the walk stops, so a search nested thousands
+    /// Past [`MAX_PIN_NESTING`] the walk stops, so a search nested thousands
     /// deep reads every service on the 2 MiB stack of a blocking worker
     /// instead of overflowing it. The parser refuses a search that deep,
     /// so that tree is built in code.
@@ -1715,13 +1467,8 @@ mod tests {
         assert_eq!(nested(4000, false), Services::Any);
     }
 
-    /// A pin reads only `{name}.parquet`, so it is sound only while every
-    /// row stored with service `name` sits in that file. Compaction names
-    /// the file after the service as sent, but its `read_json` detection
-    /// can read the value as a DATE or a UUID, and the VARCHAR conform then
-    /// stores the canonical rendering instead. Run the real WAL writer and
-    /// compaction over valid names, and require that no stored value that
-    /// differs from its file's name pins.
+    /// Run the real WAL writer and compaction over valid names, and require
+    /// that no stored value that differs from its file's name pins.
     #[tokio::test]
     async fn a_value_compaction_rewrites_never_pins() {
         use crate::ingest::wal::WalWriter;
@@ -1824,8 +1571,6 @@ mod tests {
         );
     }
 
-    /// Every file `source` reaches: each entry of its list, or the bare
-    /// source, expanded by `DuckDB`'s own `glob()`.
     fn source_files(source: &str) -> Vec<String> {
         let entries: Vec<&str> = match source.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             Some(list) => list.split(", ").map(|e| e.trim_matches('\'')).collect(),
@@ -1834,11 +1579,6 @@ mod tests {
         entries.into_iter().flat_map(glob_matches).collect()
     }
 
-    /// A selection that pins several services names only their files,
-    /// each once, and charges exactly those files, in both layouts a
-    /// selection reads: hour and day directories for `last=`, and each
-    /// date read through `**` otherwise. One day is rolled up for one
-    /// service only, and a pinned service may have no file at all.
     #[test]
     fn multi_service_selection_matches_accounting() {
         use std::collections::BTreeMap;
@@ -1930,10 +1670,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
-    // Capture windows (ADR-0057): `select`, `selection_bytes`
-    // -----------------------------------------------------------------
-
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -1943,7 +1679,6 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// Create `{root}/{rel}` as a directory.
     fn mkdir(root: &Path, rel: &str) {
         std::fs::create_dir_all(root.join(rel)).unwrap();
     }
@@ -1957,8 +1692,6 @@ mod tests {
         u64::try_from(len).unwrap()
     }
 
-    /// Write `{root}/{rel}` as parquet with one row per `_time`, each a
-    /// `DuckDB` timestamp of `ty`, and return its size.
     fn write_times(root: &Path, rel: &str, ty: &str, times: &[&str]) -> u64 {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1978,9 +1711,6 @@ mod tests {
         std::fs::metadata(path).unwrap().len()
     }
 
-    /// Write `{root}/{rel}` as parquet of two row groups of 2,048 rows,
-    /// every `_time` of the first `first` and of the second `second`, and
-    /// return its path.
     fn write_two_groups(root: &Path, rel: &str, first: &str, second: &str) -> std::path::PathBuf {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1997,8 +1727,6 @@ mod tests {
         path
     }
 
-    /// The bytes [`selection_bytes`] charges for `service`'s files over
-    /// `[09:00, 09:30)` on 2026-10-23.
     fn charged(base: &str, service: &str) -> u64 {
         let text = executed(
             &format!("service={service}"),
@@ -2014,7 +1742,6 @@ mod tests {
         .unwrap()
     }
 
-    /// The selected directories relative to `root`, for readable asserts.
     fn rel_dirs(selection: &SourceSelection, root: &Path) -> Vec<String> {
         let prefix = format!("{}/", root.to_str().unwrap());
         selection
@@ -2024,12 +1751,10 @@ mod tests {
             .collect()
     }
 
-    /// A latch nothing sets.
     fn running() -> CancelLatch {
         CancelLatch::never()
     }
 
-    /// A capture's executed text for `[earliest, latest)` over `head`.
     fn executed(head: &str, earliest: &str, latest: &str) -> String {
         let text = format!("{head} earliest={earliest} latest={latest}");
         trawl_core::parser::parse(&text).expect("the executed text parses");
@@ -2137,14 +1862,12 @@ mod tests {
             "TIMESTAMP",
             &["2026-10-21 13:00:00", "2026-10-23 09:10:00"],
         );
-        // This hour, every `_time` before the window.
         write_times(
             tmp.path(),
             "prod/2026-10-23/09/postgres.parquet",
             "TIMESTAMP",
             &["2026-10-23 08:00:00", "2026-10-23 08:59:59.999999"],
         );
-        // The last microsecond inside the window.
         let last = write_times(
             tmp.path(),
             "prod/2026-10-23/09/redis.parquet",
@@ -2254,14 +1977,11 @@ mod tests {
         assert_eq!(charged(base, "app"), len);
     }
 
-    /// A file is left out only when each of its row groups' statistics put
-    /// that group outside the window, and counts whole otherwise.
     #[test]
     fn a_file_is_left_out_only_when_every_row_group_is_outside_the_window() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let hour = "prod/2026-10-23/09";
-        // Both groups before the window.
         write_two_groups(
             tmp.path(),
             &format!("{hour}/before.parquet"),
@@ -2276,14 +1996,12 @@ mod tests {
             "2026-10-23 08:00:00",
             "2026-10-23 09:30:00",
         );
-        // One group inside it.
         let inside = write_two_groups(
             tmp.path(),
             &format!("{hour}/inside.parquet"),
             "2026-10-22 09:00:00",
             "2026-10-23 09:29:59.999999",
         );
-        // No `_time` at all.
         let untimed = tmp.path().join(format!("{hour}/untimed.parquet"));
         duckdb::Connection::open_in_memory()
             .unwrap()
@@ -2404,8 +2122,6 @@ mod tests {
             hour.join("dangling.parquet"),
         )
         .unwrap();
-        // A live link to a large file, and one to a directory of them,
-        // outside the data layout.
         write_len(tmp.path(), "elsewhere/big.parquet", 4096);
         std::os::unix::fs::symlink(
             tmp.path().join("elsewhere/big.parquet"),
@@ -2469,9 +2185,6 @@ mod tests {
         assert!(matches!(walked, Err(EngineError::Cancelled)), "{walked:?}");
     }
 
-    /// The selection parses run on the worker under the work's latch: a
-    /// job latched before it starts answers cancelled at the parse, builds
-    /// no pattern, and never takes the unparseable fallback.
     #[test]
     fn a_latched_selection_parse_is_cancelled() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2500,7 +2213,6 @@ mod tests {
         assert_eq!(trawl_core::pattern::thread_builds(), builds);
     }
 
-    /// A real parse error keeps each selection's fallback: nothing to read.
     #[test]
     fn an_unparseable_selection_still_reads_nothing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2514,8 +2226,6 @@ mod tests {
         assert_eq!((envs.names, envs.total), (Vec::new(), 0));
     }
 
-    /// The bounded env selection applies the `env=` pin rules the
-    /// source's narrowing does, and walks the root only without a pin.
     #[test]
     fn first_selected_envs_follow_the_env_pin() {
         let tmp = tempfile::tempdir().unwrap();

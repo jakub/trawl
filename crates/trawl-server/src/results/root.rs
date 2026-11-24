@@ -11,27 +11,9 @@
 //!   .stage-<16 alnum>.parquet    0600, staged; never named by a row
 //! ```
 //!
-//! [`ResultsRoot::open_apart_from`] holds the directory through
-//! [`trawl_engine::scratch::hold_apart_from`], as ADR-0052 holds a storage
-//! root: made 0700 if missing, its final component opened no-follow,
-//! refused if it is, sits inside or sits above the data root, the WAL
-//! directory, a repin staging root or the query scratch directory, closed
-//! to its owner, and locked. Unlike query scratch it is never cleared: what
-//! it holds outlives a restart. Boot reconciles it against the metadata
-//! rows instead ([`super::sweep::reconcile_at_boot`]).
-//!
 //! Every entry is reached through the held handle, by `openat`,
 //! `renameat2` and `unlinkat`, so no link in the configured path can
-//! redirect a call to another directory. A file is published in ADR-0057's
-//! order: staged under a fresh name in the root itself, so the rename stays
-//! on one filesystem, written, synced, hashed, renamed to its final name
-//! without replacing anything, and the directory synced; only then does
-//! the caller commit the row. A [`StagedFile`] that is dropped before it is
-//! published unlinks itself.
-//!
-//! Result ids are 32 lowercase hex digits. Every method checks the id
-//! before it builds a name, so no id can name an entry outside the root or
-//! one that is not a result.
+//! redirect a call to another directory.
 
 use std::fs::File;
 use std::io;
@@ -42,35 +24,25 @@ use trawl_engine::scratch::{HeldRoot, OwnedRoot, RootRole, ScratchError};
 
 use crate::error::CauseKind;
 
-/// Suffix of a published result's file name, after its id.
 const RESULT_SUFFIX: &str = ".parquet";
 
-/// Prefix and suffix of a staged file's name.
 const STAGE_PREFIX: &str = ".stage-";
-/// See [`STAGE_PREFIX`].
 const STAGE_SUFFIX: &str = ".parquet";
 
-/// Length of the random part of a staged file's name, pinned so the
-/// recognizer demands exactly what [`ResultsRoot::stage`] makes.
 const STAGE_RANDOM_LEN: usize = 16;
 
-/// Length of a result id: 128 random bits as lowercase hex.
 const ID_LEN: usize = 32;
 
-/// Whether `id` is a result id: exactly 32 lowercase hex digits.
 #[must_use]
 pub fn is_result_id(id: &str) -> bool {
     id.len() == ID_LEN && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Whether `name` is a published result's file name, `<id>.parquet`.
 #[must_use]
 pub fn is_result_name(name: &str) -> bool {
     result_id_of(name).is_some()
 }
 
-/// Whether `name` is a staged file's name, `.stage-<16 alnum>.parquet`, as
-/// [`ResultsRoot::stage`] makes it.
 #[must_use]
 pub fn is_stage_name(name: &str) -> bool {
     name.strip_prefix(STAGE_PREFIX)
@@ -80,14 +52,11 @@ pub fn is_stage_name(name: &str) -> bool {
         })
 }
 
-/// The id a published result's file name carries.
 fn result_id_of(name: &str) -> Option<&str> {
     name.strip_suffix(RESULT_SUFFIX)
         .filter(|id| is_result_id(id))
 }
 
-/// The file name of result `id`, or an `InvalidInput` error when `id` is
-/// not a result id.
 fn result_name(id: &str) -> io::Result<String> {
     if is_result_id(id) {
         Ok(format!("{id}{RESULT_SUFFIX}"))
@@ -99,7 +68,6 @@ fn result_name(id: &str) -> io::Result<String> {
     }
 }
 
-/// A fresh staged file name.
 fn stage_name() -> String {
     use rand::Rng as _;
     let random: String = rand::thread_rng()
@@ -110,34 +78,26 @@ fn stage_name() -> String {
     format!("{STAGE_PREFIX}{random}{STAGE_SUFFIX}")
 }
 
-/// The results root, held for this process.
-///
 /// The lock is the [`HeldRoot`]'s: it lives as long as this value and
 /// every [`StagedFile`] it handed out, since each staged file keeps a
 /// duplicate of the held handle to unlink itself with.
 #[derive(Debug)]
 pub struct ResultsRoot {
     held: HeldRoot,
-    /// The next unlink a test holds ([`ResultsRoot::hold_next_unlink`]).
     #[cfg(any(test, feature = "test-support"))]
     held_unlink: parking_lot::Mutex<Option<HeldUnlink>>,
 }
 
 /// The next [`ResultsRoot::unlink`], held before it unlinks anything: a
 /// results filesystem slowed under one unlink.
-///
-/// Compiled for this crate's unit tests and, via the `test-support`
-/// feature, its integration tests.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct UnlinkHold {
-    /// Answers once the unlink is parked.
     pub parked: tokio::sync::oneshot::Receiver<()>,
     /// Send, or drop, to let the unlink run.
     pub release: std::sync::mpsc::Sender<()>,
 }
 
-/// The unlink's half of an [`UnlinkHold`].
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct HeldUnlink {
@@ -145,12 +105,6 @@ struct HeldUnlink {
     release: std::sync::mpsc::Receiver<()>,
 }
 
-/// A file staged in the results root for one capture's write.
-///
-/// Dropping it before [`ResultsRoot::publish`] commits it unlinks it, so a
-/// failed write, a client abort, a timeout or a dropped task leaves no
-/// staged file behind; boot removes any that a killed process left
-/// ([`ResultsRoot::remove_stages`]).
 #[derive(Debug)]
 pub struct StagedFile {
     /// A duplicate of the root's held handle, so the drop can unlink by
@@ -192,31 +146,20 @@ impl Drop for StagedFile {
     }
 }
 
-/// What [`ResultsRoot::publish`] committed to the file's final name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Published {
-    /// The file's size.
     pub file_bytes: u64,
-    /// The blake3 digest of the whole file.
     pub digest: [u8; 32],
 }
 
-/// What [`ResultsRoot::verify`] found at a result's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verified {
-    /// The file is there and its digest matches.
     Ok,
-    /// Nothing is there.
     Missing,
-    /// The file is there and its digest does not match.
     Mismatch,
 }
 
 impl ResultsRoot {
-    /// Hold the results root at `path` apart from `roots`
-    /// ([`trawl_engine::scratch::hold_apart_from`]), for a trawld running
-    /// as this process's euid. Refusals name [`RootRole::RESULTS`]. Nothing
-    /// in the directory is touched.
     pub fn open_apart_from(path: &Path, roots: &[OwnedRoot]) -> Result<Self, ScratchError> {
         #[cfg(unix)]
         let euid = rustix::process::geteuid().as_raw();
@@ -237,8 +180,6 @@ impl ResultsRoot {
         self.held.path()
     }
 
-    /// Create a fresh staged file, 0600, by `openat` with `O_CREAT |
-    /// O_EXCL | O_NOFOLLOW`, so an existing entry is never reused.
     pub fn stage(&self) -> io::Result<StagedFile> {
         let dir = self.held.dir().try_clone()?;
         let name = stage_name();
@@ -251,11 +192,6 @@ impl ResultsRoot {
         })
     }
 
-    /// Publish `staged` as result `id`: `fsync` the file, hash it with
-    /// blake3 and read its size, both through one no-follow handle, rename
-    /// it to `<id>.parquet` with `RENAME_NOREPLACE`, so an existing name is
-    /// an error and is never replaced, then `fsync` the root.
-    ///
     /// On an error before the rename, the staged file is unlinked as it
     /// drops. A failed `fsync` of the root after the rename unlinks the
     /// published name again: the caller commits no row for it.
@@ -280,31 +216,16 @@ impl ResultsRoot {
         Ok(Published { file_bytes, digest })
     }
 
-    /// Open result `id`'s file read-only, by `openat` with `O_NOFOLLOW`.
-    /// `None` when nothing is there. A symlink at the name fails the open,
-    /// and anything other than a regular file is an error.
     pub fn open_file(&self, id: &str) -> io::Result<Option<File>> {
         sys::open_regular(self.held.dir(), &result_name(id)?)
     }
 
     /// The path of result `id`'s file, for the engine's `read_parquet`,
     /// which opens by path.
-    ///
-    /// A path is acceptable here, where an `openat` is not possible. The
-    /// root is 0700, owned by trawld's euid, held no-follow and locked, so
-    /// only trawld's own uid can add, rename or replace an entry in it, and
-    /// the directories above it are operator-trusted storage (ADR-0052,
-    /// ADR-0056). A reader that checks the digest through [`Self::verify`]
-    /// and then reads by path therefore reads the file it checked unless
-    /// trawld's own uid replaced it in between.
     pub fn path_of(&self, id: &str) -> io::Result<PathBuf> {
         Ok(self.path().join(result_name(id)?))
     }
 
-    /// Check result `id`'s file against `expected`, its digest at publish
-    /// (ADR-0057, D27): blake3 over the whole file, read through a
-    /// no-follow handle. A file that cannot be opened, such as a symlink at
-    /// the name, is an error, never [`Verified::Ok`].
     pub fn verify(&self, id: &str, expected: &[u8; 32]) -> io::Result<Verified> {
         let Some(mut file) = self.open_file(id)? else {
             return Ok(Verified::Missing);
@@ -316,27 +237,21 @@ impl ResultsRoot {
         })
     }
 
-    /// When result `id`'s file was last written, or `None` when nothing is
-    /// there.
     pub fn modified(&self, id: &str) -> io::Result<Option<SystemTime>> {
         self.open_file(id)?
             .map(|file| file.metadata()?.modified())
             .transpose()
     }
 
-    /// Unlink result `id`'s file, by `unlinkat`. Returns whether a file was
-    /// there.
     pub fn unlink(&self, id: &str) -> io::Result<bool> {
         #[cfg(any(test, feature = "test-support"))]
         self.wait_if_unlink_held();
         sys::unlink(self.held.dir(), &result_name(id)?)
     }
 
-    /// Park the next [`Self::unlink`] before it unlinks anything until the
-    /// hold's `release` is sent or dropped, or for a minute at most. One
-    /// unlink only. The wait blocks the unlinking thread, so arm it only
-    /// for an unlink that runs on a blocking thread, as the evidence and
-    /// expiry unlinks do.
+    /// Park the next [`Self::unlink`] until the hold's `release` is sent or
+    /// dropped, or for a minute at most. The wait blocks the unlinking thread,
+    /// so arm it only for an unlink that runs on a blocking thread.
     #[cfg(any(test, feature = "test-support"))]
     pub fn hold_next_unlink(&self) -> UnlinkHold {
         let (parked_tx, parked) = tokio::sync::oneshot::channel();
@@ -348,7 +263,6 @@ impl ResultsRoot {
         UnlinkHold { parked, release }
     }
 
-    /// Wait out a held unlink, if this one is held.
     #[cfg(any(test, feature = "test-support"))]
     fn wait_if_unlink_held(&self) {
         let held = self.held_unlink.lock().take();
@@ -358,10 +272,8 @@ impl ResultsRoot {
         }
     }
 
-    /// Unlink every staged file, which no row ever names. Returns how many
-    /// went. Boot calls this while it holds the lock, so no capture of this
-    /// process is staging. An entry with a staged name that is not a
-    /// regular file is not one trawld made: it is logged and left alone.
+    /// Boot calls this while it holds the lock, so no capture of this
+    /// process is staging.
     pub fn remove_stages(&self) -> io::Result<usize> {
         let dir = self.held.dir();
         let mut removed = 0;
@@ -384,11 +296,6 @@ impl ResultsRoot {
         Ok(removed)
     }
 
-    /// The ids of every published result file in the root, sorted.
-    ///
-    /// Staged files are skipped. Anything else, an entry with a name
-    /// trawld does not make or a result name that is not a regular file,
-    /// is logged at warn and left alone.
     pub fn list_ids(&self) -> io::Result<Vec<String>> {
         let mut ids = Vec::new();
         for entry in sys::entries(self.held.dir())? {
@@ -415,8 +322,6 @@ impl ResultsRoot {
     }
 }
 
-/// Log an entry in the results root that trawld did not make and leaves
-/// alone.
 fn warn_foreign(root: &Path, what: &str, name: Option<&str>) {
     tracing::warn!(
         event_type = "results_root_foreign_entry",
@@ -433,14 +338,12 @@ fn digest(file: &mut File) -> io::Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
-/// An entry of the results root.
 struct Entry {
     name: std::ffi::OsString,
     /// Whether it is a regular file, read without following a symlink.
     regular: bool,
 }
 
-/// The descriptor-relative calls behind [`ResultsRoot`].
 #[cfg(unix)]
 mod sys {
     use std::fs::File;
@@ -452,7 +355,6 @@ mod sys {
 
     use super::Entry;
 
-    /// Create `name` in `dir`, 0600, failing if anything is there.
     pub(super) fn create_new(dir: &File, name: &str) -> io::Result<File> {
         let flags =
             OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::RDWR | OFlags::CLOEXEC;
@@ -460,9 +362,7 @@ mod sys {
         Ok(File::from(fd))
     }
 
-    /// Open the regular file `name` in `dir` read-only without following a
-    /// symlink, and without waiting on a FIFO. `None` when nothing is
-    /// there; anything other than a regular file is an error.
+    /// Opened without waiting on a FIFO.
     pub(super) fn open_regular(dir: &File, name: &str) -> io::Result<Option<File>> {
         let flags =
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
@@ -480,8 +380,6 @@ mod sys {
         Ok(Some(file))
     }
 
-    /// Rename `from` to `to` within `dir`, failing with `AlreadyExists`
-    /// when `to` exists.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     pub(super) fn rename_noreplace(dir: &File, from: &str, to: &str) -> io::Result<()> {
         use rustix::fs::RenameFlags;
@@ -499,7 +397,6 @@ mod sys {
         ))
     }
 
-    /// Unlink `name` in `dir`. Returns whether it was there.
     pub(super) fn unlink(dir: &File, name: &str) -> io::Result<bool> {
         match rustix::fs::unlinkat(dir, name, AtFlags::empty()) {
             Ok(()) => Ok(true),
@@ -508,8 +405,6 @@ mod sys {
         }
     }
 
-    /// The entries of `dir`, `.` and `..` left out, each with whether it is
-    /// a regular file.
     pub(super) fn entries(dir: &File) -> io::Result<Vec<Entry>> {
         let mut out = Vec::new();
         for entry in rustix::fs::Dir::read_from(dir)? {

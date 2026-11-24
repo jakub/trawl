@@ -2,19 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! What a `trawld --doctor` row may say, and the two renderings of the
-//! report (#269, D18).
-//!
-//! A row is a [`Row`], and every string in it is built here from parts
-//! that cannot carry a value the report must not show: `&'static str`
-//! literals, integers, a [`SelectedPath`] the operator chose, the running
-//! user's [`UserName`], a [`HealthKey`], and a service name, env name or
-//! date that passed trawl's own validation. A health value is never
-//! shown as trawld sent it. No constructor takes a `String`, a `Display`,
-//! or an error, so the `Display` or `Debug` of a database, OS, TLS or HTTP
-//! error, a database URL, a certificate name, a catalog identifier, or a
-//! listener address has no way into a row. The runner in [`super`] turns
-//! rows into [`trawl_api::doctor::Check`]s; nothing else builds one.
+//! What a `trawld --doctor` row may say, and the two renderings of the report.
+//! No constructor takes a `String`, a `Display`, or an error, so the `Display`
+//! or `Debug` of an error has no way into a row.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -35,8 +25,6 @@ pub enum Format {
 }
 
 impl Format {
-    /// The format when `--format` is absent: table on a terminal, JSON
-    /// otherwise, as `trawl doctor` picks.
     #[must_use]
     pub fn detect() -> Self {
         if io::IsTerminal::is_terminal(&io::stdout()) {
@@ -47,23 +35,14 @@ impl Format {
     }
 }
 
-/// Which operator selection a [`SelectedPath`] is. ADR-0047 lets a report
-/// name the configuration and credential files the operator selected, and
-/// no other path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selection {
-    /// The file `--config` names.
     ConfigFlag,
-    /// `[server] tls_cert_path`.
     TlsCertPath,
-    /// `[server] tls_key_path`.
     TlsKeyPath,
-    /// The file `PGPASSFILE` names.
     PgPassFile,
 }
 
-/// A path the operator selected, as the report may show it: control and
-/// bidirectional-formatting characters are replaced by `?`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SelectedPath {
     selection: Selection,
@@ -71,7 +50,6 @@ pub struct SelectedPath {
 }
 
 impl SelectedPath {
-    /// The path `selection` names.
     #[must_use]
     pub fn new(selection: Selection, path: &Path) -> Self {
         let shown = path
@@ -82,13 +60,11 @@ impl SelectedPath {
         Self { selection, shown }
     }
 
-    /// Which selection this is.
     #[must_use]
     pub const fn selection(&self) -> Selection {
         self.selection
     }
 
-    /// The path as the report shows it.
     #[must_use]
     pub fn as_shown(&self) -> &str {
         &self.shown
@@ -120,14 +96,10 @@ fn is_hidden(c: char) -> bool {
         )
 }
 
-/// The running user's name, as the password database returned it, when it
-/// is a plain account name: `[A-Za-z0-9._-]`, then up to 31 more of those
-/// or `$`. Any other name is not shown; the uid still is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserName(String);
 
 impl UserName {
-    /// `name`, when it is a plain account name.
     #[must_use]
     pub fn new(name: &str) -> Option<Self> {
         let plain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-');
@@ -139,11 +111,6 @@ impl UserName {
     }
 }
 
-/// A health check name the report may show: one of the names trawld's
-/// health endpoint reports ([`HEALTH_CHECK_NAMES`]). The set is closed, so
-/// no name a listener sends is ever shown as sent, not even one shaped like
-/// an identifier; any other name belongs to the one [`HealthKey::invalid`]
-/// row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthKey(&'static str);
 
@@ -153,9 +120,6 @@ impl HealthKey {
     /// does, so it cannot collide with a server's check.
     pub const INVALID: &'static str = "_invalid";
 
-    /// The key for `name`, when trawld's health endpoint reports a check
-    /// of that name. The key holds this doctor's copy of the name, never
-    /// the text that arrived.
     #[must_use]
     pub fn new(name: &str) -> Option<Self> {
         HEALTH_CHECK_NAMES
@@ -164,72 +128,55 @@ impl HealthKey {
             .map(Self)
     }
 
-    /// The key of the row for names trawld does not report.
     #[must_use]
     pub const fn invalid() -> Self {
         Self(Self::INVALID)
     }
 }
 
-/// Shown by [`Text::service_name`] in place of a name that is not a valid
-/// service name.
 pub const INVALID_SERVICE: &str = "<invalid service>";
-/// Shown by [`Text::env_name`] in place of a name that is not a valid env
-/// name.
 pub const INVALID_ENV: &str = "<invalid env>";
-/// Shown by [`Text::date`] in place of text that is not a `YYYY-MM-DD`
-/// date.
 pub const INVALID_DATE: &str = "<invalid date>";
 
-/// Text for a row's detail, source or next action, built only from parts
-/// the report may show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Text(String);
 
 impl Text {
-    /// Start with a literal.
     #[must_use]
     pub fn new(literal: &'static str) -> Self {
         Self(literal.to_owned())
     }
 
-    /// Append a literal.
     #[must_use]
     pub fn lit(mut self, literal: &'static str) -> Self {
         self.0.push_str(literal);
         self
     }
 
-    /// Append an integer.
     #[must_use]
     pub fn int(mut self, n: impl Into<i128>) -> Self {
         self.0.push_str(&n.into().to_string());
         self
     }
 
-    /// Append a path the operator selected.
     #[must_use]
     pub fn path(mut self, path: &SelectedPath) -> Self {
         self.0.push_str(path.as_shown());
         self
     }
 
-    /// Append the running user's name.
     #[must_use]
     pub fn user(mut self, name: &UserName) -> Self {
         self.0.push_str(&name.0);
         self
     }
 
-    /// Append a health check name.
     #[must_use]
     pub fn key(mut self, key: &HealthKey) -> Self {
         self.0.push_str(key.0);
         self
     }
 
-    /// Append `name` when it is a valid service name
-    /// ([`trawl_config::is_valid_service_name`]), else [`INVALID_SERVICE`].
     #[must_use]
     pub fn service_name(mut self, name: &str) -> Self {
         self.0
@@ -241,8 +188,6 @@ impl Text {
         self
     }
 
-    /// Append `name` when it is a valid env name
-    /// ([`trawl_config::is_valid_env_name`]), else [`INVALID_ENV`].
     #[must_use]
     pub fn env_name(mut self, name: &str) -> Self {
         self.0.push_str(if trawl_config::is_valid_env_name(name) {
@@ -253,8 +198,6 @@ impl Text {
         self
     }
 
-    /// Append `day` when it is a date directory name, written back from
-    /// the parsed date, else [`INVALID_DATE`].
     #[must_use]
     pub fn date(mut self, day: &str) -> Self {
         match env_dirs::parse_date(day) {
@@ -264,24 +207,17 @@ impl Text {
         self
     }
 
-    /// The text as the report shows it.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// The text as the report shows it, owned.
     #[must_use]
     pub fn into_string(self) -> String {
         self.0
     }
 }
 
-/// One row of the report, before the runner places it.
-///
-/// A row names its [`ServerCheck`]; a per-key health row also names its
-/// [`HealthKey`]. `blocked_by` is not settable: only the runner writes a
-/// row for a check whose prerequisite did not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     check: ServerCheck,
@@ -308,39 +244,31 @@ impl Row {
         }
     }
 
-    /// The assertion held.
     #[must_use]
     pub fn complete(check: ServerCheck) -> Self {
         Self::new(check, Outcome::Complete, None)
     }
 
-    /// The assertion held, for a reason that is part of the contract, such
-    /// as [`trawl_api::doctor::reason::WILL_INITIALIZE`].
     #[must_use]
     pub fn complete_because(check: ServerCheck, reason: &'static str) -> Self {
         Self::new(check, Outcome::Complete, Some(reason))
     }
 
-    /// Evidence against the assertion, said as a fixed sentence or code.
     #[must_use]
     pub fn failed(check: ServerCheck, reason: &'static str) -> Self {
         Self::new(check, Outcome::Failed, Some(reason))
     }
 
-    /// The doctor could not look; `reason` is a code from
-    /// [`trawl_api::doctor::reason`].
     #[must_use]
     pub fn not_sampled(check: ServerCheck, reason: &'static str) -> Self {
         Self::new(check, Outcome::NotSampled, Some(reason))
     }
 
-    /// The operator did not select what the check needs.
     #[must_use]
     pub fn not_configured(check: ServerCheck, reason: &'static str) -> Self {
         Self::new(check, Outcome::NotConfigured, Some(reason))
     }
 
-    /// A per-key row of `check`, such as `server.listener.health.duckdb`.
     #[must_use]
     pub fn for_key(
         check: ServerCheck,
@@ -354,8 +282,6 @@ impl Row {
         }
     }
 
-    /// The row for a check whose prerequisite `by` did not complete. Only
-    /// the runner writes one.
     pub(super) fn blocked(check: ServerCheck, by: ServerCheck) -> Self {
         Self {
             blocked_by: Some(by),
@@ -367,9 +293,6 @@ impl Row {
         }
     }
 
-    /// This row as a root run reports it, when the check asserts access:
-    /// a `complete` becomes `not_sampled`, reason `ran_as_root`, keeping
-    /// what it observed. Only the runner applies it.
     pub(super) fn into_root_run(self) -> Self {
         if self.outcome != Outcome::Complete {
             return self;
@@ -384,52 +307,44 @@ impl Row {
         }
     }
 
-    /// Whether this is a per-key row.
     #[must_use]
     pub const fn is_keyed(&self) -> bool {
         self.key.is_some()
     }
 
-    /// Set the observed, sanitized facts.
     #[must_use]
     pub fn detail(mut self, detail: Text) -> Self {
         self.detail = Some(detail);
         self
     }
 
-    /// Name the setting or input the check read.
     #[must_use]
     pub fn source(mut self, source: Text) -> Self {
         self.source = Some(source);
         self
     }
 
-    /// Say what the operator should do next.
     #[must_use]
     pub fn next(mut self, next: Text) -> Self {
         self.next = Some(next);
         self
     }
 
-    /// The check this row reports.
     #[must_use]
     pub const fn check(&self) -> ServerCheck {
         self.check
     }
 
-    /// The row's outcome.
     #[must_use]
     pub const fn outcome(&self) -> Outcome {
         self.outcome
     }
 
-    /// The row's reason.
     #[must_use]
     pub const fn reason(&self) -> Option<&'static str> {
         self.reason
     }
 
-    /// The report's form of this row.
     pub(super) fn into_check(self) -> Check {
         let id = match &self.key {
             Some(key) => format!("{}.{}", self.check.id(), key.0),
@@ -447,8 +362,6 @@ impl Row {
     }
 }
 
-/// Render the report once: JSON is the report serialized, text is one line
-/// per check, then the notes and the verdict, as `trawl doctor` prints them.
 pub fn render(report: &Report, format: Format, out: &mut impl Write) -> io::Result<()> {
     match format {
         Format::Json => {
@@ -479,8 +392,6 @@ pub fn render(report: &Report, format: Format, out: &mut impl Write) -> io::Resu
     }
 }
 
-/// One text line: id, outcome, then reason, detail, source, what blocked
-/// it, and the next action, each when present.
 fn check_line(check: &Check, width: usize) -> String {
     let outcome = match check.outcome {
         Outcome::Complete => "complete",

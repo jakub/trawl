@@ -3,13 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `trawld --doctor` tests of the data root and recovery marker checks.
-//!
-//! Each test plants one state under a private data root, points the doctor
-//! at a migrated Fleet database and a migrated app-state database, so the
-//! database rows are not what fails, and reads the JSON report. A state
-//! boot refuses is `failed` with a stable reason and the run exits 1; the
-//! output never names the data root, a marker's content, or either catalog
-//! identifier.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -23,20 +16,14 @@ use crate::support::{
     write_parquet,
 };
 
-/// A catalog id no database here holds, for a data root restored from
-/// somewhere else.
 const FOREIGN_CATALOG: &str = "5b1e0c55-2f0e-4c1a-9d3b-00000000f0e1";
 
-/// A migrated Fleet database and a migrated app-state database.
 struct Databases {
     fleet: String,
     app: String,
-    /// `catalog_state.catalog_id` of the app-state database.
     catalog_id: String,
 }
 
-/// Mint and migrate both databases, and release everything that holds a
-/// connection before the doctor runs.
 async fn migrated_databases() -> Databases {
     let fleet = common::create_fleet_database().await;
     let pool = common::fleet_pool(&fleet).await;
@@ -65,7 +52,6 @@ async fn migrated_databases() -> Databases {
     }
 }
 
-/// The doctor's environment: `HOME` and both real database URLs.
 fn env(home: &Path, dbs: &Databases) -> Vec<(&'static str, OsString)> {
     vec![
         ("HOME", home.as_os_str().to_owned()),
@@ -74,7 +60,6 @@ fn env(home: &Path, dbs: &Databases) -> Vec<(&'static str, OsString)> {
     ]
 }
 
-/// What one doctor run printed, parsed.
 struct Run {
     code: i32,
     report: Report,
@@ -89,16 +74,12 @@ impl Run {
             .unwrap_or_else(|| panic!("no {id} row"))
     }
 
-    /// `id`'s outcome and reason.
     fn outcome(&self, id: &str) -> (Outcome, Option<&str>) {
         let row = self.row(id);
         (row.outcome, row.reason.as_deref())
     }
 }
 
-/// Write `config` into `dir`, run the doctor on it with JSON output, and
-/// check both streams for every planted value: the database URLs, both
-/// catalog ids, the data root's own path, and a configured WAL directory's.
 async fn doctor(dir: &Path, config: &DoctorConfig, dbs: &Databases) -> Run {
     let path = write_doctor_config(dir, config);
     let args: Vec<OsString> = vec![
@@ -137,14 +118,12 @@ fn write(path: &Path, bytes: &[u8]) {
     std::fs::write(path, bytes).expect("plant a file");
 }
 
-/// A repin marker document in `phase`.
 fn repin_marker(phase: &str) -> String {
     format!(
         r#"{{"job_id":9,"field":"status","from_type":"BIGINT","to_type":"VARCHAR","phase":"{phase}"}}"#
     )
 }
 
-/// One state boot refuses, the check that must fail on it, and the reason.
 struct Refusal {
     name: &'static str,
     ingest: bool,
@@ -153,7 +132,7 @@ struct Refusal {
     reason: &'static str,
 }
 
-#[allow(clippy::too_many_lines)] // one table of states, clearer unsplit
+#[allow(clippy::too_many_lines)]
 fn refusals() -> Vec<Refusal> {
     vec![
         Refusal {
@@ -258,17 +237,6 @@ fn refusals() -> Vec<Refusal> {
     ]
 }
 
-/// The storage rows of `doctor_boot_refusals_fail`: every data-root state
-/// boot refuses is `failed` with its stable reason and the run exits 1.
-///
-/// Catalog identity is stricter than boot (#269 H1): a marker naming
-/// another catalog fails on a query-only node, which boot refuses, and on
-/// an ingest node, which boot would adopt through the lossy conformance
-/// pass. Neither catalog id appears in the output, which
-/// [`doctor`] checks on every run.
-///
-/// Every case runs before the test judges, so one failure names every
-/// state that disagrees.
 #[tokio::test]
 async fn doctor_boot_refusals_fail() {
     let dbs = migrated_databases().await;
@@ -309,7 +277,6 @@ async fn doctor_boot_refusals_fail() {
     );
 }
 
-/// An ingest node's data root holding `EPOCH` 3 and its WAL inside it.
 /// The root is owner-only, as trawld's umask and boot's close step leave
 /// it, whatever this test process's umask is.
 fn current_ingest_root(dir: &Path) -> DoctorConfig {
@@ -321,22 +288,18 @@ fn current_ingest_root(dir: &Path) -> DoctorConfig {
     config
 }
 
-/// Give `path` mode `mode`.
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// The permission bits of `path`, without following a final symlink.
 #[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::MetadataExt as _;
     std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
 }
 
-/// A well-formed publication marker for `prod`/`nginx`, from the encoder
-/// compaction writes with.
 fn publication_marker(wal: &Path) -> (PathBuf, String) {
     let marker = ValidatedMarker::new(
         "prod",
@@ -353,15 +316,10 @@ fn publication_marker(wal: &Path) -> (PathBuf, String) {
     (marker.marker_path(wal), marker.encode())
 }
 
-/// A rollup of nginx over hours 07 and 08 that stopped before its rename,
-/// planted as real Parquet, and its marker, unwritten: boot's recovery
-/// finishes it.
 fn rollup_marker(data: &Path) -> (PathBuf, String) {
     pending_rollup(&data.join("prod/2026-09-23"), "nginx", &["07", "08"])
 }
 
-/// A marker from a release before identity-bearing rollup markers: the
-/// hourly inputs, one path a line. Boot's recovery keeps it.
 fn old_format_rollup_marker(data: &Path) {
     let day = data.join("prod/2026-09-23");
     write(
@@ -375,17 +333,12 @@ fn old_format_rollup_marker(data: &Path) {
     );
 }
 
-/// [`rollup_marker`], written, then a daily file the marker never recorded
-/// put in place: boot's recovery cannot prove the rename did not happen,
-/// and keeps it.
 fn prior_mismatch_rollup_marker(data: &Path) {
     let (path, body) = rollup_marker(data);
     write(&path, body.as_bytes());
     write_parquet(&data.join("prod/2026-09-23/nginx.parquet"), 99);
 }
 
-/// Whether the running user reads a file of mode 000 anyway: root, or a
-/// holder of `CAP_DAC_OVERRIDE`.
 #[cfg(unix)]
 fn reads_mode_000(dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
@@ -397,10 +350,8 @@ fn reads_mode_000(dir: &Path) -> bool {
     privileged
 }
 
-/// Whether the running user writes a directory of mode 0500 anyway: root,
-/// or a holder of `CAP_DAC_OVERRIDE`. `CAP_DAC_READ_SEARCH` alone passes
-/// [`reads_mode_000`] but not this, and the doctor's write checks go by
-/// this one.
+/// `CAP_DAC_READ_SEARCH` alone passes [`reads_mode_000`] but not this, and
+/// the doctor's write checks go by this one.
 #[cfg(unix)]
 fn writes_mode_0500(dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
@@ -413,12 +364,6 @@ fn writes_mode_0500(dir: &Path) -> bool {
     privileged
 }
 
-/// The marker states `doctor_recovery_markers` expects to fail the row:
-/// the plant, the reason, and for a rollup marker the proof the row names.
-/// A publication marker that does not parse or names another service's
-/// WAL; a rollup marker in an older release's format, one that is not
-/// text, one that is not a regular file, and one whose daily file is not
-/// the prior it recorded.
 type FailedMarker = (&'static str, fn(&Path), &'static str, Option<&'static str>);
 
 fn failed_markers() -> [FailedMarker; 6] {
@@ -467,16 +412,11 @@ fn failed_markers() -> [FailedMarker; 6] {
     ]
 }
 
-/// `doctor_recovery_markers`: a malformed publication marker, and a rollup
-/// marker boot's recovery would keep, are `failed`; an unreadable one is
-/// `not_sampled`/`unreadable`; and pending ones boot's recovery finishes
-/// are `complete`/`pending_at_next_boot`.
 #[tokio::test]
 async fn doctor_recovery_markers() {
     const CHECK: &str = "server.recovery.publication";
     let dbs = migrated_databases().await;
 
-    // Well formed and pending: boot's recovery finishes both.
     {
         let dir = tempfile::tempdir().unwrap();
         let config = current_ingest_root(dir.path());
@@ -498,7 +438,6 @@ async fn doctor_recovery_markers() {
         );
     }
 
-    // Failed: see [`failed_markers`].
     for (name, plant, why, proof) in failed_markers() {
         let dir = tempfile::tempdir().unwrap();
         let config = current_ingest_root(dir.path());
@@ -516,8 +455,6 @@ async fn doctor_recovery_markers() {
         }
     }
 
-    // Unreadable: a well-formed marker of mode 000 is not sampled, kept
-    // apart from malformed. A user who reads it anyway sees it pending.
     #[cfg(unix)]
     for rollup in [false, true] {
         use std::os::unix::fs::PermissionsExt as _;
@@ -544,8 +481,6 @@ async fn doctor_recovery_markers() {
     }
 }
 
-/// A query-only node's data root holding `EPOCH` 3, with a WAL directory
-/// inside it that the node never reads.
 fn current_query_only_root(dir: &Path) -> DoctorConfig {
     DoctorConfig {
         ingest: false,
@@ -553,14 +488,6 @@ fn current_query_only_root(dir: &Path) -> DoctorConfig {
     }
 }
 
-/// `server.recovery.publication` on a query-only node: its publication
-/// gate registers every rollup marker the boot scan finds and refuses
-/// corpus reads while one remains, so the rollup census runs there too. A
-/// rollup marker boot's recovery would keep is `failed`, an unreadable one
-/// is `not_sampled`/`unreadable`, and a pending one is
-/// `complete`/`pending_at_next_boot`. Publication markers stay an ingest
-/// node's: a malformed one in the WAL a query-only node never reads changes
-/// nothing.
 #[tokio::test]
 async fn doctor_query_only_rollup_markers() {
     const CHECK: &str = "server.recovery.publication";
@@ -568,7 +495,6 @@ async fn doctor_query_only_rollup_markers() {
     let malformed_publication =
         |data: &Path| write(&data.join("wal/prod/.publish-nginx.json"), b"{ not json");
 
-    // Pending, beside a malformed publication marker it does not count.
     {
         let dir = tempfile::tempdir().unwrap();
         let config = current_query_only_root(dir.path());
@@ -589,7 +515,6 @@ async fn doctor_query_only_rollup_markers() {
         );
     }
 
-    // No rollup marker: complete, whatever the WAL holds.
     {
         let dir = tempfile::tempdir().unwrap();
         let config = current_query_only_root(dir.path());
@@ -598,8 +523,6 @@ async fn doctor_query_only_rollup_markers() {
         assert_eq!(run.outcome(CHECK), (Outcome::Complete, None));
     }
 
-    // Unresolved: an older release's format, not a regular file, and a
-    // daily file the marker did not record.
     for (name, plant) in [
         (
             "old-format rollup marker",
@@ -625,8 +548,6 @@ async fn doctor_query_only_rollup_markers() {
         assert_eq!(run.code, 1, "{name}");
     }
 
-    // Unreadable: a well-formed marker of mode 000. A user who reads it
-    // anyway sees it pending.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -649,14 +570,6 @@ async fn doctor_query_only_rollup_markers() {
     }
 }
 
-/// `server.data.identity` over an archive the walk could not enumerate in
-/// full. A foreign `CATALOG` marker over a root whose readable part holds
-/// no parquet, beside an empty directory of mode 000, is
-/// `not_sampled`/`unreadable` on both node types: the doctor has seen no
-/// parquet the marker must account for. Boot reads the same walk as
-/// standing data (`conform::archive_is_empty`), which this leaves alone.
-/// Parquet the walk does see still fails the mismatch. A user who reads the
-/// sealed directory anyway sees an empty archive.
 #[cfg(unix)]
 #[tokio::test]
 async fn doctor_identity_over_an_unwalked_archive() {
@@ -701,13 +614,6 @@ async fn doctor_identity_over_an_unwalked_archive() {
     }
 }
 
-/// `doctor_wal_outside_the_data_root`: an ingest node's WAL directory
-/// outside its data root is one boot creates or writes at its start, so
-/// `server.data.root` fails when the running user cannot write it, or
-/// cannot create it in the directory above it, and never names it. A user
-/// who may write a directory its mode forbids without being root sees each
-/// state complete. A run as euid 0 asks nothing about access, so each state
-/// is `not_sampled`/`ran_as_root`.
 #[cfg(unix)]
 #[tokio::test]
 async fn doctor_wal_outside_the_data_root() {
@@ -769,12 +675,6 @@ async fn doctor_wal_outside_the_data_root() {
     }
 }
 
-/// `doctor_predicts_the_root_close`: `server.data.root` predicts boot's
-/// closing of the storage roots without changing a mode (ADR-0052). An
-/// owner-only root is `complete`; one with group or other bits is
-/// `complete`, `will_tighten`, on both node types; a symlinked root fails,
-/// exit 1, and the link and its target stay as they were. A run as euid 0
-/// does not judge modes or owners, but a symlink refuses whoever runs.
 #[cfg(unix)]
 #[tokio::test]
 async fn doctor_predicts_the_root_close() {
@@ -836,12 +736,6 @@ async fn doctor_predicts_the_root_close() {
     );
 }
 
-/// `doctor_predicts_the_results_root_close`: `server.data.root` judges the
-/// results root (`[server] results_dir`, by default beside the data root)
-/// as it judges the repin roots (ADR-0057). Absent before the first boot
-/// is no fault; an owner-only root is `complete`; one with group or other
-/// bits is `complete`, `will_tighten`, on both node types, and keeps its
-/// mode; a symlink fails, exit 1, whoever runs, and stays a symlink.
 #[cfg(unix)]
 #[tokio::test]
 async fn doctor_predicts_the_results_root_close() {

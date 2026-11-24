@@ -2,14 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end tests for the catalog schema surface (ADR-0009):
-//! `/api/v1/schema` served from the catalog with `?service=`/`?all=`
-//! windowing, and the three read routes `/api/v1/schema/fields`,
-//! `/api/v1/schema/field?name=`, `/api/v1/schema/conflicts`.
-//!
-//! Modeled on `field_catalog.rs`: ingest through the real handler, compact
-//! through the real compaction path (with the catalog context the daemon
-//! wires), read through the real API.
+//! End-to-end tests for the catalog schema surface (ADR-0009).
 
 mod common;
 
@@ -27,7 +20,6 @@ fn now_ts() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-/// The catalog context exactly as trawld's main wires it.
 fn catalog_ctx(server: &TestServer) -> CatalogContext {
     CatalogContext {
         store: server.state.storage.catalog.clone(),
@@ -35,7 +27,6 @@ fn catalog_ctx(server: &TestServer) -> CatalogContext {
     }
 }
 
-/// Run one compaction tick over the server's WAL with the catalog wired.
 async fn compact_tick(server: &TestServer, wal_dir: &std::path::Path, data_dir: &std::path::Path) {
     let hot_buffer = server
         .state
@@ -69,7 +60,6 @@ struct Harness {
 }
 
 impl Harness {
-    /// GET an API path with the given token; return (status, parsed body).
     async fn get(&self, token: &str, path_and_query: &str) -> (u16, serde_json::Value) {
         let resp = self
             .raw
@@ -86,7 +76,6 @@ impl Harness {
         (status, body)
     }
 
-    /// POST an API path with the given token; return (status, parsed body).
     async fn post(
         &self,
         token: &str,
@@ -109,7 +98,6 @@ impl Harness {
         (status, body)
     }
 
-    /// DELETE an API path with the given token; return (status, body text).
     async fn delete(&self, token: &str, path_and_query: &str) -> (u16, String) {
         let resp = self
             .raw
@@ -122,7 +110,6 @@ impl Harness {
         (status, resp.text().await.unwrap_or_default())
     }
 
-    /// Scrape `/metrics` (unauthenticated, outside `/api/v1`).
     async fn metrics(&self) -> String {
         self.raw
             .get(format!("{}/metrics", self.server.url))
@@ -134,7 +121,6 @@ impl Harness {
             .expect("metrics body")
     }
 
-    /// Schema column names in response order.
     fn column_names(schema: &serde_json::Value) -> Vec<String> {
         schema["columns"]
             .as_array()
@@ -170,14 +156,12 @@ async fn harness() -> Harness {
     }
 }
 
-/// Ingest `events` and run one compaction tick.
 async fn ingest_and_compact(h: &Harness, events: &[serde_json::Value]) {
     let resp = h.ingest.ingest(events).await.expect("ingest");
     assert_eq!(resp.accepted, events.len());
     compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
 }
 
-/// One field's row out of a `/schema/fields` body.
 fn field_row<'a>(body: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
     body["fields"]
         .as_array()
@@ -198,8 +182,6 @@ fn event(service: &str, extra: &serde_json::Value) -> serde_json::Value {
     base
 }
 
-/// Acceptance: an ingested field lands in `/api/v1/schema` with its pinned
-/// type, and the query path agrees with the advertised type.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingested_field_lands_in_schema_with_pinned_type() {
     let h = harness().await;
@@ -218,7 +200,6 @@ async fn ingested_field_lands_in_schema_with_pinned_type() {
         "the catalog pin is the advertised type"
     );
 
-    // The query path agrees: a numeric comparison over the field works.
     let result = h
         .query
         .query_paginated("last=1h | where duration >= 42", None, None)
@@ -227,7 +208,6 @@ async fn ingested_field_lands_in_schema_with_pinned_type() {
     assert_eq!(result.result.row_count(), 1);
 }
 
-/// Acceptance: `?service=` returns only that service's fields.
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_service_param_scopes_fields() {
     let h = harness().await;
@@ -253,18 +233,12 @@ async fn schema_service_param_scopes_fields() {
     );
 }
 
-/// Regression: the unscoped column set is TTL-cached (its aggregate spans
-/// every service, and the service axis is client-chosen and unbounded)
-/// while `?service=` is served fresh. The two must not share a slot — a
-/// scoped request must neither be answered from the unscoped cache nor
-/// poison it for the next unscoped caller.
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_service_scope_bypasses_the_unscoped_cache() {
     let h = harness().await;
     ingest_and_compact(&h, &[event("svc-a", &json!({"alpha_field": 1}))]).await;
     ingest_and_compact(&h, &[event("svc-b", &json!({"beta_field": 2}))]).await;
 
-    // Prime the unscoped cache: both services' fields.
     let (_, schema) = h.get(&h.server.analyst_token, "/schema").await;
     let names = Harness::column_names(&schema);
     assert!(
@@ -272,7 +246,6 @@ async fn schema_service_scope_bypasses_the_unscoped_cache() {
         "unscoped listing spans services: {names:?}"
     );
 
-    // Scoped: bypasses the cache entirely, so svc-b's field is gone.
     let (_, schema) = h
         .get(&h.server.analyst_token, "/schema?service=svc-a")
         .await;
@@ -282,7 +255,6 @@ async fn schema_service_scope_bypasses_the_unscoped_cache() {
         "a scoped request is never served the cached unscoped listing: {names:?}"
     );
 
-    // And the unscoped listing is unchanged after it.
     let (_, schema) = h.get(&h.server.analyst_token, "/schema").await;
     let names = Harness::column_names(&schema);
     assert!(
@@ -291,14 +263,11 @@ async fn schema_service_scope_bypasses_the_unscoped_cache() {
     );
 }
 
-/// Acceptance: a field whose last observation predates the retention window
-/// is absent from `/schema` by default and present with `?all=true`.
 #[tokio::test(flavor = "multi_thread")]
 async fn aged_out_field_windowed_away_unless_all() {
     let h = harness().await;
     ingest_and_compact(&h, &[event("nginx", &json!({"old_field": 7}))]).await;
 
-    // Age the observation past the default 90-day retention window.
     let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
         .await
         .expect("connect app db");
@@ -329,10 +298,6 @@ async fn aged_out_field_windowed_away_unless_all() {
     );
 }
 
-/// A conflicting field that has not been conflicting for LONG carries no
-/// verdict at all — not a null one, no key: an install where a shipper had
-/// one bad afternoon must read exactly as it did before the analyzer
-/// shipped.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_freshly_conflicting_field_carries_no_verdict() {
     let h = harness().await;
@@ -358,9 +323,6 @@ async fn a_freshly_conflicting_field_carries_no_verdict() {
     assert!(body.get("verdict").is_none(), "{body}");
 }
 
-/// Acceptance: a pin that has been shelving values for over a day carries
-/// the verdict on both read routes, and the evidence rows carry the misfit
-/// samples the CLI and SPA render.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_degraded_field_carries_the_verdict_and_its_samples() {
     let h = harness().await;
@@ -370,8 +332,6 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples() {
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
     }
 
-    // The evidence is real; only its age is simulated. `first_at` is the one
-    // thing a test cannot wait 24 hours for.
     let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
         .await
         .expect("connect app db");
@@ -407,7 +367,6 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples() {
     assert!(samples.contains(&"N/A"), "samples: {samples:?}");
     assert!(samples.contains(&"pending"), "samples: {samples:?}");
 
-    // The case file carries the same verdict plus per-row evidence.
     let (status, body) = h
         .get(&h.server.analyst_token, "/schema/field?name=duration")
         .await;
@@ -424,7 +383,6 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples() {
         "{row}"
     );
 
-    // A field with no conflict evidence at all is never badged.
     assert!(
         field_row(&fields, "message").get("verdict").is_none(),
         "an unconflicted envelope field carries no verdict key"
@@ -439,10 +397,6 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples() {
     );
 }
 
-/// Acceptance: a query that binds a degraded field is stamped with the
-/// incomplete-results notice, including when it projects the field away,
-/// while a query that binds none carries no key at all, and the gauge
-/// reflects the count after a refresh pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_query_binding_a_degraded_field_is_stamped() {
     let h = harness().await;
@@ -462,8 +416,6 @@ async fn a_query_binding_a_degraded_field_is_stamped() {
     .await
     .expect("backdate the evidence");
 
-    // Before the tick loads it, the query path knows nothing — the notice is
-    // bounded by one refresh interval, deliberately.
     let (status, body) = h
         .post(
             &h.server.analyst_token,
@@ -479,7 +431,6 @@ async fn a_query_binding_a_degraded_field_is_stamped() {
 
     trawl_server::schema_refresh::refresh_degraded_fields(&h.server.state).await;
 
-    // Bound in a filter, projected away by `table` — the incomplete case.
     let (status, body) = h
         .post(
             &h.server.analyst_token,
@@ -495,7 +446,6 @@ async fn a_query_binding_a_degraded_field_is_stamped() {
         "a field filtered on and projected away is exactly the notice's case: {body}"
     );
 
-    // A query binding nothing degraded carries no key.
     let (_, body) = h
         .post(
             &h.server.analyst_token,
@@ -517,26 +467,15 @@ async fn a_query_binding_a_degraded_field_is_stamped() {
     );
 }
 
-/// Acceptance: `/api/v1/schema/services` badges a service with the degraded
-/// fields it actually conflicted on. A service that merely carries the same
-/// column, having never disagreed with its pin, is not badged.
-///
-/// This is the false-positive case the wire field exists to prevent: the
-/// client-side join a SPA could otherwise do (`columns` ∩ degraded set)
-/// would badge both services here, and only one of them has anything to fix.
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_services_badges_only_the_service_that_conflicted() {
     let h = harness().await;
     let timeouts_before = bookkeeping_timeouts(&h.server.url).await;
-    // svc-a pins duration BIGINT and never disagrees with it again; svc-b
-    // sends strings under that pin, which the conform shelves.
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     for value in ["N/A", "pending", "N/A"] {
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
     }
 
-    // Only the age of the evidence is simulated: the span half of the
-    // degrade gate is the one thing a test cannot wait 24 hours for.
     let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
         .await
         .expect("connect app db");
@@ -579,8 +518,6 @@ async fn schema_services_badges_only_the_service_that_conflicted() {
             .unwrap_or_else(|| panic!("service {name} listed: {body}"))
     };
 
-    // Both services carry the column — that is exactly what makes the join
-    // tempting and wrong.
     for name in ["svc-a", "svc-b"] {
         assert!(
             svc(name)["columns"]
@@ -611,10 +548,6 @@ async fn schema_services_badges_only_the_service_that_conflicted() {
         "the badge rides the existing SchemaRead gate, not a new one"
     );
 
-    // A store error keeps the entire previous snapshot, both halves or
-    // neither: clearing on a postgres blip would silently un-badge the
-    // install, and publishing a half-built one would un-badge every service
-    // while leaving the query notice standing.
     sqlx::query("DROP TABLE field_conflict_stats")
         .execute(&mut conn)
         .await
@@ -645,10 +578,6 @@ async fn schema_services_badges_only_the_service_that_conflicted() {
     );
 }
 
-/// Acceptance (#238): a compacted service's schema samples show `_time` and
-/// `_ingested` as formatted instants, not epoch microseconds, and a plain
-/// integer column keeps its numeric text.
-///
 /// Compaction writes both envelope instants as local (not UTC-adjusted)
 /// TIMESTAMP columns — pinned by the compaction unit test
 /// `compaction_writes_envelope_instants_as_non_utc_micros` — so their
@@ -658,8 +587,6 @@ async fn service_schema_time_samples_are_formatted() {
     const SUFFIX: &str = "";
 
     let h = harness().await;
-    // Two known instants with distinct microsecond fractions, recent enough
-    // to sit inside the retention window.
     let at = |ago_minutes: i64, micros: i64| {
         let base = chrono::Utc::now() - chrono::Duration::minutes(ago_minutes);
         chrono::DateTime::from_timestamp(base.timestamp(), 0).unwrap()
@@ -739,8 +666,6 @@ async fn service_schema_time_samples_are_formatted() {
     );
 }
 
-/// Whether `text` is exactly `YYYY-MM-DDTHH:MM:SS.ffffff` followed by
-/// `suffix`, digit for digit.
 fn is_fixed_width_instant(text: &str, suffix: &str) -> bool {
     const SHAPE: &[u8] = b"dddd-dd-ddTdd:dd:dd.dddddd";
     let Some(stem) = text.strip_suffix(suffix) else {
@@ -753,18 +678,13 @@ fn is_fixed_width_instant(text: &str, suffix: &str) -> bool {
         })
 }
 
-/// Acceptance: a type conflict surfaces on `/schema/conflicts`, the field
-/// detail lists both services, and the nulled original stays findable via
-/// `_raw` search.
 #[tokio::test(flavor = "multi_thread")]
 async fn conflict_evidence_surfaces_on_the_read_routes() {
     let h = harness().await;
     let timeouts_before = bookkeeping_timeouts(&h.server.url).await;
-    // svc-a pins duration BIGINT; svc-b disagrees with a string.
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "N/A"}))]).await;
 
-    // /schema/conflicts shows the attributed evidence.
     let (status, body) = h.get(&h.server.analyst_token, "/schema/conflicts").await;
     assert_eq!(status, 200);
     let conflicts = body["conflicts"].as_array().expect("conflicts array");
@@ -777,7 +697,6 @@ async fn conflict_evidence_surfaces_on_the_read_routes() {
     assert_eq!(row["rows_nulled"], 1);
     assert_eq!(body["truncated"], false);
 
-    // --last style windowing: a 1-hour window still covers it.
     let (_, body) = h
         .get(&h.server.analyst_token, "/schema/conflicts?since_secs=3600")
         .await;
@@ -790,7 +709,6 @@ async fn conflict_evidence_surfaces_on_the_read_routes() {
         "a fresh conflict is inside a 1h window"
     );
 
-    // Field filter.
     let (_, body) = h
         .get(&h.server.analyst_token, "/schema/conflicts?field=duration")
         .await;
@@ -803,7 +721,6 @@ async fn conflict_evidence_surfaces_on_the_read_routes() {
         "field filter applies"
     );
 
-    // /schema/field?name= lists both services and the conflict.
     let (status, body) = h
         .get(&h.server.analyst_token, "/schema/field?name=duration")
         .await;
@@ -823,7 +740,6 @@ async fn conflict_evidence_surfaces_on_the_read_routes() {
         "the detail carries the conflict evidence"
     );
 
-    // The nulled original stays findable by whole-event search.
     let result = h
         .query
         .query_paginated("\"N/A\" last=1h", None, None)
@@ -836,7 +752,6 @@ async fn conflict_evidence_surfaces_on_the_read_routes() {
     );
 }
 
-/// The fields listing carries aggregates, fill stats, and a clamped limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn fields_listing_carries_aggregates_and_truncation() {
     let h = harness().await;
@@ -858,25 +773,20 @@ async fn fields_listing_carries_aggregates_and_truncation() {
     assert!(body["pin_capacity"].as_u64().unwrap() >= 10_000);
     assert_eq!(body["truncated"], false);
 
-    // Envelope-first display order, like /schema.
     assert_eq!(fields[0]["name"], "_time");
 
-    // Limit clamps and reports truncation.
     let (_, body) = h
         .get(&h.server.analyst_token, "/schema/fields?limit=2")
         .await;
     assert_eq!(body["fields"].as_array().unwrap().len(), 2);
     assert_eq!(body["truncated"], true);
 
-    // ?service= scopes the listing.
     let (_, body) = h
         .get(&h.server.analyst_token, "/schema/fields?service=nope")
         .await;
     assert!(body["fields"].as_array().unwrap().is_empty());
 }
 
-/// The detail route ASCII-folds `?name=` (mirroring ingest's fold) and
-/// 404s for a field the catalog has never pinned.
 #[tokio::test(flavor = "multi_thread")]
 async fn field_detail_folds_name_and_404s_unpinned() {
     let h = harness().await;
@@ -897,19 +807,11 @@ async fn field_detail_folds_name_and_404s_unpinned() {
     assert_eq!(status, 404);
 }
 
-/// The detail route never hands back an unbounded service history: the
-/// page is capped (and the cap survives a hostile `?limit=`), and the
-/// cursor walks the rest exactly once.
-///
-/// `field_services` rows are ever-observed, cost no pin slot, and their
-/// service axis is client-chosen — so a common envelope field's history is
-/// the one part of the catalog a sender can grow without limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn field_detail_pages_a_large_service_history() {
     let h = harness().await;
     ingest_and_compact(&h, &[event("nginx", &json!({"duration": 42}))]).await;
 
-    // 1100 services carrying `duration`, none of which spent a pin slot.
     let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
         .await
         .expect("connect app db");
@@ -923,7 +825,6 @@ async fn field_detail_pages_a_large_service_history() {
     .await
     .expect("seed a large service history");
 
-    // Default page: bounded, with a cursor for the rest.
     let (status, body) = h
         .get(&h.server.analyst_token, "/schema/field?name=duration")
         .await;
@@ -938,7 +839,6 @@ async fn field_detail_pages_a_large_service_history() {
         "a truncated page advertises its cursor"
     );
 
-    // A caller asking for everything still gets a bounded response.
     let (_, body) = h
         .get(
             &h.server.analyst_token,
@@ -952,7 +852,6 @@ async fn field_detail_pages_a_large_service_history() {
     );
     assert!(body["services_cursor"].is_string());
 
-    // The cursor walk covers the whole history exactly once.
     let mut seen: Vec<String> = Vec::new();
     let mut path = "/schema/field?name=duration&limit=500".to_owned();
     for _ in 0..10 {
@@ -968,8 +867,6 @@ async fn field_detail_pages_a_large_service_history() {
         let Some(cursor) = body["services_cursor"].as_str() else {
             break;
         };
-        // Percent-encode the two characters the cursor spelling carries
-        // that a query string may not (`:` from RFC 3339, `|` separator).
         let escaped = cursor
             .replace('%', "%25")
             .replace(':', "%3A")
@@ -983,7 +880,6 @@ async fn field_detail_pages_a_large_service_history() {
     assert_eq!(unique.len(), seen.len(), "no service delivered twice");
     assert_eq!(seen[0], "nginx", "most recent observation first");
 
-    // A garbled cursor is a client error, not a silent restart at page one.
     let (status, _) = h
         .get(
             &h.server.analyst_token,
@@ -993,16 +889,8 @@ async fn field_detail_pages_a_large_service_history() {
     assert_eq!(status, 400);
 }
 
-/// Acceptance: the three `trawl schema` read commands render populated
-/// output against a seeded catalog.
-///
-/// This is the whole vertical, joined: `run_*` → the typed client's URL and
-/// query-param construction → the real routes → the real catalog → the
-/// shared driver renderer. The CLI's own unit tests cover the converters
-/// from synthetic structs; only this test proves the client actually asks
-/// the server the question the flags describe.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+#[allow(clippy::too_many_lines)]
 async fn read_commands_render_populated_output() {
     use trawl_cli::cli::{ConnectionParams, OutputFormat};
 
@@ -1054,8 +942,6 @@ async fn read_commands_render_populated_output() {
         "the scoped listing is populated: {text}"
     );
 
-    // The `--service` scope really reached the server: svc-b's rows are the
-    // only ones nulled, so svc-a's listing reports no conflict.
     let mut out = Vec::new();
     trawl_cli::schema::run_fields(
         &mut out,
@@ -1073,8 +959,6 @@ async fn read_commands_render_populated_output() {
         "an unknown service scopes the listing to nothing"
     );
 
-    // `trawl schema field DURATION` — the name folds server-side, the header
-    // block and both tables (services, conflicts) render.
     let mut out = Vec::new();
     trawl_cli::schema::run_field(
         &mut out,
@@ -1096,7 +980,6 @@ async fn read_commands_render_populated_output() {
         "the observed type renders: {text}"
     );
 
-    // `trawl schema conflicts --last 7d` as ndjson: both conflicts.
     let mut out = Vec::new();
     trawl_cli::schema::run_conflicts(
         &mut out,
@@ -1142,7 +1025,6 @@ async fn read_commands_render_populated_output() {
     assert_eq!(row["rows_nulled"], 1);
 }
 
-/// The `field` column of every ndjson row the conflicts renderer emitted.
 fn ndjson_field_names(out: &[u8]) -> Vec<String> {
     std::str::from_utf8(out)
         .expect("utf8")
@@ -1156,8 +1038,6 @@ fn ndjson_field_names(out: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// All three read routes gate on `schema_read`: a key without it is denied
-/// with 403, as is a key with no trawl grant at all; the reader key passes.
 #[tokio::test(flavor = "multi_thread")]
 async fn catalog_routes_require_schema_read() {
     let h = harness().await;
@@ -1184,13 +1064,6 @@ async fn catalog_routes_require_schema_read() {
     }
 }
 
-// -- degraded-badge acknowledgement (issue #111) ------------------------------
-
-/// Pin `duration` BIGINT, then shelve three string values under it and
-/// backdate the evidence so the span half of the gate is met.
-///
-/// Only the AGE is simulated: the conflicts are real, written by the real
-/// conform. Waiting 24 hours is the one thing a test cannot do.
 async fn degraded_duration(h: &Harness) {
     ingest_and_compact(h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     for value in ["N/A", "pending", "N/A"] {
@@ -1208,7 +1081,6 @@ async fn degraded_duration(h: &Harness) {
     .expect("backdate the evidence");
 }
 
-/// The verdict on `/schema/fields` for one field, if it carries one.
 async fn listed_verdict(h: &Harness, field: &str) -> Option<serde_json::Value> {
     let (status, body) = h.get(&h.server.analyst_token, "/schema/fields").await;
     assert_eq!(status, 200);
@@ -1216,8 +1088,6 @@ async fn listed_verdict(h: &Harness, field: &str) -> Option<serde_json::Value> {
     row.get("verdict").cloned()
 }
 
-/// Whether a query binding `duration` is stamped with the notice, after the
-/// refresh tick has republished the snapshot.
 async fn query_is_stamped(h: &Harness) -> bool {
     trawl_server::schema_refresh::refresh_degraded_fields(&h.server.state).await;
     let (status, body) = h
@@ -1231,7 +1101,6 @@ async fn query_is_stamped(h: &Harness) -> bool {
     body.get("degraded_fields").is_some()
 }
 
-/// Whether `/schema/services` badges svc-b, the sender that conflicted.
 async fn service_is_badged(h: &Harness) -> bool {
     trawl_server::schema_refresh::refresh_degraded_fields(&h.server.state).await;
     let (status, body) = h.get(&h.server.analyst_token, "/schema/services").await;
@@ -1246,18 +1115,11 @@ async fn service_is_badged(h: &Harness) -> bool {
         .is_some()
 }
 
-/// Acceptance: acknowledging a degraded pin takes the badge off all FOUR
-/// read surfaces at once — the field listing, the field detail, the query
-/// notice and the per-service badge — because every one of them asks the
-/// same `is_degraded`. Then one more shelved batch re-raises all four,
-/// while the acknowledgement itself stays visible on the detail: "we knew
-/// on Tuesday, it is still happening" is the information the operator needs.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_ack_suppresses_every_surface_until_new_evidence_arrives() {
     let h = harness().await;
     degraded_duration(&h).await;
 
-    // Populate the per-service schema cache the badge is stamped from.
     let _refresh = trawl_server::schema_refresh::spawn_schema_refresh(h.server.state.clone());
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -1316,7 +1178,6 @@ async fn an_ack_suppresses_every_surface_until_new_evidence_arrives() {
         "the service badge is suppressed"
     );
 
-    // One more shelved value: episode 4 is past the acknowledged 3.
     ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "later"}))]).await;
 
     let verdict = listed_verdict(&h, "duration")
@@ -1338,13 +1199,9 @@ async fn an_ack_suppresses_every_surface_until_new_evidence_arrives() {
     assert!(service_is_badged(&h).await, "the service badge is back");
 }
 
-/// A field nobody could badge cannot be acknowledged: the 409 names the
-/// threshold, and an unknown field is a 404. Neither writes anything.
 #[tokio::test(flavor = "multi_thread")]
 async fn acking_a_field_with_no_verdict_is_refused() {
     let h = harness().await;
-    // Real conflicts, all of them from the last few seconds: volume without
-    // span is exactly what the badge is designed not to fire on.
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     for _ in 0..4 {
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "N/A"}))]).await;
@@ -1381,9 +1238,6 @@ async fn acking_a_field_with_no_verdict_is_refused() {
     );
 }
 
-/// Withdrawing an ack re-raises the badge and is idempotent: the second
-/// DELETE is the same 204, because "not acknowledged" is the state the
-/// caller asked for either way. Only an unknown field refuses.
 #[tokio::test(flavor = "multi_thread")]
 async fn withdrawing_an_ack_re_raises_the_badge_and_repeats_cleanly() {
     let h = harness().await;
@@ -1432,9 +1286,6 @@ async fn withdrawing_an_ack_re_raises_the_badge_and_repeats_cleanly() {
     assert_eq!(status, 404, "an unknown field is the one refusal");
 }
 
-/// The note is capped at 1024 bytes, and the refusal happens before the
-/// store: a 1025-byte note is a 400 naming the limit, not a constraint
-/// violation. The boundary itself is accepted.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_ack_note_is_refused_before_the_store() {
     let h = harness().await;
@@ -1467,9 +1318,6 @@ async fn an_oversized_ack_note_is_refused_before_the_store() {
     assert_eq!(ack["note"].as_str().expect("note").len(), 1024);
 }
 
-/// Both ack verbs ride `schema_write`: a `schema_read` key may read the
-/// badge and not answer it. Both an authenticated key without the permission
-/// and a key with no trawl grant at all receive 403.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_ack_routes_require_schema_write() {
     let h = harness().await;
@@ -1507,9 +1355,6 @@ async fn the_ack_routes_require_schema_write() {
     );
 }
 
-/// The audit trail: who acknowledged what, whether the row was created or
-/// advanced, and which of the two things clears one. The operator's note is
-/// never copied into an event — only whether they wrote one.
 #[tokio::test(flavor = "multi_thread")]
 // One process, one global subscriber, so the whole lifecycle (ack, advance,
 // operator withdrawal, repin clear) has to be asserted from one body.
@@ -1541,7 +1386,6 @@ async fn the_ack_audit_records_the_actor_and_never_the_note() {
         .await;
     assert_eq!(status, 200);
 
-    // New evidence, then a second ack: the row is advanced, not created.
     ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "later"}))]).await;
     let (status, _) = h
         .post(
@@ -1578,8 +1422,6 @@ async fn the_ack_audit_records_the_actor_and_never_the_note() {
     assert_eq!(acked[1].field("evidence_through"), "4");
     assert_eq!(acked[1].field("note_present"), "false");
 
-    // The operator withdraws it: one clear, reason `operator`. The second
-    // DELETE removes nothing, so it records nothing.
     let (status, _) = h
         .delete(
             &h.server.schema_admin_token,
@@ -1595,8 +1437,6 @@ async fn the_ack_audit_records_the_actor_and_never_the_note() {
         .await;
     assert_eq!(status, 204);
 
-    // Re-ack, then repin the field: the pin the ack was about is gone, so
-    // the cutover takes the ack with the evidence and says so.
     let (status, _) = h
         .post(
             &h.server.schema_admin_token,

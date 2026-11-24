@@ -4,22 +4,6 @@
 
 //! The investigation routes (ADR-0059): axum adapters over
 //! [`super::service`].
-//!
-//! They sit on the `authenticated` router, so every request passes bearer
-//! authentication, the trawl grant, the per-key rate and the ADR-0054
-//! request count before it reaches a handler here. A handler takes its
-//! path, query and body as they arrived, rejection included, and hands
-//! them to the service only after the service's authority check would
-//! pass: a key without the authority gets 403 whatever it sent. A path,
-//! query string or body that does not read as its type is then a 400.
-//!
-//! So no handler binds `Path`, `Query` or `Json` bare: axum would answer its
-//! plain-text rejection before the handler ran, and a key without the
-//! authority would learn whether its request parsed. Each takes the
-//! extractor's `Result`, checks its authority first, then passes the
-//! rejection through [`shaped`]. A handler that reads a body checks its
-//! authority with the [`Authorized`] extractor, ahead of the body, so the
-//! body of a key without the authority is never read.
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -65,7 +49,6 @@ pub(crate) async fn create(
     Ok((status, Json(investigation)))
 }
 
-/// The query parameters of `GET /api/v1/investigations/{id}`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadParams {

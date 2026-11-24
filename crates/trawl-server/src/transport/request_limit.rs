@@ -3,29 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! trawld's one count of requests in progress (ADR-0054).
-//!
-//! `[server] max_concurrent_requests` is the number of requests in progress
-//! on the HTTPS listener, across every route and method. Two fixed
-//! allowances sit beside it: the probe allowance of three for health and
-//! `/metrics`, and the control allowance of four for query listing and
-//! query cancellation. No count borrows from another or lends to one. A
-//! request over its count is refused at once with a 503
-//! `request_limit_reached`.
-//!
-//! [`count_request`] takes the count with a try-acquire and never waits.
-//! The request keeps it while its future runs: until the response head is
-//! produced, the future is dropped, or a panic is caught inside it. The
-//! response body is not counted. Blocking work that holds the request's
-//! body takes a clone of the count from [`current`] and keeps the count
-//! until that work ends. A write that runs in a task of its own, so that
-//! the request going away cannot cut it short, keeps the count on a
-//! [`Lease`] instead: until the write ends and no later than its deadline,
-//! whatever the task awaits then. Those are an attached capture's step
-//! admission, with the `aborted` outcome it writes for a request that went
-//! away, and an append's promotion (ADR-0059). An `aborted` outcome not
-//! written by the deadline goes to the one step writer
-//! ([`crate::investigations::step::StepWriter`]), which writes it outside
-//! any count, on at most one database connection.
 
 use std::sync::Arc;
 
@@ -41,27 +18,18 @@ use crate::deadline::Deadline;
 use crate::error::ServerError;
 use crate::metrics::{REQUEST_ALLOWANCE, REQUESTS_IN_PROGRESS, REQUESTS_REFUSED_TOTAL};
 
-/// Which count a request in progress is charged to.
-///
 /// Also the `allowance` label on the three request-count metrics, so the
 /// set is closed and carries nothing from the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Allowance {
-    /// `[server] max_concurrent_requests`: every route in neither table.
     Regular,
-    /// The fixed probe allowance of [`PROBE_ALLOWANCE`]: health and
-    /// `/metrics`.
     Probe,
-    /// The fixed control allowance of [`CONTROL_ALLOWANCE`]: query listing
-    /// and cancellation.
     Control,
 }
 
 impl Allowance {
-    /// Every allowance, for metric registration and tests that enumerate.
     pub const ALL: [Self; 3] = [Self::Regular, Self::Probe, Self::Control];
 
-    /// The fixed literal this allowance is labelled with.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -72,21 +40,10 @@ impl Allowance {
     }
 }
 
-/// Requests in progress reserved for the probe routes, fixed in code
-/// (ADR-0054): the liveness probe, the readiness probe and one scrape.
 pub const PROBE_ALLOWANCE: usize = 3;
 
-/// Requests in progress reserved for the control routes, fixed in code
-/// (ADR-0054): two operators listing or cancelling queries at once do not
-/// refuse each other.
 pub const CONTROL_ALLOWANCE: usize = 4;
 
-/// The probe routes: trawld's matched route template and the method.
-///
-/// Membership is read off the route the router matched, never the raw
-/// path, the query string or a header, so no spelling of a request can
-/// claim an allowance. A route added later is regular unless it is added
-/// to this table or to [`CONTROL_ROUTES`].
 static PROBE_ROUTES: [(Method, &str); 4] = [
     (Method::GET, "/api/v1/health"),
     (Method::HEAD, "/api/v1/health"),
@@ -94,15 +51,12 @@ static PROBE_ROUTES: [(Method, &str); 4] = [
     (Method::HEAD, "/metrics"),
 ];
 
-/// The control routes, matched as [`PROBE_ROUTES`] are.
 static CONTROL_ROUTES: [(Method, &str); 3] = [
     (Method::GET, "/api/v1/queries"),
     (Method::HEAD, "/api/v1/queries"),
     (Method::DELETE, "/api/v1/queries/{id}"),
 ];
 
-/// The allowance a request is charged to. A request that matched no route
-/// carries no [`MatchedPath`] and is regular.
 fn allowance_of(request: &Request) -> Allowance {
     let Some(matched) = request.extensions().get::<MatchedPath>() else {
         return Allowance::Regular;
@@ -121,8 +75,6 @@ fn allowance_of(request: &Request) -> Allowance {
     }
 }
 
-/// The three counts one listener shares.
-///
 /// Built once per router by [`RequestLimit::new`], before any layer is
 /// added: axum clones a layer once per route and per method, so a count
 /// built inside a layer would be one count per route.
@@ -133,10 +85,6 @@ pub(crate) struct RequestLimit {
 }
 
 impl RequestLimit {
-    /// A limit of `max_concurrent_requests` regular requests in progress,
-    /// [`PROBE_ALLOWANCE`] probe ones and [`CONTROL_ALLOWANCE`] control
-    /// ones. Publishes every size, and every in-progress gauge and refusal
-    /// counter at zero.
     #[allow(clippy::cast_precision_loss)] // gauge values are f64; sizes stay far below 2^52
     pub(crate) fn new(max_concurrent_requests: usize) -> Arc<Self> {
         for (allowance, size) in [
@@ -156,10 +104,6 @@ impl RequestLimit {
         })
     }
 
-    /// Take one request in progress from `allowance`, or `None` when it has
-    /// none free. One atomic try-acquire on that allowance's own count:
-    /// never a wait, never a check followed by a separate take, and never
-    /// a second count to fall back on.
     fn try_count(&self, allowance: Allowance) -> Option<RequestInProgress> {
         let semaphore = match allowance {
             Allowance::Regular => &self.regular,
@@ -173,11 +117,6 @@ impl RequestLimit {
     }
 }
 
-/// One request in progress: its share of a count and its gauge.
-///
-/// The gauge goes up when this is built and down when it drops, so it
-/// follows ownership and never an await point. The permit goes back when
-/// the last owner drops.
 pub(crate) struct Counted {
     allowance: Allowance,
     _permit: OwnedSemaphorePermit,
@@ -199,51 +138,27 @@ impl Drop for Counted {
     }
 }
 
-/// An owned handle on the current request's count.
-///
-/// The request holds one for as long as its future runs. Blocking work
-/// that holds the request's body moves a clone into its closure, and a
-/// detached write into its task, so the count outlives a client that hangs
-/// up until that work ends (ADR-0054).
 #[derive(Clone)]
 pub(crate) struct RequestInProgress {
-    /// Held for its `Drop`: the last owner gives the count back.
     _counted: Arc<Counted>,
 }
 
 tokio::task_local! {
-    /// The count of the request this task is serving, when
-    /// [`count_request`] admitted it.
     static CURRENT: RequestInProgress;
 }
 
-/// The current request's count, or `None` outside a request the count
-/// admitted: a background task, a unit test, a spawned task.
 pub(crate) fn current() -> Option<RequestInProgress> {
     CURRENT.try_with(Clone::clone).ok()
 }
 
 /// A request's count lent to a task that can outlive the request, back no
 /// later than a deadline (ADR-0059).
-///
-/// The task gives the count back by dropping the lease, and the deadline
-/// takes it back whatever the task awaits then: an unlink, an awaited
-/// `BEGIN` or `COMMIT`, a store that stopped answering. Whichever comes
-/// first releases it, exactly once, and the gauge follows the count, as it
-/// follows every owner's.
 pub(crate) struct Lease {
     count: Arc<Mutex<Option<RequestInProgress>>>,
-    /// The timer that takes the count back at the deadline, stopped when
-    /// the task gives it back first.
     expiry: Option<AbortHandle>,
 }
 
 impl Lease {
-    /// Lend `count` until `deadline`. `None`, a task outside a request the
-    /// count admitted, lends nothing.
-    ///
-    /// # Panics
-    /// Outside a Tokio runtime, when there is a count to lend.
     pub(crate) fn until(count: Option<RequestInProgress>, deadline: Deadline) -> Self {
         let Some(count) = count else {
             return Self {
@@ -280,9 +195,6 @@ impl Drop for Lease {
 
 /// A test seam that holds body work after it has taken the request's
 /// count, so a test can watch the count outlive the request.
-///
-/// One [`Holds`](body_work::Holds) lives on each `IngestState`, never in a
-/// process global, and none of this is built into a release binary.
 #[cfg(any(test, feature = "test-support"))]
 pub mod body_work {
     use std::collections::HashMap;
@@ -290,7 +202,6 @@ pub mod body_work {
 
     use super::{Counted, RequestInProgress};
 
-    /// The blocking work that keeps a request's count (ADR-0054).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum BodyWork {
         /// Ingest decompress and parse.
@@ -301,8 +212,6 @@ pub mod body_work {
         Preview,
     }
 
-    /// What held work reports when it is entered: a weak handle on the
-    /// count it keeps, which never keeps the count itself.
     #[derive(Debug)]
     pub struct HoldProbe(Weak<Counted>);
 
@@ -319,7 +228,6 @@ pub mod body_work {
 
     type Hold = (mpsc::Sender<HoldProbe>, mpsc::Receiver<()>);
 
-    /// The next hold for each kind of body work.
     #[derive(Debug, Default)]
     pub struct Holds(parking_lot::Mutex<HashMap<BodyWork, Hold>>);
 
@@ -357,7 +265,6 @@ pub mod body_work {
         }
     }
 
-    /// One taken hold.
     #[derive(Debug)]
     pub(crate) struct Pause {
         entered: mpsc::Sender<HoldProbe>,
@@ -366,7 +273,6 @@ pub mod body_work {
     }
 
     impl Pause {
-        /// Report entry and block this thread until the test releases it.
         pub(crate) fn wait(self) {
             let _ = self.entered.send(self.probe);
             let _ = self.release.recv();
@@ -374,14 +280,6 @@ pub mod body_work {
     }
 }
 
-/// Axum middleware: count the request in progress, or refuse it at once.
-///
-/// A refusal is [`ServerError::RequestLimitReached`]: no inner layer runs,
-/// the handler is never entered and the body is never polled. trawld does
-/// not drain it. An admitted request runs inside [`CURRENT`]'s scope, so
-/// the count ends with its future: when the response head is produced,
-/// when the future is dropped, or when the panic catcher inside this layer
-/// answers a panic.
 pub(crate) async fn count_request(
     State(limit): State<Arc<RequestLimit>>,
     request: Request,
@@ -438,9 +336,8 @@ mod tests {
         rx.recv().unwrap()
     }
 
-    /// Each table, row by row, and what falls outside both. The expected
-    /// rows are written out here, not read from the tables, so moving a
-    /// row between tables fails this test.
+    /// The expected rows are written out here, not read from the tables, so
+    /// moving a row between tables fails this test.
     #[test]
     fn allowance_membership_is_the_matched_route_and_method() {
         for (method, route, allowance) in [
@@ -473,8 +370,6 @@ mod tests {
         }
     }
 
-    /// The count and the gauge follow ownership: a clone keeps the count
-    /// after the request's own handle drops, and the last drop frees it.
     #[test]
     fn a_clone_keeps_the_count_until_the_last_owner_drops() {
         let limit = RequestLimit::new(1);
@@ -487,8 +382,6 @@ mod tests {
         assert!(limit.try_count(Allowance::Regular).is_some());
     }
 
-    /// A lease gives the count back when its holder drops it, before the
-    /// deadline, and the deadline takes nothing more.
     #[tokio::test(start_paused = true)]
     async fn a_lease_dropped_before_its_deadline_gives_the_count_back_once() {
         let limit = RequestLimit::new(1);
@@ -507,8 +400,6 @@ mod tests {
         drop(next);
     }
 
-    /// A lease's deadline takes the count back while its holder still
-    /// holds the lease, and its drop afterwards takes nothing more.
     #[tokio::test(start_paused = true)]
     async fn a_lease_gives_the_count_back_at_its_deadline_whatever_its_holder_awaits() {
         let limit = RequestLimit::new(1);
@@ -528,14 +419,12 @@ mod tests {
         drop(next);
     }
 
-    /// A lease outside a counted request lends nothing and needs no timer.
     #[test]
     fn a_lease_of_no_count_lends_nothing() {
         let deadline = Deadline::after(std::time::Duration::from_secs(5));
         drop(Lease::until(None, deadline));
     }
 
-    /// `current` answers inside the scope and nowhere else.
     #[tokio::test]
     async fn current_is_the_scoped_request() {
         assert!(current().is_none());

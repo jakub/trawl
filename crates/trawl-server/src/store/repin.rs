@@ -3,16 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Postgres-backed repin job store (ADR-0011).
-//!
-//! One repin at a time, install-wide. Within one trawld, the repin engine's
-//! in-process permit admits one job's work at a time, from before its claim
-//! to after its last staging deletion (ADR-0011, 2026-11-06 amendment). The
-//! `repin_jobs_one_running` partial unique index is the cross-restart
-//! record: it keeps a second running row out, and postgres decides the
-//! claim exactly as it decides the scheduler's run claim. The index frees
-//! at the terminal row, before the post-swap sweep, so it alone does not
-//! keep a second job out of the staging roots. Dry runs are jobs too: the row is the dry-run
-//! report, and the scan → refusal → execution lifecycle is one code path.
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
@@ -23,32 +13,20 @@ use trawl_core::severity::Dialect;
 use super::catalog::{FieldConflict, MAX_CONFLICTS_PER_FIELD, record_conflicts_in};
 use super::error::{PgViolation, StoreError, classify_violation};
 
-/// Closed job status vocabulary (mirrors the migration CHECK).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepinJobStatus {
-    /// Claimed; scanning, building, or cutting over.
     Running,
-    /// Terminal: dry-run report ready, or the corpus is repinned.
     Succeeded,
-    /// Terminal: errored (recorded); the live corpus was never mutated in
-    /// place, so it stands at the pre-repin generation.
     Failed,
     /// Terminal: nulled values without a force flag — either projected by
     /// the pre-build scan, or actually written by the finished shadow
     /// (data ingested after the scan), refused at the cutover gate.
     RefusedNeedsForce,
-    /// Terminal: the cutover could not drain queries within its budget.
     Blocked,
-    /// Terminal: an operator cancelled the job and a file boundary observed
-    /// the request before the point of no return, so the unwind ran and the
-    /// live corpus was never touched. Live-process-only: a daemon that dies
-    /// between the request and its effect leaves a `running` row that boot
-    /// reconciliation terminalizes as [`Self::Failed`], never this.
     Cancelled,
 }
 
 impl RepinJobStatus {
-    /// The stored spelling.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -61,8 +39,6 @@ impl RepinJobStatus {
         }
     }
 
-    /// Parse a stored spelling. The vocabulary is CHECK-enforced, so an
-    /// unknown string is corruption, not data.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
@@ -77,121 +53,71 @@ impl RepinJobStatus {
     }
 }
 
-/// One `repin_jobs` row.
 #[derive(Debug, Clone)]
 pub struct RepinJob {
-    /// Validated terms, absent until the scan records its plan.
     pub(crate) force_terms: Option<crate::repin::ceiling::ForceTerms>,
-    /// Job id.
     pub id: i64,
-    /// The repinned field (catalog key, folded).
     pub field: String,
     /// The pin at claim time (catalog spelling: `SEVERITY` is not
     /// `BIGINT`).
     pub from_type: String,
-    /// The target pin (catalog spelling).
     pub to_type: String,
-    /// Whether this job stops after the scan.
     pub dry_run: bool,
-    /// Whether a lossy projection was explicitly accepted.
     pub force: bool,
-    /// Job status.
     pub status: RepinJobStatus,
-    /// Requesting key's display name (audit; `None` for internal callers).
     pub requested_by: Option<String>,
-    /// The requesting key's row id, which the status read by id matches on
-    /// when the caller holds `schema_write` alone (see [`Requester`]).
-    /// `None` for internal callers, whose jobs that read answers for nobody.
     pub requested_by_key_id: Option<i64>,
-    /// Claim instant.
     pub started_at: DateTime<Utc>,
-    /// Terminal instant.
     pub finished_at: Option<DateTime<Utc>>,
-    /// Terminal error text, when any.
     pub error: Option<String>,
-    /// Scan plan: affected files.
     pub files_total: i64,
-    /// Scan plan: rows carrying a stored value for the field.
     pub rows_carrying: i64,
-    /// Scan plan: stored values the new pin cannot read (would null).
     pub projected_nulls: i64,
-    /// Scan plan: currently-shelved values `_raw` gives back under the new
-    /// pin.
     pub resurrectable: i64,
-    /// Scan plan: bytes across the affected files (the double-hold peak).
     pub affected_bytes: i64,
-    /// Progress: affected files rewritten so far.
     pub files_done: i64,
-    /// Outcome: rows written through the rewrite.
     pub rows_rewritten: i64,
-    /// Outcome: stored values the rewrite nulled.
     pub rows_nulled: i64,
-    /// Outcome: values resurrected from `_raw`.
     pub rows_resurrected: i64,
     /// The asserted dialect of the corpus's numerals: `Some` exactly for a
     /// `SEVERITY` target. Any other job is `None`, never a backfilled `otel`
     /// it did not assert.
     pub dialect: Option<String>,
-    /// Rows whose numeral reads as a different severity in each dialect
-    /// (the 1-7 overlap): the scan's projection until the finished shadow
-    /// supersedes it with what the rewrite actually saw.
     pub ambiguous_numerals: i64,
-    /// Up to five distinct sanitised samples of values the new pin cannot
-    /// read at all, `_raw` resurrection included.
     pub unmapped_samples: Vec<String>,
-    /// Scan-time liveness: the newest observation of the field anywhere in
-    /// the catalog, or `None` when nothing has written it inside the
-    /// window.
     pub field_last_seen: Option<DateTime<Utc>>,
-    /// One service behind that observation (audit/display only).
     pub field_last_service: Option<String>,
     /// Ceiling on nulled rows as the REQUEST stated it, or `None` when the
     /// operator stated none.
     pub max_nulled_rows: Option<i64>,
-    /// Ceiling on dialect-ambiguous numerals as the request stated it.
     pub max_ambiguous_rows: Option<i64>,
     /// The nulled-row ceiling the job is actually HELD to, resolved once at
     /// plan time. `None` until the scan records its plan, and for unforced jobs.
     pub accepted_max_nulled_rows: Option<i64>,
-    /// The ambiguity ceiling the job is held to. See above.
     pub accepted_max_ambiguous_rows: Option<i64>,
     /// When the scan recorded its plan, if it has. Until then the row's
     /// counts are zeros that mean "not measured yet", not "nothing to
     /// report", which is why the force verdict is absent rather than false
     /// before this is set.
     pub planned_at: Option<DateTime<Utc>>,
-    /// When a cancel request was accepted for this job, if one was. Set
-    /// together with [`Self::cancelled_by`] and never overwritten, so a
-    /// second request over a job already cancelling reads the first asker's
-    /// instant. A populated pair on a non-`Cancelled` row is not a
-    /// contradiction: the job crashed before the request took effect, or
-    /// the cancel lost its race with the point of no return.
+    /// When a cancel request was accepted for this job, if one was. A
+    /// populated pair on a non-`Cancelled` row is not a contradiction: the
+    /// job crashed before the request took effect, or the cancel lost its
+    /// race with the point of no return.
     pub cancel_requested_at: Option<DateTime<Utc>>,
-    /// The cancelling key's display name (audit), from the same identity
-    /// source as [`Self::requested_by`].
     pub cancelled_by: Option<String>,
 }
 
-/// Who requested a repin job: both halves of the calling key's identity.
-///
-/// `key_id` is the keystore's row id for the key. It is stable for the
-/// key's lifetime and never reissued, so it is what the status read by id
-/// matches on when the caller holds `schema_write` alone: a key reads the
-/// jobs it requested and no other, and carrying another key's name buys
-/// nothing. `name` is the key's operator-chosen display label, which the
-/// row's `requested_by` and the audit events carry because it is what an
-/// operator recognises; two keys may share one, which is why it decides
-/// nothing.
+/// Who requested a repin job. `key_id` is stable and never reissued, so it
+/// is what the status read by id matches on; two keys may share one `name`,
+/// which is why it decides nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requester {
-    /// The keystore row id of the requesting key.
     pub key_id: i64,
-    /// The requesting key's display name.
     pub name: String,
 }
 
 impl Requester {
-    /// Build a requester from a verified key's row id and display name.
     pub fn new(key_id: i64, name: impl Into<String>) -> Self {
         Self {
             key_id,
@@ -200,37 +126,16 @@ impl Requester {
     }
 }
 
-/// What a repin job is claimed for: the row's immutable half.
-///
-/// A struct rather than seven positional arguments: `dialect` is the one
-/// piece an operator asserts that nothing else can derive, and threading it
-/// as the seventh `Option` past two booleans is how a call site ends up
-/// asserting syslog by accident.
 #[derive(Debug, Clone, Copy)]
 pub struct RepinClaim<'a> {
-    /// The field to repin (catalog key, folded).
     pub field: &'a str,
-    /// The pin at claim time.
     pub from_type: CanonicalType,
-    /// The target pin.
     pub to_type: CanonicalType,
-    /// The asserted numeral dialect — `Some` exactly for a `SEVERITY`
-    /// target (the migration CHECKs the scope, so a mismatch is a 500, not
-    /// a silently stored lie).
     pub dialect: Option<Dialect>,
-    /// Whether this job stops after the scan.
     pub dry_run: bool,
-    /// Whether a lossy projection was explicitly accepted.
     pub force: bool,
-    /// The nulled-row ceiling the request asked for, if it asked for one.
-    /// The REQUEST's number, echoed back unchanged; what the job is held to
-    /// is resolved at plan time and rides [`RepinPlan`].
     pub max_nulled_rows: Option<i64>,
-    /// The ambiguity ceiling the request asked for, if any. See above.
     pub max_ambiguous_rows: Option<i64>,
-    /// The requesting key, or `None` for an internal caller. Its name is
-    /// written as the row's `requested_by` and its id as the row's
-    /// `requested_by_key_id`, so the two can never describe different keys.
     pub requester: Option<&'a Requester>,
 }
 
@@ -240,9 +145,7 @@ pub struct RepinClaim<'a> {
 /// samples from another would report a corpus that never existed.
 #[derive(Debug, Clone, Default)]
 pub struct RepinPlan {
-    /// Affected files.
     pub files_total: i64,
-    /// Rows carrying a stored value for the field.
     pub rows_carrying: i64,
     /// Stored values the new pin cannot read (would null).
     pub projected_nulls: i64,
@@ -250,58 +153,27 @@ pub struct RepinPlan {
     pub resurrectable: i64,
     /// Bytes across the affected files (the double-hold peak).
     pub affected_bytes: i64,
-    /// Rows whose numeral reads as a different severity in each dialect.
     pub ambiguous_numerals: i64,
-    /// Up to `MAX_CONFLICT_SAMPLES` distinct sanitised samples of the values
-    /// the new pin cannot read.
     pub unmapped_samples: Vec<String>,
-    /// Newest observation of the field inside `repin::LIVENESS_WINDOW`, or
-    /// `None` when nothing has written it lately.
     pub field_last_seen: Option<DateTime<Utc>>,
-    /// One service behind that observation.
     pub field_last_service: Option<String>,
-    /// The nulled-row ceiling this job is held to, resolved from the scan
-    /// above plus whatever the request stated. Written in the same statement
-    /// as the counts it was derived from, because a row carrying a ceiling
-    /// resolved from a different scan would report terms no gate ever
-    /// applied. `None` only for an unforced job, which refuses on any loss
-    /// and has nothing to hold.
+    /// The nulled-row ceiling this job is held to. `None` only for an unforced
+    /// job, which refuses on any loss and has nothing to hold.
     pub accepted_max_nulled_rows: Option<i64>,
-    /// The ambiguity ceiling this job is held to. See above.
     pub accepted_max_ambiguous_rows: Option<i64>,
 }
 
-/// The rewrite's running tallies: what the shadow generation holds so far.
-///
-/// One struct rather than five positional `i64`s, because the periodic
-/// progress write, the terminal write that carries a refusal's numbers and
-/// the cutover's staging write ([`RepinStore::stage_cutover_input`]) stamp
-/// the same five columns and must not drift apart in their order.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JobTotals {
-    /// Affected files rewritten so far.
     pub files_done: i64,
-    /// Rows written through the rewrite.
     pub rows_rewritten: i64,
-    /// Stored values the rewrite nulled.
     pub rows_nulled: i64,
-    /// Values resurrected from `_raw`.
     pub rows_resurrected: i64,
-    /// Rows whose numeral reads differently in each dialect.
     pub ambiguous_numerals: i64,
 }
 
-/// What one call to [`RepinStore::finish_cutover`] actually did.
-///
-/// The call is idempotent, so "did the flip work" is not the interesting
-/// question — a boot replay of an already-succeeded job returns success
-/// having changed nothing. What the caller needs to know is whether THIS
-/// call was the one that completed the job, because the side effects gated
-/// on that (the evidence clear, the ack clear) are the ones an audit event
-/// may be emitted for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CutoverOutcome {
-    /// This call moved the job from `running` to `succeeded`.
     pub completed: bool,
     /// This call removed the field's degraded acknowledgement. False when
     /// there was none, and always false on a replay.
@@ -309,13 +181,11 @@ pub struct CutoverOutcome {
 }
 
 /// The conflict evidence a completing cutover owes, read off the tallies
-/// the rewrite staged (`nulled_services` / `nulled_service_rows`, paired
-/// positionally and kept equal in length by a CHECK).
+/// the rewrite staged.
 ///
 /// `None` means the columns are NULL: staging never ran for this job, which
 /// is a different fact from staging having proved the repin lossless (empty
-/// arrays, `Some(vec![])`). Only the caller can act on that difference, so
-/// the distinction rides out rather than collapsing here.
+/// arrays, `Some(vec![])`).
 ///
 /// The evidence names the pin the values were stored under, in the CATALOG
 /// spelling: `as_duckdb` is not injective, so a SEVERITY source would indict
@@ -336,11 +206,9 @@ fn staged_conflicts(
         services
             .into_iter()
             .zip(rows)
-            // A tally of zero is not a conflict — a cast that nulls nothing
-            // is convergence, and recording it would add an episode to the
-            // degraded verdict's count for a service that lost nothing. The
-            // engine stages only positive tallies; this keeps that true of
-            // the rows regardless.
+            // A tally of zero is not a conflict: recording it would add an
+            // episode to the degraded verdict's count for a service that lost
+            // nothing.
             .filter(|(_, nulled)| *nulled > 0)
             .map(|(service, nulled)| FieldConflict {
                 field: field.to_owned(),
@@ -349,9 +217,7 @@ fn staged_conflicts(
                 expected_type: to_type,
                 rows_nulled: u64::try_from(nulled).unwrap_or_default(),
                 // The rewrite counts what it nulled per service; it never
-                // materialises the values. Carrying them back would be a
-                // second full pass over the corpus for evidence the operator
-                // asked for this repin in spite of.
+                // materialises the values.
                 samples: Vec::new(),
             })
             .collect(),
@@ -428,44 +294,30 @@ const JOB_COLS: &str = "id, field, from_type, to_type, dry_run, force, status, r
      max_nulled_rows, max_ambiguous_rows, accepted_max_nulled_rows, \
      accepted_max_ambiguous_rows, planned_at, cancel_requested_at, cancelled_by";
 
-/// Postgres-backed repin job store. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
 pub struct RepinStore {
     pool: PgPool,
 }
 
 impl RepinStore {
-    /// Wrap the shared app-state pool (must already be migrated).
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
-    /// Claim the running slot: insert a `running` row, mapping a 23505 on
-    /// `repin_jobs_one_running` to [`StoreError::RepinAlreadyRunning`].
-    ///
     /// One transaction under [`super::CATALOG_LIFECYCLE_LOCK_KEY`], because
     /// the claim is the second half of a check-then-act the engine started
     /// when it read the field's pin out of the in-process cache. Pin gc's
-    /// purge takes the same lock, so the two orderings are the only ones
-    /// possible: gc commits first and this claim finds no pin (refused
-    /// here), or the claim commits first and gc's own in-transaction
-    /// running-row check refuses the purge. The interleaving that mints a
-    /// memory-only pin — gc deleting the row a claimed cutover later
-    /// UPDATEs to zero rows — cannot be constructed.
+    /// purge takes the same lock: gc commits first and this claim finds no pin,
+    /// or the claim commits first and gc's own in-transaction running-row check
+    /// refuses the purge.
     ///
     /// The revalidation is exact: the pin must still be the one the caller
-    /// prepared against, not merely present, so a repin that flipped the
-    /// field in between refuses instead of scanning under a stale `from`.
+    /// prepared against, not merely present.
     pub async fn claim(&self, claim: RepinClaim<'_>) -> Result<i64, StoreError> {
         Ok(self.claim_job(claim).await?.id)
     }
 
-    /// [`Self::claim`], returning the claimed row as the insert wrote it.
-    ///
-    /// The row is the one thing a caller can answer with once it has stopped
-    /// waiting: the repin trigger past its answer bound replies with it
-    /// rather than reading the row back (see `RepinEngine::start_within`).
     pub async fn claim_job(&self, claim: RepinClaim<'_>) -> Result<RepinJob, StoreError> {
         let mut tx = self.pool.begin().await?;
         // Bound the advisory-lock wait the same way the purge bounds its
@@ -518,12 +370,6 @@ impl RepinStore {
         Ok(job)
     }
 
-    /// Stamp the scan's whole reading onto the job row.
-    ///
-    /// The accepted ceilings ride the same statement as the counts they were
-    /// resolved from: they are one reading of the corpus, and a row whose
-    /// terms came from a different scan than its numbers would describe a
-    /// decision nothing ever made.
     pub async fn record_plan(&self, id: i64, plan: RepinPlan) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE repin_jobs
@@ -551,8 +397,6 @@ impl RepinStore {
         Ok(())
     }
 
-    /// Stamp rewrite progress/outcome tallies onto the job row.
-    ///
     /// `ambiguous_numerals` is the one column the plan and the outcome
     /// share: the scan's projection stands until the build has actually
     /// written files, and then the shadow's own count (including everything
@@ -577,33 +421,13 @@ impl RepinStore {
     }
 
     /// Freeze the finished shadow's tallies on the job row: the five final
-    /// counts and the per-service rows the rewrite nulled, in one statement.
-    ///
-    /// This is the evidence barrier (issue #137). The cutover materialises
-    /// `field_conflicts` rows from these tallies in the same transaction
-    /// that flips the pin, so the read that first sees `succeeded` also sees
-    /// the evidence. That only works if the tallies are durable before the
-    /// `data/REPIN` Cutover marker goes down, because past that marker the
-    /// engine is forward-only and a crash completes the flip from the marker
-    /// alone, with no shadow left to re-count.
-    ///
-    /// One UPDATE, not one per column set: the counts and the per-service
-    /// tallies are one reading of the finished shadow, and a row carrying
-    /// totals from the last pass beside tallies from the one before would
-    /// describe a corpus that never existed. `services` is
-    /// `(service, rows_nulled)` pairs, already ordered and capped by the
-    /// caller.
+    /// counts and the per-service rows the rewrite nulled, in one statement
+    /// (ADR-0022 ruling 2). `services` is `(service, rows_nulled)` pairs,
+    /// already ordered and capped by the caller.
     ///
     /// Zero rows updated is an invariant violation, never a quiet success:
-    /// the `WHERE` demands a `running`, non-dry-run row, so no match means
-    /// the job was already terminal (an orphan reconciliation, a concurrent
-    /// finish) or is a dry run that has no rewrite to stage. Either way the
-    /// caller is about to write a Cutover marker for a job postgres does not
-    /// agree is running, and it must not.
-    ///
-    /// Re-staging the same job while it is still `running` is fine: the
-    /// statement is a plain overwrite, so a retried staging call lands the
-    /// same row.
+    /// the caller is about to write a Cutover marker for a job postgres does
+    /// not agree is running, and it must not.
     pub async fn stage_cutover_input(
         &self,
         id: i64,
@@ -651,27 +475,14 @@ impl RepinStore {
     /// Move a *running* job to a terminal status, stamping `finished_at`
     /// once. Returns whether this call is the one that terminalized the row.
     ///
-    /// Conditional on purpose: a terminal row is a verdict something already
-    /// published, and once cancellation exists there are two writers racing
-    /// for it (the job's own ladder and the cancel path's unwind). An
-    /// unconditional write would let the loser rewrite the winner's status,
-    /// so a job reported `cancelled` could turn back into `succeeded`. It
-    /// also makes a redundant retry harmless: `false` means someone else got
-    /// there first, not that the write failed.
-    ///
-    /// `finish_cutover` terminalizes under the same `status = 'running'`
-    /// condition, so a job whose cutover completed reads `false` here.
+    /// Conditional on purpose: the job's own ladder and the cancel path's
+    /// unwind race for the terminal row, and an unconditional write would let
+    /// a job reported `cancelled` turn back into `succeeded`.
     ///
     /// `totals` is `Some` when the caller holds counts the row must not
-    /// contradict — the cutover's ceiling refusal is the case that matters:
-    /// it decides on the finished shadow's own tallies, and the periodic
-    /// `record_progress` write that would otherwise have carried them is
-    /// best-effort, so a store blip immediately before the refusal would
-    /// leave the wire reporting `refused_needs_force` beside `rows_nulled:
-    /// 0`. Writing them in the same statement as the status makes the
-    /// verdict and the numbers behind it land together or not at all. `None`
-    /// leaves the counters as they stand. A `false` return leaves them
-    /// untouched too: the row this call lost to is the one that decided.
+    /// contradict (the cutover's ceiling refusal): writing them in the same
+    /// statement as the status makes the verdict and the numbers behind it
+    /// land together or not at all.
     pub async fn finish_if_running(
         &self,
         id: i64,
@@ -705,14 +516,7 @@ impl RepinStore {
     }
 
     /// Record an accepted cancel request against the running job, returning
-    /// the row it landed on (`None` when the job is no longer running: it
-    /// terminalized between the in-process decision and this write).
-    ///
-    /// Idempotent and first-writer-preserving. A second operator asking to
-    /// cancel a job already cancelling changes nothing — the row keeps the
-    /// instant and the actor of the request that actually took effect, which
-    /// is what the audit trail and the job's error sentence name. Both
-    /// columns move together, as the migration's paired CHECK requires.
+    /// the row it landed on (`None` when the job is no longer running).
     ///
     /// This is a record of the request, not of its effect: the terminal
     /// status is written later, by whichever file boundary observes the
@@ -741,64 +545,17 @@ impl RepinStore {
 
     /// The cutover's pin flip: `field_types` takes the new type, the job
     /// completes, and the loss the rewrite staged becomes `field_conflicts`
-    /// evidence — one transaction, so a crash between any two of them cannot
-    /// leave a flipped pin with a `running` job, or a `succeeded` job whose
-    /// losses nothing has recorded.
-    ///
-    /// That last part is the evidence barrier (issue #137): the read that
-    /// first sees `succeeded` also sees the conflicts the repin caused.
-    /// Materialising here rather than in the engine after the flip is what
-    /// makes it true for boot recovery too — recovery replays this call and
-    /// nothing else, so evidence written by the engine would simply never
-    /// exist for a job that died between the swap and the flip.
-    ///
-    /// Idempotent on purpose: boot recovery replays this after a crash in
-    /// the cutover or cleanup window, and a redo must neither error nor
-    /// restamp `finished_at`.
-    ///
-    /// The completing UPDATE gates and pays out in one locked statement —
-    /// it returns the staged tallies only when this call is the one that
-    /// moved the row out of `running`. Both writes that are not naturally
-    /// idempotent hang off that: clearing the old evidence (it indicts a pin
-    /// that no longer exists, and the analyzer's gate is span-based, so
-    /// leaving it would badge the field as degraded forever and the
-    /// operator's remedy would not clear the sign that told them to apply
-    /// it) and inserting the new. A replay of an already-succeeded job gets
-    /// no row back and therefore touches neither.
-    ///
-    /// The operator's acknowledgement of the degraded badge goes with it, in
-    /// the same transaction and under the same gate: an ack suppresses a
-    /// verdict about a pin, and that pin is gone. Whether the DELETE removed
-    /// anything comes back on [`CutoverOutcome::cleared_ack`], so the audit
-    /// event fires for the clear that happened and never for a boot replay
-    /// of it. One line per OBSERVED clear, which is weaker than one per
-    /// clear: the DELETE commits here, and a crash before the caller emits
-    /// loses the line with nothing left to replay it from
-    /// (`repin::engine`).
-    ///
-    /// The ack clear rides the same gate as the evidence writes: a replay
-    /// of an already-succeeded job gets no row back, so it neither deletes
-    /// the evidence this flip inserted for the new pin nor an ack an
-    /// operator wrote after the flip.
+    /// evidence — one transaction (ADR-0022). Idempotent on purpose: boot
+    /// recovery replays this, and a redo must neither error nor restamp
+    /// `finished_at`.
     ///
     /// The transaction OPENS with `SELECT 1 FROM field_types WHERE field =
-    /// $1 FOR UPDATE`, and that lock is not incidental to the pin flip. The
-    /// flip's own UPDATE is predicated `duckdb_type IS DISTINCT FROM $2`, so
-    /// a resurrection-only repin (`to == current`) matches no row and takes
-    /// no lock at all. `acknowledge_degraded_field` serializes against this
-    /// transaction by taking `FOR SHARE` on that same row, so without the
-    /// explicit lock a same-type cutover has nothing for the ack to wait on:
-    /// the ack reads the episode sum, this transaction clears the evidence
-    /// and the ack row, and the ack's upsert lands afterwards as a
-    /// high-water over counters that were just reset — suppressing the new
-    /// pin's first episodes. Locking unconditionally makes the two orders
-    /// the only two outcomes for every repin, not just the retyping ones.
-    ///
-    /// The job row's own `field`/`from_type`/`to_type` must agree with the
-    /// call's arguments. They are the same facts by two routes — the caller
-    /// passes what the `data/REPIN` marker or the engine holds, the row
-    /// carries what was claimed — and a disagreement means the wrong job is
-    /// about to complete a flip, so the transaction is abandoned untouched.
+    /// $1 FOR UPDATE`. The flip's own UPDATE is predicated `duckdb_type IS
+    /// DISTINCT FROM $2`, so a resurrection-only repin (`to == current`) takes
+    /// no lock at all, and `acknowledge_degraded_field` serializes against this
+    /// transaction by taking `FOR SHARE` on that same row. Without the explicit
+    /// lock the ack's upsert lands as a high-water over counters that were just
+    /// reset, suppressing the new pin's first episodes.
     pub async fn finish_cutover(
         &self,
         id: i64,
@@ -866,14 +623,8 @@ impl RepinStore {
                 Some(_) => {}
                 None => {
                     // Forward, never a refusal: the caller is past the
-                    // Cutover marker, where the corpus is already the new
-                    // generation and the only direction is done. NULL is
-                    // precise rather than heuristic — it can only mean the
-                    // staging write never ran, so this is a job from before
-                    // the barrier existed, or one whose engine died between
-                    // the marker and the flip. Its losses are unrecorded and
-                    // unrecoverable (the shadow that counted them is gone),
-                    // which is worth exactly one line of ops signal.
+                    // Cutover marker. NULL can only mean the staging write
+                    // never ran; the shadow that counted the losses is gone.
                     let rows_nulled: i64 = row.try_get("rows_nulled")?;
                     tracing::warn!(
                         event_type = "repin_evidence_unstaged",
@@ -894,7 +645,6 @@ impl RepinStore {
         })
     }
 
-    /// Read one job row.
     pub async fn get(&self, id: i64) -> Result<Option<RepinJob>, StoreError> {
         let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {JOB_COLS} FROM repin_jobs WHERE id = $1"
@@ -908,13 +658,6 @@ impl RepinStore {
             .map_err(StoreError::from)
     }
 
-    /// Read one job row, if the key with row id `key_id` requested it.
-    ///
-    /// Existence and ownership are one predicate in one statement: nothing
-    /// is read and then checked, so there is no window in which the answer
-    /// could change under the caller, and a job another key requested
-    /// returns `None`, as an id the store never issued does. A row with no
-    /// requester matches no key.
     pub async fn get_requested_by(
         &self,
         id: i64,
@@ -933,7 +676,6 @@ impl RepinStore {
             .map_err(StoreError::from)
     }
 
-    /// The running job, if any.
     pub async fn running(&self) -> Result<Option<RepinJob>, StoreError> {
         let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {JOB_COLS} FROM repin_jobs WHERE status = 'running'"
@@ -946,8 +688,6 @@ impl RepinStore {
             .map_err(StoreError::from)
     }
 
-    /// The status surface's one row: the running job if any, else the
-    /// newest job of any status.
     pub async fn latest(&self) -> Result<Option<RepinJob>, StoreError> {
         let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {JOB_COLS} FROM repin_jobs
@@ -1029,10 +769,6 @@ mod tests {
             .collect()
     }
 
-    /// The enum and the CHECK are one vocabulary. A status the database
-    /// refuses is a job the engine cannot terminalize — the running slot
-    /// wedges until a restart — and a spelling only the database knows is
-    /// a row `row_to_job` decodes as corruption.
     #[test]
     fn status_vocabulary_matches_the_migration_check() {
         for status in ALL_STATUSES {

@@ -4,13 +4,6 @@
 
 //! Disk headroom for the filesystems trawl writes to, and each
 //! environment's projected retention reach (ADR-0042).
-//!
-//! Pure logic plus injected IO seams. [`sample_headroom`] reads through a
-//! `stat` seam, inside the repin [`fence`] both capacity samples take.
-//! Nothing here reads the clock, so the projection takes `today` as an
-//! argument. The measurement's status and
-//! age belong to the ADR-0033 cache that holds the samples
-//! ([`crate::metrics`]), not to this module.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -25,8 +18,6 @@ use trawl_config::RetentionConfig;
 
 pub mod fence;
 
-/// One role's reading: the device its path lives on and that device's
-/// totals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoleReading {
     pub role: FilesystemRole,
@@ -35,7 +26,6 @@ pub struct RoleReading {
     pub available_bytes: u64,
 }
 
-/// One device's headroom, labelled with every role that lives on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceHeadroom {
     /// Non-empty, ordered data, wal, spill.
@@ -44,9 +34,6 @@ pub struct DeviceHeadroom {
     pub available_bytes: u64,
 }
 
-/// One complete headroom attempt: every role's filesystem, grouped by
-/// device, and whether the repin fence saw a repin overlap the stats.
-///
 /// The repin answer rides the same attempt so that a later projection
 /// reads both facts from one moment, with one status and one age.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,12 +42,6 @@ pub struct HeadroomSample {
     pub repin_in_flight: bool,
 }
 
-/// Collapse role readings into one row per device.
-///
-/// Rows are ordered by their first role, and each row's roles are ordered
-/// data, wal, spill. Roles on one device share a row, and that row's
-/// totals are the first role's reading: available bytes are never summed,
-/// because two paths on one device draw on the same free space.
 #[must_use]
 pub fn group_by_device(readings: &[RoleReading]) -> Vec<DeviceHeadroom> {
     let mut sorted = readings.to_vec();
@@ -85,11 +66,6 @@ pub fn group_by_device(readings: &[RoleReading]) -> Vec<DeviceHeadroom> {
     rows.into_iter().map(|(_, row)| row).collect()
 }
 
-/// The data filesystem's floor against its available bytes.
-///
-/// Pressure deletion starts only while available bytes are strictly below
-/// the floor, so equality is no deficit. A floor of 0 turns pressure
-/// deletion off.
 #[must_use]
 pub fn assess_floor(floor_bytes: u64, available_bytes: u64) -> DeletionFloor {
     if floor_bytes == 0 {
@@ -101,8 +77,6 @@ pub fn assess_floor(floor_bytes: u64, available_bytes: u64) -> DeletionFloor {
     }
 }
 
-/// The wire rows for a sample. Only the row holding the data role carries
-/// the floor: nothing reclaims the other filesystems.
 #[must_use]
 pub fn filesystem_rows(sample: &HeadroomSample, floor_bytes: u64) -> Vec<FilesystemHeadroom> {
     sample
@@ -120,15 +94,10 @@ pub fn filesystem_rows(sample: &HeadroomSample, floor_bytes: u64) -> Vec<Filesys
         .collect()
 }
 
-/// Take one headroom attempt.
-///
 /// `stat` answers `(device, total_bytes, available_bytes)` for a path
-/// ([`stat_filesystem`] in production). The stats run inside a
-/// [`fence::RepinFence`] on the data root and `jobs`, the same fence the
-/// Parquet scan takes, so any repin job that overlaps the stats is
-/// recorded in the sample. Any error fails the whole attempt, so the cache
-/// keeps the last complete sample rather than publish a partial one that
-/// would lose a device's row. `wal_dir` is `None` when ingest is off.
+/// ([`stat_filesystem`] in production). Any error fails the whole attempt,
+/// so the cache keeps the last complete sample rather than publish a
+/// partial one that would lose a device's row.
 ///
 /// # Errors
 /// The fence's open error, then the first `stat` error in role order,
@@ -180,8 +149,7 @@ pub type EnvDateBytes = BTreeMap<(String, NaiveDate), u64>;
 /// An environment with fewer observed days than this has no rate.
 pub const MIN_OBSERVED_DAYS: usize = 3;
 
-/// The newest and oldest observed day, in days before today. Today and
-/// yesterday are still settling under rollup and late arrivals.
+/// The newest and oldest observed day, in days before today.
 const NEWEST_OBSERVED_DAYS_AGO: u64 = 2;
 const OLDEST_OBSERVED_DAYS_AGO: u64 = 8;
 
@@ -192,15 +160,6 @@ const RATE_SCALE: u128 = 420;
 
 /// An environment's observed days: each date from today−8 through today−2
 /// with its stored bytes, oldest first.
-///
-/// The oldest date is the oldest one holding counted Parquet: `partitions`
-/// is one environment's bytes by date from the storage scan, which buckets
-/// only counted files, so an empty date directory never appears in it.
-/// Retention always deletes an environment's oldest date first, so a
-/// missing date newer than the oldest date was a quiet day and counts as
-/// zero. A date older than it is absent, not zero. An empty date directory
-/// does not anchor that zero-fill: it is no evidence of a quiet ingest day,
-/// and anchoring on it would add zero days and overstate reach.
 #[must_use]
 pub fn observed_days(
     today: NaiveDate,
@@ -227,17 +186,9 @@ pub struct ProjectionBasis {
     data_available_bytes: u64,
 }
 
-/// Admit the measurements behind a projection, or name why it is withheld.
-///
 /// `parquet` is the storage scan's measurement; the partition bytes handed
 /// to [`project`] must be the sample read with it, and `parquet_saw_repin`
-/// is that sample's repin evidence. `headroom` and `sample` are the
-/// headroom measurement and its retained sample. Precedence: either
-/// measurement not `complete` is [`WithheldReason::MeasurementUnavailable`];
-/// a repin in flight at either sample's attempt is
-/// [`WithheldReason::RetentionSuppressed`], since it holds two generations
-/// of stored bytes. The two samples come from separate caches with
-/// separate ages, so neither one's evidence speaks for the other.
+/// is that sample's repin evidence.
 ///
 /// # Errors
 /// The reason every environment's reach is withheld.
@@ -278,12 +229,9 @@ pub struct Projection {
     pub growth_excluded: Vec<String>,
 }
 
-/// One environment's partitions, summarised for the projection.
 struct EnvRow<'a> {
     env: &'a str,
     max_age_days: u64,
-    /// The oldest date holding counted Parquet. An empty date directory is
-    /// not a partition here (see [`observed_days`]).
     oldest: NaiveDate,
     stored_bytes: u64,
     observed: Vec<(NaiveDate, u64)>,
@@ -298,7 +246,6 @@ impl EnvRow<'_> {
         self.observed.len() >= MIN_OBSERVED_DAYS
     }
 
-    /// A finite environment with a rate: its growth is projected.
     fn is_rated(&self) -> bool {
         !self.keeps_forever() && self.has_rate()
     }
@@ -318,7 +265,6 @@ impl EnvRow<'_> {
             .saturating_mul(RATE_SCALE / days.max(1))
     }
 
-    /// The largest observed day, times [`RATE_SCALE`].
     fn scaled_largest_day(&self) -> u128 {
         let largest = self.observed.iter().map(|&(_, bytes)| bytes).max();
         u128::from(largest.unwrap_or(0)).saturating_mul(RATE_SCALE)
@@ -330,27 +276,6 @@ fn date_string(date: NaiveDate) -> String {
 }
 
 /// Project each environment's retention reach (ADR-0042).
-///
-/// `env_dates` is the storage scan's partition bytes; every environment
-/// with a partition is listed, with its effective `max_age_days` from
-/// `retention` and its oldest date (the oldest holding counted Parquet)
-/// and stored bytes, whatever the basis.
-/// `basis` comes from [`projection_basis`]; an `Err` withholds every
-/// environment's reach with that reason.
-///
-/// The model: under sustained pressure the expiry-ratio order (ADR-0018)
-/// drives every finite environment toward one fraction `f` of its
-/// `max_age_days`. The budget is every partition's bytes plus the data
-/// filesystem's available bytes, minus the deletion floor
-/// (`retention.min_free_disk_bytes`, the one the retention loop enforces).
-/// Keep-forever
-/// environments, and finite ones with fewer than [`MIN_OBSERVED_DAYS`]
-/// observed days, are reserved at their stored bytes. The rest solve
-/// `Σ daily_bytes × f × max_age_days = budget − reserved`, once with each
-/// environment's mean observed day (the `high` end) and once with its
-/// largest (the `low` end). An end is the full policy when `f ≥ 1`,
-/// decided before any rounding; otherwise `floor(f × max_age_days)` whole
-/// days, or, with a floor of 0, the disk filling first.
 ///
 /// Arithmetic is `u128` and saturating: exact while bytes × `max_age_days`
 /// × 420 fits in 128 bits, and never a panic beyond it.
@@ -411,7 +336,6 @@ pub fn project(
     }
 }
 
-/// Every row's reach from an admitted basis, in row order.
 fn reach_all(rows: &[EnvRow<'_>], basis: ProjectionBasis, floor_bytes: u64) -> Vec<Reach> {
     let stored = |row: &EnvRow<'_>| u128::from(row.stored_bytes);
     let budget = rows
@@ -506,26 +430,19 @@ fn run_ends<'a>(
 /// with it, so a status never describes a different sample's numbers.
 #[derive(Debug, Clone, Copy)]
 pub struct CapacityReadings<'a> {
-    /// The Parquet scan's measurement.
     pub parquet: &'a StorageMeasurement,
     /// That scan's partition bytes; `None` before a complete scan.
     pub env_dates: Option<&'a EnvDateBytes>,
     /// Whether a repin held the data root during that scan's attempt;
     /// `false` before a complete scan, which is withheld as unmeasured.
     pub parquet_repin_in_flight: bool,
-    /// The headroom measurement.
     pub headroom: &'a StorageMeasurement,
     /// That measurement's retained sample; `None` before a complete one.
     pub sample: Option<&'a HeadroomSample>,
 }
 
-/// The dashboard's capacity object (ADR-0042).
-///
 /// `today` is the UTC date, read once per snapshot so every environment is
-/// projected against the same day. `pressure` is retention's evidence,
-/// with the last sweep's age already evaluated. The deletion floor comes
-/// from `retention`, the config the retention loop enforces, for the
-/// headroom rows and the projection alike.
+/// projected against the same day.
 #[must_use]
 pub fn assemble(
     today: NaiveDate,
@@ -803,8 +720,6 @@ mod tests {
         );
     }
 
-    /// The production seam reads a real directory, and two paths on one
-    /// filesystem report one device.
     #[test]
     fn capacity_stat_reads_a_real_filesystem() {
         let tmp = tempfile::tempdir().unwrap();
@@ -815,8 +730,6 @@ mod tests {
         assert_eq!(stat_filesystem(&nested).unwrap().0, device);
         assert!(stat_filesystem(&tmp.path().join("absent")).is_err());
     }
-
-    // -- reach ----------------------------------------------------------------
 
     use trawl_config::EnvRetention;
 
@@ -856,7 +769,6 @@ mod tests {
         }
     }
 
-    /// `config` with a deletion floor of `floor` bytes.
     fn floored(config: &RetentionConfig, floor: u64) -> RetentionConfig {
         RetentionConfig {
             min_free_disk_bytes: floor,
@@ -886,7 +798,6 @@ mod tests {
         }
     }
 
-    /// A basis admitted from two complete measurements.
     fn basis(available: u64) -> Result<ProjectionBasis, WithheldReason> {
         let complete = measured(StorageMeasurementStatus::Complete);
         projection_basis(
@@ -1454,8 +1365,6 @@ mod tests {
         assert!(projection.growth_excluded.is_empty());
     }
 
-    /// Assembly reads the floor from the retention config for the rows and
-    /// the projection alike, and lists stored facts even while withheld.
     #[test]
     fn capacity_assemble_takes_the_floor_from_config() {
         use trawl_api::{LastSweep, PressureEvidence, SweepOutcome};

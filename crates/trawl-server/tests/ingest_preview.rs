@@ -2,14 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `POST /api/v1/ingest/preview` against a real trawld (ADR-0049, #200).
-//!
-//! The report's contract (input order, per-position outcomes, the echoed
-//! header, sender dependence), its access and bounds (permission, body
-//! limit, the 500-position cap, encodings, the disabled route, the rate
-//! class), `Cache-Control: no-store` on what the route answers, and parity
-//! with real ingest: the same body through both routes, compared against
-//! the WAL. A preview never takes a repairs metric label either.
+//! `POST /api/v1/ingest/preview` against a real trawld (ADR-0049).
 
 mod common;
 
@@ -30,14 +23,12 @@ use trawl_server::config::RateLimitConfig;
 use trawl_server::ingest::envelope::{MAX_RAW_CHARS, RejectReason, RepairCode};
 use trawl_server::metrics::OVERFLOW_SERVICE_LABEL;
 
-/// The fixture's interactive `max_request_body_bytes`.
 const INTERACTIVE_BODY_LIMIT: usize = 128 * 1024;
 
 fn raw_client() -> reqwest::Client {
     common::harness_client_builder().build().unwrap()
 }
 
-/// POST a sample to the preview with `token`, `query` appended verbatim.
 async fn post_preview(
     server: &TestServer,
     token: &str,
@@ -54,7 +45,6 @@ async fn post_preview(
         .unwrap()
 }
 
-/// A preview request head as `token`, with `framing` as its body header.
 fn preview_head(server: &TestServer, token: &str, framing: &str) -> String {
     let host = server.url.strip_prefix("https://").unwrap();
     format!(
@@ -64,13 +54,10 @@ fn preview_head(server: &TestServer, token: &str, framing: &str) -> String {
     )
 }
 
-/// A preview that announces `length` body bytes and sends none: the body
-/// limit's `Content-Length` refusal answers on the head alone.
 fn announced_body(server: &TestServer, token: &str, length: usize) -> Vec<u8> {
     preview_head(server, token, &format!("content-length: {length}")).into_bytes()
 }
 
-/// The body limit's refusal message at the fixture's interactive limit.
 const INTERACTIVE_BODY_LIMIT_MESSAGE: &str =
     "request body exceeds [server] max_request_body_bytes (131072 bytes)";
 
@@ -84,7 +71,6 @@ fn unterminated_chunked_body(server: &TestServer, token: &str, body: &[u8]) -> V
     request
 }
 
-/// Assert a raw response may not be cached.
 fn assert_raw_no_store(resp: &common::RawResponse, what: &str) {
     assert_eq!(
         resp.header("cache-control"),
@@ -93,7 +79,6 @@ fn assert_raw_no_store(resp: &common::RawResponse, what: &str) {
     );
 }
 
-/// Assert the response may not be cached.
 fn assert_no_store(resp: &reqwest::Response, what: &str) {
     assert_eq!(
         resp.headers()
@@ -104,7 +89,6 @@ fn assert_no_store(resp: &reqwest::Response, what: &str) {
     );
 }
 
-/// A 200 preview as the admin (`server_manage`) key, parsed.
 async fn preview_ok(server: &TestServer, query: &str, body: &str) -> PreviewResponse {
     let resp = post_preview(server, &server.admin_token, query, body.to_owned()).await;
     assert_eq!(resp.status(), 200, "preview must succeed");
@@ -112,8 +96,6 @@ async fn preview_ok(server: &TestServer, query: &str, body: &str) -> PreviewResp
     resp.json().await.unwrap()
 }
 
-/// `(status, error code, message)` of an error response, after checking
-/// it is no-store.
 async fn error_of(resp: reqwest::Response, what: &str) -> (u16, String, String) {
     assert_no_store(&resp, what);
     let status = resp.status().as_u16();
@@ -131,7 +113,6 @@ async fn error_of(resp: reqwest::Response, what: &str) -> (u16, String, String) 
     )
 }
 
-/// `(index, outcome, reason-or-service)` per reported position.
 fn outline(report: &PreviewResponse) -> Vec<(usize, &'static str, String)> {
     report
         .events
@@ -166,7 +147,6 @@ fn rejected(event: &PreviewEvent) -> (usize, Option<&Value>, &str, &str, bool) {
     }
 }
 
-/// `(event, repairs, host_depends_on_sender)` of an accepted position.
 fn accepted(event: &PreviewEvent) -> (&serde_json::Map<String, Value>, &[String], bool) {
     match event {
         PreviewEvent::Accepted {
@@ -178,8 +158,6 @@ fn accepted(event: &PreviewEvent) -> (&serde_json::Map<String, Value>, &[String]
         PreviewEvent::Rejected { .. } => panic!("expected an acceptance, got {event:?}"),
     }
 }
-
-// -- the report ---------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ndjson_sample_is_reported_in_input_order() {
@@ -230,7 +208,6 @@ async fn invalid_ndjson_line_gets_its_position_and_parse_reason_without_input() 
     assert!(message.starts_with("invalid JSON"), "{message}");
     assert!(!message.contains("zz-canary"), "the line is never echoed");
     assert!(!depends);
-    // Nothing invented: the wire form omits `input` entirely.
     let wire = serde_json::to_value(&report.events[1]).unwrap();
     assert!(wire.get("input").is_none(), "{wire}");
     assert_eq!((report.accepted, report.rejected), (2, 1));
@@ -311,7 +288,6 @@ async fn accepted_event_carries_canonical_event_repairs_and_lineage() {
     assert_eq!((*index, echoed), (0, &input));
     assert!(!host_depends_on_sender, "the event names its host");
 
-    // The full canonical event, server stamps included.
     assert_eq!(event["service"], "api");
     assert_eq!(event["env"], "prod");
     assert_eq!(event["host"], "web01");
@@ -324,7 +300,6 @@ async fn accepted_event_carries_canonical_event_repairs_and_lineage() {
     assert!(event.contains_key("_raw"));
     assert!(!event.contains_key("Ctx"));
 
-    // Repair codes, in application order: the event's own `_repairs`.
     assert_eq!(
         event["_repairs"]
             .as_str()
@@ -341,7 +316,6 @@ async fn accepted_event_carries_canonical_event_repairs_and_lineage() {
         assert!(repairs.iter().any(|r| r == code), "{code} in {repairs:?}");
     }
 
-    // Lineage, named.
     assert_eq!(
         lineage.time,
         TimeLineage::Arrival {
@@ -375,8 +349,6 @@ async fn accepted_event_carries_canonical_event_repairs_and_lineage() {
     );
 }
 
-/// The stored-value cap (ADR-0063) is previewed as real ingest applies
-/// it: the input as sent, the event cut, the repair and the field change.
 /// The sample proposes its own short `_raw`, so the one cut is the cap's.
 #[tokio::test(flavor = "multi_thread")]
 async fn truncated_value_is_previewed() {
@@ -445,8 +417,6 @@ async fn rejected_event_carries_reason_and_message_and_no_event() {
         assert!(wire.get(absent).is_none(), "{absent} in {wire}");
     }
 }
-
-// -- the header and the peer ----------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn header_echoes_producer_peer_relay_arrival_and_derivation() {
@@ -535,7 +505,6 @@ async fn omitted_peer_uses_the_placeholder_and_marks_sender_dependence() {
     let (_, _, _, _, depends) = rejected(&report.events[3]);
     assert!(!depends);
 
-    // With the peer given, nothing depends on an unknown sender.
     let given = preview_ok(&server, "?peer_ip=10.0.0.7", body).await;
     assert!(given.peer.given);
     let (event, _, depends) = accepted(&given.events[0]);
@@ -544,11 +513,7 @@ async fn omitted_peer_uses_the_placeholder_and_marks_sender_dependence() {
     assert!(!rejected(&given.events[2]).4);
 }
 
-/// Real ingest from the fixture's client always arrives from 127.0.0.1, so
-/// each server answers for that peer both ways: a relay server rejects the
-/// host-less event, a plain one fills `host` from the peer. The preview,
-/// given the same peer, must say the same; given an untrusted peer on the
-/// relay server, it fills.
+/// Real ingest from the fixture's client always arrives from 127.0.0.1.
 #[tokio::test(flavor = "multi_thread")]
 async fn trusted_relay_and_untrusted_peer_match_real_ingest() {
     let hostless = r#"{"service":"relayprobe","message":"m"}"#;
@@ -561,7 +526,6 @@ async fn trusted_relay_and_untrusted_peer_match_real_ingest() {
             .send()
     };
 
-    // Behind a relay: real ingest rejects, and so does the preview.
     let relay = setup_with_trusted_relays(&["127.0.0.1/32"]).await;
     let real: trawl_api::IngestResponse = ingest(&relay).await.unwrap().json().await.unwrap();
     assert_eq!(real.accepted, 0);
@@ -572,14 +536,12 @@ async fn trusted_relay_and_untrusted_peer_match_real_ingest() {
     assert_eq!(reason, real.errors[0].reason);
     assert_eq!(message, real.errors[0].message);
 
-    // The same event from an untrusted peer on the same server is filled.
     let report = preview_ok(&relay, "?peer_ip=10.9.8.7", hostless).await;
     assert!(!report.peer.trusted_relay);
     let (event, repairs, _) = accepted(&report.events[0]);
     assert_eq!(event["host"], "10.9.8.7");
     assert!(repairs.iter().any(|r| r == "host.from_peer"));
 
-    // No relay: real ingest fills from the peer, and so does the preview.
     let plain = setup().await;
     let real: trawl_api::IngestResponse = ingest(&plain).await.unwrap().json().await.unwrap();
     assert_eq!((real.accepted, real.rejected), (1, 0));
@@ -605,18 +567,12 @@ async fn trusted_relay_and_untrusted_peer_match_real_ingest() {
     );
 }
 
-// -- access and bounds ------------------------------------------------------------
-
-/// A key without `server_manage` gets 403, and gets it before its body is
-/// read: a sample whose chunked body never ends is refused while the body
-/// is still open.
 #[tokio::test(flavor = "multi_thread")]
 async fn keys_without_server_manage_get_403() {
     // A failure bound, never an ordering device: the refusal needs no byte
     // of the body, and a route that waits on the body never answers.
     const STALLED_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
     let server = setup().await;
-    // The trial's ingest key is `ingest` alone: the fixture's ingest key.
     for (who, token) in [
         ("ingest-only", &server.ingest_token),
         ("reader", &server.reader_token),
@@ -669,8 +625,6 @@ async fn body_over_max_request_body_bytes_is_413() {
     assert_raw_no_store(&resp, "streamed refusal");
 }
 
-/// A whole body past the limit, sent complete in either framing, gets the
-/// same envelope as the head-only and unterminated legs above.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_complete_body_over_the_limit_is_413_with_the_envelope() {
     let server = setup_with_body_limits(BodyLimits {
@@ -700,8 +654,6 @@ async fn a_complete_body_over_the_limit_is_413_with_the_envelope() {
     assert_raw_no_store(&resp, "complete chunked body");
 }
 
-/// Lines of `{"service":"s"}`, `valid` of them, then `invalid` lines that
-/// are not JSON, with a blank line between every two.
 fn sample(valid: usize, invalid: usize) -> String {
     let mut lines = vec!["{\"service\":\"s\"}"; valid];
     lines.extend(std::iter::repeat_n("not json", invalid));
@@ -728,7 +680,6 @@ async fn more_than_500_positions_is_413_counting_invalid_lines_not_blank_ones() 
     assert_eq!((status, code.as_str()), (413, "preview_too_large"));
     assert!(message.contains("500"), "{message}");
 
-    // The same in an array.
     let array = format!("[{}]", vec!["{\"service\":\"s\"}"; 501].join(","));
     let resp = post_preview(&server, &server.admin_token, "", array).await;
     let (status, code, _) = error_of(resp, "array preview_too_large").await;
@@ -774,11 +725,6 @@ async fn ingest_disabled_answers_404() {
     assert_eq!(resp.status(), 404);
 }
 
-/// Every response to the preview is no-store, whichever layer answers it:
-/// the handler, the body limit's refusals (on `Content-Length` and on a
-/// streamed body), the auth
-/// layer's 401 or the grant layer's 403. Another route on the same router
-/// is not given the header.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_preview_response_is_no_store() {
     let server = setup().await;
@@ -808,8 +754,6 @@ async fn every_preview_response_is_no_store() {
     assert_eq!(resp.status(), 415);
     assert_no_store(&resp, "415");
 
-    // A sized body is refused on its announced length, before a byte of it
-    // is read; an unsized one once the extractor reads past the limit.
     let request = announced_body(&server, admin, INTERACTIVE_BODY_LIMIT + 1);
     let resp = common::raw_https_exchange(&server.url, &request).await;
     assert_eq!(resp.status, 413, "body-limit 413");
@@ -820,12 +764,10 @@ async fn every_preview_response_is_no_store() {
     assert_eq!(resp.status, 413, "streamed body-limit 413");
     assert_raw_no_store(&resp, "streamed body-limit 413");
 
-    // A key with no trawl grant at all is refused by the grant layer.
     let resp = post_preview(&server, &server.coastwatch_only_token, "", "{}").await;
     let (status, code, _) = error_of(resp, "grant-layer 403").await;
     assert_eq!((status, code.as_str()), (403, "forbidden"));
 
-    // No token at all is the auth layer's 401.
     let resp = raw_client()
         .post(format!("{}/api/v1/ingest/preview", server.url))
         .body("{}")
@@ -835,7 +777,6 @@ async fn every_preview_response_is_no_store() {
     assert_eq!(resp.status(), 401);
     assert_no_store(&resp, "401");
 
-    // A neighbour on the same router keeps its own caching headers.
     let resp = raw_client()
         .get(format!("{}/api/v1/whoami", server.url))
         .bearer_auth(admin)
@@ -850,10 +791,6 @@ async fn every_preview_response_is_no_store() {
     );
 }
 
-/// A key holding both `server_manage` and `ingest` spends the interactive
-/// bucket on the preview: with the ingest class unlimited, the preview is
-/// still 429 after the interactive burst, while real ingest from the same
-/// key is not.
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_spends_the_interactive_rate_bucket() {
     let server = setup_with_rate_limit(RateLimitConfig {
@@ -881,7 +818,6 @@ async fn preview_spends_the_interactive_rate_bucket() {
         .unwrap();
     let token = key.plaintext_token.to_string();
 
-    // Spending the ingest class first leaves the interactive burst whole.
     for i in 0..5 {
         let resp = raw_client()
             .post(format!("{}/api/v1/ingest", server.url))
@@ -899,7 +835,6 @@ async fn preview_spends_the_interactive_rate_bucket() {
     }
     assert_eq!(statuses, [200, 200, 429], "the interactive burst of 2");
 
-    // Real ingest from the same key still rides its own bucket.
     let resp = raw_client()
         .post(format!("{}/api/v1/ingest", server.url))
         .header("authorization", format!("Bearer {token}"))
@@ -910,11 +845,7 @@ async fn preview_spends_the_interactive_rate_bucket() {
     assert_eq!(resp.status(), 200);
 }
 
-// -- parity with real ingest ----------------------------------------------------
-
-/// Repair codes only a profile producer (syslog, trawld) can earn: the
-/// HTTP door has a peer to fill `host` from or refuse behind, takes
-/// `service` as sent, and asserts no slot.
+/// Repair codes only a profile producer (syslog, trawld) can earn.
 const UNREACHABLE_REPAIRS: [&str; 3] = [
     "host.omitted",
     "service.from_profile",
@@ -922,14 +853,11 @@ const UNREACHABLE_REPAIRS: [&str; 3] = [
 ];
 
 /// Reject reasons storage decides after canonicalization, which the
-/// preview never reaches: a failed WAL write and the hot buffer's two
-/// admission refusals.
+/// preview never reaches.
 const UNREACHABLE_REJECTS: [&str; 3] = ["wal_failure", "hot_buffer_full", "ingest_batch_too_large"];
 
-/// One sample covering every repair the HTTP door can make on a server
-/// with no trusted relay, every per-event reject but the relay one, and
-/// the index rule (a blank line). Each event that should be accepted
-/// carries a unique `id`, the only key the WAL is matched on.
+/// Each event that should be accepted carries a unique `id`, the only key
+/// the WAL is matched on.
 ///
 /// Times sit far from the plausibility window's edges: an hour ago for a
 /// plausible time, 2001 for an implausible one, and a day ahead for one
@@ -972,7 +900,6 @@ fn plain_differential_body() -> String {
     body.join("\n")
 }
 
-/// Every `*.ndjson` line under the server's WAL directory, keyed by `id`.
 fn wal_events_by_id(server: &TestServer) -> BTreeMap<String, serde_json::Map<String, Value>> {
     let dir = server
         .state
@@ -1007,11 +934,6 @@ fn wal_events_by_id(server: &TestServer) -> BTreeMap<String, serde_json::Map<Str
     out
 }
 
-/// Send `body` through real ingest (from 127.0.0.1) and through the
-/// preview with `peer_ip=127.0.0.1` on the same server, and require the
-/// same result: every accepted event equal to its WAL line field by field,
-/// and the same rejected `(index, reason, message)` set. Returns the
-/// repair codes and reject reasons the sample covered.
 async fn assert_preview_matches_ingest(
     server: &TestServer,
     body: &str,
@@ -1088,11 +1010,6 @@ async fn assert_preview_matches_ingest(
     (repairs, rejects)
 }
 
-/// AC4: the preview's accepted events equal the WAL lines real ingest
-/// wrote for the same body, field by field, and its rejections equal real
-/// ingest's, across every repair code and canonicalization reject reason
-/// the HTTP door can reach. The relay rejection needs a relay server, so it
-/// is a second leg on one.
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_matches_real_ingest_wal_field_by_field() {
     let plain = setup().await;
@@ -1135,13 +1052,6 @@ async fn preview_matches_real_ingest_wal_field_by_field() {
     );
 }
 
-// -- the repairs label set ------------------------------------------------------
-
-/// A preview never admits a service name to the bounded repairs label set
-/// (ADR-0009's cap of 256): after 300 previews of distinct invented
-/// services, each with a repair, a real ingest of a new service still gets
-/// its own `trawl_ingest_repairs_total` label, not the overflow one.
-///
 /// The set is process-wide. Under nextest this test is its own process;
 /// under `cargo test` the other tests here admit only a handful of names,
 /// far from the cap, so 300 leaked previews would still cross it.
@@ -1199,16 +1109,10 @@ async fn previewed_services_never_take_a_repair_label() {
     );
 }
 
-// -- the shipped Vector configs ---------------------------------------------------
-
 /// The events the shipped Debian Vector configs delivered in the collector
 /// test's all-source run (`scripts/test-vector-collector.py`, ADR-0053).
 const VECTOR_CAPTURE: &str = include_str!("fixtures/vector-capture/debian.ndjson");
 
-/// What the shipped configs send is what trawld accepts: every captured
-/// event is accepted under the service Vector sent, with no profile
-/// fallback, no folded field-name collision, and no field that trawld
-/// must move off its reserved prefix.
 #[tokio::test(flavor = "multi_thread")]
 async fn shipped_vector_capture_is_accepted_under_the_services_it_sent() {
     let sent: Vec<Value> = VECTOR_CAPTURE
@@ -1258,7 +1162,6 @@ async fn shipped_vector_capture_is_accepted_under_the_services_it_sent() {
         }
     }
 
-    // journald's `UNIT` folds to `unit`, beside the kept `systemd_unit`.
     let pid1 = sent
         .iter()
         .position(|event| event["fixture_id"] == "journal-pid1")

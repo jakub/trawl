@@ -2,20 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Capture admission (ADR-0057): a key's queue, the installation's running
-//! slots and the key's quota each refuse with 429 and a `Retry-After`,
-//! and a refused capture takes nothing. A capture whose client goes away,
-//! or whose deadline passes mid-write, keeps its slots and its reservation
-//! until its work stops, then leaves nothing behind.
+//! Capture admission (ADR-0057).
 //!
 //! Captures are held at the executor pool's seams. A capture held while
 //! another is refused reads a recorded report (`| from saved`), which
 //! takes no publication guard, so [`captured::assert_nothing_held`] can
 //! prove the refusal took neither an executor permit nor the guard.
-//!
-//! A refused capture's timing account (ADR-0046) is proved here too, from
-//! the process's tracing events. The binary is in the ADR-0021 `postgres`
-//! nextest group.
 
 mod common;
 
@@ -37,10 +29,9 @@ use trawl_server::pool::seam::Seam;
 use trawl_server::results::ResultsClock;
 use trawl_server::store::{FinishOutcome, RunClaim, RunStatus};
 
-/// Where the clock stands when a test captures.
 const CAPTURED_AT: &str = "2024-01-16T10:30:00Z";
 
-/// The tracing events of the whole process. Installed once: the server
+/// Installed once: the server
 /// logs from every tokio worker and blocking thread.
 fn telemetry() -> &'static Capture {
     static CAPTURE: OnceLock<Capture> = OnceLock::new();
@@ -55,13 +46,8 @@ fn telemetry() -> &'static Capture {
     })
 }
 
-/// A capture deadline no loaded machine reaches, for a test where the
-/// deadline must decide nothing.
 const UNHURRIED_SECS: u64 = 300;
 
-/// [`boot`], with `capture`'s deadline and the query timeout both
-/// [`UNHURRIED_SECS`]: for a test that holds a seam or a queue while the
-/// deadline runs and asserts nothing about the deadline itself.
 async fn boot_unhurried(capture: CaptureConfig) -> Arc<TestServer> {
     boot_with_timeout(
         CaptureConfig {
@@ -73,8 +59,6 @@ async fn boot_unhurried(capture: CaptureConfig) -> Arc<TestServer> {
     .await
 }
 
-/// A fixture over the capture corpus with `capture`, its clock at
-/// [`CAPTURED_AT`], and a recorded report for the analyst and the admin.
 async fn boot(capture: CaptureConfig) -> Arc<TestServer> {
     boot_with_timeout(capture, common::DEFAULT_TEST_TIMEOUT_SECS).await
 }
@@ -90,9 +74,6 @@ async fn boot_with_timeout(capture: CaptureConfig, timeout_secs: u64) -> Arc<Tes
     Arc::new(server)
 }
 
-/// Record a finished run of saved query `name`, owned by `token`'s key,
-/// whose file holds two rows, through the stores the scheduler records
-/// with.
 async fn record_report(server: &TestServer, data: &str, token: &str, name: &str) {
     let client = trawl_client::HttpClient::new_insecure(&server.url, token).unwrap();
     let saved = client
@@ -155,7 +136,6 @@ fn events_body() -> serde_json::Value {
     })
 }
 
-/// Start a capture on a task of its own.
 fn spawn_capture(
     server: &Arc<TestServer>,
     token: &str,
@@ -166,7 +146,7 @@ fn spawn_capture(
     tokio::spawn(async move { captured::capture(&server, &token, &body).await })
 }
 
-/// Wait up to a minute for `done`, failing by `what`. A loaded machine has
+/// A loaded machine has
 /// run these fixtures twenty times slower than an idle one.
 async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let give_up = std::time::Instant::now() + Duration::from_mins(1);
@@ -179,8 +159,6 @@ async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// `answer` is a 429 with `code` and a `Retry-After` of whole seconds;
-/// returns them.
 fn retry_after(answer: &captured::Answer, code: &str, what: &str) -> u64 {
     let (status, headers, body) = answer;
     assert_eq!(*status, StatusCode::TOO_MANY_REQUESTS, "{what}: {body}");
@@ -198,7 +176,6 @@ fn request_id(answer: &captured::Answer) -> String {
     answer.1["x-request-id"].to_str().unwrap().to_owned()
 }
 
-/// The one `query_timing` event of request `request_id`.
 async fn timing_of(request_id: &str) -> Captured {
     let events = || telemetry().of_type("query_timing", "request_id", request_id);
     wait_until("the refused capture's timing event", || {
@@ -212,10 +189,6 @@ async fn timing_of(request_id: &str) -> Captured {
     events.into_iter().next().unwrap()
 }
 
-/// With the key's one running capture held, four more of its captures
-/// wait and the fifth is refused at once with `capture_busy`, taking no
-/// permit and no guard. Released, the five all finish.
-///
 /// The queued captures take their turns one after another, each inside
 /// its own deadline, and a queued capture whose deadline passes is refused
 /// as busy too. A loaded machine has taken longer than the fixture's ten
@@ -265,9 +238,7 @@ async fn a_full_key_queue_refuses_the_next_capture() {
     assert_eq!(captured::listed(&server, &analyst).await.len(), 5);
 }
 
-/// With two keys each running a capture, the installation's two slots are
-/// taken and a third key is refused at once with `capture_busy`, taking
-/// no permit and no guard. The two running captures are held while the
+/// The two running captures are held while the
 /// refusal is made, so they get [`UNHURRIED_SECS`].
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_installation_refuses_a_third_key() {
@@ -298,9 +269,6 @@ async fn a_full_installation_refuses_a_third_key() {
     }
 }
 
-/// A key holding `per_key_results` captures is refused with
-/// `capture_quota_exceeded`, and `Retry-After` is the seconds until its
-/// earliest capture expires on the fixture clock.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_key_quota_names_its_earliest_expiry() {
     let server = boot(CaptureConfig {
@@ -327,11 +295,6 @@ async fn a_full_key_quota_names_its_earliest_expiry() {
     captured::captured(&server, &server.reader_token, &events_body()).await;
 }
 
-/// A reservation that finds expired captures releases the admission pass
-/// before it unlinks their files. With the unlink held on a slow
-/// filesystem, another key's reservation is admitted inside its deadline
-/// instead of waiting the pass out as `capture_busy`, and the expired file
-/// goes once the unlink is let go.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reservation_unlinks_expired_files_after_it_releases_the_pass() {
     let server = boot(CaptureConfig::default()).await;
@@ -376,10 +339,7 @@ async fn a_reservation_unlinks_expired_files_after_it_releases_the_pass() {
     wait_until("the expired file to be unlinked", || !file.exists()).await;
 }
 
-/// A capture whose client goes away while its work is held keeps its lane
-/// slot, its installation slot and its quota reservation until the work
-/// stops. Then all three are free, no row and no file remain, and the
-/// key's next capture is admitted at once. The work is held while the
+/// The work is held while the
 /// refusals are made, so the captures get [`UNHURRIED_SECS`].
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abandoned_capture_stays_charged_until_its_work_stops() {
@@ -405,8 +365,6 @@ async fn an_abandoned_capture_stays_charged_until_its_work_stops() {
     })
     .await;
 
-    // Still charged: the key's reservation fills its quota, and the
-    // installation's one slot is taken.
     let answer = captured::capture(&server, &analyst, &report_body("analyst_report")).await;
     retry_after(
         &answer,
@@ -432,11 +390,7 @@ async fn an_abandoned_capture_stays_charged_until_its_work_stops() {
     assert_eq!(started.arrivals(), 2);
 }
 
-/// Hold a capture of the corpus inside its write, its deadline two
-/// seconds, until the deadline answers it: 504 with a stage file in the
-/// root. `prepare` runs on the staged file's path while the write is held.
-/// Then release the write and wait for its work to stop and the root to
-/// empty, and check that nothing is held and no row was committed.
+/// `prepare` runs on the staged file's path while the write is held.
 async fn past_the_deadline_mid_write(prepare: impl FnOnce(&Path)) {
     let server = boot(CaptureConfig {
         deadline_secs: 2,
@@ -498,10 +452,7 @@ async fn a_write_that_fails_past_its_deadline_removes_its_stage() {
     .await;
 }
 
-/// A refused capture still accounts its timing, once (ADR-0046): a busy
-/// refusal as `capacity_refused` with its admission wait booked, a bounds
-/// refusal as `error` with its DSL check booked, neither with work
-/// started. The first capture is held while the refusals are made, so it
+/// The first capture is held while the refusals are made, so it
 /// gets [`UNHURRIED_SECS`].
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_capture_accounts_its_timing_once() {
@@ -553,10 +504,6 @@ async fn a_refused_capture_accounts_its_timing_once() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// A capture whose deadline passes while its bounds resolve is refused
-/// before admission with 503, as `/query` refuses work its deadline never
-/// let start, and accounts as `capacity_refused` with no admission wait.
-///
 /// Resolution reads the results clock, so a thread holding the fixture
 /// clock's lock parks the capture there, its deadline already stamped.
 /// The capture blocks its tokio worker meanwhile, as a slow resolution

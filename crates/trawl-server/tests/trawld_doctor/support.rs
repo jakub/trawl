@@ -3,15 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! What every `trawld --doctor` test runs the doctor with.
-//!
-//! [`run_doctor`] runs the real `trawld` binary as a child process with an
-//! empty environment plus the variables the test names, so no ambient
-//! `TRAWL_*`, `PG*` or proxy variable reaches it. While it runs, it watches
-//! the doctor for child processes: the doctor starts none, and the
-//! crash-dump monitor would be one. [`assert_no_values`] is the leak check
-//! every doctor test applies to both output streams. The Postgres roles the
-//! database-backed tests log in as, and the databases they mint, are here
-//! too, so every group logs in the same way.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -29,18 +20,12 @@ mod shapes;
 
 pub use shapes::forbidden_shape;
 
-/// The password planted in every database URL a doctor test hands the
-/// doctor. It must never appear in the doctor's output.
 pub const SECRET: &str = "private-secret";
 
-/// A Fleet database URL that carries [`SECRET`] and reaches nothing.
 pub const PLANTED_FLEET_URL: &str = "postgres://user:private-secret@127.0.0.1:1/fleet";
 
-/// An app-state database URL that carries [`SECRET`] and reaches nothing.
 pub const PLANTED_APP_URL: &str = "postgres://user:private-secret@127.0.0.1:1/trawl";
 
-/// Driver and OS error fragments. Any of them in the output means an
-/// error's `Display` reached the report.
 pub const ERROR_FRAGMENTS: &[&str] = &[
     "password authentication failed",
     "os error",
@@ -52,8 +37,6 @@ pub const ERROR_FRAGMENTS: &[&str] = &[
     "invalid peer certificate",
 ];
 
-/// The longest a doctor run may take before the test calls it hung. Each
-/// network step the doctor takes has its own deadline of at most 10 s.
 const RUN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// A `trawld` command with an empty environment, except the loader's
@@ -69,28 +52,16 @@ pub fn trawld() -> Command {
     command
 }
 
-/// What one doctor run printed, and what was seen of it while it ran.
 #[derive(Debug)]
 pub struct Observed {
-    /// The exit status.
     pub code: i32,
-    /// Everything it wrote to stdout.
     pub stdout: String,
-    /// Everything it wrote to stderr.
     pub stderr: String,
     /// Whether some sample of `/proc/<pid>/status` showed `NoNewPrivs: 1`,
     /// which the crash-dump seal sets.
     pub sealed_seen: bool,
 }
 
-/// Run `trawld` with `args` and exactly the environment `env` (plus the
-/// loader path), and return its exit status, stdout and stderr.
-///
-/// The working directory is `HOME` when `env` sets it, so relative paths in
-/// a test's configuration resolve inside the test's own directory.
-///
-/// # Panics
-/// As [`run_doctor_observed`].
 pub fn run_doctor<A, K, V>(args: &[A], env: &[(K, V)]) -> (i32, String, String)
 where
     A: AsRef<OsStr>,
@@ -101,12 +72,6 @@ where
     (observed.code, observed.stdout, observed.stderr)
 }
 
-/// [`run_doctor`], also returning what was seen of the process while it
-/// ran.
-///
-/// # Panics
-/// When the run does not finish within [`RUN_DEADLINE`], ends by a signal,
-/// or was seen with a child process.
 pub fn run_doctor_observed<A, K, V>(args: &[A], env: &[(K, V)]) -> Observed
 where
     A: AsRef<OsStr>,
@@ -118,8 +83,6 @@ where
     observe(command, args, env)
 }
 
-/// Run `command`, a doctor run as built by [`trawld`] or [`Userns`], with
-/// `env` added, and watch it until it exits.
 fn observe<A, K, V>(mut command: Command, args: &[A], env: &[(K, V)]) -> Observed
 where
     A: AsRef<OsStr>,
@@ -186,10 +149,6 @@ where
 
 /// [`run_doctor`] as root in a user namespace, with `read_only`, when
 /// given, bind-mounted read-only over itself for the run.
-///
-/// # Panics
-/// As [`run_doctor_observed`], and when the namespace set-up fails after
-/// [`Userns::probe`] succeeded.
 pub fn run_doctor_in_userns<A, K, V>(
     userns: &Userns,
     read_only: Option<&Path>,
@@ -229,8 +188,6 @@ fn read_all(stream: &mut impl std::io::Read) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Watches one process for children, on Linux through
-/// `/proc/<pid>/task/*/children`.
 struct ChildWatch {
     pid: u32,
     seen: std::collections::BTreeSet<u32>,
@@ -246,10 +203,8 @@ impl ChildWatch {
         }
     }
 
-    /// Record every child any of the process's threads has right now, and
-    /// whether the process has `no_new_privs` set, once it is trawld: a
-    /// user-namespace run starts as `unshare` and a shell, whose `mount`
-    /// children are the set-up, not the doctor's.
+    /// Once it is trawld: a user-namespace run starts as `unshare` and a shell,
+    /// whose `mount` children are the set-up, not the doctor's.
     fn sample(&mut self) {
         #[cfg(target_os = "linux")]
         {
@@ -277,8 +232,6 @@ impl ChildWatch {
         }
     }
 
-    /// Fail when a child was seen, or when a crash-dump monitor naming the
-    /// doctor as its parent is still alive after the run.
     fn assert_no_child(&self, stderr: &str) {
         assert!(
             self.seen.is_empty(),
@@ -307,19 +260,6 @@ impl ChildWatch {
     }
 }
 
-/// Every string a doctor test planted that the doctor's output must not
-/// contain, beyond [`SECRET`] and [`ERROR_FRAGMENTS`], which are always
-/// checked: planted URLs, certificate names and fingerprints, catalog ids,
-/// listener addresses.
-///
-/// Whatever a test plants, the output is also checked for the shapes of
-/// the values no report may show ([`forbidden_shape`]): a catalog id, a
-/// certificate fingerprint, a listener address. So a test that did not
-/// think to plant its catalog id or its listener's port is still covered.
-///
-/// # Panics
-/// When either stream contains one of them. Error fragments are matched
-/// without regard to case.
 pub fn assert_no_values(stdout: &str, stderr: &str, planted: &[&str]) {
     for (name, stream) in [("stdout", stdout), ("stderr", stderr)] {
         for value in std::iter::once(&SECRET).chain(planted) {
@@ -341,31 +281,19 @@ pub fn assert_no_values(stdout: &str, stderr: &str, planted: &[&str]) {
     }
 }
 
-/// The settings of a `trawld.toml` a doctor test writes.
 #[derive(Debug, Clone)]
 pub struct DoctorConfig {
-    /// `[server] http_addr`.
     pub http_addr: String,
-    /// `[data] path`.
     pub data_path: PathBuf,
-    /// `[ingest] enabled`.
     pub ingest: bool,
-    /// `[ingest] wal_dir`, when set.
     pub wal_dir: Option<PathBuf>,
-    /// `[server] tls_cert_path` and `tls_key_path`, when set.
     pub tls: Option<(PathBuf, PathBuf)>,
-    /// `[auth] database_url`, when set.
     pub fleet_url: Option<String>,
-    /// `[storage] database_url`, when set.
     pub app_url: Option<String>,
-    /// TOML appended as it is, for settings the fields above do not name.
     pub extra: String,
 }
 
 impl DoctorConfig {
-    /// An ingest node with its data root at `dir/data` (not created), a
-    /// listener on a loopback port nothing listens on, auto TLS, and no
-    /// database URL in the file.
     pub fn in_dir(dir: &Path) -> Self {
         Self {
             http_addr: "127.0.0.1:1".to_owned(),
@@ -380,7 +308,6 @@ impl DoctorConfig {
     }
 }
 
-/// Write `config` as `dir/trawld.toml` and return its path.
 pub fn write_doctor_config(dir: &Path, config: &DoctorConfig) -> PathBuf {
     use std::fmt::Write as _;
     let quote = |path: &Path| toml_string(&path.to_string_lossy());
@@ -413,7 +340,6 @@ pub fn write_doctor_config(dir: &Path, config: &DoctorConfig) -> PathBuf {
     path
 }
 
-/// `value` as a TOML basic string.
 fn toml_string(value: &str) -> String {
     let mut quoted = String::from("\"");
     for c in value.chars() {
@@ -431,8 +357,6 @@ fn toml_string(value: &str) -> String {
     quoted
 }
 
-/// The environment of a doctor run in `home`: `HOME`, and the two planted
-/// database URLs.
 pub fn planted_env(home: &Path) -> Vec<(&'static str, OsString)> {
     vec![
         ("HOME", home.as_os_str().to_owned()),
@@ -441,34 +365,15 @@ pub fn planted_env(home: &Path) -> Vec<(&'static str, OsString)> {
     ]
 }
 
-/// Parse a JSON report the doctor printed.
-///
-/// # Panics
-/// When `stdout` is not one.
 pub fn report(stdout: &str) -> trawl_api::doctor::Report {
     serde_json::from_str(stdout)
         .unwrap_or_else(|error| panic!("not a doctor report ({error}):\n{stdout}"))
 }
 
-// -- Postgres roles and databases ------------------------------------------
-//
-// The roles every database-backed doctor test logs in as, and the databases
-// they log in to. Shared by `db` and `proof`.
-
-/// The login role every doctor run here uses. Its password is [`SECRET`];
-/// it inherits the admin role's privileges on the test databases.
 pub const ROLE: &str = "trawl_doctor_planted";
 
-/// A second login role, also with the password [`SECRET`], that is a
-/// member of no role: it holds only what a test database grants it or
-/// `PUBLIC`. [`forbid_advisory_locks`] leaves it no advisory-lock function.
 pub const LOCKLESS: &str = "trawl_doctor_lockless";
 
-/// Make sure [`ROLE`] exists with the planted password and the admin
-/// role's privileges, and [`LOCKLESS`] with the planted password and no
-/// membership. Idempotent, and serialized across the test processes that
-/// share the cluster by a transaction-scoped lock on the admin connection
-/// (the test's, never the doctor's).
 pub async fn ensure_role() {
     let mut admin = PgConnection::connect(&common::admin_database_url())
         .await
@@ -518,17 +423,11 @@ pub async fn ensure_role() {
     admin.close().await.expect("close");
 }
 
-/// The advisory-lock functions: every `pg_advisory*` and
-/// `pg_try_advisory*` function, including the unlocks.
 pub const ADVISORY_FUNCTIONS: &str =
     "SELECT oid FROM pg_proc WHERE proname ~ '^pg_(try_)?advisory'";
 
-/// In the database `url` names: revoke `EXECUTE` on every advisory-lock
-/// function from `PUBLIC`, grant it back to the admin role, which trawld
-/// runs as here, and let [`LOCKLESS`] read every table. Function
-/// privileges live in each database's own `pg_proc`, so this changes no
-/// other database. Asserts afterwards that [`LOCKLESS`] may execute none
-/// of them, so any call it makes is refused with `insufficient_privilege`.
+/// Function privileges live in each database's own `pg_proc`, so this
+/// changes no other database.
 pub async fn forbid_advisory_locks(url: &str) {
     let mut conn = admin(url).await;
     conn.execute(sqlx::AssertSqlSafe(format!(
@@ -562,7 +461,6 @@ pub async fn forbid_advisory_locks(url: &str) {
     conn.close().await.unwrap();
 }
 
-/// `url` as [`LOCKLESS`] with the planted password in it.
 pub fn lockless(url: &str) -> String {
     with_login(url, LOCKLESS, Some(SECRET))
 }
@@ -591,8 +489,6 @@ pub fn database_rows_complete(report: &Report) -> Result<(), String> {
     Ok(())
 }
 
-/// `url` (an admin URL naming a test database) with its userinfo replaced
-/// by `user` and, when given, `password`.
 pub fn with_login(url: &str, user: &str, password: Option<&str>) -> String {
     let (scheme, rest) = url.split_once("://").expect("a URL with a scheme");
     let host_at = rest.find('/').unwrap_or(rest.len());
@@ -607,13 +503,10 @@ pub fn with_login(url: &str, user: &str, password: Option<&str>) -> String {
     format!("{scheme}://{login}@{host}{}", &rest[host_at..])
 }
 
-/// `url` as [`ROLE`] with the planted password in it.
 pub fn planted(url: &str) -> String {
     with_login(url, ROLE, Some(SECRET))
 }
 
-/// What the report must not show of a database URL: the URL, its host and
-/// port, its database name, and the role.
 pub fn url_values(url: &str) -> Vec<String> {
     let rest = url.split_once("://").unwrap().1;
     let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
@@ -633,14 +526,12 @@ pub fn url_values(url: &str) -> Vec<String> {
     ]
 }
 
-/// A connection to `url` as the admin role.
 pub async fn admin(url: &str) -> PgConnection {
     PgConnection::connect(url)
         .await
         .expect("connect to a test database")
 }
 
-/// A test database with the Fleet schema current.
 pub async fn migrated_fleet() -> String {
     let url = common::create_fleet_database().await;
     let mut conn = admin(&url).await;
@@ -652,7 +543,6 @@ pub async fn migrated_fleet() -> String {
     url
 }
 
-/// A test database with the app-state schema current.
 pub async fn migrated_app() -> String {
     let url = common::create_app_database().await;
     let mut conn = admin(&url).await;
@@ -664,7 +554,6 @@ pub async fn migrated_app() -> String {
     url
 }
 
-/// A one-row Parquet file at `path`, holding `value`.
 pub fn write_parquet(path: &Path, value: i64) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     duckdb::Connection::open_in_memory()
@@ -677,12 +566,6 @@ pub fn write_parquet(path: &Path, value: i64) {
         .unwrap();
 }
 
-/// A rollup of `service` in `day` that stopped before its rename, which
-/// boot's recovery finishes: each hour's `HH/{service}.parquet` in place
-/// (written as Parquet when absent), the replacement Parquet in
-/// `{service}.parquet.tmp`, and a canonical daily file, when one is there,
-/// recorded as the prior. Returns the marker's path and this release's
-/// body for it, unwritten.
 pub fn pending_rollup(day: &Path, service: &str, hours: &[&str]) -> (PathBuf, String) {
     use trawl_server::ingest::publication_marker::identity_of;
     use trawl_server::ingest::rollup_marker::{RollupMarker, marker_file_name};
@@ -716,20 +599,11 @@ pub fn row<'a>(report: &'a Report, id: &str) -> &'a Check {
         .unwrap_or_else(|| panic!("no {id} row: {report:?}"))
 }
 
-/// `(outcome, reason)` of one row.
 pub fn verdict<'a>(report: &'a Report, id: &str) -> (Outcome, Option<&'a str>) {
     let check = row(report, id);
     (check.outcome, check.reason.as_deref())
 }
 
-/// The rows of an installation before its first start, on an ingest node
-/// with auto TLS and trawld not running (#269 AC3): boot initializes the
-/// app-state schema, creates the data root and writes its epoch, and
-/// generates the certificate, so each of those is `complete`,
-/// `will_initialize`; nothing listens yet.
-///
-/// # Panics
-/// When a row differs.
 pub fn assert_fresh_install_rows(report: &Report) {
     for id in [
         "server.app.schema",

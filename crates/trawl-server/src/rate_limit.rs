@@ -4,35 +4,7 @@
 
 //! Per-key rate limiting middleware using the governor crate (GCRA algorithm).
 //!
-//! Every API key gets an independent token bucket keyed by its keystore row
-//! id (`VerifiedKey.id`). The ceiling is resolved per request (ADR-0006):
-//!
-//! - When any of the key's roles set `rate_rpm`, the key's effective RPM is
-//!   the max across its roles and replaces the route class's config
-//!   default. The two are never max'd or summed together.
-//! - Otherwise the route class default applies: interactive API routes use
-//!   `default_rpm`, `/api/v1/ingest` uses `ingest_rpm`.
-//!
-//! governor fixes one quota per keyed limiter, so a per-key ceiling cannot
-//! come from a single map: each route class holds a `DashMap` of limiters
-//! indexed by effective RPM, buckets still keyed solely by key id. The maps
-//! are bounded by the number of distinct `rate_rpm` values operators define
-//! (plus the class default), a handful at fleet scale, and buckets by the
-//! keystore's key count.
-//!
-//! A `default_rpm`/`ingest_rpm` of 0 disables limiting for keys on the
-//! class default. A role-set override can never be 0 (the schema CHECKs
-//! `rate_rpm > 0`), so "0 disables" remains a config-only semantic.
-//!
-//! The ingest ceiling is additionally gated on [`Permission::Ingest`]: the
-//! handler's own permission check runs downstream of this middleware (axum
-//! resolves every extractor, including the 16 MB `body: Bytes`, before the
-//! handler body runs), so without the gate any trawl-granted key, reader
-//! keys included, would ride the shipper-sized bucket on the heaviest
-//! endpoint.
-//! Keys that cannot ingest stay on the interactive class, the same maps the
-//! query routes use. This is route-class eligibility, not per-role
-//! bucketing.
+//! The ceiling is resolved per request (ADR-0006).
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -72,16 +44,11 @@ fn refusal_retry_after_secs(
     retry_after_secs(not_until.wait_time_from(now))
 }
 
-/// One route class's limiters: the config default plus a lazily-populated
-/// map of keyed limiters indexed by effective RPM.
 #[derive(Debug)]
 struct ClassLimiters {
     /// The config default for this class. 0 disables limiting for keys
     /// without a role override.
     default_rpm: u32,
-    /// Keyed limiter per effective RPM. Two keys resolving the same
-    /// effective RPM share a map (same quota) but never a bucket (buckets
-    /// are keyed by key id).
     maps: DashMap<u32, Arc<KeyedLimiter>>,
 }
 
@@ -108,13 +75,11 @@ impl ClassLimiters {
     }
 }
 
-/// Per-key rate limiter state for one route class.
 #[derive(Debug, Clone)]
 pub struct RateLimitState {
     class: RouteClass,
 }
 
-/// Which limiter class(es) a route draws on.
 #[derive(Debug, Clone)]
 enum RouteClass {
     /// Interactive API routes: `default_rpm` ceiling unless a role override
@@ -142,11 +107,6 @@ impl RateLimitState {
     /// Limiter for `/api/v1/ingest`, on its own limiter maps so a
     /// shipper-sized ceiling never leaks onto the query routes. An
     /// `ingest_rpm` of 0 disables limiting for keys without a role override.
-    ///
-    /// Only keys holding [`Permission::Ingest`] earn that ceiling. Everyone
-    /// else shares `interactive`'s class — literally the same maps the query
-    /// routes use, so hitting `/ingest` cannot buy a key extra interactive
-    /// budget either.
     pub fn ingest(config: &RateLimitConfig, interactive: &Self) -> Self {
         let fallback = match &interactive.class {
             RouteClass::Interactive(class) => Arc::clone(class),
@@ -191,11 +151,6 @@ impl RateLimitState {
 /// keys 403 before ever reaching this middleware (pinned by the
 /// `ac3_grantless_key_never_reaches_rate_limiter` integration test), so no
 /// bypass branch is needed here. Returns 429 when the rate limit is exceeded.
-///
-/// On `/api/v1/ingest` the class depends on the key: only keys holding
-/// [`Permission::Ingest`] get the shipper-sized class (see
-/// [`RateLimitState::ingest`]). In both classes a role `rate_rpm` override
-/// replaces the class default.
 pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Response, ServerError> {
     let rate_state = request
         .extensions()
@@ -243,7 +198,6 @@ mod tests {
         }
     }
 
-    /// Count how many of `attempts` requests a limiter admits for a key.
     fn spend(limiter: &Arc<KeyedLimiter>, key_id: i64, attempts: usize) -> usize {
         (0..attempts)
             .filter(|_| limiter.check_key(&key_id).is_ok())
@@ -259,9 +213,6 @@ mod tests {
         assert_eq!(retry_after_secs(Duration::from_secs(12)), 12);
     }
 
-    /// After a key spends its quota, the refusal's `Retry-After` is the
-    /// ceiling of governor's own wait, measured on governor's clock, and at
-    /// least 1 even when the wait is under a second.
     #[test]
     fn refusal_carries_the_ceiling_of_governors_wait() {
         for rpm in [5, 60, 6000] {
@@ -308,7 +259,6 @@ mod tests {
         let state = RateLimitState::interactive(&config_with_rpm(5));
         let limiter = state.limiter_for(false, None).unwrap();
 
-        // With 5 rpm, the burst capacity is 5 — first 5 should pass.
         assert_eq!(
             spend(&limiter, 42, 20),
             5,
@@ -316,9 +266,6 @@ mod tests {
         );
     }
 
-    /// A role `rate_rpm` replaces the class default and is never max'd with
-    /// it. That cuts both ways: an override larger than the default raises
-    /// the ceiling, an override smaller than the default lowers it.
     #[test]
     fn role_override_replaces_the_class_default_in_both_directions() {
         let state = RateLimitState::interactive(&config_with_rpm(5));
@@ -334,8 +281,6 @@ mod tests {
         );
     }
 
-    /// An override even beats a disabled class default: `rate_rpm` on the
-    /// role re-enables limiting for that key.
     #[test]
     fn role_override_applies_even_when_default_disabled() {
         let state = RateLimitState::interactive(&config_with_rpm(0));
@@ -343,9 +288,6 @@ mod tests {
         assert_eq!(spend(&limiter, 9, 10), 3);
     }
 
-    /// Two keys resolving the same effective RPM share a limiter map (one
-    /// quota) but never a bucket: spending one key's budget leaves the
-    /// other untouched.
     #[test]
     fn same_effective_rpm_shares_map_not_buckets() {
         let state = RateLimitState::interactive(&config_with_rpm(5));
@@ -367,8 +309,6 @@ mod tests {
         let ingest = RateLimitState::ingest(&config, &interactive);
         let key_id: i64 = 7;
 
-        // Same key, same id: exhausting the interactive bucket must not touch
-        // the ingest one, and the ingest ceiling must not leak the other way.
         let interactive_limiter = interactive.limiter_for(false, None).unwrap();
         assert!(interactive_limiter.check_key(&key_id).is_ok());
         assert!(
@@ -385,8 +325,6 @@ mod tests {
         );
     }
 
-    /// A key whose roles set `rate_rpm` gets that one effective number in
-    /// each class it touches, spent separately per class (ADR-0006).
     #[test]
     fn override_applies_per_class_with_separate_budgets() {
         let config = RateLimitConfig {
@@ -408,10 +346,6 @@ mod tests {
         );
     }
 
-    /// The shipper-sized ceiling is earned by `Permission::Ingest`, not by
-    /// reaching the route: the handler rejects permissionless keys only after
-    /// this middleware, so an ungated ingest class would hand every reader key
-    /// the shipper budget on the heaviest endpoint.
     #[test]
     fn ingest_ceiling_needs_the_ingest_permission() {
         let config = RateLimitConfig {
@@ -422,8 +356,6 @@ mod tests {
         let ingest = RateLimitState::ingest(&config, &interactive);
         let key_id: i64 = 11;
 
-        // A key without the permission draws on the interactive class —
-        // the very same maps the query routes use, not a second allowance.
         let unprivileged = ingest.limiter_for(false, None).unwrap();
         assert!(unprivileged.check_key(&key_id).is_ok());
         assert!(
@@ -445,7 +377,6 @@ mod tests {
         let state = RateLimitState::interactive(&config_with_rpm(2));
         let limiter = state.limiter_for(false, None).unwrap();
 
-        // Exhaust key id 1's bucket.
         let key_a: i64 = 1;
         for _ in 0..10 {
             let _ = limiter.check_key(&key_a);
@@ -455,8 +386,6 @@ mod tests {
             "key A should be limited"
         );
 
-        // Key id 2 still has its own independent quota: exhausting one key
-        // never starves another, role or no role.
         let key_b: i64 = 2;
         assert!(
             limiter.check_key(&key_b).is_ok(),

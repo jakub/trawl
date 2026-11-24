@@ -3,15 +3,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! A `/query` whose search stage pins several services reads only their
-//! files, through the real router (#374).
+//! files, through the real router.
 //!
-//! The shared seed holds `prod/2024-01-15/10/{nginx,postgres}.parquet`:
-//! two nginx rows and one postgres row. A pinned service with no file in
-//! the selection must never reach `DuckDB`, which fails on a missing literal
-//! in a list. A garbage `junk.parquet` beside the seed tells a narrowed
-//! read from a filtered one: a read that opens it fails.
-//!
-//! The binary is in the ADR-0021 `postgres` nextest group.
+//! A pinned service with no file in the selection must never reach `DuckDB`,
+//! which fails on a missing literal in a list. A garbage `junk.parquet`
+//! beside the seed tells a narrowed read from a filtered one: a read that
+//! opens it fails.
 
 mod common;
 
@@ -21,7 +18,6 @@ use common::TestServer;
 use serde_json::Value;
 use trawl_server::config::RateLimitConfig;
 
-/// `/api/v1/query` over `dsl`: its status and its body.
 async fn query(server: &TestServer, dsl: &str) -> (reqwest::StatusCode, Value) {
     let response = common::harness_client_builder()
         .build()
@@ -44,8 +40,6 @@ async fn query(server: &TestServer, dsl: &str) -> (reqwest::StatusCode, Value) {
     (status, body)
 }
 
-/// The `service` of each row `/query` answers for `dsl`, sorted; the query
-/// must answer 200.
 async fn services(server: &TestServer, dsl: &str) -> Vec<String> {
     let (status, body) = query(server, dsl).await;
     assert_eq!(status, 200, "{dsl}: {body}");
@@ -58,9 +52,6 @@ async fn services(server: &TestServer, dsl: &str) -> Vec<String> {
     services
 }
 
-/// A server over a private copy of the shared seed. With `junk`, a file
-/// that is not parquet sits in the seed's hour directory beside the two
-/// services' files.
 async fn boot(dir: &Path, junk: bool) -> TestServer {
     let data = common::seed_data_root(dir);
     if junk {
@@ -73,10 +64,6 @@ async fn boot(dir: &Path, junk: bool) -> TestServer {
     common::setup_in_dir_with_data(dir, data, RateLimitConfig::default()).await
 }
 
-/// Two pinned services, one with no file: the list and the `OR` forms both
-/// answer the present service's rows, and neither opens the other files in
-/// the directory. An unpinned query opens every file there and fails on
-/// the junk, so the pinned reads were narrowed, not filtered.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_present_one_missing_reads_the_present_rows() {
     let tmp = tempfile::tempdir().unwrap();
@@ -121,7 +108,6 @@ async fn a_numeric_looking_name_reads_every_file_and_keeps_the_rows() {
     );
 }
 
-/// Two pinned services, neither with a file: 200, no rows, no error.
 #[tokio::test(flavor = "multi_thread")]
 async fn all_missing_reads_nothing() {
     let tmp = tempfile::tempdir().unwrap();

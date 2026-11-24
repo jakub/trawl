@@ -40,8 +40,6 @@ fn id(n: u32) -> String {
     format!("{n:032x}")
 }
 
-/// A temporary one-column capture `id` of `key_id`, made at `created_at`
-/// and expiring `ttl_secs` later, describing `file` or no file at all.
 fn capture(
     id: &str,
     key_id: i64,
@@ -85,14 +83,12 @@ fn capture(
     }
 }
 
-/// Publish `bytes` as result `id` in `root`.
 fn publish(root: &ResultsRoot, id: &str, bytes: &[u8]) -> Published {
     let staged = root.stage().unwrap();
     std::fs::write(staged.path(), bytes).unwrap();
     root.publish(staged, id).unwrap()
 }
 
-/// Record `row` in the server's store.
 async fn insert(results: &ResultsState, row: &NewCapture) {
     assert_eq!(
         results.store.insert(row).await.unwrap(),
@@ -100,7 +96,6 @@ async fn insert(results: &ResultsState, row: &NewCapture) {
     );
 }
 
-/// Publish a file for result `id` and record its row, made at `created_at`.
 async fn stored(
     results: &ResultsState,
     id: &str,
@@ -119,8 +114,6 @@ async fn stored(
     published
 }
 
-/// The server's results state with other `[capture]` limits: the same
-/// root, store and clock.
 fn with_limits(results: &ResultsState, capture: CaptureConfig) -> ResultsState {
     ResultsState {
         root: Arc::clone(&results.root),
@@ -139,8 +132,6 @@ fn with_limits(results: &ResultsState, capture: CaptureConfig) -> ResultsState {
     }
 }
 
-/// The row's state and `gone_at`, read straight from the table, or `None`
-/// once it is deleted.
 async fn state_of(
     server: &common::TestServer,
     id: &str,
@@ -163,7 +154,6 @@ fn seconds(secs: u64) -> TimeDelta {
     TimeDelta::seconds(i64::try_from(secs).unwrap())
 }
 
-/// The writer of every investigation here.
 fn agent() -> StoreActor {
     StoreActor {
         key_id: KEY,
@@ -172,8 +162,6 @@ fn agent() -> StoreActor {
     }
 }
 
-/// Create investigation `n` at `created`, its evidence due `due` later and
-/// its ceiling 30 days after `created`.
 async fn investigation(
     server: &common::TestServer,
     n: u32,
@@ -203,8 +191,6 @@ async fn investigation(
     id
 }
 
-/// Publish a file for result `id` and record it as kept evidence of
-/// `investigation`, made at `created_at`.
 async fn kept(
     results: &ResultsState,
     id: &str,
@@ -222,8 +208,6 @@ async fn kept(
     );
 }
 
-/// Plant `name` in the results root at `dir/data.results`, made before the
-/// fixture boots over `dir`.
 fn plant(dir: &Path, name: &str) -> std::path::PathBuf {
     let root = dir.join("data.results");
     std::fs::create_dir_all(&root).unwrap();
@@ -232,9 +216,6 @@ fn plant(dir: &Path, name: &str) -> std::path::PathBuf {
     path
 }
 
-/// Both boot doors reconcile: on an ingest node and on a query-only node,
-/// a staged file and a published file no row names are gone before the
-/// server answers, and an entry trawld does not make is left alone.
 #[tokio::test]
 async fn boot_removes_stages_and_files_no_capture_names() {
     for ingest in [true, false] {
@@ -258,8 +239,6 @@ async fn boot_removes_stages_and_files_no_capture_names() {
     }
 }
 
-/// A live row whose file is gone is marked `file_missing`; a row with no
-/// file by design (zero columns) and a row whose file is there are not.
 #[tokio::test]
 async fn boot_marks_live_rows_whose_files_are_gone() {
     let server = common::setup().await;
@@ -301,16 +280,12 @@ async fn boot_marks_live_rows_whose_files_are_gone() {
     assert!(!missing(11).await);
     assert!(!missing(12).await);
     assert!(exists(&results.root, &id(12)));
-    // Marked once: a second boot changes nothing.
     assert_eq!(
         reconcile_at_boot(results).await.unwrap(),
         Reconciled::default()
     );
 }
 
-/// A temporary row already past its deadline when the server boots (it was
-/// down when the row came due) expires at once, with `gone_at` at its
-/// deadline and its file unlinked; a row still inside its lifetime is left.
 #[tokio::test]
 async fn boot_expires_rows_already_past_their_deadline() {
     let server = common::setup().await;
@@ -338,9 +313,6 @@ async fn boot_expires_rows_already_past_their_deadline() {
     assert!(exists(&results.root, &id(16)));
 }
 
-/// A key over a lowered `per_key_results` loses its oldest temporary
-/// captures, rows pruned at the clock's instant and files unlinked; another
-/// key under the quota keeps everything.
 #[tokio::test]
 async fn boot_prunes_the_oldest_captures_of_a_key_over_its_quota() {
     let server = common::setup().await;
@@ -380,8 +352,6 @@ async fn boot_prunes_the_oldest_captures_of_a_key_over_its_quota() {
     }
 }
 
-/// An installation over a lowered `installation_bytes` loses its oldest
-/// temporary captures across keys.
 #[tokio::test]
 async fn boot_prunes_the_installation_s_oldest_captures_across_keys() {
     let server = common::setup().await;
@@ -407,10 +377,6 @@ async fn boot_prunes_the_installation_s_oldest_captures_across_keys() {
     }
 }
 
-/// On the fixture's clock: nothing happens before the deadline; at
-/// `created + ttl` the row expires, with `gone_at` at the deadline, and its
-/// file is unlinked; the tombstone stays until `expiry + tombstone` and is
-/// deleted then.
 #[tokio::test]
 async fn sweep_expires_at_the_deadline_and_deletes_the_tombstone_after_its_lifetime() {
     let server = common::setup().await;
@@ -457,8 +423,6 @@ async fn sweep_expires_at_the_deadline_and_deletes_the_tombstone_after_its_lifet
     assert_eq!(state_of(&server, &id(50)).await, None);
 }
 
-/// A read that found a capture past its deadline marked it expired (and
-/// unlinked its file); the sweep does not expire it again.
 #[tokio::test]
 async fn a_row_expired_lazily_by_a_read_is_not_expired_twice() {
     let server = common::setup().await;
@@ -476,9 +440,6 @@ async fn a_row_expired_lazily_by_a_read_is_not_expired_twice() {
     );
 }
 
-/// A published file no row names is removed only once it is older than the
-/// capture deadline, which covers a capture between publish and commit; a
-/// file a live row names and a staged file are never touched.
 #[tokio::test]
 async fn sweep_removes_unnamed_files_only_past_the_capture_deadline() {
     let server = common::setup().await;
@@ -522,10 +483,6 @@ async fn sweep_removes_unnamed_files_only_past_the_capture_deadline() {
     );
 }
 
-/// A capture whose row is still committing keeps its file through a sweep:
-/// the file is published, the row's insert is held, and a sweep past the
-/// capture deadline by the file's own age runs meanwhile. The insert then
-/// commits, the capture answers, and its first page reads its rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sweep_leaves_the_file_of_a_capture_whose_row_is_committing() {
     let server = captured::boot(RateLimitConfig::default(), CaptureConfig::default()).await;
@@ -570,9 +527,6 @@ async fn a_sweep_leaves_the_file_of_a_capture_whose_row_is_committing() {
     assert_eq!(page["pagination"]["returned"], json!(captured::ROWS));
 }
 
-/// A failed unlink is logged and counted, and the sweep's other steps
-/// still run: here an expired capture's name holds a directory, and a
-/// tombstone past its lifetime is deleted all the same.
 #[tokio::test]
 async fn a_failed_unlink_is_counted_and_the_sweep_goes_on() {
     let server = common::setup().await;
@@ -580,12 +534,10 @@ async fn a_failed_unlink_is_counted_and_the_sweep_goes_on() {
     let created = server.results_clock.now();
     let ttl = results.capture.ttl_secs;
     let tombstone = results.capture.tombstone_secs;
-    // A capture long gone, still a tombstone.
     let old = created - seconds(ttl + tombstone) - TimeDelta::seconds(1);
     stored(results, &id(80), KEY, old).await;
     assert!(results.store.mark_expired(&id(80), created).await.unwrap());
     assert!(results.root.unlink(&id(80)).unwrap());
-    // A capture due now whose name a directory took.
     let due = capture(
         &id(81),
         KEY,
@@ -613,9 +565,7 @@ async fn a_failed_unlink_is_counted_and_the_sweep_goes_on() {
     assert_eq!(state_of(&server, &id(81)).await.unwrap().0, "expired");
 }
 
-/// Poll until `id`'s row reads `expired`, failing with `what` if
-/// [`HANG_GUARD`](trawl_server::test_timing::HANG_GUARD) runs out first. The
-/// committed row is the event; the bound only names a hang.
+/// The committed row is the event; the bound only names a hang.
 async fn await_expired(server: &common::TestServer, id: &str, what: &str) {
     let start = std::time::Instant::now();
     while state_of(server, id).await.map(|(state, _)| state) != Some("expired".to_owned()) {
@@ -627,9 +577,8 @@ async fn await_expired(server: &common::TestServer, id: &str, what: &str) {
     }
 }
 
-/// The scheduler's retention tick runs the sweep. An hourly poll makes the
-/// retention interval one tick, and an interval's first tick is immediate,
-/// so the spawned scheduler sweeps at once.
+/// An hourly poll makes the retention interval one tick, and an interval's
+/// first tick is immediate, so the spawned scheduler sweeps at once.
 #[tokio::test]
 async fn the_scheduler_s_retention_tick_sweeps_captured_results() {
     let server = common::setup().await;
@@ -670,9 +619,6 @@ async fn the_scheduler_s_retention_tick_sweeps_captured_results() {
     assert!(!exists(&results.root, &id(90)));
 }
 
-/// With no scheduler to carry the retention tick, the standalone sweep task
-/// expires a capture past its deadline within its own interval, and stops
-/// when told to.
 #[tokio::test]
 async fn the_standalone_sweep_tick_expires_captures_without_the_scheduler() {
     let server = common::setup().await;
@@ -717,11 +663,6 @@ async fn the_standalone_sweep_tick_expires_captures_without_the_scheduler() {
     assert!(!exists(&results.root, &id(60)));
 }
 
-/// The sweep ends kept evidence when its investigation's `retain_until`
-/// passes: not a microsecond before, then once, the row `pruned` at the
-/// deadline it passed and its file unlinked. The pruned row is evidence a
-/// finding still cites, so it never ages out as a tombstone, and a second
-/// sweep prunes nothing.
 #[tokio::test]
 async fn sweep_prunes_kept_evidence_once_its_investigation_s_retention_ends() {
     let server = common::setup().await;
@@ -764,9 +705,6 @@ async fn sweep_prunes_kept_evidence_once_its_investigation_s_retention_ends() {
     );
 }
 
-/// Evidence whose retention ended while the server was down is pruned at
-/// boot, its file unlinked, before any capture can be admitted; evidence
-/// still inside its retention stays.
 #[tokio::test]
 async fn boot_prunes_kept_evidence_whose_retention_ended_while_down() {
     let server = common::setup().await;
@@ -798,9 +736,6 @@ async fn boot_prunes_kept_evidence_whose_retention_ended_while_down() {
     );
 }
 
-/// A step whose process died before it recorded an outcome reads
-/// `interrupted` after the next boot, which advanced the sequence and left
-/// the evidence clock where the step's admission put it.
 #[tokio::test(flavor = "multi_thread")]
 async fn boot_interrupts_the_steps_a_dead_process_left() {
     let (fixture, server) =

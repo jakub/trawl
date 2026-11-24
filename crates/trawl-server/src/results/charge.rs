@@ -5,41 +5,11 @@
 //! Capture admission and quotas (ADR-0057).
 //!
 //! [`CaptureGate::admit`] decides whether one capture may run, before the
-//! capture takes a query id or asks for an executor permit. It runs four
-//! steps, in this order:
-//!
-//! 1. **Quota pre-check.** The key's and the installation's committed
-//!    usage, plus the reservations of captures still running, plus this
-//!    capture's charge (one result and `max_file_bytes`), against the
-//!    `[capture]` quotas. A key that is already full is refused here, so it
-//!    never waits in a queue only to be refused at the end. The check is
-//!    not binding: step 4 is.
-//! 2. **The key's lane.** `per_key_running` captures run per key. When none
-//!    is free, up to `queue_depth` callers wait inside their own deadline;
-//!    the next caller is refused at once and never queues.
-//! 3. **The installation.** `installation_running` captures run at once.
-//!    A capture that finds none free is refused, not queued: its lane did
-//!    the queueing.
-//! 4. **Binding reservation.** Under the pass lock: expire every due
-//!    temporary capture's row, then read committed usage again, add every
-//!    reservation in the book, and record this capture's charge or refuse.
-//!    Once the pass is released, a task of its own unlinks the expired
-//!    captures' files, so an expired capture frees its disk at the next
-//!    reservation instead of at the next sweep, and a slow filesystem
-//!    holds up no other admission.
-//!
-//! Every refusal says when to try again, in whole seconds and never less
-//! than one. A full lane or installation names the time until the first
-//! running capture's deadline. A full quota names the time until the first
-//! temporary result in the full scope expires, capped at `ttl_secs`, or
-//! `ttl_secs` when nothing there will expire. A deadline that expires
-//! during admission names one second: the capture never started.
-//!
-//! An [`Admission`] holds the lane slot, the installation slot and the
-//! [`Reservation`]. It rides the executor slot through
-//! [`crate::pool::WorkContext::holding`] ([`Admission::into_holds`]), so all
-//! three stay charged until the work physically stops, however the request
-//! ends.
+//! capture takes a query id or asks for an executor permit, in four steps:
+//! the quota pre-check, the key's lane, the installation, then the binding
+//! reservation. The pre-check is not binding: step 4 is. A key that is
+//! already full is refused there, so it never waits in a queue only to be
+//! refused at the end.
 //!
 //! # The book
 //!
@@ -55,40 +25,7 @@
 //! row was inserted miss that capture in both places, and admit past the
 //! quota. The cost is a capture counted twice for the length of one pass.
 //!
-//! The pre-check counts only charges that are not done: it is not binding,
-//! and a capture it lets through still meets step 4.
-//!
 //! # Evidence
-//!
-//! An attached capture (ADR-0059) is kept from birth, so it never charges
-//! the temporary quota: [`CaptureGate::admit_attached`] runs the lane and
-//! the installation as for any capture, but its pre-check and its binding
-//! reservation charge `max_file_bytes` against the evidence budgets
-//! instead, the investigation's and the installation's. A promotion of an
-//! existing result ([`CaptureGate::reserve_evidence`]) takes no slot and
-//! charges the result's own stored bytes, its file and its facts document,
-//! by the same binding pass. Its charge
-//! names the results it promotes, so a promotion of the same result that
-//! the budget refused meanwhile can wait for it to end and find the result
-//! kept ([`CaptureGate::promotions_done`]). A charge's scope, temporary or
-//! evidence, decides which sums count it; the purge and the settle are the
-//! same for both.
-//!
-//! Evidence past its investigation's `retain_until` is dead, and once a
-//! binding pass has seen it, it counts against neither budget. Under the
-//! pass lock, before it reads usage, the pass prunes the kept results of
-//! every investigation whose `retain_until` is at or before the gate's
-//! clock, installation-wide, with the sweep's statements
-//! ([`crate::store::ResultsStore::prune_evidence_until`]). It then counts
-//! every kept row ([`crate::store::InvestigationStore::evidence_usage`])
-//! plus the book's evidence charges. Once the pass is released, a task of
-//! its own unlinks the pruned files. A pruned row is final, so the bytes
-//! the pass freed stay free. Leaving the due rows out of the count without
-//! pruning them would not be safe. A write takes its `now` before its
-//! reservation reads the clock, and a write whose `now` is before the
-//! deadline slides it, so the rows left out would be live again beside the
-//! charge admitted in their place. A write to another investigation would
-//! do the same to the installation's sum.
 //!
 //! The prune waits for the due investigations' locks no later than the
 //! reservation's deadline, and a prune that reaches it refuses the charge
@@ -98,21 +35,9 @@
 //! counts the due rows it did not prune, so a failed prune can refuse a
 //! charge that would have fitted, and never admits one past a budget.
 //!
-//! The evidence pre-check counts only live kept rows, those whose
-//! investigation's `retain_until` is after the gate's clock
-//! ([`crate::store::InvestigationStore::live_evidence_usage`]), plus the
-//! charges not done. It prunes nothing and only refuses, so a dead row it
-//! leaves out can only let a charge on to the binding pass. Counting every
-//! kept row there would refuse a charge that the binding pass, once it has
-//! pruned, admits.
-//!
 //! A pass awaits Postgres, so the lock that serializes passes is an async
 //! one; the book itself is a short synchronous lock, so a settle or a drop
 //! never waits for a pass.
-//!
-//! A lane is made the first time one of a key's captures passes the
-//! pre-check, and is kept for the life of the process: a few dozen bytes
-//! per key, and keys are made by an administrator.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -190,7 +115,6 @@ impl EvidenceScope {
         }
     }
 
-    /// The budget as the refusal's message names it.
     #[must_use]
     pub const fn budget(self) -> &'static str {
         match self {
@@ -212,7 +136,6 @@ pub struct EvidenceBudget {
 }
 
 impl EvidenceBudget {
-    /// The budgets `config` sets.
     #[must_use]
     pub fn of(config: &InvestigationConfig) -> Self {
         Self {
@@ -222,8 +145,6 @@ impl EvidenceBudget {
     }
 }
 
-/// What a capture holds from admission until its work stops: its lane
-/// slot, its installation slot and its quota reservation.
 #[derive(Debug)]
 pub struct Admission {
     // Fields drop in this order. The reservation goes first. The
@@ -255,11 +176,6 @@ impl Admission {
 /// One admitted capture's binding charge against its key's and the
 /// installation's quotas: one result and `max_file_bytes`.
 ///
-/// The bytes cover what the row will count: the capture refuses a file and
-/// facts document larger together than `max_file_bytes`, and usage counts
-/// both (`file_bytes` and `metadata_bytes`). So settling hands the table a
-/// row no larger than the charge it replaces.
-///
 /// A handle: clones share one charge. The charge is released by
 /// [`Self::settle`] once the capture's row is in the table, or when the
 /// last handle drops, whichever comes first.
@@ -278,7 +194,6 @@ impl Reservation {
     }
 }
 
-/// The shared part of a [`Reservation`]: its entry in the book.
 #[derive(Debug)]
 struct Charge {
     ticket: u64,
@@ -295,7 +210,6 @@ impl Charge {
 }
 
 impl Drop for Charge {
-    /// The capture ended, with its row settled or without one.
     fn drop(&mut self) {
         self.done();
     }
@@ -317,7 +231,6 @@ pub struct CaptureGate {
     /// Serializes binding passes; held across their Postgres reads.
     pass: tokio::sync::Mutex<()>,
     book: Arc<Mutex<Book>>,
-    /// Woken each time a charge in the book is done.
     done: Arc<Notify>,
     /// One ticket per admission attempt, naming its slots and its charge.
     tickets: AtomicU64,
@@ -327,9 +240,6 @@ pub struct CaptureGate {
 }
 
 impl CaptureGate {
-    /// A gate enforcing `capture`'s running limits and quotas, reading
-    /// usage from `store` at `clock`'s time and unlinking expired files
-    /// from `root`.
     #[must_use]
     pub fn new(
         capture: &CaptureConfig,
@@ -353,9 +263,6 @@ impl CaptureGate {
         }
     }
 
-    /// Admit one capture by `key_id`, waiting no later than `deadline`: the
-    /// quota pre-check, the key's lane, the installation, then the binding
-    /// reservation (module docs).
     pub async fn admit(&self, key_id: i64, deadline: Deadline) -> Result<Admission, Refusal> {
         self.pre_check(key_id, deadline).await?;
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
@@ -773,7 +680,6 @@ impl CaptureGate {
         }
     }
 
-    /// The key's lane, made on its first capture.
     fn lane(&self, key_id: i64) -> Arc<Lane> {
         Arc::clone(
             self.lanes
@@ -812,18 +718,15 @@ impl CaptureGate {
     }
 }
 
-/// The quota a refusal names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scope {
     Key,
     Installation,
 }
 
-/// One key's running slots and its queue.
 #[derive(Debug)]
 struct Lane {
     slots: Arc<Slots>,
-    /// Callers waiting for a slot.
     waiting: AtomicU64,
 }
 
@@ -835,9 +738,6 @@ impl Lane {
         }
     }
 
-    /// Take a slot: at once when one is free, else by waiting until
-    /// `deadline` as one of at most `depth` waiters. A caller that finds
-    /// `depth` already waiting is refused at once.
     async fn enter(&self, ticket: u64, deadline: Deadline, depth: u64) -> Result<Slot, Refusal> {
         if let Some(slot) = self.slots.try_hold(ticket, deadline) {
             return Ok(slot);
@@ -896,7 +796,6 @@ impl Slots {
         })
     }
 
-    /// A free slot for `ticket`, running until `deadline`, or `None`.
     fn try_hold(self: &Arc<Self>, ticket: u64, deadline: Deadline) -> Option<Slot> {
         let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
         Some(self.hold(permit, ticket, deadline))
@@ -916,8 +815,6 @@ impl Slots {
         }
     }
 
-    /// Whole seconds until the first holder's deadline, at least 1; 1 when
-    /// no holder is recorded.
     fn retry_after_secs(&self) -> u64 {
         self.deadlines.lock().values().min().map_or(1, |first| {
             ceil_secs(first.saturating_duration_since(Instant::now()))
@@ -953,7 +850,6 @@ struct Entry {
     done: bool,
 }
 
-/// What a charge counts against.
 #[derive(Debug)]
 enum Charged {
     /// The key's and the installation's temporary quotas: one result and
@@ -1019,8 +915,6 @@ impl Book {
         self.evidence_sum(investigation, |_| true)
     }
 
-    /// Whether a charge not done promotes any of `results` into
-    /// `investigation`.
     fn promoting(&self, investigation: &InvestigationId, results: &[&str]) -> bool {
         self.entries.values().any(|entry| {
             !entry.done
@@ -1046,9 +940,6 @@ impl Book {
     }
 }
 
-/// The refusal for a charge of `bytes` on top of `used` evidence in the
-/// investigation and `installation` in the installation, if either budget
-/// cannot hold it: the investigation's checked first.
 fn evidence_full(
     used: u64,
     installation: u64,
@@ -1079,8 +970,6 @@ fn plus(a: Usage, b: Usage) -> Usage {
     }
 }
 
-/// Await `work` within `deadline`. An expiry is [`busy`]; a store failure
-/// is [`Refusal::Store`].
 async fn within<T>(
     deadline: Deadline,
     work: impl Future<Output = Result<T, StoreError>>,
@@ -1104,8 +993,6 @@ pub(crate) fn ceil_secs(span: Duration) -> u64 {
     (span.as_secs() + u64::from(span.subsec_nanos() > 0)).max(1)
 }
 
-/// Whole seconds from `now` until `at`, at least 1 and at most `ttl_secs`;
-/// `ttl_secs` when nothing will expire.
 fn until_expiry(at: Option<DateTime<Utc>>, now: DateTime<Utc>, ttl_secs: u64) -> u64 {
     at.map_or(ttl_secs, |at| {
         (at - now).to_std().map_or(1, ceil_secs).min(ttl_secs)
@@ -1113,20 +1000,13 @@ fn until_expiry(at: Option<DateTime<Utc>>, now: DateTime<Utc>, ttl_secs: u64) ->
     .max(1)
 }
 
-/// What a binding pass retired under the pass lock before it counted,
-/// naming the events of that work: the rows changed under the pass, and
-/// [`CaptureGate::unlink_retired`] removes their files once it is
-/// released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Retired {
-    /// Temporary captures past their deadline, expired.
     Captures,
-    /// Kept evidence past its investigation's retention, pruned.
     Evidence,
 }
 
 impl Retired {
-    /// The `event_type` of the unlink's outcome.
     fn event(self) -> &'static str {
         match self {
             Self::Captures => "results_expire_at_reservation",
@@ -1134,7 +1014,6 @@ impl Retired {
         }
     }
 
-    /// The `event_type` of a failed step.
     fn error_event(self) -> &'static str {
         match self {
             Self::Captures => "results_expire_at_reservation_error",
@@ -1148,13 +1027,11 @@ impl Retired {
 enum RetireFailure<'a> {
     /// The unlink's own error: the OS's text, logged at DEBUG only.
     Io(&'a std::io::Error),
-    /// [`crate::error::join_failure_text`]'s fixed words.
     Join(&'a str),
 }
 
-/// Log a failed filesystem step of `what` a reservation retired at warn.
 /// An I/O failure's warning carries its closed cause, and its text goes to
-/// DEBUG only (ADR-0040, amended 2026-11-09).
+/// DEBUG only (ADR-0040).
 fn warn_retire(what: Retired, step: &str, failure: RetireFailure<'_>) {
     match failure {
         RetireFailure::Io(error) => {
@@ -1211,9 +1088,6 @@ mod tests {
 
     const KEY: i64 = 7;
 
-    /// The refusal names the budget that refused: the investigation's when
-    /// it is full, also when both are, since it is checked first, and the
-    /// installation's when only that one is.
     #[test]
     fn evidence_full_names_the_budget_that_refused() {
         let budget = EvidenceBudget {
@@ -1242,8 +1116,6 @@ mod tests {
         assert_eq!(scope_of(90, 990), None);
     }
 
-    /// A failed store step of what a reservation retires is logged by the
-    /// error's closed class only, under the event of what it retired.
     #[test]
     fn a_store_retire_warning_logs_the_errors_class_and_not_its_text() {
         let error = sentinel();
@@ -1280,8 +1152,6 @@ mod tests {
         format!("{n:032x}")
     }
 
-    /// A gate on a real store and results root, reading a fixed clock that
-    /// starts at [`start`].
     struct Fixture {
         gate: Arc<CaptureGate>,
         root: Arc<ResultsRoot>,
@@ -1401,14 +1271,12 @@ mod tests {
         }
     }
 
-    /// Publish a file of `len` bytes as result `n`.
     fn publish(root: &ResultsRoot, n: u32, len: usize) -> Published {
         let staged = root.stage().unwrap();
         std::fs::write(staged.path(), vec![b'x'; len]).unwrap();
         root.publish(staged, &id(n)).unwrap()
     }
 
-    /// Poll `done` until it holds, failing after a generous bound.
     async fn wait_until(what: &str, done: impl Fn() -> bool) {
         let give_up = std::time::Instant::now() + secs(30);
         while !done() {

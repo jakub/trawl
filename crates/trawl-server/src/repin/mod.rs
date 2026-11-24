@@ -6,32 +6,9 @@
 //! rewrite of one field's corpus to a new candidate-ladder type, with
 //! resurrection of conflict-nulled values from `_raw`, an atomic
 //! crash-recoverable cutover, and a persisted one-at-a-time job.
-//!
-//! Module map: `gate` (compaction interlocks), `marker` (the `data/REPIN`
-//! document + sibling staging layout), `plan` (the scan every job runs),
-//! `rewrite` (per-file hardlink-or-rewrite), `cutover` (the idempotent
-//! per-env swap), `engine` (the job lifecycle), `cancel` (the cooperative
-//! cancel registry and its point-of-no-return latch), `recover` (the boot
-//! decision table), `ceiling` (the numbers a forced job accepted), `jobs`
-//! (the in-process job generation capacity samples read), and, for tests
-//! only, `holds` (job-scoped holds on the engine).
 
 /// How recently the field must have been observed for a repin's report to
 /// call it live (ADR-0013 ruling 10).
-///
-/// A repin translates history. If something is still writing the field, the
-/// live half keeps arriving in the ingest-time reading, so a syslog-dialect
-/// rewrite leaves a discontinuity at the cutover instant — and the fix for
-/// that half is `[ingest] severity_from`, not another repin. The operator
-/// has to be told, so the report carries the fact and the CLI writes the
-/// warning.
-///
-/// 24 hours, deliberately not `retention.max_age_days`: that window says
-/// how much corpus a schema listing should describe, which is a different
-/// question with a different answer (90 days of history says nothing about
-/// whether a sender is still connected). It matches the degraded-pin
-/// analyzer's minimum span for the same reason — a day is the shortest
-/// window over which "still writing" is a fact rather than a coincidence.
 pub const LIVENESS_WINDOW: std::time::Duration = std::time::Duration::from_hours(24);
 
 pub mod cancel;

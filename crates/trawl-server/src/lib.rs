@@ -3,10 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! trawl-server: the trawld daemon.
-//!
-//! HTTPS server (axum over `tokio-rustls`) that authenticates clients,
-//! ingests events, executes queries and streams results, alongside a
-//! syslog listener and the compaction, retention and scheduler jobs.
 
 pub mod admission;
 pub mod audit;
@@ -67,8 +63,6 @@ pub mod tls;
 pub mod tracker;
 pub mod transport;
 
-/// A TCP proxy that holds back one Postgres session's answers, for the
-/// tests of writes whose answers never come.
 #[cfg(test)]
 #[path = "../../fleet-auth/tests/support/answer_hold.rs"]
 pub(crate) mod answer_hold;

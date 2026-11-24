@@ -2,17 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! UDP syslog listener.
-//!
-//! Binds a UDP socket and receives syslog datagrams. Each datagram is
-//! parsed, canonicalized through the one door under the `syslog` profile
-//! ([`convert::SyslogDoor::admit`]), and sent to the batcher.
-//!
-//! A failed `recv_from` does not end the listener: it logs under a
-//! throttle, waits out the shared backoff and receives again on the same
-//! socket (see `listener_error`). Datagrams the kernel drops meanwhile are
-//! lost. Only a failed bind is fatal.
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -32,9 +21,6 @@ use crate::shutdown::shutdown_observed;
 /// Maximum UDP datagram size for syslog (64 KB per RFC).
 const UDP_RECV_BUFFER_SIZE: usize = 65_536;
 
-/// Run the UDP syslog listener until shutdown.
-///
-/// Only a failed bind returns `Err`.
 pub async fn run_udp_listener(
     config: &SyslogConfig,
     door: &SyslogDoor,
@@ -70,7 +56,6 @@ impl Incoming<UdpSocket> {
     }
 }
 
-/// Receive on a bound socket until shutdown.
 async fn serve_udp(
     mut incoming: Incoming<UdpSocket>,
     config: &SyslogConfig,
@@ -91,9 +76,6 @@ async fn serve_udp(
             () = shutdown_observed(&mut shutdown_rx) => break,
 
             result = incoming.recv_from(&mut buf) => {
-                // Any error, such as EMFILE when the process is out of file
-                // descriptors, ends nothing: log it under the throttle, wait
-                // out the backoff, and ask the same socket again.
                 let (len, src_addr) = match result {
                     Ok(done) => done,
                     Err(error) => {
@@ -129,10 +111,6 @@ async fn serve_udp(
                     continue;
                 };
 
-                // The one door: parse, then canonicalize under the syslog
-                // profile. A refusal is counted as a profile reject (a
-                // server bug: there is nobody to reject a datagram to) and
-                // the frame is dropped.
                 let Some(event) = door.admit(
                     raw,
                     source_ip,
@@ -143,9 +121,6 @@ async fn serve_udp(
                     continue;
                 };
 
-                // Non-blocking send: drop if the queue is full. The drop is
-                // labelled `backpressure` while the batcher is blocked on
-                // hot-buffer admission, `queue_full` otherwise.
                 if !sender.try_enqueue(event, stats.as_ref()) {
                     tracing::debug!(
                         event_type = "syslog_event_dropped",
@@ -172,9 +147,6 @@ mod tests {
     };
     use super::*;
 
-    /// Spawn `serve_udp` on a bound loopback socket whose first receives
-    /// answer `faults`. Returns the socket's address, its attempt count,
-    /// the batcher's receiving end, the shutdown sender and the task.
     #[allow(clippy::type_complexity)]
     async fn spawn_faulty(
         faults: Vec<Fault>,
@@ -205,9 +177,6 @@ mod tests {
         (addr, attempts, rx, shutdown_tx, task)
     }
 
-    /// AC2: after injected receive errors the listener still holds its
-    /// socket, and a real datagram to that same address delivers its one
-    /// event exactly once.
     #[tokio::test]
     async fn udp_receive_recovers() {
         const FAULTS: usize = 3;
@@ -254,9 +223,6 @@ mod tests {
         assert_eq!(more, 0, "the datagram was delivered more than once");
     }
 
-    /// Drive `serve_udp` through `n` injected receive errors on the paused
-    /// clock, until a datagram that waited in the socket buffer is
-    /// delivered, and return the socket-error lines it logged.
     async fn udp_burst(n: usize) -> Vec<Line> {
         let capture = Capture::default();
         let _guard = capture.install();
@@ -282,8 +248,6 @@ mod tests {
         capture.lines()
     }
 
-    /// AC3: in every way shutdown can reach a listener in or out of its
-    /// backoff, it returns at once with no further receive.
     #[tokio::test(start_paused = true)]
     async fn listener_shutdown_during_backoff() {
         let config = SyslogConfig::default();
@@ -307,7 +271,6 @@ mod tests {
         }
     }
 
-    /// AC4: a bind to a port a real socket holds is the one fatal error.
     #[tokio::test]
     async fn listener_bind_failure_is_fatal() {
         let held = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -325,7 +288,6 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
     }
 
-    /// AC5: 650 receive errors, 65 s of backoffs, log four lines.
     #[tokio::test(start_paused = true)]
     async fn listener_error_logs_are_bounded() {
         let lines = udp_burst(650).await;
@@ -337,8 +299,6 @@ mod tests {
         );
     }
 
-    /// AC6: the first failure, a summary and the recovery line from the
-    /// real loop all carry the pre-auth target, which is never persisted.
     #[tokio::test(start_paused = true)]
     async fn listener_error_events_use_nonpersisted_target() {
         let lines = udp_burst(302).await;
@@ -361,8 +321,6 @@ mod tests {
         }
     }
 
-    /// Faults belong to one listener: a second listener in the same process
-    /// receives at once while the first waits out its errors.
     #[tokio::test]
     async fn listener_faults_are_instance_local() {
         let hang = crate::test_timing::HANG_GUARD;

@@ -5,22 +5,6 @@
 //! In-process field-catalog machinery (ADR-0009): the pin cache that keeps
 //! the query path free of postgres I/O, and the context handle compaction
 //! uses to pin and conform.
-//!
-//! The postgres tables live in [`crate::store::catalog`]; this module is
-//! the process-local view. Boot hydrates it, every `pin_missing` refresh
-//! adds entries, and the repin cutover overwrites exactly one entry through
-//! [`FieldCatalog::repin`], the only path that is not add-only. Nothing
-//! needs to detect a stale snapshot: a query roots one snapshot per
-//! execution and the cutover's exclusion primitives guarantee no query
-//! straddles a flip.
-//!
-//! Every name in the catalog is ASCII-lowercase by construction: ingest
-//! folds field names at the one door every producer enters through
-//! (`ingest::envelope::canonicalize`), and the catalog folds again at its
-//! own entry points (the boot pass when seeding from standing parquet,
-//! compaction when proposing from a stale WAL). One `DuckDB` identifier
-//! therefore has exactly one catalog spelling, and lookups are plain
-//! exact-name.
 
 pub mod analyzer;
 pub mod conform;
@@ -34,51 +18,26 @@ use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::store::CatalogStore;
 
-/// Process-local pin cache. Cheap to share (`Arc`), lock-light reads.
 #[derive(Debug, Default)]
 pub struct FieldCatalog {
     pins: RwLock<HashMap<String, CanonicalType>>,
-    /// Non-additive catalog mutation generation: bumped by
-    /// [`FieldCatalog::repin`] and [`FieldCatalog::touch_generation`], the
-    /// paths that make a served answer wrong rather than incomplete
-    /// ([`FieldCatalog::evict_many`] deliberately does NOT stamp; the gc
-    /// engine bumps per outcome, following what the store deleted). It is
-    /// a stamp readers hold beside a cached derivation of the pin set, so
-    /// those paths invalidate that cache without knowing it exists.
-    ///
-    /// [`FieldCatalog::merge`] and [`FieldCatalog::replace`] deliberately
-    /// do not bump it: those are add-only (a new pin, or boot hydration),
-    /// and a caching reader that already served a page without the new
-    /// field is no more wrong than it was a millisecond earlier. Bumping
-    /// there would burn the cache's TTL on every compaction batch that pins
-    /// something.
-    ///
-    /// The name is the original one and stays: it is on the wire in no
-    /// sense, but it is what the cached-schema code reads, and renaming it
-    /// would churn more than it explains.
     repin_generation: std::sync::atomic::AtomicU64,
-    /// Every [`FieldCatalog::all`] read ([`FieldCatalog::pins_read_for_test`]).
     #[cfg(any(test, feature = "test-support"))]
     pin_reads: parking_lot::Mutex<Vec<PinRead>>,
 }
 
-/// One [`FieldCatalog::all`] read, as the test recorder logs it.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinRead {
-    /// The [`FieldCatalog::repin_generation`] at the read.
     pub repin_generation: u64,
 }
 
 impl FieldCatalog {
-    /// An empty cache (hydrated at boot from [`CatalogStore::load_pins`]).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Replace the whole cache with an authoritative pin set (boot only —
-    /// hydration is the one place that has read the whole catalog).
     pub fn replace(&self, pins: impl IntoIterator<Item = (String, CanonicalType)>) {
         *self.pins.write() = pins.into_iter().collect();
     }
@@ -101,27 +60,9 @@ impl FieldCatalog {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
-    /// Drop `fields` from the cache, returning how many were actually
-    /// there: the pin purge's half of gc ([`crate::catalog::gc`]).
-    ///
-    /// One write lock for the whole set, and NO generation bump: the
-    /// caller stamps that separately with [`Self::touch_generation`].
-    ///
-    /// The split exists because this map cannot answer the question the
-    /// stamp is for. What invalidates a cached derivation of the pin set is
-    /// what the CATALOG lost, and a purge that deletes rows in postgres may
-    /// find nothing here to remove — a gc retry after an earlier
-    /// over-eviction is exactly that shape. Bumping on `removed > 0` would
-    /// skip precisely the case that needs it, so the gc engine bumps once
-    /// per outcome instead, and no caller gets a bump it did not ask for.
-    ///
     /// Infallible on purpose. The gc engine calls this immediately after
     /// the postgres commit, inside the corpus gate, with nothing fallible
     /// in between, so the cache can never be emptied ahead of the store.
-    /// The reverse gap is the survivable one: a panic between the two
-    /// leaves a cached pin for a field postgres no longer has, and since gc
-    /// only deletes fields no standing file carries, nothing conforms
-    /// against it and the next boot's hydration drops it.
     pub fn evict_many<'a>(&self, fields: impl IntoIterator<Item = &'a str>) -> usize {
         let mut guard = self.pins.write();
         fields
@@ -130,12 +71,7 @@ impl FieldCatalog {
             .count()
     }
 
-    /// Stamp one non-additive change to the pin set.
-    ///
-    /// The purge path's only bump, called once per gc outcome: after a
-    /// commit that deleted rows, after a commit whose outcome is unknown
-    /// (postgres may have deleted them), and after a reconcile that dropped
-    /// cached pins postgres no longer holds. Ordered Release like the
+    /// Ordered Release like the
     /// repin's, and taken after the map write it describes, so a reader can
     /// see the new pins under the old stamp (over-invalidation, discarded
     /// on the next read) but never the old pins under the new one.
@@ -144,31 +80,12 @@ impl FieldCatalog {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
-    /// How many non-additive changes the pin set has taken in this process
-    /// (a retype or a purge).
-    ///
-    /// Opaque; only equality is meaningful. A cached derivation of the pin
-    /// set (today: the `/api/v1/schema` column listing) stamps the value it
-    /// was built under and refuses to serve when it no longer matches, so a
-    /// repin cutover or a pin purge retypes that endpoint immediately
-    /// instead of at the next TTL expiry.
     #[must_use]
     pub fn repin_generation(&self) -> u64 {
         self.repin_generation
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Fold newly-durable pins into the cache, leaving every other entry
-    /// alone.
-    ///
-    /// This, not [`Self::replace`], is the steady-state update: on the
-    /// compaction path pins only ever appear (`pin_missing` never rewrites
-    /// one; the repin cutover does, through [`Self::repin`]), so a delta
-    /// merge lands the same map a full reload would, without re-reading a
-    /// catalog sized by how many distinct field names clients have ever
-    /// sent (bounded, but only by [`crate::store::MAX_PINNED_FIELDS`]).
-    /// Compaction runs this once per batch that actually pinned something;
-    /// a batch proposing nothing touches neither postgres nor this lock.
     pub fn merge(&self, pins: impl IntoIterator<Item = (String, CanonicalType)>) {
         let mut guard = self.pins.write();
         for (field, ty) in pins {
@@ -176,28 +93,20 @@ impl FieldCatalog {
         }
     }
 
-    /// Look up one field's pin.
     #[must_use]
     pub fn get(&self, field: &str) -> Option<CanonicalType> {
         self.pins.read().get(field).copied()
     }
 
-    /// A snapshot of the current pins.
     #[must_use]
     pub fn snapshot(&self) -> HashMap<String, CanonicalType> {
         self.pins.read().clone()
     }
 
-    /// The whole pin set as a [`FieldTypes`]: the comparison-typing
-    /// snapshot the query path passes to `emit_with_pins` and
-    /// `CompiledFilter::compile` (ADR-0011).
-    ///
     /// Deliberately unfiltered, unlike [`Self::intersect`]: the
     /// hot-intersected set is empty with no hot buffer and misses
     /// cold-only fields, so typing comparisons with it would make
     /// `status>=400` mean different things depending on ingest timing.
-    /// The clone is bounded by `MAX_PINNED_FIELDS` (10k) and typically
-    /// tiny; taken once per query.
     #[must_use]
     pub fn all(&self) -> FieldTypes {
         let pins = self.pins.read();
@@ -212,29 +121,16 @@ impl FieldCatalog {
         out
     }
 
-    /// Every [`Self::all`] read since the catalog was made or the log last
-    /// cleared, in order: the whole-pin-set snapshots the query path roots
-    /// each execution in. [`Self::intersect`], the hot snapshot's own
-    /// conform set, is not logged.
     #[cfg(any(test, feature = "test-support"))]
     pub fn pins_read_for_test(&self) -> Vec<PinRead> {
         self.pin_reads.lock().clone()
     }
 
-    /// Empty the [`Self::pins_read_for_test`] log.
     #[cfg(any(test, feature = "test-support"))]
     pub fn clear_pins_read_for_test(&self) {
         self.pin_reads.lock().clear();
     }
 
-    /// The pins intersected with a hot snapshot's key set — the
-    /// [`FieldTypes`] the emitter conforms the hot side of the union with.
-    /// Zero postgres I/O: this is the whole point of the cache.
-    ///
-    /// A plain exact-name lookup: catalog names and hot-snapshot keys are
-    /// both ASCII-folded at their sources (see the module doc), so two
-    /// spellings of one `DuckDB` identifier cannot meet here, and no
-    /// case-variant defence is needed.
     #[must_use]
     pub fn intersect<'a>(&self, keys: impl IntoIterator<Item = &'a str>) -> FieldTypes {
         let pins = self.pins.read();
@@ -272,10 +168,6 @@ mod tests {
 
     #[test]
     fn intersect_is_exact_name_lookup() {
-        // Folding happens at ingest/boot, not here: a key spelled
-        // differently from every pin simply matches nothing. (Such a key
-        // cannot reach this code from the wired system — hot-snapshot keys
-        // are ingest-folded — so no defensive conform is warranted.)
         let cache = catalog(&[("duration", CanonicalType::BigInt)]);
         let pins = cache.intersect(["Duration"]);
         assert_eq!(pins.get("Duration"), None);
@@ -284,10 +176,6 @@ mod tests {
 
     #[test]
     fn all_returns_the_full_unfiltered_snapshot() {
-        // The comparison-typing set must be the whole catalog: the
-        // hot-intersected set is empty with no hot buffer and misses
-        // cold-only fields, so `status>=400` would change meaning with
-        // ingest timing if `intersect` were reused.
         let cache = catalog(&[
             ("duration", CanonicalType::BigInt),
             ("status", CanonicalType::Varchar),
@@ -301,9 +189,6 @@ mod tests {
 
     #[test]
     fn merge_adds_deltas_without_dropping_existing_pins() {
-        // The steady-state compaction update: only the batch's own new pins
-        // are known, and folding them in must not evict the rest of the
-        // catalog the way `replace` would.
         let cache = catalog(&[("duration", CanonicalType::BigInt)]);
         cache.merge([("status".to_owned(), CanonicalType::BigInt)]);
         assert_eq!(cache.get("duration"), Some(CanonicalType::BigInt));
@@ -311,9 +196,6 @@ mod tests {
         assert_eq!(cache.snapshot().len(), 2);
     }
 
-    /// The one path that is not add-only: a repin overwrites exactly one
-    /// key and leaves every other pin alone, unlike `merge`, which only
-    /// ever adds.
     #[test]
     fn repin_overwrites_exactly_one_key() {
         let cache = catalog(&[
@@ -328,9 +210,6 @@ mod tests {
         assert_eq!(cache.snapshot().len(), 2, "an overwrite, never an add");
     }
 
-    /// The generation stamp exists so a cached derivation of the pin set can
-    /// tell "a field was retyped" (its answer is now wrong) from "a field was
-    /// added" (its answer is merely incomplete, which the TTL already covers).
     #[test]
     fn only_a_repin_bumps_the_generation() {
         let cache = catalog(&[("status", CanonicalType::BigInt)]);
@@ -353,9 +232,6 @@ mod tests {
         assert_eq!(cache.repin_generation(), start + 2, "every repin bumps");
     }
 
-    /// The purge takes the whole set under one lock and leaves the stamp to
-    /// its caller: a bump per removed field would invalidate the schema
-    /// cache once per deleted pin for a single operator command.
     #[test]
     fn evict_many_removes_the_set_without_stamping_it() {
         let cache = catalog(&[
@@ -381,15 +257,6 @@ mod tests {
         assert_eq!(cache.repin_generation(), start + 1, "one purge, one bump");
     }
 
-    /// A purge the cache never held is still a purge: the generation
-    /// follows the STORE.
-    ///
-    /// This is the retry shape. A run whose commit outcome was unknown
-    /// over-evicts every candidate, so the map is already empty when the
-    /// operator runs gc again and `evict_many` removes nothing. A bump
-    /// conditioned on that count would be skipped, and the
-    /// `/api/v1/schema` listing would keep naming a field postgres has
-    /// deleted until its TTL ran out.
     #[test]
     fn a_purge_the_cache_never_held_still_bumps_the_generation() {
         let cache = catalog(&[("live", CanonicalType::Double)]);
@@ -418,14 +285,8 @@ mod tests {
     }
 }
 
-/// Everything compaction needs to enforce the write-time invariant: the
-/// durable store (pins are written here before any parquet carrying them)
-/// and the in-process cache (refreshed after every pin write so the query
-/// path sees new pins without touching postgres).
 #[derive(Debug, Clone)]
 pub struct CatalogContext {
-    /// Durable catalog store (postgres).
     pub store: CatalogStore,
-    /// Shared in-process pin cache.
     pub cache: Arc<FieldCatalog>,
 }

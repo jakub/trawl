@@ -2,11 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Running `trawld` as root inside an unprivileged user namespace, with a
-//! directory bind-mounted read-only and others bound read-write onto mount
-//! points of their own, for the tests that need a root run, a read-only
-//! mount or a bind alias without real privilege.
-
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,10 +11,8 @@ use std::process::Command;
 /// never counted as passing evidence.
 pub const REQUIRE_USERNS: &str = "TRAWL_TEST_REQUIRE_USERNS";
 
-/// Running `trawld` as root inside an unprivileged user namespace, the way
-/// the doctor's root-run and read-only-mount tests do: `unshare --user
-/// --map-root-user --mount`, which maps this test's uid to 0, so `trawld`
-/// sees euid 0 and the files the test made as owned by root.
+/// `unshare --user --map-root-user --mount` maps this test's uid to 0, so
+/// `trawld` sees euid 0 and the files the test made as owned by root.
 #[derive(Debug, Clone)]
 pub struct Userns {
     unshare: PathBuf,
@@ -27,12 +20,6 @@ pub struct Userns {
     shell: PathBuf,
 }
 
-/// Inside the namespace: bind each of the `$3` pairs that follow, source
-/// then mount point, read-write in order; then bind the directory `$2` onto
-/// itself read-only when it is not empty; then exec the rest of the
-/// arguments from the same working directory. `$1` is `mount`.
-/// Any failure ends the run before the program starts, with a status the
-/// doctor never exits with.
 const USERNS_SCRIPT: &str = r#"set -e
 mount="$1"
 ro="$2"
@@ -59,12 +46,6 @@ exec "$@"
 "#;
 
 impl Userns {
-    /// The namespace tools, once a probe proved this host lets this user
-    /// make the namespace, be root in it, and mount a directory read-only
-    /// there; otherwise why not.
-    ///
-    /// # Errors
-    /// The reason the namespace is unavailable.
     pub fn probe() -> Result<Self, String> {
         let find = |name: &str| {
             let path = std::env::var_os("PATH").unwrap_or_default();
@@ -82,8 +63,6 @@ impl Userns {
         let dir = tempfile::tempdir().map_err(|e| format!("a probe directory: {e}"))?;
         let probe = dir.path().join("probe");
         std::fs::write(&probe, b"probe").map_err(|e| format!("a probe file: {e}"))?;
-        // As root in the namespace, a write to the read-only bind mount must
-        // fail; `id -u` must say 0.
         let output = tools
             .command(Some(dir.path()))
             .args([
@@ -117,11 +96,6 @@ impl Userns {
         Ok(tools)
     }
 
-    /// [`Userns::probe`] for the test `test`: the tools, or `None` after
-    /// printing `SKIPPED: ...` when the namespace is unavailable.
-    ///
-    /// # Panics
-    /// When the namespace is unavailable and [`REQUIRE_USERNS`] is `1`.
     pub fn for_test(test: &str) -> Option<Self> {
         match Self::probe() {
             Ok(tools) => Some(tools),
@@ -136,8 +110,7 @@ impl Userns {
     }
 
     /// `unshare` with an empty environment, except the loader's library
-    /// path, which the shared-DuckDB test build needs, set to run
-    /// [`USERNS_SCRIPT`]'s arguments, with `read_only` bound read-only.
+    /// path, which the shared-DuckDB test build needs.
     pub fn command(&self, read_only: Option<&Path>) -> Command {
         self.command_binding(read_only, &[])
     }

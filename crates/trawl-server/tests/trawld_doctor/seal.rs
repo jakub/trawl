@@ -4,15 +4,6 @@
 
 //! The doctor's entry: sealed like `--check-config`, never crash-dump init,
 //! and `--config` only from the command line (ADR-0023, ADR-0047).
-//!
-//! The pattern is `tests/check_config.rs`'s: crash-dump capture is enabled
-//! through `TRAWL_CRASH_DUMP_DIR` in a temporary directory, the database
-//! URLs carry a planted password, and afterwards the directory is exactly as
-//! it was. `trawl_crashdump::init` creates that directory, prunes old dumps
-//! in it, and starts a monitor process before trawld reads anything, so an
-//! absent directory that stays absent, a full one that stays full, and no
-//! child process (which [`run_doctor`] asserts on every run) together show
-//! the doctor never reached it.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -27,8 +18,6 @@ use crate::support::{
     write_doctor_config,
 };
 
-/// Every entry under `dir`, recursively, with its bytes and modification
-/// time. `None` when `dir` does not exist.
 fn snapshot(dir: &Path) -> Option<BTreeMap<String, (Vec<u8>, std::time::SystemTime)>> {
     fn walk(
         root: &Path,
@@ -60,7 +49,6 @@ fn snapshot(dir: &Path) -> Option<BTreeMap<String, (Vec<u8>, std::time::SystemTi
     Some(entries)
 }
 
-/// The names directly under `dir`.
 fn names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -102,8 +90,6 @@ fn doctor_seals_before_config() {
             let observed = run_doctor_observed(&args, &env);
             let (code, stdout, stderr) = (observed.code, observed.stdout, observed.stderr);
             assert_no_values(&stdout, &stderr, &[crate::support::PLANTED_FLEET_URL]);
-            // The seal sets no_new_privs, and the process was seen with it.
-            // That proves something only when this harness lacks it.
             #[cfg(target_os = "linux")]
             {
                 assert!(
@@ -147,13 +133,11 @@ fn doctor_seals_before_config() {
     }
 }
 
-/// A doctor run's environment.
 type Env = Vec<(&'static str, OsString)>;
 
 #[test]
 fn doctor_requires_config_flag() {
     let root = tempfile::tempdir().unwrap();
-    // A directory name that must not be echoed back from TRAWL_CONFIG.
     let private = root.path().join("private-secret-dir");
     std::fs::create_dir(&private).unwrap();
     let config = write_doctor_config(&private, &DoctorConfig::in_dir(&private));
@@ -173,7 +157,6 @@ fn doctor_requires_config_flag() {
             vec!["--doctor".into()],
             with_config_env(&[("TRAWL_CONFIG", config_arg.clone())]),
         ),
-        // No path at all.
         (vec!["--doctor".into()], with_config_env(&[])),
         // A value clap refuses, which clap's own message would quote.
         (
@@ -186,7 +169,6 @@ fn doctor_requires_config_flag() {
             ],
             with_config_env(&[]),
         ),
-        // The two check modes conflict.
         (
             vec![
                 "--doctor".into(),
@@ -219,11 +201,7 @@ fn doctor_requires_config_flag() {
 }
 
 /// With HOME unset, `~` in the `--config` path expands through the
-/// password database, which can be a network service that stalls. The
-/// doctor expands it on its blocking pool under a 5 s deadline, and the
-/// identity row's lookup has 2 s, so the run returns within 10 s whatever
-/// the lookup does, with `server.config` reporting on the path it found:
-/// here, one that does not exist.
+/// password database, which can be a network service that stalls.
 #[test]
 fn doctor_tilde_config_without_home_returns() {
     let missing = format!("~/.trawl-doctor-absent-{}/trawld.toml", std::process::id());
@@ -295,11 +273,6 @@ fn with_file_log(config: &Path, log_file: &Path) {
     std::fs::write(config, document).unwrap();
 }
 
-/// A `server.log_file` refusal fails `server.config` only when it proves
-/// the destination invalid: a reserved storage marker, or a path through a
-/// regular file. One the running user may not inspect is `not_sampled`,
-/// `permission_denied`. Either way every later check is blocked, no path
-/// the configuration names is shown, and nothing is written.
 #[cfg(unix)]
 #[test]
 fn doctor_log_file_refusals_fail_only_when_proven() {

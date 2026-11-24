@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Sourced by the harness and its disposable-container regression tests.
 
 remove_stopped_harness_container() {
   local name="$1" details id running owner

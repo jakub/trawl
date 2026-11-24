@@ -2,30 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Cooperative cancellation of the running repin job (#109).
-//!
-//! One in-process decision object, [`CancelRegistry`], carries both the
-//! operator's request and the engine's own point-of-no-return latch through
-//! a single mutex. That single lock is the whole design: a request and a
-//! latch are the two sides of one race, and two independent signals (a
-//! flag plus a watch channel, say) cannot be compared atomically, so the
-//! answer would depend on which the reader looked at first. Nobody awaits a
-//! change here; every check is a poll at a file boundary.
-//!
-//! What the engine promises is therefore a latency, not an instant: the
-//! scan and build loops check before and after each file, so a job stops at
-//! the next file boundary. The whole-corpus snapshot walk and the
-//! filesystem pre-flight are not checkpointed, and
-//! [`CANCEL_LATENCY_CONTRACT`] says so in the words the 202 response
-//! carries.
-//!
-//! Two things this module deliberately does not do. It never writes to the
-//! job store: the store's `record_cancel_request` is the engine's call,
-//! made both by the detached request path and again by the effect site, so
-//! a `cancelled` terminal status is impossible without the request row the
-//! database CHECK demands. And it never decides an HTTP status by hand
-//! outside [`CancelVerdict::wire`], which is the one status/outcome/
-//! sentence table the handler renders.
+//! Cooperative cancellation of the running repin job.
 
 use std::sync::Arc;
 
@@ -34,7 +11,7 @@ use parking_lot::Mutex;
 use trawl_api::RepinCancelOutcome;
 
 /// The stage a cancel took effect in: the one vocabulary shared by the
-/// audit events, the job row's error sentence and (through M3) the CLI.
+/// audit events and the job row's error sentence.
 pub const STAGE_SCAN: &str = "scan";
 /// The build and catch-up passes, including the final increment under the
 /// cutover exclusion.
@@ -58,10 +35,6 @@ macro_rules! latency_contract {
 /// because the API docs and the 202 body quote it verbatim.
 pub const CANCEL_LATENCY_CONTRACT: &str = latency_contract!();
 
-/// The 202 sentence. It embeds the latency contract and says plainly that
-/// accepting a request is not promising a terminal `cancelled` status: a
-/// job that reaches the point of no return first completes, and the status
-/// route is where the verdict actually lands.
 const CANCELLING_DETAIL: &str = concat!(
     "cancel accepted for the running repin job. ",
     latency_contract!(),
@@ -76,9 +49,6 @@ const PAST_NO_RETURN_DETAIL: &str = "the repin has passed its point of no return
 
 const NO_JOB_DETAIL: &str = "no repin job is running on this node";
 
-/// What a cancel request is answered with. The registry decides it under
-/// its lock, which is what makes "cancelling" and "too late" mutually
-/// exclusive rather than a matter of timing between two reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelVerdict {
     /// The request is accepted. `already_requested` marks a repeat: an
@@ -99,17 +69,11 @@ pub enum CancelVerdict {
 /// What [`CancelRegistry::request`] decided: the verdict the handler
 /// renders, and the actor the registry retained for it.
 ///
-/// The two are separate because a repeat request has two actors and they
-/// answer different questions. The audit trail wants this caller ("bob
-/// also asked"), while the durable record wants the first asker, whose
-/// request is the one that will actually stop the job. Persisting the
-/// caller instead was a real race: every repeat spawned its own store
-/// write, and `record_cancel_request` keeps the first row to LAND, not the
-/// first to be decided, so a repeat that overtook the original wrote bob
-/// into a job the registry and the effect audit both say alice cancelled.
+/// The two are separate because a repeat request has two actors. The
+/// durable record wants the first asker: `record_cancel_request` keeps
+/// the first row to LAND, not the first to be decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelDecision {
-    /// The answer this caller is given.
     pub verdict: CancelVerdict,
     /// The actor the job row must name, present exactly when the verdict is
     /// [`CancelVerdict::Cancelling`]. On a first request it is this caller;
@@ -118,7 +82,6 @@ pub struct CancelDecision {
 }
 
 impl CancelDecision {
-    /// A verdict with no actor to persist: the two refusals.
     fn plain(verdict: CancelVerdict) -> Self {
         Self {
             verdict,
@@ -128,11 +91,6 @@ impl CancelDecision {
 }
 
 /// What [`CancelRegistry::commit`] decided at the point of no return.
-///
-/// Three answers rather than a bool because the marker write lives inside
-/// the decision now, and its failure is neither a crossing nor a cancel:
-/// the job unwinds like any other pre-cutover failure, with the entry
-/// still cancellable.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Commit<E> {
     /// The marker is published and the point of no return is latched.
@@ -150,10 +108,7 @@ pub enum Commit<E> {
 /// a terminal status short of the point of no return.
 ///
 /// The two arms are exclusive by construction, because the choice is made
-/// under the same lock a cancel request takes. That is the whole point:
-/// sampling "is a cancel pending?" and then writing a terminal row are two
-/// steps, and a request landing between them used to be answered 202 while
-/// the already-chosen verdict won the row.
+/// under the same lock a cancel request takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settlement {
     /// No cancel held the job, so the caller's own verdict stands. The
@@ -167,9 +122,7 @@ pub enum Settlement {
 
 impl CancelVerdict {
     /// The one status/outcome/sentence table. The handler renders this and
-    /// decides nothing: three verdicts, three distinct status codes, and
-    /// the accepted one carries the latency contract so an operator is
-    /// never told "accepted" without being told what accepted means.
+    /// decides nothing.
     #[must_use]
     pub fn wire(&self) -> (StatusCode, RepinCancelOutcome, &'static str) {
         match self {
@@ -191,7 +144,6 @@ impl CancelVerdict {
         }
     }
 
-    /// The job the verdict is about, when there is one.
     #[must_use]
     pub fn job_id(&self) -> Option<i64> {
         match self {
@@ -203,14 +155,10 @@ impl CancelVerdict {
 
 /// Who asked for a cancel.
 ///
-/// Two fields because a display name answers a different question from the
-/// one an audit reader asks. `name` is the verified key's human label, the
-/// same identity source `requested_by` uses, so the job row reads
-/// coherently; it is operator-chosen and two keys may carry the same one.
-/// `key_prefix` is the keystore's stable identifier for the key itself, so
-/// a log reader can say which credential acted even after somebody renames
-/// it. The prefix is the key's public half — it is what the keystore lists
-/// keys by — so naming it leaks no token material.
+/// `name` is operator-chosen and two keys may carry the same one.
+/// `key_prefix` is the keystore's stable identifier for the key itself.
+/// The prefix is the key's public half, so naming it leaks no token
+/// material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelActor {
     name: String,
@@ -218,7 +166,6 @@ pub struct CancelActor {
 }
 
 impl CancelActor {
-    /// Build an actor from a verified key's display name and prefix.
     pub fn new(name: impl Into<String>, key_prefix: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -240,7 +187,6 @@ impl CancelActor {
     }
 }
 
-/// The registry's record of the one armed job.
 #[derive(Debug, Clone)]
 struct Entry {
     job_id: i64,
@@ -256,7 +202,6 @@ struct Entry {
     settled: bool,
 }
 
-/// The armed job's cancel state: one slot, one mutex, one truth.
 #[derive(Debug, Default)]
 pub struct CancelRegistry {
     slot: Mutex<Option<Entry>>,
@@ -301,11 +246,6 @@ impl CancelRegistry {
     }
 
     /// Ask to cancel whatever is running. The handler's one call.
-    ///
-    /// The decision carries the retained actor as well as the verdict,
-    /// because on a repeat the two name different people: the verdict is
-    /// this caller's answer, while the retained actor is the first asker,
-    /// the only name the job row may ever carry.
     pub fn request(&self, by: &CancelActor) -> CancelDecision {
         let mut slot = self.slot.lock();
         let Some(entry) = slot.as_mut() else {
@@ -340,18 +280,7 @@ impl CancelRegistry {
     /// Cutover marker, and latch — all three under the one lock.
     ///
     /// `publish` is the marker write itself, and it runs inside the lock on
-    /// purpose. Latching first and writing after was a third state nothing
-    /// could correct: a marker write that failed (no space, a failed fsync
-    /// or rename) unwound the job as `failed` while the latched entry kept
-    /// telling every cancel request the corpus was being swapped, for the
-    /// rest of the sweep, and [`Self::settle`] refuses to touch a latched
-    /// entry. Publication is the fact that makes the crossing real, so it
-    /// is the fact the latch waits for.
-    ///
-    /// The write is synchronous — a staged temp file, an fsync, two renames
-    /// — and happens once per job, so holding a `parking_lot` mutex across
-    /// it costs a cancel request a few milliseconds at most. `publish` must
-    /// stay sync for that reason: nothing may await under this lock.
+    /// purpose. `publish` must stay sync: nothing may await under this lock.
     ///
     /// # Errors
     /// [`Commit::Failed`] carries `publish`'s own error, with the entry
@@ -377,14 +306,6 @@ impl CancelRegistry {
     /// Choose, under the one lock, between a pending cancel and the
     /// terminal verdict a job short of the point of no return is about to
     /// write.
-    ///
-    /// This is [`Self::commit`]'s pre-cutover twin, and it exists for the
-    /// same reason: reading the pending request and then acting on the
-    /// answer is two steps, and the request that lands between them is
-    /// exactly the one an operator is watching. Before this, a cancel
-    /// arriving after the sample was told 202 while the sampled verdict
-    /// (`failed`, `blocked`, or a dry run's `succeeded`) won the row, and
-    /// the operator was left with an accepted cancel that nothing acted on.
     ///
     /// A job that no longer owns the registry settles nothing and gets
     /// [`Settlement::Candidate`]: its own verdict is all it can write, and
@@ -458,7 +379,6 @@ impl CancelHandle {
         self.registry.pending(self.job_id)
     }
 
-    /// The job this handle speaks for.
     #[must_use]
     pub fn job_id(&self) -> i64 {
         self.job_id
@@ -487,10 +407,6 @@ impl From<String> for PassStop {
 /// attempt so the trail matches what a reader of the job row can see.
 /// A repeat carries the new asker's name with `already_requested = true`:
 /// the row still names the first, and both facts belong in the log.
-///
-/// Both halves of the identity ride every one of these events: the display
-/// name an operator recognises and the key prefix that stays put when the
-/// name changes.
 pub fn audit_cancel_requested(job_id: i64, actor: &CancelActor, already_requested: bool) {
     tracing::info!(
         event_type = "repin_cancel_requested",
@@ -551,13 +467,6 @@ mod tests {
 
     /// The race the whole module exists for, driven from two threads: one
     /// asks to cancel while the other latches the point of no return.
-    ///
-    /// The assertion is not about which wins — that is genuinely timing —
-    /// but about the two answers being consistent with each other. A
-    /// latched commit must refuse the request, and an accepted request must
-    /// stop the commit. The forbidden outcomes are both "yes" (a cancelled
-    /// job whose corpus was swapped anyway) and both "no" (a job that
-    /// neither cancels nor cuts over).
     #[test]
     fn cancel_and_commit_race_to_one_answer_from_two_threads() {
         let mut cancelled_won = 0;
@@ -590,15 +499,9 @@ mod tests {
                 other => panic!("cancel and commit disagreed: {other:?}"),
             }
         }
-        // Both interleavings must be reachable in principle; the loop is
-        // not asserted to produce both, because a scheduler is free to be
-        // consistent. The counters are here so a failure message can say
-        // which family it was stuck in.
         assert_eq!(cancelled_won + committed_won, 200);
     }
 
-    /// Commit first, then ask: the answer is the refusal, and it stays the
-    /// refusal however many times it is asked.
     #[test]
     fn a_latched_job_refuses_every_later_request() {
         let (registry, handle) = armed(11);
@@ -613,16 +516,6 @@ mod tests {
         assert_eq!(handle.cancelled_by(), None);
     }
 
-    /// A publication that fails latches nothing, and the job stays
-    /// cancellable.
-    ///
-    /// Writing the marker after the latch left a state nothing could
-    /// correct: the write failed, the job unwound as `failed`, and the
-    /// latched entry answered "past the point of no return" to every cancel
-    /// for the rest of the sweep, while `settle` refused to touch it. Since
-    /// the write happens inside the decision, its failure is just a failure
-    /// — the next request is accepted, and the settlement can hand the job
-    /// to it.
     #[test]
     fn a_failed_publication_leaves_the_job_cancellable() {
         let (registry, handle) = armed(11);
@@ -652,8 +545,6 @@ mod tests {
         assert_eq!(latch(&registry, 11), Commit::Refused);
     }
 
-    /// Ask first, then latch: the latch fails, and the effect site can
-    /// still read the actor it must name.
     #[test]
     fn a_pending_request_stops_the_latch() {
         let (registry, handle) = armed(11);
@@ -674,9 +565,6 @@ mod tests {
         assert_eq!(handle.cancelled_by(), Some(actor("alice")));
     }
 
-    /// Settle first, then ask: the verdict is already written, so there is
-    /// no cancellable work and the answer is 404, not the 409 that means
-    /// "the corpus is being swapped".
     #[test]
     fn a_settled_job_has_nothing_left_to_cancel() {
         let (registry, _handle) = armed(5);
@@ -695,9 +583,6 @@ mod tests {
         );
     }
 
-    /// Ask first, then settle: the cancel wins, and the settlement hands
-    /// the caller the actor it must name so it aborts its own candidate
-    /// instead of writing it.
     #[test]
     fn a_pending_request_beats_a_terminal_candidate() {
         let (registry, handle) = armed(5);
@@ -716,9 +601,6 @@ mod tests {
         );
     }
 
-    /// Settling is per job. A job whose task is ending must not latch the
-    /// entry its successor armed, or the successor would answer 404 while
-    /// it rewrites the corpus.
     #[test]
     fn a_stale_settle_does_not_latch_a_live_entry() {
         let registry = Arc::new(CancelRegistry::default());
@@ -731,10 +613,6 @@ mod tests {
         ));
     }
 
-    /// A latched job keeps its 409. Settling one is not a thing the engine
-    /// does — past the point of no return the job completes — but the two
-    /// latches must stay distinct answers rather than one shadowing the
-    /// other.
     #[test]
     fn settling_never_downgrades_the_point_of_no_return() {
         let (registry, _handle) = armed(9);
@@ -746,9 +624,6 @@ mod tests {
         );
     }
 
-    /// A second asker changes nothing but the audit trail. The row's actor
-    /// is the one whose request actually took effect, so the registry must
-    /// keep the first name.
     #[test]
     fn a_second_request_preserves_the_first_actor() {
         let (registry, handle) = armed(3);
@@ -769,16 +644,6 @@ mod tests {
         assert_eq!(handle.cancelled_by(), Some(actor("alice")));
     }
 
-    /// A repeat's decision hands the persistence path the FIRST asker, not
-    /// the caller.
-    ///
-    /// The engine writes the request row from a detached task, so bob's
-    /// write can reach postgres before alice's. `record_cancel_request`
-    /// keeps whichever row lands first, so persisting the caller's own name
-    /// would durably record bob while the registry, the effect audit and
-    /// the job's error sentence all name alice. Handing the retained actor
-    /// back with the verdict makes every write, first or repeat, carry the
-    /// same name.
     #[test]
     fn a_repeat_request_carries_the_first_actor_for_persistence() {
         let (registry, _handle) = armed(3);
@@ -809,9 +674,6 @@ mod tests {
         assert_eq!(latched.request(&actor("bob")).retained, None);
     }
 
-    /// Disarm is owner-checked. A job whose task ends late must not clear
-    /// the entry its successor armed, or the successor would answer
-    /// "no job running" while it rewrites the corpus.
     #[test]
     fn a_stale_disarm_does_not_clear_a_live_entry() {
         let registry = Arc::new(CancelRegistry::default());
@@ -837,9 +699,6 @@ mod tests {
         assert_eq!(second.cancelled_by(), None);
     }
 
-    /// An unarmed registry cannot latch: the commit's `false` sends the
-    /// caller down the unwind rather than past the point of no return,
-    /// which is the safe direction when the bookkeeping is inconsistent.
     #[test]
     fn commit_needs_the_job_to_own_the_registry() {
         let registry = Arc::new(CancelRegistry::default());
@@ -853,9 +712,6 @@ mod tests {
         assert_eq!(latch(&registry, 1), Commit::Latched);
     }
 
-    /// The wire table: three verdicts, three distinct status codes, three
-    /// distinct discriminants, and the accepted sentence quotes the latency
-    /// contract rather than paraphrasing it.
     #[test]
     fn the_wire_table_is_pairwise_distinct_and_states_the_contract() {
         let verdicts = [
@@ -897,9 +753,6 @@ mod tests {
         );
     }
 
-    /// `?` on the existing `Result<_, String>` helpers keeps working, which
-    /// is what lets a check be added to a loop without rewriting the loop's
-    /// error handling.
     #[test]
     fn a_string_error_converts_to_a_failed_stop() {
         fn failing() -> Result<(), PassStop> {

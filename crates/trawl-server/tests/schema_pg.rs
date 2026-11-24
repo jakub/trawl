@@ -130,7 +130,6 @@ ALTER TABLE schedules
 CREATE INDEX schedules_due_idx ON schedules (next_fire_at, id)
     WHERE enabled AND (max_runs IS NULL OR runs_claimed < max_runs);
 ";
-/// The migration that adds `schedules.runs_claimed` and seeds it.
 const RUNS_CLAIMED_MIGRATION: &str = "20261106000001_schedule_runs_claimed.sql";
 async fn seed_old(pool: &PgPool) {
     sqlx::query("INSERT INTO saved_queries(key_id,name,query,created_at,updated_at) VALUES (1,'retained query','service=test',now(),now())")
@@ -139,10 +138,6 @@ async fn seed_old(pool: &PgPool) {
 #[path = "../../../scripts/schema-baseline/cases.rs"]
 mod cases;
 
-/// The upgrade seeds each schedule's run budget from the runs it still has,
-/// whatever their status (ADR-0018 amended 2026-11-06). The database stands
-/// at the migration before it, as an installation upgrading in place does,
-/// and boot's own runner applies it and every later one.
 #[sqlx::test(migrations = false)]
 async fn runs_claimed_backfill_counts_retained_runs(pool: PgPool) {
     let previous = tempfile::tempdir().unwrap();
@@ -191,8 +186,6 @@ async fn runs_claimed_backfill_counts_retained_runs(pool: PgPool) {
         .await
         .unwrap();
         for run in 0..kept {
-            // The newest run is still going; the rest finished one way or
-            // another. Every one of them was claimed.
             let status = match (kept - 1 - run, run % 3) {
                 (0, _) => "running",
                 (_, 0) => "success",
@@ -250,7 +243,6 @@ async fn failed_boot_retains_old_data_and_releases_the_sole_writer_lock(pool: Pg
     for _ in 0..2 {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
-                // The shared pool's target stays fixed for the entire test.
                 match StorageState::from_pool(pool.clone()).await {
                     Err(StoreError::Migration(SchemaError::LegacyHistory { .. })) => break,
                     Err(StoreError::LockHeld) => tokio::task::yield_now().await,

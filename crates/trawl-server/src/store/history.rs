@@ -24,7 +24,6 @@ macro_rules! history_query {
     };
 }
 
-/// A single query history entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub id: i64,
@@ -36,7 +35,6 @@ pub struct HistoryEntry {
     pub status: RunStatus,
 }
 
-/// Paginated history response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryPage {
     pub entries: Vec<HistoryEntry>,
@@ -55,17 +53,14 @@ fn row_to_history_entry(row: &PgRow) -> Result<HistoryEntry, sqlx::Error> {
     })
 }
 
-/// Clamp a usize into a non-negative i64 for binding.
 pub(crate) fn bind_usize(v: usize) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
-/// Clamp a u64 into a non-negative i64 for binding.
 pub(crate) fn bind_u64(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
-/// Postgres-backed storage for query history. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
 pub struct HistoryStore {
     pool: PgPool,
@@ -74,11 +69,6 @@ pub struct HistoryStore {
 }
 
 impl HistoryStore {
-    /// Wrap the shared app-state pool.
-    ///
-    /// The pool must point at an already-migrated trawl app-state database
-    /// (production goes through `StorageState::connect`, which migrates;
-    /// tests use `#[sqlx::test]`-migrated pools directly).
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
@@ -87,7 +77,6 @@ impl HistoryStore {
         }
     }
 
-    /// Record a query execution. Returns the new history entry id.
     pub async fn record_query(
         &self,
         key_id: i64,
@@ -109,9 +98,6 @@ impl HistoryStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| match classify_violation(&e) {
-            // Backstop: unreachable via the typed API (`running` is the only
-            // out-of-history-domain variant and callers never pass it), but
-            // kept so a future raw path still maps the CHECK to Validation.
             Some(super::error::PgViolation::Check) => {
                 StoreError::Validation(format!("invalid history status {:?}", status.as_str()))
             }
@@ -143,13 +129,8 @@ impl HistoryStore {
             .rows_affected())
     }
 
-    /// Get a user's query history, filtering query text before pagination.
-    ///
-    /// Most recent first — `ORDER BY executed_at DESC, id DESC` (the id
-    /// tie-break makes same-timestamp pages deterministic).
     /// Matching is a literal substring after PostgreSQL's locale-dependent
-    /// lowercase conversion. Whitespace is significant. Count and rows share
-    /// one read-only, repeatable-read snapshot; subsequent requests may differ.
+    /// lowercase conversion.
     pub async fn get_user_history(
         &self,
         key_id: i64,
@@ -177,8 +158,6 @@ impl HistoryStore {
 
         #[cfg(test)]
         {
-            // Instance-scoped and consumed once. Tests pause the real method
-            // after count, allowing another connection to commit a mutation.
             let barrier = self.read_barrier.lock().take();
             if let Some(barrier) = barrier {
                 barrier.pause(&mut transaction).await?;
@@ -295,7 +274,6 @@ mod tests {
                          VALUES (1, 'matching later', now(), 1, 1, 'success')")
                 .execute(&mut *writer).await.unwrap();
         }
-        // These autocommit statements complete before row selection resumes.
         resume_tx.send(()).unwrap();
         assert_eq!(reading.await.unwrap(), before);
         let after = store

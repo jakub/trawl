@@ -2,15 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! A report run's result is stored in exact types (ADR-0035, amended
-//! 2026-10-22), over the real server: real postgres, real scheduler runs,
-//! real parquet files on disk, read back through `GET run` and
-//! `| from saved`.
-//!
-//! The parquet file is the ordinary representation, a zero-row run
-//! included. The typed blob is kept for a zero-column result, a `mixed`
-//! column and a failed write; `from saved` reads a zero-column blob as an
-//! empty source and refuses any other blob by the run's name.
+//! A report run's result is stored in exact types (ADR-0035).
 
 mod common;
 
@@ -21,12 +13,9 @@ use common::{TestServer, setup};
 use trawl_api::value::{Column, ColumnType, QueryResult, Value};
 use trawl_client::{ClientError, HttpClient};
 
-/// Each of the fixture's two nginx events contributes this much, so their
-/// `sum` is 12,000,000,000,000,000,000: past `i64::MAX`, under `u64::MAX`.
 const BIG_SUM: &str = "service=nginx | let big = 6000000000000000000 | stats sum(big) as total";
 const BIG_TOTAL: u64 = 12_000_000_000_000_000_000;
 
-/// A saved query with a schedule, ready to be triggered.
 async fn net(client: &HttpClient, name: &str, query: &str) -> i64 {
     let saved = client
         .create_saved(name, query)
@@ -39,11 +28,9 @@ async fn net(client: &HttpClient, name: &str, query: &str) -> i64 {
     saved.id
 }
 
-/// Trigger one run and return it once it has finished, with the run
-/// before it if there was one: newest first. It returns only once the
-/// manual-run gate has drained too: a run's lease goes back after its
-/// terminal row is written, and the key's next press before then answers
-/// 429.
+/// Returns only once the manual-run gate has drained too: a run's lease goes
+/// back after its terminal row is written, and the key's next press before
+/// then answers 429.
 async fn run_once(
     server: &TestServer,
     client: &HttpClient,
@@ -74,7 +61,6 @@ async fn run_once(
     );
 }
 
-/// The absolute path of a run's stored parquet result.
 fn stored_path(server: &TestServer, run: &trawl_api::ReportRunSummary) -> PathBuf {
     let relative = run
         .result_path
@@ -83,7 +69,6 @@ fn stored_path(server: &TestServer, run: &trawl_api::ReportRunSummary) -> PathBu
     Path::new(server.state.query.pool.base_dir()).join(relative)
 }
 
-/// The `DuckDB` type of every column in a parquet file, in order.
 fn described(path: &Path) -> Vec<(String, String)> {
     let conn = duckdb::Connection::open_in_memory().unwrap();
     let mut stmt = conn
@@ -105,7 +90,6 @@ fn pairs(described: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The result `GET run` serves, decoded through the typed codec.
 async fn served(client: &HttpClient, saved_id: i64, run_id: i64) -> QueryResult {
     client
         .get_report_run(saved_id, run_id)
@@ -122,8 +106,6 @@ fn refusal<T: std::fmt::Debug>(outcome: Result<T, ClientError>) -> (u16, String)
     }
 }
 
-/// AC 7: a `sum` past `i64::MAX` is stored as `UBIGINT`. The footer says
-/// `UINT_64`, never a double, and the run reads back with every digit.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_value_above_i64_max_is_stored_unsigned_and_reads_back_exactly() {
     let server = setup().await;
@@ -159,9 +141,6 @@ async fn a_value_above_i64_max_is_stored_unsigned_and_reads_back_exactly() {
     );
 }
 
-/// The other stored types a run produces: `BIGINT`, a UTC `TIMESTAMP`, a
-/// `BIGINT[]`, a `DOUBLE` holding NaN, and a column of digit strings that
-/// stays `VARCHAR` because nothing is inferred.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_runs_columns_are_stored_in_their_exact_types() {
     let server = setup().await;
@@ -215,9 +194,6 @@ async fn a_runs_columns_are_stored_in_their_exact_types() {
     assert_eq!(row[4], Value::String("123".into()));
 }
 
-/// AC 1: a run whose window holds no event stores a typed empty parquet
-/// file. `GET run` serves its typed columns with no rows, and
-/// `| from saved` reads it as a typed source.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zero_row_run_stores_a_typed_empty_file() {
     let server = setup().await;
@@ -272,9 +248,6 @@ async fn a_zero_row_run_stores_a_typed_empty_file() {
     );
 }
 
-/// The same through a Rust tail that removes every row: the tail keeps the
-/// columns it projects, typed from the input, so the run stores a typed
-/// empty parquet file rather than a zero-column blob.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rust_tail_that_removes_every_row_stores_a_typed_empty_file() {
     let server = setup().await;
@@ -305,9 +278,6 @@ async fn a_rust_tail_that_removes_every_row_stores_a_typed_empty_file() {
     );
 }
 
-/// A `mixed` column has no parquet form, so the run keeps a typed blob.
-/// `GET run` serves it cell for cell, and `| from saved` refuses it by the
-/// run's name.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mixed_column_run_is_a_blob_that_from_saved_refuses() {
     let server = setup().await;
@@ -346,9 +316,6 @@ async fn a_mixed_column_run_is_a_blob_that_from_saved_refuses() {
     );
 }
 
-/// A run whose source matched no file at all has no columns, which parquet
-/// cannot hold. It keeps a blob, and `| from saved` reads it as a source
-/// with no rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zero_column_run_is_a_blob_that_counts_zero() {
     let server = setup().await;
@@ -373,8 +340,6 @@ async fn a_zero_column_run_is_a_blob_that_counts_zero() {
     assert_eq!(counted.result.rows, vec![vec![Value::Integer(0)]]);
 }
 
-/// `run=all` over a `BIGINT` run and a `UBIGINT` run: the union widens the
-/// column to `HUGEINT` in the query, and both totals answer exactly.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_all_unions_a_bigint_run_and_a_ubigint_run_exactly() {
     let server = setup().await;
@@ -417,12 +382,6 @@ async fn run_all_unions_a_bigint_run_and_a_ubigint_run_exactly() {
     );
 }
 
-/// A run is typed by what it stores, never by what the live catalog pins
-/// now (ADR-0062). A field the run does not carry reads as a VARCHAR null
-/// even while the catalog pins it DOUBLE, and a string function over it
-/// binds, on `run=latest` and on `run=all` alike. A field the run does
-/// carry keeps its live pin: `severity == "error"` still compares by
-/// rank.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_field_the_run_does_not_carry_takes_no_live_pin() {
     let server = setup().await;
@@ -476,9 +435,6 @@ async fn a_field_the_run_does_not_carry_takes_no_live_pin() {
     }
 }
 
-/// A parquet write that fails falls back to the typed blob, which `GET run`
-/// serves. The scheduled directory is made read-only, so the writer cannot
-/// create its temp file.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
 async fn a_failed_parquet_write_records_a_readable_typed_blob() {

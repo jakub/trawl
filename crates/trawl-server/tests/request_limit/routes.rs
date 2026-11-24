@@ -40,8 +40,6 @@ use crate::transport::SCRAPE;
 /// one for every real connection (ingest reads it).
 const PEER: ([u8; 4], u16) = ([127, 0, 0, 1], 40_293);
 
-/// A request through the production router: a raw URI, an optional bearer
-/// token, and the peer extension.
 fn request(method: &str, uri: &str, token: Option<&str>, body: Body) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(token) = token {
@@ -52,12 +50,10 @@ fn request(method: &str, uri: &str, token: Option<&str>, body: Body) -> Request<
     request
 }
 
-/// A request with an empty body.
 fn empty(method: &str, uri: &str, token: Option<&str>) -> Request<Body> {
     request(method, uri, token, Body::empty())
 }
 
-/// A JSON POST.
 fn json(uri: &str, token: &str, body: &serde_json::Value) -> Request<Body> {
     let mut request = request("POST", uri, Some(token), Body::from(body.to_string()));
     request.headers_mut().insert(
@@ -67,7 +63,6 @@ fn json(uri: &str, token: &str, body: &serde_json::Value) -> Request<Body> {
     request
 }
 
-/// An ndjson POST of one event for `service`.
 fn ndjson(uri: &str, token: &str, service: &str) -> Request<Body> {
     let event = serde_json::json!({ "service": service, "message": "request limit probe" });
     let mut request = request("POST", uri, Some(token), Body::from(format!("{event}\n")));
@@ -78,16 +73,12 @@ fn ndjson(uri: &str, token: &str, service: &str) -> Request<Body> {
     request
 }
 
-/// A bearer token that names no key.
 const BAD_TOKEN: &str = "flt_zzzzzzzz_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
 
-/// The production router over `server`'s state with
-/// `max_concurrent_requests` at `limit`.
 fn router(server: &TestServer, limit: usize) -> Router {
     server.router_with(|http| http.max_concurrent_requests = limit)
 }
 
-/// Assert a response's status and answer its JSON body.
 async fn status_json(
     response: Response<Body>,
     status: StatusCode,
@@ -97,22 +88,12 @@ async fn status_json(
     body_json(response).await
 }
 
-// -- holding the count ------------------------------------------------------------
-
-/// Requests that hold the regular count with a body the client holds open.
-///
-/// Each is a JSON POST whose body yields nothing until the test releases
-/// it. Its first poll reports entry, so by then the request is past auth,
-/// the grant and the rate limit, inside its handler's body extractor, and
-/// counted.
 struct Fill {
     release: Arc<Semaphore>,
     held: Vec<JoinHandle<Response<Body>>>,
 }
 
 impl Fill {
-    /// Send one held request per `(route, token)`, and wait until each
-    /// body has been polled.
     async fn hold(app: &Router, requests: &[(&str, &str)]) -> Self {
         let release = Arc::new(Semaphore::new(0));
         let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
@@ -144,7 +125,6 @@ impl Fill {
         Self { release, held }
     }
 
-    /// Let every held body finish, and require each request's 200.
     async fn release(self) {
         self.release.close();
         for handle in self.held {
@@ -155,7 +135,6 @@ impl Fill {
     }
 }
 
-/// Assert the regular count is full: a plain regular request is refused.
 async fn assert_regular_full(app: &Router, token: &str) {
     assert_refused(
         call(app, empty("GET", "/api/v1/whoami", Some(token))).await,
@@ -164,7 +143,6 @@ async fn assert_regular_full(app: &Router, token: &str) {
     .await;
 }
 
-/// Assert the regular count has room: a plain regular request is answered.
 async fn assert_regular_free(app: &Router, token: &str) {
     let response = call(app, empty("GET", "/api/v1/whoami", Some(token))).await;
     assert_eq!(
@@ -175,8 +153,6 @@ async fn assert_regular_free(app: &Router, token: &str) {
     );
 }
 
-// -- AC3, production part ------------------------------------------------------------
-
 /// The refusal on production routes: `/api/v1/ingest/preview` is refused
 /// with `Cache-Control: no-store` although its own no-store layer never
 /// runs, and a refused HEAD on a production route has an empty body.
@@ -186,7 +162,6 @@ async fn request_limit_refusal_contract_production() {
     let app = router(&server, 1);
     let fill = Fill::hold(&app, &[("/api/v1/validate", &server.admin_token)]).await;
 
-    // The preview, from the one key allowed to call it.
     let preview = call(
         &app,
         ndjson("/api/v1/ingest/preview", &server.admin_token, "rl-preview"),
@@ -199,7 +174,6 @@ async fn request_limit_refusal_contract_production() {
     assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
     assert!(headers.contains_key("x-request-id"), "{headers:?}");
 
-    // HEAD on two regular production routes, one of them unauthenticated.
     for (uri, token) in [
         ("/api/v1/schema", Some(server.analyst_token.as_str())),
         ("/api/v1/whoami", None),
@@ -222,7 +196,6 @@ async fn request_limit_refusal_contract_production() {
     }
 
     fill.release().await;
-    // Control: the same HEAD is served once the count has room.
     let head = call(
         &app,
         empty("HEAD", "/api/v1/whoami", Some(&server.analyst_token)),
@@ -231,9 +204,6 @@ async fn request_limit_refusal_contract_production() {
     assert_eq!(head.status(), StatusCode::OK);
 }
 
-// -- AC4 ------------------------------------------------------------------------------
-
-/// The WAL directory of `server`'s ingest writer.
 fn wal_dir(server: &TestServer) -> PathBuf {
     server
         .state
@@ -245,7 +215,6 @@ fn wal_dir(server: &TestServer) -> PathBuf {
         .to_path_buf()
 }
 
-/// Every path under `dir`, recursively, with its size.
 fn listing(dir: &Path) -> std::collections::BTreeSet<(PathBuf, u64)> {
     let mut out = std::collections::BTreeSet::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -265,8 +234,6 @@ fn listing(dir: &Path) -> std::collections::BTreeSet<(PathBuf, u64)> {
     out
 }
 
-/// The probes `request_limit_precedes_auth_body_rate_and_routing` sends,
-/// each with the status it gets when the count has room.
 fn precedence_probes(
     server: &TestServer,
     max_body: usize,
@@ -321,12 +288,6 @@ fn precedence_probes(
     ]
 }
 
-/// While the count is full, a bad token, an oversized body, an exhausted
-/// key rate, an unknown path and a wrong method all get
-/// `request_limit_reached`: none of those checks has run yet. With room,
-/// each gets its own answer. A refused ingest request writes nothing to
-/// the WAL.
-///
 /// The interactive rate is one request a minute, so every key here spends
 /// its one token on purpose: the reader key is the exhausted one, the
 /// admin key's token goes to the request that fills the count, and the
@@ -345,15 +306,12 @@ async fn request_limit_precedes_auth_body_rate_and_routing() {
     });
     let wal = wal_dir(&server);
 
-    // Spend the reader key's one token.
     assert_regular_free(&app, &server.reader_token).await;
 
-    // With room: each probe gets its own answer.
     for (what, probe, status) in precedence_probes(&server, max_body) {
         let response = call(&app, probe).await;
         assert_eq!(response.status(), status, "{what}: {response:?}");
     }
-    // ...and an ingest request is written: the WAL is live.
     let before = listing(&wal);
     let response = call(
         &app,
@@ -368,7 +326,6 @@ async fn request_limit_precedes_auth_body_rate_and_routing() {
         "an admitted ingest request writes the WAL"
     );
 
-    // Full: every probe is the refusal.
     let fill = Fill::hold(&app, &[("/api/v1/validate", &server.admin_token)]).await;
     for (what, probe, _) in precedence_probes(&server, max_body) {
         let response = call(&app, probe).await;
@@ -384,7 +341,6 @@ async fn request_limit_precedes_auth_body_rate_and_routing() {
         );
         assert_eq!(body["error"]["message"], REGULAR_MESSAGE, "{what}: {body}");
     }
-    // A refused ingest request writes nothing.
     let before = listing(&wal);
     assert_refused(
         call(
@@ -402,8 +358,6 @@ async fn request_limit_precedes_auth_body_rate_and_routing() {
     );
     fill.release().await;
 
-    // With room again, the exhausted key is still exhausted: its refusal
-    // spent nothing and refilled nothing.
     let response = call(
         &app,
         empty("GET", "/api/v1/whoami", Some(&server.reader_token)),
@@ -416,25 +370,11 @@ async fn request_limit_precedes_auth_body_rate_and_routing() {
     );
 }
 
-// -- AC7 ------------------------------------------------------------------------------
-
-/// With the regular count full, every probe and control route and method
-/// reaches its handler. Each handler is recognised by what only it
-/// produces: health answers 200 with its checks, the engine sample's
-/// `duckdb: ok` among them (a refusal is a 503), `/metrics` answers
-/// Prometheus text, the query list answers its three lists, and a
-/// cancellation answers a cancel result. HEAD carries the same
-/// representation without the body. Health reads the engine sample and
-/// takes no permit, so the parked query cannot fail it (ADR-0056).
+/// Health reads the engine sample and takes no permit, so the parked query
+/// cannot fail it (ADR-0056).
 ///
-/// Regular never borrows the probe or control allowance: a regular request
-/// is refused while every probe and control place is free. The allowance
-/// grants nothing: a key that does not own a query still cannot cancel it.
-///
-/// The count is full with one query parked in the pool at its work-start
-/// seam and one request holding its body open, on two routes. Held probe
-/// and control handlers are not built here: none of them can be held
-/// without a production seam, and the edge tests
+/// Held probe and control handlers are not built here: none of them can be
+/// held without a production seam, and the edge tests
 /// `probe_allowance_saturates_at_three` and
 /// `control_allowance_saturates_at_four` cover those cases.
 #[tokio::test(flavor = "multi_thread")]
@@ -455,8 +395,6 @@ async fn control_allowance_survives_regular_saturation() {
         .unwrap();
     let twin = twin.plaintext_token.to_string();
 
-    // One query, parked past its work-start transition, owned by the
-    // analyst key.
     let seams = server.state.query.pool.seams();
     let parked = seams.hold(Seam::Started);
     let query = crate::support::send(
@@ -471,8 +409,6 @@ async fn control_allowance_survives_regular_saturation() {
     let fill = Fill::hold(&app, &[("/api/v1/validate", &server.admin_token)]).await;
     assert_regular_full(&app, &server.analyst_token).await;
 
-    // Health, GET and HEAD: the handler's own 200, read off the engine
-    // sample.
     let health = call(&app, empty("GET", "/api/v1/health", None)).await;
     let status = health.status();
     let body = body_json(health).await;
@@ -485,7 +421,6 @@ async fn control_allowance_survives_regular_saturation() {
     assert_eq!(head.status(), StatusCode::OK);
     assert!(body_bytes(head).await.is_empty());
 
-    // `/metrics`, GET and HEAD: Prometheus text.
     let metrics = call(&app, empty("GET", "/metrics", None)).await;
     assert_eq!(metrics.status(), StatusCode::OK);
     assert!(
@@ -531,9 +466,6 @@ async fn control_allowance_survives_regular_saturation() {
     let active = list["active"].as_array().expect("an active list");
     assert_eq!(active.len(), 1, "{list}");
     let id = active[0]["id"].as_u64().expect("the parked query's id");
-    // Make the step-up happen on every run: sleep until `running_ms` has
-    // gained a digit, so HEAD and the second GET read a longer body than the
-    // first GET.
     sleep_past_digit_boundary(active[0]["running_ms"].as_u64().unwrap()).await;
     let head = call(
         &app,
@@ -560,8 +492,6 @@ async fn control_allowance_survives_regular_saturation() {
         listed.len()
     );
 
-    // Cancellation keeps its ownership check: the twin key is refused by
-    // the handler's own check, then the owner's cancel is a cancel result.
     let refused = call(
         &app,
         empty("DELETE", &format!("/api/v1/queries/{id}"), Some(&twin)),
@@ -613,7 +543,7 @@ async fn sleep_past_digit_boundary(running_ms: u64) {
     }
 }
 
-/// Wait until `done` holds, under the deadline. For state a test cannot
+/// For state a test cannot
 /// be told about on a channel (a pool seam's arrival count).
 async fn wait_for(mut done: impl FnMut() -> bool, what: &str) {
     tokio::time::timeout(DEADLINE, async {
@@ -625,13 +555,6 @@ async fn wait_for(mut done: impl FnMut() -> bool, what: &str) {
     .unwrap_or_else(|_| panic!("{what} before the deadline"));
 }
 
-// -- AC8 ------------------------------------------------------------------------------
-
-/// Probe and control membership is the matched route and method. With the
-/// regular count full, a path that only spells a probe or control route, a
-/// forged header and a reserved path under another method are all charged
-/// to regular and refused with its message. A query string on a real
-/// probe or control route keeps its allowance and reaches the handler.
 #[tokio::test(flavor = "multi_thread")]
 async fn control_allowance_is_keyed_by_matched_route() {
     let server = common::setup().await;
@@ -669,7 +592,6 @@ async fn control_allowance_is_keyed_by_matched_route() {
         forged.headers_mut().insert(name, value.parse().unwrap());
         assert_refused(call(&app, forged).await, REGULAR_MESSAGE).await;
     }
-    // A method override on a probe path does not make a POST a probe.
     let mut overridden = empty("POST", "/api/v1/health", None);
     overridden
         .headers_mut()
@@ -687,8 +609,6 @@ async fn control_allowance_is_keyed_by_matched_route() {
         assert_refused(response, REGULAR_MESSAGE).await;
     }
 
-    // A query string on a real probe or control route keeps its
-    // allowance, so the handler answers.
     let health = call(&app, empty("GET", "/api/v1/health?zz=/api/v1/query", None)).await;
     let body = body_json(health).await;
     assert!(body["checks"].is_object(), "{body}");
@@ -712,8 +632,6 @@ async fn control_allowance_is_keyed_by_matched_route() {
     fill.release().await;
 }
 
-// -- junk tokens in control (#298) ---------------------------------------------------
-
 /// Ungranted waits on this database's `api_keys`, one per backend. The
 /// database filter matters: every fixture's fleet database has an
 /// `api_keys` table, and `pg_locks` spans the whole cluster.
@@ -729,7 +647,7 @@ async fn api_keys_waiters(lock: &mut sqlx::PgConnection) -> i64 {
     .expect("read pg_locks")
 }
 
-/// The in-process `control` in-progress gauge. Read from the recorder, not
+/// Read from the recorder, not
 /// over `/metrics`, so the read takes no request place of its own.
 ///
 /// The recorder is process-global, so the exact values this test asserts
@@ -744,18 +662,6 @@ fn control_in_progress() -> u64 {
     )
 }
 
-/// Junk bearer tokens on the query-control routes cannot starve health or
-/// `/metrics` (#298).
-///
-/// Four `HEAD /api/v1/queries` requests carry a well-shaped token with an
-/// unknown prefix. Each is admitted to the control allowance at the edge,
-/// before authentication, and then parks in `verify_key`'s prefix lookup
-/// behind a lock on `api_keys`. While they are parked, health (GET and
-/// HEAD) and `/metrics` answer 200, and a fifth junk list request and a
-/// valid key's cancellation are refused with the control message. After
-/// the lock goes, the parked requests end with 401 and the control gauge
-/// is back at 0.
-///
 /// The fleet pool has five connections: four for the parked lookups and
 /// one for health's keystore ping. The router runs over a fresh
 /// `AuthState` on the same keystore, so the readiness probe's cached ping
@@ -763,10 +669,6 @@ fn control_in_progress() -> u64 {
 /// Health answers 200 even when its keystore ping fails (`auth_db` is not
 /// critical), so the test also requires `status` and `checks.auth_db` to
 /// read `ok`.
-///
-/// Everything here is string literals and fixture APIs, so the test also
-/// builds against the single control allowance it replaced, where health
-/// is refused.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one parked window, every probe and refusal read in it
 async fn junk_tokens_in_control_do_not_starve_probes() {
@@ -812,7 +714,6 @@ async fn junk_tokens_in_control_do_not_starve_probes() {
         "a parked request ended early"
     );
 
-    // Health, GET: 200, and healthy, so its keystore ping answered.
     let health = call(&app, empty("GET", "/api/v1/health", None)).await;
     let status = health.status();
     let body = body_json(health).await;
@@ -820,13 +721,11 @@ async fn junk_tokens_in_control_do_not_starve_probes() {
     assert_eq!(body["status"], "ok", "{body}");
     assert_eq!(body["checks"]["auth_db"], "ok", "{body}");
 
-    // Health, HEAD.
     let head = call(&app, empty("HEAD", "/api/v1/health", None)).await;
     let status = head.status();
     let bytes = body_bytes(head).await;
     assert_eq!(status, StatusCode::OK, "HEAD /api/v1/health: {bytes:?}");
 
-    // `/metrics`: 200, and the scrape shows the control allowance full.
     let metrics = call(&app, empty("GET", "/metrics", None)).await;
     let status = metrics.status();
     let text = String::from_utf8(body_bytes(metrics).await.to_vec()).unwrap();
@@ -836,7 +735,6 @@ async fn junk_tokens_in_control_do_not_starve_probes() {
         4
     );
 
-    // A fifth junk list request and a valid key's cancellation: refused.
     assert_refused(
         call(&app, empty("GET", "/api/v1/queries", Some(BAD_TOKEN))).await,
         CONTROL_MESSAGE,
@@ -852,7 +750,6 @@ async fn junk_tokens_in_control_do_not_starve_probes() {
     )
     .await;
 
-    // Still exactly the four parked lookups.
     assert_eq!(api_keys_waiters(&mut lock).await, 4);
     assert!(
         parked.iter().all(|handle| !handle.is_finished()),
@@ -867,10 +764,6 @@ async fn junk_tokens_in_control_do_not_starve_probes() {
     assert_eq!(control_in_progress(), 0);
 }
 
-// -- AC10, stream routes ------------------------------------------------------------------
-
-/// Assert `response` is an open event stream, and answer it so its body
-/// stays open.
 fn open_stream(response: Response<Body>, what: &str) -> Response<Body> {
     assert_eq!(response.status(), StatusCode::OK, "{what}: {response:?}");
     assert!(
@@ -887,10 +780,6 @@ fn open_stream(response: Response<Body>, what: &str) -> Response<Body> {
     response
 }
 
-/// With a limit of 1, an open `/api/v1/stream` and an open
-/// `/api/v1/dashboard/stream` leave the count free once their heads are
-/// sent, both at once. Each route still answers 429 `too_many_streams`
-/// past its own cap, set to one stream each here.
 #[tokio::test(flavor = "multi_thread")]
 async fn response_bodies_and_streams_do_not_hold_the_count_streams() {
     let server = common::setup().await;
@@ -937,17 +826,12 @@ async fn response_bodies_and_streams_do_not_hold_the_count_streams() {
     .await;
     assert_eq!(body["error"]["code"], "too_many_streams", "{body}");
 
-    // Both streams are still open, and the count is still free.
     assert!(!axum::body::HttpBody::is_end_stream(stream.body()));
     assert!(!axum::body::HttpBody::is_end_stream(dashboard.body()));
     assert_regular_free(&app, analyst).await;
     drop((stream, dashboard));
 }
 
-// -- AC13 -----------------------------------------------------------------------------
-
-/// The one `trawl_query_permits_retained` sample a production scrape
-/// renders.
 async fn scraped_retained(app: &Router) -> u64 {
     let metrics = call(app, empty("GET", "/metrics", None)).await;
     assert_eq!(metrics.status(), StatusCode::OK);
@@ -962,15 +846,6 @@ async fn scraped_retained(app: &Router) -> u64 {
     value.to_string().parse().unwrap()
 }
 
-/// Retained executor work holds no HTTP count. With a limit of 1, a query
-/// that times out while its worker is parked past the work-start seam
-/// answers, and the count is free again although the work still holds its
-/// executor permit and `trawl_query_permits_retained` reads 1. A manual
-/// run holds no count while its worker runs after the triggering response
-/// returned.
-///
-/// Every wait is on the pool's state (a seam's arrivals, the retained
-/// count), never on elapsed time.
 #[tokio::test(flavor = "multi_thread")]
 async fn executor_retained_work_does_not_hold_the_count() {
     let _scrape = SCRAPE.lock().await;
@@ -984,8 +859,6 @@ async fn executor_retained_work_does_not_hold_the_count() {
     let seams = pool.seams();
     let analyst = server.analyst_token.as_str();
 
-    // A query that times out with its worker parked: a 504, and the work
-    // is retained.
     let parked = seams.hold(Seam::Started);
     let response = call(
         &app,
@@ -1004,7 +877,6 @@ async fn executor_retained_work_does_not_hold_the_count() {
     let body = body_json(response).await;
     assert_eq!(parked.arrivals(), 1, "{body}");
     assert_eq!(pool.retained(), 1, "the timed-out query keeps its permit");
-    // The count is back while the permit is still retained.
     assert_regular_free(&app, analyst).await;
     // `SCRAPE` is held from the top of the test, so no other fixture's
     // scrape can overwrite the sample between publish and render.
@@ -1014,7 +886,6 @@ async fn executor_retained_work_does_not_hold_the_count() {
     parked.release();
     wait_for(|| pool.retained() == 0, "the retained permit comes back").await;
 
-    // A manual run, its worker parked after the trigger answered.
     let client = trawl_client::HttpClient::new_insecure(&server.url, analyst).unwrap();
     let saved = client
         .create_saved("rl-manual-run", "* | head 3")

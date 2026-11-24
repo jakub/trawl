@@ -8,23 +8,10 @@
 //! source paths, hot buffer state, result sample, and timing. Designed
 //! for `tail -f /var/lib/trawl/query-debug.log | jq` debugging workflows.
 //!
-//! This file is more sensitive than the underlying event corpus: one
-//! record combines identity, raw query text, SQL parameter values,
-//! filesystem layout, and result samples. It is therefore owner-only
-//! (`0600` on Unix, tightening a pre-existing looser file at open) and
-//! size-bounded: past `server.query_log_max_bytes` the file rolls over
-//! to a single retained `<path>.1` (also owner-only; `0` disables
-//! rollover).
-//!
-//! The open is then judged on the descriptor it returned, whatever the
-//! `chmod` said: the file must belong to the uid trawld runs as and carry
-//! no group or other bit, or the open is refused. A file another user owns
-//! is refused even when it is already tight, since its owner can loosen it
-//! or read it at any time. A `chmod` can also report success and change
-//! nothing, as on a filesystem with fixed modes, and a `chmod` on trawld's
-//! own file can fail, as on an append-only file; neither decides alone.
-//! trawld's `server.log_file` opens through [`open_append_owner_only`]
-//! under the same rules (ADR-0052).
+//! The file is owner-only and size-bounded: past
+//! `server.query_log_max_bytes` the file rolls over to a single retained
+//! `<path>.1` (`0` disables rollover). trawld's `server.log_file` opens
+//! through [`open_append_owner_only`] under the same rules (ADR-0052).
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -37,8 +24,6 @@ use serde::ser::SerializeMap as _;
 use serde_json::Value as JsonValue;
 use trawl_engine::timing::{PhaseTotals, QueryPhase};
 
-/// Append-only ndjson query debug log with owner-only permissions and
-/// single-file rollover.
 pub struct QueryLog {
     inner: Mutex<Inner>,
 }
@@ -48,15 +33,11 @@ struct Inner {
     path: PathBuf,
     /// Rollover threshold in bytes; `0` disables rollover.
     max_bytes: u64,
-    /// Current size of the active file.
     size: u64,
     /// Size past which the next rollover is attempted — `max_bytes`
-    /// normally, but a *failed* attempt pushes it one whole cap ahead.
-    /// Without that back-off an unrotatable path (the log deleted under
-    /// a running trawld, a `<path>.1` that is a directory, a
-    /// foreign-owned rotated file) would re-run the flush + rename
-    /// syscall pair and emit another persisted `warn` on every single
-    /// query, forever.
+    /// normally, but a *failed* attempt pushes it one whole cap ahead,
+    /// or an unrotatable path would emit another persisted `warn` on every
+    /// single query.
     next_attempt_bytes: u64,
     /// Set when a rollover renamed the active file away, failed to
     /// reopen `path`, and failed to undo the rename: `writer` then holds
@@ -67,12 +48,8 @@ struct Inner {
     detached: bool,
 }
 
-/// The `event_type` of the warning a tolerated failed `chmod` on the
-/// query log logs.
 const QUERY_LOG_CHMOD_FAILED: &str = "query_log_chmod_failed";
 
-/// Open `path` for appending, owner-only on Unix (`0600` at creation,
-/// and a pre-existing looser file is tightened).
 fn open_owner_only(path: &Path) -> io::Result<File> {
     open_append_owner_only(path, QUERY_LOG_CHMOD_FAILED)
 }
@@ -81,8 +58,7 @@ fn open_owner_only(path: &Path) -> io::Result<File> {
 /// creation, a pre-existing looser file tightened, and a symlink at the
 /// final component refused. The opened descriptor must then show a file
 /// trawld's euid owns with no group or other bit; a `chmod` that failed on
-/// such a file warns, as `event_type`, and the open goes on (see the module
-/// docs).
+/// such a file warns, as `event_type`, and the open goes on.
 ///
 /// # Errors
 /// The failed open, a file another user owns, or one that is not
@@ -126,10 +102,6 @@ fn open_owner_only_with(
     Ok(file)
 }
 
-/// Judge an opened log on its descriptor, after the `chmod` attempt: it
-/// must belong to `euid` and carry no group or other bit, whatever the
-/// `chmod` returned. A `chmod` that failed on a file that passes warns, as
-/// `event_type`, and the open goes on.
 #[cfg(unix)]
 fn check_owner_only(
     file: &File,
@@ -184,9 +156,6 @@ fn check_owner_only(
 }
 
 impl QueryLog {
-    /// Open (or create) a query log file in append mode, owner-only on
-    /// Unix. `max_bytes` bounds the file: past it the log rolls over to a
-    /// single retained `<path>.1`; `0` disables rollover.
     pub fn open(path: &Path, max_bytes: u64) -> io::Result<Self> {
         let file = open_owner_only(path)?;
         let size = file.metadata()?.len();
@@ -202,9 +171,6 @@ impl QueryLog {
         })
     }
 
-    /// Serialize and append an entry, rolling the file over first when it
-    /// would exceed the size cap. Never panics or propagates errors —
-    /// serialization failure is a bug, I/O failure is logged via tracing.
     pub fn write(&self, entry: &QueryLogEntry) {
         let line = match serde_json::to_string(entry) {
             Ok(s) => s,
@@ -224,9 +190,6 @@ impl QueryLog {
             return;
         };
         if inner.detached {
-            // A rollover left the writer on a file that is no longer the
-            // configured path and could not be undone (warned once, at
-            // detach). Appending here would defeat the size cap forever.
             return;
         }
         let line_bytes = line.len() as u64 + 1;
@@ -268,17 +231,9 @@ impl QueryLog {
 
 impl Inner {
     /// Roll the active file over to `<path>.1` (replacing any previous
-    /// rotated file — exactly one previous generation is retained) and
-    /// reopen a fresh active file. The rename preserves the `0600` mode.
-    ///
-    /// On error the caller keeps writing through the existing writer, so
-    /// a rename that lands but is not followed by a successful reopen is
-    /// undone: otherwise the writer would go on appending into the file
-    /// that is now the *rotated* generation, breaking the "entries are
-    /// split, not duplicated" contract — and, because `path` would no
-    /// longer exist, no later rollover could bound that file either.
-    /// Should the undo itself fail, the writer is unrecoverably detached
-    /// from `path` and the log is closed rather than left unbounded.
+    /// rotated file) and reopen a fresh active file. A rename that lands
+    /// but is not followed by a successful reopen is undone. Should the
+    /// undo itself fail, the log is closed rather than left unbounded.
     fn rollover(&mut self) -> io::Result<()> {
         self.rollover_with(create_owner_only)
     }
@@ -318,7 +273,6 @@ impl Inner {
         }
     }
 
-    /// The single retained previous generation, `<path>.1`.
     fn rotated_path(&self) -> PathBuf {
         let mut rotated = self.path.clone().into_os_string();
         rotated.push(".1");
@@ -348,34 +302,26 @@ impl std::fmt::Debug for QueryLog {
     }
 }
 
-/// A single query execution log entry.
 #[derive(Debug, Serialize)]
 pub struct QueryLogEntry {
     /// ISO 8601 timestamp of the log entry.
     pub ts: String,
-    /// Authenticated user name.
     pub user: String,
     /// The key's role names, comma-joined; `none` when it holds no role.
     pub role: String,
-    /// Raw DSL query string.
     pub dsl: String,
-    /// Source file selection debug info.
     pub source: SourceDebug,
-    /// Hot buffer state at query time.
     pub hot_buffer: HotBufferDebug,
     /// Generated SQL (parameterized).
     pub sql: String,
     /// SQL parameter values (Display form).
     pub params: Vec<String>,
-    /// Query result summary.
     pub result: ResultDebug,
-    /// Execution timing breakdown.
     pub timing_ms: TimingDebug,
     /// Error message if the query failed, null otherwise.
     pub error: Option<String>,
 }
 
-/// Debug info about parquet source file selection.
 #[derive(Debug, Serialize)]
 pub struct SourceDebug {
     /// The computed source argument passed to `read_parquet()`.
@@ -388,27 +334,21 @@ pub struct SourceDebug {
     pub time_filter_secs: Option<u64>,
 }
 
-/// Debug info about the hot buffer state at query time.
 #[derive(Debug, Serialize)]
 pub struct HotBufferDebug {
     /// "disabled", "empty", or "active".
     pub status: &'static str,
-    /// Total events in the hot buffer.
     pub events: usize,
-    /// Number of batches in the hot buffer.
     pub batches: usize,
     /// Estimated byte size of the hot buffer.
     pub bytes: usize,
 }
 
-/// Debug info about the query result.
 #[derive(Debug, Serialize)]
 pub struct ResultDebug {
     /// "success" or "error".
     pub status: &'static str,
-    /// Column names in the result set.
     pub columns: Vec<String>,
-    /// Total row count.
     pub row_count: usize,
     /// First N rows as self-describing maps.
     pub sample: Vec<BTreeMap<String, JsonValue>>,
@@ -421,7 +361,7 @@ pub struct ResultDebug {
 /// the query entered, named as `active_query_phase` names it, in the
 /// ADR's order, as fractional milliseconds from the event's whole
 /// microseconds. A phase never entered has no key. `total` is the
-/// execution record's whole-millisecond duration, as it always was.
+/// execution record's whole-millisecond duration.
 #[derive(Debug)]
 pub struct TimingDebug {
     phases: Vec<(QueryPhase, u64)>,
@@ -523,9 +463,6 @@ mod tests {
         rustix::process::geteuid().as_raw()
     }
 
-    /// An owner-only file of trawld's own passes, and so does one whose
-    /// `chmod` failed (an append-only file refuses it) while its descriptor
-    /// shows it owner-only.
     #[cfg(unix)]
     #[test]
     fn the_descriptor_decides_an_owner_only_file_passes() {
@@ -548,9 +485,6 @@ mod tests {
         }
     }
 
-    /// A `chmod` that reported success and left a group or other bit, as a
-    /// filesystem with fixed modes does, refuses the open: the descriptor's
-    /// mode decides, not the `chmod`'s answer.
     #[cfg(unix)]
     #[test]
     fn a_chmod_that_left_the_file_open_refuses() {
@@ -565,8 +499,6 @@ mod tests {
         assert!(error.to_string().contains("still mode 0644"), "{error}");
     }
 
-    /// A file another user owns is refused even when it is owner-only:
-    /// its owner can loosen or read it whenever they like.
     #[cfg(unix)]
     #[test]
     fn a_file_another_user_owns_refuses() {
@@ -637,12 +569,6 @@ mod tests {
         assert_eq!(files.len(), 2, "exactly path + path.1");
     }
 
-    /// A rollover that cannot happen (here: `<path>.1` occupied by a
-    /// directory — same shape as the log being deleted under a running
-    /// trawld) must not be re-attempted per entry: every attempt is a
-    /// flush + rename syscall pair and a *persisted* warn, so retrying
-    /// one per query would be exactly the write amplification this log
-    /// is bounded to avoid.
     #[test]
     fn failed_rollover_backs_off_instead_of_retrying_every_entry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -680,11 +606,6 @@ mod tests {
         assert!(new.contains("e5") && !new.contains("e4"), "entries split");
     }
 
-    /// The rename can land and the reopen still fail (fd exhaustion, a
-    /// symlink re-planted at the path, a directory gone read-only in the
-    /// window). The writer must not be left holding the rotated file:
-    /// that would append every later entry to `<path>.1` — unbounded,
-    /// since `path` no longer exists for any future rollover to rename.
     #[test]
     fn failed_reopen_undoes_the_rename_and_keeps_the_active_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -714,10 +635,6 @@ mod tests {
         assert!(!rotated.exists(), "still nothing at the rotated path");
     }
 
-    /// The active name is absent after the rename, but another process can
-    /// occupy it before the reopen. Rollover must neither append to nor replace
-    /// that file. The atomic create-new refusal and no-clobber rollback preserve
-    /// both generations, then close the now-detached writer.
     #[cfg(unix)]
     #[test]
     fn rollover_refuses_a_replacement_regular_file() {
@@ -752,10 +669,6 @@ mod tests {
         assert!(log.inner.lock().unwrap().detached);
     }
 
-    /// ...and when even the undo fails — here the reopen loses a race to
-    /// a directory planted at the path — the writer is holding a file
-    /// that is no longer `path` and never can be rotated again, so the
-    /// log closes instead of growing without bound.
     #[test]
     fn unrestorable_rollover_closes_the_log_instead_of_growing_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -805,9 +718,6 @@ mod tests {
         assert!(content.contains("entry_0") && content.contains("entry_49"));
     }
 
-    /// `timing_ms` is the phase map `query_timing` carried, in
-    /// milliseconds, with absent phases absent and the legacy `total`
-    /// beside it; the file it lands in stays owner-only.
     #[test]
     fn timing_uses_phase_map() {
         let mut totals = PhaseTotals::default();

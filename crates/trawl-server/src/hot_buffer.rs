@@ -4,32 +4,12 @@
 
 //! Hot buffer: batch-keyed in-memory event store for query freshness.
 //!
-//! Events land here via synchronous insertion during ingest/telemetry.
-//! The buffer makes fresh events visible to every query by providing
-//! a temporary ndjson file that the executor can `UNION ALL BY NAME`
-//! with the parquet source.
-//!
 //! Events stay in the hot buffer until compaction writes parquet and
 //! calls [`drain`](HotBuffer::drain). The shared publication guard keeps
 //! query and export readers outside the interval between the canonical
 //! file rename and hot drain, so they cannot count both copies.
 //!
 //! # Admission (ADR-0043)
-//!
-//! Space is admitted, never reclaimed by eviction. A producer calls
-//! [`HotBuffer::reserve`] with the exact [`Charge`] of what it is about to
-//! write, before it writes the WAL. The ledger checks and charges both
-//! dimensions (events, serialized ndjson bytes) in one critical section, so
-//! concurrent producers can never overshoot a cap together. The charge then
-//! lives in a [`Reservation`]: [`HotBuffer::insert`] moves it into the
-//! resident batch, [`HotBuffer::drain`] releases it, and dropping the
-//! reservation (a failed write, a panic, a cancelled task) releases it too.
-//! The ledger's fields are private to this module, so a charge moves only
-//! through a `Reservation`.
-//!
-//! External producers (HTTP, syslog) may fill [`EXTERNAL_SHARE`] of each
-//! cap; self-telemetry ([`ProducerKind::Trawld`]) may fill the whole cap.
-//! The producer is named by the calling code path, never by event data.
 //!
 //! Lock order is always batch map, then ledger. Nothing here traces from
 //! [`HotBuffer::reserve`], [`HotBuffer::insert`] or under the ledger lock:
@@ -38,14 +18,6 @@
 //! `insert`, a writer bug: it is emitted after every lock is released, and
 //! the telemetry batch it produces carries a fresh WAL name, so it cannot
 //! recur on its own.
-//!
-//! # Hydration (ADR-0041 slice 2)
-//!
-//! At boot, before any producer starts, [`HotBuffer::hydrate`] installs the
-//! surviving WAL as resident batches under their existing batch ids. It
-//! charges the full caps and is not a producer: it never latches
-//! `Refusing`, counts no refusal, sends no pressure wake and publishes
-//! nothing. Occupancy alone may settle the ledger into `Pressure`.
 
 use std::io::{BufWriter, Write as _};
 use std::sync::Arc;
@@ -61,13 +33,10 @@ use trawl_engine::scratch::QueryScratch;
 use crate::bus::IngestBatch;
 use crate::ingest::producer::ProducerKind;
 
-/// One buffered event, as stored in [`IngestBatch::events`].
 type Event = serde_json::Map<String, serde_json::Value>;
 
-/// Configuration for the hot buffer.
 #[derive(Debug, Clone)]
 pub struct HotBufferConfig {
-    /// Maximum number of events across all batches.
     pub max_events: usize,
     /// Maximum estimated memory usage in bytes (from ndjson byte sizes).
     ///
@@ -79,19 +48,12 @@ pub struct HotBufferConfig {
     pub max_bytes: usize,
 }
 
-// -- admission ledger ----------------------------------------------------------
-
 /// The share of each cap that external producers (HTTP, syslog) may fill,
-/// as `(numerator, denominator)`. The rest is self-telemetry's floor of
-/// opportunity: trawl's own records of a stall stay searchable during it.
+/// as `(numerator, denominator)`.
 pub const EXTERNAL_SHARE: (usize, usize) = (15, 16);
 
-/// Occupancy at or above this fraction of EITHER full cap enters
-/// [`AdmissionState::Pressure`].
 pub const PRESSURE_ENTER: (usize, usize) = (1, 2);
 
-/// Occupancy below this fraction of BOTH full caps is the only way back to
-/// [`AdmissionState::Open`], from `Pressure` and `Refusing` alike.
 pub const PRESSURE_EXIT: (usize, usize) = (1, 4);
 
 /// A hot-buffer charge in both ledger dimensions: event count and
@@ -109,17 +71,14 @@ impl Charge {
         bytes: 0,
     };
 
-    /// Whether both dimensions are zero.
     pub const fn is_zero(self) -> bool {
         self.events == 0 && self.bytes == 0
     }
 
-    /// Whether this charge fits under `ceiling` on both dimensions.
     pub const fn fits(self, ceiling: Self) -> bool {
         self.events <= ceiling.events && self.bytes <= ceiling.bytes
     }
 
-    /// Both dimensions added, or `None` if either overflows.
     pub fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             events: self.events.checked_add(other.events)?,
@@ -127,7 +86,6 @@ impl Charge {
         })
     }
 
-    /// Both dimensions subtracted, or `None` if either would go negative.
     pub fn checked_sub(self, other: Self) -> Option<Self> {
         Some(Self {
             events: self.events.checked_sub(other.events)?,
@@ -150,11 +108,6 @@ impl Charge {
     }
 }
 
-/// The external producers' ceiling for full caps `caps`:
-/// `floor(cap * 15 / 16)` per dimension, in `u128` so no cap overflows.
-///
-/// A cap of 0 or 1 gives a zero ceiling on that dimension, so every
-/// non-empty external request is [`Refusal::Oversized`].
 pub fn external_ceiling(caps: Charge) -> Charge {
     Charge {
         events: share(caps.events, EXTERNAL_SHARE),
@@ -162,24 +115,19 @@ pub fn external_ceiling(caps: Charge) -> Charge {
     }
 }
 
-/// `floor(value * num / den)`. The result never exceeds `value` for a
-/// proper fraction, so it always converts back.
 fn share(value: usize, (num, den): (usize, usize)) -> usize {
     let scaled = value as u128 * num as u128 / den as u128;
     usize::try_from(scaled).unwrap_or(usize::MAX)
 }
 
-/// `value >= cap * num / den`, exactly.
 fn at_or_above(value: usize, cap: usize, (num, den): (usize, usize)) -> bool {
     value as u128 * den as u128 >= cap as u128 * num as u128
 }
 
-/// `value < cap * num / den`, exactly.
 fn below(value: usize, cap: usize, (num, den): (usize, usize)) -> bool {
     value as u128 * (den as u128) < cap as u128 * num as u128
 }
 
-/// Why a reservation was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     /// The charge fits the producer's ceiling but not the free space.
@@ -193,7 +141,6 @@ pub enum Refusal {
 impl Refusal {
     pub const ALL: [Self; 2] = [Self::Full, Self::Oversized];
 
-    /// The `kind` label on `trawl_hot_buffer_admission_refusals_total`.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Full => "full",
@@ -202,23 +149,15 @@ impl Refusal {
     }
 }
 
-/// The ledger's hysteresis state, exported as
-/// `trawl_hot_buffer_admission_state` (the discriminant).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionState {
-    /// Below the pressure threshold, no refusal outstanding.
     Open = 0,
-    /// At or above [`PRESSURE_ENTER`] of either cap: compaction should
-    /// drain without waiting for WAL age.
     Pressure = 1,
-    /// A reservation was refused for lack of space. Latched until
-    /// occupancy falls below [`PRESSURE_EXIT`] of both caps.
     Refusing = 2,
 }
 
 impl AdmissionState {
-    /// The gauge value.
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
@@ -232,8 +171,6 @@ impl AdmissionState {
     }
 }
 
-/// Everything the ledger mutex guards: both dimensions and the hysteresis
-/// state move together in one critical section.
 #[derive(Debug)]
 struct LedgerState {
     /// Reserved plus resident, every producer included.
@@ -242,15 +179,9 @@ struct LedgerState {
 }
 
 impl LedgerState {
-    /// The sole hysteresis evaluator, run under the mutex after every
-    /// charge and release (never after a refusal).
-    ///
-    /// Any state returns to `Open` only on a release (`released`) that
-    /// leaves the ledger below [`PRESSURE_EXIT`] of BOTH caps. `Open` enters
-    /// `Pressure` at [`PRESSURE_ENTER`] of EITHER cap. `Refusing` is set only
-    /// by a refusal and leaves only through the exit, so it never decays to
-    /// `Pressure`, and a refusal latches it whatever the occupancy: only a
-    /// later drain or dropped reservation can clear it.
+    /// Run under the mutex after every charge and release, never after a
+    /// refusal. `Refusing` is set only by a refusal and leaves only through
+    /// the exit, so it never decays to `Pressure`.
     fn settle(&mut self, caps: Charge, released: bool) {
         let c = self.charged;
         let exit = c.is_zero()
@@ -267,24 +198,15 @@ impl LedgerState {
     }
 }
 
-/// The process-wide admission ledger. Private to this module: only a
-/// [`Reservation`], [`HotBuffer::insert`] and [`HotBuffer::drain`] move
-/// charge.
 struct Ledger {
-    /// The full caps: self-telemetry's ceiling and the hysteresis base.
     caps: Charge,
-    /// [`external_ceiling`] of `caps`, computed once.
     external: Charge,
     state: Mutex<LedgerState>,
     /// Lock-free copy of `state.admission`, written under the mutex.
     mirror: AtomicU8,
-    /// Advanced after every release (dropped reservation or drain).
     released: watch::Sender<u64>,
-    /// Advanced on a `Full` refusal, and on an insert while not `Open`.
     pressure: watch::Sender<u64>,
-    /// Batches removed by drain, monotonic.
     drained_batches: AtomicU64,
-    /// Batches made resident by insert, monotonic.
     inserted_batches: AtomicU64,
 }
 
@@ -316,7 +238,6 @@ impl Ledger {
         AdmissionState::from_u8(self.mirror.load(Ordering::Acquire))
     }
 
-    /// Settle and mirror. Call with the mutex held.
     fn publish(&self, state: &mut LedgerState, released: bool) {
         state.settle(self.caps, released);
         self.mirror
@@ -400,7 +321,6 @@ impl Ledger {
         }
     }
 
-    /// Give `charge` back and advance `released`.
     fn release(&self, charge: Charge) {
         if charge.is_zero() {
             return;
@@ -418,12 +338,9 @@ impl Ledger {
         advance(&self.released);
     }
 
-    /// Replace `held` with `actual` in the charged total, for an insert
-    /// whose reservation does not match its batch (a caller bug, caught by
-    /// `debug_assert` in debug builds). The ledger then charges exactly
-    /// what becomes resident, keeping `charged == reserved + resident`. A
-    /// shortfall is charged without a capacity check: the batch is already
-    /// durable and must be accounted. Returns `actual`, the resident charge.
+    /// For an insert whose reservation does not match its batch (a caller bug).
+    /// A shortfall is charged without a capacity check: the batch is already
+    /// durable and must be accounted.
     fn reconcile(&self, held: Charge, actual: Charge) -> Charge {
         if held == actual {
             return actual;
@@ -445,9 +362,6 @@ impl Ledger {
     }
 }
 
-/// A batch id that is already resident: the resident stays and the
-/// newcomer is dropped. Two WAL files never share a name while one holds
-/// it, so this is a writer bug; it is counted and logged, never a panic.
 /// Call with no hot-buffer lock held.
 fn duplicate_batch(batch: &IngestBatch) {
     metrics::counter!(crate::metrics::HOT_BUFFER_DUPLICATE_BATCHES_TOTAL).increment(1);
@@ -476,11 +390,6 @@ fn count_refusal(producer: ProducerKind, refusal: Refusal) {
 }
 
 /// Admitted hot-buffer space, held until it is inserted or released.
-///
-/// Dropping a reservation releases whatever charge it still holds, so every
-/// failure path (an error return, a panic unwinding through the holder, a
-/// cancelled task) gives the space back. [`HotBuffer::insert`] consumes it
-/// and moves the charge into the resident batch without charging again.
 #[must_use = "dropping a Reservation releases its hot-buffer charge"]
 pub struct Reservation {
     /// `None` for an unmetered reservation (a pipeline with no hot buffer)
@@ -506,8 +415,6 @@ impl Reservation {
         }
     }
 
-    /// A reservation against no ledger: what a pipeline without a hot
-    /// buffer hands out. Dropping it releases nothing.
     pub(crate) fn unmetered(charge: Charge) -> Self {
         Self {
             ledger: None,
@@ -515,7 +422,6 @@ impl Reservation {
         }
     }
 
-    /// The charge this reservation still holds.
     pub fn charge(&self) -> Charge {
         self.charge
     }
@@ -539,15 +445,12 @@ impl Reservation {
         }
     }
 
-    /// Whether this reservation draws on `ledger`.
     fn is_for(&self, ledger: &Arc<Ledger>) -> bool {
         self.ledger
             .as_ref()
             .is_some_and(|own| Arc::ptr_eq(own, ledger))
     }
 
-    /// Hand the charge to a resident batch: dropping `self` afterwards
-    /// releases nothing.
     fn convert(&mut self) -> Charge {
         self.ledger = None;
         std::mem::replace(&mut self.charge, Charge::ZERO)
@@ -562,12 +465,10 @@ impl Drop for Reservation {
     }
 }
 
-/// One resident batch and the charge it holds until drain.
 #[derive(Debug)]
 struct Resident {
     batch: Arc<IngestBatch>,
     charge: Charge,
-    /// Monotonic insert time, for the oldest-batch age gauge.
     inserted: Instant,
     /// Age the batch already had when it became resident: zero for an
     /// insert, the WAL file's age for a hydrated batch.
@@ -580,7 +481,6 @@ impl Resident {
     }
 }
 
-/// One batch reloaded from the WAL at boot, for [`HotBuffer::hydrate`].
 #[derive(Debug)]
 pub(crate) struct HydratedBatch {
     /// The batch under its existing id (`{env}/{WAL filename stem}`); its
@@ -591,40 +491,25 @@ pub(crate) struct HydratedBatch {
     pub age: Duration,
 }
 
-/// Why [`HotBuffer::hydrate`] refused to install a plan. Each is a boot
-/// bug, not a runtime condition: the plan is built to fit an empty buffer
-/// once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HydrateError {
-    /// The buffer was already hydrated (or a hydration was attempted).
     #[error("the hot buffer was already hydrated")]
     AlreadyHydrated,
     /// Something is already charged: a resident batch or a reservation.
     #[error("the hot buffer is not empty")]
     NotEmpty,
-    /// The plan's total exceeds a full cap.
     #[error("the hydration plan exceeds the hot-buffer caps")]
     ExceedsCaps,
 }
 
-/// An atomic view of the hot buffer for one query: the snapshot file, the
-/// keys its events carry, and the catalog pins that apply to it.
-///
-/// `field_types` is the catalog's pins intersected with the key set the
-/// snapshot's events actually carry, computed fresh on every
-/// [`HotBuffer::snapshot`] call, never cached per generation. Compaction
-/// makes pins durable and refreshes the in-process cache before the atomic
-/// rename publishes the conformant parquet, but the hot drain that bumps the
-/// buffer generation happens after that rename; a generation-cached pin set
-/// would be stale in between and the union would hard-error. Intersecting
-/// with the observed keys also guarantees the emitter's `REPLACE` never names
-/// a column absent from the snapshot.
+/// `field_types` is computed fresh on every [`HotBuffer::snapshot`] call,
+/// never cached per generation: the hot drain that bumps the generation
+/// happens after compaction's rename publishes the conformant parquet, so
+/// a generation-cached pin set would be stale in between and the union
+/// would hard-error.
 #[derive(Debug, Clone)]
 pub struct HotSnapshot {
-    /// The ndjson snapshot file (shared across concurrent queries).
     pub file: Arc<tempfile::NamedTempFile>,
-    /// Catalog pins ∩ observed keys — what the emitter conforms the hot
-    /// branch of the union with.
     pub field_types: Arc<trawl_core::schema::FieldTypes>,
     /// Every key the file's events carry and, among them, the keys whose
     /// every value is JSON `null` (ADR-0062). Built once per generation by
@@ -634,23 +519,17 @@ pub struct HotSnapshot {
 }
 
 impl HotSnapshot {
-    /// Path of the snapshot file (delegates to the temp file).
     #[must_use]
     pub fn path(&self) -> &std::path::Path {
         self.file.path()
     }
 }
 
-/// One cache slot: the generation it was built at, the snapshot file, and
-/// the key set the file actually carries (the same pass that finds the
-/// schema pioneers — pins are intersected against it on every call), with
-/// the [`HotSnapshot::columns`] that pass's null-only evidence builds.
 struct CachedSnapshot {
     generation: u64,
     file: Arc<tempfile::NamedTempFile>,
     keys: Vec<String>,
     columns: Arc<trawl_core::emitter::HotColumns>,
-    /// The events the file holds, for [`SnapshotRecord`].
     #[cfg(any(test, feature = "test-support"))]
     events: usize,
 }
@@ -660,15 +539,12 @@ struct CachedSnapshot {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotRecord {
-    /// The buffer generation the answer is keyed by.
     pub generation: u64,
     /// The events the answer's file holds: the resident events at the
     /// instant it was built. Zero for an empty buffer's `None`.
     pub events: usize,
 }
 
-/// Batch-keyed in-memory event store.
-///
 /// Uses an `IndexMap` for insertion-order iteration (the first entry is
 /// the oldest resident) keyed by batch id (`{env}/{WAL filename stem}`,
 /// the shape compaction derives to drain what it just wrote).
@@ -682,29 +558,14 @@ pub struct HotBuffer {
     total_bytes: AtomicUsize,
     config: HotBufferConfig,
     ledger: Arc<Ledger>,
-    /// Set by the first [`hydrate`](Self::hydrate) call, whatever its
-    /// outcome: hydration happens at most once per buffer.
     hydrated: AtomicBool,
-    /// Monotonic counter bumped on every mutation (insert, hydrate, drain).
-    /// Used to invalidate the snapshot cache.
     generation: AtomicU64,
-    /// Cached snapshot, reused across concurrent queries when the buffer
-    /// hasn't changed, avoiding O(events × queries) I/O. Old snapshots stay
-    /// alive via Arc until all queries using them finish.
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
-    /// Shared in-process pin cache; empty for a catalog-less buffer
-    /// (embedded mode, unit tests), which yields empty `field_types` on
-    /// every snapshot.
     field_catalog: Arc<crate::catalog::FieldCatalog>,
-    /// Set by [`fail_next_snapshot_for_test`](Self::fail_next_snapshot_for_test):
-    /// the next snapshot build refuses its first event's write.
     #[cfg(any(test, feature = "test-support"))]
     fail_next_snapshot: AtomicBool,
-    /// Every answered snapshot call, built, cached or empty
-    /// ([`snapshots_for_test`](Self::snapshots_for_test)).
     #[cfg(any(test, feature = "test-support"))]
     snapshot_log: Mutex<Vec<SnapshotRecord>>,
-    /// The events the last build wrote, read back under the cache lock.
     #[cfg(any(test, feature = "test-support"))]
     built_events: AtomicUsize,
 }
@@ -723,8 +584,6 @@ impl std::fmt::Debug for HotBuffer {
 }
 
 impl HotBuffer {
-    /// Create a new hot buffer with the given limits (catalog-less — every
-    /// snapshot carries empty `field_types`).
     pub fn new(config: HotBufferConfig) -> Self {
         Self {
             publication: Arc::new(crate::publication::PublicationGate::new()),
@@ -749,15 +608,11 @@ impl HotBuffer {
         }
     }
 
-    /// Shared publication interlock for this buffer and its cold corpus.
     #[must_use]
     pub fn publication(&self) -> Arc<crate::publication::PublicationGate> {
         Arc::clone(&self.publication)
     }
 
-    /// Share `publication` in place of the settled gate [`new`](Self::new)
-    /// builds, for tests whose buffer needs a gate born starting
-    /// (ADR-0041 slice 2).
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_publication_for_test(
@@ -768,8 +623,6 @@ impl HotBuffer {
         self
     }
 
-    /// Attach the shared in-process pin cache; snapshots then carry the
-    /// pins intersected with their observed key set.
     #[must_use]
     pub fn with_field_catalog(mut self, catalog: Arc<crate::catalog::FieldCatalog>) -> Self {
         self.field_catalog = catalog;
@@ -786,13 +639,6 @@ impl HotBuffer {
         self
     }
 
-    /// Admit `charge` for `producer`, or refuse it without changing any
-    /// state but the refusal counter (and, for [`Refusal::Full`], the
-    /// latched [`AdmissionState::Refusing`] and a pressure wake).
-    ///
-    /// Synchronous, O(1), no I/O, no tracing. A zero charge is admitted
-    /// without taking the lock. [`Refusal::Oversized`] is decided from the
-    /// producer's ceiling alone, before occupancy is consulted.
     pub(crate) fn reserve(
         &self,
         producer: ProducerKind,
@@ -801,43 +647,19 @@ impl HotBuffer {
         self.ledger.reserve(producer, charge)
     }
 
-    /// Refuse early, before any decompression or parsing, when `producer`
-    /// has no free space at all: [`Refusal::Full`] iff the charged total is
-    /// at or above the producer's ceiling on either dimension. Counts the
-    /// refusal, latches `Refusing` and wakes compaction, like a `Full`
-    /// [`reserve`](Self::reserve).
-    ///
-    /// A producer whose ceiling is zero on a dimension (a cap of 0 or 1 for
-    /// an external producer) can fit no non-empty charge, so it gets
-    /// [`Refusal::Oversized`] instead, with no state change.
     pub(crate) fn ensure_free_space(&self, producer: ProducerKind) -> Result<(), Refusal> {
         self.ledger.ensure_free_space(producer)
     }
 
-    /// The most `producer` may have charged at once: the full caps for
-    /// self-telemetry, [`external_ceiling`] for everything else.
     pub(crate) fn ceiling(&self, producer: ProducerKind) -> Charge {
         self.ledger.ceiling(producer)
     }
 
-    /// Insert an admitted batch. Performs no capacity check and evicts
-    /// nothing: the space was admitted by `reservation`, whose charge moves
-    /// into the resident batch here and is released by [`drain`](Self::drain).
-    ///
-    /// The reservation must come from this buffer, hold exactly the batch's
-    /// `(events.len(), byte_size)`, and the batch id must not already be
-    /// resident. A duplicate id keeps the existing resident and releases
-    /// the new reservation, so a resident is never replaced; the duplicate
-    /// is a writer bug, counted in `trawl_hot_buffer_duplicate_batches_total`
-    /// and logged as an ERROR.
-    ///
     /// # Panics
     ///
     /// If the reservation was not taken from this buffer (or is unmetered):
     /// its charge lives in another ledger, and no local repair keeps both
-    /// ledgers exact. A charge that differs from the batch is a debug
-    /// assertion; release builds reconcile the ledger to the batch's actual
-    /// charge.
+    /// ledgers exact.
     pub fn insert(&self, mut reservation: Reservation, batch: Arc<IngestBatch>) {
         assert!(
             reservation.is_for(&self.ledger),
@@ -852,7 +674,6 @@ impl HotBuffer {
             actual,
             "hot-buffer insert whose reservation does not match the batch"
         );
-        // The newcomer comes back out only when its id is already resident.
         let duplicate = {
             let mut map = self.batches.write();
             match map.entry(Arc::clone(&batch.batch_id)) {
@@ -891,8 +712,6 @@ impl HotBuffer {
         }
     }
 
-    /// Insert without a producer's reservation, for tests: reserves as
-    /// [`ProducerKind::Trawld`] (the full caps) and panics on refusal.
     #[cfg(any(test, feature = "test-support"))]
     pub fn insert_for_test(&self, batch: Arc<IngestBatch>) {
         let charge = Charge {
@@ -906,27 +725,10 @@ impl HotBuffer {
     }
 
     /// Install the WAL that survived a restart as resident batches, once,
-    /// into an empty buffer (ADR-0041 slice 2). Returns the total charged.
-    ///
-    /// The whole plan is checked against the full caps before anything
-    /// changes; a plan that does not fit is [`HydrateError::ExceedsCaps`]
-    /// and leaves the buffer untouched. Each batch is charged exactly its
-    /// `(events.len(), byte_size)`. The ledger then settles as after any
-    /// charge, so occupancy may enter `Pressure`, but hydration is not a
-    /// producer: it never latches `Refusing`, counts no refusal, advances
-    /// neither the pressure nor the released watch, and does not count
-    /// toward [`inserted_batches`](Self::inserted_batches).
-    ///
-    /// The first call spends the one shot whatever its outcome, an empty
-    /// plan included; every later call is [`HydrateError::AlreadyHydrated`].
-    /// A buffer with anything charged (a resident batch or an outstanding
-    /// reservation) is [`HydrateError::NotEmpty`], checked under both locks
-    /// so no producer can slip in between the check and the install.
+    /// into an empty buffer (ADR-0041 slice 2).
     ///
     /// Batches become resident oldest first by `age` (ties keep the plan's
-    /// order), so the map's first entry stays the oldest. A batch id that
-    /// repeats within the plan keeps its first occurrence, like a duplicate
-    /// [`insert`](Self::insert).
+    /// order), so the map's first entry stays the oldest.
     pub(crate) fn hydrate(&self, batches: Vec<HydratedBatch>) -> Result<Charge, HydrateError> {
         if self.hydrated.swap(true, Ordering::AcqRel) {
             return Err(HydrateError::AlreadyHydrated);
@@ -982,17 +784,12 @@ impl HotBuffer {
         Ok(total)
     }
 
-    /// Whether `batch_id` (`{env}/{WAL filename stem}`) is resident.
     pub(crate) fn is_resident(&self, batch_id: &str) -> bool {
         self.batches.read().contains_key(batch_id)
     }
 
     /// Remove batches that have been compacted to parquet, releasing their
-    /// charge.
-    ///
-    /// Called after compaction writes parquet — the same batch IDs
-    /// are drained from the hot buffer. The only way anything leaves the
-    /// buffer. The release happens under the map lock (map, then ledger),
+    /// charge. The release happens under the map lock (map, then ledger),
     /// so no observer sees a batch gone while its charge is still held.
     pub fn drain(&self, batch_ids: &[&str]) {
         let mut map = self.batches.write();
@@ -1018,7 +815,6 @@ impl HotBuffer {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The ledger's hysteresis state, lock-free.
     pub fn admission_state(&self) -> AdmissionState {
         self.ledger.admission()
     }
@@ -1067,39 +863,18 @@ impl HotBuffer {
         self.ledger.pressure.subscribe()
     }
 
-    /// Get a snapshot of all buffered events as a temporary ndjson file in
-    /// the query scratch directory, paired with the catalog pins that apply
-    /// to it.
-    ///
-    /// Returns `Ok(None)` if the buffer holds no event, and an error if the
-    /// file cannot be built: creating it, writing or serializing any one
-    /// event, or flushing it. A failure is never an empty buffer, because
-    /// a reader that took it for one would answer without the newest
-    /// events (ADR-0041).
-    ///
-    /// Uses a generation-based cache: concurrent queries against an unchanged
-    /// buffer share a single snapshot file (1 disk write instead of N).
-    /// The `Arc` ensures the temp file stays alive until all queries using it finish.
-    /// Every caller holds an executor permit while it holds a snapshot, so
-    /// at most one file per permit plus the cached one exists at a time,
-    /// each no larger than the serialized buffer (ADR-0056).
-    ///
-    /// The file is cached per generation; the pin intersection is not — see
-    /// [`HotSnapshot`] for why a generation-cached pin set would be stale in
-    /// the compaction rename-to-drain window. The intersect is O(observed
-    /// keys) over an in-process map, negligible next to the query itself.
+    /// Returns `Ok(None)` if the buffer holds no event. A failure is never an
+    /// empty buffer, because a reader that took it for one would answer
+    /// without the newest events (ADR-0041).
     ///
     /// The snapshot cache mutex is held for the entire check-then-build
-    /// cycle to serialize concurrent misses — one thread builds while
-    /// others wait ~40ms and get the cached result, preventing thundering
-    /// herd I/O.
+    /// cycle to serialize concurrent misses.
     ///
     /// # Errors
     ///
     /// The I/O error that stopped the build. Its text can quote a path;
     /// callers report its kind, not its text.
     pub fn snapshot(&self, scratch: &QueryScratch) -> std::io::Result<Option<HotSnapshot>> {
-        // Fast path: no events at all → skip locking entirely.
         if self.total_events.load(Ordering::Relaxed) == 0 {
             #[cfg(any(test, feature = "test-support"))]
             self.record_snapshot(self.generation.load(Ordering::Relaxed), 0);
@@ -1122,7 +897,6 @@ impl HotBuffer {
             }));
         }
 
-        // Cache miss — build under lock so concurrent queries wait.
         let Some((file, keys, null_only)) = self.build_snapshot(scratch)? else {
             #[cfg(any(test, feature = "test-support"))]
             self.record_snapshot(current_gen, 0);
@@ -1167,13 +941,11 @@ impl HotBuffer {
         self.snapshot_log.lock().clone()
     }
 
-    /// Empty the [`snapshots_for_test`](Self::snapshots_for_test) log.
     #[cfg(any(test, feature = "test-support"))]
     pub fn clear_snapshots_for_test(&self) {
         self.snapshot_log.lock().clear();
     }
 
-    /// The buffer's current generation, which every mutation advances.
     #[cfg(any(test, feature = "test-support"))]
     pub fn generation_for_test(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
@@ -1230,21 +1002,6 @@ impl HotBuffer {
     /// them whose every value is JSON `null`. Both come from the survey
     /// over the events the file is written from, under the same read lock,
     /// so no insert can slip between the evidence and the file.
-    ///
-    /// Events are written schema-pioneers-first (see [`survey_schema`]) so
-    /// that the reader can rely on `DuckDB`'s cheap default schema sample.
-    ///
-    /// The key set is ASCII-lowercase by construction, so no case merging
-    /// happens here: the production callers of [`HotBuffer::insert`] are
-    /// exactly `PipelineWriter`'s publish path and telemetry's flush, and every event reaching them was
-    /// canonicalized in `ingest::envelope::canonicalize`,
-    /// the one door that folds field names. Test-only constructors that
-    /// insert unfolded keys get the loud behaviour: an unnameable `x_1` twin
-    /// column, not a silent merge.
-    ///
-    /// `Ok(None)` when no batch holds an event. Any failure fails the whole
-    /// build and is returned, not logged: the reader that asked refuses,
-    /// and its failure record names the kind.
     fn build_snapshot(&self, scratch: &QueryScratch) -> std::io::Result<Option<SurveyedFile>> {
         let map = self.batches.read();
         let events: Vec<&Event> = map
@@ -1279,79 +1036,41 @@ impl HotBuffer {
         };
         let mut writer = writer;
         write_events(&mut writer, order)?;
-        // Flush to ensure DuckDB can read the file.
         writer.flush()?;
         drop(writer);
         Ok(Some((tmpfile, keys, null_only)))
     }
 
-    /// Total number of events across all batches.
     pub fn event_count(&self) -> usize {
         self.total_events.load(Ordering::Relaxed)
     }
 
-    /// Total estimated bytes across all batches.
     pub fn byte_count(&self) -> usize {
         self.total_bytes.load(Ordering::Relaxed)
     }
 
-    /// Number of batches in the buffer.
     pub fn batch_count(&self) -> usize {
         self.batches.read().len()
     }
 
-    /// Buffer configuration (max events, max bytes).
     pub fn config(&self) -> &HotBufferConfig {
         &self.config
     }
 }
 
-/// A built snapshot file, its key set and its null-only keys.
 type SurveyedFile = (tempfile::NamedTempFile, Vec<String>, Vec<String>);
 
-/// What one pass over the buffered events finds.
 struct Survey {
     /// Per event, in order: whether it carries a key no earlier event did.
     pioneers: Vec<bool>,
-    /// The union of every event's keys.
     keys: Vec<String>,
     /// The keys no event holds a non-null value under.
     null_only: Vec<String>,
 }
 
-/// Survey the events in one pass: flag the schema pioneers, collect the
-/// full observed key set, and find the keys that never held a non-null
-/// value.
-///
-/// `DuckDB`'s `read_json` auto-detection infers the schema from a bounded
-/// prefix of the file (~20480 records) and then hard-errors (`unknown key`)
-/// on any later record carrying a key outside it. `_repairs` is sparse by
-/// construction (only repaired events carry it, ADR-0008) and the buffer
-/// holds up to `max_events` (100k by default), so a single repaired event
-/// past the prefix would break every query touching the hot buffer.
-///
-/// Detecting over the whole file (`sample_size=-1`) also cures that, but
-/// costs a re-parse of the entire snapshot on every query and SSE poll:
-/// ~2.7x the read (+135ms measured on a full 100k-event / 100 MiB buffer,
-/// ~1s at half a million records), growing with the configured buffer size.
-/// Writing the pioneers first puts the complete key set inside the detection
-/// prefix for the price of one pass over the buffer, and does it with the
-/// events' real values: an always-emitted null placeholder column would be
-/// inferred as JSON, so `_repairs` would come back quoted and numeric fields
-/// would stop being numbers.
-///
-/// A homogeneous buffer has exactly one pioneer (the first event), so the
-/// snapshot order is unchanged in the common case.
-///
-/// The key set falls out of the same pass for free: the seen-set is the
-/// union of every event's keys. The caller intersects catalog pins against
-/// it, so the emitter's `REPLACE` can never name an absent column.
-///
-/// The null-only evidence (ADR-0062) is read off the values themselves,
-/// every event's, never off `DuckDB`'s inferred type: a key whose only
-/// non-null value sits past the inference prefix reads as JSON there, and
-/// treating it as null would erase that value. Any non-null value clears a
-/// key, so the evidence errs toward "carries data".
+/// Writing the pioneers first puts the complete key set inside `DuckDB`'s
+/// detection prefix (ADR-0008). The null-only evidence (ADR-0062) is read
+/// off the values themselves, never off `DuckDB`'s inferred type.
 fn survey_schema<'a>(events: impl Iterator<Item = &'a Event>) -> Survey {
     let mut seen: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
     let mut non_null: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
@@ -1379,14 +1098,6 @@ fn survey_schema<'a>(events: impl Iterator<Item = &'a Event>) -> Survey {
     }
 }
 
-/// Write `events` as ndjson, one line each, in order.
-///
-/// Events are written verbatim: ingest canonicalization already stringified
-/// top-level object/array values (ADR-0009), so every value is a scalar.
-/// The first failure, one event's serialization included, fails the whole
-/// write: a snapshot that skipped an event would answer a read without it.
-/// A serialization error that is not I/O becomes
-/// [`InvalidData`](std::io::ErrorKind::InvalidData).
 fn write_events<'a, W: std::io::Write>(
     writer: &mut W,
     events: impl Iterator<Item = &'a Event>,
@@ -1410,10 +1121,6 @@ pub struct TestScratch {
 
 #[cfg(any(test, feature = "test-support"))]
 impl TestScratch {
-    /// Make one.
-    ///
-    /// # Panics
-    /// The temp directory could not be made.
     #[must_use]
     pub fn new() -> Self {
         let dir = tempfile::tempdir().expect("make a scratch temp dir");
@@ -1484,7 +1191,7 @@ mod tests {
         Arc::new(IngestBatch {
             batch_id: id.into(),
             service: "test".into(),
-            byte_size: n * 50, // rough estimate
+            byte_size: n * 50,
             events,
         })
     }
@@ -1572,11 +1279,6 @@ mod tests {
     #[test]
     fn snapshot_hoists_schema_pioneers_to_the_front() {
         let scratch = TestScratch::new();
-        // DuckDB infers the snapshot's schema from a bounded prefix and then
-        // hard-errors on a later record with a key outside it. `_repairs`
-        // is sparse by construction (ADR-0008), so the writer moves the events
-        // that introduce a new key to the front — cheaper than making every
-        // query re-detect over the whole file.
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 1000,
             max_bytes: 10_000_000,
@@ -1679,10 +1381,6 @@ mod tests {
 
     #[test]
     fn snapshot_field_types_is_pins_intersect_observed_keys() {
-        // The snapshot's pin set is the catalog intersected with the keys
-        // the buffered events actually carry: a pin on a field no event has
-        // must not reach the emitter (REPLACE on an absent column throws),
-        // and an observed key without a pin contributes nothing.
         use trawl_core::schema::CanonicalType;
         let scratch = TestScratch::new();
 
@@ -1723,12 +1421,6 @@ mod tests {
 
     #[test]
     fn snapshot_reflects_new_pins_at_same_generation() {
-        // Compaction makes pins durable and refreshes the cache before the
-        // atomic rename publishes the conformant parquet, but the hot drain
-        // that bumps the generation happens after it. A generation-cached pin
-        // set would be stale in that window, and nothing retries a failed
-        // union, so a stale set is a hard error. Pins are therefore
-        // intersected on every snapshot() call, cache hit included.
         use trawl_core::schema::CanonicalType;
         let scratch = TestScratch::new();
 
@@ -1771,7 +1463,6 @@ mod tests {
         );
     }
 
-    /// One event with `_time`, a message and the given extra fields.
     fn event_with(i: usize, fields: &[(&str, serde_json::Value)]) -> Event {
         let mut m = serde_json::Map::new();
         m.insert(
@@ -1838,7 +1529,6 @@ mod tests {
             assert!(snap.columns.contains(key), "{key} is a snapshot key");
         }
 
-        // The engine's test door reads the same evidence off the file.
         let from_file = trawl_engine::executor::hot_columns_of(snap.path());
         assert_eq!(
             *snap.columns, from_file,
@@ -1865,8 +1555,6 @@ mod tests {
         let first = buf.snapshot(&scratch).unwrap().expect("should have events");
         assert!(first.columns.is_null_only("k"));
 
-        // A pin lands at the same generation: the pins refresh, the file
-        // and its evidence are the cached ones.
         catalog.replace([("k".to_string(), CanonicalType::BigInt)]);
         let pinned = buf.snapshot(&scratch).unwrap().expect("should have events");
         assert!(Arc::ptr_eq(&first.file, &pinned.file));
@@ -1874,8 +1562,6 @@ mod tests {
         assert!(pinned.columns.is_null_only("k"));
         assert_eq!(pinned.field_types.get("k"), Some(CanonicalType::BigInt));
 
-        // The next generation carries a non-null value: the evidence is
-        // rebuilt with the file and `k` is no longer null-only.
         insert_events(
             &buf,
             "b2",
@@ -1936,7 +1622,6 @@ mod tests {
 
         let tmpfile = buf.snapshot(&scratch).unwrap().expect("should have events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
-        // All 5 events from both batches should be in the snapshot.
         assert_eq!(content.lines().count(), 5);
     }
 
@@ -1950,15 +1635,12 @@ mod tests {
         buf.insert_for_test(make_batch("batch_001", 2));
         buf.insert_for_test(make_batch("batch_002", 3));
 
-        // Take a snapshot (Arc-wrapped temp file).
         let snapshot = buf.snapshot(&scratch).unwrap().expect("should have events");
         let content_before = std::fs::read_to_string(snapshot.path()).unwrap();
         assert_eq!(content_before.lines().count(), 5);
 
-        // Drain batch_001 — simulates compaction finishing.
         buf.drain(&["batch_001"]);
 
-        // The pre-drain snapshot file is still valid (Arc keeps it alive).
         let content_after = std::fs::read_to_string(snapshot.path()).unwrap();
         assert_eq!(content_after, content_before);
     }
@@ -2003,9 +1685,6 @@ mod tests {
         }
     }
 
-    /// One event that fails to serialize fails the whole snapshot write
-    /// (ADR-0041). Skipping it would leave a snapshot that answers a read
-    /// without that event.
     #[test]
     fn snapshot_failure_of_one_event_fails_the_whole_write() {
         let batch = make_batch("batch_001", 3);
@@ -2031,9 +1710,6 @@ mod tests {
         );
     }
 
-    /// A snapshot that cannot be built is an error, never `Ok(None)`, which
-    /// means an empty buffer. The failure is not cached: the next build is
-    /// whole.
     #[test]
     fn snapshot_failure_is_an_error_never_an_empty_buffer() {
         let scratch = TestScratch::new();
@@ -2072,8 +1748,6 @@ mod tests {
         assert_eq!(buf.event_count(), 2);
     }
 
-    // -- admission ledger ----------------------------------------------------
-
     use crate::ingest::producer::ProducerKind::{Http, Syslog, Trawld};
 
     pub(super) fn ledger_buffer(events: usize, bytes: usize) -> HotBuffer {
@@ -2087,7 +1761,6 @@ mod tests {
         Charge { events, bytes }
     }
 
-    /// A batch whose `(events.len(), byte_size)` is exactly `charge`.
     pub(super) fn batch_of(id: &str, charge: Charge) -> Arc<IngestBatch> {
         Arc::new(IngestBatch {
             batch_id: id.into(),
@@ -2161,7 +1834,6 @@ mod tests {
                 assert_eq!(series(producer, "full"), 0);
             }
 
-            // What exactly fits the ceiling is admitted on an empty buffer.
             let fits = buf.reserve(Http, charge(150, 15_000)).unwrap();
             assert_eq!(buf.charged(), charge(150, 15_000));
             drop(fits);
@@ -2179,7 +1851,6 @@ mod tests {
         assert_eq!(buf.ceiling(Syslog), charge(150, 15_000));
         assert_eq!(buf.ceiling(Trawld), charge(160, 16_000));
 
-        // Events dimension.
         let http = buf.reserve(Http, charge(150, 1)).unwrap();
         assert_eq!(buf.reserve(Http, charge(1, 0)).unwrap_err(), Refusal::Full);
         assert_eq!(
@@ -2195,7 +1866,6 @@ mod tests {
         drop((http, trawld));
         assert_eq!(buf.charged(), Charge::ZERO);
 
-        // Bytes dimension.
         let http = buf.reserve(Http, charge(1, 15_000)).unwrap();
         assert_eq!(buf.reserve(Http, charge(0, 1)).unwrap_err(), Refusal::Full);
         let trawld = buf.reserve(Trawld, charge(1, 1_000)).unwrap();
@@ -2205,8 +1875,6 @@ mod tests {
         );
         drop((http, trawld));
 
-        // The predicate counts everything charged, telemetry included: the
-        // reserve is a floor of opportunity for trawld, not an allocation.
         let trawld = buf.reserve(Trawld, charge(150, 0)).unwrap();
         assert_eq!(buf.reserve(Http, charge(1, 0)).unwrap_err(), Refusal::Full);
         drop(trawld);
@@ -2386,8 +2054,6 @@ mod tests {
                 2
             );
 
-            // A cap of 1 leaves external producers a zero ceiling: that
-            // can never fit, so it is oversized and latches nothing.
             let tiny = ledger_buffer(1, 1_000);
             assert_eq!(tiny.ensure_free_space(Http), Err(Refusal::Oversized));
             assert_eq!(tiny.admission_state(), AdmissionState::Open);
@@ -2401,14 +2067,11 @@ mod tests {
         let mut pressure = buf.subscribe_pressure();
         pressure.borrow_and_update();
 
-        // Open: an insert is not a pressure signal.
         let small = buf.reserve(Syslog, charge(10, 0)).unwrap();
         buf.insert(small, batch_of("env/small", charge(10, 0)));
         assert!(!pressure.has_changed().unwrap());
         assert_eq!(buf.inserted_batches(), 1, "every insert counts, Open too");
 
-        // A successful reserve that enters pressure does not wake: the WAL
-        // file does not exist yet.
         let big = buf.reserve(Syslog, charge(50, 0)).unwrap();
         assert_eq!(buf.admission_state(), AdmissionState::Pressure);
         assert!(!pressure.has_changed().unwrap());
@@ -2525,7 +2188,6 @@ mod tests {
         assert_eq!(buf.charged(), charge(10, 100), "a split charges nothing");
         drop(part);
         assert_eq!(buf.charged(), charge(6, 60));
-        // A taken share converts on insert; the remainder still releases.
         let share = whole.take(charge(2, 20));
         buf.insert(share, batch_of("prod/share", charge(2, 20)));
         drop(whole);
@@ -2685,7 +2347,6 @@ mod tests {
         let mut released = buf.subscribe_released();
         released.borrow_and_update();
 
-        // Matching charge: nothing moves.
         assert_eq!(
             ledger.reconcile(charge(10, 100), charge(10, 100)),
             charge(10, 100)
@@ -2712,7 +2373,6 @@ mod tests {
             "a converted reservation releases nothing"
         );
 
-        // Releasing the resident charge brings the ledger back exactly.
         ledger.release(resident);
         assert_eq!(buf.charged(), charge(5, 50));
     }
@@ -2807,8 +2467,6 @@ mod hydrate {
         metrics::with_local_recorder(&recorder, || {
             crate::metrics::init_operational_alert_metrics();
             let buf = ledger_buffer(100, 1_000);
-            // Above the external ceiling (93 / 937): hydration charges the
-            // full caps, like self-telemetry, never the external share.
             let total = buf
                 .hydrate(vec![
                     fresh("prod/a", charge(60, 600)),
@@ -2886,16 +2544,12 @@ mod hydrate {
             );
             assert_eq!(refusal_series(&handle).iter().sum::<u64>(), 1);
 
-            // Draining the hydrated batch is the normal exit.
             buf.drain(&["prod/a"]);
             assert_eq!(buf.charged(), Charge::ZERO);
             assert_eq!(buf.admission_state(), AdmissionState::Open);
         });
     }
 
-    /// Only a buffer given a starting gate refuses reads before hydration:
-    /// [`HotBuffer::new`] stays settled, so every buffer built outside
-    /// `AppState::from_parts` serves at once (ADR-0041 slice 2).
     #[test]
     fn only_a_buffer_given_a_starting_gate_starts_unsettled() {
         use crate::publication::{CorpusUnsettled, PublicationGate};
@@ -2937,7 +2591,6 @@ mod hydrate {
 
     #[test]
     fn hydrate_on_a_non_empty_ledger_is_not_empty() {
-        // A resident batch.
         let buf = ledger_buffer(100, 1_000);
         buf.insert_for_test(batch_of("prod/live", charge(1, 10)));
         assert_eq!(
@@ -2947,7 +2600,6 @@ mod hydrate {
         assert_eq!(buf.charged(), charge(1, 10));
         assert!(!buf.is_resident("prod/a"));
 
-        // An outstanding reservation alone.
         let buf = ledger_buffer(100, 1_000);
         let held = buf.reserve(Trawld, charge(1, 10)).unwrap();
         assert_eq!(
@@ -3050,7 +2702,6 @@ mod hydrate {
         assert_eq!(content.lines().count(), 3);
         assert!(content.contains("first") && content.contains("second"));
 
-        // Live inserts follow the hydrated batches as usual.
         let live = buf.reserve(Http, charge(1, 5)).unwrap();
         buf.insert(live, batch_of("prod/live", charge(1, 5)));
         assert_eq!(buf.charged(), charge(4, 50));
@@ -3077,7 +2728,6 @@ mod hydrate {
         assert!(oldest >= hour, "{oldest:?}");
         assert!(oldest < hour + Duration::from_secs(60), "{oldest:?}");
 
-        // The gauge is the same reader.
         let recorder = crate::metrics::prometheus_builder().build_recorder();
         let handle = recorder.handle();
         let buf = Arc::new(buf);
@@ -3101,12 +2751,10 @@ mod hydrate {
             .unwrap();
         assert!(gauge >= hour.as_secs_f64(), "{gauge}");
 
-        // Draining the oldest hands the gauge to the next oldest.
         buf.drain(&["prod/old"]);
         let next = buf.oldest_batch_age().unwrap();
         assert!(next >= Duration::from_secs(60) && next < hour, "{next:?}");
 
-        // An age past what the clock can hold saturates instead of panicking.
         let buf = ledger_buffer(100, 1_000);
         buf.hydrate(vec![aged("prod/ancient", charge(1, 1), Duration::MAX)])
             .unwrap();
@@ -3126,7 +2774,6 @@ mod duplicate_identity {
     /// `(level, event_type, field names)` of one recorded event.
     type Recorded = (tracing::Level, Option<String>, Vec<String>);
 
-    /// Every event recorded while installed.
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<Recorded>>>);
 
@@ -3203,8 +2850,7 @@ mod duplicate_identity {
                 let mut released = buf.subscribe_released();
                 released.borrow_and_update();
 
-                // Same id, different rows and charge. Debug builds used to
-                // panic here; they now take the release path.
+                // Same id, different rows and charge.
                 let intruder = rows("prod/svc_1_abcd", &["lost_one", "lost_two", "lost_three"]);
                 let held = buf.reserve(Syslog, charge(3, 30)).unwrap();
                 buf.insert(held, intruder);

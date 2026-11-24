@@ -5,24 +5,13 @@
 //! Postgres-backed field catalog: type pins, per-service observations, and
 //! conflict evidence (ADR-0009).
 //!
-//! The catalog is the write-time type authority: compaction pins every
-//! dynamic field's canonical type here before the first parquet file
-//! carrying it is written, and conforms every batch to the pins, so
-//! `union_by_name` across any set of trawl-written files can never
-//! conflict. Pins are add-only on the ingest path (the two mutations are
-//! both operator-triggered: the repin cutover, `store::repin`, and the pin
-//! purge, [`CatalogStore::delete_pins`]), and because a pin slot is
-//! therefore spent for good by ingest while its name is a client-chosen key,
-//! the catalog is bounded where a sender controls the axis: name length by
+//! Pins are add-only on the ingest path, and a pin slot is spent for good while
+//! its name is a client-chosen key, so the catalog is bounded where a sender
+//! controls the axis: name length by
 //! [`trawl_core::schema::is_storable_field_name`], pin count by
 //! [`MAX_PINNED_FIELDS`], and per-field conflict evidence by
-//! [`MAX_CONFLICTS_PER_FIELD`]. `field_services` rows are ever-observed:
-//! nothing removes one, and its worst case is bounded by the pin cap on the
-//! field axis times the services a deployment really runs; consumers window
-//! on `last_seen`. Its service axis has no cap at all (service names are
-//! client-chosen and no row is ever removed), so the read surface pages it:
-//! [`CatalogStore::field_services`] takes a bounded limit and a
-//! [`ServiceCursor`], never the whole history.
+//! [`MAX_CONFLICTS_PER_FIELD`]. The `field_services` service axis has no cap at
+//! all, so [`CatalogStore::field_services`] pages it.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -34,33 +23,24 @@ use super::error::{PgViolation, StoreError, classify_violation};
 use super::pooled::PooledTransaction;
 use crate::catalog::analyzer::{ConflictAggregate, is_degraded, meets_degraded_threshold};
 
-/// A proposed pin for a field absent from the catalog.
 #[derive(Debug, Clone)]
 pub struct PinProposal {
-    /// Field name (the global key).
     pub field: String,
-    /// The type the proposing batch's pin algorithm derived.
     pub ty: CanonicalType,
-    /// The service whose batch proposed the pin (audit trail).
     pub pinned_from: String,
 }
 
-/// One append-only conflict record: a batch column whose `TRY_CAST` to its
-/// pin nulled at least one value. A cast that nulls nothing is convergence,
-/// not conflict, and is never recorded (see `ConformPlan::tally_conflicts`);
-/// a row per lossless cast per compaction tick would grow without bound.
-/// What a genuinely lossy sender appends is bounded instead by
-/// [`MAX_CONFLICTS_PER_FIELD`].
+/// A batch column whose `TRY_CAST` to its pin nulled at least one value. A cast
+/// that nulls nothing is convergence, not conflict, and is never recorded (see
+/// `ConformPlan::tally_conflicts`); a row per lossless cast per compaction tick
+/// would grow without bound.
 #[derive(Debug, Clone)]
 pub struct FieldConflict {
-    /// Field name.
     pub field: String,
-    /// The service whose batch disagreed with the pin.
     pub service: String,
     /// The `DuckDB` type the batch actually carried (free-form spelling —
     /// may be `JSON` or a complex type, not only the canonical five).
     pub observed_type: String,
-    /// The pinned type the values were cast to.
     pub expected_type: CanonicalType,
     /// Rows whose value the cast nulled (recoverable from `_raw`).
     pub rows_nulled: u64,
@@ -72,46 +52,28 @@ pub struct FieldConflict {
     pub samples: Vec<String>,
 }
 
-/// One `(field, service)` observation reconstructed from a standing parquet
-/// file rather than reported by the batch that wrote it: the boot
-/// conformance pass's backfill ([`CatalogStore::backfill_services`]).
 #[derive(Debug, Clone)]
 pub struct ServiceObservation {
     /// Field name (already ASCII-folded — a catalog key).
     pub field: String,
-    /// Service that carries the field.
     pub service: String,
     /// Earliest instant the corpus attests to (the oldest partition
     /// directory carrying the column).
     pub first_seen: DateTime<Utc>,
     /// Latest instant the corpus attests to (the newest such partition).
     pub last_seen: DateTime<Utc>,
-    /// Rows the corpus holds for this `(field, service)` pair.
     pub row_count: i64,
 }
 
-/// One `(field, service)` pair carrying durable conflict evidence: a
-/// `field_conflict_stats` key, stripped of its counters
-/// ([`CatalogStore::conflict_service_pairs`]).
-///
-/// The counters are deliberately absent: the degraded verdict is per field
-/// (the pin is global), so all this row contributes is attribution, which
-/// sender's data the evidence came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictServicePair {
-    /// Field name (a catalog key).
     pub field: String,
-    /// Service whose batches contributed the conflict evidence.
     pub service: String,
 }
 
-/// One operator acknowledgement of a degraded pin: a `field_degraded_ack`
-/// row (migration 0015, issue #111).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DegradedAck {
-    /// The acknowledged field (a catalog key).
     pub field: String,
-    /// When the acknowledgement was written or last advanced.
     pub acked_at: DateTime<Utc>,
     /// The acknowledging key's stable prefix — never its display name: this
     /// row outlives renames and rotations.
@@ -125,34 +87,19 @@ pub struct DegradedAck {
     pub evidence_through: i64,
 }
 
-/// One field's health picture, read under a single snapshot by
-/// [`CatalogStore::field_health_snapshot`].
 #[derive(Debug, Clone)]
 pub struct FieldHealthSnapshot {
-    /// The field's conflict aggregate, absent when it has no evidence.
     pub aggregate: Option<crate::catalog::analyzer::ConflictAggregate>,
-    /// Newest `(observed_type, samples)` rows behind that aggregate.
     pub evidence: Vec<(String, Vec<String>)>,
-    /// The operator's acknowledgement, if the field carries one.
     pub ack: Option<DegradedAck>,
 }
 
-/// What [`CatalogStore::acknowledge_degraded_field`] did, or why it refused.
-///
-/// A typed outcome rather than an error: neither refusal is a fault. The
-/// caller (an HTTP handler) turns them into 404 and 409, and nothing else
-/// distinguishes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckOutcome {
-    /// The acknowledgement is stored. `created` and `advanced` are what the
-    /// audit event needs to tell the three shapes apart: a fresh row, a row
-    /// this call moved forward, and a row this call left alone because it
-    /// carried a higher high-water already.
     Acked {
         /// The stored row, as postgres returned it. On a stale call this is
         /// the OTHER operator's row, unchanged.
         ack: DegradedAck,
-        /// True when this call inserted the row rather than updating one.
         created: bool,
         /// True when this call's evidence high-water was at least the
         /// stored one, so the row now carries this call's actor, note and
@@ -160,7 +107,6 @@ pub enum AckOutcome {
         /// evidence and this call changed nothing.
         advanced: bool,
     },
-    /// No pin by that name: there is nothing to acknowledge.
     Unpinned,
     /// The field's evidence does not meet the degraded threshold, so there
     /// is no verdict to suppress. Acknowledging it would install a
@@ -169,33 +115,22 @@ pub enum AckOutcome {
     NotDegraded,
 }
 
-/// A `field_services` observation row.
 #[derive(Debug, Clone)]
 pub struct FieldServiceRow {
-    /// Service name.
     pub service: String,
-    /// First time compaction observed the field for this service.
     pub first_seen: DateTime<Utc>,
-    /// Most recent observation (consumers window on this — rows are
-    /// ever-observed: retention never reconciles them and nothing else
-    /// removes one).
     pub last_seen: DateTime<Utc>,
     /// Cumulative rows compacted in batches that wrote the field — the sum
     /// of per-batch row counts, not a per-value non-null tally.
     pub row_count: i64,
 }
 
-/// A position inside one field's observation listing: the
-/// `(last_seen, service)` of the last row already delivered.
-///
 /// `(last_seen, service)` is unique per field — `(field, service)` is the
 /// primary key — so the pair identifies an exact row, and resuming after it
 /// can neither repeat nor skip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceCursor {
-    /// Last observation instant of the row the page stopped at.
     pub last_seen: DateTime<Utc>,
-    /// Service name of the row the page stopped at.
     pub service: String,
 }
 
@@ -215,9 +150,6 @@ impl ServiceCursor {
         )
     }
 
-    /// Parse a cursor the server previously issued. `None` for anything
-    /// malformed: a cursor is opaque to clients, so a garbled one is a
-    /// client error, never a silently ignored filter.
     #[must_use]
     pub fn decode(raw: &str) -> Option<Self> {
         let (ts, service) = raw.rsplit_once('|')?;
@@ -232,7 +164,6 @@ impl ServiceCursor {
     }
 }
 
-/// Filter for [`CatalogStore::list_fields`].
 #[derive(Debug, Clone)]
 pub struct FieldListFilter {
     /// Only fields observed for this service, and every aggregate below
@@ -266,143 +197,63 @@ impl Default for FieldListFilter {
     }
 }
 
-/// One row of the field listing: the pin plus its aggregated observation
-/// and conflict evidence.
 #[derive(Debug, Clone)]
 pub struct FieldSummaryRow {
-    /// Field name.
     pub field: String,
-    /// Pinned `DuckDB` type spelling.
     pub duckdb_type: String,
     /// Which service's batch set the pin (`_declared` for the envelope
     /// seed; `NULL` only in hand-edited catalogs).
     pub pinned_from: Option<String>,
-    /// When the pin was written.
     pub pinned_at: DateTime<Utc>,
     // The four observation aggregates below span every service that ever
     // carried the field — or exactly the one service, when the listing was
     // scoped by [`FieldListFilter::service`].
     /// Distinct services that ever carried the field (1 when scoped).
     pub service_count: i64,
-    /// Cumulative rows across the observations in scope.
     pub row_count: i64,
-    /// Earliest observation in scope (`None` when never observed).
     pub first_seen: Option<DateTime<Utc>>,
-    /// Most recent observation in scope (`None` when never observed).
     pub last_seen: Option<DateTime<Utc>>,
-    /// Conflict evidence rows currently retained for the field.
     pub conflict_count: i64,
-    /// Total rows nulled across the retained evidence.
     pub rows_nulled: i64,
 }
 
-/// A pin nothing has observed since a cutoff: one gc candidate on the
-/// observation axis ([`CatalogStore::pins_unobserved_since`]).
-///
 /// The metadata axis has not been consulted yet, so this is a pin to
 /// disprove with a parquet footer, never a decision to delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcPinRow {
-    /// Field name (a catalog key).
     pub field: String,
-    /// Pinned `DuckDB` type spelling, carried so the report and the audit
-    /// event can say what was deleted without a second read.
     pub duckdb_type: String,
-    /// When the pin was taken. Read for the same reason as the type: the
-    /// catalog row is gone by the time the audit event is written, so the
-    /// record has to carry the pin's age itself.
     pub pinned_at: DateTime<Utc>,
-    /// The newest observation of the field across every service, `None`
-    /// when it was never observed at all.
     pub last_seen: Option<DateTime<Utc>>,
-    /// Distinct services that ever carried the field, over its whole
-    /// history rather than the window: how much attribution the purge is
-    /// about to discard.
+    /// Distinct services that ever carried the field, over its whole history
+    /// rather than the window.
     pub services: i64,
 }
 
-/// The pin purge transaction's own bounds, its first two statements in this
-/// order.
-///
 /// Postgres enforces them, so the bound survives what a client-side timeout
-/// cannot: the caller must not cancel that future, because a cancelled
-/// commit is an unknown outcome the pin cache would have to guess at. Five
-/// seconds is the same budget the gc engine gives its read-only gated calls;
-/// the corpus gate is held across all of them and every compaction batch
-/// waits behind it.
-///
-/// `statement_timeout` comes first because it is the only one of the two
-/// that bounds `pg_advisory_xact_lock`: `lock_timeout` covers heavyweight
-/// table and row locks, and an advisory lock is neither, so a lock_timeout-only
-/// transaction would wait on a held catalog lock forever.
+/// cannot: the caller must not cancel that future, because a cancelled commit
+/// is an unknown outcome the pin cache would have to guess at.
 const PURGE_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = '5s'";
-/// The row-lock half of the purge's bounds; see
-/// [`PURGE_STATEMENT_TIMEOUT_SQL`].
 const PURGE_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '5s'";
 
-/// How long [`CatalogStore::delete_pins`] waits for the whole pre-commit
-/// phase before it cancels it.
-///
-/// The per-statement bounds above are enforced by postgres and are the
-/// tighter ones, but they only fire when the backend notices. A connection
-/// that dies mid-statement leaves this task waiting on a socket while the
-/// corpus gate stays shut and compaction batches pile up behind it, and no
-/// database-side setting can end that wait. The bound must EXCEED the
-/// composed honest maximum: `statement_timeout` resets per statement, and
-/// prepare runs eight separately bounded waits (pool acquire ~10s, the
-/// advisory lock, the repin probe, the observation read, four deletes and
-/// the count at up to 5s each), so an honest worst case approaches fifty
-/// seconds. Sixty gives it margin; a dead connection still costs only one
-/// gc run, and the database-side bounds stay the precise ones.
-///
-/// Cancelling here is safe because nothing has committed. That is the
-/// entire difference from [`PURGE_COMMIT_BOUND`], which cannot cancel
-/// anything.
+/// A connection that dies mid-statement leaves this task waiting on a socket
+/// while the corpus gate stays shut, and no database-side setting can end that
+/// wait. The bound must EXCEED the composed honest maximum: `statement_timeout`
+/// resets per statement, so an honest worst case approaches fifty seconds.
 pub const PURGE_PREPARE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long [`CatalogStore::delete_pins`] waits for its own commit before
-/// it stops waiting and reports the outcome as unknown.
-///
 /// The commit is the one step postgres does not bound: once durable commit
-/// processing has begun the backend stops honouring cancellation, so a
-/// commit stuck behind a stalled fsync can outlast every
-/// `statement_timeout` in the transaction. The corpus gate is held across
-/// it and every compaction batch queues behind that, which is why waiting
-/// forever is not an option.
+/// processing has begun the backend stops honouring cancellation, so a commit
+/// stuck behind a stalled fsync can outlast every `statement_timeout` in the
+/// transaction.
 ///
-/// Giving up here does NOT cancel the commit. The future is detached onto
-/// its own task and runs to completion, so postgres decides the outcome
-/// exactly once and the caller merely stops knowing what it was. Thirty
-/// seconds is six times the per-statement bound: long enough that an
-/// ordinary busy checkpoint never trips it, short enough that a wedged
-/// volume costs one gc run instead of an ingest outage.
+/// Giving up here does NOT cancel the commit. The future is detached onto its
+/// own task and runs to completion.
 pub const PURGE_COMMIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Commit the pin purge, or stop waiting for it after
-/// [`PURGE_COMMIT_BOUND`] without cancelling it.
-///
-/// The distinction is the whole function. A [`tokio::time::timeout`] around
-/// the commit would DROP the future, and a dropped commit is one postgres
-/// may still perform: the caller would report "nothing happened" over a
-/// catalog that lost the rows, and every reader's pin cache would keep
-/// serving them. Here the future is boxed, so the elapsed arm can hand the
-/// same future to a task of its own instead. Postgres decides the outcome
-/// exactly once either way; only this caller stops watching.
-///
-/// A commit that COMPLETES with an error is unknown too, and returns the
-/// same [`StoreError::PurgeCommitUnknown`]. `COMMIT` fails in two very
-/// different ways that the client cannot tell apart: postgres refused the
-/// transaction (rolled back, nothing deleted), or the connection died while
-/// the answer was on its way back from a backend that had already made the
-/// commit durable. Calling the second one "the store errored" would send
-/// the caller to the reconcile read, and that read can be answered by a
-/// replica-lag-free but still racing session a microsecond before the
-/// commit record is visible. Unknown is the true statement, and the
-/// caller's unknown path (over-evict everything, read nothing) is right for
-/// both.
-///
-/// `purged` is the candidate count, carried purely so the detached task's
-/// log line says how much is in doubt.
+/// A [`tokio::time::timeout`] around the commit would DROP the future, and a
+/// dropped commit is one postgres may still perform. Here the future is boxed,
+/// so the elapsed arm can hand the same future to a task of its own instead.
 async fn commit_or_detach(tx: PooledTransaction, purged: usize) -> Result<(), StoreError> {
     let mut commit = Box::pin(tx.commit());
     tokio::select! {
@@ -412,9 +263,6 @@ async fn commit_or_detach(tx: PooledTransaction, purged: usize) -> Result<(), St
         result = &mut commit => match result {
             Ok(()) => Ok(()),
             Err(e) => {
-                // `storage.backend` is retained, so the pg diagnostics go to
-                // DEBUG, the event carries the class and the cause kind, and
-                // the caller gets the outcome word only.
                 tracing::debug!(
                     target: "storage.backend",
                     event_type = "catalog_pin_purge_commit_failed",
@@ -479,40 +327,23 @@ async fn commit_or_detach(tx: PooledTransaction, purged: usize) -> Result<(), St
     }
 }
 
-/// One pin a [`CatalogStore::delete_pins`] transaction gave up, with the
-/// metadata that transaction saw.
-///
 /// Everything here is read inside the purge transaction rather than carried
-/// over from the caller's earlier candidate snapshot. Between that snapshot
-/// and the purge, a repin cutover can retype the row and compaction can
-/// observe the field again, so a report built from the snapshot would name a
-/// type and a `last_seen` that were true minutes ago. The audit record is
-/// the only account of a row nobody can read any more; it says what was
-/// actually deleted.
+/// over from the caller's earlier candidate snapshot: between that snapshot and
+/// the purge, a repin cutover can retype the row and compaction can observe the
+/// field again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurgedPin {
-    /// Field name, as `field_types` held it.
     pub field: String,
-    /// The pinned `DuckDB` type spelling at deletion.
     pub duckdb_type: String,
-    /// Which service's batch set the pin, when the row recorded one.
     pub pinned_from: Option<String>,
-    /// When the pin was taken.
     pub pinned_at: DateTime<Utc>,
-    /// The newest `field_services` observation, read in the same
-    /// transaction just before the observations were deleted. `None` when
-    /// the field was never observed.
     pub last_seen: Option<DateTime<Utc>>,
-    /// Distinct observation rows discarded with the pin: how much
-    /// per-service attribution the purge threw away.
     pub services: i64,
 }
 
-/// What one [`CatalogStore::delete_pins`] transaction committed.
-///
 /// All of it is read INSIDE the transaction, so the caller can finish the
-/// reclaim (evict from the pin cache, publish the gauges, audit) with
-/// nothing fallible left to do.
+/// reclaim (evict from the pin cache, publish the gauges, audit) with nothing
+/// fallible left to do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PurgedPins {
     /// The pins `field_types` actually gave up, as the DELETE returned
@@ -524,166 +355,54 @@ pub struct PurgedPins {
     pub pinned_now: i64,
 }
 
-/// One field's pin row ([`CatalogStore::field_pin`]).
 #[derive(Debug, Clone)]
 pub struct FieldPinRow {
-    /// Field name.
     pub field: String,
-    /// Pinned `DuckDB` type spelling.
     pub duckdb_type: String,
-    /// Which service's batch set the pin.
     pub pinned_from: Option<String>,
-    /// When the pin was written.
     pub pinned_at: DateTime<Utc>,
 }
 
-/// A `field_conflicts` row with its field name — the cross-field listing
-/// shape ([`CatalogStore::recent_conflicts`]).
 #[derive(Debug, Clone)]
 pub struct ConflictListRow {
-    /// Field name.
     pub field: String,
-    /// Service that disagreed.
     pub service: String,
-    /// Observed `DuckDB` type spelling.
     pub observed_type: String,
-    /// Expected (pinned) type spelling.
     pub expected_type: String,
-    /// Rows nulled by the conforming cast.
     pub rows_nulled: i64,
-    /// A bounded sample of the values the cast nulled (see
-    /// [`FieldConflict::samples`]).
     pub samples: Vec<String>,
-    /// When the conflict was recorded.
     pub at: DateTime<Utc>,
 }
 
-/// A `field_conflicts` row as read back (types as stored text).
 #[derive(Debug, Clone)]
 pub struct FieldConflictRow {
-    /// Service that disagreed.
     pub service: String,
-    /// Observed `DuckDB` type spelling.
     pub observed_type: String,
-    /// Expected (pinned) type spelling.
     pub expected_type: String,
-    /// Rows nulled by the conforming cast.
     pub rows_nulled: i64,
-    /// A bounded sample of the values the cast nulled (see
-    /// [`FieldConflict::samples`]); empty for evidence recorded before
-    /// migration 0008, or by a lane with no values in hand.
     pub samples: Vec<String>,
-    /// When the conflict was recorded.
     pub at: DateTime<Utc>,
 }
 
-/// Maximum number of fields the catalog will ever pin.
+/// A field denied a pin gets the same treatment as an unstorable name: it is
+/// absent from the pin map, so compaction's conform step drops the column and
+/// the values stay findable in `_raw`.
 ///
-/// Field names are client-chosen JSON keys, and the ingest path never
-/// gives a slot back (a repin retypes a pin, retention never reconciles
-/// `field_services`, and only an operator running gc deletes one).
-/// Without a count bound, a sender that
-/// embeds identifiers in its keys, `user_12345_status`, accidental or
-/// hostile, grows postgres, the in-process [`crate::catalog::FieldCatalog`]
-/// cache, and every snapshot taken of it without limit. Name length is
-/// bounded by [`trawl_core::schema::is_storable_field_name`]; this bounds
-/// the count.
-///
-/// A field denied a pin gets the same treatment as an unstorable name: it
-/// is absent from the pin map, so compaction's conform step drops the
-/// column and the values stay findable in `_raw`. Deliberately generous:
-/// a real corpus that legitimately reaches five figures of distinct field
-/// names has a modelling problem this cap should surface, not a capacity
-/// problem trawl should silently absorb.
-///
-/// Filling the cap is the attack the cap itself invites. A slot, once
-/// taken, is taken forever, and denial is silent in the data (the column is
-/// simply absent from every later parquet file). One request carrying ten
-/// thousand junk keys would otherwise take the whole catalog in a single
-/// compaction batch. Two things keep that unreachable:
-///
-/// - Admission from the ingest path is rationed: one batch may take at most
-///   half the free slots ([`Ration::HalfOfFree`]), so exhaustion is a slope
-///   requiring sustained, repeated effort instead of a one-shot cliff, and
-///   there is always headroom left for the next field a legitimate sender
-///   introduces.
-/// - The fill level is a first-class signal,
-///   `trawl_catalog_pinned_fields` against `trawl_catalog_pin_capacity`,
-///   so an operator alerts on the slope, not on the wreckage. (The
-///   `catalog_pin_cap_reached` warning only fires once slots are already
-///   gone.)
-///
-/// The remedy for a slot spent by accident is pin garbage collection
-/// ([`crate::catalog::gc`], `trawl schema gc-pins`): a pin nothing has
-/// observed for the dead window and no standing parquet footer declares is
-/// deleted through [`CatalogStore::delete_pins`]. Both proofs are required,
-/// so the write-time conformance invariant holds by construction — a
-/// hand-run `DELETE FROM field_types` proves neither and must still never
-/// be recommended.
-///
-/// That is a repair, not a defense. Gc reclaims what a typo or a
-/// decommissioned sender left behind; against a sender still filling the
-/// catalog it collects nothing, because every pin it takes is observed and
-/// carried. The defense remains the cap, the per-batch ration and the fill
-/// gauges.
+/// A hand-run `DELETE FROM field_types` proves neither of gc's proofs and must
+/// still never be recommended.
 pub const MAX_PINNED_FIELDS: i64 = 10_000;
 
 /// Maximum `field_conflicts` rows kept per field — the newest survive.
-///
-/// [`MAX_PINNED_FIELDS`] bounds how many fields can exist; nothing bounds
-/// how often one of them disagrees with its pin. A field pinned `BIGINT`
-/// that keeps receiving strings appends a row per service per compaction
-/// tick — every ten seconds, forever — so without a per-field bound the
-/// evidence table grows without limit while the sender's behaviour, and
-/// therefore the evidence's information content, stays constant.
-///
-/// The bound is per field, not per `(field, service)`: service names are
-/// client-chosen too, so a per-service window would only move the
-/// unbounded axis. A field conflicting across more services than the
-/// window is therefore sampled, not covered; the exhaustive, never-lossy
-/// tallies are the `trawl_catalog_conflicts_total` /
-/// `trawl_catalog_rows_nulled_total` counters. These rows exist to show an
-/// operator which values a pin is currently costing them, and the newest
-/// evidence is the evidence they act on.
 pub const MAX_CONFLICTS_PER_FIELD: i64 = 100;
 
 /// Distinct misfit values kept per conflict row.
-///
-/// The samples answer "which values is this pin costing me", which five
-/// distinct examples answer as well as five hundred would. Five hundred per
-/// row, at the cap above, per field, at the pin cap, is a table whose size
-/// is set by how creatively a sender misformats its values. The exhaustive
-/// record is `_raw`, which already holds every one of them.
 pub const MAX_CONFLICT_SAMPLES: usize = 5;
 
 /// Bytes kept per sample, cut on a `char` boundary at capture.
-///
-/// A misfit value is client text of client-chosen length: a whole embedded
-/// document can arrive under a BIGINT pin. Enough to recognise the shape of
-/// what is arriving, far short of storing the payload a second time.
 pub const MAX_CONFLICT_SAMPLE_BYTES: usize = 256;
 
 /// Conflict rows per field the verdict is built from
 /// ([`CatalogStore::conflict_evidence_for`]), newest first.
-///
-/// Sized to what a verdict consumes: each row carries up to
-/// [`MAX_CONFLICT_SAMPLES`] distinct samples, so the newest five rows
-/// normally hold several times the sample budget.
-///
-/// Not guaranteed to, though — a row whose capture failed carries none
-/// (evidence is best-effort, `ConformPlan::tally_conflicts`), so five
-/// sample-less rows can leave a verdict with an empty `samples` list while
-/// older retained rows still hold values. That degrades gracefully: the
-/// verdict itself is computed from the durable aggregates and stays
-/// correct, the CLI simply omits the sample block, and the cause is counted
-/// on `trawl_catalog_sample_capture_failures_total`.
-///
-/// It also bounds the observed-type evidence the suggested target is derived
-/// from, and that is a deliberate narrowing: the suggestion describes the
-/// newest episodes rather than the whole retained window. That reads the
-/// right way round, since a field whose recent traffic is uniformly one rung
-/// should be repinned to that rung, and the suggestion is a starting point
-/// for a dry run, never an action.
 const VERDICT_EVIDENCE_ROWS: i64 = 5;
 
 // Written as a literal because it binds as a postgres `bigint`, and pinned
@@ -691,9 +410,6 @@ const VERDICT_EVIDENCE_ROWS: i64 = 5;
 // build rather than silently under-filling a verdict.
 const _: () = assert!(MAX_CONFLICT_SAMPLES == 5);
 
-/// Rows per statement in [`CatalogStore::backfill_services`]. The backfill's
-/// size is (pinned fields x services), which nothing bounds below five
-/// figures, so it is written in chunks rather than one array-of-everything.
 const BACKFILL_CHUNK: usize = 1_000;
 
 /// One field name shortened for logging: a name can be as long as a client
@@ -704,8 +420,6 @@ fn short_name(name: &str) -> String {
     format!("{head}... ({} bytes)", name.len())
 }
 
-/// The names in `names` that cannot be a catalog key, de-duplicated and
-/// each shortened for logging (see [`short_name`]).
 fn unstorable_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut out: Vec<String> = names
         .filter(|n| !trawl_core::schema::is_storable_field_name(n))
@@ -732,16 +446,8 @@ fn warn_unstorable(op: &str, rejected: &[String]) {
     bump_rejected("name_too_long", rejected.len());
 }
 
-/// How many of the free pin slots one call may consume.
-///
-/// The pin count is bounded ([`MAX_PINNED_FIELDS`]) but a slot is spent
-/// permanently, so *how fast* the free slots can be spent is its own
-/// property: a bound nothing can take in one gulp behaves very differently
-/// from one anything can. See [`MAX_PINNED_FIELDS`].
 #[derive(Debug, Clone, Copy)]
 enum Ration {
-    /// Ingest path: at most half the free slots, so no single batch, and
-    /// therefore no single ingest request, can consume the catalog.
     HalfOfFree,
     /// Boot conformance pass: every free slot, because there a denied pin
     /// deletes a column that is already on disk
@@ -749,16 +455,14 @@ enum Ration {
     EveryFreeSlot,
 }
 
-/// Publish the catalog's fill level: `used` and the ceiling it is measured
-/// against, so an alert is a ratio and needs no knowledge of the constant.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; a 10k cap is exact
 fn set_fill_gauges(pinned: i64, cap: i64) {
     metrics::gauge!(crate::metrics::CATALOG_PINNED_FIELDS).set(pinned as f64);
     metrics::gauge!(crate::metrics::CATALOG_PIN_CAPACITY).set(cap as f64);
 }
 
-/// Count fields denied a pin, by reason. No field-name label: the names are
-/// client-chosen and unbounded, which is the very problem being counted.
+/// No field-name label: the names are client-chosen and unbounded, which is the
+/// very problem being counted.
 fn bump_rejected(reason: &'static str, count: usize) {
     metrics::counter!(
         crate::metrics::CATALOG_PINS_REJECTED_TOTAL,
@@ -767,17 +471,9 @@ fn bump_rejected(reason: &'static str, count: usize) {
     .increment(count as u64);
 }
 
-/// The whole of [`CatalogStore::record_conflicts`], inside a transaction the
-/// caller owns: append the evidence rows, trim every touched field back to
-/// `conflict_cap`, upsert the durable `field_conflict_stats` aggregates.
-///
-/// It commits nothing. Compaction's own bookkeeping wants a transaction per
-/// batch and gets one from `record_conflicts`; the repin cutover has to write
-/// this evidence in the SAME transaction that flips the pin, so that the read
-/// which first sees `succeeded` also sees the conflicts the repin caused
-/// (issue #137). Two writers of `field_conflicts` would be two answers to
-/// "what does the trim measure" and two chances to forget the aggregates, so
-/// there is one body and two entry points.
+/// It commits nothing: the repin cutover has to write this evidence in the SAME
+/// transaction that flips the pin, so that the read which first sees
+/// `succeeded` also sees the conflicts the repin caused.
 pub(super) async fn record_conflicts_in(
     tx: &mut sqlx::PgConnection,
     conflicts: &[FieldConflict],
@@ -837,30 +533,9 @@ pub(super) async fn record_conflicts_in(
     .execute(&mut *tx)
     .await?;
 
-    // The durable aggregates the trim above must not be able to erase.
-    //
-    // The GROUP BY is not an optimisation: postgres refuses to let one
-    // `ON CONFLICT DO UPDATE` touch a row twice, and the boot conformance
-    // pass accumulates conflicts across every file it rewrites, so one
-    // call routinely carries many rows for the same `(field, service)`.
-    // Pre-aggregating in the statement makes a call of N such rows one
-    // upsert of N episodes: the same hazard `backfill_services` avoids
-    // by aggregating in its caller, answered here in SQL because this
-    // caller's rows are the evidence and may not be collapsed.
-    //
-    // At-least-once, not exactly-once: the bookkeeping caller retries a
-    // transaction whose COMMIT ACK was lost, and this upsert would then
-    // add the same episodes and rows a second time. Accepted rather than
-    // carried on an idempotency key: the consequence is bounded to a
-    // slightly early or spurious badge on a field that is conflicting,
-    // and the remedy it points at (a dry run) is free and reversible.
-    //
-    // `last_at` is `now()`, not `GREATEST(existing, now())`: it is the
-    // transaction's own clock, which cannot run backwards against a row
-    // this same statement is the only writer of. `first_at` is left
-    // untouched on conflict for the mirror-image reason: the row's
-    // existing value is by construction the earliest evidence there is
-    // (migration 0009's backfill included).
+    // The GROUP BY is not an optimisation: postgres refuses to let one `ON
+    // CONFLICT DO UPDATE` touch a row twice, and one call routinely carries
+    // many rows for the same `(field, service)`.
     sqlx::query(
         "INSERT INTO field_conflict_stats
              (field, service, episodes, rows_nulled_total)
@@ -882,7 +557,6 @@ pub(super) async fn record_conflicts_in(
     Ok(())
 }
 
-/// Postgres-backed field catalog. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
 pub struct CatalogStore {
     pool: PgPool,
@@ -891,8 +565,6 @@ pub struct CatalogStore {
 }
 
 impl CatalogStore {
-    /// Wrap the shared app-state pool (must already be migrated — see
-    /// [`super::HistoryStore::new`] for the contract).
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
@@ -901,28 +573,18 @@ impl CatalogStore {
         }
     }
 
-    /// Override the pin-count cap. Exists so tests can drive the cap
-    /// boundary without inserting [`MAX_PINNED_FIELDS`] rows; production
-    /// uses the constant.
     #[must_use]
     pub fn with_pin_cap(mut self, cap: i64) -> Self {
         self.pin_cap = cap;
         self
     }
 
-    /// Override the per-field conflict-retention window. Same purpose as
-    /// [`Self::with_pin_cap`]: drive the boundary without writing
-    /// [`MAX_CONFLICTS_PER_FIELD`] rows.
     #[must_use]
     pub fn with_conflict_cap(mut self, cap: i64) -> Self {
         self.conflict_cap = cap;
         self
     }
 
-    /// Load every pin in the catalog.
-    ///
-    /// A stored spelling outside the canonical five fails loudly: the
-    /// catalog is written by code, so that is corruption, not data.
     pub async fn load_pins(&self) -> Result<Vec<(String, CanonicalType)>, StoreError> {
         let rows = sqlx::query("SELECT field, duckdb_type FROM field_types ORDER BY field")
             .fetch_all(&self.pool)
@@ -942,32 +604,6 @@ impl CatalogStore {
             .map_err(StoreError::from)
     }
 
-    /// Pin every proposal whose field is absent from the catalog, then
-    /// return the authoritative pins for all proposed fields.
-    ///
-    /// First-writer-wins: `INSERT ... ON CONFLICT (field) DO NOTHING`, then
-    /// a re-read — so two racing batches (or a proposal against an existing
-    /// pin) both come back with the same pin, never their own proposal.
-    ///
-    /// A field whose name cannot be a catalog key (see
-    /// [`unstorable_names`]) is dropped from the proposal set rather than
-    /// allowed to error the insert: pinning gates every parquet write, so
-    /// one such name would otherwise retain the batch for retry on every
-    /// tick, forever. Absent from the returned map, the column is simply
-    /// unpinned, which the conform step already treats as "drop it".
-    ///
-    /// The same treatment bounds the catalog's size: the insert only fills
-    /// the slots left under [`MAX_PINNED_FIELDS`], so a batch arriving at a
-    /// full catalog pins nothing new and its novel columns are dropped from
-    /// the parquet with their values still in `_raw` (never an `Err`, which
-    /// would wedge compaction for a condition retrying cannot clear).
-    ///
-    /// This is the ingest path, so admission is rationed to half the free
-    /// slots ([`Ration::HalfOfFree`]; see [`MAX_PINNED_FIELDS`] for why a
-    /// batch that can take every remaining slot is the attack). A batch
-    /// proposing more novel fields than its ration keeps the surplus for its
-    /// next tick: an unpinned column is dropped from this file only, and a
-    /// field a sender keeps sending is proposed again ten seconds later.
     pub async fn pin_missing(
         &self,
         proposals: &[PinProposal],
@@ -975,16 +611,6 @@ impl CatalogStore {
         self.pin_missing_with(proposals, Ration::HalfOfFree).await
     }
 
-    /// Pin proposals without the per-batch ration: the boot conformance
-    /// pass only.
-    ///
-    /// That pass does not propose client input as it arrives: it proposes
-    /// what a standing parquet corpus already contains, and its next act is
-    /// to rewrite the files that disagree. There, a denied pin does not
-    /// decline to store a new column, it deletes a column that is already
-    /// on disk. Rationing the seed would therefore destroy data to slow an
-    /// attacker who has already spent the slots, so the seed gets every free
-    /// slot the cap allows; [`MAX_PINNED_FIELDS`] still bounds it absolutely.
     pub async fn pin_missing_unrationed(
         &self,
         proposals: &[PinProposal],
@@ -1013,13 +639,6 @@ impl CatalogStore {
         let types: Vec<&str> = proposals.iter().map(|p| p.ty.as_catalog()).collect();
         let sources: Vec<&str> = proposals.iter().map(|p| p.pinned_from.as_str()).collect();
 
-        // Only the free slots under the cap are filled, and on the ingest
-        // path only half of them (see `Ration`). Already-pinned proposals
-        // are excluded from `candidate` so they never consume a slot, and
-        // the surplus is ordered by name so an overflowing batch picks
-        // deterministically rather than by arrival accident — within one
-        // batch there is no legitimacy signal to rank by, which is exactly
-        // why the ration, not the ordering, is what protects the tail.
         sqlx::query(
             "WITH candidate AS (
                  SELECT u.f, u.t, u.s, row_number() OVER (ORDER BY u.f) AS rn
@@ -1048,10 +667,6 @@ impl CatalogStore {
         .execute(&self.pool)
         .await?;
 
-        // The fill level is the signal an operator can act on before the cap
-        // bites; `catalog_pin_cap_reached` below only fires once the slots
-        // are already gone, and gone permanently (a repin retypes a slot,
-        // nothing reclaims one).
         let pinned_now: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
             .fetch_one(&self.pool)
             .await?;
@@ -1103,22 +718,9 @@ impl CatalogStore {
         Ok(pins)
     }
 
-    /// Upsert per-service observations for a compacted batch: `first_seen`
-    /// is set once, `last_seen` advances, `row_count` accumulates.
-    ///
-    /// `row_count` is added to the stored value, so callers must pass the
-    /// rows this batch wrote, never a whole-file total, which would
-    /// re-count every earlier batch on every tick.
-    ///
-    /// Names that cannot be a catalog key are skipped for the same reason
-    /// as in [`Self::pin_missing`]: `field_services` keys on
-    /// `(field, service)`, so an over-long name overflows this btree too.
-    ///
-    /// Rows are ever-observed and nothing removes one, deliberately: "which
-    /// services ever carried this field" is historical fact, and consumers
-    /// window on `last_seen`. The table's worst case is bounded by
-    /// [`MAX_PINNED_FIELDS`] on the field axis times the distinct service
-    /// names a deployment really ships.
+    /// `row_count` is added to the stored value, so callers must pass the rows
+    /// this batch wrote, never a whole-file total, which would re-count every
+    /// earlier batch on every tick.
     pub async fn touch_services(
         &self,
         service: &str,
@@ -1154,29 +756,12 @@ impl CatalogStore {
         Ok(())
     }
 
-    /// Backfill observations for a corpus that predates the catalog: the
-    /// boot conformance pass, not the ingest path.
-    ///
-    /// `field_services` is the authority behind `?service=` and the
-    /// `last_seen` window on the schema surfaces, and only compaction writes
-    /// it live, so a corpus the catalog did not observe being written has no
-    /// rows until each service next sends the field. A service that stopped
-    /// sending, or an env retired but retained, would answer `?service=`
-    /// with nothing at all, and its pins would sit outside the `last_seen`
-    /// window forever (a never-observed pin is always shown, by design).
-    /// This closes that gap from the standing files themselves.
-    ///
-    /// Idempotent, because the pass re-runs on every boot until the corpus
-    /// is proven conformant: `first_seen` only moves earlier, `last_seen`
-    /// only later, and `row_count` takes the MAX rather than accumulating,
-    /// so re-running over the same corpus is a no-op and a live tick's
-    /// accumulated count is never clobbered downward by a backfill that sees
-    /// a retention-shrunk corpus.
+    /// Idempotent, because the pass re-runs on every boot until the corpus is
+    /// proven conformant: `first_seen` only moves earlier, `last_seen` only
+    /// later, and `row_count` takes the MAX rather than accumulating.
     ///
     /// Callers must pass at most one row per `(field, service)`: postgres
-    /// refuses to let one `ON CONFLICT DO UPDATE` statement touch a row
-    /// twice. The only caller aggregates into a map keyed by exactly that
-    /// pair.
+    /// refuses to let one `ON CONFLICT DO UPDATE` statement touch a row twice.
     pub async fn backfill_services(
         &self,
         observations: &[ServiceObservation],
@@ -1220,32 +805,6 @@ impl CatalogStore {
         Ok(())
     }
 
-    /// Append conflict evidence rows (never aggregated), then trim every
-    /// field this call touched back to its newest [`MAX_CONFLICTS_PER_FIELD`]
-    /// rows.
-    ///
-    /// Append + trim, not an upsert: the value of a conflict row is the
-    /// individual episode (when, which service, how many rows it cost), and
-    /// aggregating loses exactly that. Trimming only the touched fields
-    /// keeps the work proportional to the batch — a field that stops
-    /// conflicting keeps the evidence it already has and is never re-read.
-    ///
-    /// A third statement upserts the durable per-`(field, service)`
-    /// aggregates (`field_conflict_stats`, migration 0009) the degraded-field
-    /// analyzer judges a pin on. It is here, and not in a caller, because the
-    /// trim above is exactly what makes it necessary: the detail rows a
-    /// span-based verdict would have to measure are the ones the window
-    /// evicts first, so the aggregate has to be written by the same
-    /// transaction that evicts them or it is a different number.
-    ///
-    /// All three statements run in one transaction, so a reader never sees
-    /// the window overfull, a failed trim never leaves the insert behind, and
-    /// no episode is ever counted in the aggregates without its evidence row
-    /// (or the reverse).
-    ///
-    /// This is the entry point that owns that transaction. The statements
-    /// themselves are [`record_conflicts_in`], which a caller with a
-    /// transaction of its own calls directly.
     pub async fn record_conflicts(&self, conflicts: &[FieldConflict]) -> Result<(), StoreError> {
         if conflicts.is_empty() {
             return Ok(());
@@ -1259,35 +818,14 @@ impl CatalogStore {
         Ok(())
     }
 
-    /// Read one page of the observation rows for one field, most recent
-    /// first, resuming after `after`.
-    ///
-    /// Paged, never whole: `field_services` is bounded on the field axis by
-    /// the pin cap but not on the service axis. Service names are
-    /// client-chosen and rows are ever-observed, so the history of a common
-    /// envelope field grows with every service a sender ever invents,
-    /// without spending a pin slot. An unpaged read would hand one
-    /// `schema_read` request an arbitrarily large database read, allocation,
-    /// and response body.
-    ///
-    /// Keyset, not `OFFSET`: the page walks `(last_seen DESC, service ASC)`,
-    /// which is unique per field (`(field, service)` is the primary key), so
-    /// a cursor names an exact position and a concurrent observation update
-    /// cannot make a page repeat or skip a row it already delivered.
-    ///
-    /// The cursor predicate is deliberately written as
-    /// `last_seen <= cursor AND (last_seen < cursor OR service > $3)` rather
-    /// than the equivalent single `OR` chain, and `COALESCE`s the absent
-    /// cursor to `infinity` rather than guarding it with `IS NULL`. Both
-    /// shapes select the same rows, but only this one is *sargable*: the
-    /// leading conjunct is a bound postgres can push into
-    /// `field_services_field_last_seen_idx` (migration 0004) as an index
-    /// scan key, so the page starts at the cursor. Under the `OR` chain the
-    /// whole thing degrades to a filter and every page re-reads the field's
-    /// entire history, bounding the allocation and the response body but not
-    /// the read, which makes walking the pages quadratic.
-    ///
-    /// Returns `(rows, next)`; `next` is `Some` when more rows follow.
+    /// The cursor predicate is deliberately written as `last_seen <= cursor AND
+    /// (last_seen < cursor OR service > $3)` rather than the equivalent single
+    /// `OR` chain, and `COALESCE`s the absent cursor to `infinity` rather than
+    /// guarding it with `IS NULL`. Only this shape is sargable: the leading
+    /// conjunct is a bound postgres can push into
+    /// `field_services_field_last_seen_idx`, so the page starts at the cursor.
+    /// Under the `OR` chain every page re-reads the field's entire history,
+    /// which makes walking the pages quadratic.
     pub async fn field_services(
         &self,
         field: &str,
@@ -1308,7 +846,6 @@ impl CatalogStore {
         .bind(field)
         .bind(after.map(|c| c.last_seen))
         .bind(after.map_or("", |c| c.service.as_str()))
-        // Fetch one extra row purely to learn whether a next page exists.
         .bind(limit.saturating_add(1))
         .fetch_all(&self.pool)
         .await?;
@@ -1338,13 +875,9 @@ impl CatalogStore {
         Ok((rows, next))
     }
 
-    /// [`Self::conflict_aggregates`], page-keyed shape: `$1` field names.
-    /// See the method docs for why this is its own SQL text.
-    ///
-    /// The ack join hangs off the GROUPED rows, not the raw ones: one row
-    /// per field either way (`field_degraded_ack` is keyed on `field`), but
-    /// joining after the aggregation keeps the page's key pushed into the
-    /// primary key scan, and the join then runs over at most a page of rows.
+    /// The ack join hangs off the GROUPED rows, not the raw ones: joining after
+    /// the aggregation keeps the page's key pushed into the primary key scan,
+    /// and the join then runs over at most a page of rows.
     const CONFLICT_AGGREGATES_KEYED_SQL: &'static str = "\
         SELECT s.field, s.first_at, s.last_at, s.services, s.episodes,
                s.rows_nulled_total, a.evidence_through AS ack_evidence_through
@@ -1359,16 +892,6 @@ impl CatalogStore {
         ) s
         LEFT JOIN field_degraded_ack a ON a.field = s.field";
 
-    /// [`Self::conflict_aggregates`], whole-catalog shape.
-    ///
-    /// Unkeyed and periodic (every schema-refresh tick, on every node), so
-    /// it scans `field_conflict_stats` entire, and that table grows with the
-    /// distinct service names that have ever conflicted, an axis nothing
-    /// bounds. Measured at ~200ms over 1M rows, and accepted rather than
-    /// indexed or incrementalised: reaching that size means a sender
-    /// inventing service names and conflicting under each one, which already
-    /// costs it a parquet file per hour per name, while what this returns is
-    /// one row per field, pin-capped.
     const CONFLICT_AGGREGATES_ALL_SQL: &'static str = "\
         SELECT s.field, s.first_at, s.last_at, s.services, s.episodes,
                s.rows_nulled_total, a.evidence_through AS ack_evidence_through
@@ -1382,19 +905,10 @@ impl CatalogStore {
         ) s
         LEFT JOIN field_degraded_ack a ON a.field = s.field";
 
-    /// Aggregate the durable conflict evidence per field: the input the
-    /// degraded-field analyzer judges ([`crate::catalog::analyzer`]).
-    ///
-    /// `fields` keys the read to a page of pin names; `None` aggregates the
-    /// whole table, which is what a refresh tick wants and is bounded on
-    /// the returned axis by the pin cap.
-    ///
-    /// Two SQL texts rather than one `($1 IS NULL OR field = ANY($1))`
-    /// shape, for the reason [`Self::list_fields`] documents at length: a
-    /// prepared statement switching to its generic plan cannot push the
-    /// `IS NULL`-guarded `OR` into the primary key, so the page-keyed read
-    /// would degrade into a full aggregate over a table whose service axis
-    /// is client-chosen and never pruned.
+    /// Two SQL texts rather than one `($1 IS NULL OR field = ANY($1))` shape: a
+    /// prepared statement switching to its generic plan cannot push the `IS
+    /// NULL`-guarded `OR` into the primary key, so the page-keyed read would
+    /// degrade into a full aggregate.
     pub async fn conflict_aggregates(
         &self,
         fields: Option<&[String]>,
@@ -1403,13 +917,6 @@ impl CatalogStore {
         Self::conflict_aggregates_tx(&mut conn, fields).await
     }
 
-    /// [`Self::conflict_aggregates`] inside a caller's transaction: the
-    /// half of [`Self::degraded_snapshot`] that has to share one postgres
-    /// snapshot with [`Self::conflict_service_pairs_tx`].
-    ///
-    /// Public for the same reason [`Self::clear_conflict_evidence`] is: the
-    /// interleaving these two reads must survive is only expressible by a
-    /// caller that holds the transaction across both.
     pub async fn conflict_aggregates_tx(
         tx: &mut sqlx::PgConnection,
         fields: Option<&[String]>,
@@ -1444,28 +951,12 @@ impl CatalogStore {
             .map_err(StoreError::from)
     }
 
-    /// [`Self::conflict_service_pairs`]: keyed on both axes, so neither can
-    /// widen the scan into the whole table.
     const CONFLICT_SERVICE_PAIRS_SQL: &'static str = "\
         SELECT field, service
         FROM field_conflict_stats
         WHERE field = ANY($1) AND service = ANY($2)
         ORDER BY field, service";
 
-    /// Which services actually conflicted on each of `fields`: the input
-    /// `/api/v1/schema/services` badges a service from.
-    ///
-    /// Keyed on both the (pin-capped, usually empty) degraded set and the
-    /// currently renderable service names, so the result is bounded by
-    /// |degraded| × |services the schema cache can render| and the service
-    /// axis, client-chosen and never pruned, cannot widen the scan.
-    /// An empty input on either axis short-circuits, so a healthy install
-    /// pays no query at all and the refresh tick stays at one postgres read.
-    ///
-    /// Deliberately not a per-service degraded verdict: the analyzer judges
-    /// a pin globally ([`crate::catalog::analyzer::ConflictAggregate`] is
-    /// per field), and these rows only say which senders contributed the
-    /// evidence.
     pub async fn conflict_service_pairs(
         &self,
         fields: &[String],
@@ -1475,8 +966,6 @@ impl CatalogStore {
         Self::conflict_service_pairs_tx(&mut conn, fields, visible_services).await
     }
 
-    /// [`Self::conflict_service_pairs`] inside a caller's transaction; see
-    /// [`Self::conflict_aggregates_tx`].
     pub async fn conflict_service_pairs_tx(
         tx: &mut sqlx::PgConnection,
         fields: &[String],
@@ -1501,12 +990,6 @@ impl CatalogStore {
             .map_err(StoreError::from)
     }
 
-    /// Begin a read-only `REPEATABLE READ` transaction over the conflict
-    /// evidence.
-    ///
-    /// `READ COMMITTED`, postgres' default and what two separate pool reads
-    /// get, takes a fresh snapshot per statement, which is exactly the tear
-    /// [`Self::degraded_snapshot`] exists to close.
     pub async fn begin_evidence_snapshot(
         &self,
     ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, StoreError> {
@@ -1517,29 +1000,11 @@ impl CatalogStore {
         Ok(tx)
     }
 
-    /// One generation of the degraded-field picture: the fields the
-    /// analyzer indicts, and the `(field, service)` pairs that indicted
-    /// them, read as one fact.
-    ///
-    /// The two halves are separate queries, and a repin's evidence clear
-    /// ([`Self::clear_conflict_evidence`]) deletes from the table both of
-    /// them read. Run under two snapshots, a clear landing between them
-    /// publishes a generation with a degraded field and no services
-    /// attributed to it: the query notice standing while every badge
-    /// disappears, for as long as the refresh interval. So when there is
-    /// anything to attribute, both reads share one `REPEATABLE READ`
-    /// snapshot and see the same table.
-    ///
-    /// A healthy install pays one query: the probe below, from which a
-    /// catalog with nothing degraded returns without opening a transaction
-    /// at all. Only an install that has a degraded pin pays the
-    /// transactional re-read, and it is that install whose badges the tear
-    /// would drop.
-    ///
-    /// `visible_services` bounds the attribution read's service axis (see
-    /// [`Self::conflict_service_pairs`]); an empty list means the schema
-    /// cache has nothing to render yet, and the generation is published
-    /// unattributed — one tick of missing badges at boot, accepted.
+    /// A repin's evidence clear ([`Self::clear_conflict_evidence`]) deletes
+    /// from the table both halves read. Run under two snapshots, a clear
+    /// landing between them publishes a generation with a degraded field and no
+    /// services attributed to it, so both reads share one `REPEATABLE READ`
+    /// snapshot.
     pub async fn degraded_snapshot(
         &self,
         visible_services: &[String],
@@ -1569,19 +1034,8 @@ impl CatalogStore {
         Ok((degraded, pairs))
     }
 
-    /// Everything `/schema/field` needs to describe one field's health, read
-    /// as one fact: the conflict aggregate the verdict is computed from, the
-    /// detail rows the verdict cites, and the operator's acknowledgement.
-    ///
     /// Three statements under one `REPEATABLE READ` snapshot, for the same
-    /// reason [`Self::degraded_snapshot`] takes one. An ack lands between
-    /// two pooled reads and the response says "degraded, unacknowledged"
-    /// while the ack that suppressed the verdict already exists; a repin
-    /// cutover lands there instead and the response shows an ack beside
-    /// evidence it no longer describes. Neither pair was ever true.
-    ///
-    /// The aggregate is `None` when the field has no conflict evidence at
-    /// all, which is the healthy case.
+    /// reason [`Self::degraded_snapshot`] takes one.
     pub async fn field_health_snapshot(
         &self,
         field: &str,
@@ -1609,17 +1063,9 @@ impl CatalogStore {
         })
     }
 
-    /// The retained detail evidence for `fields`, newest first: the
-    /// `(observed_type, samples)` pairs a verdict is built from.
-    ///
-    /// Read only for the fields that came back degraded (usually none) and
-    /// bounded per field by [`VERDICT_EVIDENCE_ROWS`] through a LATERAL
-    /// subquery, not by an outer LIMIT: a page-wide limit would spend the
-    /// whole budget on the first field and leave the rest verdictless.
-    /// Unbounded, one `/schema/fields` request with a large `?limit=` over a
-    /// pathologically conflicted catalog would materialise
-    /// `MAX_CONFLICTS_PER_FIELD` rows — each carrying up to its full sample
-    /// payload — for every degraded field on the page.
+    /// Bounded per field by [`VERDICT_EVIDENCE_ROWS`] through a LATERAL
+    /// subquery, not by an outer LIMIT: a page-wide limit would spend the whole
+    /// budget on the first field and leave the rest verdictless.
     pub async fn conflict_evidence_for(
         &self,
         fields: &[String],
@@ -1628,8 +1074,6 @@ impl CatalogStore {
         Self::conflict_evidence_for_tx(&mut conn, fields).await
     }
 
-    /// [`Self::conflict_evidence_for`] inside a caller's transaction, so a
-    /// verdict and the evidence it cites can come from one snapshot.
     async fn conflict_evidence_for_tx(
         tx: &mut sqlx::PgConnection,
         fields: &[String],
@@ -1663,17 +1107,9 @@ impl CatalogStore {
         Ok(out)
     }
 
-    /// Drop every trace of one field's conflict evidence, inside a caller's
-    /// transaction.
-    ///
-    /// Called by the repin cutover ([`crate::store::RepinStore::finish_cutover`]):
-    /// the evidence indicts a pin that no longer exists, and the analyzer's
-    /// gate is span-based, so left standing a repinned field would keep its
-    /// verdict forever and the badge that told the operator to act would
-    /// survive their acting on it. Ordering is the cutover's, not ours: the
-    /// clear runs first and the forced lossy repin's own evidence is written
-    /// after it, in that same transaction, so the new evidence is never swept
-    /// away with the old and no read falls between the two.
+    /// Ordering is the cutover's, not ours: the clear runs first and the forced
+    /// lossy repin's own evidence is written after it, in that same
+    /// transaction, so the new evidence is never swept away with the old.
     pub async fn clear_conflict_evidence(
         tx: &mut sqlx::PgConnection,
         field: &str,
@@ -1689,38 +1125,15 @@ impl CatalogStore {
         Ok(())
     }
 
-    /// Acknowledge one field's degraded verdict up to the evidence that
-    /// exists right now (issue #111).
-    ///
     /// The whole method is one transaction, and it opens with `SELECT 1 FROM
     /// field_types WHERE field = $1 FOR SHARE`. That row lock is the
-    /// serialization point against the repin cutover, whose transaction
-    /// UPDATEs the same `field_types` row and DELETEs the ack. Without it
-    /// the two interleave in a way that is silently wrong: this method reads
-    /// the episode sum, the cutover then clears the evidence and the ack,
-    /// and this method's upsert lands afterwards — installing a high-water
-    /// over a field whose conflict counters have just been reset to zero,
-    /// which suppresses the NEW pin's first several episodes. `FOR SHARE`
-    /// is enough because `RepinStore::finish_cutover` opens by taking `FOR
-    /// UPDATE` on that same row unconditionally (its pin-flip UPDATE alone
-    /// would miss a resurrection-only cutover, where the new type equals the
-    /// old one), so the two orders are the only two outcomes: either the ack
-    /// commits first and the cutover deletes it, or the cutover commits
-    /// first and this method reads the post-clear evidence, finds nothing
-    /// degraded and refuses.
+    /// serialization point against the repin cutover, whose transaction UPDATEs
+    /// the same `field_types` row and DELETEs the ack. `FOR SHARE` is enough
+    /// because `RepinStore::finish_cutover` opens by taking `FOR UPDATE` on
+    /// that same row unconditionally.
     ///
-    /// Refusals are typed, not errors: an unpinned field and a field whose
-    /// evidence never met the threshold are both ordinary answers.
-    ///
-    /// The upsert ADVANCES: `evidence_through` never moves backwards, so a
-    /// second ack racing a concurrent evidence clear cannot lower a
-    /// high-water another one just raised. The actor, the note and the
-    /// timestamp move with it, or not at all: two operators can read the
-    /// same field a moment apart, and the one whose read saw LESS evidence
-    /// must not end up named as the person who accepted the pin through the
-    /// higher count. So the metadata columns are replaced only when the
-    /// incoming high-water is at least the stored one, and a stale call
-    /// leaves the row exactly as it found it.
+    /// The upsert ADVANCES: `evidence_through` never moves backwards. The
+    /// actor, the note and the timestamp move with it, or not at all.
     pub async fn acknowledge_degraded_field(
         &self,
         field: &str,
@@ -1816,13 +1229,11 @@ impl CatalogStore {
         Ok(outcome)
     }
 
-    /// One field's acknowledgement, if it has one.
     pub async fn degraded_ack(&self, field: &str) -> Result<Option<DegradedAck>, StoreError> {
         let mut conn = self.pool.acquire().await?;
         Self::degraded_ack_tx(&mut conn, field).await
     }
 
-    /// [`Self::degraded_ack`] inside a caller's transaction.
     async fn degraded_ack_tx(
         tx: &mut sqlx::PgConnection,
         field: &str,
@@ -1847,14 +1258,6 @@ impl CatalogStore {
         .map_err(StoreError::from)
     }
 
-    /// Drop one field's acknowledgement, inside a caller's transaction; the
-    /// answer says whether a row was actually removed.
-    ///
-    /// Public and transaction-taking for the reason
-    /// [`Self::clear_conflict_evidence`] is: the repin cutover
-    /// ([`crate::store::RepinStore::finish_cutover`]) has to clear the ack
-    /// atomically with the pin flip it invalidates, and only a caller
-    /// holding that transaction can express it.
     pub async fn clear_degraded_ack(
         tx: &mut sqlx::PgConnection,
         field: &str,
@@ -1866,14 +1269,11 @@ impl CatalogStore {
         Ok(done.rows_affected() > 0)
     }
 
-    /// [`Self::clear_degraded_ack`] on its own connection: the operator's
-    /// own "un-acknowledge", which needs no wider atomicity than the DELETE.
     pub async fn clear_degraded_ack_owned(&self, field: &str) -> Result<bool, StoreError> {
         let mut conn = self.pool.acquire().await?;
         Self::clear_degraded_ack(&mut conn, field).await
     }
 
-    /// Read the conflict rows for one field, most recent first.
     pub async fn conflicts_for_field(
         &self,
         field: &str,
@@ -1944,52 +1344,30 @@ impl CatalogStore {
         ORDER BY t.field
         LIMIT $2";
 
-    /// List pins with their aggregated observation and conflict evidence —
-    /// the read model behind `/api/v1/schema` and `/api/v1/schema/fields`.
-    ///
-    /// The pin page is one query: `field_types` LEFT JOIN grouped
-    /// `field_services`. The LEFT join is load-bearing: a pin with no
-    /// observations (the envelope seed on a fresh install, or a boot-pass
-    /// pin over standing parquet) must always appear — windowing only hides
-    /// fields whose evidence says they aged out.
+    /// The LEFT join is load-bearing: a pin with no observations (the envelope
+    /// seed on a fresh install, or a boot-pass pin over standing parquet) must
+    /// always appear.
     ///
     /// `filter.service` scopes the aggregate, not just the row set: the
-    /// predicate goes inside the `field_services` grouping, so a scoped
-    /// listing reports that service's own counts and instants, and the
-    /// `since` window is evaluated against that service's `last_seen`.
-    /// Filtering only in the `WHERE` clause would leak every other
-    /// service's numbers into the listing and keep a field alive in the
-    /// window because somebody else still sends it. The `EXISTS` stays as
-    /// the presence test: a pin the service never carried has no group
-    /// row, and the never-observed rule would otherwise show it.
+    /// predicate goes inside the `field_services` grouping. Filtering only in
+    /// the `WHERE` clause would leak every other service's numbers into the
+    /// listing and keep a field alive in the window because somebody else still
+    /// sends it. The `EXISTS` stays as the presence test: a pin the service
+    /// never carried has no group row, and the never-observed rule would
+    /// otherwise show it.
     ///
-    /// The conflict evidence is a second query, keyed on the field names
-    /// this page actually returned, and skipped entirely when
-    /// `filter.with_conflicts` is false. Joining a grouped
-    /// `SELECT ... FROM field_conflicts GROUP BY field` instead would carry
-    /// no predicate a planner can push down, so every call, including the
-    /// deliberately uncached `?service=` one, would materialise an aggregate
-    /// over the whole table, which is bounded only by
-    /// [`MAX_CONFLICTS_PER_FIELD`] x [`MAX_PINNED_FIELDS`] and not by the
-    /// pin cap the scoped listing promises. Keyed on the page it rides
-    /// 0002's `(field, at DESC)` index and reads at most
-    /// `limit` x [`MAX_CONFLICTS_PER_FIELD`] rows.
+    /// The conflict evidence is a second query, keyed on the field names this
+    /// page actually returned: a joined `GROUP BY field` would carry no
+    /// predicate a planner can push down, so every call would materialise an
+    /// aggregate over the whole table.
     ///
-    /// Scoped and unscoped are two SQL texts, not one
-    /// `($1 IS NULL OR service = $1)` shape: sqlx prepares and caches every
-    /// statement per pooled connection, and on execution 6 postgres
-    /// (`plan_cache_mode=auto`) switches a prepared statement to its
-    /// generic plan — under which the `IS NULL`-guarded `OR` cannot be
-    /// pushed into `field_services_service_field_idx` (migration 0003) as a
-    /// scan key, so the scoped listing degrades to reading the whole table
-    /// (measured at 0003's own sizing: 2 318 → 504 366 buffers), unbounded
-    /// in the client-chosen service axis. Same reasoning as the cursor
-    /// predicate in [`Self::field_services`]. The `since` guard keeps the
-    /// `IS NULL`-`OR` shape: it filters the joined rows after aggregation,
-    /// bounded by the pin cap, and is no index's scan key either way.
-    ///
-    /// Returns `(rows, truncated)`; `truncated` is set when more rows
-    /// matched than `filter.limit` allowed back.
+    /// Scoped and unscoped are two SQL texts, not one `($1 IS NULL OR service =
+    /// $1)` shape: sqlx prepares and caches every statement per pooled
+    /// connection, and on execution 6 postgres (`plan_cache_mode=auto`)
+    /// switches a prepared statement to its generic plan, under which the `IS
+    /// NULL`-guarded `OR` cannot be pushed into
+    /// `field_services_service_field_idx` as a scan key, so the scoped listing
+    /// degrades to reading the whole table.
     pub async fn list_fields(
         &self,
         filter: &FieldListFilter,
@@ -2002,7 +1380,6 @@ impl CatalogStore {
         };
         let rows = query
             .bind(filter.since)
-            // Fetch one extra row purely to learn whether the limit truncated.
             .bind(limit.saturating_add(1))
             .fetch_all(&self.pool)
             .await?;
@@ -2063,9 +1440,6 @@ impl CatalogStore {
         Ok((summaries, truncated))
     }
 
-    /// The catalog's fill level: `(pinned, capacity)`, the same pair the
-    /// `trawl_catalog_pinned_fields` / `trawl_catalog_pin_capacity` gauges
-    /// publish, surfaced on the fields listing so a client sees headroom.
     pub async fn pin_stats(&self) -> Result<(i64, i64), StoreError> {
         let pinned: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
             .fetch_one(&self.pool)
@@ -2073,11 +1447,6 @@ impl CatalogStore {
         Ok((pinned, self.pin_cap))
     }
 
-    /// Cross-field conflict listing, most recent first: the schema-health
-    /// dashboard read (`trawl schema conflicts --last 7d`).
-    ///
-    /// `field`/`service` filter exactly; `since` windows on the recording
-    /// instant. Returns `(rows, truncated)` like [`Self::list_fields`].
     pub async fn recent_conflicts(
         &self,
         field: Option<&str>,
@@ -2122,7 +1491,6 @@ impl CatalogStore {
             .map_err(StoreError::from)
     }
 
-    /// Read one field's pin row, or `None` when the field is not pinned.
     pub async fn field_pin(&self, field: &str) -> Result<Option<FieldPinRow>, StoreError> {
         let row = sqlx::query(
             "SELECT field, duckdb_type, pinned_from, pinned_at
@@ -2143,31 +1511,18 @@ impl CatalogStore {
         .map_err(StoreError::from)
     }
 
-    /// Every pin whose newest observation predates `cutoff`, plus every pin
-    /// never observed at all: the gc candidate set on the observation axis
-    /// (ADR-0009 catalog, `crate::catalog::gc`).
-    ///
-    /// Never-observed pins are included, which is a deliberate divergence
-    /// from [`Self::list_fields`], where such a pin is always shown rather
-    /// than windowed out. The listing errs toward showing; gc errs toward
-    /// reclaiming, and the caller's [`crate::catalog::gc::candidacy`] is
-    /// where the envelope is protected and the footer scan is where a
-    /// candidate is disproved. This method judges nothing: it reads.
+    /// Never-observed pins are included, a deliberate divergence from
+    /// [`Self::list_fields`]: the listing errs toward showing; gc errs toward
+    /// reclaiming.
     ///
     /// The newest observation is a per-pin LATERAL `ORDER BY last_seen DESC
-    /// LIMIT 1`, an index-only lookup of one row through migration 0004's
-    /// `field_services_field_last_seen_idx`. Deliberately not the
-    /// `GROUP BY field` aggregate [`Self::list_fields`] uses: that one reads
-    /// every observation row in the table, and the service axis is
-    /// client-chosen and never pruned, so a periodic operator command would
-    /// carry a cost set by how many service names have ever been invented.
+    /// LIMIT 1`, an index-only lookup of one row. Deliberately not the `GROUP
+    /// BY field` aggregate [`Self::list_fields`] uses: that one reads every
+    /// observation row in the table, and the service axis is client-chosen and
+    /// never pruned.
     ///
-    /// The service count is a scalar subquery over the surviving rows only,
-    /// which is what the MATERIALIZED CTE buys: it fences the count so it
-    /// runs per candidate (bounded by [`MAX_PINNED_FIELDS`]) rather than per
-    /// pin. It counts the whole history, not the window — a candidate has no
-    /// observation inside the window by construction, so a windowed count
-    /// would be zero for every row.
+    /// The MATERIALIZED CTE fences the service count so it runs per candidate
+    /// rather than per pin.
     pub async fn pins_unobserved_since(
         &self,
         cutoff: DateTime<Utc>,
@@ -2209,77 +1564,9 @@ impl CatalogStore {
             .map_err(StoreError::from)
     }
 
-    /// Delete `fields` from the catalog entirely, in one transaction:
-    /// aggregates, conflict evidence, observations, then the pins
-    /// themselves. Returns the rows deleted from `field_types`.
-    ///
-    /// One transaction because a partial purge is a catalog that lies. Left
-    /// half-done, a field would keep observation rows and conflict evidence
-    /// with no pin to explain them, and the analyzer would go on indicting a
-    /// pin that does not exist. The order is child-to-parent so a foreign
-    /// key added later cannot make the delete order matter.
-    ///
     /// A [`trawl_core::schema::is_contract_typed`] name is an error, not a
-    /// skipped element. The caller filters those out before it ever gets
-    /// here, so one arriving means the candidate set was built wrong, and
-    /// silently deleting the rest would hide that while leaving the operator
-    /// a report that claims a field they still have. Nothing is deleted:
-    /// the check runs before the transaction opens.
-    ///
-    /// `repin_jobs` is READ and never written. A repin's history says what
-    /// an operator did to the corpus, which stays true after the field is
-    /// gone — but a `running` row means a job that will later flip a pin,
-    /// so the transaction takes
-    /// [`super::CATALOG_LIFECYCLE_LOCK_KEY`], re-checks for one, and
-    /// refuses with [`StoreError::RepinAlreadyRunning`] rather than delete
-    /// the row that job is about to update.
-    ///
-    /// Returns [`PurgedPins`]: the rows `field_types` actually gave up, each
-    /// with the metadata this transaction read, and the fill count. All of
-    /// it comes out of the ONE transaction on purpose. The caller's next act
-    /// is a cache eviction that must not be skipped, and a post-commit
-    /// SELECT for the gauge is one more thing that can fail between the
-    /// commit and that eviction — which would leave the pin gone from
-    /// postgres and present in every reader's cache. Nothing fallible
-    /// happens after the commit here; the caller publishes the gauges
-    /// (infallibly, from the returned count) once the eviction is done.
-    ///
-    /// The purge is bounded in two phases, because the two halves fail
-    /// differently.
-    ///
-    /// Everything up to the commit runs in [`Self::prepare_purge`], under
-    /// postgres' own [`PURGE_STATEMENT_TIMEOUT_SQL`] AND a client-side
-    /// [`PURGE_PREPARE_BOUND`]. The database-side bound is the precise one
-    /// (`SET LOCAL statement_timeout` covers every statement including the
-    /// advisory-lock wait, which `lock_timeout` does not — it applies to
-    /// heavyweight table and row locks, not to `pg_advisory_xact_lock` — so
-    /// it is set first, and `lock_timeout` then bounds the row locks the
-    /// deletes take). It is also the one a half-open connection defeats:
-    /// the backend is idle and healthy, nothing trips its timeout, and this
-    /// task waits on a socket that will never answer while the corpus gate,
-    /// and every compaction batch behind it, waits on this task. So the
-    /// prepare phase is wrapped in a [`tokio::time::timeout`], which is
-    /// safe here for the one reason it is not safe around the commit:
-    /// dropping pre-commit work can only roll it back. Its transaction
-    /// closes its connection when dropped, rather than hand the pool a
-    /// session still inside it, even mid-`BEGIN`. On elapse the method
-    /// returns [`StoreError::PurgePrepareTimeout`], nothing was committed,
-    /// and the caller may settle its cache by re-reading the catalog.
-    ///
-    /// Only a prepared transaction ready to commit reaches
-    /// [`commit_or_detach`], and the commit is bounded differently because
-    /// postgres cannot bound it: once durable commit processing starts the
-    /// backend ignores cancellation, so a stalled fsync would hold the
-    /// corpus gate for as long as the volume takes. After
-    /// [`PURGE_COMMIT_BOUND`] this method stops waiting and returns
-    /// [`StoreError::PurgeCommitUnknown`], having first moved the commit
-    /// future onto a task of its own. The commit is never cancelled, only
-    /// unobserved: postgres still decides it exactly once, the detached
-    /// task logs which way it went, and the caller must treat both the
-    /// catalog rows and its own cache as unknown. A commit that completes
-    /// with an ERROR returns the same thing, for the same reason: the error
-    /// may have arrived from a backend that already made the commit
-    /// durable.
+    /// skipped element: the caller filters those out before it ever gets here,
+    /// so one arriving means the candidate set was built wrong.
     pub async fn delete_pins(&self, fields: &[String]) -> Result<PurgedPins, StoreError> {
         if fields.is_empty() {
             return Ok(PurgedPins::default());
@@ -2319,28 +1606,13 @@ impl CatalogStore {
         })
     }
 
-    /// Everything the purge does before the commit: open the transaction,
-    /// bound it, take the catalog lifecycle lock, refuse a running repin,
-    /// read the audit metadata, delete, and count what is left.
-    ///
-    /// Split out of [`Self::delete_pins`] so the caller can put a
-    /// wall-clock bound on exactly this half. Dropping the returned future
-    /// at any point drops the transaction, which rolls back: no caller can
-    /// be told "nothing happened" over a catalog that lost rows. The
-    /// transaction is a [`PooledTransaction`], so its connection closes
-    /// instead of going back to the pool, and Postgres ends the transaction
-    /// with the session, a `BEGIN` whose answer was still on its way
-    /// included.
-    ///
-    /// Returns the live transaction, ready to commit and nothing else.
     async fn prepare_purge(
         &self,
         fields: &[String],
     ) -> Result<(PooledTransaction, Vec<PurgedPin>, i64), StoreError> {
         let mut tx = PooledTransaction::begin(self.pool.acquire().await?).await?;
         // Bound the pre-commit work database-side, before anything that can
-        // wait. `statement_timeout` first, because the advisory lock below
-        // is a statement and no other setting bounds it.
+        // wait.
         for sql in [PURGE_STATEMENT_TIMEOUT_SQL, PURGE_LOCK_TIMEOUT_SQL] {
             sqlx::query(sql).execute(&mut *tx).await?;
         }
@@ -2356,12 +1628,8 @@ impl CatalogStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         if running.is_some() {
-            // Dropping the transaction rolls it back; nothing was deleted.
             return Err(StoreError::RepinAlreadyRunning);
         }
-        // The observation half of the audit record, read while the rows are
-        // still there. One statement for both numbers: the newest
-        // observation and how many the purge is about to discard.
         let observed: HashMap<String, (Option<DateTime<Utc>>, i64)> = sqlx::query(
             "SELECT field, max(last_seen) AS last_seen, count(*)::bigint AS services
              FROM field_services WHERE field = ANY($1) GROUP BY field",
@@ -2378,14 +1646,10 @@ impl CatalogStore {
         })
         .collect::<Result<_, sqlx::Error>>()?;
 
-        // `field_degraded_ack` is listed rather than left to its FK
-        // cascade (#111). The cascade would fire here anyway, but every
-        // other table the purge empties is named in this list, and a
-        // reader checking what a reclaimed slot leaves behind should not
-        // have to open a migration to find the one exception. It is also
-        // the table whose survival would be worst: an ack is an operator's
-        // statement about a pin, and re-pinning the same name later must
-        // not resurrect a judgement made about the pin that is gone.
+        // `field_degraded_ack` is listed rather than left to its FK cascade:
+        // every other table the purge empties is named in this list, and
+        // re-pinning the same name later must not resurrect a judgement made
+        // about the pin that is gone.
         for sql in [
             "DELETE FROM field_degraded_ack WHERE field = ANY($1)",
             "DELETE FROM field_conflict_stats WHERE field = ANY($1)",
@@ -2431,8 +1695,6 @@ impl CatalogStore {
         Ok((tx, deleted, pinned_now))
     }
 
-    /// Which of `fields` `field_types` still holds.
-    ///
     /// The reconcile read behind a purge that failed BEFORE its commit was
     /// sent: those errors prove a rollback, and this read settles the pin
     /// cache against the surviving rows. A commit-phase failure never
@@ -2466,12 +1728,10 @@ impl CatalogStore {
         Ok(read_catalog_id(&self.pool).await?)
     }
 
-    /// Whether the boot conformance pass has completed for this catalog.
     pub async fn is_conformed(&self) -> Result<bool, StoreError> {
         Ok(read_conformed(&self.pool).await?)
     }
 
-    /// Record completion of boot rewrites and service observation backfill.
     pub async fn mark_conformed(&self) -> Result<(), StoreError> {
         sqlx::query("UPDATE catalog_state SET conformed_at = now()")
             .execute(&self.pool)
@@ -2491,24 +1751,12 @@ impl CatalogStore {
     }
 }
 
-/// `catalog_state.catalog_id`, as [`CatalogStore::catalog_id`] reads it.
-/// A `SELECT` on any executor, so `trawld --doctor` reads it on its own
-/// read-only connection, without a pool.
-///
-/// # Errors
-/// Database errors, and `RowNotFound` when `catalog_state` has no row.
 pub async fn read_catalog_id<'e>(conn: impl sqlx::PgExecutor<'e>) -> Result<String, sqlx::Error> {
     sqlx::query_scalar("SELECT catalog_id::text FROM catalog_state")
         .fetch_one(conn)
         .await
 }
 
-/// Whether `catalog_state.conformed_at` is set, as
-/// [`CatalogStore::is_conformed`] reads it. A `SELECT` on any executor, as
-/// [`read_catalog_id`].
-///
-/// # Errors
-/// Database errors, and `RowNotFound` when `catalog_state` has no row.
 pub async fn read_conformed<'e>(conn: impl sqlx::PgExecutor<'e>) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT conformed_at IS NOT NULL FROM catalog_state")
         .fetch_one(conn)
@@ -2519,9 +1767,6 @@ pub async fn read_conformed<'e>(conn: impl sqlx::PgExecutor<'e>) -> Result<bool,
 mod tests {
     use super::*;
 
-    /// The cursor is opaque to clients but must round-trip exactly: a
-    /// microsecond lost in the encoding would re-deliver or skip the row it
-    /// names. Service names carry `.`, `-`, and `_`; none is `|`.
     #[test]
     fn service_cursor_roundtrips_exactly() {
         for service in ["nginx", "api.v2", "svc-a_b", "x"] {
@@ -2536,15 +1781,6 @@ mod tests {
         }
     }
 
-    /// The purge bounds itself inside postgres, and the order of the two
-    /// settings is load-bearing: `statement_timeout` is the only one that
-    /// bounds the advisory-lock wait, so it must be in force before
-    /// `pg_advisory_xact_lock` runs.
-    ///
-    /// Source-shape. `SHOW statement_timeout` is only observable from
-    /// inside the transaction, which nothing outside this method can enter,
-    /// and the live behaviour (a purge that gives up instead of hanging on
-    /// a held row lock) is asserted in `tests/store_pg.rs`.
     #[test]
     fn the_purge_sets_its_bounds_before_it_takes_the_lock() {
         let src = include_str!("catalog.rs");
@@ -2575,17 +1811,6 @@ mod tests {
         );
     }
 
-    /// The purge's commit is bounded by a `select!`, and the arm that fires
-    /// hands the future to `tokio::spawn` instead of dropping it.
-    ///
-    /// Source-shape, and it has to be: making a live postgres take longer
-    /// than [`PURGE_COMMIT_BOUND`] to commit means stalling its fsync, which
-    /// no fixture here can do. What the shape guards is the difference
-    /// between "stopped waiting" and "cancelled". A `tokio::time::timeout`
-    /// wrapped around the commit would look almost identical and would drop
-    /// the future, leaving postgres free to commit rows nobody was told
-    /// about. `biased` belongs to the same decision: a commit that lands in
-    /// the same wake as the timer is a commit, not a timeout.
     #[test]
     fn the_purge_detaches_its_commit_instead_of_cancelling_it() {
         let src = include_str!("catalog.rs");
@@ -2633,10 +1858,6 @@ mod tests {
             );
         }
 
-        // The completion arm, before the timer arm: an Err there is
-        // UNKNOWN, never a store error the caller would try to settle by
-        // reading `field_types`. A commit can fail with the write already
-        // durable, so "it errored" does not mean "it rolled back".
         let completion = &body[select..select + timer];
         let failed = completion
             .find("Err(e) =>")
@@ -2656,18 +1877,6 @@ mod tests {
         );
     }
 
-    /// The purge is two phases with two different bounds, and the
-    /// cancelling one covers only the half where cancelling is safe.
-    ///
-    /// Source-shape, because the failure it guards against is a wall-clock
-    /// stall no fixture can produce: a connection that stops answering
-    /// while postgres itself is idle. What the shape asserts is the split.
-    /// The pre-commit work must sit inside `tokio::time::timeout` (dropping
-    /// it rolls back), the commit must sit outside it, and no timeout may
-    /// wrap both — one that did would drop a commit postgres goes on to
-    /// apply. The pre-commit transaction is a `PooledTransaction`: sqlx's
-    /// own `begin()`, dropped while its `BEGIN` is answered, would hand
-    /// the pool a session still inside the transaction.
     #[test]
     fn the_purge_bounds_its_pre_commit_phase_and_only_that() {
         let src = include_str!("catalog.rs");
@@ -2699,9 +1908,6 @@ mod tests {
             "an elapsed prepare is an ordinary bounded failure: nothing committed"
         );
 
-        // The transaction is built and handed over whole. A prepare that
-        // committed anything itself would put a second, unbounded commit
-        // back in the cancellable half.
         let prepare = src
             .find("    async fn prepare_purge(")
             .expect("the pre-commit phase is one method");
@@ -2719,9 +1925,6 @@ mod tests {
         );
     }
 
-    /// A malformed cursor is a client error, never a silently dropped
-    /// filter: decoding fails so the handler can 400 instead of restarting
-    /// the walk at page one.
     #[test]
     fn service_cursor_rejects_garbage() {
         for raw in [
@@ -2737,9 +1940,6 @@ mod tests {
     }
 }
 
-/// Transaction coverage for [`record_conflicts_in`], which no integration
-/// test can reach: it is crate-internal on purpose, so the only callers are
-/// the two entry points in this crate.
 #[cfg(test)]
 mod pg_tests {
     use sqlx::PgPool;
@@ -2747,12 +1947,6 @@ mod pg_tests {
     use super::{CatalogStore, FieldConflict, MAX_CONFLICTS_PER_FIELD, record_conflicts_in};
     use trawl_core::schema::CanonicalType;
 
-    /// The helper writes into the caller's transaction and commits nothing
-    /// of its own: a rollback takes the evidence rows AND the durable
-    /// aggregates with it. The repin cutover depends on exactly this, since
-    /// it materialises evidence in the transaction that flips the pin, and a
-    /// self-committing helper would leave conflicts behind for a flip that
-    /// never happened.
     #[sqlx::test]
     async fn record_conflicts_in_commits_nothing_of_its_own(pool: PgPool) {
         let store = CatalogStore::new(pool.clone());

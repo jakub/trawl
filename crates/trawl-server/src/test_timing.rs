@@ -2,12 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Shared timing helpers for tests that wait on real worker threads or
-//! sockets (#316).
-//!
-//! Order between two steps comes from something the code publishes: a seam
-//! arrival, a join, a channel, a committed row. These helpers only wait for
-//! that to happen. They never decide correctness by elapsed time.
+//! Timing helpers for tests that wait on real worker threads or sockets.
+//! They only wait; they never decide correctness by elapsed time.
 //!
 //! trawl-web includes this file by `#[path]` for its own unit tests, so it
 //! depends on nothing but `std` and `tokio`.
@@ -16,25 +12,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-/// The one real-clock bound the tests of #316 use.
-///
 /// It only names a hang: a wait that exceeds it fails instead of blocking
 /// the run forever. It never decides correctness, so no assertion may be
 /// built on a condition a buggy build could also meet before it expires.
 pub const HANG_GUARD: Duration = Duration::from_secs(120);
 
-/// Yield until `cond` holds, panicking with `what` if [`HANG_GUARD`] runs
-/// out first.
-///
 /// A yield loop keeps a paused tokio clock fixed. Tokio auto-advances a
-/// paused clock only when the runtime has nothing runnable and parks with
-/// no timeout, and a task that always re-wakes itself leaves the runtime
-/// with a runnable task, so it parks with a zero limit and the clock never
-/// moves while a blocking thread makes real progress. A tokio sleep or
-/// timeout in its place would be idle and let the clock jump. The bound is
-/// measured on the real clock (`std::time::Instant`) for the same reason.
-/// It also works on `multi_thread` runtimes, where the yield just hands
-/// the worker back to the scheduler.
+/// paused clock only when the runtime has nothing runnable, and a task that
+/// always re-wakes itself leaves the runtime with a runnable task. A tokio
+/// sleep or timeout in its place would be idle and let the clock jump. The
+/// bound is measured on the real clock (`std::time::Instant`) for the same
+/// reason.
 pub async fn until(what: &str, mut cond: impl FnMut() -> bool) {
     let start = Instant::now();
     while !cond() {
@@ -48,11 +36,6 @@ pub async fn until(what: &str, mut cond: impl FnMut() -> bool) {
 
 /// [`until`] for a test that owns a future (a connection driver, an HTTP
 /// request) and has to keep polling it while it waits.
-///
-/// Each iteration polls `fut` once and then checks `cond`. Returns
-/// `Some(output)` if the future completes first and `None` once `cond`
-/// holds while it is still pending; the future is left unfinished for the
-/// caller to keep polling or drop. Same hang guard and yield as [`until`].
 pub async fn until_polling<F: Future + Unpin>(
     what: &str,
     fut: &mut F,
@@ -76,17 +59,9 @@ pub async fn until_polling<F: Future + Unpin>(
     }
 }
 
-/// Drive `op` to completion without letting a paused tokio clock move on
-/// its own, panicking with `what` if [`HANG_GUARD`] runs out first.
-///
-/// Use it around any await on real I/O in a paused test: a TLS request, a
-/// Postgres round trip, a `spawn_blocking` result. Awaited bare, such an
-/// await leaves the runtime idle, and tokio jumps the clock to the next
-/// timer, which fires a deadline the test never advanced to. Here `op` is
-/// polled by [`until_polling`] with a condition that never holds, so the
-/// runtime always has a runnable task. A `tokio::time::advance` inside
-/// `op` still moves the clock by exactly what it asks for. The guard
-/// panics in the test's own task, so a hang fails the test at once.
+/// Use it around any await on real I/O in a paused test. Awaited bare,
+/// such an await leaves the runtime idle, and tokio jumps the clock to the
+/// next timer, which fires a deadline the test never advanced to.
 pub async fn frozen<F: Future>(what: &str, op: F) -> F::Output {
     until_polling(what, &mut std::pin::pin!(op), || false)
         .await

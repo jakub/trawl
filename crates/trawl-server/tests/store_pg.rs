@@ -4,19 +4,10 @@
 
 //! Postgres store tests for trawl-server's app-state stores.
 //!
-//! Covers per-store behaviour, the concurrency guarantees postgres has to
-//! make on its own (nothing serialises these calls in-process), and the
-//! boot path: advisory lock, migration, idempotency, failure modes.
-//!
-//! Plain `#[sqlx::test]` auto-applies `crates/trawl-server/migrations/` to
-//! each per-test database. The boot tests take no harness pool at all:
-//! they mint their own database and drive it through `StorageState`, so
-//! `#[sqlx::test]` would only mint a second database nobody opens and
-//! charge its 5-connection pool to the admission budget for the duration
-//! (`common::BOOT_CONNECTION_CEILING`). They keep the real boot path:
-//! `from_pool` is where the advisory lock and the migration live, and the
-//! pool it is handed is `common::app_pool`, sized like the fixture's
-//! rather than trawld's production 8.
+//! The boot tests take no harness pool: they mint their own database and
+//! drive it through `StorageState`, so `#[sqlx::test]` would only mint a
+//! second database nobody opens and charge its 5-connection pool to the
+//! admission budget (`common::BOOT_CONNECTION_CEILING`).
 
 mod common;
 
@@ -41,10 +32,6 @@ fn saved(pool: &PgPool) -> SavedQueryStore {
 fn schedules(pool: &PgPool) -> ScheduleStore {
     ScheduleStore::new(pool.clone())
 }
-
-// ---------------------------------------------------------------------------
-// history
-// ---------------------------------------------------------------------------
 
 #[sqlx::test]
 async fn history_record_and_retrieve(pool: PgPool) {
@@ -90,7 +77,6 @@ async fn history_pagination(pool: PgPool) {
     let page1 = store.get_user_history(key_id, 2, 0, None).await.unwrap();
     assert_eq!(page1.total, 5);
     assert_eq!(page1.entries.len(), 2);
-    // Most recent first (descending order).
     assert_eq!(page1.entries[0].query, "query 4");
     assert_eq!(page1.entries[1].query, "query 3");
 
@@ -103,8 +89,6 @@ async fn history_pagination(pool: PgPool) {
     assert_eq!(page3.entries[0].query, "query 0");
 }
 
-/// Same-timestamp rows page deterministically: `ORDER BY executed_at DESC,
-/// id DESC` tie-breaks on id, so pagination never duplicates or skips.
 #[sqlx::test]
 async fn history_pagination_tie_breaks_on_id(pool: PgPool) {
     for i in 0..4 {
@@ -359,10 +343,6 @@ async fn history_filter_non_ascii_follows_reported_postgres_locale(pool: PgPool)
     }
 }
 
-/// The `RunStatus` enum keeps the typed write path inside the status domain;
-/// the DB CHECK is the backstop against a raw write bypassing it. Prove the
-/// constraint (23514) still fires when an out-of-domain value is inserted
-/// directly.
 #[sqlx::test]
 async fn history_status_check_is_backstop(pool: PgPool) {
     let err = sqlx::query(
@@ -375,10 +355,6 @@ async fn history_status_check_is_backstop(pool: PgPool) {
     let db = err.as_database_error().expect("database error");
     assert_eq!(db.code().as_deref(), Some("23514"), "got: {err:?}");
 }
-
-// ---------------------------------------------------------------------------
-// saved queries
-// ---------------------------------------------------------------------------
 
 #[sqlx::test]
 async fn saved_create_and_list(pool: PgPool) {
@@ -595,12 +571,9 @@ async fn saved_get_by_name(pool: PgPool) {
     assert_eq!(found.name, "my_query");
     assert_eq!(found.query, "_severity=error");
 
-    // Other user can't see it.
     assert!(store.get_by_name(2, "my_query").await.unwrap().is_none());
 }
 
-/// The bulk-join list carries schedule + latest run + run count per item in
-/// a single statement, so the query count does not grow with the list.
 #[sqlx::test]
 async fn saved_list_with_details_bulk_join(pool: PgPool) {
     let saved_store = saved(&pool);
@@ -619,7 +592,6 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
         .await
         .unwrap();
 
-    // Two finished runs on alpha.
     for i in 0..2 {
         let rid = seed_run(&schedule_store, sched_a.id, a.id, "q1").await;
         assert_eq!(
@@ -649,10 +621,6 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
     assert!(details[2].schedule.is_none(), "gamma has no schedule");
 }
 
-// ---------------------------------------------------------------------------
-// schedules + runs
-// ---------------------------------------------------------------------------
-
 async fn seed_saved(pool: &PgPool, key_id: i64, name: &str) -> i64 {
     saved(pool)
         .create(key_id, name, "_severity=error")
@@ -663,8 +631,6 @@ async fn seed_saved(pool: &PgPool, key_id: i64, name: &str) -> i64 {
 
 /// Claim a `running` report run and return its id, asserting the claim
 /// started. It spends one run of the schedule's budget, like every claim.
-/// Seeds runs for the schedule/run lifecycle tests without the concurrency
-/// guards those tests set up explicitly.
 async fn seed_run(
     store: &ScheduleStore,
     schedule_id: i64,
@@ -681,9 +647,6 @@ async fn seed_run(
     }
 }
 
-/// A claim blocked on its saved query must not hold the schedule lock.
-/// Otherwise an editor holding the saved query and reaching for the schedule
-/// closes a deadlock cycle with the claim's implicit foreign-key lock.
 #[sqlx::test]
 async fn claim_run_locks_saved_query_before_schedule(pool: PgPool) {
     let store = schedules(&pool);
@@ -772,7 +735,6 @@ async fn schedule_duplicate_returns_error(pool: PgPool) {
 
 #[sqlx::test]
 async fn schedule_for_missing_saved_query_is_not_found(pool: PgPool) {
-    // 23503 on the named FK maps to NotFound, not a raw pg error.
     let store = schedules(&pool);
     let result = store
         .create_schedule(12345, 1, 300, None, None, 0, chrono::Utc::now())
@@ -782,8 +744,6 @@ async fn schedule_for_missing_saved_query_is_not_found(pool: PgPool) {
 
 #[sqlx::test]
 async fn schedule_rejects_sub_minute_interval(pool: PgPool) {
-    // The 60s minimum is enforced on both the create and update paths, not
-    // only where `parse_interval` reads the request string.
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
 
@@ -847,13 +807,6 @@ async fn schedule_update_other_user_not_found(pool: PgPool) {
     assert!(matches!(result, Err(StoreError::NotFound { .. })));
 }
 
-// ---------------------------------------------------------------------------
-// schedule windows (ADR-0018 rulings 6-14)
-// ---------------------------------------------------------------------------
-
-/// The (SQLSTATE, constraint name) pair of a rejected write. Constraint
-/// tests assert on this rather than on message text, the same way the
-/// store's own error mapping does.
 fn violation(e: sqlx::Error) -> (Option<String>, Option<String>) {
     match e {
         sqlx::Error::Database(db) => (
@@ -864,7 +817,6 @@ fn violation(e: sqlx::Error) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Read a schedule's raw cursor columns, bypassing the decoder.
 async fn raw_cursors(
     pool: &PgPool,
     id: i64,
@@ -885,9 +837,6 @@ async fn raw_cursors(
     .unwrap()
 }
 
-/// All three window modes survive the round trip, and a `fixed` window keeps
-/// its span. Absent stays absent: a legacy schedule must not acquire a
-/// window by being written through the new columns.
 #[sqlx::test]
 async fn schedule_window_round_trips(pool: PgPool) {
     let store = schedules(&pool);
@@ -941,9 +890,6 @@ async fn schedule_window_round_trips(pool: PgPool) {
     }
 }
 
-/// `next_fire_at` is the caller's instant, not the database clock: the
-/// scheduler samples one application instant per tick, and a test with a
-/// fake clock has to be able to create a schedule that is already due.
 #[sqlx::test]
 async fn schedule_create_anchors_next_fire_at_to_caller_instant(pool: PgPool) {
     let store = schedules(&pool);
@@ -960,9 +906,6 @@ async fn schedule_create_anchors_next_fire_at_to_caller_instant(pool: PgPool) {
     assert_eq!(next_fire_at, now);
 }
 
-/// The planned cursor moves when the cadence changes and stays put
-/// otherwise. Re-anchoring on every edit would let repeated `max_runs` or
-/// `enabled` edits keep a schedule permanently un-due.
 #[sqlx::test]
 async fn schedule_update_reanchors_only_on_cadence_change(pool: PgPool) {
     let store = schedules(&pool);
@@ -976,21 +919,18 @@ async fn schedule_update_reanchors_only_on_cadence_change(pool: PgPool) {
         .unwrap();
     assert_eq!(created.next_fire_at, t0);
 
-    // max_runs and enabled: not cadence.
     let same = store
         .update_schedule(created.id, 1, 300, Some(5), false, None, 0, at(1))
         .await
         .unwrap();
     assert_eq!(same.next_fire_at, t0, "max_runs/enabled must not re-anchor");
 
-    // interval: cadence.
     let interval = store
         .update_schedule(created.id, 1, 600, Some(5), false, None, 0, at(2))
         .await
         .unwrap();
     assert_eq!(interval.next_fire_at, at(2), "interval change re-anchors");
 
-    // window: cadence, since it changes what a fire covers.
     let windowed = store
         .update_schedule(
             created.id,
@@ -1006,7 +946,6 @@ async fn schedule_update_reanchors_only_on_cadence_change(pool: PgPool) {
         .unwrap();
     assert_eq!(windowed.next_fire_at, at(3), "window change re-anchors");
 
-    // lag alone: shifts bounds, not cadence.
     let lagged = store
         .update_schedule(
             created.id,
@@ -1024,8 +963,6 @@ async fn schedule_update_reanchors_only_on_cadence_change(pool: PgPool) {
     assert_eq!(lagged.lag_secs, 120);
 }
 
-/// Editing a schedule never rewinds or advances coverage: the watermark is
-/// owned by successful runs alone (ADR-0018 ruling 14).
 #[sqlx::test]
 async fn schedule_update_preserves_covered_through(pool: PgPool) {
     let store = schedules(&pool);
@@ -1061,23 +998,12 @@ async fn schedule_update_preserves_covered_through(pool: PgPool) {
     }
 }
 
-/// A `since_last` schedule records where it starts owing coverage BEFORE it
-/// has ever run, and an edit that re-anchors the cursor records the new
-/// origin the same way.
-///
-/// Without the seed, a first run that FAILS leaves the watermark unset, the
-/// planner falls back to ruling 14, and the next run covers one interval
-/// ending at its own fire. The failed interval is dropped, silently, with
-/// no `window_truncated` to admit it. Seeded, the failure leaves the origin
-/// standing and the next success covers both intervals.
 #[sqlx::test]
 async fn since_last_watermark_is_seeded_at_the_origin_of_owed_coverage(pool: PgPool) {
     let store = schedules(&pool);
     let now = truncate_to_micros(chrono::Utc::now());
     let back = |secs: i64| Some(now - chrono::Duration::seconds(secs));
 
-    // Create: interval plus lag back from the cursor for since_last,
-    // nothing for the two modes that keep no watermark.
     for (name, window, lag, expected) in [
         ("tiled", Some(ScheduleWindow::SinceLast), 0, back(3600)),
         ("lagged", Some(ScheduleWindow::SinceLast), 300, back(3900)),
@@ -1097,8 +1023,6 @@ async fn since_last_watermark_is_seeded_at_the_origin_of_owed_coverage(pool: PgP
         assert_eq!(created.covered_through, expected, "{name}: created origin");
     }
 
-    // An edit that re-anchors a query-mode schedule into since_last is a
-    // fresh origin, and gets one.
     let sq_id = seed_saved(&pool, 1, "retyped").await;
     let sched = store
         .create_schedule(sq_id, 1, 3600, None, None, 0, now)
@@ -1127,7 +1051,6 @@ async fn since_last_watermark_is_seeded_at_the_origin_of_owed_coverage(pool: PgP
         "retyping into since_last seeds the new origin"
     );
 
-    // A watermark that already exists is never overwritten, re-anchor or not.
     let advanced = retyped_at + chrono::Duration::hours(3);
     sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
         .bind(advanced)
@@ -1154,9 +1077,8 @@ async fn since_last_watermark_is_seeded_at_the_origin_of_owed_coverage(pool: PgP
         "coverage a run earned survives every later edit"
     );
 
-    // An edit that does NOT re-anchor seeds nothing. Nothing this code
-    // writes leaves a since_last schedule watermark-less, so the row is
-    // forced back to that state to pin the rule.
+    // Nothing this code writes leaves a since_last schedule watermark-less,
+    // so the row is forced back to that state to pin the rule.
     sqlx::query("UPDATE schedules SET covered_through = NULL WHERE id = $1")
         .bind(sched.id)
         .execute(&pool)
@@ -1181,8 +1103,6 @@ async fn since_last_watermark_is_seeded_at_the_origin_of_owed_coverage(pool: PgP
     );
 }
 
-/// A lag with no window is refused at the store boundary, on both write
-/// paths, with the typed error the handler renders as a 400.
 #[sqlx::test]
 async fn schedule_lag_without_window_is_refused(pool: PgPool) {
     let store = schedules(&pool);
@@ -1214,7 +1134,6 @@ async fn schedule_lag_without_window_is_refused(pool: PgPool) {
             .await,
         Err(StoreError::LagWithoutWindow { lag_secs: 60 })
     ));
-    // The refused update changed nothing.
     let unchanged = store
         .get_schedule_for_saved_query(sq_id, 1)
         .await
@@ -1224,8 +1143,6 @@ async fn schedule_lag_without_window_is_refused(pool: PgPool) {
     assert_eq!(unchanged.lag_secs, 60);
 }
 
-/// A claimed run carries the window it is about to cover, and a claim with
-/// no window reads back three NULLs rather than a zero-length one.
 #[sqlx::test]
 async fn claimed_run_round_trips_its_window(pool: PgPool) {
     let store = schedules(&pool);
@@ -1280,10 +1197,6 @@ async fn claimed_run_round_trips_its_window(pool: PgPool) {
     assert_eq!(legacy.window_kind, None);
 }
 
-/// The `since_last` watermark advances inside the success transaction, and
-/// only there (ADR-0018 ruling 9). A failed or timed-out run leaves the gap
-/// for the next success to cover, and a slow run finishing after a later one
-/// cannot rewind coverage.
 #[sqlx::test]
 async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
     let store = schedules(&pool);
@@ -1330,7 +1243,6 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
         other => panic!("expected a started run, got {other:?}"),
     };
 
-    // An error completion covers nothing.
     let failed = run(&window(4, 3)).await;
     store
         .finish_run(failed, RunStatus::Error, 5, None, Some("boom"), None, None)
@@ -1342,7 +1254,6 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
         "a failed run leaves the seeded origin standing"
     );
 
-    // Nor does a timeout.
     let timed_out = run(&window(4, 3)).await;
     store
         .finish_run(timed_out, RunStatus::Timeout, 5, None, None, None, None)
@@ -1354,7 +1265,6 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
         "a timed-out run leaves the seeded origin standing"
     );
 
-    // A success advances the watermark to exactly its window_end.
     let ok = window(4, 3);
     let ok_id = run(&ok).await;
     store
@@ -1363,7 +1273,6 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
         .unwrap();
     assert_eq!(covered().await, Some(ok.end));
 
-    // A later window moves it forward.
     let later = window(3, 2);
     let later_id = run(&later).await;
     store
@@ -1372,7 +1281,6 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
         .unwrap();
     assert_eq!(covered().await, Some(later.end));
 
-    // An out-of-order success carrying an older window does not rewind it.
     let stale = window(9, 8);
     let stale_id = run(&stale).await;
     store
@@ -1386,13 +1294,6 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
     );
 }
 
-/// The watermark decision belongs to the run, not to the schedule's current
-/// mode: finishing a run and retyping its schedule's window must give the
-/// same coverage whichever commits first.
-///
-/// The run records the mode it was CLAIMED under, so both orders answer from
-/// that one fact. Reading the schedule at finish time instead would make an
-/// operator's edit racing an in-flight run decide whether the window counts.
 #[sqlx::test]
 async fn finish_and_window_mode_edit_are_order_independent(pool: PgPool) {
     let store = schedules(&pool);
@@ -1404,8 +1305,6 @@ async fn finish_and_window_mode_edit_are_order_independent(pool: PgPool) {
         kind,
     };
 
-    // Claim a run under `claimed`, then finish it and retype the schedule to
-    // `edited_to` in the requested order. Answers the resulting watermark.
     let covered_after = async |name: &str,
                                claimed: ScheduleWindow,
                                edited_to: ScheduleWindow,
@@ -1453,7 +1352,6 @@ async fn finish_and_window_mode_edit_are_order_independent(pool: PgPool) {
             .covered_through
     };
 
-    // A since_last run retyped to fixed still advances, in either order.
     let since_last = ScheduleWindow::SinceLast;
     let fixed = ScheduleWindow::Fixed { secs: 3600 };
     let finish_then_edit = covered_after("tiled-a", since_last, fixed, true).await;
@@ -1464,10 +1362,6 @@ async fn finish_and_window_mode_edit_are_order_independent(pool: PgPool) {
     );
     assert_eq!(finish_then_edit, Some(now), "and it must be the run's end");
 
-    // A fixed run retyped to since_last contributes nothing to the
-    // watermark in either order. The value that ends up there is the edit's
-    // own seed, the origin the new since_last mode starts owing coverage
-    // from, and never the fixed run's end.
     let finish_then_edit = covered_after("trailing-a", fixed, since_last, true).await;
     let edit_then_finish = covered_after("trailing-b", fixed, since_last, false).await;
     let seed = now - chrono::Duration::seconds(300);
@@ -1483,9 +1377,6 @@ async fn finish_and_window_mode_edit_are_order_independent(pool: PgPool) {
     );
 }
 
-/// A fixed trailing window is re-measured from every fire time, so it keeps
-/// no watermark: a success on one leaves `covered_through` untouched. Same
-/// for a legacy schedule, whose runs carry no window at all.
 #[sqlx::test]
 async fn fixed_and_legacy_schedules_keep_no_watermark(pool: PgPool) {
     let store = schedules(&pool);
@@ -1500,8 +1391,6 @@ async fn fixed_and_legacy_schedules_keep_no_watermark(pool: PgPool) {
             .create_schedule(sq_id, 1, 300, None, window, 0, now)
             .await
             .unwrap();
-        // The run is claimed the way the planner will claim it: a windowed
-        // schedule hands down its own mode, a legacy one hands down nothing.
         let covered = window.map(|w| ReportWindow {
             start: now - chrono::Duration::hours(1),
             end: now,
@@ -1540,16 +1429,10 @@ async fn fixed_and_legacy_schedules_keep_no_watermark(pool: PgPool) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// claim_due_run: plan, materialize and claim in one transaction
-// ---------------------------------------------------------------------------
-
 /// How many intervals of catch-up these tests allow. Large enough that
-/// nothing here is truncated by accident; the clamp itself is covered by
-/// the planner's own tests and by `tests/scheduler_windows.rs`.
+/// nothing here is truncated by accident.
 const CATCHUP: u32 = 24;
 
-/// Read a schedule back through its saved query.
 async fn reread(store: &ScheduleStore, sq_id: i64) -> trawl_server::store::Schedule {
     store
         .get_schedule_for_saved_query(sq_id, 1)
@@ -1558,8 +1441,6 @@ async fn reread(store: &ScheduleStore, sq_id: i64) -> trawl_server::store::Sched
         .unwrap()
 }
 
-/// The fire cursor is the whole due test: before it, nothing happens and
-/// nothing is written.
 #[sqlx::test]
 async fn claim_due_run_is_not_due_before_the_cursor(pool: PgPool) {
     let store = schedules(&pool);
@@ -1585,7 +1466,6 @@ async fn claim_due_run_is_not_due_before_the_cursor(pool: PgPool) {
         "a not-due tick writes nothing at all"
     );
 
-    // The cursor instant itself IS due: a schedule created at T fires at T.
     assert!(matches!(
         store
             .claim_due_run(sched.id, now, CATCHUP, &RunLease::unattached())
@@ -1595,9 +1475,6 @@ async fn claim_due_run_is_not_due_before_the_cursor(pool: PgPool) {
     ));
 }
 
-/// A watermark at or past the window the cursor would produce is coverage
-/// that already exists. The cursor moves so the tick stops asking, and no
-/// run is claimed.
 #[sqlx::test]
 async fn claim_due_run_advances_over_ground_the_watermark_covers(pool: PgPool) {
     let store = schedules(&pool);
@@ -1644,9 +1521,6 @@ async fn claim_due_run_advances_over_ground_the_watermark_covers(pool: PgPool) {
     );
 }
 
-/// A run still in flight blocks the claim and LEAVES the cursor, so the
-/// boundary is claimed again at the next poll after that run finishes and
-/// the coverage it owed folds into one window (ADR-0018 ruling 9).
 #[sqlx::test]
 async fn claim_due_run_leaves_the_cursor_while_a_run_is_in_flight(pool: PgPool) {
     let store = schedules(&pool);
@@ -1675,7 +1549,6 @@ async fn claim_due_run_leaves_the_cursor_while_a_run_is_in_flight(pool: PgPool) 
     let after_first = reread(&store, sq_id).await.next_fire_at;
     assert_eq!(after_first, now + chrono::Duration::hours(1));
 
-    // The first run never finishes; the next boundary arrives anyway.
     assert_eq!(
         store
             .claim_due_run(sched.id, after_first, CATCHUP, &RunLease::unattached())
@@ -1691,9 +1564,6 @@ async fn claim_due_run_leaves_the_cursor_while_a_run_is_in_flight(pool: PgPool) 
     );
 }
 
-/// The `max_runs` cap refuses the claim and leaves the cursor too: raising
-/// the cap resumes from the boundary that was refused rather than from
-/// wherever the clock has got to.
 #[sqlx::test]
 async fn claim_due_run_leaves_the_cursor_at_the_max_runs_cap(pool: PgPool) {
     let store = schedules(&pool);
@@ -1736,8 +1606,6 @@ async fn claim_due_run_leaves_the_cursor_at_the_max_runs_cap(pool: PgPool) {
     assert_eq!(reread(&store, sq_id).await.next_fire_at, after_first);
 }
 
-/// A disabled schedule is not due whatever the clock says, and neither is
-/// one whose rows are gone.
 #[sqlx::test]
 async fn claim_due_run_is_not_due_when_disabled_or_deleted(pool: PgPool) {
     let store = schedules(&pool);
@@ -1778,9 +1646,6 @@ async fn claim_due_run_is_not_due_when_disabled_or_deleted(pool: PgPool) {
     );
 }
 
-/// The claim returns the text it stored, and it is the saved DSL with the
-/// planned bounds spliced on (ADR-0018 ruling 11) — not the saved text and
-/// not something the caller has to rebuild.
 #[sqlx::test]
 async fn claim_due_run_stores_the_resolved_query_it_returns(pool: PgPool) {
     let store = schedules(&pool);
@@ -1846,11 +1711,6 @@ async fn claim_due_run_stores_the_resolved_query_it_returns(pool: PgPool) {
     );
 }
 
-/// A windowed schedule whose saved DSL grew its own time clause is refused,
-/// loudly, with the cursor left alone (rulings 7 and 11). Write-time
-/// validation is supposed to prevent the pair; if it is there anyway, the
-/// tick must not execute a query whose `last=` overrides the window the run
-/// row would claim to cover.
 #[sqlx::test]
 async fn claim_due_run_refuses_a_query_that_owns_its_own_window(pool: PgPool) {
     let store = schedules(&pool);
@@ -1873,10 +1733,7 @@ async fn claim_due_run_refuses_a_query_that_owns_its_own_window(pool: PgPool) {
         .await
         .unwrap();
     // Write the forbidden pair the only way that is still possible: past
-    // the write-time gate, straight at the column. `update_checked` refuses
-    // this text under this schedule, which is exactly what makes the
-    // claim-time re-check below a test of stored state rather than a second
-    // reading of the same request.
+    // the write-time gate, straight at the column.
     sqlx::query("UPDATE saved_queries SET query = $1 WHERE id = $2")
         .bind("service=fx last=1h | table _time")
         .bind(sq_id)
@@ -1906,13 +1763,6 @@ async fn claim_due_run_refuses_a_query_that_owns_its_own_window(pool: PgPool) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// run budget: `max_runs` counts the runs a schedule claims over its life
-// (ADR-0018 amended 2026-11-06)
-// ---------------------------------------------------------------------------
-
-/// A schedule's spent run budget, read off the row rather than through the
-/// store's decode, so these tests prove what is stored.
 async fn runs_claimed(pool: &PgPool, schedule_id: i64) -> i64 {
     sqlx::query_scalar("SELECT runs_claimed FROM schedules WHERE id = $1")
         .bind(schedule_id)
@@ -1921,7 +1771,6 @@ async fn runs_claimed(pool: &PgPool, schedule_id: i64) -> i64 {
         .unwrap()
 }
 
-/// The three doors a run comes in by.
 #[derive(Debug, Clone, Copy)]
 enum Claimant {
     /// The scheduler tick, [`ScheduleStore::claim_due_run`].
@@ -1934,7 +1783,6 @@ enum Claimant {
 
 const CLAIMANTS: [Claimant; 3] = [Claimant::Due, Claimant::Manual, Claimant::Seed];
 
-/// What a claim answered, folded across the three claimants' outcome types.
 #[derive(Debug, PartialEq, Eq)]
 enum Claimed {
     Started(i64),
@@ -1943,9 +1791,6 @@ enum Claimed {
     Other(String),
 }
 
-/// Claim a run of the schedule on saved query `sq_id` (key 1) through
-/// `claimant`. A due claim is judged at the schedule's own cursor, so it is
-/// always due. An error comes back as its `Debug` text.
 async fn claim_via(
     store: &ScheduleStore,
     claimant: Claimant,
@@ -1990,7 +1835,6 @@ async fn claim_via(
     }
 }
 
-/// Claim through `claimant` and insist that a run started.
 async fn start_via(store: &ScheduleStore, claimant: Claimant, sq_id: i64) -> i64 {
     match claim_via(store, claimant, sq_id).await {
         Ok(Claimed::Started(run_id)) => run_id,
@@ -1998,7 +1842,6 @@ async fn start_via(store: &ScheduleStore, claimant: Claimant, sq_id: i64) -> i64
     }
 }
 
-/// Finish a run with `status`, as the executor would.
 async fn finish(store: &ScheduleStore, run_id: i64, status: RunStatus) {
     let message = (status != RunStatus::Success).then_some("planted failure");
     let outcome = store
@@ -2008,9 +1851,6 @@ async fn finish(store: &ScheduleStore, run_id: i64, status: RunStatus) {
     assert_eq!(outcome, FinishOutcome::Persisted);
 }
 
-/// Every claimant spends the one budget, one claim at a time, and every
-/// claimant refuses once it is spent. Spending is not an edit: the
-/// schedule's `updated_at` stays where the operator left it.
 #[sqlx::test]
 async fn run_budget_is_spent_by_every_claimant(pool: PgPool) {
     let store = schedules(&pool);
@@ -2051,16 +1891,11 @@ async fn run_budget_is_spent_by_every_claimant(pool: PgPool) {
     );
 }
 
-/// The cap reads the counter, never the runs retention happened to keep.
-/// A spent budget with no runs left refuses every claimant, and a budget
-/// with one run left claims it even while more runs than the cap are kept.
 #[sqlx::test]
 async fn run_budget_reads_the_counter_not_the_rows(pool: PgPool) {
     let store = schedules(&pool);
     let now = truncate_to_micros(chrono::Utc::now());
 
-    // Spent, and nothing kept: what an upgraded schedule whose runs
-    // retention deleted looks like.
     let spent_sq = seed_saved(&pool, 1, "spent, nothing kept").await;
     let spent = store
         .create_schedule(spent_sq, 1, 3600, Some(2), None, 0, now)
@@ -2086,7 +1921,6 @@ async fn run_budget_reads_the_counter_not_the_rows(pool: PgPool) {
         "the refused boundary stays claimable"
     );
 
-    // One run left, with three runs kept under a cap of two.
     for claimant in CLAIMANTS {
         let sq_id = seed_saved(&pool, 1, &format!("one left for {claimant:?}")).await;
         let sched = store
@@ -2122,8 +1956,6 @@ async fn run_budget_reads_the_counter_not_the_rows(pool: PgPool) {
     }
 }
 
-/// A claim refused or failing after the budget is spent rolls the spend
-/// back with everything else: no run row, and the budget where it was.
 #[sqlx::test]
 async fn refused_claims_spend_no_budget(pool: PgPool) {
     let store = schedules(&pool);
@@ -2147,7 +1979,6 @@ async fn refused_claims_spend_no_budget(pool: PgPool) {
     assert_eq!(runs_claimed(&pool, busy.id).await, 1);
     assert_eq!(store.count_runs(busy.id).await.unwrap(), 1);
 
-    // An empty since_last window: the watermark already covers `t - lag`.
     let covered_sq = seed_saved(&pool, 1, "covered").await;
     let covered = store
         .create_schedule(
@@ -2180,8 +2011,6 @@ async fn refused_claims_spend_no_budget(pool: PgPool) {
     assert_eq!(runs_claimed(&pool, covered.id).await, 0);
     assert_eq!(store.count_runs(covered.id).await.unwrap(), 0);
 
-    // A window that cannot be put onto the saved text (rulings 7 and 11),
-    // planted past the write-time gate.
     let conflicted_sq = saved(&pool)
         .create(1, "conflicted", "service=fx | table _time")
         .await
@@ -2215,7 +2044,6 @@ async fn refused_claims_spend_no_budget(pool: PgPool) {
     assert_eq!(store.count_runs(conflicted.id).await.unwrap(), 0);
     assert_eq!(reread(&store, conflicted_sq).await.next_fire_at, now);
 
-    // An insert that fails outright, after every check has passed.
     let failing_sq = seed_saved(&pool, 1, "failing insert").await;
     let failing = store
         .create_schedule(failing_sq, 1, 3600, Some(5), None, 0, now)
@@ -2243,7 +2071,6 @@ async fn refused_claims_spend_no_budget(pool: PgPool) {
     assert_eq!(store.count_runs(failing.id).await.unwrap(), 0);
     assert_eq!(reread(&store, failing_sq).await.next_fire_at, now);
 
-    // The control: the same claim spends once its insert can land.
     sqlx::raw_sql("DROP TRIGGER refuse_report_run ON report_runs")
         .execute(&pool)
         .await
@@ -2252,9 +2079,6 @@ async fn refused_claims_spend_no_budget(pool: PgPool) {
     assert_eq!(runs_claimed(&pool, failing.id).await, 1);
 }
 
-/// A claimed run that fails keeps its claim: an error, a timeout and the
-/// boot's interrupted marking all leave the budget spent. There are no
-/// refunds.
 #[sqlx::test]
 async fn failed_runs_keep_their_claim(pool: PgPool) {
     let store = schedules(&pool);
@@ -2296,8 +2120,6 @@ async fn failed_runs_keep_their_claim(pool: PgPool) {
     assert_eq!(runs_claimed(&pool, sched.id).await, 3);
 }
 
-/// Write the schedule of `sq_id` through the HTTP door, query mode and
-/// enabled.
 async fn put_schedule(
     store: &ScheduleStore,
     sq_id: i64,
@@ -2311,10 +2133,6 @@ async fn put_schedule(
         .unwrap()
 }
 
-/// Editing a schedule keeps what it spent. Raising the cap lets it claim
-/// again; lowering it below what is spent refuses new claims while the run
-/// already going finishes; only deleting the schedule and creating a new
-/// one starts a new budget.
 #[sqlx::test]
 async fn run_budget_survives_edits_and_resets_on_recreate(pool: PgPool) {
     let store = schedules(&pool);
@@ -2327,7 +2145,6 @@ async fn run_budget_survives_edits_and_resets_on_recreate(pool: PgPool) {
     }
     assert_eq!(runs_claimed(&pool, sched.id).await, 2);
 
-    // A cadence edit re-anchors the cursor and keeps the count.
     let edited = put_schedule(&store, sq_id, 7200, Some(2), now).await;
     assert_eq!(runs_claimed(&pool, sched.id).await, 2, "an edit keeps it");
     assert_eq!(
@@ -2343,14 +2160,11 @@ async fn run_budget_survives_edits_and_resets_on_recreate(pool: PgPool) {
         );
     }
 
-    // Raising the cap above what is spent lets it claim again.
     let raised = put_schedule(&store, sq_id, 7200, Some(3), now).await;
     assert!(!raised.exhausted());
     let running = start_via(&store, Claimant::Manual, sq_id).await;
     assert_eq!(runs_claimed(&pool, sched.id).await, 3);
 
-    // Lowering it below what is spent refuses new claims, and the run
-    // already going is left to finish.
     let lowered = put_schedule(&store, sq_id, 7200, Some(1), now).await;
     assert_eq!(runs_claimed(&pool, sched.id).await, 3);
     assert_eq!(
@@ -2384,7 +2198,6 @@ async fn run_budget_survives_edits_and_resets_on_recreate(pool: PgPool) {
     }
     assert_eq!(runs_claimed(&pool, sched.id).await, 3);
 
-    // Only a new schedule starts a new budget.
     store.delete_schedule(sq_id, 1).await.unwrap();
     let recreated = put_schedule(&store, sq_id, 7200, Some(1), now).await;
     assert_ne!(recreated.id, sched.id);
@@ -2400,11 +2213,6 @@ async fn run_budget_survives_edits_and_resets_on_recreate(pool: PgPool) {
 
 /// A CHECK accepts NULL as readily as TRUE, so a shape constraint written
 /// as an OR of arms has a hole wherever an arm can evaluate to NULL.
-///
-/// `(window_kind NULL, window_secs 60)` was that hole: the fixed arm read
-/// `NULL = 'fixed' AND TRUE`, which is NULL, the other arms were FALSE, and
-/// the constraint let a span with no mode through. Every arm is a CASE
-/// branch now, and these are the writes that used to land.
 #[sqlx::test]
 async fn window_shape_rejects_null_kind_with_span(pool: PgPool) {
     let store = schedules(&pool);
@@ -2419,7 +2227,6 @@ async fn window_shape_rejects_null_kind_with_span(pool: PgPool) {
         Some("schedules_window_shape".to_owned()),
     );
 
-    // A span with no mode.
     let err =
         sqlx::query("UPDATE schedules SET window_kind = NULL, window_secs = 60 WHERE id = $1")
             .bind(sched.id)
@@ -2428,7 +2235,6 @@ async fn window_shape_rejects_null_kind_with_span(pool: PgPool) {
             .unwrap_err();
     assert_eq!(violation(err), expected, "a span with no mode");
 
-    // Its mirror: a mode that needs a span, with none.
     let err =
         sqlx::query("UPDATE schedules SET window_kind = 'fixed', window_secs = NULL WHERE id = $1")
             .bind(sched.id)
@@ -2437,7 +2243,6 @@ async fn window_shape_rejects_null_kind_with_span(pool: PgPool) {
             .unwrap_err();
     assert_eq!(violation(err), expected, "fixed with no span");
 
-    // The run side has the same obligation: bounds with no claim-time mode.
     let err = sqlx::query(
         "INSERT INTO report_runs
              (schedule_id, saved_query_id, query, status, started_at,
@@ -2459,8 +2264,6 @@ async fn window_shape_rejects_null_kind_with_span(pool: PgPool) {
     );
 }
 
-/// The named CHECKs are the backstop under the typed API: a partial run
-/// window and a `fixed` schedule with no span are both unwritable.
 #[sqlx::test]
 async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
     let store = schedules(&pool);
@@ -2471,7 +2274,6 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
         .await
         .unwrap();
 
-    // window_start with no end/truncated.
     let err = sqlx::query(
         "INSERT INTO report_runs
              (schedule_id, saved_query_id, query, status, started_at, window_start, window_kind)
@@ -2490,7 +2292,6 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
         )
     );
 
-    // An end at or before the start is not a half-open interval.
     let err = sqlx::query(
         "INSERT INTO report_runs
              (schedule_id, saved_query_id, query, status, started_at,
@@ -2510,7 +2311,6 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
         )
     );
 
-    // A fixed window with no span.
     let err = sqlx::query("UPDATE schedules SET window_kind = 'fixed' WHERE id = $1")
         .bind(sched.id)
         .execute(&pool)
@@ -2524,7 +2324,6 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
         )
     );
 
-    // And one below the 60s floor.
     let err =
         sqlx::query("UPDATE schedules SET window_kind = 'fixed', window_secs = 30 WHERE id = $1")
             .bind(sched.id)
@@ -2603,8 +2402,6 @@ async fn schedule_user_isolation(pool: PgPool) {
     );
 }
 
-/// Full cascade chain: deleting the saved query wipes its schedule and its
-/// runs, and the delete transaction reports the parquet paths to unlink.
 #[sqlx::test]
 async fn cascade_on_saved_query_delete(pool: PgPool) {
     let saved_store = saved(&pool);
@@ -2675,10 +2472,6 @@ async fn schedule_delete_collects_run_paths(pool: PgPool) {
     assert_eq!(paths, vec!["scheduled/test/run_9.parquet".to_string()]);
 }
 
-// ---------------------------------------------------------------------------
-// run lifecycle
-// ---------------------------------------------------------------------------
-
 #[sqlx::test]
 async fn start_and_finish_run(pool: PgPool) {
     let store = schedules(&pool);
@@ -2735,14 +2528,12 @@ async fn sequential_run_prevention(pool: PgPool) {
         panic!("first claim must start a run, got {first:?}");
     };
 
-    // Second claim is refused (already running) via the named 23505.
     let second = store
         .claim_run(schedule.id, sq_id, "q", None)
         .await
         .unwrap();
     assert!(matches!(second, RunClaim::AlreadyRunning), "got {second:?}");
 
-    // After finishing, a new run can start.
     store
         .finish_run(first_id, RunStatus::Success, 100, None, None, None, None)
         .await
@@ -2785,7 +2576,6 @@ async fn list_runs_paginated_and_isolated(pool: PgPool) {
     let page = store.list_runs(sq_id, 1, 2, 1).await.unwrap();
     assert_eq!(page.len(), 2);
 
-    // Wrong user sees nothing.
     assert!(store.list_runs(sq_id, 2, 100, 0).await.unwrap().is_empty());
     assert_eq!(store.count_runs_for_saved_query(sq_id, 1).await.unwrap(), 5);
     assert_eq!(store.count_runs_for_saved_query(sq_id, 2).await.unwrap(), 0);
@@ -2800,7 +2590,6 @@ async fn cleanup_stale_runs_marks_error(pool: PgPool) {
         .await
         .unwrap();
 
-    // Start a run but don't finish it (simulates crash).
     seed_run(&store, schedule.id, sq_id, "q").await;
 
     let cleaned = store.cleanup_stale_runs().await.unwrap();
@@ -2842,7 +2631,6 @@ async fn latest_run_returns_newest(pool: PgPool) {
     assert_eq!(latest.query, "q2");
 }
 
-/// Set a schedule's spent run budget, as its claims would have left it.
 async fn set_runs_claimed(pool: &PgPool, id: i64, runs: i64) {
     sqlx::query("UPDATE schedules SET runs_claimed = $2 WHERE id = $1")
         .bind(id)
@@ -2852,8 +2640,6 @@ async fn set_runs_claimed(pool: &PgPool, id: i64, runs: i64) {
         .unwrap();
 }
 
-/// Every schedule due at `now` as `(next_fire_at, id, key_id)`, read page
-/// by page as the tick reads them, and the size of each page.
 async fn list_all_due(
     store: &ScheduleStore,
     now: chrono::DateTime<chrono::Utc>,
@@ -2881,33 +2667,11 @@ async fn list_all_due(
     (listed, sizes)
 }
 
-/// The scheduler tick's listing (ADR-0018, amended 2026-11-09 and
-/// 2026-11-11): enabled, due schedules with run budget left, oldest fire
-/// cursor first and then by id, in pages of at most [`DUE_SCHEDULE_PAGE`]
-/// that resume strictly after the key they are given.
-///
-/// 141 schedules fall due over the 37 minutes before `now`, their cursors
-/// out of id order and tied in groups of three or four, and a tie spans
-/// each page boundary; one more falls due exactly at `now`. A third of
-/// them are capped with runs left; the rest are unlimited. Left out: a
-/// disabled schedule that is due, an enabled one a microsecond in the
-/// future, and spent ones tied on listed cursors with ids between theirs,
-/// at their cap, past a cap lowered below the spend, or capped at zero.
-/// The pages, read back to back, are the expected rows sorted on their own.
-///
-/// Edits then move schedules in and out with no cursor edit: raising or
-/// removing a cap and enabling bring one back at its own cursor; lowering a
-/// cap to the spend and disabling take one out. Last, a cap lowered while a
-/// claim waits on the schedule's row lock refuses that claim: the listing
-/// only picks candidates, and the claim's locked re-check decides. The
-/// refused schedule keeps its cursor, watermark and spend, and runs nothing.
 #[sqlx::test]
 async fn due_schedule_pages_order_and_resume(pool: PgPool) {
     let store = schedules(&pool);
     let now = truncate_to_micros(chrono::Utc::now());
 
-    // (next_fire_at, id, key_id) of every schedule the listing must return,
-    // in creation order, and the spent ones it must leave out with their caps.
     let mut by_index = Vec::new();
     let mut spent = Vec::new();
     for i in 0..142_i64 {
@@ -3022,8 +2786,6 @@ async fn due_schedule_pages_order_and_resume(pool: PgPool) {
         u64::try_from(143 + spent.len()).unwrap()
     );
 
-    // Edits move schedules in and out of the listing, each at its own
-    // cursor. A cap or enabled edit never re-anchors one.
     let find = |runs: i64| *spent.iter().find(|(_, _, r)| *r == runs).unwrap();
     let (at_cap, ..) = find(3);
     let (past_cap, ..) = find(5);
@@ -3064,8 +2826,6 @@ async fn due_schedule_pages_order_and_resume(pool: PgPool) {
         "re-enabled at its own cursor"
     );
 
-    // A cap lowered to the spend while the claim waits on the schedule's row
-    // lock refuses the claim, though the listing offered the schedule.
     let sq = seed_saved(&pool, 1, "cap-edit-race").await;
     let raced = store
         .create_schedule(
@@ -3141,11 +2901,6 @@ async fn due_schedule_pages_order_and_resume(pool: PgPool) {
     assert_eq!(list_all_due(&store, now).await.0, expected, "spent: gone");
 }
 
-/// A claim's `statement_timeout` ends with its transaction (ADR-0018,
-/// amended 2026-11-11). On a store pool of one connection, the connection
-/// the next caller gets reads the session's own timeout after a claim that
-/// started a run, after one that was refused, and after one that ran out
-/// at its deadline on a fixture's row lock.
 #[tokio::test]
 async fn claim_deadline_does_not_leak_to_the_pool() {
     let url = common::create_app_database().await;
@@ -3222,7 +2977,6 @@ async fn claim_deadline_does_not_leak_to_the_pool() {
     );
 }
 
-/// The fixed instant [`due_listing_uses_ordered_seek`] lists at.
 const SEEK_NOW: &str = "2026-11-10 00:00:00+00";
 
 /// 6000 schedules over 7 keys, a tenth of them disabled and the rest split
@@ -3245,9 +2999,6 @@ FROM generate_series(1, 6000) i JOIN saved_queries sq ON sq.name = 'seek-' || i;
 ANALYZE schedules;
 ";
 
-/// Assert one EXPLAIN is an ordered seek: an Index Scan on
-/// `schedules_due_idx` whose Index Cond holds `seek`, and no Sort, no
-/// sequential scan and no bitmap scan anywhere in the plan.
 fn assert_ordered_seek(what: &str, plan: &[String], seek: &str) {
     let text = plan.join("\n");
     assert!(
@@ -3268,16 +3019,10 @@ fn assert_ordered_seek(what: &str, plan: &[String], seek: &str) {
     );
 }
 
-/// The due listing is an ordered seek on `schedules_due_idx` (ADR-0018
-/// amended 2026-11-11). Over 6000 mixed schedules, analyzed, both
-/// [`DUE_FIRST_PAGE`] and [`DUE_RESUMED_PAGE`] read the index in
-/// `(next_fire_at, id)` order with no Sort node, whether Postgres plans
-/// them for the bound values (custom) or once for any value (generic, as a
-/// statement cached past five executions is). The resumed page, from a
-/// cursor 1500 candidates deep, puts its row comparison in the Index Cond,
-/// so it seeks to the cursor instead of reading and dropping the rows
-/// before it. Nothing switches a plan type off. The test prints the mix and
-/// every plan; `scripts/evidence/issue-444/explain.sh` records that output.
+/// Both pages must seek whether Postgres plans them for the bound values
+/// (custom) or once for any value (generic, as a statement cached past five
+/// executions is). `scripts/evidence/issue-444/explain.sh` records the
+/// output.
 #[sqlx::test]
 async fn due_listing_uses_ordered_seek(pool: PgPool) {
     sqlx::raw_sql(SEEK_SEED).execute(&pool).await.unwrap();
@@ -3455,7 +3200,6 @@ async fn list_all_runs_paginated_and_isolated(pool: PgPool) {
 async fn runs_stats_counts_by_status(pool: PgPool) {
     let store = schedules(&pool);
 
-    // Empty first.
     let (total, success, error, timeout, avg) = store.runs_stats(1).await.unwrap();
     assert_eq!((total, success, error, timeout, avg), (0, 0, 0, 0, None));
 
@@ -3483,16 +3227,12 @@ async fn runs_stats_counts_by_status(pool: PgPool) {
     assert_eq!(success, 2);
     assert_eq!(error, 1);
     assert_eq!(timeout, 1);
-    // avg of 100, 200, 50, 300 = 162.5 → 162 truncated
     assert_eq!(avg, Some(162));
 
-    // Other user sees nothing.
     let (total, ..) = store.runs_stats(2).await.unwrap();
     assert_eq!(total, 0);
 }
 
-/// Retention: keeps at most `max_per_schedule` runs, deletes older than the
-/// age cutoff, and returns the parquet paths of everything it deleted.
 #[sqlx::test]
 async fn delete_old_runs_retention_and_paths(pool: PgPool) {
     let store = schedules(&pool);
@@ -3502,7 +3242,6 @@ async fn delete_old_runs_retention_and_paths(pool: PgPool) {
         .await
         .unwrap();
 
-    // Four finished runs with paths; backdate the first two beyond the cutoff.
     let mut run_ids = Vec::new();
     for i in 0..4 {
         let rid = seed_run(&store, sched.id, sq_id, "q").await;
@@ -3528,7 +3267,6 @@ async fn delete_old_runs_retention_and_paths(pool: PgPool) {
             .unwrap();
     }
 
-    // Age cutoff 30 days, and keep at most 1 per schedule.
     let (deleted, mut paths) = store.delete_old_runs(30, 1).await.unwrap();
     assert_eq!(deleted, 3, "two aged out + one excess");
     paths.sort();
@@ -3549,13 +3287,7 @@ async fn delete_old_runs_retention_and_paths(pool: PgPool) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// retention spares running runs (#350, ADR-0018 amendment 2026-11-06)
-// ---------------------------------------------------------------------------
-
-/// Seed one report run for the retention tests and pin its `started_at`.
-/// A `Running` status leaves the claim open; any other status finishes it
-/// first. A schedule holds one running row at a time, so seed a schedule's
+/// A schedule holds one running row at a time, so seed a schedule's
 /// running row after its terminal rows.
 async fn seed_retention_run(
     pool: &PgPool,
@@ -3583,7 +3315,6 @@ async fn seed_retention_run(
     id
 }
 
-/// A fresh schedule on its own saved query, as `(schedule_id, saved_query_id)`.
 async fn retention_schedule(pool: &PgPool, store: &ScheduleStore, name: &str) -> (i64, i64) {
     let sq_id = seed_saved(pool, 1, name).await;
     let sched = store
@@ -3593,7 +3324,6 @@ async fn retention_schedule(pool: &PgPool, store: &ScheduleStore, name: &str) ->
     (sched.id, sq_id)
 }
 
-/// Every surviving run id, ascending.
 async fn surviving_run_ids(pool: &PgPool) -> Vec<i64> {
     sqlx::query_scalar("SELECT id FROM report_runs ORDER BY id")
         .fetch_all(pool)
@@ -3606,8 +3336,6 @@ fn sorted(mut paths: Vec<String>) -> Vec<String> {
     paths
 }
 
-/// The age branch deletes old terminal rows and spares an old running row.
-/// The keep is ample so only the age branch can act.
 #[sqlx::test]
 async fn retention_by_age_spares_running_runs(pool: PgPool) {
     let store = schedules(&pool);
@@ -3634,10 +3362,8 @@ async fn retention_by_age_spares_running_runs(pool: PgPool) {
     assert_eq!(surviving_run_ids(&pool).await, vec![young, running]);
 }
 
-/// The excess branch neither deletes a running row nor counts it toward
-/// the keep. Schedule A's running row is the newest (counting it would cost
-/// a terminal slot); schedule B's is the oldest (ranking it would delete it).
-/// The age limit is ample so only the excess branch can act.
+/// Schedule A's running row is the newest (counting it would cost a
+/// terminal slot); schedule B's is the oldest (ranking it would delete it).
 #[sqlx::test]
 async fn retention_by_count_spares_running_runs(pool: PgPool) {
     let store = schedules(&pool);
@@ -3671,8 +3397,6 @@ async fn retention_by_count_spares_running_runs(pool: PgPool) {
     assert_eq!(surviving_run_ids(&pool).await, expected);
 }
 
-/// `success`, `error` and `timeout` are each deleted by age and by excess,
-/// including terminal rows with no result file.
 #[sqlx::test]
 async fn retention_deletes_every_terminal_status(pool: PgPool) {
     let store = schedules(&pool);
@@ -3682,7 +3406,6 @@ async fn retention_deletes_every_terminal_status(pool: PgPool) {
     let old = now - chrono::Duration::days(40);
     let hours = |h: i64| now - chrono::Duration::hours(h);
 
-    // By age: the keep is ample, so only the age branch acts.
     seed_retention_run(
         &pool,
         &store,
@@ -3704,7 +3427,6 @@ async fn retention_deletes_every_terminal_status(pool: PgPool) {
     .await;
     let aged_keep =
         seed_retention_run(&pool, &store, aged, RunStatus::Success, None, hours(1)).await;
-    // By excess: young rows, the newest of which is kept.
     seed_retention_run(
         &pool,
         &store,
@@ -3750,7 +3472,6 @@ async fn retention_deletes_every_terminal_status(pool: PgPool) {
     assert_eq!(surviving_run_ids(&pool).await, vec![aged_keep, excess_keep]);
 }
 
-/// Rows with equal `started_at` keep the higher ids.
 #[sqlx::test]
 async fn retention_breaks_started_at_ties_by_id(pool: PgPool) {
     let store = schedules(&pool);
@@ -3767,7 +3488,6 @@ async fn retention_breaks_started_at_ties_by_id(pool: PgPool) {
     assert_eq!(surviving_run_ids(&pool).await, vec![ids[2], ids[3]]);
 }
 
-/// The keep counts per schedule: each keeps its own newest terminal rows.
 #[sqlx::test]
 async fn retention_keeps_each_schedule_separately(pool: PgPool) {
     let store = schedules(&pool);
@@ -3795,8 +3515,6 @@ async fn retention_keeps_each_schedule_separately(pool: PgPool) {
     assert_eq!(surviving_run_ids(&pool).await, expected);
 }
 
-/// With a keep of 1 and a running row newer than every terminal row, the
-/// running row and the newest terminal row both remain.
 #[sqlx::test]
 async fn retention_keep_one_beside_a_newer_running_run(pool: PgPool) {
     let store = schedules(&pool);
@@ -3816,15 +3534,12 @@ async fn retention_keep_one_beside_a_newer_running_run(pool: PgPool) {
     assert_eq!(surviving_run_ids(&pool).await, vec![terminal[2], running]);
 }
 
-/// Config refuses 0 for both knobs, but the store called directly with 0
-/// for either argument, or both, still spares running rows.
 #[sqlx::test]
 async fn retention_at_zero_still_spares_running_runs(pool: PgPool) {
     let store = schedules(&pool);
     let now = chrono::Utc::now();
     let minutes = |m: i64| now - chrono::Duration::minutes(m);
 
-    // A keep of zero.
     let a = retention_schedule(&pool, &store, "zero-a").await;
     seed_retention_run(
         &pool,
@@ -3841,7 +3556,6 @@ async fn retention_at_zero_still_spares_running_runs(pool: PgPool) {
     assert_eq!((deleted, paths), (1, vec!["zero/a".to_string()]));
     assert_eq!(surviving_run_ids(&pool).await, vec![a_running]);
 
-    // An age of zero.
     let b = retention_schedule(&pool, &store, "zero-b").await;
     seed_retention_run(&pool, &store, b, RunStatus::Timeout, None, minutes(20)).await;
     let b_running =
@@ -3850,15 +3564,11 @@ async fn retention_at_zero_still_spares_running_runs(pool: PgPool) {
     assert_eq!(deleted, 1);
     assert_eq!(surviving_run_ids(&pool).await, vec![a_running, b_running]);
 
-    // Both zero.
     let (deleted, paths) = store.delete_old_runs(0, 0).await.unwrap();
     assert_eq!((deleted, paths), (0, Vec::<String>::new()));
     assert_eq!(surviving_run_ids(&pool).await, vec![a_running, b_running]);
 }
 
-/// The largest `report_retention_days` config accepts computes a cutoff,
-/// and a value past what the arithmetic holds is an error, not a panic or
-/// a silent substitute.
 #[sqlx::test]
 async fn retention_cutoff_holds_the_configured_bound(pool: PgPool) {
     let store = schedules(&pool);
@@ -3930,28 +3640,17 @@ async fn successful_run_selectors(pool: PgPool) {
         .await
         .unwrap();
 
-    // `run=latest` takes the newest SUCCESS, path or no path: a run whose
-    // result had no rows has no parquet, and skipping it would answer from
-    // a window that has already been superseded (ADR-0018 ruling 13).
     let latest = store.latest_successful_run(sq_id).await.unwrap().unwrap();
     assert_eq!(
         latest.id, r3,
         "the newest success, whether or not it wrote a file"
     );
 
-    // `run=all` unions files, so a run without one is not a member.
     let all = store.list_successful_runs(sq_id).await.unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].id, r2);
 }
 
-// ---------------------------------------------------------------------------
-// concurrency: nothing serialises these calls in-process, so every
-// atomicity claim has to be a postgres one.
-// ---------------------------------------------------------------------------
-
-/// Two connections racing `claim_run` on one schedule: exactly one claims
-/// (the partial unique index `report_runs_one_running` decides).
 #[sqlx::test]
 async fn concurrent_start_run_yields_exactly_one_claim(pool: PgPool) {
     let store = schedules(&pool);
@@ -3979,8 +3678,6 @@ async fn concurrent_start_run_yields_exactly_one_claim(pool: PgPool) {
     assert_eq!(store.count_runs(sched.id).await.unwrap(), 1);
 }
 
-/// Concurrent claims cannot exceed `max_runs`: the spend and the insert
-/// share one transaction serialized by FOR UPDATE on the schedule row.
 #[sqlx::test]
 async fn concurrent_claims_respect_max_runs(pool: PgPool) {
     let store = schedules(&pool);
@@ -4023,8 +3720,6 @@ async fn concurrent_claims_respect_max_runs(pool: PgPool) {
     );
 }
 
-/// `finish_run` racing a cascade delete updates zero rows and reports it so
-/// the caller can remove the file it just wrote.
 #[sqlx::test]
 async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
     let saved_store = saved(&pool);
@@ -4037,7 +3732,6 @@ async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
 
     let rid = seed_run(&store, sched.id, sq.id, "q").await;
 
-    // Cascade-delete the run mid-flight.
     saved_store.delete(sq.id, 1).await.unwrap();
 
     let updated = store
@@ -4059,16 +3753,11 @@ async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
     );
 }
 
-/// `fail_run_if_running` is the ambiguous-commit recovery guard: it flips a
-/// still-`running` row to `error`, and must leave a run whose success already
-/// committed alone. An unconditional retry would destroy the committed result
-/// and orphan its parquet file.
 #[sqlx::test]
 async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
     let saved_store = saved(&pool);
     let store = schedules(&pool);
 
-    // A still-running run flips to error and the result path is cleared.
     let sq = saved_store.create(1, "running", "q").await.unwrap();
     let sched = store
         .create_schedule(sq.id, 1, 300, None, None, 0, chrono::Utc::now())
@@ -4088,8 +3777,6 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
     assert_eq!(run.status, RunStatus::Error);
     assert_eq!(run.result_path, None);
 
-    // A run whose success already committed must survive the guarded flip:
-    // the ambiguous-commit case where the first finish_run's COMMIT landed.
     let sq2 = saved_store.create(1, "committed", "q").await.unwrap();
     let sched2 = store
         .create_schedule(sq2.id, 1, 300, None, None, 0, chrono::Utc::now())
@@ -4134,15 +3821,9 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
     );
 }
 
-/// A scheduler's `finish_run` landing its parquet path while
-/// `SavedQueryStore::delete` is mid-flight must not orphan the file.
-///
-/// A blocker transaction pins the interleaving to the dangerous window, where
-/// `finish_run` commits its path after `delete` has collected paths but before
-/// its cascade wipes the row. `delete` locks the parent and every run row
-/// first, so it either collects the path or the run row survives long enough
-/// for `finish_run` to report the orphan. The invariant: `delete` returns the
-/// path iff `finish_run` succeeded, so exactly one side owns the cleanup.
+/// `delete` locks the parent and every run row first, so it either collects
+/// the path or the run row survives long enough for `finish_run` to report
+/// the orphan.
 #[sqlx::test]
 async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     const PATH: &str = "scheduled/race/run.parquet";
@@ -4193,23 +3874,9 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
 }
 
-/// The same delete against a `since_last` finish, which reaches for the
-/// schedule row that the delete's cascade also needs.
-///
-/// This is a lock CYCLE, not just a race. `SavedQueryStore::delete` ends by
-/// deleting the saved query, and that cascade needs the `schedules` row; a
-/// `since_last` `finish_run` locks `schedules` first and then updates the
-/// run row. With the delete holding the run rows and the finish holding the
-/// schedule, each waits on what the other holds and postgres kills one with
-/// 40P01. If the victim is the finish, the delete has already read that
-/// run's `result_path` as NULL, and the parquet the finish wrote is
-/// orphaned with nobody left to unlink it.
-///
 /// The blocker pins that interleaving by holding the run row: the delete
 /// queues for it first, the finish queues behind, and the rollback releases
-/// them in that order. The fix is the delete taking the schedule lock at
-/// level 2, so both sides walk saved -> schedules -> runs and neither can
-/// wait on a lock the other already holds out of order.
+/// them in that order. Both sides must walk saved -> schedules -> runs.
 #[sqlx::test]
 async fn delete_saved_racing_since_last_finish_never_orphans_path(pool: PgPool) {
     const PATH: &str = "scheduled/race/tiled.parquet";
@@ -4278,10 +3945,6 @@ async fn delete_saved_racing_since_last_finish_never_orphans_path(pool: PgPool) 
     assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
 }
 
-/// The same race for `ScheduleStore::delete_schedule`: the blocker holds the
-/// schedule row, `finish_run` commits its path mid-delete, and
-/// `delete_schedule` must collect that path rather than cascade it away while
-/// `finish_run` believes it persisted.
 #[sqlx::test]
 async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
     const PATH: &str = "scheduled/race/sched.parquet";
@@ -4329,24 +3992,11 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
     assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
 }
 
-// ---------------------------------------------------------------------------
-// boot: advisory lock + migration
-// ---------------------------------------------------------------------------
-
 /// Boot one `StorageState` on `url` through the real boot path.
-///
-/// `StorageState::from_pool` is that path: it takes the advisory lock on
-/// its own session, then migrates. The only thing `StorageState::connect`
-/// adds is the pool, and its production ceiling of 8 connections is more
-/// than these tests hold at once (two live instances) has any use for. The
-/// constructor itself stays under test in
-/// `boot_unreachable_database_fails_descriptively`.
 async fn boot(url: &str) -> Result<StorageState, StoreError> {
     StorageState::from_pool(common::app_pool(url).await).await
 }
 
-/// The fresh schema refuses durations above the grammar cap at the database
-/// boundary. It never repairs or clamps old schedules.
 #[sqlx::test]
 async fn initial_schema_refuses_absurd_intervals(pool: PgPool) {
     let saved_id = saved(&pool)
@@ -4366,20 +4016,15 @@ async fn initial_schema_refuses_absurd_intervals(pool: PgPool) {
     }
 }
 
-/// Fresh empty database + the real boot path applies the schema
-/// (advisory lock BEFORE migrate).
 #[tokio::test]
 async fn boot_migrates_fresh_database() {
     let url = common::create_app_database().await;
     let storage = boot(&url).await.expect("first boot");
 
-    // Schema is live: a store call succeeds.
     storage.saved.create(1, "boot", "q").await.unwrap();
     storage.ping().await.unwrap();
 }
 
-/// A second boot against an already-migrated database is a no-op (after the
-/// first instance released its advisory lock).
 #[tokio::test]
 async fn boot_is_idempotent_after_shutdown() {
     let url = common::create_app_database().await;
@@ -4395,7 +4040,6 @@ async fn boot_is_idempotent_after_shutdown() {
     for _ in 0..50 {
         match boot(&url).await {
             Ok(storage) => {
-                // Data survived; migration did not re-run destructively.
                 let survived = storage.saved.get_by_name(1, "boot").await.unwrap();
                 assert!(survived.is_some(), "second boot must keep existing data");
                 return;
@@ -4409,8 +4053,6 @@ async fn boot_is_idempotent_after_shutdown() {
     panic!("second boot never succeeded: {last_err:?}");
 }
 
-/// A second live instance on the same DSN fails startup on the advisory
-/// lock with a descriptive error.
 #[tokio::test]
 async fn boot_second_live_instance_fails_on_advisory_lock() {
     let url = common::create_app_database().await;
@@ -4426,15 +4068,9 @@ async fn boot_second_live_instance_fails_on_advisory_lock() {
     );
 }
 
-/// The lock session is detached, so it never occupies a pool slot.
-///
-/// `from_pool` acquires the advisory-lock connection from the pool it was
-/// handed — that is what makes the lock and the writes it guards provably
-/// the same database — and then detaches it. A connection merely held
-/// checked out would spend a slot for the process lifetime: on a pool of
-/// one, the migration that runs right after would wait for a connection
-/// that never comes back. Boot completing here, and the pool answering a
-/// query afterwards, is the evidence that detach happened.
+/// A connection merely held checked out would spend a slot for the process
+/// lifetime: on a pool of one, the migration that runs right after would
+/// wait for a connection that never comes back.
 #[tokio::test]
 async fn boot_lock_session_does_not_hold_a_pool_slot() {
     let url = common::create_app_database().await;
@@ -4448,12 +4084,10 @@ async fn boot_lock_session_does_not_hold_a_pool_slot() {
     .expect("boot must not wait on a pool slot the lock session took")
     .expect("boot on a single-connection pool");
 
-    // The pool refilled the detached slot: ordinary store traffic flows.
     storage.ping().await.unwrap();
     storage.saved.create(1, "detached", "q").await.unwrap();
 }
 
-/// An unreachable storage database is a descriptive startup failure.
 #[tokio::test]
 async fn boot_unreachable_database_fails_descriptively() {
     // The one boot case that must keep `StorageState::connect`: what it
@@ -4465,15 +4099,6 @@ async fn boot_unreachable_database_fails_descriptively() {
     assert!(matches!(err, StoreError::Unavailable(_)), "got: {err:?}");
 }
 
-/// Losing the lock-holding session must be detected, and must free the lock
-/// for a replacement: the guard against two live instances writing at once.
-///
-/// Terminating every backend on the app database kills the dedicated
-/// advisory-lock connection (postgres releases the session lock) while the
-/// database survives. The original instance's guard must flip its lock-lost
-/// signal (and report unhealthy on `/health`), and a *replacement* instance
-/// must then be able to acquire the freed lock — proving the original can no
-/// longer be trusted as sole writer.
 #[tokio::test]
 async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement() {
     use std::time::Duration;
@@ -4485,13 +4110,11 @@ async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement() {
     assert!(!*lost.borrow_and_update(), "lock is healthy at boot");
     first.ping_cached().await.expect("storage healthy at boot");
 
-    // While the lock is held, a replacement cannot start.
     assert!(
         matches!(boot(&url).await, Err(StoreError::LockHeld)),
         "second live instance must be locked out while the lock is held"
     );
 
-    // Kill the lock-holding session (database stays up).
     common::terminate_backends(&url).await;
 
     // The guard keepalive-probes on an interval, so allow a few cycles.
@@ -4500,8 +4123,6 @@ async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement() {
         .expect("guard must detect the lost lock")
         .expect("lock-lost sender must stay alive");
 
-    // `/health` now reports storage unhealthy even though the pool itself
-    // could reconnect — the split-brain hazard is surfaced.
     assert!(
         first.ping_cached().await.is_err(),
         "health must report the lost lock"
@@ -4522,10 +4143,6 @@ async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement() {
     panic!("replacement never acquired the freed lock: {last_err:?}");
 }
 
-// ---------------------------------------------------------------------------
-// field catalog
-// ---------------------------------------------------------------------------
-
 mod catalog {
     use super::*;
     use trawl_core::schema::{CanonicalType, ENVELOPE_TYPES};
@@ -4545,7 +4162,6 @@ mod catalog {
 
     #[sqlx::test]
     async fn migration_seed_matches_envelope_types(pool: PgPool) {
-        // The migration seed must mirror trawl-core's ENVELOPE_TYPES exactly.
         let pins = catalog(&pool).load_pins().await.unwrap();
         for (field, ty) in ENVELOPE_TYPES {
             let pinned = pins.iter().find(|(f, _)| f == field);
@@ -4560,9 +4176,6 @@ mod catalog {
             ENVELOPE_TYPES.len(),
             "a fresh catalog holds exactly the declared envelope"
         );
-        // `_severity` is pinned SEVERITY, the semantic type persisted under
-        // its own catalog spelling, and no `severity`/`severity_text` row is
-        // seeded: those are ordinary sender vocabulary.
         assert_eq!(
             pins.iter().find(|(f, _)| f == "_severity").map(|(_, t)| *t),
             Some(CanonicalType::Severity)
@@ -4573,17 +4186,12 @@ mod catalog {
                 "{gone} left the envelope (ADR-0013 §1)"
             );
         }
-        // `_producer` is server-stamped provenance, seeded VARCHAR by
-        // the initial schema so its closed vocabulary (http | syslog | trawld)
-        // is never typed by inference.
         assert_eq!(
             pins.iter().find(|(f, _)| f == "_producer").map(|(_, t)| *t),
             Some(CanonicalType::Varchar)
         );
     }
 
-    /// A baseline rerun preserves sender pins, catalog identity, and completed
-    /// passes. Fresh completion remains absent until the whole pass succeeds.
     #[sqlx::test]
     async fn baseline_restart_preserves_catalog_state_and_sender_pins(pool: PgPool) {
         let initial: (String, bool) =
@@ -4634,8 +4242,6 @@ mod catalog {
             .unwrap();
         assert_eq!(pins.get("duration"), Some(&CanonicalType::BigInt));
 
-        // A later batch proposing a different type does not repin; the
-        // authoritative pin comes back instead.
         let pins = store
             .pin_missing(&[proposal("duration", CanonicalType::Varchar)])
             .await
@@ -4649,9 +4255,6 @@ mod catalog {
 
     #[sqlx::test]
     async fn pin_missing_race_converges_on_one_pin(pool: PgPool) {
-        // Two concurrent proposals for the same unpinned field with
-        // different types: both callers must come back with the same
-        // authoritative pin (INSERT ... ON CONFLICT DO NOTHING + re-read).
         let a = catalog(&pool);
         let b = catalog(&pool);
         let pa_prop = [proposal("racy", CanonicalType::BigInt)];
@@ -4668,13 +4271,9 @@ mod catalog {
     }
 
     /// A name no btree key can hold: 3000 pseudo-random printable bytes.
-    ///
-    /// The wide alphabet is load-bearing. Postgres pglz-compresses an
+    /// The wide alphabet is load-bearing: Postgres pglz-compresses an
     /// oversized index value before giving up, so a repeated-character
-    /// name of the same length slips under the limit and would not
-    /// exercise the failure at all; this one reproduces
-    /// `index row size 3016 exceeds btree version 4 maximum 2704`
-    /// verbatim against `field_types_pkey`.
+    /// name of the same length slips under the limit.
     fn unstorable_field_name() -> String {
         let mut x: u32 = 0x1234_5678;
         std::iter::repeat_with(|| {
@@ -4687,9 +4286,6 @@ mod catalog {
 
     #[sqlx::test]
     async fn pin_missing_skips_unstorable_names_instead_of_failing(pool: PgPool) {
-        // An over-long field name must never error the pin statement:
-        // pinning gates every parquet write, so an Err here retains the
-        // batch and re-fails on every compaction tick, forever.
         let store = catalog(&pool);
         let huge = unstorable_field_name();
 
@@ -4712,24 +4308,15 @@ mod catalog {
             "every other field in the batch still pins"
         );
 
-        // And it really is absent from the catalog, not silently stored.
         let all = store.load_pins().await.unwrap();
         assert!(all.iter().all(|(f, _)| f != &huge));
     }
 
     #[sqlx::test]
     async fn pin_missing_caps_catalog_cardinality(pool: PgPool) {
-        // Field names are client-chosen JSON keys and the ingest path never
-        // reclaims a pin (retention does not reconcile the catalog), so an
-        // uncapped catalog is an unbounded postgres table and an unbounded
-        // in-process cache that a sender embedding identifiers in its keys
-        // grows for free. Only the free slots under the cap are filled; the
-        // surplus stays unpinned, which is what makes the conform step drop
-        // the column with its values still in `_raw`.
         let seeded = i64::try_from(ENVELOPE_TYPES.len()).unwrap();
         let store = catalog(&pool).with_pin_cap(seeded + 2);
 
-        // Two free slots, and one batch may take at most half of them.
         let pins = store
             .pin_missing(&[
                 proposal("a_field", CanonicalType::BigInt),
@@ -4746,8 +4333,6 @@ mod catalog {
             "an overflowing batch picks deterministically, by name"
         );
 
-        // One free slot left: the ration bounds a burst, it never strands
-        // the last slot.
         let pins = store
             .pin_missing(&[
                 proposal("b_field", CanonicalType::BigInt),
@@ -4765,9 +4350,6 @@ mod catalog {
             "the catalog never exceeds the cap"
         );
 
-        // A later batch against a full catalog pins nothing new, but must
-        // still resolve the pins that do exist, or every known column of
-        // every batch would start being dropped once the cap is reached.
         let pins = store
             .pin_missing(&[
                 proposal("e_field", CanonicalType::BigInt),
@@ -4790,12 +4372,6 @@ mod catalog {
 
     #[sqlx::test]
     async fn one_batch_cannot_consume_the_catalog_but_the_boot_seed_can(pool: PgPool) {
-        // A pin slot is spent permanently on the ingest path and denial is
-        // silent in the data: the column is simply absent from every later
-        // parquet file. Under first-come-first-served, one ingest request
-        // carrying enough junk keys would unstore every future field on the
-        // install, from every service, so a batch takes at most half the free
-        // slots and the tail survives a burst.
         let seeded = i64::try_from(ENVELOPE_TYPES.len()).unwrap();
         let store = catalog(&pool).with_pin_cap(seeded + 8);
 
@@ -4818,9 +4394,6 @@ mod catalog {
             "a burst never leaves the next legitimate field homeless"
         );
 
-        // The boot conformance pass is exempt: its proposals describe
-        // columns already on disk, so a denied pin there deletes standing
-        // data rather than declining to add a column.
         let pins = store.pin_missing_unrationed(&burst).await.unwrap();
         assert_eq!(
             pins.len(),
@@ -4900,9 +4473,6 @@ mod catalog {
 
     #[sqlx::test]
     async fn touch_services_is_ever_observed_no_eviction(pool: PgPool) {
-        // `field_services` rows are ever-observed: no window, no eviction, so
-        // a service observed once stays observed however many other services
-        // later carry the field. Consumers window on `last_seen`.
         let store = catalog(&pool);
         let fields = vec!["duration".to_owned()];
 
@@ -4924,15 +4494,10 @@ mod catalog {
         );
     }
 
-    /// The service axis is client-chosen and never pruned, so the read
-    /// surface pages it: a cursor walk over a large history delivers every
-    /// row exactly once, in order, and terminates.
     #[sqlx::test]
     async fn field_services_pages_a_large_history_without_gaps(pool: PgPool) {
         let store = catalog(&pool);
 
-        // 250 services carrying one common field — no pin slot spent, and
-        // nothing ever removes a row.
         sqlx::query(
             "INSERT INTO field_services (field, service, first_seen, last_seen, row_count)
              SELECT 'duration', 'svc-' || lpad(g::text, 4, '0'),
@@ -4982,8 +4547,6 @@ mod catalog {
         assert_eq!(seen.last().unwrap(), "svc-0250", "oldest last");
     }
 
-    /// Rows sharing a `last_seen` still page deterministically: the cursor
-    /// is `(last_seen, service)`, so the tie breaks on the service name.
     #[sqlx::test]
     async fn field_services_cursor_breaks_last_seen_ties(pool: PgPool) {
         let store = catalog(&pool);
@@ -5037,8 +4600,6 @@ mod catalog {
         );
     }
 
-    /// The samples are per-row evidence: an arbitrary list of client text
-    /// per conflict, carried whole (empty included) rather than merged.
     #[sqlx::test]
     async fn conflict_samples_round_trip_per_row(pool: PgPool) {
         let store = catalog(&pool);
@@ -5050,9 +4611,6 @@ mod catalog {
             rows_nulled: 1,
             samples,
         };
-        // Postgres array literals, JSON and SQL all have opinions about
-        // these characters; the value that arrives is the value that was
-        // captured.
         let awkward = vec![
             "n/a".to_owned(),
             "{\"a\",\"b\"}".to_owned(),
@@ -5086,10 +4644,6 @@ mod catalog {
         );
     }
 
-    /// The verdict's evidence read is bounded per field, not per page: one
-    /// degraded field cannot spend the whole budget and leave the rest of
-    /// the page verdictless, and a page of degraded fields cannot pull the
-    /// whole evidence table into one response.
     #[sqlx::test]
     async fn conflict_evidence_is_bounded_per_field(pool: PgPool) {
         let store = catalog(&pool);
@@ -5120,16 +4674,10 @@ mod catalog {
                 "{field}: {} rows exceeds the per-field bound",
                 rows.len()
             );
-            // Newest first: the last episode written is the first row back.
             assert_eq!(rows[0].1, vec!["v39".to_owned()], "{field}");
         }
     }
 
-    /// The aggregates exist because the detail window does not survive a
-    /// storm: `field_conflicts` is trimmed to the cap in the same
-    /// transaction that appends to it, while `field_conflict_stats` keeps
-    /// the span, the episode count and the lifetime shelved rows the
-    /// analyzer judges the pin on.
     #[sqlx::test]
     async fn conflict_stats_outlive_the_recency_trim(pool: PgPool) {
         let store = catalog(&pool).with_conflict_cap(10);
@@ -5176,15 +4724,6 @@ mod catalog {
         assert!(span, "the span is the evidence, and it only widens");
     }
 
-    /// The degraded generation's two reads share one postgres snapshot.
-    ///
-    /// Both halves read `field_conflict_stats`, and a repin's evidence clear
-    /// deletes from it. As two pool reads (READ COMMITTED gives a fresh
-    /// snapshot per statement) a clear landing between them would publish a
-    /// generation with a degraded field and no service attributed to it: the
-    /// query notice stands while every badge vanishes, for a whole refresh
-    /// interval.
-    ///
     /// The isolation level is only observable by interleaving a committed
     /// delete from a second connection, so the test drives the two
     /// transaction-scoped reads `CatalogStore::degraded_snapshot` composes.
@@ -5216,7 +4755,6 @@ mod catalog {
         .unwrap();
         let visible = vec!["svc-a".to_owned(), "svc-b".to_owned()];
 
-        // Baseline: the composed read gives both halves of one generation.
         let (degraded, pairs) = store.degraded_snapshot(&visible).await.unwrap();
         assert!(degraded.contains("duration"), "the pin is degraded");
         assert_eq!(
@@ -5234,7 +4772,6 @@ mod catalog {
             "both senders are attributed"
         );
 
-        // Now the interleave the transaction exists for.
         let mut tx = store.begin_evidence_snapshot().await.unwrap();
         let aggregates = CatalogStore::conflict_aggregates_tx(&mut tx, None)
             .await
@@ -5263,8 +4800,6 @@ mod catalog {
         );
         tx.commit().await.unwrap();
 
-        // And the next generation is empty on both halves: keeping the reads
-        // together does not keep evidence alive.
         let (degraded, pairs) = store.degraded_snapshot(&visible).await.unwrap();
         assert!(
             degraded.is_empty(),
@@ -5273,13 +4808,6 @@ mod catalog {
         assert!(pairs.is_empty(), "and nothing is attributed to it");
     }
 
-    /// `first_at` only ever moves earlier, the property the whole degraded
-    /// gate rests on.
-    ///
-    /// The gate is `last_at - first_at >= 24h`. If a later episode restamped
-    /// `first_at`, the span would reset on every conflict and no field could
-    /// ever be called degraded: the feature would be inert, silently, with
-    /// every other test still green.
     #[sqlx::test]
     async fn recording_an_episode_never_moves_first_at_forward(pool: PgPool) {
         let store = catalog(&pool);
@@ -5318,10 +4846,6 @@ mod catalog {
         );
     }
 
-    /// The boot conformance pass accumulates conflicts across every file it
-    /// rewrites, so one call routinely carries many rows for the same
-    /// `(field, service)`. Postgres refuses to let one `ON CONFLICT DO
-    /// UPDATE` touch a row twice, so the upsert aggregates in the statement.
     #[sqlx::test]
     async fn conflict_stats_aggregate_duplicate_pairs_within_one_call(pool: PgPool) {
         let store = catalog(&pool);
@@ -5358,9 +4882,6 @@ mod catalog {
         );
     }
 
-    /// Evidence rows, the trim and the aggregates are one transaction: a
-    /// failure in the last statement leaves none of the first two behind,
-    /// so no episode is ever counted without the row it came from.
     #[sqlx::test]
     async fn conflict_evidence_and_stats_commit_together(pool: PgPool) {
         let store = catalog(&pool);
@@ -5404,11 +4925,6 @@ mod catalog {
 
     #[sqlx::test]
     async fn conflicts_keep_only_the_newest_rows_per_field(pool: PgPool) {
-        // A field pinned BIGINT that keeps receiving strings appends a row
-        // every compaction tick, forever, while its information content
-        // stays constant — so the evidence is a rolling window, trimmed per
-        // field (service names are client-chosen too, so a per-service
-        // window would only move the unbounded axis).
         let store = catalog(&pool).with_conflict_cap(3);
         let conflict = |service: &str, nulled: u64| FieldConflict {
             field: "duration".to_owned(),
@@ -5425,7 +4941,6 @@ mod catalog {
                 .await
                 .unwrap();
         }
-        // An untouched field is never trimmed by another field's write.
         store
             .record_conflicts(&[FieldConflict {
                 field: "other".to_owned(),
@@ -5448,8 +4963,6 @@ mod catalog {
             "trimming touches only the fields the call wrote"
         );
 
-        // A single over-window batch is trimmed by the same statement that
-        // inserted it — the trim must see its own insert.
         let store = catalog(&pool).with_conflict_cap(2);
         store
             .record_conflicts(&[
@@ -5478,9 +4991,6 @@ mod catalog {
         );
     }
 
-    // -- catalog read model -------------------------------------------------
-
-    /// Age a `(field, service)` observation into the past by `days`.
     async fn age_observation(pool: &PgPool, field: &str, service: &str, days: i64) {
         sqlx::query(
             "UPDATE field_services
@@ -5541,7 +5051,6 @@ mod catalog {
         assert!(duration.last_seen.is_some());
         assert_eq!(duration.pinned_from.as_deref(), Some("svc-a"));
 
-        // A pinned-but-never-observed field carries zeroed aggregates.
         let path = rows.iter().find(|r| r.field == "path").unwrap();
         assert_eq!(path.service_count, 0);
         assert_eq!(path.row_count, 0);
@@ -5549,14 +5058,10 @@ mod catalog {
         assert!(path.first_seen.is_none());
         assert!(path.last_seen.is_none());
 
-        // The envelope seed is part of the listing (it IS pinned).
         assert!(rows.iter().any(|r| r.field == "_time"));
         assert_eq!(rows.len(), ENVELOPE_TYPES.len() + 2);
     }
 
-    /// `/api/v1/schema` wants names and types only. It must not pay for the
-    /// conflict evidence — the columns-only listing reads zeroes and skips
-    /// the `field_conflicts` query entirely.
     #[sqlx::test]
     async fn list_fields_without_conflicts_reads_zeroes(pool: PgPool) {
         let store = catalog(&pool);
@@ -5593,8 +5098,6 @@ mod catalog {
         assert_eq!(duration.conflict_count, 0, "evidence not requested");
         assert_eq!(duration.rows_nulled, 0, "evidence not requested");
 
-        // The same filter with the evidence sees it, proving the zeroes
-        // above are the skip, not a missing conflict row.
         let (rows, _) = store
             .list_fields(&trawl_server::store::FieldListFilter::default())
             .await
@@ -5604,8 +5107,6 @@ mod catalog {
         assert_eq!(duration.rows_nulled, 7);
     }
 
-    /// The evidence query is keyed on the page the pin listing returned, so
-    /// a conflict on a field the page truncated away is never read.
     #[sqlx::test]
     async fn list_fields_conflict_evidence_is_page_scoped(pool: PgPool) {
         let store = catalog(&pool);
@@ -5712,8 +5213,6 @@ mod catalog {
         assert_eq!(shared.service_count, 1, "svc-a's own service count");
         assert_eq!(shared.row_count, 1, "svc-b's 3 rows must not leak in");
 
-        // The window reads svc-a's last_seen, not the global max: svc-b is
-        // still sending, but that cannot keep the field alive for svc-a.
         age_observation(&pool, "shared", "svc-a", 100).await;
         let since = chrono::Utc::now() - chrono::Duration::days(90);
         let (rows, _) = store
@@ -5729,7 +5228,6 @@ mod catalog {
             "aged out for svc-a even though svc-b still observes it"
         );
 
-        // svc-b, and the unscoped listing, still see it.
         let (rows, _) = store
             .list_fields(&trawl_server::store::FieldListFilter {
                 service: Some("svc-b".to_owned()),
@@ -5773,7 +5271,6 @@ mod catalog {
              there is nothing to age out"
         );
 
-        // Lifting the window (since: None) restores the aged field.
         let (rows, _) = store
             .list_fields(&trawl_server::store::FieldListFilter::default())
             .await
@@ -5841,7 +5338,6 @@ mod catalog {
             .await
             .unwrap();
 
-        // Unfiltered: newest first, across fields.
         let (rows, truncated) = store.recent_conflicts(None, None, None, 100).await.unwrap();
         assert_eq!(rows.len(), 3);
         assert!(!truncated);
@@ -5849,7 +5345,6 @@ mod catalog {
         assert_eq!(rows[2].service, "svc-a");
         assert_eq!(rows[2].field, "duration");
 
-        // Field filter.
         let (rows, _) = store
             .recent_conflicts(Some("duration"), None, None, 100)
             .await
@@ -5857,7 +5352,6 @@ mod catalog {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.field == "duration"));
 
-        // Service filter.
         let (rows, _) = store
             .recent_conflicts(None, Some("svc-b"), None, 100)
             .await
@@ -5865,7 +5359,6 @@ mod catalog {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].service, "svc-b");
 
-        // Since filter: age one row into the past, then window it away.
         sqlx::query(
             "UPDATE field_conflicts SET at = now() - interval '10 days'
              WHERE field = 'path'",
@@ -5881,7 +5374,6 @@ mod catalog {
         assert_eq!(rows.len(), 2, "the aged conflict is outside the window");
         assert!(rows.iter().all(|r| r.field == "duration"));
 
-        // Limit + truncated.
         let (rows, truncated) = store.recent_conflicts(None, None, None, 2).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert!(truncated);
@@ -5908,11 +5400,6 @@ mod catalog {
         );
     }
 
-    /// Pin gc's candidate set and the schema listing's window are two
-    /// readings of one fact, `field_services.last_seen`, so for a pin that
-    /// has ever been observed they must partition it: alive in the listing,
-    /// or a gc candidate, never both and never neither. One cutoff drives
-    /// both reads, so a drift in either rule shows up here.
     #[sqlx::test]
     async fn gc_candidates_are_the_complement_of_the_schema_window(pool: PgPool) {
         let store = catalog(&pool);
@@ -5932,8 +5419,6 @@ mod catalog {
                 .await
                 .unwrap();
         }
-        // `multi` is stale for one sender and current for another: the
-        // newest observation across services is what decides it.
         store
             .touch_services("svc-b", &["multi".to_owned()], 1)
             .await
@@ -5943,8 +5428,6 @@ mod catalog {
         age_observation(&pool, "edge", "svc-a", 30).await;
         age_observation(&pool, "multi", "svc-a", 60).await;
 
-        // Between `edge` (30 days back) and `stale` (60), so `edge` is
-        // alive and `stale` is not.
         let cutoff = chrono::Utc::now() - chrono::Duration::days(45);
 
         let candidates = store.pins_unobserved_since(cutoff).await.unwrap();
@@ -5974,18 +5457,12 @@ mod catalog {
             "svc-b still writes it, so the newest observation keeps it alive"
         );
 
-        // The row carries what the report and the audit event need.
         let stale = candidates.iter().find(|c| c.field == "stale").unwrap();
         assert_eq!(stale.duckdb_type, "VARCHAR");
         assert_eq!(stale.services, 1);
         assert!(stale.last_seen.is_some_and(|seen| seen < cutoff));
     }
 
-    /// The one place gc and the listing disagree on purpose: a pin nothing
-    /// ever observed is always shown by `/schema` (there is no `last_seen`
-    /// to age out) and is a gc candidate (a `curl` typo pinned once and
-    /// never written is exactly the slot gc reclaims). Asserted so a later
-    /// "make them agree" cleanup has to argue with a test.
     #[sqlx::test]
     async fn never_observed_pin_diverges_from_the_listing_rule(pool: PgPool) {
         let store = catalog(&pool);
@@ -6022,14 +5499,8 @@ mod catalog {
         assert!(candidates.iter().any(|c| c.field == "_severity"));
     }
 
-    /// The epoch is a cutoff postgres will actually take.
-    ///
-    /// `catalog::gc::cutoff_for` clamps an unsubtractable window there, and
-    /// the point of the clamp is that the query still runs: chrono's
-    /// minimum is outside `timestamptz`, so binding it fails at the driver
-    /// and a huge `--older-than` would 503 instead of matching almost
-    /// nothing. At the epoch every observed pin is alive and only the
-    /// never-observed ones come back.
+    /// chrono's minimum is outside `timestamptz`, so binding it fails at the
+    /// driver; `catalog::gc::cutoff_for` clamps an unsubtractable window to the epoch.
     #[sqlx::test]
     async fn the_epoch_cutoff_binds_and_leaves_only_never_observed_pins(pool: PgPool) {
         let store = catalog(&pool);
@@ -6077,16 +5548,11 @@ mod catalog {
             );
         }
 
-        // Nothing was deleted: the refusal precedes the transaction, so the
-        // ordinary field named beside the contract one survives too.
         let pins = store.load_pins().await.unwrap();
         assert!(pins.iter().any(|(f, _)| f == "duration"));
         assert!(pins.iter().any(|(f, _)| f == "_severity"));
     }
 
-    /// Gc's whole safety argument is that being wrong costs a re-pin: the
-    /// purge leaves no trace in any of the four tables, so the field comes
-    /// back through the ordinary ingest path as if it were new.
     #[sqlx::test]
     async fn delete_pins_leaves_no_residue_and_a_clean_repin_follows(pool: PgPool) {
         let store = catalog(&pool);
@@ -6113,13 +5579,6 @@ mod catalog {
                 }])
                 .await
                 .unwrap();
-            // An operator's acknowledgement of the degraded badge (#111).
-            // It indicts a pin, so reclaiming the slot must take it with
-            // the rest: a name that comes back later must not inherit a
-            // judgement made about the pin that is gone. Written straight
-            // to the table rather than through `acknowledge_degraded_field`
-            // — this test is about what the purge deletes, not about which
-            // evidence the analyzer calls degraded.
             sqlx::query(
                 "INSERT INTO field_degraded_ack (field, acked_by, note, evidence_through)
                  VALUES ($1, 'key-op', 'seen', 1)",
@@ -6176,8 +5635,6 @@ mod catalog {
             assert!(kept > 0, "{table} lost the neighbouring field's rows");
         }
 
-        // Re-arrival through the normal path: a fresh pin, its own type,
-        // and a first observation. Nothing carried over from the old life.
         let pins = store
             .pin_missing(&[proposal("dead", CanonicalType::Varchar)])
             .await
@@ -6203,19 +5660,6 @@ mod catalog {
         assert_eq!(reborn.conflict_count, 0, "old evidence did not survive");
     }
 
-    /// The purge hands back everything the caller needs to finish the
-    /// reclaim, all read inside the one transaction: the names
-    /// `field_types` actually gave up, and the pins remaining for the fill
-    /// gauges. The caller's next act is an eviction that must not be
-    /// skipped, so a post-commit SELECT for the gauge would be a fallible
-    /// step in exactly the wrong place.
-    ///
-    /// The returned rows are the DELETE's own RETURNING set, never the
-    /// request: a candidate whose row went away underneath the run must not
-    /// show up in an audit event claiming this run deleted it. Their
-    /// metadata is the transaction's own read, never the caller's earlier
-    /// snapshot — a repin can retype a row between the two, and the audit
-    /// record is the only surviving account of what was deleted.
     #[sqlx::test]
     async fn delete_pins_returns_the_deleted_metadata_and_the_fill_count(pool: PgPool) {
         let store = catalog(&pool);
@@ -6283,22 +5727,6 @@ mod catalog {
         assert_eq!(purged.pinned_now, after, "the count is the committed one");
     }
 
-    /// The purge bounds its pre-commit phase twice over. A row lock
-    /// somebody else holds costs it five seconds and an error, never an
-    /// unbounded wait, while the corpus gate and every compaction batch
-    /// queued behind it wait on the answer.
-    ///
-    /// Two bounds cover this, and either refusal is correct: postgres'
-    /// `lock_timeout` at five seconds, and the caller's ten-second
-    /// `PURGE_PREPARE_BOUND` for the case postgres cannot see, a connection
-    /// that stops answering while the backend sits idle. What matters is
-    /// that the wait ends and the transaction rolls back; which bound
-    /// noticed is not the contract.
-    ///
-    /// The purge takes the row lock at `DELETE FROM field_types`, so this
-    /// exercises the `lock_timeout` half; the `statement_timeout` half is
-    /// what bounds the advisory lock a step earlier, which no test can hold
-    /// from outside (`CATALOG_LIFECYCLE_LOCK_KEY` is crate-private).
     #[sqlx::test]
     async fn delete_pins_gives_up_on_a_held_row_lock_instead_of_waiting(pool: PgPool) {
         let store = catalog(&pool);
@@ -6345,11 +5773,6 @@ mod catalog {
         );
     }
 
-    /// The purge's own half of the pin-gc race: the running-row check
-    /// lives INSIDE the transaction, under the catalog lifecycle lock, so
-    /// a claim that landed after gc's gated courtesy look still stops the
-    /// delete. Nothing is deleted, and the slot is free again once the job
-    /// is terminal.
     #[sqlx::test]
     async fn delete_pins_refuses_in_the_transaction_while_a_repin_runs(pool: PgPool) {
         let store = catalog(&pool);
@@ -6393,11 +5816,6 @@ mod catalog {
             .expect("a terminal job frees the purge");
     }
 
-    /// The interleaving the lock closes, run for real: a purge and a claim
-    /// for the same field, concurrently. Whichever transaction takes
-    /// `CATALOG_LIFECYCLE_LOCK_KEY` first, exactly one succeeds — and the
-    /// corrupt outcome (the pin deleted AND a job claimed against it, whose
-    /// cutover would then restore the pin in memory only) is unreachable.
     #[sqlx::test]
     async fn a_concurrent_purge_and_claim_never_both_win(pool: PgPool) {
         let store = catalog(&pool);
@@ -6450,8 +5868,6 @@ mod catalog {
         );
     }
 
-    /// A repin's history is what an operator did to the corpus, and it
-    /// stays true after the field is gone.
     #[sqlx::test]
     async fn delete_pins_never_touches_repin_history(pool: PgPool) {
         let store = catalog(&pool);
@@ -6478,10 +5894,6 @@ mod catalog {
     }
 }
 
-// ---------------------------------------------------------------------------
-// degraded-field acknowledgement
-// ---------------------------------------------------------------------------
-
 mod degraded_ack {
     use sqlx::PgPool;
     use sqlx::Row as _;
@@ -6504,8 +5916,7 @@ mod degraded_ack {
     }
 
     /// Record `episodes` conflict episodes for a pinned field and age the
-    /// evidence past the analyzer's 24h span. The evidence is real; only its
-    /// age is simulated, which is the one thing a test cannot wait for.
+    /// evidence past the analyzer's 24h span.
     async fn degrade(pool: &PgPool, field: &str, episodes: usize) {
         let store = catalog(pool);
         for _ in 0..episodes {
@@ -6521,9 +5932,6 @@ mod degraded_ack {
         .unwrap();
     }
 
-    /// The happy path and the advance: a first ack stores the current
-    /// episode high-water, a second one replaces the actor and the note and
-    /// moves the high-water up to the evidence recorded since.
     #[sqlx::test]
     async fn ack_upsert_advances_the_high_water_and_replaces_note_and_actor(pool: PgPool) {
         let store = catalog(&pool);
@@ -6547,7 +5955,6 @@ mod degraded_ack {
         assert_eq!(ack.note.as_deref(), Some("that shipper really sends n/a"));
         assert_eq!(ack.evidence_through, 3, "the episode sum at ack time");
 
-        // More evidence, then a second ack from a different operator.
         degrade(&pool, "host", 2).await;
         let AckOutcome::Acked {
             ack: again,
@@ -6570,15 +5977,6 @@ mod degraded_ack {
         assert_eq!(store.degraded_ack("host").await.unwrap(), Some(again));
     }
 
-    /// A stale ack cannot steal the attribution of the ack that covered
-    /// more evidence.
-    ///
-    /// The interleaving: operator A reads six episodes and acknowledges
-    /// them. The evidence is then cleared and re-accrues to three, and
-    /// operator B — whose read saw only those three — acknowledges. B's
-    /// call must not put B's name, note and timestamp on a row that
-    /// accepted the pin through six, so the row comes back untouched and
-    /// the outcome says `advanced: false`.
     #[sqlx::test]
     async fn a_stale_ack_leaves_the_higher_water_marks_attribution_alone(pool: PgPool) {
         let store = catalog(&pool);
@@ -6594,8 +5992,7 @@ mod degraded_ack {
 
         // The evidence goes away and comes back smaller, which is what a
         // repin's `clear_conflict_evidence` plus a fresh batch of conflicts
-        // does. The ack row survives it here because nothing in this test
-        // ran a cutover.
+        // does.
         sqlx::query("DELETE FROM field_conflict_stats WHERE field = 'host'")
             .execute(&pool)
             .await
@@ -6622,10 +6019,6 @@ mod degraded_ack {
         assert_eq!(store.degraded_ack("host").await.unwrap(), Some(after));
     }
 
-    /// Below the threshold there is no verdict to suppress, and installing a
-    /// high-water anyway would swallow the evidence that would have raised
-    /// the badge for the first time. Two shapes: an unpinned field, and a
-    /// pinned one whose evidence is one episode short of the gate.
     #[sqlx::test]
     async fn ack_refuses_below_the_degraded_threshold(pool: PgPool) {
         let store = catalog(&pool);
@@ -6660,7 +6053,6 @@ mod degraded_ack {
         );
         assert_eq!(store.degraded_ack("host").await.unwrap(), None);
 
-        // The episode that tips it over is acknowledgeable.
         degrade(&pool, "host", 1).await;
         assert!(matches!(
             store
@@ -6671,8 +6063,6 @@ mod degraded_ack {
         ));
     }
 
-    /// The operator's own un-acknowledge, and its idempotency: the second
-    /// clear removes nothing and says so.
     #[sqlx::test]
     async fn clearing_an_ack_reports_whether_a_row_went(pool: PgPool) {
         let store = catalog(&pool);
@@ -6690,8 +6080,6 @@ mod degraded_ack {
         );
     }
 
-    /// An ack indicts a pin and cannot outlive one: dropping the
-    /// `field_types` row takes the acknowledgement with it.
     #[sqlx::test]
     async fn deleting_the_pin_cascades_the_ack_away(pool: PgPool) {
         let store = catalog(&pool);
@@ -6713,10 +6101,6 @@ mod degraded_ack {
         );
     }
 
-    /// The two aggregate SQL texts are separate for planner reasons, so they
-    /// are two places the ack join can drift. Keyed and unkeyed must report
-    /// the same acknowledged high-water for the same field, and `None` for a
-    /// field nobody acknowledged.
     #[sqlx::test]
     async fn both_aggregate_forms_report_the_same_acked_through(pool: PgPool) {
         let store = catalog(&pool);
@@ -6753,15 +6137,11 @@ mod degraded_ack {
         );
     }
 
-    /// `/schema/field` reads the verdict's inputs and the ack that
-    /// suppresses it as one fact, so the two cannot contradict each other in
-    /// one response.
     #[sqlx::test]
     async fn field_health_snapshot_carries_the_verdict_and_its_ack_together(pool: PgPool) {
         let store = catalog(&pool);
         degrade(&pool, "host", 3).await;
 
-        // Before the ack: evidence, no acknowledgement, no high-water.
         let health = store.field_health_snapshot("host").await.unwrap();
         let agg = health.aggregate.expect("the field has evidence");
         assert_eq!(agg.episodes, 3);
@@ -6787,16 +6167,12 @@ mod degraded_ack {
         );
         assert_eq!(ack.acked_by, "key-aaa");
 
-        // A field with no evidence at all: no aggregate, and no evidence
-        // query spent looking for rows that cannot exist.
         let health = store.field_health_snapshot("service").await.unwrap();
         assert!(health.aggregate.is_none());
         assert!(health.evidence.is_empty());
         assert!(health.ack.is_none());
     }
 
-    /// The note cap is a CHECK, so an over-long note is refused rather than
-    /// silently truncated. 1024 bytes exactly is accepted.
     #[sqlx::test]
     async fn the_note_cap_is_enforced_in_bytes(pool: PgPool) {
         let store = catalog(&pool);
@@ -6827,10 +6203,6 @@ mod degraded_ack {
     }
 }
 
-// ---------------------------------------------------------------------------
-// repin jobs
-// ---------------------------------------------------------------------------
-
 mod repin_store {
     use sqlx::PgPool;
     use trawl_core::schema::CanonicalType;
@@ -6844,11 +6216,6 @@ mod repin_store {
     }
 
     /// Seed the `field_types` row a claim revalidates against.
-    ///
-    /// `claim` refuses a field whose pin is not the one the caller prepared
-    /// against, which is what closes the pin-gc race: the engine reads the
-    /// pin from its cache, so the claim transaction proves it is still
-    /// there. Every claim in these tests therefore needs the pin it names.
     async fn pin(pool: &PgPool, field: &str, ty: CanonicalType) {
         sqlx::query(
             "INSERT INTO field_types (field, duckdb_type, pinned_from)
@@ -6862,10 +6229,6 @@ mod repin_store {
         .expect("seed a pin");
     }
 
-    /// The claim writes the requesting key's row id beside its name, and
-    /// the owner-scoped read matches on that id alone: another key's job,
-    /// a job no key requested and an id never issued all read as absent,
-    /// while the plain read sees every row.
     #[sqlx::test]
     async fn get_requested_by_matches_the_claiming_key_id_only(pool: PgPool) {
         fn claim(requester: Option<&Requester>) -> RepinClaim<'_> {
@@ -6926,8 +6289,6 @@ mod repin_store {
         assert!(s.get(other).await.unwrap().is_some());
     }
 
-    /// One repin at a time, enforced by the partial unique index — the
-    /// second claim maps the named violation, never a raw pg error.
     #[sqlx::test]
     async fn second_claim_is_repin_already_running(pool: PgPool) {
         let s = store(&pool);
@@ -6965,7 +6326,6 @@ mod repin_store {
             .expect_err("a second running job must refuse");
         assert!(matches!(err, StoreError::RepinAlreadyRunning));
 
-        // A terminal job frees the slot.
         assert!(
             s.finish_if_running(id, RepinJobStatus::Failed, Some("test"), None)
                 .await
@@ -6986,8 +6346,6 @@ mod repin_store {
         .expect("a terminal job frees the one-running slot");
     }
 
-    /// Two concurrent claims: exactly one wins, and the loser sees the
-    /// domain error rather than a raw pg violation.
     #[sqlx::test]
     async fn concurrent_claims_admit_exactly_one(pool: PgPool) {
         pin(&pool, "status", CanonicalType::BigInt).await;
@@ -7023,9 +6381,6 @@ mod repin_store {
         assert!(matches!(loser, Err(StoreError::RepinAlreadyRunning)));
     }
 
-    /// The cutover flip is one transaction: the pin's stored type and the
-    /// job's completion move together, and re-running it (crash recovery's
-    /// idempotent redo) changes nothing.
     #[sqlx::test]
     async fn finish_cutover_flips_pin_and_job_transactionally_and_idempotently(pool: PgPool) {
         let s = store(&pool);
@@ -7057,7 +6412,6 @@ mod repin_store {
         assert_eq!(job.status, RepinJobStatus::Succeeded);
         assert!(job.finished_at.is_some());
 
-        // Idempotent redo (boot recovery replays the flip).
         s.finish_cutover(id, "host", CanonicalType::BigInt)
             .await
             .unwrap();
@@ -7066,11 +6420,6 @@ mod repin_store {
         assert_eq!(again.finished_at, job.finished_at, "redo must not restamp");
     }
 
-    /// The cutover clears the field's conflict evidence in the same
-    /// transaction as the flip: it indicts a pin that no longer exists, and
-    /// the analyzer's gate is span-based, so leaving it would badge the
-    /// field as degraded forever — the remedy would not clear the sign.
-    /// Another field's evidence is untouched.
     #[sqlx::test]
     async fn finish_cutover_clears_the_repinned_field_evidence(pool: PgPool) {
         let s = store(&pool);
@@ -7134,13 +6483,6 @@ mod repin_store {
         );
     }
 
-    /// A replay of an already-succeeded cutover must not clear evidence.
-    ///
-    /// A forced lossy repin records its own conflict evidence, describing
-    /// the new pin, after the flip commits. Boot recovery replays
-    /// `finish_cutover` whenever the marker outlived the cleanup window, and
-    /// an unconditional clear would delete exactly that evidence, which
-    /// nothing writes again.
     #[sqlx::test]
     async fn finish_cutover_replay_keeps_evidence_recorded_after_the_flip(pool: PgPool) {
         let s = store(&pool);
@@ -7197,11 +6539,6 @@ mod repin_store {
         );
     }
 
-    /// The evidence barrier itself (issue #137): the transaction that turns
-    /// the job `succeeded` is the one that writes the loss it staged, detail
-    /// rows and durable aggregates alike. The read below happens after that
-    /// single call and finds both — there is no window where a client can
-    /// see a completed repin whose losses are unrecorded.
     #[sqlx::test]
     async fn finish_cutover_materialises_the_staged_loss(pool: PgPool) {
         let s = store(&pool);
@@ -7251,8 +6588,6 @@ mod repin_store {
             );
         }
 
-        // The aggregates move with the detail: they are what the degraded
-        // analyzer reads, and the trim cannot erase them.
         let aggregates = catalog
             .conflict_aggregates(Some(&["duration".to_owned()]))
             .await
@@ -7262,10 +6597,6 @@ mod repin_store {
         assert_eq!(aggregates[0].rows_nulled_total, 9);
     }
 
-    /// A boot replay of a completed cutover writes the staged evidence a
-    /// second time into neither table: the completing UPDATE returns a row
-    /// only for the call that moved the job out of `running`, and the
-    /// staged tallies ride out on that row.
     #[sqlx::test]
     async fn finish_cutover_replay_does_not_double_insert_staged_evidence(pool: PgPool) {
         let s = store(&pool);
@@ -7300,8 +6631,6 @@ mod repin_store {
         assert_eq!(aggregates[0].rows_nulled_total, 4);
     }
 
-    /// Empty staged arrays are a proof, not an absence: the rewrite ran and
-    /// nulled nothing, so the cutover records nothing and says nothing.
     #[sqlx::test]
     async fn finish_cutover_records_nothing_for_a_lossless_repin(pool: PgPool) {
         let s = store(&pool);
@@ -7328,12 +6657,6 @@ mod repin_store {
         );
     }
 
-    /// NULL staged columns mean staging never completed. An engine can die
-    /// between the Cutover marker and the flip. Past that marker the corpus is already the new generation, so
-    /// the completion goes forward: the job succeeds with no evidence, and
-    /// the operator's signal is a `repin_evidence_unstaged` warn (shape
-    /// asserted at the call site, not here — this test proves the forward
-    /// completion and the absence of invented evidence).
     #[sqlx::test]
     async fn finish_cutover_completes_forward_when_nothing_was_staged(pool: PgPool) {
         let s = store(&pool);
@@ -7363,10 +6686,6 @@ mod repin_store {
         );
     }
 
-    /// The identity check: the job row's own field and target must match the
-    /// flip being asked for. A mismatch is the wrong job about to complete
-    /// somebody else's cutover, so nothing is mutated — not the pin, not the
-    /// job row.
     #[sqlx::test]
     async fn finish_cutover_refuses_a_flip_the_job_never_claimed(pool: PgPool) {
         let s = store(&pool);
@@ -7405,8 +6724,6 @@ mod repin_store {
         assert!(matches!(err, StoreError::NotFound { .. }), "{err:?}");
     }
 
-    /// Boot reconciliation: an orphaned `running` row (killed process, no
-    /// marker) fails; the marker's own job — mid-recovery — is kept.
     #[sqlx::test]
     async fn reconcile_orphans_fails_running_rows_except_the_kept_one(pool: PgPool) {
         pin(&pool, "status", CanonicalType::BigInt).await;
@@ -7439,8 +6756,6 @@ mod repin_store {
         assert!(job.error.is_some());
     }
 
-    /// Plan + progress land on the row; `latest` prefers the running job
-    /// and falls back to the newest terminal one.
     #[sqlx::test]
     async fn plan_progress_and_latest(pool: PgPool) {
         pin(&pool, "status", CanonicalType::BigInt).await;
@@ -7553,17 +6868,9 @@ mod repin_store {
         assert_eq!(dry.unmapped_samples, vec!["gold", "platinum"]);
         assert!(dry.field_last_seen.is_some(), "liveness rides the plan");
         assert_eq!(dry.field_last_service.as_deref(), Some("nginx"));
-        // Nothing asserted a dialect, so the row reports none, never a
-        // backfilled `otel`.
         assert_eq!(dry.dialect, None);
     }
 
-    /// The SEVERITY target and its dialect: both type
-    /// CHECKs admit the catalog spelling, so a repin away from a severity pin
-    /// claims a job whose `from_type` is SEVERITY, and the dialect is stored
-    /// exactly for a severity target. The scope CHECK runs both ways, so a
-    /// row can never carry an assertion nothing read, nor omit one the
-    /// rewrite needed.
     #[sqlx::test]
     async fn a_severity_repin_stores_its_asserted_dialect(pool: PgPool) {
         use trawl_core::severity::Dialect;
@@ -7595,8 +6902,6 @@ mod repin_store {
                 .unwrap()
         );
 
-        // And back off the severity pin, which 0012's widened `from_type`
-        // CHECK admits. The pin itself moved with the succeeded job.
         pin(&pool, "level", CanonicalType::Severity).await;
         let back = s
             .claim(RepinClaim {
@@ -7621,10 +6926,6 @@ mod repin_store {
                 .unwrap()
         );
 
-        // The scope CHECK, both directions: a severity target with no
-        // dialect, and a dialect on any other target, are corruption the
-        // store refuses rather than stores. Both go through the VARCHAR
-        // pin the closure names.
         pin(&pool, "level", CanonicalType::Varchar).await;
         s.claim(claim(CanonicalType::Severity, None, true))
             .await
@@ -7634,14 +6935,9 @@ mod repin_store {
             .expect_err("only a SEVERITY job may carry a dialect");
     }
 
-    /// The force ceilings round-trip: the REQUESTED numbers ride the claim,
-    /// the ACCEPTED ones ride the plan, and the job row reports all four
-    /// apart. Zero is a legitimate ceiling ("force the ambiguity, not one
-    /// row of loss"), so it must survive as zero rather than as absent.
     #[sqlx::test]
     async fn force_ceilings_round_trip_through_claim_and_plan(pool: PgPool) {
         let s = store(&pool);
-        // The claim proves the pin it was prepared against (#110).
         pin(&pool, "status", CanonicalType::BigInt).await;
         let id = s
             .claim(RepinClaim {
@@ -7690,12 +6986,9 @@ mod repin_store {
         assert!(planned.planned_at.is_some());
     }
 
-    /// A forced claim is valid before planning; a plan must record both bounds.
     #[sqlx::test]
     async fn a_forced_plan_without_recorded_bounds_is_rejected(pool: PgPool) {
         let s = store(&pool);
-        // The claim proves the pin it was prepared against (#110), so the
-        // slot has to exist before the job can take it.
         pin(&pool, "status", CanonicalType::BigInt).await;
         let id = s
             .claim(RepinClaim {
@@ -7728,7 +7021,6 @@ mod repin_store {
         );
     }
 
-    /// The fresh schema rejects contradictory force plans without losing the claim.
     #[sqlx::test]
     async fn force_plan_shape_constraints_preserve_the_unplanned_claim(pool: PgPool) {
         let s = store(&pool);
@@ -7782,7 +7074,6 @@ mod repin_store {
         }
     }
 
-    /// A corrupt row cannot be decoded into an unrestricted force verdict.
     #[sqlx::test]
     async fn inconsistent_force_rows_fail_to_decode(pool: PgPool) {
         let s = store(&pool);
@@ -7801,8 +7092,6 @@ mod repin_store {
             })
             .await
             .unwrap();
-        // Deliberately corrupt only this disposable test database, bypassing
-        // schema protection to exercise the independent read boundary.
         sqlx::raw_sql(
             "ALTER TABLE repin_jobs
             DROP CONSTRAINT repin_jobs_accepted_nulled_plan,
@@ -7844,9 +7133,6 @@ mod repin_store {
         }
     }
 
-    /// The cutover clears the operator's degraded acknowledgement with the
-    /// evidence it acknowledged, in the same transaction as the flip, and
-    /// says so exactly once.
     #[sqlx::test]
     async fn finish_cutover_clears_the_degraded_ack(pool: PgPool) {
         let s = store(&pool);
@@ -7907,9 +7193,6 @@ mod repin_store {
         assert!(!replay.cleared_ack, "so the audit event fires exactly once");
     }
 
-    /// The replay gate covers the ack the same way it covers the evidence:
-    /// an acknowledgement written AFTER the flip describes the NEW pin, and
-    /// a boot replay of an already-succeeded cutover must leave it alone.
     #[sqlx::test]
     async fn finish_cutover_replay_keeps_an_ack_written_after_the_flip(pool: PgPool) {
         let s = store(&pool);
@@ -7932,8 +7215,6 @@ mod repin_store {
             .await
             .unwrap();
 
-        // The forced job's own outcome evidence, and an operator who has
-        // looked at it and accepted the new pin's losses too.
         for _ in 0..3 {
             catalog
                 .record_conflicts(&[trawl_server::store::FieldConflict {
@@ -7971,14 +7252,6 @@ mod repin_store {
         );
     }
 
-    /// The terminal write can carry the tallies the caller decided on.
-    ///
-    /// The cutover's ceiling refusal is why: it gates on the finished
-    /// shadow's own counts, and the periodic `record_progress` write that
-    /// would otherwise have persisted them is best-effort, so a store blip
-    /// just before the gate would leave a `refused_needs_force` row beside
-    /// `rows_nulled: 0`. Passing `None` leaves the counters alone, which is
-    /// what every other terminal path wants.
     #[sqlx::test]
     async fn a_terminal_write_can_persist_the_counts_behind_its_verdict(pool: PgPool) {
         let s = store(&pool);
@@ -7996,8 +7269,6 @@ mod repin_store {
         };
         let id = s.claim(claim).await.unwrap();
 
-        // No progress write has landed: the row's counters are the claim's
-        // zeros, exactly the state a failed progress write leaves.
         assert_eq!(s.get(id).await.unwrap().unwrap().rows_nulled, 0);
 
         assert!(
@@ -8031,9 +7302,6 @@ mod repin_store {
             "the refusal and the numbers behind it land in one statement"
         );
 
-        // The write is conditional (#109), so a second one lands on a row
-        // that is no longer running: it reports it changed nothing, and
-        // neither the verdict nor the numbers behind it move.
         assert!(
             !s.finish_if_running(id, RepinJobStatus::Failed, Some("later"), None)
                 .await
@@ -8043,8 +7311,6 @@ mod repin_store {
         assert_eq!(job.status, RepinJobStatus::RefusedNeedsForce);
         assert_eq!((job.rows_nulled, job.ambiguous_numerals), (11, 4));
 
-        // And `None` on a running job leaves whatever the progress writes
-        // recorded, which is what every other terminal path wants.
         let second = s.claim(claim).await.unwrap();
         s.record_progress(
             second,
@@ -8068,17 +7334,8 @@ mod repin_store {
         assert_eq!((job.files_done, job.rows_rewritten), (1, 3));
     }
 
-    /// A resurrection-only repin (`to == current`) writes no new type, so
-    /// the pin flip's `IS DISTINCT FROM` UPDATE matches no row and used to
-    /// take no lock. `acknowledge_degraded_field` serializes against the
-    /// cutover by taking `FOR SHARE` on the pin row, so with nothing to wait
-    /// on, an ack that had already read the episode sum could commit its
-    /// high-water after the cutover cleared the counters and suppress the
-    /// new pin's first episodes.
-    ///
-    /// The blocker holds exactly the lock the ack takes. Before the fix the
-    /// same-type cutover sailed past it; now it waits, and once the ack
-    /// releases, the cutover deletes the row the ack just wrote.
+    /// `acknowledge_degraded_field` serializes against the cutover by taking
+    /// `FOR SHARE` on the pin row. The blocker holds exactly the lock the ack takes.
     #[sqlx::test]
     async fn same_type_cutover_waits_on_a_racing_ack(pool: PgPool) {
         let s = store(&pool);
@@ -8108,7 +7365,6 @@ mod repin_store {
             .await
             .unwrap();
 
-        // A resurrection-only job: same type in and out.
         let id = s
             .claim(RepinClaim {
                 field: "host",
@@ -8154,9 +7410,6 @@ mod repin_store {
         );
         assert_eq!(catalog.degraded_ack("host").await.unwrap(), None);
 
-        // The other order: the cutover has cleared the evidence, so the next
-        // ack finds no verdict to suppress and refuses rather than
-        // installing a high-water over the new pin's counters.
         assert_eq!(
             catalog
                 .acknowledge_degraded_field("host", "key-aaa", None)
@@ -8166,11 +7419,6 @@ mod repin_store {
         );
     }
 
-    /// The claim's half of the pin-gc race: the engine reads a field's pin
-    /// from the in-process cache, so the claim transaction proves — under
-    /// the catalog lifecycle lock — that `field_types` still carries it. A
-    /// pin gc purge that got there first leaves the claim refusing with the
-    /// engine's own unpinned-field sentence, and no job row behind.
     #[sqlx::test]
     async fn claim_refuses_when_the_from_pin_vanished(pool: PgPool) {
         let s = store(&pool);
@@ -8212,8 +7460,6 @@ mod repin_store {
             .unwrap();
         assert_eq!(jobs, 0, "a refused claim leaves no job row");
 
-        // A pin that merely CHANGED under the caller refuses too, with its
-        // own sentence: retrying against the current pin is the remedy.
         pin(&pool, "dur", CanonicalType::Varchar).await;
         let err = s
             .claim(taken(CanonicalType::BigInt))
@@ -8225,14 +7471,11 @@ mod repin_store {
             "unexpected error {err:?}"
         );
 
-        // Against the pin it actually holds, the same claim goes through.
         s.claim(taken(CanonicalType::Varchar))
             .await
             .expect("the current pin is claimable");
     }
 
-    /// The re-arm switch for boot recovery: a recovered cutover clears
-    /// `conformed_at` so the next conformance pass re-proves the corpus.
     #[sqlx::test]
     async fn clear_conformed_rearms_the_boot_pass(pool: PgPool) {
         let catalog = CatalogStore::new(pool.clone());
@@ -8242,9 +7485,6 @@ mod repin_store {
         assert!(!catalog.is_conformed().await.unwrap());
     }
 
-    /// A claimed job to cancel, with nothing else asserted. The claim
-    /// proves its `from` pin against `field_types`, so the pin is seeded
-    /// first.
     async fn claim_running(pool: &PgPool, s: &RepinStore) -> i64 {
         pin(pool, "status", CanonicalType::BigInt).await;
         s.claim(RepinClaim {
@@ -8262,8 +7502,6 @@ mod repin_store {
         .unwrap()
     }
 
-    /// The cancel round trip: the request lands on the running row, the job
-    /// terminalizes `cancelled`, and both columns read back.
     #[sqlx::test]
     async fn a_cancelled_job_keeps_its_request_fields(pool: PgPool) {
         let s = store(&pool);
@@ -8300,11 +7538,6 @@ mod repin_store {
         assert!(job.finished_at.is_some());
     }
 
-    /// First writer wins: a second operator cancelling a job already
-    /// cancelling changes neither the actor nor the instant, so the audit
-    /// trail names the request that actually took effect. A request against
-    /// a terminal job is `None` — it lost the race with the job's own
-    /// ladder.
     #[sqlx::test]
     async fn a_second_cancel_request_preserves_the_first(pool: PgPool) {
         let s = store(&pool);
@@ -8339,8 +7572,6 @@ mod repin_store {
         assert_eq!(job.cancelled_by.as_deref(), Some("key-op"));
     }
 
-    /// A terminal verdict is never rewritten: the second writer reports
-    /// `false` and the row keeps the first one's status, error and instant.
     #[sqlx::test]
     async fn finish_if_running_never_overwrites_a_terminal_row(pool: PgPool) {
         let s = store(&pool);
@@ -8376,11 +7607,6 @@ mod repin_store {
         assert_eq!(after_second.finished_at, after_first.finished_at);
     }
 
-    /// The crash state: a job whose cancel was requested
-    /// but never observed dies `running` and boot reconciliation fails it,
-    /// request fields and all. The constraints must admit that row —
-    /// `cancelled` is live-process-only, so recovery may not infer it from
-    /// a populated `cancel_requested_at`.
     #[sqlx::test]
     async fn a_failed_job_may_carry_cancel_request_fields(pool: PgPool) {
         let s = store(&pool);
@@ -8399,9 +7625,6 @@ mod repin_store {
         assert!(job.cancel_requested_at.is_some());
     }
 
-    /// The other direction of the same rule: `cancelled` without a recorded
-    /// request is a status nothing asked for, and the database refuses it
-    /// rather than storing a verdict with no author.
     #[sqlx::test]
     async fn cancelled_without_a_request_is_refused(pool: PgPool) {
         let s = store(&pool);
@@ -8417,7 +7640,6 @@ mod repin_store {
             "unexpected error: {err}"
         );
 
-        // And the paired CHECK: neither column stands alone.
         let err = sqlx::query("UPDATE repin_jobs SET cancelled_by = 'key-op' WHERE id = $1")
             .bind(id)
             .execute(&pool)
@@ -8430,8 +7652,7 @@ mod repin_store {
     }
 
     /// Read the staged tally columns straight off the row: they are
-    /// deliberately absent from `JOB_COLS`, so the wire cannot carry them
-    /// and only the cutover's own RETURNING reads them in production.
+    /// deliberately absent from `JOB_COLS`.
     async fn staged(pool: &PgPool, id: i64) -> (Option<Vec<String>>, Option<Vec<i64>>) {
         sqlx::query_as("SELECT nulled_services, nulled_service_rows FROM repin_jobs WHERE id = $1")
             .bind(id)
@@ -8440,8 +7661,6 @@ mod repin_store {
             .unwrap()
     }
 
-    /// A claimed, non-dry-run job on `field`, whose VARCHAR pin is seeded
-    /// first because the claim proves the pin it was prepared against.
     async fn running_execution(pool: &PgPool, field: &str) -> i64 {
         pin(pool, field, CanonicalType::Varchar).await;
         store(pool)
@@ -8460,10 +7679,6 @@ mod repin_store {
             .unwrap()
     }
 
-    /// The evidence barrier's staging write (issue #137): five final counts
-    /// and the per-service null tallies land in one statement, and the
-    /// unstaged row before it reads NULL rather than the empty arrays that
-    /// mean "proven lossless".
     #[sqlx::test]
     async fn stage_cutover_input_round_trips_totals_and_tallies(pool: PgPool) {
         let s = store(&pool);
@@ -8508,8 +7723,6 @@ mod repin_store {
         );
         assert_eq!(rows.unwrap(), vec![25, 6], "order is the caller's, kept");
 
-        // A lossless repin stages empty arrays, which is a proof, not an
-        // absence: the completing cutover must be able to tell them apart.
         s.stage_cutover_input(id, JobTotals::default(), &[])
             .await
             .unwrap();
@@ -8519,9 +7732,6 @@ mod repin_store {
         );
     }
 
-    /// A retried staging call with the same payload lands the same row: the
-    /// statement is an overwrite, and the engine may repeat it before the
-    /// Cutover marker goes down.
     #[sqlx::test]
     async fn stage_cutover_input_is_idempotent(pool: PgPool) {
         let s = store(&pool);
@@ -8544,9 +7754,6 @@ mod repin_store {
         assert_eq!(s.get(id).await.unwrap().unwrap().rows_nulled, 5);
     }
 
-    /// The cardinality CHECK: a service without its count (or the reverse)
-    /// is the failure mode parallel arrays invite, refused by postgres
-    /// rather than decoded into a lie at read time.
     #[sqlx::test]
     async fn staged_tallies_must_agree_on_cardinality(pool: PgPool) {
         let id = running_execution(&pool, "duration").await;
@@ -8563,8 +7770,6 @@ mod repin_store {
         assert_check(&err, "repin_jobs_nulled_tallies_cardinality_check");
     }
 
-    /// The paired-null CHECK: the two columns are one fact, so half of it
-    /// cannot be stored.
     #[sqlx::test]
     async fn staged_tallies_are_present_or_absent_together(pool: PgPool) {
         let id = running_execution(&pool, "duration").await;
@@ -8586,10 +7791,6 @@ mod repin_store {
         assert_eq!(db.constraint(), Some(constraint), "{db:?}");
     }
 
-    /// A dry run has no rewrite, so it has nothing to stage. The staging
-    /// call refuses it as an invariant violation rather than updating zero
-    /// rows and reporting success to a caller about to write a Cutover
-    /// marker.
     #[sqlx::test]
     async fn stage_cutover_input_refuses_a_dry_run(pool: PgPool) {
         let s = store(&pool);
@@ -8617,9 +7818,6 @@ mod repin_store {
         assert_eq!(staged(&pool, id).await, (None, None));
     }
 
-    /// Same for a job that is no longer running: an orphan reconciliation or
-    /// a concurrent finish means postgres does not agree the cutover is
-    /// live, and silence there would let the engine march on to the marker.
     #[sqlx::test]
     async fn stage_cutover_input_refuses_an_already_terminal_job(pool: PgPool) {
         let s = store(&pool);
@@ -8638,8 +7836,7 @@ mod repin_store {
 }
 
 /// Read both halves of a saved query back and assert the pair ADR-0018
-/// ruling 7 forbids is not on disk. The check is the rule itself, so the
-/// assertion cannot drift from what the write doors enforce.
+/// ruling 7 forbids is not on disk.
 async fn assert_pair_is_legal(
     saved_store: &SavedQueryStore,
     sched_store: &ScheduleStore,
@@ -8658,26 +7855,13 @@ async fn assert_pair_is_legal(
     );
 }
 
-/// ADR-0018 ruling 7 forbids exactly one pair — a schedule window over a
-/// query that spells its own interval — and the two write doors that could
-/// assemble it run concurrently.
-///
-/// Neither door can see the other's uncommitted row, so what makes the rule
-/// hold is that both take the `saved_queries` lock FIRST: the loser waits,
-/// then reads what the winner committed and refuses. The blocker
-/// transaction pins the interleaving to the dangerous window by holding
-/// that row exactly as the other door would while its write is in flight.
-///
-/// Both orders are exercised, and the invariant is asserted with the rule
-/// itself: whatever committed, `validate_window_compatibility` must accept
-/// the pair that is on disk at the end.
+/// Both write doors take the `saved_queries` lock FIRST: the loser waits,
+/// then reads what the winner committed and refuses.
 #[sqlx::test]
 async fn schedule_put_and_saved_put_cannot_commit_the_forbidden_pair(pool: PgPool) {
     let saved_store = saved(&pool);
     let sched_store = schedules(&pool);
 
-    // Order A: the saved-query edit wins the lock, the schedule write waits
-    // and must refuse against the text that landed.
     let first = saved_store
         .create(1, "pair-dsl-first", "service=x")
         .await
@@ -8733,10 +7917,8 @@ async fn schedule_put_and_saved_put_cannot_commit_the_forbidden_pair(pool: PgPoo
     );
     assert_pair_is_legal(&saved_store, &sched_store, first.id).await;
 
-    // Order B: the window wins the lock, the saved-query edit waits and must
-    // refuse against the window that landed. The blocker inserts the
-    // schedule by hand because it has to happen on the connection holding
-    // the parent row: the FK would otherwise queue behind its own lock.
+    // The blocker inserts the schedule by hand on the connection holding the
+    // parent row: the FK would otherwise queue behind its own lock.
     let second = saved_store
         .create(1, "pair-window-first", "service=x")
         .await
@@ -8785,17 +7967,9 @@ async fn schedule_put_and_saved_put_cannot_commit_the_forbidden_pair(pool: PgPoo
 }
 
 /// Every path that writes a `report_runs` row has to take the
-/// `saved_queries` lock first, whether or not its code asks for one.
-/// Inserting a run checks the `saved_query_id` foreign key, and that check
-/// takes FOR KEY SHARE on the parent row. A claim that locked the schedule
-/// and only then inserted would be holding level 2 while waiting for level
-/// 1, which closes a cycle against `set_schedule_checked` walking the same
-/// two levels the right way round. Postgres resolves a cycle by killing one
-/// side with 40P01, so the bug reads as an occasional 500 on a manual run,
-/// or an occasional 500 on the PUT beside it.
-///
-/// The blocker plays `set_schedule_checked`: it holds the saved-query row,
-/// then reaches for the schedule row once the manual claim is in flight.
+/// `saved_queries` lock first: the insert's foreign key check takes FOR KEY
+/// SHARE on the parent row, and the other order deadlocks (40P01) against
+/// `set_schedule_checked`.
 #[sqlx::test]
 async fn manual_claim_and_schedule_write_do_not_deadlock(pool: PgPool) {
     let saved_store = saved(&pool);
@@ -8828,9 +8002,7 @@ async fn manual_claim_and_schedule_write_do_not_deadlock(pool: PgPool) {
     // Let the claim reach whatever it blocks on.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-    // Level 2, from the transaction that already holds level 1. Under the
-    // old order the claim is holding this row while waiting on the foreign
-    // key, and postgres' deadlock detector fires right here.
+    // Level 2, from the transaction that already holds level 1.
     let second_level = sqlx::query_scalar::<_, i64>(
         "SELECT id FROM schedules WHERE saved_query_id = $1 FOR UPDATE",
     )

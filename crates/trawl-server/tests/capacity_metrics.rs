@@ -6,35 +6,18 @@
 //! binary alone has walked.
 //!
 //! The Parquet and headroom caches are process-global and a sample lives for
-//! the cache TTL. Under Cargo test every test in a binary shares one process,
-//! so a scrape in a shared binary can reuse a sample another test took from a
-//! different data root. A leak check against that sample would pass without
-//! the planted environment ever being walked. This dedicated integration-test
-//! binary keeps its one scrape the first collection in the process under both
-//! Cargo test and Nextest. Keep other metrics scrapes out of it.
+//! the cache TTL, so this binary keeps its one scrape the first collection in
+//! the process. Keep other metrics scrapes out of it.
 
 mod common;
 
 use std::time::Duration;
 
-/// The ADR-0042 series on the real, unauthenticated `/metrics` endpoint:
-/// headroom per role, the configured floor, and retention's two counters.
-/// Their labels are `role` and `trigger` only, and nothing in the body names
-/// the data, WAL or query scratch path or an environment with stored data.
-/// The dashboard then lists the planted environment from the same cached
-/// walk, which proves the scrape's sample saw what it must not leak.
-///
-/// The same scrape carries the ADR-0056 query series, the permits in use,
-/// the pool size and the engine sample's age, with no labels at all; and
-/// the headroom's spill role samples the query scratch directory, which
-/// sits beside the data root and so collapses into the data row. The data
-/// root is under Cargo's target temp directory rather than the system one,
-/// so where those two are on different devices, a spill role still
+/// The data root is under Cargo's target temp directory rather than the system
+/// one, so where those two are on different devices, a spill role still
 /// sampling the system temp directory would stand in a row of its own.
-/// One test, because this binary keeps its one scrape the first collection
-/// in the process.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // one scrape per process, so every series is read in it
+#[allow(clippy::too_many_lines)]
 async fn capacity_metrics_endpoint_exposes_query_scratch_and_role_series_only() {
     const SERIES: [&str; 5] = [
         "trawl_disk_total_bytes",
@@ -66,7 +49,6 @@ async fn capacity_metrics_endpoint_exposes_query_scratch_and_role_series_only() 
         .expect("the harness ingests")
         .dir()
         .to_path_buf();
-    // An environment with stored data, so its name is there to leak.
     let env = "plantedcapacityenv";
     let payload = "0123456789";
     let partition = data_root.join(env).join("2026-09-20");
@@ -131,7 +113,6 @@ async fn capacity_metrics_endpoint_exposes_query_scratch_and_role_series_only() 
         .expect("an unlabelled floor gauge");
     assert_eq!(
         floor.trim(),
-        // The harness keeps the default floor, a whole number of bytes.
         trawl_config::RetentionConfig::default()
             .min_free_disk_bytes
             .to_string()
@@ -155,9 +136,6 @@ async fn capacity_metrics_endpoint_exposes_query_scratch_and_role_series_only() 
     assert_spill_is_query_scratch(&body, &capacity, &data_root, &scratch_dir);
 }
 
-/// The ADR-0056 query series: present and unlabelled, so nothing names a
-/// principal. Nothing runs, so no permit is in use; the pool has the
-/// fixture's size; and the sample is younger than its success window.
 fn assert_query_series(body: &str) {
     let unlabelled = |name: &str| -> &str {
         assert!(
@@ -186,8 +164,6 @@ fn assert_query_series(body: &str) {
     assert!((0.0..60.0).contains(&age), "sample age {age}");
 }
 
-/// The spill role is the query scratch directory, on the data root's
-/// device: it shares the data row, and no row holds it alone.
 fn assert_spill_is_query_scratch(
     body: &str,
     capacity: &trawl_api::Capacity,
@@ -213,8 +189,6 @@ fn assert_spill_is_query_scratch(
     assert!(!body.contains("role=\"spill\""), "{body}");
 }
 
-/// The data-role gauges carry the retained headroom sample's numbers, which
-/// the dashboard shows as the row holding the data role.
 fn assert_data_gauges_match(body: &str, capacity: &trawl_api::Capacity) {
     // Whole byte counts render without a fraction, so they parse as `u64`.
     let gauge = |series: &str| -> u64 {
@@ -240,14 +214,8 @@ fn assert_data_gauges_match(body: &str, capacity: &trawl_api::Capacity) {
     );
 }
 
-/// The dashboard's capacity object, once a snapshot lists `env`.
-///
-/// The snapshot collector reads the cache a scrape filled, so an environment
-/// that walk saw appears once the next snapshot lands. Nothing else in this
-/// process collects, so the headroom rows are the same retained sample the
-/// scrape published. The collector ticks once a second; polling at 250ms
-/// keeps a full timeout of reads inside the admin key's default 100 rpm
-/// budget.
+/// The collector ticks once a second; polling at 250ms keeps a full timeout
+/// of reads inside the admin key's default 100 rpm budget.
 async fn dashboard_capacity(
     client: &reqwest::Client,
     server: &common::TestServer,
