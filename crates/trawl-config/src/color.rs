@@ -4,9 +4,6 @@
 
 //! Whether a daemon's human-readable log lines carry ANSI colour.
 //!
-//! Lives here so `trawld` and `trawl-web` apply one rule. Their stdout
-//! usually goes to journald, `kubectl logs`, or a file a log shipper
-//! reads, and escape sequences there end up inside stored events.
 //! tracing-subscriber's default colours whenever `NO_COLOR` is unset and
 //! never checks for a terminal, while an explicit `with_ansi(true)`
 //! ignores `NO_COLOR` altogether, so the daemons pass the result of this
@@ -15,14 +12,11 @@
 use std::ffi::OsStr;
 use std::io::IsTerminal as _;
 
-/// Colour only on a terminal, and never when `NO_COLOR` holds a
-/// non-empty value (<https://no-color.org>).
 #[must_use]
 pub fn ansi_enabled(stdout_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
     stdout_is_terminal && no_color.is_none_or(OsStr::is_empty)
 }
 
-/// [`ansi_enabled`] for this process's stdout and environment.
 #[must_use]
 pub fn stdout_ansi() -> bool {
     ansi_enabled(

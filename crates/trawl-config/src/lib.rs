@@ -3,15 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Shared configuration types for the trawl workspace.
-//!
-//! Lives in its own crate so consumers that only need the config types
-//! (e.g. `trawl-web`, the browser-facing session proxy) don't have to
-//! pull in `trawl-server`'s transitive deps, most loudly the `DuckDB`
-//! engine chain: depending on `trawl-server` for `Config`/`WebConfig`
-//! alone drags libduckdb-sys into every build of the proxy.
-//!
-//! `trawl-server` re-exports these types via `trawl_server::config::*`
-//! for its own modules; other crates use `trawl_config::...` directly.
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -22,7 +13,6 @@ use serde::Deserialize;
 pub mod color;
 pub mod fs;
 
-/// Top-level daemon configuration, loaded from TOML.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -48,7 +38,6 @@ pub struct Config {
     pub investigation: InvestigationConfig,
 }
 
-/// HTTPS listener settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -85,12 +74,6 @@ pub struct ServerConfig {
 
     /// Maximum HTTP requests in progress across the whole listener
     /// (default: 32, range 1 to 65,536; ADR-0054).
-    ///
-    /// One count covers every route and method. When it is full, trawld
-    /// refuses the next request at once with 503 `request_limit_reached`
-    /// and no `Retry-After`; it never queues. Two fixed allowances sit
-    /// beside the count and none borrows from another: 3 requests for health
-    /// and metrics (`probe`) and 4 for query list and cancel (`control`).
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
 
@@ -171,35 +154,19 @@ pub struct ServerConfig {
     /// default, the data root's sibling `<data.path>.query-scratch`. It may
     /// not be the data root, the WAL directory or a repin staging root, nor
     /// sit inside or above any of them. A value is an absolute path with no
-    /// `..` component and no glob metacharacter. On Linux, startup also
-    /// compares directories in different mounts by their paths within the
-    /// filesystem, so a bind mount cannot hide an overlap; when that
-    /// comparison cannot be made, the start is refused. Other platforms keep
-    /// the walk over parents alone. On every platform, a root that startup
-    /// cannot look up refuses the start, unless the lookup fails only because
-    /// part of the path does not exist yet or is not a directory.
+    /// `..` component and no glob metacharacter.
     pub query_scratch_dir: Option<PathBuf>,
 
     /// Root where captured results live (ADR-0057). Unset means [`Config::results_dir`]'s
     /// default, the data root's sibling `<data.path>.results`. It follows
-    /// the query scratch directory's rules (absolute, no `..`, no glob
-    /// metacharacter, apart from the data root, the WAL directory and the
-    /// repin staging roots) and must also stay apart from the query scratch
-    /// directory: neither may equal, sit inside or contain the other. The
-    /// same mount-aware comparison as for the query scratch directory
-    /// applies on Linux.
+    /// the query scratch directory's rules and must also stay apart from the
+    /// query scratch directory: neither may equal, sit inside or contain the other.
     pub results_dir: Option<PathBuf>,
 
     /// The origin trawld puts in front of every link to Search that it
-    /// hands out (ADR-0058), such as `https://trawl.example.com`. It is the
-    /// operator's one explicit choice, so a client that reaches trawld
-    /// through a proxy or a port-forward still gets links to the address
-    /// humans use. It is never derived from the `Host`, `X-Forwarded-*` or
-    /// `Forwarded` headers of a request, and when it is unset no link is
-    /// emitted. A value is an origin: scheme `https`, or `http` on a
-    /// loopback host only, then a host and an optional port; no userinfo,
-    /// path, query or fragment. A trailing `/` is accepted and dropped, and
-    /// the stored form is the normalized origin.
+    /// hands out (ADR-0058), such as `https://trawl.example.com`. It is never
+    /// derived from the `Host`, `X-Forwarded-*` or `Forwarded` headers of a
+    /// request, and when it is unset no link is emitted.
     pub link_origin: Option<String>,
 
     /// The query database's spill cap, `DuckDB`'s `max_temp_directory_size`,
@@ -231,17 +198,9 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Resolve the HTTPS listen address: the `TRAWL_HTTP_ADDR` environment
-    /// variable first, then `[server] http_addr` from the config file.
-    /// Empty values count as unset.
-    ///
-    /// The env override exists so a listener can be moved without editing
-    /// (or templating) the shared `trawld.toml` — `bin/dev` uses it to shift
-    /// ports off a collision, and container images can repoint the bind
-    /// without a config volume. [`Config::from_toml`] applies it at parse
-    /// time, so trawld's own call sites read the already-resolved field;
-    /// trawl-web deserializes the file itself and calls this directly when
-    /// deriving its upstream URL.
+    /// [`Config::from_toml`] applies it at parse time, so trawld's own call sites
+    /// read the already-resolved field; trawl-web deserializes the file itself
+    /// and calls this directly when deriving its upstream URL.
     #[must_use]
     pub fn resolve_http_addr(&self) -> String {
         Self::resolve_http_addr_from(
@@ -271,15 +230,6 @@ impl ServerConfig {
 }
 
 /// Per-key rate limiting in requests per minute (ADR-0006).
-///
-/// Every API key gets an independent token bucket per route class:
-/// `default_rpm` on the interactive API routes, `ingest_rpm` on
-/// `/api/v1/ingest` for a key holding the `ingest` permission (any other key
-/// on that route draws on `default_rpm`). Two ceilings, because a log shipper
-/// flushing batches and a human running `DuckDB` scans need budgets an order
-/// of magnitude apart: one number would either throttle ingest or hand every
-/// interactive key the shipper-sized ceiling. These are the class defaults; a
-/// role's `rate_rpm` in the fleet keystore overrides them for its keys.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
@@ -293,7 +243,6 @@ pub struct RateLimitConfig {
     pub ingest_rpm: u32,
 }
 
-/// Parquet data source settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataConfig {
@@ -306,17 +255,14 @@ pub struct DataConfig {
 }
 
 impl DataConfig {
-    /// The configured directory where parquet files live.
     pub fn base_dir(&self) -> PathBuf {
         PathBuf::from(&self.path)
     }
 }
 
-/// Log ingestion pipeline settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestConfig {
-    /// Whether the ingest endpoint is enabled.
     #[serde(default = "default_ingest_enabled")]
     pub enabled: bool,
 
@@ -360,14 +306,7 @@ pub struct IngestConfig {
     /// events they are writing. Default: 100,000.
     ///
     /// Ingest is admitted against this cap before it is written
-    /// (ADR-0043). HTTP and syslog may fill at most 15/16 of it
-    /// (rounded down); the server's own telemetry may fill all of it, so
-    /// its self-logs keep landing while external ingest is refused. A
-    /// batch that does not fit is refused: HTTP answers `503` with
-    /// `Retry-After` (or `413` for a batch larger than the whole external
-    /// share); syslog holds TCP senders and drops UDP datagrams until
-    /// compaction drains space.
-    /// Nothing already accepted is ever dropped to make room.
+    /// (ADR-0043).
     #[serde(default = "default_hot_buffer_max_events")]
     pub hot_buffer_max_events: usize,
 
@@ -451,21 +390,15 @@ pub struct IngestConfig {
     pub trusted_relays: Vec<String>,
 
     /// Wire keys `_severity` derives from, in precedence order — first
-    /// mappable wins (ADR-0013). Every source is read and left where it
-    /// is, as an ordinary sender column.
+    /// mappable wins (ADR-0013).
     ///
     /// Entries take the bare-string shorthand (`"level"`) or the typed
     /// form (`{ field = "syslog_severity", dialect = "syslog" }`); the
-    /// dialect governs numerics only. A producer profile's fixed sources
-    /// prepend this list and are not configurable.
+    /// dialect governs numerics only.
     ///
-    /// Empty is legal and means "derive nothing". Default:
-    /// [`DEFAULT_SEVERITY_FROM`] — a packaging contract, so the code
-    /// default, the Debian example, the Helm chart and the configuration
-    /// reference all state the same list.
+    /// Empty is legal and means "derive nothing". Default: [`DEFAULT_SEVERITY_FROM`].
     ///
-    /// Semantics (bare names only, no post-fold duplicates, bounded
-    /// length, known dialect) are validated boot-fatally by the server:
+    /// Semantics are validated boot-fatally by the server:
     /// this crate owns the shape, trawl-server owns the rules.
     #[serde(default = "default_severity_from")]
     pub severity_from: Vec<DerivationSourceSpec>,
@@ -563,7 +496,6 @@ pub const DEFAULT_SEVERITY_FROM: &[&str] = &["severity", "severity_text", "level
 /// `timestamp` → `@timestamp`, first present wins.
 pub const DEFAULT_TIME_FROM: &[&str] = &["_time", "timestamp", "@timestamp"];
 
-/// Expand a packaged default into the bare-shorthand entries it stands for.
 fn bare_sources(names: &[&str]) -> Vec<DerivationSourceSpec> {
     names
         .iter()
@@ -643,14 +575,6 @@ pub fn is_valid_env_name(name: &str) -> bool {
 }
 
 /// The characters `DuckDB` reads as a glob pattern in a path it is handed.
-///
-/// The daemon's data directory (`data.path`) is refused if it holds one of
-/// these, because the path has two readers that would disagree about it:
-/// `read_parquet` expands it as a pattern, while the filesystem presence
-/// check at startup resolves the literal name. A directory called
-/// `trawl*data` passes the literal check and then reads the files of
-/// `trawlXdata` next door. The query scratch directory is refused for the
-/// same reason: `read_json` reads the hot-buffer snapshots there by path.
 const GLOB_METACHARACTERS: &[char] = &['*', '?', '[', ']', '{', '}'];
 
 /// Maximum service name length (ADR-0009 path segment cap).
@@ -704,35 +628,11 @@ impl Default for IngestConfig {
     }
 }
 
-/// Default environment name for zero-config deployments.
 fn default_env_name() -> String {
     "prod".to_string()
 }
 
 /// Data retention policy settings.
-///
-/// Two independent policies, both always-on with defaults. Age retention
-/// deletes a date directory once it is older than the limit that applies
-/// to its env, which is the env's own `[retention.env.<name>]` entry when
-/// it has one and the global `max_age_days` otherwise. Disk-pressure
-/// retention is install-wide: below `min_free_disk_bytes` free, it deletes
-/// date directories one at a time until the volume is back over the
-/// threshold, taking the directory that has used up the largest fraction
-/// of its env's age limit first.
-///
-/// A 0 anywhere means "keep forever" for whatever it governs, never "the
-/// whole task is off": a global 0 with `[retention.env.prod] max_age_days
-/// = 30` still ages prod out, and an env whose own entry is 0 keeps its
-/// data past the global limit. A directory that no age limit will ever
-/// reach is still a disk-pressure candidate, ranked after everything that
-/// expires.
-///
-/// Unlike the rest of the config, this section refuses keys it does not
-/// know, and so does every `[retention.env.<name>]` table. Everywhere else
-/// a typo costs a setting that stays at its default. Here it costs data:
-/// `[retention.evn.prod] max_age_days = 365` would otherwise load, be
-/// discarded, and leave prod ageing out at the global limit while the
-/// operator reads their own config as keeping it a year.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
@@ -757,24 +657,11 @@ pub struct RetentionConfig {
     pub retention_interval_secs: u64,
 
     /// Per-env age overrides, keyed by env name (`[retention.env.lab]`).
-    /// An env with no entry keeps `max_age_days`. Disk-pressure retention
-    /// is install-wide and takes no override: it deletes to free space,
-    /// and every env's data sits on the one filesystem.
-    ///
-    /// Keys are validated at load like `ingest.envs` entries, and a key
-    /// naming an env that is not in `ingest.envs` is legal: de-listing an
-    /// env stops new ingest for it while its directories stay on disk and
-    /// still need an age policy.
+    /// An env with no entry keeps `max_age_days`.
     #[serde(default)]
     pub env: BTreeMap<String, EnvRetention>,
 }
 
-/// One env's retention override.
-///
-/// `max_age_days` is required: an empty `[retention.env.lab]` table is a
-/// load error rather than a silent inherit or a silent 0, because the two
-/// readings ("keep what the global says" and "keep forever") are opposite
-/// answers and the operator wrote the table to say something.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvRetention {
@@ -798,9 +685,6 @@ impl Default for RetentionConfig {
 impl RetentionConfig {
     /// The age limit that applies to `env`, in days: its own entry when it
     /// has one, else the global `max_age_days`. 0 means keep forever.
-    ///
-    /// The one fallback lookup. Env names on disk and config keys are both
-    /// held to `[a-z0-9_-]{1,32}`, so this is byte equality with no folding.
     #[must_use]
     pub fn max_age_days_for(&self, env: &str) -> u64 {
         self.env
@@ -809,11 +693,9 @@ impl RetentionConfig {
     }
 }
 
-/// Scheduler configuration for background query execution.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
-    /// Enable the scheduler. When false, no scheduled queries run.
     #[serde(default = "default_scheduler_enabled")]
     pub enabled: bool,
 
@@ -822,10 +704,7 @@ pub struct SchedulerConfig {
     pub poll_interval_secs: u64,
 
     /// How many finished report runs to keep per schedule (retention).
-    ///
-    /// Only terminal runs (`success`, `error`, `timeout`) are counted and
-    /// deleted; a `running` run is never deleted and never takes a slot.
-    /// Must be at least 1 (ADR-0018, amendment 2026-11-06).
+    /// Must be at least 1 (ADR-0018).
     #[serde(default = "default_scheduler_max_runs_per_schedule")]
     pub max_runs_per_schedule: u64,
 
@@ -837,13 +716,6 @@ pub struct SchedulerConfig {
 
     /// How many intervals of missed coverage a `since_last` report window
     /// may swallow in one catch-up run (ADR-0018 ruling 9).
-    ///
-    /// Missed runs coalesce into one window rather than backfilling one run
-    /// each. A daemon down for a week would otherwise hand the next run a
-    /// week-wide window and one enormous query, so a gap beyond this many
-    /// intervals clamps the window forward and flags the run
-    /// (`window_truncated` plus `trawl_scheduler_window_truncated_total`).
-    /// It never wedges the schedule and never drops the gap silently.
     #[serde(default = "default_scheduler_max_catchup_intervals")]
     pub max_catchup_intervals: u32,
 }
@@ -862,14 +734,7 @@ pub const DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS: u32 = 24;
 /// so the product needs a bound of its own: past what a `TimeDelta` can
 /// hold, `plan_due_run` answers `PlanError::Arithmetic` and every due
 /// `since_last` run fails on every poll, forever, with the fire cursor
-/// never advancing. A silent config value that stops the scheduler is a
-/// worse outcome than a boot refusal.
-///
-/// A million intervals against the ten-year interval cap is 3.15e14
-/// seconds, less than one twentieth of the maximum `TimeDelta`
-/// (`scheduler_catchup_span_always_fits_a_timedelta` proves it). It is also
-/// far past any real cadence: a million hourly intervals is 114 years of
-/// missed coverage, so nobody loses a setting they meant.
+/// never advancing.
 pub const MAX_SCHEDULER_CATCHUP_INTERVALS: u32 = 1_000_000;
 
 /// The longest `scheduler.report_retention_days` trawld will start with,
@@ -878,9 +743,7 @@ pub const MAX_SCHEDULER_CATCHUP_INTERVALS: u32 = 1_000_000;
 /// Retention turns the value into a cutoff date, `now` minus that many
 /// days, and the arithmetic has a range: past `i64` days, or far enough to
 /// land before chrono's minimum date, the cutoff cannot be computed and
-/// retention refuses to run. A bound the arithmetic always holds turns that
-/// into a boot refusal (ADR-0018, amendment 2026-11-06). It is far past any
-/// retention anyone means, so nobody loses a setting they wanted.
+/// retention refuses to run.
 pub const MAX_SCHEDULER_REPORT_RETENTION_DAYS: u64 = 36_500;
 
 /// The ten-year duration cap, mirrored from
@@ -889,8 +752,7 @@ pub const MAX_SCHEDULER_REPORT_RETENTION_DAYS: u64 = 36_500;
 /// trawl-server depends on this crate, so the constant cannot travel the
 /// other way and the value is copied instead of imported.
 /// `config_duration_mirror_matches_the_grammar_cap` over in trawl-server
-/// can see both and fails if the copy drifts. Nothing here reads it except
-/// the test that proves the two caps multiply to something representable.
+/// can see both and fails if the copy drifts.
 pub const MIRRORED_MAX_DURATION_SECS: u64 = 315_360_000;
 
 fn default_scheduler_enabled() -> bool {
@@ -921,11 +783,9 @@ impl Default for SchedulerConfig {
     }
 }
 
-/// Native syslog listener settings for receiving logs from network appliances.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyslogConfig {
-    /// Enable the syslog listener. Default: false.
     #[serde(default)]
     pub enabled: bool,
 
@@ -1001,7 +861,6 @@ pub struct SyslogConfig {
     pub sender_timezones: std::collections::HashMap<String, String>,
 
     /// Channel capacity for the event queue between listeners and batcher.
-    /// Increase for high-volume syslog deployments. Default: 10,000.
     #[serde(default = "default_syslog_channel_capacity")]
     pub channel_capacity: usize,
 }
@@ -1073,20 +932,15 @@ impl Default for SyslogConfig {
     }
 }
 
-// -- byte size deserializer --------------------------------------------------
-// Accepts either a raw integer or a string with a unit suffix like
-// "128K", "16M", "1G", "100MiB". All multipliers are binary
-// (1024-based) because nobody means 1,000,000 when they write "1M" in a
-// server config file.
+// All multipliers are binary (1024-based) because nobody means 1,000,000
+// when they write "1M" in a server config file.
 
-/// Parse a byte size string like "128K", "16M", "1GiB" into a raw byte count.
 fn parse_byte_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty byte size".into());
     }
 
-    // Find where digits/dots end and the suffix begins.
     let num_end = s
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(s.len());
@@ -1102,8 +956,6 @@ fn parse_byte_size(s: &str) -> Result<u64, String> {
         _ => return Err(format!("unknown byte size suffix: {suffix:?}")),
     };
 
-    // Use integer math for whole numbers (the common case), float only
-    // for decimals like "1.5G".
     if num_str.contains('.') {
         let num: f64 = num_str
             .parse()
@@ -1131,13 +983,10 @@ fn parse_byte_size(s: &str) -> Result<u64, String> {
     }
 }
 
-/// The error of a byte size larger than `u64` can hold.
 const BYTE_SIZE_OVERFLOW: &str = "byte size is too large";
 
-/// The error of a zero where a setting needs at least one.
 const NONZERO_REQUIRED: &str = "must be greater than zero";
 
-/// Deserialize a byte size that must not be zero, such as a query budget.
 fn deserialize_nonzero_byte_size<'de, D: serde::Deserializer<'de>>(
     de: D,
 ) -> Result<NonZeroU64, D::Error> {
@@ -1145,7 +994,6 @@ fn deserialize_nonzero_byte_size<'de, D: serde::Deserializer<'de>>(
     NonZeroU64::new(bytes).ok_or_else(|| serde::de::Error::custom(NONZERO_REQUIRED))
 }
 
-/// Deserialize a count that must not be zero, such as `query_threads`.
 fn deserialize_nonzero_u32<'de, D: serde::Deserializer<'de>>(
     de: D,
 ) -> Result<NonZeroU32, D::Error> {
@@ -1153,7 +1001,6 @@ fn deserialize_nonzero_u32<'de, D: serde::Deserializer<'de>>(
     NonZeroU32::new(count).ok_or_else(|| serde::de::Error::custom(NONZERO_REQUIRED))
 }
 
-/// Deserialize a byte size as either a raw number or a string with unit suffix.
 fn deserialize_byte_size<'de, D: serde::Deserializer<'de>>(de: D) -> Result<usize, D::Error> {
     use serde::de;
 
@@ -1183,7 +1030,6 @@ fn deserialize_byte_size<'de, D: serde::Deserializer<'de>>(de: D) -> Result<usiz
     de.deserialize_any(ByteSizeVisitor)
 }
 
-/// Same as [`deserialize_byte_size`] but returns `u64` (for retention config).
 fn deserialize_byte_size_u64<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u64, D::Error> {
     use serde::de;
 
@@ -1212,35 +1058,19 @@ fn deserialize_byte_size_u64<'de, D: serde::Deserializer<'de>>(de: D) -> Result<
     de.deserialize_any(ByteSizeVisitor)
 }
 
-// -- default constants -------------------------------------------------------
-// Public so another crate can name the same value the deserializer would
-// supply: trawl-server's query tracker reads `DEFAULT_MAX_QUERY_HISTORY`, its
-// ingest derivation policy reads `DEFAULT_SEVERITY_FROM`/`DEFAULT_TIME_FROM`.
-// The `default_*` functions exist only because serde's
-// `#[serde(default = "...")]` requires a function path.
-
-/// Default HTTPS listen address.
 pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:5514";
-/// Default query execution timeout (seconds).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
-/// Default maximum rows a query can return.
 pub const DEFAULT_MAX_RESULT_ROWS: usize = 100_000;
-/// Default maximum rows for export responses (1M).
 pub const DEFAULT_MAX_EXPORT_ROWS: usize = 1_000_000;
-/// Default maximum request body size (128 KB).
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
-/// Default maximum HTTP requests in progress.
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 32;
 /// Largest accepted `server.max_concurrent_requests`. Tokio's semaphore
 /// caps its permits at `Semaphore::MAX_PERMITS`; a test holds this bound
 /// below that.
 pub const MAX_CONCURRENT_REQUESTS_LIMIT: usize = 65_536;
-/// Default graceful shutdown drain timeout (seconds).
 pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
 /// Default TLS certificate reload interval (seconds). 0 = disabled.
 pub const DEFAULT_TLS_RELOAD_INTERVAL_SECS: u64 = 300;
-/// Directory under [`Config::state_dir`] where trawld keeps the
-/// self-signed certificate it generates when `[server]` names none.
 pub const GENERATED_TLS_DIR: &str = "tls";
 /// File name of trawld's generated certificate inside [`GENERATED_TLS_DIR`].
 /// trawld publishes it world-readable (`0644`) so a proxy running as another
@@ -1256,65 +1086,35 @@ pub const GENERATED_KEY_DIR: &str = "tls-key";
 /// File name of trawld's generated private key inside [`GENERATED_KEY_DIR`].
 /// Owner-only (`0600`).
 pub const GENERATED_KEY_FILE: &str = "key.pem";
-/// Default schema cache TTL (seconds).
 pub const DEFAULT_SCHEMA_CACHE_TTL_SECS: u64 = 60;
-/// Default query history ring buffer capacity.
 pub const DEFAULT_MAX_QUERY_HISTORY: usize = 1000;
-/// Default ingest request body size limit (16 MB).
 pub const DEFAULT_INGEST_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
-/// Default compaction interval (seconds).
 pub const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 10;
-/// Default internal telemetry (enabled).
 pub const DEFAULT_INTERNAL_TELEMETRY: bool = true;
-/// Default daily rollup (enabled).
 pub const DEFAULT_DAILY_ROLLUP: bool = true;
 /// Default compaction chunk size (WAL files per `read_json` call).
 pub const DEFAULT_COMPACTION_CHUNK_SIZE: usize = 500;
 /// Largest compaction chunk size. A chunk's publication marker names every
 /// WAL file the chunk consumed, and the marker reader refuses a marker over
 /// a fixed size derived from this count, so a larger chunk could publish a
-/// marker that recovery then refuses to read. Eight times the default.
+/// marker that recovery then refuses to read.
 pub const MAX_COMPACTION_CHUNK_SIZE: usize = 4096;
-/// Default spill cap of the query database (4 GiB).
 pub const DEFAULT_QUERY_SPILL_MAX_BYTES: NonZeroU64 = NonZeroU64::new(4 << 30).unwrap();
-/// Default memory limit of the query database (2 GiB).
 pub const DEFAULT_QUERY_MEMORY_LIMIT: NonZeroU64 = NonZeroU64::new(2 << 30).unwrap();
-/// Default worker threads of the query database.
 pub const DEFAULT_QUERY_THREADS: NonZeroU32 = NonZeroU32::new(4).unwrap();
-/// Most executor permits the `max_concurrent_queries` default gives. Every
-/// permit shares the one query memory limit, so permits past this many only
-/// split it thinner. An explicit value may go higher.
 pub const MAX_DEFAULT_CONCURRENT_QUERIES: usize = 8;
-/// Suffix of the data root's sibling that [`Config::query_scratch_dir`]
-/// defaults to.
 pub const QUERY_SCRATCH_SUFFIX: &str = ".query-scratch";
-/// Suffix of the data root's sibling that [`Config::results_dir`] defaults
-/// to.
 pub const RESULTS_SUFFIX: &str = ".results";
 /// Default `DuckDB` memory limit for compaction connections (1 GiB). A raw
 /// `DuckDB` string, so the unit is spelled `GiB`: `DuckDB` reads `GB` as
 /// 10^9 bytes.
 pub const DEFAULT_COMPACTION_MEMORY_LIMIT: &str = "1GiB";
-/// Default retention max age (days).
 pub const DEFAULT_RETENTION_MAX_AGE_DAYS: u64 = 90;
-/// Default retention minimum free disk space (bytes). 6 GiB: room for the
-/// default 4 GiB spill budget, the hot-buffer snapshots and export staging
-/// above ENOSPC. Nothing validates the floor against the spill budget.
 pub const DEFAULT_RETENTION_MIN_FREE_DISK_BYTES: u64 = 6 << 30;
-/// Default retention check interval (seconds). 1 hour.
 pub const DEFAULT_RETENTION_INTERVAL_SECS: u64 = 3600;
-/// Default per-key rate limit on the interactive API routes
-/// (requests/minute). Sized for a human at a terminal, an order of magnitude
-/// below `DEFAULT_INGEST_RATE_LIMIT_RPM` — an untuned key must not get a
-/// shipper-sized query budget.
 pub const DEFAULT_RATE_LIMIT_RPM: u32 = 100;
-/// Default per-key rate limit on `/api/v1/ingest` (requests/minute).
-/// Sized for shippers: vector flushes a batch per 1 MB / 5 s per source, and
-/// several sources commonly share one ingest key.
 pub const DEFAULT_INGEST_RATE_LIMIT_RPM: u32 = 1000;
-/// Default maximum concurrent SSE connections.
 pub const DEFAULT_MAX_SSE_CONNECTIONS: usize = 32;
-/// Fallback CPU count when `available_parallelism()` fails.
 const FALLBACK_CPU_COUNT: usize = 4;
 
 fn default_ingest_enabled() -> bool {
@@ -1353,9 +1153,7 @@ fn default_event_bus_capacity() -> usize {
     4096
 }
 
-/// Default hot buffer max events.
 pub const DEFAULT_HOT_BUFFER_MAX_EVENTS: usize = 100_000;
-/// Default hot buffer max bytes (100 MB).
 pub const DEFAULT_HOT_BUFFER_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 fn default_hot_buffer_max_events() -> usize {
@@ -1366,9 +1164,7 @@ fn default_hot_buffer_max_bytes() -> usize {
     DEFAULT_HOT_BUFFER_MAX_BYTES
 }
 
-/// Default server stats emission interval (seconds).
 pub const DEFAULT_STATS_INTERVAL_SECS: u64 = 60;
-/// Default telemetry flush interval (seconds).
 pub const DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS: u64 = 1;
 
 fn default_stats_interval_secs() -> u64 {
@@ -1388,20 +1184,14 @@ pub const DEFAULT_TELEMETRY_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// which charges about 2 KB. Below that, the record that reports a
 /// `buffer_cap` drop is itself refused, which counts a new drop that the
 /// next idle flush reports again, so the capacity alert never clears.
-/// 64 KiB holds dozens of recovery records or ordinary self-telemetry
-/// events, and it is still negligible next to the 16 MiB default.
 pub const MIN_TELEMETRY_BUFFER_MAX_BYTES: usize = 64 * 1024;
 
 fn default_telemetry_buffer_max_bytes() -> usize {
     DEFAULT_TELEMETRY_BUFFER_MAX_BYTES
 }
 
-/// Default key audit polling interval (seconds).
 pub const DEFAULT_AUDIT_INTERVAL_SECS: u64 = 30;
 
-/// Authentication settings.
-///
-/// API keys live in the fleet-auth Postgres keystore (`database_url`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
@@ -1429,17 +1219,10 @@ impl Default for AuthConfig {
 }
 
 impl AuthConfig {
-    /// Resolve the fleet keystore URL: `FLEET_DATABASE_URL` env var first,
-    /// then `[auth] database_url` from the config file. Empty values count
-    /// as unset.
-    ///
     /// The bare `DATABASE_URL` is deliberately not consulted: that variable
     /// belongs to the sqlx test harness (`#[sqlx::test]` hardwires it), and a
     /// process-wide `DATABASE_URL` must never silently repoint trawld's
     /// keystore.
-    ///
-    /// # Errors
-    /// Returns [`ConfigError::Validation`] when neither source is set.
     pub fn resolve_database_url(&self) -> Result<String, ConfigError> {
         self.resolve_database_url_with_source().map(|(url, _)| url)
     }
@@ -1447,9 +1230,6 @@ impl AuthConfig {
     /// [`Self::resolve_database_url`], also naming which source won, so
     /// `trawld --doctor` can say where the URL came from without showing
     /// it.
-    ///
-    /// # Errors
-    /// As [`Self::resolve_database_url`].
     pub fn resolve_database_url_with_source(
         &self,
     ) -> Result<(String, DatabaseUrlSource), ConfigError> {
@@ -1483,18 +1263,12 @@ impl AuthConfig {
     }
 }
 
-/// Which setting a resolved database URL came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseUrlSource {
-    /// The environment variable (`FLEET_DATABASE_URL` or
-    /// `TRAWL_DATABASE_URL`), which wins over the file.
     Environment,
-    /// The configuration file (`[auth]` or `[storage] database_url`).
     ConfigFile,
 }
 
-/// The environment value, else the configured one, each only when
-/// nonempty: the precedence both database URL resolvers share.
 fn pick_database_url(
     env_value: Option<&str>,
     configured: Option<&str>,
@@ -1507,11 +1281,6 @@ fn pick_database_url(
 
 /// Storage settings for trawl's own app-state database (query history,
 /// saved queries, schedules, report runs — ADR-0004).
-///
-/// This is a dedicated `trawl` postgres database owned by trawl-server
-/// (boot-time migrated, advisory-locked sole writer). Deliberately separate
-/// from `[auth]`: the stores are app state, not auth, and neither URL falls
-/// back to the other.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
@@ -1524,12 +1293,6 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
-    /// Resolve the app-state database URL: `TRAWL_DATABASE_URL` env var
-    /// first, then `[storage] database_url` from the config file. Empty
-    /// values count as unset. No fallback to the `[auth]` URL.
-    ///
-    /// # Errors
-    /// Returns [`ConfigError::Validation`] when neither source is set.
     pub fn resolve_database_url(&self) -> Result<String, ConfigError> {
         self.resolve_database_url_with_source().map(|(url, _)| url)
     }
@@ -1537,9 +1300,6 @@ impl StorageConfig {
     /// [`Self::resolve_database_url`], also naming which source won, so
     /// `trawld --doctor` can say where the URL came from without showing
     /// it.
-    ///
-    /// # Errors
-    /// As [`Self::resolve_database_url`].
     pub fn resolve_database_url_with_source(
         &self,
     ) -> Result<(String, DatabaseUrlSource), ConfigError> {
@@ -1574,11 +1334,6 @@ impl StorageConfig {
 }
 
 /// Browser-facing session proxy (`trawl-web`) settings.
-///
-/// Consumed by the `trawl-web` binary, which translates cookie-based browser
-/// sessions into bearer-token requests against trawld. Every field is
-/// optional so the proxy can supply its own defaults without coupling trawld
-/// to the proxy's operational choices.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebConfig {
@@ -1596,12 +1351,6 @@ pub struct WebConfig {
 
     /// Socket address the proxy connects to instead of resolving the
     /// `upstream_url` host, e.g. `"127.0.0.1:5514"` (ADR-0048).
-    ///
-    /// TLS still verifies the host name in `upstream_url`, so a sidecar can
-    /// dial trawld over loopback and check that trawld's certificate covers
-    /// that name. Only an IP address and port are accepted, and
-    /// `upstream_url` must then name its host by DNS name. Unset: the proxy
-    /// resolves the `upstream_url` host normally.
     ///
     /// Kept as a raw string: `trawl-web` owns the parse and those rules.
     pub upstream_connect_addr: Option<String>,
@@ -1623,28 +1372,17 @@ pub struct WebConfig {
 
     /// Browser-visible origins the proxy accepts cookie-authenticated
     /// requests from, e.g. `["https://trawl.example.com"]` (ADR-0016).
-    ///
-    /// This is the CSRF allowlist: `trawl-web` compares a request's whole
-    /// `Origin` header (scheme, host and port) against these entries and
-    /// consults no forwarding header, so an operator states the origin
-    /// their browser shows rather than trusting whatever a proxy put in
-    /// `Host`. There is deliberately no derived default. The proxy refuses
-    /// to start with an empty list, because a guessed origin is either
-    /// wrong (every browser request 403s) or right by accident.
     /// The two spellings of loopback are different origins to a browser,
     /// so `http://127.0.0.1:8090` and `http://localhost:8090` must both
     /// be listed if both are used.
     ///
     /// Kept as raw strings: this crate is trawld's dependency-light config
     /// surface and never links fleet-auth, so validation happens in
-    /// `trawl-web` where the one origin parser lives. `#[serde(default)]`
-    /// keeps a trawld-only config with no `[web]` section parsing.
+    /// `trawl-web` where the one origin parser lives.
     #[serde(default)]
     pub public_origins: Vec<String>,
 
-    /// Parent domain for the shared `fleet_session` SSO cookie — the SSO
-    /// knob shared by every fleet app so operator docs can say "set the same
-    /// value in every app" (ADR-0004).
+    /// Parent domain for the shared `fleet_session` SSO cookie (ADR-0004).
     ///
     /// When set (e.g. `".fleet.lab.ktle.net"`), the session cookie carries a
     /// `Domain=` attribute scoping it to the parent domain, so one login is
@@ -1670,8 +1408,6 @@ fn default_max_concurrent_queries() -> usize {
     default_query_permits(num_cpus())
 }
 
-/// One executor permit per CPU, at most [`MAX_DEFAULT_CONCURRENT_QUERIES`].
-/// An unknown CPU count gives [`FALLBACK_CPU_COUNT`].
 fn default_query_permits(cpus: Option<usize>) -> usize {
     cpus.unwrap_or(FALLBACK_CPU_COUNT)
         .min(MAX_DEFAULT_CONCURRENT_QUERIES)
@@ -1720,7 +1456,6 @@ fn default_max_sse_connections() -> usize {
     DEFAULT_MAX_SSE_CONNECTIONS
 }
 
-/// Default monitor refresh interval (1 second).
 const DEFAULT_MONITOR_REFRESH_MS: u64 = 1000;
 
 fn default_monitor_refresh_ms() -> u64 {
@@ -1739,9 +1474,6 @@ fn default_query_threads() -> NonZeroU32 {
     DEFAULT_QUERY_THREADS
 }
 
-/// The sibling of a data root that ends in `suffix`: the repin staging roots,
-/// the default query scratch directory and the default results root. A root
-/// with no final component is treated as one named `data`.
 #[must_use]
 pub fn data_root_sibling(data_dir: &Path, suffix: &str) -> PathBuf {
     let name = data_dir
@@ -1779,8 +1511,6 @@ impl Default for RateLimitConfig {
     }
 }
 
-// -- capture limits (ADR-0057) ------------------------------------------------
-
 /// The least `[capture] max_wire_bytes` the config accepts: a cell read's
 /// byte range must hold one whole character, and the longest UTF-8
 /// character is 4 bytes. The server's cell read minimum is this value, so a
@@ -1805,8 +1535,7 @@ const DEFAULT_CAPTURE_QUEUE_DEPTH: u64 = 4;
 const DEFAULT_CAPTURE_PAGE_MAX_ROWS: u64 = 200;
 const DEFAULT_CAPTURE_TOMBSTONE_SECS: u64 = 86_400;
 
-/// Limits of captured results (ADR-0057). Every number is configuration;
-/// the capabilities route advertises the ones a client plans around.
+/// Limits of captured results (ADR-0057).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
@@ -1986,18 +1715,12 @@ impl Default for CaptureConfig {
     }
 }
 
-// -- investigation evidence (ADR-0059) -----------------------------------------
-
 const DEFAULT_EVIDENCE_IDLE_SECS: u64 = 604_800;
 const DEFAULT_EVIDENCE_CEILING_SECS: u64 = 2_592_000;
 const DEFAULT_EVIDENCE_PER_INVESTIGATION_BYTES: u64 = 64 << 20;
 const DEFAULT_EVIDENCE_INSTALLATION_BYTES: u64 = 1 << 30;
 
-/// The evidence policy of investigations (ADR-0059). Kept evidence is the
-/// captured results attached to an investigation; its files live in the
-/// results root under these clocks and budgets instead of the `[capture]`
-/// ones. The investigation's own text outlives them. Every number is
-/// configuration, and the capabilities route advertises all four.
+/// The evidence policy of investigations (ADR-0059).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InvestigationConfig {
@@ -2051,26 +1774,16 @@ impl Default for InvestigationConfig {
     }
 }
 
-/// Portable CPU count without pulling in the `num_cpus` crate. `None` when
-/// the platform cannot say.
 fn num_cpus() -> Option<usize> {
     std::thread::available_parallelism()
         .ok()
         .map(std::num::NonZero::get)
 }
 
-/// Expand a leading `~/` to `$HOME/`.
 fn expand_tilde(path: &str) -> String {
     shellexpand::tilde(path).into_owned()
 }
 
-/// Validate the one safety budget with a floor instead of a zero off switch.
-///
-/// Other caps use zero as an explicit off switch, but an unbounded telemetry
-/// buffer can grow indefinitely behind a wedged WAL write. Self-telemetry has
-/// its own boolean off switch, so zero has no valid interpretation. The
-/// floor [`MIN_TELEMETRY_BUFFER_MAX_BYTES`] keeps the budget well clear of
-/// the size at which the record that reports its own drops is refused.
 fn validate_telemetry_buffer_max_bytes(bytes: usize) -> Result<(), ConfigError> {
     if bytes < MIN_TELEMETRY_BUFFER_MAX_BYTES {
         return Err(ConfigError::Validation(format!(
@@ -2083,15 +1796,6 @@ fn validate_telemetry_buffer_max_bytes(bytes: usize) -> Result<(), ConfigError> 
     Ok(())
 }
 
-/// Validate the catch-up ceiling, the other budget whose zero is invalid.
-///
-/// A catch-up window is measured in whole schedule intervals, so a ceiling
-/// of zero would clamp every `since_last` window to nothing and produce
-/// empty reports forever. Unlike the caps that use zero as an off switch,
-/// "do not clamp" is spelled with a large number here, not with none, which
-/// is why there is a ceiling too: the planner multiplies this by the
-/// interval and has to hold the product, so a number chosen to mean
-/// "never" must still be one the scheduler can compute with.
 fn validate_max_catchup_intervals(intervals: u32) -> Result<(), ConfigError> {
     if intervals == 0 || intervals > MAX_SCHEDULER_CATCHUP_INTERVALS {
         return Err(ConfigError::Validation(format!(
@@ -2104,12 +1808,6 @@ fn validate_max_catchup_intervals(intervals: u32) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Validate the two report-run retention knobs.
-///
-/// Zero is refused for both rather than meaning "keep none" (ADR-0018,
-/// amendment 2026-11-06). `report_retention_days` also has a ceiling, the
-/// largest value whose cutoff date retention can always compute.
-/// `max_runs_per_schedule` has none: a count needs no date arithmetic.
 fn validate_report_retention(scheduler: &SchedulerConfig) -> Result<(), ConfigError> {
     if !(1..=MAX_SCHEDULER_REPORT_RETENTION_DAYS).contains(&scheduler.report_retention_days) {
         return Err(ConfigError::Validation(format!(
@@ -2128,13 +1826,9 @@ fn validate_report_retention(scheduler: &SchedulerConfig) -> Result<(), ConfigEr
     Ok(())
 }
 
-/// The rule a `link_origin` host fails when its last label reads as an IPv4
-/// number but the host is not canonical dotted-decimal.
 const NUMERIC_HOST_RULE: &str = "must name an IPv4 host in dotted-decimal form (four labels, \
                                  0-255, no leading zeros) or a DNS name";
 
-/// Validate a non-bracketed `link_origin` host and report whether it is
-/// loopback. The result is the lowercase host.
 fn parse_link_origin_name_host(host: &str) -> Result<(String, bool), &'static str> {
     use std::net::Ipv4Addr;
 
@@ -2182,18 +1876,8 @@ fn parse_link_origin_name_host(host: &str) -> Result<(String, bool), &'static st
 }
 
 /// Parse `[server] link_origin` into its normalized origin (ADR-0058).
-///
-/// The scheme is `https`, or `http` when the host is loopback (`localhost`,
-/// `127.0.0.0/8`, `::1`). The host is required and a port is optional; the
-/// value carries no userinfo, no path beyond a single `/`, no query and no
-/// fragment. A host whose last label is all digits, or `0x` and hex digits,
-/// is an IPv4 number to a browser, so it is accepted only as canonical
-/// dotted-decimal IPv4 (four labels, 0-255, no leading zeros); `127.1`,
-/// `2130706433`, `0x7f000001` and `trawl.0x1` are refused rather than
-/// parsed. The result is lowercase, has no trailing slash, spells an IPv6
-/// host in its bracketed canonical form and drops the scheme's default port,
-/// so two spellings of one origin compare equal. The error is the rule that
-/// failed, as a phrase to follow the key's name; it never echoes the value.
+/// The error is the rule that failed, as a phrase to follow the key's name;
+/// it never echoes the value.
 fn parse_link_origin(value: &str) -> Result<String, &'static str> {
     use std::net::Ipv6Addr;
 
@@ -2280,7 +1964,6 @@ fn parse_link_origin(value: &str) -> Result<String, &'static str> {
 /// never the key, because the key is configuration too (ADR-0047).
 const PEER_KEYED_SETTINGS: [&str; 2] = ["syslog.sender_timezones", "syslog.source_service_map"];
 
-/// Cut a setting path inside a [`PEER_KEYED_SETTINGS`] map back to the map.
 fn without_peer_key(setting: String) -> String {
     PEER_KEYED_SETTINGS
         .into_iter()
@@ -2332,9 +2015,7 @@ impl Config {
         let mut config = Self::parse_toml(contents)?;
         config.resolve_paths();
         // Applied before validation so an env-supplied address is held to the
-        // same checks as a configured one, and so every downstream reader of
-        // `server.http_addr` (bind, log line, dashboard snapshot) sees one
-        // resolved value instead of each remembering to consult the env.
+        // same checks as a configured one.
         config.server.http_addr = config.server.resolve_http_addr();
         config.validate()?;
         // Validation has proved the origin parses, so the stored form can be
@@ -2345,9 +2026,6 @@ impl Config {
         Ok(config)
     }
 
-    /// Load configuration from a TOML file.
-    ///
-    /// All paths in the config are resolved (tilde-expanded) after parsing.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path.as_ref()).map_err(|e| ConfigError::Io {
             path: path.as_ref().to_owned(),
@@ -2369,7 +2047,6 @@ impl Config {
         })
     }
 
-    /// Expand `~` to `$HOME` in all path fields.
     fn resolve_paths(&mut self) {
         self.data.path = expand_tilde(&self.data.path);
         if let Some(log_file) = &self.server.log_file {
@@ -2396,7 +2073,6 @@ impl Config {
         }
     }
 
-    /// Resolve the WAL directory: explicit config value or `{data.base_dir}/wal/`.
     pub fn wal_dir(&self) -> PathBuf {
         self.ingest
             .wal_dir
@@ -2404,8 +2080,6 @@ impl Config {
             .unwrap_or_else(|| self.data.base_dir().join(WAL_DIR_NAME))
     }
 
-    /// Resolve the query scratch directory: explicit config value or the
-    /// data root's sibling `<data.path>.query-scratch` (ADR-0056).
     pub fn query_scratch_dir(&self) -> PathBuf {
         self.server
             .query_scratch_dir
@@ -2413,8 +2087,6 @@ impl Config {
             .unwrap_or_else(|| data_root_sibling(&self.data.base_dir(), QUERY_SCRATCH_SUFFIX))
     }
 
-    /// Resolve the results root: explicit config value or the data root's
-    /// sibling `<data.path>.results` (ADR-0057).
     pub fn results_dir(&self) -> PathBuf {
         self.server
             .results_dir
@@ -2422,10 +2094,6 @@ impl Config {
             .unwrap_or_else(|| data_root_sibling(&self.data.base_dir(), RESULTS_SUFFIX))
     }
 
-    /// State directory — parent of the data directory.
-    ///
-    /// Used as the base for auto-generated TLS certs (`{state_dir}/tls/`).
-    /// For the deb package this resolves to `/var/lib/trawl/`.
     pub fn state_dir(&self) -> PathBuf {
         self.data
             .base_dir()
@@ -2433,12 +2101,7 @@ impl Config {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
     }
 
-    /// Where trawld publishes the self-signed certificate it generates:
-    /// `{state_dir}/tls/cert.pem`.
-    ///
-    /// `None` when `[server]` names its own certificate, because trawld then
-    /// generates nothing. The file may not exist yet: trawld writes it on
-    /// its first start.
+    /// The file may not exist yet: trawld writes it on its first start.
     pub fn generated_cert_path(&self) -> Option<PathBuf> {
         if self.server.tls_cert_path.is_some() {
             return None;
@@ -2450,9 +2113,6 @@ impl Config {
         )
     }
 
-    /// Return warnings about potentially dangerous configuration.
-    ///
-    /// Called after tracing is initialized so these can be logged.
     pub fn warnings(&self) -> Vec<String> {
         let mut warns = Vec::new();
         if self.server.tls_cert_path.is_none() {
@@ -2479,9 +2139,6 @@ impl Config {
         warns
     }
 
-    /// Whether internal telemetry is effectively enabled.
-    ///
-    /// Requires both `ingest.enabled` and `ingest.internal_telemetry` to be true.
     pub fn internal_telemetry_enabled(&self) -> bool {
         self.ingest.enabled && self.ingest.internal_telemetry
     }
@@ -2509,14 +2166,9 @@ impl Config {
             )));
         }
 
-        // The roots trawld owns by name are kept apart from the query
-        // scratch directory by comparing the directories at startup, and a
-        // root that does not exist yet is placed by the nearest directory
-        // on its path that does. A `..` after a component that is missing
-        // places `<base>/missing/../x` at `<base>` while trawld later makes
-        // it at `<base>/x`, which can be the scratch directory itself. So
-        // the data root and the WAL directory, and with them the repin
-        // roots beside the data root, carry no `..` (ADR-0056).
+        // A `..` after a component that is missing places `<base>/missing/../x`
+        // at `<base>` while trawld later makes it at `<base>/x`, which can be the
+        // scratch directory itself (ADR-0056).
         for (key, path) in [
             ("data.path", Path::new(&self.data.path)),
             (
@@ -2611,16 +2263,9 @@ impl Config {
     }
 
     /// The query scratch directory stays apart from every directory whose
-    /// contents trawld owns by name (ADR-0056): boot removes the names it
-    /// makes in scratch, and repin swaps the data root with its siblings.
-    ///
-    /// The comparison is lexical, component by component, so it needs no
-    /// filesystem and also serves `--check-config` and the doctors. A
-    /// comparison of spellings cannot see where `..` or the working
-    /// directory leads, so an explicit directory must be absolute and free
-    /// of `..`; the default follows `data.path`'s rules, which also refuse
-    /// `..`. Startup repeats the check against the opened directory, which
-    /// also sees symlinks.
+    /// contents trawld owns by name (ADR-0056). A comparison of spellings
+    /// cannot see where `..` or the working directory leads, so an explicit
+    /// directory must be absolute and free of `..`.
     fn validate_query_scratch_dir(&self) -> Result<(), ConfigError> {
         self.validate_owned_dir(
             "server.query_scratch_dir",
@@ -2629,10 +2274,6 @@ impl Config {
         )
     }
 
-    /// The results root follows the scratch directory's rules and also stays
-    /// apart from the effective query scratch directory: boot removes the
-    /// names it makes in scratch, and a capture file must never sit where
-    /// that sweep or a query's spill can reach it.
     fn validate_results_dir(&self) -> Result<(), ConfigError> {
         const KEY: &str = "server.results_dir";
         let results = self.results_dir();
@@ -2755,10 +2396,6 @@ impl Config {
         Ok(())
     }
 
-    /// Every capture limit is positive, and each per-key limit fits inside
-    /// its installation-wide counterpart: a per-key quota above the
-    /// installation quota could never be reached, and a window default above
-    /// the span limit would refuse every default request.
     fn validate_capture(&self) -> Result<(), ConfigError> {
         let c = &self.capture;
         for (key, value) in [
@@ -2834,10 +2471,6 @@ impl Config {
         Ok(())
     }
 
-    /// Every evidence limit is positive, the idle clock fits inside the
-    /// ceiling, and the budgets nest: a per-investigation budget above the
-    /// installation's could never be reached, and one below a single
-    /// capture's file reservation would refuse every attached capture.
     fn validate_investigation(&self) -> Result<(), ConfigError> {
         let i = &self.investigation;
         for (key, value) in [
@@ -2918,10 +2551,6 @@ impl Config {
         Ok(())
     }
 
-    /// Per-env retention keys are env names too: they are matched against
-    /// directory names under the data root, so they carry the same charset
-    /// as `ingest.envs` entries and are boot-fatal in the same way.
-    ///
     /// Deliberately not cross-checked against `ingest.envs`: de-listing an
     /// env stops new ingest for it while its data stays on disk, and that
     /// data still needs an age policy.
@@ -2960,8 +2589,6 @@ impl Config {
         if !is_valid_service_name(&self.syslog.default_service) {
             return Err(invalid("syslog.default_service".to_owned()));
         }
-        // The map is named without its key: a peer address is
-        // configuration too, and error text carries no values (ADR-0047).
         if !self
             .syslog
             .source_service_map
@@ -2975,7 +2602,6 @@ impl Config {
     }
 }
 
-/// Configuration loading errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read config file {}: {source}", path.display())]
@@ -3174,7 +2800,6 @@ path = "/data"
         }
 
         assert_eq!(MAX_CONCURRENT_REQUESTS_LIMIT, 65_536);
-        // Both sides are constants, so the bound is checked at compile time.
         const { assert!(MAX_CONCURRENT_REQUESTS_LIMIT <= tokio::sync::Semaphore::MAX_PERMITS) };
     }
 
@@ -3221,7 +2846,6 @@ compaction_interval_secs = 0
             "config validation error: ingest.compaction_interval_secs must be > 0"
         );
 
-        // A query-only node runs no compaction, so the interval is unused.
         let config = Config::from_toml(&format!("{toml}enabled = false\n")).unwrap();
         assert_eq!(config.ingest.compaction_interval_secs, 0);
     }
@@ -3328,8 +2952,6 @@ path = "/data"
         assert!(config.server.cors_allowed_origins.is_empty());
     }
 
-    /// Every glob metacharacter is refused, and the refusal names the one
-    /// it found without echoing the path it found it in.
     #[test]
     fn data_dir_refuses_glob_metacharacters() {
         for metacharacter in GLOB_METACHARACTERS {
@@ -3375,8 +2997,6 @@ path = "/data"
 
     #[test]
     fn query_scratch_refuses_the_filesystem_root_as_data_root() {
-        // Every directory sits inside `/`, so no query scratch directory can
-        // stay outside a data root there.
         let err = Config::from_toml("[server]\n[data]\npath = '/'")
             .unwrap_err()
             .to_string();
@@ -3430,8 +3050,6 @@ path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        // Interactive keys default to 100/min, not the shipper-sized 1000:
-        // an untuned key must not get an ingest-sized query budget.
         assert_eq!(config.server.rate_limit.default_rpm, 100);
         assert_eq!(config.server.rate_limit.ingest_rpm, 1000);
         config.validate().unwrap();
@@ -3592,9 +3210,6 @@ path = "/data"
         );
     }
 
-    /// The report row cap was never applied, so it is gone rather than
-    /// documented as inert: a config that still sets it refuses to load
-    /// instead of reading as a limit. Runs stop at `max_result_rows`.
     #[test]
     fn scheduler_report_max_rows_is_an_unknown_key() {
         let err = Config::from_toml(
@@ -3615,10 +3230,6 @@ report_max_rows = 10000
         );
     }
 
-    /// Both ends of the range are boot-fatal, and both refusals name both
-    /// bounds: zero clamps every window to nothing, and a ceiling past the
-    /// cap makes the catch-up span unrepresentable, which stops the
-    /// scheduler as thoroughly but silently.
     #[test]
     fn scheduler_max_catchup_intervals_outside_the_range_is_boot_fatal() {
         let expected = "config validation error: scheduler.max_catchup_intervals must be \
@@ -3641,8 +3252,6 @@ max_catchup_intervals = {value}
             assert_eq!(err.to_string(), expected, "for {value}");
         }
 
-        // The ceiling itself is accepted: it is a bound, not a refusal of
-        // the value an operator writes to mean "never clamp".
         let config = Config::from_toml(&format!(
             r#"
 [server]
@@ -3660,12 +3269,9 @@ max_catchup_intervals = {MAX_SCHEDULER_CATCHUP_INTERVALS}
         );
     }
 
-    /// Both retention knobs refuse 0 at boot (ADR-0018, amendment
-    /// 2026-11-06), and `report_retention_days` refuses anything past the
-    /// bound the cutoff arithmetic holds. Both fields are `u64`, and the
-    /// toml crate deserializes an integer past `i64::MAX` into one, so the
-    /// widest value an operator can write is `u64::MAX`. The scheduler
-    /// section is not enabled here: the check holds either way.
+    /// Both fields are `u64`, and the toml crate deserializes an integer past
+    /// `i64::MAX` into one, so the widest value an operator can write is
+    /// `u64::MAX`.
     #[test]
     fn scheduler_retention_knobs_must_be_in_range() {
         let load = |line: String| {
@@ -3710,12 +3316,6 @@ enabled = false
         }
     }
 
-    /// The planner multiplies the catch-up ceiling by the schedule
-    /// interval and holds the product in one `chrono::TimeDelta`. Both
-    /// factors are capped, so the widest span any install can configure is
-    /// a fixed number, and it has to be representable: if it were not,
-    /// every due `since_last` run would answer `PlanError::Arithmetic` on
-    /// every poll and the schedule would never advance.
     #[test]
     fn scheduler_catchup_span_always_fits_a_timedelta() {
         let widest = u64::from(MAX_SCHEDULER_CATCHUP_INTERVALS) * MIRRORED_MAX_DURATION_SECS;
@@ -3854,8 +3454,6 @@ min_free_disk_bytes = 0
         assert_eq!(config.retention.min_free_disk_bytes, 0);
     }
 
-    // -- byte size deserializer tests ----------------------------------------
-
     #[test]
     fn parse_byte_size_raw_number() {
         assert_eq!(parse_byte_size("131072").unwrap(), 131_072);
@@ -3967,8 +3565,6 @@ min_free_disk_bytes = "2G"
         assert_eq!(config.retention.min_free_disk_bytes, 2 * 1024 * 1024 * 1024);
     }
 
-    // -- interval field tests ------------------------------------------------
-
     #[test]
     fn interval_defaults_when_omitted() {
         let toml = r#"
@@ -3998,7 +3594,6 @@ telemetry_flush_interval_secs = 5
         assert_eq!(config.ingest.telemetry_flush_interval_secs, 5);
     }
 
-    /// The six task periods and the section each lives in.
     const TASK_PERIODS: [(&str, &str); 6] = [
         ("ingest", "stats_interval_secs"),
         ("ingest", "telemetry_flush_interval_secs"),
@@ -4008,7 +3603,6 @@ telemetry_flush_interval_secs = 5
         ("server", "monitor_refresh_ms"),
     ];
 
-    /// A minimal valid document with `key = value` set in `section`.
     fn task_period_doc(section: &str, key: &str, value: Option<u64>) -> String {
         let mut doc = String::new();
         for name in ["server", "data", "auth", "ingest", "retention", "scheduler"] {
@@ -4090,7 +3684,6 @@ telemetry_flush_interval_secs = 5
             );
         }
 
-        // The two periods that mean "skip the task" at 0 still load.
         let config = Config::from_toml(
             "[server]\ntls_reload_interval_secs = 0\n[data]\npath = \"/data\"\n\
              [auth]\naudit_interval_secs = 0\n",
@@ -4102,8 +3695,6 @@ telemetry_flush_interval_secs = 5
 
     #[test]
     fn web_section_optional_preserves_backcompat() {
-        // A trawld.toml with no [web] section must still parse; the proxy
-        // supplies its own defaults.
         let toml = r#"
 [server]
 [data]
@@ -4119,12 +3710,8 @@ path = "/data"
         assert!(config.web.cookie_secret_env.is_none());
         assert!(config.web.session_ttl_secs.is_none());
         assert!(!config.web.allow_insecure_cookies);
-        // The proxy's own boot refusal is what turns an empty list into an
-        // error; trawld must still parse the file without one.
         assert!(config.web.public_origins.is_empty());
     }
-
-    // -- fleet-auth keystore: [auth] database_url (ADR-0004) -----------------
 
     #[test]
     fn auth_database_url_parses_from_toml() {
@@ -4169,8 +3756,6 @@ path = "/data"
         let url = AuthConfig::resolve_database_url_from(None, Some("postgres://toml/db")).unwrap();
         assert_eq!(url, "postgres://toml/db");
 
-        // Empty env values are unset — a CI secret that fails to inject must
-        // not shadow the configured value.
         let url =
             AuthConfig::resolve_database_url_from(Some(""), Some("postgres://toml/db")).unwrap();
         assert_eq!(url, "postgres://toml/db");
@@ -4183,7 +3768,6 @@ path = "/data"
         assert!(msg.contains("database_url"), "got: {msg}");
         assert!(msg.contains("DATABASE_URL"), "got: {msg}");
 
-        // Empty values on both sides are equally unset.
         let err = AuthConfig::resolve_database_url_from(Some(""), Some("")).unwrap_err();
         assert!(err.to_string().contains("database_url"));
     }
@@ -4203,9 +3787,6 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 
     #[test]
     fn web_public_origins_parse_as_written() {
-        // This crate stores the entries verbatim; trawl-web is where they
-        // reach the origin parser, so the only contract here is that the
-        // list survives TOML in order and unmodified.
         let toml = r#"
 [server]
 [data]
@@ -4220,8 +3801,6 @@ public_origins = ["https://trawl.example.com", "http://localhost:8090"]
             ["https://trawl.example.com", "http://localhost:8090"]
         );
     }
-
-    // -- [storage] database_url (ADR-0004) ------------------------------------
 
     #[test]
     fn storage_database_url_parses_from_toml() {
@@ -4242,8 +3821,6 @@ database_url = "postgres://trawl:trawl@localhost:5433/trawl"
 
     #[test]
     fn storage_section_optional_in_toml() {
-        // Old configs without [storage] must still parse; resolution is what
-        // fails loudly (at boot), not deserialization.
         let toml = r#"
 [server]
 [data]
@@ -4270,16 +3847,11 @@ path = "/data"
             StorageConfig::resolve_database_url_from(None, Some("postgres://toml/trawl")).unwrap();
         assert_eq!(url, "postgres://toml/trawl");
 
-        // Empty env values are unset — a secret that fails to inject must not
-        // shadow the configured value.
         let url = StorageConfig::resolve_database_url_from(Some(""), Some("postgres://toml/trawl"))
             .unwrap();
         assert_eq!(url, "postgres://toml/trawl");
     }
 
-    /// The source is the setting that won, under the same precedence the
-    /// URL-only resolvers apply: a nonempty environment value, else the
-    /// file.
     #[test]
     fn resolve_names_the_winning_source() {
         use DatabaseUrlSource::{ConfigFile, Environment};
@@ -4315,10 +3887,6 @@ path = "/data"
 
     #[test]
     fn storage_resolve_never_falls_back_to_auth_url() {
-        // The stores are app state, not auth: a configured [auth] database_url
-        // must not leak into storage resolution. The resolver's signature
-        // admits no auth input; this pins the end-to-end behaviour on a config
-        // carrying only the auth URL.
         let toml = r#"
 [server]
 [data]
@@ -4328,15 +3896,11 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.storage.database_url.is_none());
-        // With TRAWL_DATABASE_URL unset in the environment this must error,
-        // never borrow the auth URL. (CI never sets TRAWL_DATABASE_URL.)
         if std::env::var("TRAWL_DATABASE_URL").is_err() {
             let err = config.storage.resolve_database_url().unwrap_err();
             assert!(err.to_string().contains("[storage]"), "got: {err}");
         }
     }
-
-    // -- [server] http_addr env override: TRAWL_HTTP_ADDR --------------------
 
     #[test]
     fn http_addr_env_wins_over_config() {
@@ -4356,24 +3920,14 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 
     #[test]
     fn http_addr_empty_env_counts_as_unset() {
-        // An exported-but-blank var is a shell accident (`FOO= cmd`), not a
-        // request to bind the empty string.
         assert_eq!(
             ServerConfig::resolve_http_addr_from(Some(""), "127.0.0.1:5514"),
             "127.0.0.1:5514"
         );
     }
 
-    // -- [auth] env contract: FLEET_DATABASE_URL, not DATABASE_URL -----------
-
     #[test]
     fn auth_resolve_ignores_bare_database_url() {
-        // DATABASE_URL is ceded to the sqlx test harness (#[sqlx::test]
-        // hardwires it). trawld's [auth] resolution reads FLEET_DATABASE_URL
-        // only. Canary: with a toml value configured and FLEET_DATABASE_URL
-        // unset, resolution returns the toml value even when the process has
-        // DATABASE_URL set (CI sets it for the whole test job — this test
-        // fails there if the bare override ever creeps back in).
         let auth = AuthConfig {
             database_url: Some("postgres://toml/fleet".into()),
             ..AuthConfig::default()
@@ -4419,7 +3973,6 @@ allow_insecure_cookies = true
             config.web.upstream_ca_path.as_deref(),
             Some(std::path::Path::new("/etc/trawl/upstream-ca.pem"))
         );
-        // Raw string here; trawl-web owns the parse.
         assert_eq!(
             config.web.upstream_connect_addr.as_deref(),
             Some("127.0.0.1:5514")
@@ -4430,7 +3983,6 @@ allow_insecure_cookies = true
         );
         assert_eq!(config.web.session_ttl_secs, Some(3600));
         assert!(config.web.allow_insecure_cookies);
-        // no shared_domain in this config → standalone mode
         assert!(config.web.shared_domain.is_none());
     }
 
@@ -4453,7 +4005,6 @@ shared_domain = ".fleet.lab.ktle.net"
 
     #[test]
     fn web_shared_domain_absent_is_none() {
-        // Absent → standalone mode (origin-scoped cookie, no Domain attr).
         let toml = r#"
 [server]
 [data]
@@ -4464,8 +4015,6 @@ path = "/data"
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.web.shared_domain.is_none());
     }
-
-    // -- [ingest] env allowlist (ADR-0009) --------------------------------
 
     fn config_with_ingest(ingest: &str) -> Config {
         let toml = format!(
@@ -4483,8 +4032,6 @@ path = "/data"
 
     #[test]
     fn ingest_env_zero_config_defaults() {
-        // Zero-config ingestion works out of the box: default_env fills a
-        // missing env, and an omitted `envs` behaves as `[default_env]`.
         let config = config_with_ingest("");
         assert_eq!(config.ingest.default_env, "prod");
         assert!(config.ingest.envs.is_empty());
@@ -4532,8 +4079,6 @@ envs = ["prod", "lab"]
 
     #[test]
     fn validation_rejects_env_charset_violations() {
-        // `[a-z0-9_-]{1,32}` — uppercase, dots, slashes, spaces, empty, and
-        // over-length names are all path-placement hazards.
         for bad in [
             "Prod",
             "pro.d",
@@ -4561,8 +4106,6 @@ envs = ["prod", "lab"]
 
     #[test]
     fn validation_rejects_reserved_env_names() {
-        // `wal/` (default wal_dir) and `scheduled/` (report runs) live under
-        // the data root — an env with either name would collide with them.
         for reserved in ["wal", "scheduled"] {
             let config = config_with_ingest(&format!(r#"envs = ["prod", "{reserved}"]"#));
             let err = config.validate().unwrap_err().to_string();
@@ -4579,8 +4122,6 @@ envs = ["prod", "lab"]
             );
         }
     }
-
-    // -- [retention.env.<name>] overrides (#108) --------------------------
 
     fn config_with_retention(retention: &str) -> Result<Config, ConfigError> {
         Config::from_toml(&format!(
@@ -4651,8 +4192,6 @@ max_age_days = 0
 
     #[test]
     fn retention_env_table_without_max_age_days_is_a_load_error() {
-        // "Inherit the global" and "keep forever" are opposite answers, so
-        // an operator who wrote the table has to say which one they meant.
         let err = config_with_retention(
             r"
 max_age_days = 90
@@ -4681,9 +4220,6 @@ min_free_disk_bytes = "1G"
 
     #[test]
     fn retention_rejects_a_misspelled_sub_table_name() {
-        // The whole point of denying unknown keys here: `evn` parses as a
-        // perfectly valid table, and without the refusal the override is
-        // silently discarded while prod ages out at the global limit.
         let err = config_with_retention(
             r"
 max_age_days = 7
@@ -4741,12 +4277,6 @@ max_age_days = 30
         }
     }
 
-    /// The helm chart renders `config.retention.envs` through `toJson`, so a
-    /// values file's `1.9`, a `--set-string`'s `"1.9"`, a `"typo"` and a key
-    /// like `prod] #` reach trawld typed and quoted rather than laundered by
-    /// `int` into a one-day limit, a keep-forever 0, or an override for
-    /// `prod`. This pins the other half of that contract: every one of
-    /// those is a refused boot here.
     #[test]
     fn retention_env_refuses_what_the_chart_passes_through_typed() {
         for (label, table) in [
@@ -4773,8 +4303,6 @@ max_age_days = 30
                 "{label}: must name the refusal; got: {err}"
             );
         }
-        // And the quoted GOOD key is the same env as the bare spelling, so
-        // the chart's quoting changes nothing for a valid name.
         let config = config_with_retention(
             "max_age_days = 90\n[retention.env.\"prod\"]\nmax_age_days = 365\n",
         )
@@ -4813,9 +4341,6 @@ max_age_days = 30
         assert!(is_valid_service_name(&"a".repeat(MAX_SERVICE_NAME_LEN)));
     }
 
-    /// Syslog service names reach WAL filenames verbatim (ADR-0009), so a
-    /// path-escaping or unqueryable config value must refuse to start
-    /// rather than silently write outside the data tree.
     #[test]
     fn syslog_service_config_is_validated_at_load() {
         let with_syslog = |syslog: &str| {
@@ -4864,8 +4389,6 @@ default_service = "syslog"
         .expect("valid syslog service names must load");
     }
 
-    /// The zone keys are raw strings here; trawl-server parses and folds
-    /// them (ADR-0050). Unset means UTC, which this crate spells `None`.
     #[test]
     fn syslog_timezone_keys_parse_and_default_to_unset() {
         let config = Config::from_toml("[server]\n[data]\npath = \"/data\"\n").unwrap();
@@ -4906,8 +4429,6 @@ default_timezone = "America/Chicago"
         assert!(err.contains("unknown setting"), "got: {err}");
     }
 
-    /// A wrong-typed value inside a peer-keyed map names the map, never
-    /// the key: a peer address is configuration too (ADR-0047).
     #[test]
     fn syslog_peer_keyed_errors_name_the_map_not_the_key() {
         for map in ["sender_timezones", "source_service_map"] {
@@ -4924,7 +4445,6 @@ default_timezone = "America/Chicago"
                 assert!(!text.contains("198.51.100.77"), "{map}: {text}");
             }
         }
-        // A setting that merely shares the prefix is not cut.
         assert_eq!(
             without_peer_key("syslog.sender_timezones_x".to_owned()),
             "syslog.sender_timezones_x"
@@ -4935,9 +4455,6 @@ default_timezone = "America/Chicago"
         );
     }
 
-    /// A TCP sender under backpressure waits for hot-buffer space instead
-    /// of being disconnected (ADR-0043), so the disconnect threshold is
-    /// gone, and a config still naming it is refused rather than ignored.
     #[test]
     fn syslog_consecutive_send_failures_limit_is_refused() {
         let err = Config::from_toml(
@@ -4957,13 +4474,6 @@ consecutive_send_failures_limit = 100
         );
     }
 
-    // -- [ingest] derivation sources (ADR-0013) ---------------------------
-    //
-    // Shape only: this crate parses the TOML, trawl-server's
-    // `ingest::producer::Derivation::resolve` owns every semantic rule
-    // (bare names, `_time` presence, fold collisions, dialect vocabulary,
-    // bounds) and is boot-fatal about them.
-
     #[test]
     fn derivation_sources_default_to_the_packaged_lists() {
         let config = config_with_ingest("");
@@ -4972,8 +4482,6 @@ consecutive_send_failures_limit = 100
         };
         assert_eq!(names(&config.ingest.severity_from), DEFAULT_SEVERITY_FROM);
         assert_eq!(names(&config.ingest.time_from), DEFAULT_TIME_FROM);
-        // The shorthand carries no dialect at all — "unset", which the
-        // server reads as otel, is distinct from an explicit "otel".
         assert!(
             config
                 .ingest
@@ -4981,8 +4489,6 @@ consecutive_send_failures_limit = 100
                 .iter()
                 .all(|s| s.dialect().is_none())
         );
-        // The code default is what `IngestConfig::default()` holds, so a
-        // programmatically-built config and a parsed empty one agree.
         assert_eq!(
             config.ingest.severity_from,
             IngestConfig::default().severity_from
@@ -5030,8 +4536,6 @@ time_from = ["_time"]
 
     #[test]
     fn derivation_source_typo_in_a_typed_entry_is_an_error() {
-        // A silently-defaulted `dialct` would stop inverting a syslog feed
-        // and say nothing, so an unknown key fails the whole parse.
         let toml = r#"
 [server]
 [data]
@@ -5060,8 +4564,6 @@ time_from = [{ dialect = "otel" }]
 
     #[test]
     fn derivation_source_rejects_a_non_string_entry() {
-        // Neither spelling matches a bare integer, so the untagged enum
-        // fails rather than coercing it into a field name.
         let toml = r#"
 [server]
 [data]
@@ -5073,7 +4575,6 @@ severity_from = [7]
         assert!(toml::from_str::<Config>(toml).is_err());
     }
 
-    /// A config of `[server]` lines on a fixed data root.
     fn query_scratch_config(server: &str, ingest: &str) -> Result<Config, ConfigError> {
         Config::from_toml(&format!(
             "[server]\n{server}\n[data]\npath = \"/var/lib/trawl/data\"\n[ingest]\n{ingest}\n"
@@ -5101,20 +4602,15 @@ severity_from = [7]
 
     #[test]
     fn query_scratch_defaults_cap_query_permits_at_eight() {
-        // One permit per core up to eight. The memory budget is shared, so a
-        // large node gains no headroom from more permits than that.
         assert_eq!(default_query_permits(Some(1)), 1);
         assert_eq!(default_query_permits(Some(4)), 4);
         assert_eq!(default_query_permits(Some(8)), 8);
         assert_eq!(default_query_permits(Some(64)), 8);
-        // An unknown count falls back to four, not to the cap.
         assert_eq!(default_query_permits(None), 4);
     }
 
     #[test]
     fn query_scratch_spill_budget_and_disk_floor_are_independent() {
-        // Nothing ties the retention floor to the spill budget: a floor
-        // below the budget, a floor of zero and a floor far above it all load.
         for (spill, floor) in [
             ("\"8G\"", "\"1G\""),
             ("\"4G\"", "0"),
@@ -5134,7 +4630,6 @@ severity_from = [7]
                 parse_byte_size(floor.trim_matches('"')).unwrap()
             );
         }
-        // Each key keeps its own default when only the other is set.
         let config = Config::from_toml(
             "[server]\n[data]\npath = \"/data\"\n[retention]\nmin_free_disk_bytes = 0\n",
         )
@@ -5217,7 +4712,6 @@ severity_from = [7]
                 "{key}={value}: {err}"
             );
         }
-        // A thread count past u32 is refused by the integer parse.
         let err = query_scratch_config("query_threads = 4294967296", "")
             .unwrap_err()
             .to_string();
@@ -5279,7 +4773,6 @@ severity_from = [7]
                 err.contains(&format!("must not be {relation} the {root}")),
                 "{scratch}: {err}"
             );
-            // The message names keys, never the configured paths.
             assert!(!err.contains("/var") && !err.contains("/srv"), "{err}");
         }
     }
@@ -5312,10 +4805,6 @@ severity_from = [7]
         );
     }
 
-    /// Snapshot paths in the scratch directory reach `DuckDB`'s `read_json`,
-    /// which expands a glob, so the scratch directory carries no glob
-    /// metacharacter: `scratch[1]` would also read the snapshots of a
-    /// `scratch1` beside it. The refusal names the character, not the path.
     #[test]
     fn query_scratch_refuses_glob_metacharacters() {
         for metacharacter in GLOB_METACHARACTERS {
@@ -5331,8 +4820,6 @@ severity_from = [7]
                 )
             );
         }
-        // The default inherits the data root's name, which refuses the same
-        // characters first.
         for metacharacter in GLOB_METACHARACTERS {
             let err = Config::from_toml(&format!(
                 "[server]\n[data]\npath = '/srv/data{metacharacter}x'\n"
@@ -5348,9 +4835,6 @@ severity_from = [7]
         }
     }
 
-    /// A component comparison cannot see where `..` or a working directory
-    /// leads, so an explicit scratch directory spells neither. Startup
-    /// compares the opened directories as well.
     #[test]
     fn query_scratch_refuses_relative_paths_and_parent_components() {
         for (scratch, reason) in [
@@ -5372,8 +4856,6 @@ severity_from = [7]
             );
             assert!(!err.contains("/var") && !err.contains("/srv"), "{err}");
         }
-        // The default beside a relative data root follows the data root's
-        // own rules.
         let config = Config::from_toml("[server]\n[data]\npath = \"relative/data\"\n").unwrap();
         assert_eq!(
             config.query_scratch_dir(),
@@ -5381,14 +4863,6 @@ severity_from = [7]
         );
     }
 
-    /// #304 R5-1: a root spelled through `..` after a component that does
-    /// not exist yet, such as `<base>/missing/../scratch`, has no directory
-    /// to compare until trawld makes `missing`; the filesystem overlap
-    /// check at startup then falls back to `<base>` and passes a scratch
-    /// directory that the root resolves onto once it is made. The spelling
-    /// comparison here cannot see it either. So every owned root is spelled
-    /// without `..`: the data root, the WAL directory (and the repin roots,
-    /// which follow the data root). The refusal names the key, not the path.
     #[test]
     fn owned_roots_refuse_parent_components() {
         for (key, data, wal) in [
@@ -5416,7 +4890,6 @@ severity_from = [7]
             );
             assert!(!err.contains("/srv") && !err.contains("trawl/"), "{err}");
         }
-        // A `.` component resolves where it is spelled, so it stays accepted.
         let config = Config::from_toml(
             "[server]\n[data]\npath = \"/srv/trawl/./data\"\n[ingest]\nwal_dir = \"/srv/./wal\"\n",
         )
@@ -5424,8 +4897,6 @@ severity_from = [7]
         assert_eq!(config.wal_dir(), Path::new("/srv/./wal"));
     }
 
-    /// A config with `[server]`, `[capture]` and `[ingest]` lines on a fixed
-    /// data root.
     fn capture_config(server: &str, capture: &str) -> Result<Config, ConfigError> {
         Config::from_toml(&format!(
             "[server]\n{server}\n[data]\npath = \"/var/lib/trawl/data\"\n[capture]\n{capture}\n"
@@ -5572,7 +5043,6 @@ severity_from = [7]
             "https://0x7f000001",
             "https://trawl.0X1",
             "http://0x7f.0.0.1",
-            // Short, packed and octal-looking spellings.
             "https://127.1",
             "https://2130706433",
             "https://127.000.0.1",
@@ -5669,8 +5139,6 @@ severity_from = [7]
                 "{results}: {err}"
             );
         }
-        // Scratch placed inside the results root is the same overlap, found
-        // from the other side: the results root is `above` scratch.
         let err = capture_config(
             "query_scratch_dir = \"/srv/results/scratch\"\nresults_dir = \"/srv/results\"",
             "",
@@ -5681,7 +5149,6 @@ severity_from = [7]
             err.contains("server.results_dir must not be above the query scratch directory"),
             "{err}"
         );
-        // The default results root also checks the default scratch root.
         let err = capture_config("query_scratch_dir = \"/var/lib/trawl/data.results\"", "")
             .unwrap_err()
             .to_string();
@@ -5689,7 +5156,6 @@ severity_from = [7]
             err.contains("server.results_dir must not be equal to the query scratch directory"),
             "{err}"
         );
-        // Lookalike prefixes are siblings, not overlap.
         let config = capture_config(
             "query_scratch_dir = \"/srv/scratch\"\nresults_dir = \"/srv/scratch-results\"",
             "",
@@ -5720,7 +5186,6 @@ severity_from = [7]
         assert_eq!(capture.queue_depth, 4);
         assert_eq!(capture.page_max_rows, 200);
         assert_eq!(capture.tombstone_secs, 86_400);
-        // An empty table and `Default` agree with the absent one.
         let empty = capture_config("", "").unwrap();
         let default = CaptureConfig::default();
         assert_eq!(empty.capture.max_rows, default.max_rows);
@@ -5795,7 +5260,6 @@ severity_from = [7]
                 "{key}: {err}"
             );
         }
-        // A zero byte size spelled with a unit is the same refusal.
         let err = capture_config("", "max_file_bytes = \"0M\"")
             .unwrap_err()
             .to_string();
@@ -5838,7 +5302,6 @@ severity_from = [7]
                 "{capture}: {err}"
             );
         }
-        // Equality is allowed.
         capture_config("", "per_key_results = 512\nper_key_running = 2").unwrap();
     }
 
@@ -5855,8 +5318,6 @@ severity_from = [7]
         assert_eq!(config.capture.max_wire_bytes, CAPTURE_MAX_WIRE_BYTES_MIN);
     }
 
-    /// A config with `[capture]` and `[investigation]` lines on a fixed
-    /// data root.
     fn investigation_config(capture: &str, investigation: &str) -> Result<Config, ConfigError> {
         Config::from_toml(&format!(
             "[server]\n[data]\npath = \"/var/lib/trawl/data\"\n[capture]\n{capture}\n\
@@ -5873,7 +5334,6 @@ severity_from = [7]
         assert_eq!(investigation.evidence_ceiling_secs, 2_592_000);
         assert_eq!(investigation.evidence_per_investigation_bytes, 64 << 20);
         assert_eq!(investigation.evidence_installation_bytes, 1 << 30);
-        // An empty table and `Default` agree with the absent one.
         let empty = investigation_config("", "").unwrap().investigation;
         let default = InvestigationConfig::default();
         for (absent, empty, default) in [
@@ -5975,7 +5435,6 @@ severity_from = [7]
                 "{investigation}: {err}"
             );
         }
-        // Equality is allowed.
         investigation_config(
             "max_file_bytes = \"8MiB\"",
             "evidence_idle_secs = 2592000\nevidence_per_investigation_bytes = \"8MiB\"\n\
