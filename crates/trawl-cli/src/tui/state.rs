@@ -415,10 +415,19 @@ pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<Commo
     common
 }
 
-/// The bounds are text. Text of one server-rendered timestamp shape orders as
-/// the instants do; text of two does not: a UTC and a local sample name
-/// different instants, and a timestamp beside an integer (one service
-/// mid-repin) is no range at all. Other fields keep the text comparison.
+/// Fold one service's sample bound into a common field's bound, keeping
+/// `candidate` when `replaces(candidate, current)`.
+///
+/// The bounds are text. The server renders timestamp samples fixed-width
+/// (`YYYY-MM-DDTHH:MM:SS.ffffff`, plus `Z` when the column is UTC-adjusted),
+/// and text of one such shape orders as the instants do. Text of two shapes
+/// does not: a UTC and a local sample name different instants, and a
+/// timestamp beside an integer (one service mid-repin) is no range at all.
+/// So for a field some service types as a timestamp (`timestamp`), when
+/// either side is timestamp-shaped and the shapes differ, the common bound
+/// is dropped for good (`dropped`) rather than picking one. A field no
+/// service types as a timestamp keeps the plain text comparison, even when
+/// its text happens to look like one.
 fn fold_common_bound(
     bound: &mut Option<String>,
     dropped: &mut bool,

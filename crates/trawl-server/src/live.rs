@@ -261,9 +261,12 @@ where
     answered.await.ok()
 }
 
-/// A batch whose events have all run is closed before the frame cap
-/// ([`LIVE_JOB_FRAME_BYTES`]) is read again, so its threshold snapshot stays
-/// at its end.
+/// One job's work over `state`.
+///
+/// A chunk takes no event once its frames reach [`LIVE_JOB_FRAME_BYTES`],
+/// and hands the events it did not take back to the driver in
+/// [`JobOutput::handed_back`]. A batch whose events have all run is closed
+/// before the cap is read again, so its threshold snapshot stays at its end.
 fn run_job<C: Fn() -> EvalContext>(state: &mut LiveState, work: Work, clock: &C) -> JobOutput {
     let mut out = JobOutput::default();
     match work {

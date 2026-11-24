@@ -2,12 +2,19 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! trawld answers in UTC only; every client presents instants in the
-//! `ui.timezone` it reads at start (ADR-0051).
-//! Tests cannot set the environment in-process (`unsafe_code = forbid`), so a
-//! zone is always a child's `TZ`. The TUI runs under a PTY, because crossterm
-//! needs a real terminal. Its screen is read with the driver's `capture`;
-//! `get-results` returns the UTC frames the grid converts from.
+//! The display zone is the client machine's, in every client (ADR-0051,
+//! Amendment 2026-11-08): trawld answers in UTC only, and `trawl query`
+//! (daemon and embedded), the TUI and `trawl mcp` read `ui.timezone` once
+//! at start and present each instant with its own offset.
+//!
+//! Every client is the real `trawl` binary, started from an empty
+//! environment (only the dynamic loader's search path survives) with a
+//! temp `HOME` and the `TZ` the case names. Tests cannot set the
+//! environment in-process (`unsafe_code = forbid`), so a zone is always a
+//! child's `TZ`. The TUI runs under a PTY, because crossterm needs a real
+//! terminal, and is driven through its driver socket. Its screen is read
+//! with the driver's `capture`, which draws the grid the way the terminal
+//! does; `get-results` returns the UTC frames the grid converts from.
 
 mod common;
 
@@ -579,8 +586,15 @@ async fn cli_timestamp_output_formats() {
     server.stop().await;
 }
 
-/// A `_time` bound or value read in +05:30 would move the cut by 5h30 and
-/// keep `k=b` (05:59:59Z reads 11:29:59 there).
+/// The display zone is presentation only: a Rust-tail filter on `_time`
+/// keeps the same rows under every `ui.timezone`, daemon and embedded.
+///
+/// One RFC 3339 bound serves both modes, because both tails read `_time`
+/// as the stored instant. The daemon's tail reads it under trawld's `_time`
+/// TIMESTAMP pin. Embedded `--data` has no catalog (ADR-0011), and its tail
+/// reads `_time` under the TIMESTAMP type the SQL step returned. A bound
+/// or a value read in +05:30 would move the cut by 5h30 and keep `k=b`
+/// (05:59:59Z reads 11:29:59 there).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn display_zone_does_not_change_evaluation() {
     const TAIL: &str = "service=zone_probe | extract kv \

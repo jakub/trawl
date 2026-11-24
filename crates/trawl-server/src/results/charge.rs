@@ -5,11 +5,41 @@
 //! Capture admission and quotas (ADR-0057).
 //!
 //! [`CaptureGate::admit`] decides whether one capture may run, before the
-//! capture takes a query id or asks for an executor permit, in four steps:
-//! the quota pre-check, the key's lane, the installation, then the binding
-//! reservation. A key that is already full is refused at the pre-check,
-//! so it never waits in a queue only to be refused at the end. The
-//! pre-check is not binding: step 4 is.
+//! capture takes a query id or asks for an executor permit. It runs four
+//! steps, in this order:
+//!
+//! 1. **Quota pre-check.** The key's and the installation's committed
+//!    usage, plus the reservations of captures still running, plus this
+//!    capture's charge (one result and `max_file_bytes`), against the
+//!    `[capture]` quotas. A key that is already full is refused here, so it
+//!    never waits in a queue only to be refused at the end. The check is
+//!    not binding: step 4 is.
+//! 2. **The key's lane.** `per_key_running` captures run per key. When none
+//!    is free, up to `queue_depth` callers wait inside their own deadline;
+//!    the next caller is refused at once and never queues.
+//! 3. **The installation.** `installation_running` captures run at once.
+//!    A capture that finds none free is refused, not queued: its lane did
+//!    the queueing.
+//! 4. **Binding reservation.** Under the pass lock: expire every due
+//!    temporary capture's row, then read committed usage again, add every
+//!    reservation in the book, and record this capture's charge or refuse.
+//!    Once the pass is released, a task of its own unlinks the expired
+//!    captures' files, so an expired capture frees its disk at the next
+//!    reservation instead of at the next sweep, and a slow filesystem
+//!    holds up no other admission.
+//!
+//! Every refusal says when to try again, in whole seconds and never less
+//! than one. A full lane or installation names the time until the first
+//! running capture's deadline. A full quota names the time until the first
+//! temporary result in the full scope expires, capped at `ttl_secs`, or
+//! `ttl_secs` when nothing there will expire. A deadline that expires
+//! during admission names one second: the capture never started.
+//!
+//! An [`Admission`] holds the lane slot, the installation slot and the
+//! [`Reservation`]. It rides the executor slot through
+//! [`crate::pool::WorkContext::holding`] ([`Admission::into_holds`]), so all
+//! three stay charged until the work physically stops, however the request
+//! ends.
 //!
 //! # The book
 //!
@@ -25,21 +55,64 @@
 //! row was inserted miss that capture in both places, and admit past the
 //! quota. The cost is a capture counted twice for the length of one pass.
 //!
+//! The pre-check counts only charges that are not done: it is not binding,
+//! and a capture it lets through still meets step 4.
+//!
 //! # Evidence
 //!
-//! A binding pass first prunes the evidence of every investigation past
-//! its `retain_until`. The prune waits for the due investigations' locks
-//! no later than the reservation's deadline, and a prune that reaches it
-//! refuses the charge busy, as every wait of the pass does. No path holds
-//! an investigation's lock while it waits for the pass, so the wait
-//! closes no cycle. A prune the store fails is logged by class and left
-//! to the sweep. The pass then counts the due rows it did not prune, so a
-//! failed prune can refuse a charge that would have fitted, and never
-//! admits one past a budget.
+//! An attached capture (ADR-0059) is kept from birth, so it never charges
+//! the temporary quota: [`CaptureGate::admit_attached`] runs the lane and
+//! the installation as for any capture, but its pre-check and its binding
+//! reservation charge `max_file_bytes` against the evidence budgets
+//! instead, the investigation's and the installation's. A promotion of an
+//! existing result ([`CaptureGate::reserve_evidence`]) takes no slot and
+//! charges the result's own stored bytes, its file and its facts document,
+//! by the same binding pass. Its charge
+//! names the results it promotes, so a promotion of the same result that
+//! the budget refused meanwhile can wait for it to end and find the result
+//! kept ([`CaptureGate::promotions_done`]). A charge's scope, temporary or
+//! evidence, decides which sums count it; the purge and the settle are the
+//! same for both.
+//!
+//! Evidence past its investigation's `retain_until` is dead, and once a
+//! binding pass has seen it, it counts against neither budget. Under the
+//! pass lock, before it reads usage, the pass prunes the kept results of
+//! every investigation whose `retain_until` is at or before the gate's
+//! clock, installation-wide, with the sweep's statements
+//! ([`crate::store::ResultsStore::prune_evidence_until`]). It then counts
+//! every kept row ([`crate::store::InvestigationStore::evidence_usage`])
+//! plus the book's evidence charges. Once the pass is released, a task of
+//! its own unlinks the pruned files. A pruned row is final, so the bytes
+//! the pass freed stay free. Leaving the due rows out of the count without
+//! pruning them would not be safe. A write takes its `now` before its
+//! reservation reads the clock, and a write whose `now` is before the
+//! deadline slides it, so the rows left out would be live again beside the
+//! charge admitted in their place. A write to another investigation would
+//! do the same to the installation's sum.
+//!
+//! The prune waits for the due investigations' locks no later than the
+//! reservation's deadline, and a prune that reaches it refuses the charge
+//! busy, as every wait of the pass does. No path holds an investigation's
+//! lock while it waits for the pass, so the wait closes no cycle. A prune
+//! the store fails is logged by class and left to the sweep. The pass then
+//! counts the due rows it did not prune, so a failed prune can refuse a
+//! charge that would have fitted, and never admits one past a budget.
+//!
+//! The evidence pre-check counts only live kept rows, those whose
+//! investigation's `retain_until` is after the gate's clock
+//! ([`crate::store::InvestigationStore::live_evidence_usage`]), plus the
+//! charges not done. It prunes nothing and only refuses, so a dead row it
+//! leaves out can only let a charge on to the binding pass. Counting every
+//! kept row there would refuse a charge that the binding pass, once it has
+//! pruned, admits.
 //!
 //! A pass awaits Postgres, so the lock that serializes passes is an async
 //! one; the book itself is a short synchronous lock, so a settle or a drop
 //! never waits for a pass.
+//!
+//! A lane is made the first time one of a key's captures passes the
+//! pre-check, and is kept for the life of the process: a few dozen bytes
+//! per key, and keys are made by an administrator.
 
 use std::any::Any;
 use std::collections::HashMap;

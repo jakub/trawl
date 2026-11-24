@@ -87,10 +87,20 @@ pub mod prepare_probe {
 /// What the schema probe asked `DuckDB` (ADR-0062), for the tests that
 /// bound it: one `DESCRIBE` per request, never a bind attempt.
 ///
-/// The probe never goes through [`prepare_probe`]: a lane's last prepared
-/// statement stays its own. Each test-only fault is keyed by a marker the
+/// Beside [`prepare_probe`], for the same reason: no production seam shows
+/// the probe, so the evidence is a test-only record. It counts the
+/// `DESCRIBE`s, process-wide and on the calling thread, and keeps the text
+/// of each thread's last one. The probe never goes through
+/// [`prepare_probe`]: a lane's last prepared statement stays its own.
+///
+/// Two test-only faults ride the same door, each keyed by a marker the
 /// `DESCRIBE` text must contain, so parallel tests over different
-/// directories never meet each other's faults.
+/// directories never meet each other's faults:
+/// - [`park_when`] runs a hook between the probe's prepare and its
+///   execute, where a describe of a slow source spends its time;
+/// - [`claim_present`] makes the description claim a column no file
+///   carries, which plants a resolver defect for the outcome policy to
+///   answer.
 #[cfg(any(test, feature = "test-support"))]
 pub mod schema_probe {
     use std::cell::{Cell, RefCell};
@@ -789,8 +799,13 @@ impl Executor {
         }
     }
 
-    /// `pins` types the search-stage comparisons (ADR-0011): the server's
-    /// catalog snapshot, or an empty `FieldTypes` in embedded mode.
+    /// Full pipeline: parse DSL, emit SQL, execute.
+    ///
+    /// `pins` is the field catalog's full pin snapshot typing the
+    /// search-stage comparisons (ADR-0011). Every caller decides: the
+    /// server passes its catalog snapshot; embedded mode passes an
+    /// explicit `FieldTypes::new()`, making its pin-blindness visible at
+    /// the call site.
     ///
     /// A result past `max_rows` is refused ([`RowCap::Refuse`]); a lane
     /// that cuts instead goes through [`Cancellable::run_query`].
@@ -1814,12 +1829,25 @@ impl Executor {
     ///
     /// The file's columns are named by position, `c0`, `c1`, ..., so a
     /// display name, a duplicate one included, never reaches it: names and
-    /// types live in the capture's metadata. A column `StoredType` refuses
-    /// is stored as `VARCHAR` holding each cell's wire JSON instead, and is
-    /// [`StoredAs::WireText`].
+    /// types live in the capture's metadata. A column is stored as its
+    /// [`StoredType`], exactly as [`Self::write_query_result_to_parquet`]
+    /// stores one, and is [`StoredAs::Native`]. A column `StoredType`
+    /// refuses, a `mixed` one or integers that need both a negative and the
+    /// range above `i64::MAX`, is stored as `VARCHAR` holding each cell's
+    /// wire JSON instead, and is [`StoredAs::WireText`]: the encoded cell as
+    /// `serde_json` writes it, object members sorted by key, and a null
+    /// cell `NULL`. [`Self::read_capture_page`] lands it back through the
+    /// result wire's own decoder.
     ///
-    /// `COPY` orders the staged rows by their index `r`, so the file's order
-    /// is the result's whatever order `read_json` reads in.
+    /// The rows are staged as ndjson in the result wire's encoding, each
+    /// with its index `r`, in a 0600 file in the query scratch directory
+    /// ([`crate::scratch::QueryScratch::stage_file`]), or for a database
+    /// opened without one in its private spill directory. `COPY` reads
+    /// them back declared, never inferred, and orders them by `r`, so the
+    /// file's order is the result's whatever order `read_json` reads in.
+    /// The staging file is removed before this returns, whatever the
+    /// outcome. Row groups are [`CAPTURE_ROW_GROUP_ROWS`] rows, so a page
+    /// read decodes a row group or two, not the whole file.
     ///
     /// `dest` is a file the caller made, 0600 in the results root. `COPY`
     /// writes into it in place (`USE_TMP_FILE false`), truncating it first,
@@ -1831,7 +1859,10 @@ impl Executor {
     /// may hold part of a file, and is the caller's to remove.
     ///
     /// Refused with [`EngineError::NotParquetStorable`] when the result has
-    /// no columns: a parquet file holds at least one.
+    /// no columns: a parquet file holds at least one, so the caller keeps a
+    /// zero-column capture as its metadata alone and checks
+    /// `result.columns` before it calls. A cell that disagrees with its
+    /// column's type fails the wire encoding, and the write with it.
     pub fn write_capture_parquet(
         &self,
         result: &QueryResult,
@@ -2991,9 +3022,13 @@ fn typed_columns(stmt: &duckdb::Statement<'_>) -> Vec<Column> {
         .collect()
 }
 
-/// Temporal values render through this module's own formatters
-/// ([`format_timestamp`], [`format_date`], [`format_time`]) while the
-/// value is still an integer count, in the spelling `timestamps` picks.
+/// Extract a `Value` from a duckdb row at the given column index.
+///
+/// Uses `ValueRef` for type-safe dispatch. Temporal values render through
+/// this module's own formatters ([`format_timestamp`], [`format_date`],
+/// [`format_time`]) rather than `DuckDB`'s, because the wire spells a
+/// timestamp its own way while the value is still an integer count.
+/// `timestamps` picks the wire's RFC 3339 or `DuckDB`'s cast text ([`TimestampText`]).
 ///
 /// The cell has to agree with the type [`crate::column_type::column_type`]
 /// gives its column, or the wire encoder refuses it; a `HUGEINT` or

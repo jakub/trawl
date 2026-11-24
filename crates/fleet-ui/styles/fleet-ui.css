@@ -1121,9 +1121,10 @@ select:focus-visible,
   min-width: 0; width: 8px; height: 8px; padding: 0;
   overflow: hidden; color: transparent; background: var(--accent);
 }
-/* Below 899.98px the sidebar is an overlay behind the command bar's
- * toggle. `Shell` and `FacetSidebar` query the same width, so the
- * toggle is never revealed at a width where it opens nothing. */
+/* Below 899.98px: the sidebar is a Capture overlay behind the command
+ * bar's toggle. One spelling of "narrow" across the codebase — `Shell`
+ * and `FacetSidebar` query the same width, so the toggle is never
+ * revealed at a width where it opens nothing. */
 .nav-scrim { position: fixed; inset: 0; z-index: 50; background: oklch(14.5% 0 0 / .18); animation: sd-fade-in 140ms ease-out; }
 .rail.overlay {
   position: fixed; top: 0; left: 0; bottom: 0; z-index: 51;

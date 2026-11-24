@@ -5,19 +5,151 @@
 //! Internal telemetry: custom tracing [`Layer`] that writes server events
 //! to the ingest WAL as `service:trawld`.
 //!
+//! ## Bootstrap
+//!
+//! The tracing subscriber is initialized right after the top-level config
+//! parses. A config read/parse/validation failure happens before any
+//! subscriber exists and surfaces only through an explicit stderr
+//! diagnostic in `main`, never here. Post-parse initialization events
+//! (cert generation, epoch gate, etc.) are captured: [`WalHandle`] wraps
+//! an [`OnceLock`], so the layer registers at init time and buffers
+//! events in memory until [`WalHandle::set`] injects the writer after
+//! startup. A 1 MiB cap bounds that pre-init buffer if the writer is
+//! never set; drops past it are counted under reason `preinit_cap` (event
+//! count exact; bytes estimated from the mean buffered line size, because
+//! the drop happens before serialization and the telemetry-disabled path
+//! must stay cheap).
+//!
+//! ## What is persisted (the stdout/telemetry split)
+//!
+//! The stdout logger and this layer share one filter built from the
+//! resolved directive string, but they do not persist the same events:
+//! the WAL layer additionally refuses the targets in
+//! [`UNMETERED_TARGETS`]. Those events are emitted from request handling
+//! that no per-key rate limiter has metered yet — fleet-auth's bearer
+//! shell, which runs before the limiter; the accept loop, which runs
+//! before there is even a TLS session; trawl's own grant check, which
+//! 403s a grantless key outside the limiter by design. Persisting them
+//! would let a client the limiter cannot slow turn a connection or
+//! request flood into durable corpus growth. They stay on stdout, where
+//! retention is the operator's log pipeline rather than trawl's own disk.
+//!
+//! One unmetered event does persist, under a cap: the failure event of a
+//! server 5xx no limiter metered
+//! ([`UNMETERED_FAILURE_TARGET`]).
+//! A server fault before admission, the auth backend down say, is the
+//! incident an operator searches for afterwards, so the layer admits those
+//! events under one process-wide fixed window of
+//! [`UNMETERED_FAILURE_CAP_PER_MINUTE`] (ADR-0040). Past the cap they stay
+//! on stdout only and are counted under drop reason `unmetered_cap`. Only
+//! that exact target is capped: a target beneath it is excluded like any
+//! other unmetered descendant.
+//!
+//! ## Buffering and the bounded retry queue
+//!
+//! Events are serialized to ndjson and accumulated in an active buffer
+//! (bytes + their event maps, swapped together). Each flush cycle stages
+//! the active buffer as one [`Batch`] on a FIFO retry queue, then writes
+//! pending batches oldest-first. Once a write succeeds in a cycle the
+//! rest of the queue drains coalesced: consecutive batches are
+//! concatenated up to [`MAX_DRAIN_UNIT_BYTES`] and written as one WAL
+//! file, so recovering from a long outage costs writes proportional to
+//! queued bytes rather than to the flush ticks it lasted. That is safe for
+//! the hot-buffer `batch_id` contract — it must stay `{env}/{wal-file-stem}`
+//! of the file the events landed in, and a coalesced unit lands in exactly
+//! one file, so it has exactly one stem and publishes as one `IngestBatch`.
+//! While the volume is still failing nothing merges, so the cap keeps its
+//! per-tick shedding granularity.
+//!
+//! A normal failed write retains the batch for retry (rate-limited stderr +
+//! `trawl_telemetry_wal_write_failures_total`), so a transient storage error
+//! delays events instead of losing them. A failed directory fsync is a
+//! failed write: `WalWriter::write` withdraws the file, and the batch is
+//! retained. If that withdrawal or its own directory fsync also fails, the
+//! file stays where compaction will merge it, or a power loss may restore
+//! it, so the batch is released instead of retried (a retry would
+//! duplicate it) and is not published to the hot buffer or bus, because
+//! the write was never acknowledged. If the blocking write task itself
+//! panics or is cancelled, its consumed in-memory batch cannot be requeued
+//! and is counted once under drop reason `write_crashed`, in addition to
+//! that one write-failure count. The WAL may already be durable: the batch
+//! count describes an uncertain outcome, not confirmed permanent loss.
+//! Total retained memory is capped by
+//! `[ingest] telemetry_buffer_max_bytes` — the charge is an estimate
+//! (serialized ndjson counted twice, once for the bytes and once for the
+//! retained maps which hold roughly the same payload, plus a fixed
+//! per-event map overhead), mirroring the hot-buffer setting's estimate
+//! semantics.
+//!
+//! The budget is one shared allowance over every byte the layer holds —
+//! the active buffer, the retry queue, and the batch currently in flight
+//! through a WAL write (popped from the queue but still in memory) — and
+//! it is enforced at event insertion, not at staging. A cap applied only
+//! to the queue after staging would be no cap at all: while a wedged
+//! `spawn_blocking` write holds a batch, `on_event` would keep appending
+//! to the active buffer without any bound. Admission sheds the oldest
+//! staged batches first (current operational state is worth more than
+//! history), and when there is nothing left to shed — the in-flight batch
+//! cannot be reclaimed — it drops the incoming event rather than
+//! exempting it. Every drop is counted exactly under reason `buffer_cap`,
+//! and `trawl_telemetry_buffer_{events,bytes}` gauge the whole charge, not
+//! just the queue.
+//!
+//! ## Hot-buffer admission (ADR-0043)
+//!
+//! Each drain unit reserves its exact hot-buffer charge (events, ndjson
+//! bytes) as [`ProducerKind::Trawld`](crate::ingest::producer::ProducerKind),
+//! whose ceiling is the full caps, before any WAL write: on the async side
+//! before `spawn_blocking`, and before the publication gate in both flush
+//! paths. A refused unit goes back to the queue front and the cycle ends.
+//! Nothing was attempted, so a refusal is not a write failure: no failure
+//! count, no stderr, no trace. The unit is retried next tick under the same
+//! shared memory budget, and the ledger's refusal counter records it.
+//! Coalescing stops at the full caps on both dimensions, and a queued batch
+//! over them is split at an event boundary. An event larger than the full
+//! caps alone can never fit, so it is dropped as a `buffer_cap` loss. The
+//! reservation travels into the write task and the insert consumes it; a
+//! failed write (a withdrawn file or one left visible for compaction)
+//! releases it and inserts nothing. `on_event` never touches the ledger.
+//!
+//! ## Durability before visibility
+//!
+//! A batch is inserted into the hot buffer and published to the event bus
+//! strictly after its WAL write succeeds, exactly once (the batch is
+//! popped on success, so re-publication is structurally impossible).
+//! Queries and SSE can never observe telemetry that would disappear after
+//! a restart.
+//!
+//! ## Blocking I/O and shutdown
+//!
+//! The async flush task runs each WAL write (create, write, fsync,
+//! rename, dir-fsync) on the blocking pool via `spawn_blocking` —
+//! [`WalLayer::flush`] stays synchronous for tests only. Shutdown is
+//! bounded end to end on a frozen volume: the periodic flush is raced
+//! against the shutdown signal (so a wedged fsync cannot keep the task
+//! from observing it), the final drain runs under a wall-clock budget,
+//! and `trawld`'s `Runtime::shutdown_timeout` bounds the process exit
+//! itself — a plain runtime drop waits on started blocking tasks forever.
+//! A truly wedged fsync therefore leaves one lingering blocking thread at
+//! process exit (accepted and preferable to hanging shutdown).
+//!
 //! ## Infinite recursion guard
 //!
 //! The flush path uses `eprintln!` for error reporting, never
 //! `tracing::*`: a tracing event inside the layer's own flush path would
 //! re-enter `on_event` and loop forever. Two narrow exceptions hold
-//! because `on_event` only buffers: the `telemetry_dropped` recovery event
-//! after a successful write, and `WalWriter::write`'s own dir-fsync and
-//! staging-unlink failure warnings. The invariant is: **no locks are
-//! held across `writer.write`, and flush-path tracing may only buffer.**
+//! because `on_event` only buffers (it takes the active-buffer lock,
+//! which the flush path never holds while emitting): the
+//! `telemetry_dropped` recovery event after a successful write, and
+//! `WalWriter::write`'s own dir-fsync and staging-unlink failure warnings.
+//! The invariant is: **no locks are held across `writer.write`, and
+//! flush-path tracing may only buffer.**
 //!
 //! `on_event` calls `envelope::canonicalize`, so the guard extends to the
 //! door: `ingest/envelope.rs` and `ingest/producer.rs` never call
-//! `tracing`. `tests/canonicalize_no_tracing.rs` asserts it.
+//! `tracing`, which is why a refusal there is a metric and a silent drop
+//! rather than a warning. `tests/canonicalize_no_tracing.rs` reads both
+//! modules and asserts the token is absent outside `#[cfg(test)]`.
 
 use std::collections::{BTreeMap, VecDeque};
 #[cfg(test)]
@@ -136,8 +268,12 @@ where
     }));
 }
 
-/// The most unmetered failure events the WAL layer persists per fixed
-/// one-minute window, across the whole process (ADR-0040).
+/// How many unmetered failure events ([`UNMETERED_FAILURE_TARGET`]) the WAL
+/// layer persists per fixed one-minute window, across the whole process
+/// (ADR-0040). A constant with no operator setting: it bounds the durable
+/// writes a client the rate limiter cannot slow can cause, at 60 rows a
+/// minute. Events past it go to stdout only and are counted under drop
+/// reason `unmetered_cap`.
 pub const UNMETERED_FAILURE_CAP_PER_MINUTE: u32 = 60;
 
 const UNMETERED_FAILURE_WINDOW: Duration = Duration::from_mins(1);
@@ -169,10 +305,21 @@ impl UnmeteredFailureCap {
     }
 }
 
-/// Applied by [`WalLayer`] on top of the resolved directives, not as an
-/// appended `fleet_auth=off` directive: `EnvFilter` resolves by specificity,
-/// so an operator `RUST_LOG` naming `fleet_auth::middleware=info` would
-/// outrank an appended target-level `off` and quietly restore the amplifier.
+/// Whether events on `target` may be persisted as telemetry — false for
+/// every [`UNMETERED_TARGETS`] entry and its module descendants. True for
+/// the exact unmetered failure target ([`UNMETERED_FAILURE_TARGET`]),
+/// which [`WalLayer`] persists under its own cap; its descendants stay
+/// false, because nothing caps them.
+///
+/// [`WalLayer`] applies it on top of the resolved directives, which every
+/// sink shares. A second, non-configurable predicate rather than an
+/// appended `fleet_auth=off` directive: `EnvFilter` resolves by
+/// specificity, so an operator `RUST_LOG` naming
+/// `fleet_auth::middleware=info` would outrank an appended target-level
+/// `off` and quietly restore the amplifier. The unmetered exclusion is an
+/// invariant of what trawl writes to its own disk, not a log level — which
+/// is also why the grant rejection keeps its INFO level and loses its
+/// target instead of being demoted to DEBUG.
 #[must_use]
 pub fn is_persisted_target(target: &str) -> bool {
     target == UNMETERED_FAILURE_TARGET
@@ -984,9 +1131,13 @@ impl WalLayerInner {
         }
     }
 
+    /// Publish a durably-written batch to the hot buffer and event bus —
+    /// strictly after WAL success, exactly once (the batch was popped).
+    /// Then emit the `telemetry_dropped` recovery record if any loss is
+    /// due ([`Self::report_drops`]).
     /// The caller holds the publication read guard from before WAL writing,
     /// and `reservation` is the hot-buffer space admitted for this exact
-    /// batch; the hot-buffer insert consumes it.
+    /// batch ([`Self::reserve_hot`]); the insert consumes it.
     fn publish(
         &self,
         env: &str,

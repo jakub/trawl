@@ -94,20 +94,80 @@ impl PassPlan {
     }
 }
 
-/// When the compaction loop runs its next pass (ADR-0043, ADR-0041).
+/// When the compaction loop runs its next pass.
+///
+/// The first pass runs at once ([`PassKind::Boot`]), whatever the admission
+/// state. It takes WAL of every age and starts no daily rollup; the normal
+/// deadline stays one interval after the start (ADR-0041 slice 2).
 ///
 /// The normal deadline is independent of pressure: only a normal pass moves
 /// it, so continuous pressure can never postpone the rollup.
 ///
-/// A pass that took WAL of every age and found none is not a stall: it ran
-/// before the charge that woke it reached the WAL (a producer reserves,
-/// writes its WAL file, then inserts), so only a wake after a new insert
-/// starts the next pass.
+/// A pass is [`urgent`] while the hot buffer is not `Open` or overhang
+/// holds. Pressure passes follow what the last pass reported
+/// ([`PassOutcome`]): `eligible`, the WAL files its scan selected;
+/// `drained`, the batches it compacted and drained plus the interrupted
+/// publishes recovery finished; `persistent_failures`, its failed chunks,
+/// blocking publication markers and failed or incomplete WAL scans; and
+/// `overhang`, whether overhang still held when it ended. The first rule
+/// that matches decides:
 ///
-/// The deadlines are on tokio's clock ([`tokio::time::Instant`]), so a test
-/// that pauses tokio's time can hold the normal deadline still while real
-/// fsync and `DuckDB` work finishes. Elapsed-time measurements and WAL ages
-/// stay on the real clocks.
+/// 1. **Cooldown** when `persistent_failures > 0`, or when `drained == 0`
+///    and either `eligible > 0` or `overhang`. The WAL is stuck, or the
+///    coverage proof failed with nothing drained, and a rerun would fail or
+///    skip it the same way. Pressure is ignored until the next normal pass,
+///    at most one interval away: no refusal, insert or pressure wake starts
+///    a pass, and only the normal deadline or shutdown ends the wait. The
+///    admission state after the pass plays no part.
+/// 2. **Rerun** at once when `drained > 0` and the pass after it is urgent.
+/// 3. **Wait** otherwise, for a pressure wake or the normal deadline. When
+///    the pass took WAL of every age and still found none, only a wake
+///    after a new insert starts a pass (see below). After a pass that took
+///    only WAL older than the interval, any wake does.
+///
+/// While overhang holds, no pass waits for an insert: a pass that ends
+/// with overhang either drained something and reruns, or cools down.
+///
+/// The cooldown ignores the admission state and the drained batches because
+/// a stall feeds itself. Its error lines reach self-telemetry, and those
+/// inserts give the next pass a healthy batch to drain, which can take the
+/// buffer back to `Open` while the stuck WAL stays. Quarantines and rollup
+/// failures do not count: a quarantined file leaves the WAL, and a failed
+/// rollup does not stop the WAL from draining.
+///
+/// A failure that stays until an operator fixes it cools down every pressure
+/// pass, whichever service it belongs to: a contradictory publication marker
+/// for another service, a WAL file that always fails, or a WAL root entry
+/// the scan cannot inspect. Early draining is then lost for every service.
+/// Each cooldown lasts at most one interval, the cadence without pressure
+/// passes, and fixing the fault restores early draining. ADR-0043 accepts
+/// this trade over a cooldown scoped to the services that hold charge.
+///
+/// A pass with no eligible WAL is not a stall. It ran before the charge that
+/// woke it reached the WAL: a producer reserves, writes its WAL file and
+/// then inserts. A pass that takes every file whatever its age and finds
+/// none proves there was no resident batch, so all the charge was
+/// reservations in flight. Each one inserts or releases. An insert while
+/// not `Open` advances the pressure generation, which wakes the loop, and
+/// [`HotBuffer::inserted_batches`] has moved past its value at the empty
+/// pass's start, so that wake starts a pass. A `Full` refusal wakes the
+/// loop too, but with no insert since the empty pass it finds nothing new,
+/// so the loop waits again without a pass. A reservation's release takes
+/// the buffer back toward `Open` and needs no pass.
+///
+/// Bounds between two normal passes: at most one pass that fails or skips
+/// its WAL, since each starts a cooldown. Every other pressure pass follows
+/// the boot pass, a normal pass, a pass that drained at least one batch, or
+/// an insert since the last empty pass. Each batch drains once, so the pass
+/// count is bounded by the batches inserted, never by the refusals. Without
+/// a hot buffer, the loop runs the boot pass and then normal passes only.
+///
+/// The deadlines are on tokio's clock ([`tokio::time::Instant`]), which is
+/// the same clock as [`std::time::Instant`] unless a test pauses tokio's
+/// time. A paused test can then hold the normal deadline still while real
+/// fsync and `DuckDB` work finishes, so a pass's kind follows from the
+/// events the test drove, never from how long the machine took. Elapsed-time
+/// measurements and WAL ages stay on the real clocks.
 #[derive(Debug)]
 struct Cadence {
     interval: Duration,
@@ -288,9 +348,22 @@ async fn pressure_changed(
 
 /// Spawn the compaction background loop.
 ///
-/// Runs a normal pass every `interval` and then the daily rollup. See
-/// [`PassPlan::new`] for which WAL each pass takes and [`Cadence`] for when
-/// passes run.
+/// Runs a normal pass every `interval`, compacting `wal_dir` `.ndjson`
+/// files whose mtime is older than `interval`, and then the daily rollup.
+/// Groups by service and writes parquet to
+/// `data_dir/{env}/{date}/{HH}/{service}.parquet`.
+///
+/// The first pass runs at once: it compacts every WAL file whatever its age
+/// and skips the rollup. Between normal passes, hot-buffer pressure
+/// (ADR-0043) starts extra passes: when the buffer is not `Open` or its
+/// pressure generation advances, a pass compacts every WAL file whatever
+/// its age and skips the rollup. Overhang (ADR-0041 slice 2) makes every
+/// pass as urgent as pressure does, and each pass ends its WAL phase with
+/// a coverage proof ([`coverage_proof`]) until one clears it. A normal pass
+/// that fires while urgent also takes young WAL. See [`Cadence`] for how
+/// the extra passes stay bounded.
+///
+/// Stops when `shutdown_rx` receives a signal.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
 pub fn spawn_compaction(
     wal_dir: PathBuf,
@@ -3402,12 +3475,19 @@ pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Merge `wal_batch` with an existing parquet file via `UNION ALL BY NAME`.
+///
 /// The batch is conformed to the catalog pins before this runs, and every
-/// trawl-written parquet file is write-time conformant too (ADR-0009), so a
-/// failure here that is not out of memory means the existing file violates
-/// the invariant and is surfaced as `catalog_invariant_violation`. Do not
-/// add a cast-and-retry fallback: rewriting both sides silently hides
-/// exactly the nonconformant corpus this error exists to report.
+/// trawl-written parquet file is write-time conformant too (ADR-0009), so
+/// the direct union cannot conflict on trawl's own files. A failure here
+/// therefore means the existing file violates the invariant — foreign
+/// parquet dropped into the tree, or a restore against a stale catalog —
+/// and is surfaced as `catalog_invariant_violation`: the batch errors, the
+/// WAL files are retained, and the tick retries. A merge that runs out of
+/// memory fails the batch the same way, as a resource failure
+/// ([`StatementFailure`]), with no violation reported. Do not add a cast-and-retry
+/// fallback: rewriting both sides silently hides exactly the nonconformant
+/// corpus this error exists to report.
 fn merge_with_existing(
     conn: &duckdb::Connection,
     canonical_path: &Path,
@@ -3699,11 +3779,19 @@ pub(crate) const AGG_CHUNK_COLS: usize = 256;
 /// all but five away, and the values are client text.
 const MAX_SAMPLED_CONFLICT_COLUMNS: usize = AGG_CHUNK_COLS;
 
-/// How many distinct raw values the capture pulls per column before
-/// [`sanitize_sample`] sanitises and byte-caps them and Rust re-deduplicates:
-/// both transforms can collapse two distinct misfits into one (`a\x01b` and
-/// `a\x02b` both become `a\u{FFFD}b`), so pulling a small multiple of the
-/// budget keeps the slots fillable.
+/// How many distinct raw values the capture pulls per column before Rust
+/// sanitises them ([`sanitize_sample`]) and re-deduplicates.
+///
+/// `DISTINCT` runs in `DuckDB`, on the raw text, but the values that are
+/// stored are the sanitised, byte-capped ones — and both transforms can
+/// collapse two distinct misfits into one (`a\x01b` and `a\x02b` both
+/// become `a\u{FFFD}b`; two long values can share their first 256 bytes).
+/// Pulling a small multiple of the budget keeps the slots fillable when
+/// that happens. Residual, accepted: a column whose misfits differ only in
+/// collapsing positions still yields fewer than [`MAX_CONFLICT_SAMPLES`] —
+/// the samples are evidence of shape, and re-querying for more would cost a
+/// second pass over the batch to distinguish values an operator cannot see
+/// apart anyway.
 const SAMPLE_CANDIDATES: usize = MAX_CONFLICT_SAMPLES * 2;
 
 /// Run the candidate ladder over the columns' actual values, resolving up to
@@ -4181,11 +4269,16 @@ impl ConformPlan {
     }
 
     /// Whether the plan's only work is domain guards over columns already
-    /// of their pin's physical type ([`CastEntry::guard_only`]). A caller
-    /// that has tallied such a plan and found nothing may skip the rewrite:
-    /// every trawl-written parquet carries the SEVERITY-pinned `_severity`, so
-    /// without this the boot pass would rewrite every file in the corpus on
-    /// every re-arm (ADR-0013).
+    /// of their pin's physical type ([`CastEntry::guard_only`]).
+    ///
+    /// Such a plan rewrites nothing unless the source actually holds a
+    /// value outside the domain, and [`Self::tally_conflicts`] answers
+    /// exactly that question with two aggregates per column. So a caller
+    /// that has tallied and found nothing may skip the rewrite entirely —
+    /// which is the difference between "conform the nonconformant files"
+    /// and "COPY the whole archive": every trawl-written parquet carries
+    /// the SEVERITY-pinned `_severity`, so without this the boot pass
+    /// would rewrite every file in the corpus on every re-arm (ADR-0013).
     pub(crate) fn is_guard_only(&self) -> bool {
         !self.casts.is_empty()
             && self.dropped.is_empty()

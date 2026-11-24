@@ -482,11 +482,14 @@ pub async fn query(
             // embeds the generated SQL plus the values it choked on.
             let error_class = e.error_class();
             match &e {
-                // Every 400-class engine answer: a query nobody could have
+                // Every 400-class engine answer, including the refusal
+                // the engine proved by asking `DuckDB` about the
+                // caller's own column: a query nobody could have
                 // answered is the caller's mistake, and logging it at
                 // ERROR as the server's own failure buries the ones
-                // that are. All three share `error_type = "parse"`;
-                // `error_class` tells them apart.
+                // that are. `error_type` is the coarse lane label the
+                // three have shared since the emitter joined the
+                // parser here; `error_class` tells them apart.
                 ServerError::Engine(
                     trawl_engine::error::EngineError::Parse(_)
                     | trawl_engine::error::EngineError::Emit(_)
@@ -2289,12 +2292,22 @@ pub async fn schema_repin(
         .into_response())
 }
 
-/// `POST /api/v1/schema/repin/cancel` — ask the running repin to stop.
+/// `POST /api/v1/schema/repin/cancel` — ask the running repin to stop
+/// (#109). `SchemaWrite`-gated like the trigger, and 503 on a query-only
+/// node for the same reason: a node that owns nothing under the data root
+/// runs no job to cancel.
 ///
 /// No request body: there is at most one running job, and naming it would
 /// invite an operator to cancel a job that already ended and a newer one
-/// took the slot. A store that cannot serve the job row drops `job` from the
-/// body, never the verdict: the cancel has already taken effect in process.
+/// took the slot.
+///
+/// The verdict comes from the registry's own lock through
+/// [`crate::repin::CancelVerdict::wire`] — 202 accepted, 409 past the point
+/// of no return, 404 nothing running — and this handler renders it without
+/// deciding anything. The job row rides along for the two verdicts that
+/// name a job, so an operator sees what was cancelled without a second
+/// round trip; a store that cannot serve that row costs the body, never the
+/// verdict, because the cancel has already taken effect in process.
 pub async fn schema_repin_cancel(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -3277,8 +3290,9 @@ fn close_failed_export(
     metrics::histogram!(crate::metrics::QUERY_DURATION).record(took.as_secs_f64());
 }
 
-/// Called before any await: once the body exists the export succeeded, even
-/// if its caller leaves while the history row is written.
+/// Close a ready export's tracker entry and count its success. The caller
+/// does this before any await: once the body exists the export succeeded,
+/// even if its caller leaves while the history row is written.
 fn close_ready_export(
     tracked: Option<crate::tracker::Tracked>,
     rows: usize,

@@ -5,10 +5,52 @@
 //! A source guard for ADR-0059's rule that an authenticated route judges
 //! authority before request shape.
 //!
-//! The behavioral check of each route is
+//! An extractor that can refuse a request, such as `Path<_>`, `Query<_>`,
+//! `Json<_>` or `Bytes` bound bare, lets axum answer its own 400, 413 or
+//! 422 before the handler runs, so a key without the route's permission
+//! learns whether its request parsed or how large its body was. Every
+//! handler takes those as `Result<_, …Rejection>`, checks its authority,
+//! and only then maps the rejection through `shape::shaped`.
+//!
+//! This test reads the router in `transport/http.rs`, resolves every
+//! handler its `.route(…)` registrations name to the source file that
+//! defines it, and fails when a registered handler lives in a file the
+//! guard does not read. A registration it cannot follow to its handlers,
+//! such as `on(…)`, a macro, or a router nested from elsewhere, fails it
+//! too, named by its path and expression. A `.nest(…)` or `.merge(…)` of a
+//! name is followed through every binding of that name in `router`, and
+//! each must build a router whose own registrations the scan reads: a
+//! chain on `Router::new()`, or on a name bound the same way. A binding to
+//! anything else, or a use of the name the scan cannot follow, fails the
+//! guard. In each registered handler it fails, naming the
+//! file, the function and the parameter, on any parameter whose type is
+//! not on [`NON_REJECTING`] and is not a `Result<_, …Rejection>`: the scan
+//! fails closed, so a type alias or an extractor it does not know must be
+//! named here to pass. A tuple parameter is judged by each of its types,
+//! a `use … as` alias is resolved within its file, and a turbofish path
+//! names the same type. The behavioral check of each route is
 //! `every_handlers_route_judges_authority_before_request_shape` in
 //! `http_api.rs` and its siblings in `investigations_api.rs`; this one keeps
 //! a new route from skipping that table without anyone noticing.
+//!
+//! A second rule keeps the body of a key without the route's permission
+//! unread. axum runs extractors in parameter order, and a body extractor
+//! reads the body whatever the handler does with its result, so in each
+//! registered handler a parameter that reads the body must come after an
+//! authority extractor ([`AUTHORITY`]: `Authorized<_>` or `IngestKey`),
+//! which refuses the key on its request head. A `Result` parameter reads
+//! the body unless its extractor is on [`HEAD_ONLY_RESULTS`], so a body
+//! extractor the scan does not know fails too. A tuple parameter's members
+//! are judged in extraction order, as parameters of their own. A raw
+//! `Request` or `Body` ([`RAW`]) reads the body where the scan cannot see,
+//! and no authenticated handler takes one, so the rule refuses it outright,
+//! after an authority extractor too. The scan names the file, the function
+//! and the parameter.
+//!
+//! Handlers on the unauthenticated router are exempt by name. The list is
+//! checked against `transport/http.rs` so it cannot rot: each name must
+//! still be a function in the sources and still be mounted outside the
+//! `authenticated` router. It needs no database.
 
 use std::fs;
 use std::path::Path;

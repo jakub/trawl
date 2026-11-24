@@ -238,7 +238,9 @@ impl Layout {
         }
     }
 
-    /// Not for a filter value's list, which takes no space in either layout.
+    /// What separates the items of a list: fields, aggregates, arguments,
+    /// assignments, renames and `in` items. A filter value's list takes
+    /// no space in either layout.
     fn comma(self) -> &'static str {
         match self {
             Self::Readable => ", ",

@@ -76,9 +76,20 @@ pub(crate) fn swap_envs(data_dir: &Path, shadow: &Path, aside: &Path) -> Result<
     Ok(())
 }
 
+/// The two failures this text must explain rather than merely report,
+/// both of them a mount in the wrong place: a data root that is itself a
+/// mount point puts the staging siblings on the parent filesystem so no
+/// rename can cross (`EXDEV`), and a volume mounted at a subtree of an env
+/// directory makes that directory unrenameable (`EBUSY`).
 /// [`check_staging_filesystem`](crate::repin::marker::check_staging_filesystem)
-/// refuses a job that would meet `EXDEV` or `EBUSY`, but a marker written
-/// before the volume was mounted still replays here at every boot.
+/// refuses a job that would meet either, but a marker written before the
+/// volume was mounted still replays here at every boot, where the bare
+/// `Invalid cross-device link` / `Device or resource busy` says nothing
+/// about why the node will not start or what to do about it. Nothing has
+/// moved when the `EXDEV` fires (every rename fails alike), so the corpus
+/// stands at its pre-repin generation; the `EBUSY` is per env, so envs
+/// without a nested mount may already serve the new generation and
+/// finishing the swap, not undoing it, is the way out.
 fn cross_device_hint(e: &std::io::Error) -> &'static str {
     match e.kind() {
         std::io::ErrorKind::CrossesDevices => {

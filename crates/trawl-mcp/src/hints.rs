@@ -189,9 +189,12 @@ pub async fn never_observed<B: Backend>(backend: &B, query: &str) -> Vec<String>
     check_fields(backend, parse_work(move || fields_to_check(&query)).await).await
 }
 
-/// The advice, the nearest-bounds plan and the field checks each parse their
-/// own copy of the text, in one task on the blocking pool, so one that finds
-/// nothing never empties another.
+/// The hints of an executed search: the [`advice`] on `sent`, the text the
+/// call sent, then the hints that read trawld for `result`:
+/// [`nearest_bounds`] when it has no rows, and [`never_observed`]. All
+/// three read their text in one task on the blocking pool, each from its
+/// own parse, so one that finds nothing never empties another; then the
+/// trawld calls run together, the nearest bounds' first.
 pub(crate) async fn search_hints<B: Backend>(
     backend: &B,
     result: &CapturedResult,
@@ -870,9 +873,15 @@ mod tests {
             .expect("every hint walk must fit 512 KiB at depth 64");
     }
 
-    /// On a quarter of a worker's stack, any recursive walk of the 32 000-term
-    /// chain or the 16 000-`NOT` run would overflow and abort the test binary,
-    /// so passing shows that nothing walks the tree.
+    /// A query over the 64-level limit gets no query-derived hint, and the
+    /// hints never walk its tree: both entry points start with
+    /// `parse_unbuilt(…).ok()?`, which refuses the text before any walk.
+    ///
+    /// The 65-level `where` and `NOT` run show the boundary. The same
+    /// shapes thousands of levels deep show that nothing walks the tree:
+    /// on a quarter of a worker's stack, any recursive walk of a 32 000-term
+    /// chain or a 16 000-`NOT` run would overflow and abort the test
+    /// binary, where the refusal costs heap.
     #[test]
     fn an_over_deep_query_gets_no_hint() {
         let deep_where = format!("* | where {}", comparisons(LIMIT + 1, "or"));

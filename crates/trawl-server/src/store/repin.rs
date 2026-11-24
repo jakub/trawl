@@ -100,10 +100,12 @@ pub struct RepinJob {
     /// report", which is why the force verdict is absent rather than false
     /// before this is set.
     pub planned_at: Option<DateTime<Utc>>,
-    /// When a cancel request was accepted for this job, if one was. A
-    /// populated pair with `cancelled_by` on a non-`Cancelled` row is not a
-    /// contradiction: the job crashed before the request took effect, or the
-    /// cancel lost its race with the point of no return.
+    /// When a cancel request was accepted for this job, if one was. Set
+    /// together with [`Self::cancelled_by`] and never overwritten, so a
+    /// second request over a job already cancelling reads the first asker's
+    /// instant. A populated pair on a non-`Cancelled` row is not a
+    /// contradiction: the job crashed before the request took effect, or
+    /// the cancel lost its race with the point of no return.
     pub cancel_requested_at: Option<DateTime<Utc>>,
     pub cancelled_by: Option<String>,
 }
@@ -421,14 +423,33 @@ impl RepinStore {
     }
 
     /// Freeze the finished shadow's tallies on the job row: the five final
-    /// counts and the per-service rows the rewrite nulled, in one statement
-    /// (ADR-0022 ruling 2). `services` is `(service, rows_nulled)` pairs,
-    /// already ordered and capped by the caller.
+    /// counts and the per-service rows the rewrite nulled, in one statement.
+    ///
+    /// This is the evidence barrier (issue #137). The cutover materialises
+    /// `field_conflicts` rows from these tallies in the same transaction
+    /// that flips the pin, so the read that first sees `succeeded` also sees
+    /// the evidence. That only works if the tallies are durable before the
+    /// `data/REPIN` Cutover marker goes down, because past that marker the
+    /// engine is forward-only and a crash completes the flip from the marker
+    /// alone, with no shadow left to re-count.
+    ///
+    /// One UPDATE, not one per column set: the counts and the per-service
+    /// tallies are one reading of the finished shadow, and a row carrying
+    /// totals from the last pass beside tallies from the one before would
+    /// describe a corpus that never existed. `services` is
+    /// `(service, rows_nulled)` pairs, already ordered and capped by the
+    /// caller.
     ///
     /// Zero rows updated is an invariant violation, never a quiet success:
-    /// the job was already terminal or is a dry run that has no rewrite to
-    /// stage. Either way the caller is about to write a Cutover marker, and
-    /// it must not.
+    /// the `WHERE` demands a `running`, non-dry-run row, so no match means
+    /// the job was already terminal (an orphan reconciliation, a concurrent
+    /// finish) or is a dry run that has no rewrite to stage. Either way the
+    /// caller is about to write a Cutover marker for a job postgres does not
+    /// agree is running, and it must not.
+    ///
+    /// Re-staging the same job while it is still `running` is fine: the
+    /// statement is a plain overwrite, so a retried staging call lands the
+    /// same row.
     pub async fn stage_cutover_input(
         &self,
         id: i64,
@@ -546,18 +567,64 @@ impl RepinStore {
 
     /// The cutover's pin flip: `field_types` takes the new type, the job
     /// completes, and the loss the rewrite staged becomes `field_conflicts`
-    /// evidence — one transaction (ADR-0022). Idempotent on purpose: boot
-    /// recovery replays this, and a redo must neither error nor restamp
-    /// `finished_at`.
+    /// evidence — one transaction, so a crash between any two of them cannot
+    /// leave a flipped pin with a `running` job, or a `succeeded` job whose
+    /// losses nothing has recorded.
+    ///
+    /// That last part is the evidence barrier (issue #137): the read that
+    /// first sees `succeeded` also sees the conflicts the repin caused.
+    /// Materialising here rather than in the engine after the flip is what
+    /// makes it true for boot recovery too — recovery replays this call and
+    /// nothing else, so evidence written by the engine would simply never
+    /// exist for a job that died between the swap and the flip.
+    ///
+    /// Idempotent on purpose: boot recovery replays this after a crash in
+    /// the cutover or cleanup window, and a redo must neither error nor
+    /// restamp `finished_at`.
+    ///
+    /// The completing UPDATE gates and pays out in one locked statement —
+    /// it returns the staged tallies only when this call is the one that
+    /// moved the row out of `running`. Both writes that are not naturally
+    /// idempotent hang off that: clearing the old evidence (it indicts a pin
+    /// that no longer exists, and the analyzer's gate is span-based, so
+    /// leaving it would badge the field as degraded forever and the
+    /// operator's remedy would not clear the sign that told them to apply
+    /// it) and inserting the new. A replay of an already-succeeded job gets
+    /// no row back and therefore touches neither.
+    ///
+    /// The operator's acknowledgement of the degraded badge goes with it, in
+    /// the same transaction and under the same gate: an ack suppresses a
+    /// verdict about a pin, and that pin is gone. Whether the DELETE removed
+    /// anything comes back on [`CutoverOutcome::cleared_ack`], so the audit
+    /// event fires for the clear that happened and never for a boot replay
+    /// of it. One line per OBSERVED clear, which is weaker than one per
+    /// clear: the DELETE commits here, and a crash before the caller emits
+    /// loses the line with nothing left to replay it from
+    /// (`repin::engine`).
+    ///
+    /// The ack clear rides the same gate as the evidence writes: a replay
+    /// of an already-succeeded job gets no row back, so it neither deletes
+    /// the evidence this flip inserted for the new pin nor an ack an
+    /// operator wrote after the flip.
     ///
     /// The transaction OPENS with `SELECT 1 FROM field_types WHERE field =
-    /// $1 FOR UPDATE`. The flip's own UPDATE is predicated `duckdb_type IS
-    /// DISTINCT FROM $2`, so a resurrection-only repin (`to == current`) takes
-    /// no lock at all, and `acknowledge_degraded_field` serializes against this
-    /// transaction by taking `FOR SHARE` on that same row. Without the explicit
-    /// lock a same-type cutover gives the ack nothing to wait on: its upsert
-    /// lands as a high-water over counters that were just reset, suppressing
-    /// the new pin's first episodes.
+    /// $1 FOR UPDATE`, and that lock is not incidental to the pin flip. The
+    /// flip's own UPDATE is predicated `duckdb_type IS DISTINCT FROM $2`, so
+    /// a resurrection-only repin (`to == current`) matches no row and takes
+    /// no lock at all. `acknowledge_degraded_field` serializes against this
+    /// transaction by taking `FOR SHARE` on that same row, so without the
+    /// explicit lock a same-type cutover has nothing for the ack to wait on:
+    /// the ack reads the episode sum, this transaction clears the evidence
+    /// and the ack row, and the ack's upsert lands afterwards as a
+    /// high-water over counters that were just reset — suppressing the new
+    /// pin's first episodes. Locking unconditionally makes the two orders
+    /// the only two outcomes for every repin, not just the retyping ones.
+    ///
+    /// The job row's own `field`/`from_type`/`to_type` must agree with the
+    /// call's arguments. They are the same facts by two routes — the caller
+    /// passes what the `data/REPIN` marker or the engine holds, the row
+    /// carries what was claimed — and a disagreement means the wrong job is
+    /// about to complete a flip, so the transaction is abandoned untouched.
     pub async fn finish_cutover(
         &self,
         id: i64,

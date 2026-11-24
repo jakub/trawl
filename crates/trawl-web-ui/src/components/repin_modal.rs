@@ -51,10 +51,15 @@ enum Phase {
     },
     /// The server's own message for a status this modal cannot act on.
     /// The modal stays open and keeps the plan it was acting on, if
-    /// there was one. Any dry-run failure lands here, and so does a real
-    /// run refused with a definitive 4xx: a 4xx is decided before the
-    /// claim, so nothing started. A real run's 5xx or lost connection is
-    /// [`Phase::Indeterminate`] instead.
+    /// there was one — a 503 must not cost the operator the scan they
+    /// have already paid for.
+    ///
+    /// Two things reach this: any dry-run failure (the scan mutates
+    /// nothing, so retrying is free), and a real run refused with a
+    /// definitive 4xx. The claim happens before the server answers, so a
+    /// 4xx is decided before it — nothing started, and saying the
+    /// outcome is unknown would be a lie the operator has to chase. A
+    /// 5xx or a lost connection is [`Phase::Indeterminate`] instead.
     Failed {
         message: String,
         plan: Option<Box<RepinJobResponse>>,

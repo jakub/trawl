@@ -4,9 +4,12 @@
 
 //! The reserved `-p trial` profile, observed on the real `trawl` binary.
 //!
-//! `validate` with a token goes to the server, so a success proves the URL,
-//! the token, and the CA all came from the trial directory; a refusal
-//! proves no request was sent.
+//! Each test builds a finished trial directory under a temp
+//! `XDG_STATE_HOME`, with a temp `HOME` and the inherited `TRAWL_*`
+//! environment stripped, and serves the trial's certificate from a real
+//! rustls listener on `127.0.0.1`. `validate` with a token goes to the
+//! server, so a success proves the URL, the token, and the CA all came
+//! from the trial directory; a refusal proves nothing was sent.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};

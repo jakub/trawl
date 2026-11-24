@@ -209,12 +209,21 @@ fn a_log_enabled_probe_does_not_drop_the_next_event() {
     assert_in_both_sinks_with_request_id(marker, request_id);
 }
 
-/// Migration is forced rather than hoped for. Each future spawns a blocker,
-/// then requeues itself ([`requeue_now`]). The blocker takes the worker's
-/// LIFO slot, which no other worker can steal, and holds that worker until
-/// the future has been polled again. The requeued future waits in the
-/// worker's stealable run queue, so an idle worker steals it. A semaphore
-/// keeps at most `MAX_BLOCKED` workers held, so idle workers remain to steal.
+/// Guard for the other suspect: a request future that migrates between
+/// runtime workers across awaits must still enter and exit its span on
+/// one thread per poll, so every event it emits carries its own span and
+/// no other request's.
+///
+/// Migration is forced rather than hoped for. After its first poll each
+/// future spawns a blocker, then wakes itself and returns `Pending`
+/// ([`requeue_now`]). The blocker takes the worker's LIFO slot, which no
+/// other worker can steal, and holds that worker until the future has been
+/// polled again. The requeued future waits in the worker's stealable run
+/// queue, so an idle worker steals it and polls it on another thread. A
+/// semaphore keeps at most `MAX_BLOCKED` workers held, so idle workers
+/// remain to steal. Every future records the thread of each poll. The test
+/// fails, rather than passing vacuously, unless at least one future moved
+/// threads while inside its span.
 #[test]
 fn a_request_future_keeps_its_span_across_worker_threads() {
     const WORKERS: usize = 4;

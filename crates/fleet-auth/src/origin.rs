@@ -245,9 +245,11 @@ impl FromStr for Origin {
 }
 
 impl fmt::Display for Origin {
-    /// The canonical form a browser sends. It round-trips through
-    /// [`Origin::parse`], so the rejection log prints only bounded text,
-    /// never what the attacker typed.
+    /// The canonical serialization, which is what a browser would have
+    /// sent: lowercase scheme and host, default port omitted. Round-trips
+    /// through [`Origin::parse`], so it is also the form the rejection log
+    /// prints — bounded by construction and free of anything the attacker
+    /// typed.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}://{}", self.scheme.as_str(), self.host)?;
         if self.port != self.scheme.default_port() {

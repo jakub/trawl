@@ -2001,13 +2001,19 @@ fn job_totals(totals: BuildTotals) -> JobTotals {
 
 impl RepinEngine {
     /// Why the cutover must not swap while publication markers are pending
-    /// (ADR-0041), or `None` only when a scan read none. Call under the
-    /// cutover guard.
+    /// (ADR-0041), or `None` when there are none. Call under the cutover
+    /// guard.
     ///
     /// A marker proves its publish by the canonical output's identity. The
     /// swap replaces every canonical file with its rewritten copy, so after
     /// it recovery could no longer tell a finished publish from an
-    /// unfinished one.
+    /// unfinished one and would block the service as a contradiction.
+    /// Compaction publishes and recovers under the corpus read guard, so a
+    /// marker seen here is one that recovery left: a failed retirement or a
+    /// contradiction, which the next compaction tick or an operator resolves.
+    /// Markers that cannot be read count as pending. The returned text is
+    /// stored on the job row and served to schema readers, so it names the
+    /// reason without paths or error text; only a DEBUG event carries those.
     async fn pending_publication(&self, job_id: i64) -> Option<String> {
         let wal_dir = self.wal_dir.clone();
         let scan = on_blocking_pool("repin publication claims", move || {

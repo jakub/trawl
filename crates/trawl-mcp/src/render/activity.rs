@@ -5,12 +5,51 @@
 //! Investigations as text: the board, the activity an attached call
 //! carries, and the `investigation` reply (ADR-0059).
 //!
-//! An activity entry longer than [`ENTRY_ALLOWANCE_BYTES`] prints
-//! abbreviated. Every entry fits, so the session can count it as seen. A
-//! board read prints entries whole. The continuation line belongs to the
-//! block, so it survives when the fitting drops the proposed next calls.
-//! The mirror is the fitted reply, so it holds exactly what the text
-//! printed.
+//! One renderer prints an investigation for `investigation` with
+//! `action: read` and for `read` with `action: investigation`: its title,
+//! question, scope, status, sequence and retention, then the entries
+//! changed after `since` in `updated_seq` order, then a continuation when
+//! trawld holds more or the response budget dropped some. Every entry is
+//! one line: `#seq kind by prefix "name" at time: payload`, a step whose
+//! outcome came later marked `(changed at #n)`. The actor's name and every
+//! text an entry carries print as JSON strings, so stored text stays data
+//! and stays on its line.
+//!
+//! The activity of an attached call is the same lines for the entries
+//! other keys changed since the session's `seen_seq`, with two rules that
+//! keep each entry printed exactly once per session:
+//!
+//! - An entry whose line is longer than [`ENTRY_ALLOWANCE_BYTES`] prints
+//!   abbreviated: its header and a marker naming the bytes left out and
+//!   the read that prints it whole. Every entry fits, so the session can
+//!   count it as seen.
+//! - The budget cuts entries from the end, never from the middle, and the
+//!   block says how many it dropped. A cut, or trawld's `more`, ends the
+//!   block with `next: investigation {"action":"read",…,"since":n}` from
+//!   the last printed entry. That line belongs to the block, so it
+//!   survives when the fitting drops the proposed next calls.
+//!
+//! A board read prints entries whole. When not even its first entry fits,
+//! it prints that one abbreviated, with a marker naming the read at the
+//! hard cap when it fits there, or saying no response holds it, so the
+//! read still advances.
+//!
+//! A reply to a write trawld accepted keeps its acknowledgement, the
+//! outcome line naming the investigation and the seq written, at every
+//! budget. When the entries, the activity and the proposed next calls are
+//! gone and the reply still does not fit, the entry written prints
+//! abbreviated, its marker naming the read that prints it; then the
+//! title, question and scope print as escaped prefixes cut on a character
+//! boundary, each with a marker naming the bytes left out and where the
+//! whole text is, in the text and the mirror alike. Every reply but one
+//! whose attribution alone is larger than the budget fits.
+//!
+//! The reply's `printed_through` is the `updated_seq` of the last entry the
+//! fitted reply printed, read from its mirror by [`printed_through`]: the
+//! mirror is the fitted reply, so it holds exactly what the text printed.
+//! A board read has seen the board through trawld's `through_seq` when its
+//! reply printed every entry trawld sent and trawld holds none past them,
+//! even when there were none to print ([`board_through`]).
 
 use std::fmt::Write as _;
 

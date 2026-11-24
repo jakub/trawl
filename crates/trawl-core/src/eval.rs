@@ -115,8 +115,10 @@ pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
 /// presentation rules that diverge from Rust's `Display`/`Debug`:
 ///
 /// 1. Integer-valued doubles always carry a `.0` suffix (`1.0`, not `1`).
-/// 2. Negative zero keeps its sign: `-0.0` → `"-0.0"`. (A SQL literal
-///    `-0.0` renders `0.0` only because the parser folds it to `+0.0`.)
+/// 2. Negative zero keeps its sign: `-0.0` → `"-0.0"`. (A SQL *literal*
+///    `-0.0` renders `0.0`, but only because the parser constant-folds it to
+///    positive zero — a computed or stored `-0.0` renders signed, probe-pinned
+///    in `trawl-engine/tests/duckdb_probe.rs`.)
 /// 3. Scientific notation kicks in at the same magnitude thresholds as Rust's
 ///    `{:?}` (`>= 1e16` and `< 1e-4`), so we lean on Debug for the switch-over.
 /// 4. The exponent always carries a sign and is zero-padded to a minimum of two
@@ -124,7 +126,16 @@ pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
 ///    `e-5` (no sign, no pad).
 /// 5. Specials render lowercase: `inf`, `-inf`, `nan` — and a NaN keeps
 ///    its sign bit like any other value, so a negative one renders
-///    `-nan` (probed in `a_rendered_nan_keeps_its_sign`).
+///    `-nan` (probed in `a_rendered_nan_keeps_its_sign`). Both spellings
+///    pass the DOUBLE pin's round-trip guard, so both are values a
+///    conformed column really stores.
+///
+/// The batch lane renders `tostring()`, `concat()`/`||` and any other
+/// `CAST(… AS VARCHAR)` over a float this way; mirroring it here is what
+/// keeps the two lanes from disagreeing about a float's text. It is also
+/// the DOUBLE pin's glob/regex text — re-exported as
+/// [`crate::compare::canonical_double_text`], so a pattern over a
+/// DOUBLE-pinned column matches the same string in both engines.
 pub(crate) fn duckdb_double_to_string(x: f64) -> String {
     if x.is_nan() {
         // The sign bit, not the ordering: `-nan < 0.0` is false, so the
@@ -1416,10 +1427,14 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
     };
     let fmt = duckdb_strftime_format(fmt);
     let fmt = fmt.as_ref();
-    // chrono turns an invalid specifier (e.g. `%Q`) into `Item::Error`, whose
-    // `Display` returns `fmt::Error`, so `ts.format(fmt).to_string()` would
-    // panic. Invalid format literals are refused when either lane compiles
-    // the query, so this guard covers only a non-literal (field-ref) format.
+    // A `fmt` is fully user-controlled. chrono turns an invalid/incompatible
+    // specifier (e.g. `%Q`) into `Item::Error`, whose `Display` returns
+    // `fmt::Error` — `ts.format(fmt).to_string()` would then panic ("a Display
+    // implementation returned an error unexpectedly"). Detect the error item up
+    // front and return Null instead. Invalid format literals are rejected at
+    // emit/compile time in both paths (see emitter::validate_format_literal),
+    // so this guard covers only a non-literal (field-ref) format, which cannot
+    // be checked upfront.
     if chrono::format::StrftimeItems::new(fmt)
         .any(|item| matches!(item, chrono::format::Item::Error))
     {
@@ -1428,8 +1443,28 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
     EvalValue::Str(ts.format(fmt).to_string())
 }
 
+/// `strptime(str, fmt)` — parse a string to `Timestamp` using chrono format.
+///
 /// `DuckDB`'s `STRPTIME` fills the components a format omits from a
-/// `1900-01-01 00:00:00` base; `resolve_date`/`resolve_time` mirror it.
+/// `1900-01-01 00:00:00` base: a year-only format yields `…-01-01 00:00:00`, a
+/// date-only format yields midnight, a time-only format yields `1900-01-01`, and
+/// a date with an incomplete time (`%Y-%m-%d %H`) keeps the hour and zero-fills
+/// minute/second. We mirror this exactly by parsing once into a
+/// `chrono::format::Parsed`, then resolving each half — letting chrono resolve
+/// derived fields first (ISO week, ordinal `%j`, `%s` epoch, am/pm) and injecting
+/// the `1900-01-01 00:00:00` defaults only for components that are genuinely
+/// missing (see `resolve_date`/`resolve_time`).
+///
+/// `chrono::format::parse` matches the whole input against the whole format, so
+/// trailing or insufficient input still rejects (both paths `Null`, as `DuckDB`
+/// does), and an unparseable value returns `Null` — matching the `TRY_STRPTIME`
+/// the batch emitter uses.
+///
+/// Codes that interact with the base injection or with time zones can diverge
+/// from `DuckDB` and follow chrono per ADR-0001's parity contract: a *bare*
+/// two-digit year (`%y` alone) resolves to `Null` — the injected `1900` base year
+/// conflicts with the parsed mod-100 — and offset codes (`%z`/`%Z`) keep the
+/// wall-clock time chrono parses rather than normalizing to UTC.
 fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     if args.len() != 2 {
         return EvalValue::Null;

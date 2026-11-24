@@ -170,9 +170,10 @@ impl<S> Incoming<S> {
         (incoming, attempts)
     }
 
-    /// Called from the operation's async body, so an attempt is counted when
-    /// the listener first polls it, not when it builds it.
-    // `faults` lives on `self` only under `test-support`; the signature
+    /// Start one accept or receive: count it, and answer the next fault if
+    /// one is queued. Called from the operation's async body, so a call is
+    /// counted when the listener first polls it, not when it builds it.
+    // The queue lives on `self` only under `test-support`; the signature
     // stays the same in every build so the listeners carry no cfg.
     #[cfg_attr(
         not(any(test, feature = "test-support")),

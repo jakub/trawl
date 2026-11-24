@@ -4,11 +4,24 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # Evidence tooling for issue #241: prove signed-out-probes.spec.ts depends
-# on the status bar's session gate in src/pages/layout.rs.
+# on the status bar's session gate in src/pages/layout.rs. Removes ONLY that
+# gate (the connected-label change stays), builds the SPA, and requires the
+# spec to fail on its health-request assertion; then restores the file,
+# builds again, and requires the spec to pass. Prints both outcomes and
+# exits 0 only if both legs behave.
 #
-# The ungated and gated builds go to script-owned dist directories under target/, served
+# Each leg's outcome comes from the JSON report
+# (issue241-negative-leg.verdict.mjs): pass, fail, or INCONCLUSIVE. A failure
+# counts only if its error is located at the spec's health-count assertion
+# and its message header is that assertion's failure, so a port collision,
+# launch failure, timeout, crash, unreadable report, or an error on a
+# neighbouring line is INCONCLUSIVE (exit 3), never a kill. A surviving
+# mutant, or a gated build that fails, is RESULT: FAIL (exit 1).
+#
+# Both builds go to script-owned dist directories under target/, served
 # through TRAWL_E2E_DIST, so crates/trawl-web-ui/dist is never written and no
-# exit path can leave the ungated app there.
+# exit path can leave the ungated app there. The exit and signal traps
+# restore layout.rs and remove those directories.
 #
 # Usage: e2e/scripts/issue241-negative-leg.sh   (E2E_PORT defaults to 8123)
 #        e2e/scripts/issue241-negative-leg.sh --self-test   (verdict parser only)

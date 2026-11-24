@@ -2079,9 +2079,14 @@ mod tests {
         }
     }
 
-    /// `DuckDB` reads every input here, so each is a live tail that
-    /// UNDER-matches a batch query. The reasons are on
-    /// [`canonical_timestamp_text`].
+    /// The two shapes the mirror deliberately does NOT read, asserted here
+    /// so a later change to either has to say so out loud.
+    ///
+    /// `DuckDB` has a reading for all of them, so each is a live tail that
+    /// UNDER-matches a batch query — never the reverse. The reasons are on
+    /// [`canonical_timestamp_text`]; the divergence itself is pinned
+    /// against the engine in `trawl-engine/tests/duckdb_probe.rs`, so it
+    /// stays a known cost rather than becoming a rediscovery.
     #[test]
     fn canonical_timestamp_text_declines_the_documented_residuals() {
         for input in [

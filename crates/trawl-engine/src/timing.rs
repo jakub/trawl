@@ -282,9 +282,13 @@ impl PhaseClock {
         }
     }
 
-    /// With no phase active, `phase` was already booked by
-    /// [`Self::close_at`], as when a dropped request future releases its
-    /// locals in any order. That exit is a no-op.
+    /// Finish `phase` now and add its elapsed time to its total.
+    ///
+    /// A phase that is no longer active was already booked by
+    /// [`Self::close_at`]: an account written while a guard was still in
+    /// scope, as when a dropped request future releases its locals in
+    /// any order. That exit is a no-op. Exiting a phase while a different
+    /// one is active is a bug in the caller's instrumentation.
     pub fn exit(&self, phase: QueryPhase) {
         let now = Instant::now();
         let Some(mut state) = self.state() else {

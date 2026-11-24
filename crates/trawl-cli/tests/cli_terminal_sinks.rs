@@ -321,10 +321,14 @@ fn csv_records(text: &str) -> Vec<Vec<String>> {
     records
 }
 
-/// comfy-table sizes the table to the terminal it finds, which is the
-/// developer's own when the test runs from one, so a cell may wrap: its
-/// pieces are joined without their padding. That restores any text without
-/// spaces, which is all this test compares.
+/// The cells of each row of a drawn table, the header first.
+///
+/// A row is the run of lines that open with the table's left border, and
+/// a cell is the text between two vertical lines. comfy-table sizes the
+/// table to the terminal it finds, which is the developer's own when the
+/// test runs from one, so a cell may wrap: its pieces are joined without
+/// their padding. That restores any text without spaces, which is all
+/// this test compares.
 fn table_rows(text: &str) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     let mut row: Vec<String> = Vec::new();

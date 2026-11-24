@@ -59,10 +59,17 @@ pub async fn until_polling<F: Future + Unpin>(
     }
 }
 
-/// Awaits `op` with a paused clock held fixed. Use it around any await on
-/// real I/O in a paused test: awaited bare, such an await leaves the runtime
-/// idle, and tokio jumps the clock to the next timer, which fires a deadline
-/// the test never advanced to.
+/// Drive `op` to completion without letting a paused tokio clock move on
+/// its own, panicking with `what` if [`HANG_GUARD`] runs out first.
+///
+/// Use it around any await on real I/O in a paused test: a TLS request, a
+/// Postgres round trip, a `spawn_blocking` result. Awaited bare, such an
+/// await leaves the runtime idle, and tokio jumps the clock to the next
+/// timer, which fires a deadline the test never advanced to. Here `op` is
+/// polled by [`until_polling`] with a condition that never holds, so the
+/// runtime always has a runnable task. A `tokio::time::advance` inside
+/// `op` still moves the clock by exactly what it asks for. The guard
+/// panics in the test's own task, so a hang fails the test at once.
 pub async fn frozen<F: Future>(what: &str, op: F) -> F::Output {
     until_polling(what, &mut std::pin::pin!(op), || false)
         .await

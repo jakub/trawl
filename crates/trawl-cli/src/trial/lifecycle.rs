@@ -56,7 +56,7 @@ const _: () = assert!(secrets::READ_LIMIT >= MAX_CA_BYTES);
 
 const PROOF_QUERY: &str = "* | head 1";
 
-/// Progress goes to stderr: stdout carries only the summary.
+/// One progress line on stderr. stdout carries only the summary.
 fn progress(message: impl std::fmt::Display) {
     eprintln!("trawl trial: {message}");
 }
@@ -151,9 +151,12 @@ fn require_owned(
     }
 }
 
-/// When the one-offs outlast `wait` and all are still `created`, removes
-/// them, once and by id: their client died before starting them, so they
-/// would never finish. Refuses, naming them, when any other is left.
+/// `up` and `stop`'s wait: for one-off containers an interrupted command
+/// left unfinished, then a fresh inventory. Refuses anything foreign that
+/// appeared meanwhile. When the one-offs outlast `wait`, removes those
+/// still `created`, once and by id: their client died before starting
+/// them, so they would never finish. Refuses, naming them, when any other
+/// is left.
 async fn settle_oneoffs(
     docker: &Docker,
     paths: &TrialPaths,
@@ -1609,10 +1612,18 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
     .await
 }
 
-/// After `approve` answers [`Confirmation::Proceed`], the engine resources
-/// it was shown are deleted by id, and nothing else on the engine. The
-/// trial directory is deleted by `rm_dir` with everything in it, including
-/// files added while `approve` waited.
+/// `down` on its own engine. `approve` shows the listing and answers;
+/// nothing is deleted before it answers [`Confirmation::Proceed`]. Then
+/// the teardown marker is written, the engine resources `approve` was
+/// shown are deleted by id, and nothing else on the engine. The trial
+/// directory of a trial is deleted by `rm_dir` with everything in it,
+/// including files added while `approve` waited, and the marker goes
+/// last. For a directory without a state or a marker,
+/// [`remove_leftover`] checks the top-level entries against the listing.
+///
+/// A marker with no trial directory and nothing of its trial left on the
+/// engine is the end of an interrupted teardown: it is removed without
+/// asking, since nothing is left to delete.
 async fn remove_trial(
     docker: &Docker,
     paths: &TrialPaths,

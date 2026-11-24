@@ -170,9 +170,26 @@ impl RootSeen {
     }
 }
 
-/// On an ingest node the effective WAL directory is checked as the root is,
-/// wherever it is: a path under the data root may leave it through `..` or a
-/// symlink, and access to the root proves nothing about a child that exists.
+/// `server.data.root`: the root is a directory, or boot creates it, and the
+/// running user may read it and, on an ingest node, write it. On an ingest
+/// node the same holds for the effective WAL directory, which boot creates
+/// when it is absent, wherever it is: a path under the data root may leave
+/// it through `..` or a symlink, and access to the root proves nothing
+/// about a child that exists. The row reports the root's failure first and
+/// looks at the WAL directory only when the root holds. Unless
+/// `ask_access`, as in a root run, only the structural half of each access
+/// check is evaluated: each directory is a directory, or absent below a
+/// directory boot could create it in. When that holds the row is
+/// `not_sampled`, reason `ran_as_root`, and the checks that wait on it
+/// still look.
+///
+/// When both hold, the row predicts what boot's closing of the storage
+/// roots does (ADR-0052), through [`owner_only::predict`] over the roots
+/// boot closes; see [`closing`]. A root boot would refuse fails the
+/// row. Otherwise the results root is judged as the WAL directory is, on
+/// every node, since every node makes it and writes captures into it
+/// ([`results_row`]). Last, a root boot would close makes the row
+/// `complete`, reason `will_tighten`.
 async fn check_root(
     data_root: PathBuf,
     wal_dir: PathBuf,

@@ -251,8 +251,10 @@ async function capture(context) {
   });
 
   if (await present(page, '.facets', 8000)) {
-    // The overlong value is written into the DOM rather than the fixture:
-    // a 200-character hostname would change every other picture here.
+    // A value far longer than the row is wide, written into the DOM
+    // rather than the fixture, exactly as facets.spec.ts does it: the
+    // geometry is the subject and a 200-character hostname would change
+    // every other picture here.
     const firstValue = page.locator('.facets .g .vals .v .n').first();
     if ((await firstValue.count()) > 0) {
       await firstValue.evaluate((el) => {

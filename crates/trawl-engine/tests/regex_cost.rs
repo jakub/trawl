@@ -4,8 +4,15 @@
 
 //! What one regex call costs, in Rust and in the bundled `DuckDB`'s RE2,
 //! for the worst patterns ADR-0063's limits admit, over the longest value
-//! ingest stores. This harness measures both and prints the transcript
-//! that `scripts/evidence/issue-334/cost.sh` commits.
+//! ingest stores.
+//!
+//! ADR-0063, as amended on 2026-11-04, holds the Rust engine to a hard
+//! ceiling: one call over one stored value of at most `MAX_RAW_CHARS`
+//! (65 536) characters costs under 0.5 s, in the live tail and in every
+//! live plan. RE2 runs every batch regex and has no ceiling: its worst
+//! measured call is reported as an envelope. This harness measures both
+//! and prints the transcript that `scripts/evidence/issue-334/cost.sh`
+//! commits.
 //!
 //! Not a correctness test and not run in CI: every part is `#[ignore]`d,
 //! because a wall-clock number on a shared machine is evidence for a
@@ -40,24 +47,110 @@
 //! first non-ASCII byte, so over non-ASCII text Rust runs the Pike VM from
 //! the start.
 //!
+//! The search composes shapes from the node kinds the walk prices
+//! (`trawl_core::pattern::price`). Each repeated unit is an atom with a
+//! prefix before it and a wrapper around it:
+//!
+//! - atoms: `[abc]`, `.` under `(?s)`, `[^\n]`, `\w`, `\pL`, `\PN`,
+//!   `[abc]` and `\pL` under `(?i)`, the fan class (below), and two atoms
+//!   that cost the most translation: `\p{Any}` and the full-range bracket
+//!   `[\x00-\x{10FFFF}]`, each under `(?i)`;
+//! - prefixes: none, `\B`, `(?:\b|\B)`, `(?m:^)?`, an empty capture group,
+//!   a repeat of nothing, `(?:)?`, and an empty alternation, `(?:|)`;
+//! - wrappers: none, a capture group, `?`, two nested `?`, an alternation
+//!   with `[abc]`, and `{0,2}`.
+//!
+//! The outer shapes are `a (?:unit){k} [^abc]` for every combination,
+//! `\B (?:unit){k} \PL` for every wrapped atom, and the unit written out
+//! `k` times, with no prefix and with `\B`. Writing a unit out compiles to
+//! the same program as counting it, but it is `k` times the text and the
+//! translation, so it reaches the body cap and the translation budget:
+//! the two translation atoms written out reach the budget at about 14.
+//! Two-unit mixes put `j` optional big classes before a counted run of
+//! `[abc]` or `\B[abc]`, and the fan class padded to the body cap reaches
+//! the cap with every `k`. The fan mix, `a (?:\BX{0,2}){j} (?:X{0,2}){k}
+//! [^abc]` with `X` each of the mixes' large classes and `j` each even
+//! count up to 18, spends the positions and the batch-engine view
+//! together: each `\B` unit is three positions and two copies of the
+//! class, each plain unit two of each.
+//!
 //! Each composed shape takes the largest `k` that
 //! `trawl_core::parser::parse` admits, so it passes every check a query
-//! passes and sits at the edge of a limit.
+//! passes and sits at the edge of a limit: the 1024-byte body cap, the
+//! repeat budget of 64 positions, the translation budget of 2^24 units a
+//! query, the 1 MiB limit on the Rust program, or the 512 KiB cap on the
+//! program the batch engine compiles from the body's view. A body that
+//! nests a class or uses a class set operator is refused outright, so
+//! none is composed. The transcript counts the limit that refuses each
+//! shape's next `k`.
 //!
-//! The fan class holds only literal code points: alternating ASCII letters
-//! and digits, one character for each UTF-8 lead byte, and along the
-//! subject's own UTF-8 path one character for each sibling continuation
-//! byte, every other one at the last level. Every list of byte ranges the
-//! subject's bytes walk through is then long, and once a DFA gives up, both
+//! Named cases sit beside the composed ones: the families of the earlier
+//! transcripts, which put each priced node kind in a counted repeat or
+//! nest repeats outside and inside one; the shapes review round 3 and
+//! FIX4 to FIX9 reported, each at the count it was reported at; and the
+//! fan class.
+//!
+//! The fan class is FIX7's, ported from its generator, `gen_fan.py`. It
+//! holds only literal code points: alternating ASCII letters and digits,
+//! one character for each UTF-8 lead byte, and along the subject's own
+//! UTF-8 path one character for each sibling continuation byte, every
+//! other one at the last level. Every list of byte ranges the subject's
+//! bytes walk through is then long, and once a DFA gives up, both
 //! engines scan those lists for every live position on every byte. A
 //! class is one position, so the fan costs the most a position can.
 //!
+//! Every shape is measured over four alphabets: Deseret letters (4-byte,
+//! with case folds), CJK ideographs (3-byte, without), three characters
+//! of the Specials block, U+FFFD, U+FFFC and U+FFFB, and ASCII letters.
+//! The specials' UTF-8 bytes, `EF BF xx`, sort at or near the end of each
+//! sorted list of byte ranges the fan compiles to, and Rust's Pike VM
+//! scans each list from its start, so FIX9 found them the costliest
+//! subject for the fan. None of them is a letter, so over them a needle
+//! that ends in `\PL` ends in `\pL` instead, which they never hold either. The 2026-11-03
+//! transcripts also measured 4-byte letters with and without a 4-byte
+//! symbol, and ASCII with a space; Deseret matched or led every one of
+//! them in both engines, so they are dropped.
+//!
 //! The subject defeats literal prefilters by holding the pattern's
-//! literals everywhere. A composed shape ends in `[^abc]` or `\PL`, `\pL`
-//! over the specials, none of which is a letter. The subject never holds
-//! that end, so it never matches and each call scans the whole subject. A
-//! named family that ends in `c` gets a subject with no `c` exactly `k + 1`
-//! characters after an `a`.
+//! literals everywhere: it is eight tenths `a`, which keeps many positions
+//! alive at once, or three tenths, which keeps the set of live positions
+//! varied. The rest is split between `b` and `c`. A composed shape ends in
+//! `[^abc]` or `\PL`, which the subject never holds, so it never matches
+//! and each call scans the whole subject. A named family that ends in `c`
+//! gets a subject with no `c` exactly `k + 1` characters after an `a`. The
+//! harness checks that no call finds a match.
+//!
+//! Every admitted shape is screened with one call, over the subject that
+//! is eight tenths `a`. The slowest shapes of the screen are then timed in
+//! full over both subjects: Rust's ten slowest in seven calls each after a
+//! warm-up, and RE2's six slowest in five, because one RE2 call of those
+//! costs seconds. A shape that
+//! holds a capture group has Rust's `captures` timed beside `is_match`,
+//! because the live `extract` calls it. The slowest shape in each engine is
+//! last timed at smaller `k`, to show how its cost scales with the count.
+//!
+//! # RE2's step
+//!
+//! A second cost does not follow the positions. RE2 sizes its DFA from a
+//! fixed memory budget (`DuckDB` binds RE2's default `max_mem`, 8 MiB),
+//! and a program too large for that budget fails the DFA's init: every
+//! call then runs the NFA, at hundreds of milliseconds where the DFA took
+//! a few. Large classes, `\pL` above all, make a program large within few
+//! positions. The step part times the families FIX6 calibrated, at counts
+//! on both sides of the step, over Deseret, CJK and ASCII. Each row gives
+//! what the body compiles to in Rust and in its batch-engine view, which
+//! writes `\w`, `\d`, `\s`, `\b` and `\B` in RE2's ASCII meanings
+//! (`trawl_core::pattern::Preparer::batch_compiled_bytes`), and where the
+//! parser puts it.
+//!
+//! # What the ceiling covers
+//!
+//! The ceiling is per call, over one stored value of at most
+//! `MAX_RAW_CHARS` characters. Two things fall outside it: values stored
+//! before the ingest cap existed keep their length, and a computed
+//! subject such as `concat(message, message)` can be longer than any one
+//! stored value. A query over either stays correct and pays in proportion
+//! to the longer subject.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;

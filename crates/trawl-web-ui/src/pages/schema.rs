@@ -2,11 +2,29 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! `<SchemaPage/>` — sortable services table over
+//! `/api/v1/schema/services` with a slide-out drawer inspector for
+//! each service.
+//!
+//! URL params:
+//! - `svc=<name>` — opens the drawer on the named service; clearing
+//!   closes the drawer.
+//! - `stab=overview|fields|tail` — which drawer tab is active
+//!   (default: overview). Read through
+//!   [`schema_nav::sanitize_tab`](crate::schema_nav::sanitize_tab): the
+//!   value is re-concatenated into the drill-in URL below, so only a
+//!   spelling from the closed vocabulary is ever carried forward.
+//! - `field=<name>` — opens the field case file, which takes precedence
+//!   over `svc=` and mounts independently of the services snapshot, so
+//!   `/search/schema?field=<name>` is a working deep link. `svc=` is
+//!   carried alongside as the back-arrow's return context.
+//!
 //! Exactly one drawer is mounted at a time: `fleet_ui::Drawer` arbitrates
 //! Escape on the assumption of a single drawer layer, so the page swaps
-//! between the two rather than nesting them. The swap is also why focus is
-//! restored by hand: the originating badge is unmounted while the case file
-//! is up.
+//! between the two rather than nesting them. That swap is also why focus
+//! is restored by hand: the originating badge is unmounted while the case
+//! file is up, so the drawer shell's own opener-restore has nothing left
+//! to return to.
 
 use leptos::prelude::*;
 use leptos::web_sys;

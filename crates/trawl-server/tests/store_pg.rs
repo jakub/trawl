@@ -3019,10 +3019,16 @@ fn assert_ordered_seek(what: &str, plan: &[String], seek: &str) {
     );
 }
 
-/// Both due-listing pages must seek whether Postgres plans them for the bound
-/// values (custom) or once for any value (generic, as a statement cached past
-/// five executions is). `scripts/evidence/issue-444/explain.sh` records the
-/// output.
+/// The due listing is an ordered seek on `schedules_due_idx` (ADR-0018
+/// amended 2026-11-11). Over 6000 mixed schedules, analyzed, both
+/// [`DUE_FIRST_PAGE`] and [`DUE_RESUMED_PAGE`] read the index in
+/// `(next_fire_at, id)` order with no Sort node, whether Postgres plans
+/// them for the bound values (custom) or once for any value (generic, as a
+/// statement cached past five executions is). The resumed page, from a
+/// cursor 1500 candidates deep, puts its row comparison in the Index Cond,
+/// so it seeks to the cursor instead of reading and dropping the rows
+/// before it. Nothing switches a plan type off. The test prints the mix and
+/// every plan; `scripts/evidence/issue-444/explain.sh` records that output.
 #[sqlx::test]
 async fn due_listing_uses_ordered_seek(pool: PgPool) {
     sqlx::raw_sql(SEEK_SEED).execute(&pool).await.unwrap();
@@ -3874,10 +3880,23 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
 }
 
-/// A `since_last` finish locks the schedule row, then the run row; the
-/// delete's cascade needs both. The blocker holds the run row: the delete
+/// The same delete against a `since_last` finish, which reaches for the
+/// schedule row that the delete's cascade also needs.
+///
+/// This is a lock CYCLE, not just a race. `SavedQueryStore::delete` ends by
+/// deleting the saved query, and that cascade needs the `schedules` row; a
+/// `since_last` `finish_run` locks `schedules` first and then updates the
+/// run row. With the delete holding the run rows and the finish holding the
+/// schedule, each waits on what the other holds and postgres kills one with
+/// 40P01. If the victim is the finish, the delete has already read that
+/// run's `result_path` as NULL, and the parquet the finish wrote is
+/// orphaned with nobody left to unlink it.
+///
+/// The blocker pins that interleaving by holding the run row: the delete
 /// queues for it first, the finish queues behind, and the rollback releases
-/// them in that order. Both sides must walk saved -> schedules -> runs.
+/// them in that order. The fix is the delete taking the schedule lock at
+/// level 2, so both sides walk saved -> schedules -> runs and neither can
+/// wait on a lock the other already holds out of order.
 #[sqlx::test]
 async fn delete_saved_racing_since_last_finish_never_orphans_path(pool: PgPool) {
     const PATH: &str = "scheduled/race/tiled.parquet";
@@ -7856,8 +7875,19 @@ async fn assert_pair_is_legal(
     );
 }
 
-/// Both write doors take the `saved_queries` lock FIRST: the loser waits,
-/// then reads what the winner committed and refuses the forbidden pair.
+/// ADR-0018 ruling 7 forbids exactly one pair — a schedule window over a
+/// query that spells its own interval — and the two write doors that could
+/// assemble it run concurrently.
+///
+/// Neither door can see the other's uncommitted row, so what makes the rule
+/// hold is that both take the `saved_queries` lock FIRST: the loser waits,
+/// then reads what the winner committed and refuses. The blocker
+/// transaction pins the interleaving to the dangerous window by holding
+/// that row exactly as the other door would while its write is in flight.
+///
+/// Both orders are exercised, and the invariant is asserted with the rule
+/// itself: whatever committed, `validate_window_compatibility` must accept
+/// the pair that is on disk at the end.
 #[sqlx::test]
 async fn schedule_put_and_saved_put_cannot_commit_the_forbidden_pair(pool: PgPool) {
     let saved_store = saved(&pool);

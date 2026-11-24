@@ -161,8 +161,13 @@ const HUMAN = { prefix: 'Zy9x8w7v', name: 'jakub' };
 function investigationReader() { return scenario === 'investigations' || investigationWriter(); }
 function investigationWriter() { return scenario === 'investigations-writer'; }
 const PRUNED_RESULT = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
-// A stored-result read without `limit` gets `RESULT_PAGE_MAX_ROWS` rows,
-// as trawld answers `[capture] page_max_rows`.
+// The captured results the stub stores, each a page fixture read whole:
+// the board's kept result; a kept result of seven rows whose bounds, in
+// January, lie long before anything the stub's corpus holds, so its rows
+// exist only as captured; and a kept capture that hit the capture cap,
+// which holds the 4 most recent of its 31402 rows. A read without
+// `limit` gets `RESULT_PAGE_MAX_ROWS` rows, as trawld answers `[capture]
+// page_max_rows`, so the seven rows are three pages.
 const STORED_RESULTS = {
   fedcba9876543210fedcba9876543210: 'result-page-evidence',
   '7e57ab1e0c0ffee0d15ea5e0ba5eba11': 'result-page-paged',
@@ -748,9 +753,11 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, { ok: true, armed: scheduleRefusal });
       return;
     }
-    // A real server refuses a since_last run once coverage reaches the
-    // claim instant less lag, which no click sequence produces, so the stub
-    // arms the refusal instead.
+    // Arm the NEXT Run now to be refused with the server's 409 envelope:
+    // an empty since_last window. A real server needs coverage to reach
+    // past the claim instant for that, which no click sequence produces
+    // (two clicks inside the lag still cover a sliver), so the stub arms
+    // it instead. One-shot, like the schedule refusal.
     if (p === '/__ctl/run/refuse' && req.method === 'POST') {
       runRefusal = true;
       sendJson(res, 200, { ok: true, armed: 'run-refuse' });

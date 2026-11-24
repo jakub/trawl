@@ -5,12 +5,81 @@
 //! The step an attached capture appends to its investigation, and the
 //! completion that writes the step's terminal outcome (ADR-0059).
 //!
-//! A success is written by the transaction that keeps the result
+//! A capture that names an investigation appends one `step` entry at
+//! admission, with no outcome, and writes the outcome once when its work
+//! ends: one step, two moments. The second moment belongs to a
+//! [`StepCompletion`], a handle whose clones ride everything that can
+//! outlive the request. The admission builds it in a task of its own the
+//! moment the step commits ([`begin`]), so a request that goes away before
+//! it takes the handle leaves the handle there, and the task writes
+//! `aborted` inside the request's count, which it gives back no later than
+//! the capture's deadline ([`StepCompletion::finish`]). From then on:
+//!
+//! - one rides the executor slot's holds beside the admission
+//!   ([`crate::pool::WorkContext::holding`]), so it lives until the work
+//!   physically stops, however the request ends;
+//! - one rides the request, and passes to the commit task once the work
+//!   has produced a result.
+//!
+//! Whoever learns how the work ended records it ([`StepCompletion::record`]).
+//! The first record wins and later ones change nothing. A success is
+//! written by the transaction that keeps the result
 //! ([`crate::store::ResultsStore::insert_kept`]), which then marks the
-//! completion [`StepCompletion::written`]. Otherwise, when the last handle
-//! drops, the outcome joins the queue of the one [`StepWriter`], so a drop
-//! on the pool's blocking thread still writes it. A completion dropped with
-//! nothing recorded writes `aborted`.
+//! completion [`StepCompletion::written`]. When the last
+//! handle drops, the outcome joins the queue of the one [`StepWriter`], so
+//! a drop on the pool's blocking thread still writes it. A completion
+//! dropped with nothing recorded writes `aborted`: the client went away
+//! before the commit task took over, and the work stopped. The store
+//! writes an outcome only on a step that has none, so the fill never runs
+//! twice.
+//!
+//! The writer writes the outcomes no request waits for, in turn: those the
+//! last handle's drop leaves, and those a bounded write handed over past
+//! its capture's deadline ([`StepCompletion::finish`]). One task takes them
+//! from one queue and writes each in a transaction bounded by `[capture]
+//! deadline_secs`, so however many steps are abandoned at once, their
+//! writes hold at most one connection and wait on at most one lock. An
+//! attempt that reaches its bound, or the pool's own acquire timeout,
+//! writes nothing and goes to the back of the queue to be tried again:
+//! the fill is written once, whenever the lock it waits on is released.
+//! The one wait the bound leaves alone is a `COMMIT` already sent, awaited
+//! until it is answered, since cutting it short would leave the outcome
+//! unknown; the queue waits with it.
+//! A write that fails otherwise is logged.
+//!
+//! Each key's share of places bounds the writer's queue, since a drop
+//! cannot wait to join it. A step takes a place in its key's share before
+//! it is appended ([`StepWriter::admit`]), and a capture whose key's share
+//! is full answers 429 `capture_busy` at once, with a retry of one second
+//! and no step written. It does not wait for a place, so however many of
+//! one key's captures arrive while its share is full, none holds a request
+//! slot (ADR-0054) past its refusal, and every other key's requests still
+//! reach their own share. The place rides the completion and then its
+//! write, and goes back only once the outcome is written, or its write has
+//! failed for good: never when a write is handed over or put back in the
+//! queue. A completion whose outcome the kept transaction wrote gives it
+//! back with its last handle.
+//!
+//! A key's share is `[capture] per_key_running + queue_depth` places, the
+//! size of its lane, so however long a sent `COMMIT` waits for its answer,
+//! at most that many of the key's outcomes wait for the writer, the one it
+//! awaits included. A key whose outcome writes stall holds no more than
+//! its share and leaves every other key its own. Otherwise the share is
+//! full only when the key's lane is, or an outcome is a moment from being
+//! written, which the retry of one second covers. The writer keeps no
+//! count across keys: the outcomes waiting for it number at most a share
+//! for each key that writes, and the operator mints the keys. A key's
+//! share is kept only while one of its steps asks for a place or holds
+//! one.
+//!
+//! A runtime that shuts down drops the writer with its queue; boot records
+//! `interrupted` on every step left without an outcome
+//! ([`crate::store::InvestigationStore::interrupt_running_steps`]), and so
+//! it does for a write that failed. Those writes do not go through the
+//! writer and take no place.
+//!
+//! Each written outcome logs one `investigation_step` line. The capture's
+//! ADR-0046 timing event gains no field.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

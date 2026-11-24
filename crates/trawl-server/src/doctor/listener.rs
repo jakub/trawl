@@ -329,10 +329,15 @@ async fn check_material(
     Some(observed)
 }
 
-/// Of the generated `tls/` and `tls-key/` directories, each that exists is
-/// one the inspection opened as a directory this uid owns, and the start
-/// re-modes it before it writes, so only a read-only filesystem stops it
-/// there.
+/// When a start would generate a pair: the row that says it cannot create
+/// or write what it generates into, or `None` when it can. The start
+/// creates `tls/` and `tls-key/` under `state_dir`, creating `state_dir`
+/// first when it is absent, and writes into both. Each directory that
+/// exists is one the inspection opened as a directory this uid owns, and
+/// the start re-modes it before it writes, so only a read-only filesystem
+/// stops it there. Each absent one needs W and X on the nearest directory
+/// above it that exists, reached as `server.data.root` reaches the data
+/// root's.
 async fn generation_row(state_dir: PathBuf) -> Option<Row> {
     let check = ServerCheck::TlsMaterial;
     let dirs = [GENERATED_TLS_DIR, GENERATED_KEY_DIR].map(|name| state_dir.join(name));
@@ -623,8 +628,8 @@ struct Dial {
 /// The addresses the probe dials, in resolution order: the configured
 /// socket address, or else every address `host:port` resolves to. Boot
 /// binds the first of those it can bind, and which one that was is not
-/// something the doctor can see, so it dials each once, as [`dial_addr`]
-/// maps it.
+/// something the doctor can see, so it dials them all. Each is mapped by
+/// [`dial_addr`], and a repeat is dialed once. The error is the row.
 async fn listener_addrs(configured: &str) -> Result<Vec<Dial>, Row> {
     let check = ServerCheck::ListenerIdentity;
     let unresolved = || {

@@ -2,8 +2,10 @@
 //!
 //! A dump whose `PTRACE_ATTACH` was refused is still a well-formed file:
 //! `minidump-writer` treats the failure as soft and writes a dump with no
-//! threads and no memory. The parser mirrors the reader the deb harness uses
-//! (crates/trawl-server/debian/tests/crashdump-harness.sh), field for field.
+//! threads and no memory. So "a `.dmp` exists" answers nothing and "how many
+//! threads did it capture" answers everything. This mirrors the reader the deb
+//! harness already uses (crates/trawl-server/debian/tests/crashdump-harness.sh
+//! lines 459-483), field for field.
 //!
 //! Layout: header `magic(4) version(4) stream_count(4) directory_rva(4)`,
 //! then `stream_count` directory entries of `type(4) size(4) rva(4)`. A stream's

@@ -632,10 +632,30 @@ impl EmitterState {
         self.relation.nullness(expr, &self.lateral, &self.pin_scope)
     }
 
-    /// The one chokepoint every field read goes through (ADR-0062). An absent
-    /// read is a literal, so no identifier is left for a same-SELECT alias to
-    /// capture (`f!=web1 | rename host as f`); an absent `_time` or
-    /// `_ingested` is refused instead.
+    /// The SQL for one read of the field `name` (ADR-0062): the one
+    /// chokepoint every field read goes through. Identifiers that are not
+    /// reads (an alias, a target, a `drop`) still quote through
+    /// [`super::fields::quote_field`].
+    ///
+    /// Lookup order: the relation the stage reads, then an earlier
+    /// assignment of the `let` being emitted, then NULL —
+    /// `stream::apply_let`'s order. An absent read is a literal, so no
+    /// identifier is left for a same-SELECT alias to capture
+    /// (`f!=web1 | rename host as f`).
+    ///
+    /// A NULL has the type its direct-null column, or the earlier alias
+    /// of the same `let` that is one, records, typed or untyped, whatever
+    /// pin the scope gives `name`: `let a = f, b = a` reads `a` as a NULL
+    /// of `f`'s pin, and as an untyped NULL when `f` has none, even where
+    /// `a` is pinned. Only a fresh read of a name nothing holds is typed
+    /// by the pin the current scope gives `name`, and untyped otherwise
+    /// ([`NullType`]). [`Use`] says how it is written. A direct-null column
+    /// of the relation reads as the same literal, never by name.
+    ///
+    /// A read that reaches `_time` or `_ingested` missing from the
+    /// described source is refused, never resolved to NULL: NULL there
+    /// turns a time-windowed query into a silent empty answer
+    /// ([`super::relation::Column::Missing`]).
     pub(crate) fn read_field(
         &mut self,
         name: &str,
@@ -942,20 +962,38 @@ impl EmitterState {
         self.flushed_params = self.params.len();
     }
 
+    /// Emit SELECT-list expressions that may push parameters, keeping the
+    /// parameter list aligned with the placeholders in the rendered SQL.
+    ///
     /// `DuckDB` binds `?` positionally, so the parameter list has to run
     /// in the order the placeholders appear in the text. A built SELECT
     /// renders `SELECT … FROM … WHERE …`, but the emitter walks the
-    /// search stage first: the moment an aggregating stage pushes a
-    /// parameter of its own into the SELECT list, the predicate's value is
-    /// fed to the SELECT's placeholder.
+    /// search stage first: a parameter the search predicate pushed sits
+    /// first in the list while its placeholder sits last in the
+    /// statement. So the moment an aggregating stage pushes a parameter
+    /// of its own into the SELECT list, the two lists disagree and the
+    /// predicate's value is fed to the SELECT's placeholder — a
+    /// conversion error when the types clash, and a silent value swap
+    /// when they don't (an `earliest=` bound against `now()`'s anchor).
     ///
-    /// When this level already holds parameters and `build` pushes more, it
-    /// runs again after a flush, and the first run is discarded whole. That
-    /// is sound because the only state a SELECT
+    /// `let`/`extract`/`eventstats` avoid that by flushing to a CTE
+    /// unconditionally, since a CTE renders before the outer SELECT. An
+    /// aggregating stage cannot pay that: most aggregates push nothing,
+    /// and wrapping every `stats count() by host` in a CTE would nest the
+    /// commonest query in the language for nothing. So the decision comes
+    /// from what the emission did — the parameter list grew — never from
+    /// what its expressions are called.
+    ///
+    /// `build` therefore runs at most twice, and the first run is
+    /// discarded whole. That is sound because the only state a SELECT
     /// expression emission can touch is the parameter list and the regex
-    /// charge that follows it, so truncating the parameters and restoring
-    /// the charge undoes it exactly. A field it padded onto a pivot's fill
-    /// stays padded, and the fill keeps its charge ([`Self::bound_regex`]).
+    /// charge that follows it (it resolves fields, translates calls and
+    /// pushes literals; it binds no `_raw` and appends no WHERE clause),
+    /// so truncating the parameters and restoring the charge undoes it
+    /// exactly, and the second run's patterns are counted once. A field
+    /// it padded onto a pivot's fill stays padded, which the second run
+    /// asks for again, and the fill keeps its charge
+    /// ([`Self::bound_regex`]).
     pub(crate) fn emit_ordered_select<T>(
         &mut self,
         build: impl Fn(&mut Self) -> Result<T, super::EmitError>,
@@ -1129,8 +1167,11 @@ impl EmitterState {
 
         // Every accumulated parameter must have found a placeholder, and
         // the fill the same ones as the pivot body: the list is about to
-        // be dropped, so one left behind is a `?` that nothing binds or
-        // that takes a later stage's value.
+        // be dropped, so one left behind is a `?` that survives into SQL
+        // nothing will ever bind — or that silently takes the next
+        // stage's value. Integers to compare, and undiagnosable
+        // downstream, so it is a real error rather than a debug
+        // assertion.
         if consumed != self.params.len() || value_consumed != consumed {
             return Err(super::EmitError::UnsupportedOperation {
                 message: format!(

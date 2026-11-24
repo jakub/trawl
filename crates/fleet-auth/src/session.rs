@@ -597,9 +597,12 @@ pub fn build_session_cookie_header(
     builder.to_string()
 }
 
-/// Every attribute but `Max-Age` must match what the original `Set-Cookie`
-/// had, because browsers reject clear directives that don't match the
-/// issued attributes.
+/// Build a `Set-Cookie` header value that clears the named cookie.
+///
+/// Attributes (`HttpOnly`, `SameSite`, `Path`, optional `Secure`, optional
+/// `Domain`) must match what the original `Set-Cookie` had, because browsers
+/// reject clear directives that don't match the issued attributes.
+/// `Max-Age=0` signals immediate deletion.
 #[must_use]
 pub fn build_clear_cookie_header(
     name: &str,

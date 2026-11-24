@@ -8,9 +8,13 @@
 //! the httpOnly session cookie being attached automatically by the
 //! browser. Never touches `Authorization` — that's the proxy's job.
 //!
-//! Every ordinary endpoint's failure goes to the one classifier (ADR-0066).
-//! The investigation writes keep their own, because their unknown outcome
-//! must never read as a refusal.
+//! Every ordinary endpoint sends its request once and reads the body
+//! once ([`exchange`]), then hands the answer to [`response_policy`]:
+//! the endpoint names its success statuses, and every failure goes to
+//! the one classifier (ADR-0066). Nothing here reads a status as a
+//! failure class or navigates. The investigation writes keep their own
+//! send-once paths and classifiers, because their unknown outcome must
+//! never read as a refusal.
 
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;

@@ -30,11 +30,18 @@ pre-commit:
       run: python3 -I docs/evidence/issue-310/sanitize.py --verify
 
 pre-push:
-  # Parallel is safe because each suite gets its own postgres CLUSTER:
-  # 5433/5434 by default (docker-compose.dev.yml), or the clusters that
-  # TRAWL_TEST_DATABASE_URL and TRAWL_TEST_ND_DATABASE_URL name.
+  # Parallel is safe because each suite gets its own postgres CLUSTER
+  # (5433/5434, docker-compose.dev.yml). Separate logical databases are NOT
+  # enough: sqlx derives its per-test database name from the test path alone,
+  # so identical tests running in both suites collide cluster-wide and race
+  # dropdb against the other suite's live connections (SQLSTATE 55006).
+  # Defaults name the two local development clusters. Agents can provide
+  # dedicated clusters through TRAWL_TEST_DATABASE_URL and
+  # TRAWL_TEST_ND_DATABASE_URL; ambient DATABASE_URL is still ignored.
   # Inline defaults keep pushes independent of direnv, which does not run
   # in these non-interactive hook shells.
+  # The glob keeps doc-only pushes from paying for the full suites — tests
+  # run only when the push touches code, manifests, or migrations.
   parallel: true
   commands:
     test:

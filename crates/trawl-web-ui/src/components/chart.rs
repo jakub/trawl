@@ -148,9 +148,13 @@ enum Outcome {
     },
 }
 
+/// The sentence under a Column or Bar chart: the type, the metric
+/// column, the `by` field, and how many bars were drawn.
+///
 /// Line has a live legend; a bar canvas does not (`legend: { show:
-/// !bars }` in `vendor/src/uplot.ts`), so without this note the chart is
-/// a picture with no text representation at all.
+/// !bars }` in `vendor/src/uplot.ts`), so without this the chart is a
+/// picture with no text representation at all. It stays short: what the
+/// chart left out is the caption's job, not this one's.
 fn groups_note(ty: ChartType, metric: &str, group: &str, drawn: usize) -> String {
     let noun = if drawn == 1 { "group" } else { "groups" };
     format!(

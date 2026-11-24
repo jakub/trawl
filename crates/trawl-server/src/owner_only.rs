@@ -355,8 +355,23 @@ where
     }
 }
 
-/// A root that is gone again, or is no longer a directory, refuses here,
-/// where [`close`] would pass it: something replaced it after its creation.
+/// Close a root trawld has just created, for a trawld running as its own
+/// euid. [`close`] logs it if it had to be tightened.
+///
+/// A repin calls this right after it creates its shadow or aside root,
+/// before anything enters it. The umask makes a new directory owner-only
+/// unless a fixed-mode mount or a default ACL on the parent overrides it,
+/// so the new root goes through the same close as one boot found. A root
+/// that is gone again, or is no longer a directory, refuses too: something
+/// replaced it after its creation.
+///
+/// A refused shadow root refuses the repin: the build has not begun, so
+/// the job fails and trawld keeps serving. The aside root is created past
+/// the cutover marker, where a refusal ends the process and the boot replay
+/// refuses the start, so its refusal is the start's.
+///
+/// # Errors
+/// The root cannot be kept owner-only, as an [`OwnerOnlyError`].
 pub fn close_created(kind: RootKind, path: &Path) -> Result<(), OwnerOnlyError> {
     let root = ProtectedRoot {
         kind,

@@ -38,9 +38,9 @@ export function wireInstant(at) {
   return new Date(at).toISOString().replace(/\.(\d{3})Z$/, '.$1000Z');
 }
 
-/** An `integer` cell is a JS safe integer or already a decimal string; a
- * number past 2^53 has already lost digits, so it throws instead of being
- * spelled. */
+/** One cell under its column's type. An `integer` cell is a JS safe
+ * integer or already a decimal string; a number past 2^53 has already
+ * lost digits, so it throws instead of being spelled. */
 export function wireCell(type, value) {
   if (value === null) return null;
   if (type === 'integer') {
@@ -149,11 +149,25 @@ export function populatedServiceSchemaResponse() {
   return wire('service-schema-populated');
 }
 
-/** These are SHAPES, not whole queries: the service drawer composes its
+// ---- the `corpus` scenario ------------------------------------------------
+//
+// `corpus` is `populated` plus data: query rows, history, and the runs
+// surfaces. It exists because the row controls, the facet rail and the
+// results table are only reachable once something answers with rows, and
+// `default`/`populated` deliberately answer empty.
+
+/** The DSL substrings the stub dispatches `/api/v1/query` on.
+ *
+ * These are SHAPES, not whole queries: the service drawer composes its
  * reads with a field or service name in them, so the stub can only
- * recognise the stage. `tests/e2e_wire_fixture_contract.rs` calls the two
- * builders and greps the drawer source for the third, so a rewrite of any
- * of them fails a native test.
+ * recognise the stage. The first two are built in `src/drawer_query.rs`
+ * (`top_values_query` writes `| top 10 <field>`, `cardinality_query`
+ * writes `| stats dc(<f>) as …`); the third is built inline in the
+ * overview pane of `src/components/service_drawer.rs`.
+ * `tests/e2e_wire_fixture_contract.rs` calls the two builders and greps
+ * the drawer source for the third, so a rewrite of any of them fails a
+ * native test instead of silently routing a drawer read to the rows
+ * fixture or to the 500 arm.
  */
 export const QUERY_SHAPES = {
   topValues: '| top 10 ',

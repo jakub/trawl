@@ -1771,11 +1771,14 @@ fn doctor_redacts_the_key_from_remote_fields() {
     }
 }
 
-/// A server that splits the key into pieces too short to redact (7
-/// characters, one fewer than the shortest redacted run), one per
-/// permission, gets none of them into the report. The name is shown as
-/// sent, capped at 32 characters, so the key base64-encoded in it is not
-/// caught; this test pins that rather than promising otherwise.
+/// `api.identity`'s detail uses trawl's closed vocabulary. A server that
+/// splits the key into pieces too short to redact (7 characters, one
+/// fewer than the shortest redacted run), one per permission, gets none
+/// of them into the report: only exact permission names are shown, and
+/// the rest are counted. The name is the one field shown as sent, capped
+/// at 32 characters. The key base64-encoded in the name is not caught:
+/// that is the residual risk the redaction site documents, bounded by
+/// the cap, and this test pins it rather than promising otherwise.
 #[test]
 fn doctor_identity_shows_only_trawl_vocabulary() {
     let fragments: Vec<String> = PROFILE_TOKEN

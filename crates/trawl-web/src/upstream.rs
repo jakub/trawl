@@ -66,7 +66,9 @@ struct Observed {
     refusal: Option<Refusal>,
 }
 
-/// Equal refusals log once; unusable contents compare by digest, not reason.
+/// Why a read of the pin file produced no client. Two refusals are the
+/// same when a re-read would log the same thing: the same kind, and for
+/// contents, the same digest.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
     Absent,

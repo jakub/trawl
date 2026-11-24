@@ -415,8 +415,9 @@ const fn verdict_name(verdict: Verdict) -> &'static str {
 mod tests {
     use super::*;
 
-    /// The four names are ADR-0047's. A new env-bound flag fails here until
-    /// the ADR and the refusal agree about it.
+    /// The variables the doctor refuses are exactly the ones clap binds for
+    /// it, and those are the four ADR-0047 names. A new env-bound flag
+    /// fails here until the ADR and the refusal agree about it.
     #[test]
     fn refused_env_names_match_what_clap_binds() {
         let mut names = refused_env_names();

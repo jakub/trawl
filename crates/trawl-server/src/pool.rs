@@ -2083,11 +2083,21 @@ impl ExecutorPool {
         }
     }
 
-    /// Every query lane (queries, `from saved`, exports, captures, value
-    /// sampling) funnels through this semaphore, and each lane computes its
-    /// source and snapshots its comparison pins inside the permit-holding
-    /// task, so holding all permits means no query can straddle the per-env
-    /// swap or the pin flip.
+    /// Acquire every permit: the repin cutover's exclusion primitive.
+    ///
+    /// Every lane that can read parquet funnels through this semaphore
+    /// (queries, `from saved`, exports, captures, value sampling), and
+    /// each lane computes its source and snapshots its comparison pins
+    /// inside the permit-holding task, so holding all permits means no
+    /// query can straddle the per-env swap or the pin flip. SSE streams hold no
+    /// permit, read no parquet, and keep their compile-time snapshot until
+    /// reconnect, so a repin reaches a live stream at its next connect.
+    ///
+    /// Bounded: a wedged query holds a permit forever, and an unbounded
+    /// wait here would starve the cutover with the rollup suppressed and
+    /// retention disabled. Past `timeout` this returns
+    /// [`ServerError::Timeout`] and the caller aborts to its `blocked`
+    /// outcome.
     pub async fn exclusive(&self, timeout: Duration) -> Result<PoolExclusive, ServerError> {
         let permits = u32::try_from(self.max_concurrent)
             .map_err(|_| ServerError::Internal("pool size exceeds u32".into()))?;

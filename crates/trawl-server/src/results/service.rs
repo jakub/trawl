@@ -2369,11 +2369,13 @@ async fn verify(state: &AppState, row: &CaptureRow) -> Result<Verified, ServerEr
     .map_err(EngineError::Io)?)
 }
 
-/// The server unlinks a committed capture's file only after the store
-/// marked its row gone, and a gone row never lives again. So a row read
-/// back as gone answers as gone, and only a row still live after the file
-/// was found missing lost it out of band: that row is marked and the read
-/// answers 409.
+/// What a read answers when `row`'s file was not there.
+///
+/// The server unlinks a capture's file only after the store marked its row
+/// gone (module docs, "Reads"), and a gone row never lives again. So a row
+/// read back as gone answers as gone, and only a row still live after the
+/// file was found missing lost it out of band: that row is marked and the
+/// read answers 409.
 async fn missing_file(results: &ResultsState, row: &CaptureRow) -> ServerError {
     if let Err(refusal) = still_live(results, row).await {
         return refusal;

@@ -1168,10 +1168,15 @@ fn rewrite_file(
     .map_err(|e| StatementFailure::duckdb("conform rewrite failed", &e))?;
     // Unlike every other staged rename in the tree, this one has no backing
     // copy: the source is the destination, and once the rename lands the
-    // pre-conform file is gone. So fsync the staged file before the rename,
-    // and unlike `publish_marker`'s best-effort directory sync this file sync
-    // is fatal: failing the file is a skip (the original stays, the pass
-    // withholds completion, the next boot re-runs).
+    // pre-conform file is gone. Compaction's `.tmp` is covered by the retained
+    // WAL and the rollup keeps its hourlies until after the rename; here a
+    // crash between the rename and writeback would leave a truncated parquet
+    // where an hour (or a day) of logs used to be — and the next boot would
+    // not retry, because a successful pass publishes the marker. So fsync the
+    // staged file before the rename, and unlike `publish_marker`'s best-effort
+    // directory sync this one is fatal: failing the file is a skip (the
+    // original stays, the pass withholds completion, the next boot re-runs),
+    // which is strictly better than publishing data that may not be there.
     std::fs::File::open(&tmp)
         .and_then(|f| f.sync_all())
         .map_err(|e| format!("conform fsync failed: {e}"))?;

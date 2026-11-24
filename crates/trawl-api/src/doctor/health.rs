@@ -275,9 +275,19 @@ impl KeyAnswer {
     }
 }
 
-/// A 200 or 503 health body with a `checks` map keeps one [`KeyAnswer`] per
-/// known check, so a 503 from a failed `DuckDB` probe fails its own row,
-/// unless its `status` disagrees with the HTTP status.
+/// Judge a health answer that arrived whole with HTTP status `http` and
+/// body `body`.
+///
+/// The status comes first: one trawld's health endpoint never sends is
+/// [`Answer::Status`] whatever the body. A body past [`BODY_MAX`] is
+/// [`Answer::TooLarge`] and not parsed. A 200 or 503 health body with a
+/// `checks` map keeps one [`KeyAnswer`] per known check, so a 503 from a
+/// failed `DuckDB` probe fails its own row, unless its `status` disagrees
+/// with the HTTP status. A 503 `corpus_recovering` refusal is
+/// [`Answer::Recovering`], as [`classify`] maps the corpus recovery values,
+/// and a 503 `request_limit_reached` refusal is [`Answer::RequestLimit`].
+/// Either code under any other status, like any other body, is not
+/// trawld's health answer.
 #[must_use]
 pub fn judge(http: u16, body: &[u8]) -> Answer {
     if !is_health_http_status(http) {

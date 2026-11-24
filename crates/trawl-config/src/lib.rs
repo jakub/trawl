@@ -198,10 +198,17 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// `TRAWL_HTTP_ADDR` first, then `[server] http_addr`.
-    /// [`Config::from_toml`] applies this at parse time, so trawld's own call
-    /// sites read the already-resolved field; trawl-web deserializes the file
-    /// itself and calls this directly when deriving its upstream URL.
+    /// Resolve the HTTPS listen address: the `TRAWL_HTTP_ADDR` environment
+    /// variable first, then `[server] http_addr` from the config file.
+    /// Empty values count as unset.
+    ///
+    /// The env override exists so a listener can be moved without editing
+    /// (or templating) the shared `trawld.toml` — `bin/dev` uses it to shift
+    /// ports off a collision, and container images can repoint the bind
+    /// without a config volume. [`Config::from_toml`] applies it at parse
+    /// time, so trawld's own call sites read the already-resolved field;
+    /// trawl-web deserializes the file itself and calls this directly when
+    /// deriving its upstream URL.
     #[must_use]
     pub fn resolve_http_addr(&self) -> String {
         Self::resolve_http_addr_from(
@@ -2169,10 +2176,14 @@ impl Config {
             )));
         }
 
-        // The startup overlap check places a root that does not exist yet by
-        // the nearest existing directory on its path, so `<base>/missing/../x`
-        // lands at `<base>` while trawld later makes it at `<base>/x`, which
-        // can be the scratch directory itself (ADR-0056).
+        // The roots trawld owns by name are kept apart from the query
+        // scratch directory by comparing the directories at startup, and a
+        // root that does not exist yet is placed by the nearest directory
+        // on its path that does. A `..` after a component that is missing
+        // places `<base>/missing/../x` at `<base>` while trawld later makes
+        // it at `<base>/x`, which can be the scratch directory itself. So
+        // the data root and the WAL directory, and with them the repin
+        // roots beside the data root, carry no `..` (ADR-0056).
         for (key, path) in [
             ("data.path", Path::new(&self.data.path)),
             (

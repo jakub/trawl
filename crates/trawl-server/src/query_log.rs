@@ -8,10 +8,23 @@
 //! source paths, hot buffer state, result sample, and timing. Designed
 //! for `tail -f /var/lib/trawl/query-debug.log | jq` debugging workflows.
 //!
-//! The file is owner-only and size-bounded: past
-//! `server.query_log_max_bytes` it rolls over to a single retained
-//! `<path>.1` (`0` disables rollover). trawld's `server.log_file` shares
-//! only the owner-only open, [`open_append_owner_only`] (ADR-0052).
+//! This file is more sensitive than the underlying event corpus: one
+//! record combines identity, raw query text, SQL parameter values,
+//! filesystem layout, and result samples. It is therefore owner-only
+//! (`0600` on Unix, tightening a pre-existing looser file at open) and
+//! size-bounded: past `server.query_log_max_bytes` the file rolls over
+//! to a single retained `<path>.1` (also owner-only; `0` disables
+//! rollover).
+//!
+//! The open is then judged on the descriptor it returned, whatever the
+//! `chmod` said: the file must belong to the uid trawld runs as and carry
+//! no group or other bit, or the open is refused. A file another user owns
+//! is refused even when it is already tight, since its owner can loosen it
+//! or read it at any time. A `chmod` can also report success and change
+//! nothing, as on a filesystem with fixed modes, and a `chmod` on trawld's
+//! own file can fail, as on an append-only file; neither decides alone.
+//! trawld's `server.log_file` opens through [`open_append_owner_only`]
+//! under the same rules (ADR-0052).
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};

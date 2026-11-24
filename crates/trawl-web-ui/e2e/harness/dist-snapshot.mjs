@@ -3,15 +3,27 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // The harness serves a private copy of the trunk dist, never the build
-// directory itself. Any `trunk serve` running from the same checkout
-// rebuilds that directory on every save, so serving it live breaks:
+// directory itself.
+//
+// Two producers write `crates/trawl-web-ui/dist`: the gate's `trunk
+// build`, and any `trunk serve` running from the same checkout (bin/dev's
+// stack keeps one, and it rebuilds on every save). Reading the live
+// directory therefore photographs a moving target, and the suite reads
+// the dev server's accidents as the app's:
 //
 //   * a rebuild that lands mid-run replaces the hashed wasm index.html
-//     names, so the next navigation fails;
+//     names, so the next navigation fails with `TypeError: Failed to
+//     execute 'compile' on 'WebAssembly': HTTP status code is not ok`;
 //   * a serve build injects trunk's autoreload client, whose
 //     `{{__TRUNK_ADDRESS__}}` placeholder only trunk's own HTTP server
 //     substitutes. Served statically it opens a WebSocket to a literal
-//     placeholder host, and the failure lands in `console.error`.
+//     placeholder host, and the failure lands in `console.error`, where
+//     every "the page logged nothing" assertion counts it as the SPA's.
+//
+// So: copy the tree once at startup (a reflink clone on btrfs, cheap
+// enough to do per run), check the copy against itself, and drop the
+// autoreload client if the source happened to be a serve build. What the
+// suite then loads cannot change under it for the length of the run.
 
 import fs from 'node:fs';
 import path from 'node:path';

@@ -5,16 +5,43 @@
 //! Every committed pin-aware seed emits SQL that real `DuckDB` binds and
 //! plans.
 //!
-//! `Connection::prepare` runs `DuckDB`'s parser and binder without executing
-//! anything.
+//! That is the whole claim of this file, and it is narrow on purpose. The
+//! `parse_emit` fuzz target proves emission does not PANIC over arbitrary
+//! text and arbitrary pin maps; it never asks whether the string it
+//! produced is SQL. A target that emits `SELECT WHERE FROM` all day would
+//! stay green. This fixture closes that hole for the seeds someone chose
+//! deliberately: for each one it builds a parquet file carrying the columns
+//! the query binds, emits under the seed's own pins, and hands the result
+//! to `Connection::prepare`, which runs `DuckDB`'s parser and binder
+//! without executing anything.
 //!
-//! A seed's pins come out of [`trawl_core::fuzz_input::derive_field_types`],
-//! the same decoder the fuzz target runs. Writing the pin maps out in Rust
-//! here would be a second source of truth for what a seed MEANS.
+//! This is NOT [`duckdb_probe`](../duckdb_probe.rs)'s job and does not
+//! belong in that file. The probe establishes GROUND TRUTH, meaning what a
+//! cast domain actually contains and what a live mirror must reproduce, by
+//! executing statements and reading values back. Here nothing is executed
+//! and no value is read: the oracle is "does the binder accept it", so the
+//! two files fail for disjoint reasons and share no fixtures.
+//!
+//! # The pin map is decoded, never hardcoded
+//!
+//! A seed is `QUERY \0 SELECTOR` and its pins come out of
+//! [`trawl_core::fuzz_input::derive_field_types`], the same decoder the
+//! fuzz target runs. Writing the pin maps out in Rust here would be a
+//! second source of truth for what a seed MEANS, and the first time a
+//! selector byte changed, this file would keep asserting against the old
+//! reading while reporting green.
+//!
+//! # What a seed may reference
 //!
 //! The fixture parquet gets one column per PINNED field plus the declared
 //! envelope, and nothing else (see [`fixture_columns`]). So a seed may
 //! reference an unpinned name only when the PIPELINE produces that name.
+//! `| rename status as code` mints `code`, and materialising a `code`
+//! column would collide with the rename's own output. A future seed that
+//! reads an unpinned name out of the source instead makes this test red
+//! with `Referenced column ... not found`, which is the correct outcome:
+//! the seeds directory is a shared on-disk contract and the constraint
+//! belongs somewhere that enforces it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

@@ -30,10 +30,12 @@ pub struct PinProposal {
     pub pinned_from: String,
 }
 
-/// A record of a batch column whose `TRY_CAST` to its pin nulled at least one
-/// value. A cast that nulls nothing is convergence, not conflict, and is never
-/// recorded (see `ConformPlan::tally_conflicts`); a row per lossless cast per
-/// compaction tick would grow without bound.
+/// One append-only conflict record: a batch column whose `TRY_CAST` to its
+/// pin nulled at least one value. A cast that nulls nothing is convergence,
+/// not conflict, and is never recorded (see `ConformPlan::tally_conflicts`);
+/// a row per lossless cast per compaction tick would grow without bound.
+/// What a genuinely lossy sender appends is bounded instead by
+/// [`MAX_CONFLICTS_PER_FIELD`].
 #[derive(Debug, Clone)]
 pub struct FieldConflict {
     pub field: String,
@@ -386,13 +388,55 @@ pub struct FieldConflictRow {
     pub at: DateTime<Utc>,
 }
 
-/// A field denied a pin gets the same treatment as an unstorable name: it is
-/// absent from the pin map, so compaction's conform step drops the column and
-/// the values stay findable in `_raw`.
+/// Maximum number of fields the catalog will ever pin.
 ///
-/// A hand-run `DELETE FROM field_types` proves neither of pin gc's proofs (no
-/// observation for the dead window, no standing parquet footer declaring the
-/// pin) and must still never be recommended.
+/// Field names are client-chosen JSON keys, and the ingest path never
+/// gives a slot back (a repin retypes a pin, retention never reconciles
+/// `field_services`, and only an operator running gc deletes one).
+/// Without a count bound, a sender that
+/// embeds identifiers in its keys, `user_12345_status`, accidental or
+/// hostile, grows postgres, the in-process [`crate::catalog::FieldCatalog`]
+/// cache, and every snapshot taken of it without limit. Name length is
+/// bounded by [`trawl_core::schema::is_storable_field_name`]; this bounds
+/// the count.
+///
+/// A field denied a pin gets the same treatment as an unstorable name: it
+/// is absent from the pin map, so compaction's conform step drops the
+/// column and the values stay findable in `_raw`. Deliberately generous:
+/// a real corpus that legitimately reaches five figures of distinct field
+/// names has a modelling problem this cap should surface, not a capacity
+/// problem trawl should silently absorb.
+///
+/// Filling the cap is the attack the cap itself invites. A slot, once
+/// taken, is taken forever, and denial is silent in the data (the column is
+/// simply absent from every later parquet file). One request carrying ten
+/// thousand junk keys would otherwise take the whole catalog in a single
+/// compaction batch. Two things keep that unreachable:
+///
+/// - Admission from the ingest path is rationed: one batch may take at most
+///   half the free slots ([`Ration::HalfOfFree`]), so exhaustion is a slope
+///   requiring sustained, repeated effort instead of a one-shot cliff, and
+///   there is always headroom left for the next field a legitimate sender
+///   introduces.
+/// - The fill level is a first-class signal,
+///   `trawl_catalog_pinned_fields` against `trawl_catalog_pin_capacity`,
+///   so an operator alerts on the slope, not on the wreckage. (The
+///   `catalog_pin_cap_reached` warning only fires once slots are already
+///   gone.)
+///
+/// The remedy for a slot spent by accident is pin garbage collection
+/// ([`crate::catalog::gc`], `trawl schema gc-pins`): a pin nothing has
+/// observed for the dead window and no standing parquet footer declares is
+/// deleted through [`CatalogStore::delete_pins`]. Both proofs are required,
+/// so the write-time conformance invariant holds by construction — a
+/// hand-run `DELETE FROM field_types` proves neither and must still never
+/// be recommended.
+///
+/// That is a repair, not a defense. Gc reclaims what a typo or a
+/// decommissioned sender left behind; against a sender still filling the
+/// catalog it collects nothing, because every pin it takes is observed and
+/// carried. The defense remains the cap, the per-batch ration and the fill
+/// gauges.
 pub const MAX_PINNED_FIELDS: i64 = 10_000;
 
 /// Maximum `field_conflicts` rows kept per field — the newest survive.
@@ -1127,16 +1171,38 @@ impl CatalogStore {
         Ok(())
     }
 
+    /// Acknowledge one field's degraded verdict up to the evidence that
+    /// exists right now (issue #111).
+    ///
     /// The whole method is one transaction, and it opens with `SELECT 1 FROM
     /// field_types WHERE field = $1 FOR SHARE`. That row lock is the
-    /// serialization point against the repin cutover, whose transaction UPDATEs
-    /// the same `field_types` row and DELETEs the ack. `FOR SHARE` is enough
-    /// because `RepinStore::finish_cutover` opens by taking `FOR UPDATE` on
-    /// that same row unconditionally.
+    /// serialization point against the repin cutover, whose transaction
+    /// UPDATEs the same `field_types` row and DELETEs the ack. Without it
+    /// the two interleave in a way that is silently wrong: this method reads
+    /// the episode sum, the cutover then clears the evidence and the ack,
+    /// and this method's upsert lands afterwards — installing a high-water
+    /// over a field whose conflict counters have just been reset to zero,
+    /// which suppresses the NEW pin's first several episodes. `FOR SHARE`
+    /// is enough because `RepinStore::finish_cutover` opens by taking `FOR
+    /// UPDATE` on that same row unconditionally (its pin-flip UPDATE alone
+    /// would miss a resurrection-only cutover, where the new type equals the
+    /// old one), so the two orders are the only two outcomes: either the ack
+    /// commits first and the cutover deletes it, or the cutover commits
+    /// first and this method reads the post-clear evidence, finds nothing
+    /// degraded and refuses.
     ///
-    /// The upsert ADVANCES: `evidence_through` never moves backwards. The
-    /// actor, the note and the timestamp are replaced only when the incoming
-    /// high-water is at least the stored one.
+    /// Refusals are typed, not errors: an unpinned field and a field whose
+    /// evidence never met the threshold are both ordinary answers.
+    ///
+    /// The upsert ADVANCES: `evidence_through` never moves backwards, so a
+    /// second ack racing a concurrent evidence clear cannot lower a
+    /// high-water another one just raised. The actor, the note and the
+    /// timestamp move with it, or not at all: two operators can read the
+    /// same field a moment apart, and the one whose read saw LESS evidence
+    /// must not end up named as the person who accepted the pin through the
+    /// higher count. So the metadata columns are replaced only when the
+    /// incoming high-water is at least the stored one, and a stale call
+    /// leaves the row exactly as it found it.
     pub async fn acknowledge_degraded_field(
         &self,
         field: &str,
@@ -1347,30 +1413,52 @@ impl CatalogStore {
         ORDER BY t.field
         LIMIT $2";
 
-    /// The LEFT join is load-bearing: a pin with no observations (the envelope
-    /// seed on a fresh install, or a boot-pass pin over standing parquet) must
-    /// appear in an unscoped listing whatever the `since` window.
+    /// List pins with their aggregated observation and conflict evidence —
+    /// the read model behind `/api/v1/schema` and `/api/v1/schema/fields`.
+    ///
+    /// The pin page is one query: `field_types` LEFT JOIN grouped
+    /// `field_services`. The LEFT join is load-bearing: a pin with no
+    /// observations (the envelope seed on a fresh install, or a boot-pass
+    /// pin over standing parquet) must always appear — windowing only hides
+    /// fields whose evidence says they aged out.
     ///
     /// `filter.service` scopes the aggregate, not just the row set: the
-    /// predicate goes inside the `field_services` grouping. Filtering only in
-    /// the `WHERE` clause would leak every other service's numbers into the
-    /// listing and keep a field alive in the window because somebody else still
-    /// sends it. The `EXISTS` stays as the presence test: a pin the service
-    /// never carried has no group row, and the never-observed rule would
-    /// otherwise show it.
+    /// predicate goes inside the `field_services` grouping, so a scoped
+    /// listing reports that service's own counts and instants, and the
+    /// `since` window is evaluated against that service's `last_seen`.
+    /// Filtering only in the `WHERE` clause would leak every other
+    /// service's numbers into the listing and keep a field alive in the
+    /// window because somebody else still sends it. The `EXISTS` stays as
+    /// the presence test: a pin the service never carried has no group
+    /// row, and the never-observed rule would otherwise show it.
     ///
-    /// The conflict evidence is a second query, keyed on the field names this
-    /// page actually returned: a joined `GROUP BY field` would carry no
-    /// predicate a planner can push down, so every call would materialise an
-    /// aggregate over the whole table.
+    /// The conflict evidence is a second query, keyed on the field names
+    /// this page actually returned, and skipped entirely when
+    /// `filter.with_conflicts` is false. Joining a grouped
+    /// `SELECT ... FROM field_conflicts GROUP BY field` instead would carry
+    /// no predicate a planner can push down, so every call, including the
+    /// deliberately uncached `?service=` one, would materialise an aggregate
+    /// over the whole table, which is bounded only by
+    /// [`MAX_CONFLICTS_PER_FIELD`] x [`MAX_PINNED_FIELDS`] and not by the
+    /// pin cap the scoped listing promises. Keyed on the page it rides
+    /// 0002's `(field, at DESC)` index and reads at most
+    /// `limit` x [`MAX_CONFLICTS_PER_FIELD`] rows.
     ///
-    /// Scoped and unscoped are two SQL texts, not one `($1 IS NULL OR service =
-    /// $1)` shape: sqlx prepares and caches every statement per pooled
-    /// connection, and on execution 6 postgres (`plan_cache_mode=auto`)
-    /// switches a prepared statement to its generic plan, under which the `IS
-    /// NULL`-guarded `OR` cannot be pushed into
-    /// `field_services_service_field_idx` as a scan key, so the scoped listing
-    /// degrades to reading the whole table.
+    /// Scoped and unscoped are two SQL texts, not one
+    /// `($1 IS NULL OR service = $1)` shape: sqlx prepares and caches every
+    /// statement per pooled connection, and on execution 6 postgres
+    /// (`plan_cache_mode=auto`) switches a prepared statement to its
+    /// generic plan — under which the `IS NULL`-guarded `OR` cannot be
+    /// pushed into `field_services_service_field_idx` (migration 0003) as a
+    /// scan key, so the scoped listing degrades to reading the whole table
+    /// (measured at 0003's own sizing: 2 318 → 504 366 buffers), unbounded
+    /// in the client-chosen service axis. Same reasoning as the cursor
+    /// predicate in [`Self::field_services`]. The `since` guard keeps the
+    /// `IS NULL`-`OR` shape: it filters the joined rows after aggregation,
+    /// bounded by the pin cap, and is no index's scan key either way.
+    ///
+    /// Returns `(rows, truncated)`; `truncated` is set when more rows
+    /// matched than `filter.limit` allowed back.
     pub async fn list_fields(
         &self,
         filter: &FieldListFilter,

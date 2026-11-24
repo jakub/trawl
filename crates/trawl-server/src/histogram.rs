@@ -62,9 +62,19 @@ pub fn plan(asked: bool, query: &Query, from_saved: bool) -> HistogramPlan {
     }
 }
 
-/// Each of the two passes reads `cancel` at its first row and every
-/// [`TAIL_CANCEL_STRIDE`] rows after, and once more when the pass ends, so a
-/// result with no usable time is not answered past a cancel either.
+/// Count `result`, the final result of one execution, steps 5-7 of the
+/// eligibility rule: no `_time` column typed `timestamp` answers
+/// `no_time_column`, no row with a usable `_time` answers
+/// `no_usable_time`, and otherwise the counts are ready.
+///
+/// Two passes over the rows and constant extra memory: the first finds the
+/// bounds and the undated rows, the second fills the bins. Each pass reads
+/// `cancel` at its first row and every [`TAIL_CANCEL_STRIDE`] rows after,
+/// and once more when the pass ends, so a result with no usable time is
+/// not answered past a cancel either.
+///
+/// # Errors
+/// [`EngineError::Cancelled`] once `cancel` is latched.
 pub fn count(
     result: &QueryResult,
     kept_some: bool,

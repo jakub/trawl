@@ -1168,11 +1168,17 @@ async fn boot_recovers_publication_markers_before_serving() {
     fixture.assert_lock_free().await;
 }
 
+/// Assert the boot order (ADR-0041): both `publication_recovered` outcomes,
+/// then rollup-marker recovery, then boot conformance (its skip on an
+/// already-conformed root still logs `catalog_conform`), then hydration,
+/// then internal telemetry activation, each strictly after the one before.
 /// From activation on, a WAL file telemetry writes is inserted, so a
-/// hydration after it would count that file twice. The later steps log from
-/// their own threads, some after the listener, so they are ordered against
-/// activation only; wait for every line first. The daemon must run internal
-/// telemetry.
+/// hydration after it would count that file twice. Every later step's first
+/// line follows activation: the ingest pipeline (logged before compaction
+/// is spawned), the compaction, retention, syslog and scheduler tasks, and
+/// the listener. Those tasks log from their own threads, some after the
+/// listener, so they are ordered against activation only; wait for every
+/// line first. The daemon must run internal telemetry.
 async fn assert_recovery_precedes_boot_steps(daemon: &Daemon) {
     const TELEMETRY_ACTIVATED: &str = "internal telemetry enabled";
     let later: [(&str, &str); 10] = [

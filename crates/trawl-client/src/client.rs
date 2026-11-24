@@ -266,10 +266,14 @@ impl HttpClient {
 
     /// Check daemon health (unauthenticated).
     ///
-    /// A 503 whose body is a health body within [`HEALTH_BODY_CAP`] is an
-    /// answer, not an error: an unavailable daemon still reports its
-    /// per-subsystem checks, so it is returned as `Ok` with
-    /// `status: unavailable`.
+    /// trawld answers exactly 200 (`ok` or `degraded`) or 503
+    /// (`unavailable`). A 503 whose body is a health body is an answer, not
+    /// an error: an unavailable daemon still reports its per-subsystem
+    /// checks, so it is returned as `Ok` with `status: unavailable`. Any
+    /// other status, another 2xx included, or a 503 with a foreign body (a
+    /// proxy's error page), is a [`ClientError::Server`]. No body is read
+    /// past [`HEALTH_BODY_CAP`]: a body past it is [`ClientError::TooLarge`]
+    /// whatever the status, and an error envelope in it is never judged.
     pub async fn health(&self) -> Result<HealthResponse, ClientError> {
         self.health_with_status().await.map(|(_, health)| health)
     }
@@ -930,9 +934,16 @@ impl HttpClient {
 
     /// Trigger a repin (`POST /api/v1/schema/repin`).
     ///
-    /// The HTTP status carries the verdict; [`RepinStart`] names each one.
-    /// Every other failure, including the "already running" 409, whose body
-    /// is the error envelope, surfaces as [`ClientError::Server`].
+    /// The HTTP status carries the verdict, so this returns a three-way
+    /// outcome instead of flattening 409-with-plan into an opaque error:
+    /// 200 = dry-run report or a cancelled job, 202 = the job is running
+    /// (the rewrite, or a decision still pending at the server's answer
+    /// bound),
+    /// 409 with a job body = lossy without force (the plan rides back). The 200
+    /// pair is told apart by the row's own status, never by the code alone
+    /// (see [`decode_repin_start`]). Every other failure —
+    /// including the "already running" 409, whose body is the error
+    /// envelope — surfaces as [`ClientError::Server`].
     ///
     /// `ceilings` are the bounds a forced repin binds itself to; an absent
     /// one leaves the number to the server's own scan.
@@ -984,11 +995,14 @@ impl HttpClient {
         decode_repin_start(status, outcome.job).map_err(|e| e.answered_by(request_id.as_deref()))
     }
 
-    /// Ask the running repin to stop (`POST /api/v1/schema/repin/cancel`).
+    /// Ask the running repin to stop
+    /// (`POST /api/v1/schema/repin/cancel`, #109).
     ///
-    /// 202 accepted, 409 too late and 404 nothing running are answers rather
-    /// than failures. Every other failure status stays a
-    /// [`ClientError::Server`].
+    /// Three statuses are answers rather than failures — 202 accepted, 409
+    /// too late, 404 nothing running — so they decode into variants the way
+    /// [`Self::schema_repin`] decodes its 409 plan, before the generic
+    /// status check turns them into an opaque error. Everything else (401,
+    /// 403, 503 on a query-only node, 5xx) stays a [`ClientError::Server`].
     pub async fn schema_repin_cancel(&self) -> Result<RepinCancel, ClientError> {
         let url = self.endpoint("/api/v1/schema/repin/cancel");
         let resp = self

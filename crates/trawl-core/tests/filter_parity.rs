@@ -3315,9 +3315,12 @@ fn wire_pool(pin: CanonicalType) -> Vec<Value> {
     }
 }
 
-/// Type-appropriate on purpose: a word against a numeric pin is a `DuckDB`
-/// conversion error, so there is no row set for the evaluator to agree
-/// with. Only the VARCHAR pin takes a literal of either shape.
+/// Literals a generated comparison against `pin` can carry.
+///
+/// Type-appropriate on purpose, exactly as the deterministic matrix is: a
+/// word against a numeric pin is a `DuckDB` conversion error, so there is
+/// no row set for the evaluator to agree with. The VARCHAR pin is the
+/// exception — its rules are the ones that take a literal of either shape.
 fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
     match pin {
         CanonicalType::BigInt => &["1", "2", "404", "1.5", "-1", "9007199254740992"],

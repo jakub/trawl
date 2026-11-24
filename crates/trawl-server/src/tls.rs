@@ -2,12 +2,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `trawld --doctor` judges the TLS material boot serves without acting on it:
-//! [`TlsSource::of`] picks the pair, [`parse_pem_pair`] and
+//! TLS certificate loading and self-signed certificate generation.
+//!
+//! When no cert/key paths are configured, a self-signed certificate is
+//! auto-generated to `{state_dir}/tls/` and persisted across restarts.
+//! The state directory is typically the parent of the data directory
+//! (e.g. `/var/lib/trawl/tls/` for the deb package).
+//!
+//! `trawld --doctor` judges the same material without acting on it (#269,
+//! D12): [`TlsSource::of`] picks the pair, [`parse_pem_pair`] and
 //! [`serving_config`] are the one path from PEM bytes to a served
 //! certificate, and [`inspect_generated_pair`] reads the generated pair
-//! through the same directory checks and reads a start makes. Boot calls
-//! each of them, so the doctor's answer and boot's cannot drift.
+//! through the same directory checks and reads a start makes, creating,
+//! moving, and removing nothing. Boot calls each of them, so the doctor's
+//! answer and boot's cannot drift.
 
 use std::fs;
 use std::path::{Path, PathBuf};

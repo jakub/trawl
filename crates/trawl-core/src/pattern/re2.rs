@@ -61,9 +61,13 @@ impl Visitor for ClassSetFinder {
     }
 }
 
-/// A body with no Perl class and no word assertion prints back as its tree
-/// reads, which is the body itself unless it holds `(?x)` whitespace or
-/// comments.
+/// The body `ast` parses from, as RE2 reads it, in syntax the Rust engine
+/// reads the same way ([module docs](self)).
+///
+/// The rewrite runs on a copy of the syntax tree and prints it back, as
+/// [`super::batch_extract`] does. A body with none of the five escapes
+/// prints back as its tree reads, which is the body itself unless it
+/// holds `(?x)` whitespace or comments. It builds nothing.
 pub(crate) fn view(ast: &Ast) -> String {
     let mut tree = ast.clone();
     // An explicit stack, as the syntax tree's own visitor keeps, so a

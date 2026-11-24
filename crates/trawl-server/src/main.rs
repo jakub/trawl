@@ -1018,12 +1018,14 @@ fn log_crash_dump(status: &trawl_crashdump::Status) {
     }
 }
 
-/// Raises the soft `RLIMIT_NOFILE` to the hard limit when it can, and logs
-/// both once.
+/// Raises the soft `RLIMIT_NOFILE` to the hard limit and logs both once.
 ///
-/// The query engine opens one descriptor per Parquet file it scans, so the
-/// 1024 soft limit systemd and most shells hand out runs short well before
-/// memory or disk do.
+/// Every query, maintenance pass and ingest connection holds descriptors,
+/// and the query engine opens one per Parquet file it scans, so the 1024
+/// soft limit systemd and most shells hand out runs short well before
+/// memory or disk do. The hard limit is the operator's ceiling (`LimitNOFILE=` in the
+/// Debian unit); trawld only stops leaving headroom under it unused. A
+/// refusal is logged with the inherited values and trawld runs on them.
 #[cfg(unix)]
 fn raise_nofile_limit() {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};

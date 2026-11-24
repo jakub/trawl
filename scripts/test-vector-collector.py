@@ -928,8 +928,9 @@ def capture_recipe():
             print(f"PASS capture refuses a Vector without vector config: exit {result.returncode}, "
                   f"names {PINNED_PACKAGE}, {len(requests)} requests, empty capture")
 
-        # The stubbed `sudo` runs nothing, so the block only prepares the copy,
-        # and no host journal is read.
+        # The recent-window variant, as the guide prints it, on the shipped
+        # files with their sources: `sudo` runs nothing, so the block only
+        # prepares the copy, and no host journal is read.
         with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
             directory = Path(name)
             live = directory / "vector.d"

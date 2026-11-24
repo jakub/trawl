@@ -419,8 +419,17 @@ fn search_of(url_or_search: &str) -> &str {
 }
 
 /// Rewrite a search URL, replacing ONLY the parameter the banner names
-/// and carrying every other parameter through, because a link can be wrong
-/// in more than one place at once.
+/// and carrying every other parameter through exactly as it arrived.
+///
+/// A one-parameter edit rather than a rebuild out of the decoded memos,
+/// because a link can be wrong in more than one place at once.
+/// `?q=service%3Dnginx&f=v1.!&r=garbage` used to lose its range the
+/// moment the reader clicked "Drop filters": the rebuild wrote the
+/// range memo, which had already fallen back to the default, and the
+/// query quietly ran over the last 15 minutes with no banner and no
+/// mention. Dropping `f` and nothing else leaves `r=garbage` in the
+/// address bar, so the next verdict raises its own banner and offers
+/// its own repair.
 ///
 /// `params` is the query as the router hands it over: each value
 /// decoded exactly once, in the order the URL carries them.

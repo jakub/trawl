@@ -377,9 +377,20 @@ mod unavailable_run_result {
         // Restore, so the tempdir teardown is not fighting the mode.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
-    /// The run is PLANTED rather than triggered: an ordinary event query
-    /// cannot run under a `data_dir` the emitter's glob validator refuses, so
-    /// a real report run here would record zero rows and no parquet file.
+    /// A `data_dir` the emitter's glob validator refuses.
+    ///
+    /// `[data] path` is operator configuration, and the config layer keeps a
+    /// directory with spaces verbatim
+    /// (`daemon_data_directory_is_preserved_and_drives_wal_location`). A
+    /// single selected run reads through a source the SERVER escapes, so the
+    /// glob validator's narrow alphabet never applies to it.
+    ///
+    /// Returns the server and its data root. The run is PLANTED rather than
+    /// triggered: an ordinary event query cannot run under this `data_dir`
+    /// at all (see the commit body's parked finding), so a real report run
+    /// here would record zero rows and no parquet file. What is under test
+    /// is the read of a stored result, and that is real: a real parquet file
+    /// at a real odd path, read by a real `DuckDB` through the real handler.
     async fn server_on_odd_data_dir(leaf: &str) -> (TestServer, std::path::PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().to_path_buf();

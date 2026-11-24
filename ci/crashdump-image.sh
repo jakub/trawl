@@ -555,10 +555,15 @@ case "$scope" in
     ;;
   *)
     # Scope 0 and 1 never ask for the capability, so dropping it changes none of
-    # the inputs the classifier reads here, all readable in this container
-    # shape, so ready is the only verdict the classifier can reach. Accepting
-    # denied too would pass a probe that stopped reading an input, or a
-    # classifier that started demanding the capability at these scopes.
+    # the inputs the classifier reads here: the credentials match, both sides
+    # hold an empty permitted set, the daemon is dumpable, and PR_SET_PTRACER
+    # succeeded (checked at scope 1, not required at scope 0). All of them are
+    # readable in this container shape, so ready is the only verdict the
+    # classifier can reach, and this step is the capability-free control that
+    # says so. Accepting denied too would pass a probe that stopped reading an
+    # input, or a classifier that started demanding the capability at these
+    # scopes; requiring the exact class also makes indeterminate the failure it
+    # is, since nothing here is unreadable.
     assert_class "$misc_line" 'readiness="ready"'
     ;;
 esac
@@ -600,10 +605,27 @@ esac
 
 phase "step 7: the chart shape, no_new_privs on, still captures"
 
-# trawld has to BE the init process here, exec'd by the runtime, exactly as it
-# is in the pod. Every other step parks trawld behind a shell, which holds no
-# permitted capability, so under no_new_privs trawld's file capability is a
-# gain, and the kernel takes it back.
+# The chart adds SYS_PTRACE and leaves allowPrivilegeEscalation false, so the
+# pod runs with no_new_privs set. That reads like it should be fatal, since
+# under no_new_privs an exec may not GAIN a permitted capability: the kernel
+# intersects the new permitted set back down to what the caller already held.
+#
+# The gain is what the rule is about, not the flag. The container runtime puts
+# SYS_PTRACE in the init process's permitted set, so when that process execs
+# /usr/bin/trawld the file capability grants a bit it already had. No gain,
+# nothing taken back. The monitor exec repeats the same story one level down.
+#
+# Which is why trawld has to BE the init process here, exec'd by the runtime,
+# exactly as it is in the pod. Every other step parks trawld behind a shell
+# that mkfifo's its config, and a shell holds no permitted capability of its
+# own, because its own exec emptied the set. trawld's file capability is then a
+# gain, and the kernel takes it back. That shell does not exist in the pod, and
+# leaving it in would turn this step into a proof of the opposite.
+#
+# So the FIFO is planted from outside instead, into a created but not yet
+# started container. Same park at the config read, same proof that init()
+# finished, nothing between the runtime and trawld. start_as_init says why it
+# is planted as root.
 
 start_as_init chart-shape-crash \
   --user 1000 --cap-add SYS_PTRACE --security-opt no-new-privileges \

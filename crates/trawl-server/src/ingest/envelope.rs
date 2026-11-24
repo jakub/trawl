@@ -662,10 +662,21 @@ pub(crate) fn is_folded_name(name: &str) -> bool {
     !name.bytes().any(|b| b.is_ascii_uppercase())
 }
 
-/// Compaction pins every dynamic column in postgres before writing its
-/// parquet, and an over-long name would overflow the btree key behind
-/// `field_types.field`: without this drop, the same WAL would re-fail on
-/// every tick, permanently, for that service.
+/// Drop every field whose name cannot be a field-catalog key, returning
+/// whether any were dropped (the `field.name_too_long` repair).
+///
+/// This is the only seam that sees a client-chosen key before it becomes a
+/// column. Compaction pins every dynamic column in postgres before writing
+/// the parquet that carries it, and an over-long name overflows the btree
+/// key behind `field_types.field`: the insert errors, the batch is retained
+/// for retry, and the same WAL re-fails on every tick — permanently, for
+/// that service. Bounding the name here is what keeps that unreachable.
+///
+/// Dropping the field is a repair with an honest answer rather than a
+/// guess: `_raw` is captured before this runs, so the name and its value
+/// both stay recoverable, and no other field in the event is punished for
+/// one bad key (rejecting the event would throw away good data). Each
+/// dropped key is recorded in `changes`.
 fn drop_unstorable_names(out: &mut Map<String, Value>, changes: &mut Vec<FieldChange>) -> bool {
     let unstorable: Vec<String> = out
         .keys()
@@ -779,28 +790,55 @@ fn capture_raw(
     (raw_string, truncated)
 }
 
+/// Canonicalize one parsed event object into the declared envelope.
+///
 /// Field order of operations is load-bearing:
 /// 0. Field-name ASCII case-fold ([`fold_field_names`]), before anything
 ///    that keys on a name (service validation, reserved-prefix strip,
-///    stringification), so one code path sees one spelling.
+///    stringification), so one code path sees one spelling. Recorded as
+///    `field.name_case_folded` / `field.name_case_collision` only when it
+///    changed something.
 /// 1. `_raw` capture, before the strip and every repair, so the server's
-///    own fills never appear inside "what arrived".
-/// 2. Reserved-prefix strip ([`strip_reserved_prefixes`]).
-///    2.5. Producer assertions ([`apply_assertions`]), after the strip, so
-///    a stripped `_service` has already landed on its bare slot and the
-///    profile overrides that too, and before the validators, so an asserted
+///    own fills never appear inside "what arrived" (the serialization
+///    fallback uses the pre-fold object, so dropped and folded spellings
+///    stay findable). Whether the payload may propose `_raw` is
+///    per-profile ([`raw_is_proposable`]): trawld's own door never lets a
+///    field claim the lifeline.
+/// 2. Reserved-prefix strip ([`strip_reserved_prefixes`],
+///    `field.reserved_prefix` / `field.name_empty` / `field.stamp_claimed` /
+///    `field.reserved_prefix_collision`).
+///    2.5. Producer assertions ([`apply_assertions`],
+///    `field.producer_asserted`), after the strip, so a stripped
+///    `_service` has already landed on its bare slot and the profile
+///    overrides that too, and before the validators, so an asserted
 ///    `service`/`env` faces exactly the checks an HTTP sender's does.
+///    The HTTP door asserts nothing and skips this.
 /// 3. `service` validation (reject path), `env` and `host` resolution,
-///    after the strip, because a stripped `_env`/`_host` lands on the bare
-///    slot these read. Resolving first would let step 6 overwrite the
-///    stripped value and then confess `env.defaulted`/`host.from_peer`
-///    about a sender that did assert one.
+///    after the strip, because a stripped `_service`/`_env`/`_host` lands
+///    on exactly the bare slot these read, the same way a stripped
+///    `_severity` lands where derivation reads it (ADR-0013 §5). Resolving
+///    first would let step 6 overwrite the stripped value and then confess
+///    `env.defaulted`/`host.from_peer` about a sender that did assert one.
+///    Over-long field-name drop (`field.name_too_long`) follows.
+/// 4. `_time` derived from the first present source in this profile's
+///    `time_from` list, ADR-0008 grammar, `time.from_ingest` /
+///    `time.unparseable` / `time.out_of_range`. Only `_time` is consumed.
+/// 5. `_ingested` stamp.
 /// 6. `env` default-or-reject, `host` peer-fill / relay-reject / omit.
+/// 7. `_severity` derived from the first mappable source in this profile's
+///    `severity_from` list, read-only: every source stays where it is, and
+///    no mappable one means no key and no repair.
 ///    7.5. `_producer` stamp, after the strip, so an incoming `_producer`
 ///    has already become a bare `producer` and the column is unforgeable.
 ///    7.6. Every stored string value but `_raw` cut to [`MAX_RAW_CHARS`]
-///    after every other step that stores or reads a value, so derivation
-///    reads the whole value and a consumed `_time` proposal is never cut.
+///    ([`cap_string_values`], `field.truncated`). After stringification,
+///    so nested values are cut as their final text, and after every
+///    other step that stores or reads a value, so derivation reads the
+///    whole value and a consumed `_time` proposal is never cut.
+/// 8. `_raw` insertion and `_repairs` assembly (omitted when clean).
+///
+/// Each step records its own decision in the [`Lineage`] as it makes it,
+/// so the lineage is never reconstructed from the rules afterwards.
 #[allow(clippy::too_many_lines)]
 pub fn canonicalize(
     obj: &Map<String, Value>,

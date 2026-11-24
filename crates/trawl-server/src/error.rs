@@ -818,8 +818,17 @@ impl ServerError {
             Self::Ingest(_) | Self::IngestBodyTooLarge { .. } => "ingest",
             Self::RateLimited { .. } => "rate_limited",
             Self::TooManyStreams => "too_many_streams",
-            // One class for every 503 refusal to serve: a typed reason is a
-            // cause kind, not a class.
+            // An auth backend outage is the same 503 it was before the
+            // driver's kind rode along; `cause_kind` tells it apart.
+            // A full hot buffer is a 503 like any other refusal to serve;
+            // `cause_kind` names it, as it does an auth backend outage.
+            // An unsettled corpus, a failed hot snapshot and a failed env
+            // listing are too: the reason and the I/O kind are cause kinds,
+            // not classes. So is a
+            // request refused at the request limit (ADR-0054), a query
+            // that exhausted the query database's budgets, and a failed
+            // engine sample (ADR-0056), and a query refused for its regex
+            // memory or a preparation slot (ADR-0063).
             Self::Engine(EngineError::ResourceExhausted | EngineError::RegexResources(_))
             | Self::RegexResources(_)
             | Self::EngineSampleFailed

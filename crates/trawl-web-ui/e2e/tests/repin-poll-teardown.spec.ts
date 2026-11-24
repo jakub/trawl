@@ -2,15 +2,32 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// A leaked Interval is network-silent — its body is
-// `poll_once.try_run(())`, which no-ops once the owner is disposed —
-// so only the browser's own timer table can see it (`trackIntervals`).
-// A flat status-hit count would stay flat under a leaked timer too (the
-// in-flight guard sees a read still parked), so it never stands in
-// for the timer check.
+// The field case drawer's repin status poll dies with the drawer, by
+// every route out of it (issue #157).
 //
-// The e2e identity holds no `schema_write`, so the mount-time status
-// probe is the ONLY way a poll can start here.
+// The drawer owns one `gloo_timers::Interval` in a `StoredValue` that
+// `on_cleanup` drops, plus an `alive` latch that stops any continuation
+// of a read already in flight. Three mechanisms, and each one needs its
+// own observable:
+//
+//   1. The TIMER. A leaked Interval is network-silent — its body is
+//      `poll_once.try_run(())`, which no-ops once the owner is disposed,
+//      so a leak issues zero further HTTP reads and throws no
+//      `pageerror`. Only the browser's own timer table can see it, which
+//      is what `trackIntervals` reads.
+//   2. The READS. A flat status-hit count proves something different:
+//      that no fresh read got out. It would stay flat under a leaked
+//      timer too (the in-flight guard sees a read still parked), so it
+//      is an assertion in its own right and never a stand-in for 1.
+//   3. The LATCH. The stub parks status read 2 open and never answers
+//      it. Releasing it after the drawer is gone delivers a succeeded
+//      job to a continuation that must decline to act: no toast, and a
+//      release that reports the read was still pending, which is also
+//      the proof the client never abandoned it.
+//
+// The e2e identity holds no `schema_write`, so the repin modal is never
+// offered and the mount-time status probe is the ONLY way a poll can
+// start here. That is exactly the entry point under test.
 
 import {
   test,

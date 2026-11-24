@@ -5,8 +5,51 @@
 //! The one expression that binds a pinned column to its catalog type
 //! (ADR-0009 slice 2, ADR-0011).
 //!
-//! Every reading these casts produce has a live mirror in [`crate::compare`],
-//! executed side by side against the bundled `DuckDB`, never assumed.
+//! Two lanes conform the same value, and both build their SQL here:
+//!
+//! - **compaction** (`trawl-server`) conforms a WAL batch on its way to
+//!   parquet, and the boot pass rewrites standing files the same way — this
+//!   is what the corpus DURABLY holds;
+//! - **the hot branch** ([`crate::emitter`]'s `REPLACE` list over the
+//!   hot-buffer ndjson) conforms the same events while they are still in
+//!   memory, so a query sees the value it will keep seeing after the
+//!   compactor runs.
+//!
+//! They cannot be two expressions. A value that reads `true` while it is
+//! hot and NULL once it compacts is a query whose answer changes with a
+//! background timer, minutes after the fact, with nothing in the request to
+//! explain it.
+//!
+//! Two rules make one expression deterministic:
+//!
+//! 1. **Text first.** Both lanes read their source through `read_json`,
+//!    which types each column from the batch's CONTENTS: a field holding
+//!    only strings infers VARCHAR, one holding a number beside a string
+//!    infers JSON, and JSON's cast domain is strictly narrower than
+//!    VARCHAR's (`TRY_CAST(JSON '"1.5"' AS BIGINT)` is NULL where
+//!    `TRY_CAST('1.5' AS BIGINT)` rounds to 2 — and JSON's is WIDER for a
+//!    numeric under a BOOLEAN pin, where `200` reads `true`; both probed by
+//!    execution in `trawl-engine/tests/duckdb_probe.rs`). Casting the
+//!    inferred type would make one event's reading a function of what
+//!    happened to share its batch. Every pinned column therefore goes
+//!    through its TEXT form first ([`untyped_text`], in BOTH lanes — a
+//!    per-lane spelling is a per-lane stored value under the VARCHAR pin,
+//!    whose guard is the identity), and the guarded cast applies to that
+//!    text: the cast domain is VARCHAR, always.
+//! 2. **The guard is the cast.** A bare `TRY_CAST` to a typed pin ROUNDS
+//!    rather than fails (`'1.5'` → 2) and reads a vocabulary the rendering
+//!    does not round-trip (`'TRUE'` → `true`), so every typed rung is
+//!    wrapped in a round-trip check ([`guarded_cast`]): a value the cast
+//!    would ALTER becomes NULL — counted as a conflict, and still findable
+//!    in `_raw` — instead of being silently rewritten.
+//!
+//! The live mirror of these readings — what the in-memory SSE matcher must
+//! answer for the same wire value, before it compares or globs anything —
+//! lives in [`crate::compare`] ([`crate::compare::conformed_bigint`],
+//! [`crate::compare::conformed_boolean`],
+//! [`crate::compare::conformed_timestamp`],
+//! [`crate::compare::try_cast_double`]), and every pairing is executed
+//! side by side against the bundled `DuckDB`, never assumed.
 
 use crate::schema::CanonicalType;
 use crate::severity::Dialect;

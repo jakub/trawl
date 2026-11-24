@@ -20,8 +20,12 @@ pub(crate) enum NullPolicy {
     Strict,
 }
 
-/// The text a glob/regex matches against under the pin. The live side
-/// mirrors it exactly (`crate::pin_match`).
+/// The column expression a glob/regex matches against: the column itself,
+/// or the pin's canonical pattern text (ADR-0011) — glob on a BIGINT
+/// column matches its text form instead of leaving the outcome to
+/// `DuckDB`'s implicit-cast rules, and a TIMESTAMP renders as the RFC 3339
+/// wire form the live matcher sees rather than `DuckDB`'s space-separated
+/// default. The live side mirrors this exactly (`crate::pin_match`).
 pub(crate) fn pattern_target(field: &str, pin: Option<crate::schema::CanonicalType>) -> String {
     match compare::pattern_form(pin) {
         PatternForm::Native => field.to_owned(),

@@ -58,7 +58,8 @@ pub const RELATIVE_CHANGE: &str = "compare_relative_change";
 pub const COMPARE_STATUS: &str = "compare_status";
 
 /// Every column the `compare` pipeline assigns. A group field of one of
-/// these names would be overwritten before it is grouped, so it is refused.
+/// these names would be overwritten before it is grouped, so it is
+/// refused.
 pub const COMPARE_COLUMNS: [&str; 11] = [
     COMPARE_SIDE,
     COMPARE_FG,

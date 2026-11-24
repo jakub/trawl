@@ -273,16 +273,37 @@ impl KeyStore {
         ))
     }
 
-    /// Every failed check on a well-formed token surfaces as
-    /// [`AuthError::InvalidKey`] (with the same opaque message) so callers
-    /// cannot distinguish "not found", "wrong hash", "revoked", or
-    /// "expired" — that distinction would be an enumeration oracle. A
-    /// backend failure is [`AuthError::Database`].
+    /// Verify a plaintext token.
+    ///
+    /// Returns the verified identity if every check passes. Every failure
+    /// surfaces as [`AuthError::InvalidKey`] (with the same opaque message)
+    /// so callers cannot use the variant to distinguish "not found", "wrong
+    /// hash", "revoked", or "expired" — that distinction would be an
+    /// enumeration oracle.
+    ///
+    /// A prefix miss still pays one argon2id verification so response time
+    /// doesn't leak prefix existence. Liveness is rechecked inside the
+    /// `last_used` UPDATE, which also requires the stored hash to still be
+    /// the one this check verified against, or hit the cache under, and
+    /// locks the row for the role resolution that follows. A hash rotation
+    /// that commits between the row read and that UPDATE therefore refuses
+    /// the check in flight: the presented plaintext was never checked
+    /// against the new hash, so it is not authenticated.
     ///
     /// The `last_used` UPDATE and the role resolution run as one
     /// transaction on a task of its own, which this call awaits. A caller
     /// dropped meanwhile, as when a client resets its connection, leaves
-    /// the task to finish, so the connection returns outside any transaction.
+    /// the task to finish: the transaction commits, or a refused one is
+    /// rolled back on its connection's way back to the pool, so the
+    /// connection returns outside any transaction and the pool's return
+    /// check ([`Self::connect`]) closes no keystore session for it. That
+    /// check stays as the backstop. Each detached transaction holds one of
+    /// as many permits as the pool has connections, from before its task
+    /// starts until the transaction ends: a caller dropped while it waits
+    /// for one starts nothing, so resets leave no more transactions running
+    /// than the pool can serve. The argon2id cap is separate. The errors
+    /// are those of the transaction run inline: a backend failure is
+    /// [`AuthError::Database`], a lost recheck [`AuthError::InvalidKey`].
     pub async fn verify_key(&self, plaintext: &str) -> Result<VerifiedKey, AuthError> {
         let prefix = token::extract_prefix(plaintext).ok_or_else(|| {
             AuthError::MalformedToken("token must start with flt_ and be at least 12 chars".into())

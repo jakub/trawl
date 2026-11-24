@@ -226,9 +226,23 @@ jobs:
           if-no-files-found: error
 
   test:
-    # Every pg test runs under #[sqlx::test] (per-test ephemeral database off
-    # DATABASE_URL, so the role must have CREATEDB). Each slice has its own
-    # server, so the nextest `postgres` group's connection budget holds per job.
+    # Postgres backs the pg-based integration tests in fleet-auth,
+    # fleet-admin, AND trawl-server: every pg test runs under #[sqlx::test]
+    # (per-test ephemeral database off DATABASE_URL, so the role must have
+    # CREATEDB), and trawl-server's harness additionally creates a sibling
+    # trawl app-state database that trawld's real boot path migrates. CI
+    # uses a throwaway postgres:18 container (the default `postgres`
+    # superuser has CREATEDB); local-dev and the homelab dev/prod
+    # environments use CNPG. No test reads the service's own `postgres`
+    # database, so the migration of it runs in test-guards.
+    #
+    # Connection budget: nextest is process-per-test and sqlx pools are
+    # process-local, so unbounded parallelism can exceed the server's
+    # max_connections (default 100 — GH service containers can't override
+    # the postgres command line). The `postgres` nextest group in
+    # .config/nextest.toml bounds pg-heavy test parallelism instead, and
+    # the admission guard in test-guards proves nothing escaped it. Each
+    # slice has its own server, so the budget holds per job.
     name: test (${{ matrix.partition }}/3)
     runs-on: ubuntu-24.04
     needs: test-build

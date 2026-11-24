@@ -762,8 +762,9 @@ fn score_stage(
             charge(index, keyword, None, weight.d, total)?;
         }
         PipeStage::Rename(r) => {
-            // A renamed leaf adds no delta, but is recorded all the same: the
-            // stage's own outputs are what a same-stage reference would find.
+            // A rename substitutes a leaf, so its target carries one node
+            // and no delta. Recorded all the same: the stage's own outputs
+            // are what a same-stage reference would find.
             for (_, new) in &r.renames {
                 memo.insert(catalog_key(new), Weight::LEAF);
             }

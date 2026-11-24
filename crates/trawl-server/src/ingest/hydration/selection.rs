@@ -131,8 +131,9 @@ pub(crate) fn walk_wal(
     Some(WalWalk { unlisted, claims })
 }
 
-/// Keep the oldest `bound` writer-named candidates. Every other entry is
-/// counted here: `claimed`, `unlisted` and non-writer names as
+/// List the WAL in compaction's zero-age scope ([`walk_wal`]) and keep the
+/// oldest `bound` writer-named candidates, oldest first. Every other entry
+/// is counted here: `claimed`, `unlisted` and non-writer names as
 /// `undecodable`. Candidates beyond the bound set `bound_hit` and are not
 /// counted.
 fn list(

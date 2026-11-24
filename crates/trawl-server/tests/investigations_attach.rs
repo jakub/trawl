@@ -789,11 +789,14 @@ async fn boot_unmetered_with(capture: CaptureConfig) -> (Arc<TestServer>, Keys) 
     (Arc::new(server), keys)
 }
 
-/// Only the capture under test goes through this router: the setup's
-/// captures run through the fixture's own router under the default
-/// deadline, so a machine stall during setup cannot time them out. The
-/// in-flight set and the step writer are the fixture's, so the sweep and
-/// the writer see this router's captures.
+/// A router over `server`'s state whose captures run under `deadline`,
+/// with the fixture's HTTP config as `http` leaves it. Only the capture
+/// under test goes through it: the setup's captures run through the
+/// fixture's own router under the default deadline, so a machine stall
+/// during setup cannot time them out. The capture gate is a new one built
+/// from the same limits, store, root and clock, as the gate holds no
+/// deadline of its own; the in-flight set and the step writer are the
+/// fixture's, so the sweep and the writer see this router's captures.
 fn router_under(
     server: &TestServer,
     deadline: Duration,
@@ -1019,13 +1022,29 @@ async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_dea
     );
 }
 
+/// A step admission's statements spend one capture deadline between them
+/// (ADR-0059): each statement's `statement_timeout` is what remains of the
+/// deadline when it is sent, never a fresh budget. The due-write rule's
+/// prune waits on a kept result another session holds, three seconds of
+/// the five-second deadline pass, and the session lets go: the admission's
+/// first statement had more than four seconds, and its log insert, after
+/// the prune, no more than two. The capture then runs, answers 200, and
+/// its step settles.
+///
+/// Only the capture under test runs under the five-second deadline
+/// ([`router_under`]); the setup's capture keeps the default one.
+///
 /// The deadline is a tokio one, so the server boots and the result is
-/// held on the live clock, and the clock is then paused: the three of the
-/// deadline's five seconds the prune spends are one explicit advance, and
-/// every wait after the pause runs under `frozen`, so the real work of
-/// Postgres and the capture never lets tokio jump the clock. Postgres's
-/// clock is not paused: the prune waits under a real five-second
-/// `statement_timeout`.
+/// held on the live clock, and the clock is then paused: the three
+/// seconds are one explicit advance, and every wait after the pause runs
+/// under `frozen`, so the real work of Postgres and the capture never
+/// lets tokio jump the clock. The admission's budgets are read from the
+/// server's statement record, armed after the setup, which keeps each
+/// write transaction apart, so the step's own outcome write, or a write
+/// from a background timer the advance fires, is never read as the
+/// admission's. Postgres's clock is not paused: the prune waits under a
+/// real five-second `statement_timeout`, and after the advance each later
+/// statement gets at most two real seconds, under the hang guard.
 #[tokio::test(flavor = "current_thread")]
 async fn a_step_admission_spends_one_deadline_across_statements() {
     let deadline = Duration::from_secs(5);

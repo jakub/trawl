@@ -26,13 +26,24 @@
 //!
 //! - the no-concurrent-run guard is the partial unique index
 //!   `report_runs_one_running`; every claim maps the named 23505 to its own
-//!   already-running answer;
+//!   already-running answer ([`DueClaim::AlreadyRunning`],
+//!   [`ManualRunClaim::AlreadyRunning`], [`RunClaim::AlreadyRunning`]);
+//! - every claim spends one run of the schedule's budget (`runs_claimed`,
+//!   capped by `max_runs`) in the transaction that inserts its run, under
+//!   `FOR UPDATE` on the schedule row, manual runs included
+//!   ([`ScheduleStore::claim_manual_run`]); a refusal or failed insert
+//!   after the spend rolls it back;
 //! - deletions lock the parent row then every `report_runs` row (`FOR
 //!   UPDATE`, no `result_path` filter) before collecting parquet paths, so a
 //!   concurrent `finish_run` either lands its path before the lock or blocks
 //!   until the cascade removes its row — never orphaning the file;
-//! - [`ScheduleStore::finish_run`] takes the schedule lock FIRST for the
-//!   watermark and the fire cursor — same order as the claim and the delete.
+//! - [`ScheduleStore::finish_run`] reports whether it updated a row so a run
+//!   cascade-deleted mid-flight can have its freshly-written file removed. A
+//!   successful completion also advances the schedule's `since_last`
+//!   watermark, and a successful manual run moves an overdue fire cursor,
+//!   in that same transaction. It takes the schedule lock FIRST for them —
+//!   same order as the claim and the delete, so the three can never
+//!   deadlock against each other.
 //!
 //! Run order has one clock. Every claim stamps `report_runs.started_at`
 //! from the application clock, read after its locks are held, never from
@@ -42,9 +53,15 @@
 //! Age-based retention compares it against the same application clock.
 //!
 //! The scheduler's reads and both run claims wait a bounded time
-//! (ADR-0018), each statement its own [`WriteTx::run`], so each refreshes
-//! `statement_timeout` from what remains. A `COMMIT` already sent is never
-//! cut short.
+//! (ADR-0018, amended 2026-11-11). [`ScheduleStore::list_due_schedule_page`],
+//! [`ScheduleStore::claim_due_run`] and [`ScheduleStore::claim_manual_run`]
+//! each stamp one deadline, [`CLAIM_WAIT`] out, at entry, and run in a
+//! [`WriteTx`] under it: the connection, the `BEGIN`, every statement (each
+//! one its own [`WriteTx::run`], so each refreshes `statement_timeout` from
+//! what remains), a claim's window resolution and the rollback all end
+//! there, as [`StoreError::WaitExpired`], with nothing written. A `COMMIT`
+//! already sent is awaited past it, never cut. The lock order above is the
+//! same statement for statement; only the waits are bounded.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -1118,15 +1135,25 @@ impl ScheduleStore {
     ) -> Result<FinishOutcome, StoreError> {
         let mut tx = self.pool.begin().await?;
 
-        // Schedule before run, the order every multi-row path here takes.
+        // Schedule before run, the order every multi-row path here takes:
+        // every claim and `delete_schedule` lock the schedule before runs,
+        // so updating the run first and reaching for the schedule afterwards
+        // would let this transaction deadlock against any of them.
         // `FOR UPDATE OF s` locks the schedule alone — the join reads the
         // run without locking it, which is what keeps the order intact.
         //
-        // The lock is taken only when there is something to move: a run
-        // claimed as `since_last` (the watermark) or a manual run (the
-        // cursor). The run's `window_kind`, `origin` and `started_at` are
-        // written at claim time and never updated, so reading them unlocked
-        // is exact.
+        // The lock is taken only when there is something to move, and the
+        // test is the one the moves themselves use: a run claimed as
+        // `since_last` (the watermark) or a manual run (the cursor). Both
+        // are written at claim time and never updated, so the answer cannot
+        // change under us. Any other run does not lock the schedule and
+        // never queues behind a schedule someone else is holding. A
+        // cascade-deleted run matches nothing and skips the lock; the run
+        // UPDATE below then reports RunDeleted as it always has.
+        //
+        // The schedule columns come from the locked row, so they are the
+        // latest committed values; the run's `origin` and `started_at` are
+        // immutable, so reading them unlocked is exact.
         let mut cursor_move = None;
         if status == RunStatus::Success {
             let locked = sqlx::query(

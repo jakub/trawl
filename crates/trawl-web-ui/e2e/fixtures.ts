@@ -2,9 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Every spec imports `test`/`expect` from here instead of
-// `@playwright/test` directly, so the reset, network-guard, pageerror and
-// unstubbed-call checks apply uniformly.
+// Shared Playwright fixture: every spec imports `test`/`expect` from
+// here instead of `@playwright/test` directly, so the reset / homelab
+// -independence / pageerror / unstubbed-call contract applies uniformly
+// without being re-typed per file.
 
 import { spawn } from 'node:child_process';
 import path from 'node:path';

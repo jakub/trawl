@@ -212,9 +212,15 @@ pub(crate) fn compare_values(
                 Some(false)
             }
         }
-        // DuckDB's TRY_CAST of the VARCHAR text is wider than Rust's number
-        // parser (whitespace, `_` separators, `0404`), which
-        // `compare::decimal_micros` mirrors.
+        // The TRY_CAST rung: the column is VARCHAR under the pin, so the
+        // batch side casts the value's TEXT form — and DuckDB's cast
+        // domain is wider than Rust's number parser (whitespace, `_`
+        // separators, `0404`), which `compare::decimal_micros` mirrors, or
+        // the stream silently drops rows the batch query returns. A text
+        // outside the domain is NULL, so UNKNOWN — the one place a
+        // non-null event value can still be UNKNOWN — and a LITERAL
+        // outside it (`fv` is `None`) makes every row UNKNOWN, exactly as
+        // the SQL's NULL right-hand side does.
         CoercedValue::NumericOnText(fv) => (*fv).and_then(|literal| {
             compare::decimal_micros(&json_to_string(event_val))
                 .map(|ev| apply_ord(ev.cmp(&literal), op))

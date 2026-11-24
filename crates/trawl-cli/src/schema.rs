@@ -1161,9 +1161,9 @@ fn repin_job_cells(job: &trawl_client::RepinJobResponse, format: OutputFormat) -
         job.requires_force_reason
             .clone()
             .map_or(Json::Null, Json::from),
-        // The cancel facts: on a `running` row they say a cancel is in flight,
-        // on a `failed` one they say the process died between the request and
-        // any boundary that could observe it.
+        // Persisted facts (#109): on a `running` row they say a cancel is
+        // in flight, on a `failed` one they say the process died between
+        // the request and any boundary that could observe it.
         job.cancel_requested_at
             .clone()
             .map_or(Json::Null, Json::from),

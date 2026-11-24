@@ -132,10 +132,23 @@ pub fn in_flight_evidence(data_dir: &Path) -> Result<Option<&'static str>, std::
 /// filesystem — i.e. that neither the data root nor anything nested under
 /// an env directory is a mount point.
 ///
-/// Found mid-job, it fails the build late, or reaches the forward-only
-/// swap, which can only exit the process; every boot then replays the
-/// marker into the identical failure. A nested mount fails as `EBUSY`,
-/// not `EXDEV`.
+/// The whole staging design is renames and hardlinks between the data root
+/// and its siblings, neither of which crosses a filesystem. Discovering
+/// that mid-job is only ever bad: a hardlink `EXDEV` fails the build
+/// (clean, but late), and a corpus where nothing needed hardlinking builds
+/// fine and then meets the same failure in the forward-only swap, where
+/// the only safe answer is to exit the process — after which every boot
+/// replays the marker into the identical failure and refuses to start. A
+/// nested mount fails identically and even more opaquely: renaming a
+/// directory that contains a mount point is `EBUSY`, not `EXDEV`. One
+/// stat walk up front turns all of that into a refusal that changes
+/// nothing.
+///
+/// The refusal reaches the request and the repin job row, so it names the
+/// data root by its setting, offenders relative to the data root, the
+/// staging roots by their sibling names and I/O failures by their
+/// [`std::io::ErrorKind`] (ADR-0040, amendment of 2026-11-08). The
+/// absolute paths and the error text go to a DEBUG event only.
 pub fn check_staging_filesystem(data_dir: &Path) -> Result<(), String> {
     let parent = data_dir.parent().filter(|p| !p.as_os_str().is_empty());
     let parent = parent.unwrap_or_else(|| Path::new("."));

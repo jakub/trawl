@@ -3,10 +3,14 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // Observed outcome of one leg of issue241-negative-leg.sh, read from
-// Playwright's JSON report: `pass`, `fail`, or `inconclusive`. A `fail`
-// reads only the message header, cut before the source excerpt: the excerpt
-// quotes neighbouring lines, so an unrelated error one line up still
-// contains the assertion's label and must not count as a `fail`.
+// Playwright's JSON report: `pass` (the one test passed), `fail` (the one test
+// failed on the health-count assertion), or `inconclusive` (runner or setup
+// noise, or a failure anywhere else). The caller compares it with the leg's
+// expectation, so a surviving mutant reads as `pass`. A kill is structural: the single error must be located at
+// the spec's health-count assertion, and its message header (ANSI stripped,
+// cut before the source excerpt) must be that assertion's own failure. The
+// excerpt quotes neighbouring lines, so an unrelated error one line up still
+// contains the assertion's label and must not count.
 //
 // Usage:
 //   node issue241-negative-leg.verdict.mjs REPORT EXIT_STATUS OUT

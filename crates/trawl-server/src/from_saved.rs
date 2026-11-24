@@ -1203,8 +1203,12 @@ mod pg_tests {
         assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
     }
 
-    /// The `TIMESTAMP '<offset>'` literal built from the pg `started_at`
-    /// parses (`DuckDB` accepts and ignores the UTC offset).
+    /// The `run=all` UNION subquery must be SQL `DuckDB` executes end-to-end:
+    /// every eligible run contributes a branch, the injected `_run_id` /
+    /// `_run_time` columns materialise, and the `TIMESTAMP '<offset>'` literal
+    /// built from the pg `started_at` parses (`DuckDB` accepts and ignores the
+    /// UTC offset). Ineligible runs (error, or success without parquet) are
+    /// excluded.
     #[sqlx::test]
     async fn resolve_all_builds_union_duckdb_executes(pool: PgPool) {
         let dir = tempfile::tempdir().unwrap();
