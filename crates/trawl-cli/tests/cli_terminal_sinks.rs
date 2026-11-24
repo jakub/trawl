@@ -3,21 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! What sender-chosen text does on its way to an operator's terminal.
-//!
-//! A real trawld stores one event whose field names and values hold
-//! terminal controls: ESC sequences (a screen clear, concealed text, an
-//! OSC 52 clipboard write, a window title), the C1 CSI U+009B and the bidi
-//! override U+202E. The real `trawl` binary reads it back from an empty
-//! environment (only the dynamic loader's search path survives) with a
-//! temp `HOME` and XDG dirs, the fixture's config and the fixture's token,
-//! so no saved profile or `TRAWL_*` variable can address another server.
-//!
-//! The terminal is a PTY: `trawl` sees a TTY on stderr, and on stdout
-//! unless the case pipes it. The test reads the master until the last
-//! slave end closes, drains a piped stdout on its own thread meanwhile,
-//! then reaps the child. Nothing sleeps or polls; the timeout is a hang
-//! guard only. Captured text reaches an assertion message escaped, so a
-//! failing run cannot drive the terminal that shows it.
+//! The child runs from an empty environment so no saved profile or `TRAWL_*`
+//! variable can address another server. Captured text reaches an assertion
+//! message escaped, so a failing run cannot drive the terminal that shows it.
 
 mod common;
 
@@ -36,27 +24,18 @@ use trawl_core::sanitize::is_unsafe_display_char;
 use common::Server;
 use common::mcp::loader_path;
 
-/// How long one `trawl` run may take.
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// The service the event arrives under, and the query that finds it. A
-/// bare search projects every column, so the hostile names are headers.
+/// A bare search projects every column, so the hostile names are headers.
 const SERVICE: &str = "term_probe";
 const QUERY: &str = "service=term_probe";
 
-/// The ordinary field that carries the hostile value. The value holds
-/// plain text around an OSC 52 clipboard write, a screen clear, a C1 CSI
-/// and a bidi override.
 const VALUE_FIELD: &str = "term_payload";
 const HOSTILE_VALUE: &str = "pre\u{1b}]52;c;aGk=\u{7}mid\u{1b}[2J\u{9b}31m\u{202e}post";
 
-/// [`HOSTILE_VALUE`] as a table cell and a terminal csv field show it:
-/// U+FFFD for each control and the bidi override, one for one.
 const HOSTILE_VALUE_SHOWN: &str =
     "pre\u{fffd}]52;c;aGk=\u{fffd}mid\u{fffd}[2J\u{fffd}31m\u{fffd}post";
 
-/// A field name a sender chose: as sent, as the catalog stores it, and as
-/// a terminal shows it.
 #[derive(Clone, Copy)]
 struct HostileName {
     sent: &'static str,
@@ -64,8 +43,6 @@ struct HostileName {
     shown: &'static str,
 }
 
-/// Ingest folds a name's ASCII uppercase to lowercase and keeps every
-/// other character, controls included.
 const HOSTILE_NAMES: [HostileName; 4] = [
     HostileName {
         sent: "esc\u{1b}[2Jname",
@@ -89,17 +66,10 @@ const HOSTILE_NAMES: [HostileName; 4] = [
     },
 ];
 
-/// The value of every hostile-named field.
 const NAMED_VALUE: &str = "named field";
 
-/// The hostile name `trawl schema field` looks up.
 const LOOKED_UP: HostileName = HOSTILE_NAMES[2];
 
-// ---------------------------------------------------------------------------
-// The client
-// ---------------------------------------------------------------------------
-
-/// The `trawl` binary, configured for one fixture server.
 struct Client {
     home: tempfile::TempDir,
     config: PathBuf,
@@ -117,7 +87,6 @@ impl Client {
         }
     }
 
-    /// `trawl --config <config> args...` with stdin on `/dev/null`.
     fn command(&self, args: &[&str]) -> std::process::Command {
         let home = self.home.path();
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_trawl"));
@@ -137,7 +106,6 @@ impl Client {
         cmd
     }
 
-    /// `args` with stdout and stderr on pipes, to completion.
     async fn piped(&self, args: &[&str]) -> Output {
         let mut cmd = tokio::process::Command::from(self.command(args));
         cmd.kill_on_drop(true);
@@ -147,8 +115,6 @@ impl Client {
             .expect("spawn trawl")
     }
 
-    /// `args` with stderr on a PTY and stdout where `stdout` says, to a
-    /// successful exit.
     async fn run_on_pty(&self, args: &[&str], stdout: StdoutTo) -> PtyRun {
         let run = pty_run(self.command(args), stdout, DEADLINE)
             .await
@@ -165,8 +131,6 @@ impl Client {
         run
     }
 
-    /// `args` with stdout and stderr on a PTY; the terminal's text once
-    /// the run succeeded.
     async fn on_pty(&self, args: &[&str]) -> String {
         self.run_on_pty(args, StdoutTo::Pty).await.terminal
     }
@@ -183,34 +147,26 @@ impl Client {
         self.on_pty(&["schema", "field", name]).await
     }
 
-    /// `schema field <name> -f json` with stdout on a pipe, so its labels
-    /// go to stderr, which stays on the PTY.
     async fn schema_field_json_labels_on_pty(&self, name: &str) -> PtyRun {
         self.run_on_pty(&["schema", "field", name, "-f", "json"], StdoutTo::Pipe)
             .await
     }
 }
 
-/// Where a PTY run sends the child's stdout. Its stderr is always the PTY.
 #[derive(Clone, Copy)]
 enum StdoutTo {
     Pty,
     Pipe,
 }
 
-/// A finished PTY run.
 struct PtyRun {
     status: ExitStatus,
     /// What the PTY showed, with the `\r\n` the line discipline's ONLCR
     /// writes for each `\n` folded back.
     terminal: String,
-    /// A piped stdout's bytes; empty when stdout was the PTY.
     stdout: Vec<u8>,
 }
 
-/// Run `cmd` on a PTY to its exit. `None` when the child is still running
-/// at `deadline`, whether or not it still holds the terminal: it is then
-/// killed and reaped first.
 async fn pty_run(
     cmd: std::process::Command,
     stdout: StdoutTo,
@@ -256,8 +212,6 @@ async fn pty_run(
     })
 }
 
-/// Spawn `cmd` with stderr, and stdout unless `stdout` pipes it, on the
-/// slave side of a fresh PTY. Returns the child and the master side.
 fn spawn_on_pty(
     mut cmd: std::process::Command,
     stdout: StdoutTo,
@@ -289,7 +243,6 @@ fn spawn_on_pty(
     (child, master)
 }
 
-/// Read the PTY master to EOF.
 fn read_master(mut master: std::fs::File) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 8192];
@@ -315,10 +268,6 @@ fn describe(output: &Output) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Data
-// ---------------------------------------------------------------------------
-
 fn hostile_event() -> Value {
     let mut event = Map::new();
     event.insert("service".into(), SERVICE.into());
@@ -329,7 +278,6 @@ fn hostile_event() -> Value {
     Value::Object(event)
 }
 
-/// Each line of an NDJSON stdout as a JSON object.
 fn ndjson_rows(stdout: &[u8]) -> Vec<Map<String, Value>> {
     std::str::from_utf8(stdout)
         .expect("utf-8 stdout")
@@ -342,8 +290,6 @@ fn ndjson_rows(stdout: &[u8]) -> Vec<Map<String, Value>> {
         .collect()
 }
 
-/// RFC 4180 records: a quoted cell may hold commas, doubled quotes and
-/// line breaks.
 fn csv_records(text: &str) -> Vec<Vec<String>> {
     let mut records = Vec::new();
     let mut record = Vec::new();
@@ -373,14 +319,9 @@ fn csv_records(text: &str) -> Vec<Vec<String>> {
     records
 }
 
-/// The cells of each row of a drawn table, the header first.
-///
-/// A row is the run of lines that open with the table's left border, and
-/// a cell is the text between two vertical lines. comfy-table sizes the
-/// table to the terminal it finds, which is the developer's own when the
-/// test runs from one, so a cell may wrap: its pieces are joined without
-/// their padding. That restores any text without spaces, which is all
-/// this test compares.
+/// comfy-table sizes the table to the terminal it finds, which is the
+/// developer's own when the test runs from one, so a cell may wrap: its
+/// pieces are joined without their padding.
 fn table_rows(text: &str) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     let mut row: Vec<String> = Vec::new();
@@ -407,7 +348,6 @@ fn table_rows(text: &str) -> Vec<Vec<String>> {
     rows
 }
 
-/// The index of the column `header` names.
 fn column(header: &[String], name: &str) -> usize {
     header
         .iter()
@@ -415,12 +355,6 @@ fn column(header: &[String], name: &str) -> usize {
         .unwrap_or_else(|| panic!("no {name:?} column in {header:?}"))
 }
 
-// ---------------------------------------------------------------------------
-// Checks
-// ---------------------------------------------------------------------------
-
-/// The catalog lists every hostile name with its controls in place, read
-/// through a pipe.
 async fn assert_names_stored(client: &Client, ingest: &IngestResponse) {
     let output = client.piped(&["schema", "fields", "-f", "json"]).await;
     assert!(output.status.success(), "{}", describe(&output));
@@ -445,8 +379,6 @@ async fn assert_names_stored(client: &Client, ingest: &IngestResponse) {
     );
 }
 
-/// In a pipe, `-f json` decodes to the stored names and the sent values.
-/// Returns its rows.
 async fn assert_pipe_json_exact(client: &Client) -> Vec<Map<String, Value>> {
     let output = client.piped(&["query", QUERY, "-f", "json"]).await;
     assert!(output.status.success(), "{}", describe(&output));
@@ -469,9 +401,8 @@ async fn assert_pipe_json_exact(client: &Client) -> Vec<Map<String, Value>> {
     rows
 }
 
-/// `-f csv -o <file>` with stdout on a PTY writes the hostile names and
-/// value bare: none holds a character CSV quotes, and none starts with a
-/// formula trigger. The file is data, and the terminal gets no control.
+/// The hostile names and value are written bare: none holds a character CSV
+/// quotes, and none starts with a formula trigger.
 async fn assert_csv_file_exact(client: &Client) {
     let path = client.home.path().join("out.csv");
     let path_arg = path.to_str().expect("utf-8 path");
@@ -499,18 +430,14 @@ fn assert_mentions(what: &str, text: &str, marker: &str) {
     );
 }
 
-/// Whether `c` can drive or rewrite a terminal: every C0 and C1 control
-/// (ESC, BEL and the C1 CSI among them), the bidi override, and the rest
-/// of what the sanitize rule names. The first two are spelled out so the
-/// check does not rest on the rule it checks.
+/// Every C0 and C1 control and the bidi override are spelled out so the
+/// check does not rest on the sanitize rule it checks.
 fn is_terminal_control(c: char) -> bool {
     c.is_control() || c == '\u{202e}' || is_unsafe_display_char(c)
 }
 
-/// `text`, as a PTY showed it, holds no terminal control but the line
-/// breaks the command writes as framing: table and prose lines, csv and
-/// ndjson record ends. It is read as characters, because 0x9B, the C1 CSI
-/// as a byte, is also a UTF-8 continuation byte.
+/// Read as characters, because 0x9B, the C1 CSI as a byte, is also a UTF-8
+/// continuation byte.
 fn assert_no_terminal_control(what: &str, text: &str) {
     let found: Vec<String> = text
         .split('\n')
@@ -528,8 +455,6 @@ fn assert_no_terminal_control(what: &str, text: &str) {
     );
 }
 
-/// The terminal shows `name` through the `schema field` label, U+FFFD in
-/// place of its controls.
 fn assert_field_label(what: &str, text: &str, name: HostileName) {
     assert!(
         text.split('\n').any(|line| line
@@ -541,8 +466,6 @@ fn assert_field_label(what: &str, text: &str, name: HostileName) {
     );
 }
 
-/// The table holds U+FFFD for each control: in the header, every hostile
-/// name, and in the payload cell, the value.
 async fn assert_terminal_table(client: &Client) {
     let text = client.query_on_pty("table").await;
     assert_no_terminal_control("query -f table", &text);
@@ -569,9 +492,6 @@ async fn assert_terminal_table(client: &Client) {
     }
 }
 
-/// Terminal json escapes each control instead of replacing it, so every
-/// line decodes to the piped rows: the stored names as keys, the sent value
-/// unchanged.
 async fn assert_terminal_json(client: &Client, piped: &[Map<String, Value>]) {
     let text = client.query_on_pty("json").await;
     assert_no_terminal_control("query -f json", &text);
@@ -585,8 +505,6 @@ async fn assert_terminal_json(client: &Client, piped: &[Map<String, Value>]) {
     );
 }
 
-/// Terminal csv holds U+FFFD for each control, in the header names and the
-/// payload field.
 async fn assert_terminal_csv(client: &Client) {
     let text = client.query_on_pty("csv").await;
     assert_no_terminal_control("query -f csv", &text);
@@ -604,8 +522,6 @@ async fn assert_terminal_csv(client: &Client) {
     }
 }
 
-/// The `schema fields` table lists every hostile name with U+FFFD for each
-/// control.
 async fn assert_terminal_schema_fields(client: &Client) {
     let text = client.schema_fields_on_pty().await;
     assert_no_terminal_control("schema fields", &text);
@@ -629,8 +545,6 @@ async fn assert_terminal_schema_fields(client: &Client) {
     assert!(listed.contains(&VALUE_FIELD), "{listed:?}");
 }
 
-/// `schema field <name>` shows the name in its label on stdout and lists
-/// the service that sent it.
 async fn assert_terminal_schema_field(client: &Client) {
     let text = client.schema_field_on_pty(LOOKED_UP.stored).await;
     assert_no_terminal_control("schema field", &text);
@@ -649,9 +563,6 @@ async fn assert_terminal_schema_field(client: &Client) {
     );
 }
 
-/// With `-f json` and stdout on a pipe, `schema field` writes its labels to
-/// stderr, which stays on the PTY: the name shows there with U+FFFD for
-/// each control, and the services go to the pipe.
 async fn assert_schema_labels_on_stderr(client: &Client) {
     let run = client
         .schema_field_json_labels_on_pty(LOOKED_UP.stored)
@@ -668,8 +579,6 @@ async fn assert_schema_labels_on_stderr(client: &Client) {
     );
 }
 
-/// A stored field name may start with `--`. clap refuses it as an option
-/// and quotes it on stderr.
 async fn assert_usage_error_on_stderr(client: &Client) {
     let option_shaped = "--x\u{202e}\u{9b}31m\u{1b}[2Jname";
     let run = pty_run(
@@ -698,15 +607,6 @@ async fn assert_usage_error_on_stderr(client: &Client) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Case
-// ---------------------------------------------------------------------------
-
-/// A sender's hostile field names and value reach the catalog, and the
-/// data formats keep them exact in a pipe and in a file. On a PTY, `query`
-/// in every format and both `schema` views write no terminal control: the
-/// table, csv and schema views show U+FFFD in its place, and json escapes
-/// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_terminal_sinks_reach_no_terminal_control() {
     let server = Server::start(true).await;
@@ -734,8 +634,7 @@ async fn cli_terminal_sinks_reach_no_terminal_control() {
     server.stop().await;
 }
 
-/// A usage error exits 2 even when stderr refuses the text. `/dev/full` is
-/// Linux's device for a write that always fails.
+/// `/dev/full` is Linux's device for a write that always fails.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_usage_error_keeps_its_status_when_stderr_is_full() {
@@ -755,7 +654,6 @@ fn a_usage_error_keeps_its_status_when_stderr_is_full() {
     assert_eq!(status.code(), Some(2));
 }
 
-/// The harness's deadline covers the child's exit, not only its terminal.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_child_past_the_pty_deadline_is_killed_and_reaped() {
     let deadline = Duration::from_millis(200);

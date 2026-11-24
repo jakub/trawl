@@ -9,17 +9,6 @@
 //! the TUI connect through the same path as any other profile. It never
 //! writes `config.toml`.
 //!
-//! Anything else that could point the command somewhere else is refused
-//! rather than silently losing or winning: the variables clap binds to
-//! `--url` and `--token` (even empty), `--url`, `--token` or `--token-file`,
-//! and a `[profiles.trial]` of the user's own. The overlay turns `insecure`
-//! off and pins the trial's `ca.pem`, so `--insecure` or its variable then
-//! fails through the `ca_cert`-with-`insecure` rule.
-//!
-//! Variable names come from clap's metadata, through [`env_rules`]: each
-//! argument clap binds to a variable has an [`EnvRule`], and one without a
-//! rule is refused when set.
-//!
 //! The certificate is read once, here, through the same checked read as
 //! the token, and the connection pins those bytes. No pathname is handed
 //! on for a later step to open again.
@@ -32,7 +21,6 @@ use super::TrialError;
 use super::paths::{TrialPaths, read_private, read_public};
 use super::state::TrialState;
 
-/// A token file holds the token and one newline.
 const MAX_TOKEN_BYTES: u64 = 4096;
 
 /// `ca.pem` holds one self-signed certificate: a few kilobytes.
@@ -54,7 +42,6 @@ pub enum EnvRule {
     SelectsProfile,
 }
 
-/// The rule for the clap argument `id`, or `None` when it has none.
 pub fn env_rule(id: &str) -> Option<EnvRule> {
     match id {
         "url" | "token" => Some(EnvRule::RefuseWhenSet),
@@ -118,17 +105,12 @@ pub struct Overrides {
 }
 
 impl Overrides {
-    /// Observe this process: the `_arg`s come from the parsed command
-    /// line, the rest from the environment. A variable that is set to the
-    /// empty string counts as set.
     pub fn observe(url_arg: bool, token_arg: bool, token_file_arg: bool) -> Self {
         Self::observe_with(url_arg, token_arg, token_file_arg, |name| {
             std::env::var_os(name).is_some()
         })
     }
 
-    /// [`Overrides::observe`], with `set` answering whether a variable is
-    /// present.
     fn observe_with(
         url_arg: bool,
         token_arg: bool,
@@ -162,9 +144,6 @@ impl Overrides {
     }
 }
 
-/// Overlay the trial onto `cfg`.
-///
-/// `config_path` names the config file in the `[profiles.trial]` refusal.
 pub fn apply(
     cfg: &mut Config,
     overrides: Overrides,
@@ -225,7 +204,6 @@ mod tests {
     const TOKEN: &str = "flt_trialtokenvalue";
     const PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
 
-    /// A finished trial directory under a temp `XDG_STATE_HOME`.
     fn ready_trial(api_port: u16) -> (tempfile::TempDir, TrialPaths) {
         let tmp = tempfile::tempdir().unwrap();
         let paths = TrialPaths::resolve(Some(&tmp.path().join("state")), None).unwrap();
@@ -245,8 +223,6 @@ mod tests {
         apply(cfg, Overrides::default(), "config.toml", paths)
     }
 
-    /// URL, token, and CA all come from the trial directory, and they reach
-    /// the connection every command and the TUI build.
     #[test]
     fn resolves_url_token_and_ca_from_the_trial_directory() {
         let (_tmp, paths) = ready_trial(15999);
@@ -274,9 +250,6 @@ url = "https://lab.example:5514"
         assert_eq!(conn.trust, TlsTrust::PinnedCa(PEM.to_vec()));
     }
 
-    /// The certificate is read once, at resolution. Whatever happens to
-    /// `ca.pem` afterwards, the connection pins the bytes read then, and no
-    /// pathname is left for a later step to open.
     #[test]
     fn the_connection_pins_the_bytes_read_at_resolution() {
         let (_tmp, paths) = ready_trial(15999);
@@ -302,8 +275,6 @@ url = "https://lab.example:5514"
         );
     }
 
-    /// `ca.pem` goes through the checked read: a link or a file others can
-    /// write is refused, and an empty one is an unfinished trial.
     #[test]
     fn an_untrusted_or_empty_certificate_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -334,7 +305,6 @@ url = "https://lab.example:5514"
         );
     }
 
-    /// The ancestry rule reaches the `-p trial` read path.
     #[test]
     fn a_loose_ancestor_refuses_the_profile() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -350,8 +320,6 @@ url = "https://lab.example:5514"
         assert_eq!(cfg.server.token, None, "nothing applied");
     }
 
-    /// `--insecure` / `TRAWL_INSECURE` land after the overlay and must not
-    /// void the pin.
     #[test]
     fn insecure_after_the_overlay_fails_through_the_ca_cert_rule() {
         let (_tmp, paths) = ready_trial(15999);
@@ -450,7 +418,6 @@ url = "https://lab.example:5514"
         assert!(err.to_string().contains("trawl trial up"), "{err}");
         assert!(!paths.root.exists(), "-p trial creates nothing");
 
-        // A directory without state is no trial either.
         paths.ensure_dir().unwrap();
         let err = apply_default(&mut Config::default(), &paths).unwrap_err();
         assert!(matches!(err, TrialError::NoTrial { .. }), "{err:?}");

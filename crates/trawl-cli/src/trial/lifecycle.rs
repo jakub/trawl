@@ -8,55 +8,7 @@
 //! the Docker driver to the local engine, then the state root is created
 //! and the lifecycle lock taken. Preflight runs first because it only
 //! reads, and nothing, not even the state root, may be created before it
-//! passes. `stop` and `down` then refuse an engine other than the one the
-//! state records. Then the ownership scan refuses anything on the engine
-//! that carries the trial's names or labels without this trial's id, and
-//! one-off containers a killed command left unfinished are waited for.
-//! For `up` and `stop`, one that stays `created` past the wait never
-//! started, and is removed. `down` removes nothing before it is confirmed:
-//! it waits only for running one-offs, lists what is left with the rest,
-//! and deletes it all after a yes. A trial directory without a state,
-//! empty or not, is listed entry by entry and asked about the same way.
-//! After the yes and before the first deletion, `down` writes the
-//! teardown marker beside the trial directory, and removes it only once
-//! the directory is gone. While the marker exists, `up` refuses to start,
-//! `status` reports it, and the next `down` finishes the teardown, by the
-//! marker's trial id when the state is already gone.
-//!
-//! `up` then creates or resumes, one recorded phase at a time, so a rerun
-//! after an interruption skips what is done:
-//!
-//! 1. ports: a bind test on `127.0.0.1`, unless the trial's own container
-//!    holds the port; Docker's own publish error is the backstop.
-//! 2. images: pulled on the first `up` when absent, then recorded by id; a
-//!    resume refuses another engine, another image id, or a changed flag.
-//! 3. the state, then the engine claim, then `compose.json`.
-//! 4. every `up`, before PostgreSQL starts: the certificate in the trawld
-//!    volume is read and judged. A trial that recorded one refuses unless
-//!    the volume holds exactly that certificate. A new trial generates a
-//!    pair in process and writes the key, then the certificate, into the
-//!    volume. The certificate is copied to the host and to trawl-web's
-//!    volume until the phase is recorded, and again when the host copy is
-//!    missing. It is never replaced.
-//! 5. databases: the superuser password file, PostgreSQL, the two owner
-//!    roles and databases, the pgpass file, and both configs. Every secret
-//!    goes through [`put_file`] or sealed stdin.
-//! 6. `fleet-admin migrate`, through the pgpass file.
-//! 7. the two keys: kept when the token file matches the recorded prefix,
-//!    else every active key of that name is revoked and a new one minted.
-//! 8. every `up`: trawl-web stopped and given a new cookie key, so no
-//!    session from before this `up` survives, then `compose up --wait
-//!    trawld trawl-web`, `whoami` for both keys through the pinned
-//!    certificate, and one authenticated query.
-//! 9. samples, unless `--no-sample-data`: the intent is recorded before
-//!    the one POST, and completion only after the counts are verified.
-//!    [`sample::decide_samples`] rules every branch, and a result `up`
-//!    cannot verify is never posted again. `--no-sample-data` over such a
-//!    result records that the trial declines the samples, and every later
-//!    `up` skips them.
-//!
-//! `status`, `key`, and `-p trial` take no lock: they read files that are
-//! only ever replaced by an atomic rename.
+//! passes.
 
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, IsTerminal as _, Write};
@@ -90,40 +42,31 @@ const RUN_TIMEOUT: Duration = Duration::from_mins(3);
 /// `compose up --wait`, whose own `--wait-timeout` is [`WAIT_SECS`].
 const UP_TIMEOUT: Duration = Duration::from_mins(5);
 const WAIT_SECS: &str = "180";
-/// `docker pull` of an image the engine does not have.
 const PULL_TIMEOUT: Duration = Duration::from_mins(15);
-/// `compose stop`.
 const STOP_TIMEOUT: Duration = Duration::from_mins(2);
-/// How long `up`, `stop`, and `down` wait for a one-off container that an
-/// interrupted command left unfinished.
 const ONEOFF_WAIT: Duration = Duration::from_mins(1);
 /// How long the API may refuse connections after `compose up --wait`.
 const API_WAIT: Duration = Duration::from_secs(30);
 
-/// A token file holds the token and one newline.
 const MAX_TOKEN_BYTES: u64 = 4096;
-/// `ca.pem` holds one certificate.
 const MAX_CA_BYTES: u64 = 64 * 1024;
 // `read_file` returns more than `MAX_CA_BYTES` of a longer volume
 // certificate, so `judge_certificate` sees that it is too long.
 const _: () = assert!(secrets::READ_LIMIT >= MAX_CA_BYTES);
 
-/// The query `up` runs to prove an authenticated query works.
 const PROOF_QUERY: &str = "* | head 1";
 
-/// One progress line on stderr. stdout carries only the summary.
+/// stdout carries only the summary.
 fn progress(message: impl std::fmt::Display) {
     eprintln!("trawl trial: {message}");
 }
 
-/// What `up`, `stop`, and `down` hold while they work.
 struct Session {
     docker: Docker,
     engine: Engine,
     _lock: TrialLock,
 }
 
-/// Preflight, then the state root and the lock.
 async fn begin(paths: &TrialPaths) -> Result<Session, TrialError> {
     let (engine, docker) = preflight::preflight(
         DockerCli::new(),
@@ -142,7 +85,6 @@ async fn begin(paths: &TrialPaths) -> Result<Session, TrialError> {
     })
 }
 
-/// The trial's state, when there is a trial directory holding one.
 fn load_state(paths: &TrialPaths) -> Result<Option<TrialState>, TrialError> {
     if !paths.check_dir()? {
         return Ok(None);
@@ -180,7 +122,6 @@ fn teardown_pending(paths: &TrialPaths) -> Result<bool, TrialError> {
     }
 }
 
-/// `up` starts nothing while an interrupted `down` has not finished.
 fn require_no_teardown(paths: &TrialPaths) -> Result<(), TrialError> {
     if teardown_pending(paths)? {
         return Err(TrialError::TeardownIncomplete);
@@ -196,8 +137,7 @@ fn listing(resources: &[Foreign]) -> String {
         .join("\n")
 }
 
-/// Refuse anything on the engine that is not this trial's. With no trial
-/// id, anything in the union is an orphan.
+/// With no trial id, anything in the union is an orphan.
 fn require_owned(
     paths: &TrialPaths,
     inventory: &Inventory,
@@ -212,12 +152,9 @@ fn require_owned(
     }
 }
 
-/// `up` and `stop`'s wait: for one-off containers an interrupted command
-/// left unfinished, then a fresh inventory. Refuses anything foreign that
-/// appeared meanwhile. When the one-offs outlast `wait`, removes those
-/// still `created`, once and by id: their client died before starting
-/// them, so they would never finish. Refuses, naming them, when any other
-/// is left.
+/// When the one-offs outlast `wait`, removes those still `created`, once
+/// and by id: their client died before starting them, so they would
+/// never finish.
 async fn settle_oneoffs(
     docker: &Docker,
     paths: &TrialPaths,
@@ -274,11 +211,9 @@ async fn settle_oneoffs(
     }
 }
 
-/// `down`'s wait: for one-off containers an interrupted command left
-/// running, up to `wait`, then a fresh inventory. Refuses anything foreign
-/// that appeared meanwhile. It removes nothing and refuses no one-off:
-/// what is still unfinished, `created` or running, stays in the inventory
-/// that `down` lists before it asks, and is deleted only after a yes.
+/// It removes nothing and refuses no one-off: what is still unfinished,
+/// `created` or running, stays in the inventory that `down` lists before
+/// it asks, and is deleted only after a yes.
 async fn await_running_oneoffs(
     docker: &Docker,
     paths: &TrialPaths,
@@ -313,7 +248,6 @@ async fn await_running_oneoffs(
     }
 }
 
-/// `docker compose` for the trial with `rest`, streamed to stderr.
 async fn compose_stream(
     docker: &Docker,
     rest: &[&str],
@@ -336,9 +270,6 @@ async fn compose_capture(
         .await?)
 }
 
-// -- up ---------------------------------------------------------------------
-
-/// `trawl trial up`.
 pub async fn up(paths: &TrialPaths, args: &UpArgs) -> Result<(), TrialError> {
     let session = begin(paths).await?;
     require_no_teardown(paths)?;
@@ -378,10 +309,6 @@ pub async fn up(paths: &TrialPaths, args: &UpArgs) -> Result<(), TrialError> {
     Ok(())
 }
 
-/// Everything `up` checks before it changes anything: ownership, one-off
-/// containers, a resumed trial's volumes, the resume rules, the ports,
-/// and the images. Returns the resumed state, or a new trial's state with
-/// its claim taken.
 async fn admit(
     paths: &TrialPaths,
     session: &Session,
@@ -431,10 +358,6 @@ async fn admit(
     Ok(state)
 }
 
-/// A state that records any step resumes only when all of the trial's
-/// volumes are on the engine with its id. Without them, a resume would
-/// start PostgreSQL over an empty volume that has no password file. A
-/// state that records no step creates them.
 fn require_storage(inventory: &Inventory, state: &TrialState) -> Result<(), TrialError> {
     if !state.phases.any_recorded() {
         return Ok(());
@@ -458,8 +381,6 @@ fn require_storage(inventory: &Inventory, state: &TrialState) -> Result<(), Tria
     })
 }
 
-/// The certificate, judged on every `up`, then the phases that are not
-/// recorded yet: databases, the Fleet schema, and the keys.
 async fn setup(
     docker: &Docker,
     paths: &TrialPaths,
@@ -489,12 +410,11 @@ async fn setup(
     Ok(())
 }
 
-/// Stop trawl-web, give it a new cookie key, then `compose up --wait
-/// trawld trawl-web`. trawl-web reads the key at startup, so every `up`
-/// ends the browser sessions issued before it: a program that took the
-/// web port while the trial was stopped cannot replay a cookie the browser
-/// sent it. A failure to start names the ports, because Docker's publish
-/// error is the backstop of the bind test.
+/// trawl-web reads the key at startup, so every `up` ends the browser
+/// sessions issued before it: a program that took the web port while the
+/// trial was stopped cannot replay a cookie the browser sent it. A failure
+/// to start names the ports, because Docker's publish error is the
+/// backstop of the bind test.
 async fn start_services(docker: &Docker, state: &TrialState) -> Result<(), TrialError> {
     compose_stream(docker, &["stop", Service::Web.name()], STOP_TIMEOUT).await?;
     progress("writing a new cookie key for trawl-web");
@@ -526,9 +446,6 @@ async fn start_services(docker: &Docker, state: &TrialState) -> Result<(), Trial
     })
 }
 
-/// A resume keeps what the trial was created with: its engine, its ports,
-/// and its image. An omitted flag means the recorded value; a different
-/// one refuses.
 pub fn check_resume(state: &TrialState, engine_id: &str, args: &UpArgs) -> Result<(), TrialError> {
     if state.engine_id != engine_id {
         return Err(TrialError::EngineChanged {
@@ -569,8 +486,6 @@ pub fn check_engine(recorded: Option<&str>, found: &str) -> Result<(), TrialErro
     }
 }
 
-/// [`check_engine`] for `stop` and `down`. A refusal first says which
-/// endpoint this command reached and how another engine is selected.
 fn require_its_engine(session: &Session, view: &DownView) -> Result<(), TrialError> {
     let checked = check_engine(view.engine_id.as_deref(), &session.engine.engine_id);
     if checked.is_err() {
@@ -583,8 +498,6 @@ fn require_its_engine(session: &Session, view: &DownView) -> Result<(), TrialErr
     checked
 }
 
-/// A resume runs only the images the trial recorded: the same id, and the
-/// same registry digest.
 pub fn check_images(
     recorded: &Images,
     trawl: &ImageRecord,
@@ -606,8 +519,6 @@ pub fn check_images(
     Ok(())
 }
 
-/// Every existing trial container runs one of the recorded image ids, and
-/// PostgreSQL runs the PostgreSQL one.
 pub fn check_running_images(found: &[(String, String)], images: &Images) -> Result<(), TrialError> {
     for (name, image) in found {
         let recorded = if name.starts_with(&format!("{PROJECT}-{}-", Service::Postgres.name())) {
@@ -626,7 +537,6 @@ pub fn check_running_images(found: &[(String, String)], images: &Images) -> Resu
     Ok(())
 }
 
-/// Read the image of every non-one-off trial container and check it.
 async fn check_container_images(
     docker: &Docker,
     inventory: &Inventory,
@@ -661,8 +571,6 @@ async fn check_container_images(
     check_running_images(&found, &state.images)
 }
 
-/// The ports `up` must bind-test: each one, unless the trial's own
-/// container that publishes it is running and so holds it.
 fn ports_to_test(
     inventory: &Inventory,
     our_id: Option<&str>,
@@ -689,7 +597,6 @@ fn ports_to_test(
     test
 }
 
-/// Refuse a port another listener holds. A trial never adopts a listener.
 fn check_ports(
     inventory: &Inventory,
     our_id: Option<&str>,
@@ -710,8 +617,6 @@ fn check_ports(
     Ok(())
 }
 
-/// `docker image inspect` of `reference`: `None` when the engine has no
-/// such image.
 async fn inspect_image(
     docker: &Docker,
     reference: &str,
@@ -743,8 +648,6 @@ async fn inspect_image(
         })
 }
 
-/// Read one `image inspect` line. The registry digest is the one for the
-/// reference's repository, else the first, else none.
 fn parse_image(reference: &str, json: &[u8]) -> Option<ImageRecord> {
     #[derive(serde::Deserialize)]
     struct Inspected {
@@ -773,8 +676,7 @@ fn parse_image(reference: &str, json: &[u8]) -> Option<ImageRecord> {
     })
 }
 
-/// `ghcr.io/jakub/trawl` for `ghcr.io/jakub/trawl:0.9.0`: the reference
-/// without its tag or digest. A `:` before the last `/` is a registry port.
+/// A `:` before the last `/` is a registry port.
 fn repository(reference: &str) -> &str {
     let reference = reference
         .split_once('@')
@@ -786,7 +688,6 @@ fn repository(reference: &str) -> &str {
     }
 }
 
-/// The image for a new trial: inspected, or pulled first when absent.
 async fn resolve_image(docker: &Docker, reference: &str) -> Result<ImageRecord, TrialError> {
     if let Some(record) = inspect_image(docker, reference).await? {
         return Ok(record);
@@ -801,15 +702,12 @@ async fn resolve_image(docker: &Docker, reference: &str) -> Result<ImageRecord, 
         })
 }
 
-/// A new trial: its images, its state, and its engine claim. The state is
-/// written before the claim, so an interrupted first `up` leaves a trial
-/// the rerun resumes, never a claim without state. Only a claim our own
-/// inspect shows carrying another id ([`Claimed::Foreign`]) removes the
-/// state this call wrote, then the directory if that leaves it empty: a
-/// directory that held files without a state keeps them. Every error keeps
-/// the state, because the claim may exist with this trial's id, and a
-/// rerun must find the state that owns it; a rerun that finds no claim
-/// creates it.
+/// The state is written before the claim, so an interrupted first `up`
+/// leaves a trial the rerun resumes, never a claim without state. Only a
+/// claim our own inspect shows carrying another id ([`Claimed::Foreign`])
+/// removes the state this call wrote. Every error keeps the state, because
+/// the claim may exist with this trial's id, and a rerun must find the
+/// state that owns it.
 async fn create(
     paths: &TrialPaths,
     docker: &Docker,
@@ -922,7 +820,6 @@ async fn databases(docker: &Docker, state: &TrialState) -> Result<(), TrialError
     Ok(())
 }
 
-/// `compose up --wait postgres`.
 async fn start_postgres(docker: &Docker) -> Result<(), TrialError> {
     progress("starting PostgreSQL");
     compose_stream(
@@ -940,16 +837,6 @@ async fn start_postgres(docker: &Docker) -> Result<(), TrialError> {
     .await
 }
 
-/// The certificate phase, on every `up`.
-///
-/// The certificate in the trawld volume is the trial's identity, and the
-/// host `ca.pem` and trawl-web's copy are pins taken from it. `up` reads
-/// it and lets [`judge_certificate`] decide before it writes anything. A
-/// new trial gets a generated pair: the key first, then the certificate,
-/// so a certificate in the volume always has its key beside it. The pins
-/// are written, and the fingerprint recorded, while the phase is not
-/// recorded or the host `ca.pem` is missing. `up` never replaces a
-/// certificate in the volume.
 async fn certificate(
     docker: &Docker,
     paths: &TrialPaths,
@@ -992,27 +879,18 @@ async fn certificate(
     state.save(&paths.state_file())
 }
 
-/// What `up` does about the trial certificate.
 #[derive(Debug, PartialEq, Eq)]
 enum CertificatePlan {
-    /// The volume holds no certificate, and the trial recorded none.
     Generate,
-    /// Pin the certificate the volume holds: these bytes.
     Reuse(Vec<u8>),
 }
 
-/// Decide from what the volume holds at [`compose::TLS_CERT`] and what the
-/// state recorded. A trial recorded a certificate when its phase is done or
-/// it holds a fingerprint.
+/// A trial recorded a certificate when its phase is done or it holds a
+/// fingerprint.
 ///
-/// - Recorded: reuse the volume's certificate when its fingerprint is the
-///   recorded one. Missing, damaged, or another one refuses.
 /// - Not recorded: generate when the volume holds nothing at the path,
 ///   reuse one certificate, and refuse anything else, because it was
 ///   published and `up` cannot tell which pins it reached.
-///
-/// Damaged means not a regular file, empty, longer than ca.pem may be, or
-/// not exactly one PEM certificate ([`is_one_certificate`]).
 fn judge_certificate(state: &TrialState, found: VolumeFile) -> Result<CertificatePlan, TrialError> {
     let refuse = |problem| Err(TrialError::CertificateDamaged { problem });
     let recorded = state.phases.tls || state.tls.is_some();
@@ -1105,7 +983,6 @@ pub fn fingerprint(pem: &[u8]) -> Result<String, TrialError> {
         .join(":"))
 }
 
-/// The key record for `key` in the state.
 fn key_record(state: &mut TrialState, key: TrialKey) -> &mut Option<KeyRecord> {
     match key {
         TrialKey::Operator => &mut state.keys.operator,
@@ -1120,8 +997,6 @@ fn token_file(paths: &TrialPaths, key: TrialKey) -> std::path::PathBuf {
     }
 }
 
-/// Whether the token file's key is the recorded one: the file holds one
-/// token and a newline, and its prefix is the recorded prefix.
 pub fn token_matches(file: Option<&[u8]>, recorded: Option<&KeyRecord>, key: TrialKey) -> bool {
     let (Some(file), Some(recorded)) = (file, recorded) else {
         return false;
@@ -1195,7 +1070,6 @@ async fn ensure_key(
     state.save(&paths.state_file())
 }
 
-/// Create the key's role unless `roles show` finds it.
 async fn ensure_role(docker: &Docker, key: TrialKey) -> Result<(), TrialError> {
     let show = docker.compose(keys::role_show_args(key));
     let out = docker
@@ -1221,7 +1095,6 @@ async fn ensure_role(docker: &Docker, key: TrialKey) -> Result<(), TrialError> {
     Ok(())
 }
 
-/// The two keys' clients, pinned to the trial certificate.
 pub struct Clients {
     pub operator: HttpClient,
     pub ingest: HttpClient,
@@ -1233,7 +1106,6 @@ impl std::fmt::Debug for Clients {
     }
 }
 
-/// A client for `key`, pinned to the host `ca.pem`.
 fn client(paths: &TrialPaths, state: &TrialState, key: TrialKey) -> Result<HttpClient, TrialError> {
     let ca = read_public(&paths.ca_file(), MAX_CA_BYTES)?.ok_or(TrialError::Certificate {
         reason: "ca.pem is missing from the trial directory",
@@ -1264,8 +1136,6 @@ fn client(paths: &TrialPaths, state: &TrialState, key: TrialKey) -> Result<HttpC
     })
 }
 
-/// `whoami` for both keys through the pinned certificate, then one
-/// authenticated query. Returns the clients for the sample step.
 async fn verify(paths: &TrialPaths, state: &TrialState) -> Result<Clients, TrialError> {
     progress("checking both keys and one query through the pinned certificate");
     let url = render::api_url(state);
@@ -1331,12 +1201,8 @@ pub fn check_identity(key: TrialKey, who: &trawl_api::WhoAmIResponse) -> Result<
     Ok(())
 }
 
-// -- samples ----------------------------------------------------------------
-
-/// How long `up` waits for posted samples to become queryable.
 const SAMPLE_WAIT: Duration = Duration::from_mins(1);
 
-/// How a trial that declined the samples gets them: a fresh trial.
 const FRESH_WITH_SAMPLES: &str =
     "`trawl trial down --yes` and then `trawl trial up` start a fresh trial with samples";
 
@@ -1344,11 +1210,6 @@ const FRESH_WITH_SAMPLES: &str =
 /// trawld's self-telemetry never enters a decision.
 const COUNT_QUERY: &str = "* | stats count() as events by service";
 
-/// The sample step. [`sample::decide_samples`] decides; this carries it
-/// out. `Intent` is saved before the single POST, and `Complete` only
-/// once the sample services hold exactly the expected counts. Anything
-/// else refuses with recovery text and never posts again, or, under
-/// `--no-sample-data`, records `Declined`.
 async fn seed(
     paths: &TrialPaths,
     state: &mut TrialState,
@@ -1407,7 +1268,6 @@ async fn seed(
     }
 }
 
-/// Record the intent, post once, and wait for the exact counts.
 async fn post_samples(
     paths: &TrialPaths,
     state: &mut TrialState,
@@ -1480,7 +1340,6 @@ fn describe_counts(
         .join(", ")
 }
 
-/// Events per service, through the operator key.
 async fn count_samples(
     operator: &HttpClient,
     url: &str,
@@ -1529,8 +1388,6 @@ fn counts_by_service(
     }
     Some(counts)
 }
-
-// -- status and key ---------------------------------------------------------
 
 /// `trawl trial status`: works without the lock, and without Docker.
 ///
@@ -1604,7 +1461,6 @@ fn moving_variables() -> Vec<(String, EnvRule)> {
     render::moving_variables(&bound, set, insecure, profile.as_deref())
 }
 
-/// `(name, state)` of the trial's containers, one-offs excluded.
 fn our_containers(inventory: &Inventory, our_id: &str) -> Vec<(String, String)> {
     let mut list: Vec<(String, String)> = inventory
         .resources
@@ -1637,10 +1493,6 @@ pub fn key(paths: &TrialPaths) -> Result<(), TrialError> {
         .map_err(|e| TrialError::io("write", "stdout", e))
 }
 
-// -- stop and down ----------------------------------------------------------
-
-/// `trawl trial stop`: stop the containers; volumes, keys, samples, and
-/// state stay.
 pub async fn stop(paths: &TrialPaths) -> Result<(), TrialError> {
     let session = begin(paths).await?;
     let docker = &session.docker;
@@ -1672,17 +1524,13 @@ pub async fn stop(paths: &TrialPaths) -> Result<(), TrialError> {
     Ok(())
 }
 
-/// What `down` does once it has listed the trial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confirmation {
     Proceed,
     Declined,
-    /// stdin is not a terminal and `--yes` was not given.
     NeedsYes,
 }
 
-/// `--yes` proceeds. Otherwise a terminal is asked `[y/N]`, and only `y`
-/// or `yes` proceeds; with no terminal, nothing is asked.
 pub fn confirm(
     yes: bool,
     tty: bool,
@@ -1705,7 +1553,6 @@ pub fn confirm(
     })
 }
 
-/// What `down` shows before it asks.
 #[derive(Debug, Clone, Copy)]
 pub enum Listing<'a> {
     /// The trial's resources on the engine, then its directory as one
@@ -1717,7 +1564,6 @@ pub enum Listing<'a> {
 }
 
 impl Listing<'_> {
-    /// Print the listing for the trial directory `dir`.
     pub fn render(self, out: &mut impl Write, dir: &std::path::Path) -> io::Result<()> {
         match self {
             Self::Trial(inventory) => render::render_inventory(out, inventory, dir),
@@ -1726,7 +1572,6 @@ impl Listing<'_> {
     }
 }
 
-/// One entry of a trial directory that holds no state.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Entry {
     pub name: std::ffi::OsString,
@@ -1765,18 +1610,10 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
     .await
 }
 
-/// `down` on its own engine. `approve` shows the listing and answers;
-/// nothing is deleted before it answers [`Confirmation::Proceed`]. Then
-/// the teardown marker is written, the engine resources `approve` was
-/// shown are deleted by id, and nothing else on the engine. The trial
-/// directory of a trial is deleted by `rm_dir` with everything in it,
-/// including files added while `approve` waited, and the marker goes
-/// last. For a directory without a state or a marker,
-/// [`remove_leftover`] checks the top-level entries against the listing.
-///
-/// A marker with no trial directory and nothing of its trial left on the
-/// engine is the end of an interrupted teardown: it is removed without
-/// asking, since nothing is left to delete.
+/// The engine resources `approve` was shown are deleted by id, and nothing
+/// else on the engine. The trial directory of a trial is deleted by
+/// `rm_dir` with everything in it, including files added while `approve`
+/// waited.
 async fn remove_trial(
     docker: &Docker,
     paths: &TrialPaths,
@@ -1828,7 +1665,6 @@ fn clear_teardown(paths: &TrialPaths) -> Result<(), TrialError> {
     sync_dir(&paths.root)
 }
 
-/// `Ok` only for [`Confirmation::Proceed`].
 fn approved(answer: Confirmation) -> Result<(), TrialError> {
     match answer {
         Confirmation::Proceed => Ok(()),
@@ -1837,12 +1673,7 @@ fn approved(answer: Confirmation) -> Result<(), TrialError> {
     }
 }
 
-/// `down` over a trial directory that holds no state.
-///
-/// The directory, empty or not, is listed with its top-level entries and
-/// asked about like a trial. After a yes, each listed entry is removed, a
-/// listed subdirectory with everything in it, and then the directory with
-/// `rmdir`. Only the top-level entries are checked against the listing:
+/// Only the top-level entries are checked against the listing:
 /// a top-level entry that appeared while the prompt waited makes the
 /// `rmdir` fail, and it stays with the directory.
 fn remove_leftover(
@@ -1869,8 +1700,6 @@ fn remove_leftover(
     Ok(())
 }
 
-/// The entries of `dir`, sorted by name, each read without following a
-/// symlink.
 fn list_entries(dir: &std::path::Path) -> Result<Vec<Entry>, TrialError> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| TrialError::io("read", dir, e))? {
@@ -2001,8 +1830,6 @@ mod tests {
         }
     }
 
-    /// `stop` and `down` refuse an engine other than the recorded one,
-    /// naming both; a state that records no engine is acted on anywhere.
     #[test]
     fn stop_and_down_act_only_on_the_recorded_engine() {
         check_engine(Some("ENGINE:A"), "ENGINE:A").expect("the recorded engine");
@@ -2026,8 +1853,6 @@ mod tests {
         }
     }
 
-    /// The acceptance criterion: a resume refuses when a recorded image
-    /// digest differs.
     #[test]
     fn a_resume_refuses_a_different_image_digest_or_id() {
         let images = fixture(1).images;
@@ -2135,9 +1960,6 @@ mod tests {
         }
     }
 
-    /// A state that records any step resumes only with all three of its
-    /// volumes, each carrying its id. One that records none may start
-    /// without them.
     #[test]
     fn a_resume_past_a_recorded_step_requires_its_volumes() {
         let mut state = fixture(DEFAULT_API_PORT);
@@ -2239,8 +2061,6 @@ esac"#,
         (result, calls)
     }
 
-    /// A `created` one-off that starts and finishes within the bound is
-    /// waited for, never removed.
     #[tokio::test]
     async fn a_created_oneoff_that_starts_is_waited_for() {
         let (result, calls) = settle(
@@ -2254,9 +2074,6 @@ esac"#,
         assert_eq!(calls, "");
     }
 
-    /// A `created` one-off still `created` after the bound never starts:
-    /// its client died. It is removed by id, without `--force`, so the
-    /// engine refuses the removal if it started after all.
     #[tokio::test]
     async fn a_created_oneoff_that_never_starts_is_removed_by_id() {
         let (result, calls) = settle(&[&oneoff("created")], Duration::ZERO, false).await;
@@ -2264,8 +2081,6 @@ esac"#,
         assert_eq!(calls, "container rm -- 0ne0ff\n");
     }
 
-    /// The removal happens once: a one-off still listed after it is
-    /// refused.
     #[tokio::test]
     async fn a_oneoff_that_outlives_its_removal_is_refused() {
         let (result, calls) = settle(&[&oneoff("created")], Duration::ZERO, true).await;
@@ -2276,7 +2091,6 @@ esac"#,
         assert_eq!(calls, "container rm -- 0ne0ff\n");
     }
 
-    /// A one-off still running after the bound is refused, not removed.
     #[tokio::test]
     async fn a_running_oneoff_after_the_bound_is_refused() {
         let (result, calls) = settle(&[&oneoff("running")], Duration::ZERO, false).await;
@@ -2288,16 +2102,11 @@ esac"#,
         assert_eq!(calls, "");
     }
 
-    /// What [`remove_trial`] did against [`settle_engine`].
     struct Removal {
         result: Result<(), TrialError>,
-        /// The engine calls that change something.
         calls: String,
-        /// The inventory `approve` was shown.
         shown: String,
-        /// The trial directory is still there.
         dir_left: bool,
-        /// The teardown marker is still there.
         marker_left: bool,
         paths: TrialPaths,
         _home: tempfile::TempDir,
@@ -2317,8 +2126,6 @@ esac"#,
         remove_with(listings, wait, answer, remove_dir, |_, _| {}).await
     }
 
-    /// [`remove`], removing the trial directory with `rm_dir`, after
-    /// `prepare` is given the stub engine's directory and the paths.
     async fn remove_with(
         listings: &[&str],
         wait: Duration,
@@ -2352,8 +2159,6 @@ esac"#,
         }
     }
 
-    /// Have the stub engine log whether the marker exists at each
-    /// `container rm`.
     fn watch_marker(engine: &std::path::Path, paths: &TrialPaths) {
         use std::os::unix::ffi::OsStrExt as _;
         std::fs::write(
@@ -2363,7 +2168,6 @@ esac"#,
         .unwrap();
     }
 
-    /// [`remove_dir`], once it has seen the marker.
     fn remove_dir_after_the_marker(paths: &TrialPaths) -> Result<(), TrialError> {
         assert!(
             paths.teardown_marker().is_file(),
@@ -2372,7 +2176,6 @@ esac"#,
         remove_dir(paths)
     }
 
-    /// A directory removal interrupted after it took `state.json`.
     fn interrupted_after_the_state(paths: &TrialPaths) -> Result<(), TrialError> {
         std::fs::remove_file(paths.state_file()).unwrap();
         Err(TrialError::io(
@@ -2382,10 +2185,6 @@ esac"#,
         ))
     }
 
-    /// `down` writes the marker after the yes and before the first Docker
-    /// deletion, and removes it only after the trial directory is gone.
-    /// Every stop in between leaves a marker that blocks `up` and names
-    /// the trial for the next `down`.
     #[tokio::test]
     async fn trial_teardown_marker_order() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2397,7 +2196,6 @@ esac"#,
             engine_id: None,
         };
 
-        // A marker that cannot be written: nothing is deleted.
         let unwritable = remove_with(&[&created], Duration::ZERO, yes, remove_dir, |_, paths| {
             std::fs::create_dir(paths.teardown_marker()).unwrap();
         })
@@ -2416,7 +2214,6 @@ esac"#,
         assert_eq!(unwritable.calls, "", "deleted without a marker");
         assert!(unwritable.dir_left);
 
-        // A failed Docker deletion keeps the marker, which names the trial.
         let failed = remove_with(
             &[&created],
             Duration::ZERO,
@@ -2443,7 +2240,6 @@ esac"#,
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(DownView::load(&marker).unwrap(), Some(ours.clone()));
 
-        // Success: the marker outlives every deletion and the directory.
         let done = remove_with(
             &[&created],
             Duration::ZERO,
@@ -2459,8 +2255,6 @@ esac"#,
         );
         assert!(!done.dir_left && !done.marker_left);
 
-        // Interrupted inside the directory removal, after `state.json`
-        // went: the marker blocks `up`, and `down` finds the trial by it.
         let interrupted = remove_with(
             &[&created],
             Duration::ZERO,
@@ -2491,7 +2285,6 @@ esac"#,
         );
         assert_eq!(down_view(&interrupted.paths).unwrap(), Some(ours));
 
-        // A declined approval writes no marker.
         for answer in [(false, false, "y\n"), (false, true, "n\n")] {
             let declined =
                 remove_with(&[&created], Duration::ZERO, answer, remove_dir, |_, _| {}).await;
@@ -2503,9 +2296,6 @@ esac"#,
 
     const CREATED_ROW: &str = "  container trawl-trial-fleet-admin-run-1  created\n";
 
-    /// A `created` one-off is listed for approval, and nothing is removed
-    /// until the answer is yes: not without a terminal, and not on `n`.
-    /// It is not waited for, so `down` shows it at once.
     #[tokio::test]
     async fn down_removes_nothing_before_a_yes() {
         let created = oneoff("created");
@@ -2533,7 +2323,6 @@ esac"#,
         }
     }
 
-    /// After a yes, the listed one-off goes with everything else, by id.
     #[tokio::test]
     async fn down_deletes_the_listed_oneoff_after_a_yes() {
         let created = oneoff("created");
@@ -2546,9 +2335,6 @@ esac"#,
         }
     }
 
-    /// A running one-off is waited for before anything is shown. One that
-    /// outlasts the wait is listed as running, never removed before a
-    /// yes, and never refused: `down` deletes it with the rest.
     #[tokio::test]
     async fn down_waits_for_a_running_oneoff_then_lists_it() {
         let (running, exited) = (oneoff("running"), oneoff("exited"));
@@ -2590,9 +2376,6 @@ esac"#,
         assert_eq!(approved.calls, "container rm --force -- 0ne0ff\n");
     }
 
-    /// [`remove_trial`] without a state, of a trial directory holding
-    /// `files`, on an engine with nothing of a trial's. `approve` gets the
-    /// listing as printed, and the directory.
     async fn remove_leftover_of(
         files: &[&str],
         approve: impl FnOnce(&str, &std::path::Path) -> Confirmation,
@@ -2620,7 +2403,6 @@ esac"#,
         (result, home, paths)
     }
 
-    /// A directory without a state is listed, and a `n` keeps all of it.
     #[tokio::test]
     async fn down_keeps_a_directory_without_state_on_a_no() {
         let (result, _home, paths) = remove_leftover_of(&["a", "b"], |shown, _| {
@@ -2632,8 +2414,6 @@ esac"#,
         assert!(paths.dir.join("a").is_file() && paths.dir.join("b").is_file());
     }
 
-    /// After a yes, only the listed entries go. A file that appeared while
-    /// `down` asked stays, and so does the directory holding it.
     #[tokio::test]
     async fn down_removes_only_the_listed_entries_of_a_directory_without_state() {
         let (result, _home, paths) = remove_leftover_of(&["a"], |_, dir| {
@@ -2655,13 +2435,6 @@ esac"#,
         assert!(paths.dir.join("late").is_file());
     }
 
-    /// Every `up`, first or resumed, starts the services through
-    /// [`start_services`]. It stops trawl-web and writes a new cookie key
-    /// before starting it, so trawl-web, which reads the key at startup,
-    /// rejects every session cookie issued before this `up`
-    /// (`fleet_auth::session::decrypt` fails on another key, and
-    /// trawl-web's session extractor answers that with 401). A port taken
-    /// while the trial was stopped can have received such a cookie.
     #[tokio::test]
     async fn every_start_rotates_the_cookie_key_while_trawl_web_is_stopped() {
         let dir = tempfile::tempdir().unwrap();
@@ -2698,8 +2471,6 @@ fi"#,
         assert_ne!(first, second, "a start reused the cookie key");
     }
 
-    /// A trial's own running container holds its port; anything else,
-    /// including a stopped trial, is bind-tested.
     #[test]
     fn only_a_running_trial_container_skips_the_bind_test() {
         let ports = Ports {
@@ -2941,9 +2712,6 @@ fi"#,
         }
     }
 
-    /// An `up` killed between recording the intent and posting leaves every
-    /// sample service empty. The rerun refuses, and says the earlier post's
-    /// result is unknown rather than that the services hold events.
     #[test]
     fn an_all_zero_intent_names_the_unknown_post() {
         let expected: std::collections::BTreeMap<String, u64> = sample::expected_counts()
@@ -2978,10 +2746,6 @@ fi"#,
         );
     }
 
-    /// A plain-HTTP stand-in for trawld's query and ingest endpoints.
-    /// Every query answers `counts` as [`COUNT_QUERY`]'s rows; every
-    /// ingest post is accepted and counted. Returns the two clients and
-    /// the post count.
     async fn fake_api(
         counts: std::collections::BTreeMap<String, u64>,
     ) -> (Clients, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -3070,10 +2834,6 @@ fi"#,
         (clients, posts)
     }
 
-    /// Both refusals that name `trawl trial up --no-sample-data` keep
-    /// their word: once an `up --no-sample-data` has run, every later
-    /// plain `up` goes on without the samples. It never refuses again,
-    /// and never posts.
     #[tokio::test]
     async fn declining_the_samples_lasts() {
         let expected: std::collections::BTreeMap<String, u64> = sample::expected_counts()
@@ -3141,8 +2901,6 @@ fi"#,
         assert!(fingerprint(format!("{pem}{pem}").as_bytes()).is_err());
     }
 
-    /// A trial directory, its stub trawld volume, and a stub engine that
-    /// runs the real volume scripts there and logs each call.
     struct CertTrial {
         root: tempfile::TempDir,
         engine: tempfile::TempDir,
@@ -3168,19 +2926,16 @@ fi"#,
             }
         }
 
-        /// `path` in the stub volume.
         fn at(&self, path: &str) -> std::path::PathBuf {
             self.root.path().join(path.trim_start_matches('/'))
         }
 
-        /// The calls the engine logged since the last `take_calls`.
         fn take_calls(&self) -> String {
             let calls = crate::trial::secrets::tests::calls(&self.engine);
             let _ = std::fs::remove_file(self.engine.path().join("calls"));
             calls
         }
 
-        /// A state that recorded `tls` and the phase flag `phase`, saved.
         fn state(&self, phase: bool, tls: Option<&str>) -> TrialState {
             let mut state = fixture(DEFAULT_API_PORT);
             state.phases.tls = phase;
@@ -3191,14 +2946,11 @@ fi"#,
             state
         }
 
-        /// Every file under the stub volume, with its bytes.
         fn volume(&self) -> Vec<(std::path::PathBuf, Vec<u8>)> {
             files_under(self.root.path())
         }
     }
 
-    /// Every file under `dir`, with its bytes, sorted. Anything that is
-    /// neither a directory nor a regular file is listed without bytes.
     fn files_under(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
         fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
             for entry in std::fs::read_dir(dir).unwrap() {
@@ -3247,7 +2999,6 @@ fi"#,
         out + "-----END " + label + "-----\n"
     }
 
-    /// The mode bits of `path`.
     fn mode(path: &std::path::Path) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
@@ -3271,17 +3022,12 @@ fi"#,
         .is_ok()
     }
 
-    /// The first `up` generates the pair into the volume, key first, and
-    /// publishes its certificate. Every later `up` reuses that pair: one
-    /// that lost the host `ca.pem` restores the pins from the volume, and
-    /// one killed before the phase was recorded adopts what it published.
     #[tokio::test]
     async fn completed_trial_pair_is_reused() {
         let trial = CertTrial::new();
         let (cert, key, web) = (compose::TLS_CERT, compose::TLS_KEY, compose::WEB_CA);
         let ca = trial.paths.ca_file();
 
-        // An empty volume and an unrecorded phase: generate.
         let mut state = trial.state(false, None);
         certificate(&trial.docker, &trial.paths, &mut state)
             .await
@@ -3310,7 +3056,6 @@ fi"#,
         };
         assert_eq!(recorded(&state), (true, Some(fp.clone())));
 
-        // Recorded, with the host pin present: read, and nothing else.
         let before = std::fs::read(trial.paths.state_file()).unwrap();
         certificate(&trial.docker, &trial.paths, &mut state)
             .await
@@ -3318,7 +3063,6 @@ fi"#,
         assert_eq!(trial.take_calls(), format!("read {cert}\n"));
         assert_eq!(std::fs::read(trial.paths.state_file()).unwrap(), before);
 
-        // Recorded, with the host pin deleted: re-pin from the volume.
         std::fs::remove_file(&ca).unwrap();
         certificate(&trial.docker, &trial.paths, &mut state)
             .await
@@ -3346,8 +3090,6 @@ fi"#,
         }
     }
 
-    /// A key with no certificate beside it was never published: an
-    /// unrecorded trial replaces it with a new pair.
     #[tokio::test]
     async fn an_orphan_key_is_replaced_by_a_new_pair() {
         let trial = CertTrial::new();
@@ -3364,9 +3106,6 @@ fi"#,
         assert!(pair_loads(&cert_bytes, &key_bytes));
     }
 
-    /// A key path the writer cannot replace stops the new pair at the key:
-    /// no certificate is written beside it, nothing is pinned, and the
-    /// state is unchanged.
     #[tokio::test]
     async fn a_key_path_that_is_a_directory_stops_generation_at_the_key() {
         let trial = CertTrial::new();
@@ -3394,18 +3133,12 @@ fi"#,
         assert!(key.is_dir());
     }
 
-    /// What a refusal case puts at the certificate's path.
     enum Volume<'a> {
         Empty,
         Holds(&'a [u8]),
         Directory,
     }
 
-    /// Run the certificate phase on a fresh trial whose volume holds
-    /// `volume` at the certificate's path and a key file beside it, and
-    /// assert it refuses having read the volume once and written nothing:
-    /// no pin, no web copy, no state, no byte in the volume, and no line
-    /// of `key_body` in any file but the two the volume holds.
     async fn assert_refused(
         name: &str,
         phase: bool,
@@ -3471,11 +3204,6 @@ fi"#,
         }
     }
 
-    /// A recorded trial whose volume certificate is gone, damaged, or not
-    /// the recorded one refuses, as does an unrecorded trial whose volume
-    /// holds something that is not one certificate. The refusal reads the
-    /// volume once and writes nothing: no pin, no web copy, no state, and
-    /// no byte in the volume.
     #[tokio::test]
     async fn recorded_trial_certificate_damage_is_refused() {
         let a = TrialPair::generate().unwrap().into_cert_pem();
@@ -3535,12 +3263,6 @@ fi"#,
         }
     }
 
-    /// The pins are the volume's bytes as they are, so a payload is one
-    /// certificate only when it is one CERTIFICATE section with nothing
-    /// but whitespace around it, holding one well-formed X.509
-    /// certificate. Garbage DER, trailing DER bytes, the certificate's own
-    /// key, text, and an unknown section are each refused, recorded or
-    /// not, before the key reaches any pin.
     #[tokio::test]
     async fn a_payload_that_is_not_one_clean_certificate_is_refused() {
         let pair = TrialPair::generate().unwrap();
@@ -3609,9 +3331,6 @@ fi"#,
         }
     }
 
-    /// A read that fails says nothing about the certificate: it is the
-    /// engine's error, never the damage refusal, and it never lets `up`
-    /// generate.
     #[tokio::test]
     async fn a_failed_certificate_read_is_a_docker_error_and_writes_nothing() {
         for (phase, tls) in [(true, Some("AB:CD")), (false, None)] {
@@ -3635,9 +3354,6 @@ exit 1"#,
         }
     }
 
-    /// The certificate is judged first in setup, so a refusal or a failed
-    /// read leaves PostgreSQL stopped and every other phase untouched. A
-    /// new trial gets its certificate before its databases.
     #[tokio::test]
     async fn setup_judges_the_certificate_before_anything_else() {
         let trial = CertTrial::new();

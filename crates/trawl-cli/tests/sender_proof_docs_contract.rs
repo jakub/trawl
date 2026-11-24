@@ -4,11 +4,7 @@
 
 //! The sender proof recipes in the Vector guide and the syslog section of
 //! the ingestion guide are runnable blocks, each named by a
-//! `<!-- proof:NAME -->` comment on the line before its fence. This test
-//! holds the inventory of those names exactly, and parses every proof query
-//! with the DSL parser after putting sample values in for its shell
-//! variables. A query that stops parsing, or loses the identity, arrival, or
-//! time-window predicate that makes it a proof, fails here.
+//! `<!-- proof:NAME -->` comment on the line before its fence.
 //! `scripts/test-vector-collector.py` runs the `capture-sample` and
 //! `capture-recent` blocks itself, as written, against the Debian collector
 //! configuration.
@@ -73,7 +69,6 @@ const INGESTION_MARKERS: &[&str] = &[
     "syslog-check",
 ];
 
-// Sample values for the shell variables the proof queries read.
 const SENDER_ENV: &str = "prod";
 const HOST: &str = "collector1.example.com";
 const MARKER: &str = "trawl-check-3f6c1a2e-9b7d-4e1f-8a2b-5c4d3e2f1a0b";
@@ -86,7 +81,6 @@ const BOOT_DAYS: &str = "3";
 
 const MARKER_PREFIX: &str = "<!-- proof:";
 
-/// Every proof marker on a page, in order, with the index of its line.
 fn markers(page: &str) -> Vec<(&str, usize)> {
     page.lines()
         .enumerate()
@@ -127,8 +121,6 @@ fn assert_inventory(page: &str, page_name: &str, expected: &[&str]) {
     );
 }
 
-/// The body of the fenced block that follows the named marker, with the
-/// list indentation removed.
 fn block<'a>(page: &'a str, name: &str) -> Vec<&'a str> {
     let (_, index) = markers(page)
         .into_iter()
@@ -141,8 +133,6 @@ fn block<'a>(page: &'a str, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// The query argument of the one `trawl -p prod query "…"` line in a
-/// block, with the shell escapes undone and the sample values put in.
 fn proof_query(page: &str, name: &str) -> String {
     const COMMAND: &str = "trawl -p prod query \"";
     let lines: Vec<&str> = block(page, name)
@@ -183,7 +173,6 @@ fn parse(page: &str, name: &str) -> Query {
         .unwrap_or_else(|errors| panic!("{name}: {query:?} does not parse: {errors:?}"))
 }
 
-/// The search stage's top-level tokens. A proof query is one AND group.
 fn tokens(query: &Query, name: &str) -> Vec<SearchToken> {
     assert_eq!(query.search.groups.len(), 1, "{name}: one AND group");
     query.search.groups[0]
@@ -206,9 +195,6 @@ fn phrase(text: &str) -> SearchToken {
     })
 }
 
-/// Assert the predicates that make a query a proof: the named identity
-/// filters, any phrase, `_ingested>=` the given start, and a `last=` window
-/// of the given number of days.
 fn assert_proof(query: &Query, name: &str, expected: &[SearchToken], ingested: &str, days: u64) {
     let found = tokens(query, name);
     let mut want = expected.to_vec();
@@ -237,7 +223,6 @@ fn assert_proof(query: &Query, name: &str, expected: &[SearchToken], ingested: &
     );
 }
 
-/// Assert `| head 20 | table …` naming the given columns in order.
 fn assert_table(query: &Query, name: &str, columns: &[&str]) {
     let stages: Vec<&PipeStage> = query.pipeline.iter().map(|stage| &stage.node).collect();
     match stages.as_slice() {

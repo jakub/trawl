@@ -2,14 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `ca_cert` pinning against a real rustls listener.
-//!
-//! Each test starts a TLS server on `127.0.0.1` that answers
-//! `GET /api/v1/health`, then connects through
-//! [`ConnectionParams::client`], the one constructor every command and the
-//! TUI use. A refusal is checked from both ends: the client call fails, and
-//! the server sees its handshake fail. A plain connection error would pass
-//! the first check but not the second.
+//! `ca_cert` pinning against a real rustls listener. A refusal is checked
+//! from both ends: the client call fails, and the server sees its handshake
+//! fail. A plain connection error would pass the first check but not the
+//! second.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +24,6 @@ use trawl_client::{ClientError, HealthStatus, NetworkKind, TlsTrust};
 
 const HEALTH_BODY: &str = r#"{"status":"ok"}"#;
 
-/// A self-signed CA that can issue server certificates.
 fn ca(name: &str) -> CertifiedIssuer<'static, KeyPair> {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     params.distinguished_name.push(DnType::CommonName, name);
@@ -37,7 +32,6 @@ fn ca(name: &str) -> CertifiedIssuer<'static, KeyPair> {
     CertifiedIssuer::self_signed(params, KeyPair::generate().expect("CA key")).expect("CA cert")
 }
 
-/// A server certificate for `sans`, issued by `issuer`.
 fn leaf(issuer: &CertifiedIssuer<'static, KeyPair>, sans: &[&str]) -> Identity {
     let key = KeyPair::generate().expect("leaf key");
     let mut params =
@@ -56,7 +50,6 @@ struct Identity {
     key: PrivateKeyDer<'static>,
 }
 
-/// A TLS listener on `127.0.0.1` that reports every handshake outcome.
 struct Server {
     port: u16,
     handshakes: mpsc::UnboundedReceiver<Result<(), String>>,
@@ -96,7 +89,6 @@ impl Server {
         Self { port, handshakes }
     }
 
-    /// The next handshake outcome the server saw.
     async fn handshake(&mut self) -> Result<(), String> {
         tokio::time::timeout(Duration::from_secs(10), self.handshakes.recv())
             .await
@@ -105,7 +97,6 @@ impl Server {
     }
 }
 
-/// Read one request head and answer it with a healthy status.
 async fn answer_health<S: AsyncReadExt + AsyncWriteExt + Unpin>(stream: &mut S) {
     let mut head = Vec::new();
     let mut buf = [0u8; 1024];
@@ -201,7 +192,6 @@ async fn pinned_ca_refuses_a_server_from_another_ca() {
     expect_refused(&mut server, &conn).await;
 }
 
-/// The pin replaces the chain check only: the hostname is still verified.
 #[tokio::test]
 async fn pinned_ca_still_verifies_the_hostname() {
     let ca_a = ca("trawl test CA A");
@@ -209,13 +199,11 @@ async fn pinned_ca_still_verifies_the_hostname() {
     let conn = pinned(format!("https://127.0.0.1:{}", server.port), &ca_a.pem());
     expect_refused(&mut server, &conn).await;
 
-    // A name SAN does not cover the IP literal, and the reverse.
     let mut server = Server::start(leaf(&ca_a, &["localhost"])).await;
     let conn = pinned(format!("https://127.0.0.1:{}", server.port), &ca_a.pem());
     expect_refused(&mut server, &conn).await;
 }
 
-/// A bundle with several roots trusts each of them.
 #[tokio::test]
 async fn pinned_bundle_trusts_every_root_in_it() {
     let ca_a = ca("trawl test CA A");
@@ -226,8 +214,6 @@ async fn pinned_bundle_trusts_every_root_in_it() {
     expect_accepted(&mut server, &conn).await;
 }
 
-/// The shape `trawld` generates for itself: a self-signed end-entity
-/// certificate, pinned as its own root.
 #[tokio::test]
 async fn pinned_self_signed_server_certificate() {
     let rcgen::CertifiedKey { cert, signing_key } =
@@ -246,7 +232,6 @@ async fn pinned_self_signed_server_certificate() {
     expect_refused(&mut server, &conn).await;
 }
 
-/// Nothing listening is a connection failure, not a certificate one.
 #[tokio::test]
 async fn a_refused_connection_still_says_connection_failed() {
     let ca_a = ca("trawl test CA A");
@@ -269,8 +254,6 @@ async fn a_refused_connection_still_says_connection_failed() {
     assert!(!message.contains("certificate"), "{message}");
 }
 
-/// A plain `http://` URL would skip the pin, so a pinned client refuses it
-/// before connecting.
 #[tokio::test]
 async fn pinned_ca_refuses_plain_http() {
     let ca_a = ca("trawl test CA A");
@@ -287,16 +270,11 @@ async fn pinned_ca_refuses_plain_http() {
     }
 }
 
-/// A pin replaces the platform roots; it does not add to them.
-///
 /// Every other test here uses a CA no platform store trusts, so a pin that
-/// merged its roots into the platform store would pass them all. This one
-/// makes the server's issuer a platform root. Under the workspace's reqwest
-/// features the platform store is `rustls-platform-verifier`, which on Linux
-/// loads `rustls-native-certs`, and that reads only `SSL_CERT_FILE` when the
-/// variable is set. The process environment must not be mutated, so the
-/// clients run in a re-executed copy of this test with the variable set on
-/// its `Command`, and the server stays here to see both handshakes.
+/// merged its roots into the platform store would pass them all. On Linux
+/// the platform store reads only `SSL_CERT_FILE` when the variable is set.
+/// The process environment must not be mutated, so the clients run in a
+/// re-executed copy of this test with the variable set on its `Command`.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn pinned_ca_excludes_the_platform_roots() {
@@ -306,7 +284,6 @@ async fn pinned_ca_excludes_the_platform_roots() {
         let url = url.into_string().expect("UTF-8 URL");
         let pin = std::fs::read_to_string(std::env::var_os(CHILD_PIN).expect("pin path"))
             .expect("read the pin");
-        // The platform path trusts the server: the variable took effect.
         let system = ConnectionParams {
             url: url.clone(),
             token: "flt_test_not_real".into(),
@@ -319,7 +296,6 @@ async fn pinned_ca_excludes_the_platform_roots() {
             .await
             .expect("the platform roots must trust the server");
         assert_eq!(health.status, HealthStatus::Ok);
-        // A pin to another CA refuses the same server.
         let err = pinned(url, &pin)
             .client()
             .expect("build client")

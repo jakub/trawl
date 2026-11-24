@@ -2,13 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `trawl schema` subcommands: the field catalog's read commands plus repin.
-//!
-//! `fields`/`field`/`conflicts` hit the server's catalog routes and render
-//! through the generic driver formatter ([`crate::cli::render_driver_results`]).
-//! `fields --data <glob>` is the embedded path: a plain `DESCRIBE` over local
-//! parquet with no server and no postgres.
-
 use std::io::{self, IsTerminal, Write};
 
 use serde_json::Value as Json;
@@ -18,13 +11,10 @@ use crate::CliError;
 use crate::cli::{ConnectionParams, OutputFormat, render_driver_results};
 use crate::terminal::Destination;
 
-/// Parse a `--last` window like `30m`, `2h`, `7d`, `1w` into seconds.
 pub fn parse_last(input: &str) -> Result<u64, CliError> {
     parse_window(input, "--last")
 }
 
-/// The `--last` grammar with the failing option named by the caller, so
-/// `gc-pins --older-than 30y` complains about `--older-than`, not `--last`.
 pub fn parse_window(input: &str, option: &str) -> Result<u64, CliError> {
     let input = input.trim();
     // Split off the last char, not the last byte: `split_at` panics off a
@@ -52,13 +42,8 @@ pub fn parse_window(input: &str, option: &str) -> Result<u64, CliError> {
     Ok(n.saturating_mul(mult))
 }
 
-/// Resolve the output format like `trawl query` does, table on a terminal
-/// and ndjson on a pipe, with the [`Destination`] the renderers write for.
-///
-/// Both come from one look at this process's stdout, which is where the
-/// binary points every command's `out`. An in-process caller that passes
-/// its own writer gets whatever its stdout is: under a test harness that
-/// captures it, data.
+/// An in-process caller that passes its own writer gets whatever its stdout
+/// is: under a test harness that captures it, data.
 fn resolve_format(format: Option<OutputFormat>) -> Result<(OutputFormat, Destination), CliError> {
     let destination = Destination::stdout();
     let format = format.unwrap_or(match destination {
@@ -73,7 +58,6 @@ fn resolve_format(format: Option<OutputFormat>) -> Result<(OutputFormat, Destina
     Ok((format, destination))
 }
 
-/// `CatalogFieldsResponse` → generic (columns, rows).
 pub fn fields_to_rows(resp: &CatalogFieldsResponse) -> (Vec<String>, Vec<Vec<Json>>) {
     let columns = [
         "field",
@@ -110,7 +94,6 @@ pub fn fields_to_rows(resp: &CatalogFieldsResponse) -> (Vec<String>, Vec<Vec<Jso
     (columns, rows)
 }
 
-/// `CatalogConflictsResponse` → generic (columns, rows).
 pub fn conflicts_to_rows(resp: &CatalogConflictsResponse) -> (Vec<String>, Vec<Vec<Json>>) {
     let columns = [
         "at",
@@ -139,7 +122,6 @@ pub fn conflicts_to_rows(resp: &CatalogConflictsResponse) -> (Vec<String>, Vec<V
     (columns, rows)
 }
 
-/// The field detail's per-service observations → generic (columns, rows).
 pub fn field_services_to_rows(resp: &CatalogFieldResponse) -> (Vec<String>, Vec<Vec<Json>>) {
     let columns = ["service", "first_seen", "last_seen", "rows"]
         .map(str::to_owned)
@@ -159,7 +141,6 @@ pub fn field_services_to_rows(resp: &CatalogFieldResponse) -> (Vec<String>, Vec<
     (columns, rows)
 }
 
-/// The field detail's conflict evidence → generic (columns, rows).
 pub fn field_conflicts_to_rows(resp: &CatalogFieldResponse) -> (Vec<String>, Vec<Vec<Json>>) {
     let columns = [
         "at",
@@ -186,10 +167,6 @@ pub fn field_conflicts_to_rows(resp: &CatalogFieldResponse) -> (Vec<String>, Vec
     (columns, rows)
 }
 
-/// Embedded `fields --data`: DESCRIBE local parquet → (columns, rows).
-///
-/// Name + type only — catalog metadata (observations, conflicts, pin
-/// provenance) lives on the server.
 pub fn describe_data_to_rows(glob: &str) -> Result<(Vec<String>, Vec<Vec<Json>>), CliError> {
     let executor = trawl_engine::executor::Executor::new()?;
     let schema = executor.describe_schema(glob)?;
@@ -202,10 +179,9 @@ pub fn describe_data_to_rows(glob: &str) -> Result<(Vec<String>, Vec<Vec<Json>>)
     Ok((columns, rows))
 }
 
-/// Write a human preamble/section line for `run_field`. The labels exist
-/// for the table view; on a machine format (auto-selected on a pipe) they
-/// would interleave with the ndjson/CSV stream, so they go to stderr —
-/// like `run_fields`' pin summary — and stdout stays parseable.
+/// The labels exist for the table view; on a machine format they would
+/// interleave with the ndjson/CSV stream, so they go to stderr and stdout
+/// stays parseable.
 fn label<W: Write>(out: &mut W, human: bool, text: &str) -> Result<(), CliError> {
     if human {
         writeln!(out, "{text}")?;
@@ -227,7 +203,6 @@ fn render<W: Write>(
     Ok(())
 }
 
-/// `trawl schema fields [--service] [--last] [--limit] [--data]`.
 pub async fn run_fields<W: Write>(
     out: &mut W,
     conn: Option<ConnectionParams>,
@@ -239,7 +214,6 @@ pub async fn run_fields<W: Write>(
 ) -> Result<(), CliError> {
     let (format, destination) = resolve_format(format)?;
 
-    // Embedded mode: DESCRIBE over local parquet, no server needed.
     if let Some(glob) = data {
         let (columns, rows) = describe_data_to_rows(glob)?;
         eprintln!(
@@ -277,7 +251,6 @@ pub async fn run_fields<W: Write>(
     Ok(())
 }
 
-/// `trawl schema field <name> [--limit] [--after]`.
 pub async fn run_field<W: Write>(
     out: &mut W,
     conn: Option<ConnectionParams>,
@@ -309,16 +282,11 @@ pub async fn run_field<W: Write>(
     Ok(())
 }
 
-/// The field detail's prose above its tables, through [`label`]: the pin's
-/// facts, the case file of a degraded pin, and a standing acknowledgement.
 fn write_field_case_file<W: Write>(
     out: &mut W,
     human: bool,
     resp: &CatalogFieldResponse,
 ) -> Result<(), CliError> {
-    // Every value here is sender or server text on its way to a terminal,
-    // stdout or stderr alike, so each one is sanitised whole: a `\n` in it
-    // is U+FFFD, and only the labels' own `\n` break lines.
     label(
         out,
         human,
@@ -380,8 +348,6 @@ fn write_field_case_file<W: Write>(
     Ok(())
 }
 
-/// The stderr pointer to the next page of a field's services. The cursor is
-/// server text, so it is shown through the line rule like every other value.
 fn more_services_hint(cursor: &str) -> String {
     format!(
         "(more services — rerun with --after {})",
@@ -389,27 +355,16 @@ fn more_services_hint(cursor: &str) -> String {
     )
 }
 
-/// The case file for a degraded pin: the analyzer's facts, the values the
-/// pin is shelving, and the one command that fixes it.
-///
-/// The wire carries structured facts, never stored prose (ADR-0011), so the
-/// words are written here. "rows shelved" is the lifetime total from the
-/// durable aggregates, a different number from the `rows_nulled` column in
-/// the conflict table below it, which sums only the evidence rows still
-/// inside the per-field recency window, so the two are labelled apart on
-/// purpose.
+/// "rows shelved" is the lifetime total from the durable aggregates, a
+/// different number from the `rows_nulled` column in the conflict table
+/// below it, which sums only the evidence rows still inside the per-field
+/// recency window, so the two are labelled apart on purpose.
 fn render_verdict<W: Write>(
     out: &mut W,
     human: bool,
     field: &str,
     v: &trawl_client::DegradedVerdict,
 ) -> Result<(), CliError> {
-    // A field name is a client-chosen JSON key that ingest polices for
-    // length and case only: a name carrying `;` and a shell command, or a
-    // bidi override, is legal, and the last line here is written to be
-    // pasted into a shell. Every rendering of the name is neutralised, and
-    // so is every value of the verdict, samples included: the server
-    // sanitises those too, but the client's safety does not lean on that.
     let shown = trawl_core::sanitize::sanitize_display_text(field);
     let suggested = trawl_core::sanitize::sanitize_display_text(&v.suggested_to);
     label(out, human, "\ndegraded pin:")?;
@@ -444,19 +399,11 @@ fn render_verdict<W: Write>(
     label(out, human, &format!("  suggested:      {suggested}"))?;
 
     // The remedy line is printed only for a name a command line can carry
-    // as itself. Two ways it cannot, both reachable because ingest polices
-    // field names for length and case and nothing else:
-    //
-    // - it does not survive the neutralisation above, so the sanitised
-    //   spelling is a different string; pasted, it would repin some other
-    //   field, or nothing, or (with enough bad luck) a real field whose name
-    //   genuinely contains U+FFFD;
-    // - it starts with `-`, so the argument parser reads it as a flag
-    //   however it is quoted (executed: `unexpected argument '-x' found`).
-    //
-    // A `--` terminator would answer the second, but its interaction with
-    // the flags that follow is untested, and an offered command that does
-    // not work is worse than none.
+    // as itself: one that survives the neutralisation above, and does not
+    // start with `-`, which the argument parser reads as a flag however it
+    // is quoted. A `--` terminator's interaction with the flags that follow
+    // is untested, and an offered command that does not work is worse than
+    // none.
     if shown == field && !field.starts_with('-') {
         label(
             out,
@@ -480,14 +427,6 @@ fn render_verdict<W: Write>(
     }
 }
 
-/// `arg` as one POSIX shell word.
-///
-/// Bare when the name is already a shell-inert token — which every ordinary
-/// field name is, and the common case must stay copy-pasteable-looking —
-/// otherwise single-quoted, with embedded quotes closed and reopened
-/// (`'\''`), the one escape that works inside single quotes. Single quotes
-/// rather than double because nothing inside them expands: no `$`, no
-/// backtick, no backslash.
 fn shell_quote(arg: &str) -> String {
     let bare = !arg.is_empty()
         && arg
@@ -500,7 +439,6 @@ fn shell_quote(arg: &str) -> String {
     }
 }
 
-/// `trawl schema conflicts [--field] [--service] [--last] [--limit]`.
 pub async fn run_conflicts<W: Write>(
     out: &mut W,
     conn: Option<ConnectionParams>,
@@ -598,8 +536,6 @@ mod tests {
         assert!(parse_last("d7").is_err());
         assert!(parse_last("").is_err());
         assert!(parse_last("7y").is_err());
-        // Multi-byte trailing chars are usage errors, not char-boundary
-        // panics out of `split_at`.
         assert!(parse_last("7µ").is_err());
         assert!(parse_last("µ").is_err());
         assert!(parse_last("7é").is_err());
@@ -638,8 +574,6 @@ mod tests {
         assert_eq!(rows[0][5], Json::from(3u64));
     }
 
-    /// The degraded column is the listing's badge, and the summary counts
-    /// what it badged.
     #[test]
     fn fields_to_rows_carries_the_degraded_flag() {
         let mut resp = sample_fields();
@@ -652,9 +586,6 @@ mod tests {
         assert_eq!(rows[0].last().unwrap(), &Json::from(true));
     }
 
-    /// The case file states the facts, shows the values, and ends with the
-    /// exact command that fixes it — with the lifetime total labelled apart
-    /// from the windowed `rows_nulled` in the conflict table below it.
     #[test]
     fn the_case_file_renders_facts_samples_and_the_remedy() {
         let mut buf = Vec::new();
@@ -676,9 +607,6 @@ mod tests {
         );
     }
 
-    /// A field name is client-chosen text that ingest polices for length and
-    /// case only, and the remedy line is written to be pasted into a shell.
-    /// A name that survives sanitisation unchanged is quoted and printed.
     #[test]
     fn the_remedy_line_quotes_a_hostile_field_name() {
         let mut buf = Vec::new();
@@ -698,9 +626,6 @@ mod tests {
         );
     }
 
-    /// A name the sanitiser changes cannot be named by a command: the
-    /// printed spelling is a different string, and repinning the wrong
-    /// field rewrites the wrong corpus. The verdict facts still render.
     #[test]
     fn a_name_that_cannot_be_printed_gets_no_command() {
         let mut buf = Vec::new();
@@ -726,10 +651,6 @@ mod tests {
         );
     }
 
-    /// A dash-leading name is printable and shell-quotable but still cannot
-    /// be a command argument: the parser reads `'-x'` as a flag, quotes and
-    /// all (`unexpected argument '-x' found`). It takes the same note
-    /// branch, rather than an offered command that does not run.
     #[test]
     fn a_flag_shaped_field_name_gets_no_command() {
         for name in ["-x", "--to"] {
@@ -785,8 +706,6 @@ mod tests {
         assert_eq!(rows[0][1], Json::from("envoy"));
     }
 
-    /// Populated output: the seeded responses render non-empty tables
-    /// through the shared driver formatter.
     #[test]
     fn seeded_responses_render_populated_output() {
         let (columns, rows) = fields_to_rows(&sample_fields());
@@ -820,8 +739,6 @@ mod tests {
         assert_eq!(parsed["rows_nulled"], 3);
     }
 
-    /// Embedded mode: `fields --data` DESCRIBEs local parquet with no
-    /// server and no postgres.
     #[test]
     fn describe_data_lists_local_parquet_columns() {
         let dir = tempfile::tempdir().unwrap();
@@ -853,7 +770,6 @@ mod tests {
         let names: Vec<&str> = rows.iter().map(|r| r[0].as_str().unwrap()).collect();
         assert!(names.contains(&"service"), "{names:?}");
         assert!(names.contains(&"duration"), "{names:?}");
-        // Every column carries a non-empty physical type.
         assert!(rows.iter().all(|r| !r[1].as_str().unwrap().is_empty()));
     }
 
@@ -861,14 +777,10 @@ mod tests {
     /// a control sequence, U+202E reverses what follows, and `\n` starts a
     /// line the value does not own.
     const HOSTILE: &str = "v\u{1b}[2J\u{202e}\nx";
-    /// [`HOSTILE`] as a prose line shows it: one U+FFFD per unsafe character.
     const SHOWN: &str = "v\u{fffd}[2J\u{fffd}\u{fffd}x";
 
-    /// Set only in the child process that reads `label`'s stderr routing.
     const STDERR_CHILD: &str = "TRAWL_SCHEMA_STDERR_CHILD";
-    /// The test that child process runs.
     const STDERR_CHILD_TEST: &str = "schema::tests::terminal_schema_lines_stderr_child";
-    /// Bracket the child's block, so nothing else on its stderr counts.
     const STDERR_BEGIN: &str = "--- schema lines begin ---";
     const STDERR_END: &str = "--- schema lines end ---";
 
@@ -916,7 +828,6 @@ mod tests {
         job
     }
 
-    /// Every block written through [`label`], for one routing.
     fn write_labelled_blocks(out: &mut Vec<u8>, human: bool) {
         write_field_case_file(out, human, &hostile_field()).unwrap();
         // A name that survives sanitising earns the copyable remedy, the
@@ -925,8 +836,6 @@ mod tests {
         render_repin_case_file(out, human, &hostile_job()).unwrap();
     }
 
-    /// What [`write_labelled_blocks`] writes: [`SHOWN`] at every value, and
-    /// each label's own line breaks where the label put them.
     fn expected_labelled_blocks() -> String {
         let s = SHOWN;
         let verdict_facts = [
@@ -990,7 +899,6 @@ mod tests {
         text
     }
 
-    /// The only unsafe characters `text` may hold are line breaks.
     fn assert_only_line_breaks_unsafe(text: &str) {
         let unsafe_chars: Vec<char> = text
             .chars()
@@ -999,13 +907,8 @@ mod tests {
         assert!(unsafe_chars.is_empty(), "{unsafe_chars:?} in {text:?}");
     }
 
-    /// Every schema prose line shows a sender or server value through the
-    /// line rule, whole: ESC, U+202E and `\n` each become one U+FFFD, and
-    /// the label's own line breaks stay. `label` writes a table's lines to
-    /// stdout and a machine format's to stderr, and both routings are read.
     #[test]
     fn terminal_schema_lines_sanitize_sender_text() {
-        // The stdout routing: a table.
         let mut out = Vec::new();
         write_labelled_blocks(&mut out, true);
         let text = String::from_utf8(out).unwrap();
@@ -1042,19 +945,16 @@ mod tests {
         assert_only_line_breaks_unsafe(block);
         assert_eq!(block, expected_labelled_blocks());
 
-        // The services cursor, which always goes to stderr.
         assert_eq!(
             more_services_hint(HOSTILE),
             format!("(more services — rerun with --after {SHOWN})")
         );
 
-        // The heading above a repin job's table.
         assert_eq!(
             repin_heading(HOSTILE, "dry run"),
             format!("repin {SHOWN}: dry run")
         );
 
-        // The server's decision time above the pin gc candidates.
         let mut report = super::gc_tests::sample_report(true);
         report.decided_at = HOSTILE.into();
         assert_eq!(
@@ -1081,8 +981,6 @@ mod tests {
         assert!(table.contains("x, gold"), "{table}");
     }
 
-    /// The entry point of the child process the test above reads the stderr
-    /// routing from. Without [`STDERR_CHILD`] it does nothing.
     #[test]
     #[ignore = "entry point for the stderr child; terminal_schema_lines_sanitize_sender_text runs it"]
     fn terminal_schema_lines_stderr_child() {
@@ -1101,21 +999,15 @@ mod tests {
     }
 }
 
-// -- repin --------------------------------------------------------------------
-
-/// The `trawl schema repin` flag bundle.
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)] // four independent CLI switches
 pub struct RepinFlags {
     /// The asserted numeral dialect, for a `SEVERITY` target only.
     pub dialect: Option<crate::cli::SeverityDialect>,
-    /// Scan and report only.
     pub dry_run: bool,
     /// Accept a lossy projection / run a resurrection-only pass.
     pub force: bool,
-    /// Skip the interactive confirmation.
     pub yes: bool,
-    /// Poll the job to completion.
     pub wait: bool,
     /// The most rows the forced rewrite may null, as stated on the command
     /// line. `None` leaves the number to the server's scan.
@@ -1124,23 +1016,17 @@ pub struct RepinFlags {
     pub max_ambiguous_rows: Option<u64>,
 }
 
-/// The ceilings a forced repin is held to, both resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundCeilings {
-    /// Rows the rewrite may null.
     pub max_nulled: u64,
-    /// Dialect-ambiguous numerals the rewrite may carry.
     pub max_ambiguous: u64,
 }
 
-/// How a run reaches the numbers its forced execution is bound to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CeilingPlan {
     /// Nothing to bind: an unforced repin accepts no loss at all, and a dry
     /// run mutates nothing, so neither has terms to state.
     NotApplicable,
-    /// The command line stated both numbers. Execute with them as they
-    /// stand, and print them: no preview scan is needed to know them.
     Stated(BoundCeilings),
     /// A forced execution that stated fewer than both numbers. The missing
     /// half only exists once a scan has counted the corpus, so the run does
@@ -1149,16 +1035,6 @@ pub enum CeilingPlan {
     Preview,
 }
 
-/// Decide how a `schema repin` invocation reaches its ceilings, before any
-/// network access.
-///
-/// The rule is that an operator never reads a number the execution is not
-/// actually held to. A scan-derived default is resolved per job, and a
-/// forced execution runs its own scan, so printing the preview's number and
-/// then letting the execution derive a fresh one would print a number
-/// nothing enforces. Restating the preview's numbers as explicit ceilings
-/// makes the printed line the enforced bound by construction, at the cost of
-/// a second scan on this path only.
 #[must_use]
 pub fn ceiling_plan(flags: &RepinFlags) -> CeilingPlan {
     if flags.dry_run || !flags.force {
@@ -1173,12 +1049,6 @@ pub fn ceiling_plan(flags: &RepinFlags) -> CeilingPlan {
     }
 }
 
-/// The ceilings a preview report resolved, when it resolved both.
-///
-/// A report missing either half is a job whose scan recorded no plan (or a
-/// server older than the ceiling columns). There is nothing honest to print
-/// or to restate there, so the caller falls back to whatever the flags said
-/// and lets the execution resolve the rest.
 #[must_use]
 pub fn accepted_ceilings(job: &trawl_client::RepinJobResponse) -> Option<BoundCeilings> {
     Some(BoundCeilings {
@@ -1187,7 +1057,6 @@ pub fn accepted_ceilings(job: &trawl_client::RepinJobResponse) -> Option<BoundCe
     })
 }
 
-/// The sentence the CLI prints before a forced execution starts.
 #[must_use]
 fn ceiling_notice(bound: BoundCeilings, from_preview: bool) -> String {
     format!(
@@ -1204,20 +1073,12 @@ fn ceiling_notice(bound: BoundCeilings, from_preview: bool) -> String {
     )
 }
 
-/// One repin job → generic key/value (columns, rows) for the driver
-/// formatter — the job is a single record, so it renders as one row.
-///
-/// Every fact rides the row (dialect, ambiguity, samples, liveness, the
-/// force verdict and its reason), because a scripted caller reading
-/// `-f json` or `-f csv` must not have to parse the prose the case file
-/// writes for a human. `requires_force` is null rather than `false` while
-/// the scan has yet to record a plan: absent is "not known yet".
-///
+/// `requires_force` is null rather than `false` while the scan has yet to
+/// record a plan: absent is "not known yet".
 /// The samples are an array in JSON and a joined string everywhere else.
 /// A spreadsheet's formula-injection rule fires on a cell's first
 /// character, so a joined cell puts the first sample there where
-/// `csv_escape_string`'s `'` prefix can neutralise it; inside a rendered
-/// JSON array it would sit behind a `[` and be invisible to that rule.
+/// `csv_escape_string`'s `'` prefix can neutralise it.
 pub fn repin_job_to_rows(
     job: &trawl_client::RepinJobResponse,
     format: OutputFormat,
@@ -1225,9 +1086,8 @@ pub fn repin_job_to_rows(
     (repin_job_columns(), vec![repin_job_cells(job, format)])
 }
 
-/// The job row's column names. Shared with the cancel receipt, which
-/// carries the same columns so a machine format is one record with one
-/// header (#109).
+/// Shared with the cancel receipt, which carries the same columns so a
+/// machine format is one record with one header.
 fn repin_job_columns() -> Vec<String> {
     [
         "id",
@@ -1262,7 +1122,6 @@ fn repin_job_columns() -> Vec<String> {
     .to_vec()
 }
 
-/// One job's cells, in [`repin_job_columns`] order.
 fn repin_job_cells(job: &trawl_client::RepinJobResponse, format: OutputFormat) -> Vec<Json> {
     vec![
         Json::from(job.id),
@@ -1302,9 +1161,9 @@ fn repin_job_cells(job: &trawl_client::RepinJobResponse, format: OutputFormat) -
         job.requires_force_reason
             .clone()
             .map_or(Json::Null, Json::from),
-        // Persisted facts (#109): on a `running` row they say a cancel is
-        // in flight, on a `failed` one they say the process died between
-        // the request and any boundary that could observe it.
+        // On a `running` row they say a cancel is in flight, on a `failed` one
+        // they say the process died between the request and any boundary that
+        // could observe it.
         job.cancel_requested_at
             .clone()
             .map_or(Json::Null, Json::from),
@@ -1322,15 +1181,6 @@ fn repin_job_cells(job: &trawl_client::RepinJobResponse, format: OutputFormat) -
     ]
 }
 
-/// The repin report's case file: the evidence a plan's numbers cannot
-/// carry. What the new pin cannot read, whether the corpus is
-/// dialect-ambiguous, whether anything is still writing the field, and why
-/// force is required.
-///
-/// Facts from the job row, phrased here (ADR-0011: the server ships facts,
-/// the consumer writes the words). Every value is sender-chosen text and
-/// goes through display sanitisation, because samples are attacker text by
-/// definition and this lands in a terminal.
 fn render_repin_case_file<W: Write>(
     out: &mut W,
     human: bool,
@@ -1376,10 +1226,6 @@ fn render_repin_case_file<W: Write>(
         )?;
     }
 
-    // A repin translates history only: a live sender keeps arriving in the
-    // ingest-time reading, so a syslog rewrite leaves a discontinuity at the
-    // cutover instant, and the fix for the live half is config, not another
-    // repin (ADR-0013 ruling 10).
     if let Some(live) = &job.liveness {
         let service = trawl_core::sanitize::sanitize_display_text(&live.service);
         label(
@@ -1401,8 +1247,6 @@ fn render_repin_case_file<W: Write>(
         )?;
     }
 
-    // What this job is actually held to, once its scan has resolved the
-    // numbers. An unforced job has none: it accepts no loss at all.
     if let Some(bound) = accepted_ceilings(job) {
         label(
             out,
@@ -1446,12 +1290,6 @@ fn render_repin_case_file<W: Write>(
     Ok(())
 }
 
-/// Resolve the ceilings a forced execution states, printing them first.
-///
-/// A forced run that did not state both numbers scans the corpus first, so
-/// what gets printed is what the execution then carries. Deriving the
-/// numbers twice would print one and enforce another: the corpus grows
-/// between the two scans, and the default is a function of the scan.
 async fn bind_ceilings(
     out: &mut impl Write,
     client: &trawl_client::HttpClient,
@@ -1484,8 +1322,6 @@ async fn bind_ceilings(
                 // A forced scan resolves its own ceilings, so a refusal here
                 // is one no ceiling covers. Report it instead of executing:
                 // the execution would refuse the same way, after a rewrite.
-                // A cancelled or failed preview produced no plan either, and
-                // its own status is what the sentence names (#109).
                 trawl_client::RepinStart::Refused(job)
                 | trawl_client::RepinStart::Started(job)
                 | trawl_client::RepinStart::Cancelled(job)
@@ -1507,9 +1343,6 @@ async fn bind_ceilings(
             &ceiling_notice(bound, plan == CeilingPlan::Preview),
         )?;
     } else if plan == CeilingPlan::Preview {
-        // The preview reported no resolved ceilings, so there is no number
-        // to print or to restate. The execution derives its own, exactly as
-        // a repin did before ceilings existed.
         label(
             out,
             human,
@@ -1520,17 +1353,6 @@ async fn bind_ceilings(
     Ok(bound)
 }
 
-/// `trawl schema repin <field> --to <type>`.
-///
-/// An executing repin rewrites the archive, so it confirms interactively —
-/// and off a TTY it refuses without `--yes` rather than assuming (a piped
-/// or scripted invocation must state its intent). Dry runs never prompt.
-///
-/// A forced execution prints the ceilings it accepts before it starts. When
-/// the command line stated both, those are the numbers; otherwise the run
-/// takes a forced dry run first and restates the ceilings that scan
-/// resolved, so the printed line is the bound the job is held to rather
-/// than a default a second scan might land somewhere else.
 pub async fn run_repin(
     out: &mut impl Write,
     conn: ConnectionParams,
@@ -1592,9 +1414,6 @@ pub async fn run_repin(
         .await?;
     let (started_as, job) = match settle_dry_run(&client, outcome).await? {
         trawl_client::RepinStart::Report(job) => ("dry run", job),
-        // The client separates a cancelled row from a report, so the
-        // verdict word is decided here rather than by sniffing the status
-        // string afterwards (#109).
         trawl_client::RepinStart::Cancelled(job) => ("cancelled", job),
         // A 200 that is neither: the row's own status is the verdict, and
         // `repin_completion` turns it into a non-zero exit.
@@ -1614,15 +1433,10 @@ pub async fn run_repin(
     }
     let (columns, rows) = repin_job_to_rows(&job, format);
     render_driver_results(&columns, &rows, format, destination, out)?;
-    // The case file goes to stdout for a human and to stderr for a machine
-    // format (`label`), so a piped `-f json` stays one parseable record while
-    // the operator still reads the evidence.
     render_repin_case_file(out, format == OutputFormat::Table, &job)?;
     repin_completion(&job)
 }
 
-/// The line above a repin job's table: the field, sanitised because a
-/// sender chose it, and the verdict word.
 fn repin_heading(field: &str, verdict: &str) -> String {
     format!(
         "repin {}: {verdict}",
@@ -1630,8 +1444,6 @@ fn repin_heading(field: &str, verdict: &str) -> String {
     )
 }
 
-/// The word the table header prints.
-///
 /// The status the row ended on outranks the verdict the start request
 /// carried: a job started here and then cancelled, refused at the cutover
 /// gate or failed while `--wait` polled it would otherwise still print as
@@ -1641,35 +1453,22 @@ fn repin_verdict_word<'a>(started_as: &'a str, status: &str, forced: bool) -> &'
         "cancelled" => "cancelled",
         "failed" => "failed",
         "blocked" => "blocked",
-        // One status, two facts: `refusal_verdict` is the same split the
-        // start arm uses, so a job refused at the cutover gate after
-        // `--wait` prints the word its flags earned.
         "refused_needs_force" => refusal_verdict(forced),
         _ => started_as,
     }
 }
 
-/// Did the repin this invocation asked for actually happen?
-///
 /// Exit code is the only thing a script reads, so every terminal status
 /// that is not a completed rewrite (or the dry run's report, which is also
 /// `succeeded`) has to be an error here. `running` is the one non-terminal
 /// pass: without `--wait` the job is deliberately left in flight and the
 /// operator polls `repin-status`.
-///
-/// The catch-all arm is the point (#109 review R2-3). `failed` and
-/// `blocked` used to fall past the cancelled and refused checks into
-/// `Ok(())`, so a `--wait` that watched a job fail still exited 0, and a
-/// cancel whose request row could not be written — which downgrades the
-/// job to `failed` on a 200 — printed "dry run" and exited 0 as well.
 fn repin_completion(job: &trawl_client::RepinJobResponse) -> Result<(), CliError> {
     match job.status.as_str() {
         "succeeded" | "running" => Ok(()),
         "refused_needs_force" => {
             // A pre-scan refusal reports its projection; a cutover refusal
-            // reports what the finished rewrite actually nulled. The remedy
-            // branches on the flags the job itself carried (#111): telling a
-            // forced job to pass --force is advice it has already taken.
+            // reports what the finished rewrite actually nulled.
             let lost = if job.rows_nulled > 0 {
                 job.rows_nulled
             } else {
@@ -1690,8 +1489,6 @@ fn repin_completion(job: &trawl_client::RepinJobResponse) -> Result<(), CliError
             )))
         }
         other => {
-            // The status and the error text both come off the wire, so both
-            // are sanitized before they reach a terminal.
             let detail = job.error.as_deref().map_or_else(String::new, |e| {
                 format!(": {}", trawl_core::sanitize::sanitize_display_text(e))
             });
@@ -1705,8 +1502,6 @@ fn repin_completion(job: &trawl_client::RepinJobResponse) -> Result<(), CliError
     }
 }
 
-/// The one-line verdict above a refused job's row.
-///
 /// `refused_needs_force` is one status covering two different facts. An
 /// unforced job accepted no loss at all, so force is what it wants. A forced
 /// one accepted a number and the finished rewrite came in over it, and
@@ -1720,16 +1515,8 @@ fn refusal_verdict(forced: bool) -> &'static str {
     }
 }
 
-/// The sentence a refused repin ends on: what the server refused, and what
-/// the operator does about it.
-///
-/// The remedy branches on the flags this invocation actually carried. An
-/// unforced run is refused because it accepted no loss at all, so the answer
-/// is `--force`; a forced one already passed it and was refused by a
-/// ceiling, so telling it to pass force again is advice it has taken. The
-/// server's own reason is authoritative when it sent one — the two gates and
-/// the wire all ask one function, and it names ambiguity as well as loss —
-/// and only the fallback has to guess at the shape of the loss.
+/// The server's own reason is authoritative when it sent one; only the
+/// fallback has to guess at the shape of the loss.
 fn repin_refusal(reason: Option<&str>, forced: bool, lost: u64) -> String {
     let remedy = if forced {
         "review the loss and raise --max-nulled-rows/--max-ambiguous-rows to \
@@ -1738,8 +1525,6 @@ fn repin_refusal(reason: Option<&str>, forced: bool, lost: u64) -> String {
         "re-run with --force to accept it"
     };
     match reason {
-        // The reason comes off the wire and lands on a terminal, so it
-        // sanitises like every other server sentence this file renders.
         Some(reason) => {
             let reason = trawl_core::sanitize::sanitize_display_text(reason);
             format!("repin refused: {reason} — {remedy}")
@@ -1751,16 +1536,12 @@ fn repin_refusal(reason: Option<&str>, forced: bool, lost: u64) -> String {
     }
 }
 
-/// Follow a dry run the server answered 202 for to its end.
-///
 /// The server holds a repin request for at most its `[server]
 /// timeout_secs`. A scan still running at that bound answers 202 with the
-/// claimed row, dry runs included, and the report is then read by the
-/// job's id. A dry run exists to print its report, so it is followed
-/// whatever `--wait` says, and the outcome is classified the way the 200
-/// would have been: only a `succeeded` row is a report. The read by id
-/// accepts the `schema_write` the trigger needed, so a key without
-/// `schema_read` still gets its report.
+/// claimed row, dry runs included. A dry run exists to print its report, so
+/// it is followed whatever `--wait` says. The read by id accepts the
+/// `schema_write` the trigger needed, so a key without `schema_read` still
+/// gets its report.
 async fn settle_dry_run(
     client: &trawl_client::HttpClient,
     outcome: trawl_client::RepinStart,
@@ -1777,12 +1558,9 @@ async fn settle_dry_run(
     })
 }
 
-/// Poll the job by its id until it leaves `running`.
-///
 /// By id, never the unscoped status read: that one answers the running
 /// job, else the newest, so once ours terminalized and another job claimed
-/// the freed slot it would describe that job instead. A row that is
-/// already terminal is the answer at once.
+/// the freed slot it would describe that job instead.
 async fn wait_for_terminal(
     client: &trawl_client::HttpClient,
     job: trawl_client::RepinJobResponse,
@@ -1796,7 +1574,6 @@ async fn wait_for_terminal(
     Ok(latest)
 }
 
-/// `trawl schema repin-status`.
 pub async fn run_repin_status(
     out: &mut impl Write,
     conn: ConnectionParams,
@@ -1816,16 +1593,10 @@ pub async fn run_repin_status(
     Ok(())
 }
 
-/// `trawl schema repin-cancel` (#109).
-///
 /// No confirmation prompt, unlike the trigger: cancelling only ever leaves
-/// the corpus as it already is, so the destructive direction is the one
-/// that needs a human's word.
-///
+/// the corpus as it already is.
 /// Exit code carries the verdict, because a script that asks for a stop has
-/// to know whether it got one: accepted exits 0, and both refusals — the
-/// job is past its point of no return, or nothing was running — exit
-/// non-zero through the usual error path.
+/// to know whether it got one.
 pub async fn run_repin_cancel(
     out: &mut impl Write,
     conn: ConnectionParams,
@@ -1838,23 +1609,14 @@ pub async fn run_repin_cancel(
         trawl_client::RepinCancel::PastPointOfNoReturn(r)
         | trawl_client::RepinCancel::NoJobRunning(r) => (false, r),
     };
-    // The server ships facts and the consumer writes the words, so the
-    // detail is printed as the server phrased it — through display
-    // sanitisation, like every other server sentence this command renders.
     let detail = trawl_core::sanitize::sanitize_display_text(&receipt.detail);
     if format == OutputFormat::Table {
-        // A human reads the sentence first and the job's numbers second, so
-        // the table keeps two blocks.
         writeln!(out, "repin cancel: {detail}")?;
         if let Some(job) = &receipt.job {
             let (columns, rows) = repin_job_to_rows(job, format);
             render_driver_results(&columns, &rows, format, destination, out)?;
         }
     } else {
-        // One record, one header: the verdict and the job it is about are
-        // one answer, and a machine format that emitted them as two tables
-        // would put two headers of different widths in one csv stream.
-        // The job columns are null when the server attached no row.
         let (columns, rows) = cancel_receipt_to_rows(&receipt, format);
         render_driver_results(&columns, &rows, format, destination, out)?;
     }
@@ -1864,15 +1626,11 @@ pub async fn run_repin_cancel(
     Err(CliError::Usage(format!("repin cancel refused: {detail}")))
 }
 
-/// A cancel receipt → exactly one record: the verdict, the server's
-/// sentence, and the job columns the verdict is about.
-///
 /// One record rather than two tables, because `-f csv` is a single stream:
 /// a receipt table followed by a job table would put two headers of
-/// different widths in it, which no csv reader accepts. A verdict with no
-/// job attached — a 404, or a store that could not serve the row — leaves
-/// the job columns null, so the shape does not depend on what the server
-/// managed to look up.
+/// different widths in it. A verdict with no job attached leaves the job
+/// columns null, so the shape does not depend on what the server managed
+/// to look up.
 fn cancel_receipt_to_rows(
     receipt: &trawl_client::RepinCancelResponse,
     format: OutputFormat,
@@ -1896,13 +1654,6 @@ fn cancel_receipt_to_rows(
     (columns, vec![cells])
 }
 
-// -- degraded-badge acknowledgement -------------------------------------------
-
-/// One acknowledgement → generic (columns, rows): a single record, like the
-/// repin job row, so `-f json` is one parseable object.
-///
-/// The note is operator prose that came back off the wire, so it goes
-/// through display sanitisation before it reaches a terminal.
 pub fn ack_to_rows(
     field: &str,
     ack: &trawl_client::FieldAck,
@@ -1930,16 +1681,8 @@ pub fn ack_to_rows(
     (columns, rows)
 }
 
-/// `trawl schema ack <field> [--note <text>] [--clear]`.
-///
-/// Acknowledging a degraded badge says "I have seen this evidence", not "the
-/// pin is fine": the ack covers the conflict episodes that exist when the
-/// server writes it, so the next episode raises the badge again. A repin of
-/// the field clears it outright.
-///
-/// `--clear` withdraws the acknowledgement. It prints one line rather than a
-/// record: the DELETE has no body, and a null-filled row would be a record
-/// the server never sent.
+/// `--clear` prints one line rather than a record: the DELETE has no body,
+/// and a null-filled row would be a record the server never sent.
 pub async fn run_ack<W: Write>(
     out: &mut W,
     conn: ConnectionParams,
@@ -1994,8 +1737,6 @@ mod ack_tests {
         }
     }
 
-    /// The ack renders as one record in every format the schema family
-    /// honours: a scripted caller reads it without parsing prose.
     #[test]
     fn the_ack_renders_as_one_record_in_every_format() {
         let (columns, rows) = ack_to_rows("duration", &sample_ack(), OutputFormat::Json);
@@ -2041,9 +1782,6 @@ mod ack_tests {
         assert_eq!(parsed["note"], Json::Null);
     }
 
-    /// The note is sender-adjacent text in a terminal: an operator can paste
-    /// anything into it, and it comes back over the wire, so it is
-    /// sanitised on display like every other value this file prints.
     #[test]
     fn a_hostile_note_is_sanitised_before_it_reaches_the_terminal() {
         let mut ack = sample_ack();
@@ -2053,9 +1791,6 @@ mod ack_tests {
         assert!(!note.contains('\u{1b}'), "escape survived: {note:?}");
     }
 
-    /// The field column splits by format: the table cell is terminal
-    /// display and sanitises; machine formats carry the exact catalog key
-    /// a scripted caller matches on.
     #[test]
     fn the_table_field_cell_sanitises_and_the_machine_cell_does_not() {
         let hostile = "du\u{1b}[2Jration";
@@ -2112,8 +1847,6 @@ mod repin_tests {
         }
     }
 
-    /// The job renders through the shared driver formatter in every
-    /// format the schema family honours.
     #[test]
     fn repin_job_renders_in_table_json_and_csv() {
         let (columns, rows) = repin_job_to_rows(&sample_job(), OutputFormat::Table);
@@ -2139,14 +1872,8 @@ mod repin_tests {
         assert_eq!(parsed["projected_nulls"], 0);
     }
 
-    /// The operator-facing transcript of a `--dry-run`, rendered by the real
-    /// CLI path.
-    ///
     /// The numbers are the ones the server produces in
-    /// `trawl-server/tests/repin.rs::repin_to_severity_dry_run_matches_the_executed_rewrite`
-    /// (five rows carrying, one unreadable `gold`, one dialect-ambiguous
-    /// `3`), so this pins what an operator reads when the plan says the
-    /// executing request would refuse.
+    /// `trawl-server/tests/repin.rs::repin_to_severity_dry_run_matches_the_executed_rewrite`.
     #[test]
     fn the_dry_run_transcript_shows_the_plan_the_evidence_and_the_verdict() {
         let job = trawl_client::RepinJobResponse {
@@ -2222,11 +1949,6 @@ mod repin_tests {
         }
     }
 
-    /// The case file is the evidence a plan's numbers cannot carry: the
-    /// asserted dialect, the ambiguous rows, the values the pin cannot read,
-    /// the force verdict, and, for a field something is still writing, the
-    /// discontinuity warning. A repin translates history, while live events
-    /// keep taking the ingest-time reading.
     #[test]
     fn the_repin_case_file_states_the_evidence_and_the_discontinuity() {
         let mut job = sample_job();
@@ -2252,26 +1974,17 @@ mod repin_tests {
             "{text}"
         );
         assert!(text.contains("_raw"), "{text}");
-        // The discontinuity, in the operator's terms and with the remedy.
         assert!(text.contains("STILL being written"), "{text}");
         assert!(text.contains("nginx"), "{text}");
         assert!(text.contains("historical `3` becomes 17"), "{text}");
         assert!(text.contains("severity_from"), "{text}");
         assert!(text.contains("requires --force:"), "{text}");
 
-        // A clean plan says none of it — no dialect line for a non-severity
-        // target, no warning for a field nothing writes.
         let mut out = Vec::new();
         render_repin_case_file(&mut out, true, &sample_job()).unwrap();
         assert!(String::from_utf8(out).unwrap().is_empty());
     }
 
-    /// The row carries every fact, in every machine format: a scripted
-    /// caller must never have to parse the case file's prose. CSV joins the
-    /// samples into one cell (", "-separated) so the first sample's first
-    /// character is the cell's first character, where the formula-injection
-    /// prefix fires; rendered as a JSON array, a hostile sample would hide
-    /// behind the `[`. JSON keeps the real array.
     #[test]
     fn the_repin_row_carries_the_evidence_in_every_machine_format() {
         let mut job = sample_job();
@@ -2313,8 +2026,6 @@ mod repin_tests {
         let table = render(OutputFormat::Table);
         assert!(table.contains("otel") && table.contains("nginx"), "{table}");
 
-        // A sample whose first character is a formula trigger lands at the
-        // start of the joined cell, where the CSV escaping neutralises it.
         let mut hostile = job.clone();
         hostile.unmapped_samples = vec!["=cmd()".into(), "gold".into()];
         let (columns, rows) = repin_job_to_rows(&hostile, OutputFormat::Csv);
@@ -2330,8 +2041,6 @@ mod repin_tests {
         let csv = String::from_utf8(out).unwrap();
         assert!(csv.contains("'=cmd()"), "formula prefix missing: {csv}");
 
-        // A job whose scan has not recorded a plan reports no verdict —
-        // never `false`, which would read as "safe to execute".
         let mut running = sample_job();
         running.status = "running".into();
         running.requires_force = None;
@@ -2356,10 +2065,6 @@ mod repin_tests {
         assert!(!text.contains("requires --force"), "{text}");
     }
 
-    /// The ceiling decision, at the level where it is a decision: which
-    /// numbers a forced run is bound to, and whether it has to scan first
-    /// to learn them.
-    ///
     /// The flow around it needs a server (two round trips, the second
     /// carrying the first's answer), so what a unit test can pin is the
     /// decision and the values, not the wire. The paired evidence that the
@@ -2376,9 +2081,7 @@ mod repin_tests {
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         };
-        // Unforced: no loss is accepted at all, so there are no terms.
         assert_eq!(ceiling_plan(&base), CeilingPlan::NotApplicable);
-        // A dry run mutates nothing; there is nothing to hold it to.
         assert_eq!(
             ceiling_plan(&RepinFlags {
                 dry_run: true,
@@ -2388,7 +2091,6 @@ mod repin_tests {
             }),
             CeilingPlan::NotApplicable
         );
-        // Both stated: execute with them, no preview scan.
         assert_eq!(
             ceiling_plan(&RepinFlags {
                 force: true,
@@ -2401,8 +2103,6 @@ mod repin_tests {
                 max_ambiguous: 0,
             })
         );
-        // One stated is not both: the other half only exists once a scan
-        // has counted the corpus.
         for flags in [
             RepinFlags {
                 force: true,
@@ -2423,10 +2123,6 @@ mod repin_tests {
         }
     }
 
-    /// What the preview hands the execution: both accepted numbers, or
-    /// nothing. A half-resolved report is a job that has not scanned (or a
-    /// server without ceilings), and restating half of a pair would bind
-    /// one dimension while the other quietly re-derived.
     #[test]
     fn the_preview_restates_both_accepted_ceilings_or_neither() {
         let mut job = sample_job();
@@ -2439,7 +2135,6 @@ mod repin_tests {
                 max_ambiguous: 10,
             })
         );
-        // The printed sentence carries the numbers the request will state.
         let notice = ceiling_notice(accepted_ceilings(&job).unwrap(), true);
         assert!(notice.contains("22"), "{notice}");
         assert!(notice.contains("10"), "{notice}");
@@ -2451,9 +2146,6 @@ mod repin_tests {
         assert_eq!(accepted_ceilings(&sample_job()), None);
     }
 
-    /// The remedy a refusal ends on depends on what the invocation already
-    /// carried: force is the answer to a refusal that accepted no loss, and
-    /// nonsense to one that was refused by a ceiling.
     #[test]
     fn a_refusal_names_the_remedy_the_operator_has_not_tried() {
         let reason = "12 nulled row(s) over an accepted 10";
@@ -2474,7 +2166,6 @@ mod repin_tests {
             "an operator who passed force is not told to pass it: {forced}"
         );
 
-        // The fallback, for a refusal the server sent no reason with.
         let bare = repin_refusal(None, false, 7);
         assert!(bare.contains("would null 7 stored value(s)"), "{bare}");
         assert!(bare.contains("re-run with --force"), "{bare}");
@@ -2484,9 +2175,6 @@ mod repin_tests {
         );
     }
 
-    /// Every place the CLI names a refusal branches on whether the job
-    /// carried force, so an operator who already passed it is never told to
-    /// pass it: the table verdict, and the case file's own line.
     #[test]
     fn a_forced_refusal_is_labelled_by_its_ceilings_not_by_the_flag() {
         assert_eq!(refusal_verdict(false), "refused: needs --force");
@@ -2521,9 +2209,6 @@ mod repin_tests {
         );
     }
 
-    /// The accepted ceilings are part of the case file and part of the
-    /// machine record: an operator reading a finished job sees the terms it
-    /// ran under without asking postgres.
     #[test]
     fn the_case_file_and_the_row_report_the_accepted_ceilings() {
         let mut job = sample_job();
@@ -2552,10 +2237,6 @@ mod repin_tests {
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["accepted_max_nulled_rows"], 22);
         assert_eq!(parsed["accepted_max_ambiguous_rows"], 10);
-        // The request's echo rides beside the accepted pair: the operator
-        // asked for 25 and the job is held to 22, and a machine format that
-        // showed only one of the two could not tell that apart from a
-        // default nobody stated.
         assert_eq!(parsed["max_nulled_rows"], 25);
         assert_eq!(
             parsed["max_ambiguous_rows"],
@@ -2563,7 +2244,6 @@ mod repin_tests {
             "an unstated ceiling echoes as null, not as the resolved one"
         );
 
-        // An unforced job accepts no loss, so it states no ceilings.
         let (_, rows) = repin_job_to_rows(&sample_job(), OutputFormat::Json);
         assert_eq!(
             rows[0][columns
@@ -2610,11 +2290,6 @@ mod repin_tests {
         assert!(out.is_empty(), "nothing rendered before the refusal");
     }
 
-    /// `--dialect` is a severity-only assertion, refused here before any
-    /// network access — the server refuses it too, but this one is a typo
-    /// an operator can fix without spending a job claim. A severity target
-    /// carries it through (the refusal below is the `--yes` gate, i.e. the
-    /// dialect check passed).
     #[tokio::test]
     async fn dialect_applies_to_a_severity_target_only() {
         let conn = ConnectionParams {
@@ -2642,8 +2317,6 @@ mod repin_tests {
             );
             assert!(out.is_empty());
         }
-        // A severity target gets past the flag check and stops at the
-        // execute-confirmation gate instead.
         let mut out = Vec::new();
         let err = run_repin(
             &mut out,
@@ -2664,12 +2337,6 @@ mod repin_tests {
         );
     }
 
-    /// The cancel receipt renders in every format, and a machine format
-    /// carries the verdict even when the server attached no job row.
-    ///
-    /// With a job attached it is still ONE record: one header, one width.
-    /// Two tables in one csv stream — a two-column receipt followed by the
-    /// 23-column job — is not a csv document at all (#109 review F4).
     #[test]
     fn a_cancel_receipt_renders_its_verdict_in_every_format() {
         for (outcome, spelling) in [
@@ -2698,8 +2365,6 @@ mod repin_tests {
             }
         }
 
-        // A job rides along: same header, same width, and the job's own
-        // facts are in the same record as the verdict.
         let mut job = sample_job();
         job.status = "cancelled".into();
         job.cancelled_by = Some("ops".into());
@@ -2734,7 +2399,6 @@ mod repin_tests {
         assert!(lines[1].contains("cancelled"), "{csv}");
         assert!(lines[1].contains("ops"), "{csv}");
 
-        // json is ndjson: one object carrying both halves.
         let (columns, rows) = cancel_receipt_to_rows(&receipt, OutputFormat::Json);
         let mut out = Vec::new();
         render_driver_results(
@@ -2753,7 +2417,6 @@ mod repin_tests {
         assert_eq!(parsed["status"], "cancelled");
         assert_eq!(parsed["cancelled_by"], "ops");
 
-        // No job attached: the same columns, nulled.
         let bodiless = trawl_client::RepinCancelResponse {
             outcome: trawl_client::RepinCancelOutcome::NoJobRunning,
             detail: "nothing running".into(),
@@ -2777,13 +2440,6 @@ mod repin_tests {
         assert_eq!(parsed["status"], Json::Null);
     }
 
-    /// Only a completed rewrite (or a dry run's report) exits 0.
-    ///
-    /// `failed` is the reachable one this test exists for: a cancel whose
-    /// request row cannot be written downgrades the job to `failed`, the
-    /// route still answers 200, and under `--wait` the old code fell past
-    /// the cancelled and refused checks into `Ok(())` — exit 0 over a repin
-    /// that never ran (#109 review R2-3).
     #[test]
     fn only_a_finished_repin_exits_zero() {
         for status in ["succeeded", "running"] {
@@ -2807,10 +2463,6 @@ mod repin_tests {
         }
     }
 
-    /// The table header names what the row ended on, not what the start
-    /// request said. A `failed` row must never print as "dry run", and a
-    /// refusal keeps the split its flags earned: a forced job was stopped
-    /// by its ceilings, not by a missing flag it already passed.
     #[test]
     fn the_header_verdict_follows_the_terminal_row() {
         assert_eq!(repin_verdict_word("dry run", "succeeded", false), "dry run");
@@ -2831,8 +2483,6 @@ mod repin_tests {
         );
     }
 
-    /// A cancelled job row shows who asked and when, in the machine
-    /// formats a script reads.
     #[test]
     fn a_cancelled_job_row_names_the_asker() {
         let mut job = sample_job();
@@ -2858,11 +2508,6 @@ mod repin_tests {
     }
 }
 
-/// `GcPinsResponse` candidates → generic (columns, rows).
-///
-/// One rectangle: the run's summary numbers are printed as labels around
-/// this table, never as a second header inside it, so a piped `-f csv` is
-/// one parseable record set.
 pub fn gc_candidates_to_rows(resp: &trawl_client::GcPinsResponse) -> (Vec<String>, Vec<Vec<Json>>) {
     let columns = ["field", "type", "last_seen", "services"]
         .map(str::to_owned)
@@ -2882,11 +2527,6 @@ pub fn gc_candidates_to_rows(resp: &trawl_client::GcPinsResponse) -> (Vec<String
     (columns, rows)
 }
 
-/// A window in seconds as a short human span, for the summary lines.
-///
-/// Whole units only, largest that divides evenly, so `2592000` reads
-/// `30d` and `100000` stays `100000s`. The seconds are printed beside it,
-/// because they are the number the wire and the server logs carry.
 fn human_secs(secs: u64) -> String {
     for (unit, size) in [("w", 604_800u64), ("d", 86_400), ("h", 3600), ("m", 60)] {
         if secs >= size && secs.is_multiple_of(size) {
@@ -2896,9 +2536,6 @@ fn human_secs(secs: u64) -> String {
     format!("{secs}s")
 }
 
-/// The lines printed above the candidate table: what was asked for, what
-/// the retention floor did to it, and what the scan cost.
-///
 /// The CLI computes no window. All three numbers are the server's own, and
 /// the floor line says whether it applied, because "I asked for 7d and got
 /// 90d" is the surprise an operator has to be able to see.
@@ -2941,7 +2578,6 @@ fn gc_summary_lines(resp: &trawl_client::GcPinsResponse) -> Vec<String> {
     lines
 }
 
-/// The line printed below the candidate table.
 fn gc_outcome_line(resp: &trawl_client::GcPinsResponse) -> String {
     if resp.dry_run {
         format!(
@@ -2954,13 +2590,6 @@ fn gc_outcome_line(resp: &trawl_client::GcPinsResponse) -> String {
     }
 }
 
-/// `trawl schema gc-pins [--dry-run] [--older-than <dur>]`.
-///
-/// The candidate list is the one table; the summary lines go around it
-/// through [`label`], so they reach stdout for a human and stderr under a
-/// machine format. A csv or ndjson run is therefore a single rectangular
-/// record set with no second header in the middle of it.
-///
 /// No confirmation prompt, unlike `repin`: this deletes catalog metadata
 /// only, and a field wrongly reclaimed re-pins cleanly the next time a
 /// sender writes it. `--dry-run` is the safety.
@@ -2976,9 +2605,6 @@ pub async fn run_gc_pins<W: Write>(
         .map(|s| parse_window(s, "--older-than"))
         .transpose()?;
     let client = conn.client()?;
-    // A refusal (409 for a repin owning the data root or an unreadable
-    // corpus) arrives as a client error carrying the server's own message,
-    // and `main` prints it and exits non-zero.
     let resp = client.schema_gc_pins(dry_run, older_than_secs).await?;
 
     let human = format == OutputFormat::Table;
@@ -3029,8 +2655,6 @@ mod gc_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Json::from("retired_counter"));
         assert_eq!(rows[0][3], Json::from(2));
-        // A never-observed pin is a candidate with a null observation, not
-        // a row the renderer drops.
         assert_eq!(rows[1][2], Json::Null);
     }
 
@@ -3056,9 +2680,6 @@ mod gc_tests {
         }
     }
 
-    /// A csv run is one rectangle: exactly one header line, and every data
-    /// line carries the same field count. The summary rides stderr, which
-    /// is why a second header cannot appear here.
     #[test]
     fn csv_output_is_one_rectangle() {
         let (columns, rows) = gc_candidates_to_rows(&sample_report(false));
@@ -3118,8 +2739,6 @@ mod gc_tests {
         assert!(table.contains("typo_feild"), "{table}");
     }
 
-    /// The two floor cases the summary must tell apart, plus the one where
-    /// there is no floor at all.
     #[test]
     fn the_floor_line_says_whether_it_applied() {
         let mut report = sample_report(false);

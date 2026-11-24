@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! TUI application state machine and event loop.
-
 mod autocomplete;
 pub mod driver;
 mod handlers;
@@ -42,7 +40,6 @@ use self::state::{
 use crate::CliError;
 use crate::config::Config;
 
-/// Get text from the system clipboard. Returns `None` if clipboard is unavailable.
 fn clipboard_get() -> Option<String> {
     #[cfg(feature = "clipboard")]
     {
@@ -54,7 +51,6 @@ fn clipboard_get() -> Option<String> {
     }
 }
 
-/// Set text on the system clipboard. Silently fails if clipboard is unavailable.
 fn clipboard_set(text: &str) {
     #[cfg(feature = "clipboard")]
     if let Ok(mut cb) = arboard::Clipboard::new() {
@@ -64,131 +60,87 @@ fn clipboard_set(text: &str) {
     let _ = text;
 }
 
-/// Error from an async query execution.
 #[derive(Debug)]
 pub(super) struct QueryError {
-    /// Human-readable error message.
     pub(super) message: String,
-    /// Structured error details with optional span info.
     pub(super) details: Vec<trawl_client::ErrorDetail>,
     /// The query text the run sent: what the details' spans index.
     pub(super) query: String,
 }
 
-/// Result of an async query execution.
 #[derive(Debug)]
 pub(super) struct QueryResult {
-    /// Query execution result.
     pub(super) result: Result<QueryResponse, QueryError>,
-    /// Execution duration.
     pub(super) duration: Duration,
-    /// The caps a live aggregate snapshot reported as having dropped input
-    /// (ADR-0001). Empty for every other result.
     pub(super) capped: Vec<trawl_api::stream::SnapshotCap>,
-    /// The run that sent this result, fixed when the run was spawned.
     pub(super) generation: state::RunGeneration,
-    /// Whether a batch query or a live stream sent this result.
     pub(super) source: state::RunSource,
 }
 
-/// Result of a mutation operation (save/delete saved query).
 #[derive(Debug)]
 pub(super) enum MutationResult {
-    /// Saved query was created successfully.
-    SavedQueryCreated { name: String },
-    /// Saved query was deleted successfully.
-    SavedQueryDeleted { name: String },
-    /// Saved queries cache refreshed.
+    SavedQueryCreated {
+        name: String,
+    },
+    SavedQueryDeleted {
+        name: String,
+    },
     CacheRefreshed {
         saved: ListSavedResponse,
-        /// Name of the query to select after refresh (if any).
         select_name: Option<String>,
     },
-    /// Schedule was set on a saved query.
-    ScheduleSet { saved_query_id: i64 },
-    /// Dashboard snapshot received from server (Err on failure — preserves cached data).
+    ScheduleSet {
+        saved_query_id: i64,
+    },
     DashboardUpdate(Result<Box<trawl_client::DashboardSnapshot>, String>),
-    /// Answer to the runs request `token` for a saved query: the runs and
-    /// the server's total, or the error to show.
     RunsLoaded {
         token: state::RequestToken,
         saved_id: i64,
         outcome: Result<(Vec<trawl_client::ReportRunSummary>, usize), String>,
     },
-    /// Answer to the run-result request `token`: the result, or the error to show.
     RunResultLoaded {
         token: state::RequestToken,
         saved_id: i64,
         run_id: i64,
         outcome: Result<trawl_api::value::QueryResult, String>,
     },
-    /// Mutation failed.
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
-/// Main TUI application state.
 pub struct App {
-    /// HTTP client for API calls.
     pub client: HttpClient,
-    /// The query tab (editor + results).
     pub tab: Tab,
-    /// Which top-level navigation tab is active.
     pub main_tab: MainTab,
-    /// Which pane has focus.
     pub focus: Focus,
-    /// Saved focus state for the Query tab (preserved across tab switches).
     query_focus: Focus,
-    /// Panel state for non-Query tabs (schema tree, history/saved selection).
     pub panel: PanelState,
-    /// Active popup (if any).
     pub popup: Option<Popup>,
-    /// Cached schema response (fetched at startup).
     pub schema_cache: Option<SchemaResponse>,
-    /// Cached history response (fetched at startup).
     pub history_cache: Option<HistoryResponse>,
-    /// Cached saved queries (fetched at startup).
     pub saved_cache: Option<ListSavedResponse>,
-    /// Whether to quit the application.
     pub should_quit: bool,
-    /// Whether live tail mode is active.
     pub live_mode: bool,
-    /// The zone every instant shows in, parsed from `ui.timezone` before
-    /// the TUI takes the terminal. Results stay UTC; only drawing converts.
     pub display_zone: DisplayZone,
-    /// Active results search (vim-style `/`).
     pub results_search: Option<ResultsSearch>,
-    /// Maximum events to retain in live streaming buffer.
     max_live_events: usize,
-    /// Channel for receiving query results from background tasks.
     query_rx: mpsc::UnboundedReceiver<QueryResult>,
-    /// Sender for spawning queries.
     query_tx: mpsc::UnboundedSender<QueryResult>,
-    /// Channel for receiving mutation results.
     mutation_rx: mpsc::UnboundedReceiver<MutationResult>,
-    /// Sender for mutation operations.
     mutation_tx: mpsc::UnboundedSender<MutationResult>,
-    /// Cache of sample values for (field, optional service) pairs.
-    #[allow(dead_code)] // nothing reads or writes it yet
+    #[allow(dead_code)]
     pub sample_values_cache: std::collections::HashMap<(String, Option<String>), Vec<String>>,
-    /// Channel for receiving driver commands from the unix socket.
     driver_rx: Option<mpsc::UnboundedReceiver<DriverCommand>>,
-    /// Path to the driver socket (for cleanup on exit).
     driver_socket_path: Option<PathBuf>,
-    /// Server version string (fetched from health endpoint at startup).
     pub server_version: Option<String>,
-    /// Admin dashboard state (permissions, polling, cache).
     pub dashboard: DashboardState,
-    /// Active color theme.
     pub theme: theme::Theme,
-    /// Cached layout areas from last render (for mouse hit-testing).
     pub layout: LayoutAreas,
-    /// Whether mouse capture is enabled (from config).
     pub mouse_enabled: bool,
 }
 
 impl App {
-    /// Create a new app with the given client, showing instants in
-    /// `display_zone`.
     pub fn new(client: HttpClient, display_zone: DisplayZone) -> Self {
         let (query_tx, query_rx) = mpsc::unbounded_channel();
         let (mutation_tx, mutation_rx) = mpsc::unbounded_channel();
@@ -224,25 +176,20 @@ impl App {
         }
     }
 
-    /// Get the query tab.
     pub fn active_tab(&self) -> &Tab {
         &self.tab
     }
 
-    /// Get the query tab mutably.
     pub fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tab
     }
 
-    /// Execute a query in the background.
     pub fn execute_query(&mut self) {
         self.start_batch(None);
     }
 
-    /// End the tab's run, if any: abort its task, and answer a driver
-    /// execute waiting on a batch with `reason` as its error. The run is
-    /// taken before the answer goes out, so a client that already left
-    /// still releases the tab.
+    /// The run is taken before the answer goes out, so a client that already
+    /// left still releases the tab.
     fn end_run(&mut self, reason: &str) {
         match std::mem::take(&mut self.tab.execution) {
             state::Execution::Idle => {}
@@ -259,11 +206,6 @@ impl App {
         }
     }
 
-    /// Start a batch query that answers `reply` when it ends.
-    ///
-    /// Empty input starts nothing and ends nothing; the earlier run, batch
-    /// or live, keeps going. Otherwise the earlier run ends as "replaced"
-    /// before the new one takes `reply`.
     fn start_batch(&mut self, reply: Option<ExecuteWaiter>) {
         if self.active_tab().editor.text().trim().is_empty() {
             if let Some(reply) = reply {
@@ -274,9 +216,6 @@ impl App {
 
         self.end_run("replaced");
 
-        // Auto-format the editor before executing (best-effort: a parse
-        // failure or a format refusal leaves the text to run as typed).
-        // Uses the same path as Ctrl+F.
         self.format_editor_query();
 
         let query = self.active_tab().editor.text().trim().to_owned();
@@ -323,12 +262,6 @@ impl App {
         };
     }
 
-    /// Format the editor query in-place using the checked DSL formatter.
-    ///
-    /// No-op if the editor is empty or the query fails to parse. When the
-    /// formatter refuses (ADR-0061), the editor and its undo history stay
-    /// untouched and the reason goes on the tab's status.
-    /// Saves an undo snapshot so `Ctrl+Z` reverts the format.
     pub(super) fn format_editor_query(&mut self) {
         let tab = self.active_tab_mut();
         let text = tab.editor.text();
@@ -357,8 +290,6 @@ impl App {
         }
     }
 
-    /// Cancel the running batch query on the active tab (if any). A live
-    /// stream is not a query to cancel; F9 stops it.
     pub(super) fn cancel_query(&mut self) {
         if !self.active_tab().execution.is_batch() {
             return;
@@ -372,14 +303,11 @@ impl App {
         tracing::info!("query cancelled by user");
     }
 
-    /// Clear the query tab (Ctrl+L, the palette): end its run, batch or
-    /// live, then reset the editor and results.
     pub(super) fn clear_tab(&mut self) {
         self.end_run("cleared");
         self.active_tab_mut().clear();
     }
 
-    /// Refresh the saved queries cache from the server.
     fn refresh_saved_cache(&mut self, select_name: Option<String>) {
         let client = self.client.clone();
         let mutation_tx = self.mutation_tx.clone();
@@ -403,7 +331,6 @@ impl App {
         });
     }
 
-    /// Fetch report runs for a saved query (async, results arrive via mutation channel).
     fn fetch_runs(&self, saved_id: i64, token: state::RequestToken) {
         let client = self.client.clone();
         let mutation_tx = self.mutation_tx.clone();
@@ -423,7 +350,6 @@ impl App {
         });
     }
 
-    /// Fetch a specific run's result data (async, results arrive via mutation channel).
     fn fetch_run_result(&self, saved_id: i64, run_id: i64, token: state::RequestToken) {
         let client = self.client.clone();
         let mutation_tx = self.mutation_tx.clone();
@@ -433,7 +359,6 @@ impl App {
                     if let Some(qr) = resp.result {
                         Ok(qr)
                     } else if resp.summary.row_count == Some(0) {
-                        // Successful run with 0 rows — show empty result, not an error.
                         Ok(trawl_api::value::QueryResult::empty())
                     } else {
                         Err("Run has no result data".to_owned())
@@ -453,7 +378,6 @@ impl App {
         });
     }
 
-    /// The Saved detail, if it is for `saved_id` and waits on `token`.
     fn pending_saved_detail(
         &mut self,
         token: state::RequestToken,
@@ -465,7 +389,6 @@ impl App {
             .filter(|d| d.pending == Some(token) && d.saved_id == saved_id)
     }
 
-    /// Apply a runs response if the detail still waits on it; ignore it otherwise.
     fn apply_runs_loaded(
         &mut self,
         token: state::RequestToken,
@@ -494,7 +417,6 @@ impl App {
         }
     }
 
-    /// Apply a run-result response if the detail still waits on it; ignore it otherwise.
     fn apply_run_result_loaded(
         &mut self,
         token: state::RequestToken,
@@ -518,15 +440,12 @@ impl App {
         }
     }
 
-    /// Poll for mutation results and refresh caches.
     pub fn poll_mutations(&mut self) {
         while let Ok(mutation_result) = self.mutation_rx.try_recv() {
             match mutation_result {
                 MutationResult::SavedQueryCreated { name } => {
                     tracing::info!("saved query created: {name}");
-                    // Refresh saved queries cache and select the new query
                     self.refresh_saved_cache(Some(name.clone()));
-                    // Switch to Saved tab to show the new query
                     self.main_tab = MainTab::Saved;
                     self.focus = Focus::Panel;
                 }
@@ -540,8 +459,6 @@ impl App {
                         saved.queries.len()
                     );
 
-                    // Select the named query, else keep the previous one by
-                    // id across a reorder, else keep the index.
                     let prior_id = self
                         .saved_cache
                         .as_ref()
@@ -592,12 +509,10 @@ impl App {
         }
     }
 
-    /// Poll the dashboard endpoint when the admin user is viewing the Dashboard tab.
     fn poll_dashboard(&mut self) {
         if !self.dashboard.is_admin || self.main_tab != MainTab::Dashboard {
             return;
         }
-        // Reset inflight guard if stuck >10s (e.g. spawned task panicked).
         if !self
             .dashboard
             .check_inflight_timeout(Duration::from_secs(10))
@@ -622,11 +537,6 @@ impl App {
         });
     }
 
-    /// Poll for query results and update the tab.
-    ///
-    /// Only the current run's results apply. One from an ended or replaced
-    /// run changes nothing. A batch result ends its run and answers its
-    /// driver execute; a live snapshot leaves the stream running.
     pub fn poll_query_results(&mut self) {
         while let Ok(query_result) = self.query_rx.try_recv() {
             let event = (query_result.generation, query_result.source);
@@ -648,12 +558,10 @@ impl App {
         }
     }
 
-    /// Draw a current run's result on the tab, then answer `reply` with it.
     fn show_query_result(&mut self, query_result: QueryResult, reply: Option<ExecuteWaiter>) {
         let tab = &mut self.tab;
         match query_result.result {
             Ok(response) => {
-                // Auto-switch to line chart view for timechart queries.
                 let is_timechart = response.result.columns.iter().any(|c| c.name == "_time");
                 if is_timechart && tab.chart_view == ChartView::Table {
                     tab.chart_view = ChartView::LineChart;
@@ -662,7 +570,7 @@ impl App {
                 tab.column_config = Some(ColumnConfig::init(&response.result.columns));
                 tab.result = Some(response);
                 tab.live_capped = query_result.capped;
-                #[allow(clippy::cast_possible_truncation)] // Query duration < u64::MAX ms
+                #[allow(clippy::cast_possible_truncation)]
                 let duration_ms = query_result.duration.as_millis() as u64;
                 tab.status = TabStatus::Success { duration_ms };
                 tab.scroll_offset = 0;
@@ -691,20 +599,16 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     pub fn handle_key(&mut self, key: event::KeyEvent) {
-        // Popups take priority over everything else.
         if self.popup.is_some() {
             self.handle_popup_key(key);
             return;
         }
 
-        // Global keybindings (work regardless of focus).
         match (key.modifiers, key.code) {
-            // Quit: Ctrl+Q
             (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
                 self.should_quit = true;
                 return;
             }
-            // F1 → help popup
             (KeyModifiers::NONE, KeyCode::F(1)) => {
                 if matches!(self.popup, Some(Popup::Help { .. })) {
                     self.popup = None;
@@ -713,7 +617,6 @@ impl App {
                 }
                 return;
             }
-            // Tab switching: Alt+1 through Alt+5 (Alt+5 only for admins)
             (KeyModifiers::ALT, KeyCode::Char('1')) => {
                 self.switch_to_main_tab(MainTab::Query);
                 return;
@@ -734,12 +637,10 @@ impl App {
                 self.switch_to_main_tab(MainTab::Dashboard);
                 return;
             }
-            // Toggle live tail: F9
             (KeyModifiers::NONE, KeyCode::F(9)) => {
                 self.toggle_live_mode();
                 return;
             }
-            // Command palette: Ctrl+P
             (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
                 let items = palette::build_palette_items(
                     self.dashboard.is_admin,
@@ -759,9 +660,7 @@ impl App {
                 });
                 return;
             }
-            // Esc: on panel tabs, switch back to Query; on Query, cancel running query
             (KeyModifiers::NONE, KeyCode::Esc) if self.main_tab != MainTab::Query => {
-                // If schema filter is active, close filter first
                 if self.main_tab == MainTab::Schema
                     && self.panel.schema.as_ref().is_some_and(|s| s.filter_active)
                 {
@@ -771,11 +670,9 @@ impl App {
                     }
                     return;
                 }
-                // Saved tab: navigate focus back before leaving the tab
                 if self.main_tab == MainTab::Saved {
                     match self.panel.saved_focus {
                         state::SavedFocus::RunResults => {
-                            // Back to detail view, clear loaded result
                             if let Some(ref mut detail) = self.panel.saved_detail {
                                 detail.result = None;
                                 detail.result_scroll = 0;
@@ -784,12 +681,11 @@ impl App {
                             return;
                         }
                         state::SavedFocus::Detail => {
-                            // Back to list, clear detail state
                             self.panel.saved_detail = None;
                             self.panel.saved_focus = state::SavedFocus::List;
                             return;
                         }
-                        state::SavedFocus::List => {} // fall through to switch to Query
+                        state::SavedFocus::List => {}
                     }
                 }
                 self.switch_to_main_tab(MainTab::Query);
@@ -801,7 +697,6 @@ impl App {
                 self.cancel_query();
                 return;
             }
-            // Save current query: Ctrl+S
             (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
                 let query = self.active_tab().editor.text();
                 if !query.trim().is_empty() {
@@ -814,26 +709,20 @@ impl App {
             _ => {}
         }
 
-        // Route to tab-specific key handlers.
         match self.main_tab {
             MainTab::Query => match self.focus {
                 Focus::Editor => self.handle_editor_key(key),
                 Focus::Results => self.handle_results_key(key),
-                Focus::Panel => self.focus = Focus::Editor, // shouldn't happen on Query tab
+                Focus::Panel => self.focus = Focus::Editor,
             },
             MainTab::History => self.handle_panel_history_key(key),
             MainTab::Schema => self.handle_panel_schema_key(key),
             MainTab::Saved => self.handle_panel_saved_key(key),
-            MainTab::Dashboard => {} // Read-only dashboard — no interactive keys
+            MainTab::Dashboard => {}
         }
     }
 
-    /// Switch to a main tab, updating focus appropriately.
-    ///
-    /// Saves the current Query focus (Editor/Results) on switch-away and
-    /// restores it on switch-back, so users don't lose context.
     pub(super) fn switch_to_main_tab(&mut self, tab: MainTab) {
-        // Save Query focus before switching away.
         if self.main_tab == MainTab::Query && tab != MainTab::Query {
             self.query_focus = self.focus;
         }
@@ -864,9 +753,7 @@ fn apply_whoami_result(app: &mut App, whoami_result: Result<WhoAmIResponse, Clie
     }
 }
 
-/// Run the TUI application in `display_zone` against `conn`, both of which
-/// the caller resolved before taking the terminal.
-#[allow(clippy::too_many_lines)] // orchestration entry point — splitting adds indirection without clarity
+#[allow(clippy::too_many_lines)]
 pub async fn run(
     config: &Config,
     display_zone: DisplayZone,
@@ -875,7 +762,6 @@ pub async fn run(
 ) -> Result<(), CliError> {
     let client = conn.client()?;
 
-    // Set up terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     if config.ui.enable_mouse {
@@ -891,8 +777,6 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Fetch schema, history, saved queries, service schemas, server version and
-    // permissions concurrently.
     tracing::info!("fetching startup data");
     let (
         schema_result,
@@ -975,7 +859,6 @@ pub async fn run(
         }
     };
 
-    // Create app with schema, history, and saved queries.
     let mut app = App::new(client, display_zone);
     app.mouse_enabled = config.ui.enable_mouse;
     app.max_live_events = config.tail.max_events;
@@ -987,18 +870,14 @@ pub async fn run(
     app.server_version = server_version;
     apply_whoami_result(&mut app, whoami_result);
 
-    // Start driver socket if requested.
     if let Some(path) = driver_path {
         app.start_driver(path);
     }
 
-    // Event loop.
     let result = run_event_loop(&mut terminal, &mut app);
 
-    // Clean up driver socket.
     app.cleanup_driver();
 
-    // Restore terminal.
     disable_raw_mode()?;
     if app.mouse_enabled {
         crossterm::execute!(
@@ -1019,7 +898,6 @@ pub async fn run(
     result
 }
 
-/// Main event loop.
 fn run_event_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -1034,7 +912,6 @@ where
             tracing::debug!("event loop iteration {}", iteration);
         }
 
-        // Run debounced real-time validation on the active tab.
         app.active_tab_mut().maybe_validate();
 
         app.poll_query_results();
@@ -1043,7 +920,6 @@ where
 
         app.poll_dashboard();
 
-        // Poll for driver commands from the unix socket.
         app.poll_driver_commands(terminal);
 
         terminal.draw(|f| ui::render(app, f))?;
@@ -1075,12 +951,6 @@ where
     Ok(())
 }
 
-/// A live event carrying a number past `i64::MAX` reaches the results
-/// buffer as that exact number.
-///
-/// The frame's `integer` column carries the digits as a decimal string,
-/// so this is `trawl_api::value`'s landing rule seen from the TUI: the
-/// cell must arrive as the number, never a rounded double or a null.
 #[cfg(test)]
 #[test]
 fn live_event_large_unsigned_exact() {
@@ -1109,8 +979,6 @@ fn live_event_large_unsigned_exact() {
     );
 }
 
-/// The same rule on the aggregation lane: a snapshot row's oversized
-/// unsigned is stored as the number it is.
 #[cfg(test)]
 #[test]
 fn snapshot_large_unsigned_exact() {
@@ -1129,12 +997,9 @@ fn snapshot_large_unsigned_exact() {
     );
 }
 
-/// The toast a failed run-result fetch shows.
-///
 /// A 409 is the server saying the run succeeded and its stored result is
-/// gone (issue #227). That sentence is already the whole answer, so it is
-/// shown verbatim: prefixing it with "Failed to fetch run result" would
-/// re-assert a failure the run did not have.
+/// gone, so it is shown verbatim: prefixing it with "Failed to fetch run
+/// result" would re-assert a failure the run did not have.
 fn run_result_error_message(e: &ClientError) -> String {
     match e {
         ClientError::Server {
@@ -1144,7 +1009,6 @@ fn run_result_error_message(e: &ClientError) -> String {
     }
 }
 
-/// A 409 reaches the operator as the server's own sentence, unadorned.
 #[cfg(test)]
 #[test]
 fn unavailable_result_toast() {
@@ -1159,7 +1023,6 @@ fn unavailable_result_toast() {
     };
     assert_eq!(run_result_error_message(&conflict), SENTENCE);
 
-    // Everything else still says what went wrong with the fetch.
     let network = ClientError::Network(trawl_client::NetworkError::new(
         trawl_client::NetworkKind::Connect,
         "connection refused",
@@ -1176,26 +1039,20 @@ mod tests {
     use trawl_client::{ListSavedResponse, SavedQueryResponse};
     use trawl_engine::value::{Column, Value};
 
-    /// Create an App with a dummy client for testing.
-    /// No network calls will be made — only channel injection.
     pub(crate) fn test_app() -> App {
         let client = HttpClient::new_insecure("https://localhost:0", "flt_test_not_real").unwrap();
         App::new(client, DisplayZone::Utc)
     }
 
-    /// Build a synthetic `KeyEvent` with no modifiers.
     fn key(code: KeyCode) -> event::KeyEvent {
         event::KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// Build a synthetic `KeyEvent` with modifiers.
     fn key_mod(code: KeyCode, modifiers: KeyModifiers) -> event::KeyEvent {
         event::KeyEvent::new(code, modifiers)
     }
 
-    /// Build a successful `QueryResponse` with the given columns and rows.
     fn make_query_response(columns: Vec<&str>, rows: Vec<Vec<Value>>) -> QueryResponse {
-        // Each column typed by the cells it holds, as a server would.
         let cols = columns
             .into_iter()
             .enumerate()
@@ -1250,8 +1107,6 @@ mod tests {
         terminal.backend().to_string()
     }
 
-    // --- Focus transition tests ---
-
     #[test]
     fn key_tab_switches_focus_editor_to_results() {
         let mut app = test_app();
@@ -1268,8 +1123,6 @@ mod tests {
         assert_eq!(app.focus, Focus::Editor);
     }
 
-    // --- Help popup tests ---
-
     #[test]
     fn key_f1_toggles_help_popup() {
         let mut app = test_app();
@@ -1279,8 +1132,6 @@ mod tests {
         app.handle_key(key(KeyCode::F(1)));
         assert!(app.popup.is_none());
     }
-
-    // --- Tab switching tests ---
 
     #[test]
     fn whoami_permissions_drive_dashboard_tab_false_true_false() {
@@ -1380,13 +1231,10 @@ mod tests {
     #[test]
     fn focus_preserved_across_tab_switch() {
         let mut app = test_app();
-        // Start in Results focus
         app.focus = Focus::Results;
-        // Switch to History
         app.handle_key(key_mod(KeyCode::Char('2'), KeyModifiers::ALT));
         assert_eq!(app.main_tab, MainTab::History);
         assert_eq!(app.focus, Focus::Panel);
-        // Switch back to Query — should restore Results focus
         app.handle_key(key_mod(KeyCode::Char('1'), KeyModifiers::ALT));
         assert_eq!(app.main_tab, MainTab::Query);
         assert_eq!(app.focus, Focus::Results);
@@ -1402,8 +1250,6 @@ mod tests {
         assert_eq!(app.focus, Focus::Editor);
     }
 
-    // --- Quit ---
-
     #[test]
     fn key_ctrl_q_sets_quit() {
         let mut app = test_app();
@@ -1411,12 +1257,9 @@ mod tests {
         assert!(app.should_quit);
     }
 
-    // --- Popup interaction tests ---
-
     #[test]
     fn key_ctrl_s_opens_save_popup() {
         let mut app = test_app();
-        // Type something so editor isn't empty
         app.handle_key(key(KeyCode::Char('x')));
         app.handle_key(key_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(matches!(app.popup, Some(Popup::SaveQuery { .. })));
@@ -1429,7 +1272,6 @@ mod tests {
         assert!(app.popup.is_none());
     }
 
-    /// A schedule with the ADR-0018 window fields under the test's control.
     fn test_schedule(
         window: Option<&str>,
         lag: Option<(&str, u64)>,
@@ -1454,7 +1296,6 @@ mod tests {
         }
     }
 
-    /// Open the set-schedule popup on an app, prefilled from `schedule`.
     fn schedule_popup(schedule: Option<&trawl_api::ScheduleResponse>) -> App {
         let mut app = test_app();
         app.popup = Some(Popup::SetSchedule(Box::new(state::ScheduleForm::new(
@@ -1465,7 +1306,6 @@ mod tests {
         app
     }
 
-    /// Borrow the open set-schedule form, or fail loudly.
     fn schedule_form(app: &App) -> &state::ScheduleForm {
         match app.popup {
             Some(Popup::SetSchedule(ref form)) => form,
@@ -1484,11 +1324,9 @@ mod tests {
         assert_eq!(schedule_form(&app).focus, ScheduleField::Window);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(schedule_form(&app).focus, ScheduleField::Lag);
-        // Wraps back to the first row.
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(schedule_form(&app).focus, ScheduleField::Interval);
 
-        // BackTab walks the other way, and Up/Down are the same two moves.
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(schedule_form(&app).focus, ScheduleField::Lag);
         app.handle_key(key(KeyCode::Up));
@@ -1497,7 +1335,6 @@ mod tests {
         assert_eq!(schedule_form(&app).focus, ScheduleField::Lag);
     }
 
-    /// Typed keys land in the focused row, and nowhere else.
     #[test]
     fn schedule_popup_types_into_the_focused_row() {
         let mut app = schedule_popup(None);
@@ -1515,16 +1352,12 @@ mod tests {
         assert_eq!(form.lag.text(), "");
     }
 
-    /// The TUI does not second-guess the window/lag pair. A lag typed with no
-    /// window is submitted as-is; the server's 400 naming both sides is the
-    /// contract, and the operator reads that sentence rather than ours.
     #[test]
     fn schedule_popup_sends_a_lag_without_a_window() {
         let mut app = schedule_popup(None);
         for ch in "1h".chars() {
             app.handle_key(key(KeyCode::Char(ch)));
         }
-        // Skip the window row entirely, type only a lag.
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Tab));
         for ch in "5m".chars() {
@@ -1537,16 +1370,12 @@ mod tests {
         assert_eq!(request.lag.as_deref(), Some("5m"));
     }
 
-    /// An empty interval is the one thing the popup refuses to send: there is
-    /// no request without it.
     #[test]
     fn schedule_popup_refuses_an_empty_interval() {
         let app = schedule_popup(None);
         assert!(schedule_form(&app).submission().is_none());
     }
 
-    /// Opening the popup on a windowed schedule prefills all three rows, so
-    /// editing the interval cannot silently drop the window.
     #[test]
     fn schedule_popup_prefills_from_the_schedule_in_force() {
         let sched = test_schedule(Some("since_last"), Some(("5m", 300)));
@@ -1561,8 +1390,6 @@ mod tests {
         assert_eq!(request.lag.as_deref(), Some("5m"));
     }
 
-    /// A zero lag prefills as an empty row: empty already means `0s`, and a
-    /// prefilled `0s` would suggest the operator chose it.
     #[test]
     fn schedule_popup_prefills_a_zero_lag_as_empty() {
         let sched = test_schedule(Some("2h"), Some(("0s", 0)));
@@ -1577,7 +1404,6 @@ mod tests {
         assert!(app.popup.is_none());
     }
 
-    /// A schedule with a run cap and a paused state under the test's control.
     fn budget_schedule(max_runs: Option<u64>, enabled: bool) -> trawl_api::ScheduleResponse {
         trawl_api::ScheduleResponse {
             max_runs,
@@ -1586,8 +1412,6 @@ mod tests {
         }
     }
 
-    /// Replace the focused row's text through the key path, as an operator
-    /// would: delete what is there, then type `text`.
     fn retype_focused(app: &mut App, text: &str) {
         for _ in 0..16 {
             app.handle_key(key(KeyCode::Backspace));
@@ -1599,9 +1423,7 @@ mod tests {
 
     /// The popup edits only interval, window and lag, but the PUT replaces
     /// the whole schedule. The form sends back the cap and the paused state
-    /// it loaded, so an interval edit neither lifts a spent budget nor
-    /// resumes a paused net. With no schedule, it sends unlimited and
-    /// enabled, as a new schedule starts.
+    /// it loaded.
     #[test]
     fn schedule_popup_keeps_max_runs_and_enabled() {
         let cases = [
@@ -1628,9 +1450,6 @@ mod tests {
         }
     }
 
-    /// A schedule endpoint for saved query `saved_id` that answers every PUT
-    /// with `answer` and sends each JSON body it receives on the returned
-    /// receiver.
     async fn recording_schedule_server(
         saved_id: i64,
         answer: trawl_api::ScheduleResponse,
@@ -1658,8 +1477,6 @@ mod tests {
         (url, seen_rx)
     }
 
-    /// Enter on the popup of a net capped at 60 and paused, after an
-    /// interval edit, sends a PUT that keeps the cap and the pause.
     #[tokio::test]
     async fn schedule_popup_sends_the_kept_budget() {
         let sched = trawl_api::ScheduleResponse {
@@ -1700,7 +1517,6 @@ mod tests {
         app.popup = Some(Popup::SaveQuery {
             editor: SimpleEditor::new_single_line(),
         });
-        // F1 should NOT open help while popup is active
         app.handle_key(key(KeyCode::F(1)));
         assert!(app.popup.is_some());
     }
@@ -1744,12 +1560,9 @@ mod tests {
         }
     }
 
-    // --- Word movement keybinding tests ---
-
     #[test]
     fn key_ctrl_left_moves_word_left() {
         let mut app = test_app();
-        // Type "hello world"
         for ch in "hello world".chars() {
             app.handle_key(key(KeyCode::Char(ch)));
         }
@@ -1790,8 +1603,6 @@ mod tests {
         assert_eq!(app.active_tab().editor.cursor, (0, 6));
     }
 
-    // --- Editor key routing ---
-
     #[test]
     fn editor_keys_reach_editor() {
         let mut app = test_app();
@@ -1801,13 +1612,10 @@ mod tests {
         assert_eq!(app.active_tab().editor.text(), "hi");
     }
 
-    // --- Results key routing ---
-
     #[test]
     fn results_keys_select_rows() {
         let mut app = test_app();
         app.focus = Focus::Results;
-        // Give it some result data so row selection works
         app.tab.result = Some(make_query_response(
             vec!["x"],
             vec![
@@ -1823,14 +1631,10 @@ mod tests {
         assert_eq!(app.active_tab().selected_row, Some(1));
         app.handle_key(key(KeyCode::Up));
         assert_eq!(app.active_tab().selected_row, Some(0));
-        // Esc deselects
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.active_tab().selected_row, None);
     }
 
-    // --- Channel injection tests (poll_query_results / poll_mutations) ---
-
-    /// A query event from the run `run` names.
     fn event(
         run: (state::RunGeneration, state::RunSource),
         result: Result<QueryResponse, QueryError>,
@@ -1844,7 +1648,6 @@ mod tests {
         }
     }
 
-    /// A query event from the tab's current run.
     fn tagged(app: &App, result: Result<QueryResponse, QueryError>) -> QueryResult {
         event(
             app.tab.execution.current().expect("a run is current"),
@@ -1852,22 +1655,18 @@ mod tests {
         )
     }
 
-    /// Type a query when the editor is empty, so a run has one to start.
     fn ensure_query(app: &mut App) {
         if app.tab.editor.text().trim().is_empty() {
             app.tab.editor.insert_text("* | stats count() by host");
         }
     }
 
-    /// Start a batch query on the editor's query. Its own answer is never
-    /// polled in these tests, so it stays in flight.
     fn run_batch(app: &mut App) {
         ensure_query(app);
         app.execute_query();
         assert!(app.tab.execution.is_batch(), "{:?}", app.tab.execution);
     }
 
-    /// Start a live stream on the editor's query with F9.
     fn run_live(app: &mut App) {
         ensure_query(app);
         app.handle_key(key(KeyCode::F(9)));
@@ -1898,11 +1697,6 @@ mod tests {
         );
     }
 
-    /// A live aggregate that dropped input is still a result, not an error:
-    /// the rows render, and the results title carries the cap in the
-    /// theme's warning colour, ahead of the row counts so a narrow pane
-    /// keeps it. The latest snapshot decides, so one with nothing dropped
-    /// clears the mark.
     #[tokio::test]
     async fn live_capped_snapshot_marks_results_title() {
         use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
@@ -1976,16 +1770,6 @@ mod tests {
         }
     }
 
-    /// The cap mark rides every results title, the placeholders included.
-    ///
-    /// `timechart span=1m count() by host | where count > 1` over 10,000
-    /// hosts seen once and a new one seen twice drops that last host at the
-    /// group cap, and the filter leaves nothing: the snapshot has the
-    /// timechart's columns, no rows and the cap, while the whole answer has
-    /// one row. A grouped timechart with no rows has no series, so both
-    /// chart views draw the placeholder, and that is where the drop changed
-    /// the answer. A capped result whose columns are all hidden draws a
-    /// placeholder of its own.
     #[tokio::test]
     async fn live_capped_snapshot_marks_every_placeholder_title() {
         use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
@@ -2070,11 +1854,6 @@ mod tests {
         assert_marked(&mut app, "all columns hidden", "All columns hidden");
     }
 
-    /// The cap mark stays with the capped rows while the next query runs.
-    ///
-    /// Running a batch query stops the live stream and titles the pane
-    /// "Running..." until the answer arrives, but the last snapshot's rows
-    /// stay drawn meanwhile, so their cap stays disclosed with them.
     #[tokio::test]
     async fn live_capped_snapshot_marks_results_title_while_the_next_query_runs() {
         use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
@@ -2100,7 +1879,6 @@ mod tests {
         app.poll_query_results();
         assert!(app.live_mode);
 
-        // The answer is never polled, so the query stays pending.
         app.execute_query();
         assert!(!app.live_mode, "the batch query stops the live stream");
         assert!(
@@ -2139,20 +1917,12 @@ mod tests {
         }
     }
 
-    /// The cap mark stays with the capped rows across a live restart.
-    ///
-    /// F9 stops the stream and F9 again restarts it, but the restart keeps
-    /// the last snapshot's rows drawn until a replacement arrives, and a quiet
-    /// restarted stream may send none. The rows keep their cap with them
-    /// (the same rule as the next batch query), so the mark is never lost
-    /// while the capped table is still on screen.
     #[tokio::test]
     async fn live_capped_snapshot_marks_results_title_across_a_live_restart() {
         use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 
         const MARK: &str = " partial: groups > 10000 ";
         let mut app = test_app();
-        // Start the stream that sends the capped snapshot.
         run_live(&mut app);
         app.query_tx
             .send(QueryResult {
@@ -2171,7 +1941,6 @@ mod tests {
             .unwrap();
         app.poll_query_results();
 
-        // Stop, restart; no replacement snapshot is ever polled.
         app.handle_key(key(KeyCode::F(9)));
         app.handle_key(key(KeyCode::F(9)));
         assert!(app.live_mode, "the second F9 restarted the stream");
@@ -2223,10 +1992,6 @@ mod tests {
         ));
     }
 
-    /// A query endpoint that holds every answer until the test releases
-    /// it, then refuses the query with a parse error whose span is
-    /// `span`. Each query text it receives goes out on the returned
-    /// receiver as the request arrives.
     async fn held_parse_error_server(
         span: (usize, usize),
     ) -> (
@@ -2279,9 +2044,6 @@ mod tests {
         (url, seen_rx, release)
     }
 
-    /// The query a run sends travels with its error. The editor is changed
-    /// while the server holds the answer, so the pane can quote the sent
-    /// query only if the run captured it: the draft is not what failed.
     #[tokio::test]
     async fn tui_error_excerpt_uses_submitted_query() {
         use ratatui::Terminal;
@@ -2289,7 +2051,6 @@ mod tests {
 
         const SENT: &str = "service=web | stats count( by host";
         const DRAFT: &str = "service=api | head 5";
-        // The span covers `by`, 27 cells into the line.
         let span = (27, 29);
         assert_eq!(&SENT[span.0..span.1], "by");
 
@@ -2306,7 +2067,6 @@ mod tests {
             .expect("a query");
         assert_eq!(received, SENT, "the run sends the editor's query");
 
-        // The answer is still held: edit the query, then let it go.
         app.tab.editor.clear();
         app.tab.editor.insert_text(DRAFT);
         assert!(matches!(app.tab.status, TabStatus::Running { .. }));
@@ -2371,15 +2131,12 @@ mod tests {
         );
     }
 
-    /// The text of every cell in row `y` of `buffer`, one symbol per cell.
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16) -> Vec<String> {
         (0..buffer.area.width)
             .map(|x| buffer[(x, y)].symbol().to_owned())
             .collect()
     }
 
-    /// The first cell (x, y) at which `fragment` starts, one character per
-    /// cell, or `None` when no row holds it.
     fn find_cells(buffer: &ratatui::buffer::Buffer, fragment: &str) -> Option<(u16, u16)> {
         let wanted: Vec<String> = fragment.chars().map(String::from).collect();
         (0..buffer.area.height).find_map(|y| {
@@ -2390,7 +2147,6 @@ mod tests {
         })
     }
 
-    /// Every symbol in `buffer`, row after row.
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         (0..buffer.area.height)
             .map(|y| buffer_row(buffer, y).concat())
@@ -2398,12 +2154,8 @@ mod tests {
             .join("\n")
     }
 
-    /// A saved query is another principal's text. Loaded through the
-    /// palette, it draws through the sanitize rule in the editor and the
-    /// history pane, while the editor buffer and the query a run sends stay
-    /// exact.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // one load, four drawn surfaces, one run
+    #[allow(clippy::too_many_lines)]
     async fn terminal_loaded_query_keeps_raw_text() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -2436,7 +2188,6 @@ mod tests {
             queries: vec![shared],
         });
 
-        // Load it through the palette, as a person would.
         app.handle_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
         for ch in "qxzv".chars() {
             app.handle_key(key(KeyCode::Char(ch)));
@@ -2492,7 +2243,6 @@ mod tests {
         );
         assert_eq!(app.tab.editor.text(), HOSTILE, "drawing leaves the buffer");
 
-        // The history pane draws the same text through the highlighter.
         app.history_cache = Some(trawl_api::HistoryResponse {
             entries: vec![trawl_api::HistoryEntryResponse {
                 id: 1,
@@ -2515,8 +2265,6 @@ mod tests {
             "history pane does not draw {DRAWN:?}:\n{history}"
         );
 
-        // Ghost text, the validation message and its hint, each its own
-        // marker.
         app.tab.editor.cursor = (1, 8);
         app.tab.ghost = Some(autocomplete::Completion {
             ghost_text: "gq\u{202e}gz".to_owned(),
@@ -2605,7 +2353,6 @@ mod tests {
 
         app.poll_mutations();
 
-        // SavedQueryCreated switches to Saved tab
         assert_eq!(app.main_tab, MainTab::Saved);
         assert_eq!(app.focus, Focus::Panel);
     }
@@ -2713,19 +2460,15 @@ mod tests {
         app.popup = Some(Popup::Error {
             message: "oops".to_owned(),
         });
-        // F1 should NOT open help — popup blocks it
         app.handle_key(key(KeyCode::F(1)));
         assert!(matches!(app.popup, Some(Popup::Error { .. })));
     }
 
-    /// A live stream sends many snapshots, and the last one polled is the
-    /// one on screen. (A batch ends on its first result.)
     #[tokio::test]
     async fn multiple_results_last_wins() {
         let mut app = test_app();
         run_live(&mut app);
 
-        // Send two snapshots — the last one should be the final state.
         for i in 0..2 {
             let response =
                 make_query_response(vec!["idx"], vec![vec![Value::Integer(i64::from(i))]]);
@@ -2735,14 +2478,12 @@ mod tests {
         app.poll_query_results();
 
         assert!(app.tab.result.is_some());
-        // Last result (idx=1) should be the one stored.
         let rows = &app.tab.result.as_ref().unwrap().result.rows;
         assert_eq!(rows[0][0], Value::Integer(1));
     }
 
-    /// Swap a run's task for one that never ends on its own, and return its
-    /// abort handle. The real task's request to the dummy server fails and
-    /// finishes by itself, which would pass for an abort.
+    /// The real task's request to the dummy server fails and finishes by
+    /// itself, which would pass for an abort.
     fn hold_pending(handle: &mut tokio::task::JoinHandle<()>) -> tokio::task::AbortHandle {
         let held = tokio::spawn(std::future::pending::<()>());
         let abort = held.abort_handle();
@@ -2750,8 +2491,6 @@ mod tests {
         abort
     }
 
-    /// The abort handle of the tab's running batch, held pending so only an
-    /// abort finishes it, or fail loudly.
     fn batch_abort_handle(app: &mut App) -> tokio::task::AbortHandle {
         match &mut app.tab.execution {
             state::Execution::Batch { handle, .. } => hold_pending(handle),
@@ -2759,8 +2498,6 @@ mod tests {
         }
     }
 
-    /// The abort handle of the tab's live stream, held pending so only an
-    /// abort finishes it, or fail loudly.
     fn live_abort_handle(app: &mut App) -> tokio::task::AbortHandle {
         match &mut app.tab.execution {
             state::Execution::Live { handle, .. } => hold_pending(handle),
@@ -2768,7 +2505,6 @@ mod tests {
         }
     }
 
-    /// Wait, within a bound, for an aborted task to finish.
     async fn assert_finishes(task: &tokio::task::AbortHandle) {
         tokio::time::timeout(Duration::from_secs(2), async {
             while !task.is_finished() {
@@ -2785,9 +2521,6 @@ mod tests {
         format!("\"{}\"", "\t".repeat(40_000))
     }
 
-    /// Format refuses what it cannot write faithfully and changes nothing:
-    /// the editor, its cursor and its undo history are the same afterwards,
-    /// and the reason shows on the tab's status.
     #[test]
     fn format_refusal_keeps_the_buffer() {
         let mut app = test_app();
@@ -2836,7 +2569,6 @@ mod tests {
         assert_eq!(app.tab.editor.text(), "service=web");
     }
 
-    /// Format still rewrites a query it can write faithfully.
     #[test]
     fn format_rewrites_a_query_it_can_write_faithfully() {
         let mut app = test_app();
@@ -2848,8 +2580,6 @@ mod tests {
         assert!(matches!(app.tab.status, TabStatus::Idle));
     }
 
-    /// Running a query formats it first. When the formatter refuses, the
-    /// query runs as typed and the buffer and undo history stay as they were.
     #[tokio::test]
     async fn execute_after_format_refusal_runs_the_query_as_typed() {
         let mut app = test_app();
@@ -2868,15 +2598,12 @@ mod tests {
         );
     }
 
-    /// A refused Ctrl+F while a query runs shows the refusal and leaves the
-    /// run cancellable: Esc still aborts the request in flight.
     #[tokio::test]
     async fn format_refusal_during_a_run_keeps_it_cancellable() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut app = test_app();
         app.tab.editor.insert_text("service=web");
-        // The answer is never polled, so the query stays in flight.
         app.execute_query();
         assert!(app.tab.execution.is_batch());
 
@@ -2903,15 +2630,12 @@ mod tests {
         );
     }
 
-    /// A driver client that reaches the app through its real admission path,
-    /// `poll_driver_commands`.
     struct Driver {
         tx: mpsc::UnboundedSender<DriverCommand>,
         terminal: Terminal<ratatui::backend::TestBackend>,
     }
 
     impl Driver {
-        /// Become `app`'s driver channel.
         fn attach(app: &mut App) -> Self {
             let (tx, rx) = mpsc::unbounded_channel();
             app.driver_rx = Some(rx);
@@ -2919,7 +2643,6 @@ mod tests {
             Self { tx, terminal }
         }
 
-        /// Send an execute that `reply` answers, and let the app admit it.
         fn send_execute(
             &mut self,
             app: &mut App,
@@ -2934,7 +2657,6 @@ mod tests {
             app.poll_driver_commands(&mut self.terminal);
         }
 
-        /// Send an execute and return the client's end of its reply.
         fn execute(&mut self, app: &mut App) -> tokio::sync::oneshot::Receiver<DriverResponse> {
             let (reply, answer) = tokio::sync::oneshot::channel();
             self.send_execute(app, reply);
@@ -2942,7 +2664,6 @@ mod tests {
         }
     }
 
-    /// The driver client has had no answer yet.
     fn assert_unanswered(answer: &mut tokio::sync::oneshot::Receiver<DriverResponse>, case: &str) {
         match answer.try_recv() {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
@@ -2951,7 +2672,6 @@ mod tests {
         }
     }
 
-    /// The driver client got the error `expected`.
     fn assert_answered_err(
         answer: &mut tokio::sync::oneshot::Receiver<DriverResponse>,
         expected: &str,
@@ -2966,7 +2686,6 @@ mod tests {
         }
     }
 
-    /// The tab runs a batch that answers a driver client still waiting.
     fn assert_admitted(app: &App, case: &str) {
         assert!(
             app.tab.execution.reply_pending(),
@@ -2975,12 +2694,10 @@ mod tests {
         );
     }
 
-    /// The generation of the tab's current run, or fail loudly.
     fn current_generation(app: &App) -> state::RunGeneration {
         app.tab.execution.current().expect("a run is current").0
     }
 
-    /// Clear the editor through the command palette, as a person would.
     fn palette_clear(app: &mut App) {
         app.handle_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
         for ch in "Clear Editor".chars() {
@@ -3007,8 +2724,6 @@ mod tests {
         assert!(app.popup.is_none());
     }
 
-    /// Every way a query ends answers the driver execute waiting on it, through
-    /// the real key and palette handlers, and the next execute is admitted.
     #[tokio::test]
     async fn driver_execute_terminal_transitions() {
         type Transition = fn(&mut App);
@@ -3065,7 +2780,6 @@ mod tests {
             assert_admitted(&app, &format!("{case}, then"));
         }
 
-        // Ctrl+C over a selection copies it, and the query keeps running.
         let mut app = test_app();
         let mut driver = Driver::attach(&mut app);
         ensure_query(&mut app);
@@ -3077,8 +2791,6 @@ mod tests {
         assert_admitted(&app, "Ctrl+C over a selection");
     }
 
-    /// A result queued before a cancel, a clear or a replacement is polled
-    /// after the next execute was admitted, and changes nothing.
     #[tokio::test]
     async fn query_generation_rejects_queued_results() {
         type Transition = fn(&mut App);
@@ -3130,9 +2842,6 @@ mod tests {
         }
     }
 
-    /// A batch's own result answers the driver execute waiting on it: its
-    /// rows on success, its error text on failure. Either way the tab is
-    /// free for the next execute.
     #[tokio::test]
     async fn driver_execute_answers_with_its_own_result() {
         let mut app = test_app();
@@ -3183,11 +2892,8 @@ mod tests {
         assert!(matches!(app.tab.execution, state::Execution::Idle));
     }
 
-    /// A live snapshot never touches a batch, and a live start ends one.
     #[tokio::test]
     async fn live_and_batch_ownership() {
-        // A snapshot queued before a batch replaced the stream is dropped:
-        // the batch stays running, cancellable and unanswered.
         let mut app = test_app();
         let mut driver = Driver::attach(&mut app);
         run_live(&mut app);
@@ -3213,7 +2919,6 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert_answered_err(&mut answer, "cancelled", "Esc after a stale snapshot");
 
-        // The current stream's snapshot still draws, and the stream goes on.
         let mut app = test_app();
         run_live(&mut app);
         let generation = current_generation(&app);
@@ -3234,8 +2939,6 @@ mod tests {
             app.tab.execution
         );
 
-        // A live start answers the batch, aborts it, and its late result
-        // is dropped.
         let mut app = test_app();
         let mut driver = Driver::attach(&mut app);
         ensure_query(&mut app);
@@ -3276,10 +2979,8 @@ mod tests {
         );
     }
 
-    /// A reply whose client left stops holding the tab.
     #[tokio::test]
     async fn driver_timeout_releases_ownership() {
-        // Busy stays busy while the client waits, and frees once it leaves.
         let mut app = test_app();
         let mut driver = Driver::attach(&mut app);
         ensure_query(&mut app);
@@ -3299,7 +3000,6 @@ mod tests {
         assert_admitted(&app, "after the first client left");
         assert_ne!(current_generation(&app), first_generation);
 
-        // An execute whose client left before admission runs nothing.
         let mut app = test_app();
         let mut driver = Driver::attach(&mut app);
         ensure_query(&mut app);
@@ -3313,7 +3013,6 @@ mod tests {
         );
         assert!(matches!(app.tab.status, TabStatus::Idle));
 
-        // A cancel whose answer has nowhere to go still ends the run.
         let mut app = test_app();
         let mut driver = Driver::attach(&mut app);
         ensure_query(&mut app);
@@ -3328,7 +3027,6 @@ mod tests {
         assert_unanswered(&mut next, "after the cancel");
         assert_admitted(&app, "after the cancel");
 
-        // So does a result whose answer has nowhere to go, and it draws.
         let mut app = test_app();
         let mut driver = Driver::attach(&mut app);
         ensure_query(&mut app);
@@ -3353,8 +3051,6 @@ mod tests {
         assert_admitted(&app, "after the result");
     }
 
-    /// Ctrl+C cancels a running query after a refused Ctrl+F replaced its
-    /// Running status, from the editor and from the results pane.
     #[tokio::test]
     async fn ctrl_c_cancels_after_format_refusal() {
         for focus in [Focus::Editor, Focus::Results] {
@@ -3388,7 +3084,6 @@ mod tests {
         }
     }
 
-    /// Ctrl+L and the palette's clear stop a live stream.
     #[tokio::test]
     async fn ctrl_l_stops_live() {
         type Clear = fn(&mut App);
@@ -3413,10 +3108,8 @@ mod tests {
         }
     }
 
-    /// Running an empty editor stops nothing and replaces nothing.
     #[tokio::test]
     async fn empty_run_replaces_nothing() {
-        // A live stream keeps going.
         let mut app = test_app();
         run_live(&mut app);
         let generation = current_generation(&app);
@@ -3429,7 +3122,6 @@ mod tests {
             app.tab.execution
         );
 
-        // A batch keeps going and keeps its driver client waiting.
         let mut app = test_app();
         let mut driver = Driver::attach(&mut app);
         ensure_query(&mut app);
@@ -3441,7 +3133,6 @@ mod tests {
         assert_unanswered(&mut answer, "after an empty F5");
         assert_admitted(&app, "after an empty F5");
 
-        // An empty driver execute is refused and leaves the batch alone.
         let mut app = test_app();
         let mut driver = Driver::attach(&mut app);
         ensure_query(&mut app);
@@ -3454,8 +3145,6 @@ mod tests {
         assert_eq!(current_generation(&app), generation);
     }
 
-    /// Through a real driver socket, an execute that timed out does not
-    /// block the next one: the next is admitted, and answered when it ends.
     #[tokio::test]
     async fn driver_socket_timeout_recovery() {
         let dir = tempfile::tempdir().unwrap();
@@ -3464,7 +3153,6 @@ mod tests {
         app.driver_rx = Some(driver::spawn_listener(&path).unwrap());
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
         ensure_query(&mut app);
-        // The batch's own answer is never polled: only the driver ends it.
         let execute = |timeout_ms| {
             let path = path.clone();
             tokio::spawn(async move {
@@ -3520,7 +3208,6 @@ mod tests {
         assert_eq!(response.error.as_deref(), Some("cancelled"));
     }
 
-    /// A saved query entry for the Saved-tab request tests.
     fn saved_entry(id: i64, name: &str) -> SavedQueryResponse {
         SavedQueryResponse {
             id,
@@ -3532,7 +3219,6 @@ mod tests {
         }
     }
 
-    /// A finished report run with the given id.
     fn run_summary(id: i64) -> trawl_client::ReportRunSummary {
         trawl_client::ReportRunSummary {
             id,
@@ -3552,8 +3238,6 @@ mod tests {
         }
     }
 
-    /// An app on the Saved tab's list, holding saved queries X (id 1) and
-    /// Y (id 2) with X selected.
     fn saved_xy_app() -> App {
         let mut app = test_app();
         app.saved_cache = Some(ListSavedResponse {
@@ -3563,7 +3247,6 @@ mod tests {
         app
     }
 
-    /// The token of the request the Saved detail waits on.
     fn pending_token(app: &App) -> state::RequestToken {
         app.panel
             .saved_detail
@@ -3594,12 +3277,10 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// A runs response completes only the request that is pending. These
-    /// tests never await, so the spawned fetches never run on the
+    /// These tests never await, so the spawned fetches never run on the
     /// current-thread runtime and only the injected responses arrive.
     #[tokio::test]
     async fn saved_detail_response_order() {
-        // X then Y, X's response first: X's is stale, Y's applies.
         let mut app = saved_xy_app();
         app.handle_key(key(KeyCode::Enter));
         let x = pending_token(&app);
@@ -3617,7 +3298,6 @@ mod tests {
         assert_eq!(loaded_run_ids(&app), [201]);
         assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
 
-        // X then Y, Y's response first: Y's applies, X's late one changes nothing.
         let mut app = saved_xy_app();
         app.handle_key(key(KeyCode::Enter));
         let x = pending_token(&app);
@@ -3632,9 +3312,6 @@ mod tests {
         assert_eq!(loaded_run_ids(&app), [201]);
         assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
 
-        // X, Y, X: the first X response names the same saved query as the
-        // third request, but it answers an older request. Arriving last,
-        // after the third request completed, it changes nothing.
         let (mut app, x1, y, x3) = saved_xyx_app();
         send_runs(&mut app, y, 2, &[201]);
         send_runs(&mut app, x3, 1, &[103]);
@@ -3644,9 +3321,6 @@ mod tests {
         assert_eq!(loaded_run_ids(&app), [103]);
         assert_eq!(pending_token_or_none(&app), None);
 
-        // X, Y, X again, with the first X response (here a failure) arriving
-        // while the third request is pending: it neither completes that
-        // request nor opens a popup.
         let (mut app, x1, y, x3) = saved_xyx_app();
         send_runs(&mut app, y, 2, &[201]);
         app.mutation_tx
@@ -3665,8 +3339,6 @@ mod tests {
         assert_eq!(loaded_run_ids(&app), [103]);
         assert_eq!(pending_token_or_none(&app), None);
 
-        // A matching runs failure shows the error and closes the detail, so
-        // the pane never shows "no runs yet" for a list it could not load.
         let mut app = saved_xy_app();
         app.handle_key(key(KeyCode::Enter));
         let x = pending_token(&app);
@@ -3683,8 +3355,6 @@ mod tests {
         assert_eq!(app.panel.saved_focus, state::SavedFocus::List);
     }
 
-    /// Enter on X, Left, Down, Enter on Y, Left, Up, Enter on X: returns the
-    /// app with the third request pending and the three tokens in order.
     fn saved_xyx_app() -> (
         App,
         state::RequestToken,
@@ -3728,13 +3398,10 @@ mod tests {
         app.poll_mutations();
     }
 
-    /// One row of data, so a stale result that leaked in would be visible.
     fn one_row_result() -> trawl_api::value::QueryResult {
         make_query_response(vec!["count"], vec![vec![Value::Integer(7)]]).result
     }
 
-    /// A run result applies only for the pending request. A stale success,
-    /// a stale zero-row success and a stale failure change nothing.
     #[tokio::test]
     async fn saved_run_result_response_order() {
         let mut app = saved_xy_app();
@@ -3742,7 +3409,6 @@ mod tests {
         let runs = pending_token(&app);
         send_runs(&mut app, runs, 1, &[101, 102]);
 
-        // Enter on run 101, then Down and Enter on run 102: 101's request is stale.
         app.handle_key(key(KeyCode::Enter));
         let first = pending_token(&app);
         app.handle_key(key(KeyCode::Down));
@@ -3762,7 +3428,6 @@ mod tests {
             assert!(app.popup.is_none(), "a stale response opens no popup");
         }
 
-        // The matching failure shows the error and leaves nothing pending.
         send_result(
             &mut app,
             second,
@@ -3775,7 +3440,6 @@ mod tests {
         assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
         app.popup = None;
 
-        // A fresh request for the same run applies and opens the result.
         app.handle_key(key(KeyCode::Enter));
         let third = pending_token(&app);
         send_result(&mut app, third, 1, 102, Ok(one_row_result()));
@@ -3810,14 +3474,10 @@ mod tests {
         }
     }
 
-    /// Each way the Saved selection moves keeps the detail while it still
-    /// names the selected saved query and drops it otherwise. A dropped
-    /// detail ignores the response to its request; a kept one still applies it.
     #[tokio::test]
     async fn saved_navigation_invalidates_requests() {
         use event::{MouseButton, MouseEventKind};
         use state::SavedFocus;
-        /// Moves the Saved selection; gets the row of a list index.
         type Action = fn(&mut App, &dyn Fn(u16) -> u16);
 
         // The list's first row sits one line below the panel's top border.
@@ -3891,7 +3551,6 @@ mod tests {
             assert_eq!(app.panel.saved_focus, SavedFocus::Detail, "{name}");
         }
 
-        // A refresh that selects a new query by name moves off X and drops its detail.
         let mut app = saved_xy_app();
         app.handle_key(key(KeyCode::Enter));
         app.mutation_tx
@@ -3907,7 +3566,6 @@ mod tests {
         assert!(app.panel.saved_detail.is_none());
     }
 
-    /// Render the app and return the screen text.
     fn screen(app: &mut App) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
@@ -3915,7 +3573,6 @@ mod tests {
         terminal.backend().to_string()
     }
 
-    /// A fresh app showing the same Saved tab state as `app`.
     fn saved_view_copy(app: &App) -> App {
         let mut copy = test_app();
         copy.saved_cache.clone_from(&app.saved_cache);
@@ -3925,26 +3582,21 @@ mod tests {
         copy
     }
 
-    /// Press `q` on a copy of the app and return the editor text it builds.
     fn q_prefill(app: &App) -> String {
         let mut probe = saved_view_copy(app);
         probe.handle_key(key(KeyCode::Char('q')));
         probe.tab.editor.text()
     }
 
-    /// The header, the run-result title and `q` all name the saved query and
-    /// run the detail shows, not whatever row the list index now points at.
     #[tokio::test]
     async fn saved_header_and_q_share_identity() {
         use handlers::saved_run_query;
 
-        // Detail view: X's runs, then a refresh that puts Y at X's old index.
         let mut app = saved_xy_app();
         app.handle_key(key(KeyCode::Enter));
         let x = pending_token(&app);
         send_runs(&mut app, x, 1, &[101, 102]);
         refresh_cache(&mut app, vec![saved_entry(2, "Y"), saved_entry(1, "X")]);
-        // A stale response for an older request changes nothing either.
         send_runs(&mut app, x, 1, &[999]);
         let text = screen(&mut app);
         assert!(text.contains("query  service=X"), "{text}");
@@ -3959,8 +3611,6 @@ mod tests {
         assert!(text.contains("query  service=X"), "{text}");
         assert_eq!(q_prefill(&probe), saved_run_query("X", Some(101)));
 
-        // Run-result view: Enter on run 101, Down to 102 before 101's result
-        // lands. The displayed run is 101, so the title and `q` say 101.
         app.handle_key(key(KeyCode::Enter));
         let first = pending_token(&app);
         app.handle_key(key(KeyCode::Down));
@@ -3975,8 +3625,6 @@ mod tests {
         assert_eq!(q_prefill(&app), saved_run_query("X", Some(101)));
     }
 
-    /// Advice describes the draft, not the tab: switching to another main
-    /// tab and back shows the same advice without an edit.
     #[test]
     fn query_advice_survives_main_tab_round_trip() {
         let mut app = test_app();
@@ -4011,8 +3659,6 @@ mod tests {
         assert_eq!(before, after, "the same advice returns with the query tab");
     }
 
-    /// Run the tab's validation as the event loop would once the debounce
-    /// has passed. False means no edit was pending.
     fn tick_validation_past_debounce(app: &mut App) -> bool {
         if let Some(last) = app.tab.last_edit_time {
             app.tab.last_edit_time = last.checked_sub(Duration::from_millis(400));
@@ -4034,7 +3680,6 @@ mod tests {
         }
     }
 
-    /// Load `query` through the history pane's Enter.
     fn load_from_history(app: &mut App, query: &str) {
         app.history_cache = Some(history_with(query));
         app.panel.history_selected = 0;
@@ -4043,8 +3688,6 @@ mod tests {
         assert_eq!(app.tab.editor.text(), query, "history loads the text");
     }
 
-    /// Load `query` through the command palette, picking the saved query
-    /// named `name` that holds it.
     fn load_from_palette(app: &mut App, name: &str, query: &str) {
         let mut entry = saved_entry(9, name);
         entry.query = query.to_owned();
@@ -4060,8 +3703,6 @@ mod tests {
         assert_eq!(app.tab.editor.text(), query, "the palette loads the text");
     }
 
-    /// A query loaded from history, the palette or a saved run is validated
-    /// like a typed one: advice for a valid text, errors for a broken one.
     #[test]
     fn query_advice_follows_loaded_queries() {
         const ADVISED: &str = r#""10.244.0.83" -service=coredns"#;
@@ -4109,8 +3750,6 @@ mod tests {
         );
         broken(&app);
 
-        // The saved-run prefill replaces the text too, and a stale error
-        // from the text it replaced does not survive it.
         let mut app = test_app();
         load_from_history(&mut app, BROKEN);
         assert!(tick_validation_past_debounce(&mut app));

@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Custom DSL syntax highlighting.
-
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -12,40 +10,24 @@ use trawl_core::sanitize::sanitize_display_text;
 
 use crate::tui::theme::SyntaxColors;
 
-/// Token type for syntax highlighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenType {
-    /// Pipe stages (stats, where, sort, etc.)
     Stage,
-    /// Field filter keywords (service=, level=, status>=, etc.)
     FilterKey,
-    /// Operators (|, =, >, >=, ==, etc.)
     Operator,
-    /// Logical keywords (and, or, not, AND, OR, NOT)
     Logical,
-    /// Function names (count, avg, sum, etc.)
     Function,
-    /// Field names
     Field,
-    /// String literals
     String,
-    /// Numeric literals
     Number,
-    /// Regex literal (/pattern/)
     Regex,
-    /// Negated term (-word)
     Negated,
-    /// Comments
     Comment,
-    /// Whitespace
     Whitespace,
 }
 
-/// Syntax highlighter for DSL queries.
 pub struct Highlighter<'a> {
-    /// Known field names from the schema; unknown ones get a different colour.
     fields: Vec<std::string::String>,
-    /// Syntax colors from the active theme.
     colors: &'a SyntaxColors,
 }
 
@@ -58,10 +40,7 @@ impl<'a> Highlighter<'a> {
         Self { fields, colors }
     }
 
-    /// Highlight a single line of DSL query text.
-    ///
-    /// Each token's style comes from its raw text; only the drawn text is
-    /// sanitized. The replacement is one character for one, so character
+    /// The sanitizing replacement is one character for one, so character
     /// indexes into `text` still index the spans.
     pub fn highlight_line(&self, text: &str) -> Line<'static> {
         let mut tokens = Self::tokenize(text);
@@ -106,9 +85,6 @@ impl<'a> Highlighter<'a> {
         Line::from(spans)
     }
 
-    /// Post-tokenization pass: if a Field token is immediately followed by a
-    /// filter operator (`=`, `>=`, `<=`, `!=`, `>`, `<`), reclassify the Field
-    /// as `FilterKey`.
     fn fix_filter_keys(tokens: &mut [(TokenType, std::string::String)]) {
         for i in 0..tokens.len().saturating_sub(1) {
             if tokens[i].0 == TokenType::Field
@@ -123,32 +99,21 @@ impl<'a> Highlighter<'a> {
         }
     }
 
-    /// Tokenize a line into (`TokenType`, text) pairs.
-    ///
-    /// Display only, never correctness. This is a colouring walk over text the user
-    /// is still typing, not a reading of the query: it has no backtick awareness, and
-    /// nothing may consult it for what a query means. `trawl_core::parser` is the
-    /// authority on that, and `trawl_core::parser::scan` is the one text-level walk
-    /// allowed to change an answer (ADR-0014 ruling 5). Unifying this walk with either
-    /// needs a partial-input policy for an unterminated token at the cursor, which is
-    /// its own design problem.
+    /// Display only, never correctness: nothing may consult it for what a
+    /// query means (ADR-0014 ruling 5).
     #[allow(clippy::too_many_lines)]
     fn tokenize(text: &str) -> Vec<(TokenType, std::string::String)> {
         let mut tokens = Vec::new();
         let mut chars = text.chars().peekable();
         let mut current = std::string::String::new();
-        // Whether the cursor sits where the grammar admits a comment: start of line,
-        // or directly after whitespace. `current.is_empty()` is not that test. After
-        // `color=` it is empty too, and colouring `#ff0000` as a comment would show
-        // the user prose where the parser reports an error (ADR-0014 ruling 2).
+        // Start of line or directly after whitespace. `current.is_empty()` is
+        // not that test: after `color=` it is empty too.
         let mut at_layout_boundary = true;
 
         while let Some(ch) = chars.next() {
             let boundary = at_layout_boundary;
             at_layout_boundary = false;
 
-            // Comment: `#` to end of line, and only `#` (ADR-0014). Treating `//`
-            // as an opener would dim every URL in a query.
             if ch == '#' && boundary {
                 let mut comment = std::string::String::from('#');
                 for c in chars.by_ref() {
@@ -162,7 +127,6 @@ impl<'a> Highlighter<'a> {
                 continue;
             }
 
-            // Regex literal: /pattern/
             if ch == '/' && current.is_empty() {
                 let mut regex = std::string::String::from('/');
                 let mut closed = false;
@@ -172,7 +136,6 @@ impl<'a> Highlighter<'a> {
                         closed = true;
                         break;
                     }
-                    // Handle escaped chars in regex
                     if c == '\\'
                         && let Some(escaped) = chars.next()
                     {
@@ -182,13 +145,11 @@ impl<'a> Highlighter<'a> {
                 if closed {
                     tokens.push((TokenType::Regex, regex));
                 } else {
-                    // Unclosed — treat as operator
                     tokens.push((TokenType::Operator, regex));
                 }
                 continue;
             }
 
-            // String literals
             if ch == '"' {
                 if !current.is_empty() {
                     tokens.push((Self::classify_word(&current), current.clone()));
@@ -200,7 +161,6 @@ impl<'a> Highlighter<'a> {
                     if c == '"' {
                         break;
                     }
-                    // Handle escaped quotes
                     if c == '\\'
                         && let Some(escaped) = chars.next()
                     {
@@ -211,7 +171,6 @@ impl<'a> Highlighter<'a> {
                 continue;
             }
 
-            // Comparison operators
             if ch == '>' || ch == '<' || ch == '=' || ch == '!' {
                 if !current.is_empty() {
                     tokens.push((Self::classify_word(&current), current.clone()));
@@ -225,7 +184,6 @@ impl<'a> Highlighter<'a> {
                 continue;
             }
 
-            // Pipe operator
             if ch == '|' {
                 if !current.is_empty() {
                     tokens.push((Self::classify_word(&current), current.clone()));
@@ -235,7 +193,6 @@ impl<'a> Highlighter<'a> {
                 continue;
             }
 
-            // Whitespace
             if ch.is_whitespace() {
                 if !current.is_empty() {
                     tokens.push((Self::classify_word(&current), current.clone()));
@@ -246,7 +203,6 @@ impl<'a> Highlighter<'a> {
                 continue;
             }
 
-            // Parentheses (for functions)
             if ch == '(' || ch == ')' || ch == ',' {
                 if !current.is_empty() {
                     tokens.push((Self::classify_word(&current), current.clone()));
@@ -256,7 +212,6 @@ impl<'a> Highlighter<'a> {
                 continue;
             }
 
-            // Negated term: - at start of word
             if ch == '-' && current.is_empty() {
                 // Check if next char starts a word (not another operator)
                 if chars
@@ -275,7 +230,6 @@ impl<'a> Highlighter<'a> {
                 }
             }
 
-            // Build up current word
             current.push(ch);
         }
 
@@ -289,7 +243,6 @@ impl<'a> Highlighter<'a> {
     fn classify_word(word: &str) -> TokenType {
         let lower = word.to_lowercase();
 
-        // Pipe stages
         match lower.as_str() {
             "stats" | "where" | "sort" | "limit" | "head" | "tail" | "table" | "fields" | "top"
             | "rare" | "drop" | "let" | "eval" | "extract" | "rex" | "rename" | "dedup"
@@ -297,22 +250,18 @@ impl<'a> Highlighter<'a> {
             _ => {}
         }
 
-        // Logical operators
         if lower == "and" || lower == "or" || lower == "not" {
             return TokenType::Logical;
         }
 
-        // Functions
         if word.contains('(') || Self::is_function_name(&lower) {
             return TokenType::Function;
         }
 
-        // Numbers
         if word.parse::<f64>().is_ok() {
             return TokenType::Number;
         }
 
-        // Default to field name
         TokenType::Field
     }
 
@@ -375,9 +324,6 @@ mod tests {
             .map(|(_, s)| s)
     }
 
-    /// A `#` colours as a comment only where the grammar opens one: line
-    /// start or after whitespace. Anywhere else the parser reports an
-    /// error, and dimming the rest of the line says the opposite.
     #[test]
     fn a_hash_colours_as_a_comment_only_at_a_layout_boundary() {
         assert_eq!(comment_text("# note"), Some("# note".to_string()));
@@ -391,16 +337,11 @@ mod tests {
         assert_eq!(comment_text("count(),# x"), None, "after a delimiter");
     }
 
-    /// `//` is not a comment opener (ADR-0014 ruling 3), so a URL keeps its
-    /// ordinary colouring.
     #[test]
     fn slashes_are_not_a_comment() {
         assert_eq!(comment_text("url=https://example.com/x"), None);
     }
 
-    /// The style comes from the raw token and only the drawn text is
-    /// sanitized: a known field whose name holds U+200B keeps its
-    /// known-field colour, which a lookup by the sanitized text would miss.
     #[test]
     fn highlighted_tokens_preserve_raw_classification() {
         use trawl_client::{SchemaColumnResponse, SchemaResponse};

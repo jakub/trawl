@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Every way a trial verb or the `-p trial` profile can fail.
-//!
 //! No variant carries a token, a key prefix, or the contents of a state
 //! file: a parse failure reports its position only, because the offending
 //! value could be a secret.
@@ -175,9 +173,6 @@ pub enum TrialError {
     #[error("the trial certificate is not usable: {reason}")]
     Certificate { reason: &'static str },
 
-    /// The certificate in the trawld volume is not one `up` may use, and
-    /// `up` never replaces a published certificate. Names no fingerprint,
-    /// path, or engine output.
     #[error(
         "the trial certificate in the trial's trawld volume {problem}. trawl never \
          replaces a trial certificate once it is in the volume, because the trial's \

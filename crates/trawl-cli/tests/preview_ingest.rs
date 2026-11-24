@@ -4,21 +4,6 @@
 
 //! `trawl preview-ingest` against a real trawld (ADR-0049).
 //!
-//! The server is trawld's own stack, booted in-process by `common` the
-//! way trawl-server's integration fixture boots it: its own fleet and app
-//! databases minted from `DATABASE_URL`, the real boot path (advisory
-//! lock, migrations, corpus preparation) and the real HTTPS listener on an
-//! ephemeral port with a self-signed certificate. The CLI is the real
-//! `trawl` binary in a subprocess, so the exit status, stdin and stdout are
-//! the ones an operator sees. Every run strips the inherited `TRAWL_*`
-//! environment, gets a temp `HOME`, and pins the server's certificate
-//! through its own config file.
-//!
-//! Each test drops the databases it minted when it finishes. A panicking
-//! test leaves them behind under trawl-server's fixture naming scheme
-//! (`{prefix}_{run}_{pid}_{rand}`), which that suite's sweeper collects
-//! once the owning process is gone.
-//!
 //! Without `DATABASE_URL` these tests fail rather than skip: a real-server
 //! suite that silently skips proves nothing.
 
@@ -50,14 +35,11 @@ const MIXED: &str = concat!(
     "\n",
 );
 
-/// The two events of [`MIXED`] that are accepted, as a JSON array.
 const ACCEPTED: &str = r#"[
   {"_time":"2026-01-01T10:00:00Z","service":"api","env":"prod","host":"web-1","level":"warn","msg":"disk 91%"},
   {"service":"worker","Level":"error","timestamp":"yesterday","ctx":{"job":7}}
 ]"#;
 
-/// Run `trawl -c <config> preview-ingest <args>`, with `stdin` on its
-/// standard input and `token` as `TRAWL_TOKEN`.
 async fn trawl(config: &Path, token: Option<&str>, args: &[&str], stdin: &[u8]) -> Output {
     let home = config.parent().expect("config dir");
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_trawl"));
@@ -108,9 +90,6 @@ fn is_server_line(stderr: &str, line: &str) -> bool {
         })
 }
 
-/// The table with the header's arrival instant, the one value that
-/// changes between runs, masked. The instant must have the report's fixed
-/// shape (RFC 3339 UTC, microseconds) to be masked at all.
 fn mask_arrival(table: &str) -> String {
     let (header, rest) = table.split_once('\n').expect("a header line");
     let (head, arrival) = header.rsplit_once("; arrival ").expect("an arrival");
@@ -130,10 +109,6 @@ fn write_sample(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// The table, read from stdin with no peer: a rejected event exits 1, the
-/// header names the placeholder, and host-less events are marked as
-/// depending on the sender. The snapshot pins the whole table; only the
-/// arrival instant changes between runs.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rejected_event_exits_1_and_the_table_shows_every_outcome() {
     let server = Server::start(true).await;
@@ -159,8 +134,6 @@ async fn a_rejected_event_exits_1_and_the_table_shows_every_outcome() {
     server.stop().await;
 }
 
-/// Every event accepted, read from a file with a peer: exit 0, the peer
-/// fills `host`, and nothing depends on the sender.
 #[tokio::test(flavor = "multi_thread")]
 async fn all_accepted_from_a_file_with_a_peer_exits_0() {
     let server = Server::start(true).await;
@@ -193,8 +166,6 @@ async fn all_accepted_from_a_file_with_a_peer_exits_0() {
     server.stop().await;
 }
 
-/// An NDJSON event `depth` containers deep: the object and the arrays
-/// nested inside its `payload`.
 fn event_of_depth(depth: usize) -> String {
     let arrays = depth - 1;
     format!(
@@ -204,9 +175,8 @@ fn event_of_depth(depth: usize) -> String {
     )
 }
 
-/// The deepest event ingest accepts previews as accepted, and one
-/// container more as refused, in a complete report: the CLI decodes the
-/// report even though it echoes that event three containers further in.
+/// The CLI decodes the report even though it echoes the deepest event
+/// three containers further in.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_deepest_event_ingest_accepts_previews_whole() {
     // `serde_json`'s default recursion limit, which ingest parses with,
@@ -242,7 +212,6 @@ async fn the_deepest_event_ingest_accepts_previews_whole() {
     server.stop().await;
 }
 
-/// `--json` prints the server's report, whole, and keeps the exit status.
 #[tokio::test(flavor = "multi_thread")]
 async fn json_prints_the_report_and_keeps_the_exit_status() {
     let server = Server::start(true).await;
@@ -293,8 +262,6 @@ async fn json_prints_the_report_and_keeps_the_exit_status() {
     server.stop().await;
 }
 
-/// A key without `server_manage` gets the server's 403, which is no
-/// report: exit 2, and nothing on stdout.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_without_server_manage_exits_2() {
     let server = Server::start(true).await;
@@ -318,8 +285,6 @@ async fn a_key_without_server_manage_exits_2() {
     server.stop().await;
 }
 
-/// A server with ingest off has no preview route. Its 404 says the server
-/// does not ingest, and exits 2.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_without_ingest_exits_2_and_says_it_does_not_ingest() {
     let server = Server::start(false).await;
@@ -336,8 +301,6 @@ async fn a_server_without_ingest_exits_2_and_says_it_does_not_ingest() {
     server.stop().await;
 }
 
-/// A `--peer-ip` that is not an address is clap's usage error, exit 2,
-/// before anything is read or sent.
 #[tokio::test]
 async fn a_bad_peer_ip_is_a_usage_error() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -395,9 +358,6 @@ fn padded_events(lines: usize, line_len: usize) -> Vec<u8> {
     line.repeat(lines).into_bytes()
 }
 
-/// A body moderately over `max_request_body_bytes` gets the server's
-/// `request_too_large` message, never `unknown error`, and exits 2.
-///
 /// The 1 KiB limit and a 4 KiB body keep this deterministic: the whole
 /// request is a few TLS records that land in trawld's first read, so when
 /// it refuses and hangs up nothing it was sent is left unread. The close
@@ -426,8 +386,6 @@ async fn a_body_moderately_over_the_limit_prints_the_servers_413() {
     server.stop().await;
 }
 
-/// More events than one preview reads, in a body under the byte limit,
-/// gets the server's `preview_too_large` message and exits 2.
 #[tokio::test(flavor = "multi_thread")]
 async fn more_events_than_a_preview_reads_prints_the_servers_413() {
     let server = Server::start(true).await;
@@ -455,15 +413,11 @@ async fn more_events_than_a_preview_reads_prints_the_servers_413() {
     server.stop().await;
 }
 
-/// A body several times over `max_request_body_bytes` exits 2 with one of
-/// two exact lines, and never `request failed`.
-///
 /// Both outcomes are legitimate. trawld refuses on `Content-Length` and
-/// hangs up without draining the body (a ruling: draining would spend
-/// bandwidth on refused bodies, before authentication). The client is
-/// still uploading, so whether it reads the 413 first or hits the reset
-/// of the unread upload depends on socket buffers and timing. A reset is
-/// reported as a cut-off upload. The test never retries.
+/// hangs up without draining the body. The client is still uploading, so
+/// whether it reads the 413 first or hits the reset of the unread upload
+/// depends on socket buffers and timing. A reset is reported as a cut-off
+/// upload. The test never retries.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_body_far_over_the_limit_prints_the_413_or_a_cut_off_upload() {
     let server = Server::start(true).await;

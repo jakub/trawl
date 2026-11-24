@@ -3,44 +3,27 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Ghost-text autocomplete for the query editor.
-//!
-//! Pure functions — no I/O, fully unit-testable. The editor calls
-//! [`complete`] on every keypress and renders the returned ghost text
-//! as a dimmed inline suffix.
 
 use trawl_core::emitter::is_aggregate_function;
 use trawl_core::parser::suggest::{KNOWN_FUNCTIONS, KNOWN_PIPE_STAGES, quote_dsl_field};
 
-// ── Public types ────────────────────────────────────────────────────
-
-/// Schema field metadata passed in from the cached schema.
 #[derive(Debug, Clone)]
 pub struct SchemaField {
     pub name: String,
-    /// Whether this field has a numeric type (for filtering agg function arguments).
     #[allow(dead_code)]
-    // reserved for v2: suggest only numeric fields inside avg(), sum(), etc.
     pub is_numeric: bool,
 }
 
-/// What kind of completion to offer at the cursor position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionContext {
-    /// After `|` — suggest pipe stage names.
     PipeStage { prefix: String },
-    /// Inside `stats`/`timechart`/`eventstats` before `by` — suggest aggregate functions.
     AggFunction { prefix: String },
-    /// Inside `let`/`eval` — suggest scalar functions.
     ScalarFunction { prefix: String },
-    /// Field position (`by`, `sort`, `table`, `fields`, `drop`, etc.) — suggest field names.
     FieldName { prefix: String },
-    /// Keyword position — suggest `by`, `as`, `from`, `on`.
     Keyword { prefix: String },
-    /// Inside a string literal, regex, or free text — stay quiet.
     None,
 }
 
-/// A resolved ghost-text completion ready for display and insertion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     /// Dimmed suffix to display after the cursor (the part the user hasn't typed yet).
@@ -56,20 +39,12 @@ pub struct Completion {
 
 #[derive(Debug, Clone)]
 struct Candidate {
-    /// Display/insert name (e.g. "stats", "count", "host").
     name: String,
-    /// Whether this is a function (gets `()` appended).
     is_function: bool,
     /// Whether this is a zero-arg function (cursor goes after `()`).
     is_zero_arg: bool,
 }
 
-// ── Main entry point ────────────────────────────────────────────────
-
-/// Compute a ghost-text completion for the given editor state.
-///
-/// Returns `None` when no suggestion is appropriate (free text, inside
-/// strings, empty prefix, no match, etc.).
 pub fn complete(
     text: &str,
     cursor_byte: usize,
@@ -107,9 +82,6 @@ pub fn complete(
     build_completion(&candidate, prefix)
 }
 
-// ── Context detection ───────────────────────────────────────────────
-
-/// Detect what kind of completion context the cursor is in.
 pub fn detect_context(text: &str, cursor_byte: usize) -> CompletionContext {
     let before = &text[..cursor_byte.min(text.len())];
 
@@ -126,21 +98,17 @@ pub fn detect_context(text: &str, cursor_byte: usize) -> CompletionContext {
         return CompletionContext::None;
     }
 
-    // Look at what precedes the prefix (skipping whitespace).
     let before_prefix = before[..before.len() - prefix.len()].trim_end();
 
-    // After `|` → pipe stage.
     if before_prefix.ends_with('|') {
         return CompletionContext::PipeStage {
             prefix: prefix.to_owned(),
         };
     }
 
-    // Detect the current pipe stage by scanning backwards for `| <stage>`.
     let stage = find_current_stage(before_prefix);
 
     match stage.as_deref() {
-        // In stats/timechart/eventstats and not past `by` → agg functions.
         Some("stats" | "timechart" | "eventstats") => {
             if is_past_by_keyword(before_prefix, stage.as_deref().unwrap_or_default()) {
                 // After `by` → field names.
@@ -158,7 +126,6 @@ pub fn detect_context(text: &str, cursor_byte: usize) -> CompletionContext {
                 }
             }
         }
-        // In let/eval → scalar functions or field names.
         Some("let" | "eval") => {
             if looks_like_function_position(before_prefix) {
                 CompletionContext::ScalarFunction {
@@ -174,7 +141,6 @@ pub fn detect_context(text: &str, cursor_byte: usize) -> CompletionContext {
                 }
             }
         }
-        // In where → field names either way.
         Some("where") => {
             if before_prefix.ends_with('(') {
                 CompletionContext::FieldName {
@@ -189,13 +155,11 @@ pub fn detect_context(text: &str, cursor_byte: usize) -> CompletionContext {
                 }
             }
         }
-        // In sort/table/fields/drop/dedup/rename/top/rare → field names.
         Some("sort" | "table" | "fields" | "drop" | "dedup" | "rename" | "top" | "rare") => {
             CompletionContext::FieldName {
                 prefix: prefix.to_owned(),
             }
         }
-        // After `by` keyword (any stage) → field names.
         _ if before_prefix
             .rsplit_once(|c: char| !c.is_alphanumeric() && c != '_')
             .is_some_and(|(_, last_word)| last_word == "by") =>
@@ -207,7 +171,6 @@ pub fn detect_context(text: &str, cursor_byte: usize) -> CompletionContext {
         // Before any pipe (search stage) → no suggestion for bare text.
         // The search stage is free-form — autocomplete would be noisy.
         _ if !before.contains('|') => CompletionContext::None,
-        // Fallback: try keywords if prefix looks like one.
         _ => {
             let keyword_prefixes = ["by", "as", "from", "on"];
             if keyword_prefixes
@@ -226,9 +189,6 @@ pub fn detect_context(text: &str, cursor_byte: usize) -> CompletionContext {
     }
 }
 
-// ── Candidate generation ────────────────────────────────────────────
-
-/// Build the candidate list for a given context.
 fn candidates_for(context: &CompletionContext, schema_fields: &[SchemaField]) -> Vec<Candidate> {
     match context {
         CompletionContext::PipeStage { .. } => {
@@ -312,9 +272,6 @@ fn prefix_match(prefix: &str, candidates: &[Candidate]) -> Option<Candidate> {
         .cloned()
 }
 
-// ── Completion building ─────────────────────────────────────────────
-
-/// Build the final `Completion` from a matched candidate.
 fn build_completion(candidate: &Candidate, prefix: &str) -> Option<Completion> {
     // Candidate slicing is in bytes, editor replacement/cursor offsets are
     // character counts. Mixing them deletes text beside a non-ASCII prefix.
@@ -323,20 +280,18 @@ fn build_completion(candidate: &Candidate, prefix: &str) -> Option<Completion> {
     if candidate.is_function {
         let suffix = &candidate.name[prefix_len..];
         if candidate.is_zero_arg {
-            // count() / now() → cursor after closing paren.
             Some(Completion {
                 ghost_text: format!("{suffix}()"),
                 insert_text: format!("{}()", candidate.name),
                 replace_len: prefix_cols,
-                cursor_offset: None, // end
+                cursor_offset: None,
             })
         } else {
-            // avg( → cursor between parens.
             Some(Completion {
                 ghost_text: format!("{suffix}()"),
                 insert_text: format!("{}()", candidate.name),
                 replace_len: prefix_cols,
-                cursor_offset: Some(candidate.name.chars().count() + 1), // between ( and )
+                cursor_offset: Some(candidate.name.chars().count() + 1),
             })
         }
     } else if KNOWN_PIPE_STAGES.contains(&candidate.name.as_str()) {
@@ -361,9 +316,6 @@ fn build_completion(candidate: &Candidate, prefix: &str) -> Option<Completion> {
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-/// Whether a function takes zero arguments (cursor goes after `()`).
 fn is_zero_arg_function(name: &str) -> bool {
     matches!(name, "count" | "now")
 }
@@ -372,12 +324,7 @@ fn is_zero_arg_function(name: &str) -> bool {
 /// included. String/regex regions are skipped so a data backtick cannot
 /// disable completion for the rest of the line.
 ///
-/// **Completion only, never correctness.** This is editor state over
-/// half-typed text — an unterminated name at the cursor is the normal
-/// case, not an error — so it is a deliberate approximation and must
-/// never be consulted for what a query means. `trawl_core::parser` is the
-/// authority on that, and `trawl_core::parser::scan` is the one
-/// text-level walk allowed to change an answer (ADR-0014 ruling 5).
+/// **Completion only, never correctness** (ADR-0014 ruling 5).
 fn open_backtick_prefix(before: &str) -> Option<&str> {
     let bytes = before.as_bytes();
     let mut open = None;
@@ -420,7 +367,6 @@ fn quoted_name_can_start(bytes: &[u8], i: usize) -> bool {
         )
 }
 
-/// Extract the word prefix immediately before the cursor.
 fn extract_prefix(before_cursor: &str) -> &str {
     let end = before_cursor.len();
     let start = before_cursor
@@ -433,16 +379,9 @@ fn extract_prefix(before_cursor: &str) -> &str {
 }
 
 /// Rough check for whether the cursor is inside a string literal or regex.
-///
-/// Counts unescaped `"` and `/` delimiters before the cursor. An odd
-/// count means we're inside one.
-///
-/// **Completion only, never correctness.** It has no backtick awareness
-/// and no comment case, and a `/` in a URL counts as a delimiter here. It
-/// decides whether to offer ghost text and nothing else; the grammar
-/// (`trawl_core::parser`) decides what the query means, and
-/// `trawl_core::parser::scan` is the one text-level walk allowed to
-/// change an answer (ADR-0014 ruling 5).
+/// **Completion only, never correctness** (ADR-0014 ruling 5): it has no
+/// backtick awareness and no comment case, and a `/` in a URL counts as a
+/// delimiter here.
 fn inside_string_or_regex(before: &str) -> bool {
     let mut in_double_quote = false;
     let mut in_regex = false;
@@ -452,7 +391,6 @@ fn inside_string_or_regex(before: &str) -> bool {
         if ch == '"' && prev_char != '\\' {
             in_double_quote = !in_double_quote;
         }
-        // Regex delimiters: `/pattern/` — only toggle when not in a string.
         if ch == '/' && !in_double_quote && prev_char != '\\' {
             in_regex = !in_regex;
         }
@@ -462,12 +400,7 @@ fn inside_string_or_regex(before: &str) -> bool {
     in_double_quote || in_regex
 }
 
-/// Find the current pipe stage name by scanning backwards from the cursor.
-///
-/// Looks for the pattern `| <stage_name>` and returns the stage name
-/// if it's a known stage.
 fn find_current_stage(before: &str) -> Option<String> {
-    // Find the last `|` and extract the first word after it.
     let after_pipe = before.rsplit('|').next()?;
     let trimmed = after_pipe.trim_start();
     let first_word: String = trimmed
@@ -487,13 +420,10 @@ fn find_current_stage(before: &str) -> Option<String> {
     }
 }
 
-/// Check if we're past the `by` keyword in the current stage.
 fn is_past_by_keyword(before: &str, stage: &str) -> bool {
-    // Find the last occurrence of `| <stage>` and check for `by` after it.
     let lower = before.to_lowercase();
     if let Some(pipe_pos) = lower.rfind(&format!("| {stage}")) {
         let after_stage = &lower[pipe_pos + 2 + stage.len()..];
-        // Look for standalone `by` keyword.
         after_stage.split_whitespace().any(|w| w == "by")
     } else if let Some(pipe_pos) = lower.rfind('|') {
         let after_pipe = lower[pipe_pos + 1..].trim_start();
@@ -507,9 +437,6 @@ fn is_past_by_keyword(before: &str, stage: &str) -> bool {
     }
 }
 
-/// Check if the position looks like it expects a function name.
-///
-/// Heuristic: after `=`, `,`, `(`, or at the start of an expression.
 fn looks_like_function_position(before: &str) -> bool {
     let trimmed = before.trim_end();
     trimmed.ends_with('=')
@@ -521,24 +448,20 @@ fn looks_like_function_position(before: &str) -> bool {
         || trimmed.ends_with('/')
 }
 
-/// Convert editor `(row, col)` cursor position to a byte offset in the full text.
 pub fn cursor_to_byte_offset(lines: &[String], row: usize, col: usize) -> usize {
     let mut offset = 0;
     for (i, line) in lines.iter().enumerate() {
         if i == row {
-            // Convert char col to byte offset within this line.
             offset += line
                 .char_indices()
                 .nth(col)
                 .map_or(line.len(), |(byte_idx, _)| byte_idx);
             break;
         }
-        offset += line.len() + 1; // +1 for newline
+        offset += line.len() + 1;
     }
     offset
 }
-
-// ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -577,8 +500,6 @@ mod tests {
         ]
     }
 
-    // ── extract_prefix ──────────────────────────────────────────────
-
     #[test]
     fn prefix_simple_word() {
         assert_eq!(extract_prefix("| st"), "st");
@@ -599,8 +520,6 @@ mod tests {
         assert_eq!(extract_prefix("| let my_var"), "my_var");
     }
 
-    // ── inside_string_or_regex ──────────────────────────────────────
-
     #[test]
     fn not_inside_string() {
         assert!(!inside_string_or_regex("| stats count() by "));
@@ -620,8 +539,6 @@ mod tests {
     fn inside_regex() {
         assert!(inside_string_or_regex("message=/error"));
     }
-
-    // ── detect_context ──────────────────────────────────────────────
 
     #[test]
     fn context_after_pipe() {
@@ -751,8 +668,6 @@ mod tests {
         );
     }
 
-    // ── complete (integration) ──────────────────────────────────────
-
     #[test]
     fn complete_pipe_stage() {
         let c = complete("| st", 4, &fields()).unwrap();
@@ -767,7 +682,6 @@ mod tests {
         assert_eq!(c.ghost_text, "nt()");
         assert_eq!(c.insert_text, "count()");
         assert_eq!(c.replace_len, 3);
-        // count is zero-arg → cursor at end
         assert_eq!(c.cursor_offset, None);
     }
 
@@ -777,7 +691,6 @@ mod tests {
         assert_eq!(c.ghost_text, "g()");
         assert_eq!(c.insert_text, "avg()");
         assert_eq!(c.replace_len, 2);
-        // avg takes args → cursor between parens
         assert_eq!(c.cursor_offset, Some(4));
     }
 
@@ -791,18 +704,12 @@ mod tests {
 
     #[test]
     fn complete_field_hostname() {
-        // "hostn" should match "hostname", not "host"
         let c = complete("| stats count() by hostn", 24, &fields()).unwrap();
         assert_eq!(c.ghost_text, "ame");
         assert_eq!(c.insert_text, "hostname");
         assert_eq!(c.replace_len, 5);
     }
 
-    /// A field whose name the bare production cannot spell is inserted
-    /// backticked (ADR-0013): a suggestion trawl offers must be a query
-    /// trawl can parse. The typed `x` is not a prefix of the backticked
-    /// rendering, so the ghost is the whole name rather than the untyped
-    /// suffix.
     #[test]
     fn complete_field_needing_backticks_inserts_quoted() {
         let mut schema = fields();
@@ -876,7 +783,6 @@ mod tests {
 
     #[test]
     fn complete_exact_match_no_ghost() {
-        // Typing "stats" exactly should not suggest "stats" again.
         assert!(complete("| stats", 7, &fields()).is_none());
     }
 
@@ -896,7 +802,7 @@ mod tests {
         assert_eq!(c.ghost_text, "er()");
         assert_eq!(c.insert_text, "lower()");
         assert_eq!(c.replace_len, 3);
-        assert_eq!(c.cursor_offset, Some(6)); // between parens
+        assert_eq!(c.cursor_offset, Some(6));
     }
 
     #[test]
@@ -905,7 +811,7 @@ mod tests {
         assert_eq!(c.ghost_text, "w()");
         assert_eq!(c.insert_text, "now()");
         assert_eq!(c.replace_len, 2);
-        assert_eq!(c.cursor_offset, None); // zero-arg, cursor at end
+        assert_eq!(c.cursor_offset, None);
     }
 
     #[test]
@@ -918,11 +824,9 @@ mod tests {
 
     #[test]
     fn complete_mid_word_suppressed() {
-        // Cursor inside "message" (after "me") — should NOT offer ghost text.
         let result = complete("| table me", 10, &fields());
         assert!(result.is_some(), "sanity: 'me' at end of input completes");
 
-        // Same prefix but with word chars after cursor — suppress.
         let result = complete("| table message", 10, &fields());
         assert!(
             result.is_none(),
@@ -938,8 +842,6 @@ mod tests {
         assert_eq!(c.replace_len, 2);
     }
 
-    // ── cursor_to_byte_offset ───────────────────────────────────────
-
     #[test]
     fn byte_offset_single_line() {
         let lines = vec!["| stats count()".to_owned()];
@@ -949,7 +851,6 @@ mod tests {
     #[test]
     fn byte_offset_multiline() {
         let lines = vec!["| stats count()".to_owned(), "  by host".to_owned()];
-        // Row 1, col 5 = "host" starts at byte 16 (line0 len=15, +1 newline, +5)
         assert_eq!(cursor_to_byte_offset(&lines, 1, 5), 21);
     }
 
@@ -958,8 +859,6 @@ mod tests {
         let lines = vec!["abc".to_owned()];
         assert_eq!(cursor_to_byte_offset(&lines, 0, 3), 3);
     }
-
-    // ── find_current_stage ──────────────────────────────────────────
 
     #[test]
     fn stage_stats() {
@@ -982,8 +881,6 @@ mod tests {
         assert_eq!(find_current_stage("service=nginx _severity=error"), None);
     }
 
-    // ── is_past_by_keyword ──────────────────────────────────────────
-
     #[test]
     fn past_by_true() {
         assert!(is_past_by_keyword("| stats count() by", "stats"));
@@ -993,8 +890,6 @@ mod tests {
     fn past_by_false() {
         assert!(!is_past_by_keyword("| stats count()", "stats"));
     }
-
-    // ── prefix_match ────────────────────────────────────────────────
 
     #[test]
     fn prefix_match_finds_first() {
@@ -1036,8 +931,6 @@ mod tests {
 
     #[test]
     fn prefix_match_exact_suppresses_longer_variant() {
-        // "service" exists alongside "services" — typing the exact name
-        // should not suggest the longer variant.
         let candidates = vec![
             Candidate {
                 name: "service".to_owned(),
@@ -1055,7 +948,6 @@ mod tests {
 
     #[test]
     fn complete_exact_field_no_ghost_with_longer_variant() {
-        // End-to-end: schema has both "service" and "services".
         let schema = vec![
             SchemaField {
                 name: "service".to_owned(),

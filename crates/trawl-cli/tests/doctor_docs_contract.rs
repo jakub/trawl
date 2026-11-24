@@ -2,18 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The CLI reference documents `trawl doctor` from the names the code uses:
-//! every check id, the four outcomes, the reason codes a client doctor
-//! reports, each verdict with its exit status, and every request the doctor
-//! may send. The names are imported, not copied, so a renamed check or a
-//! new outcome fails here until the reference names it.
-
 use trawl_api::doctor::{Outcome, Verdict, reason};
 use trawl_cli::doctor::{ClientCheck, REQUESTS, api};
 
 const CLI_REFERENCE: &str = include_str!("../../../docs/src/content/docs/reference/cli.md");
 
-/// The `## Doctor mode` section of the reference, up to the next `## `.
 fn doctor_section() -> &'static str {
     let start = CLI_REFERENCE
         .find("\n## Doctor mode\n")
@@ -58,7 +51,6 @@ fn all_verdicts() -> [Verdict; 3] {
     all
 }
 
-/// The name serde gives a value, without its JSON quotes.
 fn serde_name(value: impl serde::Serialize) -> String {
     match serde_json::to_value(value).expect("serializes") {
         serde_json::Value::String(name) => name,
@@ -111,7 +103,6 @@ fn every_verdict_is_documented_with_its_exit_status() {
     }
     assert_documented("A refused command line exits `2`.", "the usage status");
 
-    // The binary-wide exit code table lists the doctor's statuses as well.
     let codes_start = CLI_REFERENCE
         .find("## Exit codes\n")
         .expect("the CLI reference has an exit code table");

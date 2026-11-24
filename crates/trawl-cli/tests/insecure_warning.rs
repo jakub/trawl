@@ -5,8 +5,7 @@
 //! The `insecure` warning, observed on the real `trawl` binary.
 //!
 //! `validate` with no token parses locally and prints `valid`, so it needs
-//! no server and its stdout is deterministic. Every run strips the
-//! inherited `TRAWL_*` environment and reads its own config file.
+//! no server and its stdout is deterministic.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -97,7 +96,6 @@ fn insecure_warns_once_on_stderr_and_leaves_stdout_alone() {
         );
     }
 
-    // A profile that turns insecure back off silences the warning.
     let profile_secure = write_config(
         dir.path(),
         "profile-secure.toml",

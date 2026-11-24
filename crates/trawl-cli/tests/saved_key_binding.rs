@@ -5,18 +5,11 @@
 //! Where a saved or exported key may go, observed on the real binary
 //! (ADR-0065).
 //!
-//! Every run starts from an empty environment (keeping only the dynamic
-//! loader's search path, see `loader_path`), with a temp `HOME` and
-//! `XDG_STATE_HOME`, plus only the variables the case sets. Tests cannot
-//! set the environment in-process (`unsafe_code = forbid`), so every case
-//! is a subprocess, killed if it outlives its deadline.
+//! Tests cannot set the environment in-process (`unsafe_code = forbid`), so
+//! every case is a subprocess, killed if it outlives its deadline.
 //!
-//! A plain-HTTP [`Recorder`] on `127.0.0.1` stands at every URL a run could
-//! reach. It counts each connection when it accepts it, before reading a
-//! byte, and records each request's target and its `Authorization` value,
-//! so a case asserts which key arrived, not just whether one did. Every
-//! case uses its own canary key per source, so a key that arrives names
-//! the source it came from.
+//! Every case uses its own canary key per source, so a key that arrives
+//! names the source it came from.
 
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -37,20 +30,16 @@ const FK: &str = "flt_keyfiletoken";
 /// A key saved in a profile's own table.
 const PK: &str = "flt_profileowntoken";
 
-/// The words every binding refusal carries.
 const BINDING: &str = "different API base";
 
-/// One request a [`Recorder`] read.
 #[derive(Debug, Clone)]
 struct Request {
     /// The request target as sent: a path, or an absolute URL through a
     /// proxy.
     target: String,
-    /// The `Authorization` header's value, if any.
     authorization: Option<String>,
 }
 
-/// What a [`Recorder`] saw.
 #[derive(Debug, Default)]
 struct Seen {
     connections: usize,
@@ -59,12 +48,9 @@ struct Seen {
     barriers: usize,
 }
 
-/// The whole request a barrier connection sends.
 const BARRIER: &[u8] = b"TRAWL-RECORDER-BARRIER\r\n\r\n";
-/// The whole request that ends the accept loop.
 const STOP: &[u8] = b"TRAWL-RECORDER-STOP\r\n\r\n";
 
-/// How a [`Recorder`] answers a request.
 #[derive(Debug, Clone)]
 enum Answer {
     /// `401`, so a run that reaches the recorder ends at once.
@@ -89,8 +75,6 @@ impl Answer {
     }
 }
 
-/// A plain TCP listener on `127.0.0.1` that records and answers.
-///
 /// One thread accepts and handles connections one at a time, in the order
 /// the kernel queued them, so once it has handled a connection it has
 /// counted every connection queued before that one.
@@ -192,7 +176,6 @@ impl Recorder {
         }
     }
 
-    /// Nothing but barriers reached the recorder.
     fn assert_untouched(&self, case: &str) {
         let seen = self.settle();
         assert_eq!(
@@ -203,12 +186,10 @@ impl Recorder {
         assert!(seen.requests.is_empty(), "{case}: {:?}", seen.requests);
     }
 
-    /// Every request so far, after the runs exit.
     fn requests(&self) -> Vec<Request> {
         self.settle().requests.clone()
     }
 
-    /// Requests arrived, and every one carried `Bearer {key}`.
     fn assert_only_key(&self, key: &str, case: &str) -> Vec<Request> {
         let requests = self.requests();
         assert!(!requests.is_empty(), "{case}: no request arrived");
@@ -252,7 +233,6 @@ fn read_head(stream: &mut TcpStream) -> (Vec<u8>, usize) {
     }
 }
 
-/// A temp `HOME` and `XDG_STATE_HOME` for one test.
 struct Sandbox {
     _tmp: tempfile::TempDir,
     home: PathBuf,
@@ -272,7 +252,6 @@ impl Sandbox {
         }
     }
 
-    /// Write the default config file, `~/.config/trawl/config.toml`.
     fn config(&self, toml: &str) {
         let dir = self.home.join(".config/trawl");
         std::fs::create_dir_all(&dir).unwrap();
@@ -298,7 +277,6 @@ impl Sandbox {
         cmd
     }
 
-    /// Run `trawl` with stdin closed.
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         let child = self
             .command(args, env)
@@ -323,7 +301,6 @@ impl Sandbox {
     }
 }
 
-/// Wait for `child` to exit, killing it at the deadline.
 fn finish(mut child: Child, args: &[&str]) -> Output {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -343,7 +320,6 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// `[server]` holding `url` and `token = T`.
 fn server(url: &str) -> String {
     format!("[server]\nurl = \"{url}\"\ntoken = \"{T}\"\n")
 }
@@ -352,8 +328,6 @@ fn server(url: &str) -> String {
 /// refusal must name as the target.
 type Case<'a> = (&'a str, Vec<&'a str>, Vec<(&'a str, &'a str)>, &'a str);
 
-/// The run failed with a binding refusal that names `credential` and
-/// `target` and both remedies, and none of `secrets`.
 fn assert_binding_refusal(
     output: &Output,
     credential: &str,
@@ -401,9 +375,6 @@ fn recorder_sees_a_keyed_request() {
     assert_eq!(seen.connections, seen.barriers + requests.len());
 }
 
-/// AC 1: `[server] url = A, token = T`, no key flag. A command pointed at
-/// B by `--url`, `TRAWL_URL`, or a profile's `url` fails before it sends
-/// anything, the TUI included, and so does a redirect from A to B.
 #[test]
 fn saved_key_never_reaches_another_base() {
     let home = Sandbox::new();
@@ -485,8 +456,6 @@ fn saved_key_never_reaches_another_base() {
     b.assert_untouched("B after a redirect");
 }
 
-/// AC 2: an exported key binds to `TRAWL_URL` or the saved base, a typed
-/// key goes where the command points, and a default port is no port.
 #[test]
 fn env_and_flag_provenance() {
     let home = Sandbox::new();
@@ -522,14 +491,12 @@ fn env_and_flag_provenance() {
     a.assert_untouched("A after the refusals");
     b.assert_untouched("B after the refusals");
 
-    // TRAWL_URL and TRAWL_TOKEN together send K to B.
     home.run(
         &["query", "*"],
         &[("TRAWL_URL", &b_url), ("TRAWL_TOKEN", K)],
     );
     b.assert_only_key(K, "TRAWL_URL=B TRAWL_TOKEN=K");
 
-    // A typed --token wins over TRAWL_TOKEN and goes to --url.
     let b2 = Recorder::start();
     home.run(
         &["--url", &b2.url(), "--token", K2, "query", "*"],
@@ -537,7 +504,6 @@ fn env_and_flag_provenance() {
     );
     b2.assert_only_key(K2, "--token K2 --url B, TRAWL_TOKEN=K");
 
-    // --token-file goes to --url, and TRAWL_TOKEN beside it is no conflict.
     let b3 = Recorder::start();
     let file = home.file("key", format!("{FK}\n").as_bytes());
     home.run(
@@ -557,7 +523,6 @@ fn env_and_flag_provenance() {
     home.run(&["query", "*"], &[("TRAWL_URL", &format!("{a_url}/"))]);
     a.assert_only_key(T, "TRAWL_URL=A/");
 
-    // TRAWL_TOKEN alone binds to the saved base and goes there.
     let c = Recorder::start();
     home.config(&format!("[server]\nurl = \"{}\"\n", c.url()));
     home.run(&["query", "*"], &[("TRAWL_TOKEN", K)]);
@@ -580,8 +545,8 @@ fn env_and_flag_provenance() {
     );
 }
 
-/// AC 5, through the binary: a saved URL with credentials is refused
-/// before any key is read, naming its source and never the URL.
+/// A saved URL with credentials is refused before any key is read, naming
+/// its source and never the URL.
 #[test]
 fn a_url_with_credentials_is_refused_without_echo() {
     let home = Sandbox::new();
@@ -606,9 +571,9 @@ fn a_url_with_credentials_is_refused_without_echo() {
     b.assert_untouched("B");
 }
 
-/// AC 6: `--token` with `--token-file` is a usage error, and a selected
-/// key source that is empty or unusable fails without falling back to
-/// `TRAWL_TOKEN` or the saved key, both of which would have been sent.
+/// A selected key source that is empty or unusable fails without falling
+/// back to `TRAWL_TOKEN` or the saved key, both of which would have been
+/// sent.
 #[test]
 fn key_sources_never_fall_through() {
     let home = Sandbox::new();
@@ -711,8 +676,6 @@ fn key_sources_never_fall_through() {
     a.assert_untouched("A: neither K nor T may be sent");
 }
 
-/// AC 8: `trawl validate` with a binding refusal is an error, not a
-/// silent local result.
 #[test]
 fn validate_refuses_a_binding_mismatch() {
     let home = Sandbox::new();
@@ -731,8 +694,6 @@ fn validate_refuses_a_binding_mismatch() {
     b.assert_untouched("B");
 }
 
-/// AC 8: with no key anywhere, `trawl validate` validates locally and
-/// contacts nothing.
 #[test]
 fn validate_without_any_credential_runs_locally() {
     let home = Sandbox::new();
@@ -780,11 +741,10 @@ fn embedded_mode_never_resolves() {
     b.assert_untouched("B");
 }
 
-/// The dynamic loader's search path, kept when the rest of the environment
-/// is cleared. It is not configuration trawl reads: the test runner sets it
-/// so a binary built in this target directory finds the libraries it links
-/// (libduckdb in CI's archive), and a child that lost it would die before
-/// it resolves anything. Every other variable stays cleared.
+/// The dynamic loader's search path. The test runner sets it so a binary
+/// built in this target directory finds the libraries it links (libduckdb
+/// in CI's archive), and a child that lost it would die before it resolves
+/// anything.
 fn loader_path() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
     [
         "LD_LIBRARY_PATH",

@@ -2,10 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Command palette types and fuzzy matching logic.
-//!
-//! Pure logic module — no I/O, no ratatui dependencies.
-
 use std::collections::HashSet;
 
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
@@ -13,22 +9,15 @@ use nucleo_matcher::{Config, Matcher, Utf32String};
 
 use super::state::{MainTab, SchemaBrowser};
 
-/// A single item in the command palette.
 #[derive(Debug, Clone)]
 pub struct PaletteItem {
-    /// Primary display text (e.g. "Execute Query", "nginx errors by host").
     pub label: String,
-    /// Optional secondary text (query body, field data type).
     pub detail: Option<String>,
-    /// Category for grouping and styling.
     pub category: PaletteCategory,
-    /// Keyboard shortcut hint (right-aligned in the UI).
     pub shortcut: Option<String>,
-    /// What happens when this item is selected.
     pub action: PaletteAction,
 }
 
-/// Item category — determines grouping order and visual styling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PaletteCategory {
     Action,
@@ -39,7 +28,6 @@ pub enum PaletteCategory {
 }
 
 impl PaletteCategory {
-    /// Display name used as a section header.
     pub fn header(self) -> &'static str {
         match self {
             Self::Action => "Actions",
@@ -51,22 +39,15 @@ impl PaletteCategory {
     }
 }
 
-/// Action to execute when a palette item is selected.
 #[derive(Debug, Clone)]
 pub enum PaletteAction {
-    /// Switch to a main tab.
     SwitchTab(MainTab),
-    /// Load a query into the editor (clear first, insert, focus editor).
     LoadQuery(String),
-    /// Insert text at the current cursor position in the editor.
     InsertAtCursor(String),
-    /// Execute a built-in action.
     RunAction(ActionKind),
-    /// Drill into a service's columns (appends "service." to palette input).
     DrillService(String),
 }
 
-/// Built-in actions available from the command palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     ExecuteQuery,
@@ -81,18 +62,13 @@ pub enum ActionKind {
     EnterColumnMode,
 }
 
-/// A filtered item with its match score and highlighted character positions.
 #[derive(Debug, Clone)]
 pub struct FilteredItem {
-    /// Index into the source `items` vec.
     pub item_index: usize,
-    /// Match score from nucleo (higher = better match).
     pub score: u32,
-    /// Character positions in the label that matched (for highlight rendering).
     pub match_positions: Vec<u32>,
 }
 
-/// Build the static action items (always available regardless of server state).
 fn action_items() -> Vec<PaletteItem> {
     vec![
         PaletteItem {
@@ -168,7 +144,6 @@ fn action_items() -> Vec<PaletteItem> {
     ]
 }
 
-/// Build tab-switching items.
 fn tab_items(is_admin: bool) -> Vec<PaletteItem> {
     let mut items = vec![
         PaletteItem {
@@ -212,10 +187,6 @@ fn tab_items(is_admin: bool) -> Vec<PaletteItem> {
     items
 }
 
-/// Build the full palette item catalog from current app state.
-///
-/// Rebuilt on open and on every input change while the input has no dot; a
-/// dotted input switches to [`build_service_column_items`] instead.
 pub fn build_palette_items(
     is_admin: bool,
     saved: Option<&trawl_client::ListSavedResponse>,
@@ -224,11 +195,9 @@ pub fn build_palette_items(
 ) -> Vec<PaletteItem> {
     let mut items = Vec::with_capacity(64);
 
-    // Static items.
     items.extend(action_items());
     items.extend(tab_items(is_admin));
 
-    // Saved queries.
     if let Some(saved) = saved {
         for sq in &saved.queries {
             items.push(PaletteItem {
@@ -241,7 +210,6 @@ pub fn build_palette_items(
         }
     }
 
-    // History (deduped by query text, most recent 5).
     if let Some(history) = history {
         let mut seen = HashSet::new();
         let mut count = 0;
@@ -262,7 +230,6 @@ pub fn build_palette_items(
         }
     }
 
-    // Services (one item per service with column count).
     if let Some(schema) = schema {
         for svc in &schema.services {
             items.push(PaletteItem {
@@ -278,9 +245,6 @@ pub fn build_palette_items(
     items
 }
 
-/// Build palette items for a specific service's columns.
-///
-/// Called when the palette input contains a dot (e.g. "nginx.").
 pub fn build_service_column_items(schema: &SchemaBrowser, service_name: &str) -> Vec<PaletteItem> {
     let Some(svc) = schema.services.iter().find(|s| s.name == service_name) else {
         return Vec::new();
@@ -301,11 +265,6 @@ pub fn build_service_column_items(schema: &SchemaBrowser, service_name: &str) ->
         .collect()
 }
 
-/// Compute ghost text completion suffix for the current palette input.
-///
-/// Returns the remaining characters that would complete the top fuzzy match,
-/// but only when the match is a case-insensitive prefix match (not a fuzzy
-/// mid-string hit).
 pub fn compute_ghost_text(
     input: &str,
     items: &[PaletteItem],
@@ -315,23 +274,18 @@ pub fn compute_ghost_text(
         return None;
     }
 
-    // Determine what we're completing: after-dot text matches column names,
-    // pre-dot text matches service names.
     let (prefix, target_category) = if let Some(dot_pos) = input.find('.') {
-        // Column mode: match text after the dot against column labels.
         let after_dot = &input[dot_pos + 1..];
         if after_dot.is_empty() {
             return None;
         }
-        (after_dot, None) // category is Service for columns too, match any
+        (after_dot, None)
     } else {
-        // Service mode: only ghost-complete service names.
         (input, Some(PaletteCategory::Service))
     };
 
     let prefix_lower = prefix.to_lowercase();
 
-    // Find the top filtered item that is a prefix match.
     for entry in filtered {
         let item = &items[entry.item_index];
         if target_category.is_some_and(|cat| item.category != cat) {
@@ -339,7 +293,6 @@ pub fn compute_ghost_text(
         }
         let label_lower = item.label.to_lowercase();
         if label_lower.starts_with(&prefix_lower) && label_lower.len() > prefix_lower.len() {
-            // Return the suffix preserving the original label's casing.
             return Some(item.label[prefix.len()..].to_string());
         }
     }
@@ -347,14 +300,8 @@ pub fn compute_ghost_text(
     None
 }
 
-/// Filter and score items against user input using fuzzy matching.
-///
-/// Returns all items when `input` is empty (in category order).
-/// Returns scored + sorted items when `input` is non-empty.
 pub fn refilter(input: &str, items: &[PaletteItem]) -> Vec<FilteredItem> {
     if input.is_empty() {
-        // Show all items in category order (preserves insertion order from
-        // `build_palette_items` which already groups by category).
         return items
             .iter()
             .enumerate()
@@ -379,20 +326,15 @@ pub fn refilter(input: &str, items: &[PaletteItem]) -> Vec<FilteredItem> {
         .iter()
         .enumerate()
         .filter_map(|(i, item)| {
-            // Try matching against label first.
             let haystack = Utf32String::from(item.label.as_str());
             let mut indices = Vec::new();
             let label_score = atom.indices(haystack.slice(..), &mut matcher, &mut indices);
 
-            // Also try matching against detail text (query body, field type).
             let detail_score = item.detail.as_ref().and_then(|d| {
                 let detail_haystack = Utf32String::from(d.as_str());
                 atom.score(detail_haystack.slice(..), &mut matcher)
             });
 
-            // Take the best score. If label matched, keep its indices for
-            // highlighting. If only detail matched, we highlight nothing in
-            // the label (the match is in the secondary text).
             match (label_score, detail_score) {
                 (Some(ls), Some(ds)) => {
                     let score = u32::from(ls).max(u32::from(ds));
@@ -437,7 +379,6 @@ mod tests {
     #[test]
     fn action_items_always_present() {
         let items = build_palette_items(false, None, None, None);
-        // Actions (10) + tabs (4, no dashboard) = 14
         assert_eq!(items.len(), 14);
         assert!(
             items.iter().all(
@@ -449,7 +390,7 @@ mod tests {
     #[test]
     fn admin_gets_dashboard_tab() {
         let items = build_palette_items(true, None, None, None);
-        assert_eq!(items.len(), 15); // 10 actions + 5 tabs
+        assert_eq!(items.len(), 15);
         assert!(items.iter().any(|i| i.label == "Go to Dashboard"));
     }
 
@@ -458,7 +399,6 @@ mod tests {
         let items = build_palette_items(false, None, None, None);
         let filtered = refilter("", &items);
         assert_eq!(filtered.len(), items.len());
-        // All scores should be 0 (unfiltered).
         assert!(filtered.iter().all(|f| f.score == 0));
     }
 
@@ -467,7 +407,6 @@ mod tests {
         let items = build_palette_items(false, None, None, None);
         let filtered = refilter("exec", &items);
         assert!(!filtered.is_empty());
-        // "Execute Query" should be the top match.
         let top = &items[filtered[0].item_index];
         assert_eq!(top.label, "Execute Query");
         assert!(!filtered[0].match_positions.is_empty());
@@ -508,7 +447,6 @@ mod tests {
             .iter()
             .filter(|i| i.category == PaletteCategory::History)
             .collect();
-        // Should be deduped to 1.
         assert_eq!(history_items.len(), 1);
     }
 
@@ -525,7 +463,6 @@ mod tests {
             }],
         };
         let items = build_palette_items(false, Some(&saved), None, None);
-        // Search for "stats count" — should match the query body in detail.
         let filtered = refilter("stats count", &items);
         let matched_labels: Vec<_> = filtered
             .iter()
@@ -673,7 +610,6 @@ mod tests {
         let items = build_palette_items(false, None, None, Some(&schema));
         let filtered = refilter("nginx", &items);
         let ghost = compute_ghost_text("nginx", &items, &filtered);
-        // "nginx" fully matches "nginx" — no suffix to complete.
         assert!(ghost.is_none());
     }
 }

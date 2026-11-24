@@ -5,21 +5,9 @@
 //! A real trawld, booted in-process, for the CLI suites that drive the
 //! `trawl` binary against a server.
 //!
-//! The server is trawld's own stack, booted the way trawl-server's
-//! integration fixture boots it: its own fleet and app databases minted
-//! from `DATABASE_URL`, the real boot path (advisory lock, migrations,
-//! corpus preparation) and the real HTTPS listener on an ephemeral port
-//! with a self-signed certificate the CLI pins. No compaction loop runs;
-//! a suite that needs ingested events in Parquet and in the catalog calls
-//! [`Server::compact`].
+//! No compaction loop runs; a suite that needs ingested events in Parquet
+//! and in the catalog calls [`Server::compact`].
 //!
-//! Each server drops the databases it minted in [`Server::stop`]. A
-//! panicking test leaves them behind under trawl-server's fixture naming
-//! scheme (`{prefix}_{run}_{pid}_{rand}`), which that suite's sweeper
-//! collects once the owning process is gone.
-//!
-//! Without `DATABASE_URL` a server does not boot and the test fails rather
-//! than skips: a real-server suite that silently skips proves nothing.
 //! Every binary that declares this module is in the ADR-0021 `postgres`
 //! nextest group.
 
@@ -51,20 +39,15 @@ const FLEET_DB_PREFIX: &str = "trawl_fleet_test";
 const FLEET_POOL_MAX: u32 = 3;
 const APP_POOL_MAX: u32 = 3;
 
-/// The fixture's default `[server] max_request_body_bytes`.
 pub const DEFAULT_BODY_LIMIT: usize = 128 * 1024;
 
 /// The permissions of the agent key: the recipe `trawl mcp` documents.
 pub const AGENT_PERMISSIONS: [&str; 3] = ["query", "schema_read", "validate"];
 
-/// What a test may vary about the server it boots.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// `[ingest] enabled`.
     pub ingest_enabled: bool,
-    /// `[server] max_request_body_bytes`.
     pub body_limit: usize,
-    /// `[server] link_origin`.
     pub link_origin: Option<String>,
     /// `[ingest] envs`, the env allowlist; empty keeps the default.
     pub envs: Vec<String>,
@@ -85,35 +68,24 @@ impl Default for Options {
     }
 }
 
-/// A running trawld and what a test needs to reach it.
 pub struct Server {
     pub url: String,
-    /// A key with `server_manage` and `query`.
     pub admin_token: String,
-    /// A key with `ingest` only: the trial's ingest-key shape.
     pub ingest_token: String,
-    /// A key with [`AGENT_PERMISSIONS`].
     pub agent_token: String,
-    /// The server's self-signed certificate, pinned by the CLI.
     pub cert_path: PathBuf,
-    /// The server's state, shared with its listener.
     pub state: AppState,
-    /// The WAL directory ingest writes.
     pub wal: PathBuf,
-    /// The data root compaction writes.
     pub data: PathBuf,
-    /// The fleet key store, for a test that mints keys of its own.
     keys: KeyStore,
     databases: Vec<String>,
     pools: Vec<PgPool>,
     serve_task: tokio::task::JoinHandle<()>,
-    /// Background jobs a test started, stopped with the server.
     background: Vec<tokio::task::JoinHandle<()>>,
     _dir: tempfile::TempDir,
 }
 
 impl Server {
-    /// Boot a trawld with ingest on or off.
     pub async fn start(ingest_enabled: bool) -> Self {
         Self::start_with(Options {
             ingest_enabled,
@@ -122,8 +94,6 @@ impl Server {
         .await
     }
 
-    /// Boot a trawld with ingest on or off and `max_request_body_bytes`
-    /// set to `body_limit`.
     pub async fn start_with_body_limit(ingest_enabled: bool, body_limit: usize) -> Self {
         Self::start_with(Options {
             ingest_enabled,
@@ -133,7 +103,6 @@ impl Server {
         .await
     }
 
-    /// Boot a trawld under `options`.
     #[allow(clippy::too_many_lines)] // linear assembly: two databases, one config, one boot
     pub async fn start_with(options: Options) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -291,8 +260,6 @@ impl Server {
         server
     }
 
-    /// Mint a key in a new role `role` holding `permissions`; returns
-    /// its token.
     pub async fn mint(&self, role: &str, permissions: &[&str]) -> String {
         mint_key(&self.keys, role, permissions).await
     }
@@ -306,8 +273,6 @@ impl Server {
             .expect("unassign the role");
     }
 
-    /// A `trawl-client` for this server as `token`, pinning its
-    /// certificate, with verification on.
     pub fn client(&self, token: &str) -> trawl_client::HttpClient {
         let pem = std::fs::read(&self.cert_path).expect("read cert");
         trawl_client::HttpClient::with_trust(
@@ -318,7 +283,6 @@ impl Server {
         .expect("build the client")
     }
 
-    /// Poll health until the listener answers, under one deadline.
     async fn wait_for_ready(&self) {
         let pem = std::fs::read(&self.cert_path).expect("read cert");
         let client = trawl_client::HttpClient::with_trust_timeout(
@@ -342,8 +306,6 @@ impl Server {
         }
     }
 
-    /// Accept `events` through `/api/v1/ingest` as the ingest key: into the
-    /// WAL and the hot buffer.
     pub async fn ingest(&self, events: &[serde_json::Value]) {
         let answer = self
             .client(&self.ingest_token)
@@ -353,9 +315,6 @@ impl Server {
         assert_eq!(answer.accepted, events.len(), "{answer:?}");
     }
 
-    /// One production compaction pass over the WAL into the data root,
-    /// draining the hot buffer and recording what it wrote in the field
-    /// catalog, as trawld's loop runs it.
     pub async fn compact(&self) {
         let state = &self.state;
         let ingest = trawl_config::IngestConfig::default();
@@ -378,10 +337,7 @@ impl Server {
         assert_eq!(failures, 0, "the compaction pass lost nothing");
     }
 
-    /// Start trawld's schema refresh job, as the daemon's `main` does, and
-    /// wait for a pass that fills the per-service schema cache with at
-    /// least `services` services. Without it `/api/v1/schema/services`
-    /// answers 503.
+    /// Without the schema refresh job `/api/v1/schema/services` answers 503.
     pub async fn refresh_schema(&mut self, services: usize) {
         self.background
             .push(trawl_server::schema_refresh::spawn_schema_refresh(
@@ -407,7 +363,6 @@ impl Server {
         }
     }
 
-    /// Stop serving and drop this server's databases.
     pub async fn stop(self) {
         self.serve_task.abort();
         for job in &self.background {
@@ -429,8 +384,6 @@ impl Server {
         }
     }
 
-    /// A config file that points the CLI at this server and pins its
-    /// certificate.
     pub fn config(&self, dir: &Path) -> PathBuf {
         let path = dir.join("config.toml");
         std::fs::write(
@@ -446,7 +399,6 @@ impl Server {
     }
 }
 
-/// The base admin DSN every database is minted from.
 fn admin_database_url() -> String {
     std::env::var("DATABASE_URL").expect(
         "DATABASE_URL must be set for this real-server suite \
@@ -454,8 +406,6 @@ fn admin_database_url() -> String {
     )
 }
 
-/// Create an empty database named under trawl-server's fixture scheme and
-/// return its DSN.
 async fn create_database(prefix: &str) -> String {
     use rand::Rng as _;
     let marker: String = std::env::var("NEXTEST_RUN_ID")
@@ -479,7 +429,6 @@ async fn create_database(prefix: &str) -> String {
     swap_database(&admin_url, &name)
 }
 
-/// Replace the database of a postgres URL, keeping any query string.
 fn swap_database(url: &str, db: &str) -> String {
     let (base, query) = url
         .split_once('?')
@@ -494,7 +443,6 @@ fn swap_database(url: &str, db: &str) -> String {
     }
 }
 
-/// The database a DSN names.
 fn database_name(url: &str) -> String {
     url.rsplit('/')
         .next()
@@ -527,7 +475,6 @@ fn metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
         .clone()
 }
 
-/// Seed a role holding `permissions` and mint a key in it.
 async fn mint_key(store: &KeyStore, role: &str, permissions: &[&str]) -> String {
     let permissions: Vec<RolePermission> = permissions
         .iter()

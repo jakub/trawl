@@ -7,9 +7,7 @@
 //! The driver sends to whatever TUI holds the socket, whichever server
 //! that TUI is connected to, so `-p trial` cannot make it reach the trial.
 //! It is refused before the socket is touched. A finished trial exists, so
-//! nothing else stops the command first. Each case points `--socket` at a
-//! listening Unix socket in a temp directory that counts the connections
-//! it receives.
+//! nothing else stops the command first.
 
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixListener;
@@ -17,10 +15,7 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// Run `trawl` with a temp `HOME` and `XDG_STATE_HOME`, the inherited
-/// `TRAWL_*` environment stripped, plus `env`, while `listener` accepts.
-/// Returns the output and how many connections reached the listener. An
-/// accepted connection is closed at once, so a driver that did connect
+/// An accepted connection is closed at once, so a driver that did connect
 /// fails instead of waiting for a TUI that is not there.
 fn trawl(
     home: &Path,
@@ -66,7 +61,6 @@ fn trawl(
     (child.wait_with_output().expect("output"), connections)
 }
 
-/// A finished trial under `home/state`, as `-p trial` reads it.
 fn finished_trial(home: &Path) {
     let dir = home.join("state/trawl/trial");
     std::fs::DirBuilder::new()
@@ -110,7 +104,6 @@ fn finished_trial(home: &Path) {
     }
 }
 
-/// Case name, flags before `driver`, extra environment.
 type Case<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, &'a str)]);
 
 #[test]
@@ -122,7 +115,6 @@ fn driver_is_refused_under_the_trial_profile_before_the_socket() {
     listener.set_nonblocking(true).expect("nonblocking");
     let socket = socket.to_str().unwrap();
 
-    // Control: without the profile, the driver does reach the socket.
     let (control, connections) = trawl(
         tmp.path(),
         &listener,

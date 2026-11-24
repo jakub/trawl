@@ -4,25 +4,14 @@
 
 //! Which Docker resources are the trial's, decided from their labels.
 //!
-//! The trial acts only on what carries its id (ADR-0045). The
-//! [`Inventory`] is every container, volume, and network in the union of:
-//!
-//! - the Compose project label `com.docker.compose.project=trawl-trial`,
-//! - the trial id label, whatever its value,
-//! - a name the trial reserves: the engine claim container, and the names
-//!   Compose gives the project's volumes and network. Compose adopts an
-//!   existing volume or network of that name with only a warning, so an
-//!   unlabelled one there must be refused, not reused.
-//!
-//! [`classify`] calls a resource in that union foreign when its id label is
-//! missing or differs from ours, and every mutating verb refuses before
-//! mutation when anything is foreign.
+//! The trial acts only on what carries its id (ADR-0045). Compose adopts an
+//! existing volume or network of a reserved name with only a warning, so an
+//! unlabelled one there must be refused, not reused.
 //!
 //! One trial per engine is enforced by the claim: a container named
 //! [`CLAIM_NAME`], labelled with the trial id, created and never started
-//! before any other resource. A second trial's create fails on the name.
-//! The claim carries no Compose project label, so Compose never treats it
-//! as an orphan.
+//! before any other resource. The claim carries no Compose project label,
+//! so Compose never treats it as an orphan.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -34,9 +23,7 @@ use super::docker::{Args, Docker, PROBE_TIMEOUT, Sensitivity, failure};
 use super::state::ImageRecord;
 use super::{CLAIM_NAME, LABEL_ID, PROJECT};
 
-/// Compose's project label.
 const PROJECT_LABEL: &str = "com.docker.compose.project";
-/// Compose's label on `compose run` containers.
 const ONEOFF_LABEL: &str = "com.docker.compose.oneoff";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -56,18 +43,14 @@ impl fmt::Display for Kind {
     }
 }
 
-/// A container, volume, or network in the trial's union.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resource {
     pub kind: Kind,
     /// The full ID; a volume's name is its ID.
     pub id: String,
     pub name: String,
-    /// The Compose project label, when present and non-empty.
     pub project: Option<String>,
-    /// The trial id label, when present and non-empty.
     pub trial_id: Option<String>,
-    /// A `compose run` container.
     pub oneoff: bool,
     /// A container's state (`running`, `exited`, ...); empty otherwise.
     pub state: String,
@@ -81,7 +64,6 @@ impl Resource {
     }
 }
 
-/// The names the trial reserves for a kind of resource.
 fn reserved_names(kind: Kind) -> Vec<String> {
     match kind {
         Kind::Container => vec![CLAIM_NAME.to_owned()],
@@ -90,13 +72,11 @@ fn reserved_names(kind: Kind) -> Vec<String> {
     }
 }
 
-/// The trial's union of resources on the engine.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Inventory {
     pub resources: Vec<Resource>,
 }
 
-/// One line of the listing formats below.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Listed {
@@ -126,7 +106,6 @@ fn label(key: &str) -> String {
     format!(r#"(.Label "{key}")"#)
 }
 
-/// Every container, stopped ones included, with full IDs.
 fn containers_args() -> Args {
     let format = format(&[
         ("id", ".ID"),
@@ -148,7 +127,6 @@ fn volumes_args() -> Args {
     Args::new().args(["volume", "ls", "--format", &format])
 }
 
-/// Every network, with full IDs.
 fn networks_args() -> Args {
     let format = format(&[
         ("id", ".ID"),
@@ -189,7 +167,6 @@ fn list(resources: &[Foreign]) -> String {
 }
 
 impl Inventory {
-    /// Build the inventory from the three listings, keeping the union.
     pub fn from_listings(
         containers: &str,
         volumes: &str,
@@ -234,8 +211,6 @@ impl Inventory {
         Ok(Self { resources })
     }
 
-    /// List the engine's containers, volumes, and networks and keep the
-    /// trial's union.
     pub async fn scan(docker: &Docker) -> Result<Self, super::TrialError> {
         let mut texts = Vec::with_capacity(3);
         for args in [containers_args(), volumes_args(), networks_args()] {
@@ -248,12 +223,10 @@ impl Inventory {
     }
 }
 
-/// A resource that is not ours, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Foreign {
     pub kind: Kind,
     pub name: String,
-    /// The id it carries; `None` when it carries none.
     pub trial_id: Option<String>,
 }
 
@@ -266,19 +239,14 @@ impl fmt::Display for Foreign {
     }
 }
 
-/// Whose resources are on the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ownership {
-    /// Nothing in the union.
     Empty,
-    /// Everything in the union carries our id.
     Ours,
-    /// At least one resource in the union is not ours.
     Foreign(Vec<Foreign>),
 }
 
 impl Ownership {
-    /// Refuse when anything is foreign.
     pub fn require_not_foreign(self) -> Result<Self, OwnershipError> {
         match self {
             Self::Foreign(resources) => Err(OwnershipError::Foreign { resources }),
@@ -287,9 +255,6 @@ impl Ownership {
     }
 }
 
-/// Classify the inventory against our trial id. With no id (no state on
-/// this host), every resource in the union is foreign: a trial never
-/// adopts what it cannot prove it made.
 pub fn classify(inventory: &Inventory, our_id: Option<&str>) -> Ownership {
     if inventory.resources.is_empty() {
         return Ownership::Empty;
@@ -311,12 +276,10 @@ pub fn classify(inventory: &Inventory, our_id: Option<&str>) -> Ownership {
     Ownership::Foreign(foreign)
 }
 
-/// Our `compose run` containers that have not finished: a killed `up` can
-/// leave one running (a `keys create` that commits after the rerun lists
-/// keys), so `up` and `stop` wait for these, then refuse, and `down` waits
-/// for the running ones, then lists them all for approval. A `created`
-/// one-off counts too: a Compose client killed after the engine accepted
-/// its create and start can leave one that starts late.
+/// A killed `up` can leave one running (a `keys create` that commits after
+/// the rerun lists keys). A `created` one-off counts too: a Compose client
+/// killed after the engine accepted its create and start can leave one that
+/// starts late.
 pub fn unfinished_oneoffs<'a>(inventory: &'a Inventory, our_id: &str) -> Vec<&'a Resource> {
     inventory
         .resources
@@ -336,9 +299,8 @@ pub fn oneoff_remove_args(id: &str) -> Args {
     Args::new().args(["container", "rm", "--", id])
 }
 
-/// `docker container create` of the claim: never started, no ports, no
-/// restart policy, and no Compose label. It names the recorded image id,
-/// never the reference, as the Compose file does.
+/// It names the recorded image id, never the reference, as the Compose
+/// file does.
 pub fn claim_create_args(trial_id: &str, image: &ImageRecord) -> Args {
     Args::new()
         .args(["container", "create", "--name", CLAIM_NAME, "--label"])
@@ -346,7 +308,6 @@ pub fn claim_create_args(trial_id: &str, image: &ImageRecord) -> Args {
         .args([image.id.as_str(), "true"])
 }
 
-/// `docker container inspect` of the claim's labels.
 pub fn claim_inspect_args() -> Args {
     Args::new().args([
         "container",
@@ -357,12 +318,9 @@ pub fn claim_inspect_args() -> Args {
     ])
 }
 
-/// What an existing claim means for us.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimDecision {
-    /// It carries our id: an earlier run of this trial made it.
     Proceed,
-    /// Another trial, or something else, holds the engine.
     Refuse { holder: Option<String> },
 }
 
@@ -383,23 +341,20 @@ pub fn decide_claim(labels_json: &[u8], our_id: &str) -> Result<ClaimDecision, O
     })
 }
 
-/// What [`claim`] observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claimed {
-    /// This call created the claim.
     Created,
-    /// Our inspect found the claim carrying our id.
     Existing,
     /// Our inspect found the claim carrying another id, or none: another
     /// trial, or something else, holds the engine, and nothing of ours
     /// was created. Every create carries our id, so this is the one
     /// outcome that proves no claim of ours exists.
-    Foreign { holder: Option<String> },
+    Foreign {
+        holder: Option<String>,
+    },
 }
 
 impl Claimed {
-    /// Go on only when the claim is ours; refuse a foreign one, naming
-    /// its holder.
     pub fn require_ours(self) -> Result<Self, OwnershipError> {
         match self {
             Self::Foreign { holder } => Err(OwnershipError::Foreign {
@@ -414,9 +369,6 @@ impl Claimed {
     }
 }
 
-/// Take the engine for `trial_id`, atomically: create the claim, and if
-/// the create fails, inspect the claim to learn whose it is.
-///
 /// A failed create proves nothing about the claim: an engine can carry
 /// out a create and then fail the response, for example when an
 /// authorization plugin denies it, and a timeout or a lost connection can
@@ -436,9 +388,6 @@ pub async fn claim(
     if created.status.success() {
         return Ok(Claimed::Created);
     }
-    // The create failed. If a claim exists, the inspect says whose it is;
-    // if the inspect finds none, the create's own error is the one to
-    // report.
     let existing = docker
         .output(
             &claim_inspect_args(),
@@ -491,8 +440,6 @@ mod tests {
             .to_string()
     }
 
-    /// A full trial of ours, plus an unrelated project that must be
-    /// ignored.
     fn our_trial() -> (String, String, String) {
         let containers = [
             container("trawl-trial-postgres-1", PROJECT, OURS, "False", "running"),
@@ -598,8 +545,6 @@ mod tests {
         assert!(message.contains("docker rm"), "{message}");
     }
 
-    /// Compose would adopt an unlabelled volume of the project's name
-    /// with only a warning.
     #[test]
     fn an_unlabelled_resource_with_a_reserved_name_is_foreign() {
         let inv = Inventory::from_listings(
@@ -722,8 +667,6 @@ mod tests {
             .iter()
             .map(|r| r.name.as_str())
             .collect();
-        // A `created` one-off may still start: a killed Compose client can
-        // leave the engine between its create and its start.
         assert_eq!(
             names,
             [
@@ -751,7 +694,6 @@ mod tests {
         );
     }
 
-    /// The trawl image as `up` records it: the claim must name the id.
     fn image() -> ImageRecord {
         ImageRecord {
             reference: "ghcr.io/jakub/trawl:0.9.0".into(),
@@ -804,11 +746,6 @@ mod tests {
         }
     }
 
-    /// The claim decision table. `lifecycle::create` deletes the state a
-    /// first `up` wrote only on a `Foreign` row: our inspect saw the claim
-    /// carrying another id, or none, so no claim of ours exists. Every
-    /// `Err` row keeps the state, because the claim may exist with our id;
-    /// the error names the create's failure, or the inspect's.
     #[tokio::test]
     async fn claim_decision_table() {
         let fail = |stderr: &str| format!("echo '{stderr}' >&2; exit 1");

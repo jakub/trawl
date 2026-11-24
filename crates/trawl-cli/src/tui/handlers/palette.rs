@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Command palette key handling and action dispatch.
-
 use crossterm::event::{self, KeyCode, KeyModifiers};
 
 use super::super::App;
@@ -15,15 +13,12 @@ use super::super::state::{Focus, MainTab, Popup, SimpleEditor};
 use super::super::ui;
 
 impl App {
-    /// Handle key events when the command palette is open.
-    #[allow(clippy::too_many_lines)] // Palette key dispatch requires many destructured arms
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn handle_command_palette_key(&mut self, key: event::KeyEvent) {
         match (key.modifiers, key.code) {
-            // Close palette.
             (KeyModifiers::NONE, KeyCode::Esc) | (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
                 self.popup = None;
             }
-            // Execute selected item.
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 let action = {
                     let Some(Popup::CommandPalette {
@@ -40,7 +35,6 @@ impl App {
                         .map(|f| items[f.item_index].action.clone())
                 };
                 if let Some(PaletteAction::DrillService(ref name)) = action {
-                    // Drill into service columns — don't close the palette.
                     let new_input = format!("{name}.");
                     self.set_palette_input(&new_input);
                 } else {
@@ -50,7 +44,6 @@ impl App {
                     }
                 }
             }
-            // Accept ghost text completion.
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 let suffix = {
                     let Some(Popup::CommandPalette { ref ghost, .. }) = self.popup else {
@@ -71,7 +64,6 @@ impl App {
                     self.refresh_palette_state();
                 }
             }
-            // Move selection up.
             (KeyModifiers::NONE, KeyCode::Up) => {
                 if let Some(Popup::CommandPalette {
                     ref mut selected, ..
@@ -80,7 +72,6 @@ impl App {
                     *selected = selected.saturating_sub(1);
                 }
             }
-            // Move selection down.
             (KeyModifiers::NONE, KeyCode::Down) => {
                 if let Some(Popup::CommandPalette {
                     ref mut selected,
@@ -92,11 +83,9 @@ impl App {
                     *selected = (*selected + 1).min(max);
                 }
             }
-            // Clear filter text.
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
                 self.set_palette_input("");
             }
-            // Delete last character.
             (KeyModifiers::NONE, KeyCode::Backspace) => {
                 let new_input = {
                     let Some(Popup::CommandPalette {
@@ -119,7 +108,6 @@ impl App {
                 };
                 self.set_palette_input(&new_input);
             }
-            // Type a character into the filter.
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
                 let new_input = {
                     let Some(Popup::CommandPalette {
@@ -142,10 +130,7 @@ impl App {
         }
     }
 
-    /// Set the palette input text and rebuild every piece of derived state:
-    /// dot-aware item list, filter, ghost text.
     fn set_palette_input(&mut self, new_input: &str) {
-        // A dot switches the item list from the whole palette to one service's columns.
         let (items, filter_text) = if let Some(dot_pos) = new_input.find('.') {
             let service_prefix = &new_input[..dot_pos];
             let after_dot = &new_input[dot_pos + 1..];
@@ -188,10 +173,6 @@ impl App {
         }
     }
 
-    /// Refresh palette items, filter, and ghost text from the current input.
-    ///
-    /// Called after Tab (ghost text acceptance) to recompute derived state
-    /// without changing the input text.
     fn refresh_palette_state(&mut self) {
         let input = {
             let Some(Popup::CommandPalette { ref input, .. }) = self.popup else {
@@ -202,7 +183,6 @@ impl App {
         self.set_palette_input(&input);
     }
 
-    /// Dispatch a palette action — called after the palette closes.
     fn execute_palette_action(&mut self, action: PaletteAction) {
         match action {
             PaletteAction::SwitchTab(tab) => {
@@ -232,7 +212,6 @@ impl App {
         }
     }
 
-    /// Execute a built-in action by kind.
     fn execute_palette_builtin(&mut self, kind: ActionKind) {
         match kind {
             ActionKind::ExecuteQuery => {

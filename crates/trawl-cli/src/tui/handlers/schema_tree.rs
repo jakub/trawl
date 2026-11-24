@@ -2,24 +2,19 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Schema tree view key handling — expand/collapse, navigation, field insertion.
-
 use crossterm::event::{self, KeyCode, KeyModifiers};
 
 use super::super::App;
 use super::super::state::{Focus, MainTab};
 
 impl App {
-    /// Handle key events for the schema tree view.
     pub(crate) fn handle_schema_tree_key(&mut self, key: event::KeyEvent) {
         if self.panel.schema.is_none() {
             return;
         }
 
-        // Compute visible node count for bounds (borrows self immutably).
         let node_count = self.visible_tree_node_count();
 
-        // Dispatch Enter/Right/Left to their own methods (which re-borrow self).
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 self.handle_tree_enter();
@@ -36,7 +31,6 @@ impl App {
             _ => {}
         }
 
-        // Navigation keys that only update cursor position.
         let schema = self.panel.schema.as_mut().unwrap();
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Up) => {
@@ -61,10 +55,6 @@ impl App {
         }
     }
 
-    /// Count visible nodes in the flattened schema tree.
-    ///
-    /// Layout: common header + common fields, then per-service rows
-    /// (each service + its unique fields when expanded).
     pub(crate) fn visible_tree_node_count(&self) -> usize {
         let Some(schema) = self.panel.schema.as_ref() else {
             return 0;
@@ -78,7 +68,6 @@ impl App {
 
         let mut count = 0;
 
-        // Common fields section.
         if !schema.common_fields.is_empty() {
             let any_common_match = filter.is_empty()
                 || schema
@@ -86,7 +75,7 @@ impl App {
                     .iter()
                     .any(|f| f.name.to_lowercase().contains(&filter));
             if any_common_match {
-                count += 1; // header
+                count += 1;
                 count += schema
                     .common_fields
                     .iter()
@@ -95,7 +84,6 @@ impl App {
             }
         }
 
-        // Per-service rows.
         for svc in &schema.services {
             let unique_fields: Vec<_> = svc
                 .columns
@@ -113,7 +101,7 @@ impl App {
                 }
             }
 
-            count += 1; // service node
+            count += 1;
             if schema.expanded.contains(&svc.name) {
                 count += unique_fields.len();
             }
@@ -121,10 +109,6 @@ impl App {
         count
     }
 
-    /// Resolve the selected tree row into `(kind, name, service)`.
-    ///
-    /// `kind` is one of `common_header`, `common_field`, `service`, `service_field`.
-    /// The third element carries the owning service, and only `service_field` has one.
     fn resolve_selected_node(&self) -> Option<(&str, String, Option<String>)> {
         let schema = self.panel.schema.as_ref()?;
         let filter = schema.filter.to_lowercase();
@@ -137,7 +121,6 @@ impl App {
         let target = schema.selected;
         let mut idx = 0;
 
-        // Common fields section.
         if !schema.common_fields.is_empty() {
             let visible_common: Vec<_> = schema
                 .common_fields
@@ -147,7 +130,6 @@ impl App {
             let any_common_match = !visible_common.is_empty() || filter.is_empty();
 
             if any_common_match && !visible_common.is_empty() {
-                // Header row.
                 if idx == target {
                     return Some(("common_header", String::new(), None));
                 }
@@ -159,7 +141,6 @@ impl App {
                     idx += 1;
                 }
             } else if any_common_match {
-                // Header row only (empty visible due to filter edge case).
                 if idx == target {
                     return Some(("common_header", String::new(), None));
                 }
@@ -167,7 +148,6 @@ impl App {
             }
         }
 
-        // Per-service rows.
         for svc in &schema.services {
             let unique_fields: Vec<_> = svc
                 .columns
@@ -202,8 +182,7 @@ impl App {
         None
     }
 
-    /// Find the flat index of the parent service node for the currently selected node.
-    #[allow(unused_assignments)] // last_service_idx initial value is a fallback, always overwritten in loop
+    #[allow(unused_assignments)]
     fn find_parent_service_index(&self) -> Option<usize> {
         let schema = self.panel.schema.as_ref()?;
         let filter = schema.filter.to_lowercase();
@@ -217,7 +196,6 @@ impl App {
         let mut idx = 0;
         let mut last_service_idx = 0;
 
-        // Skip common fields section.
         if !schema.common_fields.is_empty() {
             let any_common_match = filter.is_empty()
                 || schema
@@ -225,7 +203,7 @@ impl App {
                     .iter()
                     .any(|f| f.name.to_lowercase().contains(&filter));
             if any_common_match {
-                idx += 1; // header
+                idx += 1;
                 idx += schema
                     .common_fields
                     .iter()
@@ -269,8 +247,6 @@ impl App {
         None
     }
 
-    /// Enter toggles a service node's expansion; on a field it inserts the DSL-quoted
-    /// name into the editor and jumps to the Query tab.
     fn handle_tree_enter(&mut self) {
         let Some((kind, name, _svc)) = self.resolve_selected_node() else {
             return;
@@ -297,7 +273,6 @@ impl App {
         }
     }
 
-    /// Handle Right arrow on a tree node (expand service).
     fn handle_tree_expand(&mut self) {
         let Some((kind, name, _)) = self.resolve_selected_node() else {
             return;
@@ -308,7 +283,6 @@ impl App {
         }
     }
 
-    /// Handle Left arrow on a tree node (collapse or jump to parent).
     fn handle_tree_collapse(&mut self) {
         let Some((kind, name, _)) = self.resolve_selected_node() else {
             return;

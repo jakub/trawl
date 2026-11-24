@@ -25,11 +25,6 @@
 //!   15-minute range.
 //! - The three `service=tutorial` events that the query tutorial uses sit
 //!   at exactly `A`, the newest sample timestamp.
-//!
-//! Ingest has no idempotency key. [`decide_samples`] therefore never posts
-//! over a count it cannot explain, and trawld's own self-telemetry, which
-//! is on in a trial, never enters that decision because only the sample
-//! services are compared.
 
 use std::collections::BTreeMap;
 
@@ -38,7 +33,6 @@ use serde_json::{Value, json};
 
 use super::state::Samples;
 
-/// The seed `up` uses.
 pub const SAMPLE_SEED: u64 = 203;
 
 /// Every generated service puts events in `[anchor - RECENT, anchor)`.
@@ -47,7 +41,6 @@ const RECENT: TimeDelta = TimeDelta::minutes(10);
 /// The oldest sample is no older than `anchor - SPAN`.
 const SPAN: TimeDelta = TimeDelta::hours(24);
 
-/// Event counts by level for one service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LevelCounts {
     pub debug: u64,
@@ -101,7 +94,6 @@ impl Level {
     }
 }
 
-/// One generated service: its fixed counts and what the seed picks from.
 #[derive(Debug)]
 pub struct ServicePlan {
     pub name: &'static str,
@@ -229,14 +221,12 @@ pub const SERVICES: [ServicePlan; 5] = [
     },
 ];
 
-/// The service of the query tutorial's events.
 pub const TUTORIAL_SERVICE: &str = "tutorial";
 
 const TUTORIAL_HOST: &str = "tutorial-host";
 
 /// `(level, message, duration)` of the three events that
-/// `use/query-tutorial.md` queries, as `getting-started/first-query.md`
-/// used to send them.
+/// `use/query-tutorial.md` queries.
 const TUTORIAL_EVENTS: [(&str, &str, u64); 3] = [
     ("info", "server started", 12),
     ("error", "connection refused", 1500),
@@ -255,7 +245,6 @@ pub const QUICK_START_QUERIES: [&str; 4] = [
     "service=web _severity>=warn | timechart span=5m count()",
 ];
 
-/// The service the documented query counts.
 const DOCUMENTED_SERVICE: &str = "checkout";
 
 /// The query the trial tutorial runs. It has no time clause: `trawl query`
@@ -265,7 +254,6 @@ const DOCUMENTED_SERVICE: &str = "checkout";
 pub const DOCUMENTED_QUERY: &str =
     "service=checkout _severity>=error | stats count() as errors by service";
 
-/// The one row [`DOCUMENTED_QUERY`] returns once the samples are complete.
 pub fn documented_row() -> Value {
     let plan = SERVICES
         .iter()
@@ -274,18 +262,15 @@ pub fn documented_row() -> Value {
     json!({ "service": DOCUMENTED_SERVICE, "errors": plan.counts.error })
 }
 
-/// A generated sample set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampleSet {
     /// One JSON object per event, oldest first.
     pub events: Vec<Value>,
-    /// The oldest event's time.
     pub first: DateTime<Utc>,
     /// The newest event's time: the anchor, truncated to milliseconds.
     pub last: DateTime<Utc>,
 }
 
-/// Events per sample service. It does not depend on the seed.
 pub fn expected_counts() -> BTreeMap<&'static str, u64> {
     let mut counts: BTreeMap<&'static str, u64> = SERVICES
         .iter()
@@ -295,8 +280,6 @@ pub fn expected_counts() -> BTreeMap<&'static str, u64> {
     counts
 }
 
-/// Generate the sample set for `seed`, ending at `anchor`.
-///
 /// The same `(seed, anchor)` gives the same events, byte for byte. The
 /// anchor is truncated to whole milliseconds, the precision of every
 /// sample timestamp, so an anchor read back from `state.json` generates
@@ -384,7 +367,6 @@ pub fn rfc3339(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// The verified state of `set`, generated from `seed`.
 pub fn complete(seed: u64, set: &SampleSet) -> Samples {
     Samples::Complete {
         seed,
@@ -425,7 +407,6 @@ impl SplitMix64 {
     }
 }
 
-/// What `up` does about sample data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SampleAction {
     /// Record `Intent`, then post the samples once.
@@ -458,9 +439,6 @@ pub enum SampleAction {
     },
 }
 
-/// Decide what `up` does about samples, from the recorded state, whether
-/// this `up` asked for samples, and the observed per-service counts.
-///
 /// `observed` may carry services other than the sample services, such as
 /// trawld's self-telemetry; those are ignored, and a missing sample
 /// service counts as zero.
@@ -475,12 +453,6 @@ pub enum SampleAction {
 /// That is the table for an `up` without `--no-sample-data`. With it,
 /// nothing is posted: every refusal becomes a decline, keep declined
 /// becomes skip, and mark complete and skip stay.
-///
-/// An `Intent` whose post landed exactly is complete. Any other count
-/// leaves that post's result unknown, and posting again could duplicate
-/// it. A sample service that holds events no post of this trial accounts
-/// for could be duplicated too. Both refusals name `--no-sample-data`, and
-/// the decline it leads to lasts: no later `up` refuses or posts.
 pub fn decide_samples(
     state: &Samples,
     requested: bool,
@@ -526,7 +498,6 @@ pub fn decide_samples(
     }
 }
 
-/// The observed count of every sample service, zero when absent.
 fn sample_counts(observed: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
     expected_counts()
         .into_keys()
@@ -666,7 +637,6 @@ mod tests {
         assert_eq!(times.last(), Some(&set.last));
         assert!(times.iter().all(|t| *t >= set.first && *t <= set.last));
 
-        // A stored anchor reproduces the set.
         let stored = set.last.to_rfc3339_opts(SecondsFormat::Millis, true);
         let reread = DateTime::parse_from_rfc3339(&stored)
             .unwrap()
@@ -702,8 +672,6 @@ mod tests {
         assert!(trawl_config::DEFAULT_SEVERITY_FROM.contains(&"level"));
     }
 
-    /// The recent slice holds exactly its constants for every seed, and
-    /// holds what each quick-start example needs under a 15-minute range.
     #[test]
     fn the_recent_slice_answers_every_quick_start_example() {
         for seed in [0, SAMPLE_SEED, u64::MAX] {
@@ -748,7 +716,6 @@ mod tests {
         }
     }
 
-    /// The query tutorial's three events, at one timestamp.
     #[test]
     fn the_tutorial_events_match_the_query_tutorial() {
         let set = generate(SAMPLE_SEED, anchor());
@@ -768,9 +735,6 @@ mod tests {
         );
     }
 
-    /// The browser's examples, and the copies the CI trial proof runs
-    /// (`scripts/release/test-trial.sh`) together with the documented query
-    /// and row it asserts.
     #[test]
     fn quick_start_queries_are_the_browsers_literals() {
         let source = include_str!("../../../trawl-web-ui/src/components/search_quick_start.rs");
@@ -795,8 +759,6 @@ mod tests {
         );
     }
 
-    /// The documented query has no time clause, so its row does not age,
-    /// and the row is what the generated events imply.
     #[test]
     fn the_documented_row_is_what_the_counts_imply() {
         let query =
@@ -976,8 +938,6 @@ mod tests {
         ]);
     }
 
-    /// A declined trial never posts and never refuses, whatever the
-    /// sample services hold.
     #[test]
     fn decide_samples_once_declined_never_posts() {
         use SampleAction::{KeepDeclined, Skip};
@@ -1023,8 +983,6 @@ mod tests {
         ]);
     }
 
-    /// A refusal reports every sample service and nothing else, so its
-    /// recovery text never quotes self-telemetry.
     #[test]
     fn a_refusal_reports_only_sample_services() {
         let observed = BTreeMap::from([("web".to_owned(), 3), ("trawld".to_owned(), 9)]);

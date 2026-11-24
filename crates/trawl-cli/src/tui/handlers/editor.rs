@@ -11,7 +11,6 @@ use super::super::state::Focus;
 use super::super::{App, clipboard_get, clipboard_set};
 
 impl App {
-    /// Recompute ghost-text autocomplete for the current editor state.
     pub(crate) fn update_ghost_text(&mut self) {
         let schema_fields: Vec<autocomplete::SchemaField> = self
             .schema_cache
@@ -45,7 +44,6 @@ impl App {
             .unwrap_or_default();
 
         let tab = &self.tab;
-        // Don't show ghost text when there's an active selection.
         if tab.editor.selection_anchor.is_some() {
             self.tab.ghost = None;
             return;
@@ -58,7 +56,6 @@ impl App {
         self.tab.ghost = autocomplete::complete(&text, cursor_byte, &schema_fields);
     }
 
-    /// Accept the current ghost-text completion.
     pub(crate) fn accept_ghost_completion(&mut self) {
         if let Some(ghost) = self.tab.ghost.take() {
             self.tab.editor.replace_at_cursor(
@@ -71,7 +68,6 @@ impl App {
         }
     }
 
-    /// Handle key events when editor is focused.
     #[allow(clippy::too_many_lines)] // Inherently large key dispatch
     pub(crate) fn handle_editor_key(&mut self, key: event::KeyEvent) {
         tracing::debug!(
@@ -81,7 +77,6 @@ impl App {
         );
 
         match (key.modifiers, key.code) {
-            // Tab: accept ghost completion if active, otherwise switch to results.
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 if self.tab.ghost.is_some() {
                     self.accept_ghost_completion();
@@ -89,7 +84,6 @@ impl App {
                 }
                 self.focus = Focus::Results;
             }
-            // Esc: dismiss ghost text and clear selection.
             (KeyModifiers::NONE, KeyCode::Esc) => {
                 self.tab.ghost = None;
                 self.tab.editor.clear_selection();
@@ -221,12 +215,10 @@ impl App {
                     tab.mark_editor_dirty();
                 }
             }
-            // Kill word before cursor: Ctrl+W / Ctrl+Backspace
             (KeyModifiers::CONTROL, KeyCode::Char('w') | KeyCode::Backspace) => {
                 self.active_tab_mut().editor.delete_word_before();
                 self.active_tab_mut().mark_editor_dirty();
             }
-            // Kill word after cursor: Ctrl+Delete / Alt+D
             (KeyModifiers::CONTROL, KeyCode::Delete) | (KeyModifiers::ALT, KeyCode::Char('d')) => {
                 self.active_tab_mut().editor.delete_word_after();
                 self.active_tab_mut().mark_editor_dirty();
@@ -297,7 +289,6 @@ impl App {
             }
         }
 
-        // Recompute ghost text after every editor keypress.
         self.update_ghost_text();
     }
 }

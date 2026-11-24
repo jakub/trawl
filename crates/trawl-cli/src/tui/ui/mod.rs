@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! UI rendering dispatch.
-
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::macros::vertical;
@@ -24,7 +22,6 @@ pub mod schema;
 pub mod status;
 pub mod tabs;
 
-/// Main render function — dispatches to submodules based on app state.
 pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     // Fill entire frame with surface background so unpainted cells (spacer rows,
     // gaps between widgets) use the theme color instead of the terminal default.
@@ -39,11 +36,8 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     }
 }
 
-/// Render the Query tab: tab bar, editor, [validation hint or advice],
-/// results, status bar.
 fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
     let has_validation_hint = !app.active_tab().validation_errors.is_empty();
-    // Errors take precedence: the advice region exists only without them.
     let advice_height = if has_validation_hint {
         0
     } else {
@@ -69,7 +63,6 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
         (editor, None, None, results, status)
     };
 
-    // Populate layout areas for mouse hit-testing.
     app.layout = LayoutAreas {
         tab_bar: Rect {
             height: 2,
@@ -106,15 +99,13 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
     // Popup last so it paints over everything else.
     popup::render(app, frame);
 
-    // Set cursor position based on focus (adjusted for scroll offset).
-    // When wrapping is active, use visual coordinates from the wrap map.
     if app.focus == Focus::Editor && app.popup.is_none() {
         let tab = app.active_tab();
         let (vrow, vcol) = tab.editor.visual_cursor();
         let scroll_row = tab.editor.scroll_row;
         // +2 for x: border (1) + horizontal padding (1)
         // +1 for y: border (1) only
-        #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are always < u16::MAX
+        #[allow(clippy::cast_possible_truncation)]
         let x = editor_area.x + vcol as u16 + 2;
         #[allow(clippy::cast_possible_truncation)]
         let y = editor_area.y + vrow.saturating_sub(scroll_row) as u16 + 1;
@@ -122,9 +113,6 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
     }
 }
 
-/// Rows the advice region takes in a query layout over `area`: the rows
-/// [`editor::advice_rows`] lays out at the full width, within
-/// [`advice_row_budget`]. Zero when the draft has no advice to show.
 fn advice_region_height(app: &App, area: Rect) -> u16 {
     app.active_tab().draft_advice().map_or(0, |report| {
         let rows = editor::advice_rows(report, area.width, advice_row_budget(area.height));
@@ -140,7 +128,6 @@ fn advice_row_budget(height: u16) -> u16 {
     height.saturating_sub(RESERVED).min(height / 3)
 }
 
-/// Render the Dashboard tab: tab bar, dashboard content, status bar.
 fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
     use ratatui::style::Style;
     use ratatui::widgets::Paragraph;
@@ -186,7 +173,6 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
     popup::render(app, frame);
 }
 
-/// Render a non-Query tab: tab bar, full-width panel content, status bar.
 fn render_panel_layout(app: &mut App, frame: &mut Frame<'_>) {
     let [tab_bar, panel, status_area] = vertical![==2, >=1, ==1].areas(frame.area());
 
@@ -207,8 +193,6 @@ fn render_panel_layout(app: &mut App, frame: &mut Frame<'_>) {
     popup::render(app, frame);
 }
 
-/// Compute the popup area for hit-testing based on the active popup type.
-///
 /// Uses the same percentages as each popup's render function so click-outside
 /// detection is accurate.
 fn popup_area(popup: &Popup, frame_area: Rect) -> Rect {
@@ -234,9 +218,7 @@ mod tests {
     use crate::tui::state::{Popup, TabStatus};
     use crate::tui::tests::test_app;
 
-    /// Build a successful `QueryResponse` with the given columns and rows.
     fn make_query_response(columns: Vec<&str>, rows: Vec<Vec<Value>>) -> QueryResponse {
-        // Each column typed by the cells it holds, as a server would.
         let cols = columns
             .into_iter()
             .enumerate()
@@ -271,9 +253,6 @@ mod tests {
         }
     }
 
-    /// A schedule on a one-hour interval. `window`/`lag` are the ADR-0018
-    /// report-window fields: both absent is query mode, where the saved DSL
-    /// owns its own time bounds.
     fn make_schedule(
         window: Option<&str>,
         lag: Option<(&str, u64)>,
@@ -298,7 +277,6 @@ mod tests {
         }
     }
 
-    /// A saved query with an optional schedule, for the Saved tab renders.
     fn make_saved(schedule: Option<trawl_api::ScheduleResponse>) -> trawl_api::SavedQueryResponse {
         trawl_api::SavedQueryResponse {
             id: 7,
@@ -332,8 +310,6 @@ mod tests {
         }
     }
 
-    /// Put the app on the Saved tab with one saved query selected and its run
-    /// history loaded, which is the state the detail pane renders from.
     fn saved_app(
         schedule: Option<trawl_api::ScheduleResponse>,
         runs: Vec<trawl_api::ReportRunSummary>,
@@ -341,9 +317,7 @@ mod tests {
         use crate::tui::state::{MainTab, SavedDetailState, SavedFocus};
 
         // Start the lifetime claim count at the kept runs, as for a schedule
-        // retention has not trimmed. The lifetime count can exceed the kept
-        // runs; a test that needs that sets it after, as
-        // `saved_detail_shows_the_run_budget` does.
+        // retention has not trimmed.
         let schedule = schedule.map(|mut sched| {
             sched.total_runs = u64::try_from(runs.len()).unwrap();
             sched
@@ -404,7 +378,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// A run carrying the bounds of the window it covered.
     fn windowed_run(
         id: i64,
         minutes_ago: i64,
@@ -420,10 +393,8 @@ mod tests {
         run
     }
 
-    /// The detail `runs` line shows the run budget in its three states: the
-    /// lifetime count alone without a cap, `N/M` under a cap, and `spent N/M`
-    /// once spent. The lifetime count exceeds the one kept run, as it does
-    /// after retention, and a lowered cap leaves `spent 5/3`.
+    /// The lifetime count exceeds the one kept run, as it does after
+    /// retention, and a lowered cap leaves `spent 5/3`.
     #[test]
     fn saved_detail_shows_the_run_budget() {
         use std::fmt::Write as _;
@@ -480,9 +451,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// At `+05:30` the history `executed` line and every instant of the saved
-    /// detail (next fire, covered through, the run window) read at
-    /// `+05:30`, and none says ` UTC`.
     #[test]
     fn tui_metadata_uses_the_display_zone() {
         use crate::tui::state::MainTab;
@@ -537,9 +505,6 @@ mod tests {
         assert!(!saved.contains(" UTC"), "{saved}");
     }
 
-    /// A saved run's result table shows a timestamp cell in the display zone
-    /// with its offset, whole even with a fraction, and leaves a string cell
-    /// that only looks like an instant as it was sent.
     #[test]
     fn saved_run_results_draw_instants_in_the_display_zone() {
         use crate::tui::state::{LoadedRun, SavedFocus};
@@ -578,8 +543,6 @@ mod tests {
         );
     }
 
-    /// An instant with a fraction below the rows the widths sample still
-    /// shows its offset once it scrolls on screen.
     #[test]
     fn a_saved_run_instant_past_the_width_sample_keeps_its_offset() {
         use crate::tui::state::{LoadedRun, SavedFocus};
@@ -631,8 +594,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// Query mode: the saved DSL owns its own time bounds, so there is no
-    /// window line at all, only the fire cursor every schedule has.
     #[test]
     fn render_saved_schedule_query_mode() {
         let mut app = saved_app(Some(make_schedule(None, None)), vec![make_run(41, 45)]);
@@ -757,9 +718,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// A `_severity` column renders its `OTel` token (`17` → `error`,
-    /// `18` → `error2`), one token per number, while a sender's own `level`
-    /// column renders its text verbatim (ADR-0013 §6).
     #[test]
     fn render_with_severity_tokens() {
         let mut app = test_app();
@@ -804,9 +762,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// A `timestamp` column draws each UTC instant in the display zone
-    /// with its own offset, widths included; a string column holding the
-    /// same text draws as sent.
     #[test]
     fn wire_timestamps_draw_in_the_display_zone() {
         let draw = |time_ty: trawl_engine::value::ColumnType, zone: &str| {
@@ -841,8 +796,7 @@ mod tests {
     }
 
     /// A pivot names its columns from data, so a timestamp column can be
-    /// called `_severity`. The grid reads it by its type, in the display
-    /// zone, not as a severity number.
+    /// called `_severity`.
     #[test]
     fn a_timestamp_column_named_like_severity_draws_in_the_display_zone() {
         let mut app = test_app();
@@ -900,13 +854,10 @@ mod tests {
     /// there, under the `TZ` the parent chose.
     const BERLIN_CHILD: &str = "TRAWL_TUI_BERLIN_CHILD";
 
-    /// The TUI under `TZ=Europe/Berlin` with the display zone `local`, over
-    /// a timechart whose two buckets are the fall-back night's two 02:30s.
     /// The machine zone is per process, so the drawing happens in a CHILD
     /// PROCESS: this test binary re-runs itself with the ignored
-    /// [`utc_timechart_child_under_berlin`] selected and `TZ` set, and the
-    /// child snapshots the chart. The parent fails if the child fails or
-    /// never ran.
+    /// [`utc_timechart_child_under_berlin`] selected and `TZ` set. The
+    /// parent fails if the child fails or never ran.
     #[test]
     fn utc_timechart_arithmetic_survives_local_display() {
         const CHILD: &str = "tui::ui::tests::utc_timechart_child_under_berlin";
@@ -980,9 +931,7 @@ mod tests {
     /// The fall-back night's two 01:30s differ only in their offsets, so a
     /// grid column that cuts the offset shows the same text twice. Four
     /// columns in a 100-column terminal leave each an equal share of 19,
-    /// shorter than one instant. Drawn in a child process under
-    /// `TZ=America/New_York`, as [`utc_timechart_arithmetic_survives_local_display`]
-    /// does for Berlin.
+    /// shorter than one instant.
     #[test]
     fn grid_keeps_the_offset_of_each_instant() {
         const CHILD: &str = "tui::ui::tests::grid_offset_child_under_new_york";
@@ -1060,9 +1009,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// A validation error's one detail has no span and restates the
-    /// message, so the pane renders exactly what it renders with no
-    /// details at all: the message once, and no stray detail line.
     #[test]
     fn a_spanless_detail_renders_like_no_details() {
         let render = |details: Vec<trawl_client::ErrorDetail>| {
@@ -1111,9 +1057,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// The set-schedule popup with the window row focused: the interval and
-    /// window rows carry prefilled text, the empty lag row shows what an
-    /// empty row means rather than nothing.
     #[test]
     fn render_with_schedule_popup() {
         use crate::tui::state::{ScheduleField, ScheduleForm};
@@ -1134,9 +1077,7 @@ mod tests {
     }
 
     /// A terminal too small to hold the popup must not panic: the cursor
-    /// clamp is the arithmetic that would. Narrower than ~37 columns trips a
-    /// pre-existing overflow in the empty-results placeholder behind the
-    /// popup, which is a separate bug and not this popup's business.
+    /// clamp is the arithmetic that would.
     #[test]
     fn render_schedule_popup_on_a_tiny_terminal() {
         use crate::tui::state::ScheduleForm;
@@ -1160,9 +1101,6 @@ mod tests {
         }
     }
 
-    /// The popup shows the cap and the paused state it will send back, marked
-    /// `(kept)`, so the operator sees what an edit leaves in place. With no
-    /// schedule, they are the values a new schedule starts with, unmarked.
     #[test]
     fn render_schedule_popup_shows_the_kept_budget() {
         use crate::tui::state::ScheduleForm;
@@ -1223,14 +1161,11 @@ mod tests {
         );
         app.tab.result = Some(response);
         app.tab.status = TabStatus::Success { duration_ms: 5 };
-        // Narrow terminal: exercises responsive tab labels and status hints
         let backend = TestBackend::new(50, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
     }
-
-    // -- sender text sink sweep ----------------------------------------------
 
     use ratatui::Frame;
     use ratatui::buffer::Buffer;
@@ -1240,29 +1175,21 @@ mod tests {
     use crate::tui::palette::{PaletteAction, PaletteCategory, PaletteItem, refilter};
     use crate::tui::state::{MainTab, SavedFocus};
 
-    /// What no sink may draw: a bidi override, a zero-width space and a soft
-    /// hyphen. ratatui drops control characters by itself, so ESC would
-    /// prove nothing.
+    /// ratatui drops control characters by itself, so ESC would prove nothing.
     const FORBIDDEN: [char; 3] = ['\u{202e}', '\u{200b}', '\u{00ad}'];
 
-    /// Sender text for one field: a two-letter tag, then U+202E, U+200B,
-    /// U+00AD and a line feed, each followed by a digit.
     fn hostile(tag: &str) -> String {
         format!("{tag}\u{202e}1\u{200b}2\u{00ad}3\n4")
     }
 
-    /// [`hostile`] text drawn on one line: U+FFFD in place of all four.
     fn drawn(tag: &str) -> String {
         format!("{tag}\u{fffd}1\u{fffd}2\u{fffd}3\u{fffd}4")
     }
 
-    /// [`hostile`] query text drawn where its line feed folds to a space.
     fn drawn_folded(tag: &str) -> String {
         format!("{tag}\u{fffd}1\u{fffd}2\u{fffd}3 4")
     }
 
-    /// The first drawn line of [`hostile`] query text where its line feed
-    /// breaks the line.
     fn drawn_first_line(tag: &str) -> String {
         format!("{tag}\u{fffd}1\u{fffd}2\u{fffd}3")
     }
@@ -1282,7 +1209,6 @@ mod tests {
         /// The left column of a split panel whose left column takes this
         /// percentage.
         PanelLeft(u16),
-        /// The right column of the same split.
         PanelRight(u16),
     }
 
@@ -1309,7 +1235,6 @@ mod tests {
         }
     }
 
-    /// The symbols of `rect`, row after row.
     fn region_text(buffer: &Buffer, rect: Rect) -> String {
         (rect.top()..rect.bottom())
             .map(|y| {
@@ -1321,9 +1246,6 @@ mod tests {
             .join("\n")
     }
 
-    /// Everything a draw must leave as it was built: the caches, the popup
-    /// (palette items and their actions, popup text), the schedule popup's
-    /// submission, and the editor buffer, ghost and validation text.
     fn sender_state(app: &App) -> String {
         let submission = match app.popup {
             Some(Popup::SetSchedule(ref form)) => format!("{:?}", form.submission()),
@@ -1350,19 +1272,15 @@ mod tests {
 
     type DrawFn = fn(&mut App, &mut Frame<'_>);
 
-    /// One sweep case: how to build its app, how to draw it, and the
-    /// literal each poisoned sub-sink must draw at 120x40.
     struct SinkCase {
-        /// The surface and the branch drawn.
         name: &'static str,
         build: Box<dyn Fn() -> App>,
         draw: DrawFn,
-        /// Sub-sink (with its row in the sink table), region, fragment.
+        /// Sub-sink, region, fragment.
         expect: Vec<(&'static str, Region, String)>,
     }
 
     impl SinkCase {
-        /// A case drawn through the whole UI.
         fn new(
             name: &'static str,
             build: impl Fn() -> App + 'static,
@@ -1377,10 +1295,6 @@ mod tests {
         }
     }
 
-    /// Draw `case` at 120x40 and at 40x12. Neither may draw a forbidden
-    /// character or change the data behind the screen; 120x40 must draw
-    /// every expected fragment in its region. Each failure names the case,
-    /// the sub-sink and the size.
     fn sweep_case(case: &SinkCase) -> Vec<String> {
         let mut failures = Vec::new();
         for (width, height) in [(120, 40), (40, 12)] {
@@ -1492,9 +1406,7 @@ mod tests {
         app
     }
 
-    /// Rows 1, 2, 3 and 13a: the schema detail pane at every selection
-    /// kind, and the filter bar.
-    #[allow(clippy::too_many_lines)] // a table of cases, one sub-sink per entry
+    #[allow(clippy::too_many_lines)]
     fn schema_cases() -> Vec<SinkCase> {
         let detail = Region::PanelRight(55);
         vec![
@@ -1619,9 +1531,6 @@ mod tests {
         ]
     }
 
-    /// The Saved tab over two poisoned saved queries: the first scheduled
-    /// with a window and a lag and one run, the second unscheduled with a
-    /// name too long for the list.
     fn hostile_saved_app(focus: SavedFocus) -> App {
         let mut sched = make_schedule(Some("since_last"), Some(("5m", 300)));
         sched.interval = hostile("iv");
@@ -1642,7 +1551,6 @@ mod tests {
         app
     }
 
-    /// Rows 8 and 13b: the saved list, its detail and a run's results.
     fn saved_cases() -> Vec<SinkCase> {
         use crate::tui::state::LoadedRun;
         use trawl_api::value::{Column, ColumnType, QueryResult, Value};
@@ -1713,9 +1621,7 @@ mod tests {
         ]
     }
 
-    /// Rows 9 to 12 and the result search: the Query tab and the history
-    /// detail pane.
-    #[allow(clippy::too_many_lines)] // a table of cases, one sub-sink per entry
+    #[allow(clippy::too_many_lines)]
     fn query_cases() -> Vec<SinkCase> {
         vec![
             SinkCase::new(
@@ -1835,8 +1741,6 @@ mod tests {
         ]
     }
 
-    /// The Query tab holding one row: a well-known `message` field and a
-    /// field whose name is poisoned. Both values are poisoned.
     fn event_app() -> App {
         let mut app = test_app();
         let name = hostile("en");
@@ -1851,8 +1755,6 @@ mod tests {
         app
     }
 
-    /// The schedule popup open on a saved query whose name and schedule the
-    /// server sent poisoned.
     fn hostile_schedule_app() -> App {
         use crate::tui::state::ScheduleForm;
 
@@ -1869,8 +1771,6 @@ mod tests {
         app
     }
 
-    /// Rows 4 to 7 and 13c, the save-name input, and help: every popup
-    /// variant but the palette.
     fn popup_cases() -> Vec<SinkCase> {
         use crate::tui::state::{ColumnConfig, SimpleEditor};
 
@@ -1998,8 +1898,6 @@ mod tests {
         ]
     }
 
-    /// The palette open over the Query tab, filtered for `input`, with the
-    /// item labelled `selected` selected, or the first when none is.
     fn palette_app(
         input: &str,
         items: Vec<PaletteItem>,
@@ -2026,8 +1924,6 @@ mod tests {
         app
     }
 
-    /// [`palette_items`] filtered for `k`, which matches every label, so
-    /// every label is drawn on the matched branch.
     fn matched_palette_app(selected: &str) -> App {
         let app = palette_app("k", palette_items(), selected, None);
         let Some(Popup::CommandPalette { ref filtered, .. }) = app.popup else {
@@ -2040,8 +1936,7 @@ mod tests {
         app
     }
 
-    /// Rows 13 and 13d, and the palette input and its ghost.
-    #[allow(clippy::too_many_lines)] // a table of cases, one sub-sink per entry
+    #[allow(clippy::too_many_lines)]
     fn palette_cases() -> Vec<SinkCase> {
         let popup = Region::Popup;
         let column_items = || {
@@ -2170,7 +2065,6 @@ mod tests {
         ]
     }
 
-    /// A dashboard snapshot whose drawn remote strings are poisoned.
     fn hostile_dashboard() -> trawl_client::DashboardSnapshot {
         use trawl_api::{
             Capacity, HeadroomReading, PressureEvidence, StorageMeasurement,
@@ -2254,7 +2148,6 @@ mod tests {
         }
     }
 
-    /// The Dashboard tab with `cache` and `last_error`.
     fn dashboard_app(
         cache: Option<trawl_client::DashboardSnapshot>,
         last_error: Option<String>,
@@ -2267,7 +2160,6 @@ mod tests {
         app
     }
 
-    /// Rows 14 and 15: the dashboard fresh, stale and failed.
     fn dashboard_cases() -> Vec<SinkCase> {
         let panel = Region::Panel;
         vec![
@@ -2304,10 +2196,6 @@ mod tests {
         ]
     }
 
-    /// Every sink the TUI draws sender text through, at 120x40 and 40x12:
-    /// no U+202E, U+200B or U+00AD anywhere on screen, each poisoned
-    /// sub-sink's own U+FFFD fragment in its own region at 120x40, and the
-    /// data behind the screen as it was built.
     #[test]
     fn terminal_tui_sender_sink_matrix() {
         let mut cases = Vec::new();
@@ -2346,8 +2234,6 @@ mod tests {
             failures.join("\n\n")
         );
 
-        // What was put in comes back byte for byte: the schedule popup's
-        // submission and the palette's action arguments.
         let mut app = hostile_schedule_app();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
         terminal
@@ -2438,19 +2324,10 @@ mod tests {
             .collect()
     }
 
-    /// Cells `xs` of row `y`, one symbol each.
     fn row_cells(buffer: &Buffer, xs: std::ops::Range<u16>, y: u16) -> Vec<String> {
         xs.map(|x| buffer[(x, y)].symbol().to_owned()).collect()
     }
 
-    /// With ASCII, CJK, Arabic lam-alef and a combining accent in sender
-    /// text, every column after it starts on the cell its cells say, as
-    /// ratatui draws them: the status bar's hints end on its last cell
-    /// although they hold three-byte arrows, the palette's hint ends two
-    /// cells before the list's edge, the event popup's values line up
-    /// after the names, the save popup's cursor sits after the input's
-    /// cells, and the schema range stays on one line up to 40 cells. A
-    /// selected palette item marks `e\u{301}` as one styled cluster.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn terminal_columns_keep_cell_alignment() {

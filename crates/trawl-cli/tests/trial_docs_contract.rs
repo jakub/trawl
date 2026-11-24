@@ -139,7 +139,6 @@ fn the_tutorial_is_the_trial_tutorial() {
     }
     // `start/local-parquet.md` links to this anchor.
     assert!(FIRST_QUERY.contains("### Query the export without a server"));
-    // The manual walkthrough is gone.
     for gone in [
         "fleet-admin migrate\n",
         "trawl-admin tls generate",
@@ -204,8 +203,7 @@ fn the_tutorials_say_when_the_widest_preset_stops_covering_the_samples() {
 }
 
 /// `status` prints `created <ts>` above the `Samples` section, and most
-/// samples are older than `created`. The tutorials name the timestamp after
-/// `from` on the `Samples` line and show that line as `status` prints it.
+/// samples are older than `created`.
 ///
 /// The status snapshot's fixture records its samples through
 /// `sample::complete` over a generated set, the call `up` makes, so the
@@ -268,7 +266,6 @@ fn the_tutorials_point_at_the_first_sample_timestamp() {
     }
 }
 
-/// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 fn is_rfc3339_millis(time: &str) -> bool {
     let shape = "dddd-dd-ddTdd:dd:dd.dddZ";
     time.len() == shape.len()

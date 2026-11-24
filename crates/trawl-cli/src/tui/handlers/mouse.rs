@@ -11,7 +11,6 @@ use super::super::App;
 use super::super::state::{Focus, MainTab, Popup, TabStatus, WrapMap};
 
 impl App {
-    /// Top-level mouse event dispatch.
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -28,16 +27,13 @@ impl App {
         }
     }
 
-    /// Handle a left-click at the given terminal coordinates.
     fn handle_click(&mut self, col: u16, row: u16) {
-        // Popup takes priority: click outside dismisses (except `ConfirmDelete`).
         if self.popup.is_some() {
             if let Some(popup_rect) = self.layout.popup {
                 if contains(popup_rect, col, row) {
                     // A click inside a popup does nothing; keys and the wheel drive them.
                     return;
                 }
-                // Click outside popup — dismiss unless it's ConfirmDelete.
                 if !matches!(self.popup, Some(Popup::ConfirmDelete { .. })) {
                     self.popup = None;
                 }
@@ -45,13 +41,11 @@ impl App {
             return;
         }
 
-        // Tab bar click.
         if contains(self.layout.tab_bar, col, row) {
             self.handle_tab_bar_click(col);
             return;
         }
 
-        // Editor area click.
         if let Some(editor_area) = self.layout.editor
             && contains(editor_area, col, row)
         {
@@ -60,7 +54,6 @@ impl App {
             return;
         }
 
-        // Results area click.
         if let Some(results_area) = self.layout.results
             && contains(results_area, col, row)
         {
@@ -69,7 +62,6 @@ impl App {
             return;
         }
 
-        // Panel area click.
         if let Some(panel_area) = self.layout.panel
             && contains(panel_area, col, row)
         {
@@ -78,8 +70,6 @@ impl App {
         }
     }
 
-    /// Derive which tab was clicked from the x-coordinate and switch to it.
-    ///
     /// Replicates the label-width logic from `ui/tabs.rs`.
     fn handle_tab_bar_click(&mut self, click_x: u16) {
         let width = self.layout.tab_bar.width as usize;
@@ -124,22 +114,18 @@ impl App {
             }
             x += span_width;
 
-            // 1-char separator between tabs.
             if idx < tabs.len() - 1 {
                 x += 1;
             }
         }
     }
 
-    /// Place editor cursor at the clicked position.
-    ///
     /// When wrapping is active, the click coordinates are in visual space
     /// and must be mapped back to logical (row, col) via the wrap map.
     fn handle_editor_click(&mut self, col: u16, row: u16, area: Rect) {
         let tab = self.active_tab_mut();
         let scroll_row = tab.editor.scroll_row;
 
-        // Reverse the cursor math from ui/mod.rs render_query_layout:
         //   x = area.x + vcol + 2  (border + padding)
         //   y = area.y + (vrow - scroll_row) + 1  (border)
         let target_vrow = (row.saturating_sub(area.y).saturating_sub(1) as usize) + scroll_row;
@@ -155,7 +141,6 @@ impl App {
         }
     }
 
-    /// Select a result row at the clicked position, or enter column mode on header click.
     fn handle_results_click(&mut self, col: u16, row: u16, area: Rect) {
         let row_count = self
             .active_tab()
@@ -196,7 +181,6 @@ impl App {
         }
     }
 
-    /// Handle click within a panel area (History/Schema/Saved).
     fn handle_panel_click(&mut self, col: u16, row: u16, area: Rect) {
         match self.main_tab {
             MainTab::History => {
@@ -222,7 +206,6 @@ impl App {
                     return;
                 }
 
-                // Deactivate filter input on tree click.
                 if let Some(schema) = self.panel.schema.as_mut()
                     && schema.filter_active
                 {
@@ -267,9 +250,7 @@ impl App {
         }
     }
 
-    /// Handle scroll wheel over the pane under the cursor.
     fn handle_scroll(&mut self, col: u16, row: u16, delta: i32) {
-        // Popup scroll.
         if let Some(popup_rect) = self.layout.popup
             && contains(popup_rect, col, row)
         {
@@ -277,7 +258,6 @@ impl App {
             return;
         }
 
-        // Editor scroll.
         if let Some(editor_area) = self.layout.editor
             && contains(editor_area, col, row)
         {
@@ -292,7 +272,6 @@ impl App {
             return;
         }
 
-        // Results scroll.
         if let Some(results_area) = self.layout.results
             && contains(results_area, col, row)
         {
@@ -308,7 +287,6 @@ impl App {
             return;
         }
 
-        // Panel scroll.
         if let Some(panel_area) = self.layout.panel
             && contains(panel_area, col, row)
         {
@@ -316,7 +294,6 @@ impl App {
         }
     }
 
-    /// Scroll inside a popup (Help, `EventDetail`, `ColumnPicker`).
     fn handle_popup_scroll(&mut self, delta: i32) {
         if let Some(
             Popup::Help { scroll }
@@ -328,7 +305,6 @@ impl App {
         }
     }
 
-    /// Scroll panel content by delta (dispatches by active tab).
     fn handle_panel_scroll(&mut self, delta: i32) {
         match self.main_tab {
             MainTab::History => {
@@ -357,12 +333,10 @@ impl App {
     }
 }
 
-/// Check if a point (col, row) is inside a `Rect`.
 fn contains(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
-/// Apply a signed scroll delta to a usize offset, clamping to [0, max].
 fn apply_scroll_delta(current: usize, delta: i32, max: usize) -> usize {
     if delta < 0 {
         current.saturating_sub(delta.unsigned_abs() as usize)
@@ -372,10 +346,6 @@ fn apply_scroll_delta(current: usize, delta: i32, max: usize) -> usize {
     }
 }
 
-/// Terminal cell width of a string, counting each `char` as one cell.
-///
-/// Good enough for the tab labels, whose only non-ASCII characters are the
-/// status indicators (◉, ✓, ✗), all single-width.
 fn unicode_display_width(s: &str) -> usize {
     s.chars().count()
 }

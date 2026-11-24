@@ -7,14 +7,7 @@
 //! Every secret the CLI generates comes from the OS RNG into a buffer that
 //! is zeroed on drop, and has a `Debug` that shows no byte of it. The trial
 //! certificate's key is held the same way once it is encoded, but rcgen's
-//! own copies are not zeroed ([`super::certificate`]). A secret leaves the
-//! process only on the stdin of a sealed docker call: [`put_file`] writes
-//! it to a 0400 file in a service's volume, owned by the user that reads
-//! it. No secret is ever an argument, an environment entry, a label, or a
-//! host file.
-//!
-//! [`read_file`] reads a public file back from a volume, as the same user,
-//! and tells a missing file from a read that failed.
+//! own copies are not zeroed ([`super::certificate`]).
 
 use std::fmt;
 use std::time::Duration;
@@ -32,7 +25,6 @@ const SECRET_BYTES: usize = 32;
 /// volumes on first use, so it gets longer than a probe.
 const FILE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// `n` random bytes from the OS RNG, as lowercase hex.
 pub fn random_hex(n: usize) -> Zeroizing<String> {
     let mut bytes = Zeroizing::new(vec![0u8; n]);
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -69,7 +61,6 @@ impl fmt::Debug for HexSecret {
     }
 }
 
-/// The two owner roles' passwords.
 #[derive(Debug)]
 pub struct DbPasswords {
     pub fleet: HexSecret,
@@ -107,8 +98,6 @@ impl fmt::Debug for CookieKey {
     }
 }
 
-/// A volume that [`put_file`] writes into, and the user that owns and
-/// reads the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     /// The `postgres` volume, as the `postgres` user.
@@ -191,7 +180,6 @@ echo absent"#;
 /// The most bytes [`read_file`] returns of a file it reads whole.
 pub const READ_LIMIT: u64 = 64 * 1024;
 
-/// What [`read_file`] found at a path.
 #[derive(Debug, PartialEq, Eq)]
 pub enum VolumeFile {
     /// A regular file: its bytes, or its first [`READ_LIMIT`] + 1 bytes
@@ -203,8 +191,6 @@ pub enum VolumeFile {
     Absent,
 }
 
-/// The `compose run` arguments that run `script` with `path` as its only
-/// argument in `target`'s volume, as the volume's reading user.
 fn script_args(target: Target, script: &str, path: &str) -> Args {
     let mut args = Args::new().args(["run", "--rm", "--no-deps", "-T"]);
     if let Some(user) = target.user() {
@@ -215,18 +201,14 @@ fn script_args(target: Target, script: &str, path: &str) -> Args {
         .args(["-c", script, "sh", path])
 }
 
-/// The `compose run` arguments that write `path` in `target`'s volume.
 fn put_file_args(target: Target, path: &str) -> Args {
     script_args(target, WRITE, path)
 }
 
-/// The `compose run` arguments that read `path` in `target`'s volume.
 fn read_file_args(target: Target, path: &str) -> Args {
     script_args(target, READ, path)
 }
 
-/// Whether `path` is one the writer may take: absolute, and nothing but
-/// plain segments of `[A-Za-z0-9._-]`.
 fn is_plain_absolute(path: &str) -> bool {
     path.strip_prefix('/').is_some_and(|rest| {
         !rest.is_empty()
@@ -413,7 +395,6 @@ exec /bin/sh -c "$script" sh "{root}$path""#,
         ))
     }
 
-    /// The calls [`local_writer`] logged, one per line.
     pub(crate) fn calls(stub: &tempfile::TempDir) -> String {
         std::fs::read_to_string(stub.path().join("calls")).unwrap_or_default()
     }
@@ -435,7 +416,6 @@ exec /bin/sh -c "$script" sh "{root}$path""#,
         }
         assert_eq!(read[script], READ);
         assert!(!READ.contains("mv -f"), "the stub tells a read by this");
-        // The cap the reader applies is READ_LIMIT + 1.
         assert!(READ.contains(&format!("head -c {} --", READ_LIMIT + 1)));
     }
 
@@ -451,13 +431,11 @@ exec /bin/sh -c "$script" sh "{root}$path""#,
         std::fs::create_dir_all(at(compose::TLS_CERT).parent().unwrap()).unwrap();
         assert_eq!(read().await.unwrap(), VolumeFile::Absent);
 
-        // Bytes come back exactly, the empty file included.
         for bytes in [&b""[..], b"\n", b"-----BEGIN CERTIFICATE-----\nabc\n"] {
             std::fs::write(at(compose::TLS_CERT), bytes).unwrap();
             assert_eq!(read().await.unwrap(), VolumeFile::Present(bytes.to_vec()));
         }
 
-        // A longer file comes back one byte past the limit.
         let limit = usize::try_from(READ_LIMIT).unwrap();
         std::fs::write(at(compose::TLS_CERT), vec![b'x'; limit * 2]).unwrap();
         assert_eq!(
@@ -487,9 +465,6 @@ exec /bin/sh -c "$script" sh "{root}$path""#,
         assert_eq!(logged.lines().count(), 9, "{logged}");
     }
 
-    /// Only the reader's own `absent` line reads as absent: a parent it
-    /// cannot search, a failed run, an empty reply, and a reply without a
-    /// status line are errors.
     #[tokio::test]
     async fn a_read_that_cannot_tell_is_an_error_never_absent() {
         // The ancestor walk, run as a user who cannot search `tls/`. Root
@@ -545,7 +520,6 @@ exec /bin/sh -c "$script" sh "{root}$path""#,
         let parent = std::fs::metadata(file.parent().unwrap()).unwrap();
         assert_eq!(parent.permissions().mode() & 0o777, 0o700);
 
-        // Raw bytes survive, including newlines and NULs.
         let raw = b"\n\0line\nno-trailing".to_vec();
         put_file(&docker, Target::Web, compose::WEB_COOKIE, &raw)
             .await
@@ -558,8 +532,6 @@ exec /bin/sh -c "$script" sh "{root}$path""#,
         assert_eq!(leftovers, [std::ffi::OsString::from("web.cookie")]);
     }
 
-    /// A pipe cut short (the CLI killed mid-write) never replaces the
-    /// file: the length line catches the short write.
     #[tokio::test]
     async fn a_short_write_leaves_the_old_file() {
         let root = tempfile::tempdir().unwrap();
@@ -568,7 +540,6 @@ exec /bin/sh -c "$script" sh "{root}$path""#,
             .await
             .unwrap();
 
-        // Claim 10 bytes, send 3.
         let args = docker.compose(put_file_args(Target::Trawld, compose::PGPASS));
         let err = docker
             .capture(&args, Some(b"10\nnew"), Sensitivity::Sealed, FILE_TIMEOUT)
@@ -583,8 +554,6 @@ exec /bin/sh -c "$script" sh "{root}$path""#,
         );
     }
 
-    /// A directory at the path is never written into: the write fails,
-    /// sealed, and leaves no temporary file beside or inside it.
     #[tokio::test]
     async fn put_file_to_a_directory_fails_and_leaves_nothing() {
         let root = tempfile::tempdir().unwrap();

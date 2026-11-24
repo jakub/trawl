@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Tab bar rendering.
-
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -13,7 +11,6 @@ use ratatui::widgets::Paragraph;
 use crate::tui::App;
 use crate::tui::state::{MainTab, TabStatus};
 
-/// Render the tab bar at the top of the screen.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let theme = &app.theme;
     let width = area.width as usize;
@@ -71,8 +68,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line).style(Style::default().bg(theme.surface));
 
-    // Paint the first row only. The spacer row below it keeps the surface
-    // fill `ui::render` lays over the whole frame.
     let tab_row = Rect { height: 1, ..area };
     frame.render_widget(paragraph, tab_row);
 }

@@ -3,21 +3,16 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Config file parsing (`~/.config/trawl/config.toml`).
-//!
-//! Shared configuration for both CLI and TUI modes.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Default server URL.
 pub const DEFAULT_URL: &str = "https://localhost:5514";
 
-/// Default config file path.
 pub const DEFAULT_CONFIG_PATH: &str = "~/.config/trawl/config.toml";
 
-/// Configuration error.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read {path}: {source}")]
@@ -50,50 +45,37 @@ pub enum ConfigError {
     CaCertEmpty { path: String },
 }
 
-/// Trawl configuration loaded from TOML file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// Server connection settings.
     #[serde(default)]
     pub server: ServerConfig,
 
-    /// Named profiles that overlay `[server]` settings.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub profiles: HashMap<String, ProfileConfig>,
 
-    /// UI preferences.
     #[serde(default)]
     pub ui: UiConfig,
 
-    /// Live tail settings.
     #[serde(default)]
     pub tail: TailConfig,
 }
 
-/// Server connection configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// Server URL.
     #[serde(default = "default_url")]
     pub url: String,
 
-    /// API token (inline).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 
-    /// Accept self-signed TLS certificates.
     #[serde(default)]
     pub insecure: bool,
 
-    /// PEM file of the only CA roots to trust for this server. Absolute or
-    /// `~`-prefixed; never combined with `insecure`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert: Option<PathBuf>,
 
-    /// CA roots already read into memory, pinned in place of `ca_cert`.
     /// `-p trial` sets it from the bytes it read and checked once, so no
-    /// later step re-opens a path that could have changed. Never read from
-    /// or written to the config file.
+    /// later step re-opens a path that could have changed.
     #[serde(skip)]
     pub pinned_ca: Option<Vec<u8>>,
 }
@@ -110,54 +92,36 @@ impl Default for ServerConfig {
     }
 }
 
-/// Named profile, selected with `--profile`. Its `insecure` and `ca_cert`
-/// overlay `[server]`'s. Its `url` and `token` stay in this table: the
-/// connection module reads them in place, so a key keeps the base it was
-/// saved for (ADR-0065).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileConfig {
-    /// Server URL override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 
-    /// API token override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 
-    /// TLS insecure override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insecure: Option<bool>,
 
-    /// CA bundle override. `""` clears an inherited `[server] ca_cert`.
+    /// `""` clears an inherited `[server] ca_cert`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert: Option<PathBuf>,
 }
 
-/// UI preferences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
-    /// Theme name or path to custom theme file.
     #[serde(default = "default_theme")]
     pub theme: String,
 
-    /// Enable mouse support.
     #[serde(default = "default_true")]
     pub enable_mouse: bool,
 
-    /// Auto-save query history.
     #[serde(default = "default_true")]
     pub auto_save_history: bool,
 
-    /// Tab width in spaces.
     #[serde(default = "default_tab_width")]
     pub tab_width: usize,
 
-    /// Display zone for timestamps, parsed by `trawl_api::zone::DisplayZone`
-    /// when a command that prints instants starts.
-    ///
-    /// - `"local"` (default) — this machine's zone, offset per instant
-    /// - `"UTC"` — no conversion
-    /// - `"+HH:MM"` / `"-HH:MM"` — fixed offset
     #[serde(default = "default_timezone")]
     pub timezone: String,
 }
@@ -174,10 +138,8 @@ impl Default for UiConfig {
     }
 }
 
-/// Live tail configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TailConfig {
-    /// Maximum events to keep in memory.
     #[serde(default = "default_max_events")]
     pub max_events: usize,
 }
@@ -191,7 +153,6 @@ impl Default for TailConfig {
 }
 
 impl Config {
-    /// Load config from file, using defaults if the file doesn't exist.
     pub fn load(path: Option<&str>) -> Result<Self, ConfigError> {
         let config_path = path.unwrap_or(DEFAULT_CONFIG_PATH);
         let expanded = shellexpand::tilde(config_path);
@@ -214,11 +175,8 @@ impl Config {
         Ok(config)
     }
 
-    /// Load config from a file that must exist.
-    ///
-    /// For a caller that names a profile it will bind to, where a missing
-    /// file must not quietly turn into the defaults. The file is opened
-    /// once, so there is no gap between an existence check and the read.
+    /// The file is opened once, so there is no gap between an existence check
+    /// and the read.
     pub fn load_required(path: Option<&str>) -> Result<Self, ConfigError> {
         let config_path = path.unwrap_or(DEFAULT_CONFIG_PATH);
         let expanded = shellexpand::tilde(config_path);
@@ -243,7 +201,6 @@ impl Config {
         })
     }
 
-    /// The named profile's table.
     pub fn profile(&self, name: &str) -> Result<&ProfileConfig, ConfigError> {
         self.profiles.get(name).ok_or_else(|| {
             let mut available: Vec<&str> = self.profiles.keys().map(String::as_str).collect();
@@ -259,10 +216,6 @@ impl Config {
         })
     }
 
-    /// Apply a named profile's trust (`insecure`, `ca_cert`) to `[server]`.
-    ///
-    /// The profile's `url` and `token` are not copied: a token copied into
-    /// `[server]` would lose the URL it was saved for.
     pub fn apply_profile(&mut self, name: &str) -> Result<(), ConfigError> {
         let profile = self.profile(name)?;
         let (insecure, ca_cert) = (profile.insecure, profile.ca_cert.clone());
@@ -280,21 +233,12 @@ impl Config {
         Ok(())
     }
 
-    /// Apply `--insecure` or `TRAWL_INSECURE`.
     pub fn apply_overrides(&mut self, insecure: bool) {
         if insecure {
             self.server.insecure = true;
         }
     }
 
-    /// Resolve how the client trusts the server's certificate
-    /// (post-profile, post-override).
-    ///
-    /// A `ca_cert` is read here, so a missing, unreadable, or empty file
-    /// fails before any request. `ca_cert` beside an effective `insecure`
-    /// is refused rather than letting either one silently win. In-memory
-    /// `pinned_ca` bytes take the place of `ca_cert` and follow the same
-    /// `insecure` rule.
     pub fn tls_trust(&self) -> Result<trawl_client::TlsTrust, ConfigError> {
         if let Some(ref pem) = self.server.pinned_ca {
             if self.server.insecure {
@@ -326,8 +270,8 @@ impl Config {
     }
 }
 
-/// Expand a leading `~` and require an absolute result. A relative path
-/// would resolve against whatever directory `trawl` happens to run in.
+/// A relative path would resolve against whatever directory `trawl` happens
+/// to run in.
 fn expand_ca_cert(path: &Path) -> Result<PathBuf, ConfigError> {
     let expanded = match path.to_str() {
         Some(text) if text.starts_with('~') => PathBuf::from(shellexpand::tilde(text).as_ref()),
@@ -341,8 +285,6 @@ fn expand_ca_cert(path: &Path) -> Result<PathBuf, ConfigError> {
         })
     }
 }
-
-// -- default value functions -------------------------------------------------
 
 fn default_url() -> String {
     DEFAULT_URL.to_owned()
@@ -392,7 +334,6 @@ mod tests {
         let absent = dir.path().join("absent.toml");
         let err = Config::load_required(absent.to_str()).unwrap_err();
         assert!(matches!(err, ConfigError::Missing { .. }), "{err:?}");
-        // Config::load keeps its defaults-when-missing behavior.
         assert_eq!(
             Config::load(absent.to_str()).unwrap().server.url,
             DEFAULT_URL
@@ -410,9 +351,6 @@ mod tests {
         ));
     }
 
-    /// `--insecure` turns verification off; its absence never turns it
-    /// back on. The URL is not an override here: the connection module
-    /// reads `--url` itself.
     #[test]
     fn apply_overrides_sets_only_insecure() {
         let mut config = Config::default();
@@ -446,8 +384,6 @@ url = "https://custom:9000"
         assert_eq!(config.ui.theme, "default");
     }
 
-    /// A profile overlays its trust and leaves its `url` and `token` in
-    /// its own table, where the connection module binds them.
     #[test]
     fn profile_overlays_only_its_trust() {
         let toml_str = r#"
@@ -555,11 +491,8 @@ insecure = true
         assert_eq!(dev.insecure, Some(true));
     }
 
-    // -- ca_cert -------------------------------------------------------------
-
     use trawl_client::TlsTrust;
 
-    /// A config whose `[server] ca_cert` points at a real temp file.
     fn with_ca_file(extra: &str) -> (tempfile::TempDir, std::path::PathBuf, Config) {
         let dir = tempfile::tempdir().unwrap();
         let pem = dir.path().join("ca.pem");
@@ -674,14 +607,12 @@ ca_cert = ""
 
     #[test]
     fn ca_cert_with_insecure_is_refused() {
-        // [server] insecure
         let (_dir, _, config) = with_ca_file("insecure = true\n");
         assert!(matches!(
             config.tls_trust(),
             Err(ConfigError::CaCertWithInsecure)
         ));
 
-        // --insecure / TRAWL_INSECURE
         let (_dir, _, mut config) = with_ca_file("");
         config.apply_overrides(true);
         assert!(matches!(
@@ -689,7 +620,6 @@ ca_cert = ""
             Err(ConfigError::CaCertWithInsecure)
         ));
 
-        // A profile's insecure beside an inherited ca_cert.
         let (_dir, _, mut config) = with_ca_file("[profiles.dev]\ninsecure = true\n");
         config.apply_profile("dev").unwrap();
         assert!(matches!(
@@ -723,8 +653,6 @@ ca_cert = ""
         ));
     }
 
-    /// In-memory roots are pinned as they are, with no file behind them,
-    /// and refuse `insecure` exactly as `ca_cert` does.
     #[test]
     fn pinned_ca_bytes_pin_without_a_file() {
         let mut config = Config::default();

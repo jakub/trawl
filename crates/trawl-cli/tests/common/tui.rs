@@ -6,13 +6,9 @@
 //! holding the configs it reads, and the TUI on a PTY driven through its
 //! driver socket.
 //!
-//! Every client starts from an empty environment (only the dynamic
-//! loader's search path survives) with the temp `HOME` and the `TZ` the
-//! case names. Tests cannot set the environment in-process
-//! (`unsafe_code = forbid`), so a zone is always a child's `TZ`. The TUI
-//! runs under a PTY, because crossterm needs a real terminal. Its screen is
-//! read with the driver's `capture`, which draws the grid the way the
-//! terminal does.
+//! Tests cannot set the environment in-process (`unsafe_code = forbid`),
+//! so a zone is always a child's `TZ`. The TUI runs under a PTY, because
+//! crossterm needs a real terminal.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -27,18 +23,10 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use super::Server;
 use super::mcp::loader_path;
 
-/// How long one client run, one driver reply or one poll may take.
 pub const DEADLINE: Duration = Duration::from_secs(60);
 
-/// What the clients may do: batch queries, the live tail, Parquet export
-/// and the schema reads the TUI starts with.
 pub const READER_PERMISSIONS: [&str; 4] = ["query", "stream", "export", "schema_read"];
 
-// ---------------------------------------------------------------------------
-// Clients
-// ---------------------------------------------------------------------------
-
-/// A temp `HOME` the clients run under, holding the configs they read.
 pub struct Home {
     dir: tempfile::TempDir,
     configs: AtomicUsize,
@@ -56,8 +44,6 @@ impl Home {
         self.dir.path()
     }
 
-    /// Write a config whose `[server]` table is `server` and whose
-    /// `ui.timezone` is `zone`.
     pub fn config(&self, server: &str, zone: &str) -> PathBuf {
         let n = self.configs.fetch_add(1, Ordering::Relaxed);
         let path = self.path().join(format!("config-{n}.toml"));
@@ -69,8 +55,6 @@ impl Home {
         path
     }
 
-    /// A `trawl` command under this `HOME` and `TZ=tz`, nothing else
-    /// inherited.
     pub fn command(&self, tz: &str) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_trawl"));
         cmd.env_clear()
@@ -82,7 +66,6 @@ impl Home {
         cmd
     }
 
-    /// `trawl --config config query args...` under `TZ=tz`, to completion.
     pub async fn query(&self, tz: &str, config: &Path, args: &[&str]) -> Output {
         let run = self
             .command(tz)
@@ -98,7 +81,6 @@ impl Home {
             .expect("spawn trawl query")
     }
 
-    /// [`Self::query`] that must succeed; returns its stdout.
     pub async fn query_ok(&self, tz: &str, config: &Path, args: &[&str]) -> String {
         let output = self.query(tz, config, args).await;
         assert!(
@@ -110,8 +92,6 @@ impl Home {
     }
 }
 
-/// `[server]` for a client that reaches `server` directly as `token`,
-/// pinning its certificate.
 pub fn pinned(server: &Server, token: &str) -> String {
     format!(
         "url = {:?}\ntoken = {token:?}\nca_cert = {:?}\n",
@@ -129,12 +109,8 @@ pub fn describe(output: &Output) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
-// The TUI under a PTY
-// ---------------------------------------------------------------------------
-
-/// A bare `trawl` on a PTY. The master is drained by a thread into
-/// `screen`, or the TUI would block on a full terminal.
+/// The master is drained by a thread into `screen`, or the TUI would block
+/// on a full terminal.
 pub struct Tui {
     child: std::process::Child,
     screen: Arc<Mutex<Vec<u8>>>,
@@ -142,14 +118,12 @@ pub struct Tui {
     driver: Option<Driver>,
 }
 
-/// One connection to the TUI's driver socket.
 struct Driver {
     lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     writer: tokio::net::unix::OwnedWriteHalf,
 }
 
 impl Tui {
-    /// Start `trawl --config config [--driver=socket]` under `TZ=tz`.
     pub fn spawn(home: &Home, tz: &str, config: &Path, socket: Option<&Path>) -> Self {
         let size = nix::pty::Winsize {
             ws_row: 40,
@@ -196,13 +170,10 @@ impl Tui {
         }
     }
 
-    /// Everything the TUI wrote to its terminal so far.
     pub fn screen(&self) -> String {
         String::from_utf8_lossy(&self.screen.lock().unwrap()).into_owned()
     }
 
-    /// Start under a fresh driver socket and connect to it once the TUI
-    /// listens.
     pub async fn start(home: &Home, tz: &str, config: &Path) -> Self {
         let socket = home
             .path()
@@ -234,7 +205,6 @@ impl Tui {
         tui
     }
 
-    /// Send one driver request and return its successful reply.
     pub async fn send(&mut self, request: Value) -> Value {
         let driver = self.driver.as_mut().expect("a driver connection");
         let mut line = request.to_string();
@@ -254,7 +224,6 @@ impl Tui {
         reply
     }
 
-    /// Replace the editor with `query` and run it as a batch.
     pub async fn batch(&mut self, query: &str) {
         self.send(json!({ "cmd": "set_query", "query": query }))
             .await;
@@ -262,7 +231,6 @@ impl Tui {
             .await;
     }
 
-    /// The grid as the terminal draws it.
     pub async fn capture(&mut self) -> String {
         let reply = self
             .send(json!({ "cmd": "capture", "width": 160, "height": 40 }))
@@ -273,7 +241,6 @@ impl Tui {
             .to_owned()
     }
 
-    /// The screen in the table view, once it draws a row holding `needle`.
     /// A result with `_time` opens in the line chart; `v` cycles the
     /// results pane through the sparkline back to the table.
     pub async fn table_with(&mut self, needle: &str) -> String {
@@ -296,8 +263,6 @@ impl Tui {
         screen
     }
 
-    /// Wait for the TUI to exit, under [`DEADLINE`]; returns its status and
-    /// the whole terminal output.
     pub async fn wait(mut self) -> (std::process::ExitStatus, String) {
         let started = Instant::now();
         let status = loop {
@@ -318,7 +283,6 @@ impl Tui {
         (status, self.screen())
     }
 
-    /// Ask the TUI to quit and wait for a clean exit.
     pub async fn quit(mut self) {
         self.send(json!({ "cmd": "quit" })).await;
         let (status, screen) = self.wait().await;
@@ -333,7 +297,6 @@ impl Drop for Tui {
     }
 }
 
-/// The capture's line holding `needle`, if the grid draws one.
 pub fn line_with<'a>(screen: &'a str, needle: &str) -> Option<&'a str> {
     screen.lines().find(|line| line.contains(needle))
 }

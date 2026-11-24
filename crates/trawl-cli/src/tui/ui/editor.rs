@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Query editor pane with soft word wrapping.
-
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -20,8 +18,7 @@ use crate::tui::App;
 use crate::tui::highlight::Highlighter;
 use crate::tui::state::{Focus, WrapMap};
 
-/// Render the editor pane.
-#[allow(clippy::too_many_lines)] // Block chrome, wrap map, overlay inputs and scrollbar
+#[allow(clippy::too_many_lines)]
 pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let theme = &app.theme;
 
@@ -31,7 +28,6 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         Style::default().fg(theme.border_unfocused)
     };
 
-    // Copied out before the mutable tab borrow below, then passed to the build helpers.
     let selection_bg = theme.surface_highlight;
     let error_fg = theme.status_error;
     let ghost_style = Style::new()
@@ -73,13 +69,11 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
 
     let cursor_row = tab.editor.cursor.0;
     let cursor_col = tab.editor.cursor.1;
-    // Sanitized once here; both build paths splice this copy.
     let ghost_text = tab
         .ghost
         .as_ref()
         .map(|g| sanitize_display_text(&g.ghost_text));
 
-    // Build visual lines from logical lines using the wrap map.
     let visual_lines: Vec<Line<'static>> = if let Some(ref wm) = tab.editor.wrap_map {
         build_wrapped_lines(
             &tab.editor.lines,
@@ -143,11 +137,6 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
-/// Build visual lines with wrapping applied.
-///
-/// Iterates logical lines, highlights each, applies overlays, then splits
-/// at wrap break points. Only returns the visual lines visible in the
-/// current scroll window.
 #[allow(clippy::too_many_arguments)]
 fn build_wrapped_lines(
     lines: &[String],
@@ -167,7 +156,7 @@ fn build_wrapped_lines(
 ) -> Vec<Line<'static>> {
     let end_vrow = scroll_row + visible_rows;
     let mut result = Vec::with_capacity(visible_rows);
-    let mut vrow_offset = 0; // running visual row counter
+    let mut vrow_offset = 0;
 
     for (logical_row, line) in lines.iter().enumerate() {
         let breaks = wm.breaks_for(logical_row);
@@ -175,7 +164,6 @@ fn build_wrapped_lines(
         let vrow_start = vrow_offset;
         let vrow_end = vrow_offset + num_visual;
 
-        // Skip logical lines entirely above or below the viewport.
         if vrow_end <= scroll_row || vrow_start >= end_vrow {
             vrow_offset = vrow_end;
             continue;
@@ -208,7 +196,6 @@ fn build_wrapped_lines(
         } else if logical_row == cursor_row
             && let Some(ghost) = ghost_text
         {
-            // Ghost text (only when no selection active on this line).
             styled_line = splice_ghost_text(styled_line, cursor_col, ghost, ghost_style);
         }
 
@@ -235,7 +222,6 @@ fn build_wrapped_lines(
     result
 }
 
-/// Build visual lines without wrapping, for the no-wrap-map fallback.
 #[allow(clippy::too_many_arguments)]
 fn build_unwrapped_lines(
     lines: &[String],
@@ -295,18 +281,13 @@ fn build_unwrapped_lines(
         .collect()
 }
 
-/// Split a highlighted line into multiple visual lines at wrap break offsets.
-///
 /// `breaks` is a slice of char offsets (always starting with 0).
-/// The first visual line renders as-is. Continuation lines get `indent`
-/// spaces prepended in `indent_style`.
 fn split_line_at_wraps(
     line: Line<'static>,
     breaks: &[usize],
     indent: usize,
     indent_style: Style,
 ) -> Vec<Line<'static>> {
-    // Single visual line (no wrapping needed).
     if breaks.len() <= 1 {
         return vec![line];
     }
@@ -314,7 +295,6 @@ fn split_line_at_wraps(
     let mut visual_lines = Vec::with_capacity(breaks.len());
     let spans = line.spans;
 
-    // For each segment between consecutive breaks, extract the relevant spans.
     for (seg_idx, window) in breaks.windows(2).enumerate() {
         let seg_start = window[0];
         let seg_end = window[1];
@@ -326,7 +306,6 @@ fn split_line_at_wraps(
         visual_lines.push(Line::from(seg_spans));
     }
 
-    // Last segment: from last break to end of line.
     let last_break = *breaks.last().unwrap_or(&0);
     let mut last_spans = extract_span_range(&spans, last_break, usize::MAX);
     if breaks.len() > 1 {
@@ -339,8 +318,6 @@ fn split_line_at_wraps(
 }
 
 /// Extract spans covering the char range `[range_start, range_end)` from a span list.
-///
-/// Splits spans that straddle the range boundaries. Returns owned spans.
 fn extract_span_range(
     spans: &[Span<'static>],
     range_start: usize,
@@ -354,20 +331,16 @@ fn extract_span_range(
         let span_end = col + span_chars;
 
         if span_end <= range_start || col >= range_end {
-            // Entirely outside range — skip.
             col = span_end;
             continue;
         }
 
-        // Compute overlap in char offsets relative to this span.
         let rel_start = range_start.saturating_sub(col);
         let rel_end = range_end.saturating_sub(col).min(span_chars);
 
         if rel_start == 0 && rel_end >= span_chars {
-            // Entire span is within range.
             result.push(span.clone());
         } else {
-            // Partial span — slice by char offsets.
             let text = span.content.as_ref();
             let byte_start = char_to_byte(text, rel_start);
             let byte_end = char_to_byte(text, rel_end);
@@ -385,7 +358,6 @@ fn extract_span_range(
     result
 }
 
-/// Apply selection background to a highlighted line within the given char column range.
 fn apply_selection_style(
     line: Line<'static>,
     sel_start: usize,
@@ -397,20 +369,17 @@ fn apply_selection_style(
     }
 
     let mut result: Vec<Span<'static>> = Vec::new();
-    let mut col = 0; // char offset
+    let mut col = 0;
 
     for span in line.spans {
         let span_chars = span.content.chars().count();
         let span_end = col + span_chars;
 
         if span_end <= sel_start || col >= sel_end {
-            // Entirely outside selection
             result.push(span);
         } else if col >= sel_start && span_end <= sel_end {
-            // Entirely inside selection
             result.push(Span::styled(span.content, span.style.bg(bg)));
         } else {
-            // Partially overlapping — split the span by char offset
             let text = span.content.to_string();
             let rel_start = sel_start.saturating_sub(col);
             let rel_end = sel_end.saturating_sub(col).min(span_chars);
@@ -436,10 +405,6 @@ fn apply_selection_style(
     Line::from(result)
 }
 
-/// Convert a char offset to a byte offset within a string.
-///
-/// A char offset past the end yields `s.len()`, which is how callers slice
-/// through to the end of a span.
 fn char_to_byte(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
@@ -460,14 +425,12 @@ fn compute_error_regions(
         let span_start = error.span.start;
         let span_end = error.span.end;
 
-        // Walk lines to find which rows the span covers.
         let mut byte_offset = 0;
         for (row, line) in lines.iter().enumerate() {
             let line_byte_start = byte_offset;
             let line_byte_end = byte_offset + line.len();
 
             if line_byte_end > span_start && line_byte_start < span_end {
-                // Char-column range of the overlap within this line.
                 let byte_start_in_line = span_start.saturating_sub(line_byte_start);
                 let byte_end_in_line = (span_end - line_byte_start).min(line.len());
 
@@ -477,7 +440,6 @@ fn compute_error_regions(
                 if col_start < col_end {
                     regions.push((row, col_start, col_end));
                 } else {
-                    // Zero-width span: highlight at least 1 char.
                     regions.push((row, col_start, col_start + 1));
                 }
             }
@@ -490,7 +452,6 @@ fn compute_error_regions(
     regions
 }
 
-/// Apply error styling (red underline) to a line within the given char column range.
 fn apply_error_style(
     line: Line<'static>,
     err_start: usize,
@@ -509,16 +470,13 @@ fn apply_error_style(
         let span_end = col + span_chars;
 
         if span_end <= err_start || col >= err_end {
-            // Entirely outside error region
             result.push(span);
         } else if col >= err_start && span_end <= err_end {
-            // Entirely inside error region
             result.push(Span::styled(
                 span.content,
                 span.style.fg(fg).add_modifier(Modifier::UNDERLINED),
             ));
         } else {
-            // Partially overlapping — split the span
             let text = span.content.to_string();
             let rel_start = err_start.saturating_sub(col);
             let rel_end = err_end.saturating_sub(col).min(span_chars);
@@ -544,11 +502,6 @@ fn apply_error_style(
     Line::from(result)
 }
 
-/// Splice a ghost-text span into a line at the given char column.
-///
-/// Splits the existing spans at the cursor position and inserts a dimmed
-/// ghost text span. The ghost text extends the visual line but doesn't
-/// affect cursor positioning.
 fn splice_ghost_text(
     line: Line<'static>,
     cursor_col: usize,
@@ -564,7 +517,6 @@ fn splice_ghost_text(
         let span_end = col + span_chars;
 
         if !inserted && cursor_col >= col && cursor_col <= span_end {
-            // Cursor is inside (or at boundary of) this span — split it.
             let rel = cursor_col - col;
             let text = span.content.to_string();
             let byte_split = char_to_byte(&text, rel);
@@ -584,7 +536,6 @@ fn splice_ghost_text(
         col = span_end;
     }
 
-    // If cursor is past all spans (at the very end of the line), append ghost.
     if !inserted {
         result.push(Span::styled(ghost.to_owned(), ghost_style));
     }
@@ -592,7 +543,6 @@ fn splice_ghost_text(
     Line::from(result)
 }
 
-/// Render a one-line validation hint bar showing the first error message.
 pub fn render_validation_hint(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let tab = app.active_tab();
     let theme = &app.theme;
@@ -622,14 +572,10 @@ pub fn render_validation_hint(app: &App, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
-/// What one row of the advice region shows, which picks its style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdviceRowKind {
-    /// A finding's message (its first row carries the marker).
     Message,
-    /// A finding's hint.
     Hint,
-    /// How many findings were left out, or that rows were cut.
     Note,
 }
 
@@ -641,19 +587,12 @@ pub struct AdviceRow {
     pub text: String,
 }
 
-/// The marker in front of a finding's first row.
 const ADVICE_MARKER: &str = " i ";
-/// Where the message and hint text start, so wrapped rows line up.
 const ADVICE_INDENT: &str = "   ";
 
 /// Lay out `report` as rows `width` cells wide, at most `max_rows` of
 /// them. The region's height is the number of rows this returns, and the
 /// renderer draws exactly these rows, so measurement and drawing agree.
-///
-/// Every message and hint is sanitized before it is measured. Text wraps
-/// at whitespace by display width; a word wider than the row breaks at
-/// grapheme boundaries. When the rows do not fit `max_rows`, the last one
-/// kept says so.
 #[must_use]
 pub fn advice_rows(report: &AdviceReport, width: u16, max_rows: u16) -> Vec<AdviceRow> {
     let width = usize::from(width);
@@ -685,7 +624,6 @@ pub fn advice_rows(report: &AdviceReport, width: u16, max_rows: u16) -> Vec<Advi
         })
         .collect();
 
-    // Everything fits: every finding, then the core's omitted count.
     let mut rows: Vec<AdviceRow> = Vec::new();
     let note_rows = |hidden: usize, shown: usize| {
         let mut note = Vec::new();
@@ -708,11 +646,6 @@ pub fn advice_rows(report: &AdviceReport, width: u16, max_rows: u16) -> Vec<Advi
         return rows;
     }
 
-    // Too many rows: keep whole findings in source order, and give the
-    // last row to a count of every finding left out, so the region never
-    // cuts a finding silently or points at text the author cannot reach.
-    // A finding taller than the room left is left out whole, the first one
-    // included, and the count says a taller terminal shows it.
     let room = max_rows - 1;
     let mut shown = 0;
     for group in groups {
@@ -734,8 +667,6 @@ pub fn advice_rows(report: &AdviceReport, width: u16, max_rows: u16) -> Vec<Advi
     rows
 }
 
-/// The count of advice the region leaves out: `and N more …` after shown
-/// findings, `N … not shown` when none fit.
 fn hidden_note(hidden: usize, shown: usize) -> String {
     let noun = if hidden == 1 { "note" } else { "notes" };
     if shown == 0 {
@@ -745,9 +676,6 @@ fn hidden_note(hidden: usize, shown: usize) -> String {
     }
 }
 
-/// Wrap `body` into rows of `width` cells, the first starting with
-/// `first_prefix` and the rest indented to line up under it. A row too
-/// narrow for the prefix drops it.
 fn push_wrapped(
     rows: &mut Vec<AdviceRow>,
     kind: AdviceRowKind,
@@ -776,7 +704,6 @@ fn push_wrapped(
     }
 }
 
-/// Greedy word wrap of `text` into lines at most `width` display cells.
 /// `width` is at least 1.
 fn wrap_cells(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
@@ -802,7 +729,6 @@ fn wrap_cells(text: &str, width: usize) -> Vec<String> {
             line_width = word_width;
             continue;
         }
-        // A word wider than the row breaks between graphemes.
         for cluster in word.graphemes(true) {
             let cluster_width = UnicodeWidthStr::width(cluster);
             if line_width + cluster_width > width && !line.is_empty() {
@@ -819,7 +745,6 @@ fn wrap_cells(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// The longest prefix of `text` that fits `width` cells.
 fn fit_cells(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -834,8 +759,6 @@ fn fit_cells(text: &str, width: usize) -> String {
     out
 }
 
-/// Render the advice region: the rows [`advice_rows`] laid out for this
-/// area, which the caller sized from the same call.
 pub fn render_query_advice(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let Some(report) = app.active_tab().draft_advice() else {
         return;
@@ -883,7 +806,6 @@ mod tests {
     use crate::tui::App;
     use crate::tui::tests::test_app;
 
-    /// An app whose query draft is `text`, validated past the debounce.
     fn app_with_draft(text: &str) -> App {
         let mut app = test_app();
         app.tab.editor.insert_text(text);
@@ -950,7 +872,6 @@ mod tests {
             }
         }
 
-        // A budget too short for the finding still says it is there.
         let rows = advice_rows(&report, 80, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, AdviceRowKind::Note);
@@ -959,13 +880,10 @@ mod tests {
             "1 advice note not shown; a taller terminal shows more"
         );
 
-        // Whole frames, tiny and empty, draw without panicking; a frame too
-        // short for any advice row leaves the region out.
         for (width, height) in [(1, 1), (3, 3), (20, 6), (12, 30)] {
             let mut app = app_with_draft(r#""10.244.0.83" -service=coredns"#);
             let _ = draw(&mut app, width, height);
         }
-        // The region itself, handed an empty area, draws nothing.
         let mut terminal = Terminal::new(TestBackend::new(10, 5)).unwrap();
         terminal
             .draw(|f| super::render_query_advice(&app, f, ratatui::layout::Rect::default()))
@@ -982,9 +900,6 @@ mod tests {
         assert!(!screen.contains("advice"), "no room for advice:\n{screen}");
     }
 
-    /// A region too short for every finding keeps whole findings and
-    /// counts the rest, with the core's omitted findings, on its last row:
-    /// nothing the author cannot reach is promised.
     #[test]
     fn query_advice_counts_what_the_region_cuts() {
         let draft = (0..10)
@@ -1019,9 +934,6 @@ mod tests {
         );
     }
 
-    /// Whatever the region's size, it shows whole findings only, and its
-    /// count names every finding it does not show: a finding is never cut
-    /// silently, and the count is never zero.
     #[test]
     fn query_advice_never_cuts_a_finding_silently() {
         let many = (0..10)
@@ -1039,9 +951,6 @@ mod tests {
                 for budget in 1..=30 {
                     let rows = advice_rows(&report, width, budget);
                     assert!(rows.len() <= usize::from(budget));
-                    // The finding rows shown are the unlimited layout's first
-                    // rows, wrapped continuations included, and stop where a
-                    // finding ends.
                     let shown: Vec<_> = rows
                         .iter()
                         .filter(|r| r.kind != AdviceRowKind::Note)

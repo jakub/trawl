@@ -4,32 +4,6 @@
 
 //! The ordinary policy: where the key goes for every command but `trawl
 //! doctor`, `trawl mcp`, and `-p trial` (ADR-0065).
-//!
-//! A saved or exported key goes only to the API base it is bound to:
-//!
-//! - `[server].token` is bound to `[server].url`, whose default is
-//!   `https://localhost:5514`.
-//! - A profile's own `token` is bound to the profile's effective URL: its
-//!   own `url`, else `[server].url`. A profile with no `token` leaves
-//!   `[server].token` bound to `[server].url`.
-//! - `TRAWL_TOKEN` is bound to `TRAWL_URL` when that is set, else to the
-//!   saved base: the profile's effective URL, before `--url` or
-//!   `TRAWL_URL` applies.
-//!
-//! The target is the first of a typed `--url`, `TRAWL_URL`, the profile's
-//! `url`, and `[server].url`. A typed `--token` or `--token-file` goes to
-//! the target, whatever it is. Any other key goes only to a target equal to
-//! its binding ([`ApiBase::same_base`]).
-//!
-//! The first key source present is the one used: a typed `--token`, then
-//! `--token-file`, then `TRAWL_TOKEN`, then the profile's own `token`, then
-//! `[server].token`. One that is empty, unreadable, or bound elsewhere
-//! fails the command; the next is never tried in its place, so a key the
-//! user did not mean to send is never sent instead.
-//!
-//! Every URL in play is checked before any key is read or any file opened,
-//! because a typed key goes to whatever the target turns out to be. Only
-//! the selected profile's URL is in play; other profiles are not read.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -44,31 +18,23 @@ use super::{
 use crate::cli::ConnectionParams;
 use crate::config::{Config, ProfileConfig};
 
-/// Labels for sources that clap does not name.
 const SERVER_URL: &str = "url in [server]";
 const SERVER_TOKEN: &str = "token in [server]";
 const URL_FLAG: &str = "--url";
 const TOKEN_FLAG: &str = "--token";
 
-/// What the command line and the environment supplied, with where each
-/// value came from.
 pub(crate) struct Inputs {
-    /// `--url` or `TRAWL_URL`, as clap merged them.
     url: Option<(String, Origin)>,
     /// `TRAWL_URL`'s value: clap's when the URL came from it, read
     /// separately when `--url` was typed beside it. clap reports only the
     /// winner, and an exported key stays bound to the exported URL.
     env_url: Option<OsString>,
-    /// `--token` or `TRAWL_TOKEN`, as clap merged them.
     token: Option<(Zeroizing<String>, Origin)>,
-    /// `--token-file`.
     token_file: Option<PathBuf>,
-    /// The variable names clap binds to `--url` and `--token`.
     url_env: String,
     token_env: String,
 }
 
-/// Hand-written so the key never reaches a log line or a panic message.
 impl fmt::Debug for Inputs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Inputs")
@@ -80,9 +46,6 @@ impl fmt::Debug for Inputs {
 }
 
 impl Inputs {
-    /// The global flags as clap parsed them, and where `--url` and
-    /// `--token` came from. A value whose source is unknown counts as the
-    /// less trusted one: a URL as typed, a key as exported.
     pub(crate) fn new(
         url: Option<String>,
         token: Option<String>,
@@ -112,10 +75,8 @@ impl Inputs {
         }
     }
 
-    /// `--token` typed beside `--token-file` is a usage error. `run`
-    /// refuses it before any command; the policy checks again so it never
-    /// depends on its caller. An exported `TRAWL_TOKEN` beside
-    /// `--token-file` is not a conflict: the file wins.
+    /// `run` refuses it before any command; the policy checks again so it
+    /// never depends on its caller.
     pub(crate) fn key_flags(&self) -> Result<(), ConnectionError> {
         if matches!(self.token, Some((_, Origin::CommandLine))) && self.token_file.is_some() {
             return Err(ConnectionError::BothKeyFlags);
@@ -123,7 +84,6 @@ impl Inputs {
         Ok(())
     }
 
-    /// The error for a command that needs a key when none exists anywhere.
     pub(crate) fn no_credential(&self) -> ConnectionError {
         ConnectionError::NoCredential {
             token_env: self.token_env.clone(),
@@ -131,7 +91,6 @@ impl Inputs {
     }
 }
 
-/// The environment variable clap binds to the global argument `id`.
 fn bound_env(id: &str) -> String {
     crate::Cli::command()
         .get_arguments()
@@ -141,7 +100,6 @@ fn bound_env(id: &str) -> String {
         .expect("clap binds a variable to --url and to --token")
 }
 
-/// A checked base and the source it is reported as.
 #[derive(Debug)]
 struct Located {
     base: ApiBase,
@@ -158,21 +116,15 @@ fn located(raw: &str, label: String) -> Result<Located, ConnectionError> {
     }
 }
 
-/// Every URL in play, each checked before any key is read.
 #[derive(Debug)]
 struct Bases {
-    /// `[server].url`, or its default.
     server: Located,
-    /// The selected profile's `url`.
     profile: Option<Located>,
-    /// `TRAWL_URL`, whether or not it is the target.
     env: Option<Located>,
-    /// A typed `--url`.
     typed: Option<Located>,
 }
 
 impl Bases {
-    /// Check each URL in this order; the first that fails is reported.
     fn check(
         cfg: &Config,
         table: Option<(&str, &ProfileConfig)>,
@@ -210,14 +162,10 @@ impl Bases {
         })
     }
 
-    /// The saved base: the profile's effective URL, before `--url` or
-    /// `TRAWL_URL` applies.
     fn saved(&self) -> &Located {
         self.profile.as_ref().unwrap_or(&self.server)
     }
 
-    /// Where the command goes: a typed `--url`, else `TRAWL_URL` when it
-    /// gave the URL, else the saved base.
     fn target(&self, inputs: &Inputs) -> &Located {
         let exported = matches!(inputs.url, Some((_, Origin::Environment)));
         self.typed
@@ -227,13 +175,9 @@ impl Bases {
     }
 }
 
-/// The key source the policy selected, before it is read.
 enum Candidate<'a> {
-    /// `--token`: goes to the target.
     Typed(&'a str),
-    /// `--token-file`: goes to the target.
     File(&'a Path),
-    /// A saved or exported key: goes only to its binding.
     Bound {
         text: &'a str,
         source: String,
@@ -244,7 +188,6 @@ enum Candidate<'a> {
 }
 
 impl<'a> Candidate<'a> {
-    /// The first key source present, or `None` when there is none.
     fn select(
         cfg: &'a Config,
         table: Option<(&str, &'a ProfileConfig)>,
@@ -288,7 +231,6 @@ impl<'a> Candidate<'a> {
         })
     }
 
-    /// Read the key, after checking that a bound one may go to `target`.
     fn read(self, target: &Located) -> Result<Key, ConnectionError> {
         match self {
             Self::Typed(text) => text_key(
@@ -317,8 +259,6 @@ impl<'a> Candidate<'a> {
     }
 }
 
-/// Resolve the connection for an ordinary command.
-///
 /// `cfg` is the config as loaded, with the profile's trust applied and its
 /// `url` and `token` left in their tables. `profile` is the selected
 /// profile, never `trial`. `Ok(None)` means no key exists anywhere.
@@ -344,7 +284,6 @@ pub(crate) fn ordinary(
     }))
 }
 
-/// A trimmed, non-empty key from `input`, or the failure that names it.
 fn text_key(text: &str, input: &str, empty: &str, next: &str) -> Result<Key, ConnectionError> {
     key_from_text(text, input).ok_or_else(|| ConnectionError::Key {
         input: input.to_owned(),
@@ -398,8 +337,6 @@ mod tests {
         toml::from_str(toml).unwrap()
     }
 
-    /// Run the policy as `run_configured` does: the profile's trust
-    /// applied first.
     fn resolve(
         cfg: &Config,
         profile: Option<&str>,
@@ -427,8 +364,6 @@ mod tests {
     const SERVER: &str =
         "[server]\nurl = \"https://a.example:5514\"\ntoken = \"flt_servertoken\"\n";
 
-    /// AC 3: a profile keeps `[server].token` only for a base equal to
-    /// `[server].url`, and its own token goes to its own effective URL.
     #[test]
     fn ordinary_profile_credentials_keep_their_binding() {
         let cfg = config(&format!(
@@ -452,7 +387,6 @@ token = \"flt_ownlab\"
         ));
         let a = "https://a.example:5514".to_owned();
 
-        // A trust-only profile sends T to A, under its own trust.
         let dev = resolve(&cfg, Some("dev"), &inputs()).unwrap().unwrap();
         assert_eq!(
             (dev.url.clone(), dev.token.clone()),
@@ -460,7 +394,6 @@ token = \"flt_ownlab\"
         );
         assert_eq!(dev.trust, TlsTrust::AcceptInvalid);
 
-        // A profile pointing at another server does not take T there.
         assert_eq!(
             refused(resolve(&cfg, Some("lab"), &inputs())),
             (
@@ -469,18 +402,15 @@ token = \"flt_ownlab\"
             )
         );
 
-        // The same base spelled differently is the same base.
         assert_eq!(
             sent(resolve(&cfg, Some("same"), &inputs())),
             (a.clone(), T.to_owned())
         );
 
-        // A profile's own token with no url goes to [server].url.
         assert_eq!(
             sent(resolve(&cfg, Some("own"), &inputs())),
             (a.clone(), "flt_own".to_owned())
         );
-        // ... and its own url when it has one, never falling back to T.
         assert_eq!(
             sent(resolve(&cfg, Some("ownlab"), &inputs())),
             (
@@ -497,7 +427,6 @@ token = \"flt_ownlab\"
             ("token in [profiles.ownlab]".to_owned(), "--url".to_owned())
         );
 
-        // --url B moves even a trust-only profile's target; T stays.
         assert_eq!(
             refused(resolve(
                 &cfg,
@@ -507,14 +436,12 @@ token = \"flt_ownlab\"
             ("token in [server]".to_owned(), "--url".to_owned())
         );
 
-        // An unknown profile is the config's own error.
         assert!(matches!(
             ordinary(&cfg, Some("absent"), &inputs()),
             Err(ConnectionError::Config(_))
         ));
     }
 
-    /// The policy's rules, row by row, without a subprocess.
     #[test]
     fn ordinary_selection_and_binding() {
         let cfg = config(SERVER);
@@ -533,13 +460,11 @@ token = \"flt_ownlab\"
             refused(resolve(&cfg, None, &exported_url(b))),
             ("token in [server]".to_owned(), "TRAWL_URL".to_owned())
         );
-        // A default port and a trailing / are the same base.
         assert_eq!(
             sent(resolve(&cfg, None, &typed_url("https://A.EXAMPLE:5514/"))),
             (a.clone(), T.to_owned())
         );
 
-        // TRAWL_TOKEN binds to the saved base, or to TRAWL_URL.
         let env_k = with_token(typed_url(b), K, Origin::Environment);
         assert_eq!(
             refused(resolve(&cfg, None, &env_k)),
@@ -550,8 +475,6 @@ token = \"flt_ownlab\"
             sent(resolve(&cfg, None, &exported)),
             (b.to_owned(), K.to_owned())
         );
-        // Bound to TRAWL_URL, K is refused at a typed --url A, and T under
-        // it is not tried.
         let mut shadowed = with_token(typed_url(&a), K, Origin::Environment);
         shadowed.env_url = Some(b.into());
         assert_eq!(
@@ -559,17 +482,14 @@ token = \"flt_ownlab\"
             ("TRAWL_TOKEN".to_owned(), "--url".to_owned())
         );
 
-        // A typed key goes to the target, whatever binds the others.
         let typed = with_token(typed_url(b), K2, Origin::CommandLine);
         assert_eq!(
             sent(resolve(&cfg, None, &typed)),
             (b.to_owned(), K2.to_owned())
         );
 
-        // No key anywhere is not a refusal.
         let keyless = config("[server]\nurl = \"https://a.example:5514\"\n");
         assert!(resolve(&keyless, None, &typed_url(b)).unwrap().is_none());
-        // With nothing saved, TRAWL_TOKEN binds to the default base.
         let default = with_token(inputs(), K, Origin::Environment);
         assert_eq!(
             sent(resolve(&Config::default(), None, &default)),
@@ -577,8 +497,6 @@ token = \"flt_ownlab\"
         );
     }
 
-    /// A key source that is selected is used or fails: an empty one never
-    /// hands over to the next.
     #[test]
     fn ordinary_key_sources_never_fall_through() {
         let cfg = config(SERVER);
@@ -623,16 +541,11 @@ token = \"flt_ownlab\"
             resolve(&cfg, None, &both),
             Err(ConnectionError::BothKeyFlags)
         ));
-        // An exported key beside --token-file is no conflict: the file wins.
         std::fs::write(dir.path().join("key"), "flt_file\n").unwrap();
         file.token_file = Some(dir.path().join("key"));
         assert_eq!(sent(resolve(&cfg, None, &file)).1, "flt_file");
     }
 
-    /// AC 5: a URL with userinfo, a query, a fragment, an encoded `?` or
-    /// `#`, a backslash, whitespace, or another scheme is refused from
-    /// each source before any key file is opened, and the message names
-    /// the source, never the URL.
     #[test]
     fn connection_url_rejections_name_each_source() {
         let bad = [
@@ -714,8 +627,6 @@ token = \"flt_ownlab\"
         }
     }
 
-    /// The refusal names both sources and both remedies, and none of the
-    /// key, the URLs, or the path.
     #[test]
     fn a_binding_refusal_names_sources_and_remedies_only() {
         let message = ConnectionError::Binding {
@@ -731,8 +642,6 @@ token = \"flt_ownlab\"
         assert!(missing.contains("TRAWL_TOKEN"), "{missing}");
     }
 
-    /// The labels for the URL and token variables are the names clap
-    /// binds, and Debug never prints a key.
     #[test]
     fn inputs_take_their_names_from_clap() {
         let inputs = Inputs::new(
@@ -747,7 +656,6 @@ token = \"flt_ownlab\"
         assert_eq!(inputs.url_env, "TRAWL_URL");
         assert_eq!(inputs.token_env, "TRAWL_TOKEN");
         assert!(!format!("{inputs:?}").contains(K));
-        // An unknown source is the less trusted one.
         let unknown = Inputs::new(
             Some("https://h".to_owned()),
             Some(K.to_owned()),

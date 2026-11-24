@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Status bar.
-
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -16,7 +14,6 @@ use trawl_core::text_layout::cells;
 use crate::tui::App;
 use crate::tui::state::{Focus, MainTab, TabStatus};
 
-/// Render the status bar.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let theme = &app.theme;
     let width = area.width as usize;
@@ -65,8 +62,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     let hints = get_context_hints(app, width);
 
-    // The hints end on the bar's last cell: the padding is what the cells
-    // of the left side and of the hints leave.
     let left_cells: usize = spans.iter().map(|s| cells(&s.content)).sum();
     let padding_len = width.saturating_sub(left_cells + cells(&hints));
 
@@ -78,7 +73,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// Generate context-sensitive keybinding hints (responsive to terminal width).
 fn get_context_hints(app: &App, width: usize) -> String {
     if app.focus == Focus::Panel {
         if app.main_tab == MainTab::Schema

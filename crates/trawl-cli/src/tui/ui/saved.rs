@@ -17,7 +17,6 @@ use trawl_core::sanitize::sanitize_display_text;
 
 use crate::tui::App;
 
-/// Render the saved-queries overlay.
 pub fn render(app: &App, frame: &mut Frame<'_>) {
     let theme = &app.theme;
     let area = centered_rect(80, 80, frame.area());
@@ -43,7 +42,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             .queries
             .iter()
             .map(|query| {
-                // Format: "name - query (truncated)"
                 let line = Line::from(vec![
                     Span::styled(
                         format!("{:25}", sanitize_display_text(&query.name)),
@@ -111,8 +109,6 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    /// The overlay has no caller, but it is compiled, so it draws a saved
-    /// name and query through the sanitize rule like every other sink.
     #[test]
     fn dormant_saved_overlay_sanitizes_text() {
         let mut app = crate::tui::tests::test_app();

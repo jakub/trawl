@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Results table pane.
-
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -32,7 +30,6 @@ use crate::tui::state::{ChartView, ColumnConfig, Focus, TabStatus};
 use crate::tui::theme::Theme;
 use crate::tui::ui::common::span_advancing;
 
-/// Build the results pane frame title from the current tab status.
 fn pane_title(status: &TabStatus, theme: &Theme) -> Line<'static> {
     let (text, color) = match status {
         TabStatus::Idle => return Line::from(" Results "),
@@ -45,11 +42,8 @@ fn pane_title(status: &TabStatus, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(text, Style::default().fg(color)))
 }
 
-/// A results title for a result whose live aggregate dropped input past a
-/// cap (ADR-0001): the mark leads, in the warning colour, so a narrow pane
-/// cuts the row counts before it cuts the warning. Without a cap the title
-/// is unchanged. The result is still a result, so nothing here reads as an
-/// error.
+/// The cap mark (ADR-0001) leads, so a narrow pane cuts the row counts
+/// before it cuts the warning.
 fn capped_title(
     title: impl Into<Line<'static>>,
     capped: &[SnapshotCap],
@@ -70,7 +64,6 @@ fn capped_title(
     title
 }
 
-/// What a cap bounds, as the results title names it.
 fn cap_label(cap: SnapshotCapKind) -> &'static str {
     match cap {
         SnapshotCapKind::Groups => "groups",
@@ -79,11 +72,9 @@ fn cap_label(cap: SnapshotCapKind) -> &'static str {
     }
 }
 
-/// Render the results pane (table/sparkline + optional search bar).
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let theme = &app.theme;
 
-    // Split off a search bar row at the bottom if search is active.
     let (results_area, search_area) = if app.results_search.is_some() {
         let [content, bar] =
             Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
@@ -136,7 +127,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
-/// Render the search input bar at the bottom of the results pane.
 fn render_search_bar(
     frame: &mut Frame<'_>,
     theme: &Theme,
@@ -168,8 +158,7 @@ fn render_search_bar(
     frame.render_widget(paragraph, area);
 }
 
-/// Render the results as a table with pinned/scrollable column regions.
-#[allow(clippy::too_many_lines)] // Table rendering + column regions + scrollbars
+#[allow(clippy::too_many_lines)]
 fn render_table(
     app: &App,
     frame: &mut Frame<'_>,
@@ -200,7 +189,6 @@ fn render_table(
 
     let available_width = area.width.saturating_sub(4) as usize; // borders + padding
 
-    // Widths for every column, not just the displayed ones.
     let all_widths = compute_column_widths(
         result,
         v_scroll,
@@ -251,7 +239,6 @@ fn render_table(
         .horizontal_scroll_offset
         .min(scrollable.len().saturating_sub(1));
 
-    // Find how many scrollable columns fit starting from h_scroll
     let mut cols_width_sum = 0usize;
     let mut visible_scrollable = 0;
     for &col_idx in scrollable.iter().skip(h_scroll) {
@@ -305,7 +292,6 @@ fn render_table(
             .fg(theme.table_header),
     );
 
-    // Build search match sets for highlighting.
     let (match_cells, current_match_cell) = if let Some(ref search) = app.results_search {
         let set: HashSet<(usize, usize)> = search.matches.iter().copied().collect();
         let current = search.matches.get(search.current_match).copied();
@@ -331,8 +317,7 @@ fn render_table(
                     let ty = &result.columns[col_idx].ty;
                     // A timestamp reads by its type in the display zone,
                     // whatever its column is called. Otherwise a severity
-                    // cell shows its OTel token, so `17` reads `error`, the
-                    // same vocabulary that filters it (ADR-0013 §6).
+                    // cell shows its OTel token (ADR-0013 §6).
                     let text = match trawl_api::zone::present_cell(ty, value, app.display_zone) {
                         Some(text) => text,
                         None if trawl_core::severity::renders_as_severity(
@@ -421,7 +406,6 @@ fn render_table(
 
     frame.render_widget(table, area);
 
-    // Store column header x-ranges for mouse hit-testing and overlay dividers.
     let inner_x = area.x + 2; // border + padding
     let mut cumulative_x = inner_x;
     let mut header_ranges: Vec<(u16, u16, usize)> = Vec::with_capacity(total_display);
@@ -504,7 +488,6 @@ fn render_table(
     });
 }
 
-/// Render placeholder when all columns are hidden.
 fn render_all_hidden_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let theme = &app.theme;
     let border_style = if app.focus == Focus::Results {
@@ -533,20 +516,14 @@ fn render_all_hidden_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 std::thread_local! {
-    /// Column header x-ranges from the last `render_table` pass.
     static HEADER_RANGES: std::cell::RefCell<Vec<(u16, u16, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Take the column header ranges computed during the last `render_table` call.
-///
-/// Returns the ranges and clears the thread-local. Called by the UI dispatcher
-/// to populate `LayoutAreas::column_header_ranges`.
 pub fn take_header_ranges() -> Vec<(u16, u16, usize)> {
     HEADER_RANGES.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
-/// Render placeholder when no results are available.
 fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let theme = &app.theme;
     let border_style = if app.focus == Focus::Results {
@@ -580,14 +557,11 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     // so all the colons line up in one column. The block is then centered on
     // the longest line, shifted one column left on purpose.
     let colon_col: usize = 15; // offset of ":" within each line
-    let longest_line = "Command Palette: https://trawl.sh".len(); // 33 chars
+    let longest_line = "Command Palette: https://trawl.sh".len();
     let w = inner.width as usize;
-    // Both subtractions saturate. The `- 1` is the deliberate one-column
-    // shift, and on a pane too narrow to hold the longest line the halved
-    // width is already 0, so plain subtraction underflowed: a panic in
-    // debug, and `" ".repeat(usize::MAX)` in release. That is any terminal
-    // under 39 columns, since the block eats two borders and two of
-    // padding.
+    // Both subtractions saturate: on a pane too narrow to hold the longest
+    // line the halved width is already 0. That is any terminal under 39
+    // columns, since the block eats two borders and two of padding.
     let left_pad = w.saturating_sub(longest_line) / 2;
     let left_pad = left_pad.saturating_sub(1);
     let pad = " ".repeat(left_pad);
@@ -597,7 +571,6 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
         format!("{pad}{}{name}: {val}", " ".repeat(spacing))
     };
 
-    // "trawl" title: center it on the colon column (visually near the middle).
     let title_pad = left_pad + colon_col.saturating_sub(3);
     let title_line = format!("{}{}", " ".repeat(title_pad), "trawl");
 
@@ -618,7 +591,6 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::from(Span::styled(label("Server", &server_version), dim)),
     ];
 
-    // Vertically center by prepending empty lines.
     #[allow(clippy::cast_possible_truncation)] // content is always 9 lines
     let content_height = content.len() as u16;
     let top_pad = (inner.height.saturating_sub(content_height)) / 2;
@@ -629,19 +601,10 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, inner);
 }
 
-/// Render error details with span highlighting in the results pane.
-///
-/// Shows the error message in red, then each detail: the line of `query`
-/// its span starts on, the span underlined and a caret line below it,
-/// then the detail's message and hint. `query` is the text the failed run
-/// sent, which the spans index, never the editor's current draft.
-///
-/// Spans are UTF-8 byte offsets; [`locate_span`] resolves them and
-/// [`caret_layout`] places the carets by display cells. A span that cannot
-/// index `query` (reversed, past the end, or inside a character), or an
-/// error with no sent query, shows the message and hint without an
-/// excerpt; a span is never clamped. Every piece of text drawn here is
-/// sanitized: it can hold anything the user typed or the server said.
+/// `query` is the text the failed run sent, which the spans index, never the
+/// editor's current draft. Spans are UTF-8 byte offsets; a span that cannot
+/// index `query` shows the message and hint without an excerpt, and a span
+/// is never clamped.
 #[allow(clippy::too_many_arguments)]
 fn render_error_display(
     app: &App,
@@ -738,15 +701,6 @@ fn render_error_display(
     frame.render_widget(paragraph, inner);
 }
 
-/// Detect if a result is suitable for bar chart visualization.
-///
-/// Requires at least one string column (label) and one numeric column (value),
-/// and must not be a timechart result (those get line charts).
-///
-/// Numeric is decided by variant, `Value::UInt` included: a
-/// `stats first(request_id) by service` over an id past `i64::MAX` is a
-/// metric like any other, and reading it as text would leave the view
-/// with no value column and refuse to draw.
 pub fn is_bar_chartable(result: &trawl_engine::value::QueryResult) -> bool {
     if is_timechart_result(result) || result.rows.is_empty() {
         return false;
@@ -759,7 +713,6 @@ pub fn is_bar_chartable(result: &trawl_engine::value::QueryResult) -> bool {
     has_string && has_numeric
 }
 
-/// Render braille line chart for timechart results using `Chart` widget.
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn render_line_chart(
     app: &App,
@@ -812,7 +765,6 @@ fn render_line_chart(
         .title_bottom(series_info)
         .border_style(border_style);
 
-    // Compute per-series data points and global bounds
     let colors = &theme.chart_series;
     let n_points = series.iter().map(|s| s.values.len()).max().unwrap_or(0);
     let x_max = (n_points.saturating_sub(1)) as f64;
@@ -846,7 +798,6 @@ fn render_line_chart(
         all_points.push(pts);
     }
 
-    // Ensure y_max is non-zero for axis rendering
     if y_max == 0.0 {
         y_max = 1.0;
     }
@@ -865,7 +816,6 @@ fn render_line_chart(
         })
         .collect();
 
-    // Y-axis labels: 0, mid, max
     let y_mid = y_max / 2.0;
     let y_labels = vec![
         Span::raw("0"),
@@ -873,7 +823,6 @@ fn render_line_chart(
         Span::raw(format_axis_value(y_max)),
     ];
 
-    // X-axis labels: start and end time (or point indices)
     let x_labels = if let Some((ref start, ref end, _)) = time_info {
         vec![Span::raw(start.clone()), Span::raw(end.clone())]
     } else {
@@ -947,7 +896,6 @@ fn render_line_chart(
     }
 }
 
-/// Format a numeric value for axis labels (compact representation).
 fn format_axis_value(v: f64) -> String {
     if v >= 1_000_000.0 {
         format!("{:.1}M", v / 1_000_000.0)
@@ -962,7 +910,6 @@ fn format_axis_value(v: f64) -> String {
     }
 }
 
-/// Render horizontal bar chart for aggregation results.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn render_bar_chart(
     app: &App,
@@ -977,7 +924,6 @@ fn render_bar_chart(
         Style::default().fg(theme.border_unfocused)
     };
 
-    // Find first string column (label) and first numeric column (value)
     let first_row = &result.rows[0];
     let label_col = first_row
         .iter()
@@ -1004,8 +950,6 @@ fn render_bar_chart(
     let colors = &theme.chart_series;
     let max_bars = 20.min(result.rows.len());
 
-    // Pre-compute labels and values so we can pad labels to a uniform width,
-    // ensuring all bars start at the same x position (consistent y-axis).
     let entries: Vec<(String, u64, usize)> = result
         .rows
         .iter()
@@ -1017,10 +961,6 @@ fn render_bar_chart(
                 &row[label_col],
                 app.display_zone,
             ));
-            // A bar's height is a `u64`, which is `Value::UInt`'s own
-            // width, so an oversized unsigned draws at its real
-            // magnitude. A negative or a NaN clamps to the bottom of the
-            // axis, as it always has.
             let value = match &row[value_col] {
                 Value::Integer(i) => (*i).max(0) as u64,
                 Value::UInt(u) => *u,
@@ -1045,7 +985,6 @@ fn render_bar_chart(
     let bars: Vec<Bar<'_>> = entries
         .iter()
         .map(|(label, value, idx)| {
-            // Pad name to max width, right-align value — creates a uniform "y-axis" edge
             let value_str = format!("{value}");
             let name_pad = max_name_cells.saturating_sub(cells(label));
             let val_pad = max_value_len.saturating_sub(value_str.len());
@@ -1062,7 +1001,7 @@ fn render_bar_chart(
             Bar::default()
                 .value(*value)
                 .label(Line::from(span_advancing(padded, label_cells)))
-                .text_value(String::new()) // hide value text inside the bar
+                .text_value(String::new())
                 .style(Style::default().fg(colors[idx % colors.len()]))
         })
         .collect();
@@ -1080,7 +1019,6 @@ fn render_bar_chart(
     frame.render_widget(barchart, area);
 }
 
-/// Render sparkline visualization for timechart results.
 fn render_sparkline(
     app: &App,
     frame: &mut Frame<'_>,
@@ -1097,15 +1035,12 @@ fn render_sparkline(
     let (series, total_series) = chart_series(result, app.display_zone);
 
     if series.is_empty() {
-        // Fallback to placeholder if extraction failed
         render_placeholder(app, frame, area);
         return;
     }
 
-    // Extract time metadata for title
     let time_info = extract_time_metadata(result, app.display_zone);
 
-    // Single series: render one large sparkline
     if series.len() == 1 {
         let ChartSeries { label, values, .. } = &series[0];
 
@@ -1125,7 +1060,6 @@ fn render_sparkline(
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Reserve space for y-axis labels (8 chars wide)
         let y_axis_width = 8;
         let sparkline_area = Rect {
             x: inner.x + y_axis_width,
@@ -1134,7 +1068,6 @@ fn render_sparkline(
             height: inner.height.saturating_sub(1), // Reserve 1 row for x-axis
         };
 
-        // Downsample data to fit available width (preserves peaks via max-per-bucket)
         let display_data = downsample(values, sparkline_area.width as usize);
         let max_val = display_data.iter().max().copied().unwrap_or(100);
 
@@ -1145,7 +1078,6 @@ fn render_sparkline(
 
         frame.render_widget(sparkline, sparkline_area);
 
-        // Render y-axis labels (max at top, 0 at bottom - sparkline is filled area from 0)
         let max_label =
             Paragraph::new(format!("{max_val:>7}")).style(Style::default().fg(theme.text_muted));
         frame.render_widget(
@@ -1169,7 +1101,6 @@ fn render_sparkline(
             },
         );
 
-        // Render x-axis time labels (first and last time, properly spaced)
         if let Some((start, end, _)) = time_info {
             let available_width = sparkline_area.width as usize;
             let padding = available_width.saturating_sub(cells(&start) + cells(&end));
@@ -1200,10 +1131,6 @@ fn render_sparkline(
     }
 }
 
-/// Render y-axis labels and series name for one sparkline row.
-///
-/// When `row_height >= 3`, shows max at top, min at bottom, and the series label
-/// vertically centered. Otherwise falls back to label-only.
 #[allow(clippy::cast_possible_truncation)]
 fn render_series_label(
     frame: &mut Frame<'_>,
@@ -1243,7 +1170,6 @@ fn render_series_label(
             },
         );
     } else {
-        // Too short for y-axis labels — just show the series name
         frame.render_widget(
             Paragraph::new(display_label)
                 .alignment(Alignment::Right)
@@ -1253,20 +1179,15 @@ fn render_series_label(
     }
 }
 
-/// The stacked view's label column holds at least this many cells.
 const STACKED_LABEL_FLOOR: usize = 18;
 
 /// The fewest plot cells the stacked view draws: fewer show too few
 /// buckets to read a shape.
 const STACKED_PLOT_MIN: usize = 10;
 
-/// What the stacked view says when its labels leave too few plot cells.
 const STACKED_TOO_NARROW: &str =
     "too narrow for the stacked view: press v for the table, or widen the terminal";
 
-/// The stacked view's labels as drawn and the width of their column,
-/// for an inner width of `inner_width`, or `None` when fewer than
-/// [`STACKED_PLOT_MIN`] cells would remain for the plot.
 fn stacked_labels(series: &[ChartSeries], inner_width: u16) -> Option<(Vec<String>, u16)> {
     let inner_width = usize::from(inner_width);
     let ordinary_cap = (inner_width / 2).saturating_sub(2).max(STACKED_LABEL_FLOOR);
@@ -1291,15 +1212,6 @@ fn stacked_labels(series: &[ChartSeries], inner_width: u16) -> Option<(Vec<Strin
     Some((labels, u16::try_from(label_w).ok()?))
 }
 
-/// Render multiple sparklines stacked vertically for multi-series timechart.
-///
-/// Labels sit in a column on the right, two cells from the plot. An
-/// instant label is drawn whole, offset included. Any other label is cut
-/// to the wider of [`STACKED_LABEL_FLOOR`] cells and half the inner width
-/// less two, so a long group name leaves room for its plot. The column is
-/// as wide as its widest label and at least the floor. When fewer than
-/// [`STACKED_PLOT_MIN`] cells remain for the plot, the pane says so and
-/// draws no label, sparkline or axis: it never cuts an instant to fit.
 #[allow(clippy::cast_possible_truncation)]
 fn render_stacked_sparklines(
     app: &App,
@@ -1348,7 +1260,6 @@ fn render_stacked_sparklines(
     };
     let label_width = label_w + 2;
 
-    // Calculate per-series height: 1 row for x-axis labels, 1-row gaps between series
     let gap_rows = series.len().saturating_sub(1);
     let available_height = inner.height.saturating_sub(1) as usize; // 1 row for x-axis
     let total_chart_rows = available_height.saturating_sub(gap_rows);
@@ -1367,7 +1278,6 @@ fn render_stacked_sparklines(
 
     let mut y_offset: u16 = 0;
     for (idx, (ChartSeries { values, .. }, label)) in series.iter().zip(&labels).enumerate() {
-        // Distribute remainder rows: first `remainder` series get +1 height
         let row_height = base_height + usize::from(idx < remainder);
 
         let sparkline_area = Rect {
@@ -1377,7 +1287,6 @@ fn render_stacked_sparklines(
             height: row_height as u16,
         };
 
-        // Downsample to fit available width (preserves peaks via max-per-bucket)
         let display_data = downsample(values, sparkline_area.width as usize);
 
         // Both bounds come from this slice, so `max - min` and `v - min`
@@ -1388,7 +1297,6 @@ fn render_stacked_sparklines(
         let min_val = display_data.iter().min().copied().unwrap_or(0);
         let range = (max_val - min_val).max(1);
 
-        // Rebase to 0..range so sparkline uses full vertical extent
         let rebased: Vec<u64> = display_data.iter().map(|v| v - min_val).collect();
 
         let color = colors[idx % colors.len()];
@@ -1400,7 +1308,6 @@ fn render_stacked_sparklines(
 
         frame.render_widget(sparkline, sparkline_area);
 
-        // Y-axis labels + centered series name in right-side label area
         let label_area = Rect {
             x: inner.x + inner.width - label_w,
             y: inner.y + y_offset,
@@ -1409,14 +1316,12 @@ fn render_stacked_sparklines(
         };
         render_series_label(frame, theme, label_area, label, min_val, max_val, color);
 
-        // Advance y_offset: row height + 1 gap row (except after last series)
         y_offset += row_height as u16;
         if idx < series.len() - 1 {
             y_offset += 1;
         }
     }
 
-    // Render x-axis time labels (1 row at bottom)
     if let Some((start, end, _)) = time_info {
         let sparkline_width = usize::from(inner.width - label_width);
         let padding = sparkline_width.saturating_sub(cells(&start) + cells(&end));
@@ -1435,22 +1340,13 @@ fn render_stacked_sparklines(
     }
 }
 
-/// Compute adaptive column widths based on header + first N rows of data.
-///
-/// Samples the rows from `v_scroll` on, every row the grid draws
-/// (`visible_rows`) and at least `SAMPLE_ROWS`, taking the max display
-/// width per column, clamped to `MIN_COL` and to each
-/// column's equal share of `available_width` (itself capped at `MAX_COL`).
-/// A column of instants may take the whole `available_width` instead: its
-/// offset is often the only difference between two rows (a fall-back
-/// night's two 01:30s), so cutting it would show one reading twice. An
-/// instant's text varies in length (its fraction drops trailing zeros), so
-/// a row the sample missed could be wider than its column: every drawn row
-/// is sampled.
-/// Widths are display cells of the text as the grid draws it: each value
-/// is cut to its column's cap with [`fit_cells`] before it is measured, so
-/// a value of any length costs no more than the cap to size.
-/// Respects `width_override` from `ColumnConfig`; hidden columns get width 0.
+/// A column of instants may take the whole `available_width`: its offset is
+/// often the only difference between two rows (a fall-back night's two
+/// 01:30s), so cutting it would show one reading twice. An instant's text
+/// varies in length (its fraction drops trailing zeros), so every drawn row
+/// is sampled. Each value is cut to its column's cap with [`fit_cells`]
+/// before it is measured, so a value of any length costs no more than the
+/// cap to size.
 fn compute_column_widths(
     result: &trawl_engine::value::QueryResult,
     v_scroll: usize,
@@ -1517,14 +1413,8 @@ fn compute_column_widths(
         .collect()
 }
 
-/// Extract time metadata from timechart result.
-///
-/// Returns (`start_time`, `end_time`, `span_interval`) as formatted strings:
-/// the first and last rows' instants shown in `zone`, offset included, and
-/// the smallest gap between distinct instants. The chart plots rows in
-/// response order, so the endpoint labels follow it too. The span reads
-/// the UTC instants the rows carry, never display text, so a fall-back
-/// night's two 02:30s stay an hour apart in any zone.
+/// The span reads the UTC instants the rows carry, never display text, so a
+/// fall-back night's two 02:30s stay an hour apart in any zone.
 fn extract_time_metadata(
     result: &trawl_engine::value::QueryResult,
     zone: DisplayZone,
@@ -1572,7 +1462,7 @@ fn extract_time_metadata(
     };
 
     // Sanitized: a `_time` cell that is not a timestamp is whatever the
-    // result holds. An instant keeps its whole text, offset included.
+    // result holds.
     Some((
         sanitize_display_text(&first),
         sanitize_display_text(&last),
@@ -1580,9 +1470,7 @@ fn extract_time_metadata(
     ))
 }
 
-/// One timechart series as the TUI draws it.
 struct ChartSeries {
-    /// A metric column's name or a grouped value, sanitized.
     label: String,
     /// Whether `label` is an instant from a `timestamp` group column. The
     /// stacked view never cuts one: its offset is often the only
@@ -1591,12 +1479,6 @@ struct ChartSeries {
     values: Vec<u64>,
 }
 
-/// A timechart's series as the TUI draws them: a `timestamp` group label
-/// in `zone` through [`cell_text`], as the grid shows that column, and
-/// every label sanitized. A label is a metric column's name or a grouped
-/// value, so a sender can pick it, and it reaches titles, legends and axis
-/// labels. Whether a label is an instant comes from its column's type,
-/// never from how its text reads.
 fn chart_series(
     result: &trawl_engine::value::QueryResult,
     zone: DisplayZone,
@@ -1618,7 +1500,6 @@ fn chart_series(
     (series, total)
 }
 
-/// Format a duration in seconds as a human-readable string.
 fn format_duration(secs: u64) -> String {
     if secs >= 86400 {
         format!("{}d", secs / 86400)
@@ -1631,23 +1512,16 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-/// A result cell as the TUI shows it: an instant in `zone` with its own
-/// offset ([`present_cell`]), any other cell through [`value_to_string`].
 /// The grid, its column widths, the detail popup and the search all read
 /// this one text.
 pub fn cell_text(ty: &ColumnType, value: &Value, zone: DisplayZone) -> String {
     present_cell(ty, value, zone).unwrap_or_else(|| value_to_string(value))
 }
 
-/// A `_severity` cell as the TUI shows it: the shared `OTel` token, or the
-/// grid's ordinary rendering where the ladder has no reading for the value.
 fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
     crate::cli::severity_token(value).map_or_else(|| value_to_string(value), str::to_owned)
 }
 
-/// The timechart's span comes from the UTC instants: rows out of order and
-/// a repeated bucket still give the smallest gap, and an infinity bounds no
-/// gap. The endpoint labels are the first and last rows.
 #[cfg(test)]
 #[test]
 fn timechart_metadata_reads_utc_instants() {
@@ -1674,9 +1548,6 @@ fn timechart_metadata_reads_utc_instants() {
     assert_eq!(span, "1h");
 }
 
-/// The chart plots rows in response order, so its endpoint labels do too:
-/// under `| sort -_time` the left label names the latest bucket, which is
-/// the left-most point.
 #[cfg(test)]
 #[test]
 fn timechart_labels_follow_response_order() {
@@ -1700,9 +1571,6 @@ fn timechart_labels_follow_response_order() {
     assert_eq!(span, "1h");
 }
 
-/// A timechart grouped by a `timestamp` column names each series by its
-/// instant in the display zone, as the grid shows that column, not by the
-/// UTC wire text.
 #[cfg(test)]
 #[test]
 fn timechart_timestamp_group_labels_use_the_display_zone() {
@@ -1766,13 +1634,9 @@ fn timechart_timestamp_group_labels_use_the_display_zone() {
     }
 }
 
-/// Both timechart views survive metrics at the top of the `u64` range.
-///
 /// The stacked sparkline rebases each series by subtracting its own
-/// minimum and hands the range to ratatui as a scale. Run under the
-/// debug profile's overflow checks, this pins that arithmetic — and the
-/// shared `extract_series` ranking behind it — against a metric column
-/// holding `u64::MAX`.
+/// minimum. Run under the debug profile's overflow checks, this pins that
+/// arithmetic against a metric column holding `u64::MAX`.
 #[cfg(test)]
 #[test]
 fn timechart_sparklines_survive_unsigned_magnitudes() {
@@ -1837,14 +1701,6 @@ fn timechart_sparklines_survive_unsigned_magnitudes() {
     }
 }
 
-/// A `stats first(request_id) by service` over an id past `i64::MAX`
-/// draws a real bar.
-///
-/// Two ways it used to go wrong at once: the classifier saw no numeric
-/// column and refused to draw at all, or the per-row conversion fell
-/// through its wildcard and drew every bar at zero. Rendered through the
-/// whole UI, because the view is chosen by `is_bar_chartable` and drawn
-/// by `render_bar_chart` — the bug lived in the seam between them.
 #[cfg(test)]
 #[test]
 fn bar_chart_renders_uint_metric() {
@@ -1901,12 +1757,9 @@ fn bar_chart_renders_uint_metric() {
     );
 }
 
-/// AC 2 in the TUI: a response decoded from its wire text shows every
-/// digit of 2^53+1, 2^63 and `u64::MAX` in the grid, and the bar chart
-/// orders the three by magnitude. The TUI has no client-side row sort, so
-/// the bar lengths are where it compares the numbers: a reader that went
-/// through `f64` would print 9007199254740992 and could not tell the two
-/// largest apart.
+/// The TUI has no client-side row sort, so the bar lengths are where it
+/// compares the numbers: a reader that went through `f64` would print
+/// 9007199254740992 and could not tell the two largest apart.
 #[cfg(test)]
 #[test]
 fn big_integers_from_the_wire_render_exactly_and_in_order() {
@@ -1946,7 +1799,6 @@ fn big_integers_from_the_wire_render_exactly_and_in_order() {
     }
     assert!(!grid.contains("9007199254740992"), "{grid}");
 
-    // One bar per host; its length is its share of the largest value.
     let bars = draw(ChartView::BarChart);
     let length = |host: &str| {
         bars.lines()
@@ -1965,13 +1817,11 @@ mod severity_tests {
     use super::severity_cell_text;
     use trawl_engine::value::Value;
 
-    /// The TUI shows the token, injectively — `error2` is not `error`.
     #[test]
     fn a_severity_cell_shows_its_otel_token() {
         assert_eq!(severity_cell_text(&Value::Integer(17)), "error");
         assert_eq!(severity_cell_text(&Value::Integer(18)), "error2");
         assert_eq!(severity_cell_text(&Value::Integer(13)), "warn");
-        // No reading: the grid's own rendering, never a guess.
         assert_eq!(severity_cell_text(&Value::Integer(99)), "99");
         assert_eq!(severity_cell_text(&Value::String("gold".into())), "gold");
     }
@@ -1984,14 +1834,6 @@ mod placeholder_tests {
 
     use crate::tui::tests::test_app;
 
-    /// The placeholder centres its help block on a 33-column line, and the
-    /// centring did the shift-one-left with a plain subtraction: below 39
-    /// terminal columns the halved width is already 0, so it underflowed.
-    /// Debug builds panicked, release builds asked for `usize::MAX` spaces.
-    ///
-    /// 20x6 is well inside a real tmux split. A fresh app has no results,
-    /// so this is the placeholder pane, and the whole UI is drawn rather
-    /// than the one function: a narrow terminal narrows every pane at once.
     #[test]
     fn placeholder_renders_in_a_terminal_too_narrow_to_centre_in() {
         for (width, height) in [(20, 6), (1, 1), (38, 10), (39, 10)] {
@@ -2019,8 +1861,6 @@ mod error_pane_tests {
     const WIDTH: u16 = 60;
     const HEIGHT: u16 = 12;
 
-    /// The error pane alone, drawn for one error whose one detail has
-    /// `span` over `query`, as rows of text.
     fn pane(query: Option<&str>, span: Option<(usize, usize)>) -> Vec<String> {
         let mut app = test_app();
         app.tab.status = TabStatus::Error {
@@ -2060,8 +1900,6 @@ mod error_pane_tests {
             .collect()
     }
 
-    /// The pane's inner rows: inside the border and its one-cell padding,
-    /// trailing blanks dropped.
     fn inner(rows: &[String]) -> Vec<String> {
         rows[1..rows.len() - 1]
             .iter()
@@ -2075,7 +1913,6 @@ mod error_pane_tests {
             .collect()
     }
 
-    /// What the pane shows for a detail with no excerpt.
     fn no_excerpt() -> Vec<String> {
         let mut rows: Vec<String> = [
             "error: parse error: the error",
@@ -2096,10 +1933,6 @@ mod error_pane_tests {
             .unwrap_or_else(|| panic!("no span case {name:?}"))
     }
 
-    /// Every row of the shared span table, drawn through the real error
-    /// pane: a row that locates shows its excerpt line and a caret line at
-    /// the row's display cells; one that cannot index its text shows the
-    /// message and hint with no excerpt and no caret.
     #[test]
     fn terminal_caret_layout_conformance_tui() {
         for case in SPAN_CASES {
@@ -2129,14 +1962,11 @@ mod error_pane_tests {
         }
     }
 
-    /// An error raised before anything was sent has no query to quote: a
-    /// span shows the message and hint alone.
     #[test]
     fn terminal_caret_layout_conformance_tui_without_a_query() {
         assert_eq!(inner(&pane(None, Some((0, 0)))), no_excerpt());
     }
 
-    /// An empty sent query still gets its one caret for a valid `0..0`.
     #[test]
     fn terminal_caret_layout_conformance_tui_empty_query() {
         let rows = inner(&pane(Some(""), Some((0, 0))));
@@ -2145,8 +1975,6 @@ mod error_pane_tests {
         assert_eq!(rows[4], "  the message");
     }
 
-    /// The message, label and hint can hold anything the server said, and
-    /// a control or bidi character in them cannot rewrite the line.
     #[test]
     fn terminal_caret_layout_conformance_tui_sanitizes_messages() {
         let mut app = test_app();
@@ -2175,11 +2003,8 @@ mod error_pane_tests {
         }
     }
 
-    /// A span that ends after a base character and before the combining
-    /// mark or variation selector it carries styles the whole cluster, and
-    /// the `x` after it keeps the plain style. The excerpt row is y = 3:
-    /// the border, the message, a blank line. Its text starts at x = 4,
-    /// after the border, the padding and two spaces.
+    /// The excerpt row is y = 3: the border, the message, a blank line. Its
+    /// text starts at x = 4, after the border, the padding and two spaces.
     #[test]
     fn excerpt_styles_whole_clusters() {
         use ratatui::style::Modifier;
@@ -2258,32 +2083,26 @@ mod error_pane_tests {
         }
     }
 
-    /// Snapshots of representative rows, drawn whole with their border.
     fn snapshot_rows(name: &str) -> String {
         let case = case(name);
         pane(Some(case.text), Some((case.start, case.end))).join("\n")
     }
 
-    /// The issue's query: the caret sits under the `(`, after two
-    /// double-width characters.
     #[test]
     fn terminal_caret_layout_conformance_tui_cjk_snapshot() {
         insta::assert_snapshot!(snapshot_rows("cjk before the span"));
     }
 
-    /// A CRLF query draws no `\r` and quotes the span's own line.
     #[test]
     fn terminal_caret_layout_conformance_tui_crlf_snapshot() {
         insta::assert_snapshot!(snapshot_rows("crlf query"));
     }
 
-    /// A span running onto later lines marks only its start line.
     #[test]
     fn terminal_caret_layout_conformance_tui_multi_line_snapshot() {
         insta::assert_snapshot!(snapshot_rows("multi-line span clips to its start line"));
     }
 
-    /// A span ending inside a character draws no excerpt and no caret.
     #[test]
     fn terminal_caret_layout_conformance_tui_invalid_span_snapshot() {
         insta::assert_snapshot!(snapshot_rows("end inside a character"));
@@ -2312,9 +2131,6 @@ mod grid_tests {
         }
     }
 
-    /// A column is as wide as its widest value's display cells: six CJK
-    /// characters take 12 cells and 18 bytes, ten accented letters built
-    /// from combining marks take 10 cells and 30 bytes.
     #[test]
     fn grid_column_widths_measure_display_cells() {
         let result = result(
@@ -2347,9 +2163,6 @@ mod grid_tests {
         assert_eq!(widths[1], 8);
     }
 
-    /// A CJK value wider than its column is cut by display cells and
-    /// marked as cut, and the column after it starts in the same place on
-    /// every row.
     #[test]
     fn grid_cuts_wide_values_by_display_cells() {
         let mut app = test_app();
@@ -2399,7 +2212,6 @@ mod grid_tests {
             "{screen}"
         );
 
-        // The cell where `message` starts, in display cells from the left.
         let column_of = |row: &str, value: &str| cells(&row[..row.find(value).expect("value")]);
         assert_eq!(
             column_of(wide, "first"),
@@ -2425,10 +2237,6 @@ mod series_label_tests {
     use super::render_series_label;
     use crate::tui::tests::test_app;
 
-    /// A grouped value reaches the sparkline label from `extract_series`,
-    /// so a sender picks it. Whether it fits or is cut, by a multibyte
-    /// character past the label's last byte or into a zero-width area, it
-    /// draws right-aligned within the area instead of panicking.
     #[test]
     fn series_labels_fit_by_display_cells() {
         let theme = test_app().theme;
@@ -2479,7 +2287,6 @@ mod sender_text_tests {
     use crate::tui::state::{ChartView, TabStatus};
     use crate::tui::tests::test_app;
 
-    /// A bidi override a sender can put in a field name or a grouped value.
     const BIDI: &str = "a\u{202E}b";
 
     fn with_result(result: QueryResult, view: ChartView) -> App {
@@ -2503,7 +2310,6 @@ mod sender_text_tests {
         app
     }
 
-    /// The results pane drawn alone, as the terminal's text.
     fn pane(app: &App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("terminal");
         terminal
@@ -2527,7 +2333,6 @@ mod sender_text_tests {
         Value::String(format!("2026-01-01 00:0{i}:00"))
     }
 
-    /// `timechart count by host`: the hosts are the series labels.
     fn grouped_timechart() -> QueryResult {
         let rows = (0..3_i64)
             .flat_map(|i| {
@@ -2558,7 +2363,6 @@ mod sender_text_tests {
         }
     }
 
-    /// The line chart's legend.
     #[test]
     fn sender_text_is_sanitized_in_the_line_chart_legend() {
         let screen = pane(&with_result(grouped_timechart(), ChartView::LineChart));
@@ -2571,7 +2375,6 @@ mod sender_text_tests {
         assert_sanitized("line chart title", &screen);
     }
 
-    /// The stacked sparklines' labels.
     #[test]
     fn sender_text_is_sanitized_in_sparkline_labels() {
         let screen = pane(&with_result(grouped_timechart(), ChartView::Sparkline));
@@ -2584,7 +2387,6 @@ mod sender_text_tests {
         assert_sanitized("sparkline title", &screen);
     }
 
-    /// The time axis and the title quote the first and last `_time`.
     #[test]
     fn sender_text_is_sanitized_in_chart_time_labels() {
         let mut result = grouped_timechart();
@@ -2688,8 +2490,7 @@ mod cell_alignment_tests {
         terminal
     }
 
-    /// Row `y`'s cell symbols. A cell hidden behind a two-cell glyph
-    /// reads as a space.
+    /// A cell hidden behind a two-cell glyph reads as a space.
     fn row(terminal: &Terminal<TestBackend>, y: u16) -> Vec<&str> {
         let buffer = terminal.backend().buffer();
         (0..buffer.area.width)
@@ -2697,7 +2498,6 @@ mod cell_alignment_tests {
             .collect()
     }
 
-    /// `head`, then `n` copies of `cell`, then `tail`.
     fn cells_of<'a>(head: &[&'a str], cell: &'a str, n: usize, tail: &[&'a str]) -> Vec<&'a str> {
         head.iter()
             .copied()
@@ -2721,9 +2521,6 @@ mod cell_alignment_tests {
 
     /// ratatui's bar chart sizes its label column by the widest label's
     /// unicode-width, and `لا` has a width of one but draws in two cells.
-    /// With every label made of `لا` (here two groups of one name, so no
-    /// label is padded past another), the column still holds the whole
-    /// label line: name, two spaces, the value's digits, a space.
     #[test]
     fn bar_labels_of_lam_alef_keep_their_values() {
         let app = with_result(bars(&[("لالالا", 12), ("لالالا", 3)]), ChartView::BarChart);
@@ -2743,8 +2540,6 @@ mod cell_alignment_tests {
         );
     }
 
-    /// ASCII, CJK, Arabic and combining labels: every value's last digit
-    /// sits in the same cell, and every bar starts in the same cell.
     #[test]
     fn bar_labels_align_by_cells() {
         let app = with_result(
@@ -2799,9 +2594,6 @@ mod cell_alignment_tests {
         }
     }
 
-    /// The time axis puts the first `_time` at the plot's left edge and
-    /// the last at its right edge, measured in cells: `日本` is six bytes
-    /// and four cells.
     #[test]
     fn sparkline_time_axes_end_on_the_plot_edge() {
         let time = |t: &str| Value::String(t.into());
@@ -3028,7 +2820,6 @@ mod cell_alignment_tests {
         );
     }
 
-    /// A pane zero or one cell wide draws without a panic.
     #[test]
     fn stacked_view_survives_widths_zero_and_one() {
         let app = grouped_by_instant(ColumnType::Timestamp);

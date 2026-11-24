@@ -41,8 +41,6 @@ fn help(args: &[&str]) -> String {
 
 #[test]
 fn help_names_the_token_variable_without_its_value() {
-    // Long and short help at the top level, and a subcommand's help, which
-    // repeats the global `--token`.
     for args in [&["--help"][..], &["-h"], &["validate", "--help"]] {
         let text = help(args);
         assert!(

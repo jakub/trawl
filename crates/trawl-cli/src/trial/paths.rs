@@ -4,36 +4,15 @@
 
 //! Where the trial keeps its host state, and the owner-only file rules.
 //!
-//! ```text
-//! $XDG_STATE_HOME/trawl/      root, 0700
-//!     trial.lock              lifecycle lock, never unlinked
-//!     trial/                  dir, 0700, deleted by `down`
-//!         state.json          0600
-//!         ca.pem              0644, public
-//!         operator.token      0600
-//!         ingest.token        0600
-//! ```
-//!
-//! The lock sits beside the trial directory rather than inside it: `down`
-//! deletes the directory while holding the lock, and a lock file inside it
-//! would be unlinked under a waiter, which then locks an orphaned inode
-//! while the next arrival creates a fresh one.
-//!
 //! Both directories must be real directories owned by the current user
 //! with no group or other access. A symlink at either path is refused, not
 //! followed, and a looser directory is refused rather than re-moded,
-//! because trawl did not create it that way. The pattern follows fleet-dev's
-//! `state_root` and `secure_directory`; fleet-dev is a development
-//! controller, so it is copied rather than depended on.
+//! because trawl did not create it that way.
 //!
 //! Those two checks read metadata and keep no handle, so the files below
 //! are reached by path again later. That is sound only if no other user can
-//! swap a directory on the way there. Every directory above the root, from
-//! `/` down, must therefore be owned by root or the current user, and must
-//! not be group- or other-writable unless it has the sticky bit (as `/tmp`
-//! does). The walk follows a symlinked ancestor, such as a dotfile manager's
-//! `~/.local`, and checks the directories it resolves to. The link itself
-//! must be owned by root or the current user too, because in a sticky
+//! swap a directory on the way there. A symlinked ancestor's link must be
+//! owned by root or the current user too, because in a sticky
 //! directory the link's owner can re-point it.
 
 use std::collections::VecDeque;
@@ -46,20 +25,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::TrialError;
 
-/// Directory mode for the state root and the trial directory.
 const DIR_MODE: u32 = 0o700;
 
 /// Symlinks the ancestry walk follows before giving up, as the kernel's
 /// own `ELOOP` limit.
 pub(super) const MAX_SYMLINK_HOPS: usize = 40;
 
-/// The trial's host paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrialPaths {
     /// `$XDG_STATE_HOME`: every directory from `/` down to it must be
     /// trusted.
     base: PathBuf,
-    /// `$XDG_STATE_HOME/trawl`.
     pub root: PathBuf,
     /// `root/trial`: everything `down` deletes.
     pub dir: PathBuf,
@@ -68,8 +44,6 @@ pub struct TrialPaths {
 }
 
 impl TrialPaths {
-    /// Resolve the paths from `XDG_STATE_HOME` and `HOME`.
-    ///
     /// Per the XDG Base Directory spec, an unset, empty, or relative
     /// `XDG_STATE_HOME` is ignored in favour of `$HOME/.local/state`.
     pub fn resolve(xdg_state_home: Option<&Path>, home: Option<&Path>) -> Result<Self, TrialError> {
@@ -89,26 +63,20 @@ impl TrialPaths {
         })
     }
 
-    /// Resolve the paths from this process's environment.
     pub fn from_env() -> Result<Self, TrialError> {
         let xdg = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
         let home = std::env::var_os("HOME").map(PathBuf::from);
         Self::resolve(xdg.as_deref(), home.as_deref())
     }
 
-    /// `root/trial.teardown`: written by `down` before it deletes
-    /// anything and removed last, so it outlives the trial directory.
-    /// While it exists, `up` refuses to start.
     pub fn teardown_marker(&self) -> PathBuf {
         self.root.join("trial.teardown")
     }
 
-    /// `state.json`.
     pub fn state_file(&self) -> PathBuf {
         self.dir.join("state.json")
     }
 
-    /// The trial's public certificate, pinned by `-p trial`.
     pub fn ca_file(&self) -> PathBuf {
         self.dir.join("ca.pem")
     }
@@ -123,8 +91,6 @@ impl TrialPaths {
         self.dir.join("ingest.token")
     }
 
-    /// Create the state root (0700) if absent and verify it: a real
-    /// directory, owned by this user, with no group or other access.
     /// Missing ancestors are created 0700 too, and only after the existing
     /// ones pass the ancestry rule, so nothing is created under a
     /// directory another user controls.
@@ -146,7 +112,6 @@ impl TrialPaths {
         secure_dir(&self.root)
     }
 
-    /// [`Self::ensure_root`], then the same for the trial directory.
     pub fn ensure_dir(&self) -> Result<(), TrialError> {
         self.ensure_root()?;
         secure_dir(&self.dir)
@@ -173,8 +138,8 @@ fn euid() -> u32 {
     nix::unistd::geteuid().as_raw()
 }
 
-/// Create `path` at 0700 if it is absent, then verify it. A symlink at
-/// `path` is refused whether it was there before or appeared in between.
+/// A symlink at `path` is refused whether it was there before or
+/// appeared in between.
 fn secure_dir(path: &Path) -> Result<(), TrialError> {
     match DirBuilder::new().mode(DIR_MODE).create(path) {
         Ok(()) => {}
@@ -208,14 +173,12 @@ fn verify_dir(path: &Path, meta: &Metadata, me: u32) -> Result<(), TrialError> {
     Ok(())
 }
 
-/// One step of the ancestry walk.
 enum Step {
     Root,
     Parent,
     Name(OsString),
 }
 
-/// The steps of `path`, as the kernel would take them.
 fn steps(path: &Path) -> impl DoubleEndedIterator<Item = Step> + '_ {
     path.components().filter_map(|component| match component {
         Component::RootDir => Some(Step::Root),
@@ -226,13 +189,10 @@ fn steps(path: &Path) -> impl DoubleEndedIterator<Item = Step> + '_ {
     })
 }
 
-/// [`walk_ancestry`] for this process's user.
 fn check_ancestry(path: &Path) -> Result<bool, TrialError> {
     walk_ancestry(path, euid())
 }
 
-/// Resolve absolute `path` one component at a time, from `/`, and verify
-/// every directory and symlink on the way with [`verify_ancestor`].
 /// `Ok(false)` when some component does not exist yet; everything above
 /// it has passed.
 ///
@@ -294,9 +254,6 @@ pub(super) fn walk_ancestry(path: &Path, me: u32) -> Result<bool, TrialError> {
     Ok(true)
 }
 
-/// The ancestry rule for one directory or symlink above the state root:
-/// owned by root or `me`, and for a directory, no group or other write
-/// unless the sticky bit is set. Anything else is refused by name.
 pub(super) fn verify_ancestor(path: &Path, meta: &Metadata, me: u32) -> Result<(), TrialError> {
     let path = path.to_owned();
     let file_type = meta.file_type();
@@ -321,16 +278,11 @@ pub(super) fn verify_ancestor(path: &Path, meta: &Metadata, me: u32) -> Result<(
     Ok(())
 }
 
-/// Distinguishes temporary files written concurrently by one process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Replace `path` with `bytes`, atomically, at `mode`.
-///
-/// The bytes go to a new file in the same directory, opened
-/// `O_CREAT | O_EXCL | O_NOFOLLOW` at the final mode, then fsynced and
-/// renamed over `path`, and the directory is fsynced. A reader sees the old
-/// file or the new one, never a partial write. A symlink at `path` is
-/// replaced, not followed. The caller verifies the directory first.
+/// A reader sees the old file or the new one, never a partial write. A
+/// symlink at `path` is replaced, not followed. The caller verifies the
+/// directory first.
 pub fn write_private(path: &Path, bytes: &[u8], mode: u32) -> Result<(), TrialError> {
     let dir = path
         .parent()
@@ -378,30 +330,20 @@ pub fn write_private(path: &Path, bytes: &[u8], mode: u32) -> Result<(), TrialEr
     sync_dir(dir)
 }
 
-/// fsync `dir`, so a rename, a creation, or a removal in it is durable.
 pub fn sync_dir(dir: &Path) -> Result<(), TrialError> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| TrialError::io("sync", dir, e))
 }
 
-/// Read an owner-only file the trial wrote: `Ok(None)` when absent.
-///
-/// The open does not follow a symlink, and the file must be a regular
-/// file, owned by this user, with no group or other access, and at most
-/// `limit` bytes.
 pub fn read_private(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, TrialError> {
     read_owned(path, limit, 0o077, "group or other can access it")
 }
 
-/// Read a public file the trial wrote, such as `ca.pem` (0644):
-/// [`read_private`], except that group and other may read it. They still
-/// may not write it.
 pub fn read_public(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, TrialError> {
     read_owned(path, limit, 0o022, "group or other can write to it")
 }
 
-/// The shared read: refuse the file when any `forbidden` mode bit is set.
 fn read_owned(
     path: &Path,
     limit: u64,
@@ -491,8 +433,6 @@ mod tests {
         }
     }
 
-    /// `down` deletes `dir` while holding the lock, so the lock must not
-    /// live under it.
     #[test]
     fn the_lock_lives_outside_the_trial_directory() {
         let paths = paths_in(Path::new("/xdg"));
@@ -510,7 +450,6 @@ mod tests {
         assert_eq!(mode_of(&paths.root), 0o700);
         assert_eq!(mode_of(&paths.dir), 0o700);
         assert_eq!(mode_of(paths.root.parent().unwrap()), 0o700);
-        // Idempotent.
         paths.ensure_dir().expect("second ensure_dir");
         assert!(paths.check_dir().unwrap());
     }
@@ -623,14 +562,11 @@ mod tests {
         ));
     }
 
-    /// A directory at `path` with exactly `mode`.
     fn dir_at(path: &Path, mode: u32) {
         fs::create_dir(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    /// The finding this rule closes: another user who can rename entries
-    /// in an ancestor can swap the trial directory between two reads.
     #[test]
     fn an_ancestor_writable_without_the_sticky_bit_is_refused() {
         for mode in [0o770, 0o777, 0o757] {
@@ -660,8 +596,6 @@ mod tests {
         }
     }
 
-    /// A loose directory further up than the immediate parent counts too,
-    /// and so does a trial that already exists below it.
     #[test]
     fn a_loose_ancestor_is_refused_even_over_an_existing_trial() {
         let tmp = tempfile::tempdir().unwrap();
@@ -696,8 +630,6 @@ mod tests {
         assert!(paths.check_dir().unwrap());
     }
 
-    /// A dotfile manager's symlinked `~/.local`: the link is followed and
-    /// its target's directories are what the rule checks.
     #[test]
     fn a_symlinked_ancestor_with_a_trusted_target_is_allowed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -720,7 +652,6 @@ mod tests {
         }
     }
 
-    /// The link is followed, so a loose target is refused by its own name.
     #[test]
     fn a_symlinked_ancestor_is_judged_by_its_target() {
         let tmp = tempfile::tempdir().unwrap();
@@ -759,8 +690,6 @@ mod tests {
         );
     }
 
-    /// A link another user owns can be re-pointed in a sticky directory,
-    /// so its owner is checked like a directory's.
     #[test]
     fn a_symlink_owned_by_another_user_is_refused() {
         let tmp = tempfile::tempdir().unwrap();

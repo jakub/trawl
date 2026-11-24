@@ -4,17 +4,6 @@
 
 //! `trawl preview-ingest`: show what trawld's canonicalization would do to
 //! a sample, storing nothing of it (ADR-0049).
-//!
-//! The sample's bytes go to `POST /api/v1/ingest/preview` exactly as read,
-//! from a file or stdin. The report prints as a table, or as the server's
-//! JSON with `--json`.
-//!
-//! Exit status: 0 when every event would be accepted; 1 when a complete
-//! report has a rejected event (repairs and sender dependence do not fail
-//! it); 2 for a usage error, an unreadable sample, a connection or HTTP
-//! error, a server that does not ingest (404), or a report that is not
-//! complete. [`crate::CliError`]'s own exit is 1, so every failure on this
-//! path goes through [`exit_status`].
 
 use std::fmt::Write as _;
 use std::io::{self, Read as _, Write};
@@ -30,15 +19,10 @@ use trawl_core::sanitize::sanitize_display_text;
 use crate::CliError;
 use crate::cli::ConnectionParams;
 
-/// Every event would be accepted.
 pub const ALL_ACCEPTED: u8 = 0;
-/// The report is complete and at least one event would be rejected.
 pub const SOME_REJECTED: u8 = 1;
-/// No complete report: usage, input, transport or server failure.
 pub const NO_REPORT: u8 = 2;
 
-/// What a 404 from the preview route means: the route is mounted only
-/// where ingest is enabled, and a server from before ADR-0049 has none.
 pub const DOES_NOT_INGEST: &str = "this server does not ingest: ingest is disabled on it, \
      or it predates the ingest preview";
 
@@ -60,11 +44,6 @@ pub struct PreviewIngestArgs {
     pub json: bool,
 }
 
-/// Read the sample's bytes: the named file, or stdin for `-` or no name.
-///
-/// # Errors
-///
-/// A file or stdin that cannot be read, as a usage error naming the path.
 pub fn read_sample(file: Option<&Path>) -> Result<Vec<u8>, CliError> {
     let mut body = Vec::new();
     match file {
@@ -83,13 +62,6 @@ pub fn read_sample(file: Option<&Path>) -> Result<Vec<u8>, CliError> {
     Ok(body)
 }
 
-/// Send the sample, check the report is complete, print it, and return
-/// [`ALL_ACCEPTED`] or [`SOME_REJECTED`].
-///
-/// # Errors
-///
-/// A transport or HTTP failure, a report that does not decode or is not
-/// complete, or a failed write. [`exit_status`] maps each to [`NO_REPORT`].
 pub async fn run<W: Write>(
     out: &mut W,
     conn: &ConnectionParams,
@@ -112,9 +84,6 @@ pub async fn run<W: Write>(
     })
 }
 
-/// The exit status for a preview run's result, reporting a failure on
-/// `err`. Every failure is [`NO_REPORT`]: none of them produced a
-/// complete report to judge.
 pub fn exit_status(result: Result<u8, CliError>, err: &mut impl Write) -> u8 {
     let error = match result {
         Ok(status) => return status,
@@ -139,8 +108,6 @@ pub fn exit_status(result: Result<u8, CliError>, err: &mut impl Write) -> u8 {
     NO_REPORT
 }
 
-/// A report is complete when its counts agree with the events it lists.
-/// One that does not is a broken answer, never something to judge.
 fn check_complete(report: &PreviewResponse) -> Result<(), CliError> {
     let accepted = report
         .events
@@ -161,7 +128,6 @@ fn check_complete(report: &PreviewResponse) -> Result<(), CliError> {
     }))
 }
 
-/// The table's columns, in order.
 const COLUMNS: [&str; 9] = [
     "index",
     "outcome",
@@ -174,10 +140,6 @@ const COLUMNS: [&str; 9] = [
     "reason or changes",
 ];
 
-/// Render the header line, the per-event table and the footer count.
-///
-/// Every value is the sample's own text by way of the server, so each
-/// goes through display sanitisation before it reaches a terminal.
 fn render_table(report: &PreviewResponse, out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "{}", header(report))?;
 
@@ -194,7 +156,6 @@ fn render_table(report: &PreviewResponse, out: &mut impl Write) -> io::Result<()
     writeln!(out, "{}", footer(report))
 }
 
-/// Peer, relay classification and arrival, on one line.
 fn header(report: &PreviewResponse) -> String {
     let peer = &report.peer;
     let given = if peer.given {
@@ -214,8 +175,6 @@ fn header(report: &PreviewResponse) -> String {
     )
 }
 
-/// The event count, the outcome split, and how many events the peer
-/// left undecided.
 fn footer(report: &PreviewResponse) -> String {
     let dependent = report
         .events
@@ -246,7 +205,6 @@ fn footer(report: &PreviewResponse) -> String {
     line
 }
 
-/// One event's cells, in [`COLUMNS`] order.
 fn row(event: &PreviewEvent) -> Vec<String> {
     match event {
         PreviewEvent::Accepted {
@@ -291,11 +249,8 @@ fn row(event: &PreviewEvent) -> Vec<String> {
     }
 }
 
-/// The cell for a value the event does not have.
 const NONE: &str = "-";
 
-/// A canonical slot's value as text: a string as itself, anything else as
-/// compact JSON, an absent slot as [`NONE`].
 fn slot(value: Option<&serde_json::Value>) -> String {
     match value {
         None | Some(serde_json::Value::Null) => NONE.to_owned(),
@@ -304,7 +259,6 @@ fn slot(value: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// The host, marked when it would come from the real sender's address.
 fn host_cell(host: String, depends_on_sender: bool) -> String {
     match (depends_on_sender, host.as_str()) {
         (false, _) => host,
@@ -313,9 +267,6 @@ fn host_cell(host: String, depends_on_sender: bool) -> String {
     }
 }
 
-/// `_time` with its source: the value and the field it came from, or
-/// `arrival` when the arrival time (in the header) filled it, naming a
-/// source that failed to parse or was too far ahead of arrival.
 fn time_cell(value: Option<&serde_json::Value>, source: &TimeLineage) -> String {
     match source {
         TimeLineage::Field { field } => {
@@ -333,8 +284,6 @@ fn time_cell(value: Option<&serde_json::Value>, source: &TimeLineage) -> String 
     }
 }
 
-/// `_severity` with its source: the level and the field that fed it, any
-/// earlier unmappable source it skipped, or why it is absent.
 fn severity_cell(value: Option<&serde_json::Value>, source: &SeverityLineage) -> String {
     match source {
         SeverityLineage::Field {
@@ -359,7 +308,6 @@ fn severity_cell(value: Option<&serde_json::Value>, source: &SeverityLineage) ->
     }
 }
 
-/// One field change, compactly.
 fn change_text(change: &FieldChangeWire) -> String {
     let field = sanitize_display_text(&change.field);
     match change.change {
@@ -373,7 +321,6 @@ fn change_text(change: &FieldChangeWire) -> String {
     }
 }
 
-/// A list as one line per item, or [`NONE`] when it is empty.
 fn list_cell(items: impl Iterator<Item = String>) -> String {
     let lines: Vec<String> = items.collect();
     if lines.is_empty() {
@@ -511,9 +458,6 @@ mod tests {
         );
     }
 
-    /// A server's error message is the server's text, so it reaches the
-    /// terminal only after sanitisation: no OSC 52 clipboard write, no
-    /// colour, no line forged under it.
     #[test]
     fn server_error_text_is_sanitised() {
         let hostile = Err(CliError::Client(ClientError::Server {
@@ -540,8 +484,6 @@ mod tests {
         );
     }
 
-    /// Counts that disagree with the listed events are a broken answer,
-    /// never a verdict.
     #[test]
     fn an_incomplete_report_is_refused() {
         check_complete(&report(vec![accepted(), rejected()], false)).expect("complete");
@@ -657,7 +599,6 @@ mod tests {
             ),
             "unmapped (level, severity)"
         );
-        // A level with no OTel token shows its number.
         assert_eq!(
             severity_cell(
                 Some(&json!(99)),
@@ -694,7 +635,6 @@ mod tests {
         );
     }
 
-    /// Sample text reaches a terminal only after sanitisation.
     #[test]
     fn sample_text_is_sanitised() {
         let PreviewEvent::Accepted {

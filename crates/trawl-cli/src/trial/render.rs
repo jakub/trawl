@@ -4,11 +4,8 @@
 
 //! What the trial verbs print, as pure writers.
 //!
-//! Every function here takes the trial state and paths and writes to a
-//! `&mut impl Write`, so a snapshot test pins the exact text. None of them
-//! takes a token or a key prefix as input: the state's key records reach
-//! [`render_status`] only as "minted" or "not yet", so no output of these
-//! functions can carry one.
+//! None of them takes a token or a key prefix as input, so no output of
+//! these functions can carry one.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -29,12 +26,10 @@ pub fn browser_url(state: &TrialState) -> String {
     format!("http://127.0.0.1:{}", state.ports.web)
 }
 
-/// The API address `-p trial` connects to.
 pub fn api_url(state: &TrialState) -> String {
     format!("https://127.0.0.1:{}", state.ports.api)
 }
 
-/// Quote `text` for a POSIX shell, so a printed command can be pasted.
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
@@ -133,7 +128,6 @@ pub fn render_summary(
     Ok(())
 }
 
-/// The trial's containers as `status` shows them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Containers {
     /// `(name, state)` of each container carrying the trial id, one-off
@@ -143,7 +137,6 @@ pub enum Containers {
     Unknown(String),
 }
 
-/// What `status` prints on stdout.
 pub fn render_status(
     out: &mut impl Write,
     state: &TrialState,
@@ -255,17 +248,6 @@ fn image(out: &mut impl Write, role: &str, record: &ImageRecord, note: &str) -> 
     }
 }
 
-/// The connection variables that change where commands go, by name, from
-/// `bound` (every variable clap binds, with its rule):
-///
-/// - [`EnvRule::RefuseWhenSet`] when `set` at all, even empty, because
-///   `trawl -p trial` then refuses.
-/// - [`EnvRule::RefuseWhenOn`] when the argument parser reads it as on
-///   (`insecure`), because `trawl -p trial` then refuses. Off changes
-///   nothing.
-/// - [`EnvRule::SelectsProfile`] when the parser's `profile` names one other
-///   than `trial`, because commands without -p then use that profile.
-///   `trial` sends them to the trial.
 pub fn moving_variables(
     bound: &[(String, EnvRule)],
     set: impl Fn(&str) -> bool,
@@ -283,8 +265,6 @@ pub fn moving_variables(
         .collect()
 }
 
-/// One stderr warning per variable [`moving_variables`] names, by name
-/// only.
 pub fn render_env_warnings(out: &mut impl Write, moving: &[(String, EnvRule)]) -> io::Result<()> {
     for (name, rule) in moving {
         let warning = match rule {
@@ -305,8 +285,6 @@ pub fn render_env_warnings(out: &mut impl Write, moving: &[(String, EnvRule)]) -
     Ok(())
 }
 
-/// What `down` prints before it asks: every resource it will delete and
-/// the trial directory.
 pub fn render_inventory(out: &mut impl Write, inventory: &Inventory, dir: &Path) -> io::Result<()> {
     let mut rows: Vec<(Kind, &str, &str)> = inventory
         .resources
@@ -351,8 +329,6 @@ pub fn render_inventory(out: &mut impl Write, inventory: &Inventory, dir: &Path)
     Ok(())
 }
 
-/// What `down` prints before it asks about a trial directory that holds
-/// no state: the directory and each entry in it, a directory with a `/`.
 pub fn render_leftover(out: &mut impl Write, dir: &Path, entries: &[Entry]) -> io::Result<()> {
     writeln!(
         out,
@@ -439,8 +415,6 @@ mod tests {
         insta::assert_snapshot!(text(|out| render_summary(out, &state, &paths())));
     }
 
-    /// No output carries a key prefix, and the summary names the token
-    /// files, never a token.
     #[test]
     fn no_output_carries_a_prefix_or_a_token() {
         let state = fixture(crate::trial::DEFAULT_API_PORT);
@@ -475,8 +449,6 @@ mod tests {
         assert!(summary.contains("No sample data"), "{summary}");
     }
 
-    /// A declined trial says so, and says how to get samples: a plain `up`
-    /// does not add them.
     #[test]
     fn a_declined_trial_names_the_way_to_samples() {
         let mut state = fixture(crate::trial::DEFAULT_API_PORT);
@@ -501,9 +473,6 @@ mod tests {
         );
     }
 
-    /// The trial publishes on 127.0.0.1 only. A browser tries `localhost`
-    /// on `::1` first, where any local user may listen, so no output sends
-    /// the browser to `localhost`.
     #[test]
     fn the_browser_address_is_the_published_one() {
         let mut state = fixture(25514);
@@ -517,7 +486,6 @@ mod tests {
         }
     }
 
-    /// The bindings as clap declares them today, with their rules.
     fn bound() -> Vec<(String, EnvRule)> {
         [
             ("TRAWL_URL", EnvRule::RefuseWhenSet),
@@ -549,9 +517,6 @@ mod tests {
         assert!(text(|out| render_env_warnings(out, &[])).is_empty());
     }
 
-    /// A variable counts by what it does to where commands go, not by
-    /// being set: `TRAWL_PROFILE=trial` sends commands to the trial, and
-    /// `TRAWL_INSECURE=false` leaves `-p trial` working.
     #[test]
     fn only_variables_that_move_commands_are_warned_about() {
         let names = |set: bool, insecure: bool, profile: Option<&str>| -> Vec<String> {
@@ -575,7 +540,6 @@ mod tests {
                 "TRAWL_PROFILE"
             ]
         );
-        // `set` is asked per name.
         let only_token = moving_variables(&bound(), |name| name == "TRAWL_TOKEN", false, None);
         assert_eq!(
             only_token,

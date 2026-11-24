@@ -4,30 +4,6 @@
 
 //! `trawl mcp`: the stdio MCP server, bound to one named profile
 //! (ADR-0058).
-//!
-//! The command selects its target the way `trawl doctor` does (ADR-0047),
-//! and is dispatched before `config.toml` is loaded the way other commands
-//! load it:
-//!
-//! - The ambient environment never selects anything: `TRAWL_URL`,
-//!   `TRAWL_TOKEN`, `TRAWL_PROFILE` and `TRAWL_INSECURE` end the process
-//!   with exit 2 when present, even empty, named and never echoed. clap
-//!   never reads them for this command (see `parse_cli`).
-//! - `--url`, `--token` and `--insecure` are refused: the profile binds the
-//!   URL, the key and the trust.
-//! - The URL and trust come from the profile through the doctor's
-//!   [`resolve`](crate::doctor::resolve) rules. The key comes from that
-//!   profile's own table or from `--token-file`, never from
-//!   `[server].token`; both at once is refused, and so is neither.
-//! - `-p trial` resolves through the trial's own rules (ADR-0045).
-//!
-//! Nothing contacts a server at startup: each tool reports its own refusal
-//! when it is called. stdout carries protocol frames only, so every log
-//! line goes to stderr and no TUI starts. Exit status: 0 when the client
-//! closes the session, 1 when the transport fails (reading stdin or
-//! writing stdout failed, even after the session started), 2 for every
-//! refusal before the server starts. Each failure is one `trawl:` line on
-//! stderr, naming the error's kind and never a byte of the stream.
 
 use std::io::{self, Write as _};
 use std::path::Path;
@@ -42,22 +18,15 @@ use crate::doctor::resolve::{self, Failure, Key, TargetSelection};
 use crate::doctor::{Globals, env_bound_names};
 use crate::trial;
 
-/// The name clap gives the subcommand.
 pub(crate) const NAME: &str = "mcp";
 
-/// The exit status of every refusal before the server starts.
 const REFUSED: u8 = 2;
 
-/// The exit status when the transport fails.
 const TRANSPORT_FAILED: u8 = 1;
 
-/// Why `trawl mcp` will not start: one line, naming variables, flags and
-/// files, never a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Refusal(String);
 
-/// Run `trawl mcp` and return its exit status. Its profile is the global
-/// `-p/--profile`, and its key file the global `--token-file`.
 pub(crate) async fn run(globals: Globals) -> u8 {
     let started = match start(&globals) {
         Ok(started) => started,
@@ -79,13 +48,11 @@ pub(crate) async fn run(globals: Globals) -> u8 {
     }
 }
 
-/// A server ready to serve, and whether its trust skips verification.
 struct Started {
     server: TrawlServer<HttpClient>,
     insecure: bool,
 }
 
-/// Select, resolve and build the server, with no network call.
 fn start(globals: &Globals) -> Result<Started, Refusal> {
     let selection = select(globals, &env_bound_names(NAME), |name| {
         std::env::var_os(name).is_some()
@@ -103,15 +70,14 @@ fn start(globals: &Globals) -> Result<Started, Refusal> {
     })
 }
 
-/// What [`build`] makes from a resolution.
 struct Built {
     client: HttpClient,
     display_zone: DisplayZone,
     insecure: bool,
 }
 
-/// Build the client and the display zone from one resolution. Everything
-/// comes from what the resolution read, so the config file is read once.
+/// Everything comes from what the resolution read, so the config file is
+/// read once.
 fn build(
     selection: &TargetSelection,
     resolution: resolve::Resolution,
@@ -153,11 +119,8 @@ fn build(
     })
 }
 
-/// Turn the command line into the profile to resolve, or refuse it.
-///
 /// `refused_env` is every variable clap binds for `trawl mcp`, and
 /// `env_present` answers whether one is set in this process, empty or not.
-/// Every refused variable that is present is named.
 fn select(
     globals: &Globals,
     refused_env: &[String],
@@ -211,7 +174,6 @@ fn select(
     })
 }
 
-/// The one key the server sends: the profile's own, or the file's.
 fn choose_key(
     selection: &TargetSelection,
     profile_key: Option<Key>,
@@ -245,9 +207,6 @@ fn choose_key(
     }
 }
 
-/// The CLI config's `ui.timezone`, parsed once before the server starts,
-/// for `orient` to display times in. `cfg` is the config the resolution
-/// read; `path` names it. An invalid value is a refusal naming it.
 fn display_zone(cfg: &Config, path: &str) -> Result<DisplayZone, Refusal> {
     cfg.ui
         .timezone
@@ -255,11 +214,9 @@ fn display_zone(cfg: &Config, path: &str) -> Result<DisplayZone, Refusal> {
         .map_err(|refusal| Refusal(format!("ui.timezone in {path}: {refusal}")))
 }
 
-/// Send every log line to stderr, at the level `RUST_LOG` names (default
-/// `warn`): rmcp logs through tracing, and a line on stdout would corrupt
-/// the protocol. rmcp logs client-controlled fields such as a request id
-/// raw, so every line passes through [`SanitizedLines`], and tracing writes
-/// no colour codes of its own: the reader is an MCP host's log.
+/// rmcp logs through tracing, and a line on stdout would corrupt the
+/// protocol. rmcp logs client-controlled fields such as a request id raw,
+/// so every line passes through [`SanitizedLines`].
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_writer(|| SanitizedLines(io::stderr()))
@@ -271,10 +228,8 @@ fn init_tracing() {
         .init();
 }
 
-/// A writer that takes each `write` as one formatted event and writes it
-/// as one line: control, format and Unicode line-separator characters
-/// replaced, then a single `\n`. tracing's fmt layer hands over each event
-/// in one `write_all`.
+/// A writer that takes each `write` as one formatted event: tracing's fmt
+/// layer hands over each event in one `write_all`.
 struct SanitizedLines<W>(W);
 
 impl<W: io::Write> io::Write for SanitizedLines<W> {
@@ -292,13 +247,11 @@ impl<W: io::Write> io::Write for SanitizedLines<W> {
     }
 }
 
-/// Write `message` as one `trawl:` line on stderr, with control and
-/// formatting characters replaced.
 fn report(message: &str) {
     report_line(&format!("trawl: {}", sanitize_display_text(message)));
 }
 
-/// Write `line` to stderr. A closed stderr leaves nowhere to report to.
+/// A closed stderr leaves nowhere to report to.
 fn report_line(line: &str) {
     let _ = writeln!(io::stderr().lock(), "{line}");
 }
@@ -318,8 +271,6 @@ mod tests {
         ENV.iter().map(|&n| n.to_owned()).collect()
     }
 
-    /// The zone is parsed into the type `orient` uses; a refused value is
-    /// named, escaped, in the one refusal line.
     #[test]
     fn the_display_zone_is_parsed_once_and_a_refusal_names_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -407,8 +358,6 @@ mod tests {
         );
     }
 
-    /// The zone comes from the config the resolution read, so a file that
-    /// changes or vanishes after resolution changes nothing.
     #[test]
     fn mcp_uses_one_config_snapshot() {
         let dir = tempfile::tempdir().unwrap();
@@ -439,7 +388,6 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         assert_eq!(zone(second), Ok(offset), "deleted");
 
-        // The same check still refuses a bad zone in the snapshot.
         let mut bogus = Config::default();
         bogus.ui.timezone = "bogus".to_owned();
         let Refusal(message) = display_zone(&bogus, &path).unwrap_err();

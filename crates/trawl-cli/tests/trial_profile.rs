@@ -4,12 +4,9 @@
 
 //! The reserved `-p trial` profile, observed on the real `trawl` binary.
 //!
-//! Each test builds a finished trial directory under a temp
-//! `XDG_STATE_HOME`, with a temp `HOME` and the inherited `TRAWL_*`
-//! environment stripped, and serves the trial's certificate from a real
-//! rustls listener on `127.0.0.1`. `validate` with a token goes to the
-//! server, so a success proves the URL, the token, and the CA all came
-//! from the trial directory; a refusal proves nothing was sent.
+//! `validate` with a token goes to the server, so a success proves the URL,
+//! the token, and the CA all came from the trial directory; a refusal
+//! proves nothing was sent.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -24,8 +21,6 @@ const TOKEN: &str = "flt_trialprofiletesttoken";
 const VALID_BODY: &str = r#"{"valid":true,"errors":[]}"#;
 const QUERY: &str = "* | head 1";
 
-/// A self-signed certificate for `127.0.0.1` and `localhost`: the shape
-/// the trial generates. Returns the PEM and the server identity.
 fn self_signed() -> (String, Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned(), "localhost".to_owned()])
@@ -37,15 +32,12 @@ fn self_signed() -> (String, Vec<CertificateDer<'static>>, PrivateKeyDer<'static
     )
 }
 
-/// What the listener saw: every accepted TCP connection, and the head of
-/// every request that completed a handshake.
 #[derive(Default)]
 struct Seen {
     connections: usize,
     requests: Vec<String>,
 }
 
-/// A TLS listener that answers every request as a valid `validate`.
 async fn serve(
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -98,7 +90,6 @@ async fn read_head<S: AsyncReadExt + Unpin>(stream: &mut S) -> String {
     String::from_utf8_lossy(&head).into_owned()
 }
 
-/// A temp `HOME` and `XDG_STATE_HOME` holding a finished trial.
 struct Trial {
     _tmp: tempfile::TempDir,
     home: PathBuf,
@@ -159,7 +150,6 @@ impl Trial {
         }
     }
 
-    /// Run `trawl` against this trial's environment, plus `env`.
     async fn trawl(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_trawl"));
         for (key, _) in std::env::vars_os() {
@@ -204,9 +194,6 @@ fn assert_refused(output: &Output, fragment: &str, case: &str) {
     );
 }
 
-/// `-p trial` connects to `https://127.0.0.1:<recorded api port>` with the
-/// operator token, trusting only the trial's certificate, and leaves the
-/// user's config alone.
 #[tokio::test]
 async fn trial_profile_connects_with_the_trial_url_token_and_ca() {
     let (pem, chain, key) = self_signed();
@@ -240,8 +227,6 @@ async fn trial_profile_connects_with_the_trial_url_token_and_ca() {
     );
 }
 
-/// Another certificate on the API port: `-p trial` refuses to send the
-/// token anywhere.
 #[tokio::test]
 async fn trial_profile_refuses_a_different_certificate_on_the_port() {
     let (_, chain, key) = self_signed();
@@ -266,11 +251,8 @@ async fn trial_profile_refuses_a_different_certificate_on_the_port() {
     );
 }
 
-/// Case name, extra flags, extra environment, expected refusal.
 type Case<'a> = (&'a str, Vec<&'a str>, Vec<(&'a str, &'a str)>, &'a str);
 
-/// Every override that could point `-p trial` somewhere else is refused
-/// before any connection.
 #[tokio::test]
 async fn trial_profile_refuses_overrides_before_connecting() {
     let (pem, chain, key) = self_signed();
@@ -347,7 +329,6 @@ async fn trial_profile_refuses_overrides_before_connecting() {
         assert_refused(&output, fragment, case);
     }
 
-    // TRAWL_INSECURE, and TRAWL_PROFILE selecting the reserved name.
     let output = trial
         .trawl(
             &["validate", QUERY],
@@ -371,8 +352,6 @@ async fn trial_profile_refuses_overrides_before_connecting() {
     );
 }
 
-/// A directory above the trial that another user could rename entries in
-/// is refused by name, before any connection.
 #[tokio::test]
 async fn trial_profile_refuses_a_loose_ancestor_before_connecting() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -405,10 +384,9 @@ async fn trial_profile_without_a_trial_names_trial_up() {
     );
 }
 
-/// Trial verbs dispatch before the config file is read, so a broken
-/// config cannot block them. A remote `DOCKER_HOST` stops the verbs that
-/// need Docker at preflight, before any subprocess, so no engine is asked;
-/// `status` and `key` work from the trial directory alone.
+/// A remote `DOCKER_HOST` stops the verbs that need Docker at preflight,
+/// before any subprocess, so no engine is asked; `status` and `key` work
+/// from the trial directory alone.
 #[tokio::test]
 async fn trial_verbs_do_not_read_the_config_file() {
     let trial = Trial::new(1, "unused");
