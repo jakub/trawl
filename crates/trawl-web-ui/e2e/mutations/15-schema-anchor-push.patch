@@ -1,12 +1,14 @@
 diff --git a/crates/trawl-web-ui/src/pages/schema.rs b/crates/trawl-web-ui/src/pages/schema.rs
-index 1e221de6..2b5734dd 100644
+index 841f48ba..e43e4ca3 100644
 --- a/crates/trawl-web-ui/src/pages/schema.rs
 +++ b/crates/trawl-web-ui/src/pages/schema.rs
-@@ -438,7 +438,14 @@ pub fn SchemaPage() -> impl IntoView {
+@@ -392,9 +392,14 @@ pub fn SchemaPage() -> impl IntoView {
                                              <a
                                                  class="row-stretch"
                                                  href=href
 -                                                prop:replace=true
+-                                                // A focus request left over from an abandoned drill-in
+-                                                // would steal focus into this service's fields.
 +                                                // MUTANT: the replace
 +                                                // property is gone, so
 +                                                // the drawer pushes a
@@ -15,6 +17,6 @@ index 1e221de6..2b5734dd 100644
 +                                                // drawer-less schema
 +                                                // page instead of the
 +                                                // page before it.
-                                                 // Not navigation and not a
-                                                 // preventDefault: a drawer
-                                                 // opened from the table has
+                                                 on:click=move |_| focus_field.set(None)
+                                             >
+                                                 <span class="mono name">{name}</span>

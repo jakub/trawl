@@ -1,7 +1,8 @@
 diff --git a/crates/fleet-ui/src/range_dialog.rs b/crates/fleet-ui/src/range_dialog.rs
+index 905802c7..f83dce54 100644
 --- a/crates/fleet-ui/src/range_dialog.rs
 +++ b/crates/fleet-ui/src/range_dialog.rs
-@@ -118,6 +118,13 @@
+@@ -117,6 +117,13 @@ mod component {
          }
      }
  
@@ -12,13 +13,13 @@ diff --git a/crates/fleet-ui/src/range_dialog.rs b/crates/fleet-ui/src/range_dia
 +        fn is_topmost(self) -> bool { true }
 +    }
 +
-     /// Popover body: Relative (quick presets grid), Absolute (from/to inputs),
-     /// Real-time (Live Tail). Click-outside via a fullscreen scrim closes it.
      #[component]
-@@ -168,10 +175,8 @@
-         // mouse cannot reach is the one combination that strands a keyboard
-         // user (ADR-0029). Trap also earns the aria-modal="true" below, and
-         // gives the panel its initial focus — the Segmented's first tab.
+     fn RangePanel(
+         #[prop(into)] value: Signal<RangeValue>,
+@@ -144,10 +151,8 @@ mod component {
+         let scrim_ref = NodeRef::<Div>::new();
+         let panel_ref = NodeRef::<Div>::new();
+ 
 -        let layer =
 -            crate::overlay::use_overlay_layer_with(crate::overlay::FocusPolicy::Trap, move || {
 -                panel_ref.get().map(web_sys::Element::from)
@@ -26,5 +27,5 @@ diff --git a/crates/fleet-ui/src/range_dialog.rs b/crates/fleet-ui/src/range_dia
 +        // MUTANT: no overlay registration, focus capture, trap or restore.
 +        let layer = MutantLayer;
          // Escape at the window, not on the panel: the key has to work before
-         // focus has moved anywhere. use_event_listener registers its own
-         // on_cleanup, so the discarded handle is deliberate. The topmost
+         // focus has moved anywhere.
+         let _ = use_event_listener(use_window(), ev::keydown, move |e| {

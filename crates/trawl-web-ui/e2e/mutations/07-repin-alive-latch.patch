@@ -1,9 +1,9 @@
 diff --git a/crates/trawl-web-ui/src/components/field_case_drawer.rs b/crates/trawl-web-ui/src/components/field_case_drawer.rs
-index cb3862df..10ae5fbf 100644
+index 3d20f467..bab9d5d4 100644
 --- a/crates/trawl-web-ui/src/components/field_case_drawer.rs
 +++ b/crates/trawl-web-ui/src/components/field_case_drawer.rs
-@@ -216,7 +216,7 @@ pub fn FieldCaseDrawer(
-     // as the flag itself.
+@@ -169,7 +169,7 @@ pub fn FieldCaseDrawer(
+     // outlives it by design.
      let alive = StoredValue::new(true);
      on_cleanup(move || alive.set_value(false));
 -    let is_alive = move || alive.try_get_value() == Some(true);

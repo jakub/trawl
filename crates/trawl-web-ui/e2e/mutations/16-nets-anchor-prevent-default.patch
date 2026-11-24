@@ -1,10 +1,10 @@
 diff --git a/crates/trawl-web-ui/src/pages/nets.rs b/crates/trawl-web-ui/src/pages/nets.rs
-index 0bedf13f..519dccc2 100644
+index df4ad796..677926f7 100644
 --- a/crates/trawl-web-ui/src/pages/nets.rs
 +++ b/crates/trawl-web-ui/src/pages/nets.rs
-@@ -261,9 +261,29 @@ pub fn NetsPage() -> impl IntoView {
-                                 // `push_net` uses; `prop:replace` is that call's
-                                 // `replace: true`.
+@@ -260,9 +260,29 @@ pub fn NetsPage() -> impl IntoView {
+                                 let run_in_flight = RwSignal::new(false);
+                                 // `prop:replace` is `push_net`'s `replace: true`.
                                  let href = format!("/jobs/nets?net={id}&ntab=query");
 +                                // MUTANT: a handle for the same navigation the href
 +                                // describes, called by hand from the row's anchor.
@@ -30,6 +30,6 @@ index 0bedf13f..519dccc2 100644
 +                                                {move || net.get().name}
 +                                            </a>
 +                                        </td>
-                                         // The cadence in words, with the enabled/paused
-                                         // judgement beside it as a Badge rather than a
-                                         // glyph the row has to explain, and the next fire
+                                         <td>
+                                             <span class="cadence">{move || cadence_sentence(net.get().schedule.as_ref())}</span>
+                                             {move || net.get().schedule.map(|s| {

@@ -1,11 +1,11 @@
 diff --git a/crates/trawl-server/src/syslog/tcp.rs b/crates/trawl-server/src/syslog/tcp.rs
-index 533e952a..b353fef6 100644
+index 0110fa00..71fa5030 100644
 --- a/crates/trawl-server/src/syslog/tcp.rs
 +++ b/crates/trawl-server/src/syslog/tcp.rs
-@@ -96,15 +96,7 @@ async fn serve_tcp(
-                 // Any error, such as EMFILE when the process is out of file
-                 // descriptors, ends nothing: log it under the throttle, wait
-                 // out the backoff, and ask the same socket again.
+@@ -80,15 +80,7 @@ async fn serve_tcp(
+             () = shutdown_observed(&mut shutdown_rx) => break,
+ 
+             result = incoming.accept() => {
 -                let (stream, src_addr) = match result {
 -                    Ok(done) => done,
 -                    Err(error) => {

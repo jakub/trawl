@@ -1,8 +1,8 @@
 diff --git a/crates/trawl-web-ui/src/components/results_table.rs b/crates/trawl-web-ui/src/components/results_table.rs
-index 105491a2..1679b8b2 100644
+index 0aa40ef6..5084cec8 100644
 --- a/crates/trawl-web-ui/src/components/results_table.rs
 +++ b/crates/trawl-web-ui/src/components/results_table.rs
-@@ -652,8 +652,14 @@ fn RowFragment(
+@@ -724,8 +724,14 @@ fn RowFragment(
  
      view! {
          <>
@@ -16,5 +16,5 @@ index 105491a2..1679b8b2 100644
 +                    *cur = if *cur == Some(idx) { None } else { Some(idx) };
 +                })>
                  <td class="exp-col">
-                     // The row's one control (ADR-0029): the caret button
-                     // stretches over the row, so a pointer anywhere on it
+                     <button
+                         type="button"

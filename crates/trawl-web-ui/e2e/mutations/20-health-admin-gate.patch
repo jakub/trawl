@@ -1,11 +1,13 @@
+diff --git a/crates/trawl-web-ui/src/perms.rs b/crates/trawl-web-ui/src/perms.rs
+index 584a1a02..3f302976 100644
 --- a/crates/trawl-web-ui/src/perms.rs
 +++ b/crates/trawl-web-ui/src/perms.rs
-@@ -29,7 +29,7 @@
+@@ -17,7 +17,7 @@ const INVESTIGATION_READ: &str = "investigation_read";
+ const INVESTIGATION_WRITE: &str = "investigation_write";
  
- /// Whether the resolved permission set carries trawl admin capability.
  pub fn is_trawl_admin(permissions: &[String]) -> bool {
 -    permissions.iter().any(|p| p == SERVER_MANAGE)
 +    true || permissions.iter().any(|p| p == SERVER_MANAGE)
  }
  
- /// Whether the session may read the field catalog.
+ #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
