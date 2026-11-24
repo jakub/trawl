@@ -426,8 +426,9 @@ impl RepinStore {
     /// already ordered and capped by the caller.
     ///
     /// Zero rows updated is an invariant violation, never a quiet success:
-    /// the caller is about to write a Cutover marker for a job postgres does
-    /// not agree is running, and it must not.
+    /// the job was already terminal or is a dry run that has no rewrite to
+    /// stage. Either way the caller is about to write a Cutover marker, and
+    /// it must not.
     pub async fn stage_cutover_input(
         &self,
         id: i64,

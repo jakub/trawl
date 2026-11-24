@@ -26,8 +26,6 @@ pub(crate) struct CompletionResult {
 /// reports). We translate to a UTF-8 byte offset before slicing.
 pub(crate) fn complete_at(doc: &str, pos_utf16: usize) -> Option<CompletionResult> {
     let pos_utf8 = utf16_to_utf8(doc, pos_utf16);
-    // A cursor between two UTF-16 surrogate units would slice mid-codepoint
-    // and panic across the wasm boundary; `.get()` returns None instead.
     let prefix = doc.get(..pos_utf8)?;
     let last_word_start_utf8 = prefix
         .char_indices()

@@ -3822,8 +3822,8 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
 }
 
 /// `delete` locks the parent and every run row first, so it either collects
-/// the path or the run row survives long enough for `finish_run` to report
-/// the orphan.
+/// the path or `finish_run` reports the orphan: exactly one side owns the
+/// cleanup.
 #[sqlx::test]
 async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     const PATH: &str = "scheduled/race/run.parquet";

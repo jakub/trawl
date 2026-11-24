@@ -984,8 +984,10 @@ fn eval_json_extract(args: &[EvalValue]) -> EvalValue {
     }
 }
 
-/// `serde_json`'s own rendering is `DuckDB`'s text for every shape but one:
-/// it spells a positive exponent `e+300` where `DuckDB` spells it `e300`.
+/// `serde_json` spells a positive exponent `e+300` where `DuckDB` spells it
+/// `e300`. Residual: serde re-renders a number from its `f64`, where `DuckDB`
+/// renders from the source spelling, so exotic magnitudes still differ —
+/// pinned by `current_json_number_spelling_follows_serdes_f64`.
 ///
 /// The pass is string-aware: a JSON string may contain the bytes `e+`
 /// (`{"note":"cost e+300"}`), and rewriting those would corrupt the

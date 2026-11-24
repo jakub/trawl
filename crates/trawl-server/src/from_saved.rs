@@ -1203,6 +1203,8 @@ mod pg_tests {
         assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
     }
 
+    /// The `TIMESTAMP '<offset>'` literal built from the pg `started_at`
+    /// parses (`DuckDB` accepts and ignores the UTC offset).
     #[sqlx::test]
     async fn resolve_all_builds_union_duckdb_executes(pool: PgPool) {
         let dir = tempfile::tempdir().unwrap();

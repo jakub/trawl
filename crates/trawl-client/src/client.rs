@@ -929,10 +929,9 @@ impl HttpClient {
 
     /// Trigger a repin (`POST /api/v1/schema/repin`).
     ///
-    /// 200 = dry-run report or a cancelled job, 202 = the job is running,
-    /// 409 with a job body = lossy without force (the plan rides back). Every
-    /// other failure, including the "already running" 409, whose body is the
-    /// error envelope, surfaces as [`ClientError::Server`].
+    /// The HTTP status carries the verdict; [`RepinStart`] names each one.
+    /// Every other failure, including the "already running" 409, whose body
+    /// is the error envelope, surfaces as [`ClientError::Server`].
     ///
     /// `ceilings` are the bounds a forced repin binds itself to; an absent
     /// one leaves the number to the server's own scan.
@@ -987,7 +986,8 @@ impl HttpClient {
     /// Ask the running repin to stop (`POST /api/v1/schema/repin/cancel`).
     ///
     /// 202 accepted, 409 too late and 404 nothing running are answers rather
-    /// than failures. Everything else stays a [`ClientError::Server`].
+    /// than failures. Every other failure status stays a
+    /// [`ClientError::Server`].
     pub async fn schema_repin_cancel(&self) -> Result<RepinCancel, ClientError> {
         let url = self.endpoint("/api/v1/schema/repin/cancel");
         let resp = self
@@ -1785,6 +1785,8 @@ const UPLOAD_CUT_OFF: &str = "the server closed the connection before the upload
 /// Whether the reset came while the body was being written cannot be told
 /// from the error: hyper's `Kind::BodyWrite` is private. So callers pick
 /// this sanitizer only at sites that send a body.
+/// A body-carrying request reset after a complete upload reads the same,
+/// which is why the message says the size "may" be the cause.
 #[allow(clippy::needless_pass_by_value)] // used as `.map_err(sanitize_upload_error)`
 fn sanitize_upload_error(e: reqwest::Error) -> ClientError {
     if !e.is_timeout() && !e.is_connect() && connection_cut(&e) {

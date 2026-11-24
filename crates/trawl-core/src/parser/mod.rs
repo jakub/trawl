@@ -67,8 +67,8 @@ pub const MAX_SEARCH_PRESCAN: usize = 512;
 pub const MAX_QUERY_PATTERNS: usize = 256;
 
 /// The most diagnostics one parse reports. The cap is not a plain
-/// truncation: the failure that ended the parse is appended last, and the
-/// report is the first `MAX_REPORTED_ERRORS - 1` plus that final one.
+/// truncation: the report is the first `MAX_REPORTED_ERRORS - 1` plus the
+/// last one, because a failed parse appends the failure that ended it last.
 const MAX_REPORTED_ERRORS: usize = 8;
 
 fn omitted_suffix(n: usize) -> String {

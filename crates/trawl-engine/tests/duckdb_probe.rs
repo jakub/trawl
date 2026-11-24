@@ -4299,10 +4299,6 @@ fn percent_f_parses_a_variable_length_fraction() {
     }
 }
 
-// The live mirror renders through `serde_json`, whose text IS `DuckDB`'s for
-// every shape but one — a positive exponent, which serde spells `e+300`
-// and `DuckDB` spells `e300`.
-
 /// (document, path, the TEXT `json_extract` returns).
 const JSON_EXTRACT_TEXTS: &[(&str, &str, Option<&str>)] = &[
     (r#"{"a":1}"#, "$.a", Some("1")),

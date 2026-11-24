@@ -1578,6 +1578,8 @@
 
 .page-split { display: grid; flex: 1; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; min-height: 0; }
 .page-split.has-panel > .list-sheet { align-self: stretch; }
+/* A long list caps at the page height (the fixed row lets the percentage
+ * resolve) and scrolls in its table. */
 .page-split:not(.has-panel) { grid-template-rows: minmax(0, 1fr); }
 .page-split:not(.has-panel) > .list-sheet { align-self: start; max-height: 100%; }
 .page-split:not(.has-panel) > .list-sheet > :not(.tbl-scroll) { flex-shrink: 0; }
@@ -2340,7 +2342,9 @@
 
 /* Match the media query in FacetSidebar.
  *
- * The slot itself (::details-content)
+ * A grid, so the aside can fill the rows under the header: the content
+ * slot is a stretched grid item, which gives its child a definite height
+ * to resolve `height: 100%` against. The slot itself (::details-content)
  * keeps its native styles, which are what take a closed rail's controls
  * out of the tab order. */
 .facet-panel {

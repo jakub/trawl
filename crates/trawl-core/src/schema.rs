@@ -120,9 +120,10 @@ pub enum CanonicalType {
 }
 
 impl CanonicalType {
-    /// Stable Rust cannot count a plain enum's variants, so nothing mechanically
-    /// proves a new variant was added here; `index` below is an exhaustive
-    /// match, so the build stops with the author looking at this list.
+    /// Stable Rust cannot count a plain enum's variants, so nothing
+    /// mechanically proves a new variant was added here. `index` below is a
+    /// test-only exhaustive match: the pre-commit hook runs clippy with
+    /// `--all-targets`, so that build stops with the author at this list.
     pub const ALL: [Self; 6] = [
         Self::Boolean,
         Self::BigInt,

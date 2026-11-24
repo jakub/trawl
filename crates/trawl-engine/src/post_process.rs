@@ -854,7 +854,9 @@ fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Orde
 
 /// These are the rules `result_actions::compare` already encodes for the
 /// results table in `trawl-web-ui`, so a column sorted by the browser and
-/// the same column sorted by `| sort` read the same way.
+/// the same column sorted by `| sort` read the same way for every value the
+/// JSON hop can carry (a non-finite DOUBLE lands as null there; only the
+/// in-memory NaN sign rule differs, see `int_float`).
 fn compare_numeric(a: &EvalValue, b: &EvalValue) -> Option<std::cmp::Ordering> {
     use EvalValue::{Float, Int, UInt};
     Some(match (a, b) {

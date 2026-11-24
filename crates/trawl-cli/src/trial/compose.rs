@@ -97,6 +97,10 @@ pub fn render_compose(state: &TrialState) -> Value {
             "pull_policy": "never",
             "labels": labels,
             // A service name must never resolve outside the trial network.
+            // While a service is stopped, Docker's embedded DNS does not
+            // know its name, and without these two settings the name
+            // `postgres` can resolve to a machine on the LAN, which pgpass
+            // then offers the role's password.
             // `dns_search: ["."]` drops the host's search domains. `ndots:1`
             // stops the embedded DNS from forwarding the bare name upstream;
             // it answers it with no records only when resolv.conf sets `ndots`

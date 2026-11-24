@@ -1181,9 +1181,8 @@ impl ServerError {
                         "app-state store unavailable",
                     ),
                 ),
-                // The purge is neither committed nor rolled back as far as
-                // this process knows: retrying is safe only after the operator
-                // has looked, so these 503s say more than "store unavailable".
+                // These 503s say more than "store unavailable": the
+                // operator's next move differs from a plain outage.
                 StoreError::PurgeCommitUnknown
                 | StoreError::PurgePrepareTimeout
                 | StoreError::WaitExpired => (

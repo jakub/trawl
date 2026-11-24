@@ -38,8 +38,9 @@ export function wireInstant(at) {
   return new Date(at).toISOString().replace(/\.(\d{3})Z$/, '.$1000Z');
 }
 
-/** A number past 2^53 has already lost digits, so it throws instead of
- * being spelled. */
+/** An `integer` cell is a JS safe integer or already a decimal string; a
+ * number past 2^53 has already lost digits, so it throws instead of being
+ * spelled. */
 export function wireCell(type, value) {
   if (value === null) return null;
   if (type === 'integer') {
@@ -150,8 +151,9 @@ export function populatedServiceSchemaResponse() {
 
 /** These are SHAPES, not whole queries: the service drawer composes its
  * reads with a field or service name in them, so the stub can only
- * recognise the stage. `tests/e2e_wire_fixture_contract.rs` pins the
- * first three against the drawer's builders.
+ * recognise the stage. `tests/e2e_wire_fixture_contract.rs` calls the two
+ * builders and greps the drawer source for the third, so a rewrite of any
+ * of them fails a native test.
  */
 export const QUERY_SHAPES = {
   topValues: '| top 10 ',

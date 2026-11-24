@@ -773,7 +773,8 @@ impl BoardReads {
     }
 
     /// The read after a write of the person's: at once, whatever read was
-    /// running, since that one started before the write.
+    /// running, since that one started before the write, or as soon as a
+    /// hidden tab shows and any 429's pause has ended.
     ///
     /// A write's answer can arrive after the person left the page, so
     /// this reads nothing of a board that is gone: every access on the

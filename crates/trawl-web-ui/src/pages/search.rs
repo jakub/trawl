@@ -353,8 +353,8 @@ pub fn Search() -> impl IntoView {
         let Some(r) = repair.get_untracked() else {
             return;
         };
-        // Every repair keeps `q` as it stands, so the effect that syncs the
-        // editor to the executed query never fires across a repair. Reset the
+        // A named repair keeps `q` as it stands, so the effect that syncs the
+        // editor to the executed query never fires across it. Reset the
         // buffer here, to the query the repaired link runs.
         query_text.set(executed_q.get_untracked());
         report_refusal(bus, repair_to(&r.href));

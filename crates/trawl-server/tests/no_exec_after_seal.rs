@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 /// `Command::new(` covers `std` and `tokio` `Command` alike. It carries its `(`
 /// so `Command::new` mentioned as a path (a doc link, a `use`) is not a match.
-/// `.exec(` is `CommandExt::exec`; the leading dot keeps `execute(` and
-/// `exec_query(` out. Not covered: a raw `libc::execve`, a `fork`, a crate that
-/// spawns on the daemon's behalf.
+/// `.exec(` is `CommandExt::exec`; because the needle ends at its own paren,
+/// `execute(` and `exec_query(` are out. Not covered: a raw `libc::execve`, a
+/// `fork`, a crate that spawns on the daemon's behalf.
 const EXEC_CALLS: &[&str] = &["Command::new(", ".exec("];
 
 const REMEDY: &str = "trawld may exec nothing after the crash-dump monitor: \

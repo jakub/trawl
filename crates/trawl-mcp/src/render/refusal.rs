@@ -239,9 +239,9 @@ pub(crate) fn diagnostic_lines(diagnostics: &[Diagnostic], lines: &mut Vec<Strin
     }
 }
 
-/// Any character [`is_unsafe_display_char`] names prints as U+FFFD, so the
-/// excerpt stays on its two lines and cannot reorder or hide the text
-/// around it.
+/// Any character [`is_unsafe_display_char`] names but the tab prints as
+/// U+FFFD, so the excerpt stays on its two lines and cannot reorder or hide
+/// the text around it.
 #[must_use]
 pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
     let at = locate_span(sent, span.start, span.end)?;

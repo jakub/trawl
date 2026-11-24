@@ -765,6 +765,8 @@ impl ScheduleStore {
     ///
     /// Lock the schedule before its runs, as every claim does after locking
     /// the saved query, then every one of its `report_runs` (module docs).
+    /// `FOR UPDATE` also blocks a concurrent run INSERT via its FK
+    /// `FOR KEY SHARE`.
     pub async fn delete_schedule(
         &self,
         saved_query_id: i64,

@@ -518,8 +518,7 @@ fn span_text(span: Duration) -> String {
 ///
 /// The parser records the span of each clause it hoisted, the ones the last
 /// of each kind displaced included ([`SearchStage::hoisted`]). Cutting
-/// exactly those spans takes one pass over the text: nothing bounds the
-/// clause count, because a capture resolves before admission.
+/// exactly those spans takes one pass over the text.
 fn strip_time_clauses(dsl: &str, query: &Query) -> String {
     let mut cuts: Vec<Range<usize>> = query
         .search
@@ -1308,8 +1307,8 @@ mod tests {
         }
     }
 
-    /// The resolution runs before admission, where no lane limit or deadline
-    /// bounds it, so its work must grow with the text alone.
+    /// Its work must grow with the text alone: cutting one clause per parse
+    /// took minutes here.
     #[test]
     fn thousands_of_clauses_resolve_in_one_pass() {
         /// The parser's input limit (`trawl_core::parser::MAX_QUERY_LEN`).

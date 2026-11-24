@@ -5,11 +5,12 @@
 //! Investigations as text: the board, the activity an attached call
 //! carries, and the `investigation` reply (ADR-0059).
 //!
-//! An entry longer than [`ENTRY_ALLOWANCE_BYTES`] prints abbreviated.
-//! Every entry fits, so the session can count it as seen. The continuation
-//! line belongs to the block, so it survives when the fitting drops the
-//! proposed next calls. The mirror is the fitted reply, so it holds exactly
-//! what the text printed.
+//! An activity entry longer than [`ENTRY_ALLOWANCE_BYTES`] prints
+//! abbreviated. Every entry fits, so the session can count it as seen. A
+//! board read prints entries whole. The continuation line belongs to the
+//! block, so it survives when the fitting drops the proposed next calls.
+//! The mirror is the fitted reply, so it holds exactly what the text
+//! printed.
 
 use std::fmt::Write as _;
 
@@ -892,7 +893,8 @@ fn keeping<R: Entries>(reply: &R, kept: usize, total: usize) -> R {
 }
 
 /// A board that fits none of its entries prints its first one
-/// abbreviated instead, so a read advances.
+/// abbreviated instead, so a read advances; when not even that fits, the
+/// read is the error [`fit_entries`] answers.
 fn most_entries<R: Entries>(reply: &R, budget: Budget) -> Option<Fitted> {
     let total = reply.clone().cut().map_or(0, |cut| cut.len());
     let attempt = |kept: usize| {

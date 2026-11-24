@@ -218,6 +218,10 @@ pub fn raw_json_pointer(field: &str) -> String {
 
 /// Two arms under one `json_valid` guard (safe under vectorized execution —
 /// probed over a mixed-validity batch).
+///
+/// The case-variant arm is best-effort and second: `lower()` is Unicode
+/// where the ingest fold is ASCII, so an over-match there recovers a value
+/// that was never this field's.
 #[must_use]
 pub fn raw_extract(raw_quoted: &str, field: &str) -> String {
     let exact = sql_str(&raw_json_pointer(field));

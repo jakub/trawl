@@ -2081,10 +2081,11 @@ impl ExecutorPool {
         }
     }
 
-    /// Every lane that can read parquet funnels through this semaphore, and
-    /// each lane computes its source and snapshots its comparison pins
-    /// inside the permit-holding task, so holding all permits means no
-    /// query can straddle the per-env swap or the pin flip.
+    /// Every query lane (queries, `from saved`, exports, captures, value
+    /// sampling) funnels through this semaphore, and each lane computes its
+    /// source and snapshots its comparison pins inside the permit-holding
+    /// task, so holding all permits means no query can straddle the per-env
+    /// swap or the pin flip.
     pub async fn exclusive(&self, timeout: Duration) -> Result<PoolExclusive, ServerError> {
         let permits = u32::try_from(self.max_concurrent)
             .map_err(|_| ServerError::Internal("pool size exceeds u32".into()))?;

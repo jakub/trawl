@@ -1432,7 +1432,8 @@ select:focus-visible,
   text-align: center;
   user-select: none;
 }
-/* Full width: a <button> in the preset grid does not stretch. */
+/* Full width: a <button> in the preset grid does not stretch the way
+ * the <div> it replaced did. */
 .dr-pop button.opt { width: 100%; font: inherit; }
 .dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
 /* A disabled preset does not change under the pointer: this restates

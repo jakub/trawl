@@ -7,8 +7,8 @@
 //!
 //! The behavioral check of each route is
 //! `every_handlers_route_judges_authority_before_request_shape` in
-//! `http_api.rs`; this one keeps a new route from skipping that table
-//! without anyone noticing.
+//! `http_api.rs` and its siblings in `investigations_api.rs`; this one keeps
+//! a new route from skipping that table without anyone noticing.
 
 use std::fs;
 use std::path::Path;

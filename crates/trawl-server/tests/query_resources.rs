@@ -2154,7 +2154,8 @@ fn kinds(door: &str, log: &ParseLog) -> (usize, usize) {
 ///
 /// - `/query` with a pipe: admission (built), `source::select`
 ///   (unbuilt), the engine (built) and the severity presentation walk
-///   (unbuilt).
+///   (unbuilt). With the query log on, its debug capture adds one
+///   unbuilt.
 /// - CSV and JSON export: the same four. Parquet: three, with no
 ///   presentation walk.
 /// - A live stream: one at setup (admission; the live compile reuses its

@@ -245,8 +245,8 @@ function executedText(query, window) {
   const bounded = `${search} earliest="${window.earliest}" latest="${window.latest}"`;
   return rest ? `${bounded} | ${rest}` : `${bounded} | sort -_time, -_ingested`;
 }
-/** Pads the fraction to microseconds, so two instants compare as strings
- * at the precision trawld stores. */
+/** An RFC 3339 instant in UTC with its fraction padded to microseconds,
+ * so two instants compare as strings at the precision trawld stores. */
 function micros(instant) {
   const m = /^(.*T\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/.exec(instant);
   return m ? `${m[1]}.${(m[2] ?? '').padEnd(6, '0').slice(0, 6)}Z` : instant;

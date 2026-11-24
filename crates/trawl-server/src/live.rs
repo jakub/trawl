@@ -481,7 +481,8 @@ fn log_missing_prepared_pattern(query_id: u64, error: &trawl_core::pattern::Patt
 
 /// Each cell is first conformed to the pin `output_pins` holds for its name,
 /// so a field the catalog pins BIGINT arrives as the integer a batch query
-/// answers for it, not as the text a sender wrote.
+/// answers for it, not as the text a sender wrote. A cell with no pin or no
+/// reading keeps its own kind.
 fn data_frame(mut row: trawl_core::row::Row, output_pins: &PinScope) -> Option<Frame> {
     if !output_pins.is_empty() {
         for (name, cell) in &mut row {

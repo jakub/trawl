@@ -128,6 +128,10 @@ pub fn json_text<T: Serialize + ?Sized>(value: &T) -> String {
 /// `value` as a reply's `structuredContent` mirror: its JSON value with
 /// each [`is_unsafe_display_char`] in every string and object key replaced
 /// by the escape text [`json_text`] prints for it.
+///
+/// A proposed call's arguments are the next call's input, so the escaping
+/// never rewrites them: `next_actions` leaves out each call whose arguments
+/// hold such a character.
 pub(crate) fn mirror<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Json> {
     let mut mirror = serde_json::to_value(value)?;
     if let Some(Json::Array(actions)) = mirror.get_mut("next_actions") {

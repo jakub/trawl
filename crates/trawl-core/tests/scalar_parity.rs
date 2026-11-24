@@ -2000,6 +2000,9 @@ fn batch_errors_imply_streaming_null() {
             duckdb_error,
             dsl,
         );
+        // `EvalValue::Null`, never the `serde_json::Value` form: that
+        // conversion maps `Float(NaN)`/`Float(inf)` onto `Value::Null` too,
+        // so the weaker form would accept a non-null eval here.
         assert_eq!(
             eval_scalar(dsl, &event, now_anchor()),
             EvalValue::Null,

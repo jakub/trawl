@@ -3349,6 +3349,10 @@ fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
     }
 }
 
+/// [`literal_pool`] minus the BIGINT fraction: `DuckDB` widens a mixed
+/// integer/fraction `IN` list to DOUBLE, and DOUBLE is blind above 2^53:
+/// `status IN (1.5, 9007199254740992)` matches a stored `9007199254740993`
+/// in batch and nowhere else.
 fn in_list_pool(pin: CanonicalType) -> &'static [&'static str] {
     match pin {
         CanonicalType::BigInt => &["1", "2", "404", "-1", "9007199254740992"],

@@ -175,10 +175,10 @@ impl Harness {
         panic!("repin job {id} did not reach a terminal state within {HANG_GUARD:?}");
     }
 
-    /// `wait_terminal` is not a barrier for filesystem cleanup: the row
-    /// terminalizes while the task is still sweeping staging, and the marker is
-    /// removed last. The task holds the repin permit a little longer, so
-    /// [`Harness::wait_idle`] is the barrier before the next job.
+    /// `wait_terminal` is not a barrier for filesystem cleanup: on the success
+    /// path the row terminalizes while the task is still sweeping staging, and
+    /// the marker is removed last. The task holds the repin permit a little
+    /// longer, so [`Harness::wait_idle`] is the barrier before the next job.
     async fn wait_cleanup(&self) {
         let start = std::time::Instant::now();
         while start.elapsed() < HANG_GUARD {

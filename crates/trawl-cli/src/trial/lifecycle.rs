@@ -152,9 +152,9 @@ fn require_owned(
     }
 }
 
-/// When the one-offs outlast `wait`, removes those still `created`, once
-/// and by id: their client died before starting them, so they would
-/// never finish.
+/// When the one-offs outlast `wait` and all are still `created`, removes
+/// them, once and by id: their client died before starting them, so they
+/// would never finish. Refuses, naming them, when any other is left.
 async fn settle_oneoffs(
     docker: &Docker,
     paths: &TrialPaths,

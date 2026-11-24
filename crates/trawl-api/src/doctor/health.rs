@@ -275,9 +275,9 @@ impl KeyAnswer {
     }
 }
 
-/// A 200 or 503 health body with a
-/// `checks` map keeps one [`KeyAnswer`] per known check, so a 503 from a
-/// failed `DuckDB` probe fails its own row.
+/// A 200 or 503 health body with a `checks` map keeps one [`KeyAnswer`] per
+/// known check, so a 503 from a failed `DuckDB` probe fails its own row,
+/// unless its `status` disagrees with the HTTP status.
 #[must_use]
 pub fn judge(http: u16, body: &[u8]) -> Answer {
     if !is_health_http_status(http) {

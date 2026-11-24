@@ -1359,7 +1359,9 @@ mod tests {
     }
 
     // DuckDB's `read_json` is a recursive-descent parser: JSON nested past
-    // ~500 levels overflows the (2 MB) `spawn_blocking` stack. Ingest
+    // ~500 levels overflows the (2 MB) `spawn_blocking` stack.
+    // `maximum_depth=2` does not protect against this: that param caps
+    // schema-inference flattening, not parse recursion. Ingest
     // re-serializes every event through `serde_json`, whose default
     // recursion limit (128) rejects it at the door. These tests pin that
     // invariant.

@@ -513,6 +513,7 @@ impl App {
         if !self.dashboard.is_admin || self.main_tab != MainTab::Dashboard {
             return;
         }
+        // Reset inflight guard if stuck >10s (e.g. spawned task panicked).
         if !self
             .dashboard
             .check_inflight_timeout(Duration::from_secs(10))

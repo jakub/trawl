@@ -26,9 +26,10 @@ use crate::parser::primitives::first_cut;
 /// * **`'` is not a delimiter.** The DSL has no single-quoted string, so
 ///   an apostrophe (`message=it's`) would swallow the rest of the query.
 /// * **A `/` opens a regex only at a token boundary, and only when the
-///   text up to the next `/` is a body the grammar admits**
-///   (`primitives::first_cut`). A slash mid-token is ordinary data, which
-///   keeps `url=https://a/b last=1h` from hiding its `last=` clause.
+///   text up to the next `/` is a body of one or more bytes that the
+///   grammar's body rule admits** (`primitives::first_cut`: no raw line
+///   break, no `|` after whitespace). A slash mid-token is ordinary data,
+///   which keeps `url=https://a/b last=1h` from hiding its `last=` clause.
 /// * **A `#` opens a comment only after ASCII whitespace or at the start
 ///   of input**, tested through the grammar's own predicate.
 ///

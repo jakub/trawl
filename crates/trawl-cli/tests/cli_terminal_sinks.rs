@@ -3,9 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! What sender-chosen text does on its way to an operator's terminal.
-//! The child runs from an empty environment so no saved profile or `TRAWL_*`
-//! variable can address another server. Captured text reaches an assertion
-//! message escaped, so a failing run cannot drive the terminal that shows it.
+//! The child runs from an empty environment (only the dynamic loader's
+//! search path survives) plus the fixture's `HOME`, XDG dirs and token, so
+//! no saved profile or inherited `TRAWL_*` variable can address another
+//! server. Captured text reaches an assertion message escaped, so a failing
+//! run cannot drive the terminal that shows it.
 
 mod common;
 
@@ -321,7 +323,8 @@ fn csv_records(text: &str) -> Vec<Vec<String>> {
 
 /// comfy-table sizes the table to the terminal it finds, which is the
 /// developer's own when the test runs from one, so a cell may wrap: its
-/// pieces are joined without their padding.
+/// pieces are joined without their padding. That restores any text without
+/// spaces, which is all this test compares.
 fn table_rows(text: &str) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     let mut row: Vec<String> = Vec::new();

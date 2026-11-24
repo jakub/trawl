@@ -123,6 +123,8 @@ async fn run_doctor(target: Target<'_>, ssl_cert_file: Option<&Path>) -> Run {
         .args(["doctor_child", "--exact", "--ignored", "--test-threads=1"])
         .env_clear()
         .env(CHILD_OUT, out.path());
+    // The test binary links libduckdb dynamically, and the runner points the
+    // loader at it. Only the loader's search path crosses over.
     for name in LOADER_PATH {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);

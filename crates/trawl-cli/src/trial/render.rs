@@ -4,8 +4,9 @@
 
 //! What the trial verbs print, as pure writers.
 //!
-//! None of them takes a token or a key prefix as input, so no output of
-//! these functions can carry one.
+//! The state's key records reach [`render_status`] only as "minted" or
+//! "not yet", so no output of these functions can carry a token or a
+//! key prefix.
 
 use std::io::{self, Write};
 use std::path::Path;

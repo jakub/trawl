@@ -3418,10 +3418,10 @@ pub(crate) fn quote_ident(name: &str) -> String {
 
 /// The batch is conformed to the catalog pins before this runs, and every
 /// trawl-written parquet file is write-time conformant too (ADR-0009), so a
-/// failure here means the existing file violates the invariant and is
-/// surfaced as `catalog_invariant_violation`. Do not add a cast-and-retry
-/// fallback: rewriting both sides silently hides exactly the nonconformant
-/// corpus this error exists to report.
+/// failure here that is not out of memory means the existing file violates
+/// the invariant and is surfaced as `catalog_invariant_violation`. Do not
+/// add a cast-and-retry fallback: rewriting both sides silently hides
+/// exactly the nonconformant corpus this error exists to report.
 fn merge_with_existing(
     conn: &duckdb::Connection,
     canonical_path: &Path,

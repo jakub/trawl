@@ -2228,7 +2228,8 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 ///
 /// 200 = dry-run report, 202 = rewrite started (poll `/schema/repin/status`),
 /// 409 = the scan projected nulled values and no force flag was passed — the
-/// body is the plan the refusal is based on.
+/// body is the plan the refusal is based on. A job still running at
+/// `[server] timeout_secs` answers 202, dry runs included.
 pub async fn schema_repin(
     State(state): State<AppState>,
     verified: Authorized<needs::SchemaWrite>,

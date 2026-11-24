@@ -272,10 +272,10 @@ impl KeyStore {
         ))
     }
 
-    /// Every failure surfaces as [`AuthError::InvalidKey`] (with the same opaque
-    /// message) so callers cannot distinguish "not found", "wrong hash",
-    /// "revoked", or "expired" — that distinction would be an enumeration
-    /// oracle.
+    /// Every failed check surfaces as [`AuthError::InvalidKey`] (with the same
+    /// opaque message) so callers cannot distinguish "not found", "wrong
+    /// hash", "revoked", or "expired" — that distinction would be an
+    /// enumeration oracle. A backend failure is [`AuthError::Database`].
     ///
     /// The `last_used` UPDATE and the role resolution run as one
     /// transaction on a task of its own, which this call awaits. A caller

@@ -306,6 +306,8 @@ impl PhaseClock {
     ///
     /// A phase that is no longer active is a no-op: a refused start is
     /// discarded by whichever of the request and its worker gets there first.
+    /// Discarding a phase while a different one is active is a bug in the
+    /// caller's instrumentation.
     pub fn discard(&self, phase: QueryPhase) {
         let Some(mut state) = self.state() else {
             return;

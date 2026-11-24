@@ -74,6 +74,7 @@ fn forward_sse_response(
 ) -> Result<Response, ProxyError> {
     // Mirror the upstream status verbatim. Routing non-2xx through
     // `ProxyError::Upstream` would collapse everything but 401/403 into 502.
+    // A 3xx is the exception.
     refuse_redirect(upstream_resp.status())?;
     if !upstream_resp.status().is_success() {
         return relay_response(upstream_resp, auth);

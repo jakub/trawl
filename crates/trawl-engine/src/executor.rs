@@ -1820,12 +1820,14 @@ impl Executor {
     /// `COPY` orders the staged rows by their index `r`, so the file's order
     /// is the result's whatever order `read_json` reads in.
     ///
-    /// `COPY` writes into `dest` in place (`USE_TMP_FILE false`), truncating
-    /// it first, so its inode and mode survive: `DuckDB`'s default would
-    /// write a `tmp_` sibling and rename it over `dest`, a new inode with
-    /// the umask's mode. The file is `fsync`ed before this returns; the
-    /// directory is the caller's to sync once it renames the file. On an
-    /// error `dest` may hold part of a file, and is the caller's to remove.
+    /// `dest` is a file the caller made, 0600 in the results root. `COPY`
+    /// writes into it in place (`USE_TMP_FILE false`), truncating it first,
+    /// so its inode and mode survive: `DuckDB`'s default would write a
+    /// `tmp_` sibling and rename it over `dest`, a new inode with the
+    /// umask's mode. A `dest` that does not exist is created under the
+    /// umask. The file is `fsync`ed before this returns; the directory is
+    /// the caller's to sync once it renames the file. On an error `dest`
+    /// may hold part of a file, and is the caller's to remove.
     ///
     /// Refused with [`EngineError::NotParquetStorable`] when the result has
     /// no columns: a parquet file holds at least one.

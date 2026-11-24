@@ -1168,8 +1168,8 @@ fn rewrite_file(
     // Unlike every other staged rename in the tree, this one has no backing
     // copy: the source is the destination, and once the rename lands the
     // pre-conform file is gone. So fsync the staged file before the rename,
-    // and unlike `publish_marker`'s best-effort directory sync this one is
-    // fatal: failing the file is a skip (the original stays, the pass
+    // and unlike `publish_marker`'s best-effort directory sync this file sync
+    // is fatal: failing the file is a skip (the original stays, the pass
     // withholds completion, the next boot re-runs).
     std::fs::File::open(&tmp)
         .and_then(|f| f.sync_all())

@@ -53,10 +53,11 @@
 //! class is one position, so the fan costs the most a position can.
 //!
 //! The subject defeats literal prefilters by holding the pattern's
-//! literals everywhere. A composed shape ends in `[^abc]` or `\PL`, which
-//! the subject never holds, so it never matches and each call scans the
-//! whole subject. A named family that ends in `c` gets a subject with no
-//! `c` exactly `k + 1` characters after an `a`.
+//! literals everywhere. A composed shape ends in `[^abc]` or `\PL`, `\pL`
+//! over the specials, none of which is a letter. The subject never holds
+//! that end, so it never matches and each call scans the whole subject. A
+//! named family that ends in `c` gets a subject with no `c` exactly `k + 1`
+//! characters after an `a`.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;

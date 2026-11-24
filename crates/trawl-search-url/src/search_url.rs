@@ -419,8 +419,11 @@ fn search_of(url_or_search: &str) -> &str {
 }
 
 /// Rewrite a search URL, replacing ONLY the parameter the banner names
-/// and carrying every other parameter through exactly as it arrived,
-/// because a link can be wrong in more than one place at once.
+/// and carrying every other parameter through, because a link can be wrong
+/// in more than one place at once.
+///
+/// `params` is the query as the router hands it over: each value
+/// decoded exactly once, in the order the URL carries them.
 #[must_use]
 pub fn repair_url<'a>(
     params: impl IntoIterator<Item = (&'a str, &'a str)>,

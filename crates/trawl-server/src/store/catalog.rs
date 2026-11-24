@@ -1133,7 +1133,8 @@ impl CatalogStore {
     /// that same row unconditionally.
     ///
     /// The upsert ADVANCES: `evidence_through` never moves backwards. The
-    /// actor, the note and the timestamp move with it, or not at all.
+    /// actor, the note and the timestamp are replaced only when the incoming
+    /// high-water is at least the stored one.
     pub async fn acknowledge_degraded_field(
         &self,
         field: &str,

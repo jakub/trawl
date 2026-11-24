@@ -9,7 +9,10 @@
 //! a `data` frame, a one-row [`QueryResult`] whose columns are the fields
 //! that event carries. An aggregate stream answers with `snapshot` frames
 //! ([`SnapshotFrame`]), each of which replaces the whole result. A
-//! snapshot also carries `capped` (ADR-0001).
+//! snapshot whose aggregation dropped input past a cap also carries
+//! `capped`, one [`SnapshotCap`] per cap that dropped something since the
+//! stream started (ADR-0001). The field is omitted when nothing was
+//! dropped.
 
 use serde::{Deserialize, Serialize};
 

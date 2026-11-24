@@ -5,9 +5,12 @@
 //! The step an attached capture appends to its investigation, and the
 //! completion that writes the step's terminal outcome (ADR-0059).
 //!
-//! When the last handle drops, the outcome joins the queue of the one
-//! [`StepWriter`], so a drop on the pool's blocking thread still writes it.
-//! A completion dropped with nothing recorded writes `aborted`.
+//! A success is written by the transaction that keeps the result
+//! ([`crate::store::ResultsStore::insert_kept`]), which then marks the
+//! completion [`StepCompletion::written`]. Otherwise, when the last handle
+//! drops, the outcome joins the queue of the one [`StepWriter`], so a drop
+//! on the pool's blocking thread still writes it. A completion dropped with
+//! nothing recorded writes `aborted`.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

@@ -1411,7 +1411,8 @@ impl RepinEngine {
             }
         }
 
-        // Until this line a cancel request is answered 409 rather than 404.
+        // Past the cutover, until this line a cancel request is answered
+        // 409 rather than 404.
         // `arm` itself refuses nothing; the repin permit keeps a fresh repin
         // out while this job still deletes its staging roots.
         self.cancel.disarm(job_id);

@@ -9,7 +9,10 @@
 //!
 //! The flush path uses `eprintln!` for error reporting, never
 //! `tracing::*`: a tracing event inside the layer's own flush path would
-//! re-enter `on_event` and loop forever. The invariant is: **no locks are
+//! re-enter `on_event` and loop forever. Two narrow exceptions hold
+//! because `on_event` only buffers: the `telemetry_dropped` recovery event
+//! after a successful write, and `WalWriter::write`'s own dir-fsync and
+//! staging-unlink failure warnings. The invariant is: **no locks are
 //! held across `writer.write`, and flush-path tracing may only buffer.**
 //!
 //! `on_event` calls `envelope::canonicalize`, so the guard extends to the

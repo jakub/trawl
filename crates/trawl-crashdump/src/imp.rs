@@ -510,7 +510,7 @@ fn retain_from_env() -> usize {
         .unwrap_or(DEFAULT_RETAIN)
 }
 
-/// Delete the oldest `*.dmp` files so at most `retain` remain.
+/// Delete the oldest `*.dmp` files so at most `retain` remain. Best-effort.
 fn prune_dumps(dir: &Path, retain: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

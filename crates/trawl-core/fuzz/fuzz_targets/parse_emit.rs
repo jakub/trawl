@@ -179,10 +179,10 @@ fuzz_target!(|input: &str| {
         classify_emit_failure(err, case.query);
     }
 
-    // A pin decides how a comparison is rendered, never whether the query
-    // can be emitted at all. With a SEVERITY pin the lanes may disagree in
-    // one direction only: `_severity=banana` names no ladder point and is a
-    // refusal under the pin.
+    // With no SEVERITY pin in the map, the two lanes must agree exactly on
+    // emittability. With a SEVERITY pin they may disagree in one direction
+    // only: `_severity=banana` names no ladder point and is a refusal under
+    // the pin.
     let severity_pinned = pins.iter().any(|(_, ty)| ty == CanonicalType::Severity);
     if !severity_pinned {
         assert_eq!(

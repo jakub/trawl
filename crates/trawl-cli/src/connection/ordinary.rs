@@ -75,8 +75,9 @@ impl Inputs {
         }
     }
 
-    /// `run` refuses it before any command; the policy checks again so it
-    /// never depends on its caller.
+    /// `--token` typed beside `--token-file` is a usage error. `run`
+    /// refuses it before every command but `doctor` and `mcp`; the policy
+    /// checks again so it never depends on its caller.
     pub(crate) fn key_flags(&self) -> Result<(), ConnectionError> {
         if matches!(self.token, Some((_, Origin::CommandLine))) && self.token_file.is_some() {
             return Err(ConnectionError::BothKeyFlags);

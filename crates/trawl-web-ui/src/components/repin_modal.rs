@@ -258,7 +258,8 @@ pub fn RepinModal(
             // A real run's 202 first, before any liveness or generation
             // gate: the job is claimed and running detached server-side,
             // so the one thing that must survive a dialog closed mid-claim
-            // is the hand-up. A dry run's 202 is a scan that outlasted the
+            // is the hand-up. `try_run` because the callback may be
+            // disposed too. A dry run's 202 is a scan that outlasted the
             // server's answer bound (ADR-0054), so the dialog follows the
             // job on the status route by its id.
             let outcome = match outcome {

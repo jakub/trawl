@@ -200,6 +200,11 @@ test('history hides stale rows and completes a newer page before the older reque
 
 // The largest page the search URL admits: its offset is one page short of
 // `MAX_OFFSET` (u32::MAX), the ceiling a wasm32 `usize` can address.
+//
+// This case cannot reach the overflow branch by asking the harness for
+// `queryTotal: 4_294_967_300`: the harness stamps that number on the wire as
+// `pagination.total`, and it does not decode into a wasm32 `usize` — the
+// response fails to parse before any window is computed.
 test('Probe last addressable page renders without a wasm panic', async ({ page, request }) => {
   await configure(request);
   await page.goto('/search?q=service%3Dnginx&page=85899345');
