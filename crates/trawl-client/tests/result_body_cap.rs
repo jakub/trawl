@@ -3,18 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The captured-result readers stop at their body cap whatever the status.
-//!
-//! `result_page` and `result_cell` promise that no body is read past
-//! `RESULT_PAGE_BODY_CAP` / `RESULT_CELL_BODY_CAP`. A misconfigured endpoint
-//! or a reverse proxy can answer a 429 or a 500 with a body of any size, so
-//! the promise has to hold for an error status as much as for a 200.
-//!
-//! Each test serves one connection from a rustls listener on `127.0.0.1`
-//! whose self-signed certificate the client pins, as `results_routes.rs`
-//! does. The listener answers with a chunked body longer than the cap and
-//! stops writing the moment a write fails, which is when the client has
-//! dropped the connection. The number of body bytes it got out before then
-//! is how far the client read, give or take what the kernel buffered.
+//! A misconfigured endpoint or a reverse proxy can answer a 429 or a 500
+//! with a body of any size.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,13 +20,10 @@ use trawl_client::{ClientError, ErrorCode, HttpClient, TlsTrust};
 
 const TOKEN: &str = "flt_resultbodycaptesttoken";
 
-/// A result id the client accepts.
 const RESULT_ID: &str = "0123456789abcdef0123456789abcdef";
 
-/// Bound on every exchange, so a hang fails the test instead of wedging CI.
 const EXCHANGE: Duration = Duration::from_secs(60);
 
-/// The size of one chunk the listener writes.
 const CHUNK: usize = 64 * 1024;
 
 /// The most body bytes the listener offers: four caps, so a client that
@@ -53,15 +40,12 @@ const RUNOFF: usize = 12 * 1024 * 1024;
 const _: () = assert!(RESULT_PAGE_BODY_CAP == RESULT_CELL_BODY_CAP);
 const CAP: usize = RESULT_PAGE_BODY_CAP;
 
-/// What the listener answers with.
 struct Answer {
     status: &'static str,
     /// Extra header lines, each ending in CRLF.
     headers: &'static str,
 }
 
-/// A self-signed certificate for `127.0.0.1`: its PEM, for the client to
-/// pin, and the server identity.
 fn self_signed() -> (
     Vec<u8>,
     Vec<CertificateDer<'static>>,
@@ -76,9 +60,6 @@ fn self_signed() -> (
     )
 }
 
-/// Serve one connection: read the request head, answer `answer` with a
-/// chunked body of [`OFFERED`] filler bytes, stopping at the first failed
-/// write. The task hands back how many body bytes it wrote.
 fn serve_endless(answer: &Answer) -> (HttpClient, JoinHandle<usize>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (pem, chain, key) = self_signed();
@@ -140,8 +121,6 @@ fn serve_endless(answer: &Answer) -> (HttpClient, JoinHandle<usize>) {
     (client, served)
 }
 
-/// Run `call` against the listener, both bounded by [`EXCHANGE`]. Returns
-/// the call's outcome and the body bytes the listener wrote.
 async fn exchange<T>(
     call: impl std::future::Future<Output = Result<T, ClientError>>,
     served: JoinHandle<usize>,
@@ -152,9 +131,6 @@ async fn exchange<T>(
     (result, written.expect("the listener ran to completion"))
 }
 
-/// Assert the client stopped reading near the cap: the listener's own
-/// writes failed before it had offered everything, and got no further than
-/// the cap plus [`RUNOFF`].
 fn assert_stopped_at_cap(written: usize) {
     assert!(
         written <= CAP + RUNOFF,
@@ -162,8 +138,6 @@ fn assert_stopped_at_cap(written: usize) {
     );
 }
 
-/// The `Server` error an error status over the cap must become: the
-/// fallback envelope, the status and both headers kept.
 fn assert_fallback_server_error(
     error: &ClientError,
     want_status: u16,
@@ -196,8 +170,6 @@ const THROTTLED: Answer = Answer {
     headers: "retry-after: 7\r\nx-request-id: req-429-over-cap\r\n",
 };
 
-/// A 500 whose body outruns the cap is a `Server` error on the fallback
-/// envelope, and the page reader stops reading at the cap.
 #[tokio::test]
 async fn result_page_error_body_over_the_cap_stops_at_the_cap() {
     let (client, served) = serve_endless(&INTERNAL);
@@ -206,8 +178,6 @@ async fn result_page_error_body_over_the_cap_stops_at_the_cap() {
     assert_stopped_at_cap(written);
 }
 
-/// A 429 keeps its status, request id and `Retry-After` when its body
-/// outruns the cap: the headers were read before the body.
 #[tokio::test]
 async fn result_page_throttle_body_over_the_cap_keeps_its_headers() {
     let (client, served) = serve_endless(&THROTTLED);
@@ -221,7 +191,6 @@ async fn result_page_throttle_body_over_the_cap_keeps_its_headers() {
     assert_stopped_at_cap(written);
 }
 
-/// The cell reader holds the same line for a 500.
 #[tokio::test]
 async fn result_cell_error_body_over_the_cap_stops_at_the_cap() {
     let (client, served) = serve_endless(&INTERNAL);
@@ -230,7 +199,6 @@ async fn result_cell_error_body_over_the_cap_stops_at_the_cap() {
     assert_stopped_at_cap(written);
 }
 
-/// The cell reader holds the same line for a 429.
 #[tokio::test]
 async fn result_cell_throttle_body_over_the_cap_keeps_its_headers() {
     let (client, served) = serve_endless(&THROTTLED);
@@ -244,8 +212,6 @@ async fn result_cell_throttle_body_over_the_cap_keeps_its_headers() {
     assert_stopped_at_cap(written);
 }
 
-/// A success body over the cap stays `TooLarge`: the error-status rule does
-/// not soften the success path.
 #[tokio::test]
 async fn success_body_over_the_cap_is_too_large() {
     let ok = || Answer {

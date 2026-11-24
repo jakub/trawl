@@ -2,14 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The investigation methods (ADR-0059) on the wire: the method, path and
-//! query string each sends, its body, and how each reads the answer's
-//! status and body.
-//!
-//! Each test serves one connection from a rustls listener on `127.0.0.1`
-//! whose self-signed certificate the client pins as its CA, as
-//! `results_routes.rs` does. The listener records the request it read and
-//! writes one canned answer with the status the test names.
+//! The investigation methods (ADR-0059) on the wire.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,25 +23,20 @@ use trawl_client::{
 
 const TOKEN: &str = "flt_investigationroutestesttoken";
 
-/// An investigation id the client accepts.
 const ID: &str = "0123456789abcdef0123456789abcdef";
 
-/// Bound on every exchange, so a hang fails the test instead of wedging CI.
 const EXCHANGE: Duration = Duration::from_secs(30);
 
-/// What the listener read: the request head and its body.
 struct Seen {
     head: String,
     body: Vec<u8>,
 }
 
 impl Seen {
-    /// The request line: method, target and version.
     fn request_line(&self) -> &str {
         self.head.lines().next().expect("a request line")
     }
 
-    /// The value of header `name`, matched case-insensitively.
     fn header(&self, name: &str) -> Option<&str> {
         self.head
             .lines()
@@ -58,14 +46,11 @@ impl Seen {
             .map(|(_, value)| value.trim())
     }
 
-    /// The body decoded as JSON.
     fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).expect("a JSON body")
     }
 }
 
-/// A self-signed certificate for `127.0.0.1`: its PEM, for the client to
-/// pin, and the server identity.
 fn self_signed() -> (
     Vec<u8>,
     Vec<CertificateDer<'static>>,
@@ -80,7 +65,6 @@ fn self_signed() -> (
     )
 }
 
-/// A client that pins `pem` and addresses `address`.
 fn client_for(address: SocketAddr, pem: Vec<u8>) -> HttpClient {
     HttpClient::with_trust(
         format!("https://{address}"),
@@ -90,10 +74,6 @@ fn client_for(address: SocketAddr, pem: Vec<u8>) -> HttpClient {
     .expect("client")
 }
 
-/// Serve one connection: read the request, answer `status` (a status line
-/// such as `201 Created`) with `body` and the extra `headers` lines.
-/// Returns a client that trusts the listener's certificate as its pinned
-/// CA, and the serving task, which hands back what it read.
 async fn serve_one(
     status: &'static str,
     headers: &'static str,
@@ -140,13 +120,10 @@ async fn serve_one(
     (client_for(address, pem), served)
 }
 
-/// [`serve_one`] answering `200 OK` with `value` as JSON.
 async fn serve_ok(value: &impl serde::Serialize) -> (HttpClient, JoinHandle<Seen>) {
     serve_one("200 OK", "", serde_json::to_vec(value).unwrap()).await
 }
 
-/// Read up to the end of the request head. Returns the head and the body
-/// bytes that arrived with it.
 async fn read_head<S: AsyncReadExt + Unpin>(stream: &mut S) -> (String, Vec<u8>) {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 4096];
@@ -161,7 +138,6 @@ async fn read_head<S: AsyncReadExt + Unpin>(stream: &mut S) -> (String, Vec<u8>)
     }
 }
 
-/// The request's declared body length; zero without one.
 fn content_length(head: &str) -> usize {
     head.lines()
         .filter_map(|line| line.split_once(':'))
@@ -171,8 +147,6 @@ fn content_length(head: &str) -> usize {
         })
 }
 
-/// Run `call` against the listener, both bounded by [`EXCHANGE`]. Returns
-/// the call's answer, success or not, and what the listener read.
 async fn exchange<T>(
     call: impl std::future::Future<Output = Result<T, ClientError>>,
     served: JoinHandle<Seen>,
@@ -226,7 +200,6 @@ fn note(seq: u64, text: &str) -> LogEntry {
     }
 }
 
-/// `list_investigations` reads `/api/v1/investigations` and decodes it.
 #[tokio::test]
 async fn list_reads_the_collection() {
     let answer = InvestigationList {
@@ -248,8 +221,6 @@ async fn list_reads_the_collection() {
     assert_eq!(decoded.unwrap(), answer);
 }
 
-/// `create_investigation` puts the fields at the id's path and reads 201
-/// as created and 200 as the existing investigation.
 #[tokio::test]
 async fn create_puts_the_fields_and_reads_created_from_the_status() {
     let request = CreateInvestigation {
@@ -273,8 +244,6 @@ async fn create_puts_the_fields_and_reads_created_from_the_status() {
     }
 }
 
-/// `read_investigation` always sends `since` and sends `limit` only when
-/// given.
 #[tokio::test]
 async fn read_sends_since_and_the_limit_only_when_given() {
     let answer = InvestigationRead {
@@ -299,8 +268,6 @@ async fn read_sends_since_and_the_limit_only_when_given() {
     );
 }
 
-/// `append_entry` posts the tagged entry, `seen_seq` included, and decodes
-/// the entry written with its activity.
 #[tokio::test]
 async fn append_posts_the_tagged_entry_and_reads_the_activity() {
     let answer = AppendResponse {
@@ -329,8 +296,6 @@ async fn append_posts_the_tagged_entry_and_reads_the_activity() {
     assert_eq!(decoded.unwrap(), answer);
 }
 
-/// A `PATCH` answer: the investigation closed at seq 5, the entry
-/// written, and `activity`.
 fn closed_at_5(activity: Option<Activity>) -> PatchResponse {
     PatchResponse {
         investigation: Investigation {
@@ -348,9 +313,6 @@ fn closed_at_5(activity: Option<Activity>) -> PatchResponse {
     }
 }
 
-/// `patch_investigation` patches the investigation with the one field,
-/// the expected sequence and the `seen_seq`, and decodes the header, the
-/// entry written and the activity.
 #[tokio::test]
 async fn patch_sends_the_expected_sequence_and_one_field() {
     let request = PatchInvestigation {
@@ -378,9 +340,7 @@ async fn patch_sends_the_expected_sequence_and_one_field() {
     assert_eq!(decoded.unwrap(), answer);
 }
 
-/// A `PATCH` answer with the full allowance of activity is far past an
-/// investigation's own cap of 64 KiB, and still decodes: an overwrite that
-/// committed never reads as too large.
+/// An overwrite that committed never reads as too large.
 #[tokio::test]
 async fn a_patch_answer_with_full_activity_past_64_kib_decodes() {
     let answer = closed_at_5(Some(Activity {
@@ -402,8 +362,6 @@ async fn a_patch_answer_with_full_activity_past_64_kib_decodes() {
     assert_eq!(decoded.unwrap(), answer);
 }
 
-/// `set_finding_status` addresses the finding by its sequence in the path,
-/// sends the `seen_seq`, and decodes the activity.
 #[tokio::test]
 async fn finding_status_addresses_the_finding_by_its_sequence() {
     let answer = AppendResponse {
@@ -438,7 +396,6 @@ async fn finding_status_addresses_the_finding_by_its_sequence() {
     assert_eq!(decoded.unwrap(), answer);
 }
 
-/// `extend_retention` puts the deadline at the retention path.
 #[tokio::test]
 async fn extend_puts_the_deadline() {
     let request = RetentionExtension {
@@ -458,7 +415,6 @@ async fn extend_puts_the_deadline() {
     assert_eq!(decoded.unwrap(), investigation());
 }
 
-/// `delete_investigation` sends DELETE and takes 204 with no body as done.
 #[tokio::test]
 async fn delete_takes_no_content_as_done() {
     let (client, served) = serve_one("204 No Content", "", Vec::new()).await;
@@ -470,9 +426,6 @@ async fn delete_takes_no_content_as_done() {
     decoded.unwrap();
 }
 
-/// A 409 `sequence_conflict` decodes with its `conflict` member, its
-/// request id and no retry wait; a 409 on the delete route reads the same
-/// way.
 #[tokio::test]
 async fn a_sequence_conflict_carries_expected_and_current() {
     let envelope = ErrorResponse {
@@ -535,8 +488,6 @@ async fn a_sequence_conflict_carries_expected_and_current() {
     );
 }
 
-/// A malformed id is refused by every method before any connection: the
-/// listener sees nothing.
 #[tokio::test]
 async fn a_malformed_id_is_refused_before_any_connection() {
     let _ = rustls::crypto::ring::default_provider().install_default();

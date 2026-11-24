@@ -3,11 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! trawl-client: shared client library for communicating with trawld.
-//!
-//! Used by `trawl-cli` (CLI and TUI modes) and by the server's own
-//! integration tests. Wraps the daemon's HTTP API: bearer authentication,
-//! query submission, captured results, investigations, catalog reads,
-//! ingest and its preview, export, and SSE streaming.
 
 pub mod client;
 pub mod error;

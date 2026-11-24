@@ -3,14 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Wire types for the trawl daemon HTTP API.
-//!
-//! Response types and shared request/enum types are re-exported from
-//! `trawl-api`. Internal request types used only by the client
-//! (borrowing for zero-copy serialization) are defined here.
 
 use serde::Serialize;
-
-// -- internal types (client-only, borrow for zero-copy serialization) --------
 
 #[derive(Serialize)]
 pub(crate) struct ValidateRequest<'a> {
@@ -37,8 +31,6 @@ pub(crate) struct ExportRequestRef<'a> {
     pub limit: Option<usize>,
 }
 
-/// Body for `POST /api/v1/schema/field/ack`. The note is the operator's
-/// own prose, so it travels borrowed and verbatim.
 #[derive(Serialize)]
 pub(crate) struct FieldAckRequestRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -51,17 +43,12 @@ pub(crate) struct SetScheduleRequestRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_runs: Option<u64>,
     pub enabled: bool,
-    /// `"since_last"` or a duration; omitted for query mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<&'a str>,
-    /// Late-arrival allowance; only meaningful beside a window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lag: Option<&'a str>,
 }
 
-// -- streaming types ---------------------------------------------------------
-
-/// A single event from a live query stream.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// One event a pass-through stream emitted: a one-row result whose
@@ -69,20 +56,16 @@ pub enum StreamEvent {
     Event(trawl_api::value::QueryResult),
     /// An aggregation snapshot replacing the entire result set.
     Snapshot {
-        /// The aggregation's rows so far, typed.
         result: trawl_api::value::QueryResult,
         /// The caps that dropped input since the stream started, so the
         /// rows are partial. Empty when nothing was dropped (ADR-0001).
         capped: Vec<trawl_api::stream::SnapshotCap>,
     },
-    /// Server-side error message.
     Error(String),
     /// Back-pressure notification: the subscriber fell behind and
     /// missed `n` event batches from the bus.
     Lagged(u64),
 }
-
-// -- re-exports from trawl-api -----------------------------------------------
 
 pub use trawl_api::capabilities::{
     CapabilitiesResponse, CapabilityBounds, CaptureAdmission, CaptureQuotas, DslCapabilities,
