@@ -3,13 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Shared ratatui dashboard rendering for trawl.
-//!
-//! Pure function — takes a [`DashboardSnapshot`] and draws widgets to a
-//! ratatui [`Frame`]. No I/O, no state mutation, fully testable via
-//! `TestBackend` + insta snapshots.
-//!
-//! Used by both the server's terminal monitor and the TUI client's admin
-//! dashboard tab; the web UI reads the same [`DashboardSnapshot`] over SSE.
 
 use std::time::Duration;
 
@@ -24,10 +17,8 @@ use trawl_api::DashboardSnapshot;
 use trawl_core::sanitize::sanitize_display_text;
 use trawl_core::text_layout::fit_cells;
 
-/// Rendering options for the dashboard.
 #[derive(Debug, Clone)]
 pub struct DashboardOptions {
-    /// Footer text to display. `None` omits the footer row entirely.
     pub footer_text: Option<String>,
 }
 
@@ -39,7 +30,6 @@ impl Default for DashboardOptions {
     }
 }
 
-/// Standard panel block with dark gray border.
 fn panel_block(title: &str) -> Block<'_> {
     Block::default()
         .title(title)
@@ -47,7 +37,6 @@ fn panel_block(title: &str) -> Block<'_> {
         .border_style(Style::default().fg(Color::DarkGray))
 }
 
-/// Highlighted panel block (for active queries).
 fn panel_block_highlight(title: &str) -> Block<'_> {
     Block::default()
         .title(title)
@@ -55,11 +44,6 @@ fn panel_block_highlight(title: &str) -> Block<'_> {
         .border_style(Style::default().fg(Color::Yellow))
 }
 
-/// Render the dashboard into the given area.
-///
-/// The caller controls placement: the server passes `frame.area()` for
-/// full-screen rendering, while the TUI passes a sub-region below the
-/// tab bar and above the status bar.
 pub fn render_dashboard(
     snapshot: &DashboardSnapshot,
     frame: &mut Frame<'_>,
@@ -77,7 +61,6 @@ pub fn render_dashboard(
     }
 }
 
-/// Header: title bar + hostname/addr/uptime/health.
 fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let [title_row, info_row] = vertical![==1, ==1].areas(area);
 
@@ -119,8 +102,6 @@ fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
     frame.render_widget(Paragraph::new(info), info_row);
 }
 
-/// Body: two-column grid with panels.
-///
 /// `Flex::Start` is spelled out so the panels stay top-aligned however tall
 /// the terminal is, instead of spreading into the spare rows.
 fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
@@ -129,12 +110,10 @@ fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) 
             .flex(Flex::Start)
             .areas(area);
 
-    // -- row 1: executor pool | hot buffer --
     let [exec_area, hot_area] = horizontal![==2/5, ==3/5].areas(row1_area);
     render_executor_pool(snapshot, frame, exec_area);
     render_hot_buffer(snapshot, frame, hot_area);
 
-    // -- row 2: HTTP ingest | syslog ingest --
     if snapshot.syslog_enabled {
         let [http_area, syslog_area] = horizontal![==2/5, ==3/5].areas(row2_area);
         render_http_ingest(snapshot, frame, http_area);
@@ -143,21 +122,17 @@ fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) 
         render_http_ingest(snapshot, frame, row2_area);
     }
 
-    // -- row 3: query throughput | data pipeline --
     let [qtp_area, pipeline_area] = horizontal![==2/5, ==3/5].areas(row3_area);
     render_query_throughput(snapshot, frame, qtp_area);
     render_data_pipeline(snapshot, frame, pipeline_area);
 
-    // -- row 4: SSE | scheduler --
     let [sse_area, sched_area] = horizontal![==2/5, ==3/5].areas(row4_area);
     render_sse(snapshot, frame, sse_area);
     render_scheduler(snapshot, frame, sched_area);
 
-    // -- row 5: recent + active queries --
     render_queries(snapshot, frame, row5_area);
 }
 
-/// Executor pool panel with gauge.
 #[allow(clippy::cast_precision_loss)] // gauge ratio — pool capacity is small
 fn render_executor_pool(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block(" EXECUTOR POOL ");
@@ -172,10 +147,6 @@ fn render_executor_pool(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
     let [info_row, gauge_row] = vertical![==1, ==1].areas(inner);
 
     let active = snapshot.pool_active.min(snapshot.pool_capacity);
-    // Retained permits are a subset of the active ones, so they are a
-    // suffix on the same figure rather than a second count (ADR-0024).
-    // Nothing retained is the ordinary state, and a permanent "(0
-    // retained)" would teach an operator to stop reading the line.
     let retained = if snapshot.pool_retained == 0 {
         String::new()
     } else {
@@ -201,7 +172,6 @@ fn render_executor_pool(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
     frame.render_widget(gauge, gauge_row);
 }
 
-/// Hot buffer fill gauges.
 #[allow(clippy::cast_precision_loss)] // percentage display — precision is irrelevant
 fn render_hot_buffer(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block(" HOT BUFFER ");
@@ -245,7 +215,6 @@ fn render_hot_buffer(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: 
     frame.render_widget(Paragraph::new(batch_line), batch_row);
 }
 
-/// Query throughput panel.
 fn render_query_throughput(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block(" QUERY THROUGHPUT ");
 
@@ -272,7 +241,6 @@ fn render_query_throughput(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, 
     frame.render_widget(Paragraph::new(err_line), err_row);
 }
 
-/// HTTP ingest throughput panel.
 fn render_http_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block(" HTTP INGEST ");
 
@@ -296,7 +264,6 @@ fn render_http_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area:
     frame.render_widget(Paragraph::new(rejected_line), rejected_row);
 }
 
-/// Syslog ingest throughput panel.
 fn render_syslog_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block(" SYSLOG INGEST ");
 
@@ -331,7 +298,6 @@ fn render_syslog_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
     frame.render_widget(Paragraph::new(errors_line), errors_row);
 }
 
-/// WAL, compaction, parquet storage, and disk capacity panel.
 fn render_data_pipeline(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block(" DATA PIPELINE ");
 
@@ -388,15 +354,10 @@ fn render_data_pipeline(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
     }
 }
 
-/// The one-line disk and retention summary (ADR-0042): the data
-/// filesystem's headroom, its deletion floor, the last retention sweep, and
-/// the pressure deletions since process start.
+/// The one-line disk and retention summary (ADR-0042).
 ///
 /// Status and sample age lead, as in [`storage_reading`], so a clipped line
-/// never passes a retained reading off as fresh; the data filesystem's free
-/// and total bytes and its floor follow, and fit the 80-column panel. Available bytes are the
-/// data filesystem's own, never a sum across devices, and no environment's
-/// reach appears here: one environment is not the installation's answer.
+/// never passes a retained reading off as fresh.
 fn capacity_line(capacity: &trawl_api::Capacity) -> String {
     use trawl_api::{DeletionFloor, FilesystemRole, StorageMeasurementStatus as Status};
     let measurement = capacity.headroom.measurement;
@@ -477,7 +438,6 @@ fn storage_reading(files: u64, bytes: u64, measurement: trawl_api::StorageMeasur
     }
 }
 
-/// SSE connections panel.
 fn render_sse(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block(" SSE STREAMS ");
 
@@ -492,7 +452,6 @@ fn render_sse(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(line), inner);
 }
 
-/// Scheduler status panel.
 fn render_scheduler(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block(" SCHEDULER ");
 
@@ -511,10 +470,8 @@ fn render_scheduler(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: R
     frame.render_widget(Paragraph::new(line), inner);
 }
 
-/// Recent and active queries panels.
 fn render_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let has_active = !snapshot.active_queries.is_empty();
-    // max 4 rows + 2 for border, capped at u16::MAX (can't overflow in practice)
     let active_height: u16 = if has_active {
         u16::try_from(snapshot.active_queries.len().min(4) + 2).unwrap_or(u16::MAX)
     } else {
@@ -530,7 +487,6 @@ fn render_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rec
     }
 }
 
-/// Recent completed queries table.
 fn render_recent_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block(" RECENT QUERIES ");
 
@@ -593,7 +549,6 @@ fn render_recent_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, ar
     frame.render_widget(table, inner);
 }
 
-/// Active queries table (only shown when non-empty).
 fn render_active_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block_highlight(" ACTIVE QUERIES ");
 
@@ -637,7 +592,6 @@ fn render_active_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, ar
     frame.render_widget(table, inner);
 }
 
-/// Footer: help text.
 fn render_footer(text: &str, frame: &mut Frame<'_>, area: Rect) {
     let footer = line![Span::styled(
         sanitize_display_text(text),
@@ -646,9 +600,6 @@ fn render_footer(text: &str, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(footer), area);
 }
 
-// -- formatting helpers (public for reuse) ------------------------------------
-
-/// Format a `Duration` as human-readable (e.g. "2h 34m", "5m 12s").
 pub fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs >= 3600 {
@@ -664,7 +615,6 @@ pub fn format_duration(d: Duration) -> String {
     }
 }
 
-/// Format milliseconds as short duration (e.g. "1.2s", "340ms").
 #[allow(clippy::cast_precision_loss)] // display only
 pub fn format_duration_short(ms: u64) -> String {
     if ms >= 1000 {
@@ -674,7 +624,6 @@ pub fn format_duration_short(ms: u64) -> String {
     }
 }
 
-/// Format a number with thousands separators.
 pub fn format_number(n: u64) -> String {
     if n < 1000 {
         return n.to_string();
@@ -690,7 +639,6 @@ pub fn format_number(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-/// Format bytes as human-readable (e.g. "4.2 MB", "128 KB").
 #[allow(clippy::cast_precision_loss)] // display only — sub-byte precision is meaningless
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -708,10 +656,6 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// A query string cut to fit within `max_width` display cells, ending in
-/// `…` when cut. Whitespace runs collapse to one space, then
-/// [`fit_cells`] sanitizes the text and cuts it between grapheme clusters,
-/// each measured in the cells ratatui draws it in.
 pub fn truncate_query(query: &str, max_width: usize) -> String {
     fit_cells(
         &query.split_whitespace().collect::<Vec<_>>().join(" "),
@@ -726,9 +670,6 @@ mod tests {
     use ratatui::backend::TestBackend;
     use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot, DashboardSnapshot};
 
-    /// A complete headroom sample: data and spill share a 500 GB device
-    /// with 120 GB free above a 1 GB floor, and the WAL has its own. One
-    /// pressure-deleting sweep has run.
     fn test_capacity() -> trawl_api::Capacity {
         use trawl_api::{
             Capacity, DeletionFloor, EnvironmentCapacity, FilesystemHeadroom, FilesystemRole,
@@ -790,7 +731,7 @@ mod tests {
         DashboardSnapshot {
             hostname: "test-host".into(),
             listen_addr: "127.0.0.1:5514".into(),
-            uptime_secs: 9240, // 2h 34m
+            uptime_secs: 9240,
             version: "0.1.0".into(),
             healthy: true,
             pool_capacity: 4,
@@ -798,8 +739,8 @@ mod tests {
             pool_retained: 0,
             hot_buffer_events: 12_847,
             hot_buffer_max_events: 100_000,
-            hot_buffer_bytes: 4_404_019,       // ~4.2 MB
-            hot_buffer_max_bytes: 104_857_600, // 100 MB
+            hot_buffer_bytes: 4_404_019,
+            hot_buffer_max_bytes: 104_857_600,
             hot_buffer_batches: 23,
             total_queries: 1247,
             query_rate: 2.1,
@@ -816,7 +757,7 @@ mod tests {
             syslog_dropped: 3,
             syslog_tcp_connections: 2,
             wal_files: 12,
-            wal_bytes: 4_404_019, // ~4.2 MB
+            wal_bytes: 4_404_019,
             wal_measurement: trawl_api::StorageMeasurement {
                 status: trawl_api::StorageMeasurementStatus::Complete,
                 sample_age_secs: Some(2),
@@ -825,7 +766,7 @@ mod tests {
             compaction_runs: 1247,
             compaction_errors: 0,
             parquet_files: 847,
-            parquet_bytes: 13_312_000_000, // ~12.4 GB
+            parquet_bytes: 13_312_000_000,
             parquet_measurement: trawl_api::StorageMeasurement {
                 status: trawl_api::StorageMeasurementStatus::Complete,
                 sample_age_secs: Some(2),
@@ -1005,7 +946,6 @@ mod tests {
              sweep: completed 12m 34s ago  pressure deletions: 3"
         );
 
-        // A failed attempt keeps the last rows, marked failed and aged.
         let mut failed = test_capacity();
         failed.headroom.measurement = StorageMeasurement {
             status: Status::Failed,
@@ -1016,7 +956,6 @@ mod tests {
             "{}",
             capacity_line(&failed)
         );
-        // No rows yet: no numbers, and no floor claim.
         for (status, expected) in [
             (
                 Status::NotSampled,
@@ -1042,7 +981,6 @@ mod tests {
                 format!("{expected}  pressure deletions: 0")
             );
         }
-        // A floor of 0 says pressure deletion is off.
         let mut off = test_capacity();
         off.headroom.filesystems[0].floor = Some(DeletionFloor::Off);
         assert!(
@@ -1065,8 +1003,6 @@ mod tests {
             });
             assert!(capacity_line(&swept).contains(label), "{label}");
         }
-        // The WAL's own device never stands in for the data filesystem,
-        // and an environment's reach is not the installation's answer.
         assert!(!capacity_line(&full).contains("60.0 GB"));
         assert!(!capacity_line(&full).contains("prod"));
         assert!(!capacity_line(&full).contains("38"));
@@ -1126,8 +1062,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// Nothing retained is the ordinary state: the pool line carries no
-    /// suffix at all (ADR-0024).
     #[test]
     fn render_dashboard_retained_zero() {
         let snapshot = test_snapshot();
@@ -1145,9 +1079,6 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
-    /// A retained permit is a suffix on the active figure, not a second
-    /// count: three permits are held, one of them by work whose request
-    /// already answered.
     #[test]
     fn render_dashboard_retained_nonzero() {
         let mut snapshot = test_snapshot();
@@ -1166,7 +1097,6 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
-    /// The suffix still has to fit the narrow layout.
     #[test]
     fn render_dashboard_retained_narrow() {
         let mut snapshot = test_snapshot();
@@ -1243,10 +1173,8 @@ mod tests {
         assert_eq!(truncate_query("日本語テスト", 10), "日本語テ…");
     }
 
-    /// A query is cut between grapheme clusters, each measured in the
-    /// cells ratatui draws it in: `لا` is two cells, `ｶﾞ` is two, `e` with
-    /// a combining accent is one, and `❤` with its emoji selector is two.
-    /// A cluster is never split from its mark or selector.
+    /// `لا` is two cells, `ｶﾞ` is two, `e` with a combining accent is one,
+    /// and `❤` with its emoji selector is two.
     #[test]
     fn truncate_query_cuts_between_clusters() {
         for (query, budget, want) in [
@@ -1282,9 +1210,8 @@ mod tests {
         assert_eq!(truncate_query("abc", 0), "");
     }
 
-    /// Every string the dashboard draws that trawl did not write goes
-    /// through the sanitize rule. Each field has its own marker, so one
-    /// field's U+FFFD cannot stand in for another's.
+    /// Each field has its own marker, so one field's U+FFFD cannot stand in
+    /// for another's.
     #[test]
     fn dashboard_sanitizes_remote_text() {
         let mut snapshot = test_snapshot();
@@ -1325,8 +1252,6 @@ mod tests {
         }
     }
 
-    /// The query is sanitized before it is measured, so U+FFFD counts as
-    /// the one cell it takes, on both the fitting and the clipping path.
     #[test]
     fn truncate_query_sanitizes_before_width() {
         assert_eq!(truncate_query("a\u{202e}b", 10), "a\u{fffd}b");
