@@ -3,11 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // The answers ADR-0066 lets an endpoint read itself before the one
-// classifier sees them (issue #386): a health 503 that IS a report, the
-// repin POST's two 409 bodies, a repin job read's 404, logout's empty
-// 204, and export's binary success. Anything else these endpoints answer
-// is an ordinary failure, so a health 503 that carries the envelope is a
-// refusal, not a report.
+// classifier sees them.
 
 import { readFileSync } from 'node:fs';
 import type { Page, Route } from '@playwright/test';
@@ -42,7 +38,6 @@ test('a health 503 that carries the envelope is a refusal in the server\'s words
   const health = await openHealth(page, { status: 503, json: { error: { code: 'request_limit_reached', message: LIMIT } } });
   await expect(health.getByRole('heading')).toHaveText('Health report unavailable');
   await expect(health.getByRole('alert')).toHaveText(`Report unavailable: ${LIMIT}`);
-  // A refusal is never read as a report of any kind.
   await expect(health.locator('dl.health-checks')).toHaveCount(0);
 });
 
@@ -54,15 +49,11 @@ test('a health 503 that is neither a report nor the envelope is a bare failure',
   await expect(page.locator('body')).not.toContainText('RAW-GATEWAY-SENTINEL');
 });
 
-// ---- repin ----------------------------------------------------------------
-
 const FIELD = 'duration';
 const field = JSON.parse(readFileSync('harness/wire/catalog-field.json', 'utf8'));
 const running = JSON.parse(readFileSync('harness/wire/repin-status-running.json', 'utf8')).job;
 const BUSY = 'another repin (job 4100) holds the one-running slot';
 
-/** A schema writer on a degraded field's case file, with every repin
- * read and write scripted here. */
 async function repinPage(page: Page, onPost: (body: { dry_run: boolean }) => Reply) {
   await page.route('**/api/auth/me', route => route.fulfill({ json: {
     name: 'e2e', roles: ['schema-writer'], permissions: ['query', 'schema_read', 'schema_write'],
@@ -79,7 +70,6 @@ async function repinPage(page: Page, onPost: (body: { dry_run: boolean }) => Rep
     const id = new URL(route.request().url()).searchParams.get('id');
     if (id === null) return route.fulfill({ json: { job: null } });
     script.jobReads.push(Number(id));
-    // The route holds no job with that id.
     return route.fulfill({ status: 404, json: { error: { code: 'not_found', message: 'repin job not found' } } });
   });
   await page.route('**/api/v1/schema/repin', route => {
@@ -118,8 +108,6 @@ test('a repin 409 that carries the envelope says the slot is held, in the server
 });
 
 test('a repin job read answered 404 is no job: the plan is asked for again', async ({ page }) => {
-  // The plan's scan outlasts the server's answer bound (202), and the job
-  // read by its id answers 404.
   const { modal, script } = await repinPage(page, () =>
     ({ status: 202, json: { job: { ...plan, status: 'running', files_done: 0 } } }));
   await expect(modal.getByText("The plan's scan outlasted the server's answer", { exact: false }))
@@ -128,8 +116,6 @@ test('a repin job read answered 404 is no job: the plan is asked for again', asy
   await expect(modal.getByRole('button', { name: /Run repin/ })).toHaveCount(0);
   expect(script.jobReads).toEqual([4212]);
 });
-
-// ---- logout and export ----------------------------------------------------
 
 test('a logout answered 204 with no body signs out cleanly', async ({ page }) => {
   let logouts = 0;
@@ -141,7 +127,6 @@ test('a logout answered 204 with no body signs out cleanly', async ({ page }) =>
   await expect(page.locator(SEL.historyPage)).toBeVisible();
   await page.locator(SEL.topbarUser).click();
   await page.getByRole('menuitem', { name: 'Sign Out', exact: true }).click();
-  // Explicit logout carries no return destination.
   await expect(page).toHaveURL(url => url.pathname === '/login' && url.search === '');
   await expect(page.getByRole('button', { name: 'Sign in', exact: true })).toBeVisible();
   await expect(page.getByText('Your session may still be active', { exact: false })).toHaveCount(0);

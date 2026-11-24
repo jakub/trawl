@@ -155,15 +155,12 @@ test('history hides stale rows and completes a newer page before the older reque
   await page.goto('/search/history');
   const footer = page.locator('.results-footer');
   await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
-  // Keep an actual element identity across navigation, not just a URL check.
   const mountedInput = await page.getByPlaceholder('Filter history…').elementHandle();
   await footer.getByRole('button', { name: 'Next' }).click();
   await expect.poll(async () => (await paginationState(request)).held).toBe(true);
   await expect(footer).toHaveCount(0);
   await expect(page.locator('.tbl-body .row-stretch')).toHaveCount(0);
 
-  // Page controls are unavailable, but browser navigation can change the page.
-  // The newer page starts and completes while the older response remains held.
   await navigateHistory(page, '2');
   await expect(page).toHaveURL(/hpage=2$/);
   expect(await mountedInput!.evaluate(el => el.isConnected)).toBe(true);
@@ -203,24 +200,6 @@ test('history hides stale rows and completes a newer page before the older reque
 
 // The largest page the search URL admits: its offset is one page short of
 // `MAX_OFFSET` (u32::MAX), the ceiling a wasm32 `usize` can address.
-//
-// This case used to reach the overflow branch by asking the harness for
-// `queryTotal: 4_294_967_300` — 50 rows at that offset, and
-// `offset + returned` past `usize::MAX`. It cannot any more, and not
-// because the range is bounded: the raw table passes `PageTotal::Probe`,
-// under which `PageWindow::new` clamps `returned` to the page size and
-// the total bounds nothing. It is because the harness now stamps that
-// number on the wire as `pagination.total`, and 4,294,967,300 does not
-// decode into a wasm32 `usize` — the response fails to parse before any
-// window is computed.
-//
-// So `PageWindowOverflow` → "This result page extends past the supported
-// row range.", in both tables, is no longer exercised from a browser. The
-// arithmetic it guards is covered natively by fleet-ui's
-// `page_window_checked_arithmetic_at_usize_limits`, which drives both
-// `checked_add` sites in `PageWindow::new`. What this case proves is the
-// surviving half: the extreme page renders its empty state instead of
-// panicking the module.
 test('Probe last addressable page renders without a wasm panic', async ({ page, request }) => {
   await configure(request);
   await page.goto('/search?q=service%3Dnginx&page=85899345');
@@ -312,8 +291,6 @@ test('global Runs orders across page boundaries for every key and direction', as
     expect(await idOf(rows.last())).toBe(last);
   }
   const calls = (await paginationState(request)).runs as Array<{ sort: string; dir: string; offset: number }>;
-  // Each new ordering starts at zero, including returning to initial When
-  // after visiting other keys. No intermediate old-page/new-sort request.
   expect(calls.map(({ sort, dir, offset }) => [sort, dir, offset])).toEqual([
     ['started', 'desc', 0],
     ...cases.flatMap(([, key, dir]) => [[key, dir, 0], [key, dir, 20], [key, dir, 40]]),

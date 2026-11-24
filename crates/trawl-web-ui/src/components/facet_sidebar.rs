@@ -4,56 +4,6 @@
 
 //! `<FacetSidebar/>` — the filter rail (the glossary's term; the code
 //! keeps its old name).
-//!
-//! One `<details class="facet-panel">` serves both layouts, so the value
-//! search text and the group state survive a breakpoint crossing.
-//!
-//! At 900px and wider the rail follows the page (ADR-0044). It opens for
-//! a countable page and closes, to a 32px strip, for any other settled
-//! answer: idle, zero rows, rows with nothing to count, an aggregation, a
-//! failed query or a malformed link. A press on the `<summary>` is a
-//! hand choice, which holds for the browser session through
-//! [`FilterRailChoice`]. Below 900px the rail is a disclosure above the
-//! results that starts closed and opens only by hand, with its own
-//! component-local state.
-//!
-//! One writer each. The summary's `click` writes the state, at both
-//! widths: it cancels the native toggle and flips the narrow state or
-//! the wide choice. The `open` binding writes the DOM. `toggle` records
-//! nothing, because it also fires for the automatic changes and arrives
-//! a frame late. Below 900px it only takes up an open the browser made
-//! by itself, as find-in-page does for a match. A closed wide rail's
-//! content is `inert`, which find-in-page and text fragments skip, so
-//! the browser cannot open the wide rail that way.
-//!
-//! The `<summary>` is the rail's one control: a vertical strip when the
-//! rail is closed, and the header row (chevron, "Filters", the active
-//! count) when it is open, with "Clear all" beside it once a filter is
-//! set. Below the header sit a filter input and the per-field
-//! collapsible groups, with value bars on one scale and include/exclude
-//! actions the row reveals on hover or focus (opacity, never
-//! `display: none`, so the buttons keep their place in the tab order —
-//! ADR-0029). Pressing `+` / `⊘` on a value adds an include / exclude
-//! `Filter` to the shared filters signal; the parent owns state and
-//! re-runs the query via URL navigation. An open rail with nothing to
-//! count shows one hint in place of the input and the groups.
-//!
-//! Every value bar measures its count against the shown rows, the rows
-//! the counts come from, so equal lengths are equal shares in every
-//! group; the scope caption names that row count. A value too rare to
-//! draw keeps a 2px stub.
-//!
-//! A group lists at most [`FACET_TOP_N`] values, while its heading
-//! counts every distinct value on the page. When any field holds more
-//! values than it lists, a second caption line says where lists stop,
-//! and each group's more control names the values it reveals as listed
-//! ones, so neither reads as access to every distinct value.
-//!
-//! A value label wraps to at most three lines, so long values that share
-//! a prefix stay apart. A `_severity` value shows its name, as the
-//! results table does (`17` reads `error`), and filters by its number.
-//! Its group lists the levels most severe first, and error and warn
-//! names take the table's red and amber as text ink.
 
 use std::collections::HashMap;
 
@@ -72,7 +22,7 @@ use crate::state::filter_rail::FilterRailChoice;
 use crate::state::query::{Filter, FilterOp};
 
 #[component]
-#[allow(clippy::too_many_lines)] // facet markup tree is one cohesive view
+#[allow(clippy::too_many_lines)]
 pub fn FacetSidebar(
     /// The rows on screen, from whichever source the page's mode makes
     /// active: the snapshot page, or the live ring. Read here for its
@@ -80,52 +30,29 @@ pub fn FacetSidebar(
     /// groups come from `page`.
     #[prop(into)]
     state: Signal<LoadState<QueryResult>>,
-    /// Current filters — read to paint selected/excluded value rows.
-    #[prop(into)]
-    filters: Signal<Vec<Filter>>,
-    /// True while the link's structured state could not be read. The
-    /// rail then shows its header and nothing else: facets are counted
-    /// off rows, and a query that was refused has no rows to count —
-    /// including a response that was already in flight when the URL
-    /// turned unreadable (ADR-0027). "Clear all" goes with them, since
-    /// clearing filters navigates.
-    #[prop(into)]
-    suppressed: Signal<bool>,
+    #[prop(into)] filters: Signal<Vec<Filter>>,
+    #[prop(into)] suppressed: Signal<bool>,
     /// Hide row-derived controls for a pending response, an aggregation,
     /// or an unknown source. URL filter count and Clear all remain usable.
     #[prop(into)]
     rows_suppressed: Signal<bool>,
-    /// The last settled answer's page: the groups to render, or the hint
-    /// for a page with nothing to count. `None` before any answer.
-    #[prop(into)]
-    page: Signal<Option<RailPage>>,
+    #[prop(into)] page: Signal<Option<RailPage>>,
     /// Whether that page is countable, which opens the wide rail in
     /// automatic mode. Separate from `page` so the open state is not
     /// recomputed on every live frame.
     #[prop(into)]
     countable: Signal<Option<bool>>,
-    /// Called when the user clicks `+` or `⊘` on a facet value.
     on_add: Callback<Filter>,
-    /// Called when the user clicks "clear all" in the header.
     on_clear: Callback<()>,
 ) -> impl IntoView {
-    // Per-field collapse state — closed groups stash here. New fields
-    // start expanded.
     let collapsed: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
-    // Free-text filter applied across value names within a group.
     let needle = RwSignal::new(String::new());
-    // Per-field expansion (show top 5 vs all matching listed values).
     let expanded: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
 
-    // Keep one facet tree mounted across both layouts. Filters themselves
-    // remain URL-owned; this disclosure only controls their presentation.
     // 899.98px is the codebase's one spelling of "narrow" (`Shell` and
     // both stylesheets query it), so the disclosure and the layout it
     // presents can never disagree by a pixel.
     let compact = use_media_query("(max-width: 899.98px)");
-    // The narrow disclosure's own state, written by a narrow press on the
-    // `<summary>`, the focus reopen below, and the `toggle` reconcile for
-    // an open the browser made by itself. The wide rail never reads it.
     let open = RwSignal::new(false);
     let panel = NodeRef::<leptos::html::Details>::new();
     let summary = NodeRef::<leptos::html::Summary>::new();
@@ -146,7 +73,6 @@ pub fn FacetSidebar(
         }
     });
 
-    // The wide rail: a hand choice for the session, else the page.
     let choice = expect_context::<FilterRailChoice>();
     let wide_open = Memo::new(move |_| {
         choice
@@ -195,9 +121,6 @@ pub fn FacetSidebar(
         },
         UseEventListenerOptions::default().capture(true),
     );
-    // If the wide rail closes while the reader's focus is in it, move
-    // focus to the `<summary>`, the one control a closed rail keeps. On
-    // the close edge only; the narrow disclosure has its own rule above.
     Effect::new(move |was_open: Option<bool>| {
         let is_open = rail_open.get();
         if was_open == Some(true)
@@ -230,16 +153,10 @@ pub fn FacetSidebar(
             class="facet-panel"
             node_ref=panel
             open=move || rail_open.get()
-            // Not a record of presses: the `<summary>` click records
-            // those at both widths. `toggle` is dispatched a frame after
-            // the change it reports, when the width may have crossed the
-            // breakpoint, and it fires for the binding's own writes too.
-            // Its one job is narrow. When the DOM disagrees with what the
-            // binding last rendered, the browser opened or closed the
-            // disclosure by itself (find-in-page opens one to show a
-            // match), and the narrow state takes that up, or the next
-            // press would look dead. It never writes the wide choice: the
-            // first automatic open would become a hand choice.
+            // When the DOM disagrees with what the binding last rendered, the
+            // browser opened or closed the narrow disclosure by itself
+            // (find-in-page opens one to show a match), and the narrow state
+            // takes that up, or the next press would look dead.
             on:toggle=move |_| {
                 if compact.get_untracked()
                     && let Some(panel) = panel.get_untracked()
@@ -259,11 +176,6 @@ pub fn FacetSidebar(
         >
         <summary
             node_ref=summary
-            // The one writer of the rail's state at both widths. The
-            // press cancels the native toggle and flips the state its
-            // width owns: the narrow disclosure's own, or the wide hand
-            // choice. The `open` binding above is the only writer of the
-            // DOM, so it renders either.
             on:click=move |event: web_sys::MouseEvent| {
                 event.prevent_default();
                 if compact.get_untracked() {
@@ -284,13 +196,9 @@ pub fn FacetSidebar(
             }}</span>
         </summary>
         // A closed wide rail's content is inert, so the browser cannot
-        // open the rail by itself. Find-in-page and a link's text
-        // fragment show a match inside a closed `<details>` by opening
-        // it, and that open would bypass the hand choice: the rail would
-        // show open while its state says closed, and the next press
-        // would look dead. Inert content is not searched. The narrow
-        // disclosure stays searchable, and `on:toggle` follows what the
-        // browser opens there.
+        // open the rail by itself: find-in-page and a link's text fragment
+        // show a match inside a closed `<details>` by opening it, which
+        // would bypass the hand choice. Inert content is not searched.
         <aside
             class="facets"
             aria-label="Search filters"
@@ -305,23 +213,15 @@ pub fn FacetSidebar(
                     >"Clear all"</button>
                 </Show>
             </div>
-            // A settled page with nothing to count says so. A malformed
-            // link shows the header only: suppression outranks the hint.
             {move || {
                 (!suppressed.get())
                     .then(|| hint.get())
                     .flatten()
                     .map(|hint| view! { <p class="facets-hint">{hint}</p> })
             }}
-            // Every gate hides the value search with the groups: it
-            // filters names that are not being shown.
             <Show when=body_shown>
                 <SearchInput value=needle placeholder="Filter field values"/>
             </Show>
-            // Suppression is total: an unreadable link has no active
-            // source, so the rail shows its header and nothing else —
-            // not even the loading hint the state would otherwise
-            // render (ADR-0027).
             <Show when=body_shown>
             <Loaded
                 state=state
@@ -329,8 +229,6 @@ pub fn FacetSidebar(
                 // already reports the query failure, and repeating it in
                 // the facet rail is noise.
                 error=Box::new(|_| view! { <p class="facets-hint">"—"</p> }.into_any())
-                // The groups were counted once, with the page's verdict;
-                // this only applies the value search to them.
                 render=Box::new(move |result: QueryResult| {
                     let Some(RailPage::Countable(facets)) = page.get() else {
                         return ().into_any();
@@ -342,9 +240,6 @@ pub fn FacetSidebar(
                     let scale = f64::from(u32::try_from(rows).unwrap_or(u32::MAX).max(1));
                     let q = needle.get().to_lowercase();
                     let active = filters.get();
-                    // Both kinds of count describe the rows on screen,
-                    // not the whole corpus; the caption says so once, with
-                    // the bars' scale.
                     let scope_text = if rows == 1 {
                         "Bar = share of 1 shown row".to_owned()
                     } else {
@@ -364,13 +259,11 @@ pub fn FacetSidebar(
                         })}
                     };
                     let groups = facets.into_iter().map(|(field, values, distinct)| {
-                        // A severity field's values show as names, the
-                        // way the results table shows them. Only the
-                        // label changes: the title, the selection match,
-                        // the filter a click builds and the count all
-                        // keep the raw value. The rail counts input
-                        // fields only, so `_severity` is the one field
-                        // that qualifies; no `sev()` output reaches it.
+                        // Only the label changes: the title, the selection
+                        // match, the filter a click builds and the count all
+                        // keep the raw value. The rail counts input fields
+                        // only, so `_severity` is the one field that
+                        // qualifies.
                         let severity = trawl_core::severity::renders_as_severity(&field, &[]);
                         let label = move |v: &str| {
                             severity
@@ -390,10 +283,7 @@ pub fn FacetSidebar(
                                 })
                                 .collect()
                         };
-                        // A severity field lists its levels as a scale,
-                        // most severe first, so `error` leads the group
-                        // the way it would lead a triage. The values were
-                        // already counted and capped by count.
+                        // The values were already counted and capped by count.
                         if severity {
                             order_severity_facet(&mut filtered);
                         }
@@ -446,9 +336,6 @@ pub fn FacetSidebar(
                                         let share = (f64::from(c) / scale).min(1.0);
                                         let title = v.clone();
                                         let shown = label(&v);
-                                        // The table's level hue, as text
-                                        // ink: red for error and fatal,
-                                        // amber for warn, plain otherwise.
                                         let ink = severity.then(|| severity_facet_ink(&v)).flatten();
                                         let state = match_filter_state(&active, &field, &v);
                                         let field_for_inc = field.clone();
@@ -465,9 +352,6 @@ pub fn FacetSidebar(
                                             >
                                                 <div
                                                     class="bar"
-                                                    // The 2px floor in the
-                                                    // stylesheet keeps a rare
-                                                    // value's bar visible.
                                                     style=format!("--share: {share:.3}")
                                                 ></div>
                                                 <span

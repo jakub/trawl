@@ -3,41 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! How the investigation board keeps itself current (ADR-0059).
-//!
-//! While its tab is visible the board reads the entries changed since
-//! its last read every [`POLL_MS`]. While the tab is hidden it reads
-//! nothing; when the tab shows again it reads at once, then every
-//! [`POLL_MS`] again. A read that fails is tried again after a delay that
-//! doubles from [`POLL_MS`] up to [`BACKOFF_MAX_MS`], and a 429 waits at
-//! least the `Retry-After` it carried. Every read waits out that pause,
-//! the poll and every read a person or a write asks for, in a visible tab
-//! as in a hidden one ([`Liveness::hold_ms`]). A read the server refuses
-//! for want of a grant stops the board's reading for good.
-//!
-//! [`Liveness`] holds that schedule and what the page says about it: the
-//! [`Connection`] state and when a read was last accepted. A read that
-//! failed changes neither the board nor that instant. The page announces
-//! to screen readers only a change of state that a person did not cause
-//! by switching tabs ([`announcement`]) and how many entries a read
-//! brought ([`new_entries_text`]), never each check.
-//!
-//! A change the reader did not ask for leaves what they read where it
-//! was on screen: [`pick_anchor`] chooses the element that holds their
-//! place, and the page scrolls by however far the change moved it.
-//!
-//! A person writes to the board too: a keep from the evidence viewer,
-//! and a close or reopen from its header. [`keep_reason`] checks a
-//! keep's reason against the bounds the server enforces before anything
-//! is sent, and [`write_refusal`] reads what a refused write's answer
-//! says ([`WriteFailure`]): an overwrite whose sequence moved, an
-//! investigation closed meanwhile, or the server's own sentence. A write
-//! whose answer never arrived, or came back as a server error, is neither
-//! a success nor a refusal: its outcome is unknown, and the page never
-//! sends it again by itself.
-//!
-//! Time is milliseconds on any clock the caller passes in, so the tests
-//! drive it with a fake one. Pure and ungated so its tests run natively;
-//! the page that drives it is wasm32-only.
+//! Time is milliseconds on any clock the caller passes in.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -47,31 +13,20 @@ use trawl_api::{ErrorCode, ErrorResponse};
 
 use crate::evidence_queue::wait_ms;
 
-/// Between two reads of a visible board that is current.
 pub const POLL_MS: u32 = 5_000;
 
-/// The longest the board waits after reads failed in a row.
 pub const BACKOFF_MAX_MS: u32 = 60_000;
 
-/// What the page says about how current the board is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Connection {
-    /// No read has been accepted since the board opened or its tab
-    /// showed again.
     Checking,
-    /// The last read was accepted; the next one is [`POLL_MS`] away.
     Live,
-    /// The tab is hidden, so the board reads nothing.
     Paused,
-    /// The last read failed; the board tries again after a delay.
     Retrying,
-    /// The server refused a read for want of a grant: the board reads no
-    /// more on this visit.
     Stopped,
 }
 
 impl Connection {
-    /// The state in words.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -83,7 +38,6 @@ impl Connection {
         }
     }
 
-    /// The badge tone of the state.
     #[must_use]
     pub fn tone(self) -> Tone {
         match self {
@@ -96,17 +50,11 @@ impl Connection {
     }
 }
 
-/// Where the board's read after a conflict stands, which the conflict's
-/// notice says as it changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reread {
-    /// A read begun after the conflict landed.
     Done,
-    /// It runs, or starts once a 429's pause or a failure's backoff ends.
     Reading,
-    /// It waits for the hidden tab to show.
     Waiting,
-    /// The board stopped reading before such a read landed.
     Stopped,
 }
 
@@ -125,7 +73,6 @@ impl Reread {
         }
     }
 
-    /// What the conflict's notice says of it.
     #[must_use]
     pub fn sentence(self) -> &'static str {
         match self {
@@ -137,14 +84,10 @@ impl Reread {
     }
 }
 
-/// How a read of the board ended.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReadEnd {
-    /// The server answered the entries; the board merged them.
     Accepted,
-    /// The read failed: the network, a decode or a server error.
     Failed,
-    /// The server answered 429 and asked for this pause.
     Throttled {
         /// From [`crate::evidence_queue::retry_after_ms`].
         retry_after_ms: f64,
@@ -154,21 +97,16 @@ pub enum ReadEnd {
     Refused,
 }
 
-/// The board's reading schedule and what the page says about it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Liveness {
     connection: Connection,
-    /// Reads that failed in a row.
     failures: u32,
     /// The instant a 429 asked the board not to read before.
     hold_until: Option<f64>,
-    /// When the last read was accepted.
     last_ok: Option<f64>,
 }
 
 impl Liveness {
-    /// The schedule of a board that has not read yet, in a tab that is
-    /// `visible` or not.
     #[must_use]
     pub fn new(visible: bool) -> Self {
         Self {
@@ -183,7 +121,6 @@ impl Liveness {
         }
     }
 
-    /// What the page says about how current the board is.
     #[must_use]
     pub fn connection(&self) -> Connection {
         self.connection
@@ -196,13 +133,11 @@ impl Liveness {
         self.last_ok
     }
 
-    /// Whether the board still reads at all.
     #[must_use]
     pub fn stopped(&self) -> bool {
         self.connection == Connection::Stopped
     }
 
-    /// A read ended at `now`.
     pub fn ended(&mut self, end: ReadEnd, now: f64) {
         if self.stopped() {
             return;
@@ -227,7 +162,6 @@ impl Liveness {
         }
     }
 
-    /// The tab is hidden: the board reads nothing until it shows.
     pub fn hidden(&mut self) {
         if !self.stopped() {
             self.connection = Connection::Paused;
@@ -235,8 +169,7 @@ impl Liveness {
     }
 
     /// The tab shows at `now`: how long until the board reads, `Some(0)`
-    /// for at once, `None` when it no longer reads. A read waits only for
-    /// a 429's pause that is still running.
+    /// for at once, `None` when it no longer reads.
     pub fn shown(&mut self, now: f64) -> Option<u32> {
         if self.stopped() {
             return None;
@@ -276,10 +209,6 @@ impl Liveness {
     }
 }
 
-/// What a polite live region says when the state changes from `before`
-/// to `after`, if anything. Pausing in a hidden tab and checking when it
-/// shows again are the person's own doing and pass unannounced; a read
-/// that failed, a board that stopped, and a recovery are not.
 #[must_use]
 pub fn announcement(before: Connection, after: Connection) -> Option<&'static str> {
     match (before, after) {
@@ -291,7 +220,6 @@ pub fn announcement(before: Connection, after: Connection) -> Option<&'static st
     }
 }
 
-/// How many entries a read brought, in words; `None` for none.
 #[must_use]
 pub fn new_entries_text(added: usize) -> Option<String> {
     match added {
@@ -325,10 +253,8 @@ pub fn pick_anchor(placed: &[Placed], line: f64) -> Option<usize> {
         .position(|p| p.bottom > p.top && p.bottom > line && !(p.holds_next && p.top < line))
 }
 
-/// Why a keep's reason cannot be sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasonProblem {
-    /// Nothing but whitespace.
     Empty,
     /// Longer than [`KEEP_REASON_MAX_BYTES`] bytes of UTF-8 once trimmed.
     TooLong {
@@ -340,7 +266,6 @@ pub enum ReasonProblem {
 }
 
 impl ReasonProblem {
-    /// What the form says under the field.
     #[must_use]
     pub fn message(self) -> String {
         match self {
@@ -374,7 +299,6 @@ pub fn keep_reason(text: &str) -> Result<&str, ReasonProblem> {
     }
 }
 
-/// Why a write from the board did not land.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteFailure {
     /// 409 `sequence_conflict`: the investigation changed after the board
@@ -387,23 +311,16 @@ pub enum WriteFailure {
     /// 409 `investigation_closed`: it was closed when the write reached
     /// it. Nothing was written.
     Closed,
-    /// The session is gone (401).
     Unauthorized,
-    /// The server refused it, in its own words when it gave any.
     Refused(String),
     /// No answer was read: the write may or may not have landed.
     Unknown,
 }
 
-/// What a write's non-2xx answer, `status` with `body`, says.
-///
 /// A server error does not prove the write was refused: trawld can fail
-/// after its commit (an overwrite reads the investigation back in a
-/// separate step, and a failure there answers 500), and a gateway error
-/// may stand for an answer lost on the way. So every 5xx is an unknown
-/// outcome, envelope or not, except `request_limit_reached`: trawld
-/// answers it at admission, before the request reaches any handler, and
-/// says the request was not processed (ADR-0054).
+/// after its commit, and a gateway error may stand for an answer lost on
+/// the way. So every 5xx is unknown, except `request_limit_reached`, which
+/// trawld answers at admission, before any handler (ADR-0054).
 #[must_use]
 pub fn write_refusal(status: u16, body: &str) -> WriteFailure {
     if status == 401 {
@@ -452,7 +369,6 @@ mod tests {
         assert_eq!(live.connection(), Connection::Live);
         assert_eq!(live.last_ok(), Some(1_000.0));
         assert_eq!(live.next_delay(1_000.0), Some(POLL_MS));
-        // An empty read is still a check.
         live.ended(ReadEnd::Accepted, 6_000.0);
         assert_eq!(live.last_ok(), Some(6_000.0));
     }
@@ -483,7 +399,6 @@ mod tests {
         }
         assert_eq!(delays, vec![5_000, 10_000, 20_000, 40_000, 60_000, 60_000]);
         assert_eq!(live.last_ok(), Some(0.0));
-        // Many more failures never overflow the doubling.
         for _ in 0..100 {
             live.ended(ReadEnd::Failed, 10.0);
         }
@@ -506,7 +421,6 @@ mod tests {
         );
         assert_eq!(live.connection(), Connection::Retrying);
         assert_eq!(live.next_delay(1_000.0), Some(30_000));
-        // A short Retry-After still waits the backoff.
         let mut short = live_board(0.0);
         short.ended(
             ReadEnd::Throttled {
@@ -515,14 +429,10 @@ mod tests {
             0.0,
         );
         assert_eq!(short.next_delay(0.0), Some(POLL_MS));
-        // Showing the tab inside the pause waits out what is left of it,
-        // and the state still says the last read failed.
         live.hidden();
         assert_eq!(live.shown(11_000.0), Some(20_000));
         assert_eq!(live.connection(), Connection::Retrying);
-        // Past the pause it reads at once.
         assert_eq!(live.shown(31_000.0), Some(0));
-        // An accepted read clears the pause.
         live.ended(ReadEnd::Accepted, 31_500.0);
         assert_eq!(live.next_delay(31_500.0), Some(POLL_MS));
     }
@@ -538,18 +448,15 @@ mod tests {
             5_000.0,
         );
         assert_eq!(live.hold_ms(5_000.0), 30_000);
-        // Hidden and shown again, the pause runs on the clock.
         live.hidden();
         assert_eq!(live.hold_ms(15_000.0), 20_000);
         assert_eq!(live.shown(15_000.0), Some(20_000));
         live.hidden();
         assert_eq!(live.shown(34_000.0), Some(1_000));
-        // A read that failed otherwise does not end it.
         live.ended(ReadEnd::Failed, 20_000.0);
         assert_eq!(live.hold_ms(20_000.0), 15_000);
         assert_eq!(live.hold_ms(35_000.0), 0);
         assert_eq!(live.hold_ms(40_000.0), 0);
-        // An accepted read does, at once.
         live.ended(
             ReadEnd::Throttled {
                 retry_after_ms: 30_000.0,
@@ -603,12 +510,9 @@ mod tests {
     fn reread_prefers_an_accepted_read_over_a_stop() {
         use Connection::{Checking, Live, Paused, Retrying, Stopped};
         let all = [Checking, Live, Paused, Retrying, Stopped];
-        // A read begun after the conflict landed: done, whatever the
-        // board did since.
         for connection in all {
             assert_eq!(Reread::of(4, 5, connection), Reread::Done, "{connection:?}");
         }
-        // None has landed yet.
         for accepted in [3, 4] {
             for (connection, reread) in [
                 (Checking, Reread::Reading),
@@ -648,8 +552,6 @@ mod tests {
 
     #[test]
     fn the_entry_under_the_line_holds_the_place_not_its_section() {
-        // Activity runs 100..400 with entries of 100; the line is inside
-        // the second entry.
         let placed = [
             entry(0.0, 90.0),
             section(100.0, 400.0),
@@ -660,13 +562,11 @@ mod tests {
             entry(420.0, 600.0),
         ];
         assert_eq!(pick_anchor(&placed, 250.0), Some(3));
-        // On an entry's top edge, that entry.
         assert_eq!(pick_anchor(&placed, 200.0), Some(3));
     }
 
     #[test]
     fn a_section_whose_entries_are_all_above_the_line_passes_to_the_next() {
-        // The line is in the activity's Load more, below its last entry.
         let placed = [
             section(0.0, 260.0),
             entry(0.0, 100.0),
@@ -681,7 +581,6 @@ mod tests {
     fn a_section_below_the_line_or_without_entries_holds_the_place_itself() {
         let placed = [section(300.0, 500.0), entry(330.0, 500.0)];
         assert_eq!(pick_anchor(&placed, 250.0), Some(0));
-        // "No steps yet.": a section with nothing keyed inside it.
         let placed = [entry(0.0, 100.0), entry(100.0, 400.0)];
         assert_eq!(pick_anchor(&placed, 150.0), Some(1));
     }
@@ -725,10 +624,7 @@ mod tests {
             keep_reason(&format!("{ascii}b")),
             Err(ReasonProblem::TooLong { bytes: 1025 })
         );
-        // Whitespace around it is not counted: it is not sent.
         assert_eq!(keep_reason(&format!("  {ascii}  ")), Ok(ascii.as_str()));
-        // Four bytes each: 256 fit exactly, 257 do not, although 257
-        // characters is far below 1024 characters.
         let wide = "\u{1F4A5}".repeat(256);
         assert_eq!(wide.len(), KEEP_REASON_MAX_BYTES);
         assert_eq!(keep_reason(&wide), Ok(wide.as_str()));
@@ -769,7 +665,6 @@ mod tests {
             )
         );
         assert_eq!(write_refusal(401, ""), WriteFailure::Unauthorized);
-        // A lost answer is not a refusal.
         assert_eq!(write_refusal(502, "<html>"), WriteFailure::Unknown);
         assert_eq!(write_refusal(504, closed), WriteFailure::Unknown);
         assert_eq!(write_refusal(500, ""), WriteFailure::Unknown);
@@ -779,11 +674,6 @@ mod tests {
         );
     }
 
-    /// A server error proves nothing about the write: trawld commits a
-    /// close and then reads the investigation back, and a failure of that
-    /// read answers 500 after the close landed. So a 5xx is unknown even
-    /// when its body is trawld's envelope, unless its code is one trawld
-    /// answers only before any write.
     #[test]
     fn a_server_error_is_unknown_even_with_trawlds_envelope() {
         for (status, code) in [
@@ -800,7 +690,6 @@ mod tests {
                 "{code}"
             );
         }
-        // Refused at admission, before the request reached any handler.
         let limit = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
         assert_eq!(
             write_refusal(503, limit),

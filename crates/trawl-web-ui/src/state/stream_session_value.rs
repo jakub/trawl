@@ -4,17 +4,7 @@
 
 //! The SSE lane's live ring, kept out of the wasm-only session module.
 //!
-//! [`stream_session`](super::stream_session) is `wasm32`-gated, so a test
-//! written beside it never runs. None of this has a browser dependency,
-//! so it lives here and builds on every target. Each `data` frame the
-//! server sends is a one-row typed result, decoded by `trawl_api`'s result
-//! codec like every other result, so the ring holds those frames and
-//! [`ring_to_result`] merges them into one table. The ring and
-//! [`ring_to_result`] are here so the filter rail's live lane can be
-//! tested against its snapshot lane; the session module re-exports them.
-//!
-//! On native only the tests call them — the same shape every other
-//! pure module in this crate carries.
+//! On native only the tests call them.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -22,14 +12,10 @@ use std::collections::{HashMap, VecDeque};
 
 use trawl_api::value::{Column, ColumnType, QueryResult, TypeFold, Value};
 
-/// Max raw events retained in the ring — older events roll off.
 pub const LIVE_RING_CAPACITY: usize = 5000;
 
-/// Bounded, append-only-from-the-tail ring of live events, each the
-/// one-row typed result its `data` frame carried.
 #[derive(Clone, Default)]
 pub struct RingBuffer {
-    /// Insertion-ordered ring of event frames.
     pub events: VecDeque<QueryResult>,
     /// Monotonic counter — bumped on every push; lets `Memo`s key off a
     /// cheap `u64` instead of cloning the `VecDeque` for change detection.
@@ -46,8 +32,6 @@ impl RingBuffer {
     }
 }
 
-/// The value an event frame holds for the field `name`, if it carries
-/// that field.
 #[must_use]
 pub fn event_field<'e>(event: &'e QueryResult, name: &str) -> Option<&'e Value> {
     let idx = event.columns.iter().position(|c| c.name == name)?;
@@ -69,10 +53,6 @@ pub fn event_object(event: &QueryResult) -> serde_json::Map<String, serde_json::
         .collect()
 }
 
-/// Merge the ring's frames into one `QueryResult` suitable for rendering
-/// via `<ResultsTable/>`. Column order is first-seen stable, and a frame
-/// without a column holds NULL in it.
-///
 /// Each column merges the types its frames gave it, over the cells that
 /// hold a value ([`TypeFold::observe_typed`]): one type stays, frames that
 /// disagree make the column `mixed`, and a null cell (which its one-row
@@ -121,16 +101,10 @@ mod tests {
         Value::String(s.to_owned())
     }
 
-    /// One `data` frame off the wire, through the result codec.
     fn frame(wire: &serde_json::Value) -> QueryResult {
         serde_json::from_value(wire.clone()).expect("a valid data frame")
     }
 
-    /// A live event's oversized unsigned reaches the results table intact.
-    ///
-    /// Ingest keeps such a value as an unsigned integer and the SSE lane
-    /// sends its digits under an `integer` column, so the ring holds the
-    /// exact `UInt`, never a rounded float.
     #[test]
     fn large_unsigned_is_exact_uint() {
         let mut ring = RingBuffer::default();
@@ -146,9 +120,6 @@ mod tests {
         assert_eq!(result.rows, vec![vec![Value::UInt(u64::MAX)]]);
     }
 
-    /// Frames merge by name: first-seen column order, a missing field is
-    /// NULL, a timestamp stays `timestamp` though its cells are text, a
-    /// null cell adds no evidence, and frames that disagree make `mixed`.
     #[test]
     fn frames_merge_by_name() {
         let mut ring = RingBuffer::default();
@@ -197,13 +168,10 @@ mod tests {
                 ],
             ]
         );
-        // The merged table is itself a valid result: it encodes and
-        // decodes back to the same cells.
         let wire = serde_json::to_string(&result).expect("the merge encodes");
         assert_eq!(serde_json::from_str::<QueryResult>(&wire).unwrap(), result);
     }
 
-    /// A column every frame left null has no evidence: `string`.
     #[test]
     fn an_all_null_column_is_string() {
         let mut ring = RingBuffer::default();

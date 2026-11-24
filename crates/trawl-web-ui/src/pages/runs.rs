@@ -3,19 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<RunsPage/>` — global runs dashboard for the Jobs mode.
-//!
-//! Shows aggregate stats (recorded runs, success rate, average
-//! duration), a paginated table of recent runs across all saved
-//! queries, and the selected run's stored result above its execution
-//! receipt.
-//!
-//! URL params: `run=<id>&net=<id>` names the selected run. Both are
-//! required and both must parse — a run id means nothing without the net
-//! whose result file it names. Selection REPLACES, like schema's `svc`
-//! and nets' `net`: a list you are reading through is one history entry,
-//! not one per row you glance at. The receipt's "Open net" anchor is the
-//! one control here that pushes, so Back from the net drawer returns to
-//! the runs page with this run still selected.
 
 use leptos::prelude::*;
 use leptos_router::NavigateOptions;
@@ -52,11 +39,6 @@ struct RunsAttempt {
     error: Option<String>,
 }
 
-/// The `(net_id, run_id)` a `?run=&net=` pair names, or `None`.
-///
-/// Both halves are required: a run id alone cannot address a stored
-/// result, and a hand-edited URL that drops one of them selects nothing
-/// rather than half a run.
 fn parse_run_selection(net: Option<&str>, run: Option<&str>) -> Option<(i64, i64)> {
     Some((net?.parse().ok()?, run?.parse().ok()?))
 }
@@ -346,10 +328,6 @@ pub fn RunsPage() -> impl IntoView {
                             let run = Signal::derive(move || runs.get().and_then(Result::ok)
                                 .and_then(|(_, r)| r.runs.into_iter().find(|r| r.net_id == net_id && r.run.id == run_id))
                                 .unwrap_or_else(|| initial.clone()));
-                            // The selected run is a place with a URL, and selecting
-                            // one REPLACES: reading down a list is one history entry,
-                            // not one per row. The row link keeps focus while its
-                            // cells update in place.
                             let href = format!("/jobs/runs?run={run_id}&net={net_id}");
                             view! {
                                 <tr class="tbl-row" class:active=move || run_selected.get() == Some((net_id, run_id))>
@@ -390,9 +368,6 @@ pub fn RunsPage() -> impl IntoView {
             </div>
             </section>
 
-            // A fresh mount per selection: a late response for the run
-            // before this one lands in a disposed resource and never
-            // paints over the run now on screen.
             <For each=move || { run_selected.get().into_iter().collect::<Vec<_>>() } key=|identity| *identity
                 children=move |(net_id, run_id)| {
                     let found = Signal::derive(move || runs.get().and_then(Result::ok)
@@ -411,8 +386,6 @@ pub fn RunsPage() -> impl IntoView {
     }
 }
 
-/// The selected run: its stored result above the receipt of how it was
-/// produced.
 #[component]
 fn RunDetail(
     net_id: i64,
@@ -421,10 +394,9 @@ fn RunDetail(
     /// carry.
     net_name: Signal<Option<String>>,
     /// The same run off the page's list, for as long as the loaded page
-    /// still holds it. A run whose stored result file is gone answers
-    /// 409 (issue #227), which carries no summary at all, and the
-    /// receipt is about how the run went rather than about what is left
-    /// of it — so the list answers when the read cannot.
+    /// still holds it. A run whose stored result file is gone answers 409,
+    /// which carries no summary at all, so the list answers when the read
+    /// cannot.
     listed: Signal<Option<trawl_api::ReportRunSummary>>,
     on_close: Callback<()>,
     on_search: Callback<String>,
@@ -432,9 +404,7 @@ fn RunDetail(
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
     let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
-    // Reading a run's rows needs `query` beside `saved_query` (ADR-0018 as
-    // amended on 2026-11-11). Without both no preview is built, and the
-    // receipt stands on the list's record of the run alone.
+    // Reading a run's rows needs `query` beside `saved_query` (ADR-0018).
     let rows_readable = Signal::derive(move || {
         me.with(|m| may_run_saved(m.as_ref().map(|m| m.permissions.as_slice())))
     });
@@ -445,9 +415,6 @@ fn RunDetail(
     // tell a read still in flight from one that has refused.
     let read = RwSignal::new(None::<RunRead>);
 
-    // These memos live under the selected identity's keyed owner. Paging
-    // the list away from the selected run retains a correct name and a
-    // correct listing, and no later selection can inherit either.
     let known_name = Memo::new(move |previous: Option<&Option<String>>| {
         net_name.get().or_else(|| previous.cloned().flatten())
     });
@@ -457,14 +424,8 @@ fn RunDetail(
         },
     );
     // The read wins whenever it has a summary: a running run's duration
-    // and row count move, and the list is a page old. It has none to
-    // give once it has refused — a refusal supersedes whatever it said
-    // before, `running` included — and only then does the list's own
-    // record of the run stand in, under `RunRead::settle`'s reading of
-    // what that refusal confirms.
-    //
-    // Until a read has landed there is nothing the server has confirmed,
-    // and the receipt says so by staying empty.
+    // and row count move, and the list is a page old. Once it has refused,
+    // the list's own record of the run stands in, under `RunRead::settle`.
     let shown = Signal::derive(move || {
         if rows_readable.get() {
             read.get().and_then(|r| r.settle(known_listing.get()))

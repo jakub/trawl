@@ -2,27 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Query advice (ADR-0068): a draft that parses but reads like a field
-// filter gets a local advice mark, never an error. The editor draws a
-// warning named "Query advice" and the draft line shows the core's copy
-// in the advice tone. Advice never calls /validate and never changes the
-// text the page sends. Errors take precedence; an unknown escape is an
-// error whose mark sits on the backslash pair, counted in UTF-16 units.
+// Query advice (ADR-0068).
 
 import { test, expect } from '../fixtures';
 import { SEL, COPY } from '../selectors';
 import type { Page } from '@playwright/test';
 
-/// The survey text: one negated, field-shaped text search at bytes 14..30.
 const ADVICE = '"10.244.0.83" -service=coredns';
-/// The field filter the advice names, which has no advice.
 const CORRECTED = '"10.244.0.83" service!=coredns';
 /// An unknown escape after a one-unit CJK glyph and a two-unit emoji: the
 /// pair sits at byte 9, UTF-16 offset 5, character column 5.
 const ESCAPE = '"雪🌊 \\s"';
 
-/// The whole draft line for a negated `service=` term at `column`: the
-/// core's message and hint for the `=` operator, as the page renders them.
 const negatedServiceLine = (column: number) =>
   `Line 1:${column} — -service=… is a text search, not a field filter: it drops events whose message or _raw contain that text — ` +
   'to filter the field, write service!=… (keeps events with no service) or NOT service=… (drops them too); ' +
@@ -34,7 +25,6 @@ async function typeDraft(page: Page, text: string) {
   await page.keyboard.insertText(text);
 }
 
-/// Record every request path the page makes from now on.
 function recordPaths(page: Page) {
   const paths: string[] = [];
   page.on('request', req => paths.push(new URL(req.url()).pathname));
@@ -43,8 +33,6 @@ function recordPaths(page: Page) {
 
 const adviceMarker = (page: Page) => page.getByRole('img', { name: COPY.adviceMarkerName, exact: true });
 const errorMarker = (page: Page) => page.getByRole('img', { name: COPY.lintMarkerName, exact: true });
-/// The editor block with its draft line, as one picture, whether or not
-/// the draft line is there.
 const editorBlock = (page: Page) =>
   page.locator(SEL.dslEditor).locator('xpath=ancestor::div[@id="search-query"]');
 
@@ -63,14 +51,12 @@ test.describe('query advice', () => {
     await expect(page.locator(SEL.draftDiagnosticMore)).toHaveCount(0);
     await expect(page.locator(SEL.draftDiagnosticOmitted)).toHaveCount(0);
 
-    // A warning, named as advice, under exactly the negated term.
     await expect(adviceMarker(page)).toHaveCount(1);
     await expect(errorMarker(page)).toHaveCount(0);
     await expect(page.locator(`${SEL.dslEditor} .cm-lintRange-warning`)).toHaveText('-service=coredns');
     await expect(page.locator(`${SEL.dslEditor} .cm-lintRange-error`)).toHaveCount(0);
     await editorBlock(page).screenshot({ path: testInfo.outputPath('browser-advice.png') });
 
-    // Advice never gates: Haul sends the draft as typed.
     await page.keyboard.press('Control+Enter');
     await expect.poll(async () => {
       const state = await (await request.get('/__ctl/state')).json();
@@ -92,15 +78,12 @@ test.describe('query advice', () => {
   test('keeps further advice behind the disclosure and counts what the cap left out', async ({ page }) => {
     const paths = recordPaths(page);
     await page.goto('/search?r=15m');
-    // Ten findings: the core keeps eight and counts two.
     await typeDraft(page, Array.from({ length: 10 }, (_, i) => `-service=s${i}`).join(' '));
 
     await expect(page.locator(SEL.draftDiagnosticAdvice)).toBeVisible();
     await expect(page.locator(SEL.draftDiagnosticFirst)).toHaveText(negatedServiceLine(1));
     const more = page.locator(SEL.draftDiagnosticMore);
     await expect(more.locator('summary')).toHaveText('+7 more');
-    // Opened, the disclosure lists the second through eighth findings,
-    // each at its own term: `-service=sN` starts at column 1 + 12·N.
     await more.locator('summary').click();
     const entries = more.locator('li');
     await expect(entries).toHaveCount(7);
@@ -109,7 +92,6 @@ test.describe('query advice', () => {
       await expect(entries.nth(i)).toHaveText(negatedServiceLine(1 + 12 * (i + 1)));
     }
     await expect(page.locator(SEL.draftDiagnosticOmitted)).toHaveText('and 2 more advice notes not shown');
-    // Eight spans, never a ninth for the count.
     await expect(page.locator(`${SEL.dslEditor} .cm-lintRange-warning`)).toHaveCount(8);
 
     // The observer saw the page load, so its silence on /validate counts.
@@ -137,11 +119,9 @@ test.describe('query advice', () => {
     );
     await expect(page.locator(SEL.draftDiagnosticAdvice)).toHaveCount(0);
     await expect(errorMarker(page)).toHaveCount(1);
-    // The squiggle covers exactly `\s`, not a byte-offset neighbour.
     await expect(page.locator(`${SEL.dslEditor} .cm-lintRange-error`)).toHaveText('\\s');
     await editorBlock(page).screenshot({ path: testInfo.outputPath('browser-escape-utf16.png') });
 
-    // F8 selects the diagnostic's span.
     await page.keyboard.press('F8');
     await expect.poll(() => page.evaluate(() => window.getSelection()?.toString())).toBe('\\s');
   });

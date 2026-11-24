@@ -2,21 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// How the two detail views present an event's fields (issue 238).
-//
-// 1. An instant or the raw event (`_time`, `_ingested`, `_raw`) is never
-//    a value filter. The Range picker owns time, and a filter on the
-//    whole raw event is a text search. Copy stays: per field in the
-//    inspector, and as the Copy _raw action in both views.
-// 2. A null field is folded behind one "Show N null fields" button. It
-//    is a real button, so Enter and Space both work, and its open state
-//    belongs to the results view: selecting another event keeps it, and
-//    an event with no null field shows no button at all.
-//
-// The page is `wire/query-field-presentation.json`, pinned in
-// tests/e2e_wire_fixture_contract.rs: event 1 has no null field, event 2
-// has seven, event 3 has three.
-
 import fs from 'node:fs';
 import { test, expect, resetScenario, CORPUS } from '../fixtures';
 import { SEL } from '../selectors';
@@ -26,12 +11,10 @@ const presentation = JSON.parse(
   fs.readFileSync('harness/wire/query-field-presentation.json', 'utf8'),
 );
 const COLUMNS: string[] = presentation.columns.map((c: { name: string }) => c.name);
-/** Each detail key as it reads: a timestamp field's name, then the clock it is shown in. */
 const KEYS: string[] = presentation.columns.map((c: { name: string; type: string }) =>
   c.type === 'timestamp' ? `${c.name} UTC` : c.name,
 );
 const RESERVED = ['_time', '_ingested', '_raw'];
-/** Null fields per event, by row index. */
 const NULLS = [0, 7, 3];
 
 async function openPresentation(page: Page) {
@@ -40,7 +23,6 @@ async function openPresentation(page: Page) {
   await expect(page.locator(SEL.resultsRow)).toHaveCount(presentation.rows.length);
 }
 
-/** Open the View popover and press one option by its visible label. */
 async function pickMode(page: Page, option: string) {
   await page.locator(SEL.viewControl).click();
   await expect(page.locator(SEL.viewPanel)).toBeVisible();
@@ -53,7 +35,6 @@ function nullLabel(open: boolean, n: number): string {
   return `${open ? 'Hide' : 'Show'} ${n} null field${n === 1 ? '' : 's'}`;
 }
 
-/** The disclosure names the grid it controls, and that grid is the one in this view. */
 async function expectControlsGrid(toggle: Locator, view: Locator) {
   const id = await toggle.getAttribute('aria-controls');
   expect(id, 'the disclosure must name the grid it controls').toBeTruthy();
@@ -63,25 +44,20 @@ async function expectControlsGrid(toggle: Locator, view: Locator) {
 test('reserved rows offer no value filter, inline or in the inspector', async ({ page }) => {
   await openPresentation(page);
 
-  // Inline: the reserved values render as text, not as Include tags.
   await page.locator(SEL.resultsExpandControl).nth(0).click();
   const detail = page.locator(SEL.resultsDetailCell);
   await expect(detail.locator('.dg')).toBeVisible();
   for (const field of RESERVED) {
     await expect(detail.getByRole('button', { name: new RegExp(`^Include ${field} = `) })).toHaveCount(0);
   }
-  // `_time` is a `timestamp` column, so the detail prints its short
-  // display form, never the wire's RFC 3339.
   await expect(detail).toContainText('2026-09-01 10:00:00');
   await expect(detail).not.toContainText(presentation.rows[0][0]);
-  // Every other field keeps its tag, the sender's own `timestamp` among them.
   await expect(page.locator(SEL.resultsDetailTag)).toHaveCount(COLUMNS.length - RESERVED.length);
   await expect(
     detail.getByRole('button', { name: 'Include timestamp = 2026-09-01T10:00:00.123Z', exact: true }),
   ).toHaveCount(1);
   await expect(detail.getByRole('button', { name: 'Copy _raw', exact: true })).toBeVisible();
 
-  // Inspector: Copy on every row, Include and Exclude on all but the three.
   await pickMode(page, 'Inspector');
   await page.locator(SEL.resultsExpandControl).nth(0).click();
   const inspector = page.locator(SEL.inspector);
@@ -107,12 +83,10 @@ test('the inline expansion folds null fields behind a keyboard disclosure', asyn
   const keys = page.locator(SEL.resultsDetailFieldName);
   const toggle = page.locator(SEL.resultsDetailNullToggle);
 
-  // An event with no null field has no disclosure.
   await page.locator(SEL.resultsExpandControl).nth(0).click();
   await expect(keys).toHaveCount(COLUMNS.length);
   await expect(toggle).toHaveCount(0);
 
-  // The sparse event: its valued fields, then the count of the rest.
   await page.locator(SEL.resultsExpandControl).nth(1).click();
   await expect(keys).toHaveCount(COLUMNS.length - NULLS[1]);
   await expect(toggle).toHaveText(nullLabel(false, NULLS[1]));
@@ -121,17 +95,14 @@ test('the inline expansion folds null fields behind a keyboard disclosure', asyn
   await expectControlsGrid(toggle, detail);
   const tagsClosed = await page.locator(SEL.resultsDetailTag).count();
 
-  // Enter opens it: every field, in wire order, the nulls in their places.
   await toggle.focus();
   await page.keyboard.press('Enter');
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
   await expect(toggle).toHaveText(nullLabel(true, NULLS[1]));
   await expect(keys).toHaveText(KEYS);
-  // A revealed null row is text, never a filter.
   await expect(detail.getByRole('button', { name: /^Include user = / })).toHaveCount(0);
   await expect(page.locator(SEL.resultsDetailTag)).toHaveCount(tagsClosed);
 
-  // Enter closes it, and Space opens it again.
   await page.keyboard.press('Enter');
   await expect(toggle).toHaveAttribute('aria-expanded', 'false');
   await expect(keys).toHaveCount(COLUMNS.length - NULLS[1]);
@@ -139,16 +110,12 @@ test('the inline expansion folds null fields behind a keyboard disclosure', asyn
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
   await expect(keys).toHaveCount(COLUMNS.length);
 
-  // Selecting another event keeps it open.
   await page.locator(SEL.resultsExpandControl).nth(2).click();
   await expect(toggle).toHaveText(nullLabel(true, NULLS[2]));
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
   await expect(keys).toHaveCount(COLUMNS.length);
 });
 
-// The results view outlives any one response: hauling the same query
-// again replaces the table underneath, and the disclosure must stay the
-// way the reader left it.
 test('the null-field disclosure stays open across a re-haul of the same query', async ({ page }) => {
   let queries = 0;
   await page.route('**/api/v1/query', (route) => {
@@ -170,7 +137,6 @@ test('the null-field disclosure stays open across a re-haul of the same query', 
   await expect.poll(() => queries).toBeGreaterThan(before);
   await expect(page.locator(SEL.resultsRow)).toHaveCount(presentation.rows.length);
 
-  // The new response closes the row; reopening it shows the choice kept.
   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(0);
   await page.locator(SEL.resultsExpandControl).nth(1).click();
   await expect(toggle).toHaveText(nullLabel(true, NULLS[1]));
@@ -192,7 +158,6 @@ test('the inspector folds null fields and keeps the choice across events', async
   await expect(toggle).toHaveAttribute('aria-expanded', 'false');
   await expectControlsGrid(toggle, inspector);
 
-  // Space opens it.
   await toggle.focus();
   await page.keyboard.press(' ');
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
@@ -200,21 +165,17 @@ test('the inspector folds null fields and keeps the choice across events', async
   await expect(keys).toHaveText(KEYS);
   await expect(inspector.getByRole('button', { name: /^(Include|Exclude) user = / })).toHaveCount(0);
 
-  // Enter closes and reopens it.
   await page.keyboard.press('Enter');
   await expect(toggle).toHaveAttribute('aria-expanded', 'false');
   await expect(keys).toHaveCount(COLUMNS.length - NULLS[1]);
   await page.keyboard.press('Enter');
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
 
-  // Another event: still open.
   await page.locator(SEL.resultsExpandControl).nth(2).click();
   await expect(inspector).toContainText('Event 3');
   await expect(toggle).toHaveText(nullLabel(true, NULLS[2]));
   await expect(keys).toHaveCount(COLUMNS.length);
 
-  // An event with no null field has no disclosure, and visiting it does
-  // not reset the choice.
   await page.locator(SEL.resultsExpandControl).nth(0).click();
   await expect(inspector).toContainText('Event 1');
   await expect(keys).toHaveCount(COLUMNS.length);

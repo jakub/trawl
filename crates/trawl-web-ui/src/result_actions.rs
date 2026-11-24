@@ -2,20 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Safe actions and ordering for displayed query results.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 use std::{cmp::Ordering, collections::HashSet};
 use trawl_api::value::Value;
 use trawl_core::{ast::PipeStage, schema::catalog_key};
 
-/// Whether a stage leaves every column name it receives meaning what it
-/// meant: stages that filter, order, project or deduplicate mint no name.
-///
 /// This is the only list of that set. Result provenance
 /// ([`Capabilities::for_query`]) and the categorical chart and group links
-/// (`crate::categorical`) all read it, so a stage added to the DSL is
-/// classified here once, and the exhaustive match makes that a compile error
-/// rather than a silent default.
+/// (`crate::categorical`) all read it.
 pub(crate) fn passes_names_through(stage: &PipeStage) -> bool {
     match stage {
         PipeStage::Where(_)
@@ -119,7 +113,6 @@ impl Capabilities {
         }
         out
     }
-    /// Whether this output field still names an unchanged input field.
     pub fn input_field(&self, field: &str) -> bool {
         let field = catalog_key(field);
         !self.unknown
@@ -129,16 +122,12 @@ impl Capabilities {
     pub fn include(&self, field: &str, value: &Value) -> bool {
         self.input_field(field) && !matches!(value, Value::Null | Value::Array(_))
     }
-    /// Whether a detail row (the inline expansion or the inspector) offers
-    /// Include and Exclude: [`Self::include`], minus the reserved
-    /// non-dimensions. The Range picker owns time, and a filter on the
-    /// whole raw event is a text search. The exact table keeps calling
-    /// `include`, so a time group there can still be searched.
+    /// The Range picker owns time, and a filter on the whole raw event is a
+    /// text search. The exact table keeps calling `include`, so a time group
+    /// there can still be searched.
     pub fn detail_filter(&self, field: &str, value: &Value) -> bool {
         self.include(field, value) && !trawl_core::schema::is_non_dimension(field)
     }
-    /// Facets summarize original fields of raw rows. Aggregations and
-    /// unknown sources do not offer facet groups, even for grouping keys.
     pub fn raw_facets(&self) -> bool {
         self.raw && !self.unknown
     }
@@ -147,8 +136,6 @@ impl Capabilities {
     }
 }
 
-/// Missing cells and null sort first. Numbers compare by value, preserving
-/// integer precision even when the other operand is a floating-point value.
 pub(crate) fn compare(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     use Value::{Array, Boolean, Float, Integer, Null, String, UInt};
     let a = a.unwrap_or(&Null);
@@ -159,9 +146,6 @@ pub(crate) fn compare(a: Option<&Value>, b: Option<&Value>) -> Ordering {
         (_, Null) => Ordering::Greater,
         (Integer(a), Integer(b)) => a.cmp(b),
         (UInt(a), UInt(b)) => a.cmp(b),
-        // Every integer is a point on one line, so the two integer
-        // variants compare as the numbers they are, not by variant rank:
-        // `i128` is the narrowest type holding both ranges.
         (Integer(a), UInt(b)) => i128::from(*a).cmp(&i128::from(*b)),
         (UInt(a), Integer(b)) => i128::from(*a).cmp(&i128::from(*b)),
         (Float(a), Float(b)) => a.partial_cmp(b).unwrap_or_else(|| a.total_cmp(b)),
@@ -190,16 +174,9 @@ fn rank(v: &Value) -> u8 {
     }
 }
 /// The row indices of one locally-paged window, sorted WHOLE first.
-///
-/// Sorting happens over every row the response carried, and only then is
-/// the page cut from it. The other order — page, then sort — would make
-/// page 2 the second 50 rows of the response re-ordered among
-/// themselves, which is not the second 50 rows of the sorted result.
-///
-/// The underlying sort is stable, so the same arguments answer the same
-/// list every time. That determinism is the contract: the exact table
-/// and the bars drawn beside it each call this for themselves, and they
-/// describe the same groups only because both calls agree.
+/// The exact table and the bars drawn beside it each call this for
+/// themselves, and they describe the same groups only because both calls
+/// agree.
 pub fn sorted_page(
     rows: &[Vec<Value>],
     sort: Option<(usize, bool)>,
@@ -240,11 +217,6 @@ fn int_float(i: i64, f: f64) -> Ordering {
     i.cmp(&whole)
         .then_with(|| (whole as f64).partial_cmp(&f).unwrap_or(Ordering::Equal))
 }
-/// The unsigned twin of [`int_float`], for the range above `i64::MAX`.
-///
-/// Same shape, same NaN placement, same truncate-then-refine tie-break;
-/// only the bounds move, because a `u64` cannot be negative and reaches
-/// twice as far up.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -268,12 +240,6 @@ fn uint_float(u: u64, f: f64) -> Ordering {
     u.cmp(&whole)
         .then_with(|| (whole as f64).partial_cmp(&f).unwrap_or(Ordering::Equal))
 }
-/// The results table sorts an oversized unsigned by value, not by text.
-///
-/// This is why the variant exists. Spelled as a string, `10000000000000000000`
-/// sorts before `9223372036854775808` — the shorter number last — and a
-/// column of ids reads as shuffled. Spelled as a number, both compare on
-/// one line with every other integer.
 #[cfg(test)]
 #[test]
 fn uint_sorts_numerically() {
@@ -283,7 +249,6 @@ fn uint_sorts_numerically() {
     assert_eq!(compare(Some(&hi), Some(&lo)), Ordering::Greater);
     assert_eq!(compare(Some(&hi), Some(&hi)), Ordering::Equal);
 
-    // Across the variant boundary: one number line, not two ranks.
     assert_eq!(
         compare(Some(&Value::Integer(5)), Some(&Value::UInt(u64::MAX))),
         Ordering::Less
@@ -297,7 +262,6 @@ fn uint_sorts_numerically() {
         Ordering::Less
     );
 
-    // …and against floats, the way the signed variant already does.
     assert_eq!(
         compare(Some(&lo), Some(&Value::Float(1.0))),
         Ordering::Greater
@@ -313,9 +277,6 @@ fn uint_sorts_numerically() {
         compare(Some(&Value::Float(-1.0)), Some(&lo)),
         Ordering::Less
     );
-    // A fractional float sits between the integers on either side of it:
-    // a comparison that truncated the float first would call 1 and 1.5
-    // equal.
     assert_eq!(
         compare(Some(&Value::UInt(1)), Some(&Value::Float(1.5))),
         Ordering::Less
@@ -329,7 +290,6 @@ fn uint_sorts_numerically() {
         Ordering::Greater
     );
 
-    // Null still sorts first, whatever the number's width.
     assert_eq!(compare(None, Some(&hi)), Ordering::Less);
 }
 
@@ -337,9 +297,6 @@ fn uint_sorts_numerically() {
 mod tests {
     use super::*;
 
-    /// The detail views offer no value filter on an instant or the raw
-    /// event, while the other reserved names keep theirs and the exact
-    /// table's `include` still offers "Search _time=…" for a time group.
     #[test]
     fn reserved_fields_offer_no_detail_filter() {
         let capabilities = Capabilities::for_query("*");
@@ -601,14 +558,9 @@ mod tests {
     #[test]
     fn a_sorted_page_holds_the_rows_that_follow_the_sort() {
         let rows = descending_rows();
-        // Ascending on the counting-down column: the whole result in
-        // reverse, so page 1 is the first nine rows of the response,
-        // largest last.
         let ascending: Vec<usize> = (0..59).rev().collect();
         assert_eq!(sorted_page(&rows, Some((0, true)), 0, 50), ascending[..50]);
         assert_eq!(sorted_page(&rows, Some((0, true)), 1, 50), ascending[50..]);
-        // Not the unsorted page 1 re-ordered among itself, which is what
-        // sorting a slice would have produced.
         assert_ne!(
             sorted_page(&rows, Some((0, true)), 1, 50),
             vec![58, 57, 56, 55, 54, 53, 52, 51, 50]
@@ -627,12 +579,8 @@ mod tests {
         }
     }
 
-    /// What lets the exact table and the bars agree without sharing a
-    /// computation: two calls, one answer.
     #[test]
     fn the_same_call_answers_the_same_page_twice() {
-        // A column with ties, so a comparator that left equal rows to
-        // chance would show it here.
         let rows: Vec<Vec<Value>> = (0..59)
             .map(|i| vec![Value::Integer(i % 3), Value::String(format!("r{i}"))])
             .collect();

@@ -4,11 +4,6 @@
 
 // The recovering notice (ADR-0041): what the search page says when the
 // server refuses a snapshot as 503 `corpus_recovering`.
-//
-// The server is still loading data from before a restart, or finishing
-// an interrupted storage rollup, and cannot yet count every stored event
-// once. The page must name that state. An empty table would claim there
-// is nothing to find, and "Couldn't load results" would read as a fault.
 
 import { readFileSync } from 'node:fs';
 import { test, expect } from '../fixtures';
@@ -18,13 +13,10 @@ import type { Page, Route } from '@playwright/test';
 const wire = (name: string) =>
   JSON.parse(readFileSync(`${__dirname}/../harness/wire/${name}.json`, 'utf8'));
 
-/// The server's refusal for a restart backlog, as trawld writes it.
-/// e2e_wire_fixture_contract.rs pins the sentence.
 const RECOVERING = wire('query-corpus-recovering');
 const EVENTS_URL = '/search?q=service%3Dnginx&r=15m';
 const CHART_URL = `/search?q=${encodeURIComponent('* | stats count() by host')}&r=15m`;
 
-/// Park every POST /api/v1/query until the case answers it.
 async function holdQueries(page: Page) {
   const parked: Route[] = [];
   await page.route('**/api/v1/query', route => {
@@ -36,7 +28,6 @@ async function holdQueries(page: Page) {
   };
 }
 
-/// Answer every query with the recovering refusal.
 async function refuseQueries(page: Page) {
   let sent = 0;
   await page.route('**/api/v1/query', route => {
@@ -48,8 +39,6 @@ async function refuseQueries(page: Page) {
 
 const notice = (page: Page) => page.locator(SEL.recoveringNotice);
 
-/// Nothing in the results region reads as an empty result, a load
-/// failure or a query error.
 async function expectNoOtherState(page: Page) {
   await expect(page.locator(SEL.resultsEmptyCell)).toHaveCount(0);
   await expect(page.locator(SEL.resultsPane).locator('table')).toHaveCount(0);
@@ -70,10 +59,7 @@ test.describe('recovering notice', () => {
     await expect(alert.locator(SEL.recoveringNoticeTitle)).toHaveText(COPY.recoveringTitle);
     await expect(alert.locator(SEL.recoveringNoticeText)).toHaveText(RECOVERING.error.message);
     await expectNoOtherState(page);
-    // The footer names the same state, never a fault.
     await expect(page.locator(SEL.statusLabel)).toHaveText('Recovering');
-    // The one control is the Retry: the same request can succeed once
-    // the server catches up.
     const buttons = page.locator(SEL.resultsPane).getByRole('button');
     await expect(buttons).toHaveCount(1);
     await expect(buttons).toHaveAccessibleName('Retry');
@@ -91,9 +77,6 @@ test.describe('recovering notice', () => {
 
     await page.locator(SEL.resultsPane).getByRole('button', { name: 'Retry', exact: true }).click();
     await expect.poll(queries.count).toBe(2);
-    // While the second request is out, the first refusal is not its
-    // verdict: no notice, and no load failure copy for it either. The
-    // footer reports the request in flight, not the refusal it retries.
     await expect(notice(page)).toHaveCount(0);
     await expect(page.locator(SEL.loadHintError)).toHaveCount(0);
     await expect(page.locator(SEL.statusLabel)).toHaveText('Hauling');
@@ -121,9 +104,6 @@ test.describe('recovering notice', () => {
     await alert.screenshot({ path: testInfo.outputPath('visualization-recovering-notice.png') });
   });
 
-  // The control: a 503 that is not `corpus_recovering` is still a load
-  // failure with its Retry, so the notice above is keyed on the code,
-  // not on the status.
   test('a plain service_unavailable keeps the load failure copy', async ({ page }) => {
     await page.route('**/api/v1/query', route =>
       route.fulfill({

@@ -7,16 +7,8 @@
 // from the repository root:
 //   (cd crates/trawl-web-ui && env -u NO_COLOR trunk build)
 //   node crates/trawl-web-ui/e2e/scripts/issue231-visual-evidence.mjs [output-dir]
-// E2E_PORT picks the harness port (default 8731). The script owns its
-// harness process and browser, and a busy port stops it at startup.
 // Selectors and copy come from ../selectors.ts, which Node loads by
 // stripping its types.
-//
-// Each scene asserts the state it claims before its screenshot and again
-// after it: the rail's `open` attribute and drawn width together, and the
-// text a reader should see. The screenshots stay in memory until every
-// scene has passed, so a failed run exits non-zero and writes no PNG.
-// Stub fixtures only: no daemon, database, or real ingest.
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
@@ -41,13 +33,8 @@ const VIEWPORT = { width: 1440, height: 900 };
 const OPEN_WIDTH = 224;
 const STRIP_WIDTH = 32;
 
-// The queries of filter-rail.spec.ts. `corpus` answers the plain search
-// with 8 countable rows and the aggregation with its `stats count() by`
-// fixture; `default` answers every query with no rows.
 const COUNTABLE_URL = '/search?q=service%3Dnginx';
 const AGGREGATE = 'service=nginx | stats count() by service';
-/** `host="web-01"` and `status="200"`, the two link filters of
- * live-coherence.spec.ts. */
 const TWO_FILTERS = 'v1.' + Buffer.from(JSON.stringify([
   { op: '+', field: 'host', value: 'web-01' },
   { op: '+', field: 'status', value: '200' },
@@ -55,8 +42,6 @@ const TWO_FILTERS = 'v1.' + Buffer.from(JSON.stringify([
 
 const git = (...args) => execFileSync('git', ['-C', ROOT, ...args], { encoding: 'utf8' }).trimEnd();
 
-/** filter-rail.ts's expectRail: the `open` attribute and the drawn width,
- * read together. Returns what it read. */
 async function expectRail(page, open) {
   const rail = page.locator(SEL.filterRail);
   if (open) await expect(rail).toHaveAttribute('open', '');
@@ -70,8 +55,6 @@ async function expectRail(page, open) {
   return { open, width: (await rail.boundingBox()).width };
 }
 
-/** filter-rail.ts's expectTextShown: one run of `text` inside `locator`
- * has a box of its own, inside the element's box, in a visible element. */
 async function expectTextShown(locator, text) {
   await expect(locator).toBeVisible();
   await expect
@@ -167,7 +150,6 @@ const scenes = [
     },
     async verify(page) {
       await expectAccepted(page);
-      // The table's one row is its empty-state cell.
       await expect(page.locator(SEL.resultsRow)).toHaveCount(1);
       await expect(page.locator(SEL.resultsRow).locator('td.results-empty-cell')).toHaveCount(1);
       const rail = await expectRail(page, true);
@@ -213,8 +195,6 @@ async function digestDist() {
 }
 
 async function capture(browser, scene) {
-  // The default theme: no stored reading preferences, a light system
-  // scheme, as the suite's playwright.config.ts sets.
   const context = await browser.newContext({
     viewport: VIEWPORT, deviceScaleFactor: 1, reducedMotion: 'reduce',
     locale: 'en-US', timezoneId: 'UTC', colorScheme: 'light',
@@ -235,7 +215,6 @@ async function capture(browser, scene) {
     const before = await scene.verify(page);
     await page.evaluate(() => document.fonts.ready);
     const png = await page.screenshot({ animations: 'disabled' });
-    // Still the claimed state once the pixels are taken.
     const after = await scene.verify(page);
     expect(after, 'the state held through the screenshot').toEqual(before);
     expect(errors, 'page errors').toEqual([]);

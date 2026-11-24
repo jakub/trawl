@@ -10,24 +10,16 @@
 //! (in fleet-ui) guards the fleet-side presence of those rules; this
 //! guards the app-side absence, which fleet-ui cannot see without
 //! reaching into its own consumer.
-//!
-//! `main.css` is read locally; `fleet-ui.css` is read across the
-//! sibling-crate boundary exactly as `index.html`'s trunk `<link>`
-//! references it (`../fleet-ui/styles/fleet-ui.css`).
 
 use std::collections::BTreeSet;
 
 const APP_CSS: &str = include_str!("../styles/main.css");
 const FLEET_CSS: &str = include_str!("../../fleet-ui/styles/fleet-ui.css");
 
-/// Top-level selector strings declared in a stylesheet.
-///
 /// A rule-opening line begins at column 0 with a selector char and
-/// contains its `{` on the same line; the prefix before that `{` is the
-/// selector group, split on `,` into individual selectors. Continuation
+/// contains its `{` on the same line. Continuation
 /// lines of a multi-line selector group don't open a brace at column 0
-/// and are skipped, which is good enough for the flat style both files
-/// use.
+/// and are skipped.
 fn top_level_selectors(css: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for line in css.lines() {
@@ -192,8 +184,7 @@ const RETIRED_SELECTORS: &[&str] = &[
     // Theme choices live in the account menu (ADR-0029's theme amendment).
     ".statusbar .grp.clickable",
     ".statusbar .grp.clickable:hover",
-    // The command bar's brand, mode tabs and app links left with the
-    // sidebar (ADR-0032). `.rail .it .lb` did not: the sidebar still
+    // `.rail .it .lb` is not retired: the sidebar still
     // renders a label, visible or screen-reader-only.
     ".topbar .brand",
     ".topbar .brand .accent",
@@ -202,10 +193,6 @@ const RETIRED_SELECTORS: &[&str] = &[
     ".topbar .mode:hover",
     ".topbar .mode.active",
     ".topbar .app-links",
-    // The meta strip became the executed-scope strip (ADR-0032): the
-    // chips kept their `.meta-chips` wrapper and their own classes, but
-    // every rule that scoped them under `.meta` is re-homed under
-    // `.scope`, and the truncation note that sat there is gone.
     ".scope-lb",
     ".scope-window",
     ".meta",
@@ -217,14 +204,9 @@ const RETIRED_SELECTORS: &[&str] = &[
     ".meta .chip.excl .x",
     ".meta .chip.excl .x:hover",
     ".meta .chip.bad",
-    // The nets list says a schedule's cadence in words and leaves the
-    // enabled/paused judgement to fleet_ui::Badge (ADR-0032), so the
-    // glyph pills it used to render are gone.
     ".sched-badge",
     ".sched-badge.active",
     ".sched-badge.disabled",
-    // The health reports are cards in a split (ADR-0032), so the stack
-    // of hairline-separated bands they used to be has no markup left.
     ".health-page > section",
     ".live-badge",
     ".live-badge.live",
@@ -288,7 +270,6 @@ fn retired_selectors_absent_from_both_stylesheets() {
 fn no_selector_defined_in_both_stylesheets() {
     let app = top_level_selectors(APP_CSS);
     let fleet = top_level_selectors(FLEET_CSS);
-    // Guard against a vacuous pass if the parser ever stops matching.
     assert!(!app.is_empty(), "parsed no selectors from main.css");
     assert!(!fleet.is_empty(), "parsed no selectors from fleet-ui.css");
     let dups: Vec<&String> = app.intersection(&fleet).collect();
@@ -324,9 +305,6 @@ fn app_control_fills_read_the_fill_token() {
     // fill written as `color-mix(in oklab, var(--line) N%, transparent)`
     // renders at .10 x N in dark mode (a 20% fill lands at 2%). App fills
     // read fleet-ui's per-theme `--fill` / `--fill-2` tokens instead.
-    // Either step of the ramp satisfies the vacuous-pass guard: the
-    // editor well moved onto `--well` with ADR-0032, so the app's
-    // remaining control fill is the `--fill-2` hover step.
     assert!(
         APP_CSS.contains("var(--fill)") || APP_CSS.contains("var(--fill-2)"),
         "expected the app control fills to read fleet-ui's --fill / --fill-2 tokens"

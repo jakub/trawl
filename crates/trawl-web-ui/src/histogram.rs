@@ -2,27 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pure-logic helpers for the histogram surfaces.
-//!
-//! Three independent jobs live here:
-//!
-//! - The search-page strip. Its input is the whole-result count trawld
-//!   answers beside the page ([`EventHistogram`]): 48 half-open bins in
-//!   integer microseconds, from the first usable `_time` of the result to
-//!   past its last. The browser never buckets rows itself. [`strip`]
-//!   decides what the strip shows for a settled response, [`Series`]
-//!   carries a validated count with its integer bounds, and the copy
-//!   functions ([`caption`], [`reason_copy`], [`bar_tip`] and the key
-//!   constants) build every string it prints. Counts stay `u64` from the
-//!   wire to the tooltip and the scale ([`scale_top`]); only the CSS bar
-//!   heights ([`pct`]) and the axis layout ([`clock_ticks`]) use `f64`.
-//! - [`align_buckets`] — the service drawer's ingest chart. Lays rows
-//!   the server already aggregated (`timechart span=1h`) onto a fixed
-//!   grid, so gaps in the data render as gaps instead of collapsing the
-//!   chart to one bar per returned row.
-//! - [`tip_shift`] — how far a strip bar's tooltip moves sideways so it
-//!   stays inside the strip.
-
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use trawl_api::{EventHistogram, HistogramReason, zone};
@@ -37,20 +16,16 @@ pub struct Bucket {
 }
 
 impl Bucket {
-    /// Every event in the bin. `ok` is `events - errors` of a validated
-    /// bin, so the sum is the wire's `events` and cannot overflow.
+    /// `ok` is `events - errors` of a validated bin, so the sum is the wire's
+    /// `events` and cannot overflow.
     #[must_use]
     pub fn events(self) -> u64 {
         self.ok + self.err
     }
 }
 
-/// A validated whole-result count, laid out over the bounds trawld chose.
-///
 /// Bin `i` is `[start_micros + i × width_micros, start_micros + (i + 1) ×
-/// width_micros)`. Every surface that positions something on the strip
-/// (bar tooltips, the axis ticks) measures from these two integers, so
-/// none of them can disagree about where a bucket starts.
+/// width_micros)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Series {
     pub buckets: Vec<Bucket>,
@@ -59,9 +34,6 @@ pub struct Series {
 }
 
 impl Series {
-    /// The strip for a ready histogram that [`EventHistogram::consistent_with`]
-    /// accepts against the page's `total`. `None` for an unavailable one,
-    /// and for a ready one that breaks an invariant.
     #[must_use]
     pub fn from_ready(histogram: &EventHistogram, total: usize) -> Option<Self> {
         let EventHistogram::Ready {
@@ -108,21 +80,18 @@ impl Series {
         i64::try_from(bound).unwrap_or(i64::MAX)
     }
 
-    /// The series' start, in seconds, for the axis layout.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)] // layout only; labels read the integers
+    #[allow(clippy::cast_precision_loss)]
     pub fn min_secs(&self) -> f64 {
         self.start_micros as f64 / 1e6
     }
 
-    /// The series' end, in seconds, for the axis layout.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)] // layout only; labels read the integers
+    #[allow(clippy::cast_precision_loss)]
     pub fn max_secs(&self) -> f64 {
         self.bound_micros(self.buckets.len()) as f64 / 1e6
     }
 
-    /// The tallest bar, never below one.
     #[must_use]
     pub fn tallest(&self) -> u64 {
         self.buckets
@@ -133,7 +102,6 @@ impl Series {
             .max(1)
     }
 
-    /// Bucket `i`'s tooltip: its printed interval and its counts.
     #[must_use]
     pub fn tip(&self, i: usize) -> String {
         let b = self
@@ -150,39 +118,25 @@ impl Series {
     }
 }
 
-/// What the strip shows for a settled, successful page response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Strip {
-    /// The result is empty: the strip collapses, and the table below says
-    /// the page is empty.
     Collapsed,
-    /// The quiet `—`: no histogram came back, or a ready one broke an
-    /// invariant.
     Dash,
-    /// Why trawld did not count the result.
     Reason(&'static str),
-    /// Bars.
     Drawn(Drawn),
 }
 
-/// A strip with bars, and the words around them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Drawn {
     pub series: Series,
     pub caption: String,
     /// The result has a `_severity` column, so the key names both colours.
     pub severity: bool,
-    /// The line under the key, when the query kept only some events.
     pub kept_some: Option<&'static str>,
 }
 
-/// What the strip shows for a settled, successful response whose
-/// execution produced `total` rows. A pending or failed request never
-/// gets here: the component shows the loading hint or the dash first.
-///
-/// In order: an empty result collapses the strip, whatever reason trawld
-/// gave; no histogram is the dash; an unavailable one shows its reason; a
-/// ready one that breaks an invariant is the dash; anything else draws.
+/// A pending or failed request never gets here: the component shows the
+/// loading hint or the dash first.
 #[must_use]
 pub fn strip(total: usize, histogram: Option<&EventHistogram>) -> Strip {
     if total == 0 {
@@ -214,22 +168,16 @@ pub fn strip(total: usize, histogram: Option<&EventHistogram>) -> Strip {
     }
 }
 
-/// The swatch for an event that is not an error.
 pub const OTHER_KEY: &str = "Other";
-/// The swatch for an event at or above the error band.
 pub const ERROR_KEY: &str = "Error or fatal";
-/// The one swatch of a result with no `_severity` column.
 pub const NO_SEVERITY_KEY: &str = "Events (no severity in this result)";
 /// The line under the key when a `head`, `limit`, `tail` or `dedup`
 /// stage kept only some events.
 pub const KEPT_SOME_LINE: &str = "Only the events your query kept are counted.";
 
-/// The caption over the bars: what they count, how wide one bin is, and
-/// that the bins are UTC. `total` is every row of the result, `undated`
-/// the rows without a usable time, and `width_micros` one bin's width.
 #[must_use]
 pub fn caption(total: u64, undated: u64, width_micros: i64) -> String {
-    #[allow(clippy::cast_precision_loss)] // the label rounds to one decimal
+    #[allow(clippy::cast_precision_loss)]
     let width = bucket_width_label(width_micros as f64 / 1e6);
     let counted = if total == 1 {
         "1 event in this result".to_owned()
@@ -247,7 +195,6 @@ pub fn caption(total: u64, undated: u64, width_micros: i64) -> String {
     format!("{counted}{undated} · first to last event · {width} per bucket · UTC")
 }
 
-/// Why trawld did not count a result, in the strip's words.
 #[must_use]
 pub fn reason_copy(reason: HistogramReason) -> &'static str {
     match reason {
@@ -260,8 +207,6 @@ pub fn reason_copy(reason: HistogramReason) -> &'static str {
     }
 }
 
-/// A bar's tooltip: `{start} – {end} · {n} events`, with ` · {e} errors`
-/// when the bin holds any.
 #[must_use]
 pub fn bar_tip(start: &str, end: &str, events: u64, errors: u64) -> String {
     let errors = if errors > 0 {
@@ -284,9 +229,8 @@ pub fn scale_top(tallest: u64) -> u64 {
     }
 }
 
-/// A bar's CSS height, in percent of the scale's `top`.
 #[must_use]
-#[allow(clippy::cast_precision_loss)] // a CSS height needs no more than f64 holds
+#[allow(clippy::cast_precision_loss)]
 pub fn pct(n: u64, top: u64) -> f64 {
     if top == 0 {
         return 0.0;
@@ -310,9 +254,6 @@ pub fn bucket_time(micros: i64, end: bool) -> String {
         |dt| dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
     )
 }
-/// Where an x-axis label sits against its tick: centred on it, or
-/// starting or ending there when a centred label would cross the edge of
-/// the bar box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickAlign {
     Center,
@@ -320,7 +261,6 @@ pub enum TickAlign {
     End,
 }
 
-/// One x-axis tick: a round UTC clock time inside the series' span.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tick {
     /// Position across the bar box, `0.0` at `min_secs`, `1.0` at
@@ -330,40 +270,22 @@ pub struct Tick {
     pub align: TickAlign,
 }
 
-/// The most ticks the strip prints, however wide it is.
 const MAX_TICKS: i64 = 6;
 /// One character of an axis label, in pixels: Chivo Mono advances 0.6em,
 /// and `.histo .xax` sets it at `--fs-tiny` (10px).
 const LABEL_CHAR_PX: f64 = 6.0;
-/// The least clear space between two neighbouring labels, in pixels.
 const LABEL_GAP_PX: f64 = 12.0;
 const DAY_MS: i64 = 86_400_000;
 /// Tick steps below a day, in milliseconds. Each one divides the next
 /// unit evenly, so every tick lands on a round clock time.
 const STEPS_MS: [i64; 25] = [
-    1, 2, 5, 10, 20, 50, 100, 200, 500, // sub-second
-    1_000, 2_000, 5_000, 10_000, 15_000, 30_000, // seconds
-    60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000, // minutes
-    3_600_000, 7_200_000, 21_600_000, 43_200_000, // hours
+    1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 15_000, 30_000, 60_000,
+    120_000, 300_000, 600_000, 900_000, 1_800_000, 3_600_000, 7_200_000, 21_600_000, 43_200_000,
 ];
 
 /// The strip's x-axis ticks for a bar box `width_px` wide: round UTC
 /// clock times at their positions, never `-15m` / `now` over an observed
-/// extent the picker's range may not describe (ADR-0027, amended
-/// 2026-09-12). Every tick lies inside `[min_secs, max_secs]`.
-///
-/// The step is the smallest of 1, 2 and 5 ms up to 500 ms, then 1 s, 2 s,
-/// 5 s, 10 s, 15 s, 30 s, 1 min, 2 min, 5 min, 10 min, 15 min, 30 min,
-/// 1 h, 2 h, 6 h, 12 h, 1 d and whole multiples of days, that gives at
-/// most six ticks whose labels fit the box without touching. A narrow
-/// box therefore gets a coarser step, not overlapping labels. If even
-/// two labels cannot fit, the coarsest step's first tick is printed
-/// alone.
-///
-/// The first label carries the date, and a later one carries it only
-/// where the day changes, so a same-day strip prints the date once. The
-/// rest print `HH:MM`, `HH:MM:SS` below a one-minute step, and
-/// `HH:MM:SS.mmm` below a one-second step. A day step prints dates only.
+/// extent the picker's range may not describe (ADR-0027).
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 pub fn clock_ticks(series: &Series, width_px: f64) -> Vec<Tick> {
@@ -373,8 +295,6 @@ pub fn clock_ticks(series: &Series, width_px: f64) -> Vec<Tick> {
     }
     let min_ms = (series.min_secs() * 1000.0).ceil() as i64;
     let max_ms = (series.max_secs() * 1000.0).floor() as i64;
-    // 1, 2, 5, 10, 20, 50, ... days, so any span reaches a step with at
-    // most six ticks; the sequence ends where a step would overflow.
     let day_steps = (0..)
         .map_while(|k| 10_i64.checked_pow(k))
         .flat_map(|p| [1, 2, 5].map(move |m| p.checked_mul(m * DAY_MS)))
@@ -459,12 +379,11 @@ fn place_ticks(series: &Series, width_px: f64, first: i64, step: i64, count: i64
         .collect()
 }
 
-#[allow(clippy::cast_precision_loss)] // labels are a few dozen characters
+#[allow(clippy::cast_precision_loss)]
 fn label_px(label: &str) -> f64 {
     label.chars().count() as f64 * LABEL_CHAR_PX
 }
 
-/// The pixel span a tick's label covers in a box `width_px` wide.
 fn label_box(tick: &Tick, width_px: f64) -> (f64, f64) {
     let x = tick.fraction * width_px;
     let w = label_px(&tick.label);
@@ -475,21 +394,12 @@ fn label_box(tick: &Tick, width_px: f64) -> (f64, f64) {
     }
 }
 
-/// Every label inside the box, each clear of the next by the gap.
 fn fits(ticks: &[Tick], width_px: f64) -> bool {
     let boxes: Vec<_> = ticks.iter().map(|t| label_box(t, width_px)).collect();
     boxes.iter().all(|&(l, r)| l >= 0.0 && r <= width_px)
         && boxes.windows(2).all(|w| w[0].1 + LABEL_GAP_PX <= w[1].0)
 }
 
-/// A bucket width, in seconds, in the one unit that keeps
-/// it short: `"500ms"`, `"17.2s"`, `"≈4.4min"`, `"2h"`, `"≈1.5d"`.
-///
-/// The value keeps one decimal below 100 and none from 100 up. It is
-/// marked `≈` when that rounding changed it. The unit is the smallest one
-/// in which the rounded value stays under the next unit, so 59.97 s
-/// reads `"≈1min"`, never `"60s"`. A width that rounds to zero
-/// milliseconds reads `"<0.1ms"`, never `"0ms"`.
 #[must_use]
 pub fn bucket_width_label(seconds: f64) -> String {
     const UNITS: [(&str, f64, f64); 5] = [
@@ -527,7 +437,6 @@ pub fn bucket_width_label(seconds: f64) -> String {
     seconds.to_string()
 }
 
-/// One slot of a fixed-width timechart grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slot {
     /// Slot start, epoch milliseconds, aligned to a `slot_ms` boundary.
@@ -535,10 +444,6 @@ pub struct Slot {
     pub count: u64,
 }
 
-/// Lay pre-aggregated `(bucket_start_ms, count)` rows onto a contiguous
-/// grid of `n` slots of `slot_ms` each, ending at the slot holding the
-/// newest row. Gaps come back as zero-count slots.
-///
 /// uPlot sizes bars from the spacing of the x values it is handed and
 /// ends its axis just past the last one, so two populated hours out of
 /// twenty-four arrive as two wide bars on an axis that stops at the
@@ -548,9 +453,6 @@ pub struct Slot {
 /// deliberate: it keeps every comparison on the rows' own clock rather
 /// than the browser's, at the cost of the grid ending at the last
 /// observed bucket instead of the current one.
-///
-/// Rows falling outside the window are dropped; rows sharing a slot are
-/// summed, so unaligned input still lands somewhere sensible.
 #[must_use]
 pub fn align_buckets(rows: &[(i64, u64)], slot_ms: i64, n: usize) -> Vec<Slot> {
     if rows.is_empty() || n == 0 || slot_ms <= 0 {
@@ -559,8 +461,6 @@ pub fn align_buckets(rows: &[(i64, u64)], slot_ms: i64, n: usize) -> Vec<Slot> {
     let floor = |t: i64| t.div_euclid(slot_ms) * slot_ms;
 
     let newest = floor(rows.iter().map(|&(t, _)| t).max().unwrap_or(0));
-    // `n - 1` slots of history plus the newest one. Bail rather than wrap
-    // on absurd inputs — a saturated grid would silently mis-place bars.
     let Some(first) = i64::try_from(n - 1)
         .ok()
         .and_then(|back| back.checked_mul(slot_ms))
@@ -595,12 +495,6 @@ pub fn align_buckets(rows: &[(i64, u64)], slot_ms: i64, n: usize) -> Vec<Slot> {
 /// Parse a trawl timestamp into epoch milliseconds, treating it as
 /// naive wall-clock (the wire is UTC, so no shift is needed).
 ///
-/// Accepts the result wire's RFC 3339 `T`-separated form and the
-/// space-separated `YYYY-MM-DD HH:MM:SS[.fff]` cast text; any trailing
-/// zone designator or fractional part is ignored, since the grid
-/// resolution is whole buckets. Returns `None` on anything it can't read, which the caller
-/// treats as "fall back to unpositioned bars".
-///
 /// Deliberately lenient, unlike `series::parse_instant_secs`: the ingest
 /// grid only needs the hour a row belongs to, so a zone or a fraction
 /// can be dropped, whereas the Visualization chart must place a point
@@ -617,7 +511,6 @@ pub fn parse_bucket_ms(s: &str) -> Option<i64> {
         return None;
     }
 
-    // Keep the leading HH[:MM[:SS]]; drop fraction and zone.
     let time: String = rest
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == ':')
@@ -637,19 +530,9 @@ pub fn parse_bucket_ms(s: &str) -> Option<i64> {
 /// How far a bar's tooltip moves sideways, in pixels, to lie inside the
 /// strip.
 ///
-/// The tip is centred on its bar: its natural left edge is
-/// `bar_left + bar_width / 2 - tip_width / 2`, with every position
-/// measured from the strip's left edge. The shift moves that edge into
-/// `0..=strip_width - tip_width` and is zero when it is already there.
 /// A tip wider than the strip cannot fit either way; it aligns to the
 /// strip's left edge, so its start (the bucket's start time) stays
-/// readable. The component caps a tip's width at the strip's and lets it
-/// wrap, so in practice this case does not arise; the fallback keeps the
-/// function total.
-///
-/// A measured clamp, not a rule for "the first or last few bars": the tip
-/// width follows its label and the bar width follows the bucket count
-/// and the viewport, so no fixed number of edge bars is right.
+/// readable.
 #[must_use]
 pub fn tip_shift(bar_left: i32, bar_width: i32, tip_width: i32, strip_width: i32) -> i32 {
     let natural = bar_left + bar_width / 2 - tip_width / 2;
@@ -659,10 +542,6 @@ pub fn tip_shift(bar_left: i32, bar_width: i32, tip_width: i32, strip_width: i32
 
 /// Days since the Unix epoch for a proleptic-Gregorian date.
 /// Hinnant's `days_from_civil`.
-///
-/// Shared with the strict `_time` parser in `series::parse_instant_secs`,
-/// which validates the date before calling this and refuses what
-/// [`parse_bucket_ms`] above tolerates.
 pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -680,20 +559,16 @@ mod tests {
 
     #[test]
     fn tip_shift_leaves_a_tip_that_fits_centred() {
-        // Bar 500..520 centres a 100px tip at 460..560, inside 0..1000.
         assert_eq!(tip_shift(500, 20, 100, 1000), 0);
     }
 
     #[test]
     fn tip_shift_pushes_a_first_bar_tip_right_to_the_strip_edge() {
-        // Natural left is 40 + 10 - 150 = -100; the tip moves 100px right.
         assert_eq!(tip_shift(40, 20, 300, 1000), 100);
     }
 
     #[test]
     fn tip_shift_pulls_a_last_bar_tip_left_to_the_strip_edge() {
-        // Natural left is 966 + 10 - 150 = 826, so the right edge would be
-        // 1126; the tip moves left until it ends at 1000.
         let shift = tip_shift(966, 20, 300, 1000);
         assert_eq!(shift, -126);
         assert_eq!(826 + shift + 300, 1000);
@@ -701,7 +576,6 @@ mod tests {
 
     #[test]
     fn tip_shift_aligns_a_tip_wider_than_the_strip_to_its_left_edge() {
-        // 500px of tip in a 400px strip: left edge at 0, wherever the bar is.
         for bar_left in [0, 190, 380] {
             let natural = bar_left + 10 - 250;
             assert_eq!(natural + tip_shift(bar_left, 20, 500, 400), 0, "{bar_left}");
@@ -710,12 +584,9 @@ mod tests {
 
     #[test]
     fn tip_shift_touching_either_edge_is_inside() {
-        // Exactly at 0 and exactly ending at the strip width: no move.
         assert_eq!(tip_shift(40, 20, 100, 1000), 0);
         assert_eq!(tip_shift(940, 20, 100, 1000), 0);
     }
-
-    // ── the strip's series and copy ────────────────────────────────
 
     /// 2026-09-01T00:00:00Z, in microseconds.
     const DAY0_MICROS: i64 = 1_788_220_800_000_000;
@@ -753,8 +624,6 @@ mod tests {
         }
     }
 
-    /// The browser draws trawld's bins as they came: `ok` is the bin's
-    /// events less its errors, and no row is placed again.
     #[test]
     fn a_ready_histogram_becomes_a_series_of_its_own_bins() {
         let histogram = ready(
@@ -772,8 +641,6 @@ mod tests {
         assert_eq!(series.buckets.iter().map(|b| b.events()).sum::<u64>(), 10);
     }
 
-    /// The bounds are the wire's integers: bin `i` starts at
-    /// `start + i × width`, and the last bound is the wire's `end`.
     #[test]
     fn series_bounds_are_the_wire_bounds() {
         let series =
@@ -785,8 +652,6 @@ mod tests {
         assert!((series.max_secs() - series.min_secs() - 3600.0).abs() < 1e-6);
     }
 
-    /// One instant spans 48 bins of 20,834 µs, so the strip is 1.000032 s
-    /// wide, and the tooltip prints the bin's interval rounded outward.
     #[test]
     fn a_one_instant_series_spans_its_minimum_width() {
         let series = Series::from_ready(&ready(DAY0_MICROS + 100_000, 20_834, &[(0, 1, 1)], 0), 1)
@@ -803,8 +668,6 @@ mod tests {
         );
     }
 
-    /// A count the page's total does not account for, or one that breaks
-    /// any other invariant, is no series; so is an unavailable one.
     #[test]
     fn an_unavailable_or_inconsistent_histogram_gives_no_series() {
         let good = ready(DAY0_MICROS, 75_000_000, &[(3, 4, 1)], 2);
@@ -840,9 +703,6 @@ mod tests {
         assert!(Series::from_ready(&short, 6).is_none(), "47 bins");
     }
 
-    /// The order the strip reads a settled response in: an empty result
-    /// collapses whatever trawld said, then no histogram is the dash, a
-    /// reason shows its copy, a broken count is the dash, else bars.
     #[test]
     fn the_strip_follows_its_render_order() {
         let good = ready(DAY0_MICROS, 75_000_000, &[(0, 2, 1)], 0);
@@ -899,7 +759,6 @@ mod tests {
         assert_eq!(drawn.kept_some, Some(KEPT_SOME_LINE));
     }
 
-    /// Every string the strip prints, exactly as the spec writes it.
     #[test]
     fn histogram_copy_is_exact() {
         assert_eq!(
@@ -948,7 +807,6 @@ mod tests {
         );
     }
 
-    /// Counts past u32 reach the tooltip and the scale whole.
     #[test]
     fn series_keeps_u64_counts() {
         let past_u32 = u64::from(u32::MAX) + 1;
@@ -995,8 +853,6 @@ mod tests {
         );
     }
 
-    /// The top rounds up to an even count when it can, and stays the
-    /// tallest bar when rounding would overflow; it is never zero.
     #[test]
     fn scale_top_does_not_overflow() {
         assert_eq!(scale_top(0), 1);
@@ -1015,8 +871,6 @@ mod tests {
         assert!((pct(0, top)).abs() < f64::EPSILON);
     }
 
-    /// A 48-bin series over `min_secs..max_secs`, rounded to whole
-    /// microseconds the way the wire carries them.
     #[allow(clippy::cast_possible_truncation)]
     fn span(min_secs: f64, max_secs: f64) -> Series {
         let start_micros = (min_secs * 1e6).round() as i64;
@@ -1043,7 +897,6 @@ mod tests {
         let series = span(min, DAY0 + 6.0 * 3600.0 + 10.0 * 60.0 + 46.706);
         let ticks = clock_ticks(&series, 1100.0);
         assert_eq!(labels(&ticks), ["2026-09-01 06:00", "06:05", "06:10"]);
-        // Each tick sits at its own clock time across the span.
         let at = |secs: f64| (secs - series.min_secs()) / (series.max_secs() - series.min_secs());
         let expected = [6.0 * 3600.0, 6.0 * 3600.0 + 300.0, 6.0 * 3600.0 + 600.0];
         for (tick, secs) in ticks.iter().zip(expected) {
@@ -1072,8 +925,6 @@ mod tests {
         }
     }
 
-    /// The wire's finite instants reach either end of i64 microseconds.
-    /// Extents that wide still get an axis instead of an overflow.
     #[test]
     fn clock_ticks_survive_extents_at_the_i64_limit() {
         let far = i64::MAX - 1_000_033;
@@ -1095,9 +946,6 @@ mod tests {
         }
     }
 
-    /// The step is the smallest that fits: a one-hour span prints every
-    /// 10 minutes on a wide strip and every 30 on a 200px one, where the
-    /// dated first label would touch a 10- or 15-minute neighbour.
     #[test]
     fn clock_ticks_coarsen_the_step_to_fit_a_narrow_strip() {
         let series = span(DAY0 + 17.0, DAY0 + 3_617.0);
@@ -1132,8 +980,6 @@ mod tests {
         }
     }
 
-    /// A label whose centre would cross the box edge starts or ends at
-    /// its tick instead.
     #[test]
     fn clock_ticks_pin_edge_labels_to_their_tick() {
         // 00:00:00 is the very start and 00:00:10 is 80 ms from the end
@@ -1176,8 +1022,6 @@ mod tests {
         );
     }
 
-    /// The narrowest strip trawld counts is one instant: 48 bins of
-    /// 20,834 µs, just over one second.
     #[test]
     fn clock_ticks_print_milliseconds_below_a_second_step() {
         let series = Series::from_ready(&ready(DAY0_MICROS + 250_000, 20_834, &[(0, 1, 0)], 0), 1)
@@ -1203,7 +1047,6 @@ mod tests {
         );
     }
 
-    /// Too narrow for two labels: one tick alone, never none.
     #[test]
     fn clock_ticks_fall_back_to_one_label() {
         let ticks = clock_ticks(&span(DAY0 + 17.0, DAY0 + 3_617.0), 60.0);
@@ -1226,7 +1069,6 @@ mod tests {
             bucket_time(1_788_220_800_000_400, true),
             "2026-09-01 00:00:00.001"
         );
-        // A bound already on a millisecond stays there either way.
         assert_eq!(
             bucket_time(1_788_220_800_100_000, true),
             "2026-09-01 00:00:00.100"
@@ -1234,8 +1076,6 @@ mod tests {
         assert_eq!(bucket_time(-1, false), "1969-12-31 23:59:59.999");
         assert_eq!(bucket_time(-1, true), "1970-01-01 00:00:00.000");
     }
-
-    // ── align_buckets ──────────────────────────────────────────────
 
     const HOUR: i64 = 3_600_000;
 
@@ -1287,13 +1127,10 @@ mod tests {
 
     #[test]
     fn align_always_returns_a_full_grid() {
-        // The reason this helper exists: two populated hours must render
-        // as 24 slots, not 2 bars.
         let rows = [(100 * HOUR, 5), (103 * HOUR, 7)];
         let out = align_buckets(&rows, HOUR, 24);
         assert_eq!(out.len(), 24);
         assert_eq!(out.iter().map(|s| s.count).sum::<u64>(), 12);
-        // Newest row anchors the last slot.
         assert_eq!(out[23].start_ms, 103 * HOUR);
         assert_eq!(out[23].count, 7);
         assert_eq!(out[20].count, 5);
@@ -1318,14 +1155,11 @@ mod tests {
 
     #[test]
     fn align_floors_unaligned_rows_and_sums_collisions() {
-        // Two rows inside the same hour fold into one slot.
         let rows = [(10 * HOUR + 60_000, 2), (10 * HOUR + 120_000, 3)];
         let out = align_buckets(&rows, HOUR, 2);
         assert_eq!(out[1].start_ms, 10 * HOUR);
         assert_eq!(out[1].count, 5);
     }
-
-    // ── parse_bucket_ms ────────────────────────────────────────────
 
     #[test]
     fn parses_the_executor_display_format() {
@@ -1344,8 +1178,7 @@ mod tests {
 
     #[test]
     fn parses_a_known_instant() {
-        // 2026-07-28T00:00:00Z — cross-checked against the civil-days
-        // formula's reference epoch.
+        // 2026-07-28T00:00:00Z
         assert_eq!(
             parse_bucket_ms("2026-07-28 00:00:00"),
             Some(1_785_196_800_000)
@@ -1370,8 +1203,6 @@ mod tests {
 
     #[test]
     fn hours_within_a_day_are_distinct_and_ordered() {
-        // The chart plots these on a real time axis, so intra-day
-        // offsets have to be exact, not merely parseable.
         let midnight = parse_bucket_ms("2026-07-28 00:00:00").unwrap();
         let one_pm = parse_bucket_ms("2026-07-28 13:00:00").unwrap();
         let last_minute = parse_bucket_ms("2026-07-28 23:59:00").unwrap();

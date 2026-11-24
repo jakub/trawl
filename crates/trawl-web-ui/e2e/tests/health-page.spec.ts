@@ -223,7 +223,7 @@ test('health 503 renders the named failed subsystem', async ({ page, request }) 
     ['storage_db', 'Healthy'],
     ['data_path', 'Healthy'],
   ]) {
-    // The key now sits in a span inside the dt, so the row is the
+    // The key sits in a span inside the dt, so the row is the
     // nearest ancestor div rather than the matched node's parent.
     await expect(
       health.getByText(name, { exact: true }).locator('xpath=ancestor::div[1]').locator('dd'),
@@ -402,8 +402,6 @@ async function observeDashboardErrors(page: Page) {
 
 async function afterDashboardError(page: Page, readyState: number) {
   await expect.poll(() => page.evaluate(() => (window as any).__healthStreamErrors)).toContain(readyState);
-  // Let the application's listener and reactive render finish after the
-  // observed error dispatch. Frame boundaries prove the update ran.
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
@@ -443,8 +441,6 @@ for (const status of [500, 502, 504, 403]) {
     await rows(page);
     const dialog = await confirm(page);
     await dialog.getByRole('button', { name: 'Cancel query', exact: true }).click();
-    // A refusal the server explained is its message; a 5xx can follow a
-    // DELETE that reached the daemon, so its outcome stays unknown.
     const message = status === 403
       ? 'Cancellation failed: insufficient permissions'
       : 'Cancellation outcome unknown. Refresh queries before trying again.';
@@ -459,7 +455,6 @@ test('query-only readers can focus and scroll the queries table with the keyboar
   await page.route('**/api/v1/queries', async route => {
     const response = await route.fetch();
     const body = await response.json();
-    // Exercise a long display name alongside the narrow table viewport.
     body.active[0].user = 'queryreader'.repeat(12);
     await route.fulfill({ response, json: body });
   });
@@ -491,7 +486,6 @@ async function fact(section: Locator, label: string, value: string) {
   await expect(row.locator('dd')).toHaveText(value);
 }
 
-// A measured storage source: its state line, then exactly its three totals.
 async function storageTotals(source: Locator, state: string, files: string, size: string, age: string) {
   await expect(source.locator('.health-storage-state')).toHaveText(state);
   await expect(source.locator('dl > div > dt')).toHaveText(['Files', 'Size', 'Sample age']);
@@ -500,7 +494,6 @@ async function storageTotals(source: Locator, state: string, files: string, size
   await fact(source, 'Sample age', age);
 }
 
-// Ingestion, Storage, and Disk and retention each carry the phase label.
 async function diagnosticPhase(page: Page, label: string) {
   await expect(page.locator(SEL.healthDiagnosticState)).toHaveText([label, label, label]);
 }
@@ -530,7 +523,6 @@ for (const width of [1440, 720]) {
     await expect(storage).toContainText('Includes active WAL files');
     await expect(storage).toContainText('Excludes saved report files');
     await expect(storage).toContainText('exceed their count');
-    // Historical nonzero totals stay facts, without incident styling or roles.
     await expect(page.locator(SEL.healthDiagnostics).locator('[role="alert"], .health-check-error, [class*="danger"], [class*="warning"]')).toHaveCount(0);
     const cards = (await page.locator(SEL.healthCards).boundingBox())!;
     const a = (await ingestion.boundingBox())!;
@@ -670,7 +662,6 @@ for (const sample of [
     for (const source of ['wal', 'parquet']) {
       const reading = page.locator(`${SEL.healthStorage} [data-source="${source}"]`);
       if (sample.age === null) {
-        // No measured sample: one plain state line and no totals at all.
         await expect(reading.locator('p').first()).toHaveText(sample.expected);
         await expect(reading.locator('dl, .health-storage-state')).toHaveCount(0);
         await expect(reading).not.toContainText('Files');
@@ -678,8 +669,6 @@ for (const sample of [
         await storageTotals(reading, sample.expected, String(sample.files), sample.size, `${sample.age}s`);
       }
     }
-    // A stream drop preserves the displayed sample, including a collection
-    // failure. Neither a successful stream nor a reconnect rewrites its age.
     const before = await page.locator(`${SEL.healthStorage} .health-storage-source`).allTextContents();
     await request.post('/__ctl/dashboard/drop');
     await diagnosticPhase(page, 'Stale; reconnecting');
@@ -718,8 +707,6 @@ test('WAL failure and complete Parquet readings stay independent', async ({ page
   await expect(page.locator(SEL.healthFooterWal)).toHaveText('WAL failed; last 7 files / 91 B; age 120s');
   await request.post('/__ctl/dashboard/drop');
   await diagnosticPhase(page, 'Stale; reconnecting');
-  // The one existing Live operations status owns announcements; the adjacent
-  // visible labels remain ordinary accessible text.
   for (const label of await page.locator(SEL.healthDiagnosticState).all()) {
     await expect(label).toBeVisible();
     await expect(label).not.toHaveAttribute('role', 'status');
@@ -869,8 +856,6 @@ test('ingest refusal shows an amber chip and keeps the session connected', async
   const chip = page.locator(SEL.statusIngestRefusing);
   await expect(chip).toBeVisible();
   await expect(chip).toHaveText('Ingest refusing');
-  // Back-pressure is not an outage: the label keeps its connected
-  // semantics, and nothing signs the session out or reports it broken.
   const label = page.locator(SEL.statusLabel);
   await expect(label).toHaveText(`Connected (${host} vhealth-fixture-163)`);
   await expect(label).toHaveAttribute('data-health', 'ok');
@@ -885,7 +870,6 @@ test('ingest refusal shows an amber chip and keeps the session connected', async
   const badge = capacity.locator('dd .bdg');
   await expect(badge).toHaveText('Refusing');
   await expect(badge).toHaveClass(/\bwarn\b/);
-  // A warning, not a failure: the row is not painted as an error.
   await expect(capacity.locator('dd')).not.toHaveClass(/health-check-error/);
   await expect(chip).toBeVisible();
   await expect(page.locator(SEL.statusLabel)).toHaveText(`Connected (${host} vhealth-fixture-163)`);
@@ -897,8 +881,6 @@ for (const [reason, label] of [['rollup_pending', 'Rollup pending'], ['restart_b
     await page.route('**/api/v1/health', async route => {
       const response = await route.fetch();
       const body = await response.json();
-      // ADR-0041: corpus reads are refused until the corpus settles,
-      // which needs no restart, so the server reports degraded at 200.
       body.status = 'degraded';
       body.checks.corpus = reason;
       await route.fulfill({ response, json: body });
@@ -921,9 +903,6 @@ test('a slow query engine is a named warning, not a failure', async ({ page, req
   await page.route('**/api/v1/health', async route => {
     const response = await route.fetch();
     const body = await response.json();
-    // ADR-0056: the engine sample ran past its budget, but a sample
-    // succeeded within the last minute. The engine is busy, not broken,
-    // so the server reports degraded at 200.
     body.status = 'degraded';
     body.checks.duckdb = 'slow';
     await route.fulfill({ response, json: body });
@@ -960,7 +939,6 @@ test('the footer re-reads health every 30 s, one read at a time, and the chip cl
         await route.fulfill({ response });
         return;
       }
-      // Later reads: compaction freed space, so admission reopened.
       if (read === 2) await held;
       const body = await response.json();
       body.status = 'ok';
@@ -976,10 +954,8 @@ test('the footer re-reads health every 30 s, one read at a time, and the chip cl
     await expect(chip).toBeVisible();
     expect(reads).toBe(1);
 
-    // The next read starts 30 s after the first settled, and is held.
     await page.clock.fastForward(30_000);
     await expect.poll(() => reads).toBe(2);
-    // While it is held, no timer may start a second request beside it.
     await page.clock.fastForward(90_000);
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     expect(reads).toBe(2);
@@ -998,14 +974,9 @@ test('the footer re-reads health every 30 s, one read at a time, and the chip cl
   }
 });
 
-// The Disk and retention card (ADR-0042). Each case loads one capacity
-// fixture over the base snapshot: a slice of the snapshot holding the
-// capacity object with the Parquet and WAL fields it was assembled beside.
+// The Disk and retention card (ADR-0042).
 // The harness merges `dashboardSnapshot` shallowly, so each field rides
-// along whole. Each fixture is producer output: trawl-server's
-// src/metrics/capacity_fixtures.rs fails when one differs from what
-// capacity::assemble emits, and tests/e2e_wire_fixture_contract.rs decodes
-// each one and pins it to the state its case asserts.
+// along whole.
 const capacity = (name: string) => JSON.parse(readFileSync(`${__dirname}/../harness/wire/health-capacity-${name}.json`, 'utf8'));
 
 test.describe('Disk and retention', () => {
@@ -1030,7 +1001,6 @@ test.describe('Disk and retention', () => {
   const env = (disk: Locator, name: string) => disk.locator(`[data-env="${name}"]`);
   const reach = (disk: Locator, name: string) => env(disk, name).locator('.health-disk-reach');
 
-  // A withheld reach names its reason and carries no digit at all.
   async function withheld(disk: Locator, names: string[], text: string) {
     await expect(disk.locator('.health-disk-reach')).toHaveCount(names.length);
     for (const name of names) {
@@ -1039,10 +1009,6 @@ test.describe('Disk and retention', () => {
     }
   }
 
-  // No verdict: no incident role or tone class, no reassurance word, and
-  // every reach sentence drawn in the same ink as the Storage card's
-  // reading (its measured values, or its plain line when unmeasured),
-  // whether it projects, withholds, or names a filling disk.
   async function noVerdict(page: Page, disk: Locator) {
     await expect(disk.locator('[role="alert"], [role="status"], .badge, .health-check-error, [class*="danger"], [class*="warn"], [class*="success"], [class*="ok"]')).toHaveCount(0);
     await expect(disk).not.toContainText(/\b(safe|healthy|ok|fine|good)\b/i);
@@ -1051,12 +1017,8 @@ test.describe('Disk and retention', () => {
     expect(colors).toEqual([reading]);
   }
 
-  // A capture of the card alone, with a sidecar naming what it claims.
-  // TRAWL_HEALTH_CAPTURE_DIR collects them for visual-evidence/. Health
-  // owns its scroll container, so an element screenshot cannot stitch a
-  // card taller than the viewport: scroll the card to the top of that
-  // scroller, grow the viewport until the whole card is on screen, and
-  // clip a viewport capture to the card's box. The width is untouched.
+  // Health owns its scroll container, so an element screenshot cannot stitch a
+  // card taller than the viewport.
   async function capture(page: Page, testInfo: TestInfo, disk: Locator, name: string, claim: string) {
     const width = page.viewportSize()!.width;
     const settle = () => page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
@@ -1110,8 +1072,6 @@ test.describe('Disk and retention', () => {
     await fact(pressure, 'Last sweep', 'Completed, 754s ago');
     await expect(pressure).toContainText('since process start');
     await expect(group(disk, 'reach').locator('dl > div')).toHaveCount(5);
-    // One fraction of each policy per end: every projected env reads as
-    // whole days at both ends.
     await expect(env(disk, 'prod')).toContainText('Policy: 90 days. Oldest date: 2026-08-15. Stored: 111.1 GB.');
     await expect(reach(disk, 'prod')).toHaveText(`Reach: about 38–52 of 90 days if the observed days repeat. ${OBSERVED}`);
     await expect(reach(disk, 'staging')).toHaveText(`Reach: about 12–17 of 30 days if the observed days repeat. ${OBSERVED}`);
@@ -1127,13 +1087,11 @@ test.describe('Disk and retention', () => {
     await noVerdict(page, disk);
     await capture(page, testInfo, disk, 'disk-retention-complete-1440.png',
       'Complete sample with a floor: two headroom rows and no deficit, a completed sweep, three envs projected in whole days from one shared fraction per end, keep-forever growth, and one env withheld for history with the growth-excluded note');
-    // The card reads on a phone width without a horizontal scroll.
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(reach(disk, 'prod')).toBeVisible();
-    // The page's width settles a frame or more after the resize (under load
-    // it read 190px of the 390px viewport), so poll until it has.
+    // The page's width settles a frame or more after the resize,
+    // so poll until it has.
     await expect.poll(() => page.locator(SEL.healthPage).evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
-    // Every ISO date is one unbreakable run: it never wraps at its hyphen.
     const isoDates = (await disk.textContent())!.match(/\d{4}-\d{2}-\d{2}/g) ?? [];
     expect(isoDates.length).toBeGreaterThan(0);
     const dates = disk.locator('.health-disk-date');
@@ -1153,11 +1111,7 @@ test.describe('Disk and retention', () => {
     await expect(data).toContainText('Deletion floor: 1.1 GB. Deficit: 274 MB below the floor.');
     await expect(headroom.locator('[data-roles="wal"]')).toContainText('Collection failed; last complete reading: 60.0 GB available of 64.0 GB. Sample age: 3600s at this snapshot.');
     await fact(group(disk, 'pressure'), 'Last sweep', 'Failed, 41s ago');
-    // Global: the rate-less k8s is withheld for the measurement too, and
-    // nothing is excluded from a projection that did not run.
     await withheld(disk, ['archive', 'edge', 'k8s', 'prod'], WITHHELD.measurement);
-    // A partition dated after today, from a fast agent clock, is still the
-    // env's oldest date on disk.
     await expect(env(disk, 'edge')).toContainText('Policy: 90 days. Oldest date: 2026-09-28. Stored: 3 MB.');
     await expect(disk.locator('.health-disk-excluded')).toHaveCount(0);
     await noVerdict(page, disk);
@@ -1211,10 +1165,7 @@ test.describe('Disk and retention', () => {
     await fact(pressure, 'Pressure attempts', '5');
     await fact(pressure, 'Last sweep', 'Ran out of candidates below the floor, 61s ago');
     await expect(pressure).toContainText('Counts are since process start.');
-    // Evidence is counts and an outcome: no bytes figure anywhere in it.
     await expect(pressure).not.toContainText(/\d(\.\d+)? [KMG]?B\b/);
-    // The exhausted sweep left each env today's partition alone, so no
-    // env has a rate and every finite one is left out of the growth.
     await expect(env(disk, 'prod')).toContainText('Policy: 90 days. Oldest date: 2026-09-27. Stored: 4.1 GB.');
     await withheld(disk, ['archive', 'lab', 'prod'], WITHHELD.history);
     await expect(disk.locator('.health-disk-excluded')).toHaveText('Excludes growth of lab, prod: not enough history yet.');
@@ -1223,10 +1174,6 @@ test.describe('Disk and retention', () => {
       'Under pressure: one row for all three roles with a 474 MB deficit, 12 pressure removals over 5 attempts, and a sweep that ran out of candidates below the floor; each env holds today alone, so every reach is withheld for history and the finite envs are excluded');
   });
 
-  // An empty environment list is measured only when a complete Parquet
-  // scan established it (ADR-0033). Before the first scan, or after one
-  // that failed with nothing retained, the reach group says so in the
-  // Storage card's own words, and never "No stored date partitions".
   for (const { fixture, line, headroom, claim } of [
     {
       fixture: 'awaiting',

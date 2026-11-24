@@ -8,20 +8,12 @@
 //! degraded set are unchanged, only the offset moved — and has to lapse
 //! the moment either half changes, so a new query, or the same query
 //! after a repin retired one of the fields, gets the notice back.
-//!
-//! Pure + ungated so its table test runs natively; the one caller is
-//! wasm32-only.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-/// The identity of one notice: its effective query plus the set of
-/// degraded fields the execution reported.
-///
-/// Order- and duplicate-insensitive on the field side — the server's
-/// ordering is its own business, and two responses naming the same
-/// fields are the same notice. Injective across the join: each part is
-/// length-prefixed, so `("ab", ["c"])` and `("a", ["bc"])` cannot
-/// collide into one key and silently inherit each other's dismissal.
+/// Injective across the join: each part is length-prefixed, so
+/// `("ab", ["c"])` and `("a", ["bc"])` cannot collide into one key and
+/// silently inherit each other's dismissal.
 #[must_use]
 pub fn degraded_notice_key(query: &str, fields: &[String]) -> String {
     let mut names: Vec<&str> = fields.iter().map(String::as_str).collect();
@@ -52,8 +44,6 @@ mod tests {
 
     #[test]
     fn same_query_and_set_is_the_same_notice() {
-        // Paging moves the offset, not the query: the key must not move
-        // with it, or page two would resurrect a dismissed notice.
         let a = degraded_notice_key("status>=400 last=1h", &fields(&["duration"]));
         let b = degraded_notice_key("status>=400 last=1h", &fields(&["duration"]));
         assert_eq!(a, b);
@@ -75,12 +65,10 @@ mod tests {
     #[test]
     fn either_half_changing_is_a_new_notice() {
         let base = degraded_notice_key("*", &fields(&["duration"]));
-        // A different query over the same degraded field.
         assert_ne!(
             base,
             degraded_notice_key("* | head 5", &fields(&["duration"]))
         );
-        // The same query after the set grew, shrank, or changed.
         assert_ne!(
             base,
             degraded_notice_key("*", &fields(&["duration", "status"]))
@@ -91,9 +79,6 @@ mod tests {
 
     #[test]
     fn parts_cannot_run_together() {
-        // Field names are client-chosen text and a query is arbitrary:
-        // concatenation without lengths would make these one key, and a
-        // dismissal of either would silence the other.
         assert_ne!(
             degraded_notice_key("ab", &fields(&["c"])),
             degraded_notice_key("a", &fields(&["bc"]))
@@ -106,8 +91,6 @@ mod tests {
 
     #[test]
     fn multibyte_names_are_prefixed_in_bytes_not_chars() {
-        // `len()` is bytes on both sides of the comparison, so the only
-        // requirement is that it stays injective for non-ASCII too.
         assert_ne!(
             degraded_notice_key("*", &fields(&["dur\u{e9}e"])),
             degraded_notice_key("*", &fields(&["dur\u{e9}"]))

@@ -2,20 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The filter rail at wide widths (issue #231, ADR-0044).
-//
-// At 900px and wider the rail opens for a countable page and closes to a
-// 32px strip for every other settled answer, until the reader presses
-// its <summary>; that hand choice holds for the browser session. Each
-// test here reads the rail's `open` attribute and its measured width
-// together: one without the other would pass a rail that is open but
-// drawn as a strip, or the reverse.
-//
-// "Only a settled answer moves the rail" is checked two ways. Held
-// responses (page.route, never a harness control) show the rail keeping
-// its place while a request is in flight, and a `toggle` listener on the
-// <details> counts every open or close, automatic or by hand, so a move
-// that no single screenshot would catch still shows up as a count.
+// The filter rail at wide widths (ADR-0044).
 
 import fs from 'node:fs';
 import { test, expect, resetScenario } from '../fixtures';
@@ -28,13 +15,8 @@ const WIDE = { width: 1440, height: 900 };
 /** A plain search: `corpus` answers it with 8 countable rows. */
 const COUNTABLE = 'service=nginx';
 const COUNTABLE_URL = '/search?q=service%3Dnginx';
-/** An aggregation `corpus` answers with its `stats count() by` fixture. */
 const AGGREGATE = 'service=nginx | stats count() by service';
 
-// Issue 238's page cut down to the columns the rail may never count:
-// the event instant, the ingest instant, the raw event and a sender
-// timestamp that differs on every row. Derived from the wire fixture the
-// native contract decodes, so the body stays a real response shape.
 const presentation = JSON.parse(
   fs.readFileSync('harness/wire/query-field-presentation.json', 'utf8'),
 );
@@ -51,7 +33,6 @@ const uncountable = (() => {
   };
 })();
 
-/** Run `query` from the console, as a reader would. */
 async function haul(page: Page, query: string) {
   await page.locator(SEL.dslEditor).getByRole('textbox').fill(query);
   await page.locator(SEL.runButton).click();
@@ -72,7 +53,6 @@ test('filter rail: idle /search is a closed strip', async ({ page, request }) =>
   await page.goto('/search');
   await expect(page.locator('.search-quick-start')).toBeVisible();
   await expectRail(page, false);
-  // The strip is the summary, set vertically, and nothing else shows.
   await expectTextShown(page.locator(SEL.filterRailSummary), 'Filters');
   await expect(page.locator(SEL.facetFilterInput)).toBeHidden();
 });
@@ -142,10 +122,8 @@ test('filter rail: a countable page opens it, a following aggregation closes it'
   await expectRail(page, false);
 });
 
-// The test the record-from-toggle mutation must fail. `toggle` fires for
-// the automatic open as well as for a press, so a choice recorded from it
-// turns this first automatic open into a hand choice that holds the rail
-// open through the aggregation below.
+// `toggle` fires for
+// the automatic open as well as for a press.
 test('filter rail: an automatic open is not a hand choice', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto('/search');
@@ -168,8 +146,6 @@ test('filter rail: a pending answer does not move it', async ({ page, request })
   await expectRail(page, true);
   const toggles = await watchToggles(page);
 
-  // Held on its way to an aggregation, which will close the rail once it
-  // lands: until then the rail stays as the last answer left it.
   let held = await holdNextQuery(page);
   await haul(page, AGGREGATE);
   await held.arrived;
@@ -181,7 +157,6 @@ test('filter rail: a pending answer does not move it', async ({ page, request })
   await expectRail(page, false);
   expect(await toggles()).toBe(1);
 
-  // And the other way: a countable answer, held, leaves the strip shut.
   held = await holdNextQuery(page);
   await haul(page, COUNTABLE);
   await held.arrived;
@@ -193,7 +168,6 @@ test('filter rail: a pending answer does not move it', async ({ page, request })
   await expectRail(page, true);
   expect(await toggles()).toBe(2);
 
-  // A same-query Haul re-sends the request on screen. Held, and after.
   held = await holdNextQuery(page);
   await page.locator(SEL.runButton).click();
   await held.arrived;
@@ -202,7 +176,6 @@ test('filter rail: a pending answer does not move it', async ({ page, request })
   await expectAccepted(page);
   await expectRail(page, true);
 
-  // A switch between the Events and Visualization tabs sends nothing.
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect(page.getByRole('tab', { name: 'Visualization' })).toHaveAttribute('aria-selected', 'true');
   await page.getByRole('tab', { name: /^Events/ }).click();
@@ -212,8 +185,6 @@ test('filter rail: a pending answer does not move it', async ({ page, request })
 });
 
 test('filter rail: a page turn does not move it', async ({ page, request }) => {
-  // `pagination` pages a plain search 50 rows at a time over 53 rows,
-  // every one of them countable.
   await resetScenario(request, 'pagination');
   await page.goto(COUNTABLE_URL);
   const footer = page.locator('.results .results-footer');
@@ -238,8 +209,6 @@ test('filter rail: Enter and Space on the summary toggle it once each', async ({
   const toggles = await watchToggles(page);
   const summary = page.locator(SEL.filterRailSummary);
   await summary.focus();
-  // The press cancels the native toggle and sets the choice, so a key
-  // that the browser turns into a click still moves the rail once.
   await page.keyboard.press('Enter');
   await expectRail(page, false);
   expect(await toggles()).toBe(1);
@@ -255,8 +224,6 @@ test('filter rail: a hand close holds through a new Haul and a visit to Health, 
   await expect(page.locator(SEL.resultsRow)).toHaveCount(8);
   await expectRail(page, true);
 
-  // The press is presentation: it writes neither the link nor the
-  // stored reading preferences.
   const url = page.url();
   const prefs = await page.evaluate(() => localStorage.getItem('trawl.ui'));
   await page.locator(SEL.filterRailSummary).click();
@@ -264,7 +231,6 @@ test('filter rail: a hand close holds through a new Haul and a visit to Health, 
   expect(page.url()).toBe(url);
   expect(await page.evaluate(() => localStorage.getItem('trawl.ui'))).toBe(prefs);
 
-  // A new countable answer would open it in automatic mode.
   const toggles = await watchToggles(page);
   await haul(page, 'service=nginx host=web-01');
   await expect(page).toHaveURL(/host%3Dweb-01/);
@@ -272,7 +238,6 @@ test('filter rail: a hand close holds through a new Haul and a visit to Health, 
   await expectRail(page, false);
   expect(await toggles()).toBe(0);
 
-  // Away to Health by the navigation, and Back to the same search.
   // `corpus` does not serve Health's running-queries read, so it gets
   // the body the health scenarios serve.
   await page.route('**/api/v1/queries', (route) => route.fulfill({ json: healthQueries }));
@@ -284,7 +249,6 @@ test('filter rail: a hand close holds through a new Haul and a visit to Health, 
   await expectAccepted(page);
   await expectRail(page, false);
 
-  // A reload returns the rail to automatic behaviour.
   await page.reload();
   await expect(page.locator(SEL.resultsRow)).toHaveCount(8);
   await expectRail(page, true);
@@ -333,7 +297,6 @@ test('filter rail: a malformed link leaves the strip, and an open rail shows its
   await expectRail(page, false);
   await page.locator(SEL.filterRailSummary).click();
   await expectRail(page, true);
-  // Suppression outranks the hint: nothing but the header row.
   await expect(page.locator(SEL.filterRailSummary)).toHaveText('Filters');
   await expectTextShown(page.locator(SEL.filterRailSummary), 'Filters');
   await expect(page.locator(SEL.facetCount)).toHaveText('');
@@ -343,8 +306,7 @@ test('filter rail: a malformed link leaves the strip, and an open rail shows its
   await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
 });
 
-// Clear all is placed over the right end of the header row, and the
-// active count grows to the right from "Filters". Twelve filters give the
+// Twelve filters give the
 // count two digits, as wide as it gets under the link's cap of 32.
 test('filter rail: Clear all stands apart from a two-digit active count, inside the rail', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
@@ -385,9 +347,6 @@ test('filter rail: Clear all stands apart from a two-digit active count, inside 
     .toEqual({ countInside: true, clearInside: true, overlap: false });
 });
 
-// A closed wide rail's content is inert, so the browser cannot open the
-// rail by itself (below). The narrow disclosure's content never is: it
-// stays searchable, as it was before ADR-0044.
 test('filter rail: a closed wide rail is inert, an open one and the narrow disclosure are not', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto('/search');
@@ -408,11 +367,7 @@ test('filter rail: a closed wide rail is inert, an open one and the narrow discl
 
 // The browser opens a closed <details> by itself to show a match inside
 // it: find-in-page does, and so does a link's text fragment, which is
-// the one a test can drive. That open never reaches the rail's state,
-// so a hand-closed wide rail would show open while its state says
-// closed, and the next press would "close" it into the open it already
-// shows. The narrow leg is the control: there the same link does open
-// the disclosure, and the disclosure's state follows it.
+// the one a test can drive.
 test('filter rail: a link cannot open a closed wide rail, and the narrow disclosure follows one it opens', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto(COUNTABLE_URL);
@@ -431,7 +386,6 @@ test('filter rail: a link cannot open a closed wide rail, and the narrow disclos
   await followLink();
   expect(await toggles()).toBe(0);
   await expectRail(page, false);
-  // And the rail still answers its one control.
   await summary.click();
   await expectRail(page, true);
 
@@ -441,7 +395,6 @@ test('filter rail: a link cannot open a closed wide rail, and the narrow disclos
   await followLink();
   await expect.poll(toggles).toBe(closed + 1);
   await expect(rail).toHaveAttribute('open', '');
-  // One press closes it: the state took the browser's open.
   await summary.click();
   await expect(rail).not.toHaveAttribute('open');
 });

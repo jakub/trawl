@@ -2,26 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<ServiceDrawer/>` — slide-out right-side inspector for a single
-//! service on the Schema page. Scrim click + `Esc` to close.
-//!
-//! Three tabs, URL-synced via `?stab=overview|fields|tail`:
-//! - Overview: 24h ingest histogram + field-type donut + top-fields by
-//!   cardinality. Cardinality comes from a `stats dc(f1) as c0, …`
-//!   DSL query fired once per drawer open and cached for the lifetime;
-//!   its answer is read back by POSITION, keyed onto the field names the
-//!   builder returned beside the DSL.
-//! - Fields: sortable table of all columns with click-to-expand rows.
-//!   Expanding a row fires `service=<name> | top 10 <field>` via DSL
-//!   to render a top-values bar chart.
-//! - Live tail: opens an `EventSource` filtered to `service=<name>`
-//!   reusing the plumbing in `state::stream_session`. Pause closes the
-//!   stream; resume re-opens it. Closing the drawer tears it down.
-//!
-//! Cardinality and the histogram both live at the drawer level so they
-//! survive tab switches (Overview's top-fields widget and Fields' table
-//! column both consume the same cached signal).
-
 use std::collections::HashMap;
 
 use leptos::prelude::*;
@@ -45,11 +25,8 @@ use fleet_ui::{
     Variant, effective_active,
 };
 
-/// Display cap for the live-tail viewport — keeps the DOM snappy. The
-/// ring underneath still holds up to `LIVE_RING_CAPACITY` events.
 const TAIL_DISPLAY_MAX: usize = 150;
 
-/// Fields shown in the Overview "Top fields by cardinality" card.
 const TOP_CARDINALITY_ROWS: usize = 6;
 
 /// Ingest chart grid: 24 hourly slots, matching the `last=24h |
@@ -77,8 +54,6 @@ pub fn ServiceDrawer(
     /// so returning from the case file lands where it left. Cleared by
     /// the fields pane once it has been honoured.
     focus_field: RwSignal<Option<String>>,
-    /// Drill into a field's case file. The page owns the navigation; the
-    /// drawer only names the field.
     on_open_field: Callback<String>,
     /// Render in flow beside the services list rather than over a scrim
     /// (ADR-0032). The page feeds its viewport query straight in; the
@@ -94,9 +69,6 @@ pub fn ServiceDrawer(
     let svc_for_tail = svc.clone();
     let name_for_search = svc.name.clone();
 
-    // Shared cardinality fetch: runs once on drawer mount for this
-    // service. Signal is exposed to both OverviewPane and FieldsPane so
-    // neither re-fetches on tab switch.
     let cardinality_turn = ReadTurn::new();
     let cardinality = cardinality_resource(svc_for_card, cardinality_turn);
     let retry_cardinality = Callback::new(move |()| {
@@ -111,7 +83,6 @@ pub fn ServiceDrawer(
                 .map(|r| r.clone().map_err(|e| e.to_string()))
         });
 
-    // Drawer header sub-text: show date range when available.
     let sub_text = match (svc.earliest_date.as_deref(), svc.latest_date.as_deref()) {
         (Some(a), Some(b)) if a == b => a.to_string(),
         (Some(a), Some(b)) => format!("{a} → {b}"),
@@ -186,8 +157,6 @@ pub fn ServiceDrawer(
     }
 }
 
-// ───────────────────────── Overview pane ─────────────────────────
-
 #[component]
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn OverviewPane(
@@ -211,7 +180,6 @@ fn OverviewPane(
         }
     });
 
-    // Field-type donut is pure — derive from columns synchronously.
     let donut_segments = donut_breakdown(&svc.columns);
     let field_count = svc.columns.len();
 
@@ -266,9 +234,6 @@ fn OverviewPane(
                                 </div>
                             }
                         }).collect::<Vec<_>>();
-                        // The wrapper the `.topfields .tf` rules have always
-                        // asked for: the rows carried both classes and had no
-                        // `.topfields` ancestor, so none of it matched.
                         view! { <div class="topfields">{rows}</div> }.into_any()
                     })
                 />
@@ -276,8 +241,6 @@ fn OverviewPane(
         </div>
     }
 }
-
-// ───────────────────────── Fields pane ─────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortKey {
@@ -288,8 +251,6 @@ enum SortKey {
 }
 
 impl SortKey {
-    /// The direction a freshly-selected key starts in: ascending for
-    /// the field name, descending for the numeric columns.
     fn default_desc(self) -> bool {
         !matches!(self, Self::Name)
     }
@@ -312,14 +273,12 @@ fn FieldsPane(
     let columns_owned = svc.columns.clone();
     let svc_for_degraded = svc.clone();
 
-    // Focus return across the drawer swap. The badge's id is its position
-    // in `columns`, which is the drawer's own order and survives this
-    // table's client-side sorting.
+    // The badge's id is its position in `columns`, which is the drawer's own
+    // order and survives this table's client-side sorting.
     //
     // Re-run on `cardinality`, not once on mount: the row list is rebuilt
     // when the cardinality fetch lands, which would drop a focus placed
-    // before it. The request is only cleared once that fetch has settled,
-    // so the last attempt is the one that sticks.
+    // before it.
     let columns_for_focus = svc.columns.clone();
     Effect::new(move |_| {
         let settled = cardinality.get().is_some();
@@ -424,9 +383,6 @@ fn FieldsPane(
                         &c.name,
                     );
                     let fname_for_open = fname.clone();
-                    // Focus-return target across the case-file swap: the
-                    // column's position in the drawer's own list, never
-                    // its client-chosen name.
                     let badge_id = columns_owned
                         .iter()
                         .position(|col| col.name == c.name)
@@ -435,9 +391,7 @@ fn FieldsPane(
                         <>
                             <div class=row_class>
                                 <div>
-                                    // The row's one control (ADR-0029): the
-                                    // caret and the field name live inside
-                                    // it, and it stretches over the row.
+                                    // The row's one control (ADR-0029).
                                     <button
                                         type="button"
                                         class="row-stretch"
@@ -497,8 +451,6 @@ fn FieldsPane(
     }
 }
 
-// ───────────────────────── Field detail (expand row) ─────────────────────────
-
 #[component]
 #[allow(clippy::needless_pass_by_value)]
 fn FieldDetail(
@@ -508,9 +460,6 @@ fn FieldDetail(
     on_use_field: Callback<String>,
     field_name: String,
 ) -> impl IntoView {
-    // Composed once: the counts do not always arrive under `count` (a
-    // field of that name takes the alias form), and the reader below has
-    // to be told which column the query it actually sent counts into.
     let plan = crate::drawer_query::top_values_query(&svc, &field_name);
     let count_column = plan.as_ref().map_or("count", |p| p.count_column);
     let top_dsl = plan.map(|p| p.dsl);
@@ -592,8 +541,6 @@ fn FieldDetail(
     }
 }
 
-// ───────────────────────── Live tail pane ─────────────────────────
-
 #[component]
 #[allow(clippy::needless_pass_by_value)]
 fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
@@ -604,10 +551,8 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
     let failure = RwSignal::new(Some("Connecting…"));
     let retry = RwSignal::new(0_u64);
 
-    // Lifecycle holder — drop closes the SSE. `StreamLifecycle` owns a
-    // `wasm_bindgen::Closure`, which isn't Send/Sync, so we need the
-    // single-threaded `LocalStorage` variant (same reason as the
-    // editor / chart handles in this crate).
+    // `StreamLifecycle` owns a `wasm_bindgen::Closure`, which isn't
+    // Send/Sync, so we need the single-threaded `LocalStorage` variant.
     let lifecycle: StoredValue<Option<StreamLifecycle>, leptos::prelude::LocalStorage> =
         StoredValue::new_local(None);
     let svc_name_for_stream = svc.name.clone();
@@ -711,8 +656,6 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
     }
 }
 
-// ───────────────────────── Helpers ─────────────────────────
-
 fn declined_query_response() -> trawl_api::QueryResponse {
     trawl_api::QueryResponse {
         execution: None,
@@ -760,9 +703,6 @@ fn parse_top_values(resp: &QueryResponse, field: &str, count_column: &str) -> Ve
     let fi = cols
         .iter()
         .position(|c| c.name == field || c.name == "value");
-    // `count_column` is whatever the query that produced this response
-    // counted into, which is not always `count`
-    // (`drawer_query::top_values_query`).
     let ci = cols
         .iter()
         .position(|c| c.name == count_column || c.name.starts_with(count_column));
@@ -813,8 +753,6 @@ fn sample_range(c: &ServiceColumnStats) -> String {
 }
 
 fn short_time(iso: &str) -> String {
-    // Accept `YYYY-MM-DDTHH:MM:SS...` and chop to HH:MM:SS. Falls back
-    // to whatever was passed in so tails don't turn into a wall of "—".
     if let Some(t) = iso.split('T').nth(1) {
         let t = t.split('.').next().unwrap_or(t);
         let t = t.split(['+', 'Z', '-']).next().unwrap_or(t);
@@ -843,12 +781,9 @@ fn top_cardinality_rows(
     rows
 }
 
-// ───────────────────────── Histogram chart ─────────────────────────
-
 #[component]
 fn HistogramChart(
     resource: LocalResource<Result<QueryResponse, api::ApiError>>,
-    /// The resource's read turn, which Retry retires.
     turn: ReadTurn,
 ) -> impl IntoView {
     view! {
@@ -869,8 +804,6 @@ fn HistogramChart(
     }
 }
 
-/// uPlot column chart over the filled hourly grid — real time axis,
-/// hover readout, and zero-anchored y scale.
 #[component]
 fn IngestChart(slots: Vec<Slot>) -> impl IntoView {
     let node_ref = NodeRef::<leptos::html::Div>::new();
@@ -907,8 +840,6 @@ fn IngestChart(slots: Vec<Slot>) -> impl IntoView {
                     series: &labels,
                     y_label: None,
                     kind: ChartKind::Column,
-                    // x values were built from trawld's already-shifted
-                    // display timestamps — see `align_buckets`.
                     utc: true,
                     x_labels: None,
                     span_gaps: false,
@@ -950,11 +881,6 @@ fn slots_to_aligned(slots: &[Slot]) -> JsValue {
     aligned.into()
 }
 
-/// Pull `(bucket_start_ms, count)` out of a `timechart span=1h` response
-/// and lay it on a full 24-slot hourly grid.
-///
-/// The server only emits rows for buckets that carry events, so filling
-/// the grid is what keeps each bar at its real position on the time axis.
 fn build_histogram(resp: &QueryResponse) -> Vec<Slot> {
     let cols = &resp.result.columns;
     let ti = cols.iter().position(|c| {
@@ -981,8 +907,6 @@ fn build_histogram(resp: &QueryResponse) -> Vec<Slot> {
         .collect();
     align_buckets(&rows, INGEST_SLOT_MS, INGEST_SLOTS)
 }
-
-// ───────────────────────── Field-type donut ─────────────────────────
 
 #[derive(Clone)]
 struct DonutSegment {

@@ -5,9 +5,7 @@
 #
 # Evidence tooling: for each mutations/*.patch, apply it, rebuild
 # the SPA, run the spec file that is that mutation's subject, and require
-# at least one test to EXECUTE AND FAIL (exit code alone can't tell a
-# kill from a missing browser), then revert. Prints a PASS/FAIL table and
-# exits 0 only if every requested mutation was killed.
+# at least one test to EXECUTE AND FAIL, then revert.
 #
 # Usage:
 #   e2e/scripts/mutation-check.sh                 # run all standard mutations (21 uses its own runner)
@@ -17,11 +15,6 @@
 # own uncommitted work can't be cleanly reverted, and a failed `git
 # apply -R` would otherwise silently leave a mutation live in your working
 # tree.
-#
-# Known residual: a transient failure confined to the target spec (a
-# flake that clears before the control runs) still reads as a kill. A
-# PASS here is evidence only NEXT TO a green baseline run of the full
-# suite on the same commit — which is exactly what CI enforces.
 #
 # Each Playwright invocation writes to its own directory under
 # e2e-artifacts/mutations/<patch>/, and the JSON verdict reports stay there
@@ -38,11 +31,8 @@ MUTATIONS_DIR="$E2E_DIR/mutations"
 
 cd "$ROOT_DIR"
 
-# Every mutant rebuilds the same crates, and trawl-core's provenance build
-# script watches every tracked file, so each patch recompiles trawl-core
-# and trawl-web-ui (and fleet-ui when the patch touches it). Incremental compilation
-# lets those rebuilds reuse most of the previous compile. CI needs it set
-# here because rust-cache exports CARGO_INCREMENTAL=0 for the whole job.
+# CI needs it set here because rust-cache exports CARGO_INCREMENTAL=0 for the
+# whole job.
 export CARGO_INCREMENTAL=1
 
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -55,8 +45,6 @@ ARTIFACTS_DIR="$ROOT_DIR/e2e-artifacts/mutations"
 rm -rf "$ARTIFACTS_DIR"
 mkdir -p "$ARTIFACTS_DIR"
 
-# A verdict read from a JSON report needs the report itself to parse. An
-# unreadable report is an infra failure, never a surviving mutant.
 report_readable() {
   node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$1" 2>/dev/null
 }
@@ -113,8 +101,7 @@ declare -A SPEC_FOR=(
 # from an infra failure: a missing browser or dead stub fails the control
 # too, and playwright even records launch failures as executed-and-failed
 # tests, so neither exit codes nor the JSON reporter's stats can make
-# that call on the target spec alone (probed: an empty
-# PLAYWRIGHT_BROWSERS_PATH yields "3 tests failed", not "no tests").
+# that call on the target spec alone.
 declare -A CONTROL_FOR=(
   [01-route.patch]="api-failure.spec.ts"
   [02-editor-onchange.patch]="routing.spec.ts"
@@ -294,7 +281,6 @@ JS
     health_assertion=$?
     if [[ $health_assertion -ne 0 ]]; then status=0; fi
   elif [[ $name == 26-save-editor-snapshot.patch ]]; then
-    # The Save callback must break the console control at the snapshot assertion.
     save_report="$out/save-report.json"
     (cd "$E2E_DIR" && PLAYWRIGHT_JSON_OUTPUT_FILE="$save_report" npx playwright test --workers=1 "tests/$spec" --grep 'Save captures editor buffer:' --reporter=json --output "$out/target")
     status=$?
@@ -361,7 +347,4 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 2
 fi
 
-# Exit 0 only when every requested mutation was killed by its own spec —
-# an APPLY/BUILD/INFRA failure or a surviving mutation must fail the
-# command, not just color a table.
 exit $overall

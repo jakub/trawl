@@ -3,18 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Accessible names for sort-header buttons (ADR-0029).
-//!
-//! The div tables (schema services, nets, the service drawer's field
-//! list) get no ARIA table roles, so `aria-sort` is unavailable there
-//! and the direction has to live in the button's name instead. Pure and
-//! ungated so its table test runs under native `cargo test`; the
-//! rendering half is `components::sort_th`, which is wasm-only.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-/// The button's accessible name. `direction` is `None` when the column
-/// is not the sorted one, else `Some(desc)` matching the sort tuple's
-/// descending flag.
+/// `direction` is `None` when the column is not the sorted one, else
+/// `Some(desc)` matching the sort tuple's descending flag.
 pub fn sort_button_name(label: &str, direction: Option<bool>) -> String {
     match direction {
         None => format!("Sort by {label}"),

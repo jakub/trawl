@@ -2,23 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The three remaining pseudo-buttons, now native (issue #159,
-// ADR-0028): the modal's header close, a toast's dismiss and the bare
-// mode of `CopyButton`.
-//
-// Each was a <div> or <span> with an `on:click` and nothing else — no
-// role, no tabindex, no keydown — so a keyboard user could not reach
-// them at all and a screen reader announced the close glyph as the text
-// "×". The assertions are therefore about the ELEMENT as much as the
-// behaviour: tag name, `type="button"` (a bare <button> inside a form
-// would submit it), and an accessible name that is a sentence rather
-// than a glyph.
-//
-// The copy test also proves the propagation stop survived the
-// conversion. That is what keeps a copy trigger inside a clickable row
-// from opening the row, and it is measured against a control press that
-// does bubble — a counter nothing can increment proves nothing.
-
 import { test, expect } from '../fixtures';
 import { SEL, COPY } from '../selectors';
 
@@ -50,7 +33,6 @@ test('modal close is a named button that closes on Enter', async ({ page }) => {
   await expect(close).toHaveJSProperty('tagName', 'BUTTON');
   await expect(close).toHaveAttribute('type', 'button');
   await expect(close).toHaveRole('button');
-  // The glyph is an icon, so aria-label is the entire accessible name.
   await expect(close).toHaveAccessibleName(COPY.modalCloseName);
 
   await close.focus();
@@ -64,8 +46,6 @@ test('toast dismiss is a named button that removes one toast', async ({ page, co
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.goto('/search');
 
-  // Two successful copies produce two toasts. Dismissing one must leave
-  // the other in place.
   const share = page.locator(SEL.editorTool).filter({ hasText: COPY.copyUrlTool });
   await share.click();
   await expect(page.locator(SEL.toastAny)).toHaveCount(1);
@@ -76,7 +56,6 @@ test('toast dismiss is a named button that removes one toast', async ({ page, co
   await expect(dismiss).toHaveJSProperty('tagName', 'BUTTON');
   await expect(dismiss).toHaveAttribute('type', 'button');
   await expect(dismiss).toHaveRole('button');
-  // "×" is aria-hidden, so the name is the label and not "times".
   await expect(dismiss).toHaveAccessibleName(COPY.toastDismissName);
 
   await dismiss.focus();
@@ -107,8 +86,6 @@ test('bare copy button copies on Space and stops propagation', async ({ page, co
   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
   expect(await bubbledToolClicks(page)).toBe(1);
 
-  // Space on a native button is a click. Nothing else on this page
-  // could produce one: the trigger was a <span> before ADR-0028.
   await share.focus();
   await expect(share).toBeFocused();
   await page.keyboard.press(' ');
@@ -116,7 +93,6 @@ test('bare copy button copies on Space and stops propagation', async ({ page, co
   await expect
     .poll(() => page.evaluate(() => navigator.clipboard.readText()))
     .toContain('/search');
-  // The copy announced itself, and the press never reached the row.
   await expect(page.locator(SEL.toastAny)).toHaveCount(1);
   expect(await bubbledToolClicks(page)).toBe(1);
 });

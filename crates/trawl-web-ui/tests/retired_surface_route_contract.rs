@@ -2,9 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Native route contract: the `/intel` root has no registered route and
-//! unmatched routes render the app's 404 component.
-//!
 //! The Leptos router only compiles on wasm32, so this reads `app.rs` as
 //! source text, following the native UI contract-test pattern.
 

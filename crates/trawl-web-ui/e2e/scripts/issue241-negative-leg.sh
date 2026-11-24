@@ -4,24 +4,11 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # Evidence tooling for issue #241: prove signed-out-probes.spec.ts depends
-# on the status bar's session gate in src/pages/layout.rs. Removes ONLY that
-# gate (the connected-label change stays), builds the SPA, and requires the
-# spec to fail on its health-request assertion; then restores the file,
-# builds again, and requires the spec to pass. Prints both outcomes and
-# exits 0 only if both legs behave.
-#
-# Each leg's outcome comes from the JSON report
-# (issue241-negative-leg.verdict.mjs): pass, fail, or INCONCLUSIVE. A failure
-# counts only if its error is located at the spec's health-count assertion
-# and its message header is that assertion's failure, so a port collision,
-# launch failure, timeout, crash, unreadable report, or an error on a
-# neighbouring line is INCONCLUSIVE (exit 3), never a kill. A surviving
-# mutant, or a gated build that fails, is RESULT: FAIL (exit 1).
+# on the status bar's session gate in src/pages/layout.rs.
 #
 # Both builds go to script-owned dist directories under target/, served
 # through TRAWL_E2E_DIST, so crates/trawl-web-ui/dist is never written and no
-# exit path can leave the ungated app there. The exit and signal traps
-# restore layout.rs and remove those directories.
+# exit path can leave the ungated app there.
 #
 # Usage: e2e/scripts/issue241-negative-leg.sh   (E2E_PORT defaults to 8123)
 #        e2e/scripts/issue241-negative-leg.sh --self-test   (verdict parser only)
@@ -59,15 +46,11 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# build DIST: trunk build into a script-owned directory.
 build() {
   (cd "$WEB_UI_DIR" && env -u NO_COLOR trunk build --dist "$1" >/dev/null 2>&1) \
     || { echo "trunk build failed" >&2; exit 1; }
 }
 
-# run_spec DIST EXPECT (fail|pass): run the spec against DIST, print the
-# reporter summary, and write the verdict (fail, pass or inconclusive) to
-# $WORK/verdict-EXPECT.
 run_spec() {
   local dist="$1" expect="$2" report="$WORK/report-$2.json" out status=0
   out="$(cd "$E2E_DIR" && TRAWL_E2E_DIST="$dist" PLAYWRIGHT_JSON_OUTPUT_NAME="$report" \

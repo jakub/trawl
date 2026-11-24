@@ -157,8 +157,6 @@ test('recorded-run count distinguishes pending, failure and the confirmed total'
   await expect(page.locator('.tbl-row')).toHaveCount(2);
   release();
   await expect(card).toContainText("Couldn't load recorded runs");
-  // A failed read never reads as a count: the card says it failed
-  // rather than showing the number it could not fetch.
   await expect(card.locator('.value')).not.toHaveText(total);
   fail = false;
   await card.getByRole('button', { name: 'Retry' }).click();
@@ -217,9 +215,6 @@ for (const [tab, queryPart, errorLabel, readySelector] of [
 test('service cardinality reaches every column, including the reserved _time', async ({ page, request }) => {
   await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
   await page.goto('/search/schema?svc=nginx&stab=overview');
-  // `_time` leads every service schema and is a reserved name, so an
-  // alias spelled after the field failed the whole statement and the
-  // card rendered its error arm for all three columns.
   const top = page.locator('.topfields .tf');
   await expect(top.first()).toBeVisible();
   await expect(top.filter({ hasText: CORPUS.topCardinalityField })).toHaveCount(1);

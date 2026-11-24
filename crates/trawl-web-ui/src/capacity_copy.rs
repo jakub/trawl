@@ -3,13 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The sentences of the Health page's Disk and retention card
-//! (ADR-0042). Pure so native `cargo test` pins the copy: a headroom row
-//! shares its attempt's status and age, a floor is stated with its
-//! deficit only while below it, every pair of reach ends reads as one
-//! conditional sentence, and a withheld reach carries no digit.
-//!
-//! On native, only the tests consume some of these items: the card that
-//! renders them is wasm-only.
+//! (ADR-0042).
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use crate::service_card_fmt::format_bytes;
@@ -18,10 +12,6 @@ use trawl_api::{
     StorageMeasurement, StorageMeasurementStatus, SweepOutcome, WithheldReason,
 };
 
-/// The shared state of one headroom attempt (ADR-0042): every row comes
-/// from the same attempt, so each row carries the same prefix and age.
-/// `Err` is the one line the group shows when no complete sample exists;
-/// a failed attempt that retained a sample keeps its aged rows.
 pub fn headroom_state(
     measurement: StorageMeasurement,
 ) -> Result<(&'static str, u64), &'static str> {
@@ -41,7 +31,6 @@ pub fn headroom_state(
     }
 }
 
-/// The wire names of a row's roles, for `data-roles`: `"data wal"`.
 pub fn roles_key(roles: &[FilesystemRole]) -> String {
     roles
         .iter()
@@ -54,7 +43,6 @@ pub fn roles_key(roles: &[FilesystemRole]) -> String {
         .join(" ")
 }
 
-/// The row's title: the roles that share the filesystem, `"Data + WAL"`.
 pub fn roles_label(roles: &[FilesystemRole]) -> String {
     roles
         .iter()
@@ -67,8 +55,6 @@ pub fn roles_label(roles: &[FilesystemRole]) -> String {
         .join(" + ")
 }
 
-/// The data row's floor: the floor and, only while below it, the deficit.
-/// Equality is not a deficit, so a zero deficit is not mentioned.
 pub fn floor_line(floor: DeletionFloor) -> String {
     match floor {
         DeletionFloor::Off => "Pressure deletion off (floor 0).".into(),
@@ -87,7 +73,6 @@ pub fn floor_line(floor: DeletionFloor) -> String {
     }
 }
 
-/// The last sweep in words with its age, or the fact that none ran yet.
 pub fn sweep_line(last: Option<LastSweep>) -> String {
     let Some(last) = last else {
         return "No sweep yet since process start".into();
@@ -101,7 +86,6 @@ pub fn sweep_line(last: Option<LastSweep>) -> String {
     format!("{outcome}, {}s ago", last.age_secs)
 }
 
-/// The environment's policy beside the facts that survive a restart.
 pub fn policy_line(env: &EnvironmentCapacity) -> String {
     let policy = if env.max_age_days == 0 {
         "keep forever".to_owned()
@@ -115,8 +99,6 @@ pub fn policy_line(env: &EnvironmentCapacity) -> String {
     )
 }
 
-/// One end of the reach, as the clause that follows "at the largest
-/// observed day," or "at the mean day,".
 fn reach_end(end: ReachEnd, max_age_days: u64) -> String {
     match end {
         ReachEnd::Days { days } => format!("about {days} of {max_age_days} days"),
@@ -126,9 +108,7 @@ fn reach_end(end: ReachEnd, max_age_days: u64) -> String {
 }
 
 /// The reach sentence for the range from the largest observed day (`low`)
-/// to the mean (`high`). Ends in one unit collapse into one phrase, and a
-/// range of days never averages its ends. Ends of different kinds are
-/// named one at a time. Every form keeps the projection conditional.
+/// to the mean (`high`).
 pub fn reach_sentence(low: ReachEnd, high: ReachEnd, max_age_days: u64) -> String {
     let range = match (low, high) {
         (ReachEnd::Days { days: a }, ReachEnd::Days { days: b }) if a == b => {
@@ -155,10 +135,6 @@ pub fn reach_sentence(low: ReachEnd, high: ReachEnd, max_age_days: u64) -> Strin
     format!("Reach: {range} if the observed days repeat.")
 }
 
-/// The reach sentence. A projection names the observed days it came
-/// from and the condition it holds under. Keep-forever data gets its
-/// growth and no time claim. A withheld reach gets its reason and no
-/// digit at all, so nothing on the row can be read as a number of days.
 pub fn reach_line(reach: &Reach, max_age_days: u64) -> String {
     match reach {
         Reach::Projected {
@@ -196,12 +172,6 @@ pub fn reach_line(reach: &Reach, max_age_days: u64) -> String {
     }
 }
 
-/// The reach group's one line when it lists no environment, read from the
-/// snapshot's Parquet measurement. An empty list is a measured fact only
-/// when a scan completed (ADR-0033): before the first scan, or after a
-/// failed one that retained nothing, nothing was measured, and the words
-/// are the Storage card's. A failed scan that retained a sample still
-/// reports what its last complete scan found.
 pub fn empty_reach_line(parquet: StorageMeasurement) -> &'static str {
     match (parquet.status, parquet.sample_age_secs) {
         (StorageMeasurementStatus::Complete, Some(_)) => "No stored date partitions yet.",
@@ -211,8 +181,7 @@ pub fn empty_reach_line(parquet: StorageMeasurement) -> &'static str {
         (StorageMeasurementStatus::NotSampled, _) => "Awaiting measurement",
         (StorageMeasurementStatus::Failed, None) => "Measurement unavailable; collection failed",
         (StorageMeasurementStatus::NotConfigured, _) => "Not configured",
-        // The producer requires an age on complete samples (see
-        // `headroom_state`).
+        // The producer requires an age on complete samples.
         (StorageMeasurementStatus::Complete, None) => "Measurement unavailable",
     }
 }
@@ -254,9 +223,6 @@ pub fn date_runs(line: &str) -> Vec<(&str, bool)> {
     runs
 }
 
-/// The environments whose growth the projection left out (ADR-0042): a
-/// finite policy with too few observed days is reserved at its stored
-/// bytes. `None` when nothing was left out.
 pub fn growth_excluded_note(excluded: &[String]) -> Option<String> {
     if excluded.is_empty() {
         return None;
@@ -270,12 +236,6 @@ pub fn growth_excluded_note(excluded: &[String]) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Every low/high pair reads as one plain sentence that keeps the
-    /// projection conditional. The server's math reaches only some pairs
-    /// (`capacity::project`): with a floor, days or the full policy; with
-    /// a floor of 0, the disk filling first or the full policy; and the
-    /// low end never exceeds the high. The rest are pinned too, so a wire
-    /// that ever carries one still reads as a sentence.
     #[test]
     fn reach_line_reads_every_end_pair_as_a_sentence() {
         const OBSERVED: &str = " Observed: 7 days, 2026-09-19 to 2026-09-25.";
@@ -358,9 +318,6 @@ mod tests {
         }
     }
 
-    /// An empty environment list is a measured fact only when a complete
-    /// Parquet scan established it (ADR-0033): before the first scan, or
-    /// after a failed one with nothing retained, the list is unmeasured.
     #[test]
     fn empty_reach_says_measured_only_after_a_complete_scan() {
         let parquet = |status, sample_age_secs| StorageMeasurement {
@@ -401,8 +358,6 @@ mod tests {
         }
     }
 
-    /// The card sets each ISO date in its own unbreakable run, so the
-    /// split must find every date and keep the text byte for byte.
     #[test]
     fn date_runs_split_out_each_iso_date_and_keep_the_text() {
         let joined =
@@ -427,8 +382,6 @@ mod tests {
                 (".", false),
             ]
         );
-        // A line that is one date, and lines with no date, including
-        // digit runs that only look like part of one.
         assert_eq!(date_runs("2026-09-25"), [("2026-09-25", true)]);
         for plain in [
             "",

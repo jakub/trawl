@@ -2,22 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<StatusBar/>` — 26px footer with status, last-search summary,
-//! and admin stats.
-//!
-//! The stats cluster (hot buffer / WAL measurement / active queries /
-//! uptime) renders only while the `admin` signal carries a
-//! [`DashboardSnapshot`] — `AuthShell` feeds it from the admin-only
-//! `/api/v1/dashboard/stream` SSE stream, so non-admins never see the
-//! group.
-//!
-//! Health is re-read every [`HEALTH_REFRESH_MS`] for every session, so the
-//! `Ingest refusing` chip (ADR-0043) clears on its own once the server
-//! admits ingest again. The reads run in one sequential loop, not a
+//! The reads run in one sequential loop, not a
 //! `LocalResource`: a `refetch()` issued while a read is in flight is
 //! dropped, and a changed resource input starts a second request beside
-//! the first. The loop awaits each read before it sleeps, so at most one
-//! health request is ever in flight.
+//! the first.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,11 +19,8 @@ use crate::api;
 use crate::components::service_card_fmt::{format_bytes, format_count, format_uptime};
 use crate::search_status::{FooterCount, StatusKind, footer_count_label};
 
-/// How often the footer re-reads `/api/v1/health`, counted from the end of
-/// the previous read.
 const HEALTH_REFRESH_MS: u32 = 30_000;
 
-/// Whether a health report says hot-buffer admission is refusing ingest.
 /// Back-pressure, not an outage: it never changes the connected label.
 fn ingest_refusing(report: &HealthResponse) -> bool {
     report
@@ -46,30 +31,19 @@ fn ingest_refusing(report: &HealthResponse) -> bool {
 }
 
 #[component]
-#[allow(clippy::too_many_lines)] // one footer, one markup tree
+#[allow(clippy::too_many_lines)]
 pub fn StatusBar(
     #[prop(into)] status: Signal<StatusKind>,
-    /// The active result source's count and the source it names
-    /// (`Last —` before anything has run).
-    #[prop(into)]
-    count: Signal<FooterCount>,
-    /// Currently lagged events count, if the live stream emitted a
-    /// back-pressure notification.
-    #[prop(into)]
-    lagged: Signal<Option<u64>>,
+    #[prop(into)] count: Signal<FooterCount>,
+    #[prop(into)] lagged: Signal<Option<u64>>,
     /// Live admin stats from `/api/v1/dashboard/stream`; `None` for
     /// non-admin sessions (the stats cluster is hidden entirely).
     #[prop(into)]
     admin: Signal<Option<DashboardSnapshot>>,
 ) -> impl IntoView {
-    // Host the browser is talking to — shown in the connected-state label
-    // next to the server version from /api/v1/health. The version appears
-    // only once health returns one; while health is pending, has failed, or
-    // reports no version, the label names the host alone.
     let host = web_sys::window()
         .and_then(|w| w.location().host().ok())
         .unwrap_or_default();
-    // The latest settled health read; `None` until the first one lands.
     let server = RwSignal::new(None::<Result<HealthResponse, api::ApiError>>);
     let alive = Arc::new(AtomicBool::new(true));
     let looping = Arc::clone(&alive);
@@ -162,9 +136,6 @@ pub fn StatusBar(
                     </div>
                 </>
             })}
-            // The footer names the source it counted, so the label is
-            // data, not markup: `Last` in snapshot, `Received` or
-            // `Updates` while the stream is the active source.
             <div class="grp count">
                 <span>
                     {move || format!("{} ", footer_count_label(&count.get()).0)}
@@ -178,7 +149,6 @@ pub fn StatusBar(
     }
 }
 
-/// The hot buffer's event count and size, each with its unit.
 fn hot_reading(snapshot: &DashboardSnapshot) -> String {
     let events = u64::try_from(snapshot.hot_buffer_events).unwrap_or_default();
     let bytes = u64::try_from(snapshot.hot_buffer_bytes).unwrap_or_default();
@@ -190,13 +160,10 @@ fn hot_reading(snapshot: &DashboardSnapshot) -> String {
     )
 }
 
-/// The singular unit for exactly one, the plural for every other count.
 fn unit(n: u64, one: &'static str, many: &'static str) -> &'static str {
     if n == 1 { one } else { many }
 }
 
-/// The footer receives live dashboard snapshots, but a storage measurement can
-/// still have failed. Read its metadata before presenting numeric placeholders.
 fn wal_reading(snapshot: &DashboardSnapshot) -> String {
     use trawl_api::StorageMeasurementStatus as Status;
     match (

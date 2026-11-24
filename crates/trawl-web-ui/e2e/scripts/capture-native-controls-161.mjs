@@ -2,24 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Evidence tooling, not a test: photographs every surface issue #161
-// converted, at rest and with one control focused, against the same stub
-// harness the suite uses and the `corpus` scenario that has data in it.
-//
-// A second script rather than an extension of
-// `capture-native-controls.mjs`. That one is the ADR-0028 chrome, light
-// and dark, with the tab-strip geometry numbers beside it; this one is a
-// single light viewport over app surfaces and it has to run against TWO
-// builds, the pre-#161 one included. Folding the two together would mean
-// one script whose every step is conditional on which question it is
-// answering.
-//
-// The before build is the point. `--dist` picks the `dist/` the stub
-// serves, so the same steps run against a checkout that predates the
-// conversion: the tables and panels are there, the controls are not, and
-// a step that cannot find its control records that rather than failing.
-// `focusVisible` in the report is the whole claim in one boolean per
-// shot.
+// `--dist` picks the `dist/` the stub serves, so the same steps run
+// against a checkout that predates the conversion: a step that cannot
+// find its control records that rather than failing.
 //
 // Usage, from the repo root:
 //   node crates/trawl-web-ui/e2e/scripts/capture-native-controls-161.mjs \
@@ -48,11 +33,9 @@ function arg(name, fallback) {
 const LABEL = arg('label', 'after');
 const OUT = path.resolve(arg('out', path.join(ROOT_DIR, 'visual-evidence', 'issue-161', 'captures', LABEL)));
 const DIST = arg('dist', null);
-// A spare port, away from the suite's 8123 and the #159 capture's 8129.
+// A spare port, away from the suite's 8123 and the other capture's 8129.
 const PORT = Number(process.env.E2E_PORT ?? 8131);
 const BASE = `http://127.0.0.1:${PORT}`;
-// One viewport, one device pixel per CSS pixel. A retina pass would
-// double every file for nothing: none of this is about hairlines.
 const VIEWPORT = { width: 1440, height: 900 };
 
 const SERVICE = 'nginx';
@@ -62,10 +45,8 @@ const DEGRADED_FIELD = 'duration';
 // notice it raises is where `.url-notice-repair` lives.
 const MALFORMED = '/search?q=service%3Dnginx&mode=live&f=v1.!';
 
-/** Screenshot a rectangle covering every element named, with padding, so
- * a panel that sits outside its wrapper's box is still in frame. Missing
- * selectors are skipped rather than fatal: the before build does not
- * have all of them. */
+/** Missing selectors are skipped rather than fatal: the before build does
+ * not have all of them. */
 async function shotUnion(page, selectors, file, pad = 12) {
   const rect = await page.evaluate((sels) => {
     const boxes = sels
@@ -96,17 +77,11 @@ async function shotUnion(page, selectors, file, pad = 12) {
   return { file, clipped: true };
 }
 
-/** Focus a control the way a keyboard user arrives at it, and report
- * whether the ring is actually painted.
- *
- * The Tab first is not decoration. Chromium paints `:focus-visible` on a
+/** The Tab first is not decoration. Chromium paints `:focus-visible` on a
  * programmatically focused element only when focus was already visible
  * on the element it came from, so a bare `.focus()` from a fresh page
  * lands a focused control with no ring on it. One Tab into the document
- * establishes that, and the `.focus()` after it inherits.
- *
- * Returns `null` when the control is not in the page at all, which is
- * what the before build answers for every control #161 created. */
+ * establishes that, and the `.focus()` after it inherits. */
 async function focusControl(page, selector) {
   await page.keyboard.press('Tab');
   const el = page.locator(selector).first();
@@ -120,18 +95,14 @@ async function focusControl(page, selector) {
     focused: document.activeElement === node,
     focusVisible: node.matches(':focus-visible'),
     boxShadow: getComputedStyle(node).boxShadow,
-    // The five controls that kept an app-side `:focus-visible { outline }`
-    // before #161 read a real outline here and `none` after it, which is
-    // the difference a picture of a ring cannot spell out.
     outline: getComputedStyle(node).outline,
     tag: node.tagName,
     type: node.getAttribute('type'),
   }));
 }
 
-/** Wait out entrance animations by their own promises rather than a
- * sleep: drawers, dialogs and toasts all fade, and a frame grabbed
- * mid-fade shows the page through a half-opaque panel. */
+/** Drawers, dialogs and toasts all fade, and a frame grabbed mid-fade
+ * shows the page through a half-opaque panel. */
 async function settle(page, selectors) {
   await page.evaluate(async (sels) => {
     const els = sels.flatMap((sel) => [...document.querySelectorAll(sel)]);
@@ -143,10 +114,6 @@ async function reset(context, body) {
   await context.request.post(`${BASE}/__ctl/reset`, { data: body });
 }
 
-/** Click a control if it is there, and say whether it was. Every
- * interaction in this script is optional in exactly the same way its
- * screenshots are: the before build reaches some of these surfaces with
- * nothing to press. */
 async function clickIfPresent(page, selector, timeout = 4000) {
   const el = page.locator(selector).first();
   try {
@@ -158,8 +125,6 @@ async function clickIfPresent(page, selector, timeout = 4000) {
   }
 }
 
-/** Wait for a selector, but never fail the run over it: the before build
- * legitimately lacks some of these. */
 async function present(page, selector, timeout = 4000) {
   try {
     await page.locator(selector).first().waitFor({ state: 'visible', timeout });
@@ -169,12 +134,6 @@ async function present(page, selector, timeout = 4000) {
   }
 }
 
-/** Launch, capture, and close both halves whatever happens.
- *
- * Any step below can throw: a selector that never appears, a click that
- * times out. An early return used to leave the chromium process running
- * until the shell noticed it. The two `finally`s nest, so the context
- * closes first and the browser closes even if that close fails. */
 async function run() {
   const browser = await chromium.launch();
   try {
@@ -195,11 +154,9 @@ async function run() {
 }
 
 async function capture(context) {
-  // The corpus query fixture carries no `degraded_fields`, and that one
-  // wire field is the only thing that renders the results notice whose
-  // dismiss button (`.deg-x`) lost its outline override. Adding it at
-  // the network edge keeps the fixture (and every spec reading it)
-  // alone; both sides of the comparison get the same treatment.
+  // The corpus query fixture carries no `degraded_fields`, the only thing
+  // that renders the results notice. Adding it at the network edge keeps
+  // the fixture (and every spec reading it) alone.
   await context.route('**/api/v1/query', async (route) => {
     const res = await route.fetch();
     let body;
@@ -217,7 +174,6 @@ async function capture(context) {
   const page = await context.newPage();
   const shots = [];
 
-  /** One entry in the report and one PNG on disk. */
   async function shot({ name, clip, focus, note }) {
     const focused = focus ? await focusControl(page, focus) : null;
     const out = await shotUnion(page, clip, `${name}.png`);
@@ -231,7 +187,6 @@ async function capture(context) {
     });
   }
 
-  // ---- schema services table ---------------------------------------
   await reset(context, { scenario: 'corpus' });
   await page.goto(`${BASE}/search/schema`);
   await present(page, '.tbl-body .tbl-row');
@@ -243,7 +198,6 @@ async function capture(context) {
     note: 'the row link focused; `.row-act` reveals the two quick actions on :focus-within',
   });
 
-  // ---- nets table ---------------------------------------------------
   await page.goto(`${BASE}/jobs/nets`);
   await present(page, '.tbl-body .tbl-row');
   await shot({ name: 'nets-table-rest', clip: ['.tbl'] });
@@ -259,7 +213,6 @@ async function capture(context) {
   });
   await page.keyboard.press('Escape');
 
-  // ---- runs and history --------------------------------------------
   await page.goto(`${BASE}/jobs/runs`);
   await present(page, '.tbl-body .tbl-row');
   await shot({ name: 'runs-table-rest', clip: ['.tbl'] });
@@ -275,7 +228,6 @@ async function capture(context) {
     note: 'a button, not a link: the rerun goes through the navigator, which refuses the second entry',
   });
 
-  // ---- results table -------------------------------------------------
   await page.goto(`${BASE}/search?q=service%3D${SERVICE}&page=0`);
   await present(page, '.results-table tbody tr');
   await shot({ name: 'results-table-rest', clip: ['.results-table'] });
@@ -284,7 +236,6 @@ async function capture(context) {
     clip: ['.results-table'],
     focus: '.results-table td.exp-col button.row-stretch',
   });
-  // Expand from the keyboard so the detail row is up in the same frame.
   await page.keyboard.press('Enter');
   if (!(await present(page, '.results-table td.detail', 2000))) {
     // The before build has no caret button, so the row's own handler is
@@ -299,12 +250,9 @@ async function capture(context) {
     focus: '.results-table th.sortable button.th-sort',
   });
 
-  // ---- facets --------------------------------------------------------
   if (await present(page, '.facets', 8000)) {
-    // A value far longer than the row is wide, written into the DOM
-    // rather than the fixture, exactly as facets.spec.ts does it: the
-    // geometry is the subject and a 200-character hostname would change
-    // every other picture here.
+    // Written into the DOM rather than the fixture: a 200-character
+    // hostname would change every other picture here.
     const firstValue = page.locator('.facets .g .vals .v .n').first();
     if ((await firstValue.count()) > 0) {
       await firstValue.evaluate((el) => {
@@ -320,7 +268,6 @@ async function capture(context) {
     });
   }
 
-  // ---- editor tools and the range dialog ------------------------------
   await page.goto(`${BASE}/search`);
   await present(page, '.dsl-editor');
   await shot({ name: 'editor-tools-rest', clip: ['.editor-tools', '.daterange'] });
@@ -329,8 +276,8 @@ async function capture(context) {
     clip: ['.editor-tools', '.daterange'],
     focus: '.editor-tools button.tool',
   });
-  // Opened from the keyboard: the dialog's initial focus is the claim,
-  // and a mouse-opened panel would show it without a ring.
+  // Opened from the keyboard: a mouse-opened panel would show its initial
+  // focus without a ring.
   const trigger = await focusControl(page, '.daterange .dr-trigger');
   if (trigger?.focused) {
     await page.keyboard.press('Enter');
@@ -347,7 +294,6 @@ async function capture(context) {
     await page.keyboard.press('Escape');
   }
 
-  // ---- service drawer -------------------------------------------------
   await page.goto(`${BASE}/search/schema?svc=${SERVICE}&stab=overview`);
   await present(page, '.sd-drawer');
   await settle(page, ['.sd-drawer', '.sd-drawer *']);
@@ -373,10 +319,9 @@ async function capture(context) {
     note: 'one of the five controls whose app-side outline override was deleted',
   });
 
-  // ---- field case drawer, with a repin running on ANOTHER field -------
-  // That running job is the only thing that renders `.fc-link`, and
+  // A repin running on ANOTHER field is the only thing that renders `.fc-link`, and
   // arriving from the service drawer is the only thing that renders
-  // `.fc-back`. Both lost their outline overrides.
+  // `.fc-back`.
   await reset(context, { scenario: 'corpus', repinField: 'status' });
   await page.goto(`${BASE}/search/schema?svc=${SERVICE}&field=${DEGRADED_FIELD}`);
   if (await present(page, '.fc-case')) {
@@ -389,7 +334,6 @@ async function capture(context) {
     }
   }
 
-  // ---- the malformed-link notice --------------------------------------
   await reset(context, { scenario: 'corpus' });
   await page.goto(`${BASE}${MALFORMED}`);
   await present(page, '.url-notice');
@@ -400,7 +344,6 @@ async function capture(context) {
     note: 'reached by a hand-written malformed link, as search-url.spec.ts does',
   });
 
-  // ---- degraded results notice ----------------------------------------
   await page.goto(`${BASE}/search?q=service%3D${SERVICE}&page=0`);
   if (await present(page, '.deg-notice')) {
     await shot({ name: 'degraded-notice-dismiss-focused', clip: ['.deg-notice'], focus: 'button.deg-x' });
@@ -408,7 +351,6 @@ async function capture(context) {
     shots.push({ name: 'degraded-notice-dismiss-focused', file: null, note: 'no degraded notice rendered' });
   }
 
-  // ---- net drawer ------------------------------------------------------
   await page.goto(`${BASE}/jobs/nets?net=${NET}&ntab=query`);
   await present(page, '.sd-drawer');
   await settle(page, ['.sd-drawer', '.sd-drawer *']);
@@ -437,8 +379,7 @@ async function capture(context) {
 
 /** Readiness is the CHILD's own listening line, never a 200 from the
  * port: a harness left running by another worktree answers
- * `/__ctl/health` just as happily, and this script would then photograph
- * THAT checkout's dist while its own child had died with EADDRINUSE. */
+ * `/__ctl/health` just as happily. */
 function waitForOwnedListener(child) {
   return new Promise((resolve, reject) => {
     let settled = false;

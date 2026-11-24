@@ -11,7 +11,6 @@ const ASSERTIONS = [
   'Save snapshot POST must contain the exact editor buffer once',
 ];
 
-/** Every entry test must fail its snapshot assertion. A timeout is not a kill. */
 export function saveSnapshotMutationKilled(report) {
   if (!Array.isArray(report?.suites)) return false;
   const specs = [];

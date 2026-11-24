@@ -2,22 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Writes from the investigation board (ADR-0059, #311): Keep on a row of
-// the evidence viewer, with a reason, and Close or Reopen at the end of
-// the status line. `investigations-writer` signs in a session that holds
-// `investigation_write` beside both read grants; the stub records every
-// write's body and applies it in trawld's order (harness/server.mjs):
-// a closed investigation takes nothing but a reopen, then a PATCH whose
-// `expected_seq` moved is `sequence_conflict`.
-//
-// `/__ctl/investigation/write` stands in for an agent writing while the
-// page is open, so the board holds a sequence the server has moved past.
-// `/__ctl/investigation/drop-write` lands the next write and cuts its
-// answer short, so its outcome is unknown to the page.
-//
-// The grant matrix at the end snapshots the board header and a viewer
-// row for every session that reads, and proves the page asks nothing at
-// all of a session that cannot read, whatever else it holds.
+// Writes from the investigation board (ADR-0059).
 //
 // Each test freezes the page's clock before the page loads, so the board
 // polls only when a test moves time on.
@@ -72,7 +57,6 @@ async function openBoard(page: Pg) {
   return main;
 }
 
-/** Open the viewer on the board's kept result from its first cited row. */
 async function openViewer(page: Pg) {
   const finding = page.locator('.inv-page').getByRole('list', { name: 'Findings' }).locator('> li').nth(0);
   await finding.getByRole('button', { name: 'Open Row 0 of result fedcba98 among its rows' }).click();
@@ -83,8 +67,6 @@ async function openViewer(page: Pg) {
 
 const status = (main: import('@playwright/test').Locator) => main.locator('.page-hd .sub .bdg').first();
 
-/** Hide or show the tab: `document.hidden` overridden and announced, as
- * investigation-board.spec.ts does. */
 async function setHidden(page: Pg, hidden: boolean) {
   await page.evaluate((value) => {
     Object.defineProperty(document, 'hidden', { configurable: true, value });
@@ -92,7 +74,6 @@ async function setHidden(page: Pg, hidden: boolean) {
   }, hidden);
 }
 
-/** Nothing reads the board while time runs on in a hidden tab. */
 async function expectNoReadWhileHidden(page: Pg, request: Ctl, reads: number[]) {
   await page.waitForTimeout(300);
   await page.clock.fastForward(60_000);
@@ -100,9 +81,6 @@ async function expectNoReadWhileHidden(page: Pg, request: Ctl, reads: number[]) 
   expect(await boardReads(request)).toEqual(reads);
 }
 
-/** Hold the page's next read of the investigation once the stub has
- * served it, until the returned function lets it through. A write to
- * the same path, and every later read, pass as they are. */
 async function holdNextRead(page: Pg): Promise<() => void> {
   let letThrough!: () => void;
   const through = new Promise<void>((resolve) => { letThrough = resolve; });
@@ -128,14 +106,12 @@ test('a stale close shows the conflict, reads the board again, and the person cl
   await expect(activity).toHaveCount(6);
   expect(await boardReads(request)).toEqual([0]);
 
-  // The agent writes while the board still holds sequence 9.
   await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'note', text: 'Pool back to 64 on gw-2.' } }]);
   await main.getByRole('button', { name: 'Close investigation' }).click();
   const note = main.locator('.inv-write-note [role="status"]');
   await expect(note).toHaveText(
     'The investigation changed before your close reached it, so nothing changed. The board has read it again: check its status and act again if you still mean to.',
   );
-  // The board read again at once, from where it was, without a poll.
   await expect(activity).toHaveCount(7);
   await expect(activity.nth(6)).toContainText('Pool back to 64 on gw-2.');
   expect(await boardReads(request)).toEqual([0, 9]);
@@ -143,11 +119,9 @@ test('a stale close shows the conflict, reads the board again, and the person cl
   expect(await writes(request)).toEqual([
     { method: 'PATCH', id: ID, body: { expected_seq: 9, status: 'closed' } },
   ]);
-  // Nothing retried it.
   await page.waitForTimeout(300);
   expect(await writes(request)).toHaveLength(1);
 
-  // The person acts again, on the sequence the board now holds.
   await main.getByRole('button', { name: 'Close investigation' }).click();
   await expect(note).toHaveText('You closed the investigation.');
   await expect(status(main)).toHaveText('Closed');
@@ -157,7 +131,6 @@ test('a stale close shows the conflict, reads the board again, and the person cl
   await expect(activity.nth(7)).toContainText('jakub');
   const landed = (await writes(request))[1];
   expect(landed).toEqual({ method: 'PATCH', id: ID, body: { expected_seq: 10, status: 'closed' } });
-  // The board's cursor moves only with its own reads: no `seen_seq`.
   expect(landed.body).not.toHaveProperty('seen_seq');
   expect(await boardReads(request)).toEqual([0, 9, 10]);
 });
@@ -166,14 +139,12 @@ test('a close that finds the investigation already closed shows the conflict and
   await as(request, 'investigations-writer');
   await freezeClock(page);
   const main = await openBoard(page);
-  // Someone else closed it after the board read.
   await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'status', status: 'closed' } }]);
   await main.getByRole('button', { name: 'Close investigation' }).click();
   await expect(main.locator('.inv-write-note [role="status"]')).toHaveText(
     'The investigation was already closed when your close reached it, so nothing changed. The board has read it again.',
   );
   await expect(status(main)).toHaveText('Closed');
-  // The control is now the one that applies.
   await expect(main.getByRole('button', { name: 'Reopen investigation' })).toBeVisible();
   await expect(main.getByRole('button', { name: 'Close investigation' })).toHaveCount(0);
   expect(await writes(request)).toEqual([
@@ -187,7 +158,6 @@ test('a conflict notice says the board is reading the investigation again until 
   await freezeClock(page);
   const main = await openBoard(page);
   await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'status', status: 'closed' } }]);
-  // The read after the conflict is held on its way back.
   const letThrough = await holdNextRead(page);
   await main.getByRole('button', { name: 'Close investigation' }).click();
   const note = main.locator('.inv-write-note [role="status"]');
@@ -215,11 +185,8 @@ test('a conflict whose reread gets 403 says the board stopped reading', async ({
   await freezeClock(page);
   const main = await openBoard(page);
   await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
-  // The agent writes while the board still holds sequence 9.
   await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'note', text: 'Pool back to 64 on gw-2.' } }]);
 
-  // The close reaches the server and its 409 is held on the way back,
-  // while the grant to read is revoked: the read after it answers 403.
   let patches = 0;
   page.on('request', (r) => { if (r.method() === 'PATCH') patches += 1; });
   let release!: () => void;
@@ -247,7 +214,6 @@ test('a conflict whose reread gets 403 says the board stopped reading', async ({
   );
   await expect(main.locator('.inv-live')).toContainText('Stopped');
   await expect(main.locator('.inv-stale')).toContainText(NOT_PERMITTED);
-  // No write control stays on a board that stopped reading.
   await expect(main.getByRole('button', { name: 'Close investigation' })).toHaveCount(0);
   await expect(main.getByRole('button', { name: 'Reopen investigation' })).toHaveCount(0);
   expect(await boardReads(request)).toEqual([0, 9]);
@@ -255,7 +221,6 @@ test('a conflict whose reread gets 403 says the board stopped reading', async ({
   expect(sent).toEqual([{ method: 'PATCH', id: ID, body: { expected_seq: 9, status: 'closed' } }]);
   expect(sent[0].body).not.toHaveProperty('seen_seq');
 
-  // Neither the tab hiding and showing nor time passing reads or writes.
   await setHidden(page, true);
   await page.clock.fastForward(60_000);
   await setHidden(page, false);
@@ -301,18 +266,15 @@ test('a reopen at the current sequence lands, and the board reads the investigat
   const note = main.locator('.inv-write-note [role="status"]');
   await expect(note).toHaveText('You reopened the investigation.');
   await expect(status(main)).toHaveText('Open');
-  // The control is now the one that applies.
   await expect(main.getByRole('button', { name: 'Close investigation' })).toBeEnabled();
   await expect(main.getByRole('button', { name: 'Reopen investigation' })).toHaveCount(0);
   await expect(activity).toHaveCount(8);
   await expect(activity.nth(7)).toContainText('Reopened the investigation.');
   await expect(activity.nth(7)).toContainText('jakub');
-  // Neither a lost answer nor a conflict reads on the board.
   await expect(note).not.toContainText('may or may not have taken effect');
   await expect(note).not.toContainText('nothing changed');
   const [landed] = await writes(request);
   expect(landed).toEqual({ method: 'PATCH', id: ID, body: { expected_seq: 10, status: 'open' } });
-  // The board's cursor moves only with its own reads: no `seen_seq`.
   expect(landed.body).not.toHaveProperty('seen_seq');
   expect(await writes(request)).toHaveLength(1);
   expect(await boardReads(request)).toEqual([0, 10]);
@@ -331,7 +293,6 @@ test('a keep posts one row and its reason once, and the keep then reads on the b
   await expect(reason).toBeFocused();
   await expect(rows.getByRole('button', { name: 'Keep row 2' })).toHaveAttribute('aria-expanded', 'true');
 
-  // Blank, then too long in bytes: the field says why, and nothing is sent.
   await reason.fill('   ');
   await page.keyboard.press('Enter');
   await expect(reason).toHaveAttribute('aria-invalid', 'true');
@@ -341,8 +302,6 @@ test('a keep posts one row and its reason once, and the keep then reads on the b
   await expect(reason).toHaveAccessibleDescription('The reason is 1026 bytes; it can be at most 1024.');
   expect(await writes(request)).toEqual([]);
 
-  // Pressed twice before the first answer: sent once, trimmed, one row,
-  // no `seen_seq`.
   await reason.fill('  the first 502 on gw-2, before the resize  ');
   await expect(reason).toHaveAttribute('aria-invalid', 'false');
   await form.evaluate((el) => {
@@ -357,7 +316,6 @@ test('a keep posts one row and its reason once, and the keep then reads on the b
   await expect(form).toHaveCount(0);
   await expect(rows.getByRole('button', { name: 'Keep row 2' })).toBeFocused();
 
-  // The keep reached the board through a read, not the write's answer.
   const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
   await expect(activity).toHaveCount(7);
   await expect(activity.nth(6)).toContainText('Kept row 2 of result fedcba98: the first 502 on gw-2, before the resize');
@@ -381,7 +339,6 @@ test('a keep whose answer is lost reads as unknown, keeps the reason, and is not
   await expect(note).toHaveText(
     'The answer to your keep of row 0 was lost, so it may or may not have been kept. Refresh the board and look for it in the activity before you keep it again.',
   );
-  // The reason stays, and the form does not send again.
   await expect(reason).toHaveValue('pool exhausted at 64/64');
   const send = form.getByRole('button', { name: 'Keep row 0' });
   await expect(send).toBeDisabled();
@@ -389,11 +346,8 @@ test('a keep whose answer is lost reads as unknown, keeps the reason, and is not
   await page.keyboard.press('Enter');
   await page.waitForTimeout(300);
   expect(await writes(request)).toHaveLength(1);
-  // Nothing read the board by itself after a write it cannot vouch for.
   expect(await boardReads(request)).toEqual([0]);
 
-  // The refresh the notice offers shows the keep did land, and the form
-  // may send again only now.
   await viewer.getByRole('button', { name: 'Refresh the board' }).click();
   const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
   await expect(activity).toHaveCount(7);
@@ -460,7 +414,6 @@ test('a keep the server committed and then answered with an internal error reads
   expect(await writes(request)).toHaveLength(1);
 });
 
-/** Wait until the stub holds the answer to a write that landed. */
 async function heldWrite(request: Ctl) {
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).heldWrite).toBe(true);
 }
@@ -482,7 +435,6 @@ test('a keep that lands leaves the form open for another row, with its reason an
   await page.keyboard.press('Enter');
   await heldWrite(request);
 
-  // While row 0's keep waits for its answer, the person starts on row 2.
   await rows.getByRole('button', { name: 'Keep row 2' }).click();
   const form = viewer.getByRole('form', { name: 'Keep row 2' });
   const reason = form.getByRole('textbox', { name: 'Why keep row 2?' });
@@ -490,7 +442,6 @@ test('a keep that lands leaves the form open for another row, with its reason an
   await page.keyboard.type('the first 502 on gw-2');
   await releaseWrite(request);
 
-  // Row 0's keep is acknowledged; row 2's draft and focus are untouched.
   const note = viewer.locator('.inv-write-note [role="status"]');
   await expect(note).toHaveText('Kept row 0. The board shows it in the activity.');
   const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
@@ -500,7 +451,6 @@ test('a keep that lands leaves the form open for another row, with its reason an
   await expect(reason).toBeFocused();
   await expect(rows.getByRole('button', { name: 'Keep row 2' })).toHaveAttribute('aria-expanded', 'true');
 
-  // The draft sends as it stands.
   await page.keyboard.press('Enter');
   await expect(note).toHaveText('Kept row 2. The board shows it in the activity.');
   await expect(form).toHaveCount(0);
@@ -523,7 +473,6 @@ test('a keep that lands leaves a new draft for the same row, begun after Cancel,
   await page.keyboard.press('Enter');
   await heldWrite(request);
 
-  // While row 0's keep waits, the person cancels and starts row 0 again.
   const form = viewer.getByRole('form', { name: 'Keep row 0' });
   await form.getByRole('button', { name: 'Cancel' }).click();
   await expect(form).toHaveCount(0);
@@ -556,7 +505,6 @@ test('a keep that lands leaves a reason edited while it was in flight as it is',
   await page.keyboard.press('Enter');
   await heldWrite(request);
 
-  // While the keep waits, the person goes on editing the same row's reason.
   await reason.fill('pool exhausted at 64/64, and the retries piled up');
   await releaseWrite(request);
 
@@ -584,7 +532,6 @@ test.describe('a write that lands after its page or viewer is gone ends quietly'
     await releaseWrite(request);
     await page.waitForTimeout(500);
     expect(pageErrors.errors).toEqual([]);
-    // The board that asked is gone, so nothing reads it again.
     expect(await boardReads(request)).toEqual(before);
     expect(await writes(request)).toHaveLength(1);
   });
@@ -603,7 +550,6 @@ test.describe('a write that lands after its page or viewer is gone ends quietly'
     await page.keyboard.press('Escape');
     await expect(viewer).toHaveCount(0);
     await releaseWrite(request);
-    // The board is still here: it reads what the keep changed.
     const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
     await expect(activity).toHaveCount(7);
     await page.waitForTimeout(300);
@@ -647,7 +593,6 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     await expect(status(main)).toHaveText('Closed');
     await expectNoReadWhileHidden(page, request, [0]);
 
-    // Shown: one read at once, before any poll is due.
     await setHidden(page, false);
     await expect.poll(() => boardReads(request)).toEqual([0, 9]);
     const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
@@ -722,14 +667,11 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
     await main.getByRole('button', { name: 'Close investigation' }).click();
     await heldWrite(request);
-    // The next poll answers 429 and asks for thirty seconds.
     await request.post('/__ctl/investigation/fail', { data: { count: 1, status: 429, retryAfter: 30 } });
     await page.clock.fastForward(5_000);
     await expect(live).toContainText('Retrying');
     expect(await boardReads(request)).toEqual([0, 9]);
 
-    // The close's answer lands in the hidden tab, and the tab shows with
-    // the pause still running: the read the close asked for waits.
     await setHidden(page, true);
     await releaseWrite(request);
     const note = main.locator('.inv-write-note [role="status"]');
@@ -744,7 +686,6 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     await page.waitForTimeout(300);
     expect(await boardReads(request)).toEqual([0, 9]);
 
-    // The pause ends: one read, the close's.
     await page.clock.fastForward(1_000);
     await expect.poll(() => boardReads(request)).toEqual([0, 9, 9]);
     const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
@@ -760,8 +701,6 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     await freezeClock(page);
     const main = await openBoard(page);
     await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
-    // The next poll's answer waits until the test lets it through: that
-    // read began before the write, so it cannot say what the write did.
     let letThrough!: () => void;
     const through = new Promise<void>((resolve) => { letThrough = resolve; });
     await page.route((url) => url.pathname === `/api/v1/investigations/${ID}`, async (route) => {
@@ -781,9 +720,7 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
       "The answer to your close was lost, so it may or may not have taken effect. Refresh to see the investigation's status before you act again.",
     );
     await expect(close).toBeDisabled();
-    // The refresh the notice offers waits for the tab to show.
     await main.getByRole('button', { name: 'Refresh the board' }).click();
-    // The older poll lands: it does not release the control.
     letThrough();
     await expect(main.locator('.inv-live')).toContainText('Paused');
     await expectNoReadWhileHidden(page, request, [0, 9]);
@@ -811,7 +748,6 @@ test('a keep that finds the investigation closed keeps nothing, and the closed b
   await expect(viewer.locator('.inv-write-note [role="status"]')).toHaveText(
     'The investigation was closed before your keep of row 2 reached it, so nothing was kept.',
   );
-  // The board read again: closed, and no row offers Keep any more.
   await expect(status(main)).toHaveText('Closed');
   await expect(viewer.getByRole('button', { name: /^Keep row/ })).toHaveCount(0);
   await expect(viewer.getByRole('columnheader', { name: 'Keep' })).toHaveCount(0);

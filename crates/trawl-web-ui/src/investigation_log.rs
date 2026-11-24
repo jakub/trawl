@@ -3,34 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The investigation page's reading of one investigation (ADR-0059).
-//!
-//! A read answers the entries changed after a `since` sequence, in
-//! `updated_seq` order, bounded, with the `through_seq` the next read
-//! starts from. [`Board`] folds those reads into what the page shows:
-//! every entry once, at its latest change, keyed by the `seq` that
-//! created it. Every read is the same read, `since` the board's
-//! `through_seq`, whether the page polls, or a person asked with Refresh
-//! or Load more, so a step that gained its outcome after the page loaded
-//! replaces its running copy in place, and the page updates that step
-//! where it stands instead of adding another.
-//!
-//! The page has three readings of the log. Findings are the claims, each
-//! with its current status: a `finding_status` entry overwrites the
-//! status of the finding whose `seq` it names. The activity is every
-//! entry, findings and their status changes included, one line each in
-//! `seq` order, so a note sits between the steps it was written between.
-//! The steps are the queries that ran, each with the text it executed,
-//! its bounds and its outcome.
-//!
-//! A finding later in the log can be the latest one, and a later
-//! `finding_status` entry can overwrite a status, so the findings are
-//! claimed only from the whole log ([`Reach`]): a read that leaves
-//! entries past the board is followed at once, up to [`AUTO_PAGES`]
-//! reads, and past that what the page shows is as of the entry it
-//! reached.
-//!
-//! Pure and ungated so its tests run natively; the page that renders it
-//! is wasm32-only.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -46,12 +18,8 @@ use trawl_api::results::{CaptureKind, CapturedResult, ResultPage, ResultShape};
 use crate::results_layout::cell_text;
 use crate::severity_cell::{severity_columns, severity_display};
 
-/// Entries one read asks for.
 pub const ENTRY_PAGE: usize = 100;
 
-/// Reads the page makes one after another, from the read the person
-/// asked for, before it leaves the rest of the log to Load more: 2000
-/// entries.
 pub const AUTO_PAGES: u32 = 20;
 
 /// How much of the log the board holds, which decides what the page may
@@ -69,57 +37,40 @@ pub enum Reach {
     AsOf(u64),
 }
 
-/// One investigation as the page has read it so far.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Board {
-    /// The investigation's own fields, from the newest read.
     pub investigation: Investigation,
     /// Every entry read, at its latest change, by the `seq` that created
     /// it.
     entries: BTreeMap<u64, LogEntry>,
     /// The `updated_seq` the reads reach: the next read's `since`.
     pub through_seq: u64,
-    /// Whether the server holds entries past `through_seq`.
     pub more: bool,
 }
 
-/// What one read changed on the board.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Merged {
-    /// Entries the board did not hold before.
     pub added: usize,
-    /// Whether anything on the board changed: an entry, the
-    /// investigation's fields, or how far the reads reach.
     pub changed: bool,
 }
 
-/// One entry as the activity shows it: what happened, in a line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Activity {
     /// The `seq` that created the entry, which is its identity.
     pub seq: u64,
-    /// What kind of entry it is, in words.
     pub kind: &'static str,
-    /// A step's outcome or a finding's status, as a badge.
     pub badge: Option<(&'static str, Tone)>,
-    /// The line itself.
     pub text: String,
-    /// Who wrote the entry.
     pub actor: Actor,
-    /// When it was written.
     pub at: String,
 }
 
-/// A finding with its current status folded in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     /// The `seq` of the finding's own entry, which is its id.
     pub seq: u64,
-    /// Who wrote it.
     pub author: Actor,
-    /// When it was written.
     pub at: String,
-    /// The statement.
     pub statement: String,
     /// The current status: the newest `finding_status` entry naming this
     /// finding, else the status it was written with.
@@ -127,16 +78,12 @@ pub struct Finding {
     /// Who set the current status, when someone overwrote the one the
     /// finding was written with.
     pub status_by: Option<Actor>,
-    /// Rows that support it.
     pub references: Vec<EvidenceRef>,
-    /// Rows against it.
     pub counterevidence: Vec<EvidenceRef>,
-    /// What it leaves open.
     pub remaining_question: Option<String>,
 }
 
 impl Board {
-    /// The board after the first read.
     #[must_use]
     pub fn new(read: InvestigationRead) -> Self {
         let mut board = Self {
@@ -216,7 +163,6 @@ impl Board {
         }
     }
 
-    /// Every finding, oldest first, each with its current status.
     #[must_use]
     pub fn findings(&self) -> Vec<Finding> {
         let mut findings: BTreeMap<u64, Finding> = BTreeMap::new();
@@ -261,16 +207,11 @@ impl Board {
         findings.into_values().collect()
     }
 
-    /// The finding written last.
     #[must_use]
     pub fn latest_finding(&self) -> Option<Finding> {
         self.findings().pop()
     }
 
-    /// The activity: every entry, one line each, in `seq` order. A step
-    /// is its purpose and its outcome so far; what it executed is left to
-    /// [`Self::steps`]. A status change of a finding the board holds
-    /// quotes that finding's statement.
     #[must_use]
     pub fn activity(&self) -> Vec<Activity> {
         self.entries
@@ -335,7 +276,6 @@ impl Board {
             .collect()
     }
 
-    /// Every step, in `seq` order, each at its latest change.
     #[must_use]
     pub fn steps(&self) -> Vec<LogEntry> {
         self.entries
@@ -346,10 +286,8 @@ impl Board {
     }
 }
 
-/// What a step that was given no purpose says in its place.
 pub const NO_PURPOSE: &str = "No purpose given.";
 
-/// A keep in a line: the rows, the result and the reason.
 fn keep_text(result_id: &str, rows: &[u64], reason: &str) -> String {
     let rows = rows
         .iter()
@@ -363,7 +301,6 @@ fn keep_text(result_id: &str, rows: &[u64], reason: &str) -> String {
     )
 }
 
-/// A finding status in words.
 #[must_use]
 pub fn finding_status_label(status: FindingStatus) -> &'static str {
     match status {
@@ -374,7 +311,6 @@ pub fn finding_status_label(status: FindingStatus) -> &'static str {
     }
 }
 
-/// The badge tone of a finding status.
 #[must_use]
 pub fn finding_status_tone(status: FindingStatus) -> Tone {
     match status {
@@ -385,7 +321,6 @@ pub fn finding_status_tone(status: FindingStatus) -> Tone {
     }
 }
 
-/// An investigation status in words.
 #[must_use]
 pub fn investigation_status_label(status: InvestigationStatus) -> &'static str {
     match status {
@@ -394,7 +329,6 @@ pub fn investigation_status_label(status: InvestigationStatus) -> &'static str {
     }
 }
 
-/// The badge tone of an investigation status.
 #[must_use]
 pub fn investigation_status_tone(status: InvestigationStatus) -> Tone {
     match status {
@@ -403,7 +337,6 @@ pub fn investigation_status_tone(status: InvestigationStatus) -> Tone {
     }
 }
 
-/// How a step ended, in words. A step with no outcome is still running.
 #[must_use]
 pub fn outcome_label(outcome: Option<&StepOutcome>) -> &'static str {
     match outcome.map(|o| o.outcome) {
@@ -417,7 +350,6 @@ pub fn outcome_label(outcome: Option<&StepOutcome>) -> &'static str {
     }
 }
 
-/// The badge tone of a step's outcome.
 #[must_use]
 pub fn outcome_tone(outcome: Option<&StepOutcome>) -> Tone {
     match outcome.map(|o| o.outcome) {
@@ -429,10 +361,6 @@ pub fn outcome_tone(outcome: Option<&StepOutcome>) -> Tone {
     }
 }
 
-/// The facts of a finished step after its outcome badge: the error code,
-/// the rows kept and the duration, whichever it has, joined by ` · `. A
-/// capture cut short of the rows its query produced says so, as
-/// `4 of 5000 rows (cut)`. Empty for a running step.
 #[must_use]
 pub fn outcome_facts(outcome: Option<&StepOutcome>) -> String {
     let Some(outcome) = outcome else {
@@ -466,14 +394,11 @@ pub fn is_result_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The short form of a result id the page prints: its first eight
-/// digits. The full id rides in the element's title.
 #[must_use]
 pub fn short_result_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-/// A cited row's name: "Row 7 of result fedcba98".
 #[must_use]
 pub fn evidence_label(reference: &EvidenceRef) -> String {
     format!(
@@ -483,46 +408,29 @@ pub fn evidence_label(reference: &EvidenceRef) -> String {
     )
 }
 
-/// One cited row, as the board's evidence table renders it: the column
-/// names and the row's cells as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceRow {
-    /// The column names, in page order.
     pub columns: Vec<String>,
-    /// The row's cells as text, positional with `columns`.
     pub cells: Vec<String>,
 }
 
-/// One page of a captured result, as the evidence viewer and the board
-/// render it: the column names in page order, and each row with its
-/// captured row number and its cells as text.
-///
 /// A column keeps its display name as the server sent it, so two columns
-/// of one name stay two columns. A cell is [`cell_text`] under its
-/// column's #214 type: a timestamp in the grids' short form, an integer
-/// in full however large, a null as `NULL`, a list as its elements. A
-/// `_severity` cell is its token (`17` → `error`), as in Search.
+/// of one name stay two columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceRows {
-    /// The column names, in page order.
     pub columns: Vec<String>,
-    /// The page's rows, in captured order.
     pub rows: Vec<CapturedRow>,
 }
 
-/// One row of a captured result page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedRow {
     /// The 0-based captured row number: the page's offset plus the row's
     /// place in it. A keep and a finding cite a row by this number.
     pub number: u64,
-    /// The row's cells as text, positional with the page's columns.
     pub cells: Vec<String>,
 }
 
 impl EvidenceRows {
-    /// The row captured at `number`, as the board's one-row table shows
-    /// it. `None` when this page does not hold it.
     #[must_use]
     pub fn row(&self, number: u64) -> Option<EvidenceRow> {
         let row = self.rows.iter().find(|r| r.number == number)?;
@@ -533,10 +441,8 @@ impl EvidenceRows {
     }
 }
 
-/// A captured result page's rows, each numbered from the page's offset.
-/// A `_severity` cell reads as its token, as the Search results table
-/// shows it ([`severity_columns`], [`severity_display`]); a captured
-/// result declares no `sev()` columns, so `_severity` is the only one.
+/// A captured result declares no `sev()` columns, so `_severity` is the
+/// only one.
 #[must_use]
 pub fn evidence_rows(page: &ResultPage) -> EvidenceRows {
     let columns = &page.page.columns;
@@ -569,23 +475,16 @@ pub fn evidence_rows(page: &ResultPage) -> EvidenceRows {
     }
 }
 
-/// The Search path that reopens a captured result: its executed text and
-/// the hull of its bounds through the shared codec, the same path the MCP
-/// server links to (ADR-0027, ADR-0058). `None` for a result with no
-/// bounds, or one the codec refuses, so the viewer offers no link rather
-/// than one that would read back as something else.
+/// The Search path that reopens a captured result: the same path the MCP
+/// server links to (ADR-0027, ADR-0058).
 #[must_use]
 pub fn result_search_href(result: &CapturedResult) -> Option<String> {
     let (earliest, latest) = (result.earliest.as_deref()?, result.latest.as_deref()?);
     trawl_search_url::result_path::result_search_path(&result.executed_query, earliest, latest).ok()
 }
 
-/// What a result the capture cap cut says above its rows in the
-/// evidence viewer, or nothing for a whole one. The counts read as the
-/// viewer's pager does. Only an event-shaped search capture sorts newest
-/// first before the cut, so only it says which rows it kept: a context
-/// read cuts its rows in ascending time, and sightings and compare keep
-/// their own orders.
+/// Only an event-shaped search capture sorts newest first before the cut,
+/// so only it says which rows it kept.
 pub fn cut_notice(result: &CapturedResult) -> Option<String> {
     if !result.truncated {
         return None;
@@ -702,7 +601,6 @@ mod tests {
             3,
             false,
         ));
-        // An update, not a new entry.
         assert_eq!(
             merged,
             Merged {
@@ -734,11 +632,9 @@ mod tests {
         assert!(board.adopt(closed.clone()));
         assert_eq!(board.investigation.status, InvestigationStatus::Closed);
         assert_eq!((board.through_seq, board.more), (4, false));
-        // The same copy again, or an older one, changes nothing.
         assert!(!board.adopt(closed));
         assert!(!board.adopt(investigation(3, "old")));
         assert_eq!(board.investigation.seq, 5);
-        // The read that follows brings the status entry and moves on.
         let merged = board.merge(read(
             5,
             vec![entry(
@@ -776,15 +672,11 @@ mod tests {
     #[test]
     fn a_read_says_how_many_entries_it_added_and_whether_anything_changed() {
         let mut board = Board::new(read(2, vec![entry(1, 1, note("a"))], 2, false));
-        // Nothing past the board: nothing changed, the page need not
-        // render again.
         assert_eq!(board.merge(read(2, vec![], 2, false)), Merged::default());
-        // The same entry again changes nothing either.
         assert_eq!(
             board.merge(read(2, vec![entry(1, 1, note("a"))], 2, false)),
             Merged::default()
         );
-        // A change to the investigation alone is a change.
         let merged = board.merge(read(3, vec![], 3, false));
         assert_eq!(
             merged,
@@ -959,8 +851,6 @@ mod tests {
         assert_eq!(activity[0].text, "Finding #1, not read yet.");
     }
 
-    /// A finding at 1 written supported, 99 notes, a refutation of it at
-    /// 101 and a new finding at 102, read 100 entries at a time.
     fn long_log() -> (InvestigationRead, InvestigationRead) {
         let mut first = vec![entry(
             1,
@@ -990,8 +880,6 @@ mod tests {
     fn a_long_log_claims_no_finding_until_the_page_has_read_it_whole() {
         let (first, second) = long_log();
         let mut board = Board::new(first);
-        // What the first page alone would claim: the old finding, still
-        // supported.
         let early = board.latest_finding().unwrap();
         assert_eq!((early.seq, early.status), (1, FindingStatus::Supported));
         assert!(board.follow_up_due(1));
@@ -1028,7 +916,6 @@ mod tests {
         ));
         assert!(!board.follow_up_due(1));
         assert_eq!(board.reach(1, false), Reach::Whole);
-        // A refresh in flight over a whole board keeps claiming it.
         assert_eq!(board.reach(0, true), Reach::Whole);
     }
 
@@ -1041,7 +928,6 @@ mod tests {
         }
         assert!(!board.follow_up_due(AUTO_PAGES));
         assert_eq!(board.reach(AUTO_PAGES, false), Reach::AsOf(20));
-        // Load more starts a new run: it reads again until the next cap.
         assert_eq!(board.reach(0, true), Reach::Reading);
         assert!(board.follow_up_due(1));
     }
@@ -1136,8 +1022,6 @@ mod tests {
         assert_eq!(short_result_id("ab"), "ab");
     }
 
-    /// A page of the kept result, its `result` metadata and `page` from
-    /// `columns`, `rows` and the window `offset`/`total`.
     fn page(
         columns: serde_json::Value,
         rows: serde_json::Value,
@@ -1206,7 +1090,6 @@ mod tests {
             7,
         );
         let shown = evidence_rows(&page);
-        // Two columns of one display name stay two columns.
         assert_eq!(
             shown.columns,
             vec!["_time", "host", "host", "bytes", "tags"]
@@ -1239,9 +1122,6 @@ mod tests {
         assert_eq!(shown.rows[2].cells[2..], ["NULL", "NULL", "NULL"]);
     }
 
-    /// A captured `_severity` reads as Search's table reads it: the token,
-    /// never the number (ADR-0013 §9). A bare `severity` column is sender
-    /// data and keeps its value.
     #[test]
     fn a_severity_cell_shows_its_token_as_search_does() {
         let page = page(
@@ -1266,7 +1146,6 @@ mod tests {
             [
                 ["error", "17"],
                 ["info", "9"],
-                // Off the ladder, or absent: the raw value, never a guess.
                 ["99", "NULL"],
                 ["NULL", "13"],
             ]
@@ -1325,8 +1204,6 @@ mod tests {
             cut_notice(&page.result).as_deref(),
             Some("This result kept the 4 most recent of 31402 rows.")
         );
-        // A context read keeps its rows in ascending time, cut from the
-        // front; sightings and compare keep their own orders.
         for kind in [
             CaptureKind::Context,
             CaptureKind::Sightings,

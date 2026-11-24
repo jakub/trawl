@@ -6,45 +6,29 @@ import { defineConfig, devices } from '@playwright/test';
 
 // No `webServer`: every worker starts its own harness/server.mjs on
 // E2E_PORT + its parallelIndex (the worker-scoped `stubOrigin` fixture in
-// fixtures.ts), and `baseURL` comes from that fixture, not from here. A
-// stub server keeps one mutable "current scenario" (see its
-// `/__ctl/reset` contract), so it must never serve two tests at once; a
-// server per worker gives that at any worker count.
-//
-// Local runs use four workers, so N servers listen on E2E_PORT ..
-// E2E_PORT + 3; the full suite then fits well inside a ten-minute window
-// (measured 9.4 min on one worker, 3.4 min on four, five clean runs in a
-// row). CI keeps one worker per job: it splits the suite across shard jobs
-// instead, each on its own runner. `--workers=N` overrides either. A port
-// already in use fails the worker loudly rather than reusing a server
-// that may be serving another worktree's dist.
+// fixtures.ts). A stub server keeps one mutable "current scenario", so it
+// must never serve two tests at once.
 export default defineConfig({
   testDir: './tests',
-  // Scratch output — traces, failure screenshots, `.last-run.json` — lands
-  // at the repository root, not beside the suite. `trunk serve` watches
-  // crates/trawl-web-ui, so a write anywhere below it wakes a running dev
-  // server for a full rebuild, and that rebuild's "applying new
-  // distribution" step clears `dist/.stage` under any concurrent `trunk
-  // build`, which then dies with "error writing JS loader file to stage
-  // dir". Relative paths here resolve against this file's directory.
+  // Scratch output lands at the repository root, not beside the suite.
+  // `trunk serve` watches crates/trawl-web-ui, so a write anywhere below it
+  // wakes a running dev server for a full rebuild, and that rebuild clears
+  // `dist/.stage` under any concurrent `trunk build`.
   outputDir: '../../../e2e-artifacts/test-results',
   workers: process.env.CI ? 1 : 4,
   // Tests are independent (the contract fixture resets the scenario before
   // each one), so a file's tests may run on different workers and shards.
-  // Without this, CI's --shard split whole files, and login-return.spec.ts
-  // alone kept one shard busy for twice as long as the others.
   fullyParallel: true,
   retries: 0,
   timeout: 20_000,
   expect: { timeout: 5_000 },
   // Default for local and focused mutation runs. The complete CI suite owns
-  // its larger aggregate budget in ci.yml; per-test timeouts stay unchanged.
-  // A cut-off suite reports remaining cases as "did not run", never passes.
+  // its larger aggregate budget in ci.yml.
   globalTimeout: 720_000,
   reporter: process.env.CI ? [['github'], ['list']] : [['list']],
-  // In CI, Playwright otherwise records git metadata no reporter here reads,
-  // running `git fetch` under a 3 s timeout on every invocation and printing
-  // any failure to stdout, which corrupted mutation-check.sh's JSON reports.
+  // In CI, Playwright otherwise runs `git fetch` on every invocation and
+  // prints any failure to stdout, which corrupts mutation-check.sh's JSON
+  // reports.
   captureGitInfo: { commit: false, diff: false },
   use: {
     trace: 'retain-on-failure',

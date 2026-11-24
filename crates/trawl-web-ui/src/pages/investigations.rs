@@ -4,87 +4,6 @@
 
 //! `<InvestigationsPage/>` and `<InvestigationPage/>` — the investigation
 //! list and one investigation (ADR-0059).
-//!
-//! Both pages are for a session holding `investigation_read` and `query`
-//! ([`perms::can_read_investigations`]). Without them the page says so
-//! and asks the server nothing, and the sidebar has no entry for it. A
-//! first read the server refuses with 403 (a role revoked after `/me`
-//! answered) shows the same page, with nothing to retry; the sidebar
-//! stays as `/me` said until it answers otherwise.
-//! A session that also holds `investigation_write`
-//! ([`perms::can_write_investigations`]) closes or reopens the
-//! investigation beside its status and keeps rows from the evidence
-//! viewer; without it, no control on these pages writes or stands in for
-//! one.
-//!
-//! The list is ADR-0029 rows, one stretched link each. The investigation
-//! reads top to bottom: the question and scope, the latest finding, the
-//! activity (every entry, a line each, in the order they were written),
-//! every finding with the rows it cites, then the steps, each a
-//! disclosure over the text it executed ([`crate::investigation_log`]).
-//!
-//! The page reads on mount and on Refresh or Load more, and while its
-//! tab is visible it reads again by itself every few seconds. While the
-//! tab is hidden it reads nothing, whoever asks: not the investigation,
-//! not a cited row, not a page of the evidence viewer. A read asked for
-//! then waits until the tab shows, and a board opened in a hidden tab
-//! says Paused until then ([`crate::investigation_live`], [`BoardReads`]).
-//! Every read of the investigation also waits out a 429's pause, in a
-//! visible tab as in a hidden one: the reads asked for meanwhile join
-//! into one, which starts when the pause ends, and the page says a read
-//! waits. Once a read is refused for want of a grant, the board reads no
-//! more on this visit and shows no control that would read it.
-//! Each of the page's three kinds of read has one gate that holds it,
-//! and the board's one visibility listener opens all three when the tab
-//! shows: [`BoardReads::defer`] for the investigation,
-//! [`EvidenceReads::pump`] for cited rows, and the viewer's own
-//! ([`EvidenceDrawer`]).
-//! The header says whether the board is live and when
-//! it last checked; a polite live region says only that a check failed,
-//! that the board stopped or came back, and how many entries a read
-//! brought. Each read asks for the entries changed since the last one,
-//! and a response for a read that a later one superseded, or that lands
-//! after the page is gone, is dropped. A step that finishes or a finding
-//! whose status changes updates where it stands, so an open step stays
-//! open. A change the reader did not ask for, a poll or a cited row
-//! landing, leaves what they read where it was on screen, however much
-//! grew above it. A read a person asked for that leaves entries unread is
-//! followed at once, unless a 429's pause holds it, up to
-//! [`AUTO_PAGES`](crate::investigation_log::AUTO_PAGES) reads. Until the
-//! log is whole the latest finding and the findings say the page is
-//! still reading; when it stops short they name the entry they are as
-//! of, and Load more reads on while the board still reads.
-//!
-//! A cited row is read through the captured-result page route, once per
-//! row per page visit, paced so a board that cites many rows stays
-//! inside the reader's rate limit ([`crate::evidence_queue`]). When the
-//! server keeps refusing those reads, the queue stops and the Findings
-//! section says how many rows wait, with one control that reads them
-//! again. A row
-//! whose evidence file was pruned answers 410 and shows as pruned in its
-//! place: the finding still cites it. A row whose read failed keeps a
-//! Retry, and Refresh asks again for every failed row. A row asked for
-//! while the tab is hidden shows as loading until the tab shows.
-//!
-//! A step that captured a result, and a cited row that reads, open the
-//! evidence viewer over that result's stored rows
-//! ([`EvidenceDrawer`]): a cited row at the page that holds it, marked.
-//! The viewer is one drawer at a time, fixed over the page, so opening it
-//! or paging it never moves the board.
-//!
-//! Close or Reopen is one PATCH carrying the sequence the board holds
-//! when it is pressed, with no confirmation, sent once and never retried
-//! ([`StatusControl`]). A 409, stale or closed, leaves a notice and reads
-//! the board as soon as its tab is visible and no 429's pause runs,
-//! keeping the reader's place, so the next press acts on the
-//! status that stands. Until a read begun after the 409 lands, the
-//! notice says the board is reading it again, or that it reads it when
-//! the tab shows. A success stays acknowledged whatever the
-//! read after it does, and the board's cursor moves only with a read it
-//! accepted ([`BoardReads::after_write`]). A write whose answer was lost
-//! says its outcome is unknown and holds its control until a read begun
-//! after it lands ([`BoardReads::mark`]); the notice offers that read
-//! while the board still reads.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
@@ -116,14 +35,11 @@ use crate::investigation_log::{
 use crate::perms;
 use fleet_ui::{Badge, Btn, LoadMore, LoadState, Loaded, Pager, Size, Variant, When, WhenMode};
 
-/// What a session without the grants reads in place of either page.
 const NOT_PERMITTED: &str = "You do not have permission to read investigations.";
 
-/// What the board says while a read waits for a 429's pause to end.
 const WAITING: &str = "The server asked the board to wait. It reads again when the wait ends.";
 
-/// Whether the signed-in session may read investigations. The shell
-/// mounts pages only once `/me` has answered.
+/// The shell mounts pages only once `/me` has answered.
 fn permitted() -> Signal<bool> {
     let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
     Signal::derive(move || {
@@ -132,8 +48,6 @@ fn permitted() -> Signal<bool> {
     })
 }
 
-/// The page a session without the grants sees: the heading and the
-/// reason, and nothing to press.
 #[component]
 fn NotPermitted() -> impl IntoView {
     view! {
@@ -146,13 +60,10 @@ fn NotPermitted() -> impl IntoView {
     }
 }
 
-/// Whether the server refused a read for want of a grant.
 fn forbidden(error: &ApiError) -> bool {
     error.http_status() == Some(403)
 }
 
-/// The sentence for a failed read: the server's own for a refusal it
-/// explained, a fixed one for a permission refusal.
 fn read_failure(error: &ApiError) -> String {
     if forbidden(error) {
         NOT_PERMITTED.to_owned()
@@ -176,11 +87,8 @@ fn InvestigationList() -> impl IntoView {
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     let list = RwSignal::new(None::<InvestigationList>);
     let error = RwSignal::new(None::<String>);
-    // The first read was refused with 403: the page is the not-permitted
-    // one, with nothing to retry.
     let refused = RwSignal::new(false);
     let busy = RwSignal::new(false);
-    // Each read takes the next generation; only the newest may land.
     let generation = RwSignal::new(0u64);
 
     let load = Callback::new(move |()| {
@@ -295,8 +203,6 @@ pub fn InvestigationPage() -> impl IntoView {
     }
 }
 
-/// The page for an id the installation does not hold, or one that is not
-/// an id at all.
 #[component]
 fn Missing() -> impl IntoView {
     view! {
@@ -309,36 +215,18 @@ fn Missing() -> impl IntoView {
     }
 }
 
-/// One cited row's state on this page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Evidence {
     Loading,
     Row(EvidenceRow),
-    /// The result's evidence file is gone (410 `result_gone`).
     Pruned,
-    /// The result answered, but holds no row at that number.
     NoRow,
     Failed(String),
 }
 
-/// The page's reads of the rows its findings cite, through one
-/// [`EvidenceQueue`]: at most four at a time, a row once however many
-/// findings cite it, and a 429 pauses every read until its `Retry-After`
-/// and asks for the row again instead of failing it. When the queue
-/// stalls, `stalled` holds how many rows wait until [`Self::resume`]. A
-/// row shows [`Evidence::Loading`] from the moment it is asked for until
-/// it is answered. Leaving the page cancels the queue and aborts the reads in
-/// flight; an answer that still lands finds the page's state gone and is
-/// dropped. A row that lands, and the notice of a stalled queue, change
-/// the page out of the reader's hands, so both keep their place
-/// ([`Place`]).
-///
-/// While the board's tab is hidden no read starts. [`Self::pump`] is the
-/// one place a read starts, and it starts none then: whatever asked, a
-/// finding a read brought, Refresh, Retry or a 429's pause ending, the
-/// rows wait in the queue, and the queue pumps again when the board's
-/// visibility listener says the tab shows. A 429's pause runs on the
-/// clock meanwhile, so a row waits for whichever ends last.
+/// [`Self::pump`] is the one place a read starts, and it starts none while
+/// the board's tab is hidden: the rows wait in the queue, and the queue
+/// pumps again when the board's visibility listener says the tab shows.
 #[derive(Clone, Copy)]
 struct EvidenceReads {
     queue: StoredValue<EvidenceQueue<EvidenceRef>>,
@@ -346,7 +234,6 @@ struct EvidenceReads {
     evidence: RwSignal<HashMap<EvidenceRef, Evidence>>,
     stalled: RwSignal<Option<usize>>,
     page: NodeRef<html::Div>,
-    /// Whether the board's tab shows ([`BoardReads`]'s `visible`).
     visible: Signal<bool>,
 }
 
@@ -372,7 +259,6 @@ impl EvidenceReads {
                 }
             });
         });
-        // The tab shows: start what waited for it.
         Effect::new(move |_| {
             if visible.get() {
                 untrack(|| reads.pump());
@@ -381,7 +267,6 @@ impl EvidenceReads {
         reads
     }
 
-    /// Ask for a row: it shows as loading until it is answered.
     fn want(self, reference: EvidenceRef) {
         let _ = self.evidence.try_update(|map| {
             map.insert(reference.clone(), Evidence::Loading);
@@ -391,7 +276,6 @@ impl EvidenceReads {
         }
     }
 
-    /// Read the waiting rows again after the queue stalled.
     fn resume(self) {
         self.queue
             .try_update_value(|q| q.resume(js_sys::Date::now()));
@@ -399,9 +283,6 @@ impl EvidenceReads {
         self.pump();
     }
 
-    /// Start every read the queue allows now, arm its timer when a 429
-    /// paused it, and say how many rows wait when it stalled. While the
-    /// tab is hidden, nothing: the rows wait for it to show.
     fn pump(self) {
         if self.visible.try_get_untracked() != Some(true) {
             return;
@@ -486,7 +367,6 @@ impl EvidenceReads {
     }
 }
 
-/// The notice a stalled evidence queue shows.
 fn stalled_text(waiting: usize) -> String {
     let rows = if waiting == 1 {
         "1 cited row is".to_owned()
@@ -563,18 +443,14 @@ impl Place {
     }
 }
 
-/// What the first read of an investigation said, before there is a board
-/// to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FirstRead {
     Pending,
     Missing,
-    /// Refused with 403: the not-permitted page, with nothing to retry.
     Forbidden,
     Failed(String),
 }
 
-/// What a read the server throttled says when a person asked for it.
 const THROTTLED: &str = "The server is limiting reads for your API key.";
 
 /// Whether the board's tab is visible. The one place the board asks:
@@ -583,15 +459,14 @@ fn tab_visible() -> bool {
     !document().hidden()
 }
 
-/// A read of the board someone asked for, which waits while the tab is
-/// hidden or a 429's pause runs ([`BoardReads::defer`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ask {
     /// A person's read, `pages` reads into its run: none for mount,
     /// Refresh, Load more and Retry, more for the page that follows a
     /// short read.
-    Person { pages: u32 },
-    /// The read after a write of the person's ([`BoardReads::after_write`]).
+    Person {
+        pages: u32,
+    },
     Write,
 }
 
@@ -610,7 +485,6 @@ impl Ask {
     }
 }
 
-/// Who started a read of the board.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reader {
     /// Mount, Refresh, Load more or Retry: the page shows that it reads,
@@ -620,69 +494,18 @@ enum Reader {
     Poll,
 }
 
-/// The board's reads of its investigation.
+/// Every read a person or a write asks for passes one gate, [`Self::defer`].
+/// The gate is one place rather than a check in each caller because the
+/// rule has no exception: a caller added later cannot skip it. A deferred
+/// read claims no generation until it starts, so a write whose answer was
+/// lost stays held until that read lands ([`Self::mark`]).
 ///
-/// One read runs at a time. A person's read replaces a poll in flight,
-/// aborting it; a poll that comes due while a person's read runs is
-/// skipped, and the next one is scheduled when that read ends. Every read
-/// asks for the entries changed since the board's `through_seq` and
-/// merges what it brings ([`Board::merge`]); an answer for a read that a
-/// later one replaced, or that lands after the page is gone, is dropped.
-/// A person's read sets `busy` and counts `pages`, so the page says it is
-/// reading and Load more shows its progress; a poll touches neither.
-///
-/// The schedule is [`Liveness`]: a poll [`POLL_MS`](crate::investigation_live::POLL_MS)
-/// after a read ends while the tab is visible, none while it is hidden,
-/// and one at once when it shows again.
-///
-/// No other read starts in a hidden tab either. Every read a person or a
-/// write asks for passes one gate, [`Self::defer`], which while the tab
-/// is hidden or a 429's pause runs starts nothing and records the read as
-/// `owed` instead, and so does the page that would follow a short read.
-/// When the tab shows,
-/// [`Self::visibility_changed`] starts the owed read at once in place of
-/// the poll, replacing any read still in flight, which began before it
-/// was asked for. That holds before there is a board too: a board opened
-/// in a hidden tab says Paused, not busy, and reads when it shows. The
-/// gate is one place rather than a check in each caller because the
-/// rule has no exception: a caller added later cannot skip it. A
-/// deferred read claims no generation until it starts, so a write whose
-/// answer was lost stays held until that read lands, and a read that
-/// began before the write never releases it ([`Self::mark`]).
-///
-/// Every board read waits out a 429's pause, in a visible tab as in a
-/// hidden one: Refresh, Load more, the read after a write and the page
-/// that follows a short read. The reads asked for meanwhile join into
-/// one ([`Ask::and`]), and the page says a read waits. While the tab is
-/// visible, or once it shows, the board arms its one timer for the
-/// pause's end, however often the tab hides and shows meanwhile, and
-/// starts the owed read then as the read it is, a person's with its
-/// follow-up pages, not as a poll ([`Self::due`]). The poll checks the
-/// pause too, so no timer armed early reads inside it. A refusal that
-/// ends the visit's reads drops every read, the one owed and any asked
-/// for later: a 403 or a 404 stops the board, and after a 401 it begins
-/// no read at all ([`Self::unauthorized`]). A stopped board shows no
-/// control that would read it.
-///
-/// The board's listener is the page's only one. It keeps `visible`,
-/// which the board lends to its evidence reads, whose gates hold every
-/// read while it is false and start what waited once it is true
-/// ([`EvidenceReads`], [`EvidenceDrawer`]).
-///
-/// A read that failed keeps the
-/// board, its cursor and the instant it was last checked. A 401 sends
-/// the page to sign-in; a 403 stops the reads and leaves the board as
-/// read; a 404 ends the visit as missing. Leaving the page, or opening
-/// another investigation, drops the timer and the visibility listener
-/// and aborts the read in flight.
-///
-/// What a poll changes, the reader did not ask for, so a poll keeps their
-/// place on the page ([`Place`]). A person's own read does not: Load more
-/// grows the log under the control they pressed.
+/// The board's listener is the page's only one. It keeps `visible`, which
+/// the board lends to its evidence reads ([`EvidenceReads`],
+/// [`EvidenceDrawer`]).
 #[derive(Clone, Copy)]
 struct BoardReads {
     id: StoredValue<InvestigationId>,
-    /// The board's scroller, once the board is on the page.
     page: NodeRef<html::Div>,
     board: RwSignal<Option<Board>>,
     first: RwSignal<FirstRead>,
@@ -691,13 +514,9 @@ struct BoardReads {
     /// Reads merged since the person last asked for one.
     pages: RwSignal<u32>,
     live: RwSignal<Liveness>,
-    /// Whether the tab shows, as the visibility listener last saw it.
     visible: RwSignal<bool>,
-    /// What the polite live region says.
     said: RwSignal<String>,
-    /// Each read takes the next generation; only the newest may land.
     generation: StoredValue<u64>,
-    /// The generation of the newest read the board accepted.
     accepted: RwSignal<u64>,
     in_flight: StoredValue<Option<Reader>>,
     /// The read asked for while the tab was hidden or a 429's pause ran,
@@ -786,7 +605,6 @@ impl BoardReads {
         self.generation.try_get_value().unwrap_or(u64::MAX)
     }
 
-    /// Whether the read with generation `mine` is still the board's.
     fn current(self, mine: u64) -> bool {
         self.generation.try_get_value() == Some(mine)
     }
@@ -796,9 +614,6 @@ impl BoardReads {
             .with_untracked(|b| b.as_ref().map_or(0, |b| b.through_seq))
     }
 
-    /// Show the investigation's fields from a write's answer at once,
-    /// keeping the reader's place ([`Board::adopt`]); the cursor moves
-    /// only with the read that follows.
     fn adopt(self, investigation: Investigation) {
         let place = Place::of(self.page);
         let _ = self
@@ -809,7 +624,6 @@ impl BoardReads {
         }
     }
 
-    /// Fold a read into the board; how many entries it added.
     fn merge(self, read: InvestigationRead) -> usize {
         let mut added = 0;
         self.board.maybe_update(|board| {
@@ -826,12 +640,8 @@ impl BoardReads {
         added
     }
 
-    /// A read the board was asked for: at once while the tab is visible
-    /// and no 429's pause runs, else once the tab shows and the pause has
-    /// ended ([`Self::defer`]). Every read is dropped once the board
-    /// stopped reading, or the page is gone; a write's read also when
-    /// there is no board. A read that starts reading at least as far as
-    /// the one owed does its work, so that one is owed no more.
+    /// A read that starts reading at least as far as the one owed does its
+    /// work, so that one is owed no more.
     fn read(self, ask: Ask) {
         if self.live.try_with_untracked(Liveness::stopped) != Some(false) {
             return;
@@ -862,12 +672,8 @@ impl BoardReads {
         }
     }
 
-    /// The gate every read but the poll passes: while the tab is hidden
-    /// or a 429's pause runs it starts nothing, owes `ask`, joined with
-    /// any read already owed, for when the tab shows and the pause has
-    /// ended, and answers `true`. A hidden tab says the board is paused;
-    /// a visible one arms the timer for the pause's end. The poll checks
-    /// the pause itself ([`Self::poll`]).
+    /// The gate every read but the poll passes; the poll checks the pause
+    /// itself ([`Self::poll`]).
     fn defer(self, ask: Ask) -> bool {
         let visible = tab_visible();
         let held = self.held();
@@ -885,7 +691,6 @@ impl BoardReads {
         true
     }
 
-    /// Whether a 429's pause still holds the board's reads.
     fn held(self) -> bool {
         let now = js_sys::Date::now();
         self.live
@@ -893,18 +698,11 @@ impl BoardReads {
             .unwrap_or(false)
     }
 
-    /// Whether a quiet read has a board to read into.
     fn readable(self) -> bool {
         self.board.try_with_untracked(Option::is_some) == Some(true)
             && self.live.try_with_untracked(Liveness::stopped) == Some(false)
     }
 
-    /// A read the person asked for, `pages` reads into its run: on mount,
-    /// Refresh, Load more and Retry from the start. A read that leaves
-    /// entries unread is followed at once, up to
-    /// [`AUTO_PAGES`](crate::investigation_log::AUTO_PAGES) reads; a page
-    /// that falls due in a hidden tab, or inside a 429's pause, is owed
-    /// instead.
     fn person(self, pages: u32) {
         let mut since = self.since();
         let Some(id) = self.id.try_get_value() else {
@@ -959,10 +757,6 @@ impl BoardReads {
         });
     }
 
-    /// The board's own read, when one is due: skipped while another read
-    /// runs, while the tab is hidden, before the board exists and once it
-    /// stopped reading. Inside a 429's pause it is scheduled again for
-    /// the pause's end, whatever armed the timer.
     fn poll(self) {
         // Gone with the page, or another read runs.
         if self.in_flight.try_get_value() != Some(None) {
@@ -978,23 +772,16 @@ impl BoardReads {
         self.quiet();
     }
 
-    /// The read after a write of the person's landed, or was refused
-    /// because the board was behind: at once, whatever read was running,
-    /// since that one started before the write, or as soon as a hidden
-    /// tab shows and any 429's pause has ended, joined with the reads
-    /// owed meanwhile. It is quiet like a poll and keeps the reader's place,
-    /// because the person is acting in the viewer or the header, not
-    /// reading the log.
+    /// The read after a write of the person's: at once, whatever read was
+    /// running, since that one started before the write.
     ///
     /// A write's answer can arrive after the person left the page, so
     /// this reads nothing of a board that is gone: every access on the
-    /// way is the disposal-safe one, and a disposed board does nothing.
+    /// way is the disposal-safe one.
     fn after_write(self) {
         self.read(Ask::Write);
     }
 
-    /// One quiet read since the board's `through_seq`, replacing any read
-    /// in flight, that keeps the reader's place when it lands.
     fn quiet(self) {
         let since = self.since();
         let Some(id) = self.id.try_get_value() else {
@@ -1029,9 +816,6 @@ impl BoardReads {
         });
     }
 
-    /// What a failed read does to the page, and how it ended. A person
-    /// hears why their read failed; a failed poll shows only in the
-    /// connection state.
     fn failed(self, error: &ApiError, reader: Reader) -> ReadEnd {
         let held = self.board.with_untracked(Option::is_some);
         match error.http_status() {
@@ -1057,8 +841,6 @@ impl BoardReads {
         }
     }
 
-    /// A person's read failed with `message`: over the board when there
-    /// is one, else in its place.
     fn say_failure(self, message: String) {
         if self.board.with_untracked(Option::is_some) {
             self.stale.set(Some(message));
@@ -1067,8 +849,6 @@ impl BoardReads {
         }
     }
 
-    /// A read ended: nothing is in flight, the next poll is scheduled,
-    /// and the live region says what changed, if anything did.
     fn finish(self, mine: u64, end: ReadEnd, added: usize) {
         let _ = self.in_flight.try_set_value(None);
         if end == ReadEnd::Accepted {
@@ -1104,10 +884,6 @@ impl BoardReads {
         });
     }
 
-    /// Arm the board's one timer: for the read it owes when a 429's pause
-    /// ends, else for the next poll. None while the tab is hidden, and
-    /// none before there is a board unless a read is owed. Once the board
-    /// stopped reading, none, and the read it owes is dropped.
     fn schedule(self) {
         let _ = self.timer.try_set_value(None);
         let Some(stopped) = self.live.try_with_untracked(Liveness::stopped) else {
@@ -1149,9 +925,6 @@ impl BoardReads {
             })));
     }
 
-    /// The board's timer fired, or its tab showed with no pause to wait
-    /// out: the read it owes starts, as the read it was asked as, else
-    /// the poll.
     fn due(self) {
         match self.owed.try_update(Option::take).flatten() {
             Some(ask) => self.read(ask),
@@ -1159,13 +932,6 @@ impl BoardReads {
         }
     }
 
-    /// The tab was hidden or shown. Hidden, the board drops its pending
-    /// poll. Shown, it starts at once the read it owes, with or without a
-    /// board and whatever runs, else it polls at once, unless a read is
-    /// still running, whose end schedules the next. While a 429's pause
-    /// has time left, either waits for its end. A board that stopped
-    /// reading drops the read it owes. Either way `visible` follows, which
-    /// holds or starts the evidence reads.
     fn visibility_changed(self) {
         let visible = tab_visible();
         let _ = self.visible.try_set(visible);
@@ -1184,16 +950,12 @@ impl BoardReads {
         }
     }
 
-    /// A read was answered 401 and the page is on its way to sign-in: the
-    /// board drops its timer and the read it owes, and begins no read
-    /// more ([`Self::begin`]).
     fn unauthorized(self) {
         let _ = self.timer.try_set_value(None);
         self.drop_owed();
         let _ = self.signed_out.try_set_value(true);
     }
 
-    /// Forget the read owed, if any.
     fn drop_owed(self) {
         let _ = self
             .owed
@@ -1219,16 +981,11 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     let visible: Signal<bool> = reads.visible.into();
     let evidence = RwSignal::new(HashMap::<EvidenceRef, Evidence>::new());
     let read = Callback::new(move |()| reads.read(Ask::Person { pages: 0 }));
-    // The evidence viewer: the result it is open on, if any, and the
-    // server's page size once a viewer read has reported it.
     let viewing = RwSignal::new(None::<Opened>);
     let page_size = RwSignal::new(None::<NonZeroUsize>);
     let open = Callback::new(move |opened: Opened| viewing.set(Some(opened)));
     let close = Callback::new(move |()| viewing.set(None));
 
-    // Writes need `investigation_write` beside the read grants, and a
-    // board that still reads: once a read was refused for want of a
-    // grant, no write control stays.
     let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
     let writer = Signal::derive(move || {
         me.with(|m| {
@@ -1237,10 +994,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         }) && !live.with(Liveness::stopped)
     });
     let accepted: Signal<u64> = reads.accepted.into();
-    // Whether the board still reads on this visit. Once it stopped, no
-    // control that would read it stays.
     let can_read = Memo::new(move |_| !live.with(Liveness::stopped));
-    // A read the person or a write asked for waits for a 429's pause.
     let owed = reads.owed;
     let waiting = Signal::derive(move || visible.get() && owed.with(Option::is_some));
     let keep = KeepGate {
@@ -1261,8 +1015,6 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     read.run(());
 
     let rows = EvidenceReads::new(evidence, page, visible);
-    // Every row the findings cite is asked for once, the first time a
-    // read brings the finding that cites it.
     Effect::new(move |_| {
         let wanted: Vec<EvidenceRef> = board.with(|b| {
             b.as_ref()
@@ -1286,8 +1038,6 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     });
     let retry_row = Callback::new(move |reference| rows.want(reference));
     let resume_reads = Callback::new(move |()| rows.resume());
-    // Refresh reads the log again and asks again for every row that
-    // failed; Load more only reads the log.
     let refresh = Callback::new(move |()| {
         let failed: Vec<EvidenceRef> = evidence.with_untracked(|map| {
             map.iter()
@@ -1302,12 +1052,8 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     });
 
     // Lists render by the `seq` that created each item, and each item
-    // reads its own current copy, so a step that finishes or a finding
-    // whose status changes updates where it stands: an open step stays
-    // open and a focused row keeps its focus. The same `seq` keys each
-    // item's `data-anchor`, beside one key per section, which is how a
-    // change the reader did not ask for finds their place again
-    // ([`Place`]).
+    // reads its own current copy, so an open step stays open and a focused
+    // row keeps its focus.
     let findings = Memo::new(move |_| {
         board.with(|b| {
             b.as_ref()
@@ -1379,8 +1125,6 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         <Show when=move || board.with(Option::is_some) fallback=move || match first.get() {
             FirstRead::Missing => view! { <Missing/> }.into_any(),
             FirstRead::Forbidden => view! { <NotPermitted/> }.into_any(),
-            // A first read owed to a hidden tab: paused, not loading.
-            // A first read waiting for a 429's pause says so.
             FirstRead::Pending => view! {
                 <div class="page inv-page">
                     <Show when=move || connection.get() == Connection::Paused
@@ -1532,17 +1276,13 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         </Show>
     }
 }
-/// What became of the person's last close or reopen. It stays until they
-/// act again.
 #[derive(Debug, Clone, PartialEq)]
 enum StatusNote {
     Sending(InvestigationStatus),
-    /// The server took it.
     Done(InvestigationStatus),
-    /// Refused as stale or closed, and the board reads the
-    /// investigation again. The mark is the board's newest read
-    /// generation when the refusal arrived ([`BoardReads::mark`]): only
-    /// a later read that lands has read it again ([`Reread`]).
+    /// The mark is the board's newest read generation when the refusal
+    /// arrived ([`BoardReads::mark`]): only a later read that lands has read
+    /// it again ([`Reread`]).
     Conflict(InvestigationStatus, WriteFailure, u64),
     /// No answer arrived. The mark is the board's newest read
     /// generation when it failed ([`BoardReads::mark`]): the control
@@ -1551,7 +1291,6 @@ enum StatusNote {
     Refused(InvestigationStatus, String),
 }
 
-/// The verb for the change to `target`.
 fn status_verb(target: InvestigationStatus) -> &'static str {
     match target {
         InvestigationStatus::Closed => "close",
@@ -1560,8 +1299,6 @@ fn status_verb(target: InvestigationStatus) -> &'static str {
 }
 
 impl StatusNote {
-    /// The notice's words, when the board's newest accepted read is
-    /// `accepted` and its state `connection`; none while sending.
     fn text(&self, accepted: u64, connection: Connection) -> Option<String> {
         Some(match self {
             Self::Sending(_) => return None,
@@ -1605,14 +1342,6 @@ impl StatusNote {
     }
 }
 
-/// Close or Reopen, at the end of the status line: one PATCH with the sequence the
-/// board holds when it is pressed, never sent twice and never retried.
-/// A 409 of either kind leaves a notice and reads the board again as soon
-/// as the tab is visible and no 429's pause runs, so the control the
-/// person presses next is for the status that stands; the notice says the
-/// board is reading it, or reads it when the hidden tab shows, until a
-/// read begun after the 409 lands ([`Reread`]).
-/// A lost answer disables the control until a read lands after it.
 #[component]
 fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl IntoView {
     let board = reads.board;
@@ -1682,11 +1411,6 @@ fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl 
     }
 }
 
-/// The notice of the person's last close or reopen, with a Refresh when
-/// its outcome is unknown and the board still reads. Its words follow the
-/// board's reads, so a conflict's notice changes in place, and is
-/// announced, when the read after it lands; a read that changes nothing
-/// it says leaves it as it was.
 #[component]
 fn StatusNoteView(
     note: RwSignal<Option<StatusNote>>,
@@ -1726,7 +1450,6 @@ fn StatusNoteView(
     }
 }
 
-/// A finding's status, author and statement.
 #[component]
 fn FindingHead(finding: Finding) -> impl IntoView {
     let status_by = finding.status_by.map(|actor| {
@@ -1745,8 +1468,6 @@ fn FindingHead(finding: Finding) -> impl IntoView {
     }
 }
 
-/// A finding with every row it cites. The rows stay as they are when
-/// the finding's status changes; only its head reads again.
 #[component]
 fn FindingCard(
     finding: Memo<Option<Finding>>,
@@ -1796,9 +1517,6 @@ fn EvidenceList(
     }
 }
 
-/// One cited row: its name, then the row in the results table's body, or
-/// what stands in its place. A row that reads opens the evidence viewer
-/// at its page.
 #[component]
 fn EvidenceItem(
     reference: EvidenceRef,
@@ -1847,8 +1565,6 @@ fn EvidenceItem(
     }
 }
 
-/// One captured row in the results table's markup, scrolling sideways
-/// inside its own named region.
 #[component]
 fn EvidenceTable(row: EvidenceRow, label: String) -> impl IntoView {
     view! {
@@ -1865,13 +1581,10 @@ fn EvidenceTable(row: EvidenceRow, label: String) -> impl IntoView {
     }
 }
 
-/// The bounds a step ran inside, as sent.
 fn bounds_text(bounds: &StepBounds) -> String {
     format!("{} → {}", bounds.earliest, bounds.latest)
 }
 
-/// One entry in the activity: its kind, its outcome or status, what it
-/// says, and who wrote it when.
 #[component]
 fn ActivityLine(seq: u64, item: Memo<Option<Activity>>) -> impl IntoView {
     view! {
@@ -1888,10 +1601,8 @@ fn ActivityLine(seq: u64, item: Memo<Option<Activity>>) -> impl IntoView {
     }
 }
 
-/// One step: its outcome and purpose, and behind them the text it
-/// executed, its bounds, and who ran it when. The disclosure is made once
-/// per step, so the step finishing leaves it open or closed as the
-/// person left it.
+/// The disclosure is made once per step, so the step finishing leaves it
+/// open or closed as the person left it.
 #[component]
 fn StepItem(seq: u64, entry: Memo<Option<LogEntry>>, open: Callback<Opened>) -> impl IntoView {
     let step = move || {
@@ -1923,7 +1634,6 @@ fn StepItem(seq: u64, entry: Memo<Option<LogEntry>>, open: Callback<Opened>) -> 
                     })}
                 </summary>
                 {move || step().map(|(actor, at, executed, bounds, _, outcome)| {
-                    // A step that captured a result opens it in the viewer.
                     let result = outcome
                         .and_then(|o| o.result_id)
                         .filter(|id| is_result_id(id));

@@ -4,15 +4,6 @@
 
 //! `<DslEditor/>` — `CodeMirror` 6 editor backed by the in-browser trawl-core
 //! DSL parser.
-//!
-//! The parser is the same crate the server uses, compiled to wasm. Every
-//! keystroke re-parses and produces `Diagnostic` entries that codemirror
-//! renders as red squiggles, or, on a draft that parses, as advice
-//! warnings. No network round-trip; zero schema drift between server and
-//! browser possible.
-//!
-//! Autocomplete is fed from `trawl_core::parser::suggest::{KNOWN_PIPE_STAGES,
-//! KNOWN_FUNCTIONS}` — compile-time constants shared with the server.
 
 use leptos::prelude::*;
 use serde::Serialize;
@@ -24,7 +15,6 @@ use crate::interop::codemirror::{EditorHandle, create_editor};
 use crate::offset::utf8_to_utf16;
 use crate::query_error::{join_hint, omitted_advice_note, query_advice};
 
-/// JS-side `Diagnostic` shape expected by the codemirror bundle.
 #[derive(Serialize)]
 struct Diagnostic {
     from: usize,
@@ -33,16 +23,8 @@ struct Diagnostic {
     message: String,
 }
 
-/// Emits `CodeMirror` diagnostics for every parse error from trawl-core,
-/// or, when the draft parses, a `warning` for each advice finding
-/// (ADR-0068). Errors take precedence: a draft with any error, a
-/// semantic one included, gets no advice.
-///
-/// `doc` is the current document text. Parser spans are UTF-8 byte
-/// offsets; `CodeMirror` expects UTF-16 code-unit offsets — we translate
-/// so squiggles line up under the correct characters for non-ASCII
-/// input. Advice left out past the core's cap is counted on the last
-/// retained finding, never drawn as a span of its own.
+/// Parser spans are UTF-8 byte offsets; `CodeMirror` expects UTF-16
+/// code-unit offsets.
 fn lint_document(doc: &str) -> Vec<Diagnostic> {
     match trawl_core::parser::parse(doc) {
         Ok(query) => {
@@ -77,8 +59,6 @@ fn lint_document(doc: &str) -> Vec<Diagnostic> {
     }
 }
 
-/// Convert an `f64` into `usize`, clamping negatives and non-finite
-/// values to 0 (neither should reach here from a DOM cursor position).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn f64_to_usize(f: f64) -> usize {
     if f.is_sign_negative() || !f.is_finite() {
@@ -88,22 +68,11 @@ fn f64_to_usize(f: f64) -> usize {
     }
 }
 
-/// Bundle of everything that must outlive the editor mount.
-///
-/// `EditorHandle` is the `CodeMirror` view; this struct's `Drop` calls
-/// `destroy` on it. The four closures are installed into that JS view as
-/// callbacks, so they need to stay alive at least as long as the view.
-/// Keeping them in one struct drops them together on component cleanup,
-/// in the right order: view first, then closures.
-///
 /// Nothing here is `Closure::forget()`-ed: a parent re-render re-mounts
 /// this component, and forgotten closures would pile up unreferenceable
 /// JS functions in the GC roots.
 struct EditorLifecycle {
     handle: EditorHandle,
-    // The `dyn Fn` types differ per closure, so a Vec is impossible.
-    // Field order is drop order: the handle goes first, so CodeMirror
-    // has stopped firing callbacks before the closures are released.
     _on_change: Closure<dyn Fn(String)>,
     _on_submit: Closure<dyn Fn()>,
     _lint: Closure<dyn Fn(String) -> JsValue>,
@@ -121,22 +90,15 @@ impl Drop for EditorLifecycle {
 }
 
 /// Make the document follow `query` when something OTHER than typing
-/// moves it — a Back navigation rewriting `?q=`, a saved query being
-/// opened. Without this the editor kept whatever was mounted into it and
-/// showed a query that was not the one on screen (ADR-0027's
-/// Back/Forward contract).
+/// moves it (ADR-0027's Back/Forward contract).
 ///
 /// A keystroke never round-trips: `on_change` records the document
 /// before it sets the signal, so `push` finds them equal and does
 /// nothing.
 ///
-/// The format trigger counts Format requests. Each one pushes `query`
-/// (a second route to the same push, so a reformat that set `query`
-/// lands even if the first effect has not run yet) and then calls
-/// `on_format`. Format paths that leave `query` alone — already
-/// formatted, parse errors, an empty buffer — push the value the first
-/// effect already pushed, which `push` skips as equal, so a request can
-/// never change the document by itself.
+/// The format trigger pushes `query` (a second route to the same push, so
+/// a reformat that set `query` lands even if the first effect has not run
+/// yet) and then calls `on_format`.
 fn follow_query_signal(
     query: RwSignal<String>,
     format_trigger: Option<RwSignal<u64>>,
@@ -159,19 +121,12 @@ fn follow_query_signal(
     }
 }
 
-/// Leptos component that mounts a `CodeMirror` editor into a div. The doc
-/// text is pushed into `query` on every change; `on_submit` fires when
-/// the user hits ⌘⏎ / ctrl+⏎.
 #[component]
 pub fn DslEditor(
     #[prop(into)] query: RwSignal<String>,
     #[prop(into)] on_submit: Callback<()>,
     /// Counter of Format requests, bumped on every Format click whatever
-    /// its outcome. When the parent reformats it also sets `query` to the
-    /// formatted text. Each bump pushes `query` into `CodeMirror` via
-    /// `set_doc` (a no-op when it already matches the document) and then
-    /// closes the completion popup: clicking Format is a decision to
-    /// leave it.
+    /// its outcome.
     #[prop(optional, into)]
     format_trigger: Option<RwSignal<u64>>,
 ) -> impl IntoView {
@@ -225,9 +180,6 @@ pub fn DslEditor(
         });
 
         let complete_cb = Closure::<dyn Fn(JsValue) -> JsValue>::new(|ctx: JsValue| {
-            // The JS CompletionContext has `state.doc.toString()` and
-            // `pos` — we mine both via Reflect. A failure falls back
-            // to null (no completions), which is fine.
             let state = js_sys::Reflect::get(&ctx, &JsValue::from_str("state"))
                 .unwrap_or(JsValue::UNDEFINED);
             let pos = js_sys::Reflect::get(&ctx, &JsValue::from_str("pos"))
@@ -293,7 +245,6 @@ pub fn DslEditor(
     follow_query_signal(query, format_trigger, push_doc, close_completion);
 
     on_cleanup(move || {
-        // Dropping the `EditorLifecycle` is what tears the view down.
         lifecycle.update_value(|v| {
             let _ = v.take();
         });

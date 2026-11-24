@@ -2,23 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The query console: its draft state, its execution facts, and the
-// two keyboard bypasses that open the page (ADR-0027, ADR-0032).
-//
-// ONE PROPERTY RUNS THROUGH ALL OF IT. The console header describes the
-// EDITOR BUFFER; the strip under it describes the QUERY THE LINK RAN.
-// Typing moves the first and must never move the second — which is the
-// distinction ADR-0027 draws, now said in words on screen. So the
-// evidence is a pair: after an edit the header must flip AND the strip's
-// execution facts must still describe the accepted response. Asserting
-// only the header would pass a strip that silently followed the buffer.
+// The query console (ADR-0027, ADR-0032).
 
 import { test, expect, resetScenario, CORPUS, capturedQueryCount, lastCapturedQuery } from '../fixtures';
 import { SEL, COPY } from '../selectors';
 import type { Page } from '@playwright/test';
 
-// Literal link, independent of the app's own encoder: `q` is the
-// executed query, `r` the 15-minute window, and the base64url `f`
+// Literal link, independent of the app's own encoder: the base64url `f`
 // payload is one include filter on `host`.
 const FILTERED_URL = '/search?q=service%3Dnginx&page=0' +
   '&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0';
@@ -80,7 +70,6 @@ test('the header states the draft while the strip stays with the executed query'
 
   const draft = page.locator(SEL.draftState);
 
-  // The strip describes the executed query, independent of later edits.
   await expectFacts(page);
   await expect(page.locator(SEL.scopeStrip)).not.toContainText('Executed scope');
   await expect(page.locator(`${SEL.scopeStrip} .mode`)).toHaveCount(0);
@@ -88,7 +77,6 @@ test('the header states the draft while the strip stays with the executed query'
 
   await expect(draft).toHaveCount(0);
 
-  // The edited query has not run, so it cannot change the execution facts.
   await editBuffer(page, 'last=7d');
   await expect(draft).toHaveText(COPY.draftDirty);
   await expectFacts(page);
@@ -140,7 +128,6 @@ test('a link that cannot be read leaves the strip saying only that', async ({ pa
   await expect(page.locator(SEL.urlNotice)).toBeVisible();
   const strip = page.locator(SEL.scopeStrip);
   await expect(strip.locator(SEL.filtersBadChip)).toHaveText(COPY.filtersUnreadableChip);
-  // Nothing ran, so there are no facts, mode badge or removable chips.
   await expect(strip).toHaveText(COPY.filtersUnreadableChip);
   await noTiming(page);
   await expect(page.locator('.scope-count')).toHaveCount(0);
@@ -149,9 +136,6 @@ test('a link that cannot be read leaves the strip saying only that', async ({ pa
 
 test('a malformed range refuses the strip as completely as a malformed filter', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
-  // `f` reads perfectly here; `r` is the parameter the link got wrong.
-  // The chips used to survive that, so a refused link still listed the
-  // filters of a query that had not run (ADR-0027).
   await page.goto(`${FILTERED_URL}&r=garbage`);
 
   await expect(page.locator(SEL.urlNotice)).toBeVisible();
@@ -198,7 +182,6 @@ test('never-run has no execution, while zero rows and zero duration are valid', 
   });
   await page.goto('/search');
   await expect(page.locator(SEL.scopeCount)).toHaveText('');
-  // Nothing to report, so the strip is not drawn at all.
   await expect(page.locator(SEL.scopeStrip)).toBeHidden();
   await noTiming(page);
   expect(requests).toBe(0);
@@ -230,7 +213,6 @@ test('page changes report the execution for that response page', async ({ page, 
   await page.locator('.results-footer').getByRole('button', { name: /^Next/ }).click();
   await expect(page).toHaveURL(/page=1/);
   await expectFacts(page, '175ms', '2026-09-15 12:35:46 UTC');
-  // The pagination fixture has 53 rows, so the second page returns three.
   await expect(page.locator(SEL.scopeCount)).toHaveText('3 rows returned');
 });
 
@@ -326,11 +308,6 @@ test('the editor tools name what they act on', async ({ page }) => {
   await expect(tools.nth(2)).toHaveAccessibleName('Format');
 });
 
-// Clicking Format is a decision to leave the completion popup, whatever
-// Format then does with the buffer. Each case parks the cursor after
-// `cou` inside `count()`, which offers the `count()` completion, then
-// takes one of Format's paths. The empty-buffer path has no case: an
-// empty buffer has no word before the cursor, so completion cannot open.
 test('Format closes the completion popup', async ({ page }) => {
   await page.goto('/search');
   const format = page.getByRole('button', { name: 'Format', exact: true });
@@ -342,7 +319,6 @@ test('Format closes the completion popup', async ({ page }) => {
   ];
   for (const { path, text, after } of cases) {
     await editBuffer(page, text);
-    // Back from the end over `nt() by host` to just after `cou`.
     for (let i = 0; i < 'nt() by host'.length; i++) await page.keyboard.press('ArrowLeft');
     await page.keyboard.press('Control+Space');
     await expect(option, path).toBeVisible();
@@ -359,9 +335,7 @@ test('Format closes the completion popup', async ({ page }) => {
 
 // A query that parses but whose formatted text would be over the query
 // limit: each of the 40 000 tabs in the quoted string prints as the two
-// bytes `\t`. Format refuses it (ADR-0061), and the refusal must not
-// touch the document: the text stays as typed, the reason shows in an
-// error toast, and undo still steps back over the edit that typed it.
+// bytes `\t`.
 test('Format refusal keeps the buffer and undo history', async ({ page }) => {
   await page.goto('/search');
   const format = page.getByRole('button', { name: 'Format', exact: true });
@@ -414,11 +388,6 @@ test('the skip links reach the editor and the results', async ({ page, request }
   await expect(page.getByRole('tab', { name: /^Events/ })).toBeFocused();
 });
 
-// The bypass used to be inert wherever the results region was not the
-// snapshot table: the handler prevented the anchor's default and then
-// focused nothing at all, so the key press moved neither focus nor the
-// document (A03). The link lands on the active results tab, which every
-// mode renders; both remaining panes are asserted here.
 test('skip to results reaches live mode and the Visualization tab', async ({ page, request }) => {
   await resetScenario(request, 'stream-burst');
   await page.goto('/search?q=service%3Dnginx&mode=live');

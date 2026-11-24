@@ -25,9 +25,6 @@ pub struct ExecutedQuery {
 pub struct ExecutedResponse {
     pub query: ExecutedQuery,
     pub response: QueryResponse,
-    /// How much of the result this response was asked for. Under
-    /// `Whole` it is the same value on every page of one effective
-    /// query, which is what makes a page turn post nothing.
     pub plan: FetchPlan,
     pub generation: u64,
     pub intent: u64,
@@ -41,9 +38,6 @@ impl std::ops::Deref for ExecutedResponse {
 
 /// A request that failed, with the same identity a success carries.
 ///
-/// The query error notice quotes the text a refusal's spans index, which
-/// is the effective query this request sent, not whatever the URL or the
-/// editor holds by the time the answer lands (ADR-0039). The intent and
 /// generation let the page tell this failure from a newer request for
 /// the same text: a resubmitted query must not show the old verdict.
 #[derive(Clone)]
@@ -54,32 +48,15 @@ pub struct ExecutedFailure {
     pub intent: u64,
 }
 
-/// A failure prints as its error, so every reader that only renders the
-/// message (the tables' `Loaded`) reads what it read before.
 impl std::fmt::Display for ExecutedFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.error.fmt(f)
     }
 }
 
-/// Build a Leptos `LocalResource` that runs `api::query(q, plan)` whenever
-/// the effective-query or fetch-plan signals change.
-///
 /// Callers should feed the DSL the snapshot runs, not the user's raw editor
-/// buffer: `search_url::mode_query` with `Mode::Snapshot`, which is the base
-/// DSL with the filters and the range merged in. The resource doesn't care
-/// where the string came from — it just re-fires on value changes.
-///
-/// The request is the plan, not the page (ADR-0037): an aggregation's
-/// plan is `Whole` on every page, so turning a page under one leaves
-/// the input tuple unchanged, the intent where it was, and sends no
-/// POST. The `inputs` memo below is the only owner of that rule.
-///
-/// Empty `q` short-circuits to an `Ok(empty result)` without a network
-/// round-trip so the first page load doesn't fire a POST with `?q=`.
-///
-/// Uses `LocalResource` (CSR-only, no Serialize/Deserialize bounds on the
-/// result type) because this crate doesn't do SSR hydration.
+/// buffer: `search_url::mode_query` with `Mode::Snapshot`.
+/// The `inputs` memo below is the only owner of the plan-not-page rule.
 /// `pending` tracks the request itself: a resource retains its previous
 /// `Some` response during a reload, so presence cannot report loading.
 /// The returned intent revision advances independently of the serialized
@@ -88,12 +65,7 @@ impl std::fmt::Display for ExecutedFailure {
 /// `resubmit` is the one way to send an unchanged request again: a
 /// same-query Haul or Retry bumps it, and it advances the intent the way
 /// a changed input does. `LocalResource::refetch` is not that way. Its
-/// invalidation is consumed while a request is in flight, so a re-Haul
-/// of a pending query sent nothing, and the older request's answer then
-/// landed as the current intent's verdict. Moving the intent the moment
-/// the resubmission is asked for supersedes that answer at once: it
-/// leaves `pending` set, rearms the fetcher, and matches no reader's
-/// intent. The same holds for a success as for a failure.
+/// invalidation is consumed while a request is in flight.
 #[allow(clippy::too_many_arguments)]
 pub fn rows_resource(
     effective_q: Memo<String>,
@@ -218,8 +190,6 @@ fn empty_response() -> QueryResponse {
             returned: 0,
             total: 0,
         },
-        // A placeholder for "no query yet" — no execution, no notice,
-        // and no columns to render as anything.
         degraded_fields: Vec::new(),
         severity_columns: Vec::new(),
         histogram: None,

@@ -2,16 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Visible-page polling for Jobs. Reads are serialized; a newer intent makes
-//! the pending response obsolete and queues one fresh read. Last good data
-//! remains available through transport failures.
-//! An eligible 401 goes to the shared sign-in handler, which replaces the
-//! page with sign-in carrying its current URL; disposed or superseded
-//! reads must pass the lifetime checks first. Polling stops only when
-//! navigation started. A declined 401 (an explicit logout is pending, or
-//! another redirect started first) keeps polling, so a failed logout
-//! still lets the next 401 sign in, and settles on the session-ended
-//! sentence.
+//! Visible-page polling for Jobs.
+//! A declined 401 (an explicit logout is pending, or another redirect
+//! started first) keeps polling, so a failed logout still lets the next 401
+//! sign in.
 use crate::api::ApiError;
 use crate::auth_return::sign_in_if_unauthorized;
 use leptos::prelude::*;

@@ -2,15 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The pure service formatters live ungated at
-// [`crate::service_card_fmt`] so their tests run natively, and are
-// re-exported here so `components::service_card_fmt::…` still resolves.
 pub(crate) use crate::service_card_fmt;
 
-/// Percent-encode one URL query-parameter value. Shared by the Schema
-/// page's own drill-in links and the query notice's: a catalog field
-/// name is any ASCII-folded client JSON key, so the two must encode it
-/// the same way or a deep link would miss the field it names.
+/// Percent-encode one URL query-parameter value.
 pub(crate) fn enc_uri(raw: &str) -> String {
     js_sys::encode_uri_component(raw)
         .as_string()

@@ -3,11 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<ExportModal/>` — download query results as CSV, JSON, or Parquet.
-//!
-//! Built on `fleet_ui::Modal`: the shell owns the scrim, Escape,
-//! Cmd/Ctrl+Enter submit, and the header (Download icon chip + close);
-//! this component owns the format picker, the download flow, and the
-//! footer buttons.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -26,7 +21,6 @@ use fleet_ui::{Btn, Icon, Modal, Segmented, SegmentedOption, ToastBus, ToastKind
 #[component]
 #[allow(clippy::needless_pass_by_value)]
 pub fn ExportModal(
-    /// The DSL query to export. Shown read-only in the preview strip.
     query: String,
     /// Called on close — `true` if a download completed, `false` on cancel.
     on_close: Callback<bool>,
@@ -43,11 +37,6 @@ pub fn ExportModal(
     // What this modal refused, shown in its own body rather than as a
     // toast: the reader is looking at the dialog they just submitted.
     let refusal = RwSignal::new(None::<&'static str>);
-    // The server's sentence when it refused the export for want of the
-    // memory or scratch space it gives queries (ADR-0056), shown through
-    // the search page's notice. The same request spends the same budget
-    // again, so nothing retries it: the reader narrows the query and
-    // downloads again.
     let exhausted = RwSignal::new(None::<String>);
 
     let q_for_submit = query.clone();
@@ -55,10 +44,8 @@ pub fn ExportModal(
         if downloading.get_untracked() {
             return;
         }
-        // An empty query is the whole corpus to the server's emitter, so
-        // the download button is not a way around the malformed gate
-        // that blanked it (ADR-0027). `api::export` refuses it as well;
-        // this arm is what the reader sees.
+        // `api::export` refuses an empty query as well; this arm is what the
+        // reader sees (ADR-0027).
         if !is_executable(&q_for_submit) {
             refusal.set(Some(EMPTY_QUERY_REFUSAL));
             return;

@@ -2,13 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The net drawer's schedule window control (issue #181), and Run now
-// (issue #236). What the form
-// SHOWS is asserted in the browser; what it SENDS is asserted against
-// the stub's recorded PUT bodies, because the whole subject is which
-// keys travel: an omitted `window` is query mode, not "unchanged", so a
-// spec that only read the rendered form would say nothing about it.
-
 import {
   test,
   expect,
@@ -23,19 +16,15 @@ import {
 } from '../fixtures';
 import { SEL, COPY, nameFrom } from '../selectors';
 
-/** The window strip's option, by its visible label. */
 function windowOption(scope: import('@playwright/test').Locator, label: string) {
   return scope.locator(SEL.windowOption).filter({ hasText: label });
 }
 
-/** Open one net's drawer on the Query tab, with its schedule form up. */
 async function openScheduleForm(page: import('@playwright/test').Page, netId: number) {
   await page.goto(`/jobs/nets?net=${netId}&ntab=query`);
   const drawer = page.locator(SEL.drawerPanel);
   await expect(drawer).toBeVisible();
   const add = drawer.getByRole('button', { name: COPY.addScheduleButton, exact: true });
-  // A net with no schedule keeps the form behind this control; a net
-  // with one opens straight onto it.
   if (await add.count()) await add.click();
   await expect(drawer.getByRole('button', { name: 'Save schedule', exact: true })).toBeVisible();
   return drawer;
@@ -60,8 +49,6 @@ test('the windowed net opens on its saved window and lag', async ({ page, reques
   await expect(drawer.locator(SEL.windowLagInput)).toHaveValue(SCHEDULE.lag);
   await expect(drawer.locator(SEL.windowLagHint)).toHaveText(COPY.windowLagHintText);
   await expect(drawer.getByText(COPY.windowSinceLastHint)).toBeVisible();
-  // Tiling has no span, so the span field is not merely empty: it is
-  // absent, which is what says the two modes are not one field.
   await expect(drawer.locator(SEL.windowSpanInput)).toHaveCount(0);
 });
 
@@ -71,8 +58,6 @@ test('query text drops the window and the lag from the request', async ({ page, 
 
   await windowOption(drawer, COPY.windowOptionQuery).click();
   await expect(windowOption(drawer, COPY.windowOptionQuery)).toHaveAttribute('aria-pressed', 'true');
-  // Query mode has no lag to allow for, so the box goes rather than
-  // sitting there holding a value the request will not carry.
   await expect(drawer.locator(SEL.windowLagInput)).toHaveCount(0);
   await expect(drawer.getByText(COPY.windowRemovalHint)).toBeVisible();
   await expect(drawer.getByText(COPY.windowRescheduleHint)).toBeVisible();
@@ -96,13 +81,9 @@ test('a fixed span travels with no lag beside it', async ({ page, request }) => 
 
   await windowOption(drawer, COPY.windowOptionFixed).click();
   await expect(drawer.getByText(COPY.windowFixedHint)).toBeVisible();
-  // The saved lag survives the mode change, so blanking it is a
-  // deliberate edit rather than the form having forgotten.
   await expect(drawer.locator(SEL.windowLagInput)).toHaveValue(SCHEDULE.lag);
   await drawer.locator(SEL.windowLagInput).fill('');
 
-  // One span is one value in the server's grammar, so it is typed into
-  // one box rather than chosen from a second preset strip.
   await drawer.locator(SEL.windowSpanInput).fill('1h');
   await expect(drawer.locator(SEL.windowSpanInput)).toHaveValue('1h');
 
@@ -128,21 +109,14 @@ test('a refused save stays in the form with the draft intact', async ({ page, re
   await armScheduleRefusal(request, 'refuse');
   await drawer.getByRole('button', { name: 'Save schedule', exact: true }).click();
 
-  // The server's own sentence, character for character. The form has no
-  // copy of the window/query rule and must not invent one.
   await expect(drawer.locator(SEL.scheduleSaveError)).toHaveText(
     'schedule window "since_last" conflicts with the saved query\'s last= time clause; remove one side',
   );
   await expect(drawer.locator(SEL.scheduleSaveError)).toHaveAttribute('role', 'alert');
-  // A refusal the operator has to act on does not fly past as a toast.
   expect(await toastCount(page)).toBe(0);
-  // And the draft is still there to fix: a form that reset itself would
-  // make the operator retype what the server just rejected.
   await expect(windowOption(drawer, COPY.windowOptionSinceLast)).toHaveAttribute('aria-pressed', 'true');
   await expect(drawer.locator(SEL.windowLagInput)).toHaveValue('90s');
 
-  // A 5xx with no envelope has nothing to quote, so the inline error
-  // falls back to the client's own status text rather than going blank.
   await armScheduleRefusal(request, 'fail');
   await drawer.getByRole('button', { name: 'Save schedule', exact: true }).click();
   await expect(drawer.locator(SEL.scheduleSaveError)).toHaveText(
@@ -152,12 +126,6 @@ test('a refused save stays in the form with the draft intact', async ({ page, re
   expect(await capturedScheduleRequests(request)).toHaveLength(2);
 });
 
-// ---- Run now ---------------------------------------------------------------
-// A manual run is the schedule's next window fired early, so it is on
-// offer wherever a schedule is saved, in every mode and paused or not,
-// and nowhere else (ADR-0018 as amended on 2026-09-23).
-
-/** Every net in the `schedule` scenario, and whether it has a schedule. */
 const RUN_NOW_CASES = [
   { id: SCHEDULE.plainNetId, name: 'errors by host', offered: false },
   { id: SCHEDULE.windowedNetId, name: SCHEDULE.windowedNetName, offered: true },
@@ -178,8 +146,6 @@ test('Run now is offered on every scheduled net and on no other', async ({ page,
     );
   }
 
-  // The nets table's direct actions read the same saved state through the
-  // same predicate, so the two cannot disagree about the offer.
   await page.goto('/jobs/nets');
   const rows = page.locator(SEL.tableRow);
   await expect(rows).toHaveCount(RUN_NOW_CASES.length);
@@ -187,7 +153,6 @@ test('Run now is offered on every scheduled net and on no other', async ({ page,
     const action = rows.filter({ hasText: name }).getByRole('button', { name: COPY.netRunNow, exact: true });
     await expect(action).toHaveCount(offered ? 1 : 0);
   }
-  // Looking sends nothing.
   expect(await capturedRunRequests(request)).toEqual([]);
 });
 
@@ -207,7 +172,6 @@ test('Run now in the drawer states the claimed window and the run shows as Manua
   await expect(link).toHaveAttribute('href', `/jobs/runs?run=504&net=${SCHEDULE.windowedNetId}`);
   expect(await capturedRunRequests(request)).toEqual([SCHEDULE.windowedNetId]);
 
-  // The run leads the net's history, and it alone is marked Manual.
   await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=runs`);
   const history = page.locator(SEL.netRunRow);
   await expect(history).toHaveCount(4);
@@ -217,8 +181,6 @@ test('Run now in the drawer states the claimed window and the run shows as Manua
 
 test('Run now in a row is disabled while its request is in flight', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
-  // Hold the request so the in-flight state can be observed, then let it
-  // through to the stub.
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   await page.route(`**/api/v1/saved/${SCHEDULE.fixedNetId}/run`, async (route) => {
@@ -285,7 +247,6 @@ test('Run now from the drawer still reports when the drawer closed mid-request',
   await page.locator(`${SEL.drawerPanel} ${SEL.drawerClose}`).click();
   await expect(page.locator(SEL.drawerPanel)).toHaveCount(0);
 
-  // The server claimed the run whether or not the drawer is still open.
   release();
   await expect(page.locator(SEL.toastSuccess).locator('.title')).toHaveText(
     nameFrom(COPY.runStartedToast, '09:55', '11:15'),
@@ -306,8 +267,6 @@ test('Run now still reports without panicking when the Nets page is gone', async
     await route.continue();
   });
 
-  // One request from the drawer, one from a row, both answered after an
-  // in-app navigation has disposed the Nets page and everything it owns.
   await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
   await page
     .locator(SEL.drawerPanel)
@@ -334,8 +293,6 @@ test('Run now of a query-mode schedule claims no window', async ({ page, request
     .filter({ hasText: 'paused error sweep' })
     .getByRole('button', { name: COPY.netRunNow, exact: true })
     .click();
-  // Paused, and still fired: the schedule's enabled flag gates the
-  // scheduler, not a person.
   await expect(page.locator(SEL.toastSuccess).locator('.title')).toHaveText(COPY.runStartedPlain);
   expect(await capturedRunRequests(request)).toEqual([SCHEDULE.queryModeNetId]);
 });
@@ -350,8 +307,6 @@ test('a refused Run now shows the server\'s message', async ({ page, request }) 
     .getByRole('button', { name: COPY.netRunNow, exact: true })
     .click();
 
-  // The server's own sentence, which names where coverage stands, and
-  // never the client's bare status text.
   const toast = page.locator(SEL.toastError);
   await expect(toast.locator('.title')).toHaveText(COPY.runNotStarted);
   await expect(toast.locator('.detail')).toHaveText(
@@ -372,7 +327,6 @@ test('the schedule form says what Run now reads in each windowed mode', async ({
   await expect(drawer.getByText(COPY.runNowFixedLine)).toBeVisible();
   await expect(drawer.getByText(COPY.runNowSinceLastLine)).toHaveCount(0);
 
-  // Query mode reads the saved text whenever it runs: nothing to say.
   await windowOption(drawer, COPY.windowOptionQuery).click();
   await expect(drawer.getByText(COPY.runNowFixedLine)).toHaveCount(0);
   await expect(drawer.getByText(COPY.runNowSinceLastLine)).toHaveCount(0);

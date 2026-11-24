@@ -2,7 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Dashboard freshness and bootstrap precedence, independent of browser callbacks.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,8 +153,6 @@ mod callback_order_tests {
 
     #[test]
     fn forbidden_survives_stream_errors_in_both_callback_orders() {
-        // A 403 is a permission verdict; a 401 is the session, never
-        // read as a missing permission (ADR-0066).
         for (status, verdict) in [
             (403, DashboardPhase::Forbidden),
             (401, DashboardPhase::SessionEnded),
@@ -172,7 +169,6 @@ mod callback_order_tests {
                     }
                     assert_eq!(state.phase, verdict);
                     assert_eq!(state.snapshot, None);
-                    // A later error must not erase the GET's verdict.
                     state.stream_error(!reconnecting);
                     assert_eq!(state.phase, verdict);
                     state.stream_snapshot(7);

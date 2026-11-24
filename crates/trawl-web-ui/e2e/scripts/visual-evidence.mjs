@@ -8,21 +8,6 @@
 // 390x1000, then writes a manifest and a contact sheet that pairs each
 // capture with the mockup it was drawn from.
 //
-// Same shape as capture-native-controls.mjs: spawn harness/server.mjs
-// on E2E_PORT, wait for the child's OWN "listening" line, drive
-// Chromium from @playwright/test.
-//
-// Theme is NOT a colorScheme emulation. fleet-ui reads the theme from
-// localStorage through `theme::runtime`, never from
-// prefers-color-scheme, so each context seeds the whole prefs payload
-// with an init script before the first navigation. That is also how the
-// reading-mode scenes reach `details=inspector` and
-// `rows=message-first` without clicking through the View disclosure on
-// every viewport.
-//
-// `reducedMotion: 'reduce'` everywhere, so nothing is photographed
-// mid-fade and the captures are reproducible frame for frame.
-//
 // Usage, from the repo root (the SPA must already be built):
 //   node crates/trawl-web-ui/e2e/scripts/visual-evidence.mjs [outdir]
 //
@@ -56,9 +41,6 @@ const MOCKUPS = path.resolve(
 const WIDE = { width: 1440, height: 1000 };
 const NARROW = { width: 390, height: 1000 };
 
-/** The filtered-search URL is settings-disposition.spec.ts's literal:
- * one include filter and an absolute range, neither produced by the
- * app's own encoder. */
 const SAVE_URL = '/search?q=service%3Dnginx&page=0' +
   '&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0' +
   '&r=2026-01-01T00:00:00Z..now';
@@ -66,8 +48,6 @@ const SAVE_URL = '/search?q=service%3Dnginx&page=0' +
 const RESULTS_ROW = '.results-table tbody tr';
 const EXPAND = '.results-table td.exp-col button.row-stretch';
 
-/** Wait out any CSS entrance animation on the elements named, by their
- * own `finished` promises rather than a sleep. */
 async function settle(page, selectors) {
   await page.evaluate(
     async ({ selectors }) => {
@@ -78,13 +58,8 @@ async function settle(page, selectors) {
   );
 }
 
-/** Let every FINITE animation and transition on the page finish before
- * the shutter. Without it the Haul button is photographed mid-way
- * through its 120ms `background` transition out of the in-flight state
- * — near-white on near-white, which looks exactly like a contrast bug
- * and is not one. Infinite animations (the live dot's spin, the tail
- * pulse) never resolve, so they are excluded rather than waited on, and
- * the whole wait is capped so one wedged animation cannot hang a run. */
+/** Without it the Haul button is photographed mid-way
+ * through its 120ms `background` transition out of the in-flight state. */
 async function settleDocument(page) {
   await page.evaluate(async () => {
     const finite = document.getAnimations().filter((a) => {
@@ -98,9 +73,6 @@ async function settleDocument(page) {
   });
 }
 
-/** The scene table of spec §6.4. `prefs` are merged into the seeded
- * localStorage payload; `ready` is awaited after navigation; `act` runs
- * last, before the shutter. `narrowOnly` scenes skip the 1440 pass. */
 const SCENES = [
   {
     name: 'search-raw',
@@ -260,9 +232,6 @@ async function shoot(browser, scene, theme, viewport) {
     locale: 'en-US',
     timezoneId: 'UTC',
   });
-  // The prefs payload fleet_ui::theme::runtime reads on boot. Seeded
-  // before any script on the page runs, so the first paint is already
-  // in the right theme and reading mode.
   const prefs = {
     theme,
     rowstyle: 'bordered',
@@ -281,9 +250,6 @@ async function shoot(browser, scene, theme, viewport) {
   page.on('pageerror', (err) => errors.push(String(err)));
   await page.goto(`${BASE}${scene.route}`);
 
-  // `theme::runtime` writes the attribute once the wasm bundle boots, so
-  // this is a wait, not a read: a capture taken before it lands would be
-  // the light default wearing a dark filename.
   await page
     .waitForFunction(
       (want) => document.documentElement.getAttribute('data-theme') === want,
@@ -307,10 +273,7 @@ async function shoot(browser, scene, theme, viewport) {
   return file;
 }
 
-/** Identity of the bundle under the camera: the commit plus a digest of
- * the artifacts the harness actually serves. A capture set whose dist
- * hash does not match the tree it claims is not evidence. The digest
- * reads the harness's own snapshot, which is what the browser loaded —
+/** The digest reads the harness's own snapshot, which is what the browser loaded —
  * `crates/trawl-web-ui/dist` may already have moved on under a running
  * `trunk serve` by the time the last scene is shot. */
 async function distDigest() {
@@ -325,9 +288,6 @@ async function distDigest() {
   return { files: names, sha256: hash.digest('hex') };
 }
 
-/** Copy the mockup a capture is paired with into the evidence dir, so
- * the contact sheet stands on its own once published. Returns the local
- * filename, or null when the study bundle has no counterpart. */
 async function adoptMockup(source, dir) {
   if (!source) return null;
   const from = path.join(MOCKUPS, dir, source);

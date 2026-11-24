@@ -4,14 +4,6 @@
 
 //! `<SaveAsNetModal/>` — confirm-save dialog for turning a DSL query
 //! into a named saved query ("net").
-//!
-//! One field, the display name, because the backend's
-//! `CreateSavedRequest` carries only `{ name, query }`; description,
-//! folder or tags would mean growing the API first.
-//!
-//! `fleet_ui::Modal` owns the scrim, Escape, and Cmd/Ctrl+Enter save;
-//! this component owns the name field (autofocused and pre-selected on
-//! mount, default derived from the query) and the footer buttons.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -26,17 +18,13 @@ use crate::api;
 use fleet_ui::{Btn, Field, Icon, Modal, ToastBus, ToastKind, Variant};
 
 #[component]
-#[allow(clippy::needless_pass_by_value)] // Leptos component props: easier to pass owned
+#[allow(clippy::needless_pass_by_value)]
 pub fn SaveAsNetModal(
-    /// The DSL query to save. Shown read-only in the preview strip.
     query: String,
     /// Search captures an editor buffer; History supplies a recorded query instead.
     #[prop(optional)]
     from_editor: bool,
-    /// Called after a successful save or cancel — parent should clear
-    /// whatever made the modal open. The bool is `true` on save, `false`
-    /// on cancel; the parent can use that to decide whether to also
-    /// clear the row selection, etc.
+    /// The bool is `true` on save, `false` on cancel.
     on_close: Callback<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
@@ -51,8 +39,6 @@ pub fn SaveAsNetModal(
 
     let input_ref = NodeRef::<leptos::html::Input>::new();
     Effect::new(move |_| {
-        // First render: focus + select the suggested name so the user
-        // can just type to overwrite it.
         if let Some(el) = input_ref.get() {
             let input: web_sys::HtmlInputElement = (*el).clone().unchecked_into();
             let _ = input.focus();
@@ -93,7 +79,6 @@ pub fn SaveAsNetModal(
                         "Couldn't save",
                         Some(crate::api_error::saved_name_refusal(&e)),
                     );
-                    // Leave the modal open so the user can retry / tweak.
                 }
             }
         });
@@ -142,11 +127,7 @@ pub fn SaveAsNetModal(
     }
 }
 
-/// Suggest a display name from a DSL query: pick the first bare
-/// `field=value` pair we can find. Falls back to `"untitled"` if the
-/// query is just a free-text search or we can't spot a field clause.
 fn suggest_name(q: &str) -> String {
-    // Strip pipeline stages — only look at the search stage.
     let search = q.split('|').next().unwrap_or("").trim();
     for token in tokenize(search) {
         if let Some((_field, value)) = token.split_once('=')
@@ -161,9 +142,6 @@ fn suggest_name(q: &str) -> String {
     "untitled".to_string()
 }
 
-/// Tokenize a search stage respecting quoted strings, so `host="a b"`
-/// yields `host="a b"` rather than two tokens. Good enough for name
-/// suggestion — not a real DSL parser.
 fn tokenize(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();

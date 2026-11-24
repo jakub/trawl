@@ -2,13 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// A run that succeeded but whose stored result file is gone (issue #227).
-// The server answers 409 with a sentence naming the run; the drawer has
-// to SHOW that sentence. The two strings it must not show are the ones
-// it used to: "No result data (error or still running)", which calls a
-// finished run unfinished, and the generic "Couldn't load" wrapper,
-// which calls a read that answered a failure.
-
 import {
   test,
   expect,
@@ -28,7 +21,6 @@ const sentenceFor = (runId: number) =>
 
 const SENTENCE = sentenceFor(SCHEDULE.pagedRunId);
 
-/** One named row of a run drawer's execution receipt, by its term. */
 const receiptOf = (page: Page, detail: Locator) => (name: string) =>
   detail.locator('.receipt .fieldlist > div')
     .filter({ has: page.getByText(name, { exact: true }) })
@@ -50,12 +42,10 @@ test('unavailable result names the run', async ({ page, request }) => {
   await expect(preview).toHaveCount(1);
   await expect(preview.locator(SEL.runUnavailable)).toHaveText(SENTENCE);
 
-  // Neither of the sentences that would misdescribe the run. Scoped to
-  // the preview: the runs table beside it carries a FAILED run whose own
-  // error message is a "Couldn't load" the server wrote.
+  // Scoped to the preview: the runs table beside it carries a FAILED run
+  // whose own error message is a "Couldn't load" the server wrote.
   await expect(preview.getByText('No result data (error or still running)')).toHaveCount(0);
   await expect(preview.getByText("Couldn't load", { exact: false })).toHaveCount(0);
-  // And no table pretending the run held rows.
   await expect(preview.locator(SEL.previewRow)).toHaveCount(0);
 
   // Terminal: the 5s poll does not keep re-reading a run whose answer
@@ -65,18 +55,11 @@ test('unavailable result names the run', async ({ page, request }) => {
   await page.waitForTimeout(6000);
   expect(await runDetailReadCount(request)).toBe(before);
 
-  // The explicit control asks again, and the answer is the same.
   await preview.getByRole('button', { name: 'Check again' }).click();
   await expect.poll(() => runDetailReadCount(request)).toBeGreaterThan(before);
   await expect(preview.locator(SEL.runUnavailable)).toHaveText(SENTENCE);
 });
 
-// The runs page mounts the same preview beside its own execution
-// receipt. The 409 carries no summary, so a receipt fed only by that
-// read would go blank exactly when the page has to say what the run
-// was — while the list the page already holds knows all of it. The
-// list is a LOADED PAGE, though: reading on past the selected run has
-// to leave the drawer beside it intact.
 test('unavailable result keeps the receipt', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await armRunUnavailable(request, CORPUS.runWithResult);
@@ -113,9 +96,6 @@ test('unavailable result keeps the receipt', async ({ page, request }) => {
   };
   await filled();
 
-  // Reading on: the run leaves the loaded page, and the drawer keeps the
-  // last listing it saw under this selection — the same retention the
-  // net name has always had.
   const list = page.getByRole('region', { name: 'Recent runs table', exact: true });
   await list.getByRole('button', { name: 'Next →', exact: true }).click();
   await expect(page.locator('.runs-table')).toContainText('Other page');
@@ -127,12 +107,6 @@ test('unavailable result keeps the receipt', async ({ page, request }) => {
   await filled();
 });
 
-// The list is a snapshot, and a row read while the run was still going
-// says `running`. The server answers this 409 only for a run whose query
-// SUCCEEDED and wrote a file it can no longer find, so pairing that row
-// with the refusal unreconciled would print "report run N succeeded,
-// but…" beside a Running badge. Until the read has answered at all, the
-// receipt has nothing confirmed to print and prints nothing.
 test('unavailable result reconciles a stale running row', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await armRunUnavailable(request, CORPUS.runWithResult);
@@ -165,7 +139,6 @@ test('unavailable result reconciles a stale running row', async ({ page, request
   const detail = page.locator(SEL.runDetail);
   const field = receiptOf(page, detail);
 
-  // The stale row is on screen and the run's own read is still open.
   await expect(page.locator('.runs-table')).toContainText('Running');
   await expect.poll(() => reads).toBeGreaterThan(0);
   await expect(field('Outcome')).toHaveText('—');
@@ -178,19 +151,11 @@ test('unavailable result reconciles a stale running row', async ({ page, request
   await expect(badge).toHaveText(SUCCEEDED);
   await expect(badge).toHaveClass(/success/);
   await expect(field('Outcome')).toHaveText('success');
-  // Only the outcome was stale. A run still going had recorded no
-  // duration and no rows, and the receipt does not invent either.
   await expect(field('Duration')).toHaveText('—');
   await expect(field('Rows recorded')).toHaveText('—');
   await expect(field('Query')).toHaveText(CORPUS.runWithResultQuery);
 });
 
-// The other order: the run was selected while it was STILL GOING, so the
-// first read is a 200 that records `running` here, and only the next poll
-// finds the file gone. The refusal carries no summary of its own, so it
-// has to evict the one it supersedes — a receipt still reading the older
-// answer says Running beside a sentence that says the run succeeded, and
-// nothing later repairs it because the 409 ends the polling.
 test('unavailable result replaces a running summary', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await armRunUnavailable(request, CORPUS.runWithResult);
@@ -249,10 +214,6 @@ test('unavailable result replaces a running summary', async ({ page, request }) 
   await expect(field('Query')).toHaveText(CORPUS.runWithResultQuery);
 });
 
-// The net drawer keeps an expanded run on screen after its list has
-// moved past it, out of the last summary it saw for that run. A run
-// whose stored result is gone has a 409 for its last READ, and a 409
-// carries no summary — so the row has to survive one.
 test('unavailable result keeps the expanded row after the list moves on', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
   await armRunUnavailable(request, SCHEDULE.pagedRunId);
@@ -278,8 +239,6 @@ test('unavailable result keeps the expanded row after the list moves on', async 
   const preview = page.locator(SEL.netRunPreview);
   await expect(preview.locator(SEL.runUnavailable)).toHaveText(SENTENCE);
 
-  // The list moves past the expanded run. The row is the drawer's now,
-  // not the page's, and the refusal is not a reason to drop it.
   listed = false;
   const before = lists;
   await page.clock.fastForward(5_000);
@@ -289,11 +248,6 @@ test('unavailable result keeps the expanded row after the list moves on', async 
   await expect(preview.locator(SEL.runUnavailable)).toHaveText(SENTENCE);
 });
 
-// The same row, reached the other way round: expanded while the run was
-// STILL GOING, so both the list and the first read say `running`. The
-// list then moves past it and the next read answers the 409 — and the
-// row, now living on the last summary the drawer saw, has to take the
-// outcome that refusal settles rather than keep printing Running.
 test('unavailable result settles the expanded row of a running run', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
   await armRunUnavailable(request, SCHEDULE.pagedRunId);
@@ -318,8 +272,6 @@ test('unavailable result settles the expanded row of a running run', async ({ pa
     await route.fulfill({ response, json: body });
   });
 
-  // Hit one is the run still going; from hit two the harness's own armed
-  // 409 answers.
   const running = JSON.parse(await readFile(`${__dirname}/../harness/wire/run-result-paged.json`, 'utf8'));
   running.status = 'running';
   running.finished_at = null;
@@ -338,7 +290,6 @@ test('unavailable result settles the expanded row of a running run', async ({ pa
 
   await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=runs`);
   await page.locator(SEL.netRunRow).first().locator(SEL.rowStretch).click();
-  // Whichever row is open, wherever the list has since put it.
   const row = page.locator(SEL.netRunRow).filter({ has: page.locator('[aria-expanded="true"]') });
   await expect(row.locator('td').nth(1)).toHaveText('Running');
   // The FIRST read has to have landed and been rendered before the clock

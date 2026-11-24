@@ -3,12 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<Chart/>` — the Visualization tab's uPlot chart (ADR-0038).
-//!
-//! Every decision about WHAT to draw lives in [`crate::chart_hint`],
-//! [`crate::series`] and [`crate::categorical`], which are
-//! native-testable; this module is the wasm half: the chart type
-//! picker, the uPlot data arrays, the mount/update/destroy lifecycle,
-//! and the sentences around the canvas.
 
 use leptos::prelude::*;
 use trawl_api::PaginationMeta;
@@ -38,8 +32,6 @@ type MountedOpts = (
 /// alias would run off the canvas; the legend and Events keep it whole.
 const AXIS_LABEL_MAX: usize = 36;
 
-/// The value-axis label for a metric name, cut to [`AXIS_LABEL_MAX`]
-/// characters with an ellipsis when it would not fit.
 fn axis_label(metric: &str) -> String {
     if metric.chars().count() <= AXIS_LABEL_MAX {
         return metric.to_owned();
@@ -49,8 +41,6 @@ fn axis_label(metric: &str) -> String {
     cut
 }
 
-/// One of the three shapes the Visualization tab draws. Session state,
-/// never part of the search URL (ADR-0027).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChartType {
     Line,
@@ -61,8 +51,6 @@ pub enum ChartType {
 /// The picker's order, and the order of the `fits` array.
 const TYPES: [ChartType; 3] = [ChartType::Line, ChartType::Column, ChartType::Bar];
 
-/// Why a chart type does not fit a result: a sentence around the one
-/// query command it names, which renders in mono so it reads as DSL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Reason {
     before: &'static str,
@@ -71,7 +59,6 @@ struct Reason {
 }
 
 impl Reason {
-    /// The plain sentence, for hover text and the refusal paragraph.
     fn text(self) -> String {
         format!("{}{}{}", self.before, self.command, self.after)
     }
@@ -81,13 +68,11 @@ impl Reason {
     }
 }
 
-/// Why Line does not fit a result.
 const LINE_NEEDS: Reason = Reason {
     before: "Line needs a ",
     command: "timechart",
     after: " result.",
 };
-/// Why Column and Bar do not fit a result.
 const BARS_NEED: Reason = Reason {
     before: "Column and Bar need a ",
     command: "stats … by",
@@ -95,7 +80,6 @@ const BARS_NEED: Reason = Reason {
 };
 
 impl ChartType {
-    /// How the uPlot bridge draws this type.
     pub fn as_kind(self) -> ChartKind {
         match self {
             Self::Line => ChartKind::Line,
@@ -104,7 +88,6 @@ impl ChartType {
         }
     }
 
-    /// The value published as `data-chart-type` on the chart host.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Line => "line",
@@ -113,7 +96,6 @@ impl ChartType {
         }
     }
 
-    /// The picker's label, and this type's slot in `fits`.
     fn label(self) -> &'static str {
         match self {
             Self::Line => "Line",
@@ -131,9 +113,6 @@ impl ChartType {
     }
 }
 
-/// The type actually drawn: the reader's choice while it fits the result
-/// on screen, otherwise the shape's default.
-///
 /// A choice that does not fit is never overwritten — the reader picked
 /// Column for a `stats … by` and a `timechart` arrived; when the next
 /// `stats … by` lands, Column is still what they asked for.
@@ -147,8 +126,6 @@ fn effective_type(
         .unwrap_or(default)
 }
 
-/// Why the disabled types are disabled, one sentence per distinct
-/// reason: Column and Bar share theirs. Empty when every type fits.
 fn disabled_reasons(fits: &[Option<Reason>; 3]) -> Vec<Reason> {
     let mut reasons: Vec<Reason> = Vec::new();
     for reason in fits.iter().flatten() {
@@ -159,19 +136,11 @@ fn disabled_reasons(fits: &[Option<Reason>; 3]) -> Vec<Reason> {
     reasons
 }
 
-/// What the tab shows for the current snapshot.
 #[derive(Clone, PartialEq)]
 enum Outcome {
-    /// Neither a result nor a refusal: no frame has arrived, or the
-    /// stream died. The sentence is the component's own.
     Note(String),
-    /// A result the ladder will not draw, and why.
     Refused(Hint),
-    /// Series aligned on the bucket grid, for Line.
     Lines(SeriesSet),
-    /// One value per group on an ordinal axis, with the metric column's
-    /// name and the `by` field it groups, for Column and Bar. Both names
-    /// are the note's words as well as the series label.
     Groups {
         points: CatPoints,
         metric: String,
@@ -179,13 +148,9 @@ enum Outcome {
     },
 }
 
-/// The sentence under a Column or Bar chart: the type, the metric
-/// column, the `by` field, and how many bars were drawn.
-///
 /// Line has a live legend; a bar canvas does not (`legend: { show:
 /// !bars }` in `vendor/src/uplot.ts`), so without this the chart is a
-/// picture with no text representation at all. It stays short: what the
-/// chart left out is the caption's job, not this one's.
+/// picture with no text representation at all.
 fn groups_note(ty: ChartType, metric: &str, group: &str, drawn: usize) -> String {
     let noun = if drawn == 1 { "group" } else { "groups" };
     format!(
@@ -249,14 +214,6 @@ fn groups_data(points: &CatPoints) -> JsValue {
 /// can be mounted together.
 static PICKER_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The three chart types, with the reasons the ones that do not fit the
-/// result on screen are disabled.
-///
-/// Native `input type=radio` rather than `role="radio"` buttons: the
-/// browser then owns arrow-key movement inside the group, the single tab
-/// stop, and the checked state, none of which this component would get
-/// for free otherwise. The segmented look rides the labels
-/// (`input:checked + .seg-opt` in main.css).
 #[component]
 fn ChartTypePicker(
     selected: RwSignal<Option<ChartType>>,
@@ -329,11 +286,6 @@ pub fn Chart(
     #[prop(optional, into)] failure: Signal<Option<&'static str>>,
     #[prop(optional)] on_retry: Option<Callback<()>>,
 ) -> impl IntoView {
-    // Which types the result on screen admits. Line wants a result the
-    // query left on a bucket axis — the LAST aggregation must be the
-    // timechart, or there is no `_time` column to draw on; Column and
-    // Bar want the shape the Events tab's categorical chart already
-    // draws.
     let line_fits = Memo::new(move |_| final_stage_is_timechart(&query.get()));
     let cat_shape = Memo::new(move |_| {
         snapshot
@@ -388,9 +340,6 @@ pub fn Chart(
             };
         };
         let points = cat_points(&shape, &result);
-        // The coverage rung stays LAST, whatever the type: a shape
-        // refusal names a fix in the query, and "this is only part of
-        // the result" is the answer only once the shape is chartable.
         match coverage.as_ref().and_then(coverage_refusal) {
             Some(message) => Outcome::Refused(Hint {
                 message,
@@ -404,9 +353,6 @@ pub fn Chart(
         }
     });
 
-    // The line under a chart that drew fewer series or groups than the
-    // result holds. A legend of six over a result of fourteen is a
-    // picture that lies by omission without it (ADR-0038).
     let caption_line = Memo::new(move |_| match outcome.get() {
         Outcome::Lines(set) => caption(set.series.len(), &set.omitted, "series", &set.group_fields),
         Outcome::Groups { points, .. } => {

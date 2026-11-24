@@ -4,21 +4,13 @@
 
 //! Native drift guard for the Playwright suite in `e2e/`.
 //!
-//! `e2e/selectors.ts` is the single source every spec imports selector
-//! strings and expected copy from. This test proves both halves of that
-//! contract hold: each exported entry's full `key: 'value',` assignment
+//! Each exported entry's full `key: 'value',` assignment
 //! appears verbatim in `selectors.ts` (assignment-level, so a key's value
 //! can't rot while the old string survives in another entry), and the
 //! "hook" substring the selector is built from still appears in a
 //! comment-stripped view of the Rust (or fleet-ui) source file that
 //! emits it, so prose describing markup cannot answer for markup that
-//! was deleted. Same `include_str!`-and-scan
-//! idiom as `crates/fleet-ui/tests/component_class_contract.rs`, aimed
-//! at the e2e suite's selector sheet instead of a stylesheet.
-//!
-//! This cannot run the SPA or `CodeMirror`, so it is no substitute for
-//! running the suite (`cargo xtask e2e`); it only proves the selectors
-//! and copy the suite is built from still match the source.
+//! was deleted.
 
 const SELECTORS_TS: &str = include_str!("../e2e/selectors.ts");
 
@@ -468,7 +460,6 @@ const CONTRACTS: &[Contract] = &[
         source: EDITOR_RS,
         hook: "class=\"dsl-editor\"",
     },
-    // App-owned half only; `.cm-content` itself is CodeMirror's.
     Contract {
         assignment: "cmContent: '.dsl-editor .cm-content',",
         source_path: "src/components/editor.rs",
@@ -877,24 +868,19 @@ const CONTRACTS: &[Contract] = &[
         source: FIELD_CASE_DRAWER_RS,
         hook: "class=\"fc-case\"",
     },
-    // The job block's class is composite in the source, and only the
-    // second half is the hook the spec selects on.
     Contract {
         assignment: "fieldCaseJob: '.fc-job',",
         source_path: "src/components/field_case_drawer.rs",
         source: FIELD_CASE_DRAWER_RS,
         hook: "class=\"fc-sec fc-job\"",
     },
-    // Not a selector: a timing the specs wait out. Same drift mechanism,
-    // because a spec waiting out the WRONG period proves nothing — it
-    // would pass whether or not the poll stopped.
+    // Not a selector: a timing the specs wait out.
     Contract {
         assignment: "repinPollMs: 3000,",
         source_path: "src/repin_flow.rs",
         source: REPIN_FLOW_RS,
         hook: "pub const REPIN_POLL_MS: u32 = 3_000;",
     },
-    // -- native controls and the shared menu contract (ADR-0028) ------
     Contract {
         assignment: "atmosphere: '.atmosphere',",
         source_path: "../fleet-ui/src/atmosphere/component.rs",
@@ -907,9 +893,6 @@ const CONTRACTS: &[Contract] = &[
         source: TOPBAR_RS,
         hook: "class=\"user\"",
     },
-    // Two rows, because the selector spans two files: the panel class is
-    // the topbar's, the `role="menu"` node inside it is the shared
-    // menu's.
     Contract {
         assignment: "userMenu: '.user-menu [role=\"menu\"]',",
         source_path: "../fleet-ui/src/topbar.rs",
@@ -1022,7 +1005,6 @@ const CONTRACTS: &[Contract] = &[
         source: TOPBAR_RS,
         hook: "menu_label=\"Account\"",
     },
-    // -- the stretched row control and its neighbours (ADR-0029) ------
     // `tableRow` reaches four pages' rows, so it is pinned in all four:
     // a page that stops rendering `.tbl-row` would otherwise leave its
     // specs matching nothing and passing their `toHaveCount(0)` half.
@@ -1074,9 +1056,6 @@ const CONTRACTS: &[Contract] = &[
         source: HISTORY_RS,
         hook: "class=\"tbl-row\"",
     },
-    // Same four pages for the control itself: the class is what carries
-    // the stretching `::after`, so losing it on one page is losing that
-    // page's whole-row pointer target.
     Contract {
         assignment: "rowStretch: '.row-stretch',",
         source_path: "src/pages/schema.rs",
@@ -1113,8 +1092,6 @@ const CONTRACTS: &[Contract] = &[
         source: SCHEMA_RS,
         hook: "class=\"qa\"",
     },
-    // Two files: the header band belongs to the page, the control
-    // inside it to the shared helper.
     Contract {
         assignment: "tableSortControl: '.fleet-table thead .th.sortable button',",
         source_path: "src/pages/schema.rs",
@@ -1151,7 +1128,6 @@ const CONTRACTS: &[Contract] = &[
         source: HISTORY_RS,
         hook: "class=\"link\"",
     },
-    // -- results table --------------------------------------------------
     Contract {
         assignment: "resultsRow: '.results-table tbody tr',",
         source_path: "src/components/results_table.rs",
@@ -1255,7 +1231,6 @@ const CONTRACTS: &[Contract] = &[
         source: RESULTS_TABLE_RS,
         hook: "class=\"th-sort\"",
     },
-    // -- service drawer -------------------------------------------------
     Contract {
         assignment: "serviceFieldRow: '.sd-fields .sf-row',",
         source_path: "src/components/service_drawer.rs",
@@ -1288,9 +1263,6 @@ const CONTRACTS: &[Contract] = &[
         source: SERVICE_DRAWER_RS,
         hook: "class=\"sf-detail\"",
     },
-    // The service drawer's field row uses the shared `rowStretch`
-    // selector, so its own control is pinned here rather than under a
-    // second name.
     Contract {
         assignment: "rowStretch: '.row-stretch',",
         source_path: "src/components/service_drawer.rs",
@@ -1333,7 +1305,6 @@ const CONTRACTS: &[Contract] = &[
         source: SERVICE_DRAWER_RS,
         hook: "class=\"fn row-stretch\"",
     },
-    // -- facet rail -----------------------------------------------------
     Contract {
         assignment: "filterRail: '.facet-panel',",
         source_path: "src/components/facet_sidebar.rs",
@@ -1569,7 +1540,6 @@ const CONTRACTS: &[Contract] = &[
         source: META_STRIP_RS,
         hook: "class=\"chip\"",
     },
-    // -- chrome ---------------------------------------------------------
     Contract {
         assignment: "chipRemove: '.meta-chips .chip button.x',",
         source_path: "src/components/meta_strip.rs",
@@ -1674,7 +1644,6 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "class=\"run-preview\"",
     },
-    // -- range dialog ---------------------------------------------------
     Contract {
         assignment: "rangeDialog: '.dr-pop[role=\"dialog\"]',",
         source_path: "../fleet-ui/src/range_dialog.rs",
@@ -1723,7 +1692,6 @@ const CONTRACTS: &[Contract] = &[
         source: RANGE_DIALOG_RS,
         hook: "for=ids.get_value().1",
     },
-    // -- accessible names that are Rust format strings ------------------
     Contract {
         assignment: "sortName: 'Sort by {label}',",
         source_path: "src/sort_label.rs",
@@ -1850,7 +1818,6 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "\"+ Add Schedule\"",
     },
-    // -- the schedule form's window controls ----------------------------
     Contract {
         assignment: "windowOption: '[role=\"group\"][aria-labelledby=\"net-window-label\"] .seg-opt',",
         source_path: "src/components/net_drawer.rs",
@@ -1899,16 +1866,12 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "class=\"error-banner\" role=\"alert\"",
     },
-    // -- the stored run preview's local pager ---------------------------
     Contract {
         assignment: "previewRow: 'table tbody tr',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
         hook: "<tbody>",
     },
-    // The preview mounts fleet-ui's OffsetPager for its own footer, so a
-    // spec reads that footer through `resultsFooter` scoped to the
-    // preview rather than through a selector of its own.
     Contract {
         assignment: "previewScroll: '.preview-scroll',",
         source_path: "src/components/net_drawer.rs",
@@ -1933,7 +1896,6 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "class=\"preview-cap\"",
     },
-    // -- the schedule window form's copy --------------------------------
     Contract {
         assignment: "windowLabel: 'Each run covers',",
         source_path: "src/components/net_drawer.rs",
@@ -2024,8 +1986,6 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "Moves both bounds back by this much. Blank is none.",
     },
-    // Run now: one label, defined once and read by both places that
-    // offer it, so the row and the drawer cannot drift apart.
     Contract {
         assignment: "netRunNow: 'Run now',",
         source_path: "src/schedule_edit.rs",
@@ -2044,8 +2004,6 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "{RUN_NOW}",
     },
-    // Why Run now is disabled on a spent run budget: one reason, defined
-    // once and said by both places that disable it.
     Contract {
         assignment: "netRunNowSpentReason: 'Run limit reached. Raise it in the schedule to run again.',",
         source_path: "src/schedule_edit.rs",
@@ -2382,10 +2340,6 @@ const CONTRACTS: &[Contract] = &[
         source: include_str!("../src/state/stream_session.rs"),
         hook: "pub const STREAM_UNAVAILABLE: &str = \"Live stream unavailable. Retry or switch to Snapshot.\";",
     },
-    // -- the DSL shapes the stub dispatches on --------------------------
-    // `e2e_wire_fixture_contract.rs` proves these against the builders by
-    // CALLING them, which is the stronger half; these rows keep the
-    // selector sheet's own copy honest about which source writes them.
     Contract {
         assignment: "queryShapeTopValues: '| top 10 ',",
         source_path: "src/drawer_query.rs",
@@ -2434,21 +2388,12 @@ fn every_selector_assignment_appears_in_selectors_ts() {
 /// `src` with its comments removed, so a hook can only be satisfied by
 /// something the component actually renders.
 ///
-/// A module doc that explains a contract quotes the markup it describes
-/// (`menu.rs`'s doc names `role="menuitem"` in prose), so a raw
-/// `contains` let the guard stay green after the attribute was deleted
-/// from the button: the prose alone answered for it.
-///
-/// Block comments are removed first, counting nesting the way rustc
-/// does; then any line whose first non-space characters are `//` goes,
-/// which covers `//`, `///` and `//!` alike. A trailing comment after
+/// A trailing comment after
 /// code on the same line survives on purpose: stripping it would need
 /// to know where string literals end, and `'https://…'` inside a
-/// literal is exactly the kind of hook this file pins. String literals
-/// stay in for the same reason — `title="Close (Esc)"` is real markup.
+/// literal is exactly the kind of hook this file pins.
 /// The block scan does not know string literals either, so a source
-/// carrying a literal `/*` would over-strip; none of the files below
-/// has one, and a hook that vanished for that reason fails loudly.
+/// carrying a literal `/*` would over-strip.
 fn comment_stripped(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut kept: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -2463,9 +2408,6 @@ fn comment_stripped(src: &str) -> String {
             i += 2;
         } else {
             if depth == 0 {
-                // Byte-wise, so a multi-byte character outside a comment
-                // is copied through unchanged; inside one every byte but
-                // the newline is dropped, which cannot split a character.
                 kept.push(bytes[i]);
             } else if bytes[i] == b'\n' {
                 // Keep the newline so line-comment stripping below still
@@ -2505,7 +2447,6 @@ fn comment_stripped_hides_prose_and_keeps_markup() {
         comment_stripped(markup).contains("role=\"menuitem\""),
         "a hook in real markup must survive stripping"
     );
-    // Nesting, and a hook that shares a line with a trailing comment.
     assert!(
         !comment_stripped("/* a /* b */ role=\"menuitem\" */\n").contains("role=\"menuitem\""),
         "nested block comments must be stripped whole, as rustc reads them"
@@ -2535,8 +2476,6 @@ fn every_source_hook_still_exists() {
 
 #[test]
 fn every_selectors_ts_entry_is_pinned() {
-    // Completeness: a new selectors.ts entry must arrive with a contract,
-    // or it is an unguarded selector the suite can silently rot on.
     for line in SELECTORS_TS.lines() {
         let trimmed = line.trim_start();
         let is_entry = !trimmed.starts_with("///")
@@ -2545,11 +2484,7 @@ fn every_selectors_ts_entry_is_pinned() {
                 !key.is_empty()
                     && key.chars().all(|ch| ch.is_ascii_alphanumeric())
                     // A NUMBER is an entry too. `TIMING` mirrors Rust
-                    // constants the specs wait out, and a predicate that
-                    // only recognised quoted values left those invisible
-                    // to the very mechanism that catches an unpinned
-                    // entry — the one place a silent mirror hurts most,
-                    // since a wrong wait passes either way.
+                    // constants the specs wait out.
                     && (rest.starts_with('\'')
                         || rest.starts_with('"')
                         || rest.starts_with(|ch: char| ch.is_ascii_digit()))
@@ -2565,14 +2500,7 @@ fn every_selectors_ts_entry_is_pinned() {
     }
 }
 
-/// Every check key the health fixtures carry resolves to a friendly
-/// name in `CHECK_NAMES`.
-///
-/// The page renders an unknown key verbatim, which is the honest
-/// fallback but also a silent one: a daemon check the map never grew a
-/// name for would read as a raw identifier forever. The fixtures are the
-/// set of keys the suite exercises, so they are the set this holds the
-/// map to. Lives here rather than in `pages/health.rs` because that
+/// Lives here rather than in `pages/health.rs` because that
 /// module is wasm-only and a `#[cfg(test)]` inside it never runs.
 #[test]
 fn every_fixture_check_key_has_a_friendly_name() {
@@ -2607,19 +2535,10 @@ fn every_fixture_check_key_has_a_friendly_name() {
     }
 }
 
-// ---- key uniqueness ---------------------------------------------------
-//
 // A duplicate key inside one object literal is silent in both languages
 // that read these files. TypeScript's checker rejects it, but the specs
 // run through a transpiler that only strips types, so the LAST spelling
-// wins and the earlier one disappears without a word. That is exactly
-// what two seats writing the same sort-header pins produced: two
-// `schemaEventsHeader` keys in `COPY`, two `fieldFirstAlphabetically`
-// in `CORPUS`, and a `CONTRACTS` table with both copies pinned.
-//
-// The same NAME in two different objects is fine and deliberate:
-// `CORPUS.netId` mirrors `POPULATED.netId` because `corpus` is
-// `populated` plus data.
+// wins and the earlier one disappears without a word.
 
 const FIXTURES_TS: &str = include_str!("../e2e/fixtures.ts");
 
@@ -2719,8 +2638,7 @@ fn top_level_keys(ts: &str, decl: &str) -> Vec<String> {
 }
 
 fn assert_keys_unique(file: &str, object: &str, keys: &[String]) {
-    // Non-vacuous: an object the scan cannot find yields nothing, and
-    // a uniqueness check over nothing passes forever. `TIMING` really
+    // `TIMING` really
     // does hold one key, so one is the floor rather than two.
     assert!(
         !keys.is_empty(),
@@ -2786,13 +2704,10 @@ fn the_key_scan_reads_nesting_strings_and_comments() {
     let src = "export const A = {\n  one: 'a { b }',\n  // two: 'commented out',\n  \
                nested: { one: 1, deep: { one: 2 } },\n  two: `x`,\n} as const;\n\
                export const B = {\n  one: 'shared name, different object',\n} as const;\n";
-    // Braces inside a string, a commented-out key and a nested object's
-    // own keys are all invisible to the top-level scan.
     assert_eq!(
         top_level_keys(src, "export const A = {"),
         vec!["one".to_owned(), "nested".to_owned(), "two".to_owned()],
     );
-    // The same name in a second object is not a duplicate.
     assert_eq!(
         top_level_keys(src, "export const B = {"),
         vec!["one".to_owned()]

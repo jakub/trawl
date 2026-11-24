@@ -3,14 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<NetDrawer/>` — slide-out detail inspector for a saved query ("net").
-//!
-//! Two tabs, URL-synced via `?ntab=query|runs`:
-//! - Query + Schedule: inline-editable DSL, schedule controls with
-//!   interval chips + custom input, enabled toggle, max-runs.
-//! - Runs: paginated run history with expandable inline result previews.
-//!   The previews and Run now need `query` beside `saved_query`; without
-//!   it the history lists and nothing expands (ADR-0018 as amended on
-//!   2026-11-11).
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -36,7 +28,6 @@ use crate::api::RUNS_PAGE_SIZE;
 
 /// Rows per page inside an expanded run's stored result. The preview
 /// pages what the response already carries; page turns never re-fetch.
-/// Background refresh can supply a newly completed result.
 const PREVIEW_PAGE_SIZE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(20).unwrap();
 
 const INTERVAL_PRESETS: &[&str] = &["5m", "15m", "1h", "6h", "24h", "1w"];
@@ -51,11 +42,7 @@ pub fn NetDrawer(
     on_tab_change: Callback<String>,
     on_search: Callback<String>,
     on_refresh: Callback<()>,
-    /// Render in flow beside the nets list rather than over a scrim
-    /// (ADR-0032). The page feeds its viewport query straight in; the
-    /// panes mount once and stay mounted across the breakpoint.
-    #[prop(into, optional)]
-    docked: Signal<bool>,
+    #[prop(into, optional)] docked: Signal<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
     let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
@@ -72,22 +59,12 @@ pub fn NetDrawer(
     let net_for_runs = net.clone();
     let query_for_run = net.query.clone();
     let net_id_for_run_now = net.id;
-    // Run now fires the schedule's next run early, and the server
-    // resolves what it runs at claim time (ADR-0018 as amended on
-    // 2026-09-23). For a windowed net that is never the saved text as
-    // written: the window lives in the schedule, not in the text, so
-    // the text alone would scan with no time bounds, and the server
-    // splices the next window onto it. A query-mode net has no window,
-    // so its text runs verbatim, as a scheduled run of it would. The
-    // offer follows the SAVED state, never an unsaved draft of it: what
-    // fires is the schedule the server holds. A session without `query`
-    // is offered no Run now at all.
+    // The offer follows the SAVED state, never an unsaved draft of it: what
+    // fires is the schedule the server holds.
     let offered = move |n: &SavedQueryResponse| {
         me.with(|m| run_now_offered(n, m.as_ref().map(|m| m.permissions.as_slice())))
     };
     let run_now_allowed = move || saved.get().is_some_and(|n| offered(&n));
-    // A spent run budget keeps Run now on screen, disabled, with the
-    // spend and the reason beside it: the server would refuse the run.
     let run_now_spent_label = Signal::derive(move || {
         saved
             .get()
@@ -97,14 +74,11 @@ pub fn NetDrawer(
     let spent = Signal::derive(move || saved.get().is_some_and(|n| run_now_spent(&n)));
     let run_in_flight = RwSignal::new(false);
 
-    // -- inline rename --
     let editing_name = RwSignal::new(false);
     let name_buf = RwSignal::new(net.name.clone());
     // The trigger REPLACES itself with the input, so focus has to be
     // handed over in both directions or a keyboard user is dropped on
     // `<body>`: the browser has no memory of an element it removed.
-    // Same obligation ADR-0028 puts on an overlay opener, minus the
-    // overlay.
     let name_btn_ref = NodeRef::<leptos::html::Button>::new();
     let name_input_ref = NodeRef::<leptos::html::Input>::new();
     Effect::new(move |was_editing: Option<bool>| {
@@ -266,9 +240,6 @@ pub fn NetDrawer(
                 TabItem::new("runs", "Runs"),
             ]
             tabs_label="Saved query details"
-            // The saved record's name, never the edit buffer: the dialog
-            // keeps its name while a rename is typed and follows it once
-            // the rename lands.
             label=Signal::derive(move || saved.get().map_or_else(|| "Deleted net".to_owned(), |n| n.name))
             active_tab=eff_tab
             on_tab_change=on_tab_change
@@ -359,10 +330,6 @@ pub fn NetDrawer(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tab 1: Query + Schedule
-// ---------------------------------------------------------------------------
-
 #[component]
 fn QuerySchedulePane(
     net: SavedQueryResponse,
@@ -375,7 +342,6 @@ fn QuerySchedulePane(
     let net_id = net.id;
     let missing = Signal::derive(move || saved.get().is_none());
 
-    // -- query editing --
     let editing = RwSignal::new(false);
     let query_buf = RwSignal::new(net.query.clone());
     let saving_query = RwSignal::new(false);
@@ -410,7 +376,6 @@ fn QuerySchedulePane(
         }
     };
 
-    // -- schedule --
     let has_schedule = net.schedule.is_some();
     let interval_buf = RwSignal::new(
         net.schedule
@@ -444,10 +409,6 @@ fn QuerySchedulePane(
     });
     let saved_interval =
         Signal::derive(move || saved.get().and_then(|n| n.schedule).map(|s| s.interval));
-    // The example the callout prints needs the seconds the server
-    // already parsed for this schedule's own durations, so the whole
-    // saved shape rides along beside the draft, following the server
-    // like the fields above.
     let saved_schedule = Signal::derive(move || saved.get().and_then(|n| n.schedule));
     // A local refusal is not a failed request, so it stays in the form
     // next to the Save button instead of flying past as a toast.
@@ -552,8 +513,6 @@ fn QuerySchedulePane(
                         if alive.try_get_value() != Some(true) {
                             return;
                         }
-                        // The draft survives a refusal: the operator's
-                        // next move is to fix what the server named.
                         save_error.set(Some(e.to_string()));
                     }
                 }
@@ -590,7 +549,6 @@ fn QuerySchedulePane(
 
     view! {
         <div class="net-sched">
-            // -- query section --
             <div class="sd-card">
                 <div class="sd-card-hd">
                     <span class="ttl" id="net-query-label">"Query"</span>
@@ -635,7 +593,6 @@ fn QuerySchedulePane(
                 </Show>
             </div>
 
-            // -- schedule section --
             <div class="sd-card">
                 <div class="sd-card-hd">
                     <span class="ttl">"Schedule"</span>
@@ -660,11 +617,8 @@ fn QuerySchedulePane(
                             on_set=Callback::new(move |v| interval_buf.set(v))
                         />
 
-                        // The window decides what each run reads, so it
-                        // is a control here rather than a line of prose
-                        // about the TUI. The strip is a set of toggle
-                        // buttons, not a radio group, hence the explicit
-                        // group role and label.
+                        // The strip is a set of toggle buttons, not a radio
+                        // group, hence the explicit group role and label.
                         <div role="group" aria-labelledby="net-window-label">
                             <span class="field-label" id="net-window-label">"Each run covers"</span>
                             <Segmented
@@ -700,18 +654,11 @@ fn QuerySchedulePane(
                                     </p>
                                 }.into_any(),
                             }}
-                            // What Run now reads in the chosen mode. Query
-                            // mode says nothing: its manual run reads the
-                            // saved text like any other run.
                             {move || run_now_form_line(window_draft.get().mode).map(|line| view! {
                                 <p class="run-now-line" style="color:var(--ink-3); font-size:11px; margin:4px 0 0">{line}</p>
                             })}
                         </div>
 
-                        // The two free durations, side by side: one span
-                        // is one value in the server's grammar, so it is
-                        // a plain box rather than a second preset strip
-                        // competing with the interval's.
                         <div class="formcols">
                             <Show when=move || window_draft.get().mode == WindowMode::Fixed>
                                 <div>
@@ -754,12 +701,9 @@ fn QuerySchedulePane(
                             </Show>
                         </div>
 
-                        // The draft read back as a sentence, with a
-                        // worked example whenever every duration in it
-                        // resolves to seconds. Computed, never canned: a
-                        // fixed pair of timestamps beside a different
-                        // cadence would advertise a window the schedule
-                        // will not read (ADR-0025).
+                        // Computed, never canned: a fixed pair of timestamps
+                        // beside a different cadence would advertise a window
+                        // the schedule will not read (ADR-0025).
                         {
                             move || {
                                 let saved_schedule = saved_schedule.get();
@@ -810,9 +754,6 @@ fn QuerySchedulePane(
                             </span>
                         </div>
 
-                        // What a save is about to cost, said before it
-                        // costs it: dropping a window is not an edit the
-                        // schedule can undo by itself.
                         {
                             let had_window = move || saved_window.get().is_some();
 
@@ -831,9 +772,6 @@ fn QuerySchedulePane(
                             }
                         }
 
-                        // A window or interval change can make the next
-                        // run due already, which surprises an operator
-                        // who expected to wait for the next tick.
                         {
                             move || {
                                 let seed = WindowDraft::from_schedule(saved.get().as_ref().and_then(|n| n.schedule.as_ref()));
@@ -853,9 +791,6 @@ fn QuerySchedulePane(
                             }
                         }
 
-                        // Removal leads, save trails: the tinted
-                        // destructive variant carries the warning the
-                        // inline red used to, without a second idiom.
                         <div class="savebar">
                             {move || saved.get().is_some_and(|n| n.schedule.is_some()).then(|| {
                                 view! {
@@ -874,8 +809,6 @@ fn QuerySchedulePane(
                             >{move || if saving_schedule.get() { "Saving…" } else { "Save schedule" }}</Btn>
                         </div>
 
-                        // Reuses fleet_ui::Field's error paragraph, since
-                        // this refusal reads like any other field's.
                         {move || save_error.get().map(|e| view! {
                             <p class="error-banner" role="alert">{e}</p>
                         })}
@@ -886,16 +819,6 @@ fn QuerySchedulePane(
     }
 }
 
-/// One duration field: the preset chips plus the custom box behind them.
-///
-/// The schedule form has two of these (interval and fixed span) and they
-/// share a grammar and a 60s floor, so they share markup as well. The id
-/// is a parameter because two strips on one form cannot both be
-/// `net-interval`.
-///
-/// The custom box reads blank while a preset is pressed, and typing in
-/// it clears the pressed chip, because the two are one value shown two
-/// ways rather than two values.
 #[component]
 fn DurationChips(
     id: &'static str,
@@ -942,10 +865,6 @@ fn DurationChips(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tab 2: Runs
-// ---------------------------------------------------------------------------
-
 #[component]
 fn RunsPane(
     net_id: i64,
@@ -956,8 +875,6 @@ fn RunsPane(
 ) -> impl IntoView {
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
-    // Reading a run's rows needs `query`; the history does not. Without
-    // it a row is not a control and no preview is built.
     let rows_readable = Signal::derive(move || {
         me.with(|m| may_run_saved(m.as_ref().map(|m| m.permissions.as_slice())))
     });
@@ -983,16 +900,9 @@ fn RunsPane(
     // it from here, and the row's own cells read it — so letting a
     // refusal empty it would take an expanded run off the table for
     // having lost its result file.
-    //
-    // Keyed on the expansion: collapsing drops it, and no later
-    // expansion can inherit it. `expanded_read` belongs to the current
-    // expansion too — the control below clears it as it toggles — so
-    // the read needs no identity check of its own here.
     let expanded_summary = Memo::new(
         move |previous: Option<&Option<trawl_api::ReportRunSummary>>| {
             let expanded = expanded_run.get()?;
-            // What the list says about the run now, or failing that the
-            // last thing this table held for it.
             let held = runs
                 .get()
                 .and_then(Result::ok)
@@ -1098,53 +1008,28 @@ fn RunsPane(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Expanded run result preview
-// ---------------------------------------------------------------------------
-
-/// What one read of a stored run can come back as.
-///
-/// A run whose stored result file is gone answers 409 (issue #227). That is
-/// not a failed read — the run succeeded and the server said so in a
-/// sentence — so it travels as a successful outcome of its own rather than
-/// as an `ApiError`. The refresh helper keeps prior data through errors and
-/// replaces it through successes, and this state must replace: a preview
-/// still showing rows the server has just said it cannot serve would be the
-/// same lie in a slower form.
+/// A run whose stored result file is gone answers 409. That is not a
+/// failed read, so it travels as a successful outcome of its own: the
+/// refresh helper keeps prior data through errors and replaces it through
+/// successes, and this state must replace.
 use crate::run_read::RunRead;
 
 #[derive(Clone)]
 enum RunPreview {
-    /// The run's response, whatever it carries.
     Available(Box<trawl_api::ReportRunResponse>),
-    /// The server's sentence about a run whose stored result is gone.
     Unavailable(String),
-    /// The server's sentence about a read that used up the memory or
-    /// scratch space trawld gives queries (`query_resource_exhausted`,
-    /// ADR-0056). The saved-run read runs on that budget, so a big
-    /// stored result can be refused. Like [`Self::Unavailable`] it is
-    /// the server's answer rather than a fault of the read, so it
-    /// travels as a successful outcome that ends the poll: the same read
-    /// spends the same budget again.
+    /// Like [`Self::Unavailable`] it travels as a successful outcome that
+    /// ends the poll: the same read spends the same budget again.
     Exhausted(String),
 }
 
-/// One stored run's result, with the rerun control beneath it.
-///
-/// Shared with the runs page and the net drawer, which both show
-/// something of their own beside it out of the one `get_run` response
-/// this already fetches, rather than asking for the run a second time.
 #[component]
 #[allow(unused_variables)]
 pub(crate) fn RunResultPreview(
     active: Signal<bool>,
-    /// What the LAST read said, and nothing more: [`None`] until one
-    /// lands, then whichever [`RunRead`] it answered with, replaced by
-    /// every read after it. A read refused for want of resources puts
-    /// [`None`] back: it summarised nothing, and the summary before it is
-    /// stale. Each caller derives what it needs from
-    /// that; this component holds no opinion about what a refusal owes
-    /// whatever a caller was showing before it.
+    /// What the LAST read said, and nothing more. A read refused for want of
+    /// resources puts [`None`] back: it summarised nothing, and the summary
+    /// before it is stale.
     read: RwSignal<Option<RunRead>>,
     net_id: i64,
     run_id: i64,
@@ -1187,11 +1072,7 @@ pub(crate) fn RunResultPreview(
             terminal.set(true);
         }
         // The refusal says nothing about the run, and a summary this
-        // preview recorded on an earlier poll (`running`, typically: the
-        // run finished and this is the first read of its stored file) is
-        // stale beside it. Clearing hands the receipt back to what the
-        // caller's list knows, as before any read. The poll stops for the
-        // reason above; the control below asks again.
+        // preview recorded on an earlier poll is stale beside it.
         Some(Ok(RunPreview::Exhausted(_))) => {
             read.set(None);
             terminal.set(true);
@@ -1224,8 +1105,7 @@ pub(crate) fn RunResultPreview(
                             >"Check again"</Btn>
                         }.into_any(),
                         // The read ran out of resources: the server's
-                        // sentence, and no automatic retry (AC17). Not a
-                        // load failure and not an empty result.
+                        // sentence, and no automatic retry.
                         RunPreview::Exhausted(message) => return view! {
                             <p class="run-exhausted" role="status">{message}</p>
                             <Btn
@@ -1276,8 +1156,6 @@ fn ResultPreviewTable(
         .map(|row| row.iter().map(ToString::to_string).collect())
         .collect();
     let total = rows.len();
-    // Local to this expansion, so collapsing a run and opening it again
-    // starts at page 1 rather than on a page the operator left behind.
     let cap = preview_cap(row_count, total);
 
     let window = Signal::derive(move || {
@@ -1323,9 +1201,6 @@ fn ResultPreviewTable(
             window=window
             on_page=Callback::new(move |p| page.set(p))
         />
-        // Outside the paged slice: the gap between what the run stored
-        // and what this response carries is a property of the response,
-        // not of the page being read.
         {cap.map(|text| view! { <p class="preview-cap">{text}</p> })}
     }
 }

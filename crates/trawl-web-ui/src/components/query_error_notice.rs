@@ -4,47 +4,18 @@
 
 //! `<QueryErrorNotice/>` — what the results region shows in place of the
 //! table or chart when the query itself is wrong (ADR-0039).
-//!
-//! It is the one renderer for a snapshot refusal on Events and on
-//! Visualization and for a live stream whose sent text does not parse.
-//! It offers no Retry and no other control: sending the same text again
-//! earns the same answer, and the editor holding the text is right there.
-//! A closing sentence says so in plain words, so the way forward is not
-//! left for the reader to infer.
-//!
-//! When one detail came back and its span indexes the sent text, the
-//! verdict stands alone and the excerpt follows it, so the reader reaches
-//! the place to repair before the server's explanation, which comes after
-//! the excerpt, whole. Every other notice keeps the server's message (or
-//! the error count) on the verdict's line, with each detail's own message
-//! over its excerpt.
-//!
-//! Its strings are fixed UI copy, server-written, or quotes of the query
-//! text, and all of it renders as text nodes, never as markup. The
-//! excerpt quotes the text that was sent, which [`NoticeModel`] was built
-//! against; the caret line under it is decoration for sighted readers and
-//! hidden from
-//! assistive technology, which reads the message instead. That line opens
-//! with the quoted text before the span, laid out but invisible, so the
-//! carets start under the span however wide the glyphs before it are.
 
 use leptos::prelude::*;
 
 use crate::query_error::{Block, Excerpt, NoticeModel};
 
-/// The notice for one refused query.
 #[component]
-pub fn QueryErrorNotice(
-    /// The first line and the per-detail blocks, already resolved against
-    /// the sent text.
-    model: NoticeModel,
-) -> impl IntoView {
+pub fn QueryErrorNotice(model: NoticeModel) -> impl IntoView {
     let NoticeModel {
         verdict,
         detail,
         blocks,
     } = model;
-    // A lone detail with an excerpt moves its message under the excerpt.
     let excerpt_first = detail.is_some()
         && matches!(
             blocks.as_slice(),
@@ -58,9 +29,6 @@ pub fn QueryErrorNotice(
     } else {
         (detail, None)
     };
-    // The verdict and the detail sit in their own spans so each takes its
-    // own tone; the `: ` between them stays a bare text node, so the line
-    // reads as one sentence.
     view! {
         <div class="query-error" role="alert">
             <p class="query-error-lead">
@@ -80,8 +48,6 @@ pub fn QueryErrorNotice(
     }
 }
 
-/// One detail: its message when the headline is a count, and the sent
-/// line under its span when the span indexes that text.
 fn block(Block { message, excerpt }: Block) -> impl IntoView {
     view! {
         <div class="query-error-block">

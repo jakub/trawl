@@ -2,21 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `/login` — thin wrapper over [`fleet_ui::Login`]: error mapping +
-//! full-document replacement with the validated return destination on success.
-//! Initial session and Jobs polling redirects carry URL state in `return_to`;
-//! absent or invalid destinations fall back to `/search`. Explicit logout
-//! opens bare `/login`, so its next sign-in also opens Search. Failed sign-in
-//! retains the destination, but no unsaved state or interrupted action returns.
-//! The empty-key check lives in the fleet component.
-//!
-//! The `Atmosphere` mesh-gradient backdrop (ADR-0012) mounts as a
-//! sibling above `<Login/>`, matching the fleet-ui workbench
-//! arrangement: the backdrop layer is fixed, full-viewport,
-//! `z-index: -1`, so the login card composes above it with no stacking
-//! work here. That only paints because fleet-ui's `.login-shell`
-//! declares no opaque background: an opaque normal-flow block would
-//! occlude the z-index:-1 canvas, so don't add one in `main.css`.
+//! The `Atmosphere` backdrop layer is fixed, full-viewport, `z-index: -1`.
+//! That only paints because fleet-ui's `.login-shell` declares no opaque
+//! background, so don't add one in `main.css`.
 
 use fleet_ui::{Atmosphere, UiPrefs};
 use leptos::prelude::*;
@@ -54,8 +42,6 @@ pub fn Login() -> impl IntoView {
         });
     });
 
-    // Empty accent, unlike the command bar's "_": the login wordmark is
-    // a plain "trawl", and the empty accent span renders nothing.
     view! {
         <Atmosphere theme=prefs.theme()/>
         <div class="trawl-login">

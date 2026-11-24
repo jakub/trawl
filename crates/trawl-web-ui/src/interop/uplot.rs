@@ -2,22 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Thin `wasm-bindgen` wrapper over the vendored uPlot bundle.
-//!
-//! The JS side (crates/trawl-web-ui/vendor/src/uplot.ts) exposes
-//! `createChart(parent, data, opts)` returning a handle with
-//! `setData()` / `destroy()` / `resize()`. Data is the standard uPlot
-//! `AlignedData`: `[xs, series1, series2, ...]` where every inner array
-//! is the same length and xs are unix timestamps (seconds).
+//! Data is the standard uPlot `AlignedData`: `[xs, series1, series2, ...]`
+//! where every inner array is the same length and xs are unix timestamps
+//! (seconds).
 
 use wasm_bindgen::prelude::*;
 
-/// How the bridge draws the y-series. Serialised as `ChartOpts.kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChartKind {
-    /// One line per series over a time x axis.
     Line,
-    /// Vertical bars: one per x value.
     Column,
     /// Horizontal bars: Column rotated, categories down the left edge.
     Bar,
@@ -33,11 +26,8 @@ impl ChartKind {
     }
 }
 
-/// Rust mirror of `ChartOpts` in `vendor/src/uplot.ts`; that interface's
-/// doc comment points back here. Built here rather than at each call
-/// site so the chart surfaces (the Visualization tab and the service
-/// drawer's ingest columns) can't drift on field names the JS side reads
-/// by string key.
+/// Rust mirror of `ChartOpts` in `vendor/src/uplot.ts`; the JS side reads
+/// these field names by string key.
 pub struct Opts<'a> {
     pub width: f64,
     pub height: f64,
@@ -51,7 +41,6 @@ pub struct Opts<'a> {
     /// `Some` switches the x scale to ordinal: one label per category and
     /// xs are `0..n-1`. `None` keeps a time x scale.
     pub x_labels: Option<&'a [String]>,
-    /// Draw a line across explicit nulls instead of leaving a gap.
     pub span_gaps: bool,
     /// Let the bridge install its own `ResizeObserver` on the host. Set
     /// only by a caller that never calls [`ChartHandle::resize`]: one
@@ -99,9 +88,6 @@ impl Opts<'_> {
 extern "C" {
     pub type ChartHandle;
 
-    /// Mount a chart into `parent`, seeded with `data` and sized/labeled
-    /// by `opts`. Returns a handle whose methods mutate the chart in
-    /// place.
     #[wasm_bindgen(js_name = createChart)]
     pub fn create_chart(parent: &web_sys::HtmlElement, data: JsValue, opts: JsValue)
     -> ChartHandle;

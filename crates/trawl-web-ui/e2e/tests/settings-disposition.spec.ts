@@ -141,8 +141,6 @@ async function prepareSave(page: Page, request: APIRequestContext, scenario = 's
   expect(new URL(page.url()).searchParams.get('q'), 'editing must leave the executed URL query unchanged').toBe('service=nginx');
 }
 
-// The console's Save as Net is the Search page's one entry to the save
-// flow (ADR-0025, amended 2026-09-23).
 function saveTool(page: Page) {
   return page.locator(SEL.editorTool).filter({ hasText: COPY.saveAsNetTool });
 }
@@ -157,7 +155,7 @@ async function submitSave(page: Page, status = 200) {
   const answered = page.waitForResponse((response) =>
     response.url().endsWith('/api/v1/saved') && response.request().method() === 'POST',
   );
-  // Modal-scoped: the editor tool carries the same name now.
+  // Modal-scoped: the editor tool carries the same name.
   await page.locator(SEL.modalPanel).getByRole('button', { name: 'Save as Net', exact: true }).click();
   const response = await answered;
   expect(response.status()).toBe(status);

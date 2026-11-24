@@ -2,19 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Canned response payloads, shaped after the real wire types the SPA
-// decodes. Sources (re-verify on drift):
-//   MeResponse       crates/trawl-web/src/routes/auth.rs, crates/trawl-web-ui/src/api/mod.rs
-//   QueryResponse     crates/trawl-api/src/lib.rs (QueryResponse/QueryResult/PaginationMeta)
-//   HistoryResponse   crates/trawl-api/src/lib.rs (HistoryResponse/HistoryEntryResponse)
-//   HealthResponse    crates/trawl-api/src/lib.rs (HealthResponse/HealthStatus)
-//
 // The payloads written inline below are hand-kept. The ones under
 // `wire/` are drift-GUARDED: `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs`
 // decodes each of those files into the very trawl-api struct the SPA
-// decodes it with, so a fixture that lost a required key fails a native
-// `cargo nextest` run instead of quietly rendering an error arm in the
-// browser. Prefer a `wire/` file for anything new.
+// decodes it with. Prefer a `wire/` file for anything new.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -27,7 +18,6 @@ const WIRE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'wire')
 // route stamps `field`) cannot mutate the next caller's copy.
 const wireText = new Map();
 
-/** One drift-guarded wire body, freshly parsed. */
 export function wire(name) {
   if (!wireText.has(name)) {
     wireText.set(name, fs.readFileSync(path.join(WIRE_DIR, `${name}.json`), 'utf8'));
@@ -35,28 +25,21 @@ export function wire(name) {
   return JSON.parse(wireText.get(name));
 }
 
-// ---- the typed result wire (ADR-0035, amended 2026-10-22) ---------------
-//
 // A generated result goes through these, never through a hand-spelled
-// cell: `trawl_api::value::QueryResult` is the authority, and the SPA
-// refuses a whole response for one cell its column type refuses.
+// cell: the SPA refuses a whole response for one cell its column type
+// refuses.
 
-/** A canonical decimal integer, `-?(0|[1-9][0-9]*)`: the only spelling
- * the decoder lands. */
 const DECIMAL = /^-?(0|[1-9][0-9]*)$/;
 
-/** RFC 3339 with microseconds and an offset, `Z` at zero: how the server
- * writes a `timestamp` cell. */
+/** How the server writes a `timestamp` cell. */
 const WIRE_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}(Z|[+-]\d{2}:\d{2})$/;
 
-/** An instant (epoch ms or a `Date`) as a `timestamp` cell. */
 export function wireInstant(at) {
   return new Date(at).toISOString().replace(/\.(\d{3})Z$/, '.$1000Z');
 }
 
-/** One cell under its column's type. An `integer` cell is a JS safe
- * integer or already a decimal string; a number past 2^53 has already
- * lost digits, so it throws instead of being spelled. */
+/** A number past 2^53 has already lost digits, so it throws instead of
+ * being spelled. */
 export function wireCell(type, value) {
   if (value === null) return null;
   if (type === 'integer') {
@@ -70,8 +53,6 @@ export function wireCell(type, value) {
   return value;
 }
 
-/** `columns` (`{ name, type }`) and positional `rows`, every cell
- * encoded under its column. */
 export function typedResult(columns, rows) {
   return {
     columns,
@@ -82,8 +63,6 @@ export function typedResult(columns, rows) {
   };
 }
 
-/** One raw live event as the `data` frame the server sends: a one-row
- * typed result. `fields` is `[name, type, cell]` per field, in order. */
 export function dataFrame(fields) {
   return typedResult(
     fields.map(([name, type]) => ({ name, type })),
@@ -91,36 +70,28 @@ export function dataFrame(fields) {
   );
 }
 
-/** `GET /api/v1/schema/field?name=` — one field's pin, its per-service
- * observations and its conflict evidence. The `name` a route answers with
- * is the one that was asked for; this body carries the rest. */
 export function catalogFieldResponse() {
   return wire('catalog-field');
 }
 
-/** `GET /api/v1/schema/repin/status` while a job is still running. The
- * case file adopts this at mount and starts its 3s poll from it. */
 export function repinStatusRunningResponse() {
   return wire('repin-status-running');
 }
 
-/** The same job once it has finished. Same id on purpose: the case file
- * tracks a job by id and reads a different one as the install-wide
- * one-running slot having moved on. */
+/** Same id as the running job on purpose: the case file tracks a job by
+ * id and reads a different one as the install-wide one-running slot
+ * having moved on. */
 export function repinStatusSucceededResponse() {
   return wire('repin-status-succeeded');
 }
 
-/** `GET /api/v1/schema/repin/status` with nothing to report. */
 export function repinStatusNoJobResponse() {
   return { job: null };
 }
 
-/** Non-admin identity: no `server_manage`, so AuthShell never opens the
- * admin stats SSE stream and the only /api/v1/stream open in these tests
- * is the one the live-tail toggle opens itself. It holds `saved_query`
- * beside `query`, as trawld requires to list nets, run one and read its
- * rows. */
+/** No `server_manage`, so AuthShell never opens the admin stats SSE
+ * stream and the only /api/v1/stream open in these tests is the one the
+ * live-tail toggle opens itself. */
 export function meResponse() {
   return {
     name: 'e2e',
@@ -144,10 +115,6 @@ export function healthResponse() {
   };
 }
 
-/** Minimal valid QueryResponse: zero rows, zero columns — the results
- * table renders its "No events match this query" empty state, which is
- * fine for specs that only care about the request being made and the
- * page not crashing. */
 export function queryResponse() {
   return {
     columns: [],
@@ -171,40 +138,20 @@ export function serviceSchemaResponse() {
   return wire('service-schema');
 }
 
-/** `GET /api/v1/saved` under the `populated` scenario: one Net, so the
- * Nets table renders a row with direct action buttons and `?net=1`
- * opens the drawer. The default stays empty — specs that assert a
- * pristine page count on it. */
+/** The default stays empty — specs that assert a pristine page count on
+ * it. */
 export function populatedListSavedResponse() {
   return wire('saved-queries');
 }
 
-/** `GET /api/v1/schema/services` under the `populated` scenario: one
- * service, which is what makes `?svc=nginx` mount the service drawer and
- * its three-tab strip. */
 export function populatedServiceSchemaResponse() {
   return wire('service-schema-populated');
 }
 
-// ---- the `corpus` scenario ------------------------------------------------
-//
-// `corpus` is `populated` plus data: query rows, history, and the runs
-// surfaces. It exists because the row controls, the facet rail and the
-// results table are only reachable once something answers with rows, and
-// `default`/`populated` deliberately answer empty.
-
-/** The DSL substrings the stub dispatches `/api/v1/query` on.
- *
- * These are SHAPES, not whole queries: the service drawer composes its
+/** These are SHAPES, not whole queries: the service drawer composes its
  * reads with a field or service name in them, so the stub can only
- * recognise the stage. The first two are built in `src/drawer_query.rs`
- * (`top_values_query` writes `| top 10 <field>`, `cardinality_query`
- * writes `| stats dc(<f>) as …`); the third is built inline in the
- * overview pane of `src/components/service_drawer.rs`.
- * `tests/e2e_wire_fixture_contract.rs` calls the two builders and greps
- * the drawer source for the third, so a rewrite of any of them fails a
- * native test instead of silently routing a drawer read to the rows
- * fixture or to the 500 arm.
+ * recognise the stage. `tests/e2e_wire_fixture_contract.rs` pins the
+ * first three against the drawer's builders.
  */
 export const QUERY_SHAPES = {
   topValues: '| top 10 ',
@@ -213,177 +160,103 @@ export const QUERY_SHAPES = {
   statsBy: '| stats count() by ',
 };
 
-/** `POST /api/v1/query` under `corpus` for a plain search: 8 events over
- * `_time, host, status, message`. `host` carries 6 distinct values, one
- * more than the facet rail shows before it offers "+ 1 more", and no two
- * sort orders of these rows agree, so a sort spec can tell ascending from
- * descending by reading the first row. */
+/** No two sort orders of these rows agree, so a sort spec can tell
+ * ascending from descending by reading the first row. */
 export function corpusQueryRowsResponse() {
   return wire('query-rows');
 }
 
-/** `POST /api/v1/query` under `corpus` for a `stats count() by <field>`
- * pipeline: the one shape the categorical chart draws. Five groups over
- * `status` and `count`, of which one count is NEGATIVE so the signed
- * (two-sided) track is exercised, and one is NULL so the "no bar, no
- * value" arm is too. The exact table offers a search on `status` and
- * nothing on `count`, which is the F02 fix rendered. */
+/** One count is NEGATIVE so the signed (two-sided) track is exercised,
+ * and one is NULL so the "no bar, no value" arm is too. */
 export function corpusStatsByResponse() {
   return wire('query-stats-by');
 }
 
-/** The service drawer's cardinality read. Its columns are `c0`, `c1` and
- * `c2`, because the drawer builds `dc(<field>) as c<i>` per column of the
- * service it mounted and reads the answer back BY POSITION — a field name
- * cannot be an alias, since `_time` is reserved. So the columns stand for
- * `service-schema-corpus.json`'s columns in order: `_time`, `status`,
- * `duration`. The third count is null on purpose: a field with no count is
- * skipped by `top_cardinality_rows`, so the overview card lists two rows
- * and the Fields tab shows `duration` as unknown. */
+/** The drawer builds `dc(<field>) as c<i>` per column of the service it
+ * mounted and reads the answer back BY POSITION, so the columns stand for
+ * `service-schema-corpus.json`'s columns in order. The third count is
+ * null on purpose. */
 export function corpusCardinalityResponse() {
   return wire('query-cardinality');
 }
 
-/** The service drawer's top-values read. Its value column is named
- * `value`, which `parse_top_values` accepts for ANY field, so one fixture
- * serves whichever field the spec opened. */
+/** Its value column is named `value`, which `parse_top_values` accepts
+ * for ANY field, so one fixture serves whichever field the spec opened. */
 export function corpusTopValuesResponse() {
   return wire('query-top-values');
 }
 
-/** `GET /api/v1/history` under `corpus`: one ordinary entry, and one
- * whose query text is 32769 ASCII bytes — one over `MAX_SEARCH_BYTES`
- * (`crates/trawl-search-url/src/search_url.rs`), so rerunning it is refused by the navigator
- * rather than navigated. The length is pinned natively in
- * `tests/e2e_wire_fixture_contract.rs`. */
 export function corpusHistoryResponse() {
   return wire('history');
 }
 
-/** `GET /api/v1/saved/{id}/runs` — two runs of net 1, one success and one
- * error, so the net drawer's Runs tab renders rows to expand. */
 export function corpusNetRunsResponse() {
   return wire('net-runs');
 }
 
-/** `GET /api/v1/saved/{id}/runs/{run_id}` — run 501 with its result, which
- * is what a run row's expansion fetches. Answered for every run id: the
- * expansion is the thing under test, not the id routing. */
 export function corpusRunResultResponse() {
   return wire('run-result');
 }
 
-/** `GET /api/v1/runs` — the same two runs, enriched with the owning net,
- * for the global Runs page. */
 export function corpusAllRunsResponse() {
   return wire('runs-all');
 }
 
-/** `GET /api/v1/runs/stats` — the aggregates over those two runs. */
 export function corpusRunsStatsResponse() {
   return wire('runs-stats');
 }
 
-/** The service drawer's overview histogram read. Built inline in
- * `src/components/service_drawer.rs` (`last=24h | timechart span=1h
- * count()`) rather than in `drawer_query.rs`, so the drift test pins the
- * substring against that source file instead of calling a builder.
- *
- * `build_histogram` finds its time column by name (`_time`) and its
+/** `build_histogram` finds its time column by name (`_time`) and its
  * counts by a column named `count` or prefixed with it, so those two
- * names are the contract. The rows are hourly buckets on 2026-09-01,
- * newest 23:00. The grid anchors on the newest row, so all six land
- * inside the 24 slots it lays out. */
+ * names are the contract. */
 export function corpusTimechartResponse() {
   return wire('query-timechart');
 }
 
-/** `GET /api/v1/schema/services` under `corpus` only. The `populated`
- * copy stays exactly as it is: this one adds a third column, `duration`,
- * and names it in the service's `degraded_fields`, which is the ONLY
- * thing that renders a field row's `.deg-btn` badge
- * (`service_card_fmt::is_degraded_column`). The name matches
- * `catalog-field.json`, so the case file the badge opens describes the
- * same field the drawer sent it to. */
 export function corpusServiceSchemaResponse() {
   return wire('service-schema-corpus');
 }
 
-// ---- the `schedule` scenario ----------------------------------------------
-//
-// `schedule` is the drawer's schedule form with something to edit: four
-// nets, one with no schedule and one per schedule mode (a tiling
-// window, a fixed span, and a paused query-mode schedule), plus a run
-// whose stored result is longer than one preview page. It is a separate
-// scenario rather than a change to `populated`/`corpus` because those
-// two are pinned as one service and one net, and the specs written
-// against them count rows.
+// `schedule` is a separate scenario rather than a change to
+// `populated`/`corpus` because those two are pinned as one service and
+// one net, and the specs written against them count rows.
 
-/** `GET /api/v1/saved` under `schedule`: the `populated` net verbatim
- * (no schedule), a net whose schedule tiles (`window: "since_last"`, a
- * 5m lag and a coverage watermark), a fixed-span net and a paused
- * query-mode net. One drawer per case, so a spec can put every schedule
- * shape beside the unscheduled net without a second scenario. */
 export function windowedListSavedResponse() {
   return wire('saved-queries-windowed');
 }
 
-/** `GET /api/v1/saved` under `schedule-spent`: a capped net under its cap,
- * a net whose budget is spent past a lowered cap (`spent 5/3`), and a
- * `max_runs = 0` net that never ran. Pinned by
- * `tests/e2e_wire_fixture_contract.rs`. */
 export function spentListSavedResponse() {
   return wire('saved-queries-spent');
 }
 
-/** `PUT /api/v1/saved/{id}/schedule` — what a successful save answers.
- * The body is only decoded, never read for content: the assertion a
- * schedule spec makes is about the REQUEST. */
 export function scheduleSavedResponse() {
   return wire('schedule-saved');
 }
 
-/** The 400 `/__ctl/schedule/refuse` arms. The message is the server's
- * own `WindowPolicyError::TimeClause` sentence, which is what the form
- * renders verbatim in its inline error. */
+/** The message is the server's own `WindowPolicyError::TimeClause`
+ * sentence. */
 export function scheduleConflictResponse() {
   return wire('schedule-conflict');
 }
 
-/** `POST /api/v1/saved/{id}/run` under `schedule`: the claimed manual
- * run of the tiling net, with the window the server resolved at claim
- * time (from its watermark to the claim instant less its 5m lag). The
- * toast states these bounds, never ones the browser computed. */
 export function runStartedResponse() {
   return wire('run-started');
 }
 
-/** The 409 `/__ctl/run/refuse` arms: an empty since_last window, in the
- * server's own words. The toast quotes the message verbatim. */
 export function runRefusedResponse() {
   return wire('run-refused');
 }
 
-/** `GET /api/v1/saved/{id}/runs` under `schedule`: the two `corpus` runs
- * plus a newest third whose result is 45 rows. A separate file, so
- * `net-runs.json` and every `corpus` count written against it stay as
- * they are. */
 export function scheduleNetRunsResponse() {
   return wire('schedule-net-runs');
 }
 
-/** `GET /api/v1/saved/{id}/runs/503` — 45 rows over `seq` and `message`,
- * where `seq` is the row's 1-based position. Two and a bit preview pages
- * at `PREVIEW_PAGE_SIZE` = 20, and every row names its own index, so a
- * paging spec can say WHICH rows it is looking at. */
+/** `seq` is the row's 1-based position. */
 export function pagedRunResultResponse() {
   return wire('run-result-paged');
 }
 
-/** `GET /api/v1/saved/{id}/runs/{run_id}` for a run whose stored result
- * file is gone: trawld's 409 envelope, carrying the sentence
- * `from_saved::unavailable_run_message` writes (issue #227). Built rather
- * than filed, because the sentence names the run. */
+/** The sentence `from_saved::unavailable_run_message` writes. */
 export function unavailableRunResponse(runId) {
   return {
     error: {
@@ -394,8 +267,8 @@ export function unavailableRunResponse(runId) {
   };
 }
 
-/** Global ordering matches the API's closed token set. Fixtures use ASCII
- * names, so Buffer.compare implements the database's C collation. */
+/** Fixtures use ASCII names, so Buffer.compare implements the database's
+ * C collation. */
 export function globalRunsOrder(params) {
   if (params.getAll('sort').length > 1 || params.getAll('dir').length > 1) return null;
   const sort = params.get('sort') ?? 'started';
@@ -428,8 +301,7 @@ export function sortedGlobalRuns(runs, { sort, dir }) {
   });
 }
 
-/** A full authorized fixture set; callers sort this before slicing a page.
- * The ordinary three-row fixture remains useful for local-filter tests. */
+/** Callers sort this before slicing a page. */
 export function paginationGlobalRuns(total) {
   const source = wire(total <= 3 ? 'pagination-runs-all' : 'runs-sort').runs;
   return Array.from({ length: total }, (_, i) => ({
@@ -438,58 +310,33 @@ export function paginationGlobalRuns(total) {
   }));
 }
 
-// ---- the `aggregate` scenario ---------------------------------------------
-//
-// One aggregation, answered at whatever size the test asks for, so a
-// spec can watch the whole-result fetch (ADR-0037) without a fixture per
-// size. The rows are generated rather than pinned in `wire/` for that
-// reason: what these specs read is the COUNT of rows and the window the
-// request asked for, never a particular bucket's value.
-//
 // `total` is what the execution produced, measured BEFORE the window was
-// cut from it — a slice never renames itself the result.
+// cut from it.
 
-/** Bucket instants, two minutes apart from a fixed epoch. Fixed so a
- * chart of N buckets is the same picture on every run. */
 const AGGREGATE_EPOCH = Date.parse('2026-09-01T00:00:00Z');
 const AGGREGATE_BUCKET_MS = 2 * 60 * 1000;
 
-/** Deterministic, non-negative and not constant: a flat line would hide
- * a chart that plotted the same point N times.
+/** Not constant: a flat line would hide a chart that plotted the same
+ * point N times.
  *
  * Row 0 is a deliberate spike, well above the 13 the cycle reaches. It
  * puts the result's largest count on the FIRST page only, which is what
- * lets a width assertion tell the two scales apart: a bar measured
- * against the whole result keeps its width on page 2, while one
- * measured against its own page stretches against a page maximum of 13.
- * Without the spike both scales read 13 and the assertion passes on the
- * defect (ADR-0037). Every count stays positive so the track is
- * one-sided and the largest fills it. */
+ * lets a width assertion tell a whole-result scale from a per-page one.
+ * Every count stays positive so the track is one-sided. */
 function aggregateCount(i) {
   return i === 0 ? 47 : ((i * 7) % 13) + 1;
 }
 
-/** A `_time` bucket as a snapshot response spells it: a `timestamp`
- * cell at offset zero, because the web UI sends `timezone: None` and the
- * server defaults the offset to zero (ADR-0038). */
 function aggregateInstant(i) {
   return wireInstant(AGGREGATE_EPOCH + i * AGGREGATE_BUCKET_MS);
 }
 
-/** `POST /api/v1/query` under `aggregate` for a `| timechart` pipeline:
- * `buckets` rows of `_time, count`, sliced to the posted window. */
 export function aggregateTimechartResponse(buckets, total, offset, limit) {
   const rows = Array.from({ length: buckets }, (_, i) => [aggregateInstant(i), aggregateCount(i)]);
   return aggregateBody([TIME, COUNT], rows, total, offset, limit);
 }
 
-/** The same pipeline with a `by host`: `buckets` × `hosts` rows of
- * `_time, host, count`, one series per host on the same bucket grid.
- * Rows come out bucket-major, the order the server's ORDER BY produces.
- *
- * The window is cut from the flattened rows, so a `total` larger than
- * what one fetch carries is a cut GROUPED result — the shape that
- * draws, and so the one whose coverage rung is worth a test. */
+/** Rows come out bucket-major, the order the server's ORDER BY produces. */
 export function aggregateGroupedTimechartResponse(buckets, hosts, total, offset, limit) {
   const rows = [];
   for (let i = 0; i < buckets; i++) {
@@ -506,9 +353,7 @@ export function aggregateGroupedTimechartResponse(buckets, hosts, total, offset,
   );
 }
 
-/** `POST /api/v1/query` under `aggregate` for a `| pivot` pipeline: a
- * shape the chart refuses whatever the window, which is what makes it
- * the case for "the shape sentence comes before the coverage one". */
+/** A shape the chart refuses whatever the window. */
 export function aggregatePivotResponse(groups, total, offset, limit) {
   const rows = Array.from({ length: groups }, (_, i) => [
     `web-${String(i + 1).padStart(2, '0')}`,
@@ -524,8 +369,7 @@ export function aggregatePivotResponse(groups, total, offset, limit) {
   );
 }
 
-/** The ranked services the quick-start "Rank services by errors" query
- * answers, already in its `sort -errors` order. */
+/** Already in the quick-start query's `sort -errors` order. */
 export const RANKED_SERVICES = [
   ['api', 412],
   ['checkout', 208],
@@ -534,11 +378,8 @@ export const RANKED_SERVICES = [
   ['worker', 4],
 ];
 
-/** `POST /api/v1/query` under `aggregate` for the ranked
- * `stats count() as errors by service | sort -errors | head 10`
- * pipeline: `service, errors`, descending, never more than the ten rows
- * its `head` keeps. A group search prepends `service="<name>"` ahead of
- * the first pipe, and that follow-up answers the one matching row. */
+/** A group search prepends `service="<name>"` ahead of the first pipe,
+ * and that follow-up answers the one matching row. */
 export function aggregateRankedResponse(dsl, offset, limit) {
   const only = /(?:^|\s)service\s*=\s*"([^"]*)"/.exec(dsl.split('|')[0])?.[1];
   const rows = RANKED_SERVICES
@@ -554,8 +395,6 @@ export function aggregateRankedResponse(dsl, offset, limit) {
   );
 }
 
-/** `POST /api/v1/query` under `aggregate` for a `| stats count() by`
- * pipeline: `groups` rows of `status, count`, sliced the same way. */
 export function aggregateStatsByResponse(groups, total, offset, limit) {
   const rows = Array.from({ length: groups }, (_, i) => [`${200 + i}`, aggregateCount(i)]);
   return aggregateBody([{ name: 'status', type: 'string' }, COUNT], rows, total, offset, limit);
@@ -565,7 +404,6 @@ const TIME = { name: '_time', type: 'timestamp' };
 const COUNT = { name: 'count', type: 'integer' };
 
 function aggregateBody(columns, rows, total, offset, limit) {
-  // `total` before the slice, `returned` after it.
   const produced = total ?? rows.length;
   const window = rows.slice(offset, offset + limit);
   return {

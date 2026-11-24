@@ -105,8 +105,6 @@ test('explicit Filter submits the completed composition by pointer', async ({ pa
   await expect(rows(page)).toHaveCount(50);
   await input(page).dispatchEvent('compositionstart');
   await input(page).fill('match');
-  // Model the completed composition before the button's pointer activation.
-  // The composition flag must not suppress this explicit Filter submission.
   await input(page).dispatchEvent('compositionend');
   await page.getByRole('button', { name: 'Filter', exact: true }).click();
   await expect(summary(page)).toHaveText('1–50 of 120');

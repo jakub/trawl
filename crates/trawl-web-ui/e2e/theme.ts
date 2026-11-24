@@ -7,7 +7,6 @@ import { SEL } from './selectors';
 
 export type ThemeChoice = 'Light' | 'Dark' | 'System';
 
-/** Select through the shipped account menu, including its close/restore contract. */
 export async function selectTheme(page: Page, choice: ThemeChoice): Promise<void> {
   await page.locator(SEL.topbarUser).click();
   await page.getByRole('menuitemradio', { name: choice, exact: true }).click();

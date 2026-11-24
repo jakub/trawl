@@ -25,13 +25,10 @@ impl Default for ReadTurn {
 }
 
 impl ReadTurn {
-    /// A counter owned by the calling component.
     pub fn new() -> Self {
         Self(StoredValue::new(0))
     }
 
-    /// Start a read, retiring every earlier one, and return its turn.
-    /// Zero, which is never current, once the owner is gone.
     pub fn begin(self) -> u64 {
         self.0
             .try_update_value(|turn| {
@@ -41,18 +38,14 @@ impl ReadTurn {
             .unwrap_or(0)
     }
 
-    /// Retire the read in flight before the one that replaces it starts.
     pub fn supersede(self) {
         self.begin();
     }
 
-    /// Whether `turn` is still the newest read of a mounted owner.
     pub fn is_current(self, turn: u64) -> bool {
         turn != 0 && self.0.try_get_value() == Some(turn)
     }
 
-    /// The shared sign-in handler for the answer to read `turn`, asked only
-    /// while that read is current: whether the page left for sign-in.
     pub fn leaves_for_sign_in<T>(self, turn: u64, answer: &Result<T, ApiError>) -> bool {
         self.is_current(turn) && crate::auth_return::leaves_for_sign_in(answer)
     }

@@ -2,17 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Every failed answer is read by one classifier (ADR-0066, issue #386).
-// A refusal that carries the server's envelope shows the server's
-// sentence, on endpoints that used to drop it for a bare status. A body
-// that is not the envelope (an HTML error page) or an envelope whose code
-// this build does not know shows generic copy, and its raw text never
-// reaches the page. The investigation writes keep their own reading: an
-// answer that may follow a commit is an unknown outcome and is never sent
-// again, and `request_limit_reached` is a definite refusal.
-//
-// Each failure is a `page.route` override on the one endpoint under test,
-// so the stub's own answer for every other read stays in place.
+// Every failed answer is read by one classifier (ADR-0066).
 
 import type { Locator, Page, Route } from '@playwright/test';
 import { test, expect, resetScenario } from '../fixtures';
@@ -20,7 +10,6 @@ import { SEL, COPY } from '../selectors';
 
 type Reply = Parameters<Route['fulfill']>[0];
 
-/** The server's sentence, which an enveloped refusal must show verbatim. */
 const REFUSAL = 'Trawl is rebuilding its catalog; try again in a minute.';
 const RAW_HTML = 'RAW-HTML-SENTINEL upstream stack at /srv/trawl/worker.rs';
 const RAW_UNKNOWN = 'RAW-UNKNOWN-CODE-SENTINEL';
@@ -35,7 +24,6 @@ const htmlPage: Reply = {
 };
 const unknownCode = envelope(503, 'flux_capacitor_offline', RAW_UNKNOWN);
 
-/** Neither raw body ever reaches the document, as text or as markup. */
 async function expectNoRawText(page: Page) {
   for (const raw of [RAW_HTML, RAW_UNKNOWN, 'Internal Server Error', 'flux_capacitor_offline']) {
     await expect(page.locator('body')).not.toContainText(raw);
@@ -43,14 +31,11 @@ async function expectNoRawText(page: Page) {
   }
 }
 
-/** Answer every GET of `pathname` with `reply`; anything else passes. */
 async function failReads(page: Page, pathname: string, reply: Reply) {
   await page.route(url => url.pathname === pathname, route =>
     route.request().method() === 'GET' ? route.fulfill(reply) : route.fallback());
 }
 
-// One row per read whose failure used to be a bare status. `generic` is
-// what a status-only failure reads as on that surface.
 const reads = [
   {
     name: 'history',
@@ -77,7 +62,6 @@ const reads = [
     says: (detail: string) => `Couldn't load schema: ${detail}`,
   },
   {
-    // `telemetry_get`, as the Health page's capacity card reads it.
     name: 'health capacity',
     path: '/api/v1/stats',
     open: '/settings/health',
@@ -88,7 +72,6 @@ const reads = [
       : `Report unavailable, ${detail}. Refresh to try again.`,
   },
   {
-    // `telemetry_get`, as the Health page's query list reads it.
     name: 'health queries',
     path: '/api/v1/queries',
     open: '/settings/health',
@@ -120,7 +103,6 @@ for (const read of reads) {
   }
 }
 
-// A write that toasts its failure: Clear history.
 async function clearHistory(page: Page) {
   await page.getByRole('button', { name: COPY.historyClear, exact: true }).click();
   await page.locator(SEL.healthConfirm)
@@ -178,8 +160,6 @@ for (const [kind, reply, outcome] of [
   });
 }
 
-// AC7 names `/api/v1/schema/catalog/*`; that path is stale. The case file
-// reads `/api/v1/schema/field?name=`, which is what these routes answer.
 test('the field case file shows its missing state for an enveloped 404', async ({ page }) => {
   await failReads(page, '/api/v1/schema/field', envelope(404, 'not_found', 'no pin for duration'));
   await page.goto('/search/schema?field=duration');
@@ -197,8 +177,6 @@ test('the field case file shows the store sentence for an enveloped 503', async 
   await expectNoRawText(page);
 });
 
-// ---- AC8: investigation writes --------------------------------------------
-
 const BOARD = '5f0c1a2b3c4d5e6f7a8b9c0d1e2f3a4b';
 const BOARD_TITLE = '502s on checkout since 09:00';
 const NOW = new Date('2026-10-24T09:45:00Z');
@@ -207,9 +185,6 @@ const LIMIT = 'The server is at its request limit and did not process this reque
 type Answer = 'lost' | 'unreadable' | 'internal error' | 'gateway page' | 'request limit';
 const answers: Answer[] = ['lost', 'unreadable', 'internal error', 'gateway page', 'request limit'];
 
-/** Answer the write once, as `answer` says. A lost answer never arrives;
- * an unreadable one is a success status whose body is cut short; the
- * two 5xx may follow a commit; the request limit refuses at admission. */
 async function answerWrite(route: Route, answer: Answer, success: number) {
   switch (answer) {
     case 'lost': return route.abort('failed');
@@ -220,7 +195,6 @@ async function answerWrite(route: Route, answer: Answer, success: number) {
   }
 }
 
-/** Count every request to one write endpoint and answer it as `answer`. */
 async function oneWrite(page: Page, matches: (url: URL, method: string) => boolean, answer: Answer, success: number) {
   const sent = { count: 0 };
   await page.route(url => url.pathname.startsWith('/api/v1/'), route => {

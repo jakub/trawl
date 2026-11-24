@@ -5,16 +5,11 @@
 //! `<DegradedNotice/>` — the incomplete-results notice, the SPA's
 //! rendering of `QueryResponse.degraded_fields` (ADR-0011).
 //!
-//! Everything here is a fact about one execution. The fields are the
-//! ones the server said that query bound; nothing is re-derived from the
-//! DSL, and no catalog state is consulted afterwards — a repin that
-//! retires a badge does not edit a notice already on screen, because the
-//! results under it were still produced by the old pin.
+//! Everything here is a fact about one execution: nothing is re-derived
+//! from the DSL, and no catalog state is consulted afterwards.
 //!
-//! Nothing renders when the list is empty, which is the ordinary case,
-//! and nothing renders for the live tail: SSE carries no notice, so the
-//! search page hands this component an empty list in live mode rather
-//! than the last snapshot's.
+//! Nothing renders for the live tail: SSE carries no notice, so the
+//! search page hands this component an empty list in live mode.
 //!
 //! Field names are client-chosen text: they render in leptos text
 //! positions through `sanitize_display_text`, while the exact original
@@ -28,17 +23,13 @@ use crate::components::enc_uri;
 use crate::notice_key::degraded_notice_key;
 use crate::perms::can_schema_read;
 
-/// One line over the results: which fields are shelving values, and
-/// where to read the case file.
 #[component]
 pub fn DegradedNotice(
     /// The effective query the fields belong to — half of the dismissal
     /// identity, never displayed.
     #[prop(into)]
     query: Signal<String>,
-    /// `QueryResponse.degraded_fields`, verbatim.
-    #[prop(into)]
-    fields: Signal<Vec<String>>,
+    #[prop(into)] fields: Signal<Vec<String>>,
 ) -> impl IntoView {
     // The case file is `schema_read`-gated, so without it the link would
     // be a 403 dressed as a remedy. The names still show: knowing which
@@ -90,8 +81,6 @@ pub fn DegradedNotice(
     }
 }
 
-/// The field names as a comma-separated run — each one a case-file link
-/// when the session may read the catalog, plain text when it may not.
 fn field_names(fields: &[String], link: bool) -> Vec<AnyView> {
     let last = fields.len().saturating_sub(1);
     fields

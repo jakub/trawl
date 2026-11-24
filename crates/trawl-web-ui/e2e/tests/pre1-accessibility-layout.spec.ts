@@ -41,8 +41,6 @@ for (const theme of ['light', 'dark']) {
     await page.goto('/search?q=service%3Dnginx');
     await selectTheme(page, theme === 'dark' ? 'Dark' : 'Light');
     await expect(page.locator('.results-table thead th').first()).toBeVisible();
-    // The counts are sampled on an open rail, which a countable page opens
-    // (ADR-0044); a closed rail would leave nothing to measure.
     await expectRail(page, true);
     await expect(page.locator('.facets .v .c').first()).toBeVisible();
     async function contrast(selector: string) {
@@ -66,8 +64,7 @@ for (const theme of ['light', 'dark']) {
           for (const n of ancestors) bg = over(rgba(getComputedStyle(n).backgroundColor), bg);
           // The facet meter is a painted sibling. It only counts as a
           // surface behind the digits when its box actually meets the
-          // count's box (ADR-0032 draws it as a thin rule in the row's
-          // bottom padding), and it paints at its own opacity.
+          // count's box, and it paints at its own opacity.
           const bar = el.closest('.v')?.querySelector('.bar');
           const meets = (a: DOMRect, b: DOMRect) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
           const barSurface = () => {

@@ -60,8 +60,6 @@ try {
     return inspect(dist, 'trawl.ui', label, false);
   };
   const original = build('hash-original');
-  // Exercise HTML case semantics against the actual minimal Trunk output.
-  // This inspects known build markup; it is not a general HTML sanitizer.
   const originalIndex = path.join(scratch, 'hash-original', 'index.html');
   const originalHtml = readFileSync(originalIndex, 'utf8');
   const originalTag = originalHtml.match(/<script\b[^>]*>/i)?.[0];
@@ -86,7 +84,6 @@ try {
     assert.throws(() => inspect(path.dirname(originalIndex), 'trawl.ui', label, false), expected, label);
   }
   writeFileSync(originalIndex, originalHtml);
-  // Modify only a temporary pipeline input; the candidate source stays intact.
   writeFileSync(path.join(scratch, 'theme-bootstrap.js'), readFileSync(bootstrap, 'utf8') + '\ndocument.documentElement.dataset.hashEvidence = "changed";\n');
   const changed = build('hash-changed');
   assert.notEqual(original.src, changed.src, 'changed bootstrap content changes its Trunk URL');

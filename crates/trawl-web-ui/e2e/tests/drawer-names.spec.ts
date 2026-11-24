@@ -3,12 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Each drawer's dialog is named by the bare name of the thing it shows
-// (issue #242, ADR-0028). fleet-ui's Drawer used to name its dialog from
-// the whole title slot, so the rename button, the run's status badge and
-// the field case's Back button all leaked into the name: "Rename errors
-// by host", "errors by host success", "Back to nginx duration". Every
-// assertion here is `exact: true`, because a substring match passes with
-// or without that bug.
+// (ADR-0028).
 
 import { test, expect, resetScenario, CORPUS } from '../fixtures';
 import { SEL } from '../selectors';
@@ -60,14 +55,11 @@ test('the net drawer keeps the saved name while renaming and follows a landed re
   await page.goto(`/jobs/nets?net=${CORPUS.netId}`);
   await expect(dialogNamed(page, CORPUS.netName)).toBeVisible();
 
-  // The controls keep their own names; only the dialog's name changed.
   await expect(page.locator(SEL.netRename)).toHaveAccessibleName(`Rename ${CORPUS.netName}`);
   await page.locator(SEL.netRename).click();
   const input = page.locator(SEL.netRenameInput);
   await expect(input).toBeVisible();
   await expect(input).toHaveAccessibleName(`New name for ${CORPUS.netName}`);
-  // The edit buffer is not the name: typing a new one leaves the dialog
-  // named after the saved net until the rename lands.
   await input.fill(RENAMED);
   await expect(dialogNamed(page, CORPUS.netName)).toBeVisible();
 

@@ -5,53 +5,8 @@
 //! `<EvidenceDrawer/>` — the investigation board's viewer of one captured
 //! result (ADR-0057, ADR-0059).
 //!
-//! It opens from a step that captured a result, at the first page, and
-//! from a row a finding cites, at the page that holds that row, with the
-//! row marked. It reads the stored rows through the captured-result page
-//! route and nothing else: it never runs the query again, so a result
-//! whose events have left the corpus still shows every row it captured.
-//! Each read omits `limit`, so the server's page size decides a page, and
-//! the viewer pages by the size the last answer reported. A cited row
-//! past the first page costs one read to learn that size, which the page
-//! then keeps for every later open.
-//!
-//! Cells read as the results table's do ([`evidence_rows`], #214 types).
-//! A capture the cap cut says so above its rows, with how many it kept
-//! of how many the query produced ([`cut_notice`](crate::investigation_log::cut_notice)); the pager counts only
-//! the kept rows.
-//! A result whose evidence file was pruned answers 410 and reads Pruned;
-//! one whose file is missing answers 409 and reads unavailable; any other
-//! failure keeps a Retry. None of them reads as an empty result. A 429
-//! is the reader's rate limit, which the viewer shares with the board's
-//! polls and its cited-row reads: the viewer says it is waiting, keeps
-//! the page it shows, and reads again once the `Retry-After` has passed.
-//!
 //! While the board's tab is hidden the viewer reads nothing (ADR-0059).
-//! The gate is `Reads::read`, the one place a read starts: then it owes
-//! the read it was asked for, whether the viewer opened, paged, learned
-//! its page size or saw a 429's `Retry-After` pass, and starts it when
-//! the board's visibility listener says the tab shows.
-//!
-//! Below the rows, Open in Search reopens the result's executed text over
-//! its bounds through the shared codec ([`result_search_href`]); a result
-//! without bounds offers no link.
-//!
-//! A session that may write keeps a row from here, one row per keep, with
-//! a reason ([`KeepGate`]). The Keep column is absent without
-//! `investigation_write`, while the investigation is closed, and on a
-//! result that does not read. The reason is checked against the server's
-//! bounds before it is sent ([`keep_reason`]); the form submits from the
-//! keyboard, says what is wrong beside the field, and sends once however
-//! often it is pressed. A keep the server took is acknowledged here and
-//! the board reads what changed; its form closes only if it still holds
-//! the draft that was sent, so a reason begun or edited while the keep
-//! was in flight, for another row or for the same one, stays as it is. A keep whose answer was lost says
-//! its outcome is unknown, keeps the reason, and offers a refresh of the
-//! board, which it waits for before it sends again. A board that stopped
-//! reading offers no refresh.
-//!
-//! The drawer is fixed over the page, so nothing it reads moves the
-//! board under the reader.
+//! The gate is `Reads::read`, the one place a read starts.
 
 use std::num::NonZeroUsize;
 
@@ -70,20 +25,16 @@ use crate::investigation_log::{
     EvidenceRows, cut_notice, evidence_rows, result_search_href, short_result_id,
 };
 
-/// What the viewer was opened on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opened {
-    /// The captured result.
     pub result_id: String,
     /// The row a finding cites, when a cited row opened it: the viewer
     /// opens at its page and marks it.
     pub row: Option<u64>,
 }
 
-/// What the board lends the viewer for a keep.
 #[derive(Clone, Copy)]
 pub struct KeepGate {
-    /// The investigation a keep is written to.
     pub investigation: StoredValue<InvestigationId>,
     /// Whether a keep may be written now: the session may write, the
     /// investigation is open and the board still reads.
@@ -96,21 +47,18 @@ pub struct KeepGate {
     /// The board reads what changed, after a keep landed or was refused
     /// because the investigation closed.
     pub landed: Callback<()>,
-    /// The person's own refresh of the board.
     pub refresh: Callback<()>,
     /// Whether the board still reads on this visit: once a read was
     /// refused for want of a grant, nothing here offers its refresh.
     pub reading: Signal<bool>,
 }
 
-/// What became of the person's last keep.
 #[derive(Debug, Clone, PartialEq)]
 enum KeepNote {
     Kept(u64),
     /// No answer arrived. The mark is the board's newest read generation
     /// when it failed: the form sends again once a later read lands.
     Unknown(u64, u64),
-    /// The investigation was closed when the keep reached it.
     Closed(u64),
     Refused(u64, String),
 }
@@ -141,8 +89,6 @@ impl KeepNote {
     }
 }
 
-/// The viewer's keep: the row whose form is open, its reason, and what
-/// became of the last one sent.
 #[derive(Clone, Copy)]
 struct Keeping {
     gate: KeepGate,
@@ -221,7 +167,6 @@ impl Keeping {
         }
     }
 
-    /// Send the keep the form holds, once.
     fn submit(self) {
         if self.held() {
             return;
@@ -286,7 +231,6 @@ impl Keeping {
     }
 }
 
-/// What the viewer shows.
 #[derive(Debug, Clone)]
 enum Shown {
     Loading,
@@ -298,7 +242,6 @@ enum Shown {
     Failed(String),
 }
 
-/// What a read the server throttled says while the viewer waits.
 const THROTTLED: &str = "The server is limiting reads for your API key. Reading again shortly.";
 
 /// The viewer's reads: one in flight at a time, each taking the next
@@ -319,7 +262,6 @@ struct Reads {
     generation: StoredValue<u64>,
     abort: StoredValue<Option<web_sys::AbortController>, LocalStorage>,
     timer: StoredValue<Option<gloo_timers::callback::Timeout>, LocalStorage>,
-    /// Whether the board's tab shows.
     visible: Signal<bool>,
     /// The page, and the row it was opened on, asked for while the tab
     /// was hidden.
@@ -349,7 +291,6 @@ impl Reads {
                 }
             });
         });
-        // The tab shows: start the read it held.
         Effect::new(move |_| {
             if visible.get()
                 && let Some((page, row)) = reads.owed.try_update_value(Option::take).flatten()
@@ -452,7 +393,6 @@ impl Reads {
     }
 }
 
-/// The page a cited row is on, once the page size is known.
 fn page_of(row: Option<u64>, size: Option<NonZeroUsize>) -> usize {
     match (row, size) {
         (Some(row), Some(size)) => usize::try_from(row).unwrap_or(usize::MAX) / size,
@@ -463,15 +403,10 @@ fn page_of(row: Option<u64>, size: Option<NonZeroUsize>) -> usize {
 #[component]
 pub fn EvidenceDrawer(
     opened: Opened,
-    /// The server's page size as this page last learned it.
     page_size: RwSignal<Option<NonZeroUsize>>,
-    /// Whether the board's tab shows: while it does not, the viewer
-    /// reads nothing.
     visible: Signal<bool>,
     on_close: Callback<()>,
-    /// Present for a session that may write to the investigation.
-    #[prop(optional)]
-    keep: Option<KeepGate>,
+    #[prop(optional)] keep: Option<KeepGate>,
 ) -> impl IntoView {
     let Opened {
         result_id,
@@ -570,8 +505,6 @@ pub fn EvidenceDrawer(
     }
 }
 
-/// One page of rows, what a cut capture says above them, its pager and
-/// Open in Search.
 #[component]
 fn ViewerRows(
     answer: ResultPage,
@@ -645,8 +578,6 @@ fn ViewerRows(
     }
 }
 
-/// The reason form for the row whose Keep was pressed, and the notice of
-/// the last keep.
 #[component]
 fn KeepForm(keeping: Keeping) -> impl IntoView {
     let k = keeping;

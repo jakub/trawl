@@ -2,43 +2,21 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Both tab families as named WAI-ARIA tablists (issue #159, ADR-0028).
-//
-// Two properties, and the two strips prove them against different
-// evidence on purpose.
-//
-// MANUAL ACTIVATION. Arrows move focus and nothing else; Enter or Space
-// selects. The workspace strip's selection is local component state, so
-// the observable there is the selected tab itself — `aria-selected` and
-// the tabindex vector, which are one predicate over the active tab. The
-// drawer strip writes `?stab=` into the URL, so the observable there is
-// the URL: unchanged after arrowing, changed after Enter. A strip that
-// activated on arrow would rewrite the URL under a user who was only
-// looking around.
-//
-// WHAT THE TABLIST CONTAINS. The `role="tablist"` node wraps the tab
-// buttons and nothing else. The workspace strip's View/Export actions
-// live in the outer container, so a screen reader counts two tabs there
-// and not four; the drawer strip's title and close button sit outside it
-// the same way, leaving three.
+// Both tab families as named WAI-ARIA tablists (ADR-0028).
 
 import { test, expect, resetScenario, POPULATED, CORPUS } from '../fixtures';
 import { SEL } from '../selectors';
 
 type Loc = import('@playwright/test').Locator;
 
-/** The tabindex of every tab in the strip, in render order. */
 function tabindexes(tabs: Loc): Promise<(string | null)[]> {
   return tabs.evaluateAll((els) => els.map((el) => el.getAttribute('tabindex')));
 }
 
-/** Whether each tab reports itself selected, in render order. */
 function selectedFlags(tabs: Loc): Promise<(string | null)[]> {
   return tabs.evaluateAll((els) => els.map((el) => el.getAttribute('aria-selected')));
 }
 
-/** Whether this element sits inside a tablist. The negative is the
- * assertion: an action announced as a tab is the defect. */
 function insideTablist(loc: Loc): Promise<boolean> {
   return loc.evaluate((el) => el.closest('[role="tablist"]') !== null);
 }
@@ -56,18 +34,15 @@ test('results strip is a named tablist with manual activation', async ({ page })
   await expect(tabs.nth(0)).toHaveAttribute('type', 'button');
   await expect(tabs.nth(1)).toHaveAccessibleName('Visualization');
 
-  // The selected tab is the strip's only tab stop.
   expect(await selectedFlags(tabs)).toEqual(['true', 'false']);
   expect(await tabindexes(tabs)).toEqual(['0', '-1']);
 
   await tabs.nth(0).focus();
   await page.keyboard.press('ArrowRight');
   await expect(tabs.nth(1)).toBeFocused();
-  // Focus moved; selection did not, so neither did the tab stop.
   expect(await selectedFlags(tabs)).toEqual(['true', 'false']);
   expect(await tabindexes(tabs)).toEqual(['0', '-1']);
 
-  // Wrap, then the endpoints — all focus-only.
   await page.keyboard.press('ArrowRight');
   await expect(tabs.nth(0)).toBeFocused();
   await page.keyboard.press('End');
@@ -76,16 +51,12 @@ test('results strip is a named tablist with manual activation', async ({ page })
   await expect(tabs.nth(0)).toBeFocused();
   expect(await selectedFlags(tabs)).toEqual(['true', 'false']);
 
-  // Enter is what selects, and it moves the tab stop with the selection.
   await page.keyboard.press('End');
   await page.keyboard.press('Enter');
   await expect(tabs.nth(1)).toHaveAttribute('aria-selected', 'true');
   expect(await selectedFlags(tabs)).toEqual(['false', 'true']);
   expect(await tabindexes(tabs)).toEqual(['-1', '0']);
 
-  // The trailing actions are in `.tabs`, outside the tablist. They are
-  // View and Export: the console's Save as Net is the page's one save
-  // entry, so the results toolbar has no Save control (ADR-0025).
   await expect(page.locator(SEL.viewControl)).toBeVisible();
   await expect(page.locator(SEL.exportAction)).toBeVisible();
   expect(await insideTablist(page.locator(SEL.viewControl))).toBe(false);
@@ -114,7 +85,6 @@ test('drawer strip is a named tablist', async ({ page, request }) => {
   expect(await selectedFlags(tabs)).toEqual(['true', 'false', 'false']);
   expect(await tabindexes(tabs)).toEqual(['0', '-1', '-1']);
 
-  // Arrowing across the whole strip leaves `?stab=` exactly as it was.
   await tabs.nth(0).focus();
   await page.keyboard.press('ArrowRight');
   await expect(tabs.nth(1)).toBeFocused();
@@ -125,23 +95,16 @@ test('drawer strip is a named tablist', async ({ page, request }) => {
   await expect(page).toHaveURL(/[?&]stab=overview(&|$)/);
   expect(await selectedFlags(tabs)).toEqual(['true', 'false', 'false']);
 
-  // Enter is what writes the URL.
   await page.keyboard.press('Enter');
   await expect(page).toHaveURL(/[?&]stab=fields(&|$)/);
   await expect(tabs.nth(1)).toHaveAttribute('aria-selected', 'true');
   expect(await tabindexes(tabs)).toEqual(['-1', '0', '-1']);
 
-  // The drawer's own furniture is outside the tablist: its title and
-  // its close button.
   expect(await insideTablist(page.locator(SEL.drawerTitle))).toBe(false);
   expect(await insideTablist(page.locator(SEL.drawerClose))).toBe(false);
 });
 
 test('an unknown drawer tab id still yields one tab stop', async ({ page, request }) => {
-  // `?ntab=` is client text. A strip that answered "none of these"
-  // rendered every tab at tabindex="-1" — no keyboard entry point at
-  // all — while the pane below it showed the first tab's content. An
-  // unmatched id selects the first tab, so markup and pane agree.
   await resetScenario(request, 'corpus');
   await page.goto(`/jobs/nets?net=${CORPUS.netId}&ntab=bogus`);
 
@@ -154,13 +117,10 @@ test('an unknown drawer tab id still yields one tab stop', async ({ page, reques
   expect(await selectedFlags(tabs)).toEqual(['true', 'false']);
   expect(await tabindexes(tabs)).toEqual(['0', '-1']);
 
-  // The strip is reachable by Tab: the drawer's close button is the
-  // last control before it in DOM order.
   await page.locator(SEL.drawerClose).focus();
   await page.keyboard.press('Tab');
   await expect(tabs.nth(0)).toBeFocused();
 
-  // And once inside, the arrow walk works from that entry point.
   await page.keyboard.press('ArrowRight');
   await expect(tabs.nth(1)).toBeFocused();
   await expect(tabs.nth(1)).toHaveAccessibleName('Runs');

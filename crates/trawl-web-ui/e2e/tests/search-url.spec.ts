@@ -5,12 +5,8 @@
 // The search URL contract (ADR-0027) in a real browser.
 //
 // Every URL here is a HAND-WRITTEN literal, never one the app's own
-// encoder produced: the whole point is that a link someone pasted from a
-// chat message behaves as the contract says, and a spec that asked the
-// encoder for its input would agree with any bug the encoder has. The
-// native table tests in `crates/trawl-search-url/src/search_url.rs` cover the
-// codec's rules; this file covers what the browser does to them on the way in
-// and out.
+// encoder produced: a spec that asked the encoder for its input would
+// agree with any bug the encoder has.
 
 import {
   test,
@@ -32,11 +28,6 @@ async function sseOpens(request: Ctl): Promise<number> {
   return state.sse.opens;
 }
 
-/** Run a query from the editor buffer, replacing whatever is there, and
- * wait for the answer to land.
- *
- * Wait for the response before the next URL action. The held-response
- * tests in query-console cover navigation while a request is pending. */
 async function runInEditor(page: import('@playwright/test').Page, dsl: string) {
   const answered = page.waitForResponse((r) => r.url().includes('/api/v1/query'));
   await page.locator(SEL.cmContent).click();
@@ -46,7 +37,6 @@ async function runInEditor(page: import('@playwright/test').Page, dsl: string) {
   await answered;
 }
 
-/** A link whose structured state cannot be read: banner up, nothing run. */
 async function expectRefused(
   page: import('@playwright/test').Page,
   request: Ctl,
@@ -60,11 +50,8 @@ async function expectRefused(
   const notice = page.locator(SEL.urlNotice);
   await expect(notice, `no banner for ${url}`).toBeVisible();
   await expect(notice).toContainText(copyPrefix);
-  // The refusal is an absence, so it needs a bounded quiet wait rather
-  // than an await on something appearing.
   await page.waitForTimeout(QUIET_MS);
   expect(await capturedQueryCount(request), `${url} posted a query`).toBe(0);
-  // …and the URL is untouched until the reader clicks.
   expect(page.url()).toContain(url.slice(url.indexOf('?')));
 }
 
@@ -75,8 +62,6 @@ test('absolute range round-trips through the picker', async ({ page, request }) 
 
   await page.locator(SEL.dateRangeTrigger).click();
   await page.locator(SEL.absoluteTab).click();
-  // An offset on the way in is fine; only the canonical UTC form is
-  // written out.
   await page.locator(SEL.dateRangeFrom).fill('2026-01-01T01:00:00+01:00');
   await page.locator(SEL.dateRangeTo).fill('2026-01-01T00:15:00Z');
   await page.locator(SEL.dateRangeApply).click();
@@ -84,8 +69,6 @@ test('absolute range round-trips through the picker', async ({ page, request }) 
   const search = await page.evaluate(() => location.search);
   expect(search).toContain('r=2026-01-01T00:00:00Z..2026-01-01T00:15:00Z');
   expect(search).not.toContain('abs:');
-  // Readable in the address bar: the only escaping in the whole URL is
-  // the query text's.
   expect(search).toBe('?q=service%3Dnginx&page=0&r=2026-01-01T00:00:00Z..2026-01-01T00:15:00Z');
 
   const label = page.locator(SEL.dateRangeTrigger);
@@ -112,9 +95,8 @@ test('literal versioned filters and range produce the exact DSL', async ({ page,
 
 test('a literal percent in q survives one decode', async ({ page, request }) => {
   // `%2541` is one encoding of `%41`, so a single decode gives the DSL
-  // `message=/100%41/` while a second gives `message=/100A/`, a
-  // different regex run without a word to the reader. leptos-router's
-  // ParamsMap did exactly that: decodeURIComponent over what
+  // `message=/100%41/` while a second gives `message=/100A/`.
+  // leptos-router's ParamsMap decodes twice: decodeURIComponent over what
   // UrlSearchParams had already decoded. Hence the raw query string.
   await page.goto('/search?q=message%3D%2F100%2541%2F&page=0');
 
@@ -122,13 +104,11 @@ test('a literal percent in q survives one decode', async ({ page, request }) => 
   expect(body.query).toBe('last=15m message=/100%41/');
   await expect(page.locator(SEL.cmContent)).toHaveText('message=/100%41/');
   await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
-  // Nothing rewrites the link on the reader's behalf.
   expect(await page.evaluate(() => location.search)).toBe('?q=message%3D%2F100%2541%2F&page=0');
 });
 
 test('legacy and malformed filter payloads refuse to run', async ({ page, request }) => {
-  // The pre-#85 plain-text dialect, as the browser hands it over: `%2B`
-  // decodes to `+` before the app sees it.
+  // `%2B` decodes to `+` before the app sees it.
   await expectRefused(
     page,
     request,
@@ -149,7 +129,6 @@ test('legacy and malformed filter payloads refuse to run', async ({ page, reques
   await expect(page.locator(SEL.urlNoticeRaw)).toHaveText('-source=auth.log');
   await expect(page.locator(SEL.filtersBadChip)).toBeVisible();
 
-  // Versioned but undecodable: no longer "zero filters".
   await expectRefused(
     page,
     request,
@@ -159,12 +138,8 @@ test('legacy and malformed filter payloads refuse to run', async ({ page, reques
   await expect(page.locator(SEL.urlNoticeRaw)).toHaveText('v1.!');
   await expect(page.locator(SEL.filtersBadChip)).toBeVisible();
 
-  // A versioned payload whose RECORD is not one this app writes: an
-  // operator it never emits, and an empty field name. Skipping the bad
-  // record and running the rest would be the same lie in a narrower
-  // query. (Literals: base64url of
-  // [{"op":"x","field":"host","value":"prod"}] and of
-  // [{"op":"+","field":"","value":"prod"}].)
+  // base64url of [{"op":"x","field":"host","value":"prod"}] and of
+  // [{"op":"+","field":"","value":"prod"}].
   for (const payload of [
     'v1.W3sib3AiOiJ4IiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJwcm9kIn1d',
     'v1.W3sib3AiOiIrIiwiZmllbGQiOiIiLCJ2YWx1ZSI6InByb2QifV0',
@@ -178,7 +153,6 @@ test('legacy and malformed filter payloads refuse to run', async ({ page, reques
     await expect(page.locator(SEL.filtersBadChip)).toBeVisible();
   }
 
-  // …and the live tail does not start either.
   const opensBefore = await sseOpens(request);
   await page.goto('/search?q=service%3Dnginx&mode=live&f=v1.!');
   await expect(page.locator(SEL.urlNotice)).toBeVisible();
@@ -190,10 +164,7 @@ test('legacy and malformed filter payloads refuse to run', async ({ page, reques
 test('malformed r refuses to run and repairs on click', async ({ page, request }) => {
   for (const raw of [
     'garbage',
-    // Backwards.
     '2026-01-02T00:00:00Z..2026-01-01T00:00:00Z',
-    // The retired form, which the browser's own decode used to split
-    // inside the timestamp.
     'abs:2026-01-01T00:00:00Z:2026-01-01T00:15:00Z',
     // A real `+02:00` offset, percent-escaped so it survives the browser
     // as an offset…
@@ -210,7 +181,6 @@ test('malformed r refuses to run and repairs on click', async ({ page, request }
     await expect(page.locator(SEL.urlNoticeRepair)).toHaveText(COPY.urlNoticeRepairRange);
   }
 
-  // Repair the last one: replace navigation, `r` gone, one query runs.
   const historyBefore = await page.evaluate(() => history.length);
   await page.locator(SEL.urlNoticeRepair).click();
   await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
@@ -232,35 +202,28 @@ test('a repair fixes only the parameter the banner names', async ({ page, reques
   // says the link was not run, even for an answer already in flight.
   await expect(page.locator(SEL.resultsPane)).toHaveCount(0);
 
-  // The editor stays editable under a banner. Type over it: a named
-  // repair keeps `q`, so nothing about the URL changes to resync the
-  // buffer, and without a reset the edit would sit above results from
-  // the query that actually ran.
+  // A named repair keeps `q`, so nothing about the URL changes to resync
+  // the buffer, and without a reset the edit would sit above results
+  // from the query that actually ran.
   await page.locator(SEL.cmContent).click();
   await page.keyboard.press('Control+a');
   await page.keyboard.insertText('service=auth');
   await expect(page.locator(SEL.cmContent)).toContainText('service=auth');
 
-  // "Drop filters" drops `f` and NOTHING else. `r=garbage` is still in
-  // the address bar, so the next verdict raises its own banner and the
-  // link still has not run.
   await page.locator(SEL.urlNoticeRepair).click();
   await expect(page.locator(SEL.urlNotice)).toContainText(COPY.urlNoticeRangePrefix);
   await expect(page.locator(SEL.urlNoticeRaw)).toHaveText('garbage');
   expect(await page.evaluate(() => location.search)).toBe('?q=service%3Dnginx&r=garbage');
   await expect(page.locator(SEL.resultsPane)).toHaveCount(0);
-  // The buffer is back on the query the link carries, not the edit.
   await expect(page.locator(SEL.cmContent)).toHaveText('service=nginx');
   await page.waitForTimeout(QUIET_MS);
   expect(await capturedQueryCount(request), 'the range banner still ran a query').toBe(0);
 
-  // The second click repairs the range, and only then does it run.
   await page.locator(SEL.urlNoticeRepair).click();
   await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
   expect(await page.evaluate(() => location.search)).toBe('?q=service%3Dnginx');
   const body = await lastCapturedQuery(request, 1);
   expect(body.query).toBe('last=15m service=nginx');
-  // …and what ran is what the editor shows.
   await expect(page.locator(SEL.cmContent)).toHaveText('service=nginx');
   // …and the results pane is back, so its absence above was the gate
   // and not a selector that never matches anything.
@@ -270,7 +233,7 @@ test('a repair fixes only the parameter the banner names', async ({ page, reques
 test('a malformed link disables every control that could run it', async ({ page, request }) => {
   // Wrong in two places, so the banner names `f` while `r` is unreadable
   // too: whatever a control read back would be the fallback, not the
-  // link. Nothing here may navigate except the repair (ADR-0027).
+  // link.
   const url = '/search?q=service%3Dnginx&f=v1.!&r=garbage';
   const search = url.slice(url.indexOf('?'));
   await resetScenario(request, 'default');
@@ -285,26 +248,20 @@ test('a malformed link disables every control that could run it', async ({ page,
   await page.keyboard.press('Control+Enter');
   await page.locator(SEL.runButton).click({ force: true });
 
-  // Export: the one that used to post `{"query":""}`, which the server
-  // reads as every row. Disabled, and the modal does not even open.
   await expect(page.locator(SEL.exportAction)).toBeDisabled();
   await expect(page.locator(SEL.editorTool).filter({ hasText: COPY.saveAsNetTool })).toBeDisabled();
   await page.locator(SEL.exportAction).click({ force: true });
   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
 
-  // The range picker still opens — it is how the current range is read —
-  // but a preset applies nothing.
   await page.locator(SEL.dateRangeTrigger).click();
   const preset = page.locator(SEL.quickRangeOption).first();
   await expect(preset).toBeDisabled();
   await preset.click({ force: true });
 
-  // Live Tail, on the same popover's Real-time tab.
   await page.locator(SEL.realtimeTab).click();
   await expect(page.locator(SEL.liveTailButton)).toBeDisabled();
   await page.locator(SEL.liveTailButton).click({ force: true });
 
-  // Every refusal is an absence, so one bounded quiet wait covers them.
   await page.waitForTimeout(QUIET_MS);
   expect(await page.evaluate(() => location.search), 'a control rewrote the link').toBe(search);
   expect(await capturedQueryCount(request), 'a control ran the link').toBe(0);
@@ -318,11 +275,9 @@ test('an open modal closes when the link stops being readable', async ({ page, r
   await page.locator(SEL.exportAction).click();
   await expect(page.locator(SEL.modalPanel)).toBeVisible();
 
-  // A history entry the app itself can no longer produce — the gate
-  // above is exactly what stops it — planted with pushState (which the
-  // router does not observe) and then REACHED with a real Forward, so
-  // what the router sees is the popstate a Back into a shared broken
-  // link delivers.
+  // Planted with pushState (which the router does not observe) and then
+  // REACHED with a real Forward, so what the router sees is the popstate
+  // a Back into a shared broken link delivers.
   await page.evaluate(() => history.pushState({}, '', '/search?q=service%3Dnginx&f=v1.!'));
   await page.goBack();
   await page.goForward();
@@ -380,17 +335,13 @@ test('page offset overflows refuse to run while an unreadable page is page 1', a
 });
 
 test('a link past the length bound is refused whole', async ({ page, request }) => {
-  // 40 KiB of `q`, past MAX_SEARCH_BYTES. Nothing inside is parsed, so
-  // this is ONE verdict about the link rather than a banner per
-  // parameter, and the browser is the only thing that had to carry it.
+  // 40 KiB of `q`, past MAX_SEARCH_BYTES.
   await resetScenario(request, 'default');
   await page.goto(`/search?q=${'a'.repeat(40 * 1024)}`);
 
   const notice = page.locator(SEL.urlNotice);
   await expect(notice).toBeVisible();
   await expect(notice).toContainText(COPY.urlNoticeTooLong);
-  // Nothing of the raw link is echoed back: there is nothing in 40 KiB
-  // of `a` a reader could act on.
   await expect(page.locator(SEL.urlNoticeRaw)).toHaveCount(0);
   await expect(page.locator(SEL.urlNoticeRepair)).toHaveText(COPY.urlNoticeRepairLink);
   await expect(page.locator(SEL.runButton)).toBeDisabled();
@@ -398,18 +349,13 @@ test('a link past the length bound is refused whole', async ({ page, request }) 
   await page.waitForTimeout(QUIET_MS);
   expect(await capturedQueryCount(request), 'an oversized link posted a query').toBe(0);
 
-  // The editor is still editable under the banner, and nothing the
-  // reader types there is part of the link. For an unread link
-  // `executed_q` is already empty, so the effect that syncs the editor
-  // to the executed query does not fire on "Start over": the repair has
-  // to clear the buffer itself, or the page comes back carrying text
-  // the reader typed at a broken link.
+  // For an unread link `executed_q` is already empty, so the effect that
+  // syncs the editor to the executed query does not fire on "Start
+  // over": the repair has to clear the buffer itself.
   await page.locator(SEL.cmContent).click();
   await page.keyboard.insertText('service=nginx');
   await expect(page.locator(SEL.cmContent)).toHaveText('service=nginx');
 
-  // "Start over" is the whole query string, not an edit of a link the
-  // reader never read — and it replaces, like every other repair.
   const historyBefore = await page.evaluate(() => history.length);
   await page.locator(SEL.urlNoticeRepair).click();
   await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
@@ -420,11 +366,6 @@ test('a link past the length bound is refused whole', async ({ page, request }) 
 });
 
 test('a query too long to link is refused before it navigates', async ({ page, request }) => {
-  // The producer's half of the bound. Submitting 33 KiB of DSL builds a
-  // URL this app's own reader refuses whole, and navigating to it used
-  // to replace the page with the "Start over" banner AND take the text
-  // that caused it down with it, leaving the reader to retype the query
-  // they had just lost. Now nothing moves.
   await resetScenario(request, 'default');
   await page.goto('/search');
   const before = page.url();
@@ -434,12 +375,9 @@ test('a query too long to link is refused before it navigates', async ({ page, r
   await page.keyboard.insertText(`service=${'a'.repeat(33 * 1024)}zzzEND`);
   await page.keyboard.press('Control+Enter');
 
-  // Said out loud: a control that quietly does nothing is worse than
-  // the banner it is avoiding.
   await expect(page.locator(SEL.toastError)).toContainText(COPY.linkTooLongToast);
 
   await page.waitForTimeout(QUIET_MS);
-  // The link the reader is on, and the text they typed, both untouched.
   expect(page.url(), 'a refused submit navigated anyway').toBe(before);
   await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
   // CodeMirror renders a ~2 KB window of a 33 KiB line, not the line, so
@@ -450,12 +388,8 @@ test('a query too long to link is refused before it navigates', async ({ page, r
   expect(tail, 'the editor lost the query it refused').toBe('zzzEND');
   expect(await capturedQueryCount(request), 'a refused submit ran a query').toBe(0);
 
-  // The same door, walked with the one character the app's encoder used
-  // to spell shorter than the browser does. 12 000 apostrophes are
-  // 12 000 typed bytes and 36 000 in the address bar, `%27` each: with
-  // the apostrophe written literally this submit was ADMITTED, the
-  // browser stored the long form, and the reader answered with the "too
-  // long" banner over an editor the sync effect had just emptied.
+  // 12 000 apostrophes are 12 000 typed bytes and 36 000 in the address
+  // bar, `%27` each.
   await page.locator(SEL.cmContent).click();
   await page.keyboard.press('Control+a');
   await page.keyboard.insertText(`message="${"'".repeat(12000)}"`);
@@ -480,45 +414,30 @@ test('q encoding matches encodeURIComponent', async ({ page }) => {
   await runInEditor(page, COPY.reservedSet);
 
   await expect(page).toHaveURL(/[?&]q=/);
-  // The drift guard proper: the app's own encoder (whose output the
-  // native table test pins as RESERVED_SET_ENCODED) and the browser's
-  // encodeURIComponent produce the same string, character for
-  // character.
   const browserEncoded = await page.evaluate((raw) => encodeURIComponent(raw), COPY.reservedSet);
-  // One character apart, and the app is on the browser's side of it:
   // encodeURIComponent leaves an apostrophe literal, but `'` is in the
   // URL standard's special-query percent-encode set, so Chromium stores
-  // `%27` the moment it keeps the link. The app encodes it too, which
-  // is what makes admission measure the string the address bar will
-  // hold. Everything else agrees character for character — `!`, `~`,
-  // `*`, `(` and `)` are asserted literal on both sides below, so the
-  // apostrophe really is the only one the serializer rewrites.
+  // `%27` the moment it keeps the link. The app encodes it too, so
+  // admission measures the string the address bar will hold.
   expect(browserEncoded).toBe(COPY.reservedSetEncoded.replaceAll('%27', "'"));
 
-  // What the address bar shows is what this app wrote, byte for byte.
   const search = await page.evaluate(() => location.search);
   expect(search).toBe(`?q=${COPY.reservedSetEncoded}&page=0`);
-  // …and it decodes back to exactly what was typed.
   const roundTripped = await page.evaluate(() => new URLSearchParams(location.search).get('q'));
   expect(roundTripped).toBe(COPY.reservedSet);
 });
 
 test('a repair that cannot be admitted offers Start over instead', async ({ page, request }) => {
-  // This link reads fine as it stands: a bare `+` is one byte in the
-  // URL and arrives as a space. The range repair carries `q` back
-  // through the encoder, where each of those spaces becomes `%20`, so
-  // "Use last 15 minutes" would build a 32 KiB+ link the producer's own
-  // door refuses — a banner offering a button that does nothing, on a
-  // page where every other control is disabled. 10 918 spaces is the
-  // first count that busts it.
+  // A bare `+` is one byte in the URL and arrives as a space. The range
+  // repair carries `q` back through the encoder, where each space
+  // becomes `%20`, so "Use last 15 minutes" would build a 32 KiB+ link.
+  // 10 918 spaces is the first count that busts it.
   await resetScenario(request, 'default');
   const url = `/search?q=service%3Dnginx${'+'.repeat(10918)}&r=garbage`;
   await page.goto(url);
 
   const notice = page.locator(SEL.urlNotice);
   await expect(notice).toBeVisible();
-  // The sentence is unchanged: the banner has not changed its mind
-  // about what is broken, only about what it can do next.
   await expect(notice).toContainText(COPY.urlNoticeRangePrefix);
   await expect(page.locator(SEL.urlNoticeRaw)).toHaveText('garbage');
   await expect(page.locator(SEL.urlNoticeRepair)).toHaveText(COPY.urlNoticeRepairLink);
@@ -532,12 +451,9 @@ test('a repair that cannot be admitted offers Start over instead', async ({ page
   expect(await page.evaluate(() => location.pathname)).toBe('/search');
   expect(await page.evaluate(() => location.search)).toBe('');
   expect(await page.evaluate(() => history.length)).toBe(historyBefore);
-  // Starting over takes the editor buffer with it, wherever the repair
-  // was reached from.
   await expect(page.locator(SEL.cmContent)).not.toContainText('service=nginx');
   await expect(page.locator(SEL.cmContent)).toHaveText('');
 
-  // An empty query runs nothing, so the page it lands on is idle.
   await page.waitForTimeout(QUIET_MS);
   expect(await capturedQueryCount(request), 'starting over ran a query').toBe(0);
 });

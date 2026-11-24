@@ -4,18 +4,6 @@
 
 //! What each endpoint makes of an answer, as pure functions of its
 //! status, headers and body (ADR-0066).
-//!
-//! The transport in `api` sends a request once, reads its body once, and
-//! hands both here. An ordinary endpoint lists its success statuses and
-//! nothing else ([`answer`]); every other status goes to the one
-//! classifier, [`http_failure`]. The other functions are the exceptions
-//! ADR-0066 lists, one per endpoint, and nothing else is one. None of
-//! them navigates: what a 401 does to the page is the caller's to decide.
-//!
-//! The investigation writes are not here. They keep their own
-//! classifiers (`investigation_live::write_refusal`,
-//! `send_investigation::send_refusal`), because an unknown outcome there
-//! must never read as a refusal.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -26,13 +14,8 @@ use crate::api_error::{ApiError, http_failure};
 use crate::evidence_queue::{Paced, retry_after_ms};
 use crate::repin_flow::{ConflictBody, RepinOutcome, classify_conflict};
 
-/// What a success with no readable body decodes to.
 const UNREADABLE: &str = "the answer's body could not be read";
 
-/// An ordinary answer: a status in `ok` decodes `body` as `T`, and any
-/// other status is a failure for [`http_failure`]. A success whose body
-/// is missing or does not decode is [`ApiError::Decode`]: the server
-/// said yes, and this client cannot read what it said.
 pub fn answer<T: DeserializeOwned>(
     status: u16,
     body: Option<&str>,
@@ -45,17 +28,11 @@ pub fn answer<T: DeserializeOwned>(
     }
 }
 
-/// A success body as `T`.
 fn decode<T: DeserializeOwned>(body: Option<&str>) -> Result<T, ApiError> {
     let body = body.ok_or_else(|| ApiError::Decode(UNREADABLE.to_owned()))?;
     serde_json::from_str(body).map_err(|e| ApiError::Decode(e.to_string()))
 }
 
-/// `GET /api/v1/health`. trawld answers a degraded or unavailable report
-/// with 503, and trawl-web answers its own refusals on the same route
-/// with 503 too (`request_limit_reached`), so a 503 is a report only when
-/// its body decodes as one. Any other 503, a malformed one included, is
-/// the failure it says it is.
 pub fn health(status: u16, body: Option<&str>) -> Result<HealthResponse, ApiError> {
     match status {
         200 => decode(body),
@@ -66,11 +43,6 @@ pub fn health(status: u16, body: Option<&str>) -> Result<HealthResponse, ApiErro
     }
 }
 
-/// `POST /api/v1/schema/repin`. 200 is the plan of a dry run and 202 a
-/// claimed job. A 409 is double-shaped, the refusal's plan or the held
-/// slot's envelope, and [`classify_conflict`] tells them apart by
-/// decoding; a 409 whose body could not be read at all is a decode
-/// failure, never a guess.
 pub fn repin(status: u16, body: Option<&str>) -> Result<RepinOutcome, ApiError> {
     match status {
         200 => decode::<RepinResponse>(body).map(|r| RepinOutcome::DryRun(r.job)),
@@ -86,8 +58,6 @@ pub fn repin(status: u16, body: Option<&str>) -> Result<RepinOutcome, ApiError> 
     }
 }
 
-/// `GET /api/v1/schema/repin/status?id=`. A 404 is not a failure: the
-/// route holds no job with that id, which is `Ok(None)`.
 pub fn repin_job_status(
     status: u16,
     body: Option<&str>,
@@ -99,8 +69,6 @@ pub fn repin_job_status(
     }
 }
 
-/// `POST /api/auth/logout`. 200 and 204 both mean the cookie is cleared,
-/// whatever body came with them, an empty one included.
 pub fn logout(status: u16, body: Option<&str>) -> Result<(), ApiError> {
     match status {
         200 | 204 => Ok(()),
@@ -108,11 +76,6 @@ pub fn logout(status: u16, body: Option<&str>) -> Result<(), ApiError> {
     }
 }
 
-/// A paced read (an investigation read, a result page) before its body
-/// is read. A 429 is not an answer about the rows but the pause its
-/// `Retry-After` asks for, in either form [`retry_after_ms`] reads, and
-/// its body is never read. Anything else is [`Paced::Answered`], and the
-/// caller reads the body for [`answer`].
 pub fn paced(
     status: u16,
     retry_after: Option<&str>,
@@ -128,11 +91,6 @@ pub fn paced(
     }
 }
 
-/// `POST /api/v1/export`, with its body read once as bytes. 200 is the
-/// file, and a 200 whose body could not be read is a decode failure. Any
-/// other status is a failure for [`http_failure`], read from the same
-/// bytes: the export runs the query on the budget a search does, so it is
-/// refused with the same envelope.
 pub fn export(status: u16, body: Option<Vec<u8>>) -> Result<Vec<u8>, ApiError> {
     match status {
         200 => body.ok_or_else(|| ApiError::Decode(UNREADABLE.to_owned())),
@@ -225,8 +183,6 @@ mod response_policy_exceptions {
             repin(409, Some(busy)),
             Ok(RepinOutcome::Busy(message)) if message == "a repin job is already running"
         ));
-        // A 409 that is neither shape keeps the conflict's fallback; one
-        // with no readable body is a decode failure.
         assert!(matches!(
             repin(409, Some("<html>409</html>")),
             Ok(RepinOutcome::Busy(message)) if message == crate::repin_flow::REPIN_BUSY_FALLBACK
@@ -291,7 +247,6 @@ mod response_policy_exceptions {
                 retry_after_ms: 7000.0
             }
         );
-        // An HTTP date pauses until then.
         assert_eq!(
             paced(
                 429,
@@ -310,7 +265,6 @@ mod response_policy_exceptions {
                 "{status}"
             );
         }
-        // What is not throttled reads as any ordinary answer.
         let page: Result<serde_json::Value, ApiError> = answer(
             410,
             Some(r#"{"error":{"code":"result_gone","message":"gone"}}"#),

@@ -14,8 +14,6 @@ test('Nets keeps its focused action through polling and a clock tick', async ({ 
     const response = await route.fetch();
     const body = await response.json();
     reads++;
-    // The list shows names, cadence and last run, not query text, so the
-    // live cell under observation is the name link.
     body.queries[0].name = `polled-net-${reads}`;
     await route.fulfill({ response, json: body });
   });

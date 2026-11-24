@@ -2,29 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<SchemaPage/>` — sortable services table over
-//! `/api/v1/schema/services` with a slide-out drawer inspector for
-//! each service.
-//!
-//! URL params:
-//! - `svc=<name>` — opens the drawer on the named service; clearing
-//!   closes the drawer.
-//! - `stab=overview|fields|tail` — which drawer tab is active
-//!   (default: overview). Read through
-//!   [`schema_nav::sanitize_tab`](crate::schema_nav::sanitize_tab): the
-//!   value is re-concatenated into the drill-in URL below, so only a
-//!   spelling from the closed vocabulary is ever carried forward.
-//! - `field=<name>` — opens the field case file, which takes precedence
-//!   over `svc=` and mounts independently of the services snapshot, so
-//!   `/search/schema?field=<name>` is a working deep link. `svc=` is
-//!   carried alongside as the back-arrow's return context.
-//!
 //! Exactly one drawer is mounted at a time: `fleet_ui::Drawer` arbitrates
-//! Escape on the assumption of a single drawer layer, so the page swaps
-//! between the two rather than nesting them. That swap is also why focus
-//! is restored by hand: the originating badge is unmounted while the case
-//! file is up, so the drawer shell's own opener-restore has nothing left
-//! to return to.
+//! Escape on the assumption of a single drawer layer. That swap is also why
+//! focus is restored by hand: the originating badge is unmounted while the
+//! case file is up.
 
 use leptos::prelude::*;
 use leptos::web_sys;
@@ -36,9 +17,6 @@ use trawl_core::parser::suggest::quote_dsl_field;
 use wasm_bindgen::JsCast as _;
 
 use crate::api;
-// One URL query-parameter value. A service name's charset is narrow but
-// a catalog field name is any ASCII-folded client JSON key — shared with
-// the query notice's case-file links so both encode a name identically.
 use crate::components::enc_uri as enc;
 use crate::components::field_case_drawer::FieldCaseDrawer;
 use crate::components::read_turn::ReadTurn;
@@ -53,11 +31,8 @@ use fleet_ui::{
     Badge, Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, ToastBus, Tone,
 };
 
-/// Days of `daily_event_counts` history shown in the activity sparkline.
 const SPARK_DAYS: usize = 30;
 
-/// The page heading's element id — the focus target when the case file
-/// closes outright (nothing is left on screen to return focus to).
 const HEADING_ID: &str = "schema-heading";
 
 /// Move keyboard focus to `id` on the next frame — after the swap this
@@ -73,9 +48,6 @@ fn focus_on_next_frame(id: &'static str) {
     });
 }
 
-/// Whether a service survives the list filter: its own name, or any of
-/// the field names it carries. Named once because the sheet header
-/// counts exactly what the table renders.
 fn matches_filter(svc: &ServiceSchema, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -87,9 +59,6 @@ fn matches_filter(svc: &ServiceSchema, needle: &str) -> bool {
             .any(|c| c.name.to_lowercase().contains(needle))
 }
 
-/// Sort key for the services table. Clicking the active header flips
-/// direction; a fresh key starts at its natural direction (name
-/// ascending, everything else descending).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SvcSort {
     Name,
@@ -109,8 +78,6 @@ impl SvcSort {
 pub fn SchemaPage() -> impl IntoView {
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     let qm = use_query_map();
-    // An empty param is an absent one: `?svc=` / `?field=` reach here
-    // from a hand-edited URL, and an empty name resolves to nothing.
     let svc_selected = Memo::new(move |_| qm.get().get("svc").filter(|s| !s.is_empty()));
     let field_selected = Memo::new(move |_| qm.get().get("field").filter(|s| !s.is_empty()));
     // Closed vocabulary at read time: the resolved tab is re-emitted into
@@ -119,11 +86,6 @@ pub fn SchemaPage() -> impl IntoView {
     let tab_param = Memo::new(move |_| sanitize_tab(qm.get().get("stab").as_deref()));
     let tab_sig: Signal<String> = Signal::derive(move || tab_param.get().to_string());
 
-    // Whether to offer the repin trigger on a degraded field's case
-    // file. Affordance only — the server gates `POST /schema/repin` on
-    // `schema_write` and is the sole enforcement — and read-only until
-    // `/me` resolves, so a slow identity fetch never flashes a button
-    // the session may not have.
     let me = use_context::<RwSignal<Option<api::MeResponse>>>();
     let can_repin = Signal::derive(move || {
         me.and_then(|me| me.get())
@@ -133,8 +95,6 @@ pub fn SchemaPage() -> impl IntoView {
     let filter = RwSignal::new(String::new());
     let sort = RwSignal::new((SvcSort::Name, false));
 
-    // Only the newest read of a page still mounted may send it to
-    // sign-in; Retry retires the read it replaces.
     let services_turn = ReadTurn::new();
     let services = LocalResource::new(move || {
         let turn = services_turn.begin();
@@ -145,9 +105,6 @@ pub fn SchemaPage() -> impl IntoView {
         }
     });
 
-    // Past this width the service panel docks in the second column
-    // instead of sliding over a scrim; the field case file stays an
-    // overlay at every width (ADR-0032), so it never claims the column.
     let wide = use_media_query("(min-width: 1100px)");
     let panel_open = Signal::derive(move || {
         field_selected.get().is_none()
@@ -161,23 +118,13 @@ pub fn SchemaPage() -> impl IntoView {
     // reactive context (i.e. inside deferred callbacks).
     let nav = use_navigate();
     let goto_search = navigator();
-    // Only for a refused navigation into /search: this page has no
-    // toasts of its own, and a click that quietly does nothing is the
-    // thing the search page's own producers stopped doing.
     let bus = expect_context::<ToastBus>();
 
-    // The field history entries this page pushed, innermost last. The
-    // case file's back affordance consults the top: popping an entry we
-    // did not push would be someone else's history, and replacing one we
-    // did push leaves a duplicate service entry per drill/back cycle. A
-    // stack rather than one slot because a case file links to another
-    // case file (the "a repin is running on X" line), so A → B → A would
-    // have the third push overwrite the first. See
-    // `schema_nav::back_nav_stack` for the residual a browser-initiated
-    // Back leaves.
+    // The field history entries this page pushed, innermost last. Popping an
+    // entry we did not push would be someone else's history. A stack rather
+    // than one slot because a case file links to another case file, so
+    // A → B → A would have the third push overwrite the first.
     let pushed_fields = RwSignal::new(Vec::<String>::new());
-    // The field badge to hand focus back to when the service drawer
-    // remounts underneath a closing case file.
     let focus_field = RwSignal::new(None::<String>);
 
     let push_svc = {
@@ -201,8 +148,6 @@ pub fn SchemaPage() -> impl IntoView {
         }
     };
 
-    // The `?svc=&stab=` half of a URL — the case file's return context,
-    // carried on the drill-in and restored by a back that has to replace.
     let return_ctx = move || {
         svc_selected
             .get_untracked()
@@ -225,18 +170,13 @@ pub fn SchemaPage() -> impl IntoView {
         }
     };
 
-    // Leaving the case file by its back arrow. Origin-aware, because the
-    // two cases are different history shapes: an entry we pushed is popped
-    // (replacing it would leave the return URL twice over, so one browser
-    // Back per drill/back cycle would go nowhere), while a deep link's
-    // entry is not ours to pop and is replaced with the return context.
+    // An entry we pushed is popped (replacing it would leave the return URL
+    // twice over), while a deep link's entry is not ours to pop and is
+    // replaced with the return context.
     let back_field = {
         let nav = nav.clone();
         move || {
             let shown = field_selected.get_untracked();
-            // The decision consumes the entry it pops, so the next back
-            // decides against the one below it rather than against a
-            // name three drill-ins old.
             let decision = shown.as_deref().map_or(BackNav::Replace, |f| {
                 let mut decision = BackNav::Replace;
                 pushed_fields.update(|stack| decision = back_nav_stack(f, stack));
@@ -283,10 +223,6 @@ pub fn SchemaPage() -> impl IntoView {
             push(None, DEFAULT_SCHEMA_TAB);
         })
     };
-    // Closing the case file outright (its X, the scrim, or Escape with no
-    // service to go back to) clears every param, so nothing the drawer was
-    // opened from is left mounted for the shell's own opener-restore to
-    // find. Focus lands on the page heading rather than the document.
     let on_field_close: Callback<()> = {
         let push = push_svc.clone();
         Callback::new(move |()| {
@@ -314,12 +250,9 @@ pub fn SchemaPage() -> impl IntoView {
     let on_use_field: Callback<String> = {
         let goto = goto_search.clone();
         Callback::new(move |field: String| {
-            // Wildcard match — `field=*` selects every event carrying
-            // the field, which is what the user usually wants after
-            // drilling in from a schema view. The name goes through the
-            // DSL renderer — an ordinary ingested name the bare
-            // production can't spell needs backticks or the clause
-            // parses as a text search (ADR-0013 ruling 7).
+            // The name goes through the DSL renderer — an ordinary ingested name the
+            // bare production can't spell needs backticks or the clause parses as a
+            // text search (ADR-0013 ruling 7).
             let Some(field) = quote_dsl_field(&field) else {
                 return;
             };
@@ -337,8 +270,6 @@ pub fn SchemaPage() -> impl IntoView {
         <div class="page">
             <div class="page-hd compact">
                 <div>
-                    // `tabindex=-1` so the close handler above can put
-                    // focus here — headings are not focusable by default.
                     <h1 id=HEADING_ID tabindex="-1">"Schema"</h1>
                     <p class="sub">"Click a service to inspect fields, ingest rate, and view live logs."</p>
                 </div>
@@ -411,8 +342,6 @@ pub fn SchemaPage() -> impl IntoView {
                                     .into_iter()
                                     .rev()
                                     .collect();
-                                // One recorded day is a point, not a trend.
-                                // Keep sparse history visible without fabricating samples.
                                 let activity = match svc.daily_event_counts.as_slice() {
                                     [] => view! {
                                         <span title="No daily activity recorded">"No daily data"</span>
@@ -420,10 +349,6 @@ pub fn SchemaPage() -> impl IntoView {
                                     [day] => {
                                         let unit = if day.count == 1 { "event" } else { "events" };
                                         let label = format!("{} {unit} on {}. One day recorded.", day.count, day.date);
-                                        // The words name what the point is: history,
-                                        // not health. The point already carries the
-                                        // full description, so they stay out of the
-                                        // accessibility tree.
                                         view! {
                                             <span class="activity-single">
                                                 <svg class="sc-spark" width="8" height="16" viewBox="0 0 8 16" role="img" aria-label=label.clone()>
@@ -444,11 +369,8 @@ pub fn SchemaPage() -> impl IntoView {
                                 let degraded = degraded_count(&svc);
 
                                 let name_for_active = name.clone();
-                                // The row's one control is a link: the
-                                // drawer is a place with a URL, built by
-                                // the same encoder and default tab
-                                // `push_svc` writes, and `prop:replace`
-                                // below is that call's `replace: true`.
+                                // Built by the same encoder and default tab `push_svc` writes, and
+                                // `prop:replace` below is that call's `replace: true`.
                                 let href = format!(
                                     "/search/schema?svc={}&stab={}",
                                     enc(&name),
@@ -471,21 +393,12 @@ pub fn SchemaPage() -> impl IntoView {
                                                 class="row-stretch"
                                                 href=href
                                                 prop:replace=true
-                                                // Not navigation and not a
-                                                // preventDefault: a drawer
-                                                // opened from the table has
-                                                // no pending return, and a
-                                                // focus request left over
-                                                // from an abandoned drill-in
-                                                // would steal focus into this
-                                                // service's fields.
+                                                // A focus request left over from an abandoned drill-in
+                                                // would steal focus into this service's fields.
                                                 on:click=move |_| focus_field.set(None)
                                             >
                                                 <span class="mono name">{name}</span>
                                             </a>
-                                            // Count, not colour alone: the badge
-                                            // says how many of this service's
-                                            // fields the catalog calls degraded.
                                             {(degraded > 0).then(|| view! {
                                                 <Badge tone=Tone::Warn>
                                                     {format!("{degraded} degraded")}
@@ -500,11 +413,9 @@ pub fn SchemaPage() -> impl IntoView {
                                             <td class="num">{field_count}</td>
                                             <td class="col-slack" aria-hidden="true"></td>
                                             <td class="row-act">
-                                            // Commands, not places: both go
-                                            // through the navigator, which
-                                            // can refuse an over-bound query
-                                            // (ADR-0027), and an anchor has
-                                            // no way to say no.
+                                            // Commands, not places: both go through the navigator,
+                                            // which can refuse an over-bound query (ADR-0027), and an
+                                            // anchor has no way to say no.
                                             <button
                                                 type="button"
                                                 class="qa"
@@ -533,13 +444,10 @@ pub fn SchemaPage() -> impl IntoView {
                                             {table_sort_th(sort, SvcSort::Events, SvcSort::Events.default_desc(), "Events", "width:84px; text-align:right")}
                                             {table_sort_th(sort, SvcSort::Storage, SvcSort::Storage.default_desc(), "Storage", "width:100px; text-align:right")}
                                             {table_sort_th(sort, SvcSort::Fields, SvcSort::Fields.default_desc(), "Fields", "width:76px; text-align:right")}
-                                            // The slack column takes the spare width, so a
-                                            // service's facts sit next to its name.
                                             <th class="col-slack" aria-hidden="true"></th>
                                             <th scope="col" style="width:84px"><span class="sr-only">Actions</span></th>
                                         </tr></thead>
                                         <tbody>{rows}</tbody></table>
-                                // Summary-only Pager — the table is unpaginated.
                                 <Pager summary=format!(
                                     "{count} service{}",
                                     if count == 1 { "" } else { "s" },
@@ -554,8 +462,7 @@ pub fn SchemaPage() -> impl IntoView {
             {move || {
                 // `?field=` wins, and mounts without consulting the
                 // services resource — that independence is what makes a
-                // bare `/search/schema?field=x` deep link work. A dead
-                // `?svc=` alongside it costs the back arrow, nothing more.
+                // bare `/search/schema?field=x` deep link work.
                 if let Some(field) = field_selected.get() {
                     return view! {
                         <FieldCaseDrawer

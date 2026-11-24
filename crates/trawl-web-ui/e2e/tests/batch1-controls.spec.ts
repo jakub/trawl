@@ -43,7 +43,7 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await drawer.getByRole('button', { name: '+ Add Schedule', exact: true }).click();
     // A text box, not a number spinner: a browser reports malformed
     // numeric text as an empty value, which the form would read as
-    // "blank = unlimited" (issue #181).
+    // "blank = unlimited".
     const max = drawer.getByRole('textbox', { name: COPY.maxRunsLabel, exact: true });
     await expect(max).toHaveAccessibleDescription('runs (blank = unlimited)');
     await expect(drawer.getByRole('textbox', { name: COPY.intervalLabel, exact: true })).toBeVisible();
@@ -55,9 +55,8 @@ for (const colorScheme of ['light', 'dark'] as const) {
     const track = drawer.locator('.toggle-slider');
     await expect(track).toHaveCSS('outline-style', 'solid');
     await expect(track).toHaveCSS('outline-width', '2px');
-    // The outline is offset from the track, so both of its edges touch
-    // the actual schedule card background. Canvas converts computed OKLCH
-    // and color-mix values to the sRGB pixels used for contrast.
+    // Canvas converts computed OKLCH and color-mix values to the sRGB
+    // pixels used for contrast.
     const contrast = await track.evaluate((el) => {
       const card = el.closest('.sd-card');
       if (!card) throw new Error('Focused switch is outside the schedule card');
@@ -127,8 +126,6 @@ test('reduced motion stops actual overlays, toasts and live tail pulses', async 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await expect(page.locator('.pulse > span')).toHaveCSS('animation-name', 'none');
 
-  // The nav overlay is the other thing that slides and fades in, and the
-  // test never opened it, so its reduce rules were asserted nowhere.
   // Off the schema route first: its scrim drawer is over the toggle.
   await page.setViewportSize({ width: 720, height: 900 });
   await page.goto('/search');

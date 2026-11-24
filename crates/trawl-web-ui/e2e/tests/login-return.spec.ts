@@ -60,8 +60,6 @@ for (const failure of ['rejection', 'server', 'network'] as const) {
 
 // One test per case, not one loop per test: each sign-in round trip gets
 // its own time budget, and the cases spread across workers and CI shards.
-// As loops, these two tests ran up to 27 sign-ins against one budget and
-// timed out whenever a shard's runner was busy.
 const returnSuffix = '?note=%252F+a%2Bb&next=https%3A%2F%2Fexample.com%2Fa#row?value';
 const canonicalRoutes: [string, string][] = [
   ['/search', '/search'], ['/search/history', '/search/history'],
@@ -85,7 +83,6 @@ for (const [path, canonical] of canonicalRoutes) {
       // closing a context mid-boot stalls for Chromium's renderer shutdown.
       await expect(page.getByRole('main')).toBeVisible();
       if (canonical === '/settings/health') {
-        // Observe the mounted page, as the rest of this file does for Health.
         await expect(page.locator(SEL.healthQueries)).toContainText('No active or recent queries.');
       }
     });
@@ -125,7 +122,6 @@ for (const hostile of hostileQueries) {
       return route.fallback();
     });
     await page.route('**/api/auth/login', route => route.fulfill({ json: identity }));
-    // The first value is this worker's own origin, known only at run time.
     const query = 'value' in hostile
       ? `return_to=${component(hostile.value.replace(/^BASE/, baseURL!))}`
       : hostile.raw;
@@ -242,8 +238,6 @@ for (const kind of ['nets', 'runs', 'drawer'] as const) {
     await expect.poll(() => reads).toBeGreaterThan(0);
     await expect(page.locator(kind === 'runs' ? '.runs-table' : '.nets-table')).toBeVisible();
     const destination = `${path}${suffix}&current=a%2Bb+%2525#receipt?row`;
-    // Change only URL metadata after mount; the polling redirect must read
-    // this current address rather than a component's initial snapshot.
     await page.evaluate(value => history.replaceState(history.state, '', value), destination);
     expire = true;
     await page.clock.fastForward(5001);
@@ -385,11 +379,6 @@ test('inner malformed Search filters, relative range and URL-shaped data remain 
 });
 
 for (const phase of ['login document pending', 'logout response pending'] as const) {
-  // Every wait here is on an event: a rendered net row, a parked route, a
-  // delivered response, a document request. Residual exposure: the expect
-  // timeouts (5 s, playwright.config.ts) bound each of those waits, and
-  // the absence of a second /login attempt is only checked across the
-  // 250 ms quiet window after the late 401 reaches the browser.
   test(`explicit logout wins over a late Jobs 401 with ${phase}`, async ({ page, request }) => {
     await resetScenario(request, 'corpus');
     await page.clock.install();
@@ -463,7 +452,6 @@ for (const phase of ['login document pending', 'logout response pending'] as con
     await expect.poll(() => releaseDocuments.length).toBeGreaterThan(0);
     await expect.poll(() => releaseDocuments.length).toBe(attempts.length);
     for (const release of releaseDocuments) release();
-    // Settle the real document navigation before checking the complete trace.
     await expect(page.getByRole('button', { name: 'Sign in', exact: true })).toBeVisible();
     expect(attempts).toEqual(['/login']);
     await expect(page).toHaveURL(url => relative(url) === '/login');

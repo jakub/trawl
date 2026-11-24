@@ -209,10 +209,7 @@ test.describe('terminal context loss', () => {
     await page.goto('/search');
     await expect(page.locator('.topbar button.user')).toBeEnabled();
     await expect(page.locator('.atmosphere')).toHaveCount(0);
-    // This route loads the same wasm module but mounts no backdrop. Import its
-    // unique shipped snippet, then exercise the public handle on a separate
-    // host. /login exposes no theme control, so a real theme effect cannot be
-    // stimulated there without changing application code or closure lifetimes.
+    // This route loads the same wasm module but mounts no backdrop.
     await page.evaluate(async () => {
       const urls = performance.getEntriesByType('resource')
         .map(entry => entry.name).filter(name => new URL(name).pathname.endsWith('/vendor/paper-shaders.js'));

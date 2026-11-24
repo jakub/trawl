@@ -2,11 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Readings of the filter rail at wide widths (issue #231, ADR-0044), and
-// the held query that keeps an answer pending, shared by every spec that
-// asserts where the rail stands. A spec file cannot import another spec
-// file, so they live here.
-
 import { expect } from './fixtures';
 import { SEL } from './selectors';
 import type { Locator, Page } from '@playwright/test';
@@ -16,9 +11,7 @@ export const OPEN_WIDTH = 224;
 /** trawl-web-ui's `--facet-strip-w`, the closed rail. */
 export const STRIP_WIDTH = 32;
 
-/** The rail's state, read the way a reader sees it: open or not, and
- * how wide it is drawn. Width within a pixel, per the acceptance test.
- * One reading without the other would pass a rail that is open but
+/** One reading without the other would pass a rail that is open but
  * drawn as a strip, or the reverse. */
 export async function expectRail(page: Page, open: boolean) {
   const rail = page.locator(SEL.filterRail);
@@ -35,19 +28,14 @@ export async function expectRail(page: Page, open: boolean) {
     .toBeLessThanOrEqual(1);
 }
 
-/** Count every `toggle` the rail's <details> fires from here on, and
- * return a reader.
- *
- * The browser queues `toggle` as a task after the `open` attribute
+/** The browser queues `toggle` as a task after the `open` attribute
  * changes, so both ends wait two animation frames and a task. Before
  * the count starts, that lets a toggle the preceding automatic change
  * already queued fire uncounted. Before the reader reads, it lets a
  * toggle the last change queued be counted.
  *
- * One listener per document, whatever the number of calls: a second
- * call starts the count again from zero instead of adding a listener
- * that counts every toggle twice. `toggle` does not bubble, so the
- * listener catches it on the way down, in the capture phase. */
+ * `toggle` does not bubble, so the listener catches it on the way down,
+ * in the capture phase. */
 export async function watchToggles(page: Page): Promise<() => Promise<number>> {
   await page.locator(SEL.filterRail).evaluate(async (_el, rail) => {
     await new Promise<void>((resolve) =>
@@ -79,8 +67,6 @@ export async function watchToggles(page: Page): Promise<() => Promise<number>> {
     );
 }
 
-/** Hold the next `/api/v1/query` until `release` is called. `arrived`
- * settles once the request is parked, so the page is provably pending. */
 export async function holdNextQuery(page: Page) {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
@@ -102,10 +88,8 @@ export async function holdNextQuery(page: Page) {
   return { arrived, release };
 }
 
-/** `text` is drawn where a reader can see it: one run of it inside
- * `locator` has a box of its own, inside the element's box, in a visible
- * element. `toHaveText` passes on text nobody can see, and `toBeVisible`
- * on an element whose text is clipped away or hidden. */
+/** `toHaveText` passes on text nobody can see, and `toBeVisible` on an
+ * element whose text is clipped away or hidden. */
 export async function expectTextShown(locator: Locator, text: string) {
   await expect(locator).toBeVisible();
   await expect

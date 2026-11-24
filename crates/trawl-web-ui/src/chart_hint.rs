@@ -4,12 +4,6 @@
 
 //! The Visualization tab's Line refusal ladder, from the executed query
 //! and the response it produced (ADR-0038).
-//!
-//! [`chart_hint`] is the whole decision `components/chart.rs` makes
-//! before it touches uPlot: either the aligned [`SeriesSet`] to draw, or
-//! the one sentence shown in its place. At the crate root rather than
-//! under `components/`, which is wasm-gated, so the ladder is tested on
-//! native `cargo test -p trawl-web-ui chart_hint`.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -22,17 +16,8 @@ use crate::series::{Lane, Refusal, SeriesSet, align_series};
 
 /// Whether the LAST aggregation-bearing stage of `query` is a
 /// `timechart`, which is what makes a result drawable as lines.
-///
 /// Not "the pipeline mentions a timechart anywhere": a later
 /// aggregation re-aggregates the buckets away.
-/// `… | timechart span=1m count() by host | stats sum(count) as total by
-/// host` is a `stats … by` result with no `_time` column at all, which
-/// Column draws and [`align_series`] refuses. `top`, `rare` and `pivot`
-/// end a timechart the same way — and each of those has its own rung, so
-/// the answer here only has to be "no".
-///
-/// A query that does not parse cannot have produced a result whose axis
-/// anyone can read off it, so it is `false` as well.
 #[must_use]
 pub fn final_stage_is_timechart(query: &str) -> bool {
     let Ok(ast) = trawl_core::parser::parse(query) else {
@@ -51,8 +36,6 @@ pub fn final_stage_is_timechart(query: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// A chart that was not drawn: the sentence shown in its place, and
-/// whether a control to the Events tab belongs beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hint {
     pub message: String,
@@ -68,18 +51,8 @@ impl From<&Refusal> for Hint {
     }
 }
 
-/// Align `result` for the Line chart, or say why it is not drawn.
-///
 /// `query` is the DSL that produced `result` — the executed query, never
-/// the text being typed. Every role the ladder reads comes from it, so
-/// the answer is a function of the pair it is handed and of nothing
-/// else.
-///
-/// The rungs are ordered, and the coverage one comes LAST on purpose
-/// (ADR-0038, carried over from the chart this replaced). A result whose
-/// shape cannot be drawn has something actionable to say about that
-/// shape; "this is only part of the result" is the answer only once the
-/// shape itself is chartable.
+/// the text being typed.
 ///
 /// # Errors
 ///
@@ -92,8 +65,6 @@ pub fn chart_hint(
 ) -> Result<SeriesSet, Hint> {
     let set = align_series(query, result, lane).map_err(|refusal| Hint::from(&refusal))?;
     match coverage.and_then(coverage_refusal) {
-        // A cut result is refused with the count the server measured,
-        // and the Events tab is where the fetched rows are.
         Some(message) => Err(Hint {
             message,
             offers_events: true,

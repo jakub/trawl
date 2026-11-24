@@ -2,23 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The read-only investigation pages (ADR-0059), over the recorded wire
-// bodies in harness/wire/investigation*.json and result-*.json, whose
-// shapes and cases e2e_wire_fixture_contract.rs pins with the trawl-api
-// types. The `investigations` scenario signs in a reader holding `query`
-// and `investigation_read`; every other scenario holds neither, and the
-// stub answers an investigation read under it with 403 and counts it.
-//
-// The board reads again by itself every five seconds while its tab is
-// visible (investigation-board.spec.ts covers that). Every test here that
-// counts the stub's investigation reads freezes the page's clock first,
-// so no poll lands among the reads it counts.
-//
-// The phone capture is evidence for #310. With TRAWL_E2E_EVIDENCE set it
-// is written to docs/evidence/issue-310/investigation-phone.png (CP9
-// commits it at the final SHA); otherwise to this test's output dir. The
-// clock is fixed and the page is captured whole at the phone's width, so
-// two runs at one SHA write the same pixels.
+// The read-only investigation pages (ADR-0059).
 
 import { join, resolve } from 'node:path';
 import { devices } from '@playwright/test';
@@ -36,8 +20,6 @@ const MANY = '9e8d7c6b5a4f30211203f4e5d6c7b8a9';
 // harness/wire/investigation-read-long.json: a supported finding at 1,
 // 99 notes, its refutation at 101 and a new finding at 102.
 const LONG = '4d3c2b1a0f9e8d7c6b5a493827160514';
-// A few minutes after the fixture's last write, so relative labels read
-// the same on every run.
 const NOW = new Date('2026-10-24T09:45:00Z');
 const NOT_PERMITTED = 'You do not have permission to read investigations.';
 
@@ -70,8 +52,6 @@ async function asReader(request: Ctl, pageCap?: number, board?: 'long') {
   expect(response.ok()).toBe(true);
 }
 
-/** Neither the document nor the page's own scroller is wider than the
- * viewport: anything wide scrolls inside its own box. */
 async function expectNoHorizontalOverflow(page: Pg) {
   const overflow = await page.evaluate(() => {
     const doc = document.documentElement;
@@ -84,8 +64,6 @@ async function expectNoHorizontalOverflow(page: Pg) {
   expect(overflow).toEqual({ document: 0, page: 0 });
 }
 
-/** Grow the viewport's height, never its width, until the page's own
- * scroller holds everything, then capture it whole. */
 async function captureWhole(page: Pg, path: string) {
   for (let i = 0; i < 3; i += 1) {
     const extra = await page.evaluate(() => {
@@ -130,7 +108,6 @@ test.describe('on a phone', () => {
     await expect(rows.nth(0)).toContainText('Open');
     await expect(rows.nth(0)).toContainText('claude-agent');
     await expect(rows.nth(2)).toContainText('Closed');
-    // ADR-0029: one control per row, a link, because the row is a place.
     for (let i = 0; i < 3; i += 1) {
       await expect(rows.nth(i).locator('a, button')).toHaveCount(1);
     }
@@ -139,8 +116,7 @@ test.describe('on a phone', () => {
     await page.screenshot(steadyShot(page, capturePath(testInfo, 'investigations-phone.png')));
 
     // The fixed clock holds animation frames, so the row link is
-    // activated from the keyboard, the way a reader without a pointer
-    // would.
+    // activated from the keyboard.
     await rows.nth(0).getByRole('link', { name: '502s on checkout since 09:00' }).focus();
     await page.keyboard.press('Enter');
     await expect(page).toHaveURL(`/investigations/${ID}`);
@@ -158,19 +134,13 @@ test.describe('on a phone', () => {
     await expect(main.getByText('Why does checkout answer 502 since 09:00, and is it still happening?')).toBeVisible();
     await expect(main.getByText('service=shop-api and its upstream payment pool, 08:00 to 10:00 UTC')).toBeVisible();
 
-    // The sections come in the page's order.
     const headings = await main.getByRole('heading', { level: 2 }).allTextContents();
     expect(headings).toEqual(['Question', 'Latest finding', 'Activity', 'Findings', 'Steps']);
 
-    // The latest finding is the one written last, with its status.
     const latest = main.locator('section', { has: page.getByRole('heading', { name: 'Latest finding' }) });
     await expect(latest).toContainText('The resize halved the pool on gw-2 only');
     await expect(latest).toContainText('Hypothesis');
 
-    // The activity is every entry, findings included, one line each in
-    // the order they were written: the note sits between the second and
-    // third steps although the second step's interrupted outcome was
-    // written last.
     const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
     await expect(activity).toHaveCount(6);
     await expect(activity.nth(0)).toContainText('Find the first 502');
@@ -184,8 +154,6 @@ test.describe('on a phone', () => {
     await expect(activity.nth(5)).toContainText('The resize halved the pool on gw-2 only');
     await expect(main.getByText('Every entry is loaded.')).toBeVisible();
 
-    // Each cited row of the readable result renders in the results
-    // table's markup, read once with a one-row page.
     const findings = main.getByRole('list', { name: 'Findings' }).locator('> li');
     await expect(findings).toHaveCount(2);
     const first = findings.nth(0);
@@ -198,7 +166,6 @@ test.describe('on a phone', () => {
     await expect(row2).toContainText('upstream connect timeout to payments:8443 after 3000ms');
     await expect(row0.locator('th')).toHaveText(['_time', 'host', 'status', 'message']);
 
-    // A pruned result shows as pruned in the row's place, never a toast.
     const second = findings.nth(1);
     await expect(second.locator('.inv-pruned')).toContainText('Pruned');
     await expect(second.getByRole('region')).toHaveCount(0);
@@ -209,9 +176,6 @@ test.describe('on a phone', () => {
       .toEqual([[0, 1], [2, 1]]);
     expect(results.filter((r) => r.id === PRUNED)).toEqual([{ id: PRUNED, offset: 1, limit: 1 }]);
 
-    // The steps are the queries that ran, each closed over what it
-    // executed until the reader opens it. The fixed clock holds
-    // animation frames, so they open from the keyboard.
     const steps = main.getByRole('list', { name: 'Steps' }).locator('> li');
     await expect(steps).toHaveCount(3);
     await expect(main.locator('pre.inv-executed')).toHaveCount(3);
@@ -225,7 +189,6 @@ test.describe('on a phone', () => {
     await expect(steps.nth(1)).toContainText('Interrupted');
     await expect(steps.nth(2)).toContainText('2026-10-24T08:30:00.000000Z → 2026-10-24T09:30:00.000000Z');
 
-    // Long executed text wraps inside its box.
     for (const executed of await main.locator('pre.inv-executed').all()) {
       await expect(executed).toBeVisible();
       const fits = await executed.evaluate((el) => el.scrollWidth <= el.clientWidth);
@@ -233,11 +196,7 @@ test.describe('on a phone', () => {
     }
     await expectNoHorizontalOverflow(page);
 
-    // Read-only: besides Refresh, the page's buttons open the evidence
-    // viewer on a readable cited row or a step's captured result, and
-    // nothing offers a write the session cannot make.
     await expect(main.getByRole('button')).toHaveText(['Refresh', 'Open result', 'Open result', 'View rows', 'View rows']);
-    // The openers keep the design system's button classes beside their own.
     await expect(main.locator('button.inv-open-rows.btn-sec.btn-xs')).toHaveCount(4);
 
     await expect(main).toMatchAriaSnapshot(`
@@ -349,16 +308,12 @@ test.describe('on a phone', () => {
     `);
 
     await captureWhole(page, capturePath(testInfo, 'investigation-phone.png'));
-    // The capture never widened the page: it is the phone's width.
     expect(page.viewportSize()!.width).toBe(iphone.viewport.width);
     await expectNoHorizontalOverflow(page);
   });
 });
 
 test('a short read is followed at once, Refresh reads the entries changed since, and every control takes Tab', async ({ page, request }) => {
-  // Four entries per read: the first page ends at the third step's
-  // outcome, and the page reads the second, which brings the last
-  // finding and the second step's interrupted outcome, by itself.
   await asReader(request, 4);
   await freezeClock(page);
   await page.goto(`/investigations/${ID}`);
@@ -371,10 +326,8 @@ test('a short read is followed at once, Refresh reads the entries changed since,
   await expect(steps.nth(1)).toContainText('Interrupted');
   await expect(main.getByRole('list', { name: 'Findings' }).locator('> li')).toHaveCount(2);
   await expect(main.getByRole('button', { name: 'Load more entries' })).toHaveCount(0);
-  // The rail marks the section for the page under it.
   await expect(page.locator('nav.rail .grp > a[aria-current="page"]')).toHaveAttribute('title', 'Investigations');
 
-  // Every control on the page is reachable by Tab, in reading order.
   await main.getByRole('link', { name: 'Investigations' }).focus();
   const wanted = [
     'button:Refresh',
@@ -400,9 +353,7 @@ test('a short read is followed at once, Refresh reads the entries changed since,
   await main.getByRole('button', { name: 'Refresh' }).click();
   await expect.poll(async () => (await reads(request)).reads.length).toBe(3);
   expect((await reads(request)).reads.map((r) => r.since)).toEqual([0, 7, 9]);
-  // Nothing changed since 9, so the page reads as it did.
   await expect(steps).toHaveCount(3);
-  // Each cited row was read once in all of that.
   expect((await reads(request)).resultReads).toHaveLength(3);
 });
 
@@ -430,7 +381,6 @@ test('a log longer than one read names its latest finding only once the page has
 });
 
 test('past 20 reads the findings say the entry they are as of, and Load more reads the rest', async ({ page, request }) => {
-  // Four entries per read: 20 reads reach entry 80 of 102.
   await asReader(request, 4, 'long');
   await freezeClock(page);
   await page.goto(`/investigations/${LONG}`);
@@ -452,8 +402,6 @@ test('past 20 reads the findings say the entry they are as of, and Load more rea
 });
 
 test('a board citing 128 rows reads them four at a time, each once, and waits out a 429 instead of failing a row', async ({ page, request }) => {
-  // The first six result reads answer 429 with Retry-After: 1, and every
-  // result answer is held 40 ms so the page's reads overlap at the stub.
   const response = await request.post('/__ctl/reset', {
     data: { scenario: 'investigations', investigationBoard: 'many', investigationThrottle: 6, investigationResultDelayMs: 40 },
   });
@@ -463,27 +411,21 @@ test('a board citing 128 rows reads them four at a time, each once, and waits ou
   const main = page.locator('.inv-page');
   await expect(main.getByRole('list', { name: 'Findings' }).locator('> li')).toHaveCount(4);
 
-  // Every cited row ends loaded, the refused ones included: none shows a
-  // failure or offers Retry.
   await expect(main.locator('.inv-row-scroll')).toHaveCount(128, { timeout: 15_000 });
   await expect(main.getByText('Could not load this row.')).toHaveCount(0);
   await expect(main.getByRole('button', { name: /^Retry / })).toHaveCount(0);
   expect(await toastCount(page)).toBe(0);
 
   const state = await reads(request);
-  // Each of the 96 distinct rows was answered once; the six refused
-  // reads were asked again, and nothing else.
   expect(new Set(state.resultReads.map((r) => `${r.id}:${r.offset}`)).size).toBe(96);
   expect(state.resultReads).toHaveLength(96 + 6);
-  // Never more than four at once, and more than one: the reads overlap.
   expect(state.maxResultsInFlight).toBeLessThanOrEqual(4);
   expect(state.maxResultsInFlight).toBeGreaterThan(1);
 });
 
 test('evidence reads stop and say so after four paused rounds of 429s, and Resume reading reads every row', async ({ page, request }) => {
-  // Every result read answers 429 with Retry-After: 0, which the queue
-  // floors to one refill: rounds of 0.6, 1.2, 2.4 and 4.8 s, then it
-  // stops instead of pausing a fifth time.
+  // Retry-After: 0, which the queue
+  // floors to one refill: rounds of 0.6, 1.2, 2.4 and 4.8 s.
   // About 9 s of pauses before the notice, more than the default budget.
   test.setTimeout(60_000);
   const response = await request.post('/__ctl/reset', {
@@ -495,22 +437,16 @@ test('evidence reads stop and say so after four paused rounds of 429s, and Resum
   const main = page.locator('.inv-page');
   await expect(main.getByRole('list', { name: 'Findings' }).locator('> li')).toHaveCount(4);
 
-  // Four rounds of four reads, and the round that stalled: every refused
-  // row is back waiting with the 76 that never started.
   const notice = main.getByText('The server is limiting reads for your API key, so 96 cited rows are waiting.');
   await expect(notice).toBeVisible({ timeout: 30_000 });
   const stalledReads = (await reads(request)).resultReads.length;
   expect(stalledReads).toBe(20);
-  // The rows still read as loading: none failed, none offers Retry.
   await expect(main.locator('.inv-row-scroll')).toHaveCount(0);
   await expect(main.getByText('Could not load this row.')).toHaveCount(0);
   await expect(main.getByRole('button', { name: /^Retry / })).toHaveCount(0);
-  // Stopped means stopped: nothing more is asked for while it waits.
   await page.waitForTimeout(2_000);
   expect((await reads(request)).resultReads.length).toBe(stalledReads);
 
-  // The server lets reads through again; Resume reading reads them all,
-  // and the notice goes with the stall.
   const relax = await request.post('/__ctl/reset', {
     data: { scenario: 'investigations', investigationBoard: 'many', investigationThrottle: 0 },
   });
@@ -519,7 +455,6 @@ test('evidence reads stop and say so after four paused rounds of 429s, and Resum
   await expect(main.locator('.inv-row-scroll')).toHaveCount(128, { timeout: 15_000 });
   await expect(notice).toHaveCount(0);
   await expect(main.getByRole('button', { name: 'Resume reading' })).toHaveCount(0);
-  // Each of the 96 distinct rows was read once after the stall.
   const after = (await reads(request)).resultReads;
   expect(new Set(after.map((r) => `${r.id}:${r.offset}`)).size).toBe(96);
   expect(after).toHaveLength(96);
@@ -527,7 +462,6 @@ test('evidence reads stop and say so after four paused rounds of 429s, and Resum
 });
 
 test('without investigation_read there is no rail entry, and the pages say so and ask nothing', async ({ page, request }) => {
-  // The default session holds `query` alone.
   await resetScenario(request, 'default');
   await page.goto('/search');
   await expect(page.locator('nav.rail .grp > a[title="Search"]')).toBeVisible();
@@ -547,8 +481,6 @@ test('without investigation_read there is no rail entry, and the pages say so an
 });
 
 test('a read the server refuses with 403 shows the not-permitted page, once, with nothing to retry', async ({ page, request }) => {
-  // `/me` still grants both permissions, so the rail keeps its entry;
-  // the server refuses the reads themselves, as after a revoked role.
   const response = await request.post('/__ctl/reset', {
     data: { scenario: 'investigations', investigationRefuse: true },
   });
@@ -570,8 +502,6 @@ test('a read the server refuses with 403 shows the not-permitted page, once, wit
   await expect(main.getByText("Couldn't load")).toHaveCount(0);
   expect(await toastCount(page)).toBe(0);
 
-  // One read each, and no read of a cited row: nothing asks again, a
-  // minute on either.
   await page.clock.fastForward(60_000);
   await page.waitForTimeout(500);
   const state = await reads(request);
@@ -585,9 +515,7 @@ test('an id the installation does not hold reads as not found', async ({ page, r
   await freezeClock(page);
   await page.goto('/investigations/ffffffffffffffffffffffffffffffff');
   await expect(page.getByRole('heading', { level: 1, name: 'Investigation not found' })).toBeVisible();
-  // A missing investigation is not read again.
   await page.clock.fastForward(60_000);
-  // Not an id at all: refused before any request.
   await page.goto('/investigations/not-an-id');
   await expect(page.getByRole('heading', { level: 1, name: 'Investigation not found' })).toBeVisible();
   expect((await reads(request)).reads.map((r) => r.id)).toEqual(['ffffffffffffffffffffffffffffffff']);

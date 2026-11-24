@@ -4,10 +4,6 @@
 
 //! The copy of `<LiveCapNotice/>`: what Search says above a live
 //! aggregate whose snapshot reports `capped` (ADR-0001).
-//!
-//! Each cap gets one sentence, with the limit the snapshot carried, so
-//! the copy never hard-codes a bound the server owns. Ungated so the
-//! sentences are tested natively; the component itself is wasm32-only.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -15,13 +11,10 @@ use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 
 use crate::service_card_fmt::format_exact;
 
-/// The notice title.
 pub const LIVE_CAP_TITLE: &str = "Live aggregate is partial";
 
-/// The sentence after the caps: what the reader can do about it.
 pub const LIVE_CAP_ADVICE: &str = "Narrow the query, or switch to Snapshot.";
 
-/// One cap's sentence, naming the limit the snapshot reported.
 #[must_use]
 pub fn cap_sentence(cap: &SnapshotCap) -> String {
     let limit = format_exact(cap.limit);
@@ -55,7 +48,6 @@ mod tests {
             sentence(SnapshotCapKind::ExactValues, 100_000),
             "median and percentiles use the first 100,000 values per group."
         );
-        // The limit is the wire's, not a constant of the copy.
         assert_eq!(
             sentence(SnapshotCapKind::Groups, 250),
             "New groups past 250 are not counted."

@@ -2,55 +2,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! How much of a query's result one request asks for, and what the
-//! surfaces say when the answer on screen is not the whole of it.
-//!
-//! A raw-event query is read a page at a time: an operator scrolls, and
-//! the rows past the page are a click away. An aggregation is not — a
-//! chart drawn from 50 of 43,210 group rows is a picture of the page,
-//! not of the result, and nothing on screen says so. So the two shapes
-//! ask for different amounts, and this module owns that decision plus
-//! the window arithmetic it implies. It is the ONLY place in the crate
-//! that turns a page number into a `(limit, offset)` pair for a query.
-//!
-//! The refusal and the cap line live here too, beside the plan that
-//! produces the numbers they quote: both are read off
-//! `PaginationMeta`'s `offset`, `returned` and `total`, never off the
-//! `limit` a request happened to ask for. A server free to clamp a
-//! limit makes the asked-for number a claim about the request; the
-//! three measured ones describe the answer.
-//!
-//! At the crate root rather than under `api/` or `components/`, which
-//! are wasm-gated, so these decisions are tested on native
-//! `cargo nextest run -p trawl-web-ui` — the `categorical.rs` /
-//! `facets.rs` pattern.
-
-// The `not(target_arch = "wasm32")` form those modules use: the request
-// path calls this on wasm, and the native build compiles the surfaces
-// that read the refusal and the cap line out entirely.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use crate::search_url::PAGE_SIZE;
 use crate::service_card_fmt::format_exact;
 
-/// The ceiling one aggregation fetch asks for. A `limit` the server may clamp.
 pub const AGGREGATE_FETCH_ROWS: usize = 20_000;
 
-/// How much of a query's result one request asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchPlan {
-    /// A raw-event query: one `PAGE_SIZE` page at a time.
     Page { page: usize },
-    /// An aggregation: the whole result, once per effective query.
     Whole,
 }
 
 impl FetchPlan {
-    /// The plan for `query`, where `page` is the page the URL asks for.
-    ///
-    /// An aggregation ignores the page: every page of one effective
-    /// query asks for the same whole result, so the fetch does not
-    /// repeat when a reader walks the table under the chart.
     #[must_use]
     pub fn for_query(query: &str, page: usize) -> Self {
         if crate::facets::is_aggregation_shape(query) {
@@ -60,7 +25,6 @@ impl FetchPlan {
         }
     }
 
-    /// The `(limit, offset)` this plan requests.
     #[must_use]
     pub fn window(self) -> (usize, usize) {
         match self {
@@ -70,8 +34,6 @@ impl FetchPlan {
     }
 }
 
-/// The shared opening both lines are built from: what the execution
-/// produced, and how much of it arrived.
 fn preamble(total: usize, fetched: usize) -> String {
     format!(
         "This query produced {} rows; {} were fetched.",
@@ -80,12 +42,6 @@ fn preamble(total: usize, fetched: usize) -> String {
     )
 }
 
-/// Why this result must not be charted, or `None` when it is whole.
-///
-/// Whole means the response carries every row the execution produced:
-/// it starts at the beginning and nothing was left behind. A window cut
-/// from a larger result is a page, and a chart of a page reads as a
-/// chart of the result.
 #[must_use]
 pub fn coverage_refusal(meta: &trawl_api::PaginationMeta) -> Option<String> {
     (meta.offset != 0 || meta.returned != meta.total).then(|| {
@@ -96,8 +52,6 @@ pub fn coverage_refusal(meta: &trawl_api::PaginationMeta) -> Option<String> {
     })
 }
 
-/// The line under the exact table when the result exceeds what was
-/// fetched, or `None` when the table holds everything.
 #[must_use]
 pub fn cap_line(total: usize, fetched: usize) -> Option<String> {
     (total > fetched).then(|| {
@@ -144,8 +98,6 @@ mod tests {
                 assert_eq!(plan, FetchPlan::Whole, "{query} at page {page}");
                 assert_eq!(plan.window(), (20_000, 0));
             }
-            // The page cannot move the request, which is what lets one
-            // fetch serve every page of one effective query.
             assert_eq!(
                 FetchPlan::for_query(query, 0),
                 FetchPlan::for_query(query, 2)
@@ -153,9 +105,6 @@ mod tests {
         }
     }
 
-    /// The rail never faces the 20,000 rows a `Whole` fetch can bring
-    /// back: `compute_facets` runs only where `raw_facets()` holds, and
-    /// it holds for no shape `for_query` answers `Whole` for.
     #[test]
     fn no_whole_fetched_shape_offers_row_facets() {
         for query in [
@@ -185,8 +134,6 @@ mod tests {
     fn a_whole_result_is_not_refused() {
         assert_eq!(coverage_refusal(&meta(0, 0, 0)), None);
         assert_eq!(coverage_refusal(&meta(0, 5, 5)), None);
-        // The fetch ceiling reached exactly: every row the execution
-        // produced is on screen, so there is nothing to warn about.
         assert_eq!(coverage_refusal(&meta(0, 20_000, 20_000)), None);
     }
 
@@ -200,8 +147,6 @@ mod tests {
 
     #[test]
     fn a_later_window_is_refused_even_when_it_reaches_the_end() {
-        // `returned == total - offset`: the response carries the tail of
-        // the result, which is still not the result.
         let refusal = coverage_refusal(&meta(50, 10, 60)).expect("a nonzero offset is refused");
         assert!(refusal.contains("60 rows"), "{refusal}");
         assert!(refusal.contains("10 were fetched"), "{refusal}");
