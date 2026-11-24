@@ -26,7 +26,10 @@ use crate::tabs::{TabItem, Tabs, TabsStyle};
 pub fn Drawer(
     tabs: Vec<TabItem>,
     #[prop(into)] tabs_label: String,
-    #[prop(into)] label: Signal<String>,
+    /// Required, and the only source of the name: the title slot is
+    /// visual and never names the dialog (ADR-0028).
+    #[prop(into)]
+    label: Signal<String>,
     #[prop(into)] active_tab: Signal<String>,
     on_tab_change: Callback<String>,
     on_close: Callback<()>,
