@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `fleet-admin` — operational CLI for the shared fleet keystore (ADR-0030).
-
 use std::io::Write;
 use std::process;
 use std::time::Duration;
@@ -274,9 +272,6 @@ async fn dispatch_roles(store: KeyStore, action: RolesAction) -> Result<(), Admi
         RolesAction::RemovePerm { name, perms } => {
             commands::roles::remove_perm(&store, &name, &perms).await
         }
-        // `--default` only exists to make "clear the ceiling" explicit at
-        // the CLI boundary; clap's conflict/requirement rules already
-        // collapse it into `rate_rpm == None`.
         RolesAction::SetRate {
             name,
             rate_rpm,
@@ -319,8 +314,6 @@ mod tests {
     fn set_rate_takes_exactly_one_of_rate_rpm_or_default() {
         let parse = |args: &[&str]| Cli::try_parse_from(args);
 
-        // Ambiguity is a parse error in both directions — an operator never
-        // gets to guess whether a ceiling was set or cleared.
         assert!(parse(&["fleet-admin", "roles", "set-rate", "tier"]).is_err());
         assert!(
             parse(&[
@@ -335,7 +328,6 @@ mod tests {
             .is_err()
         );
 
-        // `--default` is how "clear the ceiling" reaches the store as None.
         let cli = parse(&["fleet-admin", "roles", "set-rate", "tier", "--default"]).unwrap();
         let Command::Roles {
             action: RolesAction::SetRate { rate_rpm, .. },

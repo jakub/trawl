@@ -2,14 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Integration coverage for `fleet-admin roles` against a real Postgres
-//! (ADR-0006).
-//!
-//! Command functions are exercised where they add behaviour over the store.
-//! The warn-only permission test runs the built binary so it can assert stderr
-//! and exit status. Pure store round-trips call `KeyStore` directly, mirroring
-//! `keys_pg.rs`.
-
 mod common;
 
 use std::process::Command;
@@ -129,7 +121,6 @@ async fn add_and_remove_perm_roundtrip(pool: sqlx::PgPool) {
     let role = store.get_role("mut").await.unwrap();
     assert_eq!(role.permissions, vec![rp("trawl", "query")]);
 
-    // Removing a pair that isn't on the role is a warning, not an error.
     roles::remove_perm(&store, &role_name("mut"), &[rp("trawl", "export")])
         .await
         .expect("removing an absent pair warns but succeeds");
@@ -160,8 +151,6 @@ async fn delete_refuses_in_use_role_without_force(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    // --yes skips the prompt; without --force the store must refuse and
-    // name the affected-key count.
     let err = roles::delete(&store, &role_name("held"), false, true)
         .await
         .expect_err("in-use role must be refused without force");
@@ -174,7 +163,6 @@ async fn delete_refuses_in_use_role_without_force(pool: sqlx::PgPool) {
         "expected RoleInUse with key_count=1, got {err:?}"
     );
 
-    // Forced: role gone, key stripped.
     roles::delete(&store, &role_name("held"), true, true)
         .await
         .expect("forced delete");
@@ -204,13 +192,8 @@ async fn delete_unheld_role_succeeds(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn schema_write_is_grantable_through_a_role(pool: sqlx::PgPool) {
-    // The migration registers `trawl:schema_write` and grants it to nobody,
-    // so the operator's whole path to a schema-admin is one
-    // `fleet-admin roles create`: no deploy, no `server_manage` riding along.
     let store = common::migrated_store(pool).await;
 
-    // Registered vocabulary: naming it in a role mutation warns about
-    // nothing (the warn-only registry exercised above).
     assert!(
         store
             .is_known_permission("trawl", "schema_write")
@@ -219,7 +202,6 @@ async fn schema_write_is_grantable_through_a_role(pool: sqlx::PgPool) {
         "slice B must register trawl:schema_write in app_permissions"
     );
 
-    // ...and no role holds it until the operator acts.
     for role in store.list_roles().await.unwrap() {
         assert!(
             !role.permissions.contains(&rp("trawl", "schema_write")),
@@ -248,7 +230,6 @@ async fn schema_write_is_grantable_through_a_role(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    // The grant resolves through the same verify path the server gates on.
     let verified = store.verify_key(&created.plaintext_token).await.unwrap();
     assert_eq!(verified.roles(), ["trawl-schema-admin"]);
     assert!(verified.has_app_permission("trawl", "schema_write"));
@@ -258,7 +239,6 @@ async fn schema_write_is_grantable_through_a_role(pool: sqlx::PgPool) {
         "a schema-admin must not need server_manage"
     );
 
-    // And it is revocable the same way it was granted.
     roles::remove_perm(
         &store,
         &role_name("trawl-schema-admin"),
@@ -272,9 +252,6 @@ async fn schema_write_is_grantable_through_a_role(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn investigation_permissions_are_grantable_through_a_role(pool: sqlx::PgPool) {
-    // The migration registers both investigation permissions and grants
-    // them to nobody (ADR-0059), so the operator's whole path to an agent
-    // or reader role is `fleet-admin roles create` / `add-perm`.
     let store = common::migrated_store(pool).await;
 
     for permission in ["investigation_read", "investigation_write"] {
@@ -316,7 +293,6 @@ async fn investigation_permissions_are_grantable_through_a_role(pool: sqlx::PgPo
         .await
         .unwrap();
 
-    // The grant resolves through the same verify path the server gates on.
     let verified = store.verify_key(&created.plaintext_token).await.unwrap();
     assert!(verified.has_app_permission("trawl", "investigation_read"));
     assert!(verified.has_app_permission("trawl", "investigation_write"));
@@ -325,7 +301,6 @@ async fn investigation_permissions_are_grantable_through_a_role(pool: sqlx::PgPo
         "an investigation writer must not need server_manage"
     );
 
-    // And it is revocable the same way it was granted.
     roles::remove_perm(
         &store,
         &role_name("trawl-investigator"),
@@ -338,7 +313,6 @@ async fn investigation_permissions_are_grantable_through_a_role(pool: sqlx::PgPo
     assert!(!verified.has_app_permission("trawl", "investigation_write"));
 }
 
-/// Every row of the role tables, in a stable order, as Postgres renders it.
 async fn role_rows(pool: &sqlx::PgPool) -> Vec<String> {
     let mut rows = Vec::new();
     for query in [
@@ -354,10 +328,6 @@ async fn role_rows(pool: &sqlx::PgPool) -> Vec<String> {
 
 #[sqlx::test(migrations = false)]
 async fn upgrade_registers_vocabulary_without_changing_roles(pool: sqlx::PgPool) {
-    // An installation at the previous schema holds roles, including one
-    // with every other trawl permission and one already naming a
-    // permission ahead of its registration (the warn-only registry allows
-    // that). Upgrading must register the vocabulary and change no role.
     fleet_auth::MIGRATOR
         .run_to(fleet_auth::migrations::BASELINE_VERSION, &pool)
         .await
@@ -424,7 +394,6 @@ async fn upgrade_registers_vocabulary_without_changing_roles(pool: sqlx::PgPool)
         );
     }
 
-    // Only the operator's explicit act grants them.
     roles::add_perm(
         &store,
         &role_name("trawl-admin"),
@@ -450,8 +419,6 @@ async fn upgrade_registers_vocabulary_without_changing_roles(pool: sqlx::PgPool)
 
 #[sqlx::test(migrations = false)]
 async fn assign_unassign_roundtrip_through_role_commands(pool: sqlx::PgPool) {
-    // Round-trip: roles create → keys create --role → assign/unassign,
-    // visible through the verify path.
     let store = common::migrated_store(pool).await;
 
     roles::create(&store, &role_name("t1"), &[rp("trawl", "query")], None)

@@ -3,22 +3,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `fleet-admin roles ...` — CRUD for data-defined roles (ADR-0006).
-//!
-//! A role is a named cross-app bundle of `APP:PERMISSION` strings with an
-//! optional `rate_rpm` ceiling. A mutation naming a permission absent from
-//! the `app_permissions` registry warns on stderr and persists anyway: a
-//! role may pre-name a permission an app is about to ship, so the warning
-//! is only there to catch typos.
 
 use fleet_auth::{KeyStore, Role, RolePermission};
 
 use crate::commands::keys::{RoleName, confirm_or_refuse};
 use crate::error::AdminError;
 
-/// Parse an `APP:PERMISSION` argument into a [`RolePermission`].
-///
-/// Both halves are shape-validated with fleet-auth's canonical rules at the
-/// clap boundary so malformed values never reach the SQL layer.
 pub fn parse_perm(s: &str) -> Result<RolePermission, AdminError> {
     let bad = |reason: &'static str| AdminError::InvalidPermSpec {
         input: s.to_owned(),
@@ -41,9 +31,6 @@ pub fn parse_perm(s: &str) -> Result<RolePermission, AdminError> {
     })
 }
 
-/// Warn on stderr for every named permission missing from the
-/// `app_permissions` registry. The rows persist regardless (warn-only
-/// registry) and the command still exits 0.
 async fn warn_unknown_permissions(
     store: &KeyStore,
     permissions: &[RolePermission],
@@ -60,7 +47,6 @@ async fn warn_unknown_permissions(
     Ok(())
 }
 
-/// Render one role's detail block to stderr.
 fn print_role(role: &Role) {
     eprintln!("  name:      {}", role.name);
     match role.rate_rpm {
@@ -74,8 +60,6 @@ fn print_role(role: &Role) {
     }
 }
 
-/// Render a permission bundle as `"app:perm, app:perm"` (already sorted by
-/// the store's ORDER BY).
 fn format_perms(perms: &[RolePermission]) -> String {
     perms
         .iter()
@@ -84,7 +68,6 @@ fn format_perms(perms: &[RolePermission]) -> String {
         .join(", ")
 }
 
-/// `roles create --name <N> [--perm APP:PERMISSION]... [--rate-rpm N]`.
 pub async fn create(
     store: &KeyStore,
     name: &RoleName,
@@ -100,7 +83,6 @@ pub async fn create(
     Ok(())
 }
 
-/// `roles list` — every role with its bundle, one table.
 pub async fn list(store: &KeyStore) -> Result<(), AdminError> {
     let roles = store.list_roles().await?;
     if roles.is_empty() {
@@ -114,7 +96,6 @@ pub async fn list(store: &KeyStore) -> Result<(), AdminError> {
     Ok(())
 }
 
-/// `roles show <NAME>` — one role's full detail.
 pub async fn show(store: &KeyStore, name: &RoleName) -> Result<(), AdminError> {
     let role = store.get_role(name.as_str()).await?;
     let key_count = store.count_role_assignments(name.as_str()).await?;
@@ -123,7 +104,6 @@ pub async fn show(store: &KeyStore, name: &RoleName) -> Result<(), AdminError> {
     Ok(())
 }
 
-/// `roles add-perm <NAME> <APP:PERMISSION>...`.
 pub async fn add_perm(
     store: &KeyStore,
     name: &RoleName,
@@ -138,11 +118,6 @@ pub async fn add_perm(
     Ok(())
 }
 
-/// `roles set-rate <NAME> (--rate-rpm N | --default)`.
-///
-/// `None` clears the ceiling back to the route-class config defaults.
-/// Non-destructive: the permission bundle and every key assignment survive,
-/// so re-tiering a class of service needs no delete-and-recreate.
 pub async fn set_rate(
     store: &KeyStore,
     name: &RoleName,
@@ -154,7 +129,6 @@ pub async fn set_rate(
     Ok(())
 }
 
-/// `roles remove-perm <NAME> <APP:PERMISSION>...`.
 pub async fn remove_perm(
     store: &KeyStore,
     name: &RoleName,
@@ -176,12 +150,6 @@ pub async fn remove_perm(
     Ok(())
 }
 
-/// `roles delete <NAME> [--force] [--yes]`.
-///
-/// Refuses while keys still hold the role unless `--force` (store-side
-/// `RoleInUse` carrying the affected-key count). Destructive, so it is
-/// TTY-confirmation-gated like `keys revoke` — the prompt names how many
-/// keys lose the role when forcing.
 pub async fn delete(
     store: &KeyStore,
     name: &RoleName,
@@ -215,7 +183,6 @@ pub async fn delete(
     Ok(())
 }
 
-/// Render a [`Role`] slice as a `comfy_table` block.
 fn format_roles_table(roles: &[Role]) -> comfy_table::Table {
     let mut table = comfy_table::Table::new();
     table
@@ -275,7 +242,6 @@ mod tests {
         assert!(parse_perm("Trawl:query").is_err());
         assert!(parse_perm("trawl:Query").is_err());
         assert!(parse_perm("trawl:que ry").is_err());
-        // Permissions can't be colon-namespaced — one app half, one perm half.
         assert!(parse_perm("trawl:sub:query").is_err());
     }
 

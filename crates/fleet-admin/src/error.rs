@@ -21,9 +21,6 @@ pub enum AdminError {
     #[error(transparent)]
     Schema(#[from] fleet_auth::SchemaError),
 
-    /// Pass-through for any error originating in fleet-auth (keystore /
-    /// session). Preserves variant identity so future error-aware UX (exit
-    /// codes, retry hints) can pattern-match without parsing strings.
     #[error(transparent)]
     Auth(#[from] AuthError),
 

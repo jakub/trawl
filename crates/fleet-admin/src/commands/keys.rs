@@ -2,14 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `fleet-admin keys ...` — lifecycle for API keys in the Postgres keystore.
-//!
 //! `create` writes the plaintext token to stdout once; everything else
 //! (metadata, prompts, summaries) goes to stderr so the output of
 //! `keys create` is shell-pipeable.
-//!
-//! Keys hold data-defined roles (ADR-0006): `create --role <NAME>` is
-//! repeatable, and `assign-role`/`unassign-role` change the set afterwards.
 
 use std::io::{BufRead, Write};
 use std::time::Duration;
@@ -19,10 +14,6 @@ use fleet_auth::{ApiKeyInfo, KeyStore, PrincipalKind};
 
 use crate::error::AdminError;
 
-/// API key prefix as shown in `keys list` — 8 base64url chars.
-///
-/// Constructed via [`KeyPrefix::parse`] (clap `value_parser`) so malformed
-/// values are rejected at parse time, not at the SQL boundary.
 #[derive(Debug, Clone)]
 pub struct KeyPrefix(String);
 
@@ -55,9 +46,6 @@ impl std::fmt::Display for KeyPrefix {
     }
 }
 
-/// Role name argument, shape-validated at the clap boundary via
-/// fleet-auth's canonical [`fleet_auth::validate_role_name`] so a typo'd
-/// charset never reaches the SQL layer.
 #[derive(Debug, Clone)]
 pub struct RoleName(String);
 
@@ -78,11 +66,6 @@ impl std::fmt::Display for RoleName {
     }
 }
 
-/// Create a new API key holding the named (pre-existing) roles.
-///
-/// Emits the plaintext token to stdout exactly once. All metadata
-/// (name, kind, roles, prefix, expiry) goes to stderr. Unknown role names
-/// error store-side (`RoleNotFound`) before anything is persisted.
 pub async fn create(
     store: &KeyStore,
     name: &str,
@@ -117,7 +100,6 @@ pub async fn create(
     Ok(())
 }
 
-/// List API keys — active only unless `all`.
 pub async fn list(store: &KeyStore, all: bool) -> Result<(), AdminError> {
     let keys = store.list_keys(!all).await?;
 
@@ -133,11 +115,6 @@ pub async fn list(store: &KeyStore, all: bool) -> Result<(), AdminError> {
     Ok(())
 }
 
-/// Revoke a key by prefix, with `[y/N]` confirmation unless `--yes`.
-///
-/// Refuses to revoke unless both stdin and stderr are TTYs or `--yes` was
-/// passed — scripts must opt in explicitly so an accidental
-/// `keys revoke <prefix>` in a pipeline never silently nukes a key.
 pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(), AdminError> {
     let info = store.get_key_by_prefix(prefix.as_str()).await?;
 
@@ -163,12 +140,6 @@ pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(
     Ok(())
 }
 
-/// Pure `[y/N]` prompt loop, factored out for unit testing.
-///
-/// Writes `"\n{question} [y/N] "` and reads one line. Returns `Ok(true)`
-/// only for `y`/`yes` (case-insensitive). EOF (a zero-byte read) is reported
-/// to the operator before falling through to `Ok(false)` — without that,
-/// "stdin closed mid-prompt" looks identical to "user typed n" in logs.
 pub fn confirm_prompt<R: BufRead, W: Write>(
     question: &str,
     reader: &mut R,
@@ -193,12 +164,6 @@ pub fn confirm_prompt<R: BufRead, W: Write>(
     }
 }
 
-/// TTY-gated `[y/N]` confirmation shared by confirmable subcommands.
-///
-/// Refuses with [`AdminError::NonInteractive`] unless both stdin and stderr
-/// are TTYs, so a piped destructive subcommand never proceeds without an
-/// explicit `--yes`. Otherwise locks the descriptors and defers to
-/// [`confirm_prompt`], returning whether the operator confirmed.
 pub(crate) fn confirm_or_refuse(question: &str) -> Result<bool, AdminError> {
     use std::io::IsTerminal as _;
     let stdin = std::io::stdin();
@@ -222,13 +187,9 @@ pub async fn assign_role(
     Ok(())
 }
 
-/// Remove a role from a key, with `[y/N]` confirmation unless `--yes`.
-///
-/// Same interactivity contract as [`revoke`]: refuses to proceed unless both
-/// stdin and stderr are TTYs or `--yes` was passed. No preflight read — the
-/// prompt is built from the arguments, and a missing assignment surfaces as
-/// the store's `RoleNotAssigned` after confirmation (no read-then-delete
-/// race).
+/// No preflight read — the prompt is built from the arguments, and a missing
+/// assignment surfaces as the store's `RoleNotAssigned` after confirmation
+/// (no read-then-delete race).
 pub async fn unassign_role(
     store: &KeyStore,
     prefix: &KeyPrefix,
@@ -247,11 +208,6 @@ pub async fn unassign_role(
     Ok(())
 }
 
-/// Change a key's kind (human <-> service).
-///
-/// Non-interactive — the change is reversible and the result is
-/// self-reported. Revoked keys are refused store-side
-/// (`AuthError::KeyRevoked`).
 pub async fn retype(
     store: &KeyStore,
     prefix: &KeyPrefix,
@@ -265,13 +221,6 @@ pub async fn retype(
     Ok(())
 }
 
-/// Render role names as `"role-a, role-b"`, sorted, or `"(none)"` if empty.
-///
-/// CLI-output flavour of `VerifiedKey::roles_display` — that one uses
-/// `"none"` and comma-without-space for log fields; this one uses `"(none)"`
-/// and comma-space for human reading. Sorted independently of the input so
-/// callers can hand us an arbitrarily-ordered slice and still get
-/// deterministic output.
 pub(crate) fn format_roles(roles: &[String]) -> String {
     if roles.is_empty() {
         return "(none)".to_owned();
@@ -281,7 +230,6 @@ pub(crate) fn format_roles(roles: &[String]) -> String {
     sorted.join(", ")
 }
 
-/// Render an [`ApiKeyInfo`] slice as a `comfy_table` block.
 fn format_keys_table(keys: &[ApiKeyInfo]) -> comfy_table::Table {
     let mut table = comfy_table::Table::new();
     table
@@ -320,15 +268,10 @@ fn format_keys_table(keys: &[ApiKeyInfo]) -> comfy_table::Table {
     table
 }
 
-/// Format a `DateTime<Utc>` as `YYYY-MM-DD HH:MM:SS`.
 pub(crate) fn format_timestamp(ts: &DateTime<Utc>) -> String {
     ts.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// Parse a human-readable duration string (`"90d"`, `"24h"`, `"52w"`).
-///
-/// Units: `s`, `m`, `h`, `d`, `w`. Numeric overflow against `u64::MAX`
-/// seconds is rejected with `duration too large`.
 pub fn parse_duration(s: &str) -> Result<Duration, AdminError> {
     let original = s;
     let bad = |reason: &'static str| AdminError::InvalidDuration {
@@ -429,8 +372,6 @@ mod tests {
 
     #[test]
     fn parse_duration_multibyte_trailing_char_doesnt_panic() {
-        // `日` is 3 bytes — naive `split_at(len-1)` would panic on a
-        // non-char-boundary. Must come back as a clean error instead.
         let err = parse_duration("90日").unwrap_err().to_string();
         assert!(err.contains("unknown duration unit"), "got: {err}");
     }
