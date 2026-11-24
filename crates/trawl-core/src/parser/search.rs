@@ -66,10 +66,10 @@ pub(crate) const MSG_NOT_DASH_BEFORE_BACKTICK: &str =
 #[derive(Clone)]
 struct ParsedValue {
     value: FilterValue,
-    /// Whether an element's own production already emitted an error. A
-    /// pattern that fails to build is refused after the parse
-    /// (`crate::parser::parse`), so it is not counted here. Such a value
-    /// gets no operator error on top: one error per value.
+    /// Whether an element's own production already emitted an error. Such a
+    /// value gets no operator error on top: one error per value. A pattern
+    /// that fails to build is refused after the parse (`crate::parser::parse`),
+    /// so it is not counted here.
     reported: bool,
 }
 

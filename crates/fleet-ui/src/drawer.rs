@@ -216,9 +216,9 @@ fn overlay_presentation(
         // Ownership must be read before release: a drawer unmounting
         // beneath a live modal doesn't own focus and must not restore.
         let Some(live) = layer.get_value() else {
-            // Docked. Focus is still inside the panel that is going away, or
-            // it has already fallen to <body>: leaving it alone loses the
-            // keyboard. Anything else put focus somewhere deliberate.
+            // Docked. Restore only if focus is still inside the closing
+            // panel or has fallen to <body>, where leaving it alone loses
+            // the keyboard. Anywhere else, focus was moved deliberately.
             let active = document().active_element();
             let inside = panel_ref
                 .get_untracked()

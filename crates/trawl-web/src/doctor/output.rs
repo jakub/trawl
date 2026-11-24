@@ -131,8 +131,7 @@ impl HealthKey {
 }
 
 /// An operator may have pasted the key itself where its variable's name
-/// belongs. So the name is shown only when it does not decode as a session
-/// key.
+/// belongs, so a name that decodes as a session key is never shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvName(Option<String>);
 
@@ -296,7 +295,7 @@ impl Row {
         }
     }
 
-    /// Only an access check's own row may carry the mark
+    /// Only an access check's own row may carry the access mark
     /// ([`WebCheck::is_access`]).
     #[must_use]
     pub const fn access(mut self) -> Self {

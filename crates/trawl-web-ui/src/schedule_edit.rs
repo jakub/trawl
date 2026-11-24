@@ -185,7 +185,8 @@ pub const RUN_NOW_SINCE_LAST_LINE: &str =
 pub const RUN_NOW_FIXED_LINE: &str =
     "Run now reads the span ending now; results can overlap earlier runs.";
 
-/// `None` is a session not read yet, which offers neither until it is.
+/// `None` is a session not read yet: no Run now and no run rows view
+/// until it is.
 #[must_use]
 pub fn may_run_saved(permissions: Option<&[String]>) -> bool {
     permissions.is_some_and(crate::perms::can_run_saved)

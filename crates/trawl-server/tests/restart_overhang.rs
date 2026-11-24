@@ -452,8 +452,6 @@ fn report() -> QueryResult {
     }
 }
 
-/// No run can
-/// execute during overhang, so this is how the overhang server gets one.
 async fn record_report(server: &TestServer, data: &str, name: &str) {
     let (saved_id, schedule_id) = scheduled_saved_query(server, name).await;
     let store = &server.state.storage.schedule;

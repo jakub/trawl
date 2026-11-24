@@ -238,7 +238,7 @@ impl Layout {
         }
     }
 
-    /// A filter value's list takes no space in either layout.
+    /// Not for a filter value's list, which takes no space in either layout.
     fn comma(self) -> &'static str {
         match self {
             Self::Readable => ", ",

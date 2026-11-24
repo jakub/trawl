@@ -88,9 +88,9 @@ pub mod prepare_probe {
 /// bound it: one `DESCRIBE` per request, never a bind attempt.
 ///
 /// The probe never goes through [`prepare_probe`]: a lane's last prepared
-/// statement stays its own. Each fault is keyed by a marker the `DESCRIBE`
-/// text must contain, so parallel tests over different directories never
-/// meet each other's faults.
+/// statement stays its own. Each test-only fault is keyed by a marker the
+/// `DESCRIBE` text must contain, so parallel tests over different
+/// directories never meet each other's faults.
 #[cfg(any(test, feature = "test-support"))]
 pub mod schema_probe {
     use std::cell::{Cell, RefCell};
@@ -274,7 +274,8 @@ impl RowCap {
 
     /// `DuckDB` builds a whole result before the first row is handed back,
     /// so a cut made only while copying rows out still pays for every row
-    /// the query matched. `Truncate` therefore wraps the SQL in a `LIMIT`.
+    /// the query matched. `Truncate` therefore wraps the SQL in a `LIMIT`
+    /// unless the cap is unbounded.
     fn statement(self, sql: &str) -> Cow<'_, str> {
         match self {
             Self::Truncate { rows, .. } => match export_row_limit(rows) {
@@ -788,8 +789,8 @@ impl Executor {
         }
     }
 
-    /// `pins` is the field catalog's full pin snapshot typing the
-    /// search-stage comparisons (ADR-0011).
+    /// `pins` types the search-stage comparisons (ADR-0011): the server's
+    /// catalog snapshot, or an empty `FieldTypes` in embedded mode.
     ///
     /// A result past `max_rows` is refused ([`RowCap::Refuse`]); a lane
     /// that cuts instead goes through [`Cancellable::run_query`].
@@ -1156,8 +1157,8 @@ impl Executor {
         })
     }
 
-    /// What the request's input carries, described once before emission
-    /// (ADR-0062).
+    /// What the request's input carries, described at most once before
+    /// emission (ADR-0062).
     ///
     /// The description is used for the whole request, the hot-only cold start
     /// included ([`InputColumns::hot_only`]), and never kept past it.
@@ -2654,9 +2655,9 @@ fn classify_query_outcome(outcome: Result<&QueryResult, &EngineError>) -> HotCol
         // Emit (an emitter refusal, or an unknown field the query path
         // remapped), Refused, ResultTooLarge, AggregationCapped,
         // ResourceExhausted, RegexResources, parse, IO — propagate. No narrower
-        // source makes any of them mean something else, and an exhausted budget
-        // is shared by every query on the database, so a hot-only retry would
-        // only spend it again.
+        // source makes any of them mean something else. A hot-only retry
+        // would spend an exhausted budget, shared by every query on the
+        // database, again, or prepare the same patterns and be refused again.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -2678,10 +2679,9 @@ fn classify_export_outcome(outcome: &Result<usize, EngineError>) -> HotColdOutco
     }
 }
 
-/// `None` is the unbounded shape, no LIMIT clause at all. `usize::MAX` is
-/// the caller-facing sentinel for an unbounded export; and `DuckDB`'s
-/// LIMIT domain is INT64, so every `usize` above `i64::MAX` is a
-/// Conversion Error rather than a bigger cap.
+/// `None`, no LIMIT clause at all, answers both the unbounded sentinel
+/// `usize::MAX` and any `usize` above `i64::MAX`: `DuckDB`'s LIMIT domain
+/// is INT64, so a bigger LIMIT would be a Conversion Error, not a cap.
 ///
 /// The sentinel is tested on the `usize` before the conversion: on a
 /// 32-bit target `usize::MAX` converts cleanly, which would silently turn
@@ -2992,9 +2992,8 @@ fn typed_columns(stmt: &duckdb::Statement<'_>) -> Vec<Column> {
 }
 
 /// Temporal values render through this module's own formatters
-/// ([`format_timestamp`], [`format_date`], [`format_time`]) rather than
-/// `DuckDB`'s, because the wire spells a timestamp its own way while the
-/// value is still an integer count.
+/// ([`format_timestamp`], [`format_date`], [`format_time`]) while the
+/// value is still an integer count, in the spelling `timestamps` picks.
 ///
 /// The cell has to agree with the type [`crate::column_type::column_type`]
 /// gives its column, or the wire encoder refuses it; a `HUGEINT` or
@@ -4317,8 +4316,8 @@ mod tests {
     use crate::cancel::CancelLatch;
     use crate::timing::{Fallback, PhaseClock, PhaseTotals, QueryPhase, Transition};
 
-    /// The cell is larger than the writer's buffer, so the
-    /// failure surfaces from `serde_json::to_writer` itself.
+    /// The cell is larger than the writer's buffer, so the staging write
+    /// fails inside `serde_json::to_writer` itself.
     #[test]
     fn a_capture_staging_write_failure_is_an_io_error() {
         use crate::value::{Column, ColumnType, QueryResult, Value};
@@ -5288,10 +5287,9 @@ mod tests {
 
     #[test]
     fn no_files_outcome_with_cold_data_errors_instead_of_empty_success() {
-        // Provoked here the same way it happens in production — the hot
-        // snapshot path matches no file while a sibling cold element still
-        // does — so narrowing cannot rescue it and the outcome policy is the
-        // last line of defence.
+        // The missing hot snapshot provokes the no-files error the way
+        // production does while the cold element still matches, so narrowing
+        // cannot rescue it and the outcome policy is the last line of defence.
         let dir = tempfile::tempdir().unwrap();
         let hour = dir.path().join("10");
         std::fs::create_dir_all(&hour).unwrap();
@@ -5894,8 +5892,8 @@ mod structured_error_classification {
     }
 
     /// The binder failures over a missing name that `DuckDB` 1.5.5 raises
-    /// without the subtype (`EXCLUDE`, `REPLACE`, a struct key, a table)
-    /// never take the binder-column fallback.
+    /// without the `COLUMN_NOT_FOUND` subtype (`EXCLUDE`, `REPLACE`, a struct
+    /// key, a table) never take the binder-column fallback.
     #[test]
     fn a_malformed_or_non_binder_diagnostic_is_never_the_fallback() {
         fn failure(message: &str) -> duckdb::Error {

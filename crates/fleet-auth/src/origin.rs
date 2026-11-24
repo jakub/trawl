@@ -245,9 +245,9 @@ impl FromStr for Origin {
 }
 
 impl fmt::Display for Origin {
-    /// Round-trips through [`Origin::parse`], so it is also the form the
-    /// rejection log prints — bounded by construction and free of anything the
-    /// attacker typed.
+    /// The canonical form a browser sends. It round-trips through
+    /// [`Origin::parse`], so the rejection log prints only bounded text,
+    /// never what the attacker typed.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}://{}", self.scheme.as_str(), self.host)?;
         if self.port != self.scheme.default_port() {
@@ -393,8 +393,8 @@ pub const REASON_MULTIPLE_HEADERS: &str = "multiple_origin_headers";
 
 pub const REASON_NON_UTF8: &str = "non_utf8_origin";
 
-/// When the header did not parse there is no text at all, because the only
-/// text available would be the attacker's.
+/// When the header did not parse the origin text is `None`, because the
+/// only text available would be the attacker's.
 #[must_use]
 pub fn rejection_log_fields(origin_header: Option<&str>) -> (&'static str, Option<String>) {
     match origin_header {
@@ -830,7 +830,6 @@ mod tests {
         let text = text.expect("a parsed origin is logged");
         assert_eq!(text, "https://evil.example.com");
         assert!(is_bounded_log_text(&text));
-        // The longest legal origin there is still fits the bound.
         let label = "a".repeat(MAX_DNS_LABEL_BYTES);
         let host = format!("{label}.{label}.{label}.{}", "b".repeat(61));
         assert_eq!(host.len(), MAX_DNS_HOST_BYTES);

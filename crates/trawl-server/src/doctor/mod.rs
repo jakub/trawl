@@ -944,7 +944,7 @@ mod tests {
     }
 
     /// The hook is process-global, so another test panicking meanwhile may add
-    /// lines; each must be the fixed one.
+    /// lines; each must be the hook's fixed line.
     #[test]
     fn the_panic_hook_prints_only_a_fixed_line() {
         use std::sync::{Arc, Mutex};

@@ -5,9 +5,8 @@
 //! The one expression that binds a pinned column to its catalog type
 //! (ADR-0009 slice 2, ADR-0011).
 //!
-//! The live mirror of these readings lives in [`crate::compare`], and every
-//! pairing is executed side by side against the bundled `DuckDB`, never
-//! assumed.
+//! Every reading these casts produce has a live mirror in [`crate::compare`],
+//! executed side by side against the bundled `DuckDB`, never assumed.
 
 use crate::schema::CanonicalType;
 use crate::severity::Dialect;

@@ -4,7 +4,7 @@
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-/// `None` in the signal that carries it means NO read has landed yet,
+/// `None` in an `Option<RunRead>` signal means NO read has landed yet,
 /// which is a third state and not a quiet [`Self::Unavailable`].
 #[derive(Clone, PartialEq)]
 pub enum RunRead {
@@ -14,9 +14,10 @@ pub enum RunRead {
 }
 
 impl RunRead {
-    /// `from_saved::unavailable_run_conflict` answers that 409 only for a run
-    /// whose query SUCCEEDED and wrote a result file the server can no longer
-    /// find, so the outcome is settled even though the summary is gone.
+    /// `Unavailable` is `from_saved::unavailable_run_conflict`'s 409, sent only
+    /// for a run whose query SUCCEEDED and wrote a result file the server can
+    /// no longer find, so the outcome is settled even though the summary is
+    /// gone.
     pub fn settle(
         self,
         fallback: Option<trawl_api::ReportRunSummary>,

@@ -147,10 +147,10 @@ pub async fn reconcile_store(
                     .map_err(|e| format!("failed to fail recovered repin job: {e}"))?;
             }
             RecoveredAction::CompletedCutover | RecoveredAction::SweptCleanup => {
-                // The physical parse (`from_duckdb`) has no `SEVERITY`
-                // spelling, so it would refuse a severity cutover marker.
-                // This path must never refuse — the corpus is already
-                // half-swapped.
+                // `target_type` parses the catalog spelling: the physical
+                // parse (`from_duckdb`) has no `SEVERITY` and would refuse a
+                // severity cutover marker. Recovery must never refuse — the
+                // corpus is already half-swapped.
                 let to = marker.target_type().ok_or_else(|| {
                     format!("repin marker names non-canonical type {:?}", marker.to_type)
                 })?;

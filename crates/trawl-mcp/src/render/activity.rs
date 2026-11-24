@@ -831,8 +831,6 @@ fn fit_reply<R: Entries>(
     Some(result)
 }
 
-/// The longest escaped prefixes, one cap for all three, with which as many
-/// entries print as with empty prefixes.
 fn cut_header<R: Entries>(reply: &R, budget: Budget) -> Option<Fitted> {
     let mut whole = reply.clone();
     let view = whole.header_mut()?;

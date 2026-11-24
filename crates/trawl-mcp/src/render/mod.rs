@@ -300,8 +300,9 @@ impl Recovery {
     }
 }
 
-/// The cell call comes right after the fixed first sentence, where the
-/// error's cap at [`refusal::MAX_ERROR_BYTES`] cannot cut it.
+/// The cell call, when there is one, comes right after the fixed first
+/// sentence, where the error's cap at [`refusal::MAX_ERROR_BYTES`] cannot
+/// cut it.
 fn does_not_fit(tool: &str, recovery: Option<&Recovery>, budget: Budget) -> CallToolResult {
     let bytes = budget.bytes();
     let unfit = "even without rows, facets, hints, next calls or the search URL.";

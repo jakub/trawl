@@ -172,7 +172,7 @@ mod support {
     }
 }
 
-/// The panic's default stderr report is expected test output.
+/// The injected panic's default stderr report is expected test output.
 #[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn a_failed_collection_does_not_end_the_loop() {
@@ -276,9 +276,9 @@ async fn shutdown_waits_for_the_collection_in_flight() {
     assert_eq!(finished.load(Ordering::SeqCst), 1);
 }
 
-/// `select!` picks among ready arms at random unless biased, so one
-/// trial would pass half the time; across 32 trials a wrong order slips
-/// through once in 2^32 runs.
+/// Shutdown and the next tick are ready together when the overrun ends, and
+/// `select!` picks among ready arms at random unless biased: one trial would
+/// pass half the time, 32 let a wrong order through once in 2^32 runs.
 #[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn shutdown_during_an_overrun_starts_no_new_collection() {

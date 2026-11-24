@@ -32,9 +32,10 @@ pub enum Paced<T> {
     Throttled { retry_after_ms: f64 },
 }
 
-/// Both forms RFC 9110 allows: whole seconds (what trawld sends), or an
-/// HTTP date, which `parse_http_date` turns into unix milliseconds and
-/// which pauses until then from `now_unix_ms`.
+/// A 429's `Retry-After`, in either form RFC 9110 allows: whole seconds
+/// (what trawld sends), or an HTTP date that `parse_http_date` turns into
+/// unix milliseconds. A date pauses until then from `now_unix_ms`, never
+/// less than one refill.
 #[must_use]
 pub fn retry_after_ms(
     header: Option<&str>,

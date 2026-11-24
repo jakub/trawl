@@ -1021,8 +1021,8 @@ async fn doctor_refuses_a_session_that_is_not_read_only() {
     database_rows_complete(&report).unwrap_or_else(|why| panic!("{why}: {report:?}"));
 }
 
-/// A driver that opened `ca` during the handshake finds nothing at
-/// the path; one that holds its bytes already connects.
+/// Moves `ca` aside for the handshake: a driver that opens `ca` then finds
+/// nothing at the path; one that holds its bytes already connects.
 fn tls_database_server(config: rustls::ServerConfig, ca: PathBuf) -> std::net::SocketAddr {
     use std::io::{Read as _, Write as _};
 

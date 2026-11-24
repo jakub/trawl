@@ -69,7 +69,7 @@ async fn migrate_with(pool: &PgPool, migrator: &Migrator) -> Result<(), SchemaEr
 /// Classify the app-state ledger as boot would admit it, without taking the
 /// migrator's lock or changing anything (`trawld --doctor`, ADR-0047). If the
 /// future is dropped part-way, the connection may still be inside the
-/// snapshot, and the caller should close it.
+/// read-only snapshot this opens, and the caller should close it.
 pub async fn validate_schema(conn: &mut PgConnection) -> Result<Ledger, SchemaError> {
     let mut snapshot = conn
         .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")

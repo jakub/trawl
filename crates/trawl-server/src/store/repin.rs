@@ -101,16 +101,16 @@ pub struct RepinJob {
     /// before this is set.
     pub planned_at: Option<DateTime<Utc>>,
     /// When a cancel request was accepted for this job, if one was. A
-    /// populated pair on a non-`Cancelled` row is not a contradiction: the
-    /// job crashed before the request took effect, or the cancel lost its
-    /// race with the point of no return.
+    /// populated pair with `cancelled_by` on a non-`Cancelled` row is not a
+    /// contradiction: the job crashed before the request took effect, or the
+    /// cancel lost its race with the point of no return.
     pub cancel_requested_at: Option<DateTime<Utc>>,
     pub cancelled_by: Option<String>,
 }
 
 /// Who requested a repin job. `key_id` is stable and never reissued, so it
-/// is what the status read by id matches on; two keys may share one `name`,
-/// which is why it decides nothing.
+/// is what the owner-scoped status read by id matches on; two keys may
+/// share one `name`, which is why it decides nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requester {
     pub key_id: i64,
@@ -555,8 +555,9 @@ impl RepinStore {
     /// DISTINCT FROM $2`, so a resurrection-only repin (`to == current`) takes
     /// no lock at all, and `acknowledge_degraded_field` serializes against this
     /// transaction by taking `FOR SHARE` on that same row. Without the explicit
-    /// lock the ack's upsert lands as a high-water over counters that were just
-    /// reset, suppressing the new pin's first episodes.
+    /// lock a same-type cutover gives the ack nothing to wait on: its upsert
+    /// lands as a high-water over counters that were just reset, suppressing
+    /// the new pin's first episodes.
     pub async fn finish_cutover(
         &self,
         id: i64,

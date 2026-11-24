@@ -58,8 +58,9 @@ async function settle(page, selectors) {
   );
 }
 
-/** Without it the Haul button is photographed mid-way
- * through its 120ms `background` transition out of the in-flight state. */
+/** Without this wait for finite animations the Haul button is photographed
+ * mid-way through its 120ms `background` transition out of the in-flight
+ * state. */
 async function settleDocument(page) {
   await page.evaluate(async () => {
     const finite = document.getAnimations().filter((a) => {

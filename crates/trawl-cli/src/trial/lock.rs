@@ -10,12 +10,12 @@
 //! inode alongside it.
 //!
 //! Its descriptor is inheritable ([`share_with_children`]), so every
-//! `docker` child holds the lock too. A `trawl` killed mid-command leaves
-//! its docker children holding the lock until they exit, and a rerun
-//! waits for them instead of racing an orphaned `compose run` or
-//! `compose exec`. A killed `docker` child leaves a `compose run`
-//! container running, and a container holds no lock. So `up`, `stop`,
-//! and `down` still wait for running one-off containers.
+//! `docker` child holds the lock too. A `trawl` killed by SIGKILL, which
+//! runs no destructor, leaves its docker children holding the lock until
+//! they exit, and a rerun waits for them instead of racing an orphaned
+//! `compose run` or `compose exec`. A killed `compose run` client leaves
+//! its container running, and a container holds no lock. So `up`,
+//! `stop`, and `down` still wait for running one-off containers.
 //!
 //! Every docker call made under the lock ends on its own, and nothing
 //! follows logs or events.
@@ -71,8 +71,8 @@ impl TrialLock {
 }
 
 /// std opens every file close-on-exec, and neither std nor tokio closes
-/// an inheritable descriptor when it spawns a child, so this is the only
-/// step needed.
+/// an inheritable descriptor when it spawns a child, so clearing
+/// `FD_CLOEXEC` is the only step needed.
 fn share_with_children(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
     let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?);

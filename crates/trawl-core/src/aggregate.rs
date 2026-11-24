@@ -200,9 +200,6 @@ fn push_slots<'a>(stack: &mut Vec<(&'a Expr, Position<'a>)>, slots: &'a [AggExpr
 mod tests {
     use crate::ast::{BinaryOp, Expr, PipeStage, Spanned, WhereStage};
 
-    /// The parser cannot produce the chain (a query is at most 64 KiB),
-    /// so the AST is built by hand. Building, validating and dropping it
-    /// all happen on the small thread.
     #[test]
     fn flat_expression_validation_is_bounded() {
         const TERMS: usize = 100_000;

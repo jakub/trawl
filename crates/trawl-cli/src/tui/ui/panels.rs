@@ -514,7 +514,7 @@ fn format_relative_time(iso_timestamp: &str) -> String {
     format!("{label:>4}")
 }
 
-/// Bounds are half-open, so the closing bracket is deliberate. Each bound is
+/// Bounds are half-open, so the closing `)` is deliberate. Each bound is
 /// a [`format_instant`], with its own offset, seconds and any fractional
 /// part, since schedule edits can re-anchor a boundary between minutes.
 fn format_run_window(start: &str, end: &str, zone: DisplayZone) -> String {
@@ -696,7 +696,7 @@ fn render_saved_detail(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Re
     }
 }
 
-/// N can exceed M after the cap is lowered; it shows as is.
+/// `total_runs` can exceed the cap after the cap is lowered; it shows as is.
 fn run_budget(sched: &trawl_api::ScheduleResponse) -> String {
     match sched.max_runs {
         None => sched.total_runs.to_string(),

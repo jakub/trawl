@@ -21,8 +21,8 @@ pub const HANG_GUARD: Duration = Duration::from_secs(120);
 /// paused clock only when the runtime has nothing runnable, and a task that
 /// always re-wakes itself leaves the runtime with a runnable task. A tokio
 /// sleep or timeout in its place would be idle and let the clock jump. The
-/// bound is measured on the real clock (`std::time::Instant`) for the same
-/// reason.
+/// [`HANG_GUARD`] bound is measured on the real clock (`std::time::Instant`)
+/// for the same reason.
 pub async fn until(what: &str, mut cond: impl FnMut() -> bool) {
     let start = Instant::now();
     while !cond() {
@@ -59,9 +59,10 @@ pub async fn until_polling<F: Future + Unpin>(
     }
 }
 
-/// Use it around any await on real I/O in a paused test. Awaited bare,
-/// such an await leaves the runtime idle, and tokio jumps the clock to the
-/// next timer, which fires a deadline the test never advanced to.
+/// Awaits `op` with a paused clock held fixed. Use it around any await on
+/// real I/O in a paused test: awaited bare, such an await leaves the runtime
+/// idle, and tokio jumps the clock to the next timer, which fires a deadline
+/// the test never advanced to.
 pub async fn frozen<F: Future>(what: &str, op: F) -> F::Output {
     until_polling(what, &mut std::pin::pin!(op), || false)
         .await

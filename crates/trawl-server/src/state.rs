@@ -128,9 +128,9 @@ impl AuthState {
         }
     }
 
-    /// `/health` is unauthenticated and unthrottled, so the ping is memoised to
-    /// protect the pool. Failed and timed-out pings are cached too, so a downed
-    /// keystore cannot turn every probe into a fresh stall.
+    /// `/health` is unauthenticated, so the ping is memoised to protect the
+    /// pool. Failed and timed-out pings are cached too, so a downed keystore
+    /// cannot turn every probe into a fresh stall.
     pub async fn ping_cached(&self) -> Result<(), String> {
         ping_cached_with(
             &self.auth_ping,
@@ -393,10 +393,10 @@ impl DegradedSnapshot {
     }
 }
 
-/// Config validation compares the spellings; this compares the
-/// directories, which a symlink in either path can make the same.
-/// trawld calls this before it waits on `PostgreSQL`: the scratch lock, not
-/// the sole-writer lock, authorizes the clearing (ADR-0056).
+/// Config validation compares the scratch directory's spelling with the
+/// storage roots'; this compares the directories, which a symlink can make
+/// the same. trawld calls this before it waits on `PostgreSQL`: the scratch
+/// lock, not the sole-writer lock, authorizes the clearing (ADR-0056).
 pub fn open_query_scratch(
     config: &Config,
 ) -> Result<ScratchLock, trawl_engine::scratch::ScratchError> {

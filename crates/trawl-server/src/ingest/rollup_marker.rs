@@ -241,7 +241,6 @@ pub enum ReadError {
     Missing,
     Unreadable(io::Error),
     Oversized,
-    /// It is not a JSON object carrying this format's discriminator.
     OldFormat,
     UnsupportedVersion,
     Malformed(String),

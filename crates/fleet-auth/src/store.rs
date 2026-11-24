@@ -80,8 +80,9 @@ where
 /// check accepts it. So the pool closes a session still inside a
 /// transaction.
 ///
-/// A failed transaction refuses the query with `in_failed_sql_transaction`,
-/// and is inside one too.
+/// The probe's two timestamps are equal only in autocommit. A failed
+/// transaction refuses it with `in_failed_sql_transaction`, and is inside
+/// one too.
 async fn released_outside_transaction(
     conn: &mut sqlx::postgres::PgConnection,
 ) -> Result<bool, sqlx::Error> {
@@ -272,10 +273,11 @@ impl KeyStore {
         ))
     }
 
-    /// Every failed check surfaces as [`AuthError::InvalidKey`] (with the same
-    /// opaque message) so callers cannot distinguish "not found", "wrong
-    /// hash", "revoked", or "expired" — that distinction would be an
-    /// enumeration oracle. A backend failure is [`AuthError::Database`].
+    /// Every failed check on a well-formed token surfaces as
+    /// [`AuthError::InvalidKey`] (with the same opaque message) so callers
+    /// cannot distinguish "not found", "wrong hash", "revoked", or
+    /// "expired" — that distinction would be an enumeration oracle. A
+    /// backend failure is [`AuthError::Database`].
     ///
     /// The `last_used` UPDATE and the role resolution run as one
     /// transaction on a task of its own, which this call awaits. A caller

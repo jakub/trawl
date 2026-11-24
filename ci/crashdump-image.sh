@@ -433,9 +433,9 @@ base_eff="$(field "$LOG_DIR/03-baseline-sh.status" CapEff)"
 base_nnp="$(field "$LOG_DIR/03-baseline-sh.status" NoNewPrivs)"
 note "CapBnd=$base_bnd CapPrm=$base_prm CapEff=$base_eff NoNewPrivs=$base_nnp"
 
-# --cap-add puts the capability in the BOUNDING set only. An ordinary binary
-# run by uid 1000 holds none of it. Everything the monitor ends up with
-# therefore came from the file capability.
+# For uid 1000, --cap-add puts the capability in the BOUNDING set only: an
+# ordinary binary holds none of it, so everything the monitor ends up with
+# came from the file capability.
 [ "$(cap_bit "$base_bnd")" = 1 ] ||
   die "--cap-add SYS_PTRACE did not reach this container's bounding set, so the docker daemon could not grant SYS_PTRACE (container CapBnd=$base_bnd; the runner's own CapBnd=$runner_bnd is informational, the container's is what was measured); this job needs a daemon that can grant it"
 [ "$(cap_bit "$base_prm")" = 0 ] ||
@@ -555,10 +555,10 @@ case "$scope" in
     ;;
   *)
     # Scope 0 and 1 never ask for the capability, so dropping it changes none of
-    # the inputs the classifier reads here, and ready is the only verdict the
-    # classifier can reach. Accepting denied too would pass a probe that stopped
-    # reading an input, or a classifier that started demanding the capability at
-    # these scopes.
+    # the inputs the classifier reads here, all readable in this container
+    # shape, so ready is the only verdict the classifier can reach. Accepting
+    # denied too would pass a probe that stopped reading an input, or a
+    # classifier that started demanding the capability at these scopes.
     assert_class "$misc_line" 'readiness="ready"'
     ;;
 esac
@@ -601,8 +601,8 @@ esac
 phase "step 7: the chart shape, no_new_privs on, still captures"
 
 # trawld has to BE the init process here, exec'd by the runtime, exactly as it
-# is in the pod. Every other step parks trawld behind a shell, and a shell holds
-# no permitted capability of its own, so trawld's file capability is then a
+# is in the pod. Every other step parks trawld behind a shell, which holds no
+# permitted capability, so under no_new_privs trawld's file capability is a
 # gain, and the kernel takes it back.
 
 start_as_init chart-shape-crash \

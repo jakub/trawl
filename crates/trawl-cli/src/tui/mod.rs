@@ -188,8 +188,8 @@ impl App {
         self.start_batch(None);
     }
 
-    /// The run is taken before the answer goes out, so a client that already
-    /// left still releases the tab.
+    /// The run is taken before a waiting driver execute is answered, so a
+    /// client that already left still releases the tab.
     fn end_run(&mut self, reason: &str) {
         match std::mem::take(&mut self.tab.execution) {
             state::Execution::Idle => {}
@@ -998,9 +998,10 @@ fn snapshot_large_unsigned_exact() {
     );
 }
 
-/// A 409 is the server saying the run succeeded and its stored result is
-/// gone, so it is shown verbatim: prefixing it with "Failed to fetch run
-/// result" would re-assert a failure the run did not have.
+/// A 409 on a run-result fetch is the server saying the run succeeded and
+/// its stored result is gone, so it is shown verbatim: prefixing it with
+/// "Failed to fetch run result" would re-assert a failure the run did not
+/// have.
 fn run_result_error_message(e: &ClientError) -> String {
     match e {
         ClientError::Server {
@@ -2483,8 +2484,8 @@ mod tests {
         assert_eq!(rows[0][0], Value::Integer(1));
     }
 
-    /// The real task's request to the dummy server fails and finishes by
-    /// itself, which would pass for an abort.
+    /// Swaps in a task that never ends: the real task's request to the dummy
+    /// server fails and finishes by itself, which would pass for an abort.
     fn hold_pending(handle: &mut tokio::task::JoinHandle<()>) -> tokio::task::AbortHandle {
         let held = tokio::spawn(std::future::pending::<()>());
         let abort = held.abort_handle();

@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Every spec imports `test`/`expect` from here instead of
-// `@playwright/test` directly, so the contract applies uniformly.
+// `@playwright/test` directly, so the reset, network-guard, pageerror and
+// unstubbed-call checks apply uniformly.
 
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -82,7 +83,7 @@ async function startStub(port: number): Promise<{ origin: string; stop: () => Pr
   return { origin, stop };
 }
 
-// The contract rides an AUTO FIXTURE, not `test.beforeEach`. This module
+// Those checks ride an AUTO FIXTURE, not `test.beforeEach`. This module
 // is loaded once per worker (ESM module cache), so a `test.beforeEach`
 // written here is registered against whichever spec file imported it
 // FIRST and silently does not run for any other file.
@@ -216,9 +217,9 @@ export const CORPUS = {
     overBoundPrefix: 'host=aaaa',
     overBoundBytes: 32769,
   },
-  /** `degraded_fields` is the only thing that renders a field row's
-   * degraded badge, and `populated` has no such column. The name is also
-   * `wire/catalog-field.json`'s field. */
+  /** The column `wire/service-schema-corpus.json` lists in
+   * `degraded_fields`, the only thing that renders a field row's degraded
+   * badge; `populated` lists none. Also `wire/catalog-field.json`'s field. */
   degradedField: 'duration',
   fieldFirstAlphabetically: '_time',
   fieldLastAlphabetically: 'status',
@@ -228,7 +229,7 @@ export const CORPUS = {
   topCardinalityField: '_time',
   /** Newest first. */
   runIds: [501, 502] as const,
-  /** It is also the newest row of the global runs list. */
+  /** This run is also the newest row of `wire/runs-all.json`. */
   runWithResult: 501,
   runWithResultRows: 3,
   runWithResultQuery: '_severity>=error last=1h | stats count() by host',
@@ -238,7 +239,7 @@ export const CORPUS = {
  * value below against `harness/wire/`.
  */
 export const SCHEDULE = {
-  /** Its query carries `last=1h`, which is the clause a window conflicts
+  /** This net's query carries `last=1h`, the clause a window conflicts
    * with. */
   plainNetId: 1,
   windowedNetId: 2,
@@ -249,8 +250,8 @@ export const SCHEDULE = {
   window: 'since_last',
   lag: '5m',
   pagedRunId: 503,
-  /** `PREVIEW_PAGE_SIZE` in `src/components/net_drawer.rs`. */
   pagedRunRows: 45,
+  /** `PREVIEW_PAGE_SIZE` in `src/components/net_drawer.rs`. */
   previewPageSize: 20,
 } as const;
 
@@ -299,9 +300,8 @@ export async function runDetailReadCount(request: Ctl): Promise<number> {
   return state.runDetailReads.length;
 }
 
-/** `GET .../runs/{id}` answers the server's 409 envelope for a run whose
- * stored result file is gone. Every read of that run answers the same
- * way. */
+/** Make `GET .../runs/{runId}` answer the server's 409 envelope for a run
+ * whose stored result file is gone, on every read, not just the next. */
 export async function armRunUnavailable(request: Ctl, runId: number): Promise<void> {
   const response = await request.post(`/__ctl/run-unavailable/${runId}`);
   expect(response.ok(), `arm run ${runId} unavailable: HTTP ${response.status()}`).toBe(true);

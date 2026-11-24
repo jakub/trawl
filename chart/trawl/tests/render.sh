@@ -322,8 +322,6 @@ assert_render_fails "a crash-dump mount at the results directory" \
 render_only configmap.yaml --set-string config.server.resultsDir=/var/lib/trawl/data.results-aside \
   >"$work_dir/results-beside.yaml"
 
-# The sidecars must not come along for the ride, hence a
-# render with the web sidecar on: render_only defaults it off.
 security_enabled="$work_dir/security-enabled.yaml"
 render "${web_enabled[@]}" \
   --set persistence.enabled=true \

@@ -50,8 +50,9 @@ fn alias(i: usize) -> String {
 /// an aggregation alias (`parser::pipe::assignment_target`).
 ///
 /// `i` counts EMITTED expressions, not input fields: a name
-/// `quote_dsl_field` cannot render is skipped here, so `fields[i]` is the
-/// source name of the i-th column of the response.
+/// `quote_dsl_field` cannot render is skipped here and left out of
+/// [`Cardinality::fields`], so that list's i-th entry names the i-th
+/// column of the response.
 pub fn cardinality_query(svc: &str, fields: &[String]) -> Option<Cardinality> {
     let mut emitted: Vec<String> = Vec::with_capacity(fields.len());
     let expressions: Vec<String> = fields
@@ -76,9 +77,9 @@ pub fn cardinality_query(svc: &str, fields: &[String]) -> Option<Cardinality> {
     })
 }
 
-/// A response that does not answer this field list yields an empty map
-/// rather than a partial one, because zipping a mismatched response would
-/// key counts onto the wrong fields.
+/// A response whose column count, column names or first-row width do not
+/// match this field list yields an empty map rather than a partial one,
+/// because zipping it would key counts onto the wrong fields.
 pub fn decode_cardinality(
     resp: &trawl_api::QueryResponse,
     fields: &[String],

@@ -680,9 +680,15 @@ async fn scheduler_runs_after(
         .unwrap();
     let schedule = storage
         .schedule
-        // 60s is the store minimum; the first poll runs regardless of interval,
-        // so cadence is immaterial here.
-        .create_schedule(saved.id, created.info.id, 60, None, None, 0, chrono::Utc::now())
+        .create_schedule(
+            saved.id,
+            created.info.id,
+            60,
+            None,
+            None,
+            0,
+            chrono::Utc::now(),
+        )
         .await
         .unwrap();
 
@@ -889,7 +895,7 @@ fn log_text(buf: &Mutex<Vec<u8>>) -> String {
 }
 
 /// fleet-auth logs its own `key_created` and `key_revoked` for mutations
-/// made in this process; only the poller's lines carry this suffix.
+/// made in this process; only the poller's lines say `detected by audit`.
 fn detected(log: &str) -> Vec<&str> {
     log.lines()
         .filter(|l| l.contains("detected by audit"))
@@ -1238,7 +1244,6 @@ async fn audit_init_recovers_after_failures(pool: PgPool) {
     drop(held);
 }
 
-/// The hold is never released, so only the shutdown race can end it.
 #[sqlx::test(migrations = false)]
 async fn audit_shutdown_while_init_fetch_is_held(pool: PgPool) {
     let buf = capture_logs();

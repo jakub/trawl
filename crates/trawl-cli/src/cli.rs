@@ -1225,8 +1225,6 @@ mod tests {
         );
     }
 
-    /// Reads the artifact back through `DuckDB`, since a literal
-    /// `LIMIT usize::MAX` fails inside `DuckDB` before any file is written.
     #[tokio::test]
     async fn embedded_parquet_export_without_limit_roundtrips() {
         let dir = tempfile::tempdir().unwrap();

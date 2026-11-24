@@ -11,8 +11,8 @@ export const OPEN_WIDTH = 224;
 /** trawl-web-ui's `--facet-strip-w`, the closed rail. */
 export const STRIP_WIDTH = 32;
 
-/** One reading without the other would pass a rail that is open but
- * drawn as a strip, or the reverse. */
+/** Reads both the `open` attribute and the width: either alone would pass
+ * a rail that is open but drawn as a strip, or the reverse. */
 export async function expectRail(page: Page, open: boolean) {
   const rail = page.locator(SEL.filterRail);
   if (open) {

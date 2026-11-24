@@ -3,9 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Exactly one drawer is mounted at a time: `fleet_ui::Drawer` arbitrates
-//! Escape on the assumption of a single drawer layer. That swap is also why
-//! focus is restored by hand: the originating badge is unmounted while the
-//! case file is up.
+//! Escape on the assumption of a single drawer layer, so the page swaps
+//! between the two rather than nesting them. The swap is also why focus is
+//! restored by hand: the originating badge is unmounted while the case file
+//! is up.
 
 use leptos::prelude::*;
 use leptos::web_sys;

@@ -43,7 +43,7 @@ struct Inner {
 }
 
 impl AppState {
-    /// Starts no task: the caller starts the re-read with
+    /// Starts no task: the caller starts the pinned CA's re-read with
     /// [`Self::spawn_upstream_ca_reread`].
     pub fn from_config(cfg: ResolvedConfig) -> Result<Self, reqwest::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();

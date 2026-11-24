@@ -25,8 +25,8 @@ fn ok(dsl: &str) -> Query {
     parse(dsl).unwrap_or_else(|e| panic!("{dsl:?} must parse: {e:?}"))
 }
 
-/// The single error `dsl` produces. Exactly one: a shape that reports two
-/// would show whichever chumsky happened to rank first.
+/// The single error `dsl` produces. Exactly one: the server's message is
+/// the first error, so with two it would be whichever chumsky ranked first.
 fn one_error(dsl: &str) -> ParseError {
     let mut errors = parse(dsl)
         .map(|_| ())

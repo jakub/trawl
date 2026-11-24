@@ -9,9 +9,9 @@
 //! for `tail -f /var/lib/trawl/query-debug.log | jq` debugging workflows.
 //!
 //! The file is owner-only and size-bounded: past
-//! `server.query_log_max_bytes` the file rolls over to a single retained
-//! `<path>.1` (`0` disables rollover). trawld's `server.log_file` opens
-//! through [`open_append_owner_only`] under the same rules (ADR-0052).
+//! `server.query_log_max_bytes` it rolls over to a single retained
+//! `<path>.1` (`0` disables rollover). trawld's `server.log_file` shares
+//! only the owner-only open, [`open_append_owner_only`] (ADR-0052).
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};

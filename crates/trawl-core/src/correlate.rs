@@ -57,8 +57,8 @@ pub const ABS_RATE_CHANGE: &str = "compare_abs_rate_change";
 pub const RELATIVE_CHANGE: &str = "compare_relative_change";
 pub const COMPARE_STATUS: &str = "compare_status";
 
-/// A group field of one of these names would be overwritten before it is
-/// grouped, so it is refused.
+/// Every column the `compare` pipeline assigns. A group field of one of
+/// these names would be overwritten before it is grouped, so it is refused.
 pub const COMPARE_COLUMNS: [&str; 11] = [
     COMPARE_SIDE,
     COMPARE_FG,
@@ -460,8 +460,8 @@ fn check_literal(literal: &str) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Its spans point into `filter`, not the composed text; nothing reads
-/// them, and the reparse proof ignores them.
+/// The returned stage's spans point into `filter`, not the composed text;
+/// nothing reads them, and the reparse proof ignores them.
 fn filter_search(filter: &str, stop: &Stop) -> Result<SearchStage, BuildError> {
     let parsed = parse_cancellable(filter, stop)?.map_err(|errors| BuildError::FilterParse {
         message: excerpt(

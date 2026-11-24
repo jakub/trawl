@@ -13,10 +13,10 @@
 //! [`coerce_filter_value`]): the AST discards quote provenance, so
 //! `status>"400"` is indistinguishable from `status>400`.
 //!
-//! The domain is `DuckDB`'s cast domain, not Rust's number parser:
-//! [`decimal_micros`] is its live mirror, executed side by side in
-//! `trawl-engine/tests/duckdb_probe.rs`. [`try_cast_double`] is the
-//! DOUBLE pin's own cast, not the VARCHAR comparison space.
+//! The VARCHAR comparison space reads numbers in `DuckDB`'s cast domain,
+//! not Rust's number parser: [`decimal_micros`] is its live mirror,
+//! executed side by side in `trawl-engine/tests/duckdb_probe.rs`.
+//! [`try_cast_double`] is the DOUBLE pin's own cast, not that space.
 
 use crate::ast::{FilterOp, LiteralValue};
 use crate::emitter::SqlValue;
@@ -608,10 +608,11 @@ pub fn compare_form(
 /// `None` for [`LiteralValue::Null`]: `== null` is not a comparison this
 /// table binds, and the caller takes the generic path.
 ///
-/// Quote provenance is discarded, deliberately: `where status == "400"`
-/// is `status == 400`, exactly as `status="400"` is `status=400` in the
-/// search stage. Honouring the AST's quoting would make adjacent stages
-/// of one query disagree about the same comparison.
+/// Quote provenance is discarded, deliberately: a string literal binds
+/// through the search stage's content coercion, so `where status == "400"`
+/// is `status == 400`, exactly as `status="400"` is `status=400` there.
+/// Honouring the AST's quoting would make adjacent stages of one query
+/// disagree about the same comparison.
 ///
 /// # Errors
 ///
@@ -746,8 +747,8 @@ pub fn severity_points(forms: &[CompareForm]) -> Option<Vec<i64>> {
 /// `SEVERITY`-typed subject evaluates to 1-24 or NULL, so for any point
 /// `p` outside 1-24, `subject = p` is FALSE or UNKNOWN, identical for
 /// every such `p`; the collapse bounds the render at **≤13 runs**.
-/// Dropping them entirely would not be equivalent: the NULL subject must
-/// still answer UNKNOWN rather than FALSE.
+/// Dropping them is not equivalent when no in-ladder point remains: the
+/// NULL subject must still answer UNKNOWN rather than FALSE.
 #[must_use]
 pub fn severity_ranges(points: &[i64]) -> Vec<(i64, i64)> {
     let mut kept: Vec<i64> = Vec::with_capacity(points.len());
@@ -823,10 +824,11 @@ const DECIMAL_SCALE: i64 = 6;
 ///
 /// Three of the cast's own quirks are REPRODUCED rather than corrected,
 /// because the SQL side has them and a tidier mirror is a divergence: a
-/// scan cut short by whitespace is forgiven ([`terminated_scan`]), a
-/// negative exponent rounds on the leading SIGNIFICANT digit
-/// ([`shift_digits`]), and the literal exponent is bounded by the type's
-/// integer digits plus the mantissa's own excessive decimals, so
+/// scan cut short by whitespace is forgiven in states an end-of-text
+/// refuses ([`terminated_scan`]), a negative exponent whose shift drops
+/// more digits than the mantissa has rounds on the leading SIGNIFICANT
+/// digit ([`shift_digits`]), and the literal exponent is bounded by the
+/// type's integer digits plus the mantissa's own excessive decimals, so
 /// `'0.01e33'` is NULL.
 #[must_use]
 pub fn decimal_micros(text: &str) -> Option<i128> {
@@ -1791,9 +1793,9 @@ mod tests {
         }
     }
 
-    /// Every expectation is the string `DuckDB` returns for `strftime`
-    /// over the same input, executed side by side in
-    /// `trawl-engine/tests/duckdb_probe.rs`.
+    /// Every expectation is the string `DuckDB` returns for `strftime` over
+    /// the input conformed by [`crate::conform::guarded_cast`]'s TIMESTAMP
+    /// rung, executed side by side in `trawl-engine/tests/duckdb_probe.rs`.
     const TIMESTAMP_RENDERINGS: &[(&str, &str)] = &[
         // The wire form ingest canonicalizes _time into.
         ("2026-01-15T09:00:00.000000Z", "2026-01-15T09:00:00.000000Z"),
@@ -2077,7 +2079,7 @@ mod tests {
         }
     }
 
-    /// `DuckDB` has a reading for all of them, so each is a live tail that
+    /// `DuckDB` reads every input here, so each is a live tail that
     /// UNDER-matches a batch query. The reasons are on
     /// [`canonical_timestamp_text`].
     #[test]

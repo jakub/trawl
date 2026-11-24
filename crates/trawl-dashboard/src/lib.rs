@@ -1173,8 +1173,6 @@ mod tests {
         assert_eq!(truncate_query("日本語テスト", 10), "日本語テ…");
     }
 
-    /// `لا` is two cells, `ｶﾞ` is two, `e` with a combining accent is one,
-    /// and `❤` with its emoji selector is two.
     #[test]
     fn truncate_query_cuts_between_clusters() {
         for (query, budget, want) in [

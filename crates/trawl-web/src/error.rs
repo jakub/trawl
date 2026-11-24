@@ -12,7 +12,7 @@ use trawl_api::{ErrorCode, ErrorEnvelope, ErrorResponse};
 pub const REQUEST_LIMIT_MESSAGE: &str = "trawl-web is at its HTTP request limit; the request \
                                          was not sent to trawld; retry later with backoff";
 
-/// Every one answers the `trawl_api` envelope with a fixed message
+/// Every variant answers the `trawl_api` envelope with a fixed message
 /// (ADR-0066). Details go to the server log, never the body.
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {

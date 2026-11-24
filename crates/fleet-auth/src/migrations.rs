@@ -79,8 +79,8 @@ pub async fn validate_schema(pool: &PgPool) -> Result<(), SchemaError> {
 }
 
 /// [`validate_schema`] on a connection the caller owns. If the future is
-/// dropped part-way, the connection may still be inside the snapshot, and
-/// the caller should close it.
+/// dropped part-way, the connection may still be inside the read-only
+/// snapshot, and the caller should close it.
 ///
 /// # Errors
 /// A validation error wins over an error rolling the snapshot back.

@@ -1,13 +1,14 @@
-# This rule cannot ban a build through `FromStr` or `TryFrom`: clippy does
-# not resolve a path to a trait impl's method, and banning the trait
-# methods themselves would ban them for every type. So `disallowed-types`
-# below bans naming `regex::Regex` or `regex::bytes::Regex` outside the
-# owner.
+# Regex construction has one owner, `trawl_core::pattern` (ADR-0063). The
+# method bans cannot catch a build through `FromStr` or `TryFrom`: clippy does
+# not resolve a path to a trait impl's method, and banning the trait methods
+# themselves would ban them for every type. So `disallowed-types` below bans
+# naming `regex::Regex` or `regex::bytes::Regex` outside the owner.
 #
 # The backtracker and the dense, sparse and DFA-regex modules exist only
 # when a crate in the build turns on their feature, as tracing-subscriber
-# does for dense DFAs in the workspace build. Their entries carry `allow-invalid`, so a build
-# without them, such as `cargo clippy -p trawl-core`, stays quiet.
+# does for dense DFAs in the workspace build. Their entries carry
+# `allow-invalid`, so a build without them, such as `cargo clippy -p
+# trawl-core`, stays quiet.
 disallowed-methods = [
     { path = "chumsky::Parser::padded", reason = "use parser::comment::Spaced::spaced — .padded() skips whitespace only, so comments would not work there (ADR-0014 ruling 4)" },
     { path = "sqlx_core::pool::options::PoolOptions::connect", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },

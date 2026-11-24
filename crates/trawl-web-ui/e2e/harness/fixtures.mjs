@@ -25,9 +25,9 @@ export function wire(name) {
   return JSON.parse(wireText.get(name));
 }
 
-// A generated result goes through these, never through a hand-spelled
-// cell: the SPA refuses a whole response for one cell its column type
-// refuses.
+// A generated result goes through `typedResult`, never through a
+// hand-spelled cell: the SPA refuses a whole response for one cell its
+// column type refuses.
 
 const DECIMAL = /^-?(0|[1-9][0-9]*)$/;
 
@@ -139,8 +139,8 @@ export function serviceSchemaResponse() {
   return wire('service-schema');
 }
 
-/** The default stays empty — specs that assert a pristine page count on
- * it. */
+/** One Net. The default `GET /api/v1/saved` stays empty: specs assert a
+ * pristine page count on it. */
 export function populatedListSavedResponse() {
   return wire('saved-queries');
 }
@@ -258,7 +258,7 @@ export function pagedRunResultResponse() {
   return wire('run-result-paged');
 }
 
-/** The sentence `from_saved::unavailable_run_message` writes. */
+/** Carries the sentence `from_saved::unavailable_run_message` writes. */
 export function unavailableRunResponse(runId) {
   return {
     error: {
@@ -303,7 +303,7 @@ export function sortedGlobalRuns(runs, { sort, dir }) {
   });
 }
 
-/** Callers sort this before slicing a page. */
+/** Unsorted: callers sort the returned runs before slicing a page. */
 export function paginationGlobalRuns(total) {
   const source = wire(total <= 3 ? 'pagination-runs-all' : 'runs-sort').runs;
   return Array.from({ length: total }, (_, i) => ({
@@ -311,9 +311,6 @@ export function paginationGlobalRuns(total) {
     id: source[i % source.length].id + Math.floor(i / source.length) * 1000,
   }));
 }
-
-// `total` is what the execution produced, measured BEFORE the window was
-// cut from it.
 
 const AGGREGATE_EPOCH = Date.parse('2026-09-01T00:00:00Z');
 const AGGREGATE_BUCKET_MS = 2 * 60 * 1000;

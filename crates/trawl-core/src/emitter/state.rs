@@ -634,7 +634,8 @@ impl EmitterState {
 
     /// The one chokepoint every field read goes through (ADR-0062). An absent
     /// read is a literal, so no identifier is left for a same-SELECT alias to
-    /// capture (`f!=web1 | rename host as f`).
+    /// capture (`f!=web1 | rename host as f`); an absent `_time` or
+    /// `_ingested` is refused instead.
     pub(crate) fn read_field(
         &mut self,
         name: &str,
@@ -864,9 +865,9 @@ impl EmitterState {
         self.where_clauses.push(clause);
     }
 
-    /// The restore happens even when the closure fails, so a failed emission
-    /// never leaks half-built clauses into the caller's buffer. Parameters
-    /// pushed during the closure are kept (ordering is preserved).
+    /// The caller's WHERE buffer is restored even when the closure fails, so
+    /// a failed emission never leaks half-built clauses into it. Parameters
+    /// the closure pushed are kept (ordering is preserved).
     pub(crate) fn collect_where_clauses(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<(), super::EmitError>,
@@ -948,8 +949,9 @@ impl EmitterState {
     /// parameter of its own into the SELECT list, the predicate's value is
     /// fed to the SELECT's placeholder.
     ///
-    /// `build` therefore runs at most twice, and the first run is
-    /// discarded whole. That is sound because the only state a SELECT
+    /// When this level already holds parameters and `build` pushes more, it
+    /// runs again after a flush, and the first run is discarded whole. That
+    /// is sound because the only state a SELECT
     /// expression emission can touch is the parameter list and the regex
     /// charge that follows it, so truncating the parameters and restoring
     /// the charge undoes it exactly. A field it padded onto a pivot's fill
@@ -1127,7 +1129,8 @@ impl EmitterState {
 
         // Every accumulated parameter must have found a placeholder, and
         // the fill the same ones as the pivot body: the list is about to
-        // be dropped, so one left behind is a `?` nothing will ever bind.
+        // be dropped, so one left behind is a `?` that nothing binds or
+        // that takes a later stage's value.
         if consumed != self.params.len() || value_consumed != consumed {
             return Err(super::EmitError::UnsupportedOperation {
                 message: format!(

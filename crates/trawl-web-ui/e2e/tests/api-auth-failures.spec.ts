@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// A 401 means one thing on every page: the session ended (ADR-0066).
-//
 // Every 401 here is held until the test releases it. The shell's own
 // reads (`/me`, the footer's health probe) are answered normally by the
 // stub, so while the target's answer is held nothing navigates, and the

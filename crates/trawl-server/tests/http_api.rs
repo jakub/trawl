@@ -5273,9 +5273,9 @@ async fn trigger_run_rejects_when_already_running() {
     assert!(message.contains("already in progress"), "{message}");
 }
 
-/// A run row turns terminal before the run lets go of its manual-run lease
-/// (ADR-0018), so a test that presses Run now again with the same key needs
-/// both, or it races its own 429.
+/// Waits for the drained gate too: a run row turns terminal before the run
+/// lets go of its manual-run lease (ADR-0018), so a test that presses Run
+/// now again with the same key would race its own 429.
 async fn wait_for_finished_runs(
     server: &common::TestServer,
     client: &HttpClient,
@@ -7536,8 +7536,8 @@ const SERVER_LIMIT: &str = "[server] max_request_body_bytes";
 const INGEST_LIMIT: &str = "[ingest] max_body_bytes";
 /// A well-formed bearer token that names no key.
 const BAD_TOKEN: &str = "flt_zzzzzzzz_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
-/// A failure bound, never an ordering device: a route that waits on the
-/// body never answers.
+/// A failure bound for a request whose body never ends, never an ordering
+/// device: a route that waits on that body never answers.
 const STALLED_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `method path` as `token`, its head ending in `framing`, then `body`:

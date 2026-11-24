@@ -56,7 +56,7 @@ const _: () = assert!(secrets::READ_LIMIT >= MAX_CA_BYTES);
 
 const PROOF_QUERY: &str = "* | head 1";
 
-/// stdout carries only the summary.
+/// Progress goes to stderr: stdout carries only the summary.
 fn progress(message: impl std::fmt::Display) {
     eprintln!("trawl trial: {message}");
 }
@@ -137,7 +137,6 @@ fn listing(resources: &[Foreign]) -> String {
         .join("\n")
 }
 
-/// With no trial id, anything in the union is an orphan.
 fn require_owned(
     paths: &TrialPaths,
     inventory: &Inventory,
@@ -410,11 +409,11 @@ async fn setup(
     Ok(())
 }
 
-/// trawl-web reads the key at startup, so every `up` ends the browser
-/// sessions issued before it: a program that took the web port while the
-/// trial was stopped cannot replay a cookie the browser sent it. A failure
-/// to start names the ports, because Docker's publish error is the
-/// backstop of the bind test.
+/// Every `up` gives trawl-web a new cookie key, which it reads at startup,
+/// so every `up` ends the browser sessions issued before it: a program
+/// that took the web port while the trial was stopped cannot replay a
+/// cookie the browser sent it. A failure to start names the ports, because
+/// Docker's publish error is the backstop of the bind test.
 async fn start_services(docker: &Docker, state: &TrialState) -> Result<(), TrialError> {
     compose_stream(docker, &["stop", Service::Web.name()], STOP_TIMEOUT).await?;
     progress("writing a new cookie key for trawl-web");
@@ -1610,10 +1609,10 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
     .await
 }
 
-/// The engine resources `approve` was shown are deleted by id, and nothing
-/// else on the engine. The trial directory of a trial is deleted by
-/// `rm_dir` with everything in it, including files added while `approve`
-/// waited.
+/// After `approve` answers [`Confirmation::Proceed`], the engine resources
+/// it was shown are deleted by id, and nothing else on the engine. The
+/// trial directory is deleted by `rm_dir` with everything in it, including
+/// files added while `approve` waited.
 async fn remove_trial(
     docker: &Docker,
     paths: &TrialPaths,

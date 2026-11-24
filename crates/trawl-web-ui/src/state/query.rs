@@ -76,8 +76,8 @@ pub struct UrlSignals {
     pub repair: Memo<Option<Repair>>,
 }
 
-/// The router's own `use_query_map` cannot be the reading:
-/// `ParamsMap::insert` percent-decodes a value `UrlSearchParams` has
+/// The router's own `use_query_map` cannot replace `use_location().search`
+/// here: `ParamsMap::insert` percent-decodes a value `UrlSearchParams` has
 /// already decoded.
 pub fn url_signals() -> UrlSignals {
     let search = use_location().search;

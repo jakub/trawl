@@ -100,9 +100,9 @@ pub fn protected_roots(
     roots
 }
 
-/// A component that does not exist yet, below directories the walk reached,
-/// is covered: boot creates it there, inside the closed root, and checks
-/// the roots again once it exists.
+/// A component of `wal_dir` that does not exist yet, below the directories
+/// the walk from `data_root` reached, is covered: boot creates it there,
+/// inside the closed root, and checks the roots again once it exists.
 #[must_use]
 pub fn data_root_covers_wal(data_root: &Path, wal_dir: &Path) -> bool {
     covers_wal_with(data_root, wal_dir, Placement::of)
@@ -355,8 +355,8 @@ where
     }
 }
 
-/// A root that is gone again, or is no longer a directory, refuses too:
-/// something replaced it after its creation.
+/// A root that is gone again, or is no longer a directory, refuses here,
+/// where [`close`] would pass it: something replaced it after its creation.
 pub fn close_created(kind: RootKind, path: &Path) -> Result<(), OwnerOnlyError> {
     let root = ProtectedRoot {
         kind,

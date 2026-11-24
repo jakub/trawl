@@ -55,8 +55,10 @@ pub struct StatusInputs {
 /// 2. A snapshot refused as `corpus_recovering` is `Recovering`, or
 ///    `Hauling` while a request is in flight: the recovering notice
 ///    leaves the region while its Retry runs.
-/// 3. The alert wins. A resource keeps its previous `Some(Err)` while a
-///    refetch is pending, so failed-and-pending reads `Error`, not `Hauling`.
+/// 3. The active source's failure. A resource keeps its previous `Some(Err)`
+///    while a refetch is pending, so failed-and-pending reads `Error`, not
+///    `Hauling`.
+/// 4. Then a pending snapshot is `Hauling`, live is `Live`, else `Connected`.
 #[must_use]
 pub fn search_status(i: StatusInputs) -> StatusKind {
     if i.unreadable {

@@ -73,8 +73,8 @@ pub struct ProxyLimits {
     pub request_body_bytes: usize,
     pub body_budget_bytes: usize,
     pub body_read_timeout: Duration,
-    /// The same value is the `TCP_USER_TIMEOUT` of every connection the proxy
-    /// opens to trawld (`upstream::proxy_client_builder`).
+    /// The response-head deadline, also the `TCP_USER_TIMEOUT` of every
+    /// connection the proxy opens to trawld (`upstream::proxy_client_builder`).
     pub upstream_head_timeout: Duration,
 }
 

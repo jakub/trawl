@@ -352,7 +352,7 @@ async fn claim_leased(
 
 /// One spelling for both claimants, the scheduler tick and a manual run:
 /// an operator watching `trawl_scheduler_window_truncated_total` has to see
-/// every uncovered span, whichever door the run came through.
+/// every clamped window, whichever door the run came through.
 pub(crate) fn note_truncated_window(schedule_id: i64, run_id: i64, window: &ReportWindow) {
     if !window.truncated {
         return;
@@ -737,8 +737,8 @@ pub(crate) async fn recover_ambiguous_finish(
     }
 }
 
-/// A file that was already gone is not a failure and does not log like one:
-/// it is the ordinary state after a `data_dir` repoint. A `NotFound` below a
+/// A file confirmed absent is not a failure and does not log like one: it is
+/// the ordinary state after a `data_dir` repoint. A `NotFound` below a
 /// dangling link, a permission error or an I/O error keeps the warning,
 /// because the file may still be there.
 pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
@@ -1529,9 +1529,6 @@ mod tests {
         );
     }
 
-    /// The failures are a directory where the file should be, which
-    /// `remove_file` refuses with something other than `NotFound`, and a file
-    /// below a dangling link, which answers `NotFound` without being absent.
     #[cfg(unix)]
     #[test]
     fn result_file_cleanup_events_carry_no_host_path_or_io_text() {
@@ -1743,10 +1740,11 @@ mod tests {
         );
     }
 
-    /// The job is parked twice: before its work runs, and after its work
-    /// returned, when everything the work captured has dropped and only the job
-    /// is left holding its slot. On a pool of two permits the one lease is the
-    /// run's, so no other lease is free until the job lets it go.
+    /// The preparation job is parked twice: before its work runs, and after
+    /// its work returned, when everything the work captured has dropped and
+    /// only the job is left holding its slot. On a pool of two permits the
+    /// one lease is the run's, so no other lease is free until the job lets
+    /// it go.
     #[sqlx::test]
     async fn a_preparation_job_holds_its_lease(pool: sqlx::PgPool) {
         use crate::pool::seam::Seam;
@@ -2061,12 +2059,6 @@ mod tests {
         );
     }
 
-    /// The arms: the result directory blocked by a file, the engine's ndjson
-    /// staging path blocked by a directory (an [`EngineError::Io`]), and the
-    /// final path blocked by a non-empty directory, so the rename fails. The
-    /// detached executor arm takes the same engine path and is not provoked here.
-    ///
-    /// [`EngineError::Io`]: trawl_engine::error::EngineError::Io
     #[test]
     fn parquet_fallback_events_carry_no_error_text() {
         use crate::test_events::events_of;

@@ -72,9 +72,9 @@ impl Output {
 }
 
 /// A string literal argument admits ESC, BEL, U+202E and every other
-/// [`sanitize::is_unsafe_display_char`], and these messages are 400 bodies
-/// rendered in a terminal, the TUI and a browser, so the rendering is
-/// sanitised.
+/// [`sanitize::is_unsafe_display_char`], and the error messages this feeds
+/// are 400 bodies rendered in a terminal, the TUI and a browser, so the
+/// rendering is sanitised.
 ///
 /// [`sanitize::is_unsafe_display_char`]: crate::sanitize::is_unsafe_display_char
 fn render_agg(agg: &AggExpr) -> String {

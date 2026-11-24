@@ -326,8 +326,8 @@ async fn step_counts_survive_evidence_pruning() {
     );
 }
 
-/// The held capture reads a window, so it holds the publication guard
-/// itself.
+/// The human's held capture reads a window, so it holds the publication
+/// guard itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_refused_busy_records_refused_with_its_code() {
     let (server, keys) = boot(CaptureConfig {
@@ -409,9 +409,9 @@ async fn an_attached_capture_past_its_deadline_records_timeout() {
     );
 }
 
-/// The work is held at its start, so the drop lands while it runs by
-/// construction; the release lets the latched cancellation stop it before
-/// the engine executes.
+/// The work is held at its start, so the client's drop lands while it runs
+/// by construction; the release lets the latched cancellation stop it
+/// before the engine executes.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_whose_client_goes_away_records_aborted() {
     let (server, keys) = boot_slow(60).await;
@@ -789,11 +789,11 @@ async fn boot_unmetered_with(capture: CaptureConfig) -> (Arc<TestServer>, Keys) 
     (Arc::new(server), keys)
 }
 
-/// Only the capture under test goes through it: the setup's captures run
-/// through the fixture's own router under the default deadline, so a
-/// machine stall during setup cannot time them out. The in-flight set and
-/// the step writer are the fixture's, so the sweep and the writer see this
-/// router's captures.
+/// Only the capture under test goes through this router: the setup's
+/// captures run through the fixture's own router under the default
+/// deadline, so a machine stall during setup cannot time them out. The
+/// in-flight set and the step writer are the fixture's, so the sweep and
+/// the writer see this router's captures.
 fn router_under(
     server: &TestServer,
     deadline: Duration,
@@ -1020,11 +1020,12 @@ async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_dea
 }
 
 /// The deadline is a tokio one, so the server boots and the result is
-/// held on the live clock, and the clock is then paused: the three
-/// seconds are one explicit advance, and every wait after the pause runs
-/// under `frozen`, so the real work of Postgres and the capture never
-/// lets tokio jump the clock. Postgres's clock is not paused: the prune
-/// waits under a real five-second `statement_timeout`.
+/// held on the live clock, and the clock is then paused: the three of the
+/// deadline's five seconds the prune spends are one explicit advance, and
+/// every wait after the pause runs under `frozen`, so the real work of
+/// Postgres and the capture never lets tokio jump the clock. Postgres's
+/// clock is not paused: the prune waits under a real five-second
+/// `statement_timeout`.
 #[tokio::test(flavor = "current_thread")]
 async fn a_step_admission_spends_one_deadline_across_statements() {
     let deadline = Duration::from_secs(5);
@@ -2228,9 +2229,10 @@ async fn a_context_read_centres_on_another_keys_kept_evidence_for_an_investigati
 }
 
 /// The fixture is unmetered so the step can be polled until it settles.
-/// The swap happens after boot, since boot refuses a dangling root, and
-/// nothing writes to the data root meanwhile: the fixture's compaction
-/// and retention are idle and the corpus is already seeded.
+/// The data root turns into a symlink to nothing after boot, since boot
+/// refuses a dangling root, and nothing writes to it meanwhile: the
+/// fixture's compaction and retention are idle and the corpus is already
+/// seeded.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_compare_over_a_dangling_data_root_settles_its_step_as_failed() {
     let _ = telemetry();

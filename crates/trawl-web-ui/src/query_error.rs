@@ -238,8 +238,9 @@ fn draft_line(doc: &str, start: usize, end: usize, message: &str, hint: Option<&
     }
 }
 
-/// The browser marks parse errors alone and leaves the semantic error to
-/// the server's verdict (ADR-0039), so this only withholds the advice.
+/// Empty when trawl-core's semantic checks refuse the pipeline. The browser
+/// marks parse errors alone and leaves the semantic error to the server's
+/// verdict (ADR-0039), so this only withholds the advice.
 #[must_use]
 pub fn query_advice(query: &trawl_core::ast::Query) -> trawl_core::advice::AdviceReport {
     if trawl_core::emitter::validate_pipeline(&query.pipeline).is_err() {

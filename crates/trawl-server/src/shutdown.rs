@@ -4,8 +4,9 @@
 
 use std::time::Duration;
 
-/// Long enough that a process out of file descriptors does not spin on the
-/// error; short enough that it serves again soon after descriptors free up.
+/// Long enough that a listener out of file descriptors does not spin on its
+/// failed accept or receive; short enough that it serves again soon after
+/// descriptors free up.
 pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 pub type ShutdownTx = tokio::sync::watch::Sender<bool>;

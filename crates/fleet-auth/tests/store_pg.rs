@@ -1559,10 +1559,10 @@ async fn a_verification_dropped_in_its_transaction_finishes_it_and_keeps_its_ses
     );
 }
 
-/// Four cache-hit verifications through a one-connection pool read their
-/// key's row in turn while the test holds the connection (the pool serves
-/// waiters first come, first served). A trigger counts the `last_used`
-/// updates: exactly one transaction ran.
+/// Four cache-hit verifications queue for a one-connection pool the test
+/// holds. The pool serves waiters first come, first served, so all four
+/// have read the key's row when the first transaction blocks on its row
+/// lock. All four are dropped and the lock released: exactly one ran.
 #[sqlx::test]
 async fn dropped_verifications_leave_no_more_transactions_than_the_pool_has_connections(
     pool: sqlx::PgPool,

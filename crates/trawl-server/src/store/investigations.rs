@@ -456,8 +456,8 @@ impl InvestigationStore {
     /// it, and then finds them kept elsewhere.
     ///
     /// An investigation whose deadline is pinned at its ceiling stays due
-    /// after the write slides it, and the rule prunes again, the promoted
-    /// results included.
+    /// after the write slides it, and the due-write rule prunes again, the
+    /// promoted results included.
     #[allow(clippy::too_many_arguments)] // one append, each part named
     pub async fn append_citing(
         &self,
@@ -709,8 +709,9 @@ impl InvestigationStore {
         })
     }
 
-    /// A closed investigation still takes it: the work was admitted while it
-    /// was open. Evidence the due-write rule prunes here is left to the sweep.
+    /// A closed investigation still takes the step's outcome: the work was
+    /// admitted while it was open. Evidence the due-write rule prunes here is left
+    /// to the sweep.
     pub async fn complete_step_until(
         &self,
         id: &InvestigationId,
@@ -886,8 +887,8 @@ impl InvestigationStore {
         tx.finish(extended).await
     }
 
-    /// Its kept results are pruned in the same transaction and lose their
-    /// investigation id with it, so they age out as tombstones.
+    /// The investigation's kept results are pruned in the deleting transaction and
+    /// lose their investigation id, so they age out as tombstones.
     pub async fn delete(
         &self,
         id: &InvestigationId,
@@ -978,9 +979,10 @@ impl InvestigationStore {
         })
     }
 
-    /// Only the capture gate's evidence pre-check reads this. A count that
-    /// admitted on this would be unsafe: a write whose `now` is before the
-    /// deadline slides it, and the rows left out are live again.
+    /// Leaves out kept rows once `retain_until` is not after `now`. Only the
+    /// capture gate's evidence pre-check reads this. A count that admitted on this
+    /// would be unsafe: a write whose `now` is before the deadline slides it, and
+    /// the rows left out are live again.
     pub async fn live_evidence_usage(
         &self,
         id: &InvestigationId,
@@ -1152,9 +1154,9 @@ impl WriteTx {
         })
     }
 
-    /// The deadline is checked again once the lift is answered, since an answer
-    /// already waiting when the write is next polled is taken however late that
-    /// poll comes.
+    /// Under a deadline, the deadline is checked again once lifting
+    /// `statement_timeout` is answered, since an answer already waiting when the
+    /// write is next polled is taken however late that poll comes.
     pub(crate) async fn commit(mut self) -> Result<(), StoreError> {
         if let LockWait::Until(deadline) = self.wait {
             if deadline.expired() {
@@ -1200,8 +1202,9 @@ impl WriteTx {
         }
     }
 
-    /// Roll back and wait for Postgres to answer the rollback, because the
-    /// caller may give a request's count back the moment this returns.
+    /// Roll back and wait for Postgres to answer, because the caller may give a
+    /// request's count back the moment this returns. A write cut short or past
+    /// its deadline sends no rollback, and an unanswered one ends at the deadline.
     pub(crate) async fn end(self, error: StoreError) -> StoreError {
         let wait = self.wait;
         match self.rollback().await {

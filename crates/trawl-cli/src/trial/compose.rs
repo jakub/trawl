@@ -3,8 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The trial's Compose project and the files its containers read, as pure
-//! renderers. The output is deterministic and holds no secret, so `up`
-//! rewrites it on every run.
+//! renderers. The Compose file is deterministic and holds no secret, so
+//! `up` rewrites it on every run.
 //!
 //! Every `image:` is the recorded image id (`sha256:…`), never the
 //! reference it was resolved from. A tag can move after `up` checked it,
@@ -77,7 +77,7 @@ impl Service {
     }
 }
 
-/// Docker names them `trawl-trial_<key>`.
+/// Compose volume keys; Docker names the volumes `trawl-trial_<key>`.
 pub const VOLUMES: [&str; 3] = ["postgres", "trawld", "web"];
 
 pub fn fleet_database_url() -> String {
@@ -102,9 +102,10 @@ pub fn render_compose(state: &TrialState) -> Value {
             // `postgres` can resolve to a machine on the LAN, which pgpass
             // then offers the role's password.
             // `dns_search: ["."]` drops the host's search domains. `ndots:1`
-            // stops the embedded DNS from forwarding the bare name upstream;
-            // it answers it with no records only when resolv.conf sets `ndots`
-            // explicitly (moby `daemon/libnetwork/resolver.go`, docker-v29.7.2).
+            // stops the embedded DNS from forwarding the bare name upstream:
+            // it answers a single-label A or AAAA query it cannot resolve with
+            // no records only when resolv.conf sets `ndots` explicitly (moby
+            // `daemon/libnetwork/resolver.go`, docker-v29.7.2).
             "dns_search": ["."],
             "dns_opt": ["ndots:1"],
         });
@@ -271,7 +272,7 @@ allow_insecure_cookies = true
 }
 
 /// Idempotent: until the database phase is recorded, every `up` generates
-/// new passwords and runs it again, so the roles and the pgpass file
+/// new passwords and runs this SQL again, so the roles and the pgpass file
 /// converge. Statement logging is off for the session and an error never
 /// logs its statement, so the passwords stay out of the server log.
 pub fn database_sql(passwords: &DbPasswords) -> Zeroizing<String> {
@@ -313,7 +314,7 @@ $trial$;
     ))
 }
 
-/// Run it sealed: `psql` quotes a failing statement.
+/// Run `psql` with these arguments sealed: it quotes a failing statement.
 pub fn database_sql_args() -> super::docker::Args {
     super::docker::Args::new().args([
         "exec",

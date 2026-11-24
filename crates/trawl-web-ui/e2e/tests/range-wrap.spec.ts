@@ -46,7 +46,8 @@ for (const width of [320, 390]) {
   });
 }
 
-// Below 600px the popover is `position: fixed`, so only the wide layout proves it.
+// Below 600px the popover is `position: fixed`, so only the wide layout
+// can catch the console clipping it.
 test('the range dialog is fully visible inside the console at 1440px', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.setViewportSize({ width: 1440, height: 1000 });

@@ -409,8 +409,8 @@ async fn prepared(fixture: &Restartable, server: TestServer) -> Unserved {
     }
 }
 
-/// The target schedule's fire cursor is a day out, so the loop never claims
-/// it.
+/// The fire cursor is a day out, so the scheduler loop, when enabled, never
+/// claims the target schedule.
 async fn stale_run_marked_before_serving(ingest_enabled: bool, scheduler_enabled: bool) {
     let (mut fixture, server) =
         Restartable::boot(RateLimitConfig::default(), CaptureConfig::default(), |_| {}).await;
@@ -541,8 +541,6 @@ async fn stale_report_run_recovery_is_idempotent() {
     drop(server);
 }
 
-/// Both cursors are set to real instants first, so a NULL-equals-NULL pass
-/// is impossible.
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_report_run_recovery_moves_no_cursor() {
     let (fixture, server) =

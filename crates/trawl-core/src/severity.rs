@@ -190,8 +190,9 @@ pub fn reading(value: &serde_json::Value, dialect: Dialect) -> Option<u8> {
     }
 }
 
-/// Strict means `str::parse::<i64>`: the SQL mirror admits exactly
-/// `[+-]?[0-9]+`, so any wider Rust-side parse would be a batch/live split.
+/// The integer rung is `str::parse::<i64>` alone: the SQL mirror admits
+/// exactly `[+-]?[0-9]+`, so any wider Rust-side parse would be a
+/// batch/live split.
 #[must_use]
 pub fn reading_text(text: &str, dialect: Dialect) -> Option<u8> {
     let trimmed = text.trim_matches(WHITESPACE.as_slice());

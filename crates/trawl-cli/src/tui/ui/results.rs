@@ -559,9 +559,9 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let colon_col: usize = 15; // offset of ":" within each line
     let longest_line = "Command Palette: https://trawl.sh".len();
     let w = inner.width as usize;
-    // Both subtractions saturate: on a pane too narrow to hold the longest
-    // line the halved width is already 0. That is any terminal under 39
-    // columns, since the block eats two borders and two of padding.
+    // Both subtractions saturate: the `- 1` shift underflows once the halved
+    // width is 0, which is any terminal under 39 columns, since the block
+    // eats two borders and two of padding.
     let left_pad = w.saturating_sub(longest_line) / 2;
     let left_pad = left_pad.saturating_sub(1);
     let pad = " ".repeat(left_pad);
@@ -1757,9 +1757,6 @@ fn bar_chart_renders_uint_metric() {
     );
 }
 
-/// The TUI has no client-side row sort, so the bar lengths are where it
-/// compares the numbers: a reader that went through `f64` would print
-/// 9007199254740992 and could not tell the two largest apart.
 #[cfg(test)]
 #[test]
 fn big_integers_from_the_wire_render_exactly_and_in_order() {

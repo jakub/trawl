@@ -72,8 +72,8 @@ assert.equal(sourceHash.digest('hex'), build.sourceHash, 'source changed since e
 await verifyRunIdentity(run, instance, buildRecord);
 const output = path.join(run, 'issue233-evidence');
 await fs.mkdir(output, { mode: 0o700 }); // Refuse accidental overwrite/reseed.
-// Issue 233 (ADR-0039): the query error bodies the real daemon writes are the
-// oracle for the e2e suite's route fixtures: each must equal its committed
+// The error bodies the real daemon writes for these cases are the oracle for
+// the e2e suite's route fixtures (ADR-0039): each must equal its committed
 // file under crates/trawl-web-ui/e2e/harness/wire/.
 const wireDir = path.join(root, 'crates/trawl-web-ui/e2e/harness/wire');
 const cases = [

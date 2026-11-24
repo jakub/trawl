@@ -5,9 +5,10 @@
 //! The canonical form of a parsed query (ADR-0061): what two parses must
 //! share to mean the same thing.
 //!
-//! It walks with an explicit stack: `MAX_EXPR_DEPTH` bounds nesting, not
-//! tree depth, so `1+1+…` folds to a left-leaning tree as deep as the
-//! chain is long, and derived `PartialEq` on it would recurse once per term.
+//! [`same_query`] walks with an explicit stack: `MAX_EXPR_DEPTH` bounds
+//! nesting, not tree depth, so `1+1+…` folds to a left-leaning tree as deep
+//! as the chain is long, and derived `PartialEq` on it would recurse once
+//! per term.
 //!
 //! Every AST struct is destructured in full and every enum matched
 //! without a wildcard arm, so a new field or variant fails to compile
@@ -716,7 +717,6 @@ mod tests {
         assert!(same_query(&b, &a));
     }
 
-    /// Such a tree comes only from code, so the deep chains are built there.
     #[test]
     fn a_flat_chain_compares_on_a_worker_stack() {
         use crate::parser::depth_fixtures::{chain_of, flat_chain, int, spliced};

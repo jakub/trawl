@@ -6,8 +6,8 @@
 //!
 //! One of the tests below deliberately plants `Host`, `Forwarded` and
 //! `X-Forwarded-*` headers, and the scan in `no_forwarded_trust.rs` cannot
-//! tell the two apart. So the table lives out here, where the scan does not
-//! reach.
+//! tell a planted header from a trusted one. So the table lives out here,
+//! where the scan does not reach.
 
 #![cfg(feature = "session")]
 

@@ -189,8 +189,9 @@ pub async fn never_observed<B: Backend>(backend: &B, query: &str) -> Vec<String>
     check_fields(backend, parse_work(move || fields_to_check(&query)).await).await
 }
 
-/// All three read their text in one task on the blocking pool, each from its
-/// own parse, so one that finds nothing never empties another.
+/// The advice, the nearest-bounds plan and the field checks each parse their
+/// own copy of the text, in one task on the blocking pool, so one that finds
+/// nothing never empties another.
 pub(crate) async fn search_hints<B: Backend>(
     backend: &B,
     result: &CapturedResult,
@@ -257,8 +258,9 @@ fn fields_to_check(query: &str) -> Option<(Option<String>, Vec<String>)> {
 }
 
 /// The walk stops after a stage that replaces the relation, since every later
-/// name is its output. A pipeline with `from saved` reads a recorded run, not
-/// the events, and gives nothing.
+/// name is its output, and after an `extract` whose outputs it cannot name. A
+/// pipeline with `from saved` reads a recorded run, not the events, and gives
+/// nothing.
 fn stage_reads(pipeline: &[Spanned<PipeStage>]) -> Vec<String> {
     let mut reads = Vec::new();
     if pipeline
@@ -680,9 +682,9 @@ mod tests {
 
     use super::{NearestPlan, fields_to_check};
 
-    /// The count is per thread and [`crate::blocking::parse_work`] runs the
-    /// hints' parses on pool threads, so this calls the functions it runs
-    /// on the test's own thread.
+    /// `thread_builds` counts per thread and [`crate::blocking::parse_work`]
+    /// runs the hints' parses on pool threads, so this calls the functions it
+    /// runs on the test's own thread.
     #[test]
     fn hints_build_no_regex_from_stored_text() {
         let search = r"service=api path=/v[0-9]+\.(users|orders)/ host=web-* error";
@@ -709,7 +711,8 @@ mod tests {
         assert!(plan.is_some());
     }
 
-    /// The test's current-thread runtime polls the handler on this thread.
+    /// The current-thread runtime polls the handler on the test's thread, so
+    /// that thread is the reactor.
     #[tokio::test]
     async fn query_advice_builds_no_regex_and_runs_off_the_reactor() {
         use serde_json::json;
@@ -867,10 +870,9 @@ mod tests {
             .expect("every hint walk must fit 512 KiB at depth 64");
     }
 
-    /// The same shapes thousands of levels deep show that nothing walks the tree:
-    /// on a quarter of a worker's stack, any recursive walk of a 32 000-term
-    /// chain or a 16 000-`NOT` run would overflow and abort the test
-    /// binary, where the refusal costs heap.
+    /// On a quarter of a worker's stack, any recursive walk of the 32 000-term
+    /// chain or the 16 000-`NOT` run would overflow and abort the test binary,
+    /// so passing shows that nothing walks the tree.
     #[test]
     fn an_over_deep_query_gets_no_hint() {
         let deep_where = format!("* | where {}", comparisons(LIMIT + 1, "or"));

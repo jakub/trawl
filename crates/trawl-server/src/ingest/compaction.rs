@@ -99,13 +99,10 @@ impl PassPlan {
 /// The normal deadline is independent of pressure: only a normal pass moves
 /// it, so continuous pressure can never postpone the rollup.
 ///
-/// A pass with no eligible WAL is not a stall. It ran before the charge that
-/// woke it reached the WAL: a producer reserves, writes its WAL file and
-/// then inserts. An insert while not `Open` advances the pressure generation,
-/// which wakes the loop, and [`HotBuffer::inserted_batches`] has moved past
-/// its value at the empty pass's start, so that wake starts a pass. A `Full`
-/// refusal wakes the loop too, but with no insert since the empty pass it
-/// finds nothing new, so the loop waits again without a pass.
+/// A pass that took WAL of every age and found none is not a stall: it ran
+/// before the charge that woke it reached the WAL (a producer reserves,
+/// writes its WAL file, then inserts), so only a wake after a new insert
+/// starts the next pass.
 ///
 /// The deadlines are on tokio's clock ([`tokio::time::Instant`]), so a test
 /// that pauses tokio's time can hold the normal deadline still while real
@@ -291,12 +288,9 @@ async fn pressure_changed(
 
 /// Spawn the compaction background loop.
 ///
-/// Runs a normal pass every `interval`, compacting `wal_dir` `.ndjson`
-/// files whose mtime is older than `interval`, and then the daily rollup.
-/// The first pass, and the extra passes that hot-buffer pressure (ADR-0043)
-/// or overhang (ADR-0041 slice 2) start between normal passes, compact every
-/// WAL file whatever its age and skip the rollup. See [`Cadence`] for how
-/// the extra passes stay bounded.
+/// Runs a normal pass every `interval` and then the daily rollup. See
+/// [`PassPlan::new`] for which WAL each pass takes and [`Cadence`] for when
+/// passes run.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
 pub fn spawn_compaction(
     wal_dir: PathBuf,
@@ -1138,10 +1132,6 @@ fn relocate_pending_rollups(publication: &PublicationGate, io: &RollupIo) -> Res
 /// from a blocking thread, before any reader, producer or compaction pass
 /// exists. No repin job can hold the corpus gate yet, so the publication
 /// write guard alone excludes every other relocator.
-///
-/// A failure does not stop the boot: it logs one `rollup_boot_recovery`
-/// ERROR, naming no path, and leaves the marker pending, so reads refuse
-/// `rollup_pending` until a compaction pass recovers it.
 pub(crate) fn recover_rollups_at_boot(publication: &PublicationGate) {
     let markers = publication.pending_rollup_markers();
     let _publication_guard = publication.blocking_write();
@@ -1486,8 +1476,8 @@ async fn rollup_env_once(
             }
         }
 
-        // Deliberately ungated: `remove_dir` fails on a non-empty
-        // directory, so this can never take a parquet file with it.
+        // Removing empty hour directories is deliberately ungated: `remove_dir`
+        // fails on a non-empty directory, so it never takes a parquet file.
         for hour_dir in &hour_dirs {
             if is_dir_empty(hour_dir) {
                 let _ = std::fs::remove_dir(hour_dir);
@@ -2337,9 +2327,8 @@ fn rollup_day_inner(
         }
     }
 
-    // Every input was corrupt and has been quarantined, and with no daily
-    // file either there is nothing readable to retry: data loss. A daily
-    // file that remains is left as it is, and no marker lists no input.
+    // No hourly input is left: write no marker and leave any daily file as it
+    // is. Quarantined inputs with no daily file either are data loss.
     if merged_hourly.is_empty() {
         if all_files.is_empty() && *quarantined > 0 {
             tracing::error!(
@@ -2418,9 +2407,6 @@ fn rollup_day_inner(
         // Running out of memory says nothing about the inputs; the failure
         // is already reported as a resource failure.
         if !failure.is_out_of_memory() {
-            // A file that passed `is_valid_parquet`'s magic-byte sniff but
-            // fails `read_parquet`. No amount of retrying repairs it. The
-            // driver text goes to DEBUG only.
             tracing::debug!(
                 event_type = "rollup_unreadable",
                 compact_service = %service,
@@ -2925,8 +2911,8 @@ impl InFlight {
 /// Run a batch's bookkeeping writes under [`BOOKKEEPING_BUDGET`], dropping
 /// them when it runs out so compaction can get on with the next chunk.
 ///
-/// Cancelling mid-write is safe for the same reason the retry is. The
-/// conflict insert's transaction is a
+/// Cancelling mid-write is safe: the upsert is idempotent and the conflict
+/// insert atomic, and its transaction is a
 /// [`crate::store::pooled::PooledTransaction`], so one cut short, even
 /// mid-`BEGIN`, closes its connection instead of handing the pool a session
 /// still inside it.
@@ -3272,9 +3258,9 @@ pub(crate) fn structured_errors(conn: &duckdb::Connection) -> Result<(), String>
 /// A failed maintenance statement: compaction, rollup, conform or repin
 /// (ADR-0056).
 ///
-/// A caller that would otherwise read the failure as bad input (a corrupt WAL
-/// file to quarantine, a nonconformant parquet file, a file the boot pass
-/// skips) asks [`Self::is_out_of_memory`] first and leaves its inputs alone.
+/// A caller that would read the failure as bad input (a WAL file to
+/// quarantine, a nonconformant parquet, a file the boot pass skips) leaves
+/// its inputs alone when [`Self::is_out_of_memory`] is true.
 ///
 /// The text can quote the generated SQL and the values a statement choked
 /// on, so it belongs at DEBUG only (ADR-0040): a retained event logs
@@ -3713,11 +3699,11 @@ pub(crate) const AGG_CHUNK_COLS: usize = 256;
 /// all but five away, and the values are client text.
 const MAX_SAMPLED_CONFLICT_COLUMNS: usize = AGG_CHUNK_COLS;
 
-/// How many distinct raw values the capture pulls per column before Rust
-/// sanitises them ([`sanitize_sample`]) and re-deduplicates: both transforms
-/// can collapse two distinct misfits into one (`a\x01b` and `a\x02b` both
-/// become `a\u{FFFD}b`), so pulling a small multiple of the budget keeps the
-/// slots fillable.
+/// How many distinct raw values the capture pulls per column before
+/// [`sanitize_sample`] sanitises and byte-caps them and Rust re-deduplicates:
+/// both transforms can collapse two distinct misfits into one (`a\x01b` and
+/// `a\x02b` both become `a\u{FFFD}b`), so pulling a small multiple of the
+/// budget keeps the slots fillable.
 const SAMPLE_CANDIDATES: usize = MAX_CONFLICT_SAMPLES * 2;
 
 /// Run the candidate ladder over the columns' actual values, resolving up to
@@ -4196,8 +4182,8 @@ impl ConformPlan {
 
     /// Whether the plan's only work is domain guards over columns already
     /// of their pin's physical type ([`CastEntry::guard_only`]). A caller
-    /// that has tallied and found nothing may skip the rewrite: every
-    /// trawl-written parquet carries the SEVERITY-pinned `_severity`, so
+    /// that has tallied such a plan and found nothing may skip the rewrite:
+    /// every trawl-written parquet carries the SEVERITY-pinned `_severity`, so
     /// without this the boot pass would rewrite every file in the corpus on
     /// every re-arm (ADR-0013).
     pub(crate) fn is_guard_only(&self) -> bool {
@@ -4952,8 +4938,8 @@ fn remove_stale_tmp(path: &Path, max_age: Duration) {
     }
 }
 
-/// Returns `None` (after logging) when the directory cannot be read, so the
-/// compaction cycle can skip that env and carry on.
+/// Returns `None` (after logging) on a read failure, so the compaction
+/// cycle skips only this env. A missing directory scans as empty.
 fn scan_env_wal_files(env: &str, env_wal_dir: &Path, min_age: Duration) -> Option<Vec<PathBuf>> {
     match scan_wal_files(env_wal_dir, min_age) {
         Ok(files) => Some(files),
@@ -11531,8 +11517,6 @@ mod tests {
         let good = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"hello"}"#;
         let good_file = write_wal_file(&wal_dir, "nginx", &[good]);
 
-        // write_wal_file only writes text, so write it directly; keep the
-        // `nginx_` prefix so it groups with the good file's service.
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()

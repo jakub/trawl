@@ -25,8 +25,8 @@ const OUT = path.resolve(
   process.argv[2] ?? path.join(ROOT_DIR, 'visual-evidence', 'issue-159'),
 );
 
-/** A union of every element named, so an absolutely-positioned panel
- * outside its wrapper's own box (the menu) is still in frame. */
+/** One padded rectangle around every element named, so an absolutely-
+ * positioned panel outside its wrapper's own box (the menu) is in frame. */
 async function shotUnion(page, selectors, file, pad = 12) {
   const rect = await page.evaluate(
     ({ selectors }) => {

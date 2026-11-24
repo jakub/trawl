@@ -400,10 +400,10 @@ fn render_verdict<W: Write>(
 
     // The remedy line is printed only for a name a command line can carry
     // as itself: one that survives the neutralisation above, and does not
-    // start with `-`, which the argument parser reads as a flag however it
-    // is quoted. A `--` terminator's interaction with the flags that follow
-    // is untested, and an offered command that does not work is worse than
-    // none.
+    // start with `-`, since the argument parser reads such a name as a flag
+    // however it is quoted. A `--` terminator's interaction with the flags
+    // that follow is untested, and an offered command that does not work is
+    // worse than none.
     if shown == field && !field.starts_with('-') {
         label(
             out,
@@ -1161,9 +1161,9 @@ fn repin_job_cells(job: &trawl_client::RepinJobResponse, format: OutputFormat) -
         job.requires_force_reason
             .clone()
             .map_or(Json::Null, Json::from),
-        // On a `running` row they say a cancel is in flight, on a `failed` one
-        // they say the process died between the request and any boundary that
-        // could observe it.
+        // The cancel facts: on a `running` row they say a cancel is in flight,
+        // on a `failed` one they say the process died between the request and
+        // any boundary that could observe it.
         job.cancel_requested_at
             .clone()
             .map_or(Json::Null, Json::from),
@@ -1872,7 +1872,8 @@ mod repin_tests {
         assert_eq!(parsed["projected_nulls"], 0);
     }
 
-    /// The numbers are the ones the server produces in
+    /// The scan counts (five rows carrying, one unreadable `gold`, one
+    /// ambiguous numeral) are the ones the server produces in
     /// `trawl-server/tests/repin.rs::repin_to_severity_dry_run_matches_the_executed_rewrite`.
     #[test]
     fn the_dry_run_transcript_shows_the_plan_the_evidence_and_the_verdict() {

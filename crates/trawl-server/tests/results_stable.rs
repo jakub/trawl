@@ -135,8 +135,6 @@ async fn a_capture_reads_the_same_bytes_through_ingest_compaction_and_a_restart(
         "the recorded text answers the corpus before the late events"
     );
 
-    // Held after its rename with the publication write guard still held:
-    // every read runs while the corpus is mid-publish.
     captured::ingest(&server, &late_events()).await;
     let publication = server
         .state

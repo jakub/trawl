@@ -3,8 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The SSE lane's live ring, kept out of the wasm-only session module.
-//!
-//! On native only the tests call them.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 

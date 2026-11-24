@@ -1240,7 +1240,7 @@ mod oracle {
     }
 
     /// Not under the DOUBLE pin: a present DOUBLE column is no
-    /// `regexp_extract` argument either.
+    /// `regexp_extract` argument.
     #[test]
     fn extract_from_absent() {
         let rows = |cells: &[(i64, Cell)]| {
@@ -1418,8 +1418,8 @@ mod absent_equals_explicit_null {
         );
     }
 
-    /// The count is the answer because the lanes keep different
-    /// representatives: batch the newest row of a partition, live the first
+    /// Counted, not compared by row: the lanes keep different
+    /// representatives, batch the newest row of a partition, live the first
     /// to arrive.
     #[test]
     fn dedup() {
@@ -1619,7 +1619,7 @@ mod absent_equals_explicit_null {
         ]
     }
 
-    /// Read as the subquery source `from saved` also hands the executor, so
+    /// A subquery, the source shape `from saved` also hands the executor, so
     /// the probe describes it like any other reader.
     fn function_source(nulls: &[(String, &str)]) -> String {
         let nulls = nulls.iter().fold(String::new(), |mut acc, (name, ty)| {
@@ -2496,8 +2496,8 @@ mod alias_capture {
         }
     }
 
-    /// The hot-only split of the explicit null holds JSON `null` alone,
-    /// which batch reads as an absent unpinned field.
+    /// The explicit DOUBLE NULL skips the hot-only split: it holds JSON
+    /// `null` alone, which batch reads as an absent unpinned field.
     const DOUBLE_NULL_F: [(Variant, &[Split]); 2] = [
         (Variant::PinnedDouble, &Split::ALL),
         (Variant::NullDouble, &[Split::ColdOnly, Split::Mixed]),
@@ -2532,8 +2532,6 @@ mod alias_capture {
         pins
     }
 
-    /// The alias names are pinned to the other type, so a copy that took
-    /// that pin shows.
     #[test]
     fn a_lateral_alias_keeps_its_nulls_type() {
         let exec = Executor::new().expect("executor");
@@ -2875,8 +2873,8 @@ mod post_projection_reads_are_null {
         );
     }
 
-    /// Only where `f` is absent or numeric: `sum` over a present VARCHAR
-    /// column is refused too.
+    /// Only where `f` is absent or numeric: `sum` refuses a present VARCHAR
+    /// column.
     #[test]
     fn a_projected_null_sums_to_null() {
         let numeric = &[Variant::Absent, Variant::PinnedDouble, Variant::NullDouble];

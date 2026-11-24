@@ -101,9 +101,9 @@ pub enum RepinStart {
     /// 200 with a `succeeded` row: a dry-run report.
     Report(trawl_api::RepinJobResponse),
     /// 200 with a terminal row that is neither a report nor a
-    /// cancellation: the job stopped, the corpus is untouched, and the
-    /// row's own `status` is the verdict. A caller must render that status
-    /// and treat it as a failure.
+    /// cancellation, such as `failed`: the job stopped, and the row's own
+    /// `status` is the verdict. A caller must render that status and treat
+    /// it as a failure.
     Failed(trawl_api::RepinJobResponse),
     /// 200 with a `cancelled` row: an operator stopped the job while this
     /// request's own ladder was still running it. The corpus is
@@ -266,9 +266,10 @@ impl HttpClient {
 
     /// Check daemon health (unauthenticated).
     ///
-    /// A 503 whose body is a health body is an answer, not an error: an
-    /// unavailable daemon still reports its per-subsystem checks, so it is
-    /// returned as `Ok` with `status: unavailable`.
+    /// A 503 whose body is a health body within [`HEALTH_BODY_CAP`] is an
+    /// answer, not an error: an unavailable daemon still reports its
+    /// per-subsystem checks, so it is returned as `Ok` with
+    /// `status: unavailable`.
     pub async fn health(&self) -> Result<HealthResponse, ClientError> {
         self.health_with_status().await.map(|(_, health)| health)
     }
@@ -1779,14 +1780,16 @@ const UPLOAD_CUT_OFF: &str = "the server closed the connection before the upload
                               the request may exceed the server's request size limit, \
                               or the server may be at its request limit";
 
-/// An untrusted certificate, a timeout and a failed connect come first, so
-/// a reset during the TLS handshake stays a connect failure.
+/// A reset while a body is sent reads as [`NetworkKind::UploadCutOff`]. An
+/// untrusted certificate, a timeout and a failed connect come first, so a
+/// reset during the TLS handshake stays a connect failure.
 ///
 /// Whether the reset came while the body was being written cannot be told
-/// from the error: hyper's `Kind::BodyWrite` is private. So callers pick
-/// this sanitizer only at sites that send a body.
-/// A body-carrying request reset after a complete upload reads the same,
-/// which is why the message says the size "may" be the cause.
+/// from the error: hyper's `Kind::BodyWrite` is private, and a reset the
+/// read side sees mid-upload is a plain I/O error. So callers pick this
+/// sanitizer only at sites that send a body, and a reset after a complete
+/// upload reads the same, which is why the message says the size "may" be
+/// the cause.
 #[allow(clippy::needless_pass_by_value)] // used as `.map_err(sanitize_upload_error)`
 fn sanitize_upload_error(e: reqwest::Error) -> ClientError {
     if !e.is_timeout() && !e.is_connect() && connection_cut(&e) {
@@ -1846,9 +1849,9 @@ fn decode_repin_start(
     }
 }
 
-/// The server answers that one job or a 404, so an empty body or another
-/// job's row did not come from a server honouring the id (a server that
-/// predates it answers the unscoped read).
+/// A read by id is answered with that job or a 404, so an empty body or
+/// another job's row did not come from a server honouring the id (a server
+/// that predates it answers the unscoped read).
 fn decode_repin_job(
     id: i64,
     body: RepinStatusResponse,
@@ -1865,9 +1868,9 @@ fn decode_repin_job(
     }
 }
 
-/// The server writes both from one table, so a disagreement means the
-/// response did not come from a server that shares this table: a proxy
-/// rewriting a status, or a version skew.
+/// The server writes the status and the body's `outcome` from one table, so
+/// a disagreement means the response did not come from a server that shares
+/// this table: a proxy rewriting a status, or a version skew.
 fn decode_repin_cancel(
     status: u16,
     body: trawl_api::RepinCancelResponse,
@@ -3306,8 +3309,8 @@ mod tests {
         }
     }
 
-    /// Each wrapper's `source` skips the error it wraps, so a walk by `source`
-    /// alone never reaches `kind`; only `get_ref` does.
+    /// Each `io::Error` wrapper's `source` skips the error it wraps, so a walk
+    /// by `source` alone never reaches `kind`; only `get_ref` does.
     fn nested(kind: std::io::ErrorKind) -> std::io::Error {
         let inner = std::io::Error::other(std::io::Error::from(kind));
         std::io::Error::other(Layer {

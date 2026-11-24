@@ -282,7 +282,7 @@ impl PhaseClock {
         }
     }
 
-    /// A phase that is no longer active was already booked by
+    /// With no phase active, `phase` was already booked by
     /// [`Self::close_at`], as when a dropped request future releases its
     /// locals in any order. That exit is a no-op.
     pub fn exit(&self, phase: QueryPhase) {
@@ -349,8 +349,8 @@ impl PhaseClock {
         }
     }
 
-    /// The cut is read while the account is locked, so no phase can
-    /// finish between the cut and the copy.
+    /// `cut` is read after the account is locked, so no phase can finish
+    /// between it and the totals.
     #[must_use]
     pub fn snapshot(&self) -> Option<(PhaseTotals, Instant)> {
         let state = self.state()?;

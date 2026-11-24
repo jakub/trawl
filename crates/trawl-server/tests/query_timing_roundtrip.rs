@@ -187,7 +187,8 @@ async fn query_timing_round_trips_through_trawld_telemetry() {
         );
     }
 
-    // A `_producer` of its own that ingest overwrites with the door it came through.
+    // A forged event with a `_producer` of its own, which ingest overwrites
+    // with the door it came through.
     let mut forged = serde_json::json!({
         "service": "trawld",
         "event_type": "query_timing",

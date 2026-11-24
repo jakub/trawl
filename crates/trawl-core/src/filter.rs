@@ -8,9 +8,9 @@
 //! against `DuckDB` for every `(event, search_stage)` pair, under the same
 //! `now()` anchor (ADR-0017 §3).
 //!
-//! Collapsing UNKNOWN to `false` at a field-comparison leaf would invert
-//! under `NOT`. Text containment is the deliberate two-valued exception
-//! (ADR-0015).
+//! Evaluation is three-valued, like the SQL it mirrors: collapsing UNKNOWN
+//! to `false` at a field-comparison leaf would invert under `NOT`. Text
+//! containment is the deliberate two-valued exception (ADR-0015).
 
 use std::cell::OnceCell;
 
@@ -256,9 +256,9 @@ fn compile_token(
     })
 }
 
-/// `compile_token` recurses once per search bracket and per `NOT`. Inlined,
-/// this arm's locals would sit in every level's frame; here they cost one
-/// frame, at the leaf.
+/// `compile_token` recurses once per search bracket and per `NOT`. Inlined
+/// there, this field-filter arm's locals would sit in every level's frame;
+/// out of line they cost one frame, at the leaf.
 #[inline(never)]
 fn compile_field_filter(
     ff: &FieldFilter,
@@ -306,15 +306,16 @@ fn compile_field_filter(
         }
     };
     Ok(Some(TokenMatcher::Field(FieldMatcher {
-        // The event key is the same `catalog_key` the pin lookup used. Without
-        // the fold a mixed-case reference would read every event as a NULL
-        // column, which `!=` reports as a match.
+        // The event key folds through `catalog_key`, as the pin lookup and
+        // ingest do. Without the fold a mixed-case reference would read
+        // every event as a NULL column, which `!=` reports as a match.
         field: crate::schema::catalog_key(&ff.field),
         predicate,
     })))
 }
 
-/// A syntax error gives no cause: regex-syntax's text spans several lines.
+/// A syntax error's cause is left out of the refusal: regex-syntax's text
+/// spans several lines.
 fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern, FilterError> {
     let (label, kind, text) = match pattern {
         Scalar::Glob(glob) => ("glob", PatternKind::Glob, glob),

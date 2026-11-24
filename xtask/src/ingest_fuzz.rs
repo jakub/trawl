@@ -7,7 +7,7 @@
 //! Vector's `file` source can decode it, and an HTTP test can post the same
 //! bytes directly as `application/x-ndjson`.
 //!
-//! The in-process proof that each shape survives its own door is
+//! The in-process proof that each `--profile` shape survives its own door is
 //! `crates/trawl-server/tests/profile_fuzz.rs`, which generates its own corpus
 //! deliberately: this command's job is a wire artifact, that test's job is the
 //! function.

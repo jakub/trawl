@@ -5,8 +5,8 @@
 //! The captured-results capability (ADR-0057), transport-free.
 //!
 //! A column's facts list its values only when every one is at most
-//! [`VALUE_TEXT_MAX`] bytes; a longer value is never cut, because a cut
-//! value would pass for a real one.
+//! [`VALUE_TEXT_MAX`] bytes as its self-tagged cell; a longer value is
+//! never cut, because a cut value would pass for a real one.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -316,8 +316,8 @@ pub(crate) async fn run(
     let limits = &results.capture;
     let pool = &state.query.pool;
 
-    // One absolute budget for the whole capture, stamped before anything
-    // waits.
+    // One absolute budget for resolution, admission, execution and the
+    // file write together, stamped before anything waits.
     let deadline = Deadline::after(Duration::from_secs(
         limits.deadline_secs.min(state.query.timeout_secs),
     ));
@@ -2369,11 +2369,11 @@ async fn verify(state: &AppState, row: &CaptureRow) -> Result<Verified, ServerEr
     .map_err(EngineError::Io)?)
 }
 
-/// The server unlinks a capture's file only after the store marked its row
-/// gone, and a gone row never lives again. So a row read back as gone
-/// answers as gone, and only a row still live after the file was found
-/// missing lost it out of band: that row is marked and the read answers
-/// 409.
+/// The server unlinks a committed capture's file only after the store
+/// marked its row gone, and a gone row never lives again. So a row read
+/// back as gone answers as gone, and only a row still live after the file
+/// was found missing lost it out of band: that row is marked and the read
+/// answers 409.
 async fn missing_file(results: &ResultsState, row: &CaptureRow) -> ServerError {
     if let Err(refusal) = still_live(results, row).await {
         return refusal;

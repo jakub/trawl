@@ -818,8 +818,8 @@ impl ServerError {
             Self::Ingest(_) | Self::IngestBodyTooLarge { .. } => "ingest",
             Self::RateLimited { .. } => "rate_limited",
             Self::TooManyStreams => "too_many_streams",
-            // Each is a 503 refusal to serve; `cause_kind` tells them apart,
-            // not the class.
+            // One class for every 503 refusal to serve: a typed reason is a
+            // cause kind, not a class.
             Self::Engine(EngineError::ResourceExhausted | EngineError::RegexResources(_))
             | Self::RegexResources(_)
             | Self::EngineSampleFailed

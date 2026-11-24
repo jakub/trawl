@@ -199,7 +199,8 @@ async fn state_of(
 }
 
 /// A second writer queues behind the first waiter rather than the holder, so
-/// this counts lock waits on the statement, not the holder's blocked pids.
+/// this counts sessions waiting on the investigation row lock's statement,
+/// not the holder's blocked pids.
 async fn writers_waiting(probe: &PgPool, count: i64) {
     lock_waits(probe, "SELECT status, seq FROM investigations%", count).await;
 }

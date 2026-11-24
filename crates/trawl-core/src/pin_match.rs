@@ -78,9 +78,9 @@ pub(crate) enum PinLiteral {
     Double(f64),
     Bool(bool),
     Time(compare::Instant),
-    /// `DuckDB` cannot compare the two at all and raises an ERROR, which
-    /// returns no rows. UNKNOWN matches nothing, and `NOT` cannot invert it
-    /// into a match the failed query never had.
+    /// `DuckDB` cannot compare this literal with the pinned column and raises
+    /// an ERROR, which returns no rows. UNKNOWN matches nothing, and `NOT`
+    /// cannot invert it into a match the failed query never had.
     Unreadable,
 }
 
@@ -212,8 +212,8 @@ pub(crate) fn compare_values(
                 Some(false)
             }
         }
-        // DuckDB's cast domain is wider than Rust's number parser
-        // (whitespace, `_` separators, `0404`), which
+        // DuckDB's TRY_CAST of the VARCHAR text is wider than Rust's number
+        // parser (whitespace, `_` separators, `0404`), which
         // `compare::decimal_micros` mirrors.
         CoercedValue::NumericOnText(fv) => (*fv).and_then(|literal| {
             compare::decimal_micros(&json_to_string(event_val))

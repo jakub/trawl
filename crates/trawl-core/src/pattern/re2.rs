@@ -4,10 +4,11 @@
 
 //! A regex body as the batch engine reads it (ADR-0063).
 //!
-//! Under `(?i)` RE2 case-folds a Perl class like any other class: `\w`
-//! gains the Kelvin sign and the long s, and `\W` loses them. The view
-//! writes the ASCII class where the Perl class stood, so the Rust
-//! engine folds it under the same flags.
+//! The view ([`view`]) writes each Perl class and word assertion in the
+//! ASCII meaning RE2 gives it. Under `(?i)` RE2 case-folds a Perl class
+//! like any other class: `\w` gains the Kelvin sign and the long s, and
+//! `\W` loses them. Writing the ASCII class where the Perl class stood
+//! makes the Rust engine fold it under the same flags.
 
 use regex_syntax::ast::{
     self, Ast, ClassBracketed, ClassPerl, ClassPerlKind, ClassSet, ClassSetItem, ClassSetRange,
@@ -60,8 +61,9 @@ impl Visitor for ClassSetFinder {
     }
 }
 
-/// A body with none of the five escapes prints back as its tree reads,
-/// which is the body itself unless it holds `(?x)` whitespace or comments.
+/// A body with no Perl class and no word assertion prints back as its tree
+/// reads, which is the body itself unless it holds `(?x)` whitespace or
+/// comments.
 pub(crate) fn view(ast: &Ast) -> String {
     let mut tree = ast.clone();
     // An explicit stack, as the syntax tree's own visitor keeps, so a

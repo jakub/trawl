@@ -130,8 +130,8 @@ pub enum Reason {
 }
 
 /// The value is attacker-controlled and unbounded, and the verdict is
-/// cloned into every memo that reads it, so keeping the whole string
-/// would hand the address bar a megabyte of resident state per read.
+/// cloned into every memo that reads it, so it keeps only the prefix the
+/// banner shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Malformed {
     pub param: Param,

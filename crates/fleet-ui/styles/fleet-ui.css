@@ -29,8 +29,8 @@
   font-display: swap;
 }
 
-/* Mira Blue direction (ADR-0007). The accent hue
- * deliberately equals --blue; the tokens stay separate because
+/* Mira Blue direction (ADR-0007). The accent shares --blue's
+ * value; the tokens stay separate because
  * they name different ROLES (brand accent vs info semantic). */
 :root, [data-theme="light"] {
   color-scheme: light;
@@ -126,7 +126,7 @@
   /* Dark control fills are stated as white-alpha overlays instead of
    * mixed from --line: --line is ITSELF an alpha white here, and
    * `color-mix(..., transparent)` MULTIPLIES alphas, so the light
-   * recipe would resolve to a wash of nothing. */
+   * recipe would resolve to about 2% white, a wash of nothing. */
   --fill:      oklch(100% 0 0 / .06);
   --fill-2:    oklch(100% 0 0 / .11);
 
@@ -1121,9 +1121,9 @@ select:focus-visible,
   min-width: 0; width: 8px; height: 8px; padding: 0;
   overflow: hidden; color: transparent; background: var(--accent);
 }
-/* Below 899.98px: `Shell`
- * and `FacetSidebar` query the same width, so the toggle is never
- * revealed at a width where it opens nothing. */
+/* Below 899.98px the sidebar is an overlay behind the command bar's
+ * toggle. `Shell` and `FacetSidebar` query the same width, so the
+ * toggle is never revealed at a width where it opens nothing. */
 .nav-scrim { position: fixed; inset: 0; z-index: 50; background: oklch(14.5% 0 0 / .18); animation: sd-fade-in 140ms ease-out; }
 .rail.overlay {
   position: fixed; top: 0; left: 0; bottom: 0; z-index: 51;
@@ -1432,8 +1432,7 @@ select:focus-visible,
   text-align: center;
   user-select: none;
 }
-/* Full width: a <button> in the preset grid does not stretch the way
- * the <div> it replaced did. */
+/* Full width: a <button> preset does not fill its grid cell by itself. */
 .dr-pop button.opt { width: 100%; font: inherit; }
 .dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
 /* A disabled preset does not change under the pointer: this restates

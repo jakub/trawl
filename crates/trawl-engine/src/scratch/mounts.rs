@@ -232,7 +232,7 @@ pub(super) fn within_filesystem(
     Ok(path)
 }
 
-/// Of the two mounts, the one whose root within the filesystem is
+/// When the two overlap, the mount whose root within the filesystem is
 /// deeper is the alias of the other's interior, so its mount point is
 /// named; with equal roots, the held directory's.
 pub(super) fn alias(

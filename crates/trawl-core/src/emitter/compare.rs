@@ -20,7 +20,8 @@ pub(crate) enum NullPolicy {
     Strict,
 }
 
-/// The live side mirrors this exactly (`crate::pin_match`).
+/// The text a glob/regex matches against under the pin. The live side
+/// mirrors it exactly (`crate::pin_match`).
 pub(crate) fn pattern_target(field: &str, pin: Option<crate::schema::CanonicalType>) -> String {
     match compare::pattern_form(pin) {
         PatternForm::Native => field.to_owned(),
@@ -138,8 +139,9 @@ pub(crate) fn in_list_sql(
 }
 
 /// Both `COALESCE`s are load-bearing: without them a value with no numeric
-/// reading (`'accepted'`) would make the whole predicate UNKNOWN —
-/// `status=200` would then be filtered out AND survive `NOT`.
+/// reading (`'accepted'`) makes the whole predicate UNKNOWN, so the row
+/// would fail both `status=200` and its `NOT`, and `status!=200` would
+/// stop returning it.
 fn text_or_numeric(field: &str, op: FilterOp, literal: String, state: &mut EmitterState) -> String {
     let text_param = state.push_param(SqlValue::String(literal.clone()));
     let num_param = state.push_param(SqlValue::String(literal));

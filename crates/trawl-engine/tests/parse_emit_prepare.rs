@@ -5,9 +5,8 @@
 //! Every committed pin-aware seed emits SQL that real `DuckDB` binds and
 //! plans.
 //!
-//! The `parse_emit` fuzz target proves emission does not PANIC; it never
-//! asks whether the string it produced is SQL. `Connection::prepare` runs
-//! `DuckDB`'s parser and binder without executing anything.
+//! `Connection::prepare` runs `DuckDB`'s parser and binder without executing
+//! anything.
 //!
 //! A seed's pins come out of [`trawl_core::fuzz_input::derive_field_types`],
 //! the same decoder the fuzz target runs. Writing the pin maps out in Rust

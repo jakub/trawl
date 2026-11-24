@@ -4,7 +4,7 @@
 
 //! `executor::prepare_probe` counts statements handed to `DuckDB`, and the
 //! counter is process-global: this file is its own binary with one test in
-//! it, so the count belongs to this call alone.
+//! it, so no other test's binds land between its counts.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

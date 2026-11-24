@@ -7,9 +7,7 @@
 //!
 //! The formula follows regex-automata's internals, so the root
 //! `Cargo.toml` pins that crate's exact version. `tests/regex_memory.rs`
-//! checks each term against a counting allocator at that version. The
-//! program term follows the CPU's choice of prefilter, so
-//! `pattern::tests::corpus_charges` holds it under a ceiling instead.
+//! checks each term against a counting allocator at that version.
 
 use regex_automata::hybrid;
 use regex_automata::nfa::thompson::{NFA, State};

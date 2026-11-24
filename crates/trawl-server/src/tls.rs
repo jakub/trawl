@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `trawld --doctor` judges the same material without acting on it:
+//! `trawld --doctor` judges the TLS material boot serves without acting on it:
 //! [`TlsSource::of`] picks the pair, [`parse_pem_pair`] and
 //! [`serving_config`] are the one path from PEM bytes to a served
 //! certificate, and [`inspect_generated_pair`] reads the generated pair

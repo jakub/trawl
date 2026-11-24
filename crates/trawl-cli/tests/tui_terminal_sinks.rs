@@ -12,7 +12,7 @@ use serde_json::json;
 use common::Server;
 use common::tui::{Home, READER_PERMISSIONS, Tui, pinned};
 
-/// The query projects no `_time`, so the result opens in the table view.
+/// `QUERY` projects no `_time`, so the result opens in the table view.
 const SERVICE: &str = "tui_sink_probe";
 const QUERY: &str = "service=tui_sink_probe | table message";
 

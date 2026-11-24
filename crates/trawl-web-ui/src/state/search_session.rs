@@ -56,7 +56,8 @@ impl std::fmt::Display for ExecutedFailure {
 
 /// Callers should feed the DSL the snapshot runs, not the user's raw editor
 /// buffer: `search_url::mode_query` with `Mode::Snapshot`.
-/// The `inputs` memo below is the only owner of the plan-not-page rule.
+/// The request is the plan, not the page (ADR-0037): `inputs` keys on
+/// `plan` and is the only owner of that rule.
 /// `pending` tracks the request itself: a resource retains its previous
 /// `Some` response during a reload, so presence cannot report loading.
 /// The returned intent revision advances independently of the serialized

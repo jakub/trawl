@@ -49,8 +49,8 @@ fn a_literal_names_list_refuses_a_bound_pattern() {
     );
 }
 
-/// An invalid pattern fails at bind over zero rows. (A pattern that only
-/// rows compile would pass over zero rows.)
+/// Over zero rows, so only a bind-time compile can fail: a pattern that
+/// only rows compile would pass.
 #[test]
 fn bound_names_make_the_pattern_a_constant() {
     let conn = Connection::open_in_memory().expect("in-memory duckdb");

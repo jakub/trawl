@@ -7,11 +7,11 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 pub type HeaderLayer = SetResponseHeaderLayer<HeaderValue>;
 
-/// `wasm-unsafe-eval` is mandatory for `WebAssembly.instantiate`;
-/// `unsafe-inline` is required because Trunk bootstraps the wasm via an
-/// injected `<script type="module">` block. `style-src 'unsafe-inline'`:
-/// inline style attributes are used by some component patterns (codemirror
-/// does this).
+/// `script-src`: `wasm-unsafe-eval` is mandatory for
+/// `WebAssembly.instantiate`; `unsafe-inline` is required because Trunk
+/// bootstraps the wasm via an injected `<script type="module">` block.
+/// `style-src 'unsafe-inline'`: inline style attributes are used by some
+/// component patterns (codemirror does this).
 pub const CSP: &str = "default-src 'self'; \
     script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; \
     style-src 'self' 'unsafe-inline'; \

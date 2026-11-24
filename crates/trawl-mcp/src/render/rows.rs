@@ -176,8 +176,8 @@ fn escape_strings(value: &mut Json) {
     }
 }
 
-/// Every such character is in the Basic Multilingual Plane, so `\uXXXX`
-/// always has four hex digits.
+/// Every [`is_unsafe_display_char`] is in the Basic Multilingual Plane, so
+/// `\uXXXX` always has four hex digits.
 fn escape_unsafe(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 16);
     for c in text.chars() {

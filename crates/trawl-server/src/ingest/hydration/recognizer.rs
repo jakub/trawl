@@ -55,8 +55,9 @@ pub(crate) struct Limits {
 }
 
 /// Counting the newlines of bytes already read costs no allocation, so a
-/// file of tiny lines never builds more events than fit. Every byte read is
-/// added to `spent`, including the bytes of a file rejected after reading.
+/// file of tiny lines is rejected before it builds more than `limits.events`
+/// events. Every byte read is added to `spent`, including the bytes of a
+/// file rejected after reading.
 pub(crate) fn examine(
     path: &Path,
     limits: Limits,

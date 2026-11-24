@@ -203,8 +203,9 @@ impl ChildWatch {
         }
     }
 
-    /// Once it is trawld: a user-namespace run starts as `unshare` and a shell,
-    /// whose `mount` children are the set-up, not the doctor's.
+    /// Samples only once the process is trawld: a user-namespace run starts
+    /// as `unshare` and a shell, whose `mount` children are the set-up, not
+    /// the doctor's.
     fn sample(&mut self) {
         #[cfg(target_os = "linux")]
         {

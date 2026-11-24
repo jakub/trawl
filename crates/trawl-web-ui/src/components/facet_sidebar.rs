@@ -153,10 +153,11 @@ pub fn FacetSidebar(
             class="facet-panel"
             node_ref=panel
             open=move || rail_open.get()
-            // When the DOM disagrees with what the binding last rendered, the
-            // browser opened or closed the narrow disclosure by itself
+            // Narrow only: when the DOM disagrees with what the binding last
+            // rendered, the browser opened or closed the disclosure by itself
             // (find-in-page opens one to show a match), and the narrow state
-            // takes that up, or the next press would look dead.
+            // takes that up, or the next press would look dead. Never write the
+            // wide choice here: an automatic open would become a hand choice.
             on:toggle=move |_| {
                 if compact.get_untracked()
                     && let Some(panel) = panel.get_untracked()
@@ -259,11 +260,11 @@ pub fn FacetSidebar(
                         })}
                     };
                     let groups = facets.into_iter().map(|(field, values, distinct)| {
-                        // Only the label changes: the title, the selection
-                        // match, the filter a click builds and the count all
-                        // keep the raw value. The rail counts input fields
-                        // only, so `_severity` is the one field that
-                        // qualifies.
+                        // Severity values show as names. Only the label
+                        // changes: the title, the selection match, the
+                        // filter a click builds and the count keep the raw
+                        // value. The rail counts input fields only, so no
+                        // `sev()` column reaches it.
                         let severity = trawl_core::severity::renders_as_severity(&field, &[]);
                         let label = move |v: &str| {
                             severity

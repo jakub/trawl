@@ -59,8 +59,8 @@ test('the stored preview pages in the browser without a second read', async ({ p
 
 test('a preview that fetched less than the run stored says so', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
-  // The fixture ships the two equal so the uncapped case is testable at
-  // all, so the capped one is made here, on the wire.
+  // The fixture ships the run's stored count equal to its fetched rows so
+  // the uncapped case is testable at all, so the capped one is made here.
   const stored = 100;
   await page.route(`**/api/v1/saved/*/runs/${SCHEDULE.pagedRunId}`, async (route) => {
     const response = await route.fetch();

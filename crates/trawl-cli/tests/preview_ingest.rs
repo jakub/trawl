@@ -175,8 +175,8 @@ fn event_of_depth(depth: usize) -> String {
     )
 }
 
-/// The CLI decodes the report even though it echoes the deepest event
-/// three containers further in.
+/// The report echoes the accepted event three containers further in, and
+/// the CLI still decodes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_deepest_event_ingest_accepts_previews_whole() {
     // `serde_json`'s default recursion limit, which ingest parses with,
@@ -413,11 +413,11 @@ async fn more_events_than_a_preview_reads_prints_the_servers_413() {
     server.stop().await;
 }
 
-/// Both outcomes are legitimate. trawld refuses on `Content-Length` and
-/// hangs up without draining the body. The client is still uploading, so
-/// whether it reads the 413 first or hits the reset of the unread upload
-/// depends on socket buffers and timing. A reset is reported as a cut-off
-/// upload. The test never retries.
+/// The 413 and a cut-off upload are both legitimate. trawld refuses an
+/// oversized `Content-Length` and hangs up without draining the body. The
+/// client is still uploading, so whether it reads the 413 first or hits the
+/// reset of the unread upload depends on socket buffers and timing. A reset
+/// is reported as a cut-off upload. The test never retries.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_body_far_over_the_limit_prints_the_413_or_a_cut_off_upload() {
     let server = Server::start(true).await;

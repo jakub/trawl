@@ -51,9 +51,10 @@ enum Phase {
     },
     /// The server's own message for a status this modal cannot act on.
     /// The modal stays open and keeps the plan it was acting on, if
-    /// there was one. A real run refused with a definitive 4xx lands here:
-    /// a 4xx is decided before the claim, so nothing started. A 5xx or a
-    /// lost connection is [`Phase::Indeterminate`] instead.
+    /// there was one. Any dry-run failure lands here, and so does a real
+    /// run refused with a definitive 4xx: a 4xx is decided before the
+    /// claim, so nothing started. A real run's 5xx or lost connection is
+    /// [`Phase::Indeterminate`] instead.
     Failed {
         message: String,
         plan: Option<Box<RepinJobResponse>>,
@@ -160,8 +161,9 @@ pub fn RepinModal(
     field: String,
     current_type: String,
     suggested_to: String,
-    /// A refusal to re-present instead of planning afresh: that job's scan
-    /// is the plan, so asking for a second one would be a second
+    /// A refusal to re-present instead of planning afresh: `Some` when the
+    /// case file's poll watched a running job land `refused_needs_force`.
+    /// That job's scan is the plan; a second one would be a second
     /// full-corpus pass for the same answer.
     refused: Option<RepinJobResponse>,
     on_close: Callback<Option<RepinJobResponse>>,
@@ -801,9 +803,10 @@ async fn job_probe(id: i64) -> Probed {
     }
 }
 
-/// Follow the dry run a 202 answered with until its row is terminal,
-/// under the case file's own [`poll_decide`] rules. By id, so another job
-/// in the one-running slot can never stand in for this one.
+/// Follow the dry run a 202 answered with, under the case file's own
+/// [`poll_decide`] rules. By id, so another job in the one-running slot
+/// can never stand in for this one. `None` once the dialog is gone or a
+/// read sent the page to sign-in.
 async fn follow_plan(
     started: RepinJobResponse,
     seq: u32,

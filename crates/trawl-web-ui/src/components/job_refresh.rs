@@ -3,9 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Visible-page polling for Jobs.
-//! A declined 401 (an explicit logout is pending, or another redirect
-//! started first) keeps polling, so a failed logout still lets the next 401
-//! sign in.
+//! A 401 the shared sign-in handler declines (an explicit logout is pending,
+//! or another redirect started first) keeps polling, so a failed logout
+//! still lets the next 401 sign in.
 use crate::api::ApiError;
 use crate::auth_return::sign_in_if_unauthorized;
 use leptos::prelude::*;

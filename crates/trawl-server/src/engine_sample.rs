@@ -974,8 +974,8 @@ mod tests {
         }
     }
 
-    /// The budget is generous, so the probe fails within it and the watchdog
-    /// never runs: the exhausted budget alone is what reads `slow`.
+    /// The time budget is generous, so the probe fails within it and the
+    /// watchdog never runs: the exhausted memory limit alone reads `slow`.
     #[test]
     fn engine_sample_reads_duckdb_s_own_out_of_memory_as_slow() {
         const PATIENT: SampleConfig = SampleConfig {

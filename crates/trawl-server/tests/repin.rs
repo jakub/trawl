@@ -70,8 +70,9 @@ async fn hang_guard_harness() -> Harness {
 
 /// `timeout_secs` also bounds how long the repin trigger holds its response.
 ///
-/// The rate limit is off: these tests poll in loops for as long as a job
-/// takes, and a per-minute budget would fail a correct build with 429.
+/// The interactive API rate limit is off: these tests poll in loops for as
+/// long as a job takes, so a slow job would spend a per-minute budget and
+/// fail a correct build with 429.
 async fn harness_with_query_timeout(timeout_secs: u64) -> Harness {
     let rate_limit = RateLimitConfig {
         default_rpm: 0,
@@ -1124,8 +1125,8 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     )
     .unwrap_or(0.0);
 
-    // They run while the progress hold pins the job mid-build, so each one has
-    // given back its permit before the cutover starts its drain.
+    // These queries run while the progress hold pins the job mid-build, so
+    // each one has given back its permit before the cutover starts its drain.
     let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
     for _ in 0..3 {
         let result = client
@@ -2330,10 +2331,10 @@ use trawl_server::repin::engine::{
 use trawl_server::store::{RepinJob, RepinJobStatus};
 
 /// A hold waits only for its release flag: the engine has no clock lapse
-/// that frees it. Dropping it unreleased disarms a hold the engine has not
-/// reached and sets the release flag for one it has, so a panicking test
-/// never leaves a job (or a blocking-pool thread the runtime waits for on
-/// teardown) held. The flags are process-global, so arming resets the
+/// that frees it. Dropping this guard unreleased disarms a hold the engine
+/// has not reached and sets the release flag for one it has, so a panicking
+/// test never leaves a job (or a blocking-pool thread the runtime waits for
+/// on teardown) held. The flags are process-global, so arming resets the
 /// arrival and release flags and sets the hold last.
 ///
 /// Bind the guard as a local of the test body, so unwinding drops it before
@@ -2813,8 +2814,9 @@ async fn pass_the_answer_bound() {
     tokio::time::advance(ANSWER_BOUND + Duration::from_millis(1)).await;
 }
 
-/// The scan is still held, so the answer is the 202 with the claimed row,
-/// and the hold may be released without the scan deciding inside the bound.
+/// Called after [`pass_the_answer_bound`] with the scan still held, so the
+/// answer it waits for is the 202 with the claimed row, and the hold may be
+/// released without the scan deciding inside the bound.
 async fn await_the_late_answer(h: &Harness) {
     frozen_until("the trigger answers past its bound", move || async move {
         (regular_requests_in_progress(h).await == 0.0).then_some(())
@@ -2824,8 +2826,9 @@ async fn await_the_late_answer(h: &Harness) {
 
 /// The CLI's status reads run a client timeout on tokio's clock, and nothing
 /// publishes when a read is in flight, so stepping a frozen clock could time
-/// out a pending read on a correct build. Every precondition is already a
-/// fact here, so the clock resumes.
+/// out a pending read on a correct build. The caller's preconditions (the
+/// 202 produced, the job terminal, the slot taken) are already facts, so the
+/// clock resumes.
 async fn follow_the_cli_on_real_time<F: std::future::Future + Unpin>(cli: &mut F) -> F::Output {
     tokio::time::resume();
     until_polling("the CLI follows its job", cli, || false)
@@ -2993,7 +2996,6 @@ async fn schema_write_only_token(h: &Harness) -> String {
     mint_schema_write_only_key(h, "schema-writer").await
 }
 
-/// Seed it once per harness.
 async fn seed_schema_write_only_role(h: &Harness) {
     fleet_auth::KeyStore::from_pool(h.server.fleet_pool.clone())
         .create_role(
@@ -4705,9 +4707,6 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
     );
     assert!(refused.error.is_some(), "the refused job kept its reason");
 
-    // The other place a cutover completes: boot recovery. The replay finishes
-    // the flip, including the ack clear, which owes the same audit record
-    // the live path emits.
     let catalog = &h.server.state.storage.catalog;
     for _ in 0..3 {
         catalog
@@ -4809,9 +4808,9 @@ impl Harness {
         self.server.state.repin_jobs.read()
     }
 
-    /// Polled from the job's release, not from its terminal row: a success row
-    /// lands before the post-cutover sweep, the gauge reset and the outcome
-    /// count, and the generation guard drops after all three.
+    /// Waits for the job generation to read idle, not for the terminal row: a
+    /// success row lands before the post-cutover sweep, the gauge reset and the
+    /// outcome count, and the generation guard drops after all three.
     async fn await_jobs_idle(&self) -> JobReading {
         let start = std::time::Instant::now();
         while start.elapsed() < HANG_GUARD {
@@ -5435,8 +5434,8 @@ impl Harness {
         }
     }
 
-    /// A claim released from a lock lands a moment later, so the newest row
-    /// until then is an older job's.
+    /// A claim released from a lock lands a moment later, so until then the
+    /// newest row, if any, is an older job's: `after` names it.
     async fn wait_latest_terminal(&self, after: Option<i64>) -> RepinJob {
         let store = &self.server.state.storage.repin;
         let start = std::time::Instant::now();

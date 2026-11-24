@@ -126,9 +126,6 @@ pub(crate) fn scan(
 
 #[cfg(test)]
 mod tests {
-    /// The check is a real read of the corpus (`DuckDB` plus a parquet
-    /// tree), so what is guarded here is the control flow rather than the
-    /// latency.
     #[test]
     fn no_scanned_file_skips_the_post_file_cancel_check() {
         const SOURCE: &str = include_str!("plan.rs");

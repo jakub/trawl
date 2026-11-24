@@ -3311,9 +3311,9 @@ fn eventstats_case_variant_alias_overwrites_the_incoming_column() {
     );
 }
 
-/// The SQL half of that fold has to be the EXACT mirror of
-/// `schema::catalog_key`. `lower()` is not: it folds non-ASCII too, where
-/// `DuckDB`'s own identifier binding does not.
+/// The SQL half of the overwrite projection's ASCII case fold has to be
+/// the EXACT mirror of `schema::catalog_key`. `lower()` is not: it folds
+/// non-ASCII too, where `DuckDB`'s own identifier binding does not.
 #[test]
 fn the_columns_exclusion_fold_mirrors_catalog_key() {
     fn fold_sql(expr: &str) -> String {
@@ -4656,8 +4656,8 @@ fn the_inlined_anchor_literal_matches_the_bound_form() {
     }
 }
 
-/// chrono SIGNS such a year — `+10000-01-01` — and `DuckDB`'s timestamp
-/// parser accepts a leading `-` but not a leading `+`.
+/// chrono SIGNS a year past 9999 (`+10000-01-01`), and `DuckDB`'s
+/// timestamp parser accepts a leading `-` but not a leading `+`.
 #[test]
 fn the_anchor_literal_parses_at_every_year_chrono_can_render() {
     let conn = conn();

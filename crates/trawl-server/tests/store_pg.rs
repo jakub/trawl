@@ -1077,8 +1077,8 @@ async fn since_last_watermark_is_seeded_at_the_origin_of_owed_coverage(pool: PgP
         "coverage a run earned survives every later edit"
     );
 
-    // Nothing this code writes leaves a since_last schedule watermark-less,
-    // so the row is forced back to that state to pin the rule.
+    // An edit that does NOT re-anchor seeds nothing. Nothing this code writes
+    // leaves a since_last schedule watermark-less, so the row is forced there.
     sqlx::query("UPDATE schedules SET covered_through = NULL WHERE id = $1")
         .bind(sched.id)
         .execute(&pool)
@@ -3019,9 +3019,9 @@ fn assert_ordered_seek(what: &str, plan: &[String], seek: &str) {
     );
 }
 
-/// Both pages must seek whether Postgres plans them for the bound values
-/// (custom) or once for any value (generic, as a statement cached past five
-/// executions is). `scripts/evidence/issue-444/explain.sh` records the
+/// Both due-listing pages must seek whether Postgres plans them for the bound
+/// values (custom) or once for any value (generic, as a statement cached past
+/// five executions is). `scripts/evidence/issue-444/explain.sh` records the
 /// output.
 #[sqlx::test]
 async fn due_listing_uses_ordered_seek(pool: PgPool) {
@@ -3874,7 +3874,8 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
 }
 
-/// The blocker pins that interleaving by holding the run row: the delete
+/// A `since_last` finish locks the schedule row, then the run row; the
+/// delete's cascade needs both. The blocker holds the run row: the delete
 /// queues for it first, the finish queues behind, and the rollback releases
 /// them in that order. Both sides must walk saved -> schedules -> runs.
 #[sqlx::test]
@@ -7856,7 +7857,7 @@ async fn assert_pair_is_legal(
 }
 
 /// Both write doors take the `saved_queries` lock FIRST: the loser waits,
-/// then reads what the winner committed and refuses.
+/// then reads what the winner committed and refuses the forbidden pair.
 #[sqlx::test]
 async fn schedule_put_and_saved_put_cannot_commit_the_forbidden_pair(pool: PgPool) {
     let saved_store = saved(&pool);

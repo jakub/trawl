@@ -941,8 +941,8 @@ mod tests {
         });
     }
 
-    /// A recursive drop overflows this stack at about 16 000 levels. A tree
-    /// that outlives a parse, as the unwind case needs, is built in code.
+    /// A recursive drop overflows a tokio worker's 2 MiB stack in a debug
+    /// build at about 16 000 levels.
     #[test]
     fn expression_drop_fits_worker_stack() {
         const TERMS: usize = 32_000;

@@ -10,9 +10,7 @@ const CSS: &str = include_str!("../styles/fleet-ui.css");
 
 const PREMIGRATION_CHROME: &str = include_str!("fixtures/premigration-chrome.css");
 
-/// Anchored on a preceding newline so `.rail .it` does not
-/// match `.rail .it .lb` / `.rail .it:hover`. Chrome rules
-/// have no nested braces, so the body ends at the first `}`.
+/// Chrome rules have no nested braces, so the body ends at the first `}`.
 fn rule_body(selector: &str) -> &'static str {
     let needle = format!("\n{selector} {{");
     let start = CSS
@@ -307,10 +305,6 @@ fn mira_blue_button_recipes_pinned() {
 
 #[test]
 fn dark_outline_hover_is_a_backdrop_independent_lift() {
-    // The shared hover fill — `color-mix(in oklab, var(--panel-3) 55%,
-    // transparent)` — is translucent, so what it renders depends on the
-    // backdrop it composites over, while the dark resting fill is a fixed
-    // white-alpha overlay.
     let rest = rule_body("[data-theme=\"dark\"] .btn-sec,\n[data-theme=\"dark\"] .btn-sm");
     assert!(
         rest.contains("background: var(--fill)"),

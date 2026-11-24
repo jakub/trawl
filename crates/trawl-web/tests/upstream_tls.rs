@@ -2,9 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! A refusal is checked from both ends: the login fails, and the server
-//! sees its handshake fail. A plain connection error would pass the first
-//! check but not the second.
+//! A refused upstream is checked from both ends: the login fails, and the
+//! server sees its handshake fail. A plain connection error would pass the
+//! first check but not the second.
 //!
 //! Every response closes its connection, so each request makes a fresh
 //! handshake and a pooled connection cannot hide a change of trust.
@@ -671,8 +671,8 @@ where
     }
 }
 
-/// Nothing ever opens its write end, so a plain `open` for reading waits
-/// forever.
+/// Nothing ever opens the FIFO's write end, so a plain `open` for reading
+/// waits forever.
 #[cfg(unix)]
 fn mkfifo(path: &std::path::Path) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("create the directory");

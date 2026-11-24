@@ -6,8 +6,8 @@
 //!
 //! Its own test binary because `.init()` installs the global subscriber,
 //! exactly as `trawld` does. Cases share one subscriber and may run in one
-//! process, so each selects its events by a field only it logs, and the
-//! sentinel search is its own.
+//! process, so each selects its events by a field only it logs and searches
+//! for a sentinel no other case uses.
 
 mod common;
 

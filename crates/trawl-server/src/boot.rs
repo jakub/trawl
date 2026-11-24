@@ -54,8 +54,9 @@ pub async fn prepare_corpus(state: &AppState, config: &Config) -> Result<(), Str
         .map_err(|e| join_failure_text("boot rollup recovery", e))?;
     }
 
-    // Fatal on failure, like the epoch gate: a data root not proven
-    // conformant must not serve queries.
+    // Fatal on failure, like the epoch gate. A bad or claimed path is not a
+    // failure: the pass skips and counts it, so one bad file cannot keep the
+    // daemon down.
     let summary = conform::ensure_conformance(
         &state.storage.catalog,
         &state.query.field_catalog,

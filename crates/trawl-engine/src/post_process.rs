@@ -35,11 +35,13 @@ use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 
 /// Apply Rust pipeline stages to a SQL result set.
 ///
-/// The result's columns are the steps' output schema over the input's, so a
-/// tail that removes every row still answers with the columns it projects.
+/// The result's columns are the steps' output schema over the input's,
+/// then any field an `extract kv` found, so a tail that removes every row
+/// still answers with the columns it projects.
 ///
 /// An input with no columns is the SQL read's answer for a source that
-/// matched no file, and it is returned as it came.
+/// matched no file, and it is returned as it came, though a stage the tail
+/// refuses is still refused over it.
 ///
 /// `anchor` is the statement's `now()` instant (ADR-0017 §3). `last` is the
 /// query's `last=` window: a `timechart` in the tail with no `span=` picks
@@ -276,7 +278,7 @@ fn tail_cell_type(ty: &ColumnType) -> ColumnType {
 }
 
 /// Reads the lane's latch every [`TAIL_CANCEL_STRIDE`] rows: a result can be
-/// a million rows, and the copy holds the lane's permit.
+/// a million rows, and the conversion holds the lane's permit.
 fn rows_to_events(result: &QueryResult, cancel: &CancelLatch) -> Result<Vec<Row>, EngineError> {
     let mut events = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
@@ -496,8 +498,9 @@ fn rows_to_result_within(
     Ok(QueryResult { columns, rows: out })
 }
 
-/// The plan compile prepared every pattern the tail reads, so the server
-/// broke its own invariant and the query is not to blame (ADR-0063).
+/// Any error but a cancel means the server broke its own invariant: the plan
+/// compile prepared every pattern the tail reads, so the query is not to
+/// blame (ADR-0063).
 fn tail_pattern_error(error: &PatternError) -> EngineError {
     if matches!(error, PatternError::Cancelled) {
         return EngineError::Cancelled;
@@ -836,7 +839,7 @@ fn stable_sort<T>(
 
 /// Two numbers compare numerically and exactly: an integer pair never
 /// becomes a pair of doubles, so `u64::MAX` and `u64::MAX - 1` keep their
-/// order. Everything else compares as the text the cell shows
+/// order. Any other non-null pair compares as the text the cell shows
 /// (`row::cell_text`, the same renderer the live lane groups by).
 fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Ordering {
     match (a, b) {
@@ -852,7 +855,7 @@ fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Orde
     }
 }
 
-/// These are the rules `result_actions::compare` already encodes for the
+/// Numbers order by the rules `result_actions::compare` encodes for the
 /// results table in `trawl-web-ui`, so a column sorted by the browser and
 /// the same column sorted by `| sort` read the same way for every value the
 /// JSON hop can carry (a non-finite DOUBLE lands as null there; only the

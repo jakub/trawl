@@ -204,7 +204,7 @@ impl RootReader for BootReader {
 }
 
 /// Decide what the boot gate does with `data_root`, writing nothing.
-/// The precedence is the gate's, so boot and `trawld --doctor` reach the
+/// The check order is the gate's, so boot and `trawld --doctor` reach the
 /// same answer from the same observations.
 pub fn classify_data_root<R: RootReader>(
     data_root: &Path,

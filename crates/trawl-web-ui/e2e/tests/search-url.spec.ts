@@ -96,7 +96,7 @@ test('literal versioned filters and range produce the exact DSL', async ({ page,
 test('a literal percent in q survives one decode', async ({ page, request }) => {
   // `%2541` is one encoding of `%41`, so a single decode gives the DSL
   // `message=/100%41/` while a second gives `message=/100A/`.
-  // leptos-router's ParamsMap decodes twice: decodeURIComponent over what
+  // leptos-router's ParamsMap decodes again: decodeURIComponent over what
   // UrlSearchParams had already decoded. Hence the raw query string.
   await page.goto('/search?q=message%3D%2F100%2541%2F&page=0');
 

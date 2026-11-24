@@ -4,10 +4,10 @@
 
 //! Where the trial keeps its host state, and the owner-only file rules.
 //!
-//! Both directories must be real directories owned by the current user
-//! with no group or other access. A symlink at either path is refused, not
-//! followed, and a looser directory is refused rather than re-moded,
-//! because trawl did not create it that way.
+//! The state root and its `trial/` directory must be real directories
+//! owned by the current user with no group or other access. A symlink at
+//! either path is refused, not followed, and a looser directory is refused
+//! rather than re-moded, because trawl did not create it that way.
 //!
 //! Those two checks read metadata and keep no handle, so the files below
 //! are reached by path again later. That is sound only if no other user can
@@ -138,8 +138,8 @@ fn euid() -> u32 {
     nix::unistd::geteuid().as_raw()
 }
 
-/// A symlink at `path` is refused whether it was there before or
-/// appeared in between.
+/// A symlink at `path` is refused whether it was there before the create
+/// or appeared after it.
 fn secure_dir(path: &Path) -> Result<(), TrialError> {
     match DirBuilder::new().mode(DIR_MODE).create(path) {
         Ok(()) => {}

@@ -129,7 +129,7 @@ async fn login_does_not_follow_an_upstream_redirect() {
     leg.assert_untouched("/api/v1/whoami", before).await;
 }
 
-/// Mount the route's redirect after this, so the redirect is what the
+/// Mount the route's redirect after this login, so the redirect is what the
 /// route sees and not the login.
 async fn session_cookie(state: AppState, upstream: &MockServer) -> String {
     Mock::given(method("GET"))

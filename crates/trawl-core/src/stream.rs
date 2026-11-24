@@ -56,7 +56,8 @@ pub enum StreamPlanError {
     /// Never [`PatternError::Cancelled`], which is [`Self::Cancelled`].
     Pattern(PatternError),
     /// The emitter's sentence, verbatim. This compiler does not call
-    /// `validate_pipeline`, so it runs both shared checks itself.
+    /// `validate_pipeline`, so it runs `check_positions` and `check_calls`
+    /// itself.
     InvalidFunction(String),
     /// A pinned comparison the shared rule table refuses (ADR-0013).
     InvalidComparison(String),
@@ -361,11 +362,9 @@ impl fmt::Debug for CompiledStage {
 }
 
 impl CompiledStage {
-    /// Re-arm a `limit`, and leave every other stage alone.
-    ///
-    /// - a pre-aggregation `limit` caps the input set, so its exhaustion stays
-    ///   sticky for the life of the subscription;
-    /// - a post-aggregation `limit` caps each snapshot as batch caps its one.
+    /// Re-arm a `limit`, and leave every other stage alone. Only
+    /// [`emit_snapshot`] calls it, on post-aggregation stages, so a
+    /// pre-aggregation `limit` stays spent for the life of the subscription.
     fn reset_limit(&mut self) {
         if let Self::Limit { count, remaining } = self {
             remaining.store(*count, Ordering::Relaxed);
@@ -1217,9 +1216,11 @@ fn remove_folded_twins(event: &mut Row, name: &str) {
 }
 
 /// Apply a `let` stage in place, with the SQL's column-then-alias
-/// resolution (ADR-0062): an input column wins, by `DuckDB`'s own
+/// resolution (ADR-0062): a column the row carries wins, by `DuckDB`'s own
 /// case-insensitive binding ([`bind_event_key`]), and only a name resolving
-/// to no input column falls through to the lateral column alias.
+/// to no column falls through to the lateral column alias. Batch binds per
+/// relation, so a sparse field this row lacks reads NULL there and the
+/// alias here.
 ///
 /// Pins do not follow the alias: [`PinScope::advance`] resolves every
 /// assignment's pin against the pre-stage scope.
@@ -2823,9 +2824,6 @@ mod tests {
         assert!(matches!(plan, StreamPlan::PassThrough(stages) if stages.is_empty()));
     }
 
-    /// A retype of this read would silently bucket every event at
-    /// the current time through the fallback, which no assertion about
-    /// counts would catch, so the bucket itself is asserted.
     #[test]
     fn the_time_bucket_reads_the_wire_string() {
         let ev = event(&json!({"_time": "2026-01-15T09:07:00Z", "service": "nginx"}));

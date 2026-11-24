@@ -161,8 +161,8 @@ const HUMAN = { prefix: 'Zy9x8w7v', name: 'jakub' };
 function investigationReader() { return scenario === 'investigations' || investigationWriter(); }
 function investigationWriter() { return scenario === 'investigations-writer'; }
 const PRUNED_RESULT = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
-// A read without `limit` gets `RESULT_PAGE_MAX_ROWS` rows, as trawld
-// answers `[capture] page_max_rows`.
+// A stored-result read without `limit` gets `RESULT_PAGE_MAX_ROWS` rows,
+// as trawld answers `[capture] page_max_rows`.
 const STORED_RESULTS = {
   fedcba9876543210fedcba9876543210: 'result-page-evidence',
   '7e57ab1e0c0ffee0d15ea5e0ba5eba11': 'result-page-paged',
@@ -748,16 +748,16 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, { ok: true, armed: scheduleRefusal });
       return;
     }
-    // A real server refuses an empty since_last window only when coverage
-    // reaches past the claim instant, which no click sequence produces, so
-    // the stub arms it instead.
+    // A real server refuses a since_last run once coverage reaches the
+    // claim instant less lag, which no click sequence produces, so the stub
+    // arms the refusal instead.
     if (p === '/__ctl/run/refuse' && req.method === 'POST') {
       runRefusal = true;
       sendJson(res, 200, { ok: true, armed: 'run-refuse' });
       return;
     }
-    // The state is a property of the RUN, so a repeated read answers the
-    // same 409 rather than a one-shot.
+    // Not one-shot: a missing stored result belongs to the RUN, so every
+    // read of it answers the same 409.
     const unavailableRun = p.match(/^\/__ctl\/run-unavailable\/(\d+)$/);
     if (unavailableRun && req.method === 'POST') {
       unavailableRunId = Number(unavailableRun[1]);

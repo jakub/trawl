@@ -186,8 +186,8 @@ fn assert_no_repair_warning(request_id: &str) {
     assert!(persisted.is_empty(), "{persisted:#?}");
 }
 
-/// Persisted telemetry pins a field's type, so each must reach stdout
-/// unquoted and the record as a number.
+/// The repair fields logged as integers. Persisted telemetry pins a field's
+/// type, so each must reach stdout unquoted and the record as a number.
 const NUMERIC_FIELDS: &[&str] = &[
     "key_id",
     "repairs",

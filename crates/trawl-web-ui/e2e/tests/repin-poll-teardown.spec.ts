@@ -6,7 +6,8 @@
 // `poll_once.try_run(())`, which no-ops once the owner is disposed —
 // so only the browser's own timer table can see it (`trackIntervals`).
 // A flat status-hit count would stay flat under a leaked timer too (the
-// in-flight guard sees a read still parked), so it is never a stand-in.
+// in-flight guard sees a read still parked), so it never stands in
+// for the timer check.
 //
 // The e2e identity holds no `schema_write`, so the mount-time status
 // probe is the ONLY way a poll can start here.
@@ -69,8 +70,8 @@ async function waitForHeldStatusRead(request: Ctl, n: number): Promise<RepinStat
   );
 }
 
-/** Read 1 is the mount probe, read 2 the immediate `poll_once` the
- * adoption starts. The stub parks read 2, so the in-flight guard makes
+/** Read 1 is the mount probe, read 2 the immediate `poll_once` that
+ * adopting the running job starts. The stub parks read 2, so the in-flight guard makes
  * every later tick a no-op and the hit count stays at 2. */
 async function expectPollStarted(page: Pg, request: Ctl) {
   await expect(page.locator(SEL.fieldCase)).toBeVisible();

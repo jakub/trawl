@@ -280,8 +280,8 @@ struct Sinks {
     wal_dir: tempfile::TempDir,
 }
 
-/// Its WAL lives in the child's work directory when there is one, so the
-/// subscriber writes nothing to `TMPDIR` either.
+/// The production subscriber's WAL lives in the child's work directory when
+/// there is one, so it writes nothing to `TMPDIR`.
 fn sinks() -> &'static Sinks {
     static SINKS: OnceLock<Sinks> = OnceLock::new();
     SINKS.get_or_init(|| {

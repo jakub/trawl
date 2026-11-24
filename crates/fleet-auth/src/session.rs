@@ -597,8 +597,9 @@ pub fn build_session_cookie_header(
     builder.to_string()
 }
 
-/// Attributes must match what the original `Set-Cookie` had, because
-/// browsers reject clear directives that don't match the issued attributes.
+/// Every attribute but `Max-Age` must match what the original `Set-Cookie`
+/// had, because browsers reject clear directives that don't match the
+/// issued attributes.
 #[must_use]
 pub fn build_clear_cookie_header(
     name: &str,

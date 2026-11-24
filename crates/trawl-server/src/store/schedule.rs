@@ -43,7 +43,8 @@
 //!
 //! The scheduler's reads and both run claims wait a bounded time
 //! (ADR-0018), each statement its own [`WriteTx::run`], so each refreshes
-//! `statement_timeout` from what remains.
+//! `statement_timeout` from what remains. A `COMMIT` already sent is never
+//! cut short.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -95,8 +96,9 @@ pub struct Schedule {
 }
 
 /// How long a run's claim, or one page of the due listing, may wait on the
-/// database (ADR-0018). A manual run's estimated end, from which a refused
-/// press derives its advisory `Retry-After`, is this plus the query timeout.
+/// database (ADR-0018); a `COMMIT` already sent is awaited past it. A manual
+/// run's estimated end, from which a refused press derives its advisory
+/// `Retry-After`, is this plus the query timeout.
 pub const CLAIM_WAIT: Duration = Duration::from_secs(5);
 
 pub const DUE_SCHEDULE_PAGE: usize = 64;
@@ -252,9 +254,9 @@ pub struct ClaimedRun {
 /// fire cursor alone.
 ///
 /// It is deliberately NOT a [`StoreError`] variant. `ServerError` already
-/// wraps these three window errors directly, with a considered wire
-/// treatment for each. Re-wrapping them in `StoreError` would give each
-/// leaf a second, differently-mapped route to the same wire.
+/// wraps the `Plan`, `Policy` and `Materialize` errors directly, with a
+/// considered wire treatment for each. Re-wrapping them in `StoreError`
+/// would give each leaf a second, differently-mapped route to the same wire.
 #[derive(Debug, thiserror::Error)]
 pub enum DueClaimError {
     #[error(transparent)]
@@ -1003,10 +1005,9 @@ impl ScheduleStore {
     /// This path keeps its own key-scoped lookups rather than `lock_for_claim`,
     /// which reads a disabled schedule as nothing to run.
     ///
-    /// The resolution's parses, which cannot be stopped,
-    /// keep a clone of `lease`, the run's place among the manual runs in
-    /// flight, until they return, whether or not the claim still waits for
-    /// them.
+    /// The window resolution's parses, which cannot be stopped, keep a clone
+    /// of `lease`, the run's place among the manual runs in flight, until
+    /// they return, whether or not the claim still waits for them.
     pub async fn claim_manual_run(
         &self,
         saved_query_id: i64,
@@ -1056,8 +1057,8 @@ impl ScheduleStore {
     /// [`DueClaim::Advanced`] commit, which claims no run and so spends
     /// none.
     ///
-    /// The resolution's parses keep a clone of `lease`, the run's place
-    /// among the scheduled runs in flight, until they return.
+    /// The window resolution's parses keep a clone of `lease`, the run's
+    /// place among the scheduled runs in flight, until they return.
     pub async fn claim_due_run(
         &self,
         schedule_id: i64,
@@ -1123,9 +1124,9 @@ impl ScheduleStore {
         //
         // The lock is taken only when there is something to move: a run
         // claimed as `since_last` (the watermark) or a manual run (the
-        // cursor). Both are written at claim time and never updated, so the
-        // answer cannot change under us; the run's `origin` and `started_at`
-        // are immutable, so reading them unlocked is exact.
+        // cursor). The run's `window_kind`, `origin` and `started_at` are
+        // written at claim time and never updated, so reading them unlocked
+        // is exact.
         let mut cursor_move = None;
         if status == RunStatus::Success {
             let locked = sqlx::query(
@@ -1853,10 +1854,10 @@ async fn due_claim_in(
     })))
 }
 
-/// Take the claim's locks in order and read what the plan needs. Both rows
-/// are read here rather than trusted from the tick's listing, because an
-/// operator can edit the DSL, disable the schedule or delete either one
-/// between the listing and the claim.
+/// Take the saved query's lock, then the schedule's, and read both rows
+/// here rather than trust the tick's listing: an operator can edit the
+/// DSL, disable the schedule or delete either one between the listing and
+/// the claim.
 async fn lock_for_claim(
     tx: &mut WriteTx,
     schedule_id: i64,
@@ -2457,9 +2458,6 @@ mod tests {
         ));
     }
 
-    /// The ten-year cap lives in two places that cannot see each other:
-    /// this constant and the initial schema's CHECK constraints, so the test
-    /// reads the migration and compares the literal.
     #[test]
     fn initial_schema_spells_the_same_duration_cap() {
         let sql = std::fs::read_to_string("migrations/20260913000001_initial_schema.sql")

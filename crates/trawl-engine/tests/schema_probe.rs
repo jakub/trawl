@@ -883,10 +883,10 @@ fn late_rows(rows: &[(String, Option<String>)]) -> Vec<Option<&str>> {
         .collect()
 }
 
-/// The park sits after the probe's prepare and before its execute, and the
-/// `DESCRIBE` expands the source's globs when it executes, so an unguarded
-/// publish during the park is described and read with its real `f`. A
-/// publish between the probe's execute and the statement's cannot be shown:
+/// `park_probe` holds the probe after its prepare and before its execute, and
+/// the `DESCRIBE` expands the source's globs when it executes, so an
+/// unguarded publish during the park is described and read with its real `f`.
+/// A publish between the probe's execute and the statement's cannot be shown:
 /// nothing parks there.
 #[test]
 #[allow(clippy::too_many_lines)]

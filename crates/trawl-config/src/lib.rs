@@ -198,9 +198,10 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// [`Config::from_toml`] applies it at parse time, so trawld's own call sites
-    /// read the already-resolved field; trawl-web deserializes the file itself
-    /// and calls this directly when deriving its upstream URL.
+    /// `TRAWL_HTTP_ADDR` first, then `[server] http_addr`.
+    /// [`Config::from_toml`] applies this at parse time, so trawld's own call
+    /// sites read the already-resolved field; trawl-web deserializes the file
+    /// itself and calls this directly when deriving its upstream URL.
     #[must_use]
     pub fn resolve_http_addr(&self) -> String {
         Self::resolve_http_addr_from(
@@ -396,7 +397,8 @@ pub struct IngestConfig {
     /// form (`{ field = "syslog_severity", dialect = "syslog" }`); the
     /// dialect governs numerics only.
     ///
-    /// Empty is legal and means "derive nothing". Default: [`DEFAULT_SEVERITY_FROM`].
+    /// Empty is legal and derives nothing past a producer profile's fixed
+    /// sources, which prepend this list. Default: [`DEFAULT_SEVERITY_FROM`].
     ///
     /// Semantics are validated boot-fatally by the server:
     /// this crate owns the shape, trawl-server owns the rules.
@@ -2101,7 +2103,8 @@ impl Config {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
     }
 
-    /// The file may not exist yet: trawld writes it on its first start.
+    /// The generated certificate may not exist yet: trawld writes it on its
+    /// first start.
     pub fn generated_cert_path(&self) -> Option<PathBuf> {
         if self.server.tls_cert_path.is_some() {
             return None;
@@ -2166,9 +2169,10 @@ impl Config {
             )));
         }
 
-        // A `..` after a component that is missing places `<base>/missing/../x`
-        // at `<base>` while trawld later makes it at `<base>/x`, which can be the
-        // scratch directory itself (ADR-0056).
+        // The startup overlap check places a root that does not exist yet by
+        // the nearest existing directory on its path, so `<base>/missing/../x`
+        // lands at `<base>` while trawld later makes it at `<base>/x`, which
+        // can be the scratch directory itself (ADR-0056).
         for (key, path) in [
             ("data.path", Path::new(&self.data.path)),
             (
@@ -3269,9 +3273,9 @@ max_catchup_intervals = {MAX_SCHEDULER_CATCHUP_INTERVALS}
         );
     }
 
-    /// Both fields are `u64`, and the toml crate deserializes an integer past
-    /// `i64::MAX` into one, so the widest value an operator can write is
-    /// `u64::MAX`.
+    /// Both retention knobs are `u64`, and the toml crate deserializes an
+    /// integer past `i64::MAX` into one, so the widest value an operator can
+    /// write is `u64::MAX`.
     #[test]
     fn scheduler_retention_knobs_must_be_in_range() {
         let load = |line: String| {

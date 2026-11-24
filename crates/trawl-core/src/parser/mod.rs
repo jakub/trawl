@@ -143,9 +143,9 @@ fn count_read(input: &str, kind: ParseKind) {
     watch::record(input, kind);
 }
 
-/// How many queries [`parse`] and [`parse_unbuilt`] have read on this
-/// thread. Take the difference across the work: other work on the same
-/// thread counts too.
+/// How many queries the parse entry points, cancellable or not, have read
+/// on this thread. Take the difference across the work: other work on the
+/// same thread counts too.
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn thread_parses() -> usize {
@@ -174,8 +174,9 @@ mod watch {
         parses: Mutex<Vec<(ThreadId, ParseKind)>>,
     }
 
-    /// Each test watches a marker of its own, so tests that run in parallel
-    /// never see each other's parses. It records until it drops.
+    /// Records the parses whose input holds its marker until it drops. Each
+    /// test watches a marker of its own, so tests that run in parallel never
+    /// see each other's parses.
     #[derive(Debug)]
     pub struct ParseLog(Arc<Watched>);
 
@@ -274,7 +275,8 @@ fn admit(input: &str, stop: &Stop) -> Admitted {
 /// Name each `/…/` run a pipe stage cut out of a search value, beside the
 /// first reported error that falls inside it (ADR-0061 ruling 1), never in
 /// place of it: an unrelated mistake can sit inside the run too
-/// (`path=/tmp* | wher x / 2`), and its own error is the one to fix.
+/// (`path=/tmp* | wher x / 2`), and its own error is the one to fix. A
+/// report already at [`MAX_REPORTED_ERRORS`] gets no name.
 fn name_pipe_cut_runs(errors: &mut Vec<ParseError>, runs: &[std::ops::Range<usize>]) {
     let mut named: Vec<&std::ops::Range<usize>> = Vec::new();
     for run in runs {

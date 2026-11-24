@@ -145,8 +145,9 @@ fn splits_into_or_groups(prefix: &str, search: &str) -> bool {
 }
 
 /// A time clause sits only at the top level of the search stage (ADR-0061
-/// ruling 2), so a clause left inside the new group would not parse. The
-/// clauses move out in written order, so the last of each kind still wins.
+/// ruling 2), so a clause left inside the parenthesised search would not
+/// parse. The clauses move out in written order, so the last of each kind
+/// still wins.
 /// The cut is kept only when the grammar reads the moved clauses and the
 /// cut text as the search itself; otherwise the search is grouped whole,
 /// which the parser refuses over the clause, so a missed case is an error

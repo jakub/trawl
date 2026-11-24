@@ -9,7 +9,7 @@ import { LIMITS, SEL } from '../selectors';
 const BUCKETS = 59;
 
 // The range rides the URL as `r=4h` and merges into the search stage, so
-// the posted DSL is longer than this; the harness dispatches on the
+// the posted DSL is longer than `q`; the harness dispatches on the
 // `| timechart` pipeline.
 const AGG_URL = `/search?q=${encodeURIComponent('level=error | timechart span=2m count()')}&r=4h`;
 

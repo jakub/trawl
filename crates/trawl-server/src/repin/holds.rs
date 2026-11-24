@@ -7,9 +7,9 @@
 //! The holds live on the [`crate::repin::RepinEngine`] that runs the job,
 //! not in a static, so one test's hold cannot reach another engine's job.
 //!
-//! The hold latches on arrival because a test cannot know the job id in
-//! time. A small corpus can reach the post-swap sweep before the request
-//! that started the job has answered with the id.
+//! An armed hold latches the first job to arrive, because a test cannot
+//! know the job id in time. A small corpus can reach the post-swap sweep
+//! before the request that started the job has answered with the id.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;

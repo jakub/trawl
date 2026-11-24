@@ -144,8 +144,9 @@ fn render_save_query(
     frame.render_widget(paragraph, area);
 
     // The paragraph centres the input line in the block's inner area, half
-    // the line's cells left of the middle, both halves rounded down. The
-    // cursor's column counts characters.
+    // the line's cells left of the middle, both halves rounded down. A line
+    // too wide wraps; the cursor stays on its first row. The cursor's column
+    // counts characters.
     let line_cells = u16::try_from(2 + cells(&input) + 1).unwrap_or(u16::MAX);
     let before: String = input.chars().take(editor.cursor.1).collect();
     let offset = (inner.width / 2).saturating_sub(line_cells.min(inner.width) / 2);

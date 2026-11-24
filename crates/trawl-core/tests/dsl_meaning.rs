@@ -631,7 +631,6 @@ fn pattern_table() {
 struct Context {
     before: &'static str,
     after: &'static str,
-    /// The meaning of the context, from the tokens the filter reads as alone.
     wrap: fn(&[String]) -> String,
 }
 

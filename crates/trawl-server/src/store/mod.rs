@@ -85,7 +85,7 @@ pub async fn writer_lock_held(conn: &mut PgConnection) -> Result<bool, sqlx::Err
 
 /// A single `bigint` key appears with its high 32 bits in `classid`, its low
 /// 32 bits in `objid`, and `objsubid` 1; `pg_locks` lists every database's
-/// locks, so the row must also name this one.
+/// locks, so the row must also name the database `conn` is connected to.
 pub(crate) async fn advisory_lock_granted(
     conn: &mut PgConnection,
     key: i64,
@@ -160,8 +160,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// second writer could start.
 const LOCK_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Aborting the task on drop drops the lock connection with it, so a graceful
-/// shutdown releases the advisory lock.
+/// Aborting the keepalive task on drop drops the lock connection with it, so
+/// dropping the last `StorageState` clone releases the advisory lock.
 #[derive(Debug)]
 struct LockGuard(JoinHandle<()>);
 
@@ -241,11 +241,11 @@ impl StorageState {
         Self::from_pool(pool).await
     }
 
-    /// The pool's connect target must never be reconfigured for the LIFETIME of
-    /// the returned [`StorageState`]. A sqlx 0.9 `Pool` clone shares one `Arc`, so
-    /// `set_connect_options` on a clone the caller kept repoints every
-    /// connection the stores open from then on, while the detached lock
-    /// session below stays on the old database.
+    /// The pool's connect target must never be reconfigured, during this call or
+    /// for the LIFETIME of the returned [`StorageState`]. A sqlx 0.9 `Pool` clone
+    /// shares one `Arc`, so `set_connect_options` on a clone the caller kept
+    /// repoints every connection the stores open from then on, while the detached
+    /// lock session below stays on the old database.
     ///
     /// Boot order is load-bearing here, not in the caller: take the session
     /// advisory lock BEFORE migrate.

@@ -342,7 +342,7 @@ async fn without_a_named_service_only_an_unknown_field_is_named() {
     assert_eq!(found, [r#"the catalog has no pin for field "nope""#]);
 }
 
-/// That they build no regex is `hints::tests` in the library: the
+/// That the hints build no regex is `hints::tests` in the library: the
 /// build count is per thread and the hints parse on the blocking pool.
 #[tokio::test]
 async fn hints_read_stored_text_with_patterns() {

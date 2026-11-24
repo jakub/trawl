@@ -519,8 +519,8 @@ fn doctor_web_truncated_body_is_too_large() {
     }
 }
 
-/// It records each request it read as [`record`] does, headers and body
-/// included, so [`Origin::keyless_requests`] applies to it.
+/// The origin records each request it read as [`record`] does, headers and
+/// body included, so [`Origin::keyless_requests`] applies to it.
 fn cut_short_origin(cut_healthz: bool) -> Origin {
     use std::io::{Read as _, Write as _};
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

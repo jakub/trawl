@@ -113,8 +113,9 @@ pub(crate) fn starts_with_slashes(text: &str) -> bool {
     text.starts_with(SLASHES)
 }
 
-/// The split takes the first separator: every message in this module is a
-/// `const` that carries none, so the head is always exactly the message.
+/// The split of a payload into message and token slice takes the first
+/// separator: every message in this module is a `const` that carries none,
+/// so the head is always exactly the message.
 const PAYLOAD_SEP: char = '\u{1f}';
 
 /// The messages a [`payload`] may be minted with — the one list

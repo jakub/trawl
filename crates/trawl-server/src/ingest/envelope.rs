@@ -554,8 +554,8 @@ fn is_proposable(key: &str, value: &Value, raw_proposable: bool) -> bool {
 
 /// Seal the `_` namespace at the ingest door (ADR-0013 §5).
 ///
-/// Two prefixed claimants for one bare name: the first in map order
-/// wins (`serde_json::Map` iterates sorted, so that is the
+/// Two prefixed claimants for a bare name the event lacks: the first in map
+/// order wins (`serde_json::Map` iterates sorted, so that is the
 /// ASCII-lexicographically first spelling), the rest collide out.
 fn strip_reserved_prefixes(
     out: &mut Map<String, Value>,
@@ -662,10 +662,10 @@ pub(crate) fn is_folded_name(name: &str) -> bool {
     !name.bytes().any(|b| b.is_ascii_uppercase())
 }
 
-/// Compaction pins every dynamic column in postgres before writing the
-/// parquet that carries it, and an over-long name overflows the btree key
-/// behind `field_types.field`: the insert errors, and the same WAL re-fails
-/// on every tick, permanently, for that service.
+/// Compaction pins every dynamic column in postgres before writing its
+/// parquet, and an over-long name would overflow the btree key behind
+/// `field_types.field`: without this drop, the same WAL would re-fail on
+/// every tick, permanently, for that service.
 fn drop_unstorable_names(out: &mut Map<String, Value>, changes: &mut Vec<FieldChange>) -> bool {
     let unstorable: Vec<String> = out
         .keys()
@@ -791,7 +791,8 @@ fn capture_raw(
 ///    profile overrides that too, and before the validators, so an asserted
 ///    `service`/`env` faces exactly the checks an HTTP sender's does.
 /// 3. `service` validation (reject path), `env` and `host` resolution,
-///    after the strip. Resolving first would let step 6 overwrite the
+///    after the strip, because a stripped `_env`/`_host` lands on the bare
+///    slot these read. Resolving first would let step 6 overwrite the
 ///    stripped value and then confess `env.defaulted`/`host.from_peer`
 ///    about a sender that did assert one.
 /// 6. `env` default-or-reject, `host` peer-fill / relay-reject / omit.

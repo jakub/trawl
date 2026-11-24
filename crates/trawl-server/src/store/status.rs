@@ -4,8 +4,8 @@
 
 //! Report-run / query-history status domain, and how a report run started.
 //!
-//! `running` is report-run only — query history never records it; the
-//! CHECK enforces the narrower history domain.
+//! `running` is report-run only — query history never records it;
+//! `query_history_status_check` enforces the narrower history domain.
 
 use std::str::FromStr;
 

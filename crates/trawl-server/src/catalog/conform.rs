@@ -599,7 +599,8 @@ pub(crate) fn open_bounded_connection(
 }
 
 /// Enumerate every parquet file under the data root (hourly + daily
-/// rollups, skipping `scheduled/`) and describe each.
+/// rollups, skipping `scheduled/`) and describe each readable one. A path
+/// that is unreadable, foreign, claimed or deferred is skipped and counted.
 ///
 /// `claims` is the publication marker scan and `rollups` the day
 /// directories deferred behind a rollup ([`rollup_deferred_days`]). An `Err`

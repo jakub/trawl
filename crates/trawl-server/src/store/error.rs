@@ -83,10 +83,10 @@ pub enum StoreError {
     )]
     PurgeCommitUnknown,
 
-    /// Postgres bounds each statement itself, but a connection that stops
-    /// answering mid-statement is invisible to a database-side timeout. The purge
-    /// holds the corpus gate, and every compaction batch queues behind that, so
-    /// the wait is bounded here as well.
+    /// Postgres bounds each pre-commit statement itself, but a connection that
+    /// stops answering mid-statement is invisible to a database-side timeout. The
+    /// purge holds the corpus gate, and every compaction batch queues behind that,
+    /// so the wait is bounded here as well.
     #[error(
         "the field-catalog pin purge gave up waiting on the database before it \
          committed; nothing was reclaimed"

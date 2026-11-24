@@ -340,7 +340,6 @@ async fn patch_sends_the_expected_sequence_and_one_field() {
     assert_eq!(decoded.unwrap(), answer);
 }
 
-/// An overwrite that committed never reads as too large.
 #[tokio::test]
 async fn a_patch_answer_with_full_activity_past_64_kib_decodes() {
     let answer = closed_at_5(Some(Activity {

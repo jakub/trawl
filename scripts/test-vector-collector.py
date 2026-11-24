@@ -842,7 +842,7 @@ def capture_recipe():
                   f"{len(raw)} bytes")
 
         # Each message is mostly two-byte characters, so a cap that
-        # counted characters instead of bytes would pass the limit.
+        # counted characters instead of bytes would pass the byte limit.
         requests.clear()
         with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
             directory = Path(name)
@@ -928,8 +928,8 @@ def capture_recipe():
             print(f"PASS capture refuses a Vector without vector config: exit {result.returncode}, "
                   f"names {PINNED_PACKAGE}, {len(requests)} requests, empty capture")
 
-        # `sudo` runs nothing, so the block only prepares the copy, and no host
-        # journal is read.
+        # The stubbed `sudo` runs nothing, so the block only prepares the copy,
+        # and no host journal is read.
         with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
             directory = Path(name)
             live = directory / "vector.d"

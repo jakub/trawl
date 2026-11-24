@@ -9,9 +9,6 @@
 //! does not follow control flow either: a top-level write counts as
 //! unconditional even when an earlier `return` can skip it and send the
 //! source event on as it came. No shipped remap returns early.
-//!
-//! A closure that assigns nothing cannot change the gated variable (VRL
-//! closures can assign to the variables around them).
 
 use std::collections::BTreeSet;
 
@@ -225,7 +222,9 @@ fn path_end(tokens: &[Token], mut j: usize) -> usize {
 }
 
 /// From token `k`, exactly `filter(.) -> |a, b| { ... }` ending its
-/// statement. The closure's tokens are still scanned for writes of their own.
+/// statement, whose closure assigns nothing, not even a local: VRL closures
+/// can assign to the variables around them, such as the gated `service`.
+/// The closure's tokens are still scanned for writes of their own.
 fn filters_the_event(tokens: &[Token], k: usize) -> bool {
     let head = matches!(tokens.get(k).map(|t| &t.tok), Some(Tok::Ident(f)) if f == "filter")
         && is_punct(tokens, k + 1, "(")

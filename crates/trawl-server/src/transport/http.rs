@@ -10,8 +10,9 @@
 //! `graceful_shutdown` per connection so idle keep-alives close instead of
 //! waiting out the drain timeout.
 //!
-//! The listener speaks HTTP/1.1 only, and holds every connection to the
-//! fixed deadlines in [`ConnectionTimeouts`] (ADR-0054).
+//! The listener speaks HTTP/1.1 only, and holds each connection's TLS
+//! handshake and request headers to the fixed deadlines in
+//! [`ConnectionTimeouts`] (ADR-0054).
 
 use std::any::Any;
 #[cfg(any(test, feature = "test-support"))]

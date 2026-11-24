@@ -136,8 +136,8 @@ where
     }));
 }
 
-/// Unmetered failure events the WAL layer persists per fixed one-minute
-/// window, across the whole process (ADR-0040).
+/// The most unmetered failure events the WAL layer persists per fixed
+/// one-minute window, across the whole process (ADR-0040).
 pub const UNMETERED_FAILURE_CAP_PER_MINUTE: u32 = 60;
 
 const UNMETERED_FAILURE_WINDOW: Duration = Duration::from_mins(1);
@@ -169,10 +169,10 @@ impl UnmeteredFailureCap {
     }
 }
 
-/// A predicate on top of the resolved directives rather than an appended
-/// `fleet_auth=off` directive: `EnvFilter` resolves by specificity, so an
-/// operator `RUST_LOG` naming `fleet_auth::middleware=info` would outrank
-/// an appended target-level `off` and quietly restore the amplifier.
+/// Applied by [`WalLayer`] on top of the resolved directives, not as an
+/// appended `fleet_auth=off` directive: `EnvFilter` resolves by specificity,
+/// so an operator `RUST_LOG` naming `fleet_auth::middleware=info` would
+/// outrank an appended target-level `off` and quietly restore the amplifier.
 #[must_use]
 pub fn is_persisted_target(target: &str) -> bool {
     target == UNMETERED_FAILURE_TARGET
@@ -197,9 +197,9 @@ pub struct ResolvedLogFilter {
     pub parse_error: Option<String>,
 }
 
-/// The warning never carries the raw environment value: it may contain
-/// anything, pasted secrets included, and the warning is persisted as
-/// telemetry.
+/// The warning for an unparseable `RUST_LOG` never carries its value: it
+/// may contain anything, pasted secrets included, and the warning is
+/// persisted as telemetry.
 ///
 /// Takes the env value as a parameter so it is unit-testable without
 /// mutating process env (`unsafe_code = "forbid"`).
@@ -328,8 +328,6 @@ impl WalHandle {
         Self(Arc::new(OnceLock::new()))
     }
 
-    /// Inject the WAL writer and the env telemetry events land under
-    /// (`default_env`).
     pub fn set(&self, writer: Arc<WalWriter>, env: &str) {
         let _ = self.0.set((writer, env.into()));
     }
@@ -720,9 +718,9 @@ impl WalLayerInner {
 
     /// The pre-init cap: while the writer is not yet set, the active
     /// buffer is the only place events can go, so it is bounded on its own.
-    /// Bytes are estimated from the mean buffered line size, because the drop
-    /// happens before serialization and the telemetry-disabled path (where the
-    /// writer is never injected) must stay cheap.
+    /// A shed event's bytes are estimated from the mean buffered line size:
+    /// it is shed before serialization, and the telemetry-disabled path (where
+    /// the writer is never injected) must stay cheap.
     fn shed_at_preinit_cap(&self) -> bool {
         const PRE_INIT_CAP: usize = 1024 * 1024;
         if self.handle.get().is_some() {
@@ -988,7 +986,7 @@ impl WalLayerInner {
 
     /// The caller holds the publication read guard from before WAL writing,
     /// and `reservation` is the hot-buffer space admitted for this exact
-    /// batch; the insert consumes it.
+    /// batch; the hot-buffer insert consumes it.
     fn publish(
         &self,
         env: &str,

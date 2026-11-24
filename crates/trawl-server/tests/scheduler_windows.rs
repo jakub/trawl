@@ -863,9 +863,9 @@ async fn a_materialize_failure_is_loud_and_leaves_the_cursor() {
     assert_eq!(h.cursor(sq).await, (t0(), Some(at(hours(-1)))));
 }
 
-/// The texts are planted straight in the column, below the write-time gate,
-/// because that is how they reach a scheduler after an upgrade: they were
-/// saved by a release that accepted them.
+/// The refused texts are planted straight in the column, below the
+/// write-time gate, because that is how they reach a scheduler after an
+/// upgrade: they were saved by a release that accepted them.
 ///
 /// The expression grammar spells equality `==`, so the aggregate texts use
 /// a comparison the parser accepts and reach the position check, not a
@@ -1547,7 +1547,7 @@ const MANUAL_RUN_BUSY: &str =
 
 const NGINX_DSL: &str = "service=nginx | stats count()";
 
-/// Its hourly schedule fires a day out, so no tick claims it.
+/// The net's hourly schedule fires a day out, so no tick claims it.
 async fn server_net(
     server: &common::TestServer,
     key_id: i64,

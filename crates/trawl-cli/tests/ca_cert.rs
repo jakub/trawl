@@ -272,7 +272,8 @@ async fn pinned_ca_refuses_plain_http() {
 
 /// Every other test here uses a CA no platform store trusts, so a pin that
 /// merged its roots into the platform store would pass them all. On Linux
-/// the platform store reads only `SSL_CERT_FILE` when the variable is set.
+/// the platform store (`rustls-platform-verifier` under the workspace's
+/// reqwest features) reads only `SSL_CERT_FILE` when the variable is set.
 /// The process environment must not be mutated, so the clients run in a
 /// re-executed copy of this test with the variable set on its `Command`.
 #[cfg(target_os = "linux")]

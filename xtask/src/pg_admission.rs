@@ -2,9 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `cargo xtask pg-admission-guard` — prove that every pg-touching test in
-//! the workspace runs inside the `postgres` nextest group (ADR-0021
-//! ruling 4).
+//! `cargo xtask pg-admission-guard` — check that every test a source scan
+//! finds touching postgres runs inside the `postgres` nextest group
+//! (ADR-0021 ruling 4).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -479,7 +479,7 @@ fn path_prefix(source_root: &Path, file: &Path) -> String {
 /// first, and [`unit_files`] decides target ownership on the lexical path.
 ///
 /// A ROOT that does not exist is an empty sweep, by design: a bin whose source
-/// is a single file has none.
+/// is a single file has no sweep directory.
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     match fs::symlink_metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -574,8 +574,9 @@ fn scan(files: &[(SourceFile, FileFacts)], root: &Path, scope: Scope) -> Vec<Evi
                 });
             }
         } else {
-            // A test fn's own body counts too: a `#[test]` or `#[tokio::test]` written
-            // at a `src/` file's top level, under no `#[cfg(test)]` at all.
+            // A test fn's own body counts too, so a `#[test]` or
+            // `#[tokio::test]` at a `src/` file's top level, under no
+            // `#[cfg(test)]`, is still scanned.
             for span in facts.cfg_test_spans.iter().chain(&facts.test_fn_spans) {
                 if let Some((line, api)) = connection_site(facts, span.0, span.1) {
                     evidence.push(Evidence {

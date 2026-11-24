@@ -4,10 +4,10 @@
 
 //! Over-budget DSL never reaches `DuckDB` (ADR-0024).
 //!
-//! The counter is process-global, so every test in this file takes one
-//! lock: the positive controls deliberately bind, and under the plain
-//! `cargo test` harness, where these run as threads of one process, a
-//! concurrent refusal case must not see its increment.
+//! `prepare_probe`'s statement counter is process-global, so every test
+//! in this file takes one lock: the positive controls deliberately bind,
+//! and under the plain `cargo test` harness, where these run as threads
+//! of one process, a concurrent refusal case must not see its increment.
 
 mod common;
 

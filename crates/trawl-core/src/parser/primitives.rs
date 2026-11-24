@@ -82,9 +82,9 @@ pub(crate) fn quoted_string<'src>()
     quoted_string_reported().map(|(s, _)| s).boxed()
 }
 
-/// A payload: the backslash pair rides along, and
-/// [`crate::parser::comment::message_for`] puts a display-safe rendering
-/// of it into the message.
+/// A payload's message: the backslash pair rides along, and
+/// [`crate::parser::comment::message_for`] splices a display-safe rendering
+/// of it in after the opening `unknown escape`.
 pub(crate) const MSG_UNKNOWN_ESCAPE: &str =
     "unknown escape: a quoted string decodes only \\\\, \\\", \\n, \\t and \\r";
 
@@ -527,10 +527,9 @@ enum Checked {
     Recorded { units: u64 },
 }
 
-/// Why a pattern is refused before anything builds it, in the order every
-/// pattern site shares (ADR-0063). The class check is a regex body's alone:
-/// the batch lane runs a glob, `like` or `ilike` operand as `DuckDB`'s GLOB,
-/// LIKE or ILIKE, never RE2.
+/// The checks run in the order every pattern site shares (ADR-0063). The
+/// class check is a regex body's alone: the batch lane runs a glob, `like`
+/// or `ilike` operand as `DuckDB`'s GLOB, LIKE or ILIKE, never RE2.
 fn pattern_refusal(kind: PatternKind, text: &str) -> Result<Checked, String> {
     let body = match kind {
         PatternKind::Regex => Some(regex_syntax(text)?),

@@ -7,11 +7,10 @@
 use trawl_api::display::{timestamp_cell_text, value_to_string};
 use trawl_api::value::{ColumnType, Value};
 
-/// The CLI and the TUI drop the fraction's trailing zeros
-/// ([`timestamp_cell_text`]); the browser pads the fraction to at
-/// least milliseconds instead, so the digits line up down a column.
-/// Display only: a filter built from a cell keeps the wire text, which
-/// names the instant exactly.
+/// A `timestamp` column's fraction is padded to at least milliseconds, so
+/// the digits line up down a column; the CLI and the TUI drop its trailing
+/// zeros ([`timestamp_cell_text`]). Display only: a filter built from a
+/// cell keeps the wire text, which names the instant exactly.
 #[must_use]
 pub fn cell_text(ty: Option<&ColumnType>, value: &Value) -> String {
     ty.and_then(|ty| millis_cell_text(ty, value))

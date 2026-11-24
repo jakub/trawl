@@ -4,7 +4,7 @@
 
 // The harness serves a private copy of the trunk dist, never the build
 // directory itself. Any `trunk serve` running from the same checkout
-// rebuilds it on every save:
+// rebuilds that directory on every save, so serving it live breaks:
 //
 //   * a rebuild that lands mid-run replaces the hashed wasm index.html
 //     names, so the next navigation fails;

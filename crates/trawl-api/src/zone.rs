@@ -337,8 +337,6 @@ pub fn present(wire: &str, zone: DisplayZone) -> Option<Presented> {
     })
 }
 
-/// `wire` as a terminal table shows it in `zone`
-/// (`2026-10-25 02:30:00 +02:00`), each instant with its own offset.
 #[must_use]
 pub fn present_human(wire: &str, zone: DisplayZone) -> Option<String> {
     let micros = wire_micros(wire)?;
@@ -386,9 +384,6 @@ fn cell_text(ty: &ColumnType, value: &Value, zone: DisplayZone) -> String {
     }
 }
 
-/// Re-spell every `timestamp` cell of `result`, in lists at any depth too,
-/// in `zone`, for machine output such as JSON and CSV.
-///
 /// An instant the zone cannot place keeps its UTC text, which says so
 /// with its `Z`; machine output carries no marker a parser would trip on.
 pub fn apply_zone(result: &mut QueryResult, zone: DisplayZone) {

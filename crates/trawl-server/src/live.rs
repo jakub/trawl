@@ -261,8 +261,9 @@ where
     answered.await.ok()
 }
 
-/// A batch whose events have all run is closed before the cap is read again,
-/// so its threshold snapshot stays at its end.
+/// A batch whose events have all run is closed before the frame cap
+/// ([`LIVE_JOB_FRAME_BYTES`]) is read again, so its threshold snapshot stays
+/// at its end.
 fn run_job<C: Fn() -> EvalContext>(state: &mut LiveState, work: Work, clock: &C) -> JobOutput {
     let mut out = JobOutput::default();
     match work {
@@ -371,8 +372,9 @@ impl JobOutput {
     }
 }
 
-/// It never waits for more. A batch the chunk ends inside is left in `carry`,
-/// so at most one partly read batch is held.
+/// Gathers one chunk and never waits for an event that has not arrived. A
+/// batch the chunk ends inside is left in `carry`, so at most one partly
+/// read batch is held.
 fn gather<S: EventSubscriber>(
     subscriber: &mut S,
     start: Carry,

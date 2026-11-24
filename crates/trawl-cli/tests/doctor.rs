@@ -508,8 +508,8 @@ fn recorder_counts_a_keyed_request() {
     assert_eq!(seen.authorization_headers, 1, "{seen:?}");
 }
 
-/// clap never reads these variables for `doctor`, so a value it would reject
-/// (a non-bool `TRAWL_INSECURE`) is refused by name like any other.
+/// clap never reads the ambient `TRAWL_*` variables for `doctor`, so a value
+/// it would reject (a non-bool `TRAWL_INSECURE`) is refused by name too.
 #[test]
 fn doctor_refuses_ambient_env() {
     const PLANTED: &str = "flt_plantedambientvalue";
@@ -1773,9 +1773,9 @@ fn doctor_redacts_the_key_from_remote_fields() {
 
 /// A server that splits the key into pieces too short to redact (7
 /// characters, one fewer than the shortest redacted run), one per
-/// permission, gets none of them into the report. The key base64-encoded
-/// in the name is not caught, bounded by the cap, and this test pins it
-/// rather than promising otherwise.
+/// permission, gets none of them into the report. The name is shown as
+/// sent, capped at 32 characters, so the key base64-encoded in it is not
+/// caught; this test pins that rather than promising otherwise.
 #[test]
 fn doctor_identity_shows_only_trawl_vocabulary() {
     let fragments: Vec<String> = PROFILE_TOKEN

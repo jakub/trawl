@@ -131,9 +131,10 @@ pub(crate) fn walk_wal(
     Some(WalWalk { unlisted, claims })
 }
 
-/// Every other entry is counted here: `claimed`, `unlisted` and non-writer
-/// names as `undecodable`. Candidates beyond the bound set `bound_hit` and
-/// are not counted.
+/// Keep the oldest `bound` writer-named candidates. Every other entry is
+/// counted here: `claimed`, `unlisted` and non-writer names as
+/// `undecodable`. Candidates beyond the bound set `bound_hit` and are not
+/// counted.
 fn list(
     wal_dir: &Path,
     bound: usize,

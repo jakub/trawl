@@ -77,9 +77,6 @@ pub struct ResultsState {
 /// whose row's insert has not been decided (ADR-0057). The sweep never
 /// unlinks the file of one, however long its insert takes
 /// ([`sweep::sweep`]).
-/// One whose fence failed too stays through its grace
-/// ([`service::COMMIT_GRACE`]), so no sweep judges its file while the row
-/// may still land.
 #[derive(Debug, Default)]
 pub struct InFlight(Mutex<HashSet<String>>);
 

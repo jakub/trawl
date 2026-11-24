@@ -88,7 +88,7 @@ pub fn role_create_args(key: TrialKey) -> Args {
     fleet_admin(args)
 }
 
-/// Run it sealed: stdout is the token.
+/// Run `keys create` sealed: stdout is the token.
 pub fn key_create_args(key: TrialKey) -> Args {
     fleet_admin(Args::new().args([
         "keys",
@@ -102,7 +102,7 @@ pub fn key_create_args(key: TrialKey) -> Args {
     ]))
 }
 
-/// The table holds prefixes, so never show its stdout.
+/// The `keys list` table holds prefixes, so never show its stdout.
 pub fn keys_list_args() -> Args {
     fleet_admin(Args::new().args(["keys", "list"]))
 }

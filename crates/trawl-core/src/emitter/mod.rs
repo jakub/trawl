@@ -2631,9 +2631,9 @@ mod tests {
         );
     }
 
-    /// The set is a single run here on purpose: a multi-run set repeats
-    /// the subject, which is out of contract
-    /// (see [`severity_subjects_never_push_parameters`]).
+    /// The set is a single run here on purpose: a multi-run set repeats the
+    /// subject, and repeating one that carries `?` placeholders is out of
+    /// contract (see [`severity_subjects_never_push_parameters`]).
     #[test]
     fn a_severity_set_pushes_no_parameters_and_preserves_positions() {
         let mut state =

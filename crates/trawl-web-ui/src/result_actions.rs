@@ -7,9 +7,9 @@ use std::{cmp::Ordering, collections::HashSet};
 use trawl_api::value::Value;
 use trawl_core::{ast::PipeStage, schema::catalog_key};
 
-/// This is the only list of that set. Result provenance
-/// ([`Capabilities::for_query`]) and the categorical chart and group links
-/// (`crate::categorical`) all read it.
+/// The only list of the stages that leave every column name meaning what
+/// it meant. Result provenance ([`Capabilities::for_query`]) and the
+/// categorical chart and group links (`crate::categorical`) all read it.
 pub(crate) fn passes_names_through(stage: &PipeStage) -> bool {
     match stage {
         PipeStage::Where(_)

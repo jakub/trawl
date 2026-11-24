@@ -1,5 +1,6 @@
 [env]
-# trawl-core's build script prepares the checksum-verified shared runtime.
+# trawl-core's build script prepares the checksum-verified shared runtime for
+# native builds.
 # libduckdb-sys must not download or select a host copy.
 DUCKDB_DOWNLOAD_LIB = "0"
 DUCKDB_NO_PKG_CONFIG = { value = "1", force = true }

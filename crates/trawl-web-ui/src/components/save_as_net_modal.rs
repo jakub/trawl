@@ -24,7 +24,7 @@ pub fn SaveAsNetModal(
     /// Search captures an editor buffer; History supplies a recorded query instead.
     #[prop(optional)]
     from_editor: bool,
-    /// The bool is `true` on save, `false` on cancel.
+    /// `true` after a successful save, `false` on cancel.
     on_close: Callback<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();

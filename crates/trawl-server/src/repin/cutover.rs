@@ -77,8 +77,8 @@ pub(crate) fn swap_envs(data_dir: &Path, shadow: &Path, aside: &Path) -> Result<
 }
 
 /// [`check_staging_filesystem`](crate::repin::marker::check_staging_filesystem)
-/// refuses a job that would meet either failure, but a marker written before
-/// the volume was mounted still replays here at every boot.
+/// refuses a job that would meet `EXDEV` or `EBUSY`, but a marker written
+/// before the volume was mounted still replays here at every boot.
 fn cross_device_hint(e: &std::io::Error) -> &'static str {
     match e.kind() {
         std::io::ErrorKind::CrossesDevices => {

@@ -65,10 +65,10 @@ const MAX_PIN_NESTING: usize = 32;
 
 /// The SQL filter still decides every row, so a pin only has to name each
 /// file a matching row can be in.
-/// Each name is interpolated verbatim into a single-quoted glob entry, so
-/// the final set must pass the same `is_valid_service_name` predicate
-/// ingest enforces, rather than being allowed to close one path and
-/// open another.
+///
+/// Each name is interpolated verbatim into a single-quoted glob entry, so a
+/// set holding a name `is_valid_service_name` refuses reads every service: a
+/// quote or slash in a name could close one path and open another.
 fn service_pins(search: &SearchStage) -> Services {
     match disjunction_pins(&search.groups, 0) {
         Some(services)

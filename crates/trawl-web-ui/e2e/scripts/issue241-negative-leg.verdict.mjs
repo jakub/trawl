@@ -3,9 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // Observed outcome of one leg of issue241-negative-leg.sh, read from
-// Playwright's JSON report: `pass`, `fail`, or `inconclusive`. The
-// excerpt quotes neighbouring lines, so an unrelated error one line up still
-// contains the assertion's label and must not count.
+// Playwright's JSON report: `pass`, `fail`, or `inconclusive`. A `fail`
+// reads only the message header, cut before the source excerpt: the excerpt
+// quotes neighbouring lines, so an unrelated error one line up still
+// contains the assertion's label and must not count as a `fail`.
 //
 // Usage:
 //   node issue241-negative-leg.verdict.mjs REPORT EXIT_STATUS OUT

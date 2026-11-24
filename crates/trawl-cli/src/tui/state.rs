@@ -415,10 +415,10 @@ pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<Commo
     common
 }
 
-/// The bounds are text. Text of one timestamp shape orders as the instants do.
-/// Text of two shapes does not: a UTC and a local sample name different
-/// instants, and a timestamp beside an integer (one service mid-repin) is no
-/// range at all.
+/// The bounds are text. Text of one server-rendered timestamp shape orders as
+/// the instants do; text of two does not: a UTC and a local sample name
+/// different instants, and a timestamp beside an integer (one service
+/// mid-repin) is no range at all. Other fields keep the text comparison.
 fn fold_common_bound(
     bound: &mut Option<String>,
     dropped: &mut bool,

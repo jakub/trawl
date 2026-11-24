@@ -2,8 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Regression guard for ADR-0027: `search_url::mode_query` is the ONE place
-//! either DSL is produced.
+//! Regression guard for ADR-0027: nothing under `src` names
+//! `effective_query` or `live_query`; the shell reaches a DSL only through
+//! `search_url::mode_query`.
 
 use std::fs;
 use std::path::{Path, PathBuf};

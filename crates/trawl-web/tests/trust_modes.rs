@@ -30,8 +30,8 @@ fn fleet_dev_process<'a>(manifest: &'a toml::Table, name: &str) -> &'a toml::Tab
         .unwrap_or_else(|| panic!("fleet-dev.toml declares no {name} process"))
 }
 
-/// Neither side expands `~` here: fleet-dev passes the value through
-/// literally and `trawl-web` expands it, as trawld expands the data path.
+/// The paths compare unexpanded: fleet-dev passes the value through
+/// literally, and `trawl-web` expands `~` as trawld expands the data path.
 #[test]
 fn fleet_dev_pins_the_dev_certificate() {
     let manifest: toml::Table = read("fleet-dev.toml")

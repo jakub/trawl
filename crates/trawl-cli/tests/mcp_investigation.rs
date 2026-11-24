@@ -466,7 +466,8 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
     server.stop().await;
 }
 
-/// trawld sends at most 50 entries with `more`.
+/// One answer carries at most 50 activity entries, then `more`, so `NOTES`
+/// needs a continued read.
 #[tokio::test(flavor = "multi_thread")]
 async fn activity_past_one_answer_continues_and_prints_every_entry_once() {
     const NOTES: usize = 60;

@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // `--dist` picks the `dist/` the stub serves, so the same steps run
-// against a checkout that predates the conversion: a step that cannot
+// against a checkout that predates the native controls: a step that cannot
 // find its control records that rather than failing.
 //
 // Usage, from the repo root:
@@ -33,7 +33,7 @@ function arg(name, fallback) {
 const LABEL = arg('label', 'after');
 const OUT = path.resolve(arg('out', path.join(ROOT_DIR, 'visual-evidence', 'issue-161', 'captures', LABEL)));
 const DIST = arg('dist', null);
-// A spare port, away from the suite's 8123 and the other capture's 8129.
+// A spare port, away from the suite's 8123 and capture-native-controls.mjs's 8129.
 const PORT = Number(process.env.E2E_PORT ?? 8131);
 const BASE = `http://127.0.0.1:${PORT}`;
 const VIEWPORT = { width: 1440, height: 900 };
@@ -154,9 +154,9 @@ async function run() {
 }
 
 async function capture(context) {
-  // The corpus query fixture carries no `degraded_fields`, the only thing
-  // that renders the results notice. Adding it at the network edge keeps
-  // the fixture (and every spec reading it) alone.
+  // The corpus query fixture carries no `degraded_fields`, the only field
+  // that renders the notice with the `.deg-x` dismiss button. Adding it at
+  // the network edge keeps the fixture (and every spec reading it) alone.
   await context.route('**/api/v1/query', async (route) => {
     const res = await route.fetch();
     let body;
@@ -251,8 +251,8 @@ async function capture(context) {
   });
 
   if (await present(page, '.facets', 8000)) {
-    // Written into the DOM rather than the fixture: a 200-character
-    // hostname would change every other picture here.
+    // The overlong value is written into the DOM rather than the fixture:
+    // a 200-character hostname would change every other picture here.
     const firstValue = page.locator('.facets .g .vals .v .n').first();
     if ((await firstValue.count()) > 0) {
       await firstValue.evaluate((el) => {

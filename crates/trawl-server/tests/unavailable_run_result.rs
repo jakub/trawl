@@ -378,8 +378,8 @@ mod unavailable_run_result {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
     /// The run is PLANTED rather than triggered: an ordinary event query
-    /// cannot run under this `data_dir` at all, so a real report run here
-    /// would record zero rows and no parquet file.
+    /// cannot run under a `data_dir` the emitter's glob validator refuses, so
+    /// a real report run here would record zero rows and no parquet file.
     async fn server_on_odd_data_dir(leaf: &str) -> (TestServer, std::path::PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().to_path_buf();

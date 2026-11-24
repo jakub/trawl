@@ -2,10 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! App namespace, role-name, and permission-string validation. They mirror the
-//! CHECK constraints on the `roles` / `role_permissions` /
-//! `app_permissions` tables.
-
 use crate::error::AuthError;
 
 pub const TRAWL_APP: &str = "trawl";
@@ -54,9 +50,9 @@ pub fn validate_app_namespace(app: &str) -> Result<(), AuthError> {
     )
 }
 
-/// The hyphen is the one charset difference from app namespaces and
-/// permission strings: role names are `<app>-<role>` (`trawl-admin`,
-/// `coastwatch-analyst`). Mirrors the `roles_name_format` CHECK.
+/// Role names alone allow a hyphen, for the `<app>-<role>` convention
+/// (`trawl-admin`), which this check does not enforce. Mirrors the
+/// `roles_name_format` CHECK.
 pub fn validate_role_name(role: &str) -> Result<(), AuthError> {
     validate_identifier(
         role,

@@ -6,7 +6,7 @@
 //!
 //! `validate` with a token goes to the server, so a success proves the URL,
 //! the token, and the CA all came from the trial directory; a refusal
-//! proves nothing was sent.
+//! proves no request was sent.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};

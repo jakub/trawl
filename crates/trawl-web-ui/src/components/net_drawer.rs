@@ -1018,8 +1018,10 @@ use crate::run_read::RunRead;
 enum RunPreview {
     Available(Box<trawl_api::ReportRunResponse>),
     Unavailable(String),
-    /// Like [`Self::Unavailable`] it travels as a successful outcome that
-    /// ends the poll: the same read spends the same budget again.
+    /// A read refused for using up the memory or scratch space trawld gives
+    /// queries (`query_resource_exhausted`). Like [`Self::Unavailable`] it
+    /// travels as a successful outcome that ends the poll: the same read
+    /// would spend the same budget again.
     Exhausted(String),
 }
 

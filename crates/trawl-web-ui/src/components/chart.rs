@@ -149,8 +149,8 @@ enum Outcome {
 }
 
 /// Line has a live legend; a bar canvas does not (`legend: { show:
-/// !bars }` in `vendor/src/uplot.ts`), so without this the chart is a
-/// picture with no text representation at all.
+/// !bars }` in `vendor/src/uplot.ts`), so without this note the chart is
+/// a picture with no text representation at all.
 fn groups_note(ty: ChartType, metric: &str, group: &str, drawn: usize) -> String {
     let noun = if drawn == 1 { "group" } else { "groups" };
     format!(

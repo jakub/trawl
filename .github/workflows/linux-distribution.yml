@@ -59,7 +59,8 @@ jobs:
     steps:
       # Both SHAs are free-form inputs, and this job saves default-branch
       # caches that later builds restore. Refuse any commit main does not
-      # contain before a checkout can run its code.
+      # contain before a checkout can run its code. Pull requests skip it:
+      # they build unmerged commits and save no cache.
       - name: Refuse source or tooling that is not on main
         if: github.event_name != 'pull_request'
         env:

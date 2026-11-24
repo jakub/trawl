@@ -1929,8 +1929,9 @@ async fn pinned_varchar_comparisons_behave_over_http() {
         "cold '404' plus hot '500'"
     );
 
-    // `read_json` types the column from the whole batch, so the fractional
-    // sibling widens it to DOUBLE and `200` is stored as the text "200.0".
+    // Under the VARCHAR pin: `read_json` types the column from the whole
+    // batch, so the fractional sibling widens it to DOUBLE and `200` is
+    // stored as the text "200.0".
     let numeric: Vec<serde_json::Value> = [json!(200), json!(200.5)]
         .iter()
         .map(|n| {

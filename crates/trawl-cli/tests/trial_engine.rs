@@ -443,8 +443,8 @@ impl Engine {
     }
 }
 
-/// Port 0 names no port: its bind test passes on an ephemeral port, and
-/// the trial would record 0 and print addresses nothing listens on.
+/// Port 0 names no port: its bind check would pass on an ephemeral port,
+/// and the trial would record 0 and print addresses nothing listens on.
 #[test]
 fn up_refuses_port_zero() {
     for (zero, other) in [("--api-port", "--web-port"), ("--web-port", "--api-port")] {

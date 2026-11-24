@@ -112,7 +112,7 @@ pub fn syslog_to_payload<S: BuildHasher>(
 
     // The timestamp artifact, canonicalized to the envelope's spelling so
     // the profile's fixed `_time` source can read it. Omitted when the
-    // frame carried none: substituting `Utc::now()` here would make an
+    // frame named no instant: substituting `Utc::now()` here would make an
     // absent frame timestamp indistinguishable from a present one and hide
     // `time.from_ingest` from `_repairs`.
     if let Some(ts) = msg.timestamp {

@@ -671,8 +671,8 @@ const ORDER: &[(&str, &str)] = &[
     ),
 ];
 
-/// A same-stage chain over the lateral-expansion budget at 513
-/// (`tests/complexity_parity.rs`), with a bad call after it.
+/// 513 references, one over the lateral-expansion budget
+/// (`tests/complexity_parity.rs`), then a bad call.
 fn over_budget_with_a_bad_call() -> String {
     let args = vec!["x"; 513].join(", ");
     format!("* | let x = abs(y), z = coalesce({args}) | let r = nosuchfn(x)")

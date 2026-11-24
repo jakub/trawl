@@ -444,8 +444,8 @@ verdict_line() { # verdict_line <daemon pid>
 }
 
 # Wait until the daemon has published that verdict, and only then read anyone's
-# capability masks. `systemctl is-active` and the monitor's existence both come
-# BEFORE the parent has dropped CAP_SYS_PTRACE (ADR-0023 ruling 4).
+# capability masks. `systemctl is-active` and the monitor's existence can both
+# hold BEFORE the parent has dropped CAP_SYS_PTRACE (ADR-0023 ruling 4).
 wait_verdict() { # wait_verdict <daemon pid>
   if wait_for "$VERDICT_WAIT_SECS" "trawld logged its crash-dump verdict" \
     "[[ -n \$(verdict_line $1) ]]"; then
@@ -773,9 +773,9 @@ wait_for "$ACTIVE_WAIT_SECS" "trawl-web is-active=active" \
   "[[ \$(docker exec $NODE systemctl is-active trawl-web 2>/dev/null) == active ]]" \
   || { docker exec "$NODE" journalctl -u trawl-web --no-pager -n 20 || true
        die "trawl-web did not start; the mask may be hiding web.cookie or $WEB_UPSTREAM_CA"; }
-# Type=simple reports active on exec. trawl-web exits when the cookie or the
-# pinned certificate read fails, except a certificate that is not there: then
-# it logs upstream_ca_pending and keeps running.
+# Type=simple reports active on exec. trawl-web reads the cookie and the pinned
+# certificate at startup and exits when either read fails, except a certificate
+# that is not there: then it logs upstream_ca_pending and keeps running.
 sleep 3
 [[ "$(nshq "systemctl is-active trawl-web")" == "active" ]] \
   || { docker exec "$NODE" journalctl -u trawl-web --no-pager -n 20 || true

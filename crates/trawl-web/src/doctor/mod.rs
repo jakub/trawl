@@ -90,9 +90,9 @@ impl WebCheck {
         }
     }
 
-    /// Only the cookie key asserts access, and only for a `cookie_secret_path`
-    /// file: its row carries [`Row::access`], and a root run reports that
-    /// row's `complete` as `not_sampled`, reason `ran_as_root`.
+    /// Only the cookie key may assert access, and only its row for a
+    /// `cookie_secret_path` file carries [`Row::access`]; a root run reports
+    /// that row's `complete` as `not_sampled`, reason `ran_as_root`.
     #[must_use]
     pub const fn is_access(self) -> bool {
         matches!(self, Self::CookieKey)
@@ -917,7 +917,7 @@ mod tests {
     }
 
     /// The hook is process-global, so another test panicking meanwhile may
-    /// add lines; each must be the fixed one.
+    /// add lines; each must be the fixed line.
     #[test]
     fn the_panic_hook_prints_only_a_fixed_line() {
         use std::sync::{Arc, Mutex};

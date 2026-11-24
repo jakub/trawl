@@ -672,7 +672,7 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
     }
 }
 
-/// Each is a slice of `DashboardSnapshot`: the
+/// A capacity fixture is a slice of `DashboardSnapshot`: the
 /// capacity object with the Parquet and WAL fields it was assembled
 /// beside, because the card reads the Parquet measurement and the
 /// producer derives reach from both measurements.
@@ -1996,9 +1996,6 @@ const INVESTIGATION_READ: &str = include_str!("../e2e/harness/wire/investigation
 const RESULT_PAGE_EVIDENCE: &str = include_str!("../e2e/harness/wire/result-page-evidence.json");
 const RESULT_GONE: &str = include_str!("../e2e/harness/wire/result-gone.json");
 
-/// The read is
-/// internally consistent the way the server writes it, so a page that
-/// trusts the sequence fields reads it as a real one.
 #[test]
 fn the_investigation_fixtures_are_one_consistent_board() {
     let list: InvestigationList = decode("investigations-list.json", INVESTIGATIONS_LIST);
@@ -2325,10 +2322,6 @@ fn the_write_conflicts_are_trawlds_409s() {
 
 const CAPTURE_ATTACHED: &str = include_str!("../e2e/harness/wire/capture-attached.json");
 
-/// The answer to Send to investigation, as the stub fills it
-/// (`harness/server.mjs` `captureAttached`). The stub pages those rows
-/// under this result's metadata, so its columns are the rows' columns,
-/// in order and type.
 #[test]
 fn the_attached_capture_keeps_the_rows_search_showed() {
     let capture: trawl_api::results::CaptureResponse =

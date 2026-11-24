@@ -1076,8 +1076,6 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// A terminal too small to hold the popup must not panic: the cursor
-    /// clamp is the arithmetic that would.
     #[test]
     fn render_schedule_popup_on_a_tiny_terminal() {
         use crate::tui::state::ScheduleForm;

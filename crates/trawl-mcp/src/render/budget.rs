@@ -338,7 +338,6 @@ fn most_entries<R: Fit>(
     Some(best)
 }
 
-/// The session counts as seen only what the fitted reply prints (ADR-0059).
 fn most_activity<R: Fit>(
     reply: &R,
     rows: usize,
@@ -669,8 +668,8 @@ pub(crate) fn follow_cell_cut(reply: &mut ReadReply, original_next: Option<u64>)
     ensure_continuation(&mut reply.next_actions, continuation);
 }
 
-/// When the calls are at [`MAX_NEXT_ACTIONS`] it replaces the last,
-/// because a continuation outranks a suggestion.
+/// Without a call that continues there, the continuation displaces the last
+/// at [`MAX_NEXT_ACTIONS`], because a continuation outranks a suggestion.
 fn ensure_continuation(actions: &mut Vec<NextAction>, continuation: NextAction) {
     if actions
         .iter()

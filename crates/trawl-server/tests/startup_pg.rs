@@ -1051,8 +1051,8 @@ async fn fresh_boot_restart_and_interrupted_current_cutover() {
 }
 
 /// The first compaction pass runs at boot, after recovery, and publishes the
-/// kept WAL once; a long compaction interval keeps every later tick out of
-/// the picture.
+/// unpublished WAL that recovery kept once; a long compaction interval keeps
+/// every later tick out of the picture.
 #[tokio::test]
 async fn boot_recovers_publication_markers_before_serving() {
     use trawl_server::ingest::publication_marker::{ValidatedMarker, identity_of, write_marker};
@@ -1169,7 +1169,7 @@ async fn boot_recovers_publication_markers_before_serving() {
 }
 
 /// From activation on, a WAL file telemetry writes is inserted, so a
-/// hydration after it would count that file twice. Those tasks log from
+/// hydration after it would count that file twice. The later steps log from
 /// their own threads, some after the listener, so they are ordered against
 /// activation only; wait for every line first. The daemon must run internal
 /// telemetry.
@@ -1317,9 +1317,6 @@ impl CrashedPublish {
         }
     }
 
-    /// No pass can have published anything yet, so when recovery rolled the
-    /// publish back, parquet holds none of the rows and the query counts them
-    /// from the hot buffer the boot hydrated from the kept WAL.
     async fn restart_exactly_once(&self, recovered: Recovered) {
         let mut daemon = self.fixture.spawn_holding_boot_pass();
         let client = client(&daemon.ready().await, &self.token);
@@ -1674,7 +1671,7 @@ async fn restart_publication_recovery_crash_in_unpublished_branch_reruns_exactly
 /// The first daemon holds its boot pass, which compacts WAL of any age, from
 /// before the ingest through the stop or kill, and an hour between
 /// compaction ticks keeps any later pass away. The restart holds its boot
-/// pass too, which would otherwise publish the file at once.
+/// pass too, which would otherwise publish the acknowledged WAL at once.
 async fn restart_counts_every_acknowledged_event_once(kill: bool) {
     let mut fixture = Fixture::new().await;
     fixture.current_fleet().await;
@@ -2703,8 +2700,8 @@ async fn query_scratch_symlink_refuses_the_start() {
     assert_mode(&target, 0o755);
 }
 
-/// The configured paths share no prefix with the roots', so only the opened
-/// directories show the overlap.
+/// The scratch paths, spelled through symlinks, share no prefix with the
+/// roots', so only the opened directories show the overlap.
 #[tokio::test]
 async fn query_scratch_reached_through_a_link_refuses_the_start() {
     let mut fixture = Fixture::new().await;
@@ -2736,8 +2733,6 @@ async fn query_scratch_reached_through_a_link_refuses_the_start() {
     }
 }
 
-/// The preflight reads the whole tree first, so the stale entries beside it,
-/// which a clean boot would reclaim, are left too.
 #[tokio::test]
 async fn query_scratch_foreign_entry_refuses_the_start() {
     let fixture = Fixture::new().await;

@@ -3,9 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The `trawld --doctor` checks of the certificate and trawld's own listener.
-//! The probe is one `GET /api/v1/health` per address over HTTP/1.1, with
-//! no proxy, no redirect, no retry, no key, and one bounded time for all
-//! addresses.
+//! The probe makes at most one `GET /api/v1/health` per address, over
+//! HTTP/1.1 with no proxy, no redirect, no retry and no key, in one bounded
+//! time for all addresses.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -329,9 +329,10 @@ async fn check_material(
     Some(observed)
 }
 
-/// Each directory that exists is one the inspection opened as a directory this
-/// uid owns, and the start re-modes it before it writes, so only a read-only
-/// filesystem stops it there.
+/// Of the generated `tls/` and `tls-key/` directories, each that exists is
+/// one the inspection opened as a directory this uid owns, and the start
+/// re-modes it before it writes, so only a read-only filesystem stops it
+/// there.
 async fn generation_row(state_dir: PathBuf) -> Option<Row> {
     let check = ServerCheck::TlsMaterial;
     let dirs = [GENERATED_TLS_DIR, GENERATED_KEY_DIR].map(|name| state_dir.join(name));
@@ -622,7 +623,8 @@ struct Dial {
 /// The addresses the probe dials, in resolution order: the configured
 /// socket address, or else every address `host:port` resolves to. Boot
 /// binds the first of those it can bind, and which one that was is not
-/// something the doctor can see, so it dials them all.
+/// something the doctor can see, so it dials each once, as [`dial_addr`]
+/// maps it.
 async fn listener_addrs(configured: &str) -> Result<Vec<Dial>, Row> {
     let check = ServerCheck::ListenerIdentity;
     let unresolved = || {
@@ -1975,8 +1977,6 @@ mod tests {
         Option<&'static str>,
     );
 
-    /// A privileged user may do everything its modes forbid; the test asserts
-    /// whichever the running user is.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_start_that_cannot_create_its_pair_fails() {

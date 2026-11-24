@@ -103,11 +103,12 @@ impl StagingEvidence {
     }
 }
 
-/// The one authority on that question. Retention stands down on it, pin
-/// gc refuses on it, and repin admission refuses to start a job over it.
+/// The marker, shadow root or aside root showing a repin job owns this
+/// data root now. The one authority on that question: retention stands
+/// down on it, pin gc refuses on it, and repin admission refuses over it.
 ///
 /// Fallible, unlike [`Path::exists`], which folds every I/O error into
-/// `false`. Here `false` means "go ahead", so a data root that cannot be
+/// `false`. `None` means "go ahead", so a data root that cannot be
 /// stat'ed would read as permission to proceed.
 pub fn staging_evidence(data_dir: &Path) -> Result<Option<StagingEvidence>, std::io::Error> {
     for (path, found) in [
@@ -131,9 +132,10 @@ pub fn in_flight_evidence(data_dir: &Path) -> Result<Option<&'static str>, std::
 /// filesystem — i.e. that neither the data root nor anything nested under
 /// an env directory is a mount point.
 ///
-/// Discovering that mid-job is only ever bad: the forward-only swap can
-/// only exit the process, after which every boot replays the marker into
-/// the identical failure. A nested mount fails as `EBUSY`, not `EXDEV`.
+/// Found mid-job, it fails the build late, or reaches the forward-only
+/// swap, which can only exit the process; every boot then replays the
+/// marker into the identical failure. A nested mount fails as `EBUSY`,
+/// not `EXDEV`.
 pub fn check_staging_filesystem(data_dir: &Path) -> Result<(), String> {
     let parent = data_dir.parent().filter(|p| !p.as_os_str().is_empty());
     let parent = parent.unwrap_or_else(|| Path::new("."));

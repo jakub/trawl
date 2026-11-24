@@ -266,8 +266,8 @@ pub const TABLE_LOCK_CONNECTIONS: u32 = 1;
 
 pub const APP_POOL_MAX: u32 = 3;
 
-/// Not ours to choose: sqlx builds it at `max_connections(5)`
-/// (`sqlx-postgres/src/testing/mod.rs`).
+/// Not ours to choose: sqlx builds the `#[sqlx::test]` pool at
+/// `max_connections(5)` (`sqlx-postgres/src/testing/mod.rs`).
 pub const SQLX_TEST_POOL_MAX: u32 = 5;
 
 /// Charged on top of the app pool's own ceiling: the store acquires it from
@@ -1191,9 +1191,9 @@ impl TestServer {
         (format!("https://{addr}"), task)
     }
 
-    /// Such a request must carry a `SocketAddr` extension where a route reads
-    /// the peer (ingest does), as the accept loop inserts one for every real
-    /// connection.
+    /// For in-process `oneshot` requests, which must carry a `SocketAddr`
+    /// extension where a route reads the peer (ingest does): only the accept
+    /// loop inserts one, for every real connection.
     pub fn router_with(
         &self,
         f: impl FnOnce(&mut trawl_server::state::HttpConfig),
@@ -2320,8 +2320,9 @@ pub mod captured {
         seed_partition(data, &format!("prod/{hour}"), service, events)
     }
 
-    /// Compaction names a partition by when it wrote it, not by the events'
-    /// `_time`, so this is the file a sender whose clock was off leaves behind.
+    /// Writes `events` whatever their times: compaction names a partition by
+    /// when it wrote it, not by `_time`, so this is the file a sender whose
+    /// clock was off leaves behind.
     pub fn seed_partition(data: &str, partition: &str, service: &str, events: &[Event]) -> PathBuf {
         let dir = Path::new(data).join(partition);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2382,7 +2383,8 @@ pub mod captured {
         pub fields: Vec<(String, Cell)>,
     }
 
-    /// A file's column takes the type of the first row that names it.
+    /// An extra field's value. A file's column takes the type of the first
+    /// row that names it.
     #[derive(Debug, Clone, PartialEq)]
     pub enum Cell {
         Text(String),
@@ -3199,7 +3201,7 @@ pub mod audit_capture {
             self.events.lock().unwrap().clone()
         }
 
-        /// The correlation half is not optional. The subscriber this layer
+        /// Filtering on `key` is not optional: the subscriber this layer
         /// installs is GLOBAL, so under `cargo test` a sibling test's ack or
         /// repin lands in the same buffer.
         ///

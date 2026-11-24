@@ -1018,7 +1018,8 @@ fn log_crash_dump(status: &trawl_crashdump::Status) {
     }
 }
 
-/// Raises the soft `RLIMIT_NOFILE` to the hard limit and logs both once.
+/// Raises the soft `RLIMIT_NOFILE` to the hard limit when it can, and logs
+/// both once.
 ///
 /// The query engine opens one descriptor per Parquet file it scans, so the
 /// 1024 soft limit systemd and most shells hand out runs short well before

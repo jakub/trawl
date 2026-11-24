@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The window names the canonical `_time` column, because the DSL has no
-//! aliases (ADR-0013 §6).
+//! The Show context window filters on the canonical `_time` column, never
+//! `@timestamp`: the DSL has no aliases (ADR-0013 §6).
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 

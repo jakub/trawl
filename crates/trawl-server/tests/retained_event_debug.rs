@@ -7,9 +7,9 @@
 //!
 //! Its own test binary because `.init()` installs one global subscriber per
 //! process, and this one runs under a filter `retained_event_redaction`
-//! cannot share. Raising the one directive, not replacing the filter, keeps
-//! the `trawld`, `storage.backend` and `auth.backend` targets at the levels
-//! they ship at.
+//! cannot share. Raising the `trawl_server` directive to `debug`, not
+//! replacing the filter, keeps the `trawld`, `storage.backend` and
+//! `auth.backend` targets at the levels they ship at.
 
 mod common;
 

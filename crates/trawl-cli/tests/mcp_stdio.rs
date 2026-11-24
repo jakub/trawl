@@ -573,8 +573,8 @@ fn startup_contacts_no_server() {
     }
 }
 
-/// Rust ignores SIGPIPE, so the write fails with EPIPE instead of killing
-/// the process.
+/// Rust ignores SIGPIPE, so a write to the closed stdout fails with EPIPE
+/// instead of killing the process.
 #[test]
 fn a_broken_stdout_after_initialize_exits_one() {
     let home = Sandbox::new();

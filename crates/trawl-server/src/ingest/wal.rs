@@ -225,8 +225,8 @@ impl WalWriter {
     /// Write events durably under a name no other file holds: stage them in
     /// a new `.tmp`, fsync its data, link it under a free `.ndjson` name,
     /// unlink the `.tmp`, then fsync the parent directory so the link
-    /// survives a crash. `Ok` is the acknowledgement: every step,
-    /// directory fsyncs included, has succeeded.
+    /// survives a crash. `Ok` is the acknowledgement: every step but the `.tmp`
+    /// unlink, directory fsyncs included, has succeeded.
     ///
     /// The fsync *before* the link prevents a torn write: without it the
     /// link can be journaled before the data blocks reach the device, so a

@@ -925,8 +925,8 @@ struct Search {
     parsed: usize,
 }
 
-/// Admission is monotone in the count: positions, bytes, translation units
-/// and compiled sizes all grow with it.
+/// Admission is monotone in `k`, the template's count: positions, bytes,
+/// translation units and compiled sizes all grow with it.
 fn edge(
     t: &Template,
     x: Alphabet,

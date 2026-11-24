@@ -153,7 +153,8 @@ const SPILL_SIZE_CLASSES: [&str; 8] = [
 /// (`temporary_file_manager.cpp`, `CreateTemporaryFileName`). The files
 /// of buffers larger than a block are `duckdb_temp_block-<id>.block`
 /// (`standard_buffer_manager.cpp`, `GetTemporaryPath`). A `DuckDB`
-/// upgrade has to re-check both shapes, the classes and the floor.
+/// upgrade has to re-check both shapes, `SPILL_SIZE_CLASSES` and
+/// `MAXIMUM_BLOCK`.
 #[must_use]
 pub fn is_spill_file_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
@@ -483,9 +484,9 @@ impl HeldRoot {
         &self.path
     }
 
-    /// Reach the directory's entries through it, by `openat`, `renameat`
-    /// and `unlinkat`, and `fsync` it after a rename, so no link in the
-    /// configured path can redirect a call to another directory.
+    /// Reach the directory's entries through this handle, by `openat`,
+    /// `renameat` and `unlinkat`, and `fsync` it after a rename, so no link
+    /// in the configured path can redirect a call to another directory.
     #[must_use]
     pub fn dir(&self) -> &std::fs::File {
         &self.handle
@@ -841,7 +842,6 @@ mod lock {
         tail: &'a Path,
     }
 
-    /// Every root's handle stays open until both are done.
     fn refuse_roots(
         path: &Path,
         held: &Held<'_>,
@@ -910,10 +910,10 @@ mod lock {
         Ok(mount)
     }
 
-    /// Its path is read from `/proc/self/fd`, then that path is opened and
-    /// its identity compared with `fd`'s, so a path the kernel marks
-    /// deleted, one renamed since, or one spelled from outside this
-    /// process's root cannot stand for the directory.
+    /// The path of the directory `fd` holds is read from `/proc/self/fd`,
+    /// then opened and its identity compared with `fd`'s, so a path the
+    /// kernel marks deleted, one renamed since, or one spelled from outside
+    /// this process's root cannot stand for the directory.
     #[cfg(target_os = "linux")]
     pub(super) fn anchor(
         fd: BorrowedFd<'_>,
@@ -1087,9 +1087,8 @@ mod lock {
     }
 
     impl Placement {
-        /// On Linux it must name its mount, since a bind mount keeps the
-        /// device. Elsewhere the platform names no mount, and the device is all
-        /// there is.
+        /// On Linux and Android a placement must name its mount, since a bind
+        /// mount keeps the device. Elsewhere the device is all there is.
         const fn names_its_mount(self) -> bool {
             !cfg!(any(target_os = "linux", target_os = "android")) || self.mount.is_some()
         }
@@ -1471,8 +1470,8 @@ mod tests {
         }
     }
 
-    /// The private directory is read while the sort runs (`DuckDB` removes
-    /// its files when the query ends).
+    /// Read while the sort runs: `DuckDB` removes its spill files when the
+    /// query ends.
     #[test]
     fn duckdb_spill_files_carry_the_recognized_names() {
         let parent = tempfile::tempdir().expect("parent");
@@ -2307,9 +2306,6 @@ mod tests {
         }
     }
 
-    /// Read as missing, the root would be placed at the nearest directory
-    /// above it that opens: a results root at `hour` would hold, and a
-    /// scratch directory at `hour` would be cleared.
     #[cfg(unix)]
     fn assert_lookup_refuses(
         protected: &Path,

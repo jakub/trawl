@@ -11,9 +11,9 @@
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-/// Injective across the join: each part is length-prefixed, so
-/// `("ab", ["c"])` and `("a", ["bc"])` cannot collide into one key and
-/// silently inherit each other's dismissal.
+/// Injective over the query and the deduplicated field set: each part is
+/// length-prefixed, so `("ab", ["c"])` and `("a", ["bc"])` cannot collide
+/// into one key and silently inherit each other's dismissal.
 #[must_use]
 pub fn degraded_notice_key(query: &str, fields: &[String]) -> String {
     let mut names: Vec<&str> = fields.iter().map(String::as_str).collect();

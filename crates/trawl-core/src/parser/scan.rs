@@ -24,7 +24,8 @@ use crate::parser::primitives::first_cut;
 ///   reads it as the contents of a quoted phrase. A backtick's only escape
 ///   is a doubled backtick, which this walk sees as a close and a re-open.
 /// * **`'` is not a delimiter.** The DSL has no single-quoted string, so
-///   an apostrophe (`message=it's`) would swallow the rest of the query.
+///   treating one as an opener would let an apostrophe (`message=it's`)
+///   swallow the rest of the query.
 /// * **A `/` opens a regex only at a token boundary, and only when the
 ///   text up to the next `/` is a body of one or more bytes that the
 ///   grammar's body rule admits** (`primitives::first_cut`: no raw line

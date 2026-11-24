@@ -1187,9 +1187,9 @@ impl ResultsStore {
         self.prune_evidence_waiting(now, LockWait::Unbounded).await
     }
 
-    /// [`Self::prune_evidence`], waiting no later than `deadline`, with
-    /// nothing pruned ([`StoreError::WaitExpired`]). The commit is never cut
-    /// short.
+    /// [`Self::prune_evidence`], waiting no later than `deadline`. A wait that
+    /// expires prunes nothing ([`StoreError::WaitExpired`]). The commit is
+    /// never cut short.
     pub async fn prune_evidence_until(
         &self,
         now: DateTime<Utc>,

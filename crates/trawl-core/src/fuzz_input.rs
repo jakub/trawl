@@ -239,8 +239,6 @@ mod tests {
             Some(CanonicalType::ALL[0])
         );
 
-        // 255 is where byte-flip mutations pile up. Computed rather than written
-        // down: the answer moves when the vocabulary grows.
         let choice = usize::from(255 % modulus);
         let expected = if choice == 0 {
             None

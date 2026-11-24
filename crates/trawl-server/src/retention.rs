@@ -274,9 +274,9 @@ fn expiry_rank(dir: &DateDir, config: &RetentionConfig, today: NaiveDate) -> Exp
     }
 }
 
-/// Two `Expiring` compare by expiry ratio, evaluated as
-/// `a.age * b.max > b.age * a.max` in `u128`, where an `f64` division
-/// would tie candidates that differ by one day.
+/// Two `Expiring` compare by expiry ratio `age / max`, cross-multiplied in
+/// `u128`, where an `f64` division would tie candidates that differ by one
+/// day.
 fn cmp_priority(a: ExpiryRank, b: ExpiryRank) -> Ordering {
     use ExpiryRank::{Expiring, KeepForever};
     match (a, b) {

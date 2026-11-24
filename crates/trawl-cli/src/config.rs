@@ -74,8 +74,9 @@ pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert: Option<PathBuf>,
 
-    /// `-p trial` sets it from the bytes it read and checked once, so no
-    /// later step re-opens a path that could have changed.
+    /// CA roots pinned in place of `ca_cert`. `-p trial` sets them from the
+    /// bytes it read and checked once, so no later step re-opens a path
+    /// that could have changed.
     #[serde(skip)]
     pub pinned_ca: Option<Vec<u8>>,
 }

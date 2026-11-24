@@ -494,11 +494,11 @@ enum Reader {
     Poll,
 }
 
-/// Every read a person or a write asks for passes one gate, [`Self::defer`].
-/// The gate is one place rather than a check in each caller because the
-/// rule has no exception: a caller added later cannot skip it. A deferred
-/// read claims no generation until it starts, so a write whose answer was
-/// lost stays held until that read lands ([`Self::mark`]).
+/// Every read a person or a write asks for passes one gate, [`Self::defer`],
+/// which holds it while the tab is hidden or a 429's pause runs. The gate is
+/// one place rather than a check in each caller, so a caller added later
+/// cannot skip it. A deferred read claims no generation until it starts, so
+/// it still counts as later than a lost write's mark ([`Self::mark`]).
 ///
 /// The board's listener is the page's only one. It keeps `visible`, which
 /// the board lends to its evidence reads ([`EvidenceReads`],
@@ -672,8 +672,8 @@ impl BoardReads {
         }
     }
 
-    /// The gate every read but the poll passes; the poll checks the pause
-    /// itself ([`Self::poll`]).
+    /// The gate every read but the poll passes; the poll checks the 429
+    /// pause itself ([`Self::poll`]).
     fn defer(self, ask: Ask) -> bool {
         let visible = tab_visible();
         let held = self.held();
@@ -1281,9 +1281,9 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
 enum StatusNote {
     Sending(InvestigationStatus),
     Done(InvestigationStatus),
-    /// The mark is the board's newest read generation when the refusal
-    /// arrived ([`BoardReads::mark`]): only a later read that lands has read
-    /// it again ([`Reread`]).
+    /// Refused as stale or closed. The mark is the board's newest read
+    /// generation when the refusal arrived ([`BoardReads::mark`]): only a
+    /// later read that lands has read the investigation again ([`Reread`]).
     Conflict(InvestigationStatus, WriteFailure, u64),
     /// No answer arrived. The mark is the board's newest read
     /// generation when it failed ([`BoardReads::mark`]): the control

@@ -6,7 +6,7 @@
 # Evidence tooling for issue #241: prove signed-out-probes.spec.ts depends
 # on the status bar's session gate in src/pages/layout.rs.
 #
-# Both builds go to script-owned dist directories under target/, served
+# The ungated and gated builds go to script-owned dist directories under target/, served
 # through TRAWL_E2E_DIST, so crates/trawl-web-ui/dist is never written and no
 # exit path can leave the ungated app there.
 #

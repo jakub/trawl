@@ -122,9 +122,9 @@ pub(crate) fn layout_path(data_root: &Path, path: &Path) -> Option<LayoutPath> {
     })
 }
 
-/// Date-shaped, whether or not it names a calendar date (ADR-0036): deliberately
-/// looser than [`parse_date`], so boot refuses a root holding `2026-13-45`
-/// rather than reading it as a generic archive.
+/// Date-shaped, whether or not it names a calendar date (ADR-0036):
+/// deliberately looser than [`parse_date`], so boot refuses an unmarked root
+/// holding `2026-13-45` rather than reading it as a generic archive.
 pub(crate) fn is_owned_residue_dir_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() == 10

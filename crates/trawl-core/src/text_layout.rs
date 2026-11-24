@@ -192,9 +192,10 @@ pub fn locate_span(text: &str, start: usize, end: usize) -> Option<SpanLine> {
     })
 }
 
-/// A cluster that holds either end of the span falls whole into `covered`,
-/// so each part can be drawn as a span of its own and every cluster still
-/// draws in the cells it takes in the whole line.
+/// `before`, `covered` and `after` are cut between grapheme clusters of the
+/// sanitized line. A cluster that holds either end of the span falls whole
+/// into `covered`, so each part draws in the cells it takes in the whole
+/// line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaretLayout {
     /// The line before the cluster that holds the span's start.

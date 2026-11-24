@@ -7,9 +7,9 @@
 //! [`CaptureGate::admit`] decides whether one capture may run, before the
 //! capture takes a query id or asks for an executor permit, in four steps:
 //! the quota pre-check, the key's lane, the installation, then the binding
-//! reservation. The pre-check is not binding: step 4 is. A key that is
-//! already full is refused there, so it never waits in a queue only to be
-//! refused at the end.
+//! reservation. A key that is already full is refused at the pre-check,
+//! so it never waits in a queue only to be refused at the end. The
+//! pre-check is not binding: step 4 is.
 //!
 //! # The book
 //!
@@ -27,13 +27,15 @@
 //!
 //! # Evidence
 //!
-//! The prune waits for the due investigations' locks no later than the
-//! reservation's deadline, and a prune that reaches it refuses the charge
-//! busy, as every wait of the pass does. No path holds an investigation's
-//! lock while it waits for the pass, so the wait closes no cycle. A prune
-//! the store fails is logged by class and left to the sweep. The pass then
-//! counts the due rows it did not prune, so a failed prune can refuse a
-//! charge that would have fitted, and never admits one past a budget.
+//! A binding pass first prunes the evidence of every investigation past
+//! its `retain_until`. The prune waits for the due investigations' locks
+//! no later than the reservation's deadline, and a prune that reaches it
+//! refuses the charge busy, as every wait of the pass does. No path holds
+//! an investigation's lock while it waits for the pass, so the wait
+//! closes no cycle. A prune the store fails is logged by class and left
+//! to the sweep. The pass then counts the due rows it did not prune, so a
+//! failed prune can refuse a charge that would have fitted, and never
+//! admits one past a budget.
 //!
 //! A pass awaits Postgres, so the lock that serializes passes is an async
 //! one; the book itself is a short synchronous lock, so a settle or a drop

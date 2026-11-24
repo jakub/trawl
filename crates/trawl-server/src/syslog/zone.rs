@@ -112,7 +112,7 @@ fn resolve_in<T: TimeZone>(zone: &T, wall: NaiveDateTime, arrival: DateTime<Utc>
 impl FromStr for SyslogZone {
     type Err = ZoneRefused;
 
-    /// The `/` rule refuses the database's single-word legacy
+    /// Requiring `/` in a zone name refuses the database's single-word legacy
     /// names (`EST`, `CET`, `Zulu`, `GMT`, `EST5EDT`), which read as
     /// abbreviations.
     fn from_str(s: &str) -> Result<Self, Self::Err> {

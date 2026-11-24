@@ -175,8 +175,8 @@ fn is_prose_query_command(line: &str) -> bool {
             .any(|word| line.contains(&format!("{word} '")) || line.contains(&format!("{word} \"")))
 }
 
-/// This is deliberately broad; a fragment or placeholder it catches is
-/// excluded by name.
+/// Deliberately broad; a fragment or placeholder this catches is excluded
+/// by name.
 pub fn is_query_shaped(span: &str) -> bool {
     span.starts_with('|')
         || span.contains(" | ")

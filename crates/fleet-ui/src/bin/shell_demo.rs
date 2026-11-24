@@ -229,7 +229,7 @@ fn DemoApp() -> impl IntoView {
     // mount — panics with "spawn_local before a global executor was
     // initialized".
     let prefs = install("fleet-ui-demo:prefs");
-    // TopBar's theme choices reach them via `use_context::<UiPrefs>()`;
+    // TopBar's theme choices read the prefs via `use_context::<UiPrefs>()`;
     // missing context hides the choices and warns.
     provide_context(prefs);
 

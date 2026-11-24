@@ -663,9 +663,9 @@ impl RepinEngine {
                 // entry still armed through all of that answers 202 to
                 // cancels of a job whose task no longer exists.
                 //
-                // The request is written HERE, synchronously, before the
-                // terminal status: `record_cancel_request` only matches a row
-                // whose status is still `running`.
+                // A pending cancel's request is written HERE, synchronously,
+                // before the terminal status: `record_cancel_request` only
+                // matches a row whose status is still `running`.
                 if let Settlement::Cancelled(actor) = self.cancel.settle(job_id) {
                     tracing::warn!(
                         event_type = "repin_cancel_unobserved",
@@ -770,11 +770,10 @@ impl RepinEngine {
         }
     }
 
-    /// Detached because a cancel must not be split by a client disconnect.
-    /// The in-process flag is already set when this returns, so the effect
-    /// site can fire before the request row lands; that is safe, because
-    /// the effect site records the request itself before writing a
-    /// `cancelled` terminal status.
+    /// For a `Cancelling` verdict the request row is written detached, so a
+    /// client disconnect cannot split the cancel. The in-process flag is
+    /// already set, so the effect site can fire before the row lands; that
+    /// is safe because the effect site records the request itself first.
     pub fn cancel(self: &Arc<Self>, actor: &CancelActor) -> CancelVerdict {
         let decision = self.cancel.request(actor);
         match decision.verdict {
@@ -1296,8 +1295,8 @@ impl RepinEngine {
 
     /// The order is the database's requirement: a `cancelled` row without a
     /// recorded request violates the CHECK, so the terminal write is
-    /// unreachable until `record_cancel_request` has landed. If it fails
-    /// too, the job ends `failed` naming the store trouble.
+    /// unreachable until `record_cancel_request` has landed. If this write
+    /// fails after the detached one did, the job ends `failed`.
     async fn finish_cancelled(&self, job_id: i64, stage: &'static str, actor: Option<CancelActor>) {
         let Some(actor) = actor else {
             // Only reachable if the registry stopped naming this job
@@ -1721,9 +1720,9 @@ impl RepinEngine {
             Commit::Failed(msg) => return Err(JobAbort::Failed(msg)),
         }
 
-        // Emitted once the latch is held and before the swap: a marker write
-        // that fails takes the cutover with it, and a cancel that won the
-        // latch stops it, so neither reaches this line.
+        // Forced only, once the latch is held and before the swap: a marker
+        // write that fails takes the cutover with it, and a cancel that won
+        // the latch stops it, so neither reaches this audit event.
         if let ForceTerms::Forced(ceilings) = terms.force {
             tracing::info!(
                 event_type = "repin_force_accepted",
@@ -2002,8 +2001,8 @@ fn job_totals(totals: BuildTotals) -> JobTotals {
 
 impl RepinEngine {
     /// Why the cutover must not swap while publication markers are pending
-    /// (ADR-0041), or `None` when there are none. Call under the cutover
-    /// guard.
+    /// (ADR-0041), or `None` only when a scan read none. Call under the
+    /// cutover guard.
     ///
     /// A marker proves its publish by the canonical output's identity. The
     /// swap replaces every canonical file with its rewritten copy, so after
@@ -2254,8 +2253,8 @@ fn run_pass_blocking(
     cancel.check(STAGE_BUILD)?;
     let sources = snapshot_env_files(data_dir)?;
 
-    // Test-only happened-before edge. This is a std thread inside a
-    // blocking pass, so the test's drop guard must free it when the test
+    // Test-only hold after the snapshot. It parks a std thread inside a
+    // blocking pass, so the test's drop guard must release it when the test
     // fails: the runtime's blocking pool waits for it on teardown.
     #[cfg(any(test, feature = "test-support"))]
     if TEST_BARRIER_FIRST_PASS.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -3109,8 +3108,6 @@ mod tests {
         }
     }
 
-    /// Pinned because this sentence is what the CLI prints and what an
-    /// integration test asserts on the row.
     #[test]
     fn the_cancelled_row_names_the_actor_the_stage_and_the_untouched_corpus() {
         assert_eq!(

@@ -192,7 +192,7 @@ const BINDER: &str = "Binder";
 const COLUMN_NOT_FOUND: &str = "COLUMN_NOT_FOUND";
 
 /// The column `error` names as missing from the statement's input, if it
-/// is that binder failure (ADR-0056).
+/// is a `Binder` diagnostic with the `COLUMN_NOT_FOUND` subtype (ADR-0056).
 pub(crate) fn missing_column(error: &duckdb::Error) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct ColumnNotFound {

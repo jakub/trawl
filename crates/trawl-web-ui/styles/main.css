@@ -1147,7 +1147,7 @@
   pointer-events: none;
 }
 
-/* Each
+/* Each gridline
  * hairline is painted in the pixel inside its percentage, so the top
  * and middle labels sit half a pixel lower; the extra 1px in the
  * transform drops Chivo Mono's figures, which ride above the centre of
@@ -1767,7 +1767,7 @@
 
 
 
-/* ADR-0007 turns
+/* The numeric pills read --accent, not --accent-2: ADR-0007 turns
    --accent-2 into a light tint that measures 3.67:1 on this wash, under
    the AA floor. */
 .tp { display:inline-block; font-family: var(--font-mono); font-size: var(--fs-tiny); font-weight: 600;

@@ -357,8 +357,6 @@ async fn request_count_released_on_end_error_panic_and_drop() {
     assert_eq!(holds.entered().await, "free");
 }
 
-/// The stream routes' half is
-/// `response_bodies_and_streams_do_not_hold_the_count_streams` in `routes.rs`.
 #[tokio::test]
 async fn response_bodies_and_streams_do_not_hold_the_count() {
     let mut holds = Holds::new();

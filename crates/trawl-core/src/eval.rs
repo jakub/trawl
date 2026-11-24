@@ -40,8 +40,9 @@ pub enum EvalValue {
 }
 
 impl EvalValue {
-    /// This is not `DuckDB`'s boolean domain, which [`read_condition`] mirrors
-    /// and what `if`/`case` read their condition through.
+    /// The permissive predicate behind `and`/`or`/`not` and the streaming
+    /// `where` gate, not `DuckDB`'s boolean domain, which [`read_condition`]
+    /// mirrors for `if`/`case`.
     pub fn is_truthy(&self) -> bool {
         match self {
             Self::Null => false,
@@ -114,7 +115,8 @@ pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
 /// presentation rules that diverge from Rust's `Display`/`Debug`:
 ///
 /// 1. Integer-valued doubles always carry a `.0` suffix (`1.0`, not `1`).
-/// 2. Negative zero keeps its sign: `-0.0` → `"-0.0"`.
+/// 2. Negative zero keeps its sign: `-0.0` → `"-0.0"`. (A SQL literal
+///    `-0.0` renders `0.0` only because the parser folds it to `+0.0`.)
 /// 3. Scientific notation kicks in at the same magnitude thresholds as Rust's
 ///    `{:?}` (`>= 1e16` and `< 1e-4`), so we lean on Debug for the switch-over.
 /// 4. The exponent always carries a sign and is zero-padded to a minimum of two
@@ -333,9 +335,9 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
 /// case-insensitively, but `rename status as St` gives the row an `St` key,
 /// and a fold-only lookup would miss it.
 ///
-/// A residual ambiguity (several case-variants, none exact) picks the
-/// lexicographically-first variant, the same tie-break ingest's own
-/// fold-collision rule uses.
+/// A residual ambiguity (several case-variants, none exact), where `DuckDB`
+/// errors, picks the lexicographically-first variant, the same tie-break
+/// ingest's own fold-collision rule uses.
 pub fn bind_event_key<'e>(event: &'e Row, name: &str) -> Option<&'e str> {
     if let Some((key, _)) = event.get_key_value(name) {
         return Some(key.as_str());
@@ -1416,8 +1418,8 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
     let fmt = fmt.as_ref();
     // chrono turns an invalid specifier (e.g. `%Q`) into `Item::Error`, whose
     // `Display` returns `fmt::Error`, so `ts.format(fmt).to_string()` would
-    // panic. Invalid format literals are rejected at emit time, so this guard
-    // covers only a non-literal (field-ref) format.
+    // panic. Invalid format literals are refused when either lane compiles
+    // the query, so this guard covers only a non-literal (field-ref) format.
     if chrono::format::StrftimeItems::new(fmt)
         .any(|item| matches!(item, chrono::format::Item::Error))
     {
@@ -1427,7 +1429,7 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
 }
 
 /// `DuckDB`'s `STRPTIME` fills the components a format omits from a
-/// `1900-01-01 00:00:00` base (see `resolve_date`/`resolve_time`).
+/// `1900-01-01 00:00:00` base; `resolve_date`/`resolve_time` mirror it.
 fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     if args.len() != 2 {
         return EvalValue::Null;

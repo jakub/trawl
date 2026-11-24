@@ -21,7 +21,6 @@ pub struct RailItem {
     pub label: &'static str,
     pub icon: Icon,
     pub path: &'static str,
-    /// `None` for one every session reaches.
     pub requires: Option<fn(&[String]) -> bool>,
 }
 

@@ -1389,7 +1389,7 @@ fn with_long_query(
     captured
 }
 
-/// `bytes` is at most 509 so that no page abbreviates one.
+/// `bytes` is at most 509 so that no page abbreviates a cell.
 #[derive(Debug, Clone, Copy)]
 struct WideRow {
     columns: usize,

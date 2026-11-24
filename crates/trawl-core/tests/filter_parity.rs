@@ -228,8 +228,8 @@ fn byte_wildcards(value: &str) -> String {
     )
 }
 
-/// Sometimes the last token of a group, which closes tight after a regex
-/// as after any value.
+/// The pattern sometimes ends a group, so `)` closes tight after a regex as
+/// after any value.
 fn random_field_pattern(rng: &mut Rng) -> String {
     let field = string_field(rng);
     let op = if rng.bool() { "=" } else { "!=" };
@@ -1671,9 +1671,9 @@ fn pinned_double_pattern_parity() {
     }
 }
 
-/// Every NaN equals every other NaN whatever its sign and outranks `inf`,
-/// so `status=nan` matches a stored NaN where a matcher comparing through
-/// Rust's IEEE `==` would not.
+/// In `DuckDB`'s total order, which a live filter on a DOUBLE pin uses, every
+/// NaN equals every other NaN whatever its sign and outranks `inf`, so
+/// `status=nan` matches a stored NaN where Rust's IEEE `==` would not.
 #[test]
 fn pinned_double_special_value_parity() {
     let conn = Connection::open_in_memory().unwrap();
@@ -1768,8 +1768,9 @@ fn mixed_case_field_reference_parity() {
     }
 }
 
-/// That rung parses through `TIMESTAMPTZ`, so the writing session is
-/// pinned to UTC exactly as every conforming connection is.
+/// `guarded_cast` parses zone-bearing values through `TIMESTAMPTZ`, so the
+/// session writing the parquet is pinned to UTC as every conforming
+/// connection is.
 #[test]
 fn pinned_timestamp_pattern_parity() {
     let conn = Connection::open_in_memory().unwrap();
@@ -3316,7 +3317,7 @@ fn wire_pool(pin: CanonicalType) -> Vec<Value> {
 
 /// Type-appropriate on purpose: a word against a numeric pin is a `DuckDB`
 /// conversion error, so there is no row set for the evaluator to agree
-/// with. The VARCHAR pin is the exception.
+/// with. Only the VARCHAR pin takes a literal of either shape.
 fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
     match pin {
         CanonicalType::BigInt => &["1", "2", "404", "1.5", "-1", "9007199254740992"],

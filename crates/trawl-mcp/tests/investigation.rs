@@ -1584,9 +1584,6 @@ async fn read_paged_board(case: &BoardCase, via_read: bool) {
     assert_eq!(printed, expected, "{label}");
 }
 
-/// The other key's name, which no entry prints shorter, makes each of its
-/// entries larger than the budget leaves beside the acknowledgement, so
-/// the activity prints none of them.
 async fn write_with_unprintable_activity(label: &str, theirs: u64, page: usize, holds: bool) {
     let long_named = Actor {
         name: "n".repeat(2000),

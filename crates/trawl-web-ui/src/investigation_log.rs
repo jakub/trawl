@@ -441,8 +441,8 @@ impl EvidenceRows {
     }
 }
 
-/// A captured result declares no `sev()` columns, so `_severity` is the
-/// only one.
+/// Only `_severity` cells read as severity tokens: a captured result
+/// declares no `sev()` columns.
 #[must_use]
 pub fn evidence_rows(page: &ResultPage) -> EvidenceRows {
     let columns = &page.page.columns;

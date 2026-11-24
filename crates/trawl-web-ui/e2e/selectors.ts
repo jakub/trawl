@@ -284,9 +284,8 @@ export const COPY = {
   historyH1: 'Search history',
   notFoundHeading: '404',
   notFoundSubtitle: 'That page does not exist.',
-  /// The stable substring is this prefix (the `msg`
-  /// tail comes from the server's own error envelope and is not pinned
-  /// here).
+  /// Only the prefix is stable: the tail after it is the server's own error
+  /// message and is not pinned here.
   loadHintErrorPrefix: "Couldn't load results:",
   railHintNothingToCount: 'No field values to count.',
   railHintAggregate: 'Field values are not counted for an aggregate result.',

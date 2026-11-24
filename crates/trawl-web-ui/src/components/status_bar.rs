@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The reads run in one sequential loop, not a
+//! The health reads run in one sequential loop, not a
 //! `LocalResource`: a `refetch()` issued while a read is in flight is
 //! dropped, and a changed resource input starts a second request beside
 //! the first.

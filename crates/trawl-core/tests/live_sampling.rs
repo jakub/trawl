@@ -218,7 +218,7 @@ fn a_limit_reports_done_rather_than_emitting() {
     }
 }
 
-/// This lane never stops asking, because an aggregate subscription keeps
+/// The aggregate lane never stops asking, because its subscription keeps
 /// running so its snapshots stay current. So a `Done` that fired once and
 /// then lapsed would let every later event feed the accumulators.
 #[test]

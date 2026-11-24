@@ -366,7 +366,7 @@ fn control(kind: Kind, k: usize) -> String {
     format!("{}{}{{{k}}}{end}", DESERET.a, DESERET.b)
 }
 
-/// Admission is monotone in the count.
+/// Admission is monotone in `k`, the family body's count.
 fn edge(f: &Family) -> Option<(usize, String)> {
     let (mut admitted, mut refused, mut why) = (0, 65, String::from("none"));
     while refused - admitted > 1 {

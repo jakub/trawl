@@ -95,8 +95,8 @@ pub enum UrlProblem {
 /// The authority ends where the WHATWG parser ends it, at the first `/`,
 /// `\`, `?` or `#`, and any `@` inside it is userinfo. That check comes
 /// first, so a URL with credentials is always reported as such.
-/// `%3F` and `%23` are refused because a proxy that decodes the path
-/// would read them as the same delimiters.
+/// Request paths are appended after it, so a `?` or `#` there, or a `%3F`
+/// or `%23` a proxy decodes, would carry them into a query or fragment.
 pub fn check_url(raw: &str) -> Result<CheckedUrl, UrlProblem> {
     let (scheme, rest) = raw.split_once("://").ok_or(UrlProblem::Malformed)?;
     let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());

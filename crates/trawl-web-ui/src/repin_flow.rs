@@ -71,7 +71,8 @@ pub enum ConflictBody {
     Busy(String),
 }
 
-/// The one-running slot is the only other thing a 409 means here.
+/// For a 409 that is neither a plan nor an error envelope: the one-running
+/// slot is the only other thing a 409 means here.
 pub const REPIN_BUSY_FALLBACK: &str = "another repin already holds the one-running slot";
 
 #[must_use]
@@ -190,7 +191,8 @@ pub enum Unproven {
 /// force could equally be the previous repin of the same field. Only an id
 /// strictly newer than a row that existed before the request went out can
 /// have been created by that request.
-/// The negative is deliberately never proven.
+/// Nothing newer never proves the run did not start: a timed-out request
+/// can still be in flight.
 #[must_use]
 pub fn recovery_verdict(run: &LostRun, probe: &StatusProbe) -> Recovery {
     let StatusProbe::Job(job) = probe else {
@@ -252,8 +254,8 @@ pub struct BoundCeilings {
     pub max_ambiguous: u64,
 }
 
-/// The arithmetic lives on the server, and a copy of it here would be a
-/// second one to keep in step. This is the SPA's half of the CLI's
+/// The server resolves the ceilings; a copy of that arithmetic here would
+/// be a second one to keep in step. This is the SPA's half of the CLI's
 /// `schema::accepted_ceilings`. Both read the same two wire fields and
 /// both refuse a half-filled pair.
 #[must_use]

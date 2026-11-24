@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The display zone is the client machine's, in every client (ADR-0051).
+//! trawld answers in UTC only; every client presents instants in the
+//! `ui.timezone` it reads at start (ADR-0051).
 //! Tests cannot set the environment in-process (`unsafe_code = forbid`), so a
 //! zone is always a child's `TZ`. The TUI runs under a PTY, because crossterm
 //! needs a real terminal. Its screen is read with the driver's `capture`;
@@ -80,7 +81,7 @@ fn only_row(ndjson: &str) -> Value {
     serde_json::from_str(lines[0]).expect("a JSON row")
 }
 
-/// The clients send no `Accept-Encoding`, so both logs are text.
+/// The clients send no `Accept-Encoding`, so `sent` and `received` are text.
 struct Proxy {
     url: String,
     sent: Arc<Mutex<Vec<u8>>>,
@@ -578,8 +579,8 @@ async fn cli_timestamp_output_formats() {
     server.stop().await;
 }
 
-/// A bound or a value read in +05:30 would move the cut by 5h30 and keep
-/// `k=b` (05:59:59Z reads 11:29:59 there).
+/// A `_time` bound or value read in +05:30 would move the cut by 5h30 and
+/// keep `k=b` (05:59:59Z reads 11:29:59 there).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn display_zone_does_not_change_evaluation() {
     const TAIL: &str = "service=zone_probe | extract kv \

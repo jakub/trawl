@@ -4,6 +4,7 @@
 
 //! The client that reaches trawld, and the pinned CA behind it (ADR-0048).
 //!
+//! Under a pinned CA, a request reads the file only while no client exists.
 //! Reads are single-flight, and each runs on tokio's blocking pool, never
 //! on a runtime worker: opening, reading and parsing the file and building
 //! a client are all synchronous, and a file on a stalled network volume
@@ -65,7 +66,7 @@ struct Observed {
     refusal: Option<Refusal>,
 }
 
-/// Two refusals are the same when a re-read would log the same thing.
+/// Equal refusals log once; unusable contents compare by digest, not reason.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
     Absent,
@@ -302,7 +303,7 @@ pub(crate) fn upstream_client(
     }
 }
 
-/// Every connection's `TCP_USER_TIMEOUT` at `head_deadline` (ADR-0054).
+/// `TCP_USER_TIMEOUT` at `head_deadline`, where the OS offers it (ADR-0054).
 fn proxy_client_builder(head_deadline: Duration) -> ClientBuilder {
     let builder = Client::builder();
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
@@ -335,8 +336,8 @@ mod tests {
         if pinned.is_some() { "pinned" } else { "system" }
     }
 
-    /// The TLS handshake then fails, since the listener speaks no TLS; only
-    /// the dial matters here.
+    /// The TLS handshake fails, since the listener speaks no TLS; only the
+    /// dial matters here.
     async fn dials(client: &Client, url: String, listener: &TcpListener) -> bool {
         let request = tokio::spawn(client.get(url).send());
         let accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept())
@@ -682,7 +683,6 @@ mod tests {
         );
     }
 
-    /// Its absence was logged at resolution and is not logged again.
     #[test]
     fn a_pending_pin_warns_once_per_unusable_file() {
         let dir = tempfile::tempdir().unwrap();

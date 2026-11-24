@@ -209,7 +209,8 @@ fn a_log_enabled_probe_does_not_drop_the_next_event() {
     assert_in_both_sinks_with_request_id(marker, request_id);
 }
 
-/// Migration is forced rather than hoped for. The blocker takes the worker's
+/// Migration is forced rather than hoped for. Each future spawns a blocker,
+/// then requeues itself ([`requeue_now`]). The blocker takes the worker's
 /// LIFO slot, which no other worker can steal, and holds that worker until
 /// the future has been polled again. The requeued future waits in the
 /// worker's stealable run queue, so an idle worker steals it. A semaphore
@@ -321,8 +322,8 @@ async fn requeue_now() {
 }
 
 /// Plain connections, not a pool: a pool has one owner per process (ADR-0021
-/// ruling 3), and the probe lives in the connection's statement logger
-/// either way.
+/// ruling 3), and sqlx's `log_enabled!` probe lives in the connection's
+/// statement logger either way.
 #[test]
 fn a_slow_sqlx_statement_does_not_strip_the_next_request_span() {
     use std::str::FromStr as _;

@@ -248,8 +248,8 @@ impl ParsedEvents {
 }
 
 /// A parts extractor because axum runs those before the body extractor:
-/// a key without the grant is refused on its request head, before trawld
-/// collects up to `[ingest] max_body_bytes` it would discard.
+/// a key without `Permission::Ingest` is refused on its request head, before
+/// trawld collects up to `[ingest] max_body_bytes` it would discard.
 pub struct IngestKey(VerifiedKey);
 
 impl std::fmt::Debug for IngestKey {

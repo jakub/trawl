@@ -565,7 +565,6 @@ async fn a_failed_unlink_is_counted_and_the_sweep_goes_on() {
     assert_eq!(state_of(&server, &id(81)).await.unwrap().0, "expired");
 }
 
-/// The committed row is the event; the bound only names a hang.
 async fn await_expired(server: &common::TestServer, id: &str, what: &str) {
     let start = std::time::Instant::now();
     while state_of(server, id).await.map(|(state, _)| state) != Some("expired".to_owned()) {

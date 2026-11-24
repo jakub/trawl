@@ -749,8 +749,8 @@ fn aggregate_position_refusals_match() {
     }
 }
 
-/// The literal below pins the same thing a second time, so a change to
-/// both sides at once is still visible.
+/// The literal pins the bytes a second time, so a change to both sides of
+/// the round trip at once is still visible.
 #[test]
 fn the_row_doors_keep_an_event_maps_bytes() {
     let event = json!({
@@ -940,8 +940,8 @@ fn sample_output_stage_composition() {
     assert_eq!(only_row(dsl, &run(dsl)), cells(&[("a", "10"), ("b", "10")]),);
 }
 
-/// The kv-tail half of this boundary lives in the engine's `kv_tail_order`
-/// tests.
+/// The live lane refuses `sample`; the kv-tail half of this boundary lives
+/// in the engine's `kv_tail_order` tests.
 #[test]
 fn sample_lane_boundaries() {
     let query = trawl_core::parser::parse("* | sample 5").expect("dsl parses");

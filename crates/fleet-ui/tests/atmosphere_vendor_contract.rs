@@ -136,8 +136,8 @@ fn the_snippet_binding_stays_behind_the_default_off_atmosphere_feature() {
 
 #[test]
 fn interop_path_agrees_with_the_vendored_filename() {
-    // The compiler enforces this on wasm32 only; this test carries it onto
-    // native builds.
+    // The compiler checks this crate-root-relative snippet path on wasm32
+    // only; this test carries the check onto native builds.
     assert!(
         INTEROP.contains(r#"module = "/vendor/paper-shaders.js""#),
         "interop.rs must bind module = \"/vendor/paper-shaders.js\" — \

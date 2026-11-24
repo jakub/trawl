@@ -2,9 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `~` in a path is expanded on the reading thread, under the same deadline:
-//! with `HOME` unset or empty that expansion asks the user database, which
-//! can stall.
+//! The key and pin readers expand `~` on the reading thread, under the read
+//! deadline: with `HOME` unset or empty that expansion asks the user
+//! database, which can stall.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};

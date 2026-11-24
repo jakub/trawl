@@ -107,7 +107,7 @@ async fn listener_drops_partial_headers_despite_byte_progress() {
     let trickle = Duration::from_millis(50);
     let mut trickled = 0_usize;
     let closed_after = loop {
-        // A write error after the close is the close.
+        // A write error after the server's close is the close.
         if stream.write_all(b"a").await.is_err() {
             break started.elapsed();
         }

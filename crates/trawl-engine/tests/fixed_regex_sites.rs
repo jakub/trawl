@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The batch lane's RE2 allowance counts every regex call `DuckDB` binds
-//! and runs for a statement (ADR-0063).
+//! The batch lane's RE2 allowance counts the regex calls one thread of
+//! a statement holds, as `DuckDB` binds and runs them (ADR-0063).
 //!
 //! `json_serialize_plan` needs constants, so each statement runs with its
 //! parameters inlined, and it cannot serialize a `read_json` scan, so the

@@ -33,8 +33,9 @@ POD_SPEC_PATHS = {
 }
 CONTAINER_LISTS = ("initContainers", "containers", "ephemeralContainers")
 
-# Oldest Kubernetes the chart supports (README). Later releases only widen these
-# allowlists, so a pod that passes the 1.26 tables passes every newer one.
+# Oldest Kubernetes the chart supports (README). The tables below follow its
+# pod-security-admission policy. Later releases only widen these allowlists,
+# so a pod that passes the 1.26 tables passes every newer one.
 # Checks a later release adds, such as host probes and the appArmorProfile
 # field, stay in, because a newer cluster enforces them.
 KUBERNETES_MINIMUM = "1.26"
@@ -46,8 +47,8 @@ BASELINE_CAPABILITIES = {
 RESTRICTED_CAPABILITIES = {"NET_BIND_SERVICE"}
 # container_engine_t joins the list only in Kubernetes 1.31.
 SELINUX_TYPES = {"", "container_t", "container_init_t", "container_kvm_t"}
-# The ip_local_reserved_ports, tcp keepalive
-# and tcp_fin_timeout sysctls join it only in Kubernetes 1.27 and 1.29.
+# The ip_local_reserved_ports, tcp keepalive and tcp_fin_timeout sysctls join
+# this set only in Kubernetes 1.27 and 1.29.
 SAFE_SYSCTLS = {
     "kernel.shm_rmid_forced", "net.ipv4.ip_local_port_range",
     "net.ipv4.ip_unprivileged_port_start", "net.ipv4.tcp_syncookies",

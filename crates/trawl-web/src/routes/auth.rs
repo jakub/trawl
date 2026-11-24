@@ -24,9 +24,10 @@ pub const LOGIN_BODY_LIMIT_NAME: &str = "the login body limit";
 
 /// The body is read here and the bytes are handed on to the `Json`
 /// extractor, so the limit holds whatever the request's framing or content
-/// type: hyper gives `Transfer-Encoding: chunked` precedence over
-/// `Content-Length` and removes the latter from the headers the router sees,
-/// and the extractor answers a non-JSON type 415 without reading the body.
+/// type. Nothing else enforces it: hyper gives `Transfer-Encoding: chunked`
+/// precedence over `Content-Length` and removes the latter from the headers
+/// the router sees, and the extractor answers a non-JSON type 415 without
+/// reading the body.
 pub async fn envelope_login_body_limit(request: Request, next: Next) -> Response {
     let too_large = || {
         ProxyError::RequestTooLarge {

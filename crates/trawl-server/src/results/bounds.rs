@@ -280,9 +280,9 @@ pub fn window_bounds(
 /// Decide whether a query's result is event-shaped (ADR-0057).
 ///
 /// `Query::has_aggregation` is not this question, since it does not see
-/// projection, ordering or sampling. `extract` cannot write either column:
-/// a capture group or a kv key in the `_` namespace is refused or sealed
-/// before it executes (ADR-0013), so `extract` needs no name check.
+/// projection, ordering or sampling. `extract` cannot write `_time` or
+/// `_ingested`: a capture group or a kv key in the `_` namespace is
+/// refused or sealed before it executes (ADR-0013), so it needs no check.
 pub fn classify(query: &Query) -> Shape {
     if query.pipeline.iter().all(|stage| keeps_events(&stage.node)) {
         Shape::Events
@@ -319,8 +319,8 @@ fn keeps_events(stage: &PipeStage) -> bool {
     }
 }
 
-/// An `eventstats` cannot write an order column: the parser refuses an
-/// alias in the `_` namespace (ADR-0013).
+/// An `eventstats` cannot write `_time` or `_ingested`: the parser refuses
+/// an alias in the `_` namespace (ADR-0013).
 fn events_by_eventstats(query: &Query) -> bool {
     query
         .pipeline
@@ -1307,8 +1307,6 @@ mod tests {
         }
     }
 
-    /// Its work must grow with the text alone: cutting one clause per parse
-    /// took minutes here.
     #[test]
     fn thousands_of_clauses_resolve_in_one_pass() {
         /// The parser's input limit (`trawl_core::parser::MAX_QUERY_LEN`).

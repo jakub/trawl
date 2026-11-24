@@ -4,16 +4,16 @@
 max-threads = 8
 
 [[profile.default.overrides]]
-# Each holds two 8-connection pools, the sole-writer session,
+# Each startup_pg test holds two 8-connection pools, the sole-writer session,
 # two 1-connection fixture pools, and the competing writer's lock session:
 # 20 connections, which is two slots of WORST_TEST_CONNECTION_CEILING (10).
 filter = 'package(trawl-server) & binary(startup_pg)'
 threads-required = 2
 
 [[profile.default.overrides]]
-# Only the listed Postgres modules belong
-# here: the other library unit tests open no connection. A pool-constructing case
-# in an otherwise pure module moves to a sibling `pg_tests` module.
+# Of trawl-server's library tests, only the listed Postgres modules belong
+# here: the others open no connection. A pool-constructing case in an
+# otherwise pure module moves to a sibling `pg_tests` module.
 filter = '''
   (package(trawl-server) & kind(lib)
     & (test(/^from_saved::/) | test(/^scheduler::/)

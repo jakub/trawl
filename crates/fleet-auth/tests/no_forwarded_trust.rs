@@ -12,9 +12,9 @@
 //! # Threat model
 //!
 //! The scan catches an honest reintroduction, and that is all it is for.
-//! It does not catch a contributor who wants the read to go unseen.
-//! `DOCUMENTED_NON_GOALS` below is exactly that list. What holds the
-//! invariant against a hostile contributor is code review.
+//! It does not catch a contributor who wants the read to go unseen:
+//! `DOCUMENTED_NON_GOALS` below lists evasions it misses by decision. What
+//! holds the invariant against a hostile contributor is code review.
 
 use std::fs;
 use std::path::{Path, PathBuf};

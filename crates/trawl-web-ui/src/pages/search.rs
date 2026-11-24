@@ -346,16 +346,17 @@ pub fn Search() -> impl IntoView {
         })
     };
 
-    // Built by `search_url::repair_url` off the query map. Rebuilding it
-    // from the memos instead would write every parameter's fallback.
+    // `r.href` comes from `search_url::repair_url` off the query map: built
+    // from the memos it would write every parameter's fallback. `replace` so
+    // the broken link does not become a Back destination.
     let repair_to = replace_navigator();
     let on_repair = Callback::new(move |()| {
         let Some(r) = repair.get_untracked() else {
             return;
         };
-        // A named repair keeps `q` as it stands, so the effect that syncs the
-        // editor to the executed query never fires across it. Reset the
-        // buffer here, to the query the repaired link runs.
+        // No repair changes the executed query (an unreadable link's is
+        // already empty), so the effect that syncs the editor to it never
+        // fires across one. Reset the buffer here, to the query it runs.
         query_text.set(executed_q.get_untracked());
         report_refusal(bus, repair_to(&r.href));
     });
@@ -609,9 +610,9 @@ pub fn Search() -> impl IntoView {
             _ => None,
         })
     });
-    // A named refusal the resource still holds after a newer request
-    // superseded it. The tables would render it as "Couldn't load results"
-    // with a Retry, so the region waits for the new answer instead.
+    // A query-error, recovering or exhausted refusal the resource still
+    // holds after a newer request superseded it. The tables would render it
+    // as "Couldn't load results" with a Retry, so the region waits instead.
     let refusal_superseded = Signal::derive(move || {
         query_notice.get().is_none()
             && recovering_notice.get().is_none()
@@ -855,7 +856,7 @@ pub fn Search() -> impl IntoView {
                     .is_some_and(|r| r.query.effective != effective_q.get()))
     });
     // Idle is decided before the rows are read: with no snapshot query
-    // `loading` is false, and `rows` still holds the previous response
+    // `loading` is false, and `rows` still holds any previous response
     // until the synthetic empty one lands, so reading it would count a page
     // that is no longer asked for.
     let rail_page = Memo::new(move |held: Option<&Option<RailPage>>| {
@@ -1243,9 +1244,9 @@ pub fn Search() -> impl IntoView {
     }
 }
 
-/// A `FocusPolicy::None` overlay layer (`fleet_ui::overlay`). The chord IS
-/// silenced while it is open: `has_layers()` counts layers and ignores
-/// their focus policy.
+/// A `FocusPolicy::None` overlay layer (`fleet_ui::overlay`). The command
+/// palette chord IS silenced while it is open: `has_layers()` counts
+/// layers and ignores their focus policy.
 #[component]
 fn ViewPanel(
     #[prop(into)] details: Signal<Details>,

@@ -1875,8 +1875,8 @@ fn extract_kv_tail_rename_keeps_the_wire_rendering() {
     );
 }
 
-/// The names are not envelope fields, which the query's log-column reorder
-/// would move.
+/// The projected names are not envelope fields, which the query's log-column
+/// reorder would move.
 #[test]
 fn extract_kv_tail_keeps_the_projected_column_order() {
     let (exec, src, ft, _dir) = setup_pinned_time();
@@ -2254,8 +2254,8 @@ fn a_limit_before_timechart_applies_before_the_aggregation() {
     );
 }
 
-/// Deliberately order-independent, because `head` with no sort takes
-/// whichever rows the scan yields.
+/// Sums the counts instead of checking groups, because `head` with no sort
+/// takes whichever rows the scan yields.
 fn counted_rows(result: &QueryResult) -> i64 {
     integer_column(result, "count").iter().sum()
 }

@@ -402,8 +402,8 @@ test('filters on a field the rail no longer counts stay visible and removable', 
   const first = presentation.rows[0][ts] as string;
   const second = presentation.rows[1][ts] as string;
 
-  // The exclude from the inspector, which is the only
-  // view that offers one.
+  // Both filters come from the detail views' own controls, never a
+  // hand-written URL; only the inspector offers an exclude.
   await page.locator(SEL.resultsExpandControl).nth(0).click();
   await page
     .locator(SEL.resultsDetailCell)

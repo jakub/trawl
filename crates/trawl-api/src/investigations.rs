@@ -237,7 +237,8 @@ pub struct StepOutcome {
     pub rows: Option<u64>,
     /// For a success, the rows the execution produced before the capture
     /// cut; equals the kept result's `total_rows`, and exceeds `rows` when
-    /// the capture was cut. Absent on other outcomes.
+    /// the capture was cut. Absent on other outcomes and on a success
+    /// written before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_rows: Option<u64>,
     /// How long the work ran, in milliseconds, when it ran.

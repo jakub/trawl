@@ -478,9 +478,9 @@ pub async fn main() {
 const ENVLESS: [&str; 2] = [doctor::NAME, mcp::NAME];
 
 /// clap reads `TRAWL_URL`, `TRAWL_TOKEN`, `TRAWL_INSECURE` and
-/// `TRAWL_PROFILE` while it parses, so a malformed value would fail as a
-/// clap error that quotes it, before the command could refuse the variable
-/// by name.
+/// `TRAWL_PROFILE` while it parses, and a malformed value fails as a clap
+/// error that quotes it. So the first pass parses without those bindings,
+/// and an [`ENVLESS`] command refuses a present variable by name.
 ///
 /// The matches are kept long enough to read where `--url` and `--token`
 /// came from: the parsed values cannot tell a typed flag from an exported
@@ -1200,7 +1200,6 @@ mod arg_tests {
         );
     }
 
-    /// Absent is "let the server's scan decide", which is not the same as zero.
     #[test]
     fn repin_ceiling_flags_parse() {
         let cli = Cli::try_parse_from([

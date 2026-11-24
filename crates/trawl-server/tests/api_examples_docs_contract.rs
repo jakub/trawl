@@ -2,10 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The API reference's response examples are wire values: each must decode
-//! as the `trawl_api` type the route answers with and encode back to the
-//! same JSON, so a renamed, misspelled, or invented field fails here.
-
 use std::collections::BTreeMap;
 
 use serde::Serialize;

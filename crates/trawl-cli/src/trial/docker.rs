@@ -9,8 +9,9 @@
 //! `docker context use` in another terminal between two calls would send
 //! the later ones to an engine preflight never checked. The docker CLI
 //! reads an endpoint in this order: the `--context` flag, `DOCKER_HOST`,
-//! `DOCKER_CONTEXT`, then `currentContext` in its config. The driver never
-//! passes `--context`, so `DOCKER_HOST` decides.
+//! `DOCKER_CONTEXT`, then `currentContext` in its config. The driver sets
+//! `DOCKER_HOST` to the pinned endpoint and never passes `--context`, so
+//! `DOCKER_HOST` decides.
 //!
 //! [`Docker::output`] and [`Docker::capture`] buffer both streams. Every
 //! query the trial parses and every call that carries a secret runs this
@@ -262,8 +263,9 @@ fn trust_socket(socket: &Path, me: u32) -> Result<bool, TrialError> {
     }
 }
 
-/// It runs one command, `docker context inspect`, which reads the CLI's own
-/// configuration and contacts no engine.
+/// The `docker` program before [`DockerCli::pin`]. Its one command,
+/// `docker context inspect`, reads the CLI's own configuration and contacts
+/// no engine.
 #[derive(Debug, Clone)]
 pub struct DockerCli {
     program: OsString,
@@ -551,8 +553,8 @@ fn detail(stderr: &[u8]) -> Option<String> {
     })
 }
 
-/// `None` when it exceeds [`MAX_STDOUT`]; the rest is drained so the child
-/// never blocks on a full pipe.
+/// `None` when stdout exceeds [`MAX_STDOUT`]; the rest is drained so the
+/// child never blocks on a full pipe.
 async fn read_stdout(mut pipe: impl AsyncRead + Unpin) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
     let mut out = Zeroizing::new(Vec::new());
     let mut chunk = Zeroizing::new(vec![0u8; 8192]);

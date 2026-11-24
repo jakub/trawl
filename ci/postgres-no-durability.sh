@@ -2,8 +2,8 @@
 #
 # postgres-no-durability.sh turns off durability on CI's throwaway postgres
 # service container, so per-test CREATE and DROP DATABASE stay cheap.
-# GitHub service containers take no command line, but all three settings
-# apply on a configuration reload.
+# GitHub service containers take no command line, but the three settings
+# below apply on a configuration reload.
 set -euo pipefail
 
 container=$1

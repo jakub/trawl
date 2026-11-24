@@ -18,7 +18,7 @@ use trawl_core::sanitize::sanitize_display_text;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const STATUS_RUNNING: &str = "running";
 
-/// Mirrors the CLI's sentence.
+/// Mirrors the CLI's sentence, minus its `trawl schema field` pointer.
 pub const REPIN_HINT_REFUSED: &str = "This field's name cannot be safely embedded in a command \
      line (it does not survive display sanitisation, or it begins with `-` and would be read as a \
      flag), so no repin command is shown — take the exact name from GET /api/v1/schema/field \
@@ -27,7 +27,7 @@ pub const REPIN_HINT_REFUSED: &str = "This field's name cannot be safely embedde
 /// Two names get no command, matching the CLI exactly:
 /// - one that does not survive display sanitisation, because the
 ///   sanitised spelling is a different string and would repin something
-///   else;
+///   else (or nothing);
 /// - one starting with `-`, which the argument parser reads as a flag
 ///   however it is quoted.
 #[must_use]

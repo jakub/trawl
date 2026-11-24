@@ -157,10 +157,10 @@ impl Flags {
     }
 }
 
-/// `Hir::alternation` unions branches that are classes into one class, one
-/// branch at a time, so each class branch costs a union with the branches
-/// merged before it. When the walk cannot tell, it says `Class`, which only
-/// charges more.
+/// What a finished node translates to, as far as the alternation merge
+/// cares: `Hir::alternation` unions class branches into one class, one at a
+/// time, so each class branch costs a union with the branches before it.
+/// When the walk cannot tell, it says `Class`, which only charges more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Translated {
     /// Matches only the empty string, so a concatenation drops it.
@@ -658,7 +658,6 @@ pub(crate) mod calibration {
     pub(crate) fn calibration_cases() -> Vec<Case> {
         use Verdict::{Admitted, RefusedByRepeat, RefusedByTranslation};
         let mut cases = vec![
-            // Each attack is as many classes as the repeat budget admits.
             case(
                 "A1 (?i) + 64 \\p{Any}",
                 format!("(?i){}", r"\p{Any}".repeat(64)),
@@ -1082,7 +1081,6 @@ mod tests {
         ] {
             assert_eq!(positions(body), expect, "{body}");
         }
-        // The three splits count, and `{0,2}` doubles them: (12 + 3)·2 + 38 + 2.
         assert_eq!(positions(&super::calibration::unequal_alternation()), 70);
     }
 

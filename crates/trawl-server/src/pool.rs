@@ -120,7 +120,7 @@ impl WorkContext {
     }
 
     /// Only [`ExecutorPool::execute`] and [`ExecutorPool::execute_capped`] read
-    /// it.
+    /// the ask.
     #[must_use]
     pub fn with_histogram(mut self, ask: HistogramAsk) -> Self {
         self.histogram = Some(ask);
@@ -653,10 +653,10 @@ fn account_refused(timing: Option<&QueryTiming>) {
     }
 }
 
-/// One refused request can reach two of these: the request future gives
-/// up on its budget, which latches cancellation, and the worker it
-/// released then refuses to start on that latch. The first one to arrive
-/// logs and names the reason, and the second is silent.
+/// One refused request can refuse twice: the request future gives up on
+/// its budget, which latches cancellation, and the worker it released
+/// then refuses to start on that latch. It is one refusal, so the first
+/// to arrive logs and names the reason, and the second is silent.
 #[derive(Clone)]
 struct RefusalOnce {
     logged: Arc<AtomicBool>,
@@ -977,7 +977,8 @@ pub struct ExecuteOutcome {
     /// pipeline (ADR-0013 ruling 9). Empty for a failed, timed-out or
     /// never-started run.
     pub severity_columns: Vec<String>,
-    /// The final result counted by `_time`, before the page is cut.
+    /// The final result counted by `_time` before the page is cut, when the
+    /// work asked ([`WorkContext::with_histogram`]).
     pub histogram: Option<EventHistogram>,
 }
 
@@ -1113,9 +1114,9 @@ pub struct ExecutorPool {
     preparation: crate::prepare::Preparation,
     scheduled: Arc<Semaphore>,
     manual: Arc<ManualGate>,
-    /// Its lock is not held here but by every connection to the query
-    /// database ([`Executor::open_query_database`]), so it stays held while
-    /// any worker's connection is open, the pool gone or not.
+    /// The scratch directory's lock is not held here but by every connection
+    /// to the query database ([`Executor::open_query_database`]), so it stays
+    /// held while any worker's connection is open, the pool gone or not.
     scratch: QueryScratch,
     /// The temp directory a [`Self::for_test`] pool's scratch lives in,
     /// declared last so it is removed after the pool's own connections
@@ -1618,8 +1619,9 @@ impl ExecutorPool {
             .collect()
     }
 
-    /// This is the single id authority, so `/queries` listings and
-    /// [`cancel_by_id`](Self::cancel_by_id) speak the same id space.
+    /// The single id authority: pass the returned id to the work and, for
+    /// user-visible work, to `QueryTracker::start`, so `/queries` listings
+    /// and [`cancel_by_id`](Self::cancel_by_id) speak the same id space.
     pub fn allocate_query_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -2970,11 +2972,10 @@ mod tests {
 
     /// A global subscriber, not a thread-local one: the events these
     /// tests are about are emitted from the blocking worker thread, which
-    /// does not inherit `set_default`. The sink keeps only the events
-    /// carrying that test's own POOL and `query_id`: ids start at zero in
-    /// every pool, and the plain `cargo test` harness runs tests in threads.
-    /// The timing events carry no pool: they are kept by the test's own
-    /// `request_id`.
+    /// does not inherit `set_default`. A work sink matches POOL and
+    /// `query_id` together: ids start at zero in every pool, and the plain
+    /// `cargo test` harness runs tests in threads. Timing events carry no
+    /// pool: a work sink keeps them by the test's own `request_id`.
     mod capture {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -3373,8 +3374,8 @@ mod tests {
         assert_eq!(failed.histogram, None, "a failed run has no rows to count");
     }
 
-    /// The DSL has no `|`, so the severity walk reads no latch: the histogram
-    /// walk is what stops.
+    /// The DSL has no `|`, so the severity walk reads no latch and the
+    /// histogram walk is the one that sees the cancel.
     #[tokio::test(start_paused = true)]
     async fn histogram_walk_stops_on_a_latched_cancel() {
         use crate::histogram::HistogramAsk;

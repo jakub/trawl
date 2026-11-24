@@ -170,10 +170,9 @@ impl RootSeen {
     }
 }
 
-/// On an ingest node the same holds for the effective WAL directory, which
-/// boot creates when it is absent, wherever it is: a path under the data root
-/// may leave it through `..` or a symlink, and access to the root proves
-/// nothing about a child that exists.
+/// On an ingest node the effective WAL directory is checked as the root is,
+/// wherever it is: a path under the data root may leave it through `..` or a
+/// symlink, and access to the root proves nothing about a child that exists.
 async fn check_root(
     data_root: PathBuf,
     wal_dir: PathBuf,
@@ -238,7 +237,7 @@ enum Closing {
     Refused(RootKind, Unclosable),
 }
 
-/// It carries no path and no uid, so no row can name one.
+/// Carries no path and no uid, so no row can name one.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unclosable {
@@ -319,7 +318,8 @@ const fn root_name(kind: RootKind) -> &'static str {
     }
 }
 
-/// Its sentences name the root by kind, never by path, and never an owner.
+/// The row's sentences name the root by kind, never by path, and never an
+/// owner.
 #[cfg(unix)]
 #[allow(
     clippy::too_many_lines,
@@ -478,8 +478,8 @@ fn wal_row(seen: RootSeen) -> Option<Row> {
     Some(row)
 }
 
-/// A symlink, a non-directory or another owner there is boot's closing's to
-/// report first ([`closing`]).
+/// A symlink, a non-directory or another owner at the results root is boot's
+/// closing's to report first ([`closing`]).
 fn results_row(seen: RootSeen) -> Option<Row> {
     let check = ServerCheck::DataRoot;
     let access = || Text::new("give the service user access to the results root, or run as it");
@@ -1284,9 +1284,9 @@ fn observe_rollup_path(path: &Path, blind: &mut bool) -> rollup_marker::Observat
         .map_or(Observation::Unreadable, Observation::Identity)
 }
 
-/// Read the rollup marker at `path` with the decoder boot's recovery reads
-/// it with, then classify it with recovery's own [`rollup_marker::classify`],
-/// read-only.
+/// Like boot's recovery: refuse a day directory not named as a canonical
+/// date, read the marker with recovery's decoder, then classify it with
+/// [`rollup_marker::classify`], read-only.
 fn see_rollup(path: &Path) -> RollupSeen {
     let canonical_day = path
         .parent()

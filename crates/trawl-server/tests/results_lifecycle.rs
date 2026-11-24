@@ -501,8 +501,9 @@ async fn fence_blocked_by(probe: &sqlx::PgPool, pid: i32) {
     }
 }
 
-/// Besides the fixture's pools it holds the first insert's own connection
-/// and a one-connection probe pool, inside the direct-store ceiling.
+/// Besides the fixture's pools this test holds the first insert's own
+/// connection and a one-connection probe pool, inside the direct-store
+/// ceiling.
 async fn fence_waits_for_an_open_commit(end: CommitEnd) {
     let telemetry = telemetry();
     let server = boot(CaptureConfig {

@@ -13,8 +13,8 @@
 //! head — into one equality predicate per `WHEN` arm, at PARSE time, before
 //! the binder ever sees a lateral alias. A SEARCHED `CASE` is not
 //! rewritten. Text-level drift tests count the wrong side of the parser, so
-//! the copy counts here are held against the PARSED tree by
-//! `trawl-engine/tests/duckdb_probe.rs`.
+//! the copy counts of the conform and severity renderings are held against
+//! the PARSED tree by `trawl-engine/tests/duckdb_probe.rs`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -248,9 +248,9 @@ pub enum CompareKind {
     /// VARCHAR pin's equality against a numeric literal, which names its
     /// subject twice.
     TextOrNumeric,
-    /// A `SEVERITY` band reached through a MIXED `IN` list. No single pin can
-    /// produce that mixture, so this arm is defensive and takes the widest
-    /// set the ladder can render.
+    /// A `SEVERITY` band in an `IN` list that also holds a non-severity
+    /// element. No single pin can produce that mixture, so this arm is
+    /// defensive and takes the widest set the ladder can render.
     SeverityBand,
 }
 
@@ -762,8 +762,8 @@ fn score_stage(
             charge(index, keyword, None, weight.d, total)?;
         }
         PipeStage::Rename(r) => {
-            // Recorded all the same: the stage's own outputs are what a
-            // same-stage reference would find.
+            // A renamed leaf adds no delta, but is recorded all the same: the
+            // stage's own outputs are what a same-stage reference would find.
             for (_, new) in &r.renames {
                 memo.insert(catalog_key(new), Weight::LEAF);
             }
@@ -828,7 +828,9 @@ fn score_aggregations(
 }
 
 /// The regex pattern copies `DuckDB` binds for one stage beyond the
-/// patterns the emitter writes for it (ADR-0063).
+/// patterns the emitter writes for it (ADR-0063), except a pivot's fill,
+/// which the emitter charges if a later stage renders it
+/// ([`pivot_aggregate_regex`]).
 #[must_use]
 #[allow(clippy::match_same_arms)]
 pub fn stage_regex_copies(stage: &PipeStage) -> RegexLoad {

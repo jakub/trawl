@@ -222,8 +222,8 @@ pub(crate) fn check_call(name: &str, args: &[Spanned<Expr>]) -> Result<(), EmitE
     Ok(())
 }
 
-/// Anything else is refused, including `-1`, which parses as a
-/// negation of `1` rather than as a literal.
+/// Only an integer literal is accepted: `-1` is refused, because it parses
+/// as a negation of `1`.
 pub(crate) fn int_literal_arg(name: &str, index: usize, arg: &Expr) -> Result<i64, EmitError> {
     match arg {
         Expr::Literal(LiteralValue::Int(n)) => Ok(*n),
@@ -376,7 +376,7 @@ pub(crate) fn translate_function(
         }),
         // DuckDB's STRFTIME accepts (timestamp, format) directly. A text-level
         // swap would desynchronize the `?` placeholders from emit_call_args'
-        // DSL-order param push.
+        // DSL-order param push whenever both arguments bind parameters.
         "strftime" => require_n_args(name, args, 2, |a| format!("STRFTIME({}, {})", a[0], a[1])),
         // TRY_STRPTIME (not STRPTIME) so an unparseable input yields NULL, not a
         // whole-query error — matching the streaming eval path, which nulls.

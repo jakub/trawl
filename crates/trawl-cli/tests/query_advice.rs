@@ -286,7 +286,6 @@ async fn cli_semantic_error_has_no_advice() {
 /// build, and that advice would otherwise flag.
 const INVALID_REGEX: &str = r"-service=x f=/\p{Nope}/";
 
-/// The endpoint is unreachable: the advice is printed before any request.
 #[tokio::test]
 async fn cli_query_advice_skips_locally_invalid_regex() {
     let (home, config) = local_home();

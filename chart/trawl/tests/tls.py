@@ -229,7 +229,8 @@ class TLS(unittest.TestCase):
         self.assertEqual(upstream(objects), {"upstream_ca_path": "/var/lib/trawl/tls/cert.pem"})
         sidecar = container(objects, "trawl-web")
         self.assertEqual([e["name"] for e in sidecar["env"]], SIDECAR_ENV)
-        # As a directory: a file subPath would pin the first certificate forever.
+        # tls/ as a directory: a file subPath would pin the first certificate
+        # forever.
         data = [m for m in sidecar["volumeMounts"] if m["name"] == "data"]
         self.assertEqual(data, [{"name": "data", "mountPath": "/var/lib/trawl/tls", "subPath": "tls", "readOnly": True}])
         self.assertNotIn("tls", [m["name"] for m in sidecar["volumeMounts"]])

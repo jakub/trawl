@@ -485,7 +485,8 @@ pub async fn query(
                 // Every 400-class engine answer: a query nobody could have
                 // answered is the caller's mistake, and logging it at
                 // ERROR as the server's own failure buries the ones
-                // that are. `error_class` tells them apart.
+                // that are. All three share `error_type = "parse"`;
+                // `error_class` tells them apart.
                 ServerError::Engine(
                     trawl_engine::error::EngineError::Parse(_)
                     | trawl_engine::error::EngineError::Emit(_)
@@ -601,7 +602,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
 
 /// Shared by the health route and `GET /api/v1/capabilities`. It records no
 /// request failure: that is the health route's, the one caller that answers
-/// the 503.
+/// 503 for `unavailable`.
 pub(crate) async fn health_report(state: &AppState) -> (StatusCode, HealthResponse) {
     let duckdb = state.engine_sample.read();
 
@@ -1463,7 +1464,7 @@ fn current_pin(duckdb_type: &str) -> trawl_core::schema::CanonicalType {
         .unwrap_or(trawl_core::schema::CanonicalType::Varchar)
 }
 
-/// Two page-keyed queries, never a join into the listing SQL: the same trap
+/// Page-keyed queries, never a join into the listing SQL: the same trap
 /// [`crate::store::CatalogStore::list_fields`] documents for its conflict
 /// evidence applies here — a grouped subquery over the whole
 /// `field_conflict_stats` table has no predicate a planner can push down,
@@ -2225,11 +2226,6 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 }
 
 /// `POST /api/v1/schema/repin` — trigger a repin (ADR-0011).
-///
-/// 200 = dry-run report, 202 = rewrite started (poll `/schema/repin/status`),
-/// 409 = the scan projected nulled values and no force flag was passed — the
-/// body is the plan the refusal is based on. A job still running at
-/// `[server] timeout_secs` answers 202, dry runs included.
 pub async fn schema_repin(
     State(state): State<AppState>,
     verified: Authorized<needs::SchemaWrite>,
@@ -2297,8 +2293,8 @@ pub async fn schema_repin(
 ///
 /// No request body: there is at most one running job, and naming it would
 /// invite an operator to cancel a job that already ended and a newer one
-/// took the slot. A store that cannot serve that row costs the body, never
-/// the verdict, because the cancel has already taken effect in process.
+/// took the slot. A store that cannot serve the job row drops `job` from the
+/// body, never the verdict: the cancel has already taken effect in process.
 pub async fn schema_repin_cancel(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -3024,8 +3020,8 @@ pub async fn export(
         .query
         .pool
         .pend(query_id, crate::pool::WorkKind::Export);
-    // Left in place when the transport drops this future at an await, it
-    // closes as abandoned. A mutex, not a cell: `refused` lives across
+    // The entry, left in place when the transport drops this future at an
+    // await, closes as abandoned. A mutex, not a cell: `refused` lives across
     // awaits, and the handler's future must stay `Send`.
     let tracked = parking_lot::Mutex::new(Some(
         state.query.tracker.start(query_id, &verified, &req.query),
@@ -3281,8 +3277,8 @@ fn close_failed_export(
     metrics::histogram!(crate::metrics::QUERY_DURATION).record(took.as_secs_f64());
 }
 
-/// The caller does this before any await: once the body exists the export
-/// succeeded, even if its caller leaves while the history row is written.
+/// Called before any await: once the body exists the export succeeded, even
+/// if its caller leaves while the history row is written.
 fn close_ready_export(
     tracked: Option<crate::tracker::Tracked>,
     rows: usize,

@@ -276,10 +276,10 @@ pub fn classify(inventory: &Inventory, our_id: Option<&str>) -> Ownership {
     Ownership::Foreign(foreign)
 }
 
-/// A killed `up` can leave one running (a `keys create` that commits after
-/// the rerun lists keys). A `created` one-off counts too: a Compose client
-/// killed after the engine accepted its create and start can leave one that
-/// starts late.
+/// A killed `up` can leave a one-off running (a `keys create` that commits
+/// after the rerun lists keys). A `created` one-off counts too: a Compose
+/// client killed after the engine accepted its create and start can leave
+/// one that starts late.
 pub fn unfinished_oneoffs<'a>(inventory: &'a Inventory, our_id: &str) -> Vec<&'a Resource> {
     inventory
         .resources
@@ -299,8 +299,8 @@ pub fn oneoff_remove_args(id: &str) -> Args {
     Args::new().args(["container", "rm", "--", id])
 }
 
-/// It names the recorded image id, never the reference, as the Compose
-/// file does.
+/// The claim names the recorded image id, never the reference, as the
+/// Compose file does.
 pub fn claim_create_args(trial_id: &str, image: &ImageRecord) -> Args {
     Args::new()
         .args(["container", "create", "--name", CLAIM_NAME, "--label"])

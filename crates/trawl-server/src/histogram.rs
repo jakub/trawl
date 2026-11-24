@@ -62,9 +62,9 @@ pub fn plan(asked: bool, query: &Query, from_saved: bool) -> HistogramPlan {
     }
 }
 
-/// Each pass reads `cancel` at its first row and every [`TAIL_CANCEL_STRIDE`]
-/// rows after, and once more when the pass ends, so a result with no usable
-/// time is not answered past a cancel either.
+/// Each of the two passes reads `cancel` at its first row and every
+/// [`TAIL_CANCEL_STRIDE`] rows after, and once more when the pass ends, so a
+/// result with no usable time is not answered past a cancel either.
 pub fn count(
     result: &QueryResult,
     kept_some: bool,

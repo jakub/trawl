@@ -45,7 +45,7 @@ async fn scrape_metrics(url: &str) -> String {
         .unwrap()
 }
 
-/// 0 when it has never been incremented
+/// An unlabelled counter's value, 0 when it has never been incremented
 /// (prometheus does not render a counter until something touches it).
 fn counter_value(scrape: &str, name: &str) -> u64 {
     scrape
@@ -492,9 +492,9 @@ async fn gc_waits_for_the_compaction_batch_and_sees_what_it_published() {
     assert!(h.pinned("slow"));
 }
 
-/// Polling the route instead would deadlock under the opposite scheduler order:
-/// the polled call could be the one that took admission, and it would then
-/// block on the corpus gate this test is holding.
+/// Waits on `admission_held` rather than polling the route: a polled call
+/// could be the one that took admission, and it would then block on the
+/// corpus gate this test is holding.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_concurrent_gc_run_is_refused_immediately() {
     let h = harness().await;

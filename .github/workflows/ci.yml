@@ -228,7 +228,7 @@ jobs:
   test:
     # Every pg test runs under #[sqlx::test] (per-test ephemeral database off
     # DATABASE_URL, so the role must have CREATEDB). Each slice has its own
-    # server, so the budget holds per job.
+    # server, so the nextest `postgres` group's connection budget holds per job.
     name: test (${{ matrix.partition }}/3)
     runs-on: ubuntu-24.04
     needs: test-build
@@ -834,13 +834,14 @@ jobs:
     # The build target is pinned explicitly below, and that flag is
     # load-bearing. `cargo fuzz` does NOT default `--target` to the host
     # triple: it defaults to the triple cargo-fuzz ITSELF was compiled for.
-    # install-action hands every Linux runner a musl-static binary that then
-    # builds the fuzz target for musl, and AddressSanitizer cannot instrument
-    # a statically linked libc.
+    # install-action hands every Linux runner a musl-static binary, which
+    # without the flag builds the fuzz target for musl, and AddressSanitizer
+    # cannot instrument a statically linked libc.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # This job executes code the PR controls: read-only token, and no
-    # credentials persisted into .git/config for that code to read.
+    # This job runs code the PR controls (the fuzz target and every build
+    # script), so: read-only token, and no credentials persisted into
+    # .git/config for that code to read.
     permissions:
       contents: read
     steps:
@@ -878,11 +879,11 @@ jobs:
       - name: Fuzz parse_emit
         working-directory: crates/trawl-core
         env:
-          # cargo-fuzz APPENDS its sanitizer flags to the inherited
-          # `RUSTFLAGS: -D warnings`, and nightly 1.100 deprecates
-          # `AtomicU64::fetch_update`, which crates/trawl-core/src/stream.rs uses.
-          # `try_update` does not exist on stable 1.98. The stable clippy job
-          # is what actually gates warnings.
+          # Cleared: cargo-fuzz APPENDS its sanitizer flags to the workflow's
+          # `-D warnings`, which turns nightly 1.100's deprecation of
+          # `AtomicU64::fetch_update` (crates/trawl-core/src/stream.rs) into an
+          # error. `try_update` does not exist on stable 1.98. The stable clippy
+          # job is what actually gates warnings.
           RUSTFLAGS: ""
         run: |
           # A writable scratch corpus FIRST, the committed inputs after:
@@ -902,7 +903,6 @@ jobs:
           # The input paths are relative to THIS step's working directory,
           # crates/trawl-core: cargo-fuzz does not chdir into fuzz/ before
           # exec'ing the target, so `seeds/parse_emit` would resolve to
-          # nothing and libFuzzer exits 1 with "No such file or directory"
           # nothing and libFuzzer exits 1 with "No such file or directory".
           cargo +nightly-2026-08-24 fuzz run parse_emit \
             --target x86_64-unknown-linux-gnu \
