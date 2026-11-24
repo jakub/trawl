@@ -5,7 +5,6 @@ pagination defect. Amended 2026-09-21 by ADR-0038: the chart's x axis is
 now the bucket instant, and grouped results draw. The coverage rule and
 its place last in the ladder are unchanged. Amended 2026-11-09 (#197
 prep): the raw-event Histogram counts the whole result; see Consequences.
-Amended 2026-11-23: rulings moved from code comments; see the Amendment.
 
 `api::query` sends `limit: PAGE_SIZE` with `offset: page * PAGE_SIZE` for
 every snapshot query (`crates/trawl-web-ui/src/api/mod.rs:408-417`), and
@@ -146,9 +145,3 @@ fetched.
 - Fetching whole removes a request per page turn on aggregations, so the
   change spends fewer requests against the interactive rate limit than
   the behaviour it replaces, not more.
-
-## Amendment (2026-11-23): rulings moved from code comments
-
-A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
-
-- **The 48 bins in `histogram::count` are half-open, start at the first usable `_time`, and end strictly after the last one.** Each bin is a whole number of microseconds, rounded up, and the 48 bins together span at least `HISTOGRAM_MIN_SPAN_MICROS`, one second. A half-open bin cannot hold its own end, so the last event needs a bin past it. Without the one-second floor, a single event or a burst inside one microsecond gives bins of zero width.

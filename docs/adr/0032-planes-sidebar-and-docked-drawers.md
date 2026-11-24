@@ -180,18 +180,22 @@ A comment audit on 2026-11-23 removed these rulings from the code, where
 they were the only record. They were already in force. None is a new
 decision.
 
-- **A change of `docked` never remounts a drawer's children.** Only the
-  overlay layer registration and the two host classes change. A resize
+- **A change of `docked` never remounts a drawer's children.** The drawer
+  registers or releases its overlay layer, the wrapper switches between
+  `sd-scrim` and `sd-host`, and the panel toggles `sd-docked`. A resize
   across the docking width is not an open or a close, so the panes keep
   their state and their loaded data. The nets detail panes depend on
   this, as the Runs detail does.
-- **Only an undocked drawer takes focus on open, and both presentations
-  return focus to the opener on close.** A panel that mounts docked
-  takes no initial focus, and a later undock is a resize, so it takes
-  none either. A docked drawer holds no layer, so `Drawer` records the
-  opener itself. On close it restores the opener only when focus was
-  inside the closing panel or had fallen to `<body>`. Focus anywhere
-  else was put there on purpose and stays.
+- **A drawer moves focus only when the focus belongs to it.** On open,
+  only a drawer that mounts undocked with an overlay layer that owns
+  focus takes initial focus. A panel that mounts docked takes none, and
+  a later undock is a resize, so it takes none either. `Drawer` records
+  the opener itself in both presentations, because a docked drawer
+  holds no layer whose restore could run. On close, an undocked drawer
+  restores the opener when its layer owns focus. A docked drawer
+  restores it when focus is inside the closing panel or has fallen to
+  `<body>`. Focus anywhere else, including a modal above the drawer,
+  was put there on purpose and stays.
 - **A collapsed sidebar link keeps its visible label as screen-reader
   text.** `nav.rail.collapsed` clips `.lb` and `.grp-lb` visually and
   does not remove them. An icon-only link then keeps its accessible
@@ -208,9 +212,11 @@ decision.
   summary belongs to the selected identity, the same way the known net
   name does, so a later selection cannot inherit it.
 - **The Search reading modes, Inspector details and message-first rows,
-  default off and apply only to snapshot raw results.** A live ring
-  evicts rows every frame, so a selected row in it would be cleared
-  continuously. `LiveRawTable` takes neither mode.
+  default off and apply only to snapshot raw results.** An Inspector
+  selection is a row index. Once the live ring holds
+  `LIVE_RING_CAPACITY` events, each new event drops the oldest one and
+  shifts every index by one, so a selected index would name a different
+  event. `LiveRawTable` takes neither mode.
 - **A segmented control has one active treatment: the chosen option is
   raised out of the well track onto the sheet plane.** The stylesheet
   holds exactly one `.seg-opt.on` rule, and `component_class_contract`

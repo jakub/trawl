@@ -84,4 +84,4 @@ compile-fix at this rev.
 
 A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
 
-- **fleet-ui ships one closed `Icon` enum in `icon.rs`, and no component accepts arbitrary SVG from a consumer.** Chrome props such as `RailItem::icon` take an `Icon`, so every app draws its chrome from the same glyph set and style. A new glyph is a new `Icon` variant and a match arm in `icon_body`, not a raw SVG in the app crate (coastwatch ADR-0030).
+- **Every fleet-ui icon prop takes the closed `Icon` enum in `icon.rs`, never an SVG view.** `RailItem::icon`, the modal `icon` prop and `IconView` take an `Icon`, so every app draws its chrome from the same glyph set and style. A new shared glyph is a new `Icon` variant and a match arm in `icon_body` (coastwatch ADR-0030). Content slots such as `children` stay open and can carry any view the app passes, SVG included.

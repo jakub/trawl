@@ -110,4 +110,4 @@ names and exclusive-choice controls keep this ADR's existing rules.
 
 A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
 
-- **Correction. Selecting a run on the Runs page replaces the history entry, the same as the schema and nets drawers.** The Runs row link in `pages/runs.rs` sets `prop:replace=true`, and `push_run` navigates with `replace: true`. Reading down a list adds one history entry, not one per row. The receipt's Open net is the one control on that page that pushes, as ADR-0032 states. This corrects "the Runs page keeps its push" in the Decision.
+- **Correction. Selecting or closing a run on the Runs page replaces the history entry, the same as the schema and nets drawers.** The Runs row link in `pages/runs.rs` sets `prop:replace=true`, and `push_run` navigates with `replace: true`, so reading down the list does not add a history entry per row. The receipt's Open net pushes, as ADR-0032 states. Run query again also pushes when the search navigator accepts the query. This corrects "the Runs page keeps its push" in the Decision.
